@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::command_ran::RanFeed;
+use crate::holder_image::{start_clock_us, start_tick_us};
 
 /// How soon after the gather hands on a batch the sampler looks at the parse stage: the batch may
 /// hold a block's C, and a command's job takes the foreground about a millisecond after its shell
@@ -137,46 +138,6 @@ fn execd_start_using(
 ) -> Option<u64> {
     let before = start(pgid)?;
     (execd(pgid) == Some(true) && start(pgid) == Some(before)).then_some(before)
-}
-
-/// Now on the clock a leader's start is read on (`crate::holder_image::start_us_of`), in
-/// microseconds: Linux's boot clock (`CLOCK_BOOTTIME`, which `/proc/<pid>/stat`'s start time
-/// counts from), macOS's wall clock (a process's birth record); `None` elsewhere.
-pub(crate) fn start_clock_us() -> Option<u64> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        aterm_uds::process::boot_clock_now().map(|c| c.0 / 1_000)
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|d| u64::try_from(d.as_micros()).ok())
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    {
-        None
-    }
-}
-
-/// How far a leader's start as read (`crate::holder_image::start_us_of`) can precede its real
-/// start, in microseconds: one tick of Linux's `/proc/<pid>/stat` start time (10 ms at 100 a
-/// second, `aterm_uds::process::proc_start_tick_ns`), a microsecond of macOS's birth record;
-/// `None` elsewhere.
-pub(crate) fn start_tick_us() -> Option<u64> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        aterm_uds::process::proc_start_tick_ns().map(|ns| ns.div_ceil(1_000))
-    }
-    #[cfg(target_vendor = "apple")]
-    {
-        Some(1)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
-    {
-        None
-    }
 }
 
 /// The latest wall-clock ms a process whose start reads `start_us` (microseconds on the start

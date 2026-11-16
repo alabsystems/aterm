@@ -1453,12 +1453,13 @@ pub fn accepted(
 }
 
 /// Rewrite `commit`'s FAIL of `check` (a bundle check's on `executable`, a tree check's with
-/// none) as the owner's acceptance of it: the check must be one whose FAIL is accepted
-/// ([`acceptable`]), the FAIL's key this tree's and `seal`'s, its log `report` and that log's
-/// SHA-256 `report_sha256`.
+/// none), or a bundle check's NOT RUN, as the owner's acceptance of it: the check must be one
+/// whose FAIL is accepted ([`acceptable`]), the record's key this tree's and `seal`'s, its log
+/// `report` and that log's SHA-256 `report_sha256`.
 ///
 /// # Errors
-/// A check whose FAIL is never accepted, no such FAIL record, any mismatch, or the write.
+/// A check whose FAIL is never accepted, no such FAIL (or bundle NOT RUN) record, any mismatch,
+/// or the write.
 pub fn accept(
     git: &dyn GitRunner,
     commit: &str,
@@ -1510,12 +1511,21 @@ pub fn accept_in(
             at.display()
         ));
     };
-    if record.outcome != FAIL {
+    // A bundle check that could not run is accepted like its FAIL: since 32e0e3aa45c a release
+    // bundle is measured only inside a virtual machine (a fresh HOME on the live LAN is A12's
+    // refusal), so the release host records measure NOT RUN for every release it cuts. A tree
+    // check that could not run is never accepted: it runs again.
+    if record.outcome != FAIL && !(bundle(check) && record.outcome == NOT_RUN) {
         return Err(format!(
-            "the {name} record of {}'s tree{} is {}, not FAIL: only a FAIL is accepted",
+            "the {name} record of {}'s tree{} is {}, not FAIL: only a FAIL is accepted{}",
             short(commit),
             executable.map_or_else(String::new, |u| format!(" on {}", short(u))),
-            record.outcome
+            record.outcome,
+            if bundle(check) {
+                " (or a NOT RUN of the bundle)"
+            } else {
+                ""
+            }
         ));
     }
     if !answers(&record, name, tree, seal, executable) {
@@ -1525,7 +1535,9 @@ pub fn accept_in(
         ));
     }
     let logged = std::fs::canonicalize(&record.log).ok();
-    if logged.as_deref() != Some(report) || record.log_sha256 != report_sha256 {
+    if logged.as_deref() != Some(report)
+        || (record.log_sha256 != report_sha256 && !begins_with(report, &record.log_sha256)?)
+    {
         return Err(format!(
             "the {name} FAIL was read from {} (sha256 {}), not {} as it is now",
             record.log,
@@ -1540,6 +1552,29 @@ pub fn accept_in(
     });
     write(&at, &record)?;
     Ok(at)
+}
+
+/// The largest step log [`begins_with`] reads: a release's whole-tree log is about 13 MiB.
+const MAX_REPORT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Whether `report`'s first lines are the bytes whose SHA-256 is `digest`: the cutter hashes a
+/// step's log when it writes that step's records and then appends its own lines (the records it
+/// wrote) to the same log, so the log a record names has grown since it was hashed. The bytes it
+/// hashed are still the log's first bytes, unchanged, up to the end of a line.
+///
+/// # Errors
+/// The report cannot be read.
+fn begins_with(report: &Path, digest: &str) -> Result<bool, String> {
+    let bytes = crate::durable::read_regular_bytes(report, MAX_REPORT_BYTES)
+        .map_err(|e| format!("read {}: {e}", report.display()))?;
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+        hasher.update(line);
+        if aterm_codec::hex::encode_lower(hasher.clone().finish().as_ref()) == digest {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn write(at: &Path, record: &CheckRecord) -> Result<(), String> {

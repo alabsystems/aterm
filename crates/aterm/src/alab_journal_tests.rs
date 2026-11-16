@@ -30,6 +30,9 @@ fn every_harness_word_is_a_journal_word() {
     for why in journal::WHYS {
         assert!(Word::<16>::new(why).is_some(), "{why}");
     }
+    for plan in journal::PLANS {
+        assert!(Word::<12>::new(plan).is_some(), "{plan}");
+    }
     for cli in Cli::ALL {
         assert!(Word::<10>::new(cli.id()).is_some(), "{}", cli.id());
     }
@@ -51,6 +54,7 @@ fn every_harness_word_is_a_journal_word() {
         to: None,
         tab: None,
         harness: None,
+        plan: None,
     };
     let shapes = [
         base,
@@ -110,6 +114,14 @@ fn every_harness_word_is_a_journal_word() {
             journal::SeenWhy::First,
             9_999_999_999,
         ),
+        // The widest plan word an account's plan is noted with.
+        journal::plan_note(
+            Cli::Claude,
+            account,
+            "enterprise",
+            journal::ObservedSrc::Profile,
+            9_999_999_999,
+        ),
     ];
     let mut buf = [0; aterm_db::alab::journal::event::MAX_EVENT];
     for note in &shapes {
@@ -160,6 +172,32 @@ fn every_harness_word_is_a_journal_word() {
     );
 }
 
+/// EVERY PLAN THE REGISTRY SEEDS IS A PLAN WORD A MAC WRITES. The accounts relation reads an
+/// observed plan as `<provider>-<word>` and compares it with the plan row a person set, so a
+/// seeded row (`openai-prolite`, which Codex reports as `prolite`) whose word `plan_word` does
+/// not keep could be set but never observed: its `plan-seen` would never be written.
+/// NEGATIVE CONTROL: with `prolite` out of `journal::PLANS`, `` the registry's plan
+/// openai-prolite is no plan word a Mac writes ``.
+#[test]
+fn every_plan_the_registry_seeds_is_a_plan_word_a_mac_writes() {
+    let mut seen = 0;
+    for seed in &aterm_db::alab::seeds::PLANS {
+        let word = seed
+            .pk
+            .strip_prefix(seed.provider)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .unwrap_or_else(|| panic!("{} is keyed <provider>-<word>", seed.pk));
+        assert_eq!(
+            journal::plan_word(word),
+            Some(word),
+            "the registry's plan {} is no plan word a Mac writes",
+            seed.pk
+        );
+        seen += 1;
+    }
+    assert!(seen >= 7, "the registry seeds its plans: {seen}");
+}
+
 /// The backfill is marked done only once its notes are in the spool: a spool that cannot
 /// be written leaves it unmarked, so the next start backfills again and no note is lost.
 /// NEGATIVE CONTROL: with `record` marking first (`journal::mark_backfilled(state)?` before
@@ -188,6 +226,7 @@ fn a_backfill_is_marked_only_once_its_notes_are_spooled() {
         to: None,
         tab: None,
         harness: None,
+        plan: None,
     };
     assert!(record(&spool, &state, &[note]).is_err());
     assert!(
@@ -428,6 +467,7 @@ fn missing_harness_state_or_pre_epoch_clock_leaves_backfill_unmarked_and_bad_not
         to: None,
         tab: None,
         harness: None,
+        plan: None,
     };
     assert!(event(&zero_time).is_none());
     let over_pct = Note {
@@ -463,6 +503,7 @@ fn a_workspace_and_a_realm_only_probe_reach_the_journal() {
         to: None,
         tab: None,
         harness: None,
+        plan: None,
     };
     assert_eq!(event(&reading).unwrap().sub, Word::new("0123456789ab"));
     let probe = Note {
@@ -522,6 +563,7 @@ fn a_note_made_while_the_journal_is_off_is_never_spooled() {
         to: None,
         tab: None,
         harness: None,
+        plan: None,
     };
     let spooled = scratch
         .path()
@@ -742,5 +784,193 @@ fn holdings_come_from_the_rosters_beside_the_config() {
         holdings_in(&lab, &config, None, &OnToken::none()),
         None,
         "a broken roster"
+    );
+}
+
+/// A PLAN ATERM READS REACHES THE ACCOUNTS' OBSERVED PLAN, once per change of word. The machine
+/// sweep reads Claude Code's profile (`oauthAccount.organizationType`) and Codex's `auth.json`
+/// (its tokens' `chatgpt_plan_type`); each account's plan becomes one `plan-seen` through the
+/// glue's `event` into a spool, and what this Mac publishes of the account (its book, its `use`
+/// row's `plan` and its `ev` batch, which the fleet's accounts relation reads as `plan_observed`,
+/// `plan_at`) states the word and when. A later look writes nothing; a changed word is written
+/// once; a plan outside the vocabulary (Claude Code's other organization types, a plan claim
+/// that is no plan word) and a CLI that states none (Muse Code) write nothing. A canary sits in
+/// every other field of the fixture files (a credential, a claim, a token's signature, the plan
+/// claim itself once): no note, spool file, sweep file, fold or log line carries it. What a peer
+/// folds of this Mac's `ev` batch and `use` row (`Seen::plan`, which the accounts relation
+/// reads as `plan_observed`) states the same word and time.
+/// NEGATIVE CONTROLS: with `event` dropping the note's plan (`plan: None`, as before), no event
+/// holds the plan: `` left: None right: Some(("max", 1800000000)) ``; with `sweep` noting a plan
+/// whatever word it last noted, the second look writes again: `` left: [("claude", "max"),
+/// ("codex", "plus")] right: [] ``; with `journal::plan_word` taking any word-shaped text, the
+/// canary plan claim is written: `` a plan-seen of codex carries the canary ``; with a peer's
+/// `Seen` keeping no plan it folds, `` left: None right: Some(("max", 1800000000)) `` at the
+/// `peer` check; with `prolite` out of `journal::PLANS`, `` left: [("claude", "pro")] right:
+/// [("claude", "pro"), ("codex", "prolite")] ``.
+#[cfg(unix)]
+#[test]
+fn a_plan_aterm_reads_is_written_once_and_read_as_the_accounts_observed_plan() {
+    use aterm_agent::harness::observe::sweep;
+    use aterm_db::alab::journal::fold_plan_for_test;
+    // Word-shaped (12 bytes of `[a-z0-9]`), so only the plan vocabulary keeps it out.
+    const CANARY: &str = "zqcanary5b7d";
+    const ANN: &str = "ann@example.invalid";
+    const T0: i64 = 1_800_000_000;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let state = scratch.path().join("harness");
+    let spool = Spool::at(scratch.path().join("alab"));
+    let write = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    let profile = |organization: &str| {
+        format!(
+            r#"{{"primaryApiKey":"{CANARY}","oauthAccount":{{"emailAddress":"{ANN}","accountUuid":"11111111-2222-3333-4444-555555555555","organizationType":"{organization}","organizationName":"{CANARY}","billingType":"{CANARY}"}}}}"#
+        )
+    };
+    let codex_auth = |plan: &str| {
+        let part = |bytes: &[u8]| {
+            aterm_codec::base64::encode(bytes)
+                .unwrap()
+                .trim_end_matches('=')
+                .replace('+', "-")
+                .replace('/', "_")
+        };
+        let claims = format!(
+            r#"{{"email":"{ANN}","sid":"{CANARY}","https://api.openai.com/auth":{{"chatgpt_account_id":"acct-1","chatgpt_user_id":"user-1","chatgpt_plan_type":"{plan}","chatgpt_subscription_active_until":"{CANARY}"}}}}"#
+        );
+        let token = format!(
+            "{}.{}.{CANARY}",
+            part(br#"{"alg":"none"}"#),
+            part(claims.as_bytes())
+        );
+        format!(
+            r#"{{"auth_mode":"chatgpt","OPENAI_API_KEY":"{CANARY}","tokens":{{"id_token":"{token}","access_token":"{token}","refresh_token":"{CANARY}","account_id":"acct-1"}}}}"#
+        )
+    };
+    let claude_file = home.join(".claude.json");
+    let codex_file = home.join(".codex/auth.json");
+    write(&claude_file, &profile("claude_max"));
+    write(&codex_file, &codex_auth("plus"));
+    write(
+        &home.join(".config/muse/auth.json"),
+        &format!(
+            r#"{{"providers":{{"meta":{{"mechanism":"oauth","user_email":"{ANN}","access_token":"{CANARY}"}}}}}}"#
+        ),
+    );
+    let pk = |cli: Cli| {
+        let (realm, email) = journal::claims_of(cli, ANN).unwrap();
+        Pk::new(&keyer(&realm, &email).unwrap()).unwrap()
+    };
+    let (claude, codex) = (pk(Cli::Claude), pk(Cli::Codex));
+    // One look of the sweep at `now`, its notes spooled: the plan-seen notes, by CLI and word,
+    // and every CLI it noted anything of.
+    let look = |now: i64| {
+        let ((_, notes), logged) =
+            crate::test_log::logged_on_this_thread(aterm_log::Level::Trace, || {
+                journal::capture(|| {
+                    journal::with_keyer(keyer, || {
+                        sweep::run(&state, &home, &[], &OnToken::none(), now)
+                    })
+                })
+            });
+        for line in &logged {
+            assert!(!line.contains(CANARY), "a log line carries the canary");
+        }
+        for note in &notes {
+            assert!(
+                !format!("{note:?}").contains(CANARY),
+                "a {} of {} carries the canary",
+                note.kind,
+                note.cli
+            );
+            if let Some(event) = event(note) {
+                assert!(matches!(spool.append(&event), Ok(Appended::Written)));
+            }
+        }
+        let mut plans: Vec<_> = notes
+            .iter()
+            .filter(|note| note.kind == "plan-seen")
+            .map(|note| (note.cli, note.plan.unwrap_or_default()))
+            .collect();
+        plans.sort_unstable();
+        let clis: std::collections::BTreeSet<_> = notes.iter().map(|note| note.cli).collect();
+        (plans, clis)
+    };
+    let observed = |account: &Pk, now: i64| {
+        let folded = fold_plan_for_test(&spool, account, now.unsigned_abs()).unwrap();
+        assert!(!format!("{folded:?}").contains(CANARY));
+        folded
+    };
+    let at = |word: &str, t: i64| Some((word.to_owned(), t.unsigned_abs()));
+
+    let (plans, clis) = look(T0);
+    assert_eq!(plans, [("claude", "max"), ("codex", "plus")]);
+    assert!(
+        clis.contains("muse"),
+        "Muse Code's login was read: {clis:?}"
+    );
+    for (account, word) in [(&claude, "max"), (&codex, "plus")] {
+        let folded = observed(account, T0);
+        assert_eq!(folded.book, at(word, T0));
+        assert_eq!(folded.use_row, at(word, T0));
+        assert_eq!(folded.events, [(word.to_owned(), T0.unsigned_abs())]);
+        assert_eq!(folded.peer, at(word, T0));
+    }
+
+    // A later look of the same words writes none, in this process or another.
+    let (plans, _) = look(T0 + 900);
+    assert_eq!(plans, []);
+
+    // The plan changed: one plan-seen of the new word, which the account now reads. Codex's
+    // `prolite` is the registry's `openai-prolite`, so it is a word too.
+    let t = T0 + 1_800;
+    write(&claude_file, &profile("claude_pro"));
+    write(&codex_file, &codex_auth("prolite"));
+    let (plans, _) = look(t);
+    assert_eq!(plans, [("claude", "pro"), ("codex", "prolite")]);
+    let folded = observed(&claude, t);
+    assert_eq!(folded.book, at("pro", t));
+    assert_eq!(folded.use_row, at("pro", t));
+    assert_eq!(folded.peer, at("pro", t));
+    assert_eq!(observed(&codex, t).peer, at("prolite", t));
+    assert_eq!(
+        folded.events,
+        [
+            ("max".to_owned(), T0.unsigned_abs()),
+            ("pro".to_owned(), t.unsigned_abs())
+        ]
+    );
+
+    // A plan outside the vocabulary is none: nothing is written, and the account keeps its word.
+    write(&claude_file, &profile("claude_zero"));
+    write(&codex_file, &codex_auth(CANARY));
+    let (plans, _) = look(T0 + 2_700);
+    assert_eq!(plans, []);
+    assert_eq!(observed(&codex, T0 + 2_700).book, at("prolite", t));
+
+    // Nothing this Mac keeps carries the canary: the spool, its book and the sweep's file.
+    let mut kept = vec![scratch.path().join("alab"), state.clone()];
+    let mut files = 0;
+    while let Some(path) = kept.pop() {
+        if path.is_dir() {
+            kept.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        } else {
+            files += 1;
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(
+                !bytes.windows(CANARY.len()).any(|w| w == CANARY.as_bytes()),
+                "{} carries the canary",
+                path.display()
+            );
+        }
+    }
+    assert!(files >= 2, "the spool and the sweep's file were read");
+    // The fixtures do carry it, so the absence is the readers' doing.
+    assert!(
+        std::fs::read_to_string(&codex_file)
+            .unwrap()
+            .contains(CANARY)
     );
 }

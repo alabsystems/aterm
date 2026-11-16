@@ -1432,6 +1432,7 @@ fn holdings_follow_the_login_each_place_holds() {
                     src: ObservedSrc::Profile,
                     path: PathBuf::from("/scratch/home/.claude.json"),
                     mtime: None,
+                    plan: None,
                 })
             }),
             fallback: PathBuf::from("/scratch/home/.claude.json"),

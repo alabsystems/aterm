@@ -542,6 +542,7 @@ impl App {
                     | crate::native_app::AppViewState::Recovery(_)
                     | crate::native_app::AppViewState::Workers(_)
                     | crate::native_app::AppViewState::Tables(_)
+                    | crate::native_app::AppViewState::Navigator(_)
                     | crate::native_app::AppViewState::Allocation(_) => false,
                 });
             if changed && let Some(mut window) = self.windows.get_mut(&wid) {

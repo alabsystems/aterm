@@ -2315,6 +2315,10 @@ pub fn spawn_shell_with_pid_cell_px(
             // arrays of live C strings, all outliving the call; `write`/`_exit` are
             // async-signal-safe.
             unsafe {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a forked child's exec: it has one thread, so nothing in it can hold the exec"
+                )]
                 libc::execve(exec_target.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 let b: u8 = b'E';
                 libc::write(status_wr, std::ptr::addr_of!(b).cast::<libc::c_void>(), 1);

@@ -14,6 +14,15 @@
 //! admin Mac's snapshot, a program `agent on --program` named) starts that copy, and the copy
 //! hands the pass to the installed aterm.app (`aterm init --converge`'s hand-off), started as its
 //! own responsible process: the rows it applies are aterm.app's, as the window's are.
+//!
+//! A runner a starter started never ends for the lock another pass holds: it waits for it in
+//! the kernel and runs once it is let go (`aterm_machines::sync::wait_lock`), running nothing
+//! only where its starter ended first (a restarted subscriber, a quit window), whose successor
+//! starts its own. A held copy's hand-off keeps that true one process on: the installed app's
+//! runner watches the copy that started it, and the copy ends as soon as the subscriber that
+//! started it does. Each starter keeps one runner at a time, so what comes due while its runner
+//! waits is owed to the start that follows that runner's end, and no clock starts a runner while
+//! the lock is held.
 
 use crate::client::SyncOutcome;
 use aterm_uds::spawnfd::{Child, Command, Stdio};
@@ -22,12 +31,15 @@ use std::path::Path;
 
 mod note;
 mod refresh;
-pub use note::{Causes, MarkMoved, NOTE_MAX, START_NOTE_ENV, StartNote, note_word, noting, reap};
+pub use note::{Causes, MarkMoved, NOTE_MAX, START_NOTE_ENV, StartNote, note_word, noting};
 pub use refresh::{
     RefreshObservation, RefreshRequest, RefreshScope, RefreshVersion, RepositoryRequest,
 };
 
-/// The exit status a runner ends with while another pass holds the pass's lock: it did not run.
+/// The exit status of a pass that ran nothing for the lock another pass holds: a person's
+/// `aterm init --converge`, which never waits for it, or a runner a starter started whose starter
+/// ended while it waited (`aterm_machines::sync::Stop::Abandoned`). No starter reads it apart
+/// from any other unsuccessful exit ([`Last::of`]): a runner it started waits for the lock.
 pub const HELD: u8 = 75;
 
 /// The runner ran without failure but admitted work still waits on a precondition or readback.
@@ -149,9 +161,12 @@ pub enum Last {
     Ended,
     /// It ran without failure, with admitted work still unfinished ([`UNFINISHED`]).
     Unfinished,
-    /// It exited unsuccessfully, or ended by a signal.
+    /// It exited unsuccessfully (exit [`HELD`] included), or ended by a signal.
     Failed,
-    /// It ended without running, another pass holding the lock ([`HELD`]).
+    /// It ran nothing: another owner held what it needs, and it is owed again without spending
+    /// or resetting its backoff ([`RunnerRetry::reaped`]). The window's in-process keepers (the
+    /// deferred-preference follow-up, the keyboard attachment activation) end so; a converge
+    /// runner never does: one a starter started waits for the lock instead.
     Held,
 }
 
@@ -164,7 +179,6 @@ impl Last {
         };
         let last = match child.try_wait() {
             Ok(None) | Err(_) => Self::Running,
-            Ok(Some(status)) if status.code() == Some(i32::from(HELD)) => Self::Held,
             Ok(Some(status)) if status.code() == Some(i32::from(UNFINISHED)) => Self::Unfinished,
             Ok(Some(status)) if status.success() => Self::Ended,
             Ok(Some(_)) => Self::Failed,
@@ -176,7 +190,8 @@ impl Last {
     }
 }
 
-/// Unfinished and failed runner pacing shared by the subscriber, mesh node and window lane.
+/// Unfinished, failed and held attempt pacing shared by the subscriber, mesh node and window lane
+/// (their runners) and the window's in-process keepers (their attempts).
 #[derive(Debug, Default)]
 pub struct RunnerRetry {
     at: Option<u64>,
@@ -196,7 +211,7 @@ impl RunnerRetry {
                 self.at = None;
                 self.delay = 0;
             }
-            // A held lock owes a pass, without spending or resetting its unfinished backoff.
+            // A held attempt is owed again, without spending or resetting its backoff.
             Last::Held => self.at = Some(now_ms.saturating_add(FIRST_RETRY_MS)),
             Last::None | Last::Running => {}
         }
@@ -226,9 +241,10 @@ impl RunnerRetry {
 /// Mac came back to it: `docs/DESIGN-fluid-swarm-2026-10-28.md` §3.5.2), and after any other
 /// healthy pass once this Mac's routes moved or [`RECHECK_MS`] passed (or the clock went back)
 /// since the last start. One runner at a time: a start that comes due while the last one runs,
-/// or after one that found the lock held, is owed to the next round, so a version applied during
-/// a pass is never left to the next recheck. An unfinished or failed runner retries on a
-/// bounded backoff; every time here is elapsed milliseconds on the subscriber's monotonic clock.
+/// waiting for the lock another pass holds included, is owed to the round after its end, so a
+/// version applied during a pass is never left to the next recheck. An unfinished or failed
+/// runner retries on a bounded backoff; every time here is elapsed milliseconds on the
+/// subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
     /// The last refresh boundary's local start and remaining wait. A shared
@@ -236,7 +252,7 @@ pub struct Due {
     started: Option<(u64, u64)>,
     /// Routes already observed, including a request queued while the lane was held.
     routes: Option<Routes>,
-    /// A start came due while the last runner ran, or the last one found the lock held.
+    /// A start came due while the last runner ran (or waited for the lock).
     pending: Option<RepositoryRequest>,
     /// A canonical identity transition is not paced or fulfilled by repository receipts.
     identity_pending: bool,
@@ -262,11 +278,6 @@ pub struct Due {
     retry_cause: Causes,
     /// The last start's note.
     noted: StartNote,
-    /// How many runners in a row ended finding the lock held, the CPU they spent, and when the
-    /// first of them was reaped: zeroed by a runner that ended any other way.
-    held: u32,
-    held_cpu_ms: u64,
-    held_since: Option<u64>,
     /// What moved the inputs' mark, and in how many looks, since the last start
     /// ([`Due::because_moved`]).
     moved: MarkMoved,
@@ -330,15 +341,8 @@ impl Due {
         self.moves = self.moves.saturating_add(looks);
     }
 
-    /// Add the CPU a runner that found the lock held spent, as its reap measured it.
-    pub(crate) fn held_spent(&mut self, cpu: std::time::Duration) {
-        self.held_cpu_ms = self
-            .held_cpu_ms
-            .saturating_add(u64::try_from(cpu.as_millis()).unwrap_or(u64::MAX));
-    }
-
     /// The note of the start the latest pacing method that returned true chose: why it was
-    /// owed, and the held runners before it.
+    /// owed, and what moved the inputs' mark.
     #[must_use]
     pub fn note(&self) -> StartNote {
         self.noted
@@ -461,33 +465,19 @@ impl Due {
     }
 
     /// Keep one reaped runner's outcome even while the vault source is unavailable. Successful
-    /// completion ends its failure streak; a held lock stays owed without consuming backoff.
-    /// A Repair that ran beside deferred Refresh debt cannot retire or reschedule that debt.
+    /// completion ends its failure streak. A Repair that ran beside deferred Refresh debt
+    /// cannot retire or reschedule that debt. No runner reads as held ([`Last::of`]); a held end
+    /// given here is kept as a failed one, so nothing restarts a runner on a flat clock.
     pub fn reaped(&mut self, last: Last, now_ms: u64) {
-        match last {
-            Last::Held => {
-                self.held = self.held.saturating_add(1);
-                self.held_since.get_or_insert(now_ms);
-                // The pass is still owed for what its held start was owed for.
-                self.causes = self.causes.with(self.noted.causes);
-                self.because_moved(self.noted.moved, self.noted.moves);
-            }
-            Last::Ended | Last::Failed | Last::Unfinished => {
-                self.held = 0;
-                self.held_cpu_ms = 0;
-                self.held_since = None;
-            }
-            Last::None | Last::Running => {}
-        }
-        if self.identity_running
-            && matches!(
-                last,
-                Last::Ended | Last::Failed | Last::Unfinished | Last::Held
-            )
-        {
+        let last = if last == Last::Held {
+            Last::Failed
+        } else {
+            last
+        };
+        if self.identity_running && matches!(last, Last::Ended | Last::Failed | Last::Unfinished) {
             self.identity_running = false;
             // A late result retires only the identity that child carried. Newer input stays
-            // immediately pending; otherwise its own failure/hold retains a local retry.
+            // immediately pending; otherwise its own failure retains a local retry.
             if last == Last::Ended || !self.identity_pending {
                 self.identity_retry.reaped(last, now_ms);
             }
@@ -497,8 +487,8 @@ impl Due {
                 .retry_request
                 .is_some_and(|request| request.work() == RepositoryWork::Refresh)
         {
-            // The stronger retained refresh includes acquisition/repair. A held
-            // repair cannot create an immediate queue or spend that retry budget.
+            // The stronger retained refresh includes acquisition/repair. A repair
+            // that ended cannot create an immediate queue or spend that retry budget.
             return;
         }
         // A started job already took its captured work from the queues. A later
@@ -508,17 +498,12 @@ impl Due {
             match last {
                 Last::Failed => self.retry_cause = Causes::RETRY_FAILED,
                 Last::Unfinished => self.retry_cause = Causes::RETRY_UNFINISHED,
-                Last::Held => self.retry_cause = Causes::RETRY_HELD,
                 Last::Ended => self.retry_cause = Causes::default(),
-                Last::None | Last::Running => {}
+                Last::None | Last::Running | Last::Held => {}
             }
         }
         match last {
             Last::Failed | Last::Unfinished => {
-                self.retry_request =
-                    merge_requests(Some(self.repository_request), self.retry_request);
-            }
-            Last::Held => {
                 self.retry_request =
                     merge_requests(Some(self.repository_request), self.retry_request);
             }
@@ -529,7 +514,7 @@ impl Due {
                     self.acknowledged(now_ms);
                 }
             }
-            Last::None | Last::Running => {}
+            Last::None | Last::Running | Last::Held => {}
         }
     }
 
@@ -615,11 +600,6 @@ impl Due {
         }
         self.noted = StartNote {
             causes: std::mem::take(&mut self.causes),
-            held: self.held,
-            held_cpu_ms: self.held_cpu_ms,
-            waited_ms: self
-                .held_since
-                .map_or(0, |since| now_ms.saturating_sub(since)),
             moved: std::mem::take(&mut self.moved),
             moves: std::mem::take(&mut self.moves),
         };

@@ -6,36 +6,46 @@ use crate::session_store::{
     ExitActor, ExitReason, SessionHandoff, SessionStore, new_store, test_handle,
 };
 
+/// `exits` ids keep rising across a handoff: the successor's table reads the rows the producer's
+/// left in the same folder (tracker ST-15), and its own close takes an id above theirs, so a
+/// reader's `since=` from before the update pages on; the producer's row names no local id here.
 #[test]
 fn exits_ids_keep_rising_across_a_handoff() {
-    let mut producer = SessionStore::default();
+    let rows = aterm_tempfile::tempdir().expect("the table's folder");
+    let table_of = |store: &crate::session_store::Store| {
+        crate::session_table::SessionTable::at(rows.path().to_path_buf()).serve(store);
+        let table = store.read().unwrap().table();
+        assert!(table.loaded_within(std::time::Duration::from_secs(60)));
+        table
+    };
+    let producer = new_store();
+    let producer_table = table_of(&producer);
     for local in 1..=3 {
-        producer.register(test_handle(local));
+        producer.write().unwrap().register(test_handle(local));
     }
-    producer.deregister_local_as(3, ExitReason::ShellExit, ExitActor::Human);
-    assert_eq!(producer.roster_seq(), 4);
-    let manifest = SessionHandoff::from_store(&producer);
-    let read = SessionHandoff::from_toml(&manifest.to_toml().unwrap()).unwrap();
-    assert_eq!(read.roster_seq, Some(4));
+    crate::session_table::close_leaving_row(&producer, 3, ExitReason::ShellExit, ExitActor::Human)
+        .expect("a close");
+    assert!(producer_table.flush());
+    let first = producer_table.exits_since(0).expect("loaded")[0].id;
+    drop(producer_table);
+    drop(producer);
 
     let successor = new_store();
-    successor
-        .write()
-        .unwrap()
-        .continue_roster_seq(read.roster_seq.unwrap());
-    for rec in &read.sessions {
-        successor
-            .write()
-            .unwrap()
-            .register(test_handle(rec.local_id));
-    }
-    successor
-        .write()
-        .unwrap()
-        .deregister_local_as(1, ExitReason::ShellExit, ExitActor::Human);
-    let page = cmd_exits(&successor, "since=4", &[]);
+    let _table = table_of(&successor);
+    successor.write().unwrap().register(test_handle(1));
+    crate::session_table::close_leaving_row(&successor, 1, ExitReason::ShellExit, ExitActor::Human)
+        .expect("a close");
+    let page = cmd_exits(&successor, &format!("since={first}"), &[]);
     assert!(page.starts_with("OK 1\n"), "{page}");
-    assert!(page.contains("reason=shell-exit"), "{page}");
+    assert!(page.contains(" local=1 reason=shell-exit "), "{page}");
+    let all = cmd_exits(&successor, "", &[]);
+    assert!(all.starts_with("OK 2\n"), "{all}");
+    assert!(
+        all.lines().nth(1).is_some_and(
+            |row| row.starts_with(&format!("exit {first} ")) && row.contains(" local=- ")
+        ),
+        "the producer's row, first: {all}"
+    );
     let old = SessionHandoff::from_toml(
         "schema = 1\n\n[[sessions]]\nlocal_id = 3\nsid = \"s-old\"\nstate = \"alive\"\ntitle = \"zsh\"\n",
     )

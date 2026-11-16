@@ -5,7 +5,6 @@
 //! The UI owns selection and drafts; providers own remote message identities.
 
 pub mod crypto;
-pub mod human;
 pub mod imap;
 pub mod mime;
 pub mod oauth;

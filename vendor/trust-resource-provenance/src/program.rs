@@ -251,6 +251,19 @@ fn file(
     root: &Path,
     deadline: Instant,
 ) -> io::Result<(HeldFile, Vec<u8>)> {
+    file_bounded(directories, path, executable, root, deadline, 1, MAX_IMAGE)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn file_bounded(
+    directories: &mut BTreeMap<PathBuf, HeldDirectory>,
+    path: &Path,
+    executable: bool,
+    root: &Path,
+    deadline: Instant,
+    remaining_files: usize,
+    remaining_bytes: u64,
+) -> io::Result<(HeldFile, Vec<u8>)> {
     canonical(path)?;
     let parent = path
         .parent()
@@ -267,8 +280,17 @@ fn file(
         false,
     )?;
     let before = owned(&file, false, executable)?;
+    // Test actual existence/kind before refusing a full population, preserving
+    // absent search-root probes and repeated dependencies. No candidate bytes
+    // are read beyond the remaining transaction budget, including on refusal.
+    if remaining_files == 0 {
+        return Err(refused("native runtime population exceeds bound"));
+    }
     if before.len() == 0 || before.len() > MAX_IMAGE {
         return Err(refused("native image size exceeds supported bound"));
+    }
+    if before.len() > remaining_bytes {
+        return Err(refused("native runtime byte population exceeds bound"));
     }
     let mut hash = NativeSha256::new();
     let mut offset = 0u64;
@@ -312,17 +334,22 @@ impl HeldProgram {
     /// This cannot construct SDK/source/output or operation authority.
     pub fn original_tree_identities(&self, deadline: Instant) -> io::Result<Vec<(u64, u64)>> {
         self.validate(deadline)?;
-        Ok(self.directories.values().map(|held| (held.before.dev(), held.before.ino())).collect())
+        Ok(self
+            .directories
+            .values()
+            .map(|held| (held.before.dev(), held.before.ino()))
+            .collect())
     }
-    /// Conservative capacity request for this supported capture profile: all
-    /// original directory/runtime descriptions, the executable and two
-    /// simultaneous descriptor-relative validation scratch descriptions. This
-    /// is demand data only: the caller must reserve actual process capacity
-    /// before capture and retain that reservation until every input closes.
+    /// Conservative upper bound on descriptions owned by this bounded capture:
+    /// retained directories/runtime/executable, one current candidate and two
+    /// descriptor-relative traversal scratch descriptions. This is count DATA,
+    /// never reservation/admission or a guarantee of POSIX descriptor room.
+    /// Actual open/duplicate failures (including concurrent EMFILE/ENFILE) refuse;
+    /// RAII closes only descriptions opened by the failed transaction.
     pub fn capture_descriptor_bound() -> io::Result<usize> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
-            Ok(MAX_DIRECTORIES + MAX_RUNTIME + 1 + 2)
+            Ok(MAX_DIRECTORIES + MAX_RUNTIME + 1 + 1 + 2)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         {
@@ -332,6 +359,8 @@ impl HeldProgram {
 
     /// Open the exact native executable and supported runtime once. The expected
     /// digest is an equality assertion, never writer or release authority.
+    /// Directory, image, total byte and load-edge bounds apply to actual reads;
+    /// all partial descriptors are transaction-local and close on any error.
     pub fn open(
         root: &Path,
         program: &Path,
@@ -423,7 +452,15 @@ impl HeldProgram {
                     selected = Some(None);
                     break;
                 }
-                match file(&mut directories, &path, false, root, deadline) {
+                match file_bounded(
+                    &mut directories,
+                    &path,
+                    false,
+                    root,
+                    deadline,
+                    MAX_RUNTIME.saturating_sub(runtime.len()),
+                    MAX_TOTAL.saturating_sub(total),
+                ) {
                     Ok(value) => {
                         selected = Some(Some(value));
                         break;

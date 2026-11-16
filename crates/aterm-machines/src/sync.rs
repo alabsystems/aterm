@@ -8,10 +8,13 @@
 //! Its triggers decide when a pass runs: the vault's subscriber as it starts, after each version
 //! it applies and once its own recheck or a route move says so (`aterm_secrets::converge::Due`),
 //! the window's lane at launch and every 30 minutes, the first-launch Secrets stage as it ends,
-//! and a person. [`converge`] runs the one it is asked for, under a try-lock
-//! (`<state_dir>/converge/align.lock`, one pass at a time), records it in
-//! `<state_dir>/converge/aligned.json` ([`Record`]) beside the change journal, and writes one
-//! aterm.log line, a refused pass included. The record names why the pass was [`due`] (a build
+//! and a person. [`converge`] runs the one it is asked for under `<state_dir>/converge/align.lock`
+//! (one pass at a time: a trigger's pass waits for it in the kernel, [`wait_lock`], and a
+//! person's tries it once, [`try_lock`]), records it in
+//! `<state_dir>/converge/aligned.json` ([`Record`]) beside the change journal, and writes
+//! aterm.log lines: a pass that ran writes its ledger line and its cost line, a refused pass its
+//! refusal line, and a start that ran nothing for the lock its `converge held` or `converge
+//! abandoned` line ([`converge`] names each). The record names why the pass was [`due`] (a build
 //! that ran none or a new [`SPEC`], moved routes, [`RECHECK`] since the last attempt, or none),
 //! a word the ledger line carries; no row and no trigger reads it, and each row is decided by
 //! its own probe. The base layer keeps its own record ([`BaseRecord`]). Its items reach the
@@ -39,23 +42,18 @@ pub use cost::Spent;
 /// `sync.steward.revoke`; 6: `sync.node`; 7: `sync.steward.lease` and
 /// `sync.steward.server.standby`; 8: the steward's fleet item retired; 9: automatic signing;
 /// 10: the vault GitHub helper; 11: `sync.clone`; 12: `sync.clone-tuning`;
-/// 13: admitted repository prerequisites).
-pub const SPEC: u32 = 13;
+/// 13: admitted repository prerequisites; 14: `sync.refresh`, the refresh of the checkouts
+/// already here, split from `sync.clone`'s acquisition).
+pub const SPEC: u32 = 14;
 
 /// The pass's record, in `<state_dir>/converge` ([`FileJournal::DIR`]).
 pub const RECORD: &str = "aligned.json";
 
-/// The try-lock one pass holds, beside the record.
+/// The lock one pass holds, beside the record ([`try_lock`], [`wait_lock`]).
 pub const LOCK: &str = "align.lock";
 
 /// How long after a pass's attempt the next one is due on the same build and routes.
 pub const RECHECK: Duration = Duration::from_secs(30 * 60);
-
-/// Total capacity-retry wait budget for one `sync.fleet` apply (§12.3, C18).
-pub const FLEET_JOIN_RETRY_BUDGET: Duration = Duration::from_secs(10 * 60);
-
-/// Per-retry backoff caps when the fleet listener or resolver is at capacity.
-const FLEET_CAPACITY_BACKOFF_SECS: &[u64] = &[2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60];
 
 /// The family every sync row carries (the `--only` merge key).
 pub const FAMILY: &str = "sync";
@@ -70,8 +68,13 @@ pub const VAULT: &str = "sync.vault";
 /// `sync.github`: replace the block an earlier `aterm init` wrote with aterm's own GitHub helper.
 pub const GITHUB: &str = "sync.github";
 /// `sync.clone`: the GitHub step an `aterm init` owes, run once the vault's token lands
-/// ([`crate::init::owed_clone`]).
+/// ([`crate::init::owed_clone`]): acquisition alone, cloning what is missing and giving
+/// checkouts without a commit their first.
 pub const CLONE: &str = "sync.clone";
+/// `sync.refresh`: a refresh pass's fast-forward of the vault's checkouts already here, after
+/// `sync.clone` ([`crate::init::refresh_repositories_captured`]). Its fault or wait is its own
+/// row's and never holds back an acquisition.
+pub const REFRESH: &str = "sync.refresh";
 /// `sync.clone-tuning`: each vault clone's git tuning, as its repository declares it
 /// ([`crate::clone_tuning`]).
 pub const CLONE_TUNING: &str = "sync.clone-tuning";
@@ -170,6 +173,14 @@ impl Trigger {
     /// Whether an aterm window runs this pass: its upkeep, not the pass, keeps the accounts.
     const fn in_window(self) -> bool {
         matches!(self, Self::Window | Self::Setup)
+    }
+
+    /// Whether a pass this trigger runs waits for the lock another pass holds ([`wait_lock`]):
+    /// one a starter started does, since its starter keeps one runner at a time and owes the
+    /// next start to its end; a person's tries it once and says it is held ([`Stop::Held`]).
+    #[must_use]
+    pub const fn waits_for_the_lock(self) -> bool {
+        !matches!(self, Self::Init)
     }
 }
 
@@ -274,9 +285,20 @@ fn write_record(dir: &Path, record: &Record) -> Result<(), String> {
         .map_err(|why| format!("{}: {why}", dir.join(RECORD).display()))
 }
 
-/// The pass's lock ([`try_lock`]), let go when dropped.
+/// The pass's lock ([`try_lock`], [`wait_lock`]), let go when dropped.
 pub struct AlignLock {
     _held: aterm_uds::private_file::PrivateLock,
+}
+
+/// What watches the process that started a runner while it waits for the lock
+/// ([`Ports::watch_starter`]).
+pub enum StarterWatch {
+    /// Kept while the runner waits: the callback it was given runs once the starter ended.
+    Watching(Box<dyn std::any::Any + Send>),
+    /// The starter has ended already.
+    Ended,
+    /// Nothing watches it here: the runner waits for the lock alone.
+    Unwatched,
 }
 
 /// Take `<state_dir>/converge/align.lock` without waiting, making the folder 0700 where it is
@@ -296,6 +318,62 @@ pub fn try_lock(state_dir: &Path) -> Result<Option<AlignLock>, String> {
         Ok(held) => Ok(Some(AlignLock { _held: held })),
         Err(why) if why.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
         Err(why) => Err(format!("{}: {why}", dir.join(LOCK).display())),
+    }
+}
+
+/// Take `<state_dir>/converge/align.lock` for a pass a starter started, waiting for it while
+/// another pass holds it: the wait sleeps in the kernel
+/// ([`aterm_uds::private_file::PrivateLock::wait_for`]), so no clock wakes it and no process is
+/// started meanwhile, and the lock is this pass's the moment its holder lets it go or ends.
+/// `None` where the starter `watch` watches, from the moment the lock is found held, ended
+/// first: nothing then owes the pass it waits to run, and that starter's successor (a
+/// restarted subscriber, a window launched again) starts its own. Where it ended before the
+/// wait began the lock is not waited for at all.
+///
+/// # Errors
+/// As [`try_lock`], and where the wait could not be made or failed.
+pub fn wait_lock(
+    state_dir: &Path,
+    watch: impl FnOnce(Box<dyn FnOnce() + Send>) -> StarterWatch,
+) -> Result<Option<AlignLock>, String> {
+    enum Woke {
+        Free(std::io::Result<aterm_uds::private_file::PrivateLock>),
+        StarterEnded,
+    }
+    if let Some(lock) = try_lock(state_dir)? {
+        return Ok(Some(lock));
+    }
+    let dir = state_dir.join(FileJournal::DIR);
+    let failed = |why: &dyn std::fmt::Display| format!("{}: {why}", dir.join(LOCK).display());
+    let (woke, wakes) = std::sync::mpsc::channel();
+    let ended = woke.clone();
+    let watching = match watch(Box::new(move || {
+        let _ = ended.send(Woke::StarterEnded);
+    })) {
+        StarterWatch::Ended => return Ok(None),
+        StarterWatch::Watching(kept) => Some(kept),
+        StarterWatch::Unwatched => None,
+    };
+    // A waiter left blocked once the starter ended dies with this process, which returns at
+    // once; a later take of the lock it then makes is let go as its send finds no one.
+    let waiter = dir.clone();
+    std::thread::Builder::new()
+        .name("aterm-align-wait".to_owned())
+        .spawn(move || {
+            let _ = woke.send(Woke::Free(aterm_uds::private_file::PrivateLock::wait_for(
+                &waiter,
+                LOCK,
+                || {},
+            )));
+        })
+        .map_err(|why| failed(&why))?;
+    let first = wakes.recv();
+    drop(watching);
+    match first {
+        Ok(Woke::Free(Ok(held))) => Ok(Some(AlignLock { _held: held })),
+        Ok(Woke::Free(Err(why))) => Err(failed(&why)),
+        Ok(Woke::StarterEnded) => Ok(None),
+        Err(_) => Err(failed(&"the wait for it ended without an answer")),
     }
 }
 
@@ -351,8 +429,6 @@ pub enum FleetDone {
     Synced(String),
     /// It left the fleet this Mac holds as it is: why, and what a person does about it.
     Blocked(String),
-    /// Every dialled listener or the DNS resolver was at connection capacity: why.
-    AtCapacity(String),
 }
 
 /// What `systems.alab.aterm-node` reads as (`sync.node`, C20).
@@ -573,6 +649,12 @@ pub trait Ports: Sync {
     /// class, and the subscriber's leaves its band (`aterm_secrets::converge::runner`), so it
     /// lowers its own.
     fn background(&self, trigger: Trigger);
+    /// Begin this pass's record of checkout facts: forget the one the systems its rows read
+    /// through keep ([`crate::port::CheckoutRecords::new_pass`]), so the pass's rows share what
+    /// each of them reads of a checkout and nothing read before the pass stands for it. A pass
+    /// calls it once, once it holds its lock (a plan holds none); one that found the lock held
+    /// reads nothing and calls it not at all.
+    fn new_pass(&self);
     /// Whether this process runs as its account's own login, in its home (not root, a private
     /// state root or another home): a pass refuses otherwise, as `aterm init` does.
     fn own_account(&self) -> bool;
@@ -589,13 +671,6 @@ pub trait Ports: Sync {
     fn routes(&self) -> Vec<String>;
     /// Now, in ms since the epoch.
     fn now_ms(&self) -> u64;
-    /// Draw a uniform random wait in `0..=max` for `sync.fleet`'s capacity backoff.
-    /// Overridden in tests for deterministic virtual-clock simulation.
-    fn random_wait(&self, max: Duration) -> Duration {
-        random_duration_up_to(max, self.now_ms())
-    }
-    /// Pause this pass for `duration` (real sleep in `Live`, recorded or virtual-clock in tests).
-    fn sleep(&self, duration: Duration);
     /// Whether this process is the installed release aterm.app's (not a build, a renamed or held
     /// copy): only it re-lays the base layer.
     fn installed_release(&self) -> bool;
@@ -849,17 +924,27 @@ pub trait Ports: Sync {
                 _ => None,
             })
     }
-    /// `sync.clone`'s apply: that step, run once ([`crate::init::clone_owed`]). The keychain
-    /// row's retry is `sync.github`'s.
+    /// `sync.clone`'s apply: that step's acquisition, run once ([`crate::init::clone_owed`]).
+    /// The keychain row's retry is `sync.github`'s.
     ///
     /// # Errors
     /// A repository row of the step did not end in place.
     fn clone_owed(
         &self,
-        _work: aterm_secrets::converge::RepositoryWork,
         _execution: Option<repository_refresh::Execution>,
     ) -> Result<crate::init::CloneOwedOutcome, String> {
         Err("this build runs no clone aterm init owes".into())
+    }
+    /// `sync.refresh`'s apply: the refresh of the vault's checkouts already here, within the
+    /// pass's repository `execution` ([`crate::init::refresh_repositories_captured`]).
+    ///
+    /// # Errors
+    /// The refresh failed: its row's words.
+    fn refresh_repositories(
+        &self,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<crate::init::RepositoryRefreshed, String> {
+        Err("this build refreshes no repository".into())
     }
     /// Forget the clone an `aterm init` owes ([`crate::init::forget_owed_clone`]): its step was
     /// turned off, so turning it on later clones nothing by itself.
@@ -870,21 +955,30 @@ pub trait Ports: Sync {
         Ok(())
     }
     /// `sync.clone-tuning`'s read: how each vault clone differs from the git tuning its
-    /// repository declares ([`crate::clone_tuning::read`], under System State's holds now).
+    /// repository declares ([`crate::clone_tuning::read`], under System State's holds now),
+    /// keeping what `keep` asks for: an applying pass's read keeps what it read of each
+    /// declaration, a plan's nothing.
     ///
     /// # Errors
     /// This login's context, its init.toml, the inventory or the tuning record cannot be read.
-    fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
+    fn clone_tuning(
+        &self,
+        _keep: crate::clone_tuning::Keep,
+    ) -> Result<crate::clone_tuning::Reading, String> {
         Ok(crate::clone_tuning::Reading::NotApplicable(
             "this build tunes no clone".into(),
         ))
     }
     /// `sync.clone-tuning`'s apply ([`crate::clone_tuning::apply`]): what it tuned, and why it
-    /// stood aside where it did.
+    /// stood aside where it did. `execution` is the pass's repository lease, where it holds one:
+    /// its writes to the clones are recorded as that pass's own.
     ///
     /// # Errors
     /// A write failed, or the record or self-test could not be had.
-    fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
+    fn tune_clones(
+        &self,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<crate::clone_tuning::Tuned, String> {
         Err("this build tunes no clone".into())
     }
     /// Whether the fabric is hosted by the node service and must follow `sync.node`.
@@ -951,8 +1045,8 @@ pub trait Ports: Sync {
     /// # Errors
     /// The join did not finish.
     fn join_peers(&self) -> Result<PeersDone, String>;
-    /// Write `line` to aterm.log: a pass's ledger line and its cost line, a start's that found
-    /// the lock held, or why a pass was refused.
+    /// Write `line` to aterm.log: a pass's ledger line and its cost line, the line of a start
+    /// that ran nothing for the lock another pass holds, or why a pass was refused.
     fn log(&self, line: &str);
     /// What this process has spent so far, which a pass reads once it holds its lock and again
     /// as it ends: its cost line says the difference. Nothing where a port does not measure.
@@ -960,23 +1054,38 @@ pub trait Ports: Sync {
         Spent::default()
     }
     /// The note this runner's starter gave its start (`aterm_secrets::converge::StartNote`'s
-    /// word: why the pass was owed, and the runners before it that found the lock held), where
-    /// it gave one. The pass's cost line carries it; a pass that finds the lock held says it in
-    /// a line of its own.
+    /// word: why the pass was owed), where it gave one. The pass's cost line carries it; a start
+    /// that ran nothing for the lock says it in a line of its own.
     fn start_note(&self) -> Option<String> {
         None
+    }
+    /// Watch the process that started this runner, `ended` called once it ended, for as long as
+    /// the watch returned is kept: a pass a starter started keeps it while it waits for the lock
+    /// another pass holds ([`wait_lock`]), and a held copy's hand-off while the installed app's
+    /// pass it started runs (`aterm init --converge`'s). [`StarterWatch::Unwatched`] where
+    /// nothing watches it.
+    fn watch_starter(&self, ended: Box<dyn FnOnce() + Send>) -> StarterWatch {
+        drop(ended);
+        StarterWatch::Unwatched
     }
     /// The installed release aterm.app's program where it is installed and this process is not
     /// it (a held copy a vault subscriber's job runs, say): the subscriber's pass runs from there
     /// (`aterm init --converge`'s hand-off), so the rows a held copy applies are the installed
     /// app's, as the window's are. `None` where this process is it, or none is found.
     fn installed_release_elsewhere(&self) -> Option<PathBuf>;
-    /// Run `program` with `args` and wait for it: its exit status, `None` where a signal ended it.
+    /// Start `program` with `args` (the installed app's run of a held copy's pass), returning
+    /// what waits for it to end ([`ElsewhereRun`]). Its starter waits for that on a thread of its
+    /// own, beside the watch on its own starter (`aterm init --converge`'s hand-off), so it can
+    /// stop waiting the moment its own starter ends.
     ///
     /// # Errors
-    /// It could not be started or waited for.
-    fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String>;
+    /// It could not be started.
+    fn start_elsewhere(&self, program: &Path, args: &[String]) -> Result<ElsewhereRun, String>;
 }
+
+/// The wait for a run [`Ports::start_elsewhere`] started: its exit status, `None` where a signal
+/// ended it, or why it could not be waited for.
+pub type ElsewhereRun = Box<dyn FnOnce() -> Result<Option<i32>, String> + Send>;
 
 /// Declares [`Kind`] with each kind's row id beside it, so [`Kind::ALL`] and [`Kind::id`] hold
 /// every kind by construction: a kind added here is in both.
@@ -1008,6 +1117,7 @@ kinds! {
     Github => GITHUB,
     OwedClone => CLONE,
     CloneTuning => CLONE_TUNING,
+    RefreshRepositories => REFRESH,
     Identity => IDENTITY,
     StewardRevoke => STEWARD_REVOKE,
     StewardLease => STEWARD_LEASE,
@@ -1102,15 +1212,6 @@ impl<'a> Synced<'a> {
 
     fn stand_aside(&self, aside: StoodAside) {
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = Some(aside);
-    }
-
-    /// Whether the engine still runs this row's refresh after the probe now reading: an
-    /// applying Refresh pass, before its apply said anything or stood aside.
-    fn refresh_ahead(&self) -> bool {
-        self.mode == Mode::Apply
-            && self.refresh_changes()
-            && self.detail().is_none()
-            && self.stood_aside().is_none()
     }
 
     /// `sync.clone`'s row where its step was turned off (`why`): an apply forgets the clone
@@ -1221,48 +1322,6 @@ fn read<T>(read: Result<T, String>, probe: impl FnOnce(T) -> Probe) -> Probe {
     read.map_or_else(|why| Probe::Unusable { why }, probe)
 }
 
-fn random_duration_up_to(max: Duration, fallback_seed: u64) -> Duration {
-    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
-    if max_ms == 0 {
-        return Duration::ZERO;
-    }
-    let mut bytes = [0u8; 8];
-    let raw = if aterm_uds::rand::fill(&mut bytes).is_ok() {
-        u64::from_le_bytes(bytes)
-    } else {
-        fallback_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-    };
-    let span = max_ms.saturating_add(1);
-    let pick = if span == 0 { raw } else { raw % span };
-    Duration::from_millis(pick)
-}
-
-fn sync_fleet_with_retry(ports: &dyn Ports) -> Result<FleetDone, String> {
-    let mut waited = Duration::ZERO;
-    let mut attempt = 0;
-    loop {
-        match ports.sync_fleet() {
-            Ok(FleetDone::AtCapacity(why)) => {
-                let remaining = FLEET_JOIN_RETRY_BUDGET.saturating_sub(waited);
-                let Some(&cap_secs) = FLEET_CAPACITY_BACKOFF_SECS.get(attempt) else {
-                    return Err(why);
-                };
-                if remaining.is_zero() {
-                    return Err(why);
-                }
-                let cap = Duration::from_secs(cap_secs);
-                let half = cap / 2;
-                let extra = ports.random_wait(cap - half).min(cap - half);
-                let delay = (half + extra).min(remaining);
-                ports.sleep(delay);
-                waited += delay;
-                attempt += 1;
-            }
-            other => return other,
-        }
-    }
-}
-
 impl Item for Synced<'_> {
     fn id(&self) -> String {
         self.kind.id().to_owned()
@@ -1290,9 +1349,12 @@ impl Item for Synced<'_> {
             | Kind::Release
             | Kind::Fabric
             | Kind::Awake => Class::Relay,
-            Kind::Peers | Kind::OwedClone | Kind::Fleet | Kind::SharedData | Kind::Accounts => {
-                Class::Install
-            }
+            Kind::Peers
+            | Kind::OwedClone
+            | Kind::RefreshRepositories
+            | Kind::Fleet
+            | Kind::SharedData
+            | Kind::Accounts => Class::Install,
         }
     }
 
@@ -1303,6 +1365,7 @@ impl Item for Synced<'_> {
             Kind::Github => "the vault GitHub credential helper",
             Kind::OwedClone => "the repositories aterm init owes",
             Kind::CloneTuning => "git tuning of the vault's clones",
+            Kind::RefreshRepositories => "the vault's checkouts already here, fast-forwarded",
             Kind::Identity => "this Mac's swarm label",
             Kind::StewardRevoke => "the revoke cascade, finished by the ALab steward",
             Kind::StewardLease => "the ALab steward lease",
@@ -1380,33 +1443,18 @@ impl Item for Synced<'_> {
                 }
                 match owed {
                     crate::init::OwedClone::Nothing(why) => not_applicable(why),
-                    crate::init::OwedClone::Verified { present, total } => Probe::Ok {
+                    crate::init::OwedClone::Verified(counts) => Probe::Ok {
                         now: format!(
-                            "{present}/{total} vault repositories verified on this machine"
+                            "vault repositories: {}, verified on this machine",
+                            counts.summary()
                         ),
                     },
-                    // This row's refresh reads those remotes anyway, so they are no clone owed
-                    // before it; its read-back must then verify them, or the row fails.
-                    crate::init::OwedClone::Unobserved {
-                        present,
-                        unborn,
-                        total,
-                    } if self.refresh_ahead() => Probe::Ok {
-                        now: format!(
-                            "{present}/{total} vault repositories verified on this machine, \
-                             {unborn} more checked out without a commit: this pass reads their \
-                             remotes"
-                        ),
-                    },
-                    crate::init::OwedClone::Unobserved {
-                        present,
-                        unborn,
-                        total,
-                    } => Probe::Change {
+                    // Acquisition reads each such remote and takes any commits it finds; its
+                    // read-back must then verify them, or the row fails.
+                    crate::init::OwedClone::Unobserved(counts) => Probe::Change {
                         from: format!(
-                            "{present}/{total} vault repositories verified on this machine, \
-                             {unborn} more checked out without a commit: their remotes are not \
-                             read yet"
+                            "vault repositories: {}: their remotes are not read yet",
+                            counts.summary()
                         ),
                         to: "their remotes read, as aterm init reads them".to_owned(),
                     },
@@ -1424,10 +1472,50 @@ impl Item for Synced<'_> {
                     },
                 }
             }),
+            // Only an applying pass keeps what it read of the clones' declarations: a plan
+            // (`--check`) writes nothing.
             Kind::CloneTuning => read(
-                self.ports.clone_tuning(),
+                self.ports.clone_tuning(if self.mode == Mode::Apply {
+                    crate::clone_tuning::Keep::Declarations
+                } else {
+                    crate::clone_tuning::Keep::Nothing
+                }),
                 crate::clone_tuning::Reading::probe,
             ),
+            // The refresh runs as this row's engine refresh (its apply plans no change), in a
+            // Refresh pass alone, wherever the repositories `sync.clone` reads can be read:
+            // whether that row's acquisition is owed, ran or failed, the checkouts already here
+            // are refreshed. A local read alone: no remote is read before the refresh.
+            Kind::RefreshRepositories => {
+                if self.repository_work != aterm_secrets::converge::RepositoryWork::Refresh {
+                    return not_applicable(
+                        "this pass repairs local checkouts and reads no remote head of one \
+                         already here",
+                    );
+                }
+                read(
+                    self.ports
+                        .owed_clone(None, aterm_secrets::converge::RepositoryWork::Repair),
+                    |owed| match owed {
+                        crate::init::OwedClone::Verified(_)
+                        | crate::init::OwedClone::Unobserved(_)
+                        | crate::init::OwedClone::Due(_) => Probe::Ok {
+                            now: "each clean checkout of the vault's here before sync.clone \
+                                  that is behind its origin is fast-forwarded in a refresh pass"
+                                .to_owned(),
+                        },
+                        crate::init::OwedClone::Nothing(why)
+                        | crate::init::OwedClone::Off(why)
+                        | crate::init::OwedClone::Held(why) => not_applicable(why),
+                        crate::init::OwedClone::Waiting(why) => not_applicable(format!(
+                            "no checkout is refreshed while repository setup waits: {why}"
+                        )),
+                        crate::init::OwedClone::Person(how) => not_applicable(format!(
+                            "no checkout is refreshed while repository setup needs you: {how}"
+                        )),
+                    },
+                )
+            }
             Kind::Github => read(self.ports.github(), |github| {
                 let replaced = self
                     .replaced_github
@@ -1625,7 +1713,7 @@ impl Item for Synced<'_> {
     }
 
     fn refresh_changes(&self) -> bool {
-        self.kind == Kind::OwedClone
+        self.kind == Kind::RefreshRepositories
             && self.repository_work == aterm_secrets::converge::RepositoryWork::Refresh
     }
 
@@ -1662,10 +1750,7 @@ impl Item for Synced<'_> {
                     self.stand_aside(StoodAside::Waiting(why));
                     return Ok(());
                 }
-                None => match self
-                    .ports
-                    .clone_owed(self.repository_work, self.repository_execution.clone())
-                {
+                None => match self.ports.clone_owed(self.repository_execution.clone()) {
                     Ok(outcome) => {
                         *self
                             .repository_readback
@@ -1688,6 +1773,26 @@ impl Item for Synced<'_> {
                     }
                 },
             },
+            Kind::RefreshRepositories => {
+                // A Stop pressed, or the group turned off, since the row read its controls
+                // holds the refresh as it holds the owed clone.
+                if let Some(why) = self.owed_clone_held()? {
+                    self.stand_aside(StoodAside::Waiting(why));
+                    return Ok(());
+                }
+                match self
+                    .ports
+                    .refresh_repositories(self.repository_execution.clone())
+                {
+                    Ok(crate::init::RepositoryRefreshed::Ran(said)) => said,
+                    // The shared refresh waits for its retry: this row alone is unfinished.
+                    Ok(crate::init::RepositoryRefreshed::Waiting(why)) => {
+                        self.stand_aside(StoodAside::Waiting(why));
+                        return Ok(());
+                    }
+                    Err(why) => return Err(format!("{why}; the next pass tries again")),
+                }
+            }
             Kind::CloneTuning => {
                 // A Stop pressed since the row read the clones holds them, as it holds the
                 // owed clone ([`Self::owed_clone_held`]); the apply reads System State's
@@ -1698,7 +1803,7 @@ impl Item for Synced<'_> {
                 }
                 let tuned = self
                     .ports
-                    .tune_clones()
+                    .tune_clones(self.repository_execution.clone())
                     .map_err(|why| format!("{why}; the next pass tries again"))?;
                 if let Some(why) = tuned.aside {
                     self.say(tuned.said);
@@ -1733,15 +1838,16 @@ impl Item for Synced<'_> {
                 .ports
                 .apply_steward_standby_server()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
-            Kind::Fleet => match sync_fleet_with_retry(self.ports) {
+            // A join that fails ends the row, and with it this pass's hold on the converge lock:
+            // the starter's runner retry tries again within seconds, backing off to minutes
+            // (`aterm_secrets::converge::RunnerRetry`), never a wait inside the pass.
+            Kind::Fleet => match self.ports.sync_fleet() {
                 Ok(FleetDone::Synced(said)) => said,
                 Ok(FleetDone::Blocked(why)) => {
                     self.stand_aside(StoodAside::Waiting(why));
                     return Ok(());
                 }
-                Ok(FleetDone::AtCapacity(why)) | Err(why) => {
-                    return Err(format!("{why}; the next pass tries again"));
-                }
+                Err(why) => return Err(format!("{why}; the next pass tries again")),
             },
             Kind::Node => self
                 .ports
@@ -1808,7 +1914,7 @@ impl Item for Synced<'_> {
             Kind::Peers => Remedy::Command("aterm init".to_owned()),
             Kind::Vault => Remedy::Command("aterm secrets agent on".to_owned()),
             Kind::Github => Remedy::None,
-            Kind::OwedClone => Remedy::Command(
+            Kind::OwedClone | Kind::RefreshRepositories => Remedy::Command(
                 crate::init::naming(aterm_types::macos_setup::Setting::Repositories).to_owned(),
             ),
             // Only macOS's doctor carries the tuning; elsewhere the pass alone applies it.
@@ -2047,9 +2153,11 @@ fn builds_after(record: Option<&Record>, build: &str) -> Vec<String> {
 /// before what it brings, and a node-hosted fabric after the node. The optional repository
 /// prerequisite and potentially long clones follow fleet, node and account work.
 /// The prerequisite owns its unattended package attempt after the base store lock is gone.
-/// Clone tuning follows acquisition, over every clone the pass leaves in place. The single
-/// credential publisher follows all synchronous local producers, so their new needs reach
-/// this pass's table operation. Independent processes may still raise needs afterward.
+/// Clone tuning follows acquisition (`sync.clone`), over every clone the pass leaves in place,
+/// and the refresh of the checkouts already here (`sync.refresh`) follows both: a missing
+/// repository never waits behind fetches of the ones here. The single credential publisher
+/// follows all synchronous local producers, so their new needs reach this pass's table
+/// operation. Independent processes may still raise needs afterward.
 fn sync_items<'a>(
     ports: &'a dyn Ports,
     trigger: Trigger,
@@ -2085,15 +2193,16 @@ fn sync_items<'a>(
         items.push(prerequisites);
     }
     let mut repositories = Synced::new(Kind::OwedClone, ports, trigger, mode);
-    repositories.repository_execution = execution;
+    repositories.repository_execution = execution.clone();
     repositories.repository_work = work;
     items.push(Box::new(repositories));
-    items.push(Box::new(Synced::new(
-        Kind::CloneTuning,
-        ports,
-        trigger,
-        mode,
-    )));
+    let mut tuning = Synced::new(Kind::CloneTuning, ports, trigger, mode);
+    tuning.repository_execution = execution.clone();
+    items.push(Box::new(tuning));
+    let mut refresh = Synced::new(Kind::RefreshRepositories, ports, trigger, mode);
+    refresh.repository_execution = execution;
+    refresh.repository_work = work;
+    items.push(Box::new(refresh));
     items.push(Box::new(Synced::new(Kind::Requests, ports, trigger, mode)));
     items
 }
@@ -2101,8 +2210,13 @@ fn sync_items<'a>(
 /// Why a pass did not run ([`converge`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
-    /// Another pass holds the lock (exit 75).
+    /// Another pass holds the lock, and this is a person's, which does not wait for it
+    /// ([`Trigger::waits_for_the_lock`]; exit 75).
     Held,
+    /// A starter's pass found the lock another pass holds with its starter already ended, or
+    /// its starter ended while it waited: nothing owes it any more, and the starter's successor
+    /// starts its own ([`wait_lock`]; exit 75, which no one reads).
+    Abandoned,
     /// It cannot run here: why.
     Refused(String),
 }
@@ -2126,19 +2240,27 @@ impl Pass {
     }
 }
 
-/// Run one pass for `trigger`: `mode` [`Mode::Apply`] under [`try_lock`] (a held lock stops it
-/// with [`Stop::Held`]), its record written and one aterm.log line; [`Mode::Plan`] probes and
-/// writes nothing (no lock, record, journal or log line, and no look for the open vault, which
-/// keeps what it heard). The base layer runs first, under the store lock it alone holds
-/// ([`base_layer`]), which is let go before the sync kinds run. Each row reaches `on_row` as it
-/// finishes.
+/// Run one pass for `trigger`: `mode` [`Mode::Apply`] under the pass's lock, which a starter's
+/// pass waits for while another pass holds it ([`wait_lock`]) and a person's tries once
+/// ([`try_lock`]), reading nothing before it holds it; its record written and then two aterm.log
+/// lines, its ledger line (`ledger`, `converge build=…`) and its cost line (`cost::line`,
+/// `converge cost build=…`), after a `converge vault subscriber: …` line where it moved the
+/// vault's subscriber onto this release. [`Mode::Plan`] probes and writes nothing (no lock,
+/// record, journal or log line, and no look for the open vault, which keeps what it heard). The
+/// base layer runs first, under the store lock it alone holds ([`base_layer`]), which is let go
+/// before the sync kinds run. Each row reaches `on_row` as it finishes. System State's holds and
+/// the swarm switch are read as each row starts, after the wait, so a Stop pressed while a pass
+/// waited holds its rows.
 ///
 /// # Errors
-/// [`Stop::Held`] while another pass runs; [`Stop::Refused`] outside the account's own login,
-/// where its context or state directory cannot be read, or when the items cannot be ordered. A
-/// refused [`Mode::Apply`] pass writes its own aterm.log line (`refusal`): a runner's stderr goes
-/// nowhere, so a Mac whose every pass is refused leaves that trace. So does one that found the
-/// lock held (`held_line`), which is how the starts that ran nothing are counted.
+/// [`Stop::Held`] while another pass runs, for a person's pass; [`Stop::Abandoned`] where a
+/// starter's pass found the lock held with its starter already ended, or its starter ended
+/// while it waited for the lock; [`Stop::Refused`]
+/// outside the account's own login, where its context or state directory cannot be read, or
+/// when the items cannot be ordered. A refused [`Mode::Apply`] pass writes its own aterm.log
+/// line (`refusal`): a runner's stderr goes nowhere, so a Mac whose every pass is refused leaves
+/// that trace. So does a start that ran nothing for the lock (`unrun_line`), which is how such
+/// starts are counted.
 pub fn converge(
     ports: &dyn Ports,
     trigger: Trigger,
@@ -2150,7 +2272,8 @@ pub fn converge(
     if mode == Mode::Apply {
         match &pass {
             Err(Stop::Refused(why)) => ports.log(&refusal(&ports.build(), trigger, why)),
-            Err(Stop::Held) => ports.log(&held_line(
+            Err(stop @ (Stop::Held | Stop::Abandoned)) => ports.log(&unrun_line(
+                stop,
                 &ports.build(),
                 trigger,
                 ports.start_note().as_deref(),
@@ -2161,12 +2284,19 @@ pub fn converge(
     pass
 }
 
-/// The one aterm.log line of a start that found the lock held and ran nothing: the build, the
-/// trigger and the start's note. Its head is its own (`converge held`), never a pass line's
-/// `converge build=`, so a tally of passes counts no held start.
-fn held_line(build: &str, trigger: Trigger, note: Option<&str>) -> String {
+/// The one aterm.log line of a start that ran nothing for the lock another pass holds: a
+/// person's that found it held (`converge held`), or a starter's whose starter had ended by the
+/// time it found it held or ended while it waited for it (`converge abandoned`), with the build,
+/// the trigger and the start's note. Its
+/// head is its own, never a pass line's `converge build=`, so a tally of passes counts neither.
+fn unrun_line(stop: &Stop, build: &str, trigger: Trigger, note: Option<&str>) -> String {
+    let head = if *stop == Stop::Abandoned {
+        "abandoned"
+    } else {
+        "held"
+    };
     format!(
-        "converge held build={build} trigger={} note={}",
+        "converge {head} build={build} trigger={} note={}",
         trigger.word(),
         note.unwrap_or("-")
     )
@@ -2193,11 +2323,18 @@ fn run_pass(
             "run in your own login and home directory".to_owned(),
         ));
     }
-    let at_console = ports.at_console().map_err(Stop::Refused)?;
     let state = ports.state_dir().ok_or_else(|| {
         Stop::Refused("this account has no state directory to record a pass in".to_owned())
     })?;
     let (pass, observed) = match mode {
+        Mode::Apply if trigger.waits_for_the_lock() => {
+            let access =
+                repository_refresh::RepositoryPass::wait(&state, ports.now_ms(), |ended| {
+                    ports.watch_starter(ended)
+                })
+                .map_err(Stop::Refused)?;
+            (Some(access.pass.ok_or(Stop::Abandoned)?), access.observed)
+        }
         Mode::Apply => {
             let access = repository_refresh::RepositoryPass::open(&state, ports.now_ms())
                 .map_err(Stop::Refused)?;
@@ -2205,7 +2342,10 @@ fn run_pass(
         }
         Mode::Plan => (None, Default::default()),
     };
-    // Read under the lock, so a pass that found it held, and a plan, read nothing.
+    // Read once the lock is held: a pass that found it held reads nothing, and one that waited
+    // for it reads this Mac as it is when it runs. A plan holds no lock and spends nothing.
+    ports.new_pass();
+    let at_console = ports.at_console().map_err(Stop::Refused)?;
     let began = pass.as_ref().map(|_| ports.spent());
     let record = if let Some(pass) = &pass {
         Some(pass.record())

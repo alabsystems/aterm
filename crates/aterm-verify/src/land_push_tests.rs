@@ -226,7 +226,7 @@ fn tracking_after_a_push_preserves_a_newer_tip_and_tolerates_a_locked_ref() {
         );
         let pushes = Cell::new(0);
         let observed = RefCell::new(None);
-        let step: &RemoteStep<'_> = &|root, make, tool, args, until| {
+        let step: &RemoteStep<'_> = &|root, make, tool, args, until, _mode| {
             let out = crate::remote::run(root, make, tool, args, until)?;
             if is_push(args) && out.status.success() {
                 pushes.set(pushes.get() + 1);
@@ -303,9 +303,14 @@ fn racing(world: &World, moves: usize) -> Raced {
     let left = Cell::new(moves);
     let pushes = Cell::new(0);
     let tips = RefCell::new(Vec::new());
-    let step: &RemoteStep<'_> = &|root, git, tool, args, until| {
+    let step: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
         let allowed = until.saturating_duration_since(Instant::now());
         if is_push(args) {
+            assert_eq!(
+                mode,
+                RemoteMode::Mutation,
+                "a push retains its native owner"
+            );
             assert!(
                 allowed > WRITE - SLACK,
                 "push {}: {allowed:?}",
@@ -321,13 +326,14 @@ fn racing(world: &World, moves: usize) -> Raced {
                 tips.borrow_mut().push(rival_moves(world, "b/y.txt", &text));
             }
         } else {
+            assert_eq!(mode, RemoteMode::Read, "discovery keeps the read lifetime");
             assert!(
                 allowed > NETWORK - SLACK,
                 "{args:?} after {} pushes: {allowed:?}",
                 pushes.get()
             );
         }
-        crate::remote::run(root, git, tool, args, until)
+        remote_step(root, git, tool, args, until, mode)
     };
     let (code, said, bases, _) = land_wired(
         world,
@@ -633,7 +639,7 @@ fn a_read_of_main_that_times_out_after_the_pass_is_made_again_and_the_landing_la
         let moved = RefCell::new(None);
         let failed = Cell::new(0);
         let pauses = RefCell::new(Vec::new());
-        let step: &RemoteStep<'_> = &|root, git, tool, args, until| {
+        let step: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
             if is_push(args) && moved.borrow().is_none() {
                 *moved.borrow_mut() = Some(rival_moves(&world, "b/y.txt", "b2\n"));
             }
@@ -641,7 +647,7 @@ fn a_read_of_main_that_times_out_after_the_pass_is_made_again_and_the_landing_la
                 failed.set(failed.get() + 1);
                 return Err(TIMED_OUT.to_owned());
             }
-            crate::remote::run(root, git, tool, args, until)
+            remote_step(root, git, tool, args, until, mode)
         };
         let (code, said, bases, _) = land_wired(
             &world,
@@ -699,16 +705,16 @@ fn a_push_that_timed_out_is_landed_where_main_took_it_and_never_made_again() {
         let tree = head_tree(&world);
         let before = origin_main(&world);
         let pushes = Cell::new(0);
-        let step: &RemoteStep<'_> = &|root, git, tool, args, until| {
+        let step: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
             if is_push(args) {
                 pushes.set(pushes.get() + 1);
                 if sent {
-                    let out = crate::remote::run(root, git, tool, args, until)?;
+                    let out = remote_step(root, git, tool, args, until, mode)?;
                     assert!(out.status.success(), "the push reached main");
                 }
                 return Err(TIMED_OUT.to_owned());
             }
-            crate::remote::run(root, git, tool, args, until)
+            remote_step(root, git, tool, args, until, mode)
         };
         let (code, said, bases, _) = land_wired(
             &world,

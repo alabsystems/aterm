@@ -159,7 +159,7 @@ impl Listener {
                 serve_offering_with_ask_within(
                     &listener,
                     (&listening, Arc::new(|| (FleetScope::Content, SERVES)), deny),
-                    None,
+                    (None, None),
                     &stop,
                     HANG,
                     move |served, _| {

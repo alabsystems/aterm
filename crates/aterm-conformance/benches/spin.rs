@@ -117,7 +117,9 @@ mod measuring {
         // on a release build of 921fbd893d) makes the bound hang on a focus the rig does not
         // decide: the cursor blink (19 timer wakes), the vitals (10 timer, 10 event) and each
         // frame's surface-ready wake, 72 and 73 wakes measured (74, 75 and 98 on that release
-        // build), bounded at 200. Proven red 2026-10-25: a debug build of 71b865e7c4 with
+        // build), bounded at 200. The surface-ready wake is since posted only for a frame that
+        // waits for its drawable, so those takes count one wake a frame more than a window
+        // takes now. Proven red 2026-10-25: a debug build of 71b865e7c4 with
         // 5db5aa8c37^'s event_loop.rs, whose proxy clone (taken by `aos_watch` in every
         // `about_to_wait`) made a run loop source and woke the loop, measured 456,021 wakes
         // (455,992 wait-cancelled) with 25 past-deadline arms and 29 timer wakes, and the three
@@ -169,8 +171,10 @@ mod measuring {
         // the window opens has left to fire (`needle_episode_left`), so the row bounds the needle's
         // fires by those, each counted between the window's opening and closing metrics: a needle
         // that fires more than its readings owed fails, whatever the
-        // Mac's load. The needle's own wakes, two a fire, are left out of the 200, which the
-        // rest of the window kept to 91 or 92 in each of those takes. Since the window's rest
+        // Mac's load. The needle's own wakes are left out of the 200: two a fire in those takes
+        // (its timer and the surface-ready wake every present then brought), which the rest of
+        // the window kept to 91 or 92 in each, and one a fire since the drawable worker posts
+        // that wake only for a frame that waits (`WAKES_PER_NEEDLE_FRAME`). Since the window's rest
         // (`idle_rest_secs`, ATERM-KI-1027-4) the row's head turns it off (`idle_rest_secs = 0`),
         // so it stays the awake deck's row; a take whose window rests anyway is a refusal.
         // Those takes predate the deck clock (`docs/DESIGN-stats-deck-gpu-motion-2026-10-26.md`

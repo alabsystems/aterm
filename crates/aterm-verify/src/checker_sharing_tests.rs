@@ -82,7 +82,8 @@ fn one_recorded_execution_decides_both_checks_even_when_it_fails_or_cannot_run()
             StageId::TestCompile,
         )
     }
-    let cases: [(fn(&Ctx, &plan::StageSpec) -> Report, Outcome); 5] = [
+    type Case = (fn(&Ctx, &plan::StageSpec) -> Report, Outcome);
+    let cases: [Case; 5] = [
         (pass, Outcome::Ok),
         (fail, Outcome::Fail(Severity::GateFailed)),
         (cannot_run, Outcome::Fail(Severity::CouldNotRun)),

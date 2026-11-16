@@ -1718,11 +1718,47 @@ fn every_default_text_reply_keeps_to_its_cut() {
     ];
     let w = world("macOS", 2);
     for scene in &scenes {
-        let s = read(scene, 3);
-        for owner in [true, false] {
-            for text in ["why", "why cpu", "why mem"] {
-                let t = why(text, &ctx(&w, &s, owner));
-                assert!(t.len() <= REPLY_MAX, "{} bytes\n{t}", t.len());
+        let original = read(scene, 3);
+        let observed = |name| {
+            crate::self_cpu::OwnCpuView::Observed(crate::self_cpu::OwnCpuChanges {
+                process: crate::self_cpu::OwnCpuProcess {
+                    pid: 42,
+                    start: 1,
+                    version: -7,
+                },
+                before_begin_ns: 1,
+                before_end_ns: 2,
+                after_begin_ns: u64::MAX - 1,
+                after_end_ns: u64::MAX,
+                process_growth: crate::self_cpu::OwnCpuGrowth {
+                    lower_ns: u64::MAX,
+                    upper_ns: u64::MAX,
+                },
+                groups: vec![crate::self_cpu::OwnCpuGroup {
+                    name,
+                    growth: crate::self_cpu::OwnCpuGrowth {
+                        lower_ns: u64::MAX,
+                        upper_ns: u64::MAX,
+                    },
+                    threads: 1,
+                }],
+                coverage: crate::self_cpu::OwnCpuWindowCoverage::default(),
+            })
+        };
+        for detail in [
+            crate::self_cpu::OwnCpuView::default(),
+            observed("\"".repeat(62)),
+            // This valid 62-byte native name expands more than ASCII quotes under Debug.
+            observed("\u{061c}".repeat(31)),
+            crate::self_cpu::OwnCpuView::Unavailable("thread_list_unread"),
+        ] {
+            let mut s = original.clone();
+            s.self_cpu = detail;
+            for owner in [true, false] {
+                for text in ["why", "why cpu", "why mem"] {
+                    let t = why(text, &ctx(&w, &s, owner));
+                    assert!(t.len() <= REPLY_MAX, "{} bytes\n{t}", t.len());
+                }
             }
         }
     }

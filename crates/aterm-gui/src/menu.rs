@@ -449,7 +449,7 @@ pub(crate) enum MenuAction {
     Messages,
     /// Aterm ▸ System State…: focus or create the System State tab in the front window.
     SystemState,
-    /// Aterm ▸ Tables…: focus or create the Tables tab, the registry's tables, in the front
+    /// Aterm ▸ Registry…: focus or create the Tables tab, the registry's tables, in the front
     /// window.
     Tables,
     /// Open the read-only Allocation pane beside the focused view, or in a tab when space is tight.
@@ -474,6 +474,10 @@ pub(crate) enum MenuAction {
     Overview,
     /// Workers…: the window's list of the workers it hosts.
     Workers,
+    /// Navigator…: every live session of every window, as a tab.
+    Navigator,
+    /// Navigator in Left Split: the same list as the active tab's left pane.
+    NavigatorSplit,
     /// Next That Needs You ⇧⌘J.
     NextNeed,
     /// Harness Log for This Tab ⇧⌘L.
@@ -569,6 +573,8 @@ impl MenuAction {
             MenuAction::RenameSession => 48,
             MenuAction::Overview => 54,
             MenuAction::Workers => 99,
+            MenuAction::Navigator => 107,
+            MenuAction::NavigatorSplit => 108,
             MenuAction::Allocation => 100,
             MenuAction::NextKitty => 57,
             MenuAction::HarnessLog => 60,
@@ -661,6 +667,8 @@ impl MenuAction {
             48 => MenuAction::RenameSession,
             54 => MenuAction::Overview,
             99 => MenuAction::Workers,
+            107 => MenuAction::Navigator,
+            108 => MenuAction::NavigatorSplit,
             100 => MenuAction::Allocation,
             57 => MenuAction::NextKitty,
             60 => MenuAction::HarnessLog,
@@ -1292,6 +1300,8 @@ impl MenuAction {
             }
             MenuAction::Overview
             | MenuAction::Workers
+            | MenuAction::Navigator
+            | MenuAction::NavigatorSplit
             | MenuAction::Allocation
             | MenuAction::HarnessLog
             | MenuAction::ReadThisMac
@@ -1423,6 +1433,8 @@ impl MenuAction {
             | MenuAction::CopyCwd
             | MenuAction::Overview
             | MenuAction::Workers
+            | MenuAction::Navigator
+            | MenuAction::NavigatorSplit
             | MenuAction::NextNeed
             | MenuAction::HarnessLog
             | MenuAction::TakeOver
@@ -1528,6 +1540,13 @@ impl MenuAction {
             MenuAction::Workers => {
                 "Show the workers this window hosts: what each is doing, how each ended, and its \
                  result."
+            }
+            MenuAction::Navigator => {
+                "List every live session of every window: your tabs first, each with the \
+                 sessions under it, then the rest of this machine's."
+            }
+            MenuAction::NavigatorSplit => {
+                "Open the list of every live session as the left pane of this tab."
             }
             MenuAction::NextNeed => {
                 "Go to the tab that needs you most; again, to the next one that needs you."
@@ -1715,6 +1734,8 @@ impl MenuAction {
             "CopyCwd" => Some(MenuAction::CopyCwd),
             "Overview" => Some(MenuAction::Overview),
             "Workers" => Some(MenuAction::Workers),
+            "Navigator" => Some(MenuAction::Navigator),
+            "NavigatorSplit" => Some(MenuAction::NavigatorSplit),
             "NextNeed" => Some(MenuAction::NextNeed),
             "HarnessLog" => Some(MenuAction::HarnessLog),
             "ReadThisMac" => Some(MenuAction::ReadThisMac),
@@ -1853,20 +1874,14 @@ const APP_MENU: &[MenuEntry] = &[
         mods: MenuMods::None,
     },
     Item {
-        label: "Tables…",
+        label: "Registry…",
         action: MenuAction::Tables,
         key: "",
         mods: MenuMods::None,
     },
     Item {
-        label: "Allocation…",
-        action: MenuAction::Allocation,
-        key: "",
-        mods: MenuMods::None,
-    },
-    Item {
-        label: "Mail…",
-        action: MenuAction::Mail,
+        label: "amacs…",
+        action: MenuAction::OpenEditor,
         key: "",
         mods: MenuMods::None,
     },
@@ -1957,6 +1972,18 @@ const AGENTS_MENU: &[MenuEntry] = &[
     Item {
         label: "Workers…",
         action: MenuAction::Workers,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Navigator…",
+        action: MenuAction::Navigator,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "Navigator in Left Split",
+        action: MenuAction::NavigatorSplit,
         key: "",
         mods: MenuMods::None,
     },

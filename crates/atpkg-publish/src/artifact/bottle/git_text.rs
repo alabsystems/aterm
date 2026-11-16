@@ -9,8 +9,8 @@ use crate::artifact::relocate;
 use crate::error::{Error, Result};
 
 /// Replace Git's own bottled prefix in script literals with its runtime package root.
-/// Libraries in `share/perl5` use their own file location; shell libraries inherit the
-/// wrapper's root or derive it from Git's exec path when sourced outside the wrapper.
+/// Libraries in `share/perl5` use their own file location; shell libraries take the root from
+/// `ATERM_GIT_ROOT` when their caller set it, else derive it from Git's exec path.
 ///
 /// # Errors
 /// An unreadable helper, an unknown script language or an unsupported prefix literal.

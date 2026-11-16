@@ -640,7 +640,7 @@ pub fn synced(
     let at_cut = records_anywhere(&ledger.cut);
     let held = client::load_records(&mac.paths)
         .map_err(|e| format!("{}'s records: {e}", mac.name))
-        .and_then(|store| records_of(&store.encode(), signers));
+        .and_then(|store| records_of(&store.read_encoded().unwrap(), signers));
     let on_server = aterm_secrets::transport::fetch_records(server, &[], None, READ, None)
         .map_err(|e| format!("island {}'s server's records: {e}", mac.island.word()))
         .and_then(|bytes| records_of(&bytes, signers));
@@ -756,7 +756,7 @@ pub fn read(macs: &[Watched], servers: &[(Island, String)], signers: &mut Signer
     for m in macs {
         let records = client::load_records(&m.paths)
             .map_err(|e| e.to_string())
-            .and_then(|store| records_of(&store.encode(), signers));
+            .and_then(|store| records_of(&store.read_encoded().unwrap(), signers));
         match records {
             Ok(records) => snapshot.holders.push(Holder {
                 name: m.name.clone(),

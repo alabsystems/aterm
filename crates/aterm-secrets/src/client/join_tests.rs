@@ -5741,9 +5741,7 @@ fn the_members_asking_rings_as_what_its_worker_reads_moves() {
 /// built inside its start carries [`crate::converge::START_NOTE_ENV`] and nothing else, set to
 /// the start's note as the projection's own update made it. The first start says `start` and
 /// `recheck`; an input look that asked for a repair with the index moved says `input-repair`,
-/// `m=index`, `n=1`; a runner that found the lock held is reaped with its CPU and the retry 5 s
-/// later says what that held start was owed for, `retry-held`, one held start, its CPU, the 5 s
-/// waited and the same class.
+/// `m=index`, `n=1`; that runner failed, and the retry 5 s later says `retry-failed`.
 /// NEGATIVE CONTROL: a projection that starts its runner under an empty note
 /// (`noting(&StartNote::default(), …)`) builds commands that carry no variable: the first
 /// start's is `[]` where `[("ATERM_CONVERGE_START", Some("c=start+recheck"))]` is wanted.
@@ -5772,12 +5770,9 @@ fn a_projection_hands_each_runner_the_note_of_why_it_starts() {
         }
     }));
     let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
-    // How each runner ends: it ran; it found the lock held, after spending CPU enough that its
-    // reap measures some; it ran.
+    // How each runner ends: it ran; it failed; it ran.
     let ends = std::sync::Mutex::new(std::collections::VecDeque::from([
-        "exit 0",
-        "i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done; exit 75",
-        "exit 0",
+        "exit 0", "exit 1", "exit 0",
     ]));
     let notes = std::sync::Mutex::new(Vec::new());
     let start = |exe: &Path, request: RepositoryRequest| {
@@ -5826,31 +5821,10 @@ fn a_projection_hands_each_runner_the_note_of_why_it_starts() {
     assert_eq!(
         notes.lock().unwrap().len(),
         2,
-        "a held runner's retry waits"
+        "a failed runner's retry waits"
     );
     now.store(crate::converge::FIRST_RETRY_MS, Ordering::SeqCst);
     projection.poll();
     let notes = notes.lock().unwrap().clone();
-    assert_eq!(notes.len(), 3, "{notes:?}");
-    let [(name, Some(word))] = notes[2].as_slice() else {
-        panic!("one variable, set: {notes:?}");
-    };
-    assert_eq!(name, crate::converge::START_NOTE_ENV);
-    let fields: Vec<&str> = word.split(',').collect();
-    let [causes, held, held_cpu, waited, classes, looks] = fields.as_slice() else {
-        panic!("every field: {word}");
-    };
-    assert_eq!(
-        [*causes, *held, *waited, *classes, *looks],
-        [
-            "c=input-repair+retry-held",
-            "h=1",
-            "w=5000",
-            "m=index",
-            "n=1"
-        ],
-        "{word}"
-    );
-    let held_cpu: u64 = held_cpu.strip_prefix("hc=").unwrap().parse().unwrap();
-    assert!(held_cpu >= 1, "{word}");
+    assert_eq!(notes[2..], [noted("c=retry-failed")], "{notes:?}");
 }

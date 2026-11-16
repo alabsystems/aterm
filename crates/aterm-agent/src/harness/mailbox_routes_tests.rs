@@ -880,6 +880,90 @@ fn a_webmail_login_counts_as_signed_in_only_on_the_inbox_list() {
     assert!(login_held(Some(&record), &webmail, login, now).is_some());
 }
 
+/// A WEBMAIL PAGE THAT CARRIES A CHECK IS NEVER OPENED AGAIN ON A CLOCK: a poll whose page
+/// answers a check ends at once naming it and records it as a `c1` line of the login record,
+/// whether or not the mailbox names a login; the next poll opens no page and ends naming it.
+/// The line is kept through a refusal's rewrite of the record and a sign-in's; an unknown word
+/// on a `c1` line holds nothing. With no login named, the check holds every login on that host.
+/// Only a person clears it, by removing the line.
+/// NEGATIVE CONTROL: with the check recorded only where a login is named (the branch's first
+/// form), the poll of a mailbox with no login records nothing and the next opens the page:
+/// `` the next poll opened the checked page ``; with `write_record` dropping `c1` lines, the
+/// first poll's check is on no record: `` left: None ``.
+#[test]
+fn a_webmail_page_that_carries_a_check_is_never_opened_again() {
+    use crate::harness::headless_oauth::{CheckMet, WEBMAIL_BOT_CHECK, WEBMAIL_HUMAN_CHECK};
+    let store = aterm_tempfile::tempdir().expect("tempdir");
+    let record = store.path().join(LOGIN_RECORD_FILE);
+    let login = "owner@proton.example.test";
+    let mut cfg = config(&format!(
+        "[[mailboxes]]\nlogin = \"{login}\"\npassword = \"pw\"\n\
+         webmail_url = \"https://mail.example.test/u/0/inbox\"\n\
+         receives = [\"*@pm.example.test\"]\n"
+    ));
+    cfg.login_record = Some(record.clone());
+    let target = Some("ai@pm.example.test");
+    let webmail = login_source("https://mail.example.test/u/0/inbox");
+    let checked = aterm_json::json!({
+        "state": "human_check", "check": "Proton", "url": "https://account.example.test/login"
+    });
+    let (got, opened) = poll_webmail(&cfg, target, move |_| checked.clone());
+    assert!(opened);
+    assert_eq!(got, Err(WEBMAIL_HUMAN_CHECK));
+    assert_eq!(
+        login_check(Some(&record), &webmail, login).as_deref(),
+        Some("human_check:Proton")
+    );
+    let (got, opened) = poll_webmail(&cfg, target, |_| aterm_json::json!({"state": "loading"}));
+    assert!(!opened, "the next poll opened the checked page");
+    assert_eq!(got, Err(WEBMAIL_HUMAN_CHECK));
+
+    // A refusal's rewrite and a sign-in's keep the line.
+    let now = unix_now();
+    note_login_refused(Some(&record), &webmail, login, now);
+    assert!(
+        login_check(Some(&record), &webmail, login).is_some(),
+        "a refusal's rewrite dropped the check"
+    );
+    note_login_accepted(Some(&record), &webmail, login);
+    assert!(
+        login_check(Some(&record), &webmail, login).is_some(),
+        "a sign-in dropped the check"
+    );
+    // An unknown word holds nothing.
+    let other = "other@proton.example.test";
+    let text = std::fs::read_to_string(&record).expect("record");
+    std::fs::write(
+        &record,
+        format!("{text}c1 {} made-up\n", login_digest(&webmail, other)),
+    )
+    .expect("record");
+    assert_eq!(login_check(Some(&record), &webmail, other), None);
+
+    // A mailbox that names no login: the check is the host's, and holds every login there.
+    let nameless_record = store.path().join("nameless");
+    let mut nameless = config("webmail_url = \"https://mail.example.test/u/0/inbox\"\n");
+    nameless.login_record = Some(nameless_record.clone());
+    assert_eq!(
+        nameless.webmail_user_for(None),
+        None,
+        "a mailbox that names no login"
+    );
+    let checked = aterm_json::json!({
+        "state": "bot_check", "check": "Cloudflare", "url": "https://mail.example.test/u/0/inbox"
+    });
+    let (got, opened) = poll_webmail(&nameless, None, move |_| checked.clone());
+    assert!(opened);
+    assert_eq!(got, Err(WEBMAIL_BOT_CHECK));
+    let (got, opened) = poll_webmail(&nameless, None, |_| aterm_json::json!({"state": "loading"}));
+    assert!(!opened, "the next poll opened the checked page");
+    assert_eq!(got, Err(WEBMAIL_BOT_CHECK));
+    assert_eq!(
+        login_check(Some(&nameless_record), &webmail, other).as_deref(),
+        Some(CheckMet::BotCheck.page_word().as_str())
+    );
+}
+
 /// A ROUTED ADDRESS KEEPS THE PASSWORD THAT WORKS: importing the CSV into a single-mailbox file
 /// (a top-level `user` with its password, second password and TOTP secret, and a per-email
 /// password for a Gmail address) adds entries that use those very credentials, so every alias

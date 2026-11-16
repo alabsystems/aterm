@@ -123,7 +123,8 @@ USAGE:
     aterm harness accounts observed [--json]
                                                  each login place here: the account it really holds,
                                                  the row aterm believed, its tabs and source;
-                                                 Muse Code's with its sign-in and week
+                                                 Muse Code's with its sign-in and week; each of
+                                                 aterm's browser profiles signed in to an account
     aterm harness accounts add <label> [--pool] [--email <e>] [--browser <b>]
                                                  create login directory and append roster row
     aterm harness accounts adopt-default <label> --email <e> [--browser <b>]
@@ -376,6 +377,10 @@ REBUILDABLE BUDGET (`budget` in `aterm ctl @self sys disk`):
 
 AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before each item; tiers
 1-3 over the rebuildable budget as well, at any state, stopping at its cap):
+  - tier 0 (`short`): what a build that died left in a Cargo profile, taken whole ahead of any
+    finished unit the pass reaches: an unfinished incremental session (`s-...-working`) whose
+    lock no rustc holds, unwritten for >=10s (its lock file stays for rustc's own collection),
+    and a metadata temp folder (`rmeta` and 6 letters or digits) no process uses, for >=1m.
   - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
     owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
   - tier 2 (`low`): idle Cargo profile `incremental/` dirs (idle past `disk.target_stale_days`,
@@ -385,8 +390,19 @@ AUTOMATIC TIERS (window or `disk watch`, cheapest first, re-measuring before eac
   - tier 4 (`short`): recent profile caches (untouched for >=10m and unlocked) until free
     space reaches `floor + 5 GiB` or reclaimed bytes cover the shortfall.
 
-`--apply cargo-targets` takes tier 1 (when `low`), tier 2 (at any free level), and tier 4
-(when `short`); tier 3 (`idle_whole_up_to=`) is emptied only by an automatic pass.
+`--apply cargo-targets` takes tiers 0 and 4 (when `short`), tier 1 (when `low`) and tier 2 (at
+any free level); tier 3 (`idle_whole_up_to=`) is emptied only by an automatic pass.
+
+AT THE EMERGENCY (`emergency`):
+  - The reserve: a file of a twelfth of `room` (at least 256 MiB, at most the `emergency`
+    line) the watch writes once free space is that much over `floor + 5 GiB`. A look that
+    reads `emergency` deletes it first, so the pass's journal rows can be written on a full
+    volume; it is written again once there is that room.
+  - A pass at `emergency` that takes nothing writes one `cannot-meet` row (`by: emergency`) to
+    disk.jsonl an episode (a record; a restart keeps it said) and plans no further pass until
+    free space moves by 512 MiB either way, an agent waits for room (`await sys`), a build lock
+    it waited on is let go, something kept for its age may go (an hour on at the latest) or
+    the live sessions change. The episode ends once the volume reads 512 MiB over the line.
 
 WHO HOLDS THE DISK: a look that finds the volume below `floor`, or projected under it, writes
   its report row to `<state>/disk.jsonl` with `holders`: the largest twenty folders of build
@@ -1591,7 +1607,8 @@ pub enum AccountsCmd {
     /// `accounts observed [--json]`: what each login place on this Mac really holds, beside the
     /// row the roster believes is there ([`run_accounts_observed`];
     /// `docs/DESIGN-account-discovery-2026-11-09.md`). Claude Code's places, and Muse Code's
-    /// with whether its login works and its week ([`muse_place_seen`]).
+    /// with whether its login works and its week ([`muse_place_seen`]), and each of aterm's own
+    /// browser profiles signed in to an account ([`browser_places_seen`]).
     Observed {
         /// The JSON form.
         json: bool,
@@ -5936,29 +5953,36 @@ fn budget_end(
                 partial,
             );
             BudgetEnd::CannotMeet {
-                row: disk_cannot_meet(look.state, look.now, &inputs, &row),
+                row: disk_cannot_meet(
+                    look.state,
+                    disk::budget::UNMET_FILE,
+                    look.now,
+                    &inputs,
+                    &row,
+                ),
                 partial,
             }
         }
     }
 }
 
-/// The memo, then the row: `<state>`'s memo says this volume and cap cannot meet the target
-/// ([`disk::budget::unmet`]), and where none said so before, `row` goes into `<state>/disk.jsonl`.
-/// Whether the row was written; a memo that cannot be kept writes none.
+/// The memo, then the row: `<state>`'s memo `file` says this volume and cap cannot meet the
+/// target ([`disk::budget::unmet_in`]), and where none said so before, `row` goes into
+/// `<state>/disk.jsonl`. Whether the row was written; a memo that cannot be kept writes none.
 fn disk_cannot_meet(
     state: &Path,
+    file: &str,
     now: i64,
     inputs: &disk::budget::Inputs,
     row: &disk::CannotMeetRow<'_>,
 ) -> bool {
-    match disk::budget::unmet(state, inputs, now) {
+    match disk::budget::unmet_in(state, file, inputs, now) {
         Ok(true) => {}
         Ok(false) => return false,
         Err(e) => {
             aterm_log::warn!(
-                "harness disk watch: the budget's memo was not kept, so no cannot-meet row is \
-                 written: {e}"
+                "harness disk watch: the cannot-meet memo {file} was not kept, so no \
+                 cannot-meet row is written: {e}"
             );
             return false;
         }
@@ -5968,6 +5992,116 @@ fn disk_cannot_meet(
     let mut sink = io::sink();
     let mut journal = Journal::open(Some(&path), None, &mut sink);
     journal.append_raw(&disk::cannot_meet_row(now, row), &mut sink)
+}
+
+/// Where a pressure pass ran, as its emergency end reads it ([`disk_emergency_end`]).
+#[derive(Debug, Clone, Copy)]
+pub struct EmergencyAt<'a> {
+    /// The harness state directory: the memo and `disk.jsonl` go there.
+    pub state: &'a Path,
+    /// Unix seconds.
+    pub now: i64,
+    /// The level the pass ran at: off [`disk::Level::Emergency`] it ends no wait.
+    pub level: disk::Level,
+    /// The volume, by its spelled key.
+    pub volume: &'a str,
+    /// The volume's size, bytes.
+    pub total: u64,
+    /// The emergency line, free bytes.
+    pub line: u64,
+    /// The live sessions' digest ([`disk::budget::live_digest`]).
+    pub live: u64,
+}
+
+/// THE EMERGENCY END of a pressure pass (DC-06a), which a host hands every pass it ran (`done`,
+/// `None` for one that scanned nothing) and its watch's wait (`emergency`). A pass at the
+/// emergency that took nothing (`done` removed no row and freed no byte, `swept`, the sweeps of
+/// its look, freed nothing, and no row was refused) and left the volume read `after` it still
+/// under the line gathers what it waited on ([`disk::cadence::Emergency::page`]). Where it ran
+/// out of what it may take, so closing its discovery cycle, `<state>`'s memo says so
+/// ([`disk::EMERGENCY_UNMET_FILE`]), once an episode one `cannot-meet` row goes into
+/// `<state>/disk.jsonl` with the free, kept and rebuildable figures (a record, not a request: no
+/// alert reads it), and the watch waits on what every page of the cycle waited on, the clock at
+/// most [`disk::cadence::UNMET_WAIT_MAX_S`] on: the host plans no pass until
+/// [`disk::cadence::Emergency::due`] says one is. Any other pass ends the wait and the gathering.
+pub fn disk_emergency_end(
+    at: &EmergencyAt<'_>,
+    emergency: &mut disk::cadence::Emergency,
+    done: Option<&disk::Applied>,
+    swept: u64,
+    after: Option<u64>,
+) {
+    let (Some(done), Some(free)) = (
+        done.filter(|_| at.level == disk::Level::Emergency),
+        after.filter(|free| *free < at.line),
+    ) else {
+        emergency.reset();
+        return;
+    };
+    if !done.removed.is_empty() || done.freed_bytes > 0 || swept > 0 || !done.denials.is_empty() {
+        emergency.reset();
+        return;
+    }
+    emergency.unmet = None;
+    let Some((ripens, held)) = emergency.page(&done.waits, done.ran_out(), at.now) else {
+        return;
+    };
+    let rebuildable = done.seen.bytes;
+    let cap = at.total.saturating_sub(at.line);
+    let kept = at.total.saturating_sub(free).saturating_sub(rebuildable);
+    let budget = disk::Budget {
+        cap,
+        cap_written: false,
+        kept,
+        target: cap.saturating_sub(kept),
+        rebuildable,
+    };
+    let row = disk::CannotMeetRow {
+        by: disk::EMERGENCY_ROW_BY,
+        volume: at.volume,
+        budget: &budget,
+        partial: done.seen.partial,
+        free,
+        free_target: at.line,
+        held: held.len(),
+    };
+    let inputs = disk::budget::Inputs {
+        volume: at.volume.to_owned(),
+        cap,
+        kept,
+        rebuildable,
+        partial: done.seen.partial,
+        live: at.live,
+    };
+    disk_cannot_meet(at.state, disk::EMERGENCY_UNMET_FILE, at.now, &inputs, &row);
+    emergency.unmet = Some(disk::cadence::Unmet {
+        free,
+        ripens,
+        held,
+        live: at.live,
+    });
+}
+
+/// One look's reading of the emergency's episode: where it reads the volume out of it
+/// ([`disk::cadence::over`]: off the emergency at `level`, and `free` bytes
+/// [`disk::cadence::EMERGENCY_DROP`] or more over the `line`), the watch's wait and what its
+/// pages gathered go (`emergency`), and so does `<state>`'s emergency memo, so the next episode
+/// plans its own pass and writes its own `cannot-meet` row ([`disk_emergency_end`]). A host calls
+/// it at every look it may run a pass from, before it asks whether one is due.
+pub fn disk_emergency_look(
+    state: &Path,
+    emergency: &mut disk::cadence::Emergency,
+    level: disk::Level,
+    free: Option<u64>,
+    line: u64,
+) {
+    if !disk::cadence::over(level, free, line) {
+        return;
+    }
+    emergency.reset();
+    if let Err(e) = disk::budget::met_in(state, disk::EMERGENCY_UNMET_FILE) {
+        aterm_log::warn!("harness disk watch: the emergency's memo was not removed: {e}");
+    }
 }
 
 /// [`disk_tick`] and its kin: with `budget`, one page of the budget pass ([`disk_tick_budget`]),
@@ -6032,6 +6166,8 @@ fn disk_tick_with(
             cursor.reset_cycle();
         }
     }
+    // Read before the page, which may begin a cycle: a page that continues one sees only part.
+    let mid_cycle = paged && cursor.as_deref().is_some_and(|c| c.mid_cycle());
     let _exposed = disk::discover::expose_placeholders().ok();
     let found = discover.map_or_else(disk::discover::Discovered::default, |r| {
         match cursor.as_deref_mut() {
@@ -6042,6 +6178,7 @@ fn disk_tick_with(
         }
     });
     let unfinished = found.cut.clone();
+    let found_cut = found.cut.is_some();
     let dangling = found.dangling.clone();
     let paths: Vec<PathBuf> = found.found.iter().map(|f| f.path.clone()).collect();
     let fresh = (cfg!(windows) && table.is_none()).then(aterm_sysprobe::volumes::table);
@@ -6148,9 +6285,15 @@ fn disk_tick_with(
     } else {
         unfinished
     };
+    let seen = disk::Rebuildable {
+        partial: rep.seen.partial || found_cut || mid_cycle,
+        ..rep.seen
+    };
     let done = disk::Applied {
         unfinished,
         dangling,
+        seen,
+        waits: rep.waits.clone(),
         ..done
     };
     let there = |p: &Path| {
@@ -6259,35 +6402,51 @@ fn reserve_write_waits(reserve: &Path, now: i64) -> bool {
         .is_some_and(|at| now < at.saturating_add(RESERVE_REWRITE_AFTER_SECS))
 }
 
-/// THE RESERVE'S MOVE on one look ([`disk::reserve`]): at [`disk::Level::Emergency`] the reserve at `reserve` is UNLINKED FIRST and then the `released` row is appended to `<state>/disk.jsonl` — the unlink needs no space, and the room it made is what lets that row and the pass's intent rows be written (at a true `ENOSPC` they could not be, and the write-ahead rule removed nothing: [`disk::Refusal::Unjournalled`]). A partial recovery rearms this small reserve above the emergency line with one reserve of hysteresis; it need not recover the adaptive build-room target first.
+/// THE RESERVE'S MOVE on one look ([`disk::reserve`]): at [`disk::Level::Emergency`] the reserve at `reserve` is UNLINKED FIRST and then the `released` row is appended to `<state>/disk.jsonl` — the unlink needs no space, and the room it made is what lets that row and the pass's intent rows be written (at a true `ENOSPC` they could not be, and the write-ahead rule removed nothing: [`disk::Refusal::Unjournalled`]).
+///
+/// The reserve is sized to the volume's `room` ([`disk::reserve::sized`]: a twelfth of it, never
+/// under [`disk::reserve::RESERVE_BYTES`] nor over the emergency line), and
+/// written once free space is twice that much over the emergency line: a partial recovery rearms
+/// it with one reserve of hysteresis, and need not recover the adaptive build-room target first.
+/// It grows, never shrinks: a reserve there of three quarters of that size or more is kept, so a
+/// room that moves by the day rewrites no gigabytes by the day. The `written` row carries the
+/// bytes written.
 pub fn disk_reserve_look(
     state: &Path,
     reserve: &Path,
     level: disk::Level,
     free: Option<u64>,
     thresholds: &disk::Thresholds,
+    room: Option<u64>,
     now: i64,
 ) -> ReserveMove {
     if level == disk::Level::Unknown || thresholds.floor == 0 {
         return ReserveMove::Kept;
     }
     let _exposed = disk::discover::expose_placeholders().ok();
+    let want = disk::reserve::sized(room, thresholds.emergency);
     let mut unwritten_at = None;
+    let mut size = want;
     let moved = if level == disk::Level::Emergency {
         match disk::reserve::release(reserve) {
             Ok(Some(bytes)) => ReserveMove::Released(bytes),
             Ok(None) => return ReserveMove::Kept,
             Err(e) => ReserveMove::Refused(e.to_string()),
         }
-    } else if free.is_some_and(|f| {
-        f >= thresholds
-            .emergency
-            .saturating_add(disk::reserve::RESERVE_BYTES.saturating_mul(2))
-    }) {
+    } else if free.is_some_and(|f| f >= thresholds.emergency.saturating_add(want.saturating_mul(2)))
+    {
         if reserve_write_waits(reserve, now) {
             return ReserveMove::StillRefused;
         }
-        match disk::reserve::ensure(reserve, disk::reserve::RESERVE_BYTES) {
+        size = match disk::reserve::state(reserve) {
+            Ok(disk::reserve::State::Present(len))
+                if len.saturating_mul(4) >= want.saturating_mul(3) =>
+            {
+                len.min(want)
+            }
+            _ => want,
+        };
+        match disk::reserve::ensure(reserve, size) {
             Ok(true) => ReserveMove::Written,
             Ok(false) => {
                 reserve_refusal_news(reserve, None, None);
@@ -6327,8 +6486,29 @@ pub fn disk_reserve_look(
         ReserveMove::Written => disk::reserve_row(
             now,
             "written",
-            Some(disk::reserve::RESERVE_BYTES),
-            &format!("the reserve {} was written", reserve.display()),
+            Some(size),
+            &room.map_or_else(
+                || {
+                    format!(
+                        "the reserve {} was written at {}, the least it is kept at: no room was \
+                         read for this volume",
+                        reserve.display(),
+                        disk::human_bytes(size)
+                    )
+                },
+                |room| {
+                    format!(
+                        "the reserve {} was written at {}: a twelfth of the room {} (the \
+                         second-largest two-hour fall of the week, its least before two days are \
+                         measured), never under {} nor over the {} emergency line",
+                        reserve.display(),
+                        disk::human_bytes(size),
+                        disk::human_bytes(room),
+                        disk::human_bytes(disk::reserve::RESERVE_BYTES),
+                        disk::human_bytes(thresholds.emergency)
+                    )
+                },
+            ),
         ),
         ReserveMove::Refused(why) => disk::reserve_row(now, "refused", None, why),
         ReserveMove::Kept => return ReserveMove::Kept,
@@ -6724,20 +6904,161 @@ pub struct WorktreeLook<'a> {
     pub open: &'a [disk::worktree::OpenSession],
     /// The mount table the look read.
     pub table: Option<&'a aterm_sysprobe::volumes::Table>,
+    /// The sessions the window holds, `None` where they are not known (the headless watch).
+    pub roster: Option<&'a [disk::worktree::SessionSeen]>,
+    /// The build-start record's lines ([`atpkg::build_start::read`]).
+    pub starts: &'a [atpkg::build_start::Start],
+    /// The build-start record's file ([`atpkg::build_start::record`]), read again just before a
+    /// worktree that stays gives back a build directory: a build started since the host read
+    /// `starts` keeps it. `None`: the lines of `starts` stand.
+    pub record: Option<&'a Path>,
+}
+
+/// A headless fixture's process probe, as atpkg's fenced removals take one.
+pub type StepProbe<'a> = &'a dyn Fn(&[PathBuf], &[u32]) -> io::Result<aterm_uds::holders::PathScan>;
+
+/// Whose process table fences the worktree step's removals: the kernel's (`None`), or the probe
+/// a headless fixture hands [`disk_worktree_step_with_processes`], which no release build holds.
+#[derive(Clone, Copy)]
+struct StepFence<'a>(Option<StepProbe<'a>>);
+
+impl StepFence<'_> {
+    /// `atpkg::build_cache::retired::remove_worktree` under this fence.
+    fn remove(
+        self,
+        git: &dyn atpkg::build_cache::retired::Git,
+        home: &Path,
+        checkout: &Path,
+        wt: &Path,
+        now: std::time::SystemTime,
+    ) -> Result<(), String> {
+        use atpkg::build_cache::retired;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(processes) = self.0 {
+                return retired::remove_worktree_with_processes(
+                    git, home, checkout, wt, now, processes,
+                );
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = self.0;
+        retired::remove_worktree(git, home, checkout, wt, now)
+    }
+
+    /// `atpkg::build_cache::retired::remove_pinned_worktree` under this fence.
+    fn remove_pinned(
+        self,
+        git: &dyn atpkg::build_cache::retired::Git,
+        home: &Path,
+        checkout: &Path,
+        wt: &Path,
+        now: std::time::SystemTime,
+        pinned: &atpkg::build_cache::retired::Pinned,
+    ) -> Result<(), String> {
+        use atpkg::build_cache::retired;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(processes) = self.0 {
+                return retired::remove_pinned_worktree_with_processes(
+                    git, home, checkout, wt, now, pinned, processes,
+                );
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = self.0;
+        retired::remove_pinned_worktree(git, home, checkout, wt, now, pinned)
+    }
+
+    /// `atpkg::build_cache::retired::worktree_unused` under this fence.
+    fn unused(self, wt: &Path) -> Result<(), String> {
+        use atpkg::build_cache::retired;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(processes) = self.0 {
+                return retired::worktree_unused_with_processes(wt, processes);
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = self.0;
+        retired::worktree_unused(wt)
+    }
+
+    /// `atpkg::build_cache::reclaim_merged_worktree` under this fence.
+    fn remove_build(
+        self,
+        home: &Path,
+        wt: &Path,
+        now: std::time::SystemTime,
+        leave: &atpkg::build_cache::Leave<'_>,
+        record: disk::worktree::Record<'_>,
+    ) -> Vec<(PathBuf, atpkg::build_cache::Unused)> {
+        use atpkg::build_cache;
+        #[cfg(any(test, debug_assertions))]
+        {
+            if let Some(processes) = self.0 {
+                return build_cache::reclaim_merged_worktree_with_processes(
+                    home, wt, now, leave, record, processes,
+                );
+            }
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = self.0;
+        build_cache::reclaim_merged_worktree(home, wt, now, leave, record)
+    }
 }
 
 /// One run of the disk look's worktree step ([`disk::worktree::step`]) over the linked
 /// worktrees of `look.home`'s checkouts: each merged, clean worktree no session uses goes,
 /// journalled into `<state>/disk.jsonl` before and after, with its merged branch, through the
-/// retired gate's remover under the live process fence, while `still_held` says the pass lock
-/// is this host's: no judgment or removal starts after [`disk::worktree::STEP_WALL`], and no git
-/// run outlives it by more than [`disk::worktree::GIT_GRACE`]. `disk.auto_free_gib = 0` (an
-/// unreadable aterm.toml included) runs nothing and leaves `schedule` due.
+/// retired gate's remover under the live process fence, and so does each whose session is gone
+/// once its commits and edits are on refs, what those owe its origin recorded in
+/// `<state>/disk-owed.json` and pushed at a later run ([`disk::worktree::pins`]), while
+/// `still_held` says the pass lock is this host's: no judgment or removal starts after
+/// [`disk::worktree::STEP_WALL`], and no git run outlives it by more than
+/// [`disk::worktree::GIT_GRACE`]. `disk.auto_free_gib = 0` (an unreadable aterm.toml included)
+/// runs nothing and leaves `schedule` due. A merged, clean, quiet worktree outside an agent's
+/// shape stays and gives back its shared build directories through the build cache's remover
+/// and fences (`atpkg::build_cache::reclaim_merged_worktree`), each unwritten for the longer of
+/// seven days and `disk.idle_build_days`, while `[disk]` lets an idle build directory go whole
+/// ([`disk::Config::idle_whole_on`]); the build-start record is read again just before
+/// (`look.record`), and a worktree whose build directory was judged and stays is not judged
+/// for it again for a day (`schedule`, [`disk::worktree::BUILD_DIR_EVERY`]).
 pub fn disk_worktree_step(
     look: &WorktreeLook<'_>,
     config: disk::Config,
     schedule: &mut disk::worktree::Schedule,
     still_held: &dyn Fn() -> bool,
+) -> disk::worktree::Done {
+    disk_worktree_step_on(look, config, schedule, still_held, StepFence(None))
+}
+
+/// [`disk_worktree_step`] with an ownership probe supplied by a headless fixture: every
+/// removal's process fence, and the step's own question whether a process uses a worktree,
+/// read `processes` and never this machine's process table.
+#[cfg(any(test, debug_assertions))]
+pub fn disk_worktree_step_with_processes(
+    look: &WorktreeLook<'_>,
+    config: disk::Config,
+    schedule: &mut disk::worktree::Schedule,
+    still_held: &dyn Fn() -> bool,
+    processes: StepProbe<'_>,
+) -> disk::worktree::Done {
+    disk_worktree_step_on(
+        look,
+        config,
+        schedule,
+        still_held,
+        StepFence(Some(processes)),
+    )
+}
+
+fn disk_worktree_step_on(
+    look: &WorktreeLook<'_>,
+    config: disk::Config,
+    schedule: &mut disk::worktree::Schedule,
+    still_held: &dyn Fn() -> bool,
+    fence: StepFence<'_>,
 ) -> disk::worktree::Done {
     if config.auto_free_gib == 0 {
         return disk::worktree::Done::default();
@@ -6758,6 +7079,13 @@ pub fn disk_worktree_step(
         .collect();
     let now = std::time::SystemTime::UNIX_EPOCH
         + std::time::Duration::from_secs(u64::try_from(look.now).unwrap_or(0));
+    let owed = look.state.join(disk::worktree::pins::OWED_FILE);
+    let build_dirs = config.idle_whole_on().then(|| {
+        let days = u64::try_from(config.idle_build_days).unwrap_or(0);
+        let asked = std::time::Duration::from_secs(days.saturating_mul(86_400));
+        atpkg::build_cache::retired::UNWRITTEN.max(asked)
+    });
+    let build_rested = schedule.rested(started);
     let facts = disk::worktree::Facts {
         home: look.home,
         transcripts_root: look.transcripts,
@@ -6766,16 +7094,26 @@ pub fn disk_worktree_step(
         open: look.open,
         table: look.table,
         known: &known,
+        roster: look.roster,
+        starts: look.starts,
+        owed: Some(&owed),
+        build_dirs,
+        build_rested: &build_rested,
     };
     // Every git run ends by the wall and a grace for the one judgment or removal under way at
     // it: none starts after the wall, and a hung git cannot hold the disk look's thread.
     let git = atpkg::build_cache::retired::GitUntil(
         started + disk::worktree::STEP_WALL + disk::worktree::GIT_GRACE,
     );
-    let mut remove = |checkout: &Path, wt: &Path| {
-        atpkg::build_cache::retired::remove_worktree(&git, look.home, checkout, wt, now)
-    };
+    let mut remove = |checkout: &Path, wt: &Path| fence.remove(&git, look.home, checkout, wt, now);
+    let mut remove_pinned =
+        |checkout: &Path, wt: &Path, pinned: &atpkg::build_cache::retired::Pinned| {
+            fence.remove_pinned(&git, look.home, checkout, wt, now, pinned)
+        };
     let mut journal = |row: &str| disk_ledger_append(look.state, row);
+    let agh = disk::worktree::pins::agh_until(
+        started + disk::worktree::STEP_WALL + disk::worktree::GIT_GRACE,
+    );
     let after = schedule.after().map(Path::to_path_buf);
     let (done, reached) = disk::worktree::step(
         &git,
@@ -6787,10 +7125,24 @@ pub fn disk_worktree_step(
         disk::worktree::Hooks {
             still_held,
             remove: &mut remove,
+            remove_pinned: &mut remove_pinned,
             journal: &mut journal,
+            unused: &|wt| fence.unused(wt),
+            free: &disk::free_bytes,
+            agh: &agh,
+            said: schedule.said(),
+            remove_build: &mut |wt, leave, record| {
+                fence.remove_build(look.home, wt, now, leave, record)
+            },
+            starts: &|| match look.record {
+                Some(record) => atpkg::build_start::read(record),
+                None => look.starts.to_vec(),
+            },
         },
     );
-    schedule.ran(std::time::Instant::now(), reached);
+    let ended = std::time::Instant::now();
+    schedule.rest(ended, &done.build_kept);
+    schedule.ran(ended, reached);
     done
 }
 
@@ -8270,7 +8622,7 @@ pub trait AccountsHost {
         &self,
         _req: &super::login_drive::Request<'_>,
         _recovery: super::agy_signin::RecoveryKey,
-    ) -> Result<super::agy_signin::VerifiedGoogleGrant, String> {
+    ) -> Result<super::agy_signin::VerifiedGoogleGrant, super::agy_signin::GoogleSignInEnd> {
         Err("this host has no native Google sign-in".into())
     }
 
@@ -8406,6 +8758,12 @@ pub enum RenewBrowser {
     Window {
         /// The opener's link ([`super::open_url::OPENER`]).
         opener: PathBuf,
+        /// Nobody at a terminal of their own started it: this Mac's upkeep, or an agent's or a
+        /// script's `accounts renew` ([`person_at_terminal`]). The window is told so
+        /// ([`super::open_url::UNATTENDED_ENV`]): it ends at the read that finds any check,
+        /// naming it, with nothing pressed, as the headless drives do, and waits on no page for
+        /// a person who is not there (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3).
+        unattended: bool,
     },
     /// Nothing a person sees opens on this machine: over SSH, for another Mac's request, and
     /// off macOS at an agent's terminal or with no terminal. The opener, where there is one,
@@ -8961,7 +9319,7 @@ impl AccountsHost for LiveAccounts {
         &self,
         req: &super::login_drive::Request<'_>,
         recovery: super::agy_signin::RecoveryKey,
-    ) -> Result<super::agy_signin::VerifiedGoogleGrant, String> {
+    ) -> Result<super::agy_signin::VerifiedGoogleGrant, super::agy_signin::GoogleSignInEnd> {
         if req.cli != Cli::Agy {
             return Err("native Google sign-in is not this CLI's route".into());
         }
@@ -8995,9 +9353,9 @@ impl AccountsHost for LiveAccounts {
             deadline,
             self.work.clone(),
         )
-        .map_err(|error| error.to_string())?
+        .map_err(|error| super::agy_signin::GoogleSignInEnd::of(&error))?
         .verify(deadline)
-        .map_err(str::to_owned)
+        .map_err(super::agy_signin::GoogleSignInEnd::from)
     }
 
     fn vendor_sign_in_with_mailbox(
@@ -9295,7 +9653,7 @@ fn window_until_enter<T>(
     wait(&|| None)
 }
 
-/// `<program> auth login --claudeai --email <email>` as a renewal runs it ([`AccountsHost::renew_flow`]): the login made under the staging home alone ([`accounts::HOME_ENV`] = `home`) with [`accounts::LOGIN_ENV`] removed (set, it would name the keychain item instead, and the new login would land in a live session's), and the page opened as `browser` says: the account's profile through the argv0 opener, Claude Code's default, or, over SSH, nothing (the opener with no profile: the paste-code flow). Whether aterm's sign-in window may open is `browser`'s alone to say: the variable that lets the opener open it ([`super::open_url::WINDOW_ENV`]) is removed from what the provider inherits and set only for [`RenewBrowser::Window`].
+/// `<program> auth login --claudeai --email <email>` as a renewal runs it ([`AccountsHost::renew_flow`]): the login made under the staging home alone ([`accounts::HOME_ENV`] = `home`) with [`accounts::LOGIN_ENV`] removed (set, it would name the keychain item instead, and the new login would land in a live session's), and the page opened as `browser` says: the account's profile through the argv0 opener, Claude Code's default, or, over SSH, nothing (the opener with no profile: the paste-code flow). Whether aterm's sign-in window may open is `browser`'s alone to say: the variable that lets the opener open it ([`super::open_url::WINDOW_ENV`]) is removed from what the provider inherits and set only for [`RenewBrowser::Window`], and so is the one that says nobody started the sign-in ([`super::open_url::UNATTENDED_ENV`]), set only for a window renewal nobody at a terminal started.
 pub(super) fn renew_command(
     program: &std::ffi::OsStr,
     home: &str,
@@ -9309,12 +9667,16 @@ pub(super) fn renew_command(
         .env_remove(super::open_url::PROFILE_ENV)
         .env_remove(super::open_url::INPUT_ENV)
         .env_remove(super::open_url::NO_HEADLESS_ENV)
-        .env_remove(super::open_url::WINDOW_ENV);
+        .env_remove(super::open_url::WINDOW_ENV)
+        .env_remove(super::open_url::UNATTENDED_ENV);
     match browser {
         RenewBrowser::Default => {}
-        RenewBrowser::Window { opener } => {
+        RenewBrowser::Window { opener, unattended } => {
             cmd.env("BROWSER", opener)
                 .env(super::open_url::WINDOW_ENV, "1");
+            if *unattended {
+                cmd.env(super::open_url::UNATTENDED_ENV, "1");
+            }
         }
         RenewBrowser::Profile { opener, profile } => {
             cmd.env("BROWSER", opener)
@@ -15392,8 +15754,8 @@ pub(super) enum Renewal {
     /// stopped it (its page waits on one, or its time ran out), so a background renewal of the
     /// row waits for one ([`super::accounts_sync`]'s `PERSON_BACKOFF`).
     NeedsPerson,
-    /// A bot protection stopped the sign-in: Cloudflare's bot check, which did not clear, or a
-    /// block page. Its account keeps the check on record ([`accounts::CheckStop`]) and a human
+    /// A bot protection stopped the sign-in: Cloudflare's bot check, a human check or a block
+    /// page, met on its first read with nothing pressed. Its account keeps the check on record ([`accounts::CheckStop`]) and a human
     /// sign-in task, without an immediate prompt, and nothing with nobody at this Mac signs it
     /// in again, on any clock ([`super::accounts_sync::left_to_a_person`]); a person can start
     /// the native login explicitly.
@@ -15888,7 +16250,7 @@ fn renew_one_observed(
         .map_or(true, |exit| matches!(exit.code, 1..=127))
         && observed
             .met()
-            .is_some_and(super::open_url::Met::takes_a_person)
+            .is_some_and(super::open_url::Met::holds_the_renewal)
     {
         let recorded = store.transact_renewal_within(
             &accounts::LOCK_LADDER,
@@ -16738,7 +17100,12 @@ fn run_accounts_renew(
         let used_headless_profile_only =
             !window && !stopped && !host.under_ssh() && !row_has_mailbox(label) && headless;
         let browser = if let Some(opener) = window_opener {
-            Ok(RenewBrowser::Window { opener })
+            // Nobody at a terminal of their own started an agent's or a script's renewal: its
+            // window ends at the read of any check instead of waiting on it.
+            Ok(RenewBrowser::Window {
+                opener,
+                unattended: !person,
+            })
         } else if stopped {
             interactive_browser(&mut opener).map(|browser| match browser {
                 RenewBrowser::Profile { opener, profile } => {
@@ -16882,7 +17249,14 @@ fn run_accounts_renew(
             // token verb is Unix's (macOS's, by its own refusal), so no other system has
             // this step.
             #[cfg(unix)]
-            let _ = super::accounts_tokens::after_sign_in(env, host, label, signed_in, out, err);
+            let _ = super::accounts_tokens::after_sign_in(
+                env,
+                host,
+                label,
+                signed_in,
+                (out, err),
+                &mut |_| {},
+            );
         }
     }
     for machine in &machines {
@@ -17282,7 +17656,7 @@ impl SignInPlan {
         #[cfg(unix)]
         let native = self
             .native_recovery
-            .ok_or_else(|| "native Google recovery scope is unavailable".to_owned())
+            .ok_or_else(|| "native Google recovery scope is unavailable".into())
             .and_then(|recovery| host.native_google_sign_in(&request, recovery));
         #[cfg(unix)]
         match native {
@@ -17297,7 +17671,13 @@ impl SignInPlan {
                     host: Some("accounts.google.com".into()),
                 }
             }
-            Err(why) => Drove {
+            // Google's page carried a check: the row is held for a person on no clock
+            // (`bot-check`), and the upkeep opens Google's sign-in for it no more.
+            Err(super::agy_signin::GoogleSignInEnd::Check(why)) => Drove {
+                outcome: Outcome::BotCheck(why),
+                host: Some("accounts.google.com".into()),
+            },
+            Err(super::agy_signin::GoogleSignInEnd::Failed(why)) => Drove {
                 outcome: Outcome::Unverified(why),
                 host: None,
             },
@@ -19849,6 +20229,10 @@ fn run_accounts_browser(
         label,
         Some(&email),
     );
+    // A profile this window makes is unproven until a sign-in in it is kept, as a headless
+    // sign-in's fresh profile is: one closed with nothing signed in proves nothing to a renewal
+    // or to the sweep (`observe::sweep::browser_logins`).
+    let made = !profile.exists();
     for dir in [profile.parent(), Some(profile.as_path())]
         .into_iter()
         .flatten()
@@ -19859,6 +20243,12 @@ fn run_accounts_browser(
                 &format!("{label}: its browser profile's folder could not be made ({e})"),
             );
         }
+    }
+    if made && let Err(e) = super::headless_oauth::mark_profile_unproven(&profile) {
+        return refuse(
+            err,
+            &format!("{label}: its new browser profile could not be marked unproven ({e})"),
+        );
     }
     let _claimed = match super::browser_window::ProfileLock::claim(&profile) {
         Ok(claimed) => claimed,
@@ -20894,6 +21284,37 @@ pub fn places_seen_on(
         .collect()
 }
 
+/// Each of aterm's own browser profiles signed in to an account, as a place
+/// ([`super::observe::sweep::browser_profiles`], the logins the sweep hands the registry from
+/// source `browser`): the profile's directory, the address it is signed in to and the row of
+/// `rosters` that owns it, if one does. The address of an owned profile is its row's own, so
+/// nothing is compared (`agrees` is `None`), and no file is read for when it was written.
+#[must_use]
+pub fn browser_places_seen(
+    harness_state: &Path,
+    rosters: &[(Cli, Roster)],
+    user_home: &Path,
+    now: i64,
+) -> Vec<PlaceSeen> {
+    super::observe::sweep::browser_profiles(harness_state, user_home, rosters, now)
+        .into_iter()
+        .map(|seen| PlaceSeen {
+            cli: seen.login.cli.id(),
+            place: home_place(&seen.profile, user_home),
+            observed: Some(seen.login.email),
+            believed: seen.row,
+            agrees: None,
+            tabs: Vec::new(),
+            written_s: None,
+            src: seen.login.src.word(),
+            gap: None,
+            auth: None,
+            signed_out_reason: None,
+            week: None,
+        })
+        .collect()
+}
+
 /// `path` as a report shows a place: under `user_home`, `~/` and its names joined by `/` on
 /// every host (on Windows `~/.codex/auth.json`, never `~/.codex\auth.json`); else as written.
 fn home_place(path: &Path, user_home: &Path) -> String {
@@ -21063,7 +21484,9 @@ pub fn muse_place_seen(
 /// `aterm harness accounts observed [--json]`: one row per login place on this Mac (Claude
 /// Code's, Codex's, agy's, Grok Build's, Kimi Code's and Muse Code's), what its file names beside
 /// what the CLI's roster believes is there, `✗` where they disagree; for Muse Code, whether its
-/// login works and its week, from the account's record ([`muse_place_seen`]).
+/// login works and its week, from the account's record ([`muse_place_seen`]); and each of aterm's
+/// own browser profiles signed in to an account, beside the row that owns it
+/// ([`browser_places_seen`]).
 fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     let Some(user_home) = env.home.as_deref() else {
         let _ = writeln!(out, "aterm harness accounts observed: no home is known");
@@ -21088,6 +21511,7 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
     let on_token = std::collections::BTreeMap::<String, u64>::new();
     let on_token = super::observe::sweep::OnToken::Rows(on_token.into_keys().collect());
     let mut rows = places_seen_on(&roster, &state, user_home, env.now, &on_token);
+    let mut rosters = vec![(Cli::Claude, roster)];
     for cli in [Cli::Codex, Cli::Agy, Cli::Grok, Cli::Kimi] {
         let records = env.accounts_store_for(cli).and_then(|store| {
             store
@@ -21099,11 +21523,15 @@ fn run_accounts_observed(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode
             |records| (records.roster, records.state),
         );
         rows.extend(pool_places_seen(cli, &roster, &state, user_home, env.now));
+        rosters.push((cli, roster));
     }
     rows.extend(muse_place_seen(
         &super::observed_account::Store::at(&env.state, super::journal::ObservedCli::Muse),
         user_home,
         env.now,
+    ));
+    rows.extend(browser_places_seen(
+        &env.state, &rosters, user_home, env.now,
     ));
     if json {
         let value = Value::Array(

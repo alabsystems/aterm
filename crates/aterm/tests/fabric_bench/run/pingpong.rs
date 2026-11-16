@@ -522,6 +522,8 @@ pub(super) fn describe(row: TallyRow) -> &'static str {
         TallyRow::QueuedRecord => "queued: a broker record queued while the loop worked",
         TallyRow::PostPublish => "a post's path: its `post` event taken to its publish written",
         TallyRow::DrainPosts => "posts each outbox peek listed (a count)",
+        TallyRow::PostsPerAppend => "fresh posts each reserving journal append carried (a count)",
+        TallyRow::PostsPerWrite => "posts each broker send write carried (a count)",
         TallyRow::Park => "the loop parked on its mailbox",
         TallyRow::TallyWrite => "the tally's own idle writes",
     }

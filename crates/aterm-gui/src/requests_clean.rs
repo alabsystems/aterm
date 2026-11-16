@@ -744,11 +744,11 @@ impl Archiving {
         let n = self.listed;
         let mut rows = format!("# claim {} n={n}\n", pct::encode(&path.to_string_lossy()));
         let mut shape = aterm_digest::Sha256::new();
-        let whole = walk_claim(path, home, budget, &mut |rel, seen, meta, budget| {
+        let whole = walk_claim(path, home, budget, &mut |rel, seen, entry, budget| {
             if rows.len() + self.manifest.len() > MANIFEST_BYTES_MAX {
                 return false;
             }
-            shape.update(stamp(rel, seen, meta).as_bytes());
+            shape.update(stamp(rel, seen, entry).as_bytes());
             let shown = pct::encode(&rel.to_string_lossy());
             match seen {
                 Seen::File => match self.file(&path.join(rel), rel, n, budget) {
@@ -888,16 +888,47 @@ impl Seen {
     }
 }
 
+/// What a walk read of one entry: its own metadata (never a link's target's) and, on Windows, its
+/// change-journal counter.
+struct Entry {
+    meta: std::fs::Metadata,
+    /// The entry's counter in its volume's change journal ([`aterm_dirfd::usn`]); `None` where the
+    /// volume keeps no journal.
+    #[cfg(windows)]
+    usn: Option<aterm_dirfd::Usn>,
+}
+
+/// Entry `path`'s [`Entry`], read through one handle on the entry itself, opened as
+/// `symlink_metadata` opens it: no right asked (neither read needs one), every sharing allowed,
+/// and a folder, a link or another reparse point opened as itself.
+#[cfg(windows)]
+fn entry_at(path: &Path) -> std::io::Result<Entry> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    /// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`.
+    const FILE_SHARE_ALL: u32 = 0x7;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let file = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_ALL)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    Ok(Entry {
+        meta: file.metadata()?,
+        usn: aterm_dirfd::usn(&file)?,
+    })
+}
+
 /// Walk claimed folder `path` breadth first, no link followed and no folder macOS guards entered
 /// (none at all without a home), calling `visit` with each entry's path relative to `path`, what
-/// it is and its own metadata (never a link's target's); `visit` answers whether the walk goes on.
-/// Whether the walk was whole: `path` a folder and no link, every folder listed, every entry read,
-/// `visit` never stopping it, and within `budget`'s [`MANIFEST_FILES_MAX`] and [`HASH_BUDGET`].
+/// it is and its [`Entry`]; `visit` answers whether the walk goes on. Whether the walk was whole:
+/// `path` a folder and no link, every folder listed, every entry read, `visit` never stopping it,
+/// and within `budget`'s [`MANIFEST_FILES_MAX`] and [`HASH_BUDGET`].
 fn walk_claim(
     path: &Path,
     home: Option<&Path>,
     budget: &mut Budget,
-    visit: &mut dyn FnMut(&Path, Seen, &std::fs::Metadata, &mut Budget) -> bool,
+    visit: &mut dyn FnMut(&Path, Seen, &Entry, &mut Budget) -> bool,
 ) -> bool {
     // A claim that is now a link, or no folder, is never walked through.
     if !std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
@@ -924,16 +955,16 @@ fn walk_claim(
             // The entry's own metadata: a link is read as a link. Off Windows that is the
             // listing's `DirEntry::metadata`. Windows lists the folder's copy of an entry's times
             // and size, which NTFS can leave behind the entry's own until something opens it, so
-            // a walk just after a write read a shape the next walk did not: there it is read by
-            // the entry's path.
+            // a walk just after a write read a shape the next walk did not: there it is read
+            // through a handle on the entry, with the entry's change-journal counter.
             #[cfg(not(windows))]
-            let meta = entry.metadata();
+            let read = entry.metadata().map(|meta| Entry { meta });
             #[cfg(windows)]
-            let meta = std::fs::symlink_metadata(path.join(&rel));
-            let Ok(meta) = meta else {
+            let read = entry_at(&path.join(&rel));
+            let Ok(facts) = read else {
                 return false;
             };
-            let kind = meta.file_type();
+            let kind = facts.meta.file_type();
             let seen = if kind.is_symlink() {
                 Seen::Link
             } else if kind.is_dir() {
@@ -943,7 +974,7 @@ fn walk_claim(
             } else {
                 Seen::Other
             };
-            if !visit(&rel, seen, &meta, budget) {
+            if !visit(&rel, seen, &facts, budget) {
                 return false;
             }
             if seen == Seen::Dir {
@@ -954,24 +985,42 @@ fn walk_claim(
     true
 }
 
-/// One entry's line in a [`Shape`]: what it is, its path, its size and its change times (its
-/// inode and status change too where the platform keeps them, which no write can leave as they
-/// were).
-fn stamp(rel: &Path, seen: Seen, meta: &std::fs::Metadata) -> String {
+/// One entry's line in a [`Shape`]: its [`times`], then what tells a change its times cannot (a
+/// rewrite of as many bytes in the clock step of the write before it leaves them as they were).
+/// On unix that is its inode and status change. On Windows it is its change-journal counter,
+/// `usn <journal>.<usn>`, which moves at the first change of each kind made while the file stays
+/// open and as its last handle closes (`aterm_dirfd::Usn`), or `no-journal` where its volume
+/// keeps none (FAT, exFAT, a network share, a journal turned off) and the line tells only what its
+/// times do. Neither counts a rewrite in the clock step of the write before it every time: not on
+/// Windows by a writer that held the file open across both, nor on unix where the clock steps
+/// coarser than the writes (ATERM-KI-1115-47201).
+fn stamp(rel: &Path, seen: Seen, entry: &Entry) -> String {
+    #[cfg(unix)]
+    let counter = {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = &entry.meta;
+        format!("{}\t{}.{}", meta.ino(), meta.ctime(), meta.ctime_nsec())
+    };
+    #[cfg(windows)]
+    let counter = entry.usn.map_or_else(
+        || "no-journal".to_owned(),
+        |usn| format!("usn {:x}.{}", usn.journal, usn.usn),
+    );
+    #[cfg(not(any(unix, windows)))]
+    let counter = String::new();
+    format!("{}\t{counter}\n", times(rel, seen, &entry.meta))
+}
+
+/// What an entry is, its path, its size and its modified time: the first fields of its
+/// [`stamp`].
+fn times(rel: &Path, seen: Seen, meta: &std::fs::Metadata) -> String {
     let modified = meta
         .modified()
         .ok()
         .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |at| at.as_nanos());
-    #[cfg(unix)]
-    let more = {
-        use std::os::unix::fs::MetadataExt as _;
-        format!("{}\t{}.{}", meta.ino(), meta.ctime(), meta.ctime_nsec())
-    };
-    #[cfg(not(unix))]
-    let more = String::new();
     format!(
-        "{}\t{}\t{}\t{modified}\t{more}\n",
+        "{}\t{}\t{}\t{modified}",
         seen.word(),
         pct::encode(&rel.to_string_lossy()),
         meta.len()
@@ -982,10 +1031,15 @@ fn stamp(rel: &Path, seen: Seen, meta: &std::fs::Metadata) -> String {
 /// walk was not whole.
 fn shape_of(path: &Path, home: Option<&Path>) -> Option<Shape> {
     let mut shape = aterm_digest::Sha256::new();
-    let whole = walk_claim(path, home, &mut Budget::new(), &mut |rel, seen, meta, _| {
-        shape.update(stamp(rel, seen, meta).as_bytes());
-        true
-    });
+    let whole = walk_claim(
+        path,
+        home,
+        &mut Budget::new(),
+        &mut |rel, seen, entry, _| {
+            shape.update(stamp(rel, seen, entry).as_bytes());
+            true
+        },
+    );
     whole.then(|| shape.finalize())
 }
 

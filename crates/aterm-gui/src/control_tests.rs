@@ -16602,10 +16602,15 @@ fn help_names_the_harness_lane_and_exactly_the_exempt_lanes() {
 /// logged; with its `a.lane.is_some()` dropped, the observed disk lanes on another connection
 /// pass; with `agent_act::withheld_with`'s unadmitted agent read as confirmed, the Codex and
 /// Grok rows pass.
-/// It keeps the kernel's read of the session (`agent_act::keep_live_for_test`), which stands only
-/// where the kernel reads a leader's start (`holder_image::start_us_of`): not elsewhere (Windows),
-/// where every gate read is made afresh (ATERM-KI-1115-12549).
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+/// It keeps the kernel's read of the session (`agent_act::keep_live_for_test`), which stands
+/// only where the kernel reads a leader's start (`holder_image::start_us_of`): macOS, Linux,
+/// Android and Windows.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
 #[test]
 fn every_harness_write_lane_passes_the_one_observe_gate() {
     use aterm_agent::harness::agent_image::{self, Act, Lane};
@@ -22956,9 +22961,10 @@ fn the_autopilot_words_meta_lines_wait_on_the_journal() {
     );
 }
 
-/// A DRIVE READS WHAT A WORKER THE DRIVEN MAC'S REAPER CLOSED LEFT ([`crate::retired_workers`]):
-/// `@<sid> result` and an `await task` naming its sid pass the gate, read as Owner, as a hosted
-/// worker's do. CONTROL: every other verb on it; a sid nothing hosts or kept.
+/// A DRIVE READS WHAT A WORKER THAT ENDED ON THE DRIVEN MAC LEFT (its row in that Mac's session
+/// table, [`crate::session_table`]): `@<sid> result` and an `await task` naming its sid pass the
+/// gate, read as Owner, as a hosted worker's do. CONTROL: every other verb on it; a sid nothing
+/// hosts or kept.
 #[test]
 fn a_drive_reads_a_reaped_workers_result_and_waits_on_its_end() {
     const W: &str = "t00000000aa";

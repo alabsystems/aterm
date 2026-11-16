@@ -34,7 +34,6 @@ use crate::age::Recipient;
 use crate::commons::binding::{BINDING_LEN, Binding, REQUEST_LEN, Request};
 use crate::text::Audience;
 use crate::{Error, Result};
-use aterm_digest::Sha256;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,7 +47,7 @@ const HEADS_DIGEST_MAGIC: &[u8; 5] = b"ALHD1";
 /// log's digest ([`Log::heads_digest`]) equals, since every log has at least one head.
 #[must_use]
 pub fn empty_heads_digest() -> [u8; 32] {
-    Sha256::digest(HEADS_DIGEST_MAGIC)
+    digest(HEADS_DIGEST_MAGIC)
 }
 
 pub mod admission;
@@ -58,6 +57,8 @@ mod epochs;
 mod eval;
 mod fold;
 pub mod genesis;
+#[cfg(unix)]
+pub(crate) mod head;
 #[cfg(unix)]
 pub(crate) mod history;
 mod payload;
@@ -83,9 +84,11 @@ pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
 #[cfg(unix)]
 pub(crate) use store::decode_records_before_cut;
+#[cfg(test)]
+pub(crate) use store::encode_records;
 pub use store::{
     MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
-    encode_records, on_written,
+    on_written, read_records,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -558,7 +561,7 @@ pub struct Record {
     id: RecordId,
     header: Arc<Header>,
     body: Arc<Body>,
-    wire: Arc<[u8]>,
+    wire: payload::Wire,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -648,7 +651,93 @@ impl Record {
         if wire.len() > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
-        let mut reader = Reader::new(wire);
+        let owned = payload::Wire::Whole(Arc::from(wire));
+        let (header, body, body_end) = Self::parse(owned.bytes(), &owned)?;
+        let key: &[u8] = match &body {
+            Body::Genesis { signer, .. } => signer,
+            _ => &header.actor[..32],
+        };
+        let bytes = owned.bytes();
+        if !crate::ed25519::verifies(key, &signed_message(&bytes[..body_end]), &bytes[body_end..]) {
+            return Err(Error::new("membership record signature failed"));
+        }
+        Ok(Self {
+            id: digest(bytes),
+            header: Arc::new(header),
+            body: Arc::new(body),
+            wire: owned,
+        })
+    }
+
+    /// Read exact bytes as [`Record::decode`] does, but for their signature: a record this Mac
+    /// verified in full before and whose bytes the vault's head, sealed under this Mac's key,
+    /// holds ([`head`]). Its id is the SHA-256 of the bytes.
+    ///
+    /// # Errors
+    /// Anything in the bytes is malformed, out of bound or trailing.
+    #[cfg(unix)]
+    pub(crate) fn vouched(wire: &[u8]) -> Result<Self> {
+        if wire.len() > MAX_RECORD {
+            return Err(Error::new("membership record is too long"));
+        }
+        let owned = payload::Wire::Whole(Arc::from(wire));
+        let (header, body, _) = Self::parse(owned.bytes(), &owned)?;
+        Ok(Self {
+            id: digest(owned.bytes()),
+            header: Arc::new(header),
+            body: Arc::new(body),
+            wire: owned,
+        })
+    }
+
+    /// A record whose bytes stay in its records file ([`payload::Shelved`]): its frame (every byte
+    /// before its payload, which is the last field of a `Wrap`, `Put` or `Delete`), its id, its
+    /// length and where it starts in `source`. What the frame says is read as
+    /// [`Record::vouched`] reads it; the payload and the signature are read back, and checked
+    /// against the id, the first time they are asked for.
+    ///
+    /// # Errors
+    /// The frame is malformed, out of bound, ends anywhere but at its payload, or is of a kind
+    /// with no payload; or the length is not the one the frame declares.
+    #[cfg(unix)]
+    pub(crate) fn shelved(
+        id: RecordId,
+        len: usize,
+        frame: &[u8],
+        at: u64,
+        source: Arc<payload::Source>,
+    ) -> Result<Self> {
+        if len > MAX_RECORD || frame.len() >= len {
+            return Err(Error::new("a shelved membership record is out of bound"));
+        }
+        let kind = Kind::from_code(
+            *frame
+                .get(KIND_AT)
+                .ok_or_else(|| Error::new("membership record is truncated"))?,
+        )?;
+        if !matches!(kind, Kind::Wrap | Kind::Put | Kind::Delete) {
+            return Err(Error::new("only a record with a payload is shelved"));
+        }
+        let wire = payload::Wire::Shelved(Arc::new(payload::Shelved::new(
+            id,
+            len,
+            frame.into(),
+            at,
+            source,
+        )));
+        let (header, body, _) = Self::parse(frame, &wire)?;
+        Ok(Self {
+            id,
+            header: Arc::new(header),
+            body: Arc::new(body),
+            wire,
+        })
+    }
+
+    /// The header and body `available` frames, and where the body ends: `available` is every
+    /// byte of `wire`, or a shelved record's frame, which ends where its payload begins.
+    fn parse(available: &[u8], wire: &payload::Wire) -> Result<(Header, Body, usize)> {
+        let mut reader = Reader::new(available);
         if reader.take(4)? != MAGIC || reader.byte()? != VERSION {
             return Err(Error::new("not a membership record"));
         }
@@ -668,12 +757,28 @@ impl Record {
         let authored_ms = reader.u64()?;
         let length = reader.len(4)?;
         let body_start = reader.at;
-        reader.take(length)?;
-        let body_end = reader.at;
-        let owned_wire: Arc<[u8]> = Arc::from(wire);
-        let body = decode_body(kind, &owned_wire, body_start..body_end)?;
-        reader.take(64)?;
-        reader.finish()?;
+        let body_end = body_start
+            .checked_add(length)
+            .ok_or_else(|| Error::new("membership record is too long"))?;
+        let signed_end = body_end
+            .checked_add(64)
+            .ok_or_else(|| Error::new("membership record is too long"))?;
+        match signed_end.cmp(&wire.len()) {
+            std::cmp::Ordering::Greater => {
+                return Err(Error::new("membership record is truncated"));
+            }
+            std::cmp::Ordering::Less => {
+                return Err(Error::new("membership record has trailing bytes"));
+            }
+            std::cmp::Ordering::Equal => {}
+        }
+        let in_frame = available.get(body_start..body_end.min(available.len()));
+        let body = decode_body(
+            kind,
+            wire,
+            in_frame.ok_or_else(|| Error::new("membership record is truncated"))?,
+            body_start..body_end,
+        )?;
         let header = Header {
             network,
             kind,
@@ -684,32 +789,54 @@ impl Record {
             authored_ms,
         };
         check_shape(&header, &body)?;
-        let key: &[u8] = match &body {
-            Body::Genesis { signer, .. } => signer,
-            _ => &actor[..32],
-        };
-        if !crate::ed25519::verifies(
-            key,
-            &signed_message(&owned_wire[..body_end]),
-            &owned_wire[body_end..],
-        ) {
-            return Err(Error::new("membership record signature failed"));
-        }
-        Ok(Self {
-            id: Sha256::digest(&owned_wire),
-            header: Arc::new(header),
-            body: Arc::new(body),
-            wire: owned_wire,
-        })
+        Ok((header, body, body_end))
     }
 
-    /// The SHA-256 of [`Record::bytes`].
+    /// The SHA-256 of [`Record::wire_bytes`].
     pub const fn id(&self) -> &RecordId {
         &self.id
     }
-    /// The exact signed bytes.
-    pub fn bytes(&self) -> &[u8] {
-        &self.wire
+    /// The exact signed bytes, keeping none it reads: borrowed where they are in memory (a
+    /// record decoded, drafted or taken whole), and a shelved record's ([`Record::shelved`]) read
+    /// back from its records file and checked against its id for this use alone. It is the one
+    /// way to a record's bytes, so nothing that sends, writes or copies records sends a short
+    /// stream, or keeps a replaced body in memory, for one that does not read back.
+    ///
+    /// # Errors
+    /// A shelved record cannot be read back as it was.
+    pub fn wire_bytes(&self) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
+        self.wire.read()
+    }
+    /// The length of [`Record::wire_bytes`], without reading a shelved record back.
+    #[must_use]
+    pub fn wire_len(&self) -> usize {
+        self.wire.len()
+    }
+    /// The bytes of the record kept in memory: all of them, or a shelved record's frame and
+    /// whatever was read back.
+    #[must_use]
+    pub(crate) fn resident_len(&self) -> usize {
+        self.wire.resident()
+    }
+    /// Whether its payload and signature are still in its records file, never read back.
+    #[cfg(all(unix, test))]
+    #[must_use]
+    pub(crate) fn is_shelved(&self) -> bool {
+        self.wire.is_shelved()
+    }
+    /// Whether an open through the vault's head shelved it ([`Record::shelved`]), read back
+    /// since or not: what the head says of it stands either way.
+    #[cfg(unix)]
+    #[must_use]
+    pub(crate) const fn on_shelf(&self) -> bool {
+        self.wire.on_shelf()
+    }
+    /// Write [`Record::wire_bytes`] to `writer`.
+    ///
+    /// # Errors
+    /// The writer fails, or a shelved record cannot be read back as it was.
+    pub fn write_to<W: std::io::Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
+        self.wire.write_to(writer)
     }
     /// What the record does.
     pub fn kind(&self) -> Kind {
@@ -1031,6 +1158,16 @@ fn key_pair(seed: &[u8; 32]) -> Result<Ed25519KeyPair> {
         .map_err(|_| Error::new("invalid membership signing seed"))
 }
 
+/// SHA-256 of a record's bytes, its id: ring's, which runs on the CPU's SHA-256 instructions
+/// where it has them (ARMv8's on every Apple silicon Mac), where the portable `aterm_digest::Sha256` took a
+/// fifth of an open over a long log (ATERM-KI-1113-902). The same digest either way.
+pub(crate) fn digest(bytes: &[u8]) -> RecordId {
+    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
+    let mut out = [0; 32];
+    out.copy_from_slice(digest.as_ref());
+    out
+}
+
 fn signed_message(unsigned: &[u8]) -> Vec<u8> {
     [SIGNING_DOMAIN, unsigned].concat()
 }
@@ -1183,8 +1320,15 @@ fn encode_text(out: &mut Vec<u8>, text: &str) {
     }
 }
 
-fn decode_body(kind: Kind, wire: &Arc<[u8]>, range: std::ops::Range<usize>) -> Result<Body> {
-    let mut reader = Reader::new(&wire[range.clone()]);
+/// The body of a record of `kind` whose bytes in `wire` are `range`, from `available`: the body
+/// whole, or a shelved record's body up to the payload that ends it ([`Reader::payload`]).
+fn decode_body(
+    kind: Kind,
+    wire: &payload::Wire,
+    available: &[u8],
+    range: std::ops::Range<usize>,
+) -> Result<Body> {
+    let mut reader = Reader::framed(available, range.len());
     let body = match kind {
         Kind::Genesis => {
             let signer = reader.array::<32>()?;
@@ -1366,11 +1510,23 @@ fn put_len(out: &mut Vec<u8>, length: usize, width: usize) -> Result<()> {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    /// Where what it reads ends: past `bytes` only for a shelved record's body, whose payload
+    /// stays in its file.
+    end: usize,
 }
 
 impl<'a> Reader<'a> {
     const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
+        Self {
+            bytes,
+            at: 0,
+            end: bytes.len(),
+        }
+    }
+    /// A reader of `bytes` that ends at `end`: a shelved record's body, of which `bytes` holds
+    /// all before the payload.
+    const fn framed(bytes: &'a [u8], end: usize) -> Self {
+        Self { bytes, at: 0, end }
     }
     fn take(&mut self, length: usize) -> Result<&'a [u8]> {
         let end = self
@@ -1387,11 +1543,19 @@ impl<'a> Reader<'a> {
             .try_into()
             .map_err(|_| Error::new("membership record is truncated"))
     }
-    fn payload(&mut self, length: usize, wire: &Arc<[u8]>, base: usize) -> Result<Payload> {
+    /// The next `length` bytes, as a payload of `wire`, whose body starts at `base`. A shelved
+    /// record's payload is the last field of its body, and its frame ends where it begins: the
+    /// reader then steps over it without its bytes.
+    fn payload(&mut self, length: usize, wire: &payload::Wire, base: usize) -> Result<Payload> {
         let start = base
             .checked_add(self.at)
             .ok_or_else(|| Error::new("membership record is too long"))?;
-        self.take(length)?;
+        let ends_body = self.at.checked_add(length) == Some(self.end);
+        if self.at == self.bytes.len() && self.bytes.len() < self.end && ends_body {
+            self.at = self.end;
+        } else {
+            self.take(length)?;
+        }
         let end = base
             .checked_add(self.at)
             .ok_or_else(|| Error::new("membership record is too long"))?;
@@ -1410,7 +1574,7 @@ impl<'a> Reader<'a> {
             .map_err(|_| Error::new("membership record is too long"))
     }
     fn finish(&self) -> Result<()> {
-        if self.at == self.bytes.len() {
+        if self.at == self.end && self.at >= self.bytes.len() {
             Ok(())
         } else {
             Err(Error::new("membership record has trailing bytes"))
@@ -1529,6 +1693,17 @@ pub struct Log {
     /// go; clones share it until one holds a record.
     #[cfg(unix)]
     opened: Arc<history::Opened>,
+    /// What the vault's head said the resolve of this Mac's entries read of the ops it opened,
+    /// where this log was read through a head ([`head::open`]): carried by every log made from
+    /// it (a projection, records it holds since), since what it says of an op is the op's own
+    /// under any epoch keys that open it. The head leaves out every inner-sealed entry, the
+    /// one whose reading the keys a log holds change ([`head`]).
+    #[cfg(unix)]
+    head: Option<Arc<head::Ops>>,
+    /// The records file this log is exactly, as it stood when it was read ([`head::Origin`]),
+    /// whose head a resolve writes; `hold` lets it go, since the log is then no longer the file.
+    #[cfg(unix)]
+    origin: Option<Arc<head::Origin>>,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1590,7 +1765,7 @@ impl Log {
         }
         let held = Arc::new(BTreeMap::from([(genesis.id, 0)]));
         let heads = BTreeSet::from([genesis.id]);
-        let held_bytes = genesis.bytes().len();
+        let held_bytes = genesis.wire_len();
         let mut reach = reach::Reach::default();
         reach.push(std::iter::empty());
         let mut seats: BTreeMap<MemberId, Seating> = BTreeMap::new();
@@ -1623,6 +1798,10 @@ impl Log {
             historical: Arc::default(),
             #[cfg(unix)]
             opened: Arc::default(),
+            #[cfg(unix)]
+            head: None,
+            #[cfg(unix)]
+            origin: None,
         })
     }
 
@@ -1637,6 +1816,7 @@ impl Log {
         let mut projected = Self::new(first)?;
         projected.budgets = self.budgets;
         projected.enforce_seats = self.enforce_seats;
+        projected.head.clone_from(&self.head);
         for record in records {
             let _ = projected.insert(record)?;
         }
@@ -1773,7 +1953,7 @@ impl Log {
         for id in &self.heads {
             buf.extend_from_slice(id);
         }
-        Sha256::digest(&buf)
+        digest(&buf)
     }
 
     /// A draft by `actor` that follows the heads: its sequence one past `actor`'s highest held
@@ -1985,7 +2165,7 @@ impl Log {
                 ));
             }
             if self.waiting.len() >= MAX_WAITING
-                || self.total_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM
+                || self.total_bytes().saturating_add(record.wire_len()) > MAX_RECORDS_STREAM
             {
                 return Err(Error::of_kind(
                     crate::ErrorKind::MembershipCapacity,
@@ -1995,8 +2175,7 @@ impl Log {
             self.wait(record);
             return Ok(Inserted::Waiting);
         }
-        if let Some(budget) = self.passed_by(budgets::counted(record.kind()), record.bytes().len())
-        {
+        if let Some(budget) = self.passed_by(budgets::counted(record.kind()), record.wire_len()) {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
                 format!("membership log holds its limit of {}", budget.counts()),
@@ -2396,7 +2575,7 @@ impl Log {
                     && record.actor() == actor
                     && (since_ms..=until_ms).contains(&record.authored_ms())
             })
-            .fold(0, |sum, record| sum.saturating_add(record.bytes().len()))
+            .fold(0, |sum, record| sum.saturating_add(record.wire_len()))
     }
 
     /// How full the log is at `now_ms` ([`budgets::Fill`]), from the held records' headers alone:
@@ -2412,7 +2591,7 @@ impl Log {
         for record in self.order.iter() {
             if let Some(row) = by_kind.iter_mut().find(|row| row.0 == record.kind()) {
                 row.1 = row.1.saturating_add(1);
-                row.2 = row.2.saturating_add(record.bytes().len());
+                row.2 = row.2.saturating_add(record.wire_len());
             }
         }
         let clocked = self.order.iter().any(|record| record.authored_ms() != 0);
@@ -2424,7 +2603,7 @@ impl Log {
                 record.kind() != Kind::Genesis && window.contains(&record.authored_ms())
             }) {
                 let bytes = seats.entry(*record.actor()).or_default();
-                *bytes = bytes.saturating_add(record.bytes().len());
+                *bytes = bytes.saturating_add(record.wire_len());
             }
             let mut seats: Vec<budgets::SeatBytes> = seats
                 .into_iter()
@@ -2533,11 +2712,18 @@ impl Log {
         self.held_bytes().saturating_add(self.waiting_bytes())
     }
 
-    /// Wire bytes of held and waiting records plus the reachability index's bytes.
-    /// A cache of decoded logs counts both rather than only the input wire.
+    /// The bytes held and waiting records keep in memory ([`Record::resident_len`]: a shelved
+    /// record's frame alone until it is read back) plus the reachability index's bytes. A cache
+    /// of decoded logs counts both rather than only the input wire.
     #[must_use]
     pub fn footprint(&self) -> usize {
-        self.total_bytes().saturating_add(self.reach.bytes())
+        self.order
+            .iter()
+            .chain(self.waiting.values())
+            .fold(0, |sum: usize, record| {
+                sum.saturating_add(record.resident_len())
+            })
+            .saturating_add(self.reach.bytes())
     }
 
     fn hold(&mut self, record: Record) {
@@ -2553,6 +2739,10 @@ impl Log {
             self.opened = Arc::default();
         }
         self.historical = Arc::default();
+        #[cfg(unix)]
+        {
+            self.origin = None;
+        }
         #[cfg(test)]
         let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
         #[cfg(not(test))]
@@ -2574,14 +2764,14 @@ impl Log {
             self.heads.remove(parent);
         }
         self.heads.insert(record.id);
-        self.held_bytes = self.held_bytes.saturating_add(record.bytes().len());
+        self.held_bytes = self.held_bytes.saturating_add(record.wire_len());
         self.counts = self.counts.plus(budgets::counted(record.kind()));
         Arc::make_mut(&mut self.order).push(record);
     }
 
     /// Keep `record` waiting for a parent, with [`Log::waiting_bytes`] and its seat.
     fn wait(&mut self, record: Record) {
-        self.waiting_bytes = self.waiting_bytes.saturating_add(record.bytes().len());
+        self.waiting_bytes = self.waiting_bytes.saturating_add(record.wire_len());
         if let Some(member) = seated_by(&record) {
             self.seats.entry(member).or_default().waiting += 1;
         }
@@ -2590,7 +2780,7 @@ impl Log {
 
     /// Account for `record` no longer waiting: [`Log::waiting_bytes`] and its seat.
     fn unwaited(&mut self, record: &Record) {
-        self.waiting_bytes = self.waiting_bytes.saturating_sub(record.bytes().len());
+        self.waiting_bytes = self.waiting_bytes.saturating_sub(record.wire_len());
         if let Some(member) = seated_by(record)
             && let Some(seat) = self.seats.get_mut(&member)
         {
@@ -2625,7 +2815,7 @@ impl Log {
                 };
                 self.unwaited(&record);
                 if self
-                    .passed_by(budgets::counted(record.kind()), record.bytes().len())
+                    .passed_by(budgets::counted(record.kind()), record.wire_len())
                     .is_none()
                     && self.check_against_parents(&record).is_ok()
                 {

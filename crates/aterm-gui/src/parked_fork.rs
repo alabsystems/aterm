@@ -177,6 +177,10 @@ unsafe fn parked(
                 }
             };
             if released {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "a forked child's exec: it has one thread, so nothing in it can hold the exec"
+                )]
                 libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
             }
         }

@@ -26,7 +26,8 @@ pub enum Recovery {
     /// A caller may retry a read after a delay; never replay a send automatically.
     RetryRead,
     Reauthenticate,
-    Verify,
+    /// Nothing is tried again by aterm: a refusal, or a verification Proton asks a person for
+    /// (aterm never answers one).
     Stop,
 }
 
@@ -153,7 +154,6 @@ impl Failure {
                 Recovery::RetryRead
             }
             Kind::SessionExpired => Recovery::Reauthenticate,
-            Kind::Verification | Kind::DeviceVerification => Recovery::Verify,
             _ => Recovery::Stop,
         }
     }

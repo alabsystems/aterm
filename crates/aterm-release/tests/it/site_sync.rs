@@ -283,7 +283,8 @@ enum Call {
 #[derive(Clone, Copy)]
 enum UnreadGit {
     SourceStatus,
-    StagedDiff { after_add: bool },
+    TrackedFiles,
+    StagedDiff { after_add: bool, child_fails: bool },
     CurrentBranch,
     Upstream,
     UnpushedHistory,
@@ -335,7 +336,8 @@ impl Launch for Signals {
                             .is_some_and(|dir| Path::new(dir).ends_with("clone"))
                 }
                 Some(UnreadGit::CurrentBranch) => cmd.get_args().any(|arg| arg == "symbolic-ref"),
-                Some(UnreadGit::StagedDiff { after_add }) => {
+                Some(UnreadGit::TrackedFiles) => cmd.get_args().any(|arg| arg == "ls-files"),
+                Some(UnreadGit::StagedDiff { after_add, .. }) => {
                     self.added.get() == after_add
                         && cmd.get_args().any(|arg| arg == "diff")
                         && cmd.get_args().any(|arg| arg == "--cached")
@@ -364,10 +366,23 @@ impl Launch for Signals {
             self.engine_reads.set(self.engine_reads.get() + 1);
         }
         if unread {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "fixture: repository evidence is unread",
-            ));
+            if matches!(
+                self.unread,
+                Some(UnreadGit::StagedDiff {
+                    child_fails: true,
+                    ..
+                })
+            ) {
+                // A directory cannot be a Git index. Let Git itself reject the read,
+                // without damaging the checkout's real index or its recovery path.
+                let directory = cmd.get_args().nth(1).unwrap().to_owned();
+                cmd.env("GIT_INDEX_FILE", directory);
+            } else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "fixture: repository evidence is unread",
+                ));
+            }
         }
         if git
             && cmd.get_args().any(|arg| arg == "pull")
@@ -1839,10 +1854,42 @@ fn a_tag_named_like_the_site_branch_does_not_change_the_publication_destination(
         }
         lab.git.ok(&lab.site_root, &["tag", branch]);
         lab.git.ok(&lab.site_root, &["push", "origin", &tag_ref]);
+        let peer = lab.root.join("peer");
+        lab.git.ok(
+            &lab.root,
+            &[
+                "clone",
+                "-q",
+                &lab.origin.to_string_lossy(),
+                &peer.to_string_lossy(),
+            ],
+        );
+        lab.git.ok(
+            &peer,
+            &[
+                "checkout",
+                "--detach",
+                &format!("refs/remotes/origin/{branch}"),
+            ],
+        );
+        std::fs::write(
+            peer.join("web/site/public/releases.html"),
+            "a newer remote release\n",
+        )
+        .unwrap();
+        lab.git
+            .commit_all(&peer, "site: advance the branch past its same-named tag");
+        lab.git
+            .ok(&peer, &["push", "origin", &format!("HEAD:{branch_ref}")]);
+        let peer_tip = lab.git.ok(&peer, &["rev-parse", "HEAD"]);
         let (ended, out) = lab.run(&mut lab.fake("releases-fat.json"));
         deployed(&ended, &out);
         let after = lab.head();
         assert_ne!(after, before);
+        assert_eq!(
+            lab.git.ok(&lab.site_root, &["rev-parse", "HEAD^"]),
+            peer_tip
+        );
         assert_eq!(lab.git.ok(&lab.origin, &["rev-parse", &branch_ref]), after);
         assert_eq!(lab.git.ok(&lab.origin, &["rev-parse", &tag_ref]), before);
         assert_eq!(lab.git.ok(&lab.site_root, &["rev-parse", &tag_ref]), before);
@@ -1897,36 +1944,42 @@ fn an_unknown_site_branch_never_defaults_to_publishing_main() {
 
 #[test]
 fn an_unread_staged_diff_never_authorizes_a_commit() {
-    at_once([false, true], |after_add| {
-        let lab = Lab::new();
-        let head = lab.head();
-        let mut world = lab.fake("releases-fat.json");
-        world.signals = Rc::new(Signals {
-            unread: Some(UnreadGit::StagedDiff { after_add }),
-            ..Signals::default()
-        });
-        let (ended, out) = lab.run(&mut world);
-        assert!(matches!(
-            failure(ended, &out),
-            Failure::Child {
-                child: "git diff",
-                ..
-            }
-        ));
-        assert_eq!(lab.head(), head);
-        assert_eq!(lab.origin_main(), head);
-        assert!(world.deploys().is_empty());
-        if after_add {
-            assert!(!lab.status().is_empty());
+    at_once(
+        [(false, false), (false, true), (true, false), (true, true)],
+        |(after_add, child_fails)| {
+            let lab = Lab::new();
+            let head = lab.head();
             let mut world = lab.fake("releases-fat.json");
+            world.signals = Rc::new(Signals {
+                unread: Some(UnreadGit::StagedDiff {
+                    after_add,
+                    child_fails,
+                }),
+                ..Signals::default()
+            });
             let (ended, out) = lab.run(&mut world);
-            deployed(&ended, &out);
-            assert_eq!(lab.status(), "");
-        } else {
-            assert!(world.builds().is_empty());
-            assert_eq!(lab.status(), "");
-        }
-    });
+            assert!(matches!(
+                failure(ended, &out),
+                Failure::Child {
+                    child: "git diff",
+                    ..
+                }
+            ));
+            assert_eq!(lab.head(), head);
+            assert_eq!(lab.origin_main(), head);
+            assert!(world.deploys().is_empty());
+            if after_add {
+                assert!(!lab.status().is_empty());
+                let mut world = lab.fake("releases-fat.json");
+                let (ended, out) = lab.run(&mut world);
+                deployed(&ended, &out);
+                assert_eq!(lab.status(), "");
+            } else {
+                assert!(world.builds().is_empty());
+                assert_eq!(lab.status(), "");
+            }
+        },
+    );
 }
 
 #[test]
@@ -3332,12 +3385,31 @@ fn a_pinned_windows_installer_is_served_as_committed_and_an_unpinned_one_is_take
     let paths = planned_paths(&out);
     assert!(paths.contains(&"/install.sh"), "{out}");
     assert!(!paths.contains(&"/get-aterm.ps1"), "{out}");
-    assert_eq!((lab.head(), lab.status()), (before, String::new()));
+    assert_eq!(lab.head(), before);
+    assert_eq!(lab.status(), "");
     assert_eq!(
         lab.page("get-aterm.ps1"),
         pinned,
         "a dry run removes nothing"
     );
+
+    let mut world = lab.fake("releases-fat.json");
+    world.signals = Rc::new(Signals {
+        unread: Some(UnreadGit::TrackedFiles),
+        ..Signals::default()
+    });
+    let (ended, out) = lab.run(&mut world);
+    assert!(matches!(
+        failure(ended, &out),
+        Failure::Child {
+            child: "git ls-files",
+            ..
+        }
+    ));
+    assert_eq!(lab.head(), before);
+    assert_eq!(lab.origin_main(), before);
+    assert!(world.deploys().is_empty());
+    assert!(!lab.site.join("public/get-aterm.ps1").exists());
 
     let mut world = lab.fake("releases-fat.json");
     let (ended, out) = lab.run(&mut world);

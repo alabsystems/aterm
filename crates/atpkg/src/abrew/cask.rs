@@ -2079,13 +2079,18 @@ fn segment_matches(pattern: &str, name: &str) -> bool {
     if name.starts_with('.') && !pattern.starts_with('.') {
         return false;
     }
-    fn inner(p: &[u8], s: &[u8]) -> bool {
+    fn inner(p: &[u8], s: &[u8], depth: usize) -> bool {
+        // Patterns are stanza data; recursion depth tracks
+        // pattern length, which no real glob approaches.
+        if depth > 4096 {
+            return false;
+        }
         if p.is_empty() {
             return s.is_empty();
         }
         match p[0] {
-            b'*' => (0..=s.len()).any(|i| inner(&p[1..], &s[i..])),
-            b'?' => !s.is_empty() && inner(&p[1..], &s[1..]),
+            b'*' => (0..=s.len()).any(|i| inner(&p[1..], &s[i..], depth + 1)),
+            b'?' => !s.is_empty() && inner(&p[1..], &s[1..], depth + 1),
             b'[' => {
                 if s.is_empty() {
                     return false;
@@ -2112,15 +2117,21 @@ fn segment_matches(pattern: &str, name: &str) -> bool {
                 if i >= p.len() {
                     return false;
                 }
-                (hit != negate) && inner(&p[i + 1..], &s[1..])
+                (hit != negate) && inner(&p[i + 1..], &s[1..], depth + 1)
             }
-            c => s.first() == Some(&c) && inner(&p[1..], &s[1..]),
+            c => s.first() == Some(&c) && inner(&p[1..], &s[1..], depth + 1),
         }
     }
-    inner(pattern.as_bytes(), name.as_bytes())
+    inner(pattern.as_bytes(), name.as_bytes(), 0)
 }
 
 fn glob_walk(base: &Path, segments: &[&str], out: &mut Vec<PathBuf>) {
+    // Stanza paths are data; no real path approaches this
+    // many segments, and the walk must not recurse without
+    // bound on a pathological one.
+    if segments.len() > 512 {
+        return;
+    }
     let Some((first, rest)) = segments.split_first() else {
         if base.symlink_metadata().is_ok() {
             out.push(base.to_path_buf());
@@ -2204,7 +2215,17 @@ fn resolve_stanza_paths(
 /// Ruby `Dir.glob` brace expansion: `{a,b}` alternatives,
 /// nestable, at any point in the path. A group without a
 /// top-level comma expands to its sole contents, as in Ruby.
+/// Expansion depth is bounded: stanza paths are data, and a
+/// pathological nesting must not overflow the stack — past
+/// the bound the text stays unexpanded (matching nothing).
 fn brace_expand(text: &str) -> Vec<String> {
+    brace_expand_depth(text, 0)
+}
+
+fn brace_expand_depth(text: &str, expansion_depth: usize) -> Vec<String> {
+    if expansion_depth > 32 {
+        return vec![text.to_string()];
+    }
     let bytes = text.as_bytes();
     let mut depth = 0usize;
     let mut start: Option<usize> = None;
@@ -2231,12 +2252,10 @@ fn brace_expand(text: &str) -> Vec<String> {
                     }
                     let mut out = Vec::new();
                     for alt in alts {
-                        out.extend(brace_expand(&format!(
-                            "{}{}{}",
-                            &text[..open],
-                            alt,
-                            &text[i + 1..]
-                        )));
+                        out.extend(brace_expand_depth(
+                            &format!("{}{}{}", &text[..open], alt, &text[i + 1..]),
+                            expansion_depth + 1,
+                        ));
                     }
                     return out;
                 }

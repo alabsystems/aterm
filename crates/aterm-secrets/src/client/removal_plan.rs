@@ -86,9 +86,9 @@ fn plan_error(error: Error, before: &Store, prefix: &[Record]) -> Error {
         .log()
         .into_iter()
         .flat_map(|log| log.records())
-        .map(|record| record.bytes().len())
+        .map(Record::wire_len)
         .sum();
-    let additional: usize = prefix.iter().map(|record| record.bytes().len()).sum();
+    let additional: usize = prefix.iter().map(Record::wire_len).sum();
     Error::of_kind(
         crate::ErrorKind::MembershipCapacity,
         format!(
@@ -335,7 +335,7 @@ impl Prepared {
             self.retirement
         };
         if !self.records.is_empty() {
-            let wire = crate::membership_log::encode_records(&self.records);
+            let wire = crate::membership_log::read_records(&self.records)?;
             log_entries::commit_authored_records(paths, &mut current, &wire, &self.records)
                 .map_err(|error| Error::of_kind(error.kind(), format!(
                     "removal commit is unconfirmed; retry the same revoke before assuming it failed: {error}"

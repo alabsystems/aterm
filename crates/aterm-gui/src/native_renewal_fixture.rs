@@ -11,7 +11,8 @@ use aterm_window::event_loop::ActiveEventLoop;
 use aterm_window::platform::pump_events::EventLoopExtPumpEvents;
 use aterm_window::window::WindowId;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[path = "native_renewal_live_snapshot.rs"]
@@ -46,6 +47,484 @@ pub struct NativeRenewalFixture {
     /// usage-limit handoff's fixture lays out, with the move rather than the handoff enabled.
     #[serde(default)]
     pub lost_login: bool,
+    /// How the shell starts codex ([`NativeRenewalLaunch`]); absent, codex leads the PTY's
+    /// foreground job, as it always did.
+    #[serde(default)]
+    pub launch: NativeRenewalLaunch,
+}
+
+/// How the fixture's shell starts codex. Only [`Self::Leader`] leaves codex leading the PTY's
+/// foreground process group (`tcgetpgrp`), which an exec run's claim of its tab requires; each
+/// other shape starts it where a run a person or an agent starts often sits. Each but the leader
+/// runs codex through [`RUN_REPORT`], which appends its pid to the host's launch record and then
+/// execs codex in its own place, so the record names codex's own process. On the wire it is a bare
+/// word (`"sh-child"`), or `{"background": <runs>}`; any other word fails the config's parse.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeRenewalLaunch {
+    /// The shell runs codex as its foreground job, which codex leads.
+    #[default]
+    Leader,
+    /// A child of `sh -c`, which leads the foreground job.
+    ShChild,
+    /// The last stage of `true | codex …`, in the foreground job its first stage leads (zsh makes
+    /// a pipeline's first stage its leader, so `codex … | cat` would leave codex leading). Codex's
+    /// stdin is that empty pipe: `codex exec` with a positional prompt says `Reading additional
+    /// input from stdin...` on stderr, reads the pipe to its end and adds it to the prompt only
+    /// when it is not empty, so the prompt is unchanged.
+    Pipeline,
+    /// That many runs, each started with `&` and leading a background job of its own, while the
+    /// shell waits for them and, for an exec run, reports each one's pid and status as it ends
+    /// ([`BACKGROUND_WAIT`]).
+    Background(LaunchRuns),
+    /// A child of the `sh -c` a `setsid` helper ([`SETSID`]) became: in a session of its own,
+    /// with no controlling terminal. The helper leads the foreground job, so it forks first and
+    /// waits, as util-linux `setsid --wait` does.
+    Setsid,
+    /// A tool shell's `sh -c 'setsid sh -c "codex …"'`, run under one more `sh -c` as an agent's
+    /// tool shell runs it: codex as [`Self::Setsid`] has it, four hops below the tab's shell.
+    SetsidChain,
+}
+
+/// How many runs [`NativeRenewalLaunch::Background`] starts: 1 to [`LaunchRuns::MAX`], a bare
+/// number on the wire, any other number failing the parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchRuns(u8);
+
+impl LaunchRuns {
+    /// The most runs one PTY starts.
+    pub const MAX: u8 = 16;
+}
+
+impl TryFrom<u8> for LaunchRuns {
+    type Error = String;
+
+    fn try_from(runs: u8) -> Result<Self, String> {
+        if (1..=Self::MAX).contains(&runs) {
+            Ok(Self(runs))
+        } else {
+            Err(format!("background runs must be 1 to {}", Self::MAX))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LaunchRuns {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::try_from(u8::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for LaunchRuns {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.0)
+    }
+}
+
+/// `sh -c` script that runs its arguments as one command and exits with its status; the trailing
+/// `exit` keeps every `sh` from replacing itself with that command.
+const SH_CHILD: &str = "\"$@\"; exit \"$?\"";
+
+/// `sh -c` script that appends its own pid to the launch record its first argument names, then
+/// replaces itself with the rest of its arguments: codex's argv, never parsed by a shell.
+const RUN_REPORT: &str = "printf \"%s\\n\" \"$$\" >>\"$1\" || exit 126; shift; exec \"$@\"";
+
+/// The `setsid` helper and its arguments up to the program it runs. macOS ships no `setsid`, so
+/// this is util-linux `setsid --wait` in perl: a process leading its group (as each job a shell
+/// starts does) forks and waits for its child, exiting with that child's status; the process that
+/// does not lead one starts a session of its own and execs the program in its own place.
+const SETSID: [&str; 4] = [
+    "/usr/bin/perl",
+    "-e",
+    "use POSIX (); if (getpgrp == $$) { defined(my $child = fork) or die qq(setsid: fork: $!\\n); \
+     if ($child) { waitpid($child, 0) == $child or die qq(setsid: wait: $!\\n); \
+     exit($? & 127 ? 128 + ($? & 127) : $? >> 8) } } \
+     defined POSIX::setsid() or die qq(setsid: $!\\n); \
+     exec { $ARGV[0] } @ARGV or die qq(setsid: exec: $!\\n)",
+    "--",
+];
+
+/// What an exec run's line ends with: its exit status on a line of its own, as the driver reads it.
+const EXEC_STATUS: &str = "printf '\\nEXEC_FIXTURE_EXIT=%s\\n' \"$?\"";
+
+/// How the shell waits for the exec runs [`NativeRenewalLaunch::Background`] started, their pids in
+/// `$fixture_runs`: as each one ends, in whatever order, it prints `EXEC_FIXTURE_RUN=<pid>` and
+/// then [`EXEC_STATUS`]'s line for it, so a status names its run and none waits behind a run still
+/// going. zsh's `wait` takes no `-n`, so the shell looks at each run every tenth of a second, with
+/// `kill -0` and `zselect` (`zsh/zselect`), both builtins: the wait starts no process. A run zsh has
+/// reaped answers no `kill -0`, and `wait` still hands back its status.
+const BACKGROUND_WAIT: &str = "while (( $#fixture_runs )); do for fixture_run in $fixture_runs; do \
+     kill -0 $fixture_run 2>/dev/null && continue; wait $fixture_run; \
+     printf '\\nEXEC_FIXTURE_RUN=%s\\nEXEC_FIXTURE_EXIT=%s\\n' $fixture_run \"$?\"; \
+     fixture_runs=( ${fixture_runs:#$fixture_run} ); done; \
+     (( $#fixture_runs )) && zselect -t 10; done";
+
+/// `word` as one word of the line the fixture types into its interactive zsh: in single quotes
+/// when it is all printable ASCII (the only form before launch shapes), else as `$'…'` with each
+/// byte outside printable ASCII a `\xHH` escape, so no byte of it reaches the line editor as a key
+/// it acts on.
+///
+/// # Errors
+/// `word` holds a NUL, which no argv word can carry.
+fn typed_word(word: &str) -> Result<String, String> {
+    if word.contains('\0') {
+        return Err("fixture argv word holds a NUL".into());
+    }
+    if word.bytes().all(|byte| (0x20..0x7f).contains(&byte)) {
+        return Ok(format!("'{}'", word.replace('\'', "'\\''")));
+    }
+    let mut typed = String::from("$'");
+    for byte in word.bytes() {
+        match byte {
+            b'\\' => typed.push_str("\\\\"),
+            b'\'' => typed.push_str("\\'"),
+            0x20..=0x7e => typed.push(char::from(byte)),
+            _ => typed.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    typed.push('\'');
+    Ok(typed)
+}
+
+impl NativeRenewalLaunch {
+    /// How many codex runs it starts.
+    fn runs(self) -> usize {
+        match self {
+            Self::Background(runs) => usize::from(runs.0),
+            _ => 1,
+        }
+    }
+
+    /// The line the fixture types into its shell ([`type_line`]) to start `codex` with `args` as
+    /// this shape has it, each run but a leader's reporting its pid to `record`. An exec run
+    /// (`args` opening with `exec`) ends each run with [`EXEC_STATUS`]. Every word is typed through
+    /// [`typed_word`], and each `sh -c` and the helper pass codex's argv on as arguments, so no
+    /// word of it is parsed by a shell. A leader's line, for an argv of printable ASCII, is the one
+    /// the fixture typed before launch shapes, byte for byte.
+    ///
+    /// # Errors
+    /// A word holds a NUL, or `record` is not UTF-8.
+    fn line(self, codex: &Path, args: &[String], record: &Path) -> Result<String, String> {
+        let record = record.to_str().ok_or("fixture launch record path")?;
+        let report = ["/bin/sh", "-c", RUN_REPORT, "fixture-run", record];
+        let run = std::iter::once(codex.to_string_lossy().into_owned())
+            .chain(args.iter().cloned())
+            .collect::<Vec<_>>();
+        let words = |prefix: &[&[&str]]| -> Result<String, String> {
+            let report: &[&str] = if self == Self::Leader { &[] } else { &report };
+            let typed = prefix
+                .iter()
+                .chain([&report])
+                .flat_map(|group| group.iter().copied())
+                .chain(run.iter().map(String::as_str))
+                .map(typed_word)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(typed.join(" "))
+        };
+        let sh = |name| ["/bin/sh", "-c", SH_CHILD, name];
+        let status = if args.first().is_some_and(|arg| arg == "exec") {
+            format!("; {EXEC_STATUS}")
+        } else {
+            String::new()
+        };
+        let line = match self {
+            Self::Leader => words(&[])?,
+            Self::ShChild => words(&[&sh("fixture-sh-child")])?,
+            Self::Pipeline => format!("{} | {}", typed_word("/usr/bin/true")?, words(&[])?),
+            Self::Setsid => words(&[&SETSID, &sh("fixture-setsid")])?,
+            Self::SetsidChain => words(&[
+                &sh("fixture-tool-shell"),
+                &sh("fixture-sh"),
+                &SETSID,
+                &sh("fixture-setsid"),
+            ])?,
+            Self::Background(runs) => {
+                // The blank after `$!` keeps interactive zsh's history expansion off it: `!)`
+                // would read as a history event and the shell would run nothing.
+                let start = format!(
+                    "repeat {} do {} & fixture_runs+=( $! ); done",
+                    runs.0,
+                    words(&[])?
+                );
+                // An exec run's wait needs `zsh/zselect`; where it does not load, no run starts.
+                return Ok(if status.is_empty() {
+                    format!("fixture_runs=(); {start}; wait\n")
+                } else {
+                    format!("fixture_runs=(); zmodload zsh/zselect && {start}; {BACKGROUND_WAIT}\n")
+                });
+            }
+        };
+        Ok(format!("{line}{status}\n"))
+    }
+
+    /// Ready this shape to start: a leader needs nothing; each other shape needs the empty launch
+    /// record its runs report to, made here (one already there would name runs this host did
+    /// not start), and a setsid shape needs its helper.
+    ///
+    /// # Errors
+    /// The helper is missing, or the record exists or cannot be made.
+    fn prepare(self, record: &Path) -> Result<(), String> {
+        self.prepare_with(record, Path::new(SETSID[0]))
+    }
+
+    /// [`Self::prepare`], the setsid helper's interpreter at `helper`.
+    fn prepare_with(self, record: &Path, helper: &Path) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if self == Self::Leader {
+            return Ok(());
+        }
+        if matches!(self, Self::Setsid | Self::SetsidChain) && !helper.is_file() {
+            return Err(format!(
+                "fixture setsid helper {} missing",
+                helper.display()
+            ));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(record)
+            .map(drop)
+            .map_err(|error| format!("fixture launch record: {error}"))
+    }
+
+    /// The pid of each codex run the line started, each run added to `runs` the moment its pid is
+    /// seen, so a teardown after a failure here still ends it ([`end_runs`]). A leader's is the
+    /// PTY's foreground group once it is not the shell's (`shell_pid`), or none after
+    /// [`MUST_HAPPEN`], as before launch shapes; each other shape's are the pids its runs appended
+    /// to `record`, every run's within [`MUST_HAPPEN`]. A pid shows a moment before its process
+    /// execs codex, while it is still the shell's fork or [`RUN_REPORT`]'s `sh`, so each is
+    /// answered only once its argument record is no longer that one's: the image is then the one
+    /// the line started. A run that ended before that is answered as it is.
+    ///
+    /// # Errors
+    /// Not every run reported within [`MUST_HAPPEN`], or `record` holds more runs than started,
+    /// or a line that is no pid, or does not read; or a run still there did not exec within
+    /// [`MUST_HAPPEN`], or the shell's argument record does not read.
+    fn started(
+        self,
+        master: i32,
+        shell_pid: i32,
+        record: &Path,
+        runs: &mut Vec<Run>,
+    ) -> Result<Vec<i32>, String> {
+        self.started_reading(
+            master,
+            shell_pid,
+            record,
+            runs,
+            aterm_uds::process::read_process_argv,
+        )
+    }
+
+    /// [`Self::started`], each process's argument record read by `argv`.
+    fn started_reading(
+        self,
+        master: i32,
+        shell_pid: i32,
+        record: &Path,
+        runs: &mut Vec<Run>,
+        mut argv: impl FnMut(i32) -> Option<Vec<OsString>>,
+    ) -> Result<Vec<i32>, String> {
+        let pids = if self == Self::Leader {
+            let launched = Instant::now();
+            let child_pid = loop {
+                let foreground = crate::quit_safety::foreground_pgrp(master);
+                if foreground > 1 && foreground != shell_pid {
+                    break Some(foreground);
+                }
+                if launched.elapsed() >= MUST_HAPPEN {
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            runs.extend(child_pid.and_then(Run::observe));
+            child_pid.into_iter().collect::<Vec<_>>()
+        } else {
+            self.reported(record, runs)?
+        };
+        if pids.is_empty() {
+            return Ok(pids);
+        }
+        // Until it execs, a process's argument record is the one it was forked or exec'd with.
+        let forked = if self == Self::Leader {
+            argv(shell_pid).ok_or("the fixture shell's argument record does not read")?
+        } else {
+            ["/bin/sh", "-c", RUN_REPORT].map(OsString::from).to_vec()
+        };
+        let waiting = Instant::now();
+        for &pid in &pids {
+            while runs.iter().any(|run| run.pid == pid && run.live())
+                && argv(pid).is_none_or(|words| words.starts_with(&forked))
+            {
+                if waiting.elapsed() >= MUST_HAPPEN {
+                    return Err(format!("fixture run {pid} never ran past its fork"));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        Ok(pids)
+    }
+
+    /// The pids this shape's runs appended to `record`, each run added to `runs` (where its pid
+    /// still names a live process) the moment it is seen.
+    ///
+    /// # Errors
+    /// Not every run reported within [`MUST_HAPPEN`], or `record` holds more runs than started,
+    /// or a line that is no pid, or does not read.
+    fn reported(self, record: &Path, runs: &mut Vec<Run>) -> Result<Vec<i32>, String> {
+        let launched = Instant::now();
+        let expected = self.runs();
+        let mut pids = Vec::new();
+        loop {
+            let text = std::fs::read_to_string(record)
+                .map_err(|error| format!("fixture launch record: {error}"))?;
+            let complete = text.rsplit_once('\n').map_or("", |(lines, _)| lines);
+            for line in complete.lines().skip(pids.len()) {
+                let pid = line
+                    .parse::<i32>()
+                    .ok()
+                    .filter(|pid| *pid > 1)
+                    .ok_or("fixture launch record holds a line that is no pid")?;
+                if pids.len() == expected {
+                    return Err(format!(
+                        "fixture launch record names more runs than the {expected} the line starts"
+                    ));
+                }
+                pids.push(pid);
+                runs.extend(Run::observe(pid));
+            }
+            if pids.len() == expected {
+                return Ok(pids);
+            }
+            if launched.elapsed() >= MUST_HAPPEN {
+                return Err(format!(
+                    "fixture launch started {} of {expected} runs",
+                    pids.len()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// A codex run the launch started: its pid, and the birth that tells it from a later process
+/// given the same pid. The birth is the fork's, kept through every exec.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Run {
+    pid: i32,
+    birth: aterm_uds::process::Birth,
+}
+
+impl Run {
+    /// `pid`'s run, or none where no live process of this user answers it.
+    fn observe(pid: i32) -> Option<Self> {
+        aterm_uds::process::read_identity(pid).map(|identity| Self {
+            pid,
+            birth: identity.birth,
+        })
+    }
+
+    /// Whether this run is still there: its pid names a live process (no zombie) with its birth.
+    fn live(self) -> bool {
+        aterm_uds::process::read_identity(self.pid).is_some_and(|now| now.birth == self.birth)
+    }
+
+    /// Send `signal` to this run while its pid still names it.
+    fn signal(self, signal: i32) {
+        if self.live() {
+            // SAFETY: `kill` posts a signal to one pid, just read as this run's, and takes no
+            // pointers.
+            unsafe { libc::kill(self.pid, signal) };
+        }
+    }
+}
+
+/// End each of `runs` still there: `SIGTERM`, then `SIGKILL` for any left after
+/// [`aterm_uds::process::END_GRACE`], then wait until none is left. The shell's hang-up reaches
+/// only the runs in the PTY's session (zsh hangs up its jobs, the kernel the foreground group); a
+/// run in a session of its own, as both setsid shapes start it, has no controlling terminal and
+/// hears nothing of it, and nothing else ends it.
+///
+/// # Errors
+/// A run outlived its `SIGKILL` by [`MUST_HAPPEN`].
+fn end_runs(runs: &[Run]) -> Result<(), String> {
+    let left = || {
+        runs.iter()
+            .copied()
+            .filter(|run| run.live())
+            .collect::<Vec<_>>()
+    };
+    let left_after = |within: Duration| {
+        let since = Instant::now();
+        loop {
+            let left = left();
+            if left.is_empty() || since.elapsed() >= within {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    for run in left() {
+        run.signal(libc::SIGTERM);
+    }
+    for run in left_after(aterm_uds::process::END_GRACE) {
+        run.signal(libc::SIGKILL);
+    }
+    let left = left_after(MUST_HAPPEN);
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "fixture runs {:?} outlived their SIGKILL",
+            left.iter().map(|run| run.pid).collect::<Vec<_>>()
+        ))
+    }
+}
+
+/// Type `line` into the shell on `master` once its line editor reads. Until zsh's line editor
+/// takes the terminal out of canonical mode, the line discipline holds what is typed as one line
+/// of at most `MAX_INPUT` bytes (1024 on macOS) and drops the rest, its newline with it, so a
+/// longer line would never run; the editor takes a line of any length. A master that does not
+/// block waits out a full input queue. Some reader must drain `master` meanwhile: zsh does not
+/// switch modes until what it wrote has been read.
+///
+/// # Errors
+/// The terminal's modes do not read, the editor did not start within [`MUST_HAPPEN`], or the
+/// terminal refused the line or took none of it for [`MUST_HAPPEN`].
+fn type_line(master: i32, line: &str) -> Result<(), String> {
+    let spawned = Instant::now();
+    while aterm_pty::tty_echo(master)
+        .ok_or("the fixture shell's terminal modes do not read")?
+        .canonical
+    {
+        if spawned.elapsed() >= MUST_HAPPEN {
+            return Err("the fixture shell's line editor never started".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut rest = line.as_bytes();
+    let mut progressed = Instant::now();
+    while !rest.is_empty() {
+        match aterm_pty::write_some(master, rest) {
+            Ok(written) if written > 0 => {
+                rest = rest.get(written..).unwrap_or_default();
+                progressed = Instant::now();
+                continue;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("typing the fixture launch: {error}")),
+        }
+        if progressed.elapsed() >= MUST_HAPPEN {
+            return Err(format!(
+                "the fixture shell took {} of its line's {} bytes",
+                line.len() - rest.len(),
+                line.len()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    Ok(())
 }
 
 impl NativeRenewalFixture {
@@ -53,6 +532,24 @@ impl NativeRenewalFixture {
     /// lost login's.
     const fn moves_account(&self) -> bool {
         self.weekly_quota || self.lost_login
+    }
+
+    /// The line this host types to start codex, its runs reporting to `record`; none for a host
+    /// that adopts a PTY, which starts no run.
+    ///
+    /// # Errors
+    /// An adopting host is given a launch shape other than the leader, which it could not honour;
+    /// or the line refuses ([`NativeRenewalLaunch::line`]).
+    fn launch_line(&self, record: &Path) -> Result<Option<String>, String> {
+        if self.adopt.is_none() {
+            return self.launch.line(&self.codex, &self.args, record).map(Some);
+        }
+        if self.launch != NativeRenewalLaunch::Leader {
+            return Err(
+                "an adopting fixture host starts no run, so it takes no launch shape".into(),
+            );
+        }
+        Ok(None)
     }
 }
 
@@ -434,6 +931,8 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     {
         return Err("fixture paths must remain in the owned root".into());
     }
+    let record = config.root.join("launch-record");
+    let line = config.launch_line(&record)?;
     std::fs::create_dir_all(&config.root).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(home.join(".native-renewal-fixture")).map_err(|e| e.to_string())?;
     let roster = env
@@ -719,94 +1218,94 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
         }
         Ok::<_, io::Error>(())
     });
-    let serving = Serving {
+    let mut serving = Serving {
         server_stop,
         server,
         pty_stop,
         pty,
+        runs: Vec::new(),
         reader,
     };
-    let quote = |word: &str| format!("'{}'", word.replace('\'', "'\\''"));
-    let line = std::iter::once(config.codex.to_string_lossy().into_owned())
-        .chain(config.args.clone())
-        .map(|word| quote(&word))
-        .collect::<Vec<_>>()
-        .join(" ")
-        + if config.args.first().is_some_and(|arg| arg == "exec") {
-            "; printf '\\nEXEC_FIXTURE_EXIT=%s\\n' \"$?\"\n"
-        } else {
-            "\n"
-        };
-    if config.adopt.is_none() {
-        aterm_pty::write_all(master, line.as_bytes());
-    }
-    let launched = Instant::now();
-    let child_pid = loop {
-        let foreground = crate::quit_safety::foreground_pgrp(master);
-        if foreground > 1 && foreground != shell_pid {
-            break Some(foreground);
-        }
-        if launched.elapsed() >= MUST_HAPPEN {
-            break None;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    };
-    if config.adopt.is_none() && child_pid.is_some() {
-        // This facade launched the actual prompt above, just as a managed worker
-        // launch creates its task. The owner Stop uses the production task check.
-        crate::task_record::mark_session_task_within(
-            &ctx,
-            handle.local_id,
-            &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
-            ctx.fabric.fence_wait(),
-        )
-        .map_err(|_| "fixture initial task mark fenced")?;
-    }
-    let host = aterm_agent::harness::native_act::Process::observe(std::process::id())
-        .ok_or("fixture host identity unavailable")?;
-    if let Some(guardian) = &config.guardian_socket {
-        if !guardian.starts_with(&config.root) {
-            return Err("fixture guardian outside root".into());
-        }
-        use std::os::fd::BorrowedFd;
-        let stream = CtlStream::connect(guardian).map_err(|e| e.to_string())?;
-        let payload =
-            aterm_json::to_vec(&aterm_json::json!({"sid":sid,"nonce":handle.nonce.to_hex(),
-            "shell_pid":shell_pid,"prior_host_pid":host.pid,"prior_host_birth":host.birth}))
-            .map_err(|e| e.to_string())?;
-        // SAFETY: the live fixture retains this master throughout sendmsg; SCM_RIGHTS duplicates it.
-        let descriptor = unsafe { BorrowedFd::borrow_raw(master) };
-        if aterm_uds::fdpass::send_with_fds(&stream, &payload, &[descriptor])
-            .map_err(|e| e.to_string())?
-            != payload.len()
-        {
-            return Err("fixture guardian short transfer".into());
-        }
-    }
-    println!(
-        "{}",
-        aterm_json::json!({"socket":socket_text,"sid":sid,"shell_pid":shell_pid,"child_pid":child_pid,
-        "host_pid":host.pid,"host_birth":host.birth,"nonce":handle.nonce.to_hex(),"root":config.root,"token_path":config.root.join(&names[0])})
-    );
-    std::io::stdout().flush().map_err(|e| e.to_string())?;
     let mut pump = Pump {
         ctx: Arc::clone(&ctx),
         term,
         handle: handle.clone(),
         unhandled_wakes: Default::default(),
     };
+    // Every refusal from here on tears down what serves and ends each run already started.
+    let launched = (|| -> Result<(), String> {
+        let codex_pids = match &line {
+            Some(line) => {
+                config.launch.prepare(&record)?;
+                type_line(master, line)?;
+                config
+                    .launch
+                    .started(master, shell_pid, &record, &mut serving.runs)?
+            }
+            // The adopted PTY's run, which the host it adopts from started.
+            None => config
+                .launch
+                .started(master, shell_pid, &record, &mut serving.runs)?,
+        };
+        let child_pid = match codex_pids.as_slice() {
+            [pid] => Some(*pid),
+            _ => None,
+        };
+        if line.is_some() && !codex_pids.is_empty() {
+            // This facade launched the actual prompt above, just as a managed worker
+            // launch creates its task. The owner Stop uses the production task check.
+            crate::task_record::mark_session_task_within(
+                &ctx,
+                handle.local_id,
+                &crate::task_record::TaskMark::new(crate::task_record::TaskState::Working),
+                ctx.fabric.fence_wait(),
+            )
+            .map_err(|_| "fixture initial task mark fenced")?;
+        }
+        let host = aterm_agent::harness::native_act::Process::observe(std::process::id())
+            .ok_or("fixture host identity unavailable")?;
+        if let Some(guardian) = &config.guardian_socket {
+            if !guardian.starts_with(&config.root) {
+                return Err("fixture guardian outside root".into());
+            }
+            use std::os::fd::BorrowedFd;
+            let stream = CtlStream::connect(guardian).map_err(|e| e.to_string())?;
+            let payload =
+                aterm_json::to_vec(&aterm_json::json!({"sid":sid,"nonce":handle.nonce.to_hex(),
+                "shell_pid":shell_pid,"prior_host_pid":host.pid,"prior_host_birth":host.birth}))
+                .map_err(|e| e.to_string())?;
+            // SAFETY: the live fixture retains this master throughout sendmsg; SCM_RIGHTS duplicates it.
+            let descriptor = unsafe { BorrowedFd::borrow_raw(master) };
+            if aterm_uds::fdpass::send_with_fds(&stream, &payload, &[descriptor])
+                .map_err(|e| e.to_string())?
+                != payload.len()
+            {
+                return Err("fixture guardian short transfer".into());
+            }
+        }
+        println!(
+            "{}",
+            aterm_json::json!({"socket":socket_text,"sid":sid,"shell_pid":shell_pid,"child_pid":child_pid,
+            "codex_pids":codex_pids,"host_pid":host.pid,"host_birth":host.birth,"nonce":handle.nonce.to_hex(),"root":config.root,"token_path":config.root.join(&names[0])})
+        );
+        std::io::stdout().flush().map_err(|e| e.to_string())
+    })();
     let opts =
         crate::harness_host::window_drive_opts(home.clone(), env.state.clone(), Some(socket_text));
-    let live_reader =
-        match live_snapshot::Reader::start(Arc::clone(&ctx), master, opts, config.root.clone()) {
-            Ok(reader) => reader,
-            Err(why) => {
-                serving.tear_down(None, || {
-                    event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
-                })?;
-                return Err(why);
-            }
-        };
+    let live_reader = match launched.and_then(|()| {
+        live_snapshot::Reader::start(Arc::clone(&ctx), master, opts, config.root.clone())
+    }) {
+        Ok(reader) => reader,
+        Err(why) => {
+            let torn_down = serving.tear_down(None, || {
+                event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
+            });
+            return Err(match torn_down {
+                Ok(()) => why,
+                Err(also) => format!("{why}; {also}"),
+            });
+        }
+    };
     let run_result = (|| -> Result<(), String> {
         while !config.root.join("stop").exists() {
             event_loop.pump_app_events(Some(Duration::from_millis(10)), &mut pump);
@@ -937,25 +1436,28 @@ pub fn run_native_renewal_host_fixture(config: NativeRenewalFixture) -> Result<(
     torn_down
 }
 
-/// What the host serves with: the control server, and the PTY (`P`, whose drop hangs up the
-/// shell) with the thread that reads it.
+/// What the host serves with: the control server, the PTY (`P`, whose drop hangs up the shell)
+/// with the thread that reads it, and the codex runs its launch started.
 struct Serving<P> {
     server_stop: Arc<AtomicBool>,
     server: std::thread::JoinHandle<io::Result<()>>,
     pty_stop: Arc<AtomicBool>,
     pty: P,
+    runs: Vec<Run>,
     reader: std::thread::JoinHandle<io::Result<()>>,
 }
 
 impl<P> Serving<P> {
-    /// End the live reader, then the control server, then the PTY. Hanging up a connection does
-    /// not wake a worker that waits on a main-thread hop (`call_main`, for up to a minute), so
-    /// `pump` runs the event loop until the server has joined every worker, and the PTY is hung
-    /// up only after that. Nothing pumps once it is gone: dispatch reads and writes its master,
-    /// whose number may by then name another file.
+    /// End the live reader, then the control server, then each run, then the PTY. Hanging up a
+    /// connection does not wake a worker that waits on a main-thread hop (`call_main`, for up to
+    /// a minute), so `pump` runs the event loop until the server has joined every worker, and the
+    /// PTY is hung up only after that. Nothing pumps once it is gone: dispatch reads and writes its
+    /// master, whose number may by then name another file. The runs end before the hang-up, which
+    /// does not reach a run in a session of its own ([`end_runs`]), and while the reader still
+    /// logs what the shell prints of them.
     ///
     /// # Errors
-    /// The live reader failed.
+    /// The live reader failed, or a run outlived its `SIGKILL` ([`end_runs`]).
     ///
     /// # Panics
     /// The live reader or the server outlives its one-minute hang detector.
@@ -971,10 +1473,11 @@ impl<P> Serving<P> {
             "fixture control server shutdown hang detector",
             &mut pump,
         );
+        let ended = end_runs(&self.runs);
         self.pty_stop.store(true, Ordering::Release);
         drop(self.pty);
         let _ = self.reader.join();
-        live
+        live.and(ended)
     }
 }
 

@@ -40,6 +40,9 @@ mod assessment;
 #[path = "vitals_ownership.rs"]
 mod ownership;
 
+#[path = "vitals_self_cpu.rs"]
+mod self_cpu;
+
 /// A reading a second while a focused window shows the Deck.
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
 /// One every five seconds while aterm is in the background.
@@ -81,6 +84,12 @@ const DEEDS_KEPT: usize = 8;
 const DEEDS_REACH_MS: i64 = 504 * 3_600_000;
 /// How much of the journal's tail is read: all of it, since `disk` cuts it back past this.
 const DEEDS_READ_BYTES: u64 = aterm_agent::harness::cli::DISK_LEDGER_MAX_BYTES;
+/// How often the probe thread gathers `sys disk held`'s rows again while a window holds a Disk
+/// lens open ([`HoldingsRead`]). The lens says how old its rows are once they are older than a
+/// few of these.
+pub(crate) const HELD_EVERY: Duration = Duration::from_secs(5);
+/// How often it does while none does: the rows are in the Snapshot when a lens opens.
+const HELD_IDLE_EVERY: Duration = Duration::from_secs(300);
 /// The lock beside [`PEAKS_FILE`] whose holder is the one aterm of a state home that writes it and
 /// the strip's checkpoint ([`StripLock`], [`strip::StripStore`]): the strip's base, rewritten at a
 /// start's first reading, hourly and at the thread's stop (clean only at a quit,
@@ -468,6 +477,10 @@ pub(crate) struct Request {
     pub(crate) layout: Vec<PaneFact>,
     /// Authenticated global session ids for those process-local tab keys.
     pub(crate) session_ids: Vec<(u64, String)>,
+    /// Every session aterm's table holds, its local key and id: `sys disk held`'s live set
+    /// ([`crate::sys_host::held_for`]). `session_ids` leaves out a session with no pooled
+    /// terminal or no shell, which that reply still counts as at work.
+    pub(crate) live_ids: Vec<(u64, String)>,
     /// The cadence this reading was asked at, ms: the gap rule's (Stats Deck v2 §5.4).
     pub(crate) cadence_ms: u32,
     /// Read the machine counters alone: every window that draws the bars is hidden (Stats Deck v2
@@ -1942,6 +1955,19 @@ fn hand_over(
     hand_over_allocation(latest, snap, words, began, None, None, true)
 }
 
+#[cfg(all(test, unix))]
+impl VitalsHost {
+    /// A test's stand-in reader ([`Self::attach_test_reader`]) hands over the reading numbered
+    /// `seq`, begun at `began`, as the probe thread does before it posts `Wake::Vitals`.
+    pub(crate) fn land_for_test(&self, seq: u64, began: Instant) {
+        let snap = Arc::new(Snapshot {
+            seq,
+            ..Snapshot::default()
+        });
+        let _ = hand_over(&self.latest, &snap, Vec::new(), began);
+    }
+}
+
 fn hand_over_allocation(
     latest: &Mutex<Handover>,
     snap: &Arc<Snapshot>,
@@ -3197,6 +3223,8 @@ pub(crate) struct Reader {
     ownership: ownership::Images,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
     hardware_read: HardwareProbe,
+    /// Own-process thread observations; test readers never inspect the host.
+    self_cpu_read: self_cpu::Probe,
     /// The queries that arm a pull's CPU Stats ([`HARDWARE_ARMED`]; a unit test's reader has its
     /// own), read once as each pull begins ([`Request::hardware`]).
     hardware_armed: &'static Arming,
@@ -3245,6 +3273,8 @@ pub(crate) struct Reader {
     census: crate::vitals_census::CensusLane,
     /// The disk journal's tail, for the Disk lens's list and chart.
     journal: DeedTail,
+    /// `sys disk held`'s rows, for the Disk lens's Held by and its bar's classes.
+    holdings: HoldingsRead,
     /// Where the process reads run: a lane, or a unit test's reading thread.
     pub(crate) procs: ProcsRead,
     /// The processes of the last whole sweep that answered: the names a stalled read's pid goes
@@ -3400,6 +3430,11 @@ impl Reader {
             } else {
                 HardwareProbe::NATIVE
             },
+            self_cpu_read: if cfg!(test) {
+                self_cpu::Probe::INERT
+            } else {
+                self_cpu::Probe::NATIVE
+            },
             hardware_armed: if cfg!(test) {
                 Box::leak(Box::new(Arming::new()))
             } else {
@@ -3483,6 +3518,12 @@ impl Reader {
             } else {
                 crate::harness_host::harness_state()
                     .map(|state| state.join(aterm_agent::harness::cli::DISK_LEDGER))
+            }),
+            // A unit test's reader gathers nothing: no board, build-start record or aterm.toml.
+            holdings: HoldingsRead::new(if cfg!(test) {
+                None
+            } else {
+                Some(crate::sys_host::held_for)
             }),
             procs: if cfg!(test) {
                 ProcsRead::Inline
@@ -3950,9 +3991,21 @@ impl Reader {
             Instant::now(),
             at_unix_ms,
         );
+        self.holdings.refresh(
+            req.lenses.contains(&aterm_vitals::Resource::Disk),
+            req.machine_only,
+            Instant::now(),
+            &req.live_ids,
+        );
         let mut disk = disk_facts(shelf, key.as_ref(), Clock::read, &self.survey, &self.home);
         (disk.deeds, disk.removals) = self.journal.facts(&req.session_ids, &req.tabs, at_unix_ms);
+        disk.held = self.holdings.rows();
+        disk.held_age_s = self.holdings.age_s(Instant::now());
         let mut sample = Sample {
+            self_cpu: self.self_cpu_read.sample(
+                self.epoch,
+                self.fixture.as_ref().is_some_and(WhyFixture::is_recorded),
+            ),
             hardware: None,
             at_ns: u64::try_from(since.as_nanos()).unwrap_or(u64::MAX),
             cores: self.probe.core_ticks().map(|cores| {
@@ -4463,6 +4516,10 @@ fn local_volume(
     read(&local_mount(path, table)?.on)
 }
 
+/// The Disk row's facts for the home volume `home_key`: the watch's level, lines and passes
+/// with the survey's folders ([`deck_disk`]), and the cap DC-04's budget holds the volume to
+/// where the watch sized one ([`DiskFacts::cap`]). With the harness off (no watch) it reads no
+/// clock and no board fact, and the facts are the default.
 fn disk_facts(
     shelf: &Shelf,
     home_key: Option<&VolumeKey>,
@@ -4470,12 +4527,31 @@ fn disk_facts(
     survey: &Where,
     home: &Path,
 ) -> DiskFacts {
-    let raw = match home_key {
-        Some(key) if shelf.watched() => shelf.deck_facts(key, &now()),
-        _ => DiskFactsRaw::default(),
+    let (raw, cap) = match home_key {
+        Some(key) if shelf.watched() => {
+            let clock = now();
+            // The level and the budget are one board state: one guard reads both, and it is
+            // held across no other lock.
+            let (raw, budget) = {
+                let board = shelf.board_lock();
+                (
+                    board.deck_facts(key, &clock),
+                    board.budget_read(Some(key), clock.unix),
+                )
+            };
+            let cap = match budget {
+                aterm_vitals::sys::BudgetRead::Sized(sized) => Some(sized.cap),
+                _ => None,
+            };
+            (raw, cap)
+        }
+        _ => (DiskFactsRaw::default(), None),
     };
     let (found, sizing) = survey.read();
-    deck_disk(raw, found, sizing, home)
+    DiskFacts {
+        cap,
+        ..deck_disk(raw, found, sizing, home)
+    }
 }
 
 fn deck_disk(
@@ -4524,6 +4600,9 @@ fn deck_disk(
         sizing,
         deeds: Vec::new(),
         removals: Vec::new(),
+        held: None,
+        held_age_s: None,
+        cap: None,
     }
 }
 
@@ -5566,6 +5645,66 @@ impl DeedTail {
     }
 }
 
+/// How the probe thread gathers `sys disk held`'s rows ([`crate::sys_host::held_for`]): from
+/// every session aterm's table holds and home.
+type HeldGather = fn(&[(u64, String)], Option<&Path>) -> aterm_vitals::sys::held::Holdings;
+
+/// `sys disk held`'s rows as the probe thread keeps them for the Disk lens: gathered again at
+/// most every [`HELD_EVERY`] while a Disk lens is open and every [`HELD_IDLE_EVERY`] while none
+/// is, and never while every window is hidden. A gather reads the disk walker's last board, the
+/// build-start record and aterm.toml; it demands no walk and waits on none. Nothing gathers on
+/// the main or paint thread: the lens draws what the Snapshot carries, so a row is as old as
+/// the last gather, and the Snapshot carries that age beside the rows ([`Self::age_s`]).
+struct HoldingsRead {
+    /// The gather; `None` in a unit test's reader.
+    gather: Option<HeldGather>,
+    read_at: Option<Instant>,
+    rows: Option<Arc<aterm_vitals::sys::held::Holdings>>,
+}
+
+impl HoldingsRead {
+    const fn new(gather: Option<HeldGather>) -> Self {
+        Self {
+            gather,
+            read_at: None,
+            rows: None,
+        }
+    }
+
+    /// Gathers the rows again at `now` if they are due: `open` while a window holds a Disk lens
+    /// open, `hidden` while every window is; `live` is every session aterm's table holds
+    /// ([`Request::live_ids`]).
+    fn refresh(&mut self, open: bool, hidden: bool, now: Instant, live: &[(u64, String)]) {
+        if hidden {
+            return;
+        }
+        let Some(gather) = self.gather else {
+            return;
+        };
+        let every = if open { HELD_EVERY } else { HELD_IDLE_EVERY };
+        let due = self
+            .read_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= every);
+        if !due {
+            return;
+        }
+        let home = aterm_types::dirs::home_dir();
+        self.rows = Some(Arc::new(gather(live, home.as_deref())));
+        self.read_at = Some(now);
+    }
+
+    /// The rows last gathered; `None` before the first gather.
+    fn rows(&self) -> Option<Arc<aterm_vitals::sys::held::Holdings>> {
+        self.rows.clone()
+    }
+
+    /// How old those rows are at `now`, whole seconds; `None` before the first gather.
+    fn age_s(&self, now: Instant) -> Option<u64> {
+        self.read_at
+            .map(|at| now.saturating_duration_since(at).as_secs())
+    }
+}
+
 impl crate::App {
     pub(crate) fn vitals_audience(&self) -> Audience {
         if self.proxy.is_none() && self.vitals.tx.is_none() {
@@ -5616,6 +5755,17 @@ impl crate::App {
                 .windows
                 .values()
                 .any(|ws| crate::stats_deck::stats_drawn_on(ws) && !ws.occluded)
+    }
+
+    /// The moment the loop last asked for a reading, while a window in view shows the bars and
+    /// the next ask is armed ([`Self::vitals_deadline`] wakes the loop for it): `Some(None)`
+    /// before the first ask. `None` where no reading is asked on a timer.
+    pub(crate) const fn timed_reading_asked(&self) -> Option<Option<Instant>> {
+        if self.vitals.windowed && self.vitals.next_due.is_some() {
+            Some(self.vitals.asked_at)
+        } else {
+            None
+        }
     }
 
     /// The deadline the loop folds for the next reading.
@@ -6005,6 +6155,8 @@ impl crate::App {
 
     fn show_vitals_reading(&mut self) {
         self.redraw_stats_decks();
+        // The frame this asks for draws the band as the last poll adopted it.
+        self.network_ride.drawn();
         self.push_chip_loads();
         if self.tabs_page_shown() {
             self.publish_native_harness_state();
@@ -6411,7 +6563,9 @@ impl crate::App {
         let store = self.store.read().unwrap_or_else(|p| p.into_inner());
         let windowless = tabs.len();
         let mut session_ids = Vec::new();
+        let mut live_ids = Vec::new();
         for handle in store.live_handles() {
+            live_ids.push((handle.local_id, handle.sid.as_str().to_string()));
             let Some(session) = self.pool.get(handle.local_id) else {
                 continue;
             };
@@ -6484,6 +6638,7 @@ impl crate::App {
             inputs,
             layout,
             session_ids,
+            live_ids,
             cadence_ms: duration_ms(period),
             machine_only,
             jobs_now: false,

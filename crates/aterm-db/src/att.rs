@@ -7,8 +7,10 @@
 //! - [`View`]: one read of a typed table, the per-Mac quota applied: past-quota automatic
 //!   records never project, owned rows count only at their signer's own key.
 //! - [`Handle`]: read (at the head or as of a past point, [`Point`]), compare two points
-//!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation, and
-//!   list history, for any table in [`TABLES`].
+//!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation,
+//!   read history in pages ([`history`]), and list every value one cell held and what one write
+//!   replaced and had not seen ([`Handle::cell_values`], [`Handle::wrote`]), for any table in
+//!   [`TABLES`].
 //! - [`command`]: `aterm db table ls|schema|get|scan|history|diff|check|revert|export|apply|edit`,
 //!   and the amacs grid round trip. A secret cell shows as the name of its secret-store entry
 //!   ([`typed::secret`]); nothing here holds a secret's value.
@@ -18,6 +20,8 @@ pub(crate) mod checkpoint;
 pub mod command;
 mod diff;
 mod edit;
+pub mod history;
+mod values;
 
 use crate::{
     Error, Result,
@@ -42,6 +46,8 @@ pub use crate::documents::log::Hlc;
 pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
 pub use edit::{Edited, Opener, amacs, open_every_ordinary, open_ordinary};
+pub use history::{Ask, Cursor, Entry, EntryKind, Filter, Inert, Page, Revision, Writer};
+pub use values::{Held, Source, Wrote};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
 /// table's cells as they are (an account's key needs its login's address).
@@ -50,17 +56,30 @@ pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<Str
 /// A table's rules on what the owner writes, over each row's changes (one record each) and the
 /// table's cells as they are under the writer: it answers the first write the rules stop
 /// ([`Refused`]), and may add to a row's record the cells its rules derive from one the write
-/// changes. It runs through [`Compiled::rules`], before the missing-row rule every table keeps,
-/// on a grid save ([`Handle::apply`]), an owner verb's write ([`Handle::commit_owner`]) and a
-/// revert ([`Handle::revert`], which writes the exact compensation and none of the additions); a
-/// plan written through [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the
-/// importer's, `adopt`'s, `prefer`'s) does not pass it.
+/// changes. It runs through [`Compiled::rules`] for [`Author::Owner`], before the rules every
+/// table keeps on every write ([`typed::check::refused`]), on a grid save ([`Handle::apply`]),
+/// an owner verb's write ([`Handle::commit_owner`]) and a revert ([`Handle::revert`], which
+/// writes the exact compensation and none of the additions); a plan written through
+/// [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the importer's, `adopt`'s,
+/// `prefer`'s) and an automatic pass's write pass only the rules every table keeps.
 ///
 /// # Errors
 /// A change is not a typed cell of its collection.
 pub type Guard = fn(&mut [Vec<crate::database::Change>], &Cells) -> Result<Option<Refused>>;
 
 pub use crate::typed::Refused;
+
+/// Who authors a write [`Compiled::rules`] judges. Every write this Mac authors is one of these;
+/// a peer's record arriving by sync is none and is never judged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Author {
+    /// The owner's own word: a grid save, an owner verb, a revert. The table's [`Guard`] runs
+    /// first.
+    Owner,
+    /// A plan derived from the table and a source: the importer, `adopt`, `prefer`, a seed,
+    /// registration or observation pass.
+    Derived,
+}
 
 /// A typed catalog table this build compiles.
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +88,7 @@ pub struct Compiled {
     /// The table descriptor's version.
     pub version: u32,
     pub birth: Birth,
-    /// Its rules on the owner's writes.
+    /// Its rules on the owner's writes ([`Author::Owner`]).
     pub guard: Guard,
     /// Whether every build of the table compiles a row keyed `pk` in `collection` (the
     /// registry's seeds): the table holds it by construction, so a write may name it before a
@@ -95,24 +114,30 @@ impl Compiled {
         std::iter::successors(Some(self), |compiled| compiled.successor).collect()
     }
 
-    /// Its rules on an owner write's `rows` (one record each) over `cells`, the table as the
-    /// writer reads it: the table's own ([`Self::guard`]), which may add derived cells, then the
-    /// rule every table keeps, that a reference the write makes names a row the table holds once
-    /// the write lands or compiles ([`Self::seeded`], [`typed::check::missing_row`]). Answers the
-    /// first refusal.
+    /// Its rules on a write's `rows` (one record each) that this Mac authors over `view`, the
+    /// table as the writer reads it: for the owner's own word the table's own ([`Self::guard`]),
+    /// which may add derived cells; then, whoever authors it, the rules every table keeps
+    /// ([`typed::check::refused`]): a reference the write makes names a row the table holds once
+    /// the write lands or compiles ([`Self::seeded`]), no two live rows come to share a unique
+    /// set, and no row live rows reference is retired. Every path that appends a record this
+    /// Mac authors to a typed table passes it once over the whole write, before the first
+    /// record; a roll's restatement, which carries what the sealed generation's Macs wrote, does
+    /// not. Answers the first refusal.
     ///
     /// # Errors
     /// A change is not a typed cell of its collection.
-    pub fn rules(&self, rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>> {
-        if let Some(refused) = (self.guard)(rows, cells)? {
+    pub fn rules(
+        &self,
+        rows: &mut [Vec<Change>],
+        view: &View,
+        author: Author,
+    ) -> Result<Option<Refused>> {
+        if author == Author::Owner
+            && let Some(refused) = (self.guard)(rows, &view.cells)?
+        {
             return Ok(Some(refused));
         }
-        Ok(typed::check::missing_row(
-            self.table,
-            rows,
-            cells,
-            self.seeded,
-        ))
+        Ok(typed::check::refused(self.table, rows, view, self.seeded))
     }
 
     /// The key a new grid row in `collection` is born under ([`Birth`]), refused when the
@@ -547,11 +572,24 @@ impl View {
 /// this build does not compile is left out; nothing a later writer wrote can stand for another
 /// Mac's row or take one away.
 pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> Vec<Op> {
+    archived_records(table, session, ops)
+        .into_iter()
+        .map(|(_, record)| record)
+        .collect()
+}
+
+/// [`archived_ops`], each with the operation of `ops` that archived it: the first, in `ops`'
+/// order, whose row authenticates as that record.
+pub(crate) fn archived_records(
+    table: &Table,
+    session: &Session<'_>,
+    ops: &[Op],
+) -> Vec<(Digest, Op)> {
     let Some(collection) = table.collection(registry::ARCHIVED.name) else {
         return Vec::new();
     };
     let trust = session.trust();
-    let mut out: BTreeMap<Digest, Op> = BTreeMap::new();
+    let mut out: BTreeMap<Digest, (Digest, Op)> = BTreeMap::new();
     for op in ops.iter().filter(|op| !op.revert) {
         // One archived row's cells go in one record (`pack` never splits a row).
         let mut rows: BTreeMap<&str, (Option<u64>, Option<String>)> = BTreeMap::new();
@@ -607,25 +645,23 @@ pub(crate) fn archived_ops(table: &Table, session: &Session<'_>, ops: &[Op]) -> 
             else {
                 continue;
             };
-            out.insert(
-                header.id,
-                Op {
-                    id: header.id,
-                    actor: header.actor,
-                    sequence: header.sequence,
-                    roster: *record.roster(),
-                    period: 0,
-                    revert: false,
-                    changes: changes
-                        .into_iter()
-                        .filter(|change| {
-                            table
-                                .collection(&change.collection)
-                                .is_some_and(|c| c.kind == typed::Kind::Owned)
-                        })
-                        .collect(),
-                },
-            );
+            let archived = Op {
+                id: header.id,
+                actor: header.actor,
+                sequence: header.sequence,
+                roster: *record.roster(),
+                period: 0,
+                revert: false,
+                changes: changes
+                    .into_iter()
+                    .filter(|change| {
+                        table
+                            .collection(&change.collection)
+                            .is_some_and(|c| c.kind == typed::Kind::Owned)
+                    })
+                    .collect(),
+            };
+            out.insert(header.id, (op.id, archived));
         }
     }
     out.into_values().collect()
@@ -762,6 +798,27 @@ pub fn capacity(table: &Table, view: &View, usage: &Usage) -> Vec<Capacity> {
     found
 }
 
+/// What the store lets one table hold here, which `aterm db table ls` reports a table's records
+/// and bytes against: in all, and authored by one writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Caps {
+    pub records: usize,
+    pub bytes: usize,
+    pub writer_records: usize,
+    pub writer_bytes: usize,
+}
+
+/// The store's [`Caps`].
+pub const CAPS: Caps = {
+    use crate::table::store::{MAX_BYTES, MAX_RECORDS, WRITER_BYTES, WRITER_RECORDS};
+    Caps {
+        records: MAX_RECORDS,
+        bytes: MAX_BYTES,
+        writer_records: WRITER_RECORDS,
+        writer_bytes: WRITER_BYTES,
+    }
+};
+
 /// The records and bytes a table holds here, in all and authored by this Mac.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
@@ -771,22 +828,6 @@ pub struct Usage {
     pub bytes: usize,
     pub mine_records: usize,
     pub mine_bytes: usize,
-}
-
-/// One eligible operation as history shows it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Entry {
-    pub operation: Digest,
-    pub actor: Actor,
-    /// The writer's Commons machine, from the binding in the roster the record names.
-    pub machine: Option<[u8; 16]>,
-    /// The signed writer clock claim, retained separately from the derived causal order.
-    pub authored_ms: u64,
-    /// Read-time clock derived from the authenticated causal graph, including hidden parents.
-    pub hlc: Hlc,
-    pub request: Option<[u8; 16]>,
-    pub reverts: Option<Digest>,
-    pub changes: Vec<Change>,
 }
 
 /// The sealer of table `name` in `session` ([`typed::secret::Sealer`]), for a generation that
@@ -1031,36 +1072,6 @@ impl Handle {
         })
     }
 
-    /// Every eligible edit in derived causal-clock order, with concurrent edits ordered by
-    /// clock then digest. The writer's machine is resolved through the record's roster.
-    ///
-    /// # Errors
-    /// As [`Self::view`]; also refuses incomplete causal clocks or a logical counter overflow.
-    pub fn history(&self) -> Result<Vec<Entry>> {
-        reopened(crate::admission::deadline(), || {
-            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                let log = Log::read_with(session, store, scope, decode)?;
-                let resolve = owned::commons::historical(session);
-                let entries: Vec<Entry> = log
-                    .into_causal_history()?
-                    .filter_map(|(operation, command, hlc)| {
-                        Some(Entry {
-                            operation: operation.header.id,
-                            actor: operation.header.actor,
-                            machine: resolve(&operation.roster, &operation.header.actor),
-                            authored_ms: operation.authored_ms,
-                            hlc,
-                            request: operation.request,
-                            reverts: operation.reverts,
-                            changes: command.into_changes()?,
-                        })
-                    })
-                    .collect();
-                Ok(entries)
-            })
-        })
-    }
-
     /// The history a roll carried into this generation (`alab::history`): each entry of an
     /// earlier generation's log with its operation, writer, machine, clocks and changes, a
     /// secret's value withheld, and each horizon a roll's bound stated. Empty for a generation no
@@ -1106,7 +1117,10 @@ impl Handle {
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
                 let mut settled = grid::settle(collection, plan, &view.cells);
-                if let Some(refused) = self.compiled.rules(&mut settled.rows, &view.cells)? {
+                if let Some(refused) =
+                    self.compiled
+                        .rules(&mut settled.rows, &view, Author::Owner)?
+                {
                     return Ok(Applied {
                         refused: Some(refused),
                         ..Applied::default()
@@ -1145,6 +1159,7 @@ impl Handle {
 
     /// Write rows `derive` computes from the table as it is under the store's writer (the lab
     /// importer's three-way plan, design §9), declaring and enrolling the table when `declare`:
+    /// the rows pass the rules every table keeps ([`Compiled::rules`], [`Author::Derived`]), and
     /// the plan is written only where no withheld operation writes a row it writes
     /// ([`View::holds_back`]), so a withheld operation can never hide an owner's edit from the
     /// comparison; its rows are packed into records of at most 64 changes, each with a
@@ -1152,8 +1167,8 @@ impl Handle {
     /// plan writes nothing.
     ///
     /// # Errors
-    /// No Commons writer; a row the plan writes may still change under it here
-    /// ([`View::holds_back`]); `derive` fails; or a record cannot be written.
+    /// No Commons writer; the rules refuse the rows; a row the plan writes may still change under
+    /// it here ([`View::holds_back`]); `derive` fails; or a record cannot be written.
     pub(crate) fn commit_derived<T>(
         &self,
         declare: bool,
@@ -1248,9 +1263,10 @@ impl Handle {
         })
     }
 
-    /// The plan `derive` makes, written: `owner` is the owner's own word, whose records take
-    /// random request ids and whose rows pass the table's rules ([`Compiled::rules`]); otherwise
-    /// each record's request id derives from its content, so a retry returns its first receipt.
+    /// The plan `derive` makes, written once its rows pass the table's rules
+    /// ([`Compiled::rules`]): `owner` is the owner's own word, whose records take random request
+    /// ids and whose rows pass the table's guard too; otherwise each record's request id derives
+    /// from its content, so a retry returns its first receipt.
     fn commit_planned<T>(
         &self,
         declare: bool,
@@ -1271,7 +1287,12 @@ impl Handle {
                 log.writable(session.actor())?;
                 let view = View::read(table, session, &log);
                 let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
-                if owner && let Some(refused) = self.compiled.rules(&mut rows, &view.cells)? {
+                let author = if owner {
+                    Author::Owner
+                } else {
+                    Author::Derived
+                };
+                if let Some(refused) = self.compiled.rules(&mut rows, &view, author)? {
                     return Err(refused.into());
                 }
                 if let Some(why) = view.holds_back(&rows) {
@@ -1373,7 +1394,8 @@ impl Handle {
                 }
                 if let Some(changes) = command.changes()
                     && let Some(refused) =
-                        self.compiled.rules(&mut [changes.to_vec()], &view.cells)?
+                        self.compiled
+                            .rules(&mut [changes.to_vec()], &view, Author::Owner)?
                 {
                     return Err(refused.into());
                 }

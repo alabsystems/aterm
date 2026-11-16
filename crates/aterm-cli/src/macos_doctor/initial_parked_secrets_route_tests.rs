@@ -610,7 +610,11 @@ fn a_new_managed_git_wakes_repositories_even_when_native_git_was_already_install
         before.watches().git,
         "keep watching a selected unfinished repository stage"
     );
-    let command = aterm_machines::items::github::installed_git(&sys);
+    assert_eq!(
+        aterm_machines::items::github::installed_git(&sys),
+        Some(store.join("12/bin/git")),
+        "setup runs the build's own git"
+    );
     assert!(
         !read().facts_changed_since(&after),
         "unchanged activation stays parked"
@@ -621,12 +625,12 @@ fn a_new_managed_git_wakes_repositories_even_when_native_git_was_already_install
     }
     assert_eq!(
         aterm_machines::items::github::installed_git(&sys),
-        command,
-        "atpkg's command shim stays at the same path"
+        Some(store.join("13/bin/git")),
+        "a newer build behind the same PATH entry is the git setup runs"
     );
     assert!(
         read().facts_changed_since(&after),
-        "a newer build behind that shim wakes too"
+        "a newer build behind that entry wakes too"
     );
     assert!(
         sys.calls().is_empty(),

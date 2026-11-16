@@ -11,7 +11,7 @@ use super::cli::Env;
 use super::codex_app_login::{self, IdentifiedRead, IdentifiedUsage};
 use super::codex_renewal::{self as renewal, Identity, Receipt, ReceiptWriter, Successor};
 use super::codex_rotation_pace::OwnRead;
-pub use super::codex_rotation_pace::ReadPace;
+pub use super::codex_rotation_pace::{KeptPace, Paces, ReadPace};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -960,21 +960,10 @@ impl<'a> From<&'a super::codex_renewal::Intent> for Ask<'a> {
 /// about another limit ([`Ask::limit`]), that limit's, and every destination must list that
 /// limit with room ([`usable`]). Every destination is freshly read using its own immutable
 /// credential snapshot. One total deadline bounds all candidate reads. Nothing is read while a
-/// selection could not be published ([`publication_open`]). Each call is paced as an asker that
-/// has read nothing ([`ReadPace`]), so no earlier call's reads hold this one's.
+/// selection could not be published ([`publication_open`]). The asking process's reads so far
+/// are `pace`, its tab's ([`Paces`]): what it leaves unread is neither read nor a target, and
+/// what this call reads is added to it. Its keeper noted this ask to it ([`KeptPace::asks`]).
 pub fn prepare<'a>(
-    seat: &Seat<'_>,
-    session: &Session<'_>,
-    ask: impl Into<Ask<'a>>,
-    reader: &dyn UsageReader,
-    wait: Duration,
-) -> Result<Option<Proposal>, &'static str> {
-    prepare_paced(seat, session, ask, reader, wait, &mut ReadPace::new())
-}
-
-/// [`prepare`] for an asking process whose reads so far are `pace`: what it leaves unread is
-/// neither read nor a target, and what this call reads is added to it.
-pub(super) fn prepare_paced<'a>(
     seat: &Seat<'_>,
     session: &Session<'_>,
     ask: impl Into<Ask<'a>>,
@@ -995,11 +984,23 @@ pub(super) fn prepare_paced<'a>(
     )
 }
 
-/// Read and verify the source and candidate accounts through the same provider
-/// and roster path, while preparing a typed cooperative exec handoff. Gated and paced as
-/// [`prepare`] is.
-#[cfg(unix)]
-pub fn prepare_exec<'a, R: Clone>(
+/// [`prepare`] of a process that has read nothing and keeps nothing it reads: each call reads as
+/// the first ask of a new process would.
+#[cfg(test)]
+pub(crate) fn prepare_once<'a>(
+    seat: &Seat<'_>,
+    session: &Session<'_>,
+    ask: impl Into<Ask<'a>>,
+    reader: &dyn UsageReader,
+    wait: Duration,
+) -> Result<Option<Proposal>, &'static str> {
+    prepare(seat, session, ask, reader, wait, &mut ReadPace::new())
+}
+
+/// [`prepare_exec`] of a process that has read nothing and keeps nothing it reads, as
+/// [`prepare_once`].
+#[cfg(all(test, unix))]
+pub(crate) fn prepare_exec_once<'a, R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
     program: &std::path::Path,
@@ -1008,7 +1009,7 @@ pub fn prepare_exec<'a, R: Clone>(
     wait: Duration,
     command: impl FnMut(&Row) -> Option<super::codex_exec_handoff::ExecCommand>,
 ) -> Result<Option<Proposal<super::codex_exec_handoff::ExecCommand>>, &'static str> {
-    prepare_exec_paced(
+    prepare_exec(
         seat,
         session,
         program,
@@ -1020,13 +1021,15 @@ pub fn prepare_exec<'a, R: Clone>(
     )
 }
 
-/// [`prepare_exec`] for an asking process whose reads so far are `pace`, as [`prepare_paced`].
+/// Read and verify the source and candidate accounts through the same provider
+/// and roster path, while preparing a typed cooperative exec handoff. Gated and paced as
+/// [`prepare`] is, by the asking process's `pace`.
 #[cfg(unix)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "prepare_exec's seven, and the asking process's pace"
+    reason = "the handoff's six, the program it execs and the asking process's pace"
 )]
-pub(super) fn prepare_exec_paced<'a, R: Clone>(
+pub fn prepare_exec<'a, R: Clone>(
     seat: &Seat<'_>,
     session: &Session<'_, R>,
     program: &std::path::Path,
@@ -1064,7 +1067,6 @@ fn prepare_quota_wall<T, R: Clone>(
     pace: &mut ReadPace,
     select: impl FnOnce(&Seat<'_>, &Session<'_, R>, &mut dyn FnMut(&Row) -> bool) -> SessionPlan<T>,
 ) -> Result<Option<Proposal<T>>, &'static str> {
-    pace.asks(seat.now);
     if session.cli != Cli::Codex || session.supervisor != Supervisor::Own {
         return Err("not-native-codex");
     }
@@ -1181,8 +1183,10 @@ fn prepare_quota_wall<T, R: Clone>(
         || (named.is_none() && wall_recorded.is_some())
         || pace.holds(&old_auth, repeat, seat.now)
     {
-        // The holds that refused the ask are said nowhere yet: no pace outlives its ask.
-        let _ = pace.waits(seat.now);
+        // Each hold that stands is logged at the first ask it refuses on its rung.
+        for wait in pace.waits(seat.now) {
+            aterm_log::info!("codex rotation: session {} {wait}", session.sid);
+        }
         return Ok(None);
     }
     let left = remaining().saturating_sub(RECORD_WITHIN);
@@ -1196,6 +1200,7 @@ fn prepare_quota_wall<T, R: Clone>(
     }
     // From here every way out, an unwinding read included, counts as a pass of this process.
     let mut pass = pace.begin(
+        session.sid,
         &old_auth,
         named.map(|label| {
             let context = roster

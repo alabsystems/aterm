@@ -6,22 +6,6 @@ use aterm_agent::harness::headless_oauth;
 use aterm_mail::{Mailbox, Secret};
 use std::path::PathBuf;
 
-fn verify(challenge: &aterm_mail::human::Challenge) -> Result<aterm_mail::human::Verified, String> {
-    let recovery = aterm_mail::human::Recovery::prepare(challenge)?;
-    println!("Proton verification purpose: {:?}", recovery.purpose);
-    if !recovery.is_email() {
-        return Err("No configured unattended SMS recovery route".into());
-    }
-    let config = aterm_agent::harness::mail_recovery::configured()?;
-    if aterm_agent::harness::mail_recovery::candidates(&config, &recovery.destination).is_empty() {
-        return Err("No stored mailbox route matches Proton's recovery address".into());
-    }
-    let since = aterm_time::unix_secs().ok_or("System clock is invalid")?;
-    recovery.request_code()?;
-    let code = aterm_agent::harness::mail_recovery::code(&config, &recovery.destination, since)?;
-    recovery.complete(&Secret::new(code))
-}
-
 fn run() -> Result<(), String> {
     aterm_uds::secret::no_core_dumps();
     let mut args = std::env::args().skip(1);
@@ -80,9 +64,9 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     println!("Starting Proton password authentication.");
-    let mut proton = aterm_mail::proton::Proton::sign_in_with_verifier(&user, &password, verify)?;
+    let mut proton = aterm_mail::proton::Proton::sign_in(&user, &password)?;
     println!("Password authentication accepted; checking mailbox access.");
-    let outcome: Result<(), String> = proton.with_verification(|proton| {
+    let outcome: Result<(), String> = proton.with_renewal(|proton| {
         if proton.needs_two_factor {
             let secret = Secret::new(
                 config
@@ -121,7 +105,7 @@ fn run() -> Result<(), String> {
             messages.len()
         );
         Ok(())
-    }, verify);
+    });
     let sign_out = proton.sign_out();
     match (outcome, sign_out) {
         (outcome, Ok(())) => {

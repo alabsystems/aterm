@@ -461,11 +461,17 @@ pub(crate) fn keep_for_test(sid: &str, agent: Program, group: i32, act: Act) {
 
 /// Keep `act` as the host's read of `sid`'s `agent` leading `group`, a live group the kernel
 /// reads (the test's own process), under the key the kernel gives it now, so that the gate's own
-/// read of it ([`read_with`] through [`Kernel::LIVE`]) stands on it; and forget what the gate
-/// said of `sid`. Only where the kernel reads a leader's start ([`Key::stands_for`] needs it).
+/// read of it ([`read_process`] through [`Kernel::LIVE`]) stands on it; and forget what the gate
+/// said of `sid`. Only where the kernel reads a leader's start ([`Key::stands_for`] needs it,
+/// [`crate::holder_image::start_us_of`]).
 #[cfg(all(
     test,
-    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )
 ))]
 pub(crate) fn keep_live_for_test(sid: &str, agent: Program, group: i32, act: Act) {
     let (key, _) = key_of(group, group, &Kernel::LIVE);
@@ -530,10 +536,16 @@ pub(crate) fn fixture_row(group: i32, start_us: u64, version: i32) -> String {
     row
 }
 
-/// How many withheld lines the gate logged of `sid` ([`withheld`]).
+/// How many withheld lines the gate logged of `sid` ([`withheld`]); read where
+/// [`keep_live_for_test`] is.
 #[cfg(all(
     test,
-    any(target_vendor = "apple", target_os = "linux", target_os = "android")
+    any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        windows
+    )
 ))]
 pub(crate) fn withheld_said(sid: &str) -> usize {
     SAID.lock()

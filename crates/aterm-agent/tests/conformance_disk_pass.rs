@@ -12,7 +12,9 @@ use aterm_agent::harness::disk::{
     self, Applied, Class, Config, Planned, Refusal, Removed, Report, Row, Step, Tier, Trigger,
     Witness, discover,
 };
-use aterm_models_harness::{disk_budget_pass_model, disk_reclaim_pass_model};
+use aterm_models_harness::{
+    disk_budget_pass_model, disk_emergency_unmet_model, disk_reclaim_pass_model,
+};
 use aterm_spec::derive::Model;
 
 type S = std::collections::BTreeMap<&'static str, i64>;
@@ -47,6 +49,9 @@ enum Event {
     Removed(PathBuf, Option<Tier>),
     Failed(PathBuf),
     Stopped(Option<u8>, u64),
+    /// A rustc holds the lock of the died build's piece being removed (the model's
+    /// `WriterHolds`), told as its removal begins.
+    Writing(PathBuf),
 }
 
 fn levels() -> [(&'static str, u64); 4] {
@@ -239,10 +244,30 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
     let mut locked = false;
     let mut removed = false;
     let mut held: Vec<&PathBuf> = Vec::new();
+    // Tier 0's steps are its own: admitted, journalled, its writer's lock probed, removed.
+    let mut current: Option<Tier> = None;
+    let word_of = |tier: Option<Tier>, died: &'static str, other: &'static str| {
+        if tier == Some(Tier::DiedBuild) {
+            died
+        } else {
+            other
+        }
+    };
     for e in events {
         match e {
             Event::Read(free) => pending = Some(*free),
+            Event::Removing(_, tier) if *tier == Some(Tier::DiedBuild) => {
+                current = *tier;
+                if s.get("died") == Some(&0) {
+                    step(m, s, "AdmitDied")?;
+                }
+                step(m, s, "JournalDied")?;
+                (locked, removed) = (false, false);
+                held.clear();
+            }
+            Event::Writing(_) => step(m, s, "WriterHolds")?,
             Event::Removing(_, tier) => {
+                current = *tier;
                 let n = tier.map_or(0, Tier::number);
                 enter(s, n)?;
                 if let Some(free) = pending.take() {
@@ -257,7 +282,7 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
             Event::Locked(_, profile) => {
                 held.push(profile);
                 if !locked {
-                    step(m, s, "LockHeld")?;
+                    step(m, s, word_of(current, "ProbeHeld", "LockHeld"))?;
                     locked = true;
                 }
             }
@@ -271,18 +296,18 @@ fn project(m: &Model, s: &mut S, plan: &[Planned], events: &[Event]) -> Result<(
                     ));
                 }
                 if !removed {
-                    step(m, s, "Remove")?;
+                    step(m, s, word_of(current, "RemoveDied", "Remove"))?;
                     removed = true;
                 }
             }
             Event::Removed(..) => {
                 if !removed {
-                    step(m, s, "Remove")?;
+                    step(m, s, word_of(current, "RemoveDied", "Remove"))?;
                     removed = true;
                 }
             }
             Event::Failed(_) => {
-                step(m, s, "LockRefused")?;
+                step(m, s, word_of(current, "ProbeRefused", "LockRefused"))?;
             }
             Event::Stopped(tier, target) => {
                 enter(s, tier.unwrap_or(0))?;
@@ -451,6 +476,302 @@ fn run_with(rep: &Report, script: &[u64], whole: Whole) -> (Option<Applied>, Vec
     (done, events.into_inner())
 }
 
+/// A build that died, laid in a build directory under `dir`: the build directory, its profile,
+/// the unfinished session folder (its lock file beside it) and a metadata temporary folder in
+/// `deps/`, each piece dated `at`.
+#[cfg(unix)]
+fn lay_died(dir: &Path, at: i64) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let target = lay(&dir.join("target"));
+    let profile = target.join("debug");
+    let krate = profile.join("incremental/lay-1");
+    let session = krate.join("s-old1-died1-working");
+    std::fs::create_dir_all(&session).expect("session");
+    std::fs::write(session.join("query-cache.bin"), vec![1u8; 4096]).expect("cache");
+    std::fs::write(krate.join("s-old1-died1.lock"), b"").expect("lock");
+    let meta = profile.join("deps/rmetaAb12Cd");
+    std::fs::create_dir_all(&meta).expect("rmeta");
+    std::fs::write(meta.join("lib.rmeta"), vec![2u8; 4096]).expect("rmeta file");
+    let when = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+    for piece in [&session, &meta] {
+        std::fs::File::open(piece)
+            .and_then(|f| f.set_modified(when))
+            .expect("dated");
+    }
+    (target, profile, session, meta)
+}
+
+/// The tier 0 row of the piece `entry` [`lay_died`] laid in `profile` of `target`, dated `at`:
+/// a session (its lock beside it) or a metadata folder.
+#[cfg(unix)]
+fn died_row(target: &Path, profile: &Path, entry: &Path, at: i64) -> Row {
+    let session_lock = entry
+        .to_str()
+        .is_some_and(|p| p.ends_with("-working"))
+        .then(|| entry.with_file_name("s-old1-died1.lock"));
+    Row {
+        class: Class::CargoTargets,
+        path: entry.to_path_buf(),
+        bytes: 4096,
+        bytes_partial: false,
+        witness: Witness::DiedBuild {
+            marker: "CACHEDIR.TAG".to_owned(),
+            build_dir: target.to_path_buf(),
+            profile: profile.to_path_buf(),
+            session_lock,
+            modified: at,
+            age_s: 3_600,
+            device: 0,
+        },
+        removable: true,
+        blocked: None,
+    }
+}
+
+/// A rustc still writing its session: it holds the session's lock (`flock`) until dropped.
+#[cfg(unix)]
+struct Rustc(std::fs::File);
+
+#[cfg(unix)]
+impl Rustc {
+    fn holds(lock: &Path) -> Self {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock)
+            .expect("the lock");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test's rustc: its Drop lets the lock go"
+        )]
+        let taken = file.try_lock();
+        taken.expect("the test's rustc takes its lock");
+        Self(file)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Rustc {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// How a run removes a tier 0 row.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiedBy {
+    /// The real primitive.
+    Real,
+    /// NEGATIVE CONTROL: the folder deleted outright, no lock taken.
+    IgnoringTheLock,
+}
+
+/// A pass over `rep` at `now` whose tier 0 rows are removed `by` the way named, every other row
+/// by a stand-in, each step told as [`run_with`] tells it; the piece at `writing` is one a rustc
+/// holds, told ([`Event::Writing`]) as its removal begins, after its journal row.
+#[cfg(unix)]
+fn run_died(
+    rep: &Report,
+    script: &[u64],
+    now: i64,
+    by: DiedBy,
+    writing: Option<&Path>,
+) -> Vec<Event> {
+    let events = RefCell::new(Vec::new());
+    let reads = RefCell::new(0usize);
+    let judge = disk::Judge {
+        now,
+        threshold_days: 1,
+        device: None,
+        volume: None,
+    };
+    disk::apply_auto(
+        rep,
+        None,
+        &mut |row: &Row| {
+            let Witness::DiedBuild {
+                build_dir,
+                profile,
+                modified,
+                ..
+            } = &row.witness
+            else {
+                return Ok(Removed {
+                    bytes: row.bytes,
+                    units: vec![row.path.clone()],
+                    ..Removed::default()
+                });
+            };
+            if writing == Some(row.path.as_path()) {
+                events.borrow_mut().push(Event::Writing(row.path.clone()));
+            }
+            if by == DiedBy::IgnoringTheLock {
+                std::fs::remove_dir_all(&row.path)?;
+                return Ok(Removed {
+                    bytes: row.bytes,
+                    units: vec![row.path.clone()],
+                    ..Removed::default()
+                });
+            }
+            disk::target::reclaim_died_with(
+                build_dir,
+                profile,
+                &row.path,
+                &judge,
+                *modified,
+                &mut || Ok(()),
+                &mut |stage, at| {
+                    let e = match stage {
+                        disk::target::Stage::Locked => {
+                            Event::Locked(row.path.clone(), at.to_path_buf())
+                        }
+                        disk::target::Stage::Deleting => {
+                            Event::Deleting(row.path.clone(), at.to_path_buf())
+                        }
+                        disk::target::Stage::Released => return,
+                    };
+                    events.borrow_mut().push(e);
+                },
+            )
+        },
+        &mut || {
+            let mut n = reads.borrow_mut();
+            let got = script.get(*n).or(script.last()).copied();
+            *n += 1;
+            events.borrow_mut().push(Event::Read(got.unwrap_or(0)));
+            got
+        },
+        &mut |s: &Step<'_>| {
+            let e = match s {
+                Step::Removing(r) => Event::Removing(r.path.clone(), r.tier()),
+                Step::Removed(r, _) => Event::Removed(r.path.clone(), r.tier()),
+                Step::Denied(Refusal::RemoveFailed(p, _)) => Event::Failed(p.clone()),
+                Step::Denied(other) => panic!("an unexpected refusal: {other:?}"),
+                Step::Stopped(stop) => Event::Stopped(stop.tier, stop.target),
+            };
+            events.borrow_mut().push(e);
+            true
+        },
+    )
+    .expect("short: a pass runs");
+    events.into_inner()
+}
+
+/// The model's state once a build died leaving `pieces` pieces and the volume was measured
+/// short.
+#[cfg(unix)]
+fn died_and_short(m: &Model, pieces: usize) -> Result<S, String> {
+    let mut s = m.init_state();
+    for _ in 0..pieces {
+        step(m, &mut s, "BuildDied")?;
+    }
+    step(m, &mut s, "MeasureShort")?;
+    Ok(s)
+}
+
+/// A report measured short whose rows are `rows`, in the order given.
+#[cfg(unix)]
+fn short_with(rows: Vec<Row>) -> Report {
+    let mut rep = report_at(levels()[2].1, None);
+    rep.rows = rows;
+    rep
+}
+
+/// THE TIER 0 CONFORMANCE: the real primitive takes each of a died build's two pieces (an
+/// unfinished session and a metadata folder) under its locks, journalled, the locks taken, then
+/// deleted, each taken whole; where a rustc holds the session's lock the session is refused and
+/// kept, and the pass goes on to the metadata folder; the model accepts both runs step for step,
+/// a finished unit's tier admitted only once both pieces were dealt with. The order of the
+/// tiers is the real report's, which exit test 2 holds (`disk_pressure_tests`).
+/// NEGATIVE CONTROL: the two tests below, a plan that takes a finished unit first and a remover
+/// that deletes past the held lock, each rejected by the model; and a primitive that skipped
+/// the session's lock would delete the held session (the `session.exists()` line fails).
+#[cfg(unix)]
+#[test]
+fn the_real_pass_takes_a_died_builds_pieces_under_their_locks_as_the_model_says() {
+    let m = disk_reclaim_pass_model();
+    let now = NOW;
+    for writing in [false, true] {
+        let scratch = Scratch::new(if writing { "died-held" } else { "died" });
+        let (target, profile, session, meta) = lay_died(&scratch.0, now - 3_600);
+        let lock = session.with_file_name("s-old1-died1.lock");
+        let rustc = writing.then(|| Rustc::holds(&lock));
+        let rep = short_with(vec![
+            died_row(&target, &profile, &session, now - 3_600),
+            died_row(&target, &profile, &meta, now - 3_600),
+            idle("/h/x/target", 9),
+            recent("/h/z/target/debug", NOW - 7_200),
+        ]);
+        let plan = disk::pass_plan(&rep).expect("short: a plan");
+        assert!(
+            plan.iter()
+                .filter(|p| p.row.tier() == Some(Tier::DiedBuild))
+                .all(|p| p.target.is_none()),
+            "taken whole: {plan:?}"
+        );
+        let held = writing.then_some(session.as_path());
+        let events = run_died(&rep, &[levels()[2].1], now, DiedBy::Real, held);
+        let mut s = died_and_short(&m, 2).expect("the model's start");
+        project(&m, &mut s, &plan, &events).unwrap_or_else(|e| panic!("{e}: {events:?}"));
+        assert_eq!(
+            s.get("partial"),
+            Some(&0),
+            "both pieces dealt with: {events:?}"
+        );
+        assert_eq!(session.exists(), writing, "{events:?}");
+        assert!(!meta.exists(), "{events:?}");
+        assert!(lock.exists(), "the lock is rustc's own to collect");
+        drop(rustc);
+    }
+}
+
+/// NEGATIVE CONTROL of the tier 0 order: a plan that takes a finished unit (tier 2) before the
+/// died build's session is rejected: the model admits no finished unit's tier while a died
+/// build's piece is still to be dealt with at a short.
+#[cfg(unix)]
+#[test]
+fn a_plan_that_takes_a_finished_unit_before_the_died_build_is_rejected() {
+    let m = disk_reclaim_pass_model();
+    let now = NOW;
+    let scratch = Scratch::new("died-late");
+    let (target, profile, session, _) = lay_died(&scratch.0, now - 3_600);
+    let died = died_row(&target, &profile, &session, now - 3_600);
+    let rep = short_with(vec![idle("/h/x/target", 9), died]);
+    let plan = disk::pass_plan(&rep).expect("short: a plan");
+    let events = run_died(&rep, &[levels()[2].1], now, DiedBy::Real, None);
+    let mut s = died_and_short(&m, 1).expect("the model's start");
+    let refused = project(&m, &mut s, &plan, &events).expect_err("a finished unit first");
+    assert!(refused.contains("Admit2"), "{refused}");
+}
+
+/// NEGATIVE CONTROL of the session's lock: a remover that deletes a session whose lock a rustc
+/// holds, without taking it, is rejected: the model removes a died build's piece only with its
+/// lock taken.
+#[cfg(unix)]
+#[test]
+fn a_remover_that_deletes_a_session_rustc_holds_is_rejected() {
+    let m = disk_reclaim_pass_model();
+    let now = NOW;
+    let scratch = Scratch::new("died-robbed");
+    let (target, profile, session, _) = lay_died(&scratch.0, now - 3_600);
+    let rustc = Rustc::holds(&session.with_file_name("s-old1-died1.lock"));
+    let rep = short_with(vec![died_row(&target, &profile, &session, now - 3_600)]);
+    let plan = disk::pass_plan(&rep).expect("short: a plan");
+    let events = run_died(
+        &rep,
+        &[levels()[2].1],
+        now,
+        DiedBy::IgnoringTheLock,
+        Some(&session),
+    );
+    assert!(!session.exists(), "the control deleted it");
+    let mut s = died_and_short(&m, 1).expect("the model's start");
+    let refused = project(&m, &mut s, &plan, &events).expect_err("deleted past a held lock");
+    assert!(refused.contains("RemoveDied"), "{refused}");
+    drop(rustc);
+}
+
 #[test]
 fn the_real_pass_takes_only_the_models_steps_at_every_level() {
     let m = disk_reclaim_pass_model();
@@ -566,7 +887,7 @@ fn the_reserve_is_released_exactly_where_the_model_lets_it_go() {
         let reserve = tmp.path().join(format!("{measure}/reserve"));
         std::fs::create_dir_all(reserve.parent().expect("folder")).expect("folder");
         std::fs::write(&reserve, vec![7u8; 4096]).expect("a small reserve");
-        let moved = disk_reserve_look(&state, &reserve, level, Some(free), &t, NOW);
+        let moved = disk_reserve_look(&state, &reserve, level, Some(free), &t, None, NOW);
         let released = matches!(moved, ReserveMove::Released(_));
         // A projection is a forecast: the look that projects a crossing reads the reserve by its
         // measured level alone, so the model's look projects too.
@@ -1116,4 +1437,299 @@ fn the_budget_laws_hold_and_each_mutant_breaks_its_own() {
     );
     let caught = replay(&with_buggy(&m, 4), &trace).expect_err("its mutant breaks the law");
     assert!(caught.contains("NothingStranded"), "{caught}");
+}
+
+/// How a host plans its passes at the emergency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plans {
+    /// The real hosts' way: [`disk::cadence::Emergency::due`].
+    Real,
+    /// NEGATIVE CONTROL: on the interval alone ([`disk::cadence::due`]), the wait ignored.
+    Interval,
+    /// NEGATIVE CONTROL: the wait cleared at every look, whatever moved.
+    Blind,
+}
+
+/// One look of the emergency's script: the level and free bytes read at unix second `now`,
+/// whether an agent waits for room (`demand`), the live sessions' digest, whether something the
+/// wait reads moved since the last look (`moved`, the script's own word, never the code's), and
+/// whether the host restarted just before it (`restart`).
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    level: disk::Level,
+    free: u64,
+    now: i64,
+    demand: bool,
+    live: u64,
+    moved: bool,
+    restart: bool,
+}
+
+/// A host's look at `disk=emergency` over the real episode's end ([`cli::disk_emergency_look`]),
+/// the real wait ([`disk::cadence::Emergency::due`]) and the real pass end
+/// ([`cli::disk_emergency_end`]), each pass recorded as the hosts record it
+/// ([`disk::cadence::ran`]), its passes planned the way `plans` names.
+struct EmergencyHost<'a> {
+    at: cli::EmergencyAt<'a>,
+    done: Applied,
+    emergency: disk::cadence::Emergency,
+    last: Option<disk::cadence::Pass>,
+    started: std::time::Instant,
+    plans: Plans,
+}
+
+impl EmergencyHost<'_> {
+    /// One look as `seen`, told as the model's actions, in order: `Leave` where it read the
+    /// episode's end, `Enter` where the model is out of one and the level reads the emergency,
+    /// `Restart` where the host restarted, `Move` where the script says something moved while
+    /// the model waits, `Wake` where the real wait went before the look's pass, `PassUnmet` where
+    /// the look's pass left a wait standing.
+    fn look(&mut self, s: &S, seen: Seen) -> Vec<&'static str> {
+        let mut took = Vec::new();
+        if seen.restart {
+            self.emergency = disk::cadence::Emergency::default();
+            self.last = None;
+            took.push("Restart");
+        }
+        let line = self.at.line;
+        let over = disk::cadence::over(seen.level, Some(seen.free), line);
+        cli::disk_emergency_look(
+            self.at.state,
+            &mut self.emergency,
+            seen.level,
+            Some(seen.free),
+            line,
+        );
+        let waiting = s.get("waiting") == Some(&1) && !seen.restart;
+        if over && s.get("emergency") == Some(&1) {
+            took.push("Leave");
+        } else if !over && seen.level == disk::Level::Emergency && s.get("emergency") == Some(&0) {
+            took.push("Enter");
+        }
+        if seen.moved && waiting && !over {
+            took.push("Move");
+        }
+        let elapsed = u64::try_from(seen.now - NOW).expect("the script runs forward");
+        let look = disk::cadence::Look {
+            at: self.started + std::time::Duration::from_secs(elapsed),
+            unix: seen.now,
+            level: seen.level,
+            free: Some(seen.free),
+            room: 16 * GIB_BYTES,
+            poked: false,
+            demand: seen.demand,
+        };
+        let stood = self.emergency.unmet.is_some();
+        let due = match self.plans {
+            Plans::Real => self
+                .emergency
+                .due(&mut self.last, &look, || Some(seen.live)),
+            Plans::Interval => disk::cadence::due(
+                &mut self.last,
+                look.at,
+                look.level,
+                look.free,
+                look.poked,
+                look.room,
+            ),
+            Plans::Blind => {
+                self.emergency.unmet = None;
+                self.emergency
+                    .due(&mut self.last, &look, || Some(seen.live))
+            }
+        };
+        if stood && self.emergency.unmet.is_none() {
+            took.push("Wake");
+        }
+        if due {
+            let at = cli::EmergencyAt {
+                now: seen.now,
+                level: seen.level,
+                live: seen.live,
+                ..self.at
+            };
+            cli::disk_emergency_end(
+                &at,
+                &mut self.emergency,
+                Some(&self.done),
+                0,
+                Some(seen.free),
+            );
+            let fruitless = seen.level == disk::Level::Emergency;
+            disk::cadence::ran(
+                &mut self.last,
+                look.at,
+                look.free,
+                fruitless,
+                seen.level,
+                false,
+            );
+            if self.emergency.unmet.is_some() {
+                took.push("PassUnmet");
+            }
+        }
+        took
+    }
+}
+
+/// The `cannot-meet` rows in the ledger under `state`.
+fn cannot_meet_in(state: &Path) -> i64 {
+    i64::try_from(cannot_meet_rows(state)).unwrap_or(i64::MAX)
+}
+
+/// The emergency's script ([`Seen`]): a pass that takes nothing; a look past the ten-minute
+/// interval with nothing moved; free space moving by the drop; a restart; the clock reaching
+/// the hour's bound; an agent's wait for room; the live sessions changing; a look at `short`
+/// inside the drop over the line (the same episode); the volume read out of it by the drop; and
+/// the emergency again, its interval past.
+fn emergency_script() -> Vec<Seen> {
+    use disk::cadence::{EMERGENCY_DROP, PASS_EVERY, UNMET_WAIT_MAX_S};
+    let emergency = disk::Level::Emergency;
+    let every = i64::try_from(PASS_EVERY.as_secs()).expect("seconds");
+    let first = Seen {
+        level: emergency,
+        free: GIB_BYTES,
+        now: NOW,
+        demand: false,
+        live: 7,
+        moved: false,
+        restart: false,
+    };
+    let moved = GIB_BYTES + EMERGENCY_DROP + (64 << 20);
+    let restarted = NOW + every + 120;
+    let ripe = restarted + UNMET_WAIT_MAX_S;
+    vec![
+        first,
+        Seen {
+            now: NOW + every + 60,
+            ..first
+        },
+        Seen {
+            free: moved,
+            now: NOW + every + 90,
+            moved: true,
+            ..first
+        },
+        Seen {
+            free: moved,
+            now: restarted,
+            restart: true,
+            ..first
+        },
+        Seen {
+            free: moved,
+            now: ripe,
+            moved: true,
+            ..first
+        },
+        Seen {
+            free: moved,
+            now: ripe + 60,
+            demand: true,
+            moved: true,
+            ..first
+        },
+        Seen {
+            free: moved,
+            now: ripe + 120,
+            live: 8,
+            moved: true,
+            ..first
+        },
+        Seen {
+            level: disk::Level::Short,
+            free: 4 * GIB_BYTES + (64 << 20),
+            now: ripe + 180,
+            live: 8,
+            moved: true,
+            ..first
+        },
+        Seen {
+            level: disk::Level::Ok,
+            free: 10 * GIB_BYTES,
+            now: ripe + 240,
+            live: 8,
+            moved: true,
+            ..first
+        },
+        Seen {
+            now: ripe + 240 + every,
+            live: 8,
+            ..first
+        },
+    ]
+}
+
+/// THE EMERGENCY'S RECORD CONFORMANCE: the real episode's end, wait and pass end, through the
+/// script of [`emergency_script`] (two episodes, a restart in the first), take only the model's
+/// steps, and after each look the ledger holds as many `cannot-meet` rows as the model's
+/// episodes wrote: one in the first, across its restart (the memo is a file), and one in the
+/// second. Whether something moved is the script's word, so a wait that went with nothing moved
+/// is a `Wake` the model refuses. The clock is frozen: every look's time is the script's.
+/// NEGATIVE CONTROLS: a host that plans on the interval alone runs a pass past the ten minutes
+/// with the wait standing and nothing moved (`PassUnmet` is not enabled while the model waits);
+/// one whose wait goes at every look wakes with nothing moved (`Wake` is not enabled).
+#[test]
+fn the_emergency_record_takes_only_the_models_steps() {
+    let m = disk_emergency_unmet_model();
+    for plans in [Plans::Real, Plans::Interval, Plans::Blind] {
+        let scratch = Scratch::new("emergency");
+        let mut host = EmergencyHost {
+            at: cli::EmergencyAt {
+                state: &scratch.0,
+                now: NOW,
+                level: disk::Level::Emergency,
+                volume: "/",
+                total: 100 * GIB_BYTES,
+                line: 4 * GIB_BYTES,
+                live: 7,
+            },
+            done: Applied {
+                seen: disk::Rebuildable {
+                    bytes: 3 * GIB_BYTES,
+                    partial: false,
+                },
+                ..Applied::default()
+            },
+            emergency: disk::cadence::Emergency::default(),
+            last: None,
+            started: std::time::Instant::now(),
+            plans,
+        };
+        let mut s = m.init_state();
+        let mut written = 0;
+        let mut ran = Ok(());
+        let mut trace = Vec::new();
+        for seen in emergency_script() {
+            for action in host.look(&s, seen) {
+                trace.push(action);
+                let rows = s.get("rows").copied();
+                ran = ran.and_then(|()| step(&m, &mut s, action));
+                written += i64::from(s.get("rows").copied() > rows);
+            }
+            if ran.is_ok() {
+                assert_eq!(cannot_meet_in(&scratch.0), written, "{plans:?}: {trace:?}");
+            }
+        }
+        match plans {
+            Plans::Real => {
+                ran.unwrap_or_else(|e| panic!("{e}: {trace:?}"));
+                assert_eq!(written, 2, "one row an episode, two episodes: {trace:?}");
+                assert_eq!(
+                    trace.iter().filter(|a| **a == "PassUnmet").count(),
+                    7,
+                    "the first pass, after the move, the restart, the clock, the ask, the live \
+                     sessions, and the second episode's: {trace:?}"
+                );
+            }
+            Plans::Interval => {
+                let refused = ran.expect_err("a pass on the interval alone");
+                assert!(refused.contains("`PassUnmet` is not enabled"), "{refused}");
+            }
+            Plans::Blind => {
+                let refused = ran.expect_err("a wake with nothing moved");
+                assert!(refused.contains("`Wake` is not enabled"), "{refused}");
+            }
+        }
+    }
 }

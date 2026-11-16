@@ -212,13 +212,20 @@ fn bound_names(tree: &Tree<'_>) -> Vec<Bound> {
     out
 }
 
-/// The crate a source file is in: its directory (`crates/aterm-netplace/`) and its name in a
-/// path (`aterm_netplace`).
+/// The crate a source file is in: its directory (`crates/aterm-netplace/`, or for a crate of a
+/// repository vendored whole under `vendor/`, `vendor/alab-harness/crates/alab-policy/`) and its
+/// name in a path (`aterm_netplace`, `alab_policy`).
 pub(super) fn crate_of(rel: &str) -> (String, String) {
-    let mut parts = rel.split('/');
+    let parts: Vec<&str> = rel.split('/').collect();
+    if let ["vendor", repo, "crates", name, _, ..] = parts.as_slice() {
+        return (
+            format!("vendor/{repo}/crates/{name}/"),
+            name.replace('-', "_"),
+        );
+    }
     let (top, name) = (
-        parts.next().unwrap_or_default(),
-        parts.next().unwrap_or_default(),
+        parts.first().copied().unwrap_or_default(),
+        parts.get(1).copied().unwrap_or_default(),
     );
     (format!("{top}/{name}/"), name.replace('-', "_"))
 }

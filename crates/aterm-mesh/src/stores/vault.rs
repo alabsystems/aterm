@@ -162,11 +162,13 @@ impl Stores for VaultStores {
         let Some(log) = store.log() else {
             return Ok((Vec::new(), 0));
         };
+        // A record an open through the vault's head shelved is read back for this alone, and
+        // one that does not read back as it was fails the read.
         let records = log
             .records()
             .skip(from)
-            .map(|record| record.bytes().to_vec())
-            .collect();
+            .map(|record| record.wire_bytes().map(std::borrow::Cow::into_owned))
+            .collect::<io::Result<_>>()?;
         Ok((records, log.held_count()))
     }
 
@@ -211,12 +213,15 @@ impl Stores for VaultStores {
     fn members_wires(&self, ids: &[Digest]) -> io::Result<Vec<Vec<u8>>> {
         let wanted: BTreeSet<Digest> = ids.iter().copied().collect();
         let store = self.members()?;
-        Ok(store.log().map_or_else(Vec::new, |log| {
-            log.records()
-                .filter(|record| wanted.contains(record.id()))
-                .map(|record| record.bytes().to_vec())
-                .collect()
-        }))
+        store.log().map_or_else(
+            || Ok(Vec::new()),
+            |log| {
+                log.records()
+                    .filter(|record| wanted.contains(record.id()))
+                    .map(|record| record.wire_bytes().map(std::borrow::Cow::into_owned))
+                    .collect()
+            },
+        )
     }
 
     fn hook(&self) {
@@ -298,15 +303,17 @@ fn members_feed(store: &aterm_secrets::membership_log::Store, cursor: Option<usi
         };
     };
     let from = cursor.unwrap_or(0);
+    // A shelved record that does not read back leaves the records unknown: the egress reads
+    // them itself, and fails there.
+    let records = log
+        .records()
+        .skip(from)
+        .map(|record| record.wire_bytes().map(std::borrow::Cow::into_owned))
+        .collect::<io::Result<Vec<_>>>()
+        .ok();
     Feed::Members {
         length: log.held_count(),
-        records: Some((
-            from,
-            log.records()
-                .skip(from)
-                .map(|record| record.bytes().to_vec())
-                .collect(),
-        )),
+        records: records.map(|records| (from, records)),
     }
 }
 

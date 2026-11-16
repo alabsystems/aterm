@@ -73,7 +73,17 @@
 //! and grants nothing: the window reads a line only for a session it holds, names from it only
 //! roots a pane's own directory could name, and nothing reads the line as authority. A total
 //! built from lines (a tab's bytes, a session's worktrees) must never drive a removal, a quota or
-//! a hold.
+//! a hold. The disk watch's worktree step reads every line that names a worktree, and a line's
+//! session for two things: a worktree any line of which names a session the window holds live
+//! stays, which a forged line can only lengthen; and one every line of which names a session the
+//! window holds as exited waits an hour of quiet rather than seven days before its commits and
+//! edits are pinned on refs and it goes. A forged line naming an exited session can shorten that
+//! wait to the hour, so the hour is never the guard against a loss: the session, transcript and
+//! process checks still keep a worktree anyone works in, and nothing goes before every pin of it
+//! is read back from the shared repository with what it holds. The step reads a line's date for
+//! one thing more (DC-21): a worktree that stays whatever it holds keeps its shared build
+//! directory while a line names it within the build directory's wait, since a build that
+//! compiled nothing writes no file there; a forged or misdated line can only lengthen that.
 //!
 //! aterm's front reads what a call builds with a reader of its own
 //! ([`crate::build_cache::registered::observe_shim_call`]), beside the one that registers the
@@ -274,7 +284,9 @@ fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
 }
 
 /// `path` opened for writing, never where its name is a link or anything but a file; `append`
-/// for appending, else truncated.
+/// for appending, else truncated. Opened for reading too: Windows takes no lock
+/// (`LockFileEx`) through a handle opened only to append, which holds neither read nor write
+/// data access, so [`compact`]'s lock beside the record would be refused every time.
 #[cfg(not(unix))]
 fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
     if let Ok(meta) = std::fs::symlink_metadata(path)
@@ -283,6 +295,7 @@ fn open_private(path: &Path, append: bool) -> io::Result<std::fs::File> {
         return Err(not_regular());
     }
     let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .append(append)
         .truncate(!append)

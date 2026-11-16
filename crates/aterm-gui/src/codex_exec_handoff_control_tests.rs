@@ -18,7 +18,7 @@ type Read = Result<Option<codex_rotation::Proposal<ExecCommand>>, &'static str>;
 
 /// The progress once a job's first read, come back at `at`, refused the session for `why`.
 fn refused(why: &'static str, at: Instant) -> Progress {
-    progress_after_observation(&Progress::Reading(0), Err(why), true, at)
+    progress_after_observation(&Progress::Reading(0, at), Err(why), true, at)
 }
 
 /// A READ'S REFUSAL THAT STANDS ENDS THE ASKING, UNDER ITS OWN KIND AND TIME: each refusal the
@@ -48,7 +48,7 @@ fn a_standing_refusal_is_kept_with_its_kind_and_the_time_it_was_read() {
         );
         assert!(
             matches!(
-                progress_after_observation(&Progress::Reading(0), Err(why), false, now),
+                progress_after_observation(&Progress::Reading(0, now), Err(why), false, now),
                 Progress::Retry(at) if at > now
             ),
             "stale {why}"
@@ -57,7 +57,7 @@ fn a_standing_refusal_is_kept_with_its_kind_and_the_time_it_was_read() {
     let again: [Read; 3] = [Err("roster-busy"), Err("probe-panicked"), Ok(None)];
     for result in again {
         assert!(matches!(
-            progress_after_observation(&Progress::Reading(0), result, true, now),
+            progress_after_observation(&Progress::Reading(0, now), result, true, now),
             Progress::Retry(at) if at > now
         ));
     }
@@ -99,7 +99,7 @@ fn no_wall_to_leave_stands_until_its_wall_has_reset_and_is_then_read_again() {
         (WAITING.to_owned(), true),
         "the first ask past it reads the login again"
     );
-    assert!(matches!(progress, Progress::Reading(_)));
+    assert!(matches!(progress, Progress::Reading(..)));
     assert_eq!(
         answer(&mut progress, &intent, past + Duration::from_secs(5)),
         (WAITING.to_owned(), false),
@@ -241,10 +241,10 @@ fn an_ask_that_starts_a_read_runs_it_once_with_the_progress_unlocked() {
     ] {
         let progress = Mutex::new(first);
         let reads = std::cell::Cell::new(0_u32);
-        let read = || {
+        let read = |_: Instant| {
             reads.set(reads.get() + 1);
             assert!(
-                matches!(progress.try_lock().as_deref(), Ok(Progress::Reading(_))),
+                matches!(progress.try_lock().as_deref(), Ok(Progress::Reading(..))),
                 "the read runs with the progress unlocked and already reading"
             );
         };
@@ -258,10 +258,53 @@ fn an_ask_that_starts_a_read_runs_it_once_with_the_progress_unlocked() {
     }
     let standing = Mutex::new(refused("not-walled", decided));
     assert_eq!(
-        ask(&standing, &intent, decided + Duration::from_secs(5), || {
+        ask(&standing, &intent, decided + Duration::from_secs(5), |_| {
             panic!("an answer that stands reads nothing")
         }),
         NOT_NEEDED
+    );
+}
+
+/// A READ OUT FOR LONGER THAN ONE CAN TAKE IS TAKEN FOR ONE THAT WILL NOT END, AND THE NEXT ASK
+/// STARTS ANOTHER OF THE SAME WAIT: an ask [`renewal::READ_LAPSES`] after a read began starts
+/// none, and the first ask past it starts one, out from that ask's time, that keeps the count of
+/// no-wall reads the wait had made. What the read taken never to end answers, should it end,
+/// changes nothing; what the new one answers is the job's, the third no-wall read in a row of
+/// its wait. CONTROL: a read's own answer is written.
+#[test]
+fn a_read_out_too_long_is_read_again_and_its_late_answer_dropped() {
+    let began = Instant::now();
+    let intent = intent();
+    let progress = Mutex::new(Progress::Reading(2, began));
+    assert_eq!(
+        ask(&progress, &intent, began + renewal::READ_LAPSES, |_| {
+            panic!("a read that may still end is not read again")
+        }),
+        WAITING
+    );
+    let past = began + renewal::READ_LAPSES + Duration::from_millis(1);
+    let started = std::cell::Cell::new(None);
+    assert_eq!(
+        ask(&progress, &intent, past, |since| started.set(Some(since))),
+        WAITING
+    );
+    assert_eq!(started.get(), Some(past), "the ask started another read");
+    let mut progress = progress.into_inner().unwrap();
+    assert!(matches!(progress, Progress::Reading(2, at) if at == past));
+    let later = past + Duration::from_secs(1);
+    observed(&mut progress, began, Err("not-walled"), true, later);
+    assert!(
+        matches!(progress, Progress::Reading(2, at) if at == past),
+        "the late answer of the read taken never to end changes nothing: {progress:?}"
+    );
+    observed(&mut progress, past, Err("not-walled"), true, later);
+    assert!(
+        matches!(
+            progress,
+            Progress::NotNeeded(NoneComing { end: NoHandoff::NoWallToLeave, decided, reads: 3, .. })
+                if decided == later
+        ),
+        "CONTROL: the new read's answer is the job's: {progress:?}"
     );
 }
 
@@ -431,7 +474,7 @@ fn a_writer_that_says_nothing_of_the_selection_keeps_it_for_the_next_arm() {
                 "{step:?} {outcome:?}: the next arm takes it"
             );
             assert_eq!(
-                ask(&Mutex::new(progress), &intent, later, || {
+                ask(&Mutex::new(progress), &intent, later, |_| {
                     panic!("a kept selection reads nothing")
                 }),
                 offer(),
@@ -486,14 +529,14 @@ fn a_writer_that_refutes_the_selection_drops_it_and_the_next_ask_reads() {
                 "{step:?} {why}: another selection stands, {another:?}"
             );
 
-            let mut reading = Progress::Reading(2);
+            let mut reading = Progress::Reading(2, now);
             assert_eq!(
                 after_writer(&mut reading, true, step, &outcome, now),
                 Some(DENIED.to_owned()),
                 "{step:?} {why}"
             );
             assert!(
-                matches!(reading, Progress::Reading(2)),
+                matches!(reading, Progress::Reading(2, at) if at == now),
                 "{step:?} {why}: a read that is out stays the one read, {reading:?}"
             );
         }
@@ -702,41 +745,48 @@ fn prepared_asking(
         (main, source),
         (work, target),
     ]));
-    let read = codex_rotation::prepare_exec(
-        &seat,
-        &accounts_pool::Session {
-            cli: codex,
-            sid: "session",
-            supervisor: accounts::Supervisor::Own,
-            env: &[],
-            seen: &seen,
-            sample: None,
-            point: codex_rotation::wall_asked(NOW),
-            mode: accounts::Mode::Early,
-            relaunch: (),
-        },
-        &exe,
-        asking,
-        &reader,
-        Duration::from_secs(60),
-        |row| {
-            Some(ExecCommand {
-                argv0: "codex".into(),
-                image: image.clone(),
-                program: program.to_str()?.into(),
-                argv: vec!["exec".into()],
-                auth_path: row
-                    .dir
-                    .as_ref()
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| home.join(codex.accounts().default_home))
-                    .join("auth.json")
-                    .to_str()?
-                    .into(),
-                cwd: None,
-            })
-        },
-    );
+    // A process that has read nothing: the one pace a new table hands out.
+    let pace = codex_rotation::Paces::default().of((), Instant::now(), Duration::MAX);
+    let read = pace
+        .observe(Instant::now(), |pace| {
+            codex_rotation::prepare_exec(
+                &seat,
+                &accounts_pool::Session {
+                    cli: codex,
+                    sid: "session",
+                    supervisor: accounts::Supervisor::Own,
+                    env: &[],
+                    seen: &seen,
+                    sample: None,
+                    point: codex_rotation::wall_asked(NOW),
+                    mode: accounts::Mode::Early,
+                    relaunch: (),
+                },
+                &exe,
+                asking,
+                &reader,
+                Duration::from_secs(60),
+                pace,
+                |row| {
+                    Some(ExecCommand {
+                        argv0: "codex".into(),
+                        image: image.clone(),
+                        program: program.to_str()?.into(),
+                        argv: vec!["exec".into()],
+                        auth_path: row
+                            .dir
+                            .as_ref()
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| home.join(codex.accounts().default_home))
+                            .join("auth.json")
+                            .to_str()?
+                            .into(),
+                        cwd: None,
+                    })
+                },
+            )
+        })
+        .expect("no other observation holds a new pace");
     (dir, read)
 }
 
@@ -778,12 +828,12 @@ fn an_exec_prepare_at_a_spend_control_answers_selected() {
     );
     let now = Instant::now();
     let progress = Mutex::new(progress_after_observation(
-        &Progress::Reading(0),
+        &Progress::Reading(0, now),
         Ok(Some(proposal.clone())),
         true,
         now,
     ));
-    let reply = ask(&progress, &intent(), now, || {
+    let reply = ask(&progress, &intent(), now, |_| {
         panic!("a selection in hand reads nothing")
     });
     assert_eq!(reply, offer_of(&proposal));
@@ -869,13 +919,13 @@ fn an_exec_prepare_with_a_limit_judges_that_limit() {
     );
     let now = Instant::now();
     let progress = Mutex::new(progress_after_observation(
-        &Progress::Reading(0),
+        &Progress::Reading(0, now),
         Ok(Some(proposal.clone())),
         true,
         now,
     ));
     assert_eq!(
-        ask(&progress, &limited, now, || {
+        ask(&progress, &limited, now, |_| {
             panic!("a selection in hand reads nothing")
         }),
         offer_of(&proposal)
@@ -1019,7 +1069,7 @@ fn a_step_whose_writer_says_nothing_keeps_the_selection() {
                 "{step:?} {outcome:?}: the next arm takes it"
             );
             assert_eq!(
-                ask(&progress, &intent, Instant::now(), || {
+                ask(&progress, &intent, Instant::now(), |_| {
                     panic!("a kept selection reads nothing")
                 }),
                 offer_of(&proposal),
@@ -1157,12 +1207,12 @@ fn a_refutation_drops_only_the_selection_it_judged() {
             "{step:?}: no arm takes a refuted selection"
         );
         assert_eq!(
-            ask(&progress, &intent, Instant::now(), || {}),
+            ask(&progress, &intent, Instant::now(), |_| {}),
             WAITING,
             "{step:?}"
         );
         assert!(
-            matches!(*progress.lock().unwrap(), Progress::Reading(_)),
+            matches!(*progress.lock().unwrap(), Progress::Reading(..)),
             "{step:?}: the next ask reads"
         );
 
@@ -1443,4 +1493,78 @@ fn a_completion_a_lock_held_up_waits_and_one_the_records_refuse_is_denied() {
             "{why}"
         );
     }
+}
+
+/// When a test's process asks (Unix seconds).
+const ASKED: i64 = 1_792_700_000;
+
+/// EVERY `prepare` OF AN EXEC RUN IS NOTED TO ITS PROCESS'S PACE, WHATEVER ANSWERS IT: under a
+/// hold, each ask of a captured run is answered `waiting` before any job is made, and is noted all
+/// the same, at the time of its ask, to the pace its tab keeps for that process, `codex-rotation`'s
+/// and this lane's alike.
+#[test]
+fn every_exec_prepare_is_noted_to_its_processs_pace_whatever_answers_it() {
+    let handle = crate::session_store::test_handle_on(9137, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    ctx.fabric
+        .seed_holds(crate::fabric::parse_holds(["local mine"]), &ctx.timeline);
+    let home = aterm_tempfile::tempdir().expect("a home");
+    let me = std::process::id();
+    let mine = source(process(me, born(me)), home.path());
+    let key = ProcessKey::of(&mine.process);
+    let mut env = Env::from_process().unwrap();
+    env.home = Some(home.path().into());
+    env.state = home.path().join("state");
+    env.config = None;
+    let proof = crate::self_claim::Proven {
+        pid: me,
+        start: "fixture".into(),
+    };
+    for at in [ASKED, ASKED + 5] {
+        let env = Env {
+            now: at,
+            ..env.clone()
+        };
+        assert_eq!(
+            serve_captured(&ctx, (proof.clone(), mine.clone(), env), intent()),
+            WAITING,
+            "{at}"
+        );
+        let asked = ctx
+            .fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .rotation_paces
+            .of(key, Instant::now(), Duration::MAX)
+            .asked_at();
+        assert_eq!(asked, Some(at), "{at}");
+    }
+    let table = ctx.fenced_writes.native.lock().unwrap();
+    assert!(table.exec.processes().is_empty(), "no job was made");
+}
+
+/// A GONE PROCESS'S READ PACE IS FORGOTTEN AT THE NEXT ASK, BY THE RULE ITS PREPARATION IS: an
+/// ask of this live process forgets the paces of a process that has exited and been reaped and
+/// of this test's pid at a birth that is not its own, and keeps its own.
+#[test]
+fn a_gone_process_read_pace_is_forgotten_at_the_next_ask() {
+    let handle = crate::session_store::test_handle_on(9138, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let ended = ProcessKey::of(&Sleeper::start().process());
+    let me = std::process::id();
+    let live = ProcessKey::of(&process(me, born(me)));
+    let reborn = ProcessKey::of(&process(me, born(me) + 1));
+    let mut table = ctx.fenced_writes.native.lock().unwrap();
+    for kept in [ended, reborn] {
+        let _ = table.rotation_paces.of(kept, Instant::now(), Duration::MAX);
+    }
+    assert_eq!(table.rotation_paces.processes().count(), 2, "CONTROL");
+    drop(table);
+    renewal::note_ask(&ctx, live, ASKED);
+    let table = ctx.fenced_writes.native.lock().unwrap();
+    assert_eq!(
+        table.rotation_paces.processes().collect::<BTreeSet<_>>(),
+        BTreeSet::from([live])
+    );
 }

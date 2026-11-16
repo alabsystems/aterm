@@ -554,11 +554,11 @@ pub use ancestry::{Ancestry, stable_descendant};
 #[path = "process_kin.rs"]
 mod kin;
 pub use kin::{
-    GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, TRUST_CHECK_VAR,
-    VERIFY_RUN_VAR, at_program_check, boot_id, group_listing_can_be_whole, group_members, held_age,
-    held_programs, held_since, host_id, launchd_idversion, launched_before, pid_namespace,
-    process_serial, read_identity, read_lineage, read_process_markers, stripped_from_child,
-    thread_ran,
+    GroupMembers, HeldNow, Hop, Lineage, MARKER_VARS, MAX_GROUP_PIDS, MAX_HOPS, Markers, Stop,
+    TRUST_CHECK_VAR, VERIFY_RUN_VAR, Walk, at_program_check, boot_id, group_listing_can_be_whole,
+    group_members, held_age, held_programs, held_since, host_id, launchd_idversion,
+    launched_before, pid_namespace, process_serial, read_hop, read_identity, read_lineage,
+    read_process_markers, stripped_from_child, thread_ran, walk,
 };
 #[cfg(any(unix, windows))]
 pub use kin::{held_among, held_since_among};
@@ -664,8 +664,24 @@ pub fn read_process_execd(pid: i32) -> Option<bool> {
     procfs::execd_row(&stat, pid)
 }
 
+/// See the Apple twin. Windows: `Some(true)` for every live process whose creation record
+/// reads ([`read_process_birth`]). Windows has no fork: `CreateProcess` maps the image the new
+/// process is created from, and nothing replaces it, so no live process maps another's image as
+/// a forked child maps its parent's (a Cygwin or MSYS2 fork is a process created from the
+/// shell's own image, which it runs, and its exec creates another process).
+#[cfg(windows)]
+#[must_use]
+pub fn read_process_execd(pid: i32) -> Option<bool> {
+    read_process_birth(pid).map(|_| true)
+}
+
 /// See the Apple twin.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 #[must_use]
 pub fn read_process_execd(_pid: i32) -> Option<bool> {
     None

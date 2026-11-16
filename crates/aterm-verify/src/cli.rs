@@ -579,6 +579,7 @@ Run aterm's checks in place, alone or in any combination.
   verify release --app <APP>      everything publication requires
   verify release --tree           its tree half: no bundle, nothing timed
   verify watch                    the follower: judges main tips, posts commit statuses
+  verify watch --once             judge one tip; return repair context to the caller
   verify land                     merge main, judge the cone since it, push; compose a
                                   moved main, or judge the merge over what the two
                                   share (`verify land --help`)
@@ -595,7 +596,8 @@ Run aterm's checks in place, alone or in any combination.
   verify glue <in.wasm> <out-dir>
                                   a wasm module's ES module glue (`verify glue --help`)
   verify vendor-out --into <dir> [--check]
-                                  sealed copies of alab-policy, aterm-phase and
+                                  sealed copies of alab-policy (aterm's pinned
+                                  copy, vendor/alab-harness), aterm-phase and
                                   aterm-agent-names in <dir>/vendor for another
                                   repository to build (`verify vendor-out --help`)
   verify provision [--linux] [--check] [ROW...]

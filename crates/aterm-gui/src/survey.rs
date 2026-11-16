@@ -377,10 +377,25 @@ impl WordsRead {
 /// ([`crate::fabric::SessionFabric::last_topic_post`]) where that is newer than its screen's
 /// words, else those words ([`screen_words`]); redacted and capped as a `survey` row's are.
 pub(crate) fn last_words(h: &SessionHandle, finished: bool) -> Option<String> {
-    step_of(
-        screen_words(h, finished),
+    last_words_now(h, finished)
+        .unwrap_or_else(|ScreenBusy| step_of(None, h.ctx.fabric.last_topic_post().as_ref()))
+}
+
+/// A session's screen could not be read now: its terminal is held, or its frame is unfinished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScreenBusy;
+
+/// [`last_words`], or [`ScreenBusy`] where the words are the screen's and the screen could not
+/// be read now: no words then says nothing of what the screen holds, and a reader that keeps a
+/// line keeps the one it has and reads again.
+pub(crate) fn last_words_now(
+    h: &SessionHandle,
+    finished: bool,
+) -> Result<Option<String>, ScreenBusy> {
+    Ok(step_of(
+        screen_words(h, finished)?,
         h.ctx.fabric.last_topic_post().as_ref(),
-    )
+    ))
 }
 
 /// [`last_words`] of what was read: `words` with when they were written, on the wall clock
@@ -401,7 +416,7 @@ pub(crate) fn step_of(
 /// end, once `finished`, as `said=` does), as of the row its transcript or rollout stamped it
 /// with, else as of the read that first saw those words; else what it is doing, as of that read;
 /// else a shell's bottom rows, as of the feed that last moved the screen.
-fn screen_words(h: &SessionHandle, finished: bool) -> Option<(String, u64)> {
+fn screen_words(h: &SessionHandle, finished: bool) -> Result<Option<(String, u64)>, ScreenBusy> {
     let (excerpts, read) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -430,11 +445,14 @@ fn screen_words(h: &SessionHandle, finished: bool) -> Option<(String, u64)> {
             (None, _) => (excerpts.doing.as_deref(), Word::Doing),
         };
         if let Some(words) = excerpt_plain(words) {
-            return Some((words, written(word)));
+            return Ok(Some((words, written(word))));
         }
     }
-    excerpt_plain(engine_read(h, true).rows.as_deref())
-        .map(|rows| (rows, h.ctx.screen_moves.moved_ms()))
+    let engine = engine_read(h, true);
+    if engine.busy {
+        return Err(ScreenBusy);
+    }
+    Ok(excerpt_plain(engine.rows.as_deref()).map(|rows| (rows, h.ctx.screen_moves.moved_ms())))
 }
 
 fn branch_token(text: Option<&str>) -> String {
@@ -1588,6 +1606,9 @@ struct EngineRead {
     command: Option<String>,
     /// The last [`SHELL_ROWS`] non-blank rows (asked only with `shell`).
     rows: Option<String>,
+    /// The rows were asked for and could not be read: the terminal is held, or its frame is
+    /// unfinished.
+    busy: bool,
 }
 
 fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
@@ -1607,12 +1628,16 @@ fn engine_read(h: &SessionHandle, shell: bool) -> EngineRead {
                 .then(|| crate::session_status::executing_command_line(t))
                 .flatten(),
             rows,
+            busy: shell && !whole,
         }
     };
     match h.term.try_lock() {
         Ok(t) => read(&t),
         Err(std::sync::TryLockError::Poisoned(p)) => read(&p.into_inner()),
-        Err(std::sync::TryLockError::WouldBlock) => EngineRead::default(),
+        Err(std::sync::TryLockError::WouldBlock) => EngineRead {
+            busy: shell,
+            ..EngineRead::default()
+        },
     }
 }
 

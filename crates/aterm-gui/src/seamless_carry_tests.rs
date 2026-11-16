@@ -124,7 +124,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
-        retired_workers: Vec::new(),
+        last_launches: Vec::new(),
     })
 }
 
@@ -1070,7 +1070,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
-        retired_workers: Vec::new(),
+        last_launches: Vec::new(),
     };
     let wire = new.to_toml().unwrap();
     assert!(new.roundtrips());

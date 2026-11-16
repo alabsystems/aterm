@@ -646,6 +646,7 @@ label_enum! {
         AgentsDiscovery => "agents_discovery",
         RestoreDrain => "restore_drain",
         RestoreGlass => "restore_glass",
+        Navigator => "navigator",
     }
 }
 

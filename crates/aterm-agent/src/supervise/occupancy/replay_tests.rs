@@ -241,6 +241,37 @@ fn a_told_guard_holds_the_replayed_line() {
     );
 }
 
+/// A LOOK THAT NAMES NO SESSION OF THE REPLAY'S IS NO MINUTE OF THAT SESSION'S: the window
+/// judged nothing for it there, so a replay over a ring holding such looks inside an open hold
+/// says what it says over the ring without them, which is the ring a window now writes for an
+/// hour it supervised nobody (`occupancy_host::append_look`). NEGATIVE CONTROL: judge those looks
+/// (no guard, no held slot) and the guard's held nudge gives way to a would at the first of them.
+#[test]
+fn a_look_that_names_no_session_is_left_out_of_the_replay() {
+    let mut rows = f1_ring(true);
+    for row in &mut rows {
+        row.sessions[0].guard = Some(Guard::Person.word().to_string());
+    }
+    let nobody = at(20, 0, 0)..at(21, 0, 0);
+    for row in rows.iter_mut().filter(|r| nobody.contains(&r.at)) {
+        row.sessions.clear();
+    }
+    let named: Vec<RingRow> = rows
+        .iter()
+        .filter(|r| !r.sessions.is_empty())
+        .cloned()
+        .collect();
+    assert!(named.len() < rows.len(), "the ring holds looks of nobody");
+    let spans = spans_of(&f1_holds()[..1]);
+    let replayed = replay(&rows, &spans, SID, rows[0].at);
+    assert_eq!(
+        first_would(&replayed, RuleId::WaitNudge),
+        None,
+        "the guard holds the nudge throughout: {replayed:#?}"
+    );
+    assert_eq!(replayed, replay(&named, &spans, SID, rows[0].at));
+}
+
 #[test]
 fn the_ledger_rows_make_the_holds() {
     let t = at(20, 0, 0);

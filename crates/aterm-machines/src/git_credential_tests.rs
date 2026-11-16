@@ -154,6 +154,104 @@ fn a_read_is_records_of_a_file_a_key_and_a_value() {
     assert!(parse("file:/a").is_none());
 }
 
+/// A pass keeps a read of every file git reads ([`Records`]) only where each setting is in a
+/// file the record watches and each include names one it watches by an absolute path: an
+/// include of `~/.config/git/config` from `~/.gitconfig` is kept, and so is a managed GNU Git's
+/// own system file (`<prefix>/etc/gitconfig`, which its build writes so) including
+/// `/etc/gitconfig`, with the settings of the file it includes. Negative controls: an include
+/// of a file the record does not watch, one by a path git resolves against something else
+/// (`~/`, a relative path, `%(prefix)/`), one with no value, a conditional include even of a
+/// watched file, a setting in a file it does not watch, one from no file and one from a
+/// relative path (a repository's own config, where the reader runs inside one) are each never
+/// kept.
+#[test]
+fn a_settings_read_is_kept_only_from_the_files_it_watches() {
+    let watch = [PathBuf::from(GLOBAL), PathBuf::from(XDG)];
+    let watched = at(&[(GLOBAL, HELPER, Some("")), (XDG, HELPER, Some("x"))]);
+    assert!(kept_from(&watched, &watch));
+    assert!(kept_from(&[], &watch));
+    let mut included = at(&[(GLOBAL, INCLUDE, Some(XDG))]);
+    included.extend(watched.iter().cloned());
+    assert!(kept_from(&included, &watch));
+
+    // A managed GNU Git on Linux: its own system file includes the distribution's.
+    let system = "/home/alice/.local/share/aterm/pkg/store/git/1/etc/gitconfig";
+    let managed = [PathBuf::from(system), PathBuf::from("/etc/gitconfig")];
+    let linux = at(&[
+        (system, INCLUDE, Some("/etc/gitconfig")),
+        ("/etc/gitconfig", HELPER, Some("store")),
+    ]);
+    assert!(kept_from(&linux, &managed));
+    assert!(
+        !kept_from(&linux, &managed[..1]),
+        "control: the file it includes is not watched"
+    );
+
+    for (key, value) in [
+        (INCLUDE, Some("/opt/other.gitconfig")),
+        (INCLUDE, Some("~/.config/git/config")),
+        (INCLUDE, Some(".config/git/config")),
+        (INCLUDE, Some("%(prefix)/etc/gitconfig")),
+        (INCLUDE, None),
+        ("includeif.gitdir:~/work/.path", Some(XDG)),
+    ] {
+        let mut read = watched.clone();
+        read.extend(at(&[(GLOBAL, key, value)]));
+        assert!(!kept_from(&read, &watch), "{key} {value:?}");
+    }
+    let mut read = watched.clone();
+    read.extend(at(&[("/opt/other.gitconfig", HELPER, Some("x"))]));
+    assert!(!kept_from(&read, &watch), "a file it does not watch");
+    for origin in ["command line:", "file:.git/config"] {
+        let mut read = watched.clone();
+        read.push(Setting {
+            origin: origin.into(),
+            key: HELPER.into(),
+            value: Some("x".into()),
+        });
+        assert!(!kept_from(&read, &watch), "{origin}");
+    }
+}
+
+/// What a read of every file git reads keeps ([`Records`]) watches a git build's own files: its
+/// system file under its prefix, the Command Line Tools' `share/git-core/gitconfig`, and the
+/// program, as the program's path names them. NEGATIVE CONTROL: the account's files alone
+/// leave a managed build's system file unwatched, and its include of `/etc/gitconfig` unkept.
+#[test]
+fn a_settings_read_watches_the_git_build_s_own_files() {
+    let prefix = "/home/alice/.local/share/aterm/pkg/store/git/1";
+    let git = Git {
+        program: PathBuf::from(format!("{prefix}/bin/git")),
+        env: Vec::new(),
+    };
+    let mut who = alice();
+    who.home = "/home/alice".into();
+    let watch = git.settings_watch(&Fake::default(), &who);
+    let system = format!("{prefix}/etc/gitconfig");
+    let own = [
+        system.clone(),
+        format!("{prefix}/share/git-core/gitconfig"),
+        format!("{prefix}/bin/git"),
+    ];
+    for file in [
+        "/etc/gitconfig",
+        "/home/alice/.gitconfig",
+        "/home/alice/.config/git/config",
+    ]
+    .into_iter()
+    .chain(own.iter().map(String::as_str))
+    {
+        assert!(watch.contains(&PathBuf::from(file)), "{file}: {watch:?}");
+    }
+    let linux = at(&[(system.as_str(), INCLUDE, Some("/etc/gitconfig"))]);
+    assert!(kept_from(&linux, &watch));
+    let account = crate::checkout::facts::config_files(Path::new(&who.home));
+    assert!(
+        !kept_from(&linux, &account),
+        "control: the account's files alone"
+    );
+}
+
 /// A conditional include's file resolves as git resolves it, each once. Negative control:
 /// one this cannot resolve, and one nested past git's bound, are reasons, not skipped.
 #[test]
@@ -1581,8 +1679,8 @@ fn the_block_gh_setup_git_wrote_gives_way_to_atermss_route() {
     assert!(git.keychain_in_effect(&spawns, &who).is_some());
     assert_eq!(
         spawns.record().len(),
-        2,
-        "two settings reads: no helper ran"
+        1,
+        "one settings read, the pass's record of which both checks judge: no helper ran"
     );
     assert_eq!(std::fs::read_to_string(&gitconfig).unwrap(), wrapped);
     scratch.close().unwrap();

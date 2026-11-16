@@ -204,6 +204,39 @@ impl Next {
             Self::Unknown => "not known, no walk measured it".to_owned(),
         }
     }
+
+    /// [`Self::says`] in a few words, for a column that has no room for it (the Disk lens's
+    /// rows): the same statement, with no command in it.
+    #[must_use]
+    pub fn brief(self) -> String {
+        match self {
+            Self::Nothing => "nothing".to_owned(),
+            Self::NotAterms => "nothing, not aterm's".to_owned(),
+            Self::CleanupOff => "nothing, cleanup is off".to_owned(),
+            Self::TierPass => "removed when the disk runs low".to_owned(),
+            Self::DailyCache { stale_days } => {
+                format!("daily pass, parts unwritten {}", days(stale_days))
+            }
+            Self::DailyUnused { after_s } => {
+                format!("daily pass, entries unused {}", span(after_s))
+            }
+            Self::RunEnd { .. } => "trimmed when a verify run ends here".to_owned(),
+            Self::Unknown => "not known".to_owned(),
+        }
+    }
+
+    /// [`Self::brief`] in a word or two, for a column too narrow for it: when the pass comes,
+    /// with no command in it. A column never cuts a statement: it draws this whole or nothing.
+    #[must_use]
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::Nothing | Self::NotAterms | Self::CleanupOff => "nothing",
+            Self::TierPass => "low-disk pass",
+            Self::DailyCache { .. } | Self::DailyUnused { .. } => "daily pass",
+            Self::RunEnd { .. } => "at a run's end",
+            Self::Unknown => "not known",
+        }
+    }
 }
 
 fn days(n: u64) -> String {
@@ -259,12 +292,25 @@ impl Walk {
     }
 
     /// The summary's clause on it, after a ` · `; none where every walk is complete.
-    fn clause(self) -> Option<&'static str> {
+    #[must_use]
+    pub fn clause(self) -> Option<&'static str> {
         match self {
             Self::Complete => None,
             Self::Walking => Some("still walking: sizes are lower bounds"),
             Self::Idle => Some("no walk is asked for now: each size is its last walk's"),
             Self::Stopped => Some("the disk walker is not running: no size is measured anew"),
+        }
+    }
+
+    /// [`Self::clause`] in a few words, for a line that has no room for it (the Disk lens's
+    /// headings and one-line forms); none where every walk is complete.
+    #[must_use]
+    pub fn brief(self) -> Option<&'static str> {
+        match self {
+            Self::Complete => None,
+            Self::Walking => Some("still walking"),
+            Self::Idle => Some("sizes from the last walk"),
+            Self::Stopped => Some("walker not running"),
         }
     }
 }
@@ -317,7 +363,8 @@ pub struct Holding {
     pub next: Next,
 }
 
-/// `sys disk held`'s rows, gathered by the host once per reply.
+/// `sys disk held`'s rows, gathered by the host: once per reply, and by its probe thread at its
+/// own pace for the Disk lens.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Holdings {
     /// One per holding, in no order ([`balance`] orders them).

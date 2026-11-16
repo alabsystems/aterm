@@ -8,7 +8,7 @@ use super::*;
 use crate::commons::bootstrap::Device;
 use crate::membership_log::{
     Author, Authoring, Body, Class, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, Record,
-    RecordId, Root, SeatAudience, Store, encode_records, secure_twins,
+    RecordId, Root, SeatAudience, Store, read_records, secure_twins,
 };
 use aterm_digest::Sha256;
 use aterm_mesh_core::no_lost_edit as nle;
@@ -2243,7 +2243,7 @@ pub(super) fn append_document_diff_to_log(
         && !everyone.waits
         && !drafted.records.is_empty()
     {
-        super::save_records(paths, &encode_records(&drafted.records))?;
+        super::save_records(paths, &read_records(&drafted.records)?)?;
     }
     Ok(drafted)
 }
@@ -2422,7 +2422,7 @@ pub(super) fn hold_drafted(
     write_held(
         &held_draft_file(paths, seq, version),
         reach,
-        &encode_records(&drafted.records),
+        &read_records(&drafted.records)?,
     )
 }
 
@@ -2859,7 +2859,7 @@ pub(super) fn keep_drafted_until(
             commit_authored_records(
                 paths,
                 &mut current,
-                &encode_records(&drafted.records),
+                &read_records(&drafted.records)?,
                 &drafted.records,
             )?;
         }
@@ -2876,7 +2876,9 @@ pub(super) fn keep_drafted_until(
     }
     let by = posts_by.unwrap_or_else(super::fan_out::one_exchange);
     let bound = super::records_bound(paths, &store)?;
-    let _ = super::fan_out::post_records_to(urls, &store.encode(), bound, by);
+    if let Ok(wire) = store.read_encoded() {
+        let _ = super::fan_out::post_records_to(urls, &wire, bound, by);
+    }
     Ok(kept)
 }
 
@@ -4834,7 +4836,7 @@ pub(super) fn author_and_commit_records<T>(
         if minted.is_empty() {
             return Ok((minted, snapshot, out));
         }
-        let wire = encode_records(&minted);
+        let wire = read_records(&minted)?;
         #[cfg(test)]
         author_batch_tests::before_commit();
         let _state = StateLock::take(paths)?;
@@ -4985,7 +4987,7 @@ pub(super) fn author_and_commit_records_held<T>(
         if minted.is_empty() {
             return Ok(Some((minted, snapshot, out)));
         }
-        let wire = encode_records(&minted);
+        let wire = read_records(&minted)?;
         #[cfg(test)]
         author_batch_tests::before_commit();
         let Some(_state) = StateLock::try_take_until(paths, deadline)? else {
@@ -5053,9 +5055,7 @@ pub(super) fn post_records_best_effort(paths: &Paths, wire: &[u8]) {
         && let Source::Url(url) = &cfg.source
         && let Ok(store) = super::load_acknowledged_records(paths)
         && let Ok(records) = crate::membership_log::decode_records(wire)
-        && records
-            .iter()
-            .all(|record| store.complete_bytes(record.id()).is_some())
+        && records.iter().all(|record| store.holds(record.id()))
         && let Ok(bound) = super::records_bound(paths, &store)
     {
         let _ = transport::post_records_answered_until(url, wire, bound, None);
@@ -5307,7 +5307,7 @@ pub fn publish_local_node_key(
         return Ok(None);
     };
     if !minted.is_empty() {
-        post_records_aside(paths, encode_records(&minted));
+        post_records_aside(paths, read_records(&minted)?);
     }
     Ok(minted.into_iter().next())
 }
@@ -5387,7 +5387,7 @@ pub fn publish_local_chosen_name(
         return Ok(None);
     };
     if !minted.is_empty() {
-        post_records_aside(paths, encode_records(&minted));
+        post_records_aside(paths, read_records(&minted)?);
     }
     Ok(minted.into_iter().next())
 }
@@ -5411,7 +5411,7 @@ pub fn admit_member_in_log(
         ))
     })?;
     if !minted.is_empty() {
-        post_records_best_effort(paths, &encode_records(&minted));
+        post_records_best_effort(paths, &read_records(&minted)?);
     }
     Ok(minted)
 }
@@ -5555,7 +5555,7 @@ fn draft_admit_member_in_log(
 pub fn remove_member_in_log(paths: &Paths, target: MemberId) -> crate::Result<Vec<Record>> {
     let minted = super::remove::remove_actor(paths, target)?;
     if !minted.is_empty() {
-        let wire = encode_records(&minted);
+        let wire = read_records(&minted)?;
         post_records_best_effort(paths, &wire);
     }
     Ok(minted)
@@ -5577,7 +5577,7 @@ pub(super) fn retire_recipients_in_log_local(
         Some(lock),
     )?;
     if !minted.is_empty() {
-        let wire = encode_records(&minted);
+        let wire = read_records(&minted)?;
         let _ = super::save_records_unlocked(paths, &wire)?;
         aterm_durable::durable_dir(&paths.dir).map_err(|e| Error::new(e.to_string()))?;
         post_records_best_effort(paths, &wire);
@@ -6546,7 +6546,7 @@ impl RekeyCost {
 /// what it sealed: its own bytes, with the most parents in place of its own.
 fn resealed_bytes(record: &Record) -> usize {
     let parents = crate::membership_log::MAX_PARENTS.saturating_sub(record.parents().len());
-    record.bytes().len().saturating_add(32 * parents)
+    record.wire_len().saturating_add(32 * parents)
 }
 
 /// An upper bound on the keyed records one re-key of `audience` signs, and on their wire bytes,
@@ -7145,7 +7145,7 @@ pub fn enroll_commons_member_in_log(
         })?
         .ok_or_else(|| Error::new("this peer's membership log is busy; try again"))?;
     if !minted.is_empty() {
-        post_records_aside(paths, encode_records(&minted));
+        post_records_aside(paths, read_records(&minted)?);
     }
     let log = committed
         .log()
@@ -7397,10 +7397,11 @@ pub(super) fn mirror_log_to_servers(
         if let Ok(store) = super::load_records(paths)
             && !store.is_empty()
             && let Ok(bound) = super::records_bound(paths, &store)
+            && let Ok(wire) = store.read_encoded()
         {
             let _ = super::fan_out::post_records_to(
                 &candidate_urls,
-                &store.encode(),
+                &wire,
                 bound,
                 super::fan_out::one_exchange(),
             );
@@ -7661,7 +7662,7 @@ fn mirror_heads(
     {
         let _ = super::fan_out::post_records_to(
             candidate_urls,
-            &encode_records(&drafted.records),
+            &read_records(&drafted.records)?,
             bound,
             super::fan_out::one_exchange(),
         );
@@ -8210,7 +8211,7 @@ fn wrap_gaps_pass(
     for gap in &due_now {
         seen.remove(&(gap.epoch, gap.recipient.to_bech32()));
     }
-    store.ingest(&encode_records(&signed))?;
+    store.ingest(&read_records(&signed)?)?;
     super::write_records(paths, &store)?;
     // The digest changed with the new records, so the next pass looks again, with first sight
     // kept for the gaps still open.

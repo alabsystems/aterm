@@ -105,3 +105,36 @@ fn summarize_peer_reads_a_scripted_sibling() {
         assert_eq!(row.sessions, 2, "exited row excluded: {needs:?}");
     }
 }
+
+/// A SCAN IS SENT TO THE WINDOW ONLY WHERE ITS ROWS CHANGED: the first scan is sent, an equal
+/// one after it is not, and a changed one is; a failed send ends the passes. NEGATIVE CONTROL: a
+/// pass that sends every scan sends the equal one too (two sends for identical rows).
+#[test]
+fn identical_scans_are_sent_once() {
+    use super::{Scans, SiblingInstance};
+    use std::cell::RefCell;
+    let one = vec![SiblingInstance {
+        pid: 41,
+        sessions: 2,
+    }];
+    let two = vec![SiblingInstance {
+        pid: 41,
+        sessions: 3,
+    }];
+    let mut script = vec![one.clone(), one.clone(), two.clone()].into_iter();
+    let sent = RefCell::new(Vec::new());
+    let mut scans = Scans::new(
+        || script.next().expect("a scripted scan"),
+        |rows| {
+            sent.borrow_mut().push(rows);
+            true
+        },
+    );
+    assert_eq!(scans.pass(), Some(true));
+    assert_eq!(scans.pass(), Some(true));
+    assert_eq!(sent.borrow().len(), 1, "identical rows are sent once");
+    assert_eq!(scans.pass(), Some(true));
+    assert_eq!(*sent.borrow(), vec![one, two], "the changed rows are sent");
+    let mut gone = Scans::new(Vec::new, |_| false);
+    assert_eq!(gone.pass(), None, "a failed send ends the passes");
+}

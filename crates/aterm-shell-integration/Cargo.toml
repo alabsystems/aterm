@@ -27,7 +27,8 @@ aterm-uds = { workspace = true }
 # verification, spare-FIFO wakes, and live-shell fixtures.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
-# `tab_id::is_tab_id`: a spare FIFO's name ends in its session's tab ID, the one parser's shape.
+# `control_verbs::is_minted_sid`: a spare FIFO's name ends in its session's ID, a tab ID or an
+# earlier build's `s-` one, each in the one parser's shape.
 aterm-types = { workspace = true }
 
 # No wasm32 dependency table: a browser spawns no shell, so the nonce mint exists only

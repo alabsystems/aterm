@@ -391,21 +391,31 @@ pub(super) fn work(pid: i32) -> Option<u64> {
     }
     #[cfg(target_os = "linux")]
     {
-        let stat =
-            aterm_uds::process::read_proc_text(Path::new(&format!("/proc/{pid}/stat"))).ok()?;
-        // The fields after the command name, which ends at the last `)`: the state, the stat's
-        // third field, is at index 0 here, so its fourteenth to seventeenth are at 11 to 14.
-        let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-        fields
-            .get(11..15)?
-            .iter()
-            .try_fold(0_u64, |sum, field| sum.checked_add(field.parse().ok()?))
+        stat_work(
+            &aterm_uds::process::read_proc_text(Path::new(&format!("/proc/{pid}/stat"))).ok()?,
+        )
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = pid;
         None
     }
+}
+
+/// The work a Linux `/proc/<pid>/stat` line records: the sum of its `utime`, `stime`, `cutime`
+/// and `cstime` (its fourteenth to seventeenth fields), in clock ticks. `None` where the line
+/// has no command name, too few fields, or one of those four is not a count. Compiled for tests
+/// on every platform, so the field indexes are checked where no Linux runs.
+#[cfg(any(target_os = "linux", test))]
+fn stat_work(stat: &str) -> Option<u64> {
+    // The fields after the command name, which ends at the last `)` (the name may hold one):
+    // the state, the stat's third field, is at index 0 here, so its fourteenth to seventeenth
+    // are at 11 to 14.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    fields
+        .get(11..15)?
+        .iter()
+        .try_fold(0_u64, |sum, field| sum.checked_add(field.parse().ok()?))
 }
 
 /// A WAITING PRODUCER'S HANG DETECTOR (GATE-WAIT): since when no running holder on record of the

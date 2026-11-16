@@ -76,6 +76,75 @@ pub(crate) const PERSON_HELPER: &str = "/usr/local/libexec/aterm-lab-guest";
 /// build's cdhash, which every checkout's build changes (its debug info names the build folder).
 pub(crate) const PERSON_ID: &str = "aterm-lab-guest";
 
+/// Exact CPU/memory covered by admission, and a nominal decimal-GB disk reporting bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Shape {
+    pub cpus: u32,
+    pub memory_mib: u32,
+    /// Tart's floored logical-storage bucket; actual disk capacity must be below `(gb+1)*1e9`.
+    pub disk_gb: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DiskInterval {
+    pub reported_decimal_gb: u32,
+    pub reported_lower_bytes: u64,
+    pub capacity_upper_exclusive_bytes: u64,
+}
+
+impl Shape {
+    pub(crate) fn disk_interval(self) -> Result<DiskInterval, Fail> {
+        let lower = u64::from(self.disk_gb)
+            .checked_mul(1_000_000_000)
+            .ok_or_else(|| Fail::die("disk interval overflow"))?;
+        let upper = u64::from(self.disk_gb)
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(1_000_000_000))
+            .ok_or_else(|| Fail::die("disk interval overflow"))?;
+        Ok(DiskInterval {
+            reported_decimal_gb: self.disk_gb,
+            reported_lower_bytes: lower,
+            capacity_upper_exclusive_bytes: upper,
+        })
+    }
+}
+
+fn configure_shape<T>(
+    vm: &mut T,
+    shape: Shape,
+    mut get: impl FnMut(&mut T, &'static str) -> Result<aterm_json::Value, Fail>,
+    set: impl FnOnce(&mut T, Shape, bool) -> Result<(), Fail>,
+) -> Result<DiskInterval, Fail> {
+    let bucket = |v: &aterm_json::Value| {
+        if v["Running"].as_bool() != Some(false) || v["State"].as_str() != Some("stopped") {
+            return Err(Fail::die(
+                "VM configuration did not prove a stopped machine",
+            ));
+        }
+        v["Disk"]
+            .as_u64()
+            .ok_or_else(|| Fail::die("Tart did not report an integer disk bucket"))
+    };
+    let before = bucket(&get(vm, "before")?)?;
+    let requested = u64::from(shape.disk_gb);
+    if before > requested {
+        return Err(Fail::die(
+            "the VM's disk exceeds the requested storage bucket",
+        ));
+    }
+    set(vm, shape, before < requested)?;
+    let after = get(vm, "after")?;
+    if bucket(&after)? != requested
+        || after["CPU"].as_u64() != Some(u64::from(shape.cpus))
+        || after["Memory"].as_u64() != Some(u64::from(shape.memory_mib))
+    {
+        return Err(Fail::die(
+            "Tart's post-configuration CPU, memory or disk bucket differs",
+        ));
+    }
+    shape.disk_interval()
+}
+
 /// What a prepared base holds besides SIP on ([`prepared_base_with`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Prep {
@@ -91,6 +160,8 @@ pub(crate) struct Prep {
     /// installs ([`NUX_APP_EXE`]), written into nehelper's record while SIP is off
     /// ([`lan_allow`]): a Mac whose aterm a person once allowed.
     pub lan_allow: bool,
+    /// Configure the preparation clone before every boot; the caller holds its admission.
+    pub shape: Option<Shape>,
 }
 
 /// The executable nux installs and launches (`/Applications/aterm.app`): what a
@@ -102,8 +173,8 @@ pub(crate) const NUX_APP_EXE: &str = "/Applications/aterm.app/Contents/MacOS/ate
 const LAN_ALLOWED_FILE: &str = "nehelper-allowed.plist";
 
 /// The name of the prepared base for `image` and `prep`: [`base_name`], then `-noclt`,
-/// `-lanallow` and `-personid` (grants that require [`PERSON_ID`]) as `prep` asks. Not
-/// `-person-<…>`: a lab from before identifier grants named its base `-person-<digest>` and
+/// `-lanallow`, its explicit shape and `-personid` (grants that require [`PERSON_ID`]) as `prep`
+/// asks. Not `-person-<…>`: a lab from before identifier grants named its base `-person-<digest>` and
 /// deletes every other base under that prefix when it prepares its own.
 #[must_use]
 pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
@@ -114,6 +185,12 @@ pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
     if prep.lan_allow {
         name.push_str("-lanallow");
     }
+    if let Some(shape) = prep.shape {
+        name.push_str(&format!(
+            "-cpu{}-mem{}-disk{}",
+            shape.cpus, shape.memory_mib, shape.disk_gb
+        ));
+    }
     if prep.person.is_some() {
         name.push_str("-personid");
     }
@@ -123,6 +200,9 @@ pub(crate) fn prep_name(image: &str, prep: &Prep) -> String {
 pub const USAGE: &str = "\
 targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM (Apple's Virtualization framework)
   provision     locate Tart or fetch the pinned version when absent; no app build, image pull, VM clone or boot
+  self-cpu --record NEW_DIR [--image REF]
+                build and copy the self-CPU fixture into one disposable SIP-on guest;
+                a single five-second named worker runs only after kernel VM evidence
   commons-startup --aterm FILE --record NEW_DIR [--image REF]
                 the existing guarded Commons startup component in one disposable guest; see `mac commons-startup --help`
   codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF]
@@ -155,6 +235,7 @@ pub const CLEAN_USAGE: &str = "\
 pub fn cmd_mac(args: &[String]) -> Res {
     match args.first().map(String::as_str) {
         Some("provision") => cmd_provision(&args[1..]),
+        Some("self-cpu") => crate::mac_self_cpu::cmd(&args[1..]),
         Some("commons-startup") => crate::mac_commons_startup::cmd(&args[1..]),
         #[cfg(debug_assertions)]
         Some("codex-source-proof") => crate::mac_codex_source_proof::cmd(&args[1..]),
@@ -643,6 +724,21 @@ pub(crate) struct Vm {
     slot: Option<crate::mac_slots::Slot>,
     display_slot: Option<crate::mac_slots::Slot>,
     pub(crate) graphics: bool,
+    /// When present, reapplied before every boot, including preparation and later boots.
+    pub(crate) shape: Option<Shape>,
+    configurations: u64,
+}
+
+fn configure_then_boot<T>(
+    vm: &mut T,
+    shape: Option<Shape>,
+    configure: impl FnOnce(&mut T, Shape) -> Result<(), Fail>,
+    boot: impl FnOnce(&mut T) -> Result<(), Fail>,
+) -> Result<(), Fail> {
+    if let Some(shape) = shape {
+        configure(vm, shape)?;
+    }
+    boot(vm)
 }
 
 impl Vm {
@@ -677,12 +773,115 @@ impl Vm {
             slot: None,
             display_slot: None,
             graphics: false,
+            shape: None,
+            configurations: 0,
         })
+    }
+
+    /// Set the admitted shape while stopped. Keep both complete streams, even on refusal.
+    pub(crate) fn configure(&mut self, shape: Shape) -> Result<(), Fail> {
+        if self.run.is_some() {
+            return Err(Fail::die(
+                "a running VM cannot be configured for another boot",
+            ));
+        }
+        if shape.cpus == 0 || shape.memory_mib == 0 || shape.disk_gb == 0 {
+            return Err(Fail::usage(
+                "a VM shape needs positive CPU, memory and disk bounds",
+            ));
+        }
+        self.configurations = self
+            .configurations
+            .checked_add(1)
+            .ok_or_else(|| Fail::die("VM configuration counter exhausted"))?;
+        let prefix = format!("{}-shape-{}", self.name, self.configurations);
+        let interval = configure_shape(
+            self,
+            shape,
+            |vm, phase| {
+                let output = vm.configuration_output(
+                    &prefix,
+                    phase,
+                    aterm_uds::spawnfd::command(&vm.tart)
+                        .args(["get", &vm.name, "--format", "json"]),
+                )?;
+                aterm_json::from_slice(&output.stdout)
+                    .map_err(|e| Fail::die(format!("invalid complete Tart configuration: {e}")))
+            },
+            |vm, shape, grow| {
+                let mut command = aterm_uds::spawnfd::command(&vm.tart);
+                command.args([
+                    "set",
+                    &vm.name,
+                    "--cpu",
+                    &shape.cpus.to_string(),
+                    "--memory",
+                    &shape.memory_mib.to_string(),
+                ]);
+                if grow {
+                    command.args(["--disk-size", &shape.disk_gb.to_string()]);
+                }
+                vm.configuration_output(&prefix, "set", &mut command)
+                    .map(|_| ())
+            },
+        )?;
+        let record = self
+            .log
+            .parent()
+            .ok_or_else(|| Fail::die("VM log has no record directory"))?;
+        crate::mac_component::json_file(
+            record,
+            &format!("{prefix}.interval.json"),
+            &aterm_json::to_value(interval).map_err(|e| Fail::die(e.to_string()))?,
+        )
+    }
+
+    fn configuration_output(
+        &self,
+        prefix: &str,
+        phase: &str,
+        command: &mut aterm_uds::spawnfd::Command,
+    ) -> Result<std::process::Output, Fail> {
+        let record = self
+            .log
+            .parent()
+            .ok_or_else(|| Fail::die("VM log has no record directory"))?;
+        let prefix = format!("{prefix}.{phase}");
+        let output = capture_output(command, STEP);
+        let out = match output {
+            Ok(out) => out,
+            Err(why) => {
+                crate::mac_component::save(record, &format!("{prefix}.error"), why.as_bytes())?;
+                return Err(not_run(format!("VM shape output unavailable: {why}")));
+            }
+        };
+        crate::mac_component::save(record, &format!("{prefix}.stdout"), &out.stdout)?;
+        crate::mac_component::save(record, &format!("{prefix}.stderr"), &out.stderr)?;
+        crate::mac_component::json_file(
+            record,
+            &format!("{prefix}.status.json"),
+            &aterm_json::json!({"exit":out.status.code(),"success":out.status.success(),"complete":true}),
+        )?;
+        if !out.status.success() {
+            return Err(Fail::die(format!(
+                "tart configuration {phase} {}: {}; complete output: {}/{}.stdout and .stderr",
+                self.name,
+                out.status,
+                record.display(),
+                prefix
+            )));
+        }
+        Ok(out)
     }
 
     /// Boot it with the selected display, the share read-only, and wait for the guest agent ([`ATTEMPT`] at a
     /// time).
     pub(crate) fn boot(&mut self) -> Result<(), Fail> {
+        let shape = self.shape;
+        configure_then_boot(self, shape, Self::configure, Self::boot_configured)
+    }
+
+    fn boot_configured(&mut self) -> Result<(), Fail> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let display_slot = if self.graphics {
             Some(crate::mac_slots::Slot::display()?)
@@ -938,6 +1137,7 @@ pub(crate) fn prepared_base_with(
         "mac: preparing {base} from {image}, once (tart pulls the image first when this Mac has no copy)"
     );
     let mut prep_vm = Vm::clone_from(tart, image, run, share, false)?;
+    prep_vm.shape = prep.shape;
     prep_vm.boot()?;
     between()?;
     let vm = &mut prep_vm;

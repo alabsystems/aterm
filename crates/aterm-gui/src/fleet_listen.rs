@@ -1796,7 +1796,7 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 }),
                 denial_under_take(traffic, window_denied),
             ),
-            members_ask(),
+            (members_ask(), None),
             &stop,
             within,
             move |served, op| {

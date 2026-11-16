@@ -657,30 +657,6 @@ impl<'a> MemoryBrowser<'a> {
         value.pointer("/result/value").cloned().ok_or(Error::Script)
     }
 
-    /// Send one primary-button pointer click inside an admitted page.
-    /// Coordinates are viewport CSS pixels read from that page, never screen coordinates.
-    ///
-    /// # Errors
-    /// The coordinates are invalid, the page is not admitted, or browser control failed.
-    pub fn click(&mut self, page: &Page, x: f64, y: f64) -> Result<(), Error> {
-        self.check_page(page)?;
-        if !x.is_finite()
-            || !y.is_finite()
-            || !(0.0..=16384.0).contains(&x)
-            || !(0.0..=16384.0).contains(&y)
-        {
-            return Err(Error::Script);
-        }
-        for (kind, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
-            self.call(
-                Some(&page.session),
-                "Input.dispatchMouseEvent",
-                json!({"type":kind,"x":x,"y":y,"button":"left","buttons":buttons,"clickCount":1}),
-            )?;
-        }
-        Ok(())
-    }
-
     fn check_page(&self, page: &Page) -> Result<(), Error> {
         if page.context != self.context || page.target.is_empty() || page.session.is_empty() {
             return Err(Error::WrongContext);

@@ -220,7 +220,7 @@ fn a_pin_on_another_row_holds_the_handoff_before_any_provider_read() {
     let source = Identity::from_native("source", "user");
     let (world, reader) = fixture("quota-pinned-elsewhere");
     pin(&world, "work");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -233,7 +233,7 @@ fn a_pin_on_another_row_holds_the_handoff_before_any_provider_read() {
 
     let (world, reader) = fixture("quota-pinned-here");
     pin(&world, "main");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -246,7 +246,7 @@ fn a_pin_on_another_row_holds_the_handoff_before_any_provider_read() {
     assert!(!world.load(Cli::Codex).pinned, "the wall ended the pin");
 
     let (world, reader) = fixture("quota-unpinned");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -282,7 +282,7 @@ fn a_low_row_is_no_handoffs_target() {
         })
         .unwrap();
     let work = world.work_dir(Cli::Codex).join("auth.json");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -293,7 +293,7 @@ fn a_low_row_is_no_handoffs_target() {
     assert!(proposal.is_none(), "{proposal:?}");
     assert!(!reader.calls.borrow().contains(&work), "{:?}", reader.calls);
     let (world, reader) = fixture("quota-room-target");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -343,7 +343,7 @@ fn a_wall_no_recorded_row_can_take_is_read_once() {
             .transact(NOW, &mut None, |state| Ok(work(state)))
             .unwrap();
         for _ in 0..3 {
-            let proposal = codex_rotation::prepare(
+            let proposal = codex_rotation::prepare_once(
                 &world.seat(),
                 &weekly_session(&world),
                 &source,
@@ -360,7 +360,7 @@ fn a_wall_no_recorded_row_can_take_is_read_once() {
     }
 
     let (world, reader) = fixture("quota-row-open");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -398,7 +398,7 @@ fn a_read_that_answers_no_figure_waits_its_rung_not_the_next_ask() {
             now: at,
             ..world.seat()
         };
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &seat,
             &weekly_session(world),
             &source,
@@ -517,7 +517,7 @@ fn a_failed_read_of_a_replaced_login_is_not_its_rows() {
                 })
                 .unwrap();
         }
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &Identity::from_native("source", "user"),
@@ -565,7 +565,7 @@ fn a_handoffs_reads_leave_room_to_record_them() {
     let (world, _) = fixture("quota-record-room");
     let reader = Waits(RefCell::new(Vec::new()));
     let wait = Duration::from_secs(2);
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &Identity::from_native("source", "user"),
@@ -693,7 +693,7 @@ fn selected_quota_guard_requires_pool_commit_both_identities_and_current_policy(
         env.state = world.state.clone();
         env.config = Some(world.cfg.join("aterm.toml"));
         env.now = NOW;
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &Identity::from_native("source", "user"),
@@ -896,7 +896,7 @@ fn terminal_quota_receipts_retire_only_their_exact_pool_binding() {
         env.state = world.state.clone();
         env.config = Some(world.cfg.join("aterm.toml"));
         env.now = NOW;
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &Identity::from_native("source", "user"),
@@ -1064,7 +1064,7 @@ fn quota_proposal_binds_fresh_identities_and_defers_the_pool_commit() {
     let (world, reader) = fixture("quota-proposal");
     let s = weekly_session(&world);
     let expected = Identity::from_native("source", "user");
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &s,
         &expected,
@@ -1095,7 +1095,7 @@ fn native_quota_commit_retries_charge_once_and_refuse_a_different_binding() {
     let s = weekly_session(&world);
     let expected = Identity::from_native("source", "user");
     let prepare = || {
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             &s,
             &expected,
@@ -1136,7 +1136,7 @@ fn concurrent_native_plans_follow_the_proven_target_without_another_rotation() {
     next_session.sid = "next-native-session";
     let expected = Identity::from_native("source", "user");
     let prepare = |session: &Session<'_>| {
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             session,
             &expected,
@@ -1182,7 +1182,7 @@ fn native_quota_retry_cannot_override_a_later_selection_or_unusable_target() {
         let s = weekly_session(&world);
         let expected = Identity::from_native("source", "user");
         let prepare = || {
-            codex_rotation::prepare(
+            codex_rotation::prepare_once(
                 &world.seat(),
                 &s,
                 &expected,
@@ -1259,7 +1259,7 @@ fn quota_proposal_refuses_wrong_source_restored_quota_and_unusable_destinations(
             }
         }
         let s = weekly_session(&world);
-        let result = codex_rotation::prepare(
+        let result = codex_rotation::prepare_once(
             &world.seat(),
             &s,
             &Identity::from_native("source", "user"),
@@ -1287,7 +1287,7 @@ fn disabled_rotation_and_an_expired_budget_make_no_provider_requests() {
             .unwrap();
         }
         let s = weekly_session(&world);
-        let result = codex_rotation::prepare(
+        let result = codex_rotation::prepare_once(
             &world.seat(),
             &s,
             &Identity::from_native("source", "user"),
@@ -1323,7 +1323,7 @@ fn native_exec_proposal_uses_fresh_shared_account_reads_and_typed_dispatch() {
         mode: request.mode,
         relaunch: (),
     };
-    let proposal = codex_rotation::prepare_exec(
+    let proposal = codex_rotation::prepare_exec_once(
         &world.seat(),
         &request,
         &world.exe,
@@ -1401,7 +1401,7 @@ fn a_fresh_read_that_finds_a_row_low_selects_nothing_and_stays_on_record() {
     let work = world.work_dir(Cli::Codex).join("auth.json");
     native_auth(&work, "target");
     reader.answers.insert(work, usage_at("target", 95, 0));
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -1465,7 +1465,7 @@ fn a_candidate_whose_login_reads_signed_out_is_recorded_signed_out() {
                 PathBuf::new()
             },
         };
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &source,
@@ -1570,7 +1570,7 @@ fn a_prepare_keeps_the_reset_a_launch_read_named() {
         Ok(accounts::note_sample(state, "main", read, NOW))
     })
     .unwrap();
-    codex_rotation::prepare(
+    codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &source,
@@ -1676,7 +1676,7 @@ fn a_five_hour_wall_hands_off_and_holds_its_row_only_to_the_five_hour_reset() {
             main_of(&world),
             usage_resetting("source", (100, 40), Some(reset), NOW),
         );
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             &source,
@@ -1723,7 +1723,7 @@ fn a_five_hour_wall_hands_off_and_holds_its_row_only_to_the_five_hour_reset() {
     reader
         .answers
         .insert(main_of(&world), usage_at("source", 100, 100));
-    codex_rotation::prepare(
+    codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &source,
@@ -1768,7 +1768,7 @@ fn a_five_hour_wall_about_to_reset_is_refused_and_charges_nothing() {
             main_of(&world),
             usage_resetting("source", (100, 40), away.map(|away| NOW + away), NOW),
         );
-        let result = codex_rotation::prepare(
+        let result = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             &source,
@@ -1822,7 +1822,7 @@ fn a_row_at_its_five_hour_wall_is_no_handoffs_target() {
         reader
             .answers
             .insert(work.clone(), usage_at("target", 100, 0));
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             &source,
@@ -1863,7 +1863,7 @@ fn two_rows_at_five_hour_walls_do_not_trade_a_session_back_and_forth() {
     );
     let on_main = Identity::from_native("source", "user");
     let on_work = Identity::from_native("target", "user");
-    let first = codex_rotation::prepare(
+    let first = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &on_main,
@@ -1895,7 +1895,7 @@ fn two_rows_at_five_hour_walls_do_not_trade_a_session_back_and_forth() {
             now: at,
             ..world.seat()
         };
-        codex_rotation::prepare(&seat, &session, &on_work, reader, Duration::from_secs(60))
+        codex_rotation::prepare_once(&seat, &session, &on_work, reader, Duration::from_secs(60))
     };
     let walled = NOW + HOUR / 2;
     reader.answers.insert(
@@ -1966,7 +1966,7 @@ fn a_five_hour_wall_with_no_target_waits_only_to_its_own_reset() {
             now: at,
             ..world.seat()
         };
-        codex_rotation::prepare(&seat, &session, &source, reader, Duration::from_secs(60))
+        codex_rotation::prepare_once(&seat, &session, &source, reader, Duration::from_secs(60))
     };
     let back = reset + accounts::RESET_GRACE_S;
     for at in [NOW, NOW + 5, reset, back - 1] {
@@ -2019,7 +2019,7 @@ fn native_exec_proposal_hands_off_at_a_five_hour_wall() {
         mode: request.mode,
         relaunch: (),
     };
-    let proposal = codex_rotation::prepare_exec(
+    let proposal = codex_rotation::prepare_exec_once(
         &world.seat(),
         &request,
         &world.exe,
@@ -2101,7 +2101,7 @@ fn an_exec_session_refused_near_a_five_hour_reset_is_handed_off_at_its_next_wall
             now: at,
             ..world.seat()
         };
-        codex_rotation::prepare_exec(
+        codex_rotation::prepare_exec_once(
             &seat,
             &request,
             &world.exe,
@@ -2196,7 +2196,7 @@ fn a_session_whose_rows_login_names_another_is_told_at_once() {
     .unwrap();
     let login = world.home.join(".codex/auth.json");
     let prepare = || {
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &Identity::from_native("source", "user"),
@@ -2240,7 +2240,7 @@ fn a_candidate_whose_login_names_another_is_not_read() {
         let source = world.home.join(".codex/auth.json");
         let work = world.work_dir(Cli::Codex).join("auth.json");
         native_auth_naming(&work, "target", Some(email));
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &weekly_session(&world),
             &Identity::from_native("source", "user"),
@@ -2472,7 +2472,7 @@ fn a_spend_control_beside_a_five_hour_wall_about_to_reset_leaves() {
         main_of(&world),
         read_refusing("source", Refuses::SpendControl, (100.0, 10.0), Some(reset)),
     );
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &Identity::from_native("source", "user"),
@@ -2500,7 +2500,7 @@ struct Asked {
 fn asked_with(name: &str, read: IdentifiedUsage) -> Asked {
     let (world, mut reader) = fixture(name);
     reader.answers.insert(main_of(&world), read);
-    let result = codex_rotation::prepare(
+    let result = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &Identity::from_native("source", "user"),
@@ -2622,7 +2622,7 @@ fn a_source_refusing_by_any_kind_moves_and_a_row_refusing_so_is_passed_over() {
             main_of(&world),
             read_refusing("source", refuses, roomy, reset),
         );
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             &source,
@@ -2666,7 +2666,7 @@ fn a_source_refusing_by_any_kind_moves_and_a_row_refusing_so_is_passed_over() {
                 read_refusing("source", refuses, roomy, reset),
             );
             reader.answers.insert(work.clone(), candidate);
-            let result = codex_rotation::prepare(
+            let result = codex_rotation::prepare_once(
                 &world.seat(),
                 &asked_session(&world),
                 &source,
@@ -2794,7 +2794,7 @@ fn a_source_walled_on_another_limit_moves_to_a_row_with_room_on_it() {
         ]),
     };
     let ask = |reader: &Reader| {
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             limit_ask(&source),
@@ -2857,7 +2857,7 @@ fn a_source_walled_on_another_limit_moves_to_a_row_with_room_on_it() {
         );
     }
 
-    let control = codex_rotation::prepare(
+    let control = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &source,
@@ -2881,7 +2881,7 @@ fn a_limit_the_sources_read_does_not_list_is_answered_absent() {
         reader
             .answers
             .insert(main_of(&world), read_with_limit("source", (10, 10), other));
-        let result = codex_rotation::prepare(
+        let result = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             limit_ask(&source),
@@ -2949,7 +2949,7 @@ fn another_limit_neither_blocks_nor_holds_an_ordinary_move() {
         })
         .unwrap();
     assert!(condition_at(&world, "work", NOW).fresh());
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &Identity::from_native("source", "user"),
@@ -3170,7 +3170,7 @@ fn a_limit_ask_passes_over_an_active_row_without_room_on_it_and_commits() {
         };
         let ask = || {
             reader.calls.borrow_mut().clear();
-            codex_rotation::prepare(
+            codex_rotation::prepare_once(
                 &world.seat(),
                 &asked_session(&world),
                 limit_ask(&source),
@@ -3231,7 +3231,7 @@ fn a_limit_ask_passes_over_an_active_row_without_room_on_it_and_commits() {
             ),
         ]),
     };
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         limit_ask(&source),
@@ -3284,7 +3284,7 @@ fn a_pin_holds_a_limit_ask_before_any_provider_read() {
         ]),
     };
     for _ in 0..3 {
-        let asked = codex_rotation::prepare(
+        let asked = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             limit_ask(&source),
@@ -3307,7 +3307,7 @@ fn a_pin_holds_a_limit_ask_before_any_provider_read() {
         logins["main"].clone(),
         read_with_limit("source", (10, 100), Some(100)),
     );
-    let control = codex_rotation::prepare(
+    let control = codex_rotation::prepare_once(
         &world.seat(),
         &asked_session(&world),
         &source,
@@ -3346,7 +3346,7 @@ fn a_limit_moves_writer_and_commit_refuse_a_target_that_limit_holds_since_its_pr
                 ),
             ]),
         };
-        let proposal = codex_rotation::prepare(
+        let proposal = codex_rotation::prepare_once(
             &world.seat(),
             &asked_session(&world),
             limit_ask(&source),
@@ -3515,6 +3515,7 @@ fn an_exec_sources_prepare_asks_what_its_intent_asks() {
             &intent,
             &reader,
             Duration::from_secs(60),
+            &mut codex_rotation::ReadPace::new(),
             &world.exe,
         );
         assert_eq!(prepared.err(), Some("exec-source-changed"), "{limit:?}");

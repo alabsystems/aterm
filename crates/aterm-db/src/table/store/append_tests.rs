@@ -628,6 +628,42 @@ fn a_stores_writer_counts_are_what_a_walk_of_its_records_gives() {
     check_usage(combined.observed_primary.as_ref().unwrap(), &session);
 }
 
+/// A read checks each held record's signature through the fact its shared wire keeps
+/// (`signatures::Identified`), never through the process-wide cache alone, which holds 4,096
+/// successes: a table past that, or a process reading other tables, finds none of its own there
+/// (tracker LT-B76; measured on 7,801 records, every read verified every signature again, 1.2 to
+/// 1.6 s a pass). With the cache emptied, two reads of an observed table verify no signature.
+/// NEGATIVE CONTROL: `StoredWire::authenticate` checking a shared wire with
+/// `ReadBatch::authenticate` verifies each record's again: 3, then 3.
+#[test]
+fn a_second_read_of_a_table_past_the_signature_cache_checks_no_signature() {
+    use crate::table::signatures::{test_forget, test_verified};
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let dir = lab._home.path().join("checked-once");
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let mut store = Store::create(&session, &dir).unwrap();
+    let scope = store.scope();
+    for row in [&b"one"[..], b"two", b"three"] {
+        store.commit_catalog(&session, row).unwrap();
+    }
+    drop(store);
+    let observer = Session::observe(&bootstrap).unwrap();
+    let observed = Store::observe(&observer, &dir, scope).unwrap();
+    for read in ["first", "second"] {
+        test_forget();
+        let before = test_verified();
+        let evidence = observed.metadata_evidence(&observer).unwrap();
+        assert_eq!(evidence.len(), 3);
+        assert!(evidence.iter().all(|held| held.record.is_some()));
+        assert_eq!(
+            test_verified() - before,
+            0,
+            "the {read} read verified a signature its wire already holds"
+        );
+    }
+}
+
 /// An open's replay checks each operation record's signature under the identifier its receipt took
 /// as the journal was read (`signatures::Identified`), so each operation record's wire is hashed
 /// once: a writing reopen and a first observation of a table of three operation records hash

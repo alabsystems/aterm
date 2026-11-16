@@ -559,7 +559,7 @@ impl Authoring {
     pub fn classed(records: &[Record], mut class_of: impl FnMut(&Record) -> Option<Class>) -> Self {
         let mut batch = Self::default();
         for record in records {
-            let bytes = record.bytes().len();
+            let bytes = record.wire_len();
             let class = class_of(record);
             batch.bytes = batch.bytes.saturating_add(bytes);
             if record.kind() == Kind::Put {

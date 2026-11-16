@@ -7859,8 +7859,18 @@ fn an_aborted_update_keeps_a_build_it_did_not_create() {
 }
 
 /// [`fixture`] with a harness program, `hx-alab`, in the index and pinned at `pin`, whose build 4
-/// is ay 18's pack under a manifest carrying `table` (none: no `[harness]`).
+/// is ay 18's pack under a manifest carrying `table` (none: no `[harness]`), for [`TRIPLE`].
 fn fixture_with_harness(dir: &Path, pin: Option<u64>, table: Option<&str>) -> Fake {
+    fixture_with_harness_for(dir, pin, table, TRIPLE)
+}
+
+/// [`fixture_with_harness`] whose `hx-alab` manifest carries its one artifact for `triple`.
+fn fixture_with_harness_for(
+    dir: &Path,
+    pin: Option<u64>,
+    table: Option<&str>,
+    triple: &str,
+) -> Fake {
     let fake = fixture(dir);
     let ay = String::from_utf8(fake.pkg[&("ay".to_string(), 18)].0.clone()).unwrap();
     let line = |key: &str| {
@@ -7881,7 +7891,7 @@ fn fixture_with_harness(dir: &Path, pin: Option<u64>, table: Option<&str>) -> Fa
     let body = format!(
         "schema = 2\nprogram = \"hx-alab\"\nversion = \"0.4\"\nbuild_number = 4\n\
          exposes = [\"ay\"]\n{}\n\
-         [[artifact]]\ntarget = \"{TRIPLE}\"\nkind = \"binary\"\nasset = \"ay-18.tar.zst\"\n\
+         [[artifact]]\ntarget = \"{triple}\"\nkind = \"binary\"\nasset = \"ay-18.tar.zst\"\n\
          {}\n{}\nsize = 100\n[artifact.cost]\ndisk_installed = 1048576\n",
         table.unwrap_or(""),
         line("sha256"),
@@ -7978,13 +7988,27 @@ fn a_named_harness_install_never_takes_over_the_persons_pin() {
 
 /// THE UPDATE PASS KEEPS THE RECORDS AN OLDER ATPKG LEFT OUT: hx-alab 4 is current and keeps no
 /// signed manifest; an install that finds it up to date fetches the manifest once and, its tree
-/// being the signed one, keeps its records beside it, its `.harness` among them.
+/// being the signed one for the install's triple, keeps its records beside it, its `.harness`
+/// among them. The install is for a triple this host never reports ([`cli::current_triple`]),
+/// and the manifest carries no artifact for the host's, so a pass that read the signed tree by
+/// the host's triple keeps nothing, on every host.
+///
+/// [`cli::current_triple`]: crate::cli::current_triple
 #[test]
 fn an_up_to_date_harness_build_gets_the_records_an_older_atpkg_left_out() {
+    let elsewhere = crate::manifest::TARGETS
+        .iter()
+        .copied()
+        .find(|triple| *triple != crate::cli::current_triple())
+        .expect("a target that is not this host's");
     let dir = scratch("harness-backfill");
     let layout = layout(&dir);
-    let fake = fixture_with_harness(&dir, Some(4), Some(&hx_table("")));
-    install(&fake, &layout, &anchor(), &HX, fl(0), 0).unwrap();
+    let fake = fixture_with_harness_for(&dir, Some(4), Some(&hx_table("")), elsewhere);
+    let hx = InstallRequest {
+        triple: elsewhere,
+        ..HX
+    };
+    install(&fake, &layout, &anchor(), &hx, fl(0), 0).unwrap();
     let build = layout.build_dir("hx-alab", 4);
     let record = crate::store::sidecar_path(&build, crate::harness_record::RECORD_SUFFIX).unwrap();
     assert!(record.is_file(), "a fresh install keeps its record");
@@ -7999,7 +8023,7 @@ fn an_up_to_date_harness_build_gets_the_records_an_older_atpkg_left_out() {
     }
     let up = InstallRequest {
         installed: Some(4),
-        ..HX
+        ..hx
     };
     let report = install(&fake, &layout, &anchor(), &up, fl(0), 0).unwrap();
     assert!(report.already_current);

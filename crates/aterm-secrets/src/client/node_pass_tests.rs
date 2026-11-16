@@ -1381,18 +1381,12 @@ fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold
     for code in [1, crate::converge::UNFINISHED] {
         let root = aterm_tempfile::tempdir().unwrap();
         let failed = converge_program(root.path(), "retry", &format!("exit {code}"));
-        let held = converge_program(
-            root.path(),
-            "held",
-            &format!("exit {}", crate::converge::HELD),
-        );
         let success = converge_program(root.path(), "success", "exit 0");
         let calls = std::cell::Cell::new(0);
         let start = |_: crate::converge::RepositoryRequest| {
             calls.set(calls.get() + 1);
             Some(ended_runner(match calls.get() {
-                1 | 4 => &failed,
-                2 => &held,
+                1 | 2 | 4 => &failed,
                 _ => &success,
             }))
         };
@@ -1421,17 +1415,17 @@ fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold
         assert_eq!(
             calls.get(),
             2,
-            "a held pass waits for the shared five-second retry"
+            "a second failure waits for its doubled retry"
         );
-        converge.tend_at(11_000, [None; 3], &|| true, &start);
+        converge.tend_at(16_000, [None; 3], &|| true, &start);
         assert_eq!(calls.get(), 2);
-        converge.tend_at(11_001, [None; 3], &|| true, &start);
+        converge.tend_at(16_001, [None; 3], &|| true, &start);
         assert_eq!(
             calls.get(),
             3,
-            "the held pass stays owed at its retry boundary"
+            "the failed pass stays owed at its retry boundary"
         );
-        converge.tend_at(11_002, [None; 3], &|| true, &start);
+        converge.tend_at(16_002, [None; 3], &|| true, &start);
         converge.tend_at(30_000, [None; 3], &|| true, &start);
         assert_eq!(calls.get(), 3, "success ends the retry streak");
 

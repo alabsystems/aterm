@@ -38,6 +38,26 @@ pub enum MachineNickname {
     Conflict,
 }
 
+impl MachineNickname {
+    /// The nickname a `lab/machines` snapshot row holds: unset where its cell is empty, the
+    /// register's own value where the cell shows exactly it (with `nickname_auto` saying whether
+    /// an automatic path wrote it), and a conflict where the cell shows a conflict or a refusal
+    /// in its place.
+    #[must_use]
+    pub fn of_file_row(row: &aterm_file::Row) -> Self {
+        if row.cell("nickname").is_empty() {
+            return Self::Unset;
+        }
+        match row.values.get("nickname").and_then(Value::as_str) {
+            Some(word) if row.cell("nickname") == word => Self::Named {
+                word: word.to_owned(),
+                automatic: row.cell("nickname_auto") == "yes",
+            },
+            _ => Self::Conflict,
+        }
+    }
+}
+
 /// A machine row, by its key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
@@ -355,16 +375,7 @@ impl LabView {
             .rows()
             .iter()
             .map(|row| {
-                let nickname = if row.cell("nickname").is_empty() {
-                    MachineNickname::Unset
-                } else if let Some(word) = unconflicted(row, "nickname") {
-                    MachineNickname::Named {
-                        word,
-                        automatic: yes(row, "nickname_auto"),
-                    }
-                } else {
-                    MachineNickname::Conflict
-                };
+                let nickname = MachineNickname::of_file_row(row);
                 let aliases = row
                     .values
                     .get("aliases")

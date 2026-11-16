@@ -54,6 +54,63 @@ fn quiet_pool_has_zero_cadence_latch_visits_at_repeated_parks() {
 }
 
 #[test]
+fn a_cadence_read_observes_its_selected_latch_without_servicing_or_scanning() {
+    let mut app = app();
+    let visits = crate::wake_census::pool_visits();
+    let empty = app.pool.output_cadence_snapshot(None, CADENCE);
+    assert_eq!(empty.sessions, 201);
+    assert_eq!((empty.ordered, empty.indexed), (0, 0));
+    assert!(empty.selected.is_none());
+
+    hold(&mut app, 197, CADENCE);
+    dirty(&app, 197, CADENCE + 1);
+    let passes = app.pool.output_holds.passes;
+    for at in [CADENCE + 1, 2 * CADENCE, 3 * CADENCE] {
+        let read = app.pool.output_cadence_snapshot(Some(197), at);
+        assert_eq!(read.now_ns, at);
+        assert_eq!((read.ordered, read.indexed), (1, 1));
+        let selected = read.selected.unwrap();
+        assert_eq!(selected.session, 197);
+        assert!(selected.pooled && selected.enrolled && selected.current);
+        assert!(selected.held && selected.dirty);
+        assert_eq!(selected.due_ns, 2 * CADENCE);
+    }
+    let quiet = app
+        .pool
+        .output_cadence_snapshot(Some(198), 3 * CADENCE + 1)
+        .selected
+        .unwrap();
+    assert!(quiet.pooled);
+    assert!(!quiet.enrolled && !quiet.current && !quiet.held && !quiet.dirty);
+    assert_eq!(quiet.due_ns, 0);
+    assert_eq!(app.pool.output_holds.passes, passes);
+    assert_eq!(app.pool.output_holds.visits, 0);
+    assert_eq!(crate::wake_census::pool_visits(), visits);
+
+    // A real reader clear leaves an indexed candidate until UI service sees it. A
+    // diagnostic must preserve, and distinguish, that state rather than repair it.
+    spawn::PostCadence::default().foreground_edge(&app.pool.get(197).unwrap().output_wake_pending);
+    let cleared = app
+        .pool
+        .output_cadence_snapshot(Some(197), 3 * CADENCE + 2)
+        .selected
+        .unwrap();
+    assert!(cleared.enrolled && cleared.current);
+    assert!(!cleared.held && !cleared.dirty);
+    assert_eq!(app.pool.output_holds.ordered.len(), 1);
+    assert_eq!(park(&mut app, 3 * CADENCE + 2), None);
+    let retired = app.pool.output_cadence_snapshot(Some(197), 4 * CADENCE);
+    assert_eq!((retired.ordered, retired.indexed), (0, 0));
+    assert!(!retired.selected.unwrap().enrolled);
+    let absent = app
+        .pool
+        .output_cadence_snapshot(Some(404), 4 * CADENCE)
+        .selected
+        .unwrap();
+    assert!(!absent.pooled && !absent.enrolled && !absent.current && !absent.held);
+}
+
+#[test]
 fn repeated_actual_rearms_replace_the_owned_record_without_stale_heap_growth() {
     let mut app = app();
     for turn in 1..=1000 {

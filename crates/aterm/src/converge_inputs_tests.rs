@@ -8,8 +8,13 @@ use aterm_machines::port::{Fake, Stat};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The managed Git setup runs is its build's own `bin/git`, never the PATH entry atpkg laid for
+/// it (on macOS a `/bin/sh` script that execs it), so a broken entry stops no git setup runs.
+/// The entry admits the build, so its repair is heard as new readiness, once, and leaves the
+/// git setup runs, its file and the private inputs as they were.
+/// NEGATIVE CONTROL: the broken entry itself fails where it is run.
 #[test]
-fn repairing_the_executed_git_shim_wakes_the_same_admitted_build() {
+fn repairing_the_managed_git_entry_wakes_the_same_git_setup_runs() {
     // Every look here falls within one minute of the first ([`CHECKOUT_LOOK`]).
     let now = Instant::now();
     use std::os::unix::fs::PermissionsExt as _;
@@ -61,38 +66,42 @@ fn repairing_the_executed_git_shim_wakes_the_same_admitted_build() {
         sys.vault_set(&home, name, bytes);
     }
     let paths = Paths::locate_for_home(&home);
-    let mut inputs = Inputs::new(&sys, &paths, true, now);
+    let mut inputs = Inputs::new(&sys, &paths, None, true, now);
     let installed = aterm_machines::items::github::installed_git_for(&sys, Some(&home)).unwrap();
-    assert_eq!(installed, shim, "the actual command uses the managed shim");
-    assert!(
-        !aterm_uds::spawnfd::command(&installed)
-            .output()
-            .unwrap()
-            .status
-            .success()
+    assert_eq!(
+        installed, payload,
+        "setup runs the build's own git, not its PATH entry"
     );
-    let identity = aterm_machines::items::github::installed_git_identity(&sys);
-    let payload_version = sys.file_version(&payload).unwrap();
-    let before = repository_input_mark(&sys).unwrap();
-    let watched = repository_input_watch_paths(&sys).unwrap();
-    assert!(watched.contains(&shim) && watched.contains(&payload));
-
-    // The package repair producer restores the execution route without reinstalling
-    // the already admitted payload, touching private inputs, or changing its selection.
-    atpkg::platform::install_shim_to(&shim, &payload).unwrap();
-    let repaired = std::fs::read(&shim).unwrap();
-    sys.file(shim.to_str().unwrap(), &repaired)
-        .stat_of(shim.to_str().unwrap(), Live::new().stat(&shim).unwrap());
     assert!(
         aterm_uds::spawnfd::command(&installed)
             .output()
             .unwrap()
             .status
-            .success()
+            .success(),
+        "a broken entry stops nothing setup runs"
     );
+    assert!(
+        !aterm_uds::spawnfd::command(&shim)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "control: the broken entry fails where it is run"
+    );
+    let payload_version = sys.file_version(&payload).unwrap();
+    let before = repository_input_mark(&sys).unwrap();
+    let watched = repository_input_watch_paths(&sys).unwrap();
+    assert!(watched.contains(&shim) && watched.contains(&payload));
+
+    // The package repair producer restores the PATH entry without reinstalling the already
+    // admitted build, touching private inputs, or changing which git setup runs.
+    atpkg::platform::install_shim_to(&shim, &payload).unwrap();
+    let repaired = std::fs::read(&shim).unwrap();
+    sys.file(shim.to_str().unwrap(), &repaired)
+        .stat_of(shim.to_str().unwrap(), Live::new().stat(&shim).unwrap());
     assert_eq!(
-        aterm_machines::items::github::installed_git_identity(&sys),
-        identity
+        aterm_machines::items::github::installed_git_for(&sys, Some(&home)),
+        Some(payload.clone())
     );
     assert_eq!(sys.file_version(&payload).unwrap(), payload_version);
     for (name, bytes) in &private {
@@ -108,7 +117,7 @@ fn repairing_the_executed_git_shim_wakes_the_same_admitted_build() {
     );
     assert!(
         inputs.changed(&sys, true, now).unwrap() == Some(RepositoryWork::Refresh),
-        "the repaired execution route is new readiness"
+        "the repaired entry is new readiness"
     );
     assert!(
         inputs.changed(&sys, true, now).unwrap().is_none(),
@@ -180,7 +189,7 @@ fn repaired_materialization_parent_wakes_without_changing_the_credential_inode()
     let metadata = Metadata::read(&sys, &paths, None, &mut RepositoryInputPathCache::default())
         .unwrap()
         .0;
-    let mut inputs = Inputs::new(&sys, &paths, true, now);
+    let mut inputs = Inputs::new(&sys, &paths, None, true, now);
     assert!(
         inputs.changed(&sys, true, now).unwrap().is_none(),
         "blocked but unchanged"
@@ -234,6 +243,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     let mut cold = Readiness::new(
         &sys,
         &paths,
+        None,
         || panic!("an unread account cannot inspect sharing or holds"),
         || panic!("an unread account cannot establish a receipt basis"),
         now,
@@ -322,7 +332,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     sys.on_vault_read(move |_, _| {
         counted.fetch_add(1, Ordering::SeqCst);
     });
-    let mut inputs = Inputs::new(&sys, &paths, true, now);
+    let mut inputs = Inputs::new(&sys, &paths, None, true, now);
     // What moved the mark is taken with each look that called for work (`take_moved`), as
     // classes: the first look has no mark before it.
     assert_eq!(inputs.take_moved(), (MarkMoved::FIRST, 1));
@@ -430,7 +440,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     let owned = sys.stat(std::path::Path::new(&profile)).unwrap();
     sys.stat_of(&profile, Stat { uid: 0, ..owned });
     assert_eq!(
-        Inputs::new(&sys, &paths, true, minute(5)).unsettled,
+        Inputs::new(&sys, &paths, None, true, minute(5)).unsettled,
         None,
         "a refused declaration owes no settle look"
     );
@@ -499,6 +509,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     let mut refused = Readiness::new(
         &root,
         &paths,
+        None,
         || panic!("root cannot inspect this login's inputs"),
         || panic!("root cannot establish this login's receipt basis"),
         now,
@@ -526,7 +537,7 @@ fn local_readiness_changes_wake_once_without_programs_or_unchanged_private_reads
     );
     assert_eq!(refused.take_moved(), (MarkMoved::default(), 0), "taken");
     // Receipt first, then local source capture, exactly as the real factory.
-    let mut delayed = Inputs::new(&sys, &paths, true, now);
+    let mut delayed = Inputs::new(&sys, &paths, None, true, now);
     let mut cursor = RepositoryRefreshCursor::new(before, delayed.seen.as_ref());
     assert!(
         delayed
@@ -909,6 +920,7 @@ fn inputs_owe_their_next_look_by_what_no_watch_hears() {
     let now = Instant::now();
     let mut inputs = Inputs {
         paths: Paths::locate_for_home(std::path::Path::new("/inputs-next-look")),
+        state: None,
         metadata: None,
         seen: None,
         held: false,
@@ -943,6 +955,7 @@ fn inputs_owe_their_next_look_by_what_no_watch_hears() {
         RepositoryRefreshCursor::new(aterm_secrets::converge::RefreshObservation::default(), None);
     let mut readiness = Readiness {
         paths,
+        state: None,
         ready: Some((inputs, cursor)),
     };
     assert_eq!(
@@ -953,6 +966,7 @@ fn inputs_owe_their_next_look_by_what_no_watch_hears() {
     let mut observed = Observed {
         readiness: Readiness {
             paths: readiness.paths.clone(),
+            state: None,
             ready: readiness.ready.take(),
         },
         watched: None,
@@ -1037,4 +1051,164 @@ fn the_watch_follows_what_the_last_look_read() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
+}
+
+/// A CONVERGE PASS'S OWN CHECKOUT WRITES CALL FOR NO REPAIR (FL-163): a write the pass made to a
+/// watched checkout through [`PassWrites`](aterm_machines::init_github::PassWrites), recorded in
+/// the pass record under the account's state folder, moves the checkout exactly as the record
+/// says, so the look that reads it once the effect ended calls for nothing, and so does a look
+/// while the effect runs, which judges it once it ended. What else wrote still calls for repair:
+/// a write after the pass's effect, a write during the pass before the effect began (the effect
+/// began from another checkout than the one the observer last compared), and an effect's work
+/// once its pass's process is gone.
+/// NEGATIVE CONTROL: `Inputs::own_writes` answering [`Accounted::Not`] makes the first look a
+/// repair, as before the record; answering [`Accounted::Own`] makes each later repair nothing.
+#[test]
+fn a_passs_own_checkout_writes_call_for_no_repair() {
+    use aterm_machines::init_github::{PassWrites, Wrote};
+    use aterm_machines::sync::repository_refresh::RepositoryPass;
+
+    let now = Instant::now();
+    let minute = |n: u32| now + CHECKOUT_LOOK * n;
+    let user = User {
+        name: "fixture".into(),
+        uid: 501,
+        gid: 20,
+        home: "/own-writes-home".into(),
+        shell: "/bin/zsh".into(),
+        admin: false,
+    };
+    let paths = Paths::locate_for_home(std::path::Path::new(&user.home));
+    let mut sys = Fake::root();
+    sys.euid = user.uid;
+    sys.logged_in(&user);
+    let file = |path: &str, bytes: &[u8]| {
+        sys.file(path, bytes).stat_of(
+            path,
+            Stat {
+                uid: user.uid,
+                gid: user.gid,
+                mode: 0o600,
+                dir: false,
+                symlink: false,
+                len: bytes.len() as u64,
+            },
+        );
+    };
+    let profile = format!("{}/.config/aterm/init.toml", user.home);
+    let store = paths.dir.join("state.toml");
+    file(&profile, b"");
+    sys.vault_set(&user.home, "gh_access_token", b"inert_token_one");
+    sys.vault_set(
+        &user.home,
+        "github-repositories.json",
+        br#"{"schema":2,"account":"fixture","repositories":[{"id":1,"name":"code","owner":{"login":"fixture"},"full_name":"fixture/code","clone_url":"https://github.com/fixture/code.git","private":true,"default_branch":"main"}]}"#,
+    );
+    file(
+        store.to_str().unwrap(),
+        b"gh_access_token github-repositories.json",
+    );
+    let directory = Stat {
+        uid: user.uid,
+        gid: user.gid,
+        mode: 0o700,
+        dir: true,
+        symlink: false,
+        len: 0,
+    };
+    sys.stat_of(&user.home, directory);
+    for parent in [std::path::Path::new(&profile), store.as_path()]
+        .into_iter()
+        .flat_map(|leaf| leaf.ancestors().skip(1))
+    {
+        sys.stat_of(parent.to_str().unwrap(), directory);
+    }
+    file(&format!("{}/.local/bin/aterm", user.home), b"helper one");
+    sys.executable(aterm_machines::items::github::CLT_GIT, b"git one");
+    let checkout = format!("{}/code", user.home);
+    let config = format!("{checkout}/.git/config");
+    sys.stat_of(&checkout, directory);
+    sys.stat_of(&format!("{checkout}/.git"), directory);
+    file(&config, b"[core]\n");
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let state = scratch.path().to_path_buf();
+    let pid = std::process::id();
+    sys.born(pid, 1_000);
+    let mut inputs = Inputs::new(&sys, &paths, Some(state.clone()), true, now);
+    assert_eq!(inputs.take_moved(), (MarkMoved::FIRST, 1));
+    let pass = RepositoryPass::open(&state, 0)
+        .unwrap()
+        .pass
+        .expect("no other pass holds the lock");
+    let writes = PassWrites::new(&sys, &user, Arc::clone(&pass))
+        .expect("the default inventory's checkouts are watched");
+    let folder = std::path::Path::new(&checkout);
+
+    writes.around(&sys, folder, || {
+        file(&config, b"[core]\n\tuntrackedCache = true\n");
+        ((), Wrote::Own)
+    });
+    assert_eq!(
+        inputs.changed(&sys, true, minute(1)).unwrap(),
+        None,
+        "the pass's own write calls for no repair"
+    );
+    writes.around(&sys, folder, || {
+        file(
+            &config,
+            b"[core]\n\tuntrackedCache = true\n\tfsmonitor = false\n",
+        );
+        assert_eq!(
+            inputs.changed(&sys, true, minute(2)).unwrap(),
+            None,
+            "a look while the pass's effect runs waits for its end"
+        );
+        ((), Wrote::Own)
+    });
+    assert_eq!(
+        inputs.changed(&sys, true, minute(3)).unwrap(),
+        None,
+        "the effect once it ended is the pass's own"
+    );
+    assert_eq!(inputs.take_moved(), (MarkMoved::default(), 0));
+
+    file(&config, b"[core]\n\tbare = false\n");
+    assert_eq!(
+        inputs.changed(&sys, true, minute(4)).unwrap(),
+        Some(RepositoryWork::Repair),
+        "a write after the pass's effect still calls for repair"
+    );
+    assert_eq!(inputs.take_moved(), (MarkMoved::CONFIG, 1));
+
+    file(
+        &config,
+        b"[core]\n\tbare = false\n\tlogallrefupdates = true\n",
+    );
+    writes.around(&sys, folder, || {
+        file(
+            &config,
+            b"[core]\n\tbare = false\n\tlogallrefupdates = true\n\tuntrackedCache = true\n",
+        );
+        ((), Wrote::Own)
+    });
+    assert_eq!(
+        inputs.changed(&sys, true, minute(5)).unwrap(),
+        Some(RepositoryWork::Repair),
+        "a write during the pass, before its effect began, still calls for repair"
+    );
+    assert_eq!(inputs.take_moved(), (MarkMoved::CONFIG, 1));
+
+    writes.around(&sys, folder, || {
+        file(&config, b"[core]\n\tfsmonitor = false\n");
+        sys.born(pid, 2_000);
+        let work = inputs.changed(&sys, true, minute(6)).unwrap();
+        sys.born(pid, 1_000);
+        assert_eq!(
+            work,
+            Some(RepositoryWork::Repair),
+            "an effect whose pass's process is gone accounts for nothing"
+        );
+        ((), Wrote::Own)
+    });
+    assert_eq!(inputs.changed(&sys, true, minute(7)).unwrap(), None);
 }

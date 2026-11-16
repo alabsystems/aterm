@@ -65,46 +65,53 @@ fn the_real_lint_stage_installs_pool_flags_without_an_outer_wrapper() {
         admit_memory: admit,
         ..crate::LIVE
     };
-    let _ = crate::staged(&ctx, &quiet, &spec, None, seams, &early, || {
-        assert_eq!(current(), Some(3));
-        let pool = ctx.pool.as_ref().unwrap();
-        let mut command = aterm_uds::spawnfd::command("unused");
-        configure(&mut command);
-        assert!(
-            command
-                .get_envs()
-                .any(|(k, v)| k == "MAKEFLAGS" && v == Some(std::ffi::OsStr::new(&pool.flags())))
+    let _ =
+        crate::staged(
+            &ctx,
+            &quiet,
+            &spec,
+            None,
+            seams,
+            crate::StageAdmission::Conservative(&early),
+            || {
+                assert_eq!(current(), Some(3));
+                let pool = ctx.pool.as_ref().unwrap();
+                let mut command = aterm_uds::spawnfd::command("unused");
+                configure(&mut command);
+                assert!(command.get_envs().any(
+                    |(k, v)| k == "MAKEFLAGS" && v == Some(std::ffi::OsStr::new(&pool.flags()))
+                ));
+                assert!(
+                    !command
+                        .get_envs()
+                        .any(|(name, _)| { name == "RUSTC_WRAPPER" || name == UNIT_MODE })
+                );
+                let tokens: Vec<_> = (0..3)
+                    .map(|_| pool.try_acquire().unwrap().unwrap())
+                    .collect();
+                assert!(pool.try_acquire().unwrap().is_none());
+                drop(tokens);
+                let meter = crate::memory::current().unwrap();
+                meter.started();
+                meter.book(
+                    123,
+                    &[aterm_sysprobe::MemberUsage {
+                        pid: 123,
+                        start: 1,
+                        cpu_ns: 1,
+                        runnable_ns: 1,
+                        io_bytes: 0,
+                        footprint: 8 << 20,
+                        peak_footprint: 8 << 20,
+                    }],
+                );
+                meter.ended(123);
+                observed.set(true);
+                let mut report = crate::Report::new("lint");
+                report.pass("ran with the shared pool");
+                report
+            },
         );
-        assert!(
-            !command
-                .get_envs()
-                .any(|(name, _)| { name == "RUSTC_WRAPPER" || name == UNIT_MODE })
-        );
-        let tokens: Vec<_> = (0..3)
-            .map(|_| pool.try_acquire().unwrap().unwrap())
-            .collect();
-        assert!(pool.try_acquire().unwrap().is_none());
-        drop(tokens);
-        let meter = crate::memory::current().unwrap();
-        meter.started();
-        meter.book(
-            123,
-            &[aterm_sysprobe::MemberUsage {
-                pid: 123,
-                start: 1,
-                cpu_ns: 1,
-                runnable_ns: 1,
-                io_bytes: 0,
-                footprint: 8 << 20,
-                peak_footprint: 8 << 20,
-            }],
-        );
-        meter.ended(123);
-        observed.set(true);
-        let mut report = crate::Report::new("lint");
-        report.pass("ran with the shared pool");
-        report
-    });
     assert!(observed.get(), "the lint callback must actually run");
     assert_eq!(current(), None);
     let ordinary = crate::memory::Key::of_stage(&spec, &ctx);
@@ -1005,23 +1012,31 @@ fn an_obsolete_tippy_unit_book_cannot_replace_the_whole_stage_claim() {
         assert!(UNITS.with(|slot| slot.borrow().is_none()));
         let quiet = crate::Quiet::of(&ctx, std::slice::from_ref(&spec), crate::LIVE.admit_quiet);
         let ran = std::cell::Cell::new(false);
-        let _ = crate::staged(&ctx, &quiet, &spec, None, crate::LIVE, &early, || {
-            let rows = aterm_capacity::Ledger::at(&ledger_path).list().unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].accounting, aterm_capacity::Accounting::Holder);
-            assert!(rows[0].held.is_some());
-            let mut command = aterm_uds::spawnfd::command("unused");
-            configure(&mut command);
-            assert!(
-                !command
-                    .get_envs()
-                    .any(|(name, _)| name == "RUSTC_WRAPPER" || name == UNIT_MODE)
-            );
-            ran.set(true);
-            let mut report = crate::Report::new("lint");
-            report.pass("ran with its exact early claim");
-            report
-        });
+        let _ = crate::staged(
+            &ctx,
+            &quiet,
+            &spec,
+            None,
+            crate::LIVE,
+            crate::StageAdmission::Conservative(&early),
+            || {
+                let rows = aterm_capacity::Ledger::at(&ledger_path).list().unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].accounting, aterm_capacity::Accounting::Holder);
+                assert!(rows[0].held.is_some());
+                let mut command = aterm_uds::spawnfd::command("unused");
+                configure(&mut command);
+                assert!(
+                    !command
+                        .get_envs()
+                        .any(|(name, _)| name == "RUSTC_WRAPPER" || name == UNIT_MODE)
+                );
+                ran.set(true);
+                let mut report = crate::Report::new("lint");
+                report.pass("ran with its exact early claim");
+                report
+            },
+        );
         assert!(ran.get());
         assert!(UNITS.with(|slot| slot.borrow().is_none()));
         assert!(early.take(crate::plan::StageId::Tippy).is_none());

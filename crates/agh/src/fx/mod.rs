@@ -567,7 +567,15 @@ impl Fx {
         Fx::over(Seam::Live(Mutex::new(LiveSeam::new(OsEffects::new()))))
     }
 
-    pub(crate) fn with_git_stop(mut self, stop: Option<Arc<std::sync::atomic::AtomicBool>>) -> Fx {
+    /// Set an owner's cooperative native Git stop request, or clear it with `None`.
+    ///
+    /// Native operations observe the flag and retire their actual child before returning.
+    /// Journaled writes still return through intent settlement: a stop does not establish
+    /// whether a dispatched write reached its remote, and an unknown intent stays open.
+    /// The caller retains the operation's owner until it returns; setting the flag neither
+    /// kills that owner nor authorizes replay. This does not cancel HTTP requests.
+    #[must_use]
+    pub fn with_git_stop(mut self, stop: Option<Arc<std::sync::atomic::AtomicBool>>) -> Fx {
         self.git_stop = stop;
         self
     }

@@ -3,8 +3,8 @@
 
 use super::*;
 
-/// [`lane`] for a test of its pacing: `pass` takes no start note and measures no CPU, and the
-/// clock is the real one, as the lane's was before its passes were noted.
+/// [`lane`] for a test of its pacing: `pass` takes no start note, and the clock is the real one,
+/// as the lane's was before its passes were noted.
 #[cfg(unix)]
 fn lane_plain(
     pass: &mut dyn FnMut(&str, aterm_secrets::converge::RepositoryWork) -> Ended,
@@ -13,7 +13,7 @@ fn lane_plain(
 ) {
     let clock = std::time::Instant::now();
     lane(
-        &mut |trigger, work, _| (pass(trigger, work), None),
+        &mut |trigger, work, _| pass(trigger, work),
         log,
         wait,
         &mut || u64::try_from(clock.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -21,39 +21,27 @@ fn lane_plain(
 }
 
 /// EACH WINDOW PASS IS STARTED UNDER A NOTE THAT SAYS WHY, IN FULL: the first pass is `first`;
-/// a timer names how the pass before it ended (`timer` after one that ran, `retry-held`,
-/// `retry-unfinished`, `retry-failed`); a network move is `network` and an input its work. A
-/// pass that found the lock held is still owed for its own causes, so the pass after it names
-/// them again beside `retry-held`, with how many passes in a row were held, the CPU they
-/// spent and the time since the first of them ended; a pass that ended any other way settles
-/// all of that. An input's note also names what moved the inputs' mark and in how many looks,
-/// and a held pass carries those too, adding the next input's. On a stepped clock (1 s a
-/// reading) the thirteen notes are exactly those below.
-/// NEGATIVE CONTROLS: a timer read as `timer` however the last pass ended makes the third
-/// note `c=timer,h=1,hc=7,w=1000`; a held pass whose causes are not carried makes it
-/// `c=retry-held,h=1,hc=7,w=1000`; a held pass whose mark moves are not carried makes the
-/// eleventh `c=input-repair+retry-held,h=1,hc=4,w=1000`.
+/// a timer names how the pass before it ended (`timer` after one that ran, `retry-failed`,
+/// `retry-unfinished`); a network move is `network` and an input its work, with what moved the
+/// inputs' mark and in how many looks. Each note is its own start's alone: nothing of one is
+/// carried to the next, so the eight notes are exactly those below.
+/// NEGATIVE CONTROLS: a timer read as `timer` however the last pass ended makes the third note
+/// `c=timer`; a lane that keeps the last note's classes makes the eighth `c=timer,m=config,n=2`.
 #[cfg(unix)]
 #[test]
-fn each_window_pass_is_started_under_a_note_of_its_causes_and_held_starts() {
+fn each_window_pass_is_started_under_a_note_of_its_causes() {
     use crate::network_moved::Woke;
     use aterm_secrets::converge::MarkMoved;
-    use aterm_secrets::converge::RepositoryWork::{Refresh, Repair};
-    use std::time::Duration;
+    use aterm_secrets::converge::RepositoryWork::Repair;
     let mut ends = [
-        (Ended::Ran, Some(Duration::from_millis(900))),
-        (Ended::Held, Some(Duration::from_millis(7))),
-        (Ended::Held, Some(Duration::from_millis(5))),
-        (Ended::Failed(Some(1)), Some(Duration::from_millis(800))),
-        (Ended::Unfinished, None),
-        (Ended::Ran, None),
-        (Ended::Failed(Some(1)), None),
-        (Ended::Unfinished, None),
-        (Ended::Ran, None),
-        (Ended::Held, Some(Duration::from_millis(4))),
-        (Ended::Held, Some(Duration::from_millis(6))),
-        (Ended::Ran, None),
-        (Ended::Ran, None),
+        Ended::Ran,
+        Ended::Failed(Some(1)),
+        Ended::Unfinished,
+        Ended::Ran,
+        Ended::Ran,
+        Ended::Ran,
+        Ended::Ran,
+        Ended::Ran,
     ]
     .into_iter();
     let mut wakes = [
@@ -62,17 +50,11 @@ fn each_window_pass_is_started_under_a_note_of_its_causes_and_held_starts() {
         LaneWake::Network(Woke::Timer),
         LaneWake::Inputs(Repair, MarkMoved::default(), 0),
         LaneWake::Network(Woke::Route),
-        LaneWake::Inputs(Refresh, MarkMoved::default(), 0),
-        LaneWake::Network(Woke::Timer),
-        LaneWake::Network(Woke::Timer),
         LaneWake::Inputs(Repair, MarkMoved::CONFIG, 2),
-        LaneWake::Network(Woke::Timer),
-        LaneWake::Inputs(Repair, MarkMoved::INDEX, 1),
         LaneWake::Network(Woke::Timer),
     ]
     .into_iter();
     let mut notes = Vec::new();
-    let mut clock = 0_u64;
     lane(
         &mut |_, _, note| {
             notes.push(note.word());
@@ -80,38 +62,32 @@ fn each_window_pass_is_started_under_a_note_of_its_causes_and_held_starts() {
         },
         &mut |_| {},
         &mut |_| wakes.next(),
-        &mut || {
-            clock += 1000;
-            clock
-        },
+        &mut || 0,
     );
     assert_eq!(
         notes,
         [
             "c=first",
             "c=timer",
-            "c=retry-held+timer,h=1,hc=7,w=1000",
-            "c=retry-held+timer,h=2,hc=12,w=3000",
-            "c=input-repair",
-            "c=network",
-            "c=input-refresh",
             "c=retry-failed",
             "c=retry-unfinished",
+            "c=input-repair",
+            "c=network",
             "c=input-repair,m=config,n=2",
-            "c=input-repair+retry-held,h=1,hc=4,w=1000,m=config,n=2",
-            "c=input-repair+retry-held,h=2,hc=10,w=3000,m=config+index,n=3",
             "c=timer",
         ]
     );
 }
 
 /// THE WINDOW'S OWN PASS STARTS ITS RUNNER UNDER THE NOTE THE LANE GAVE IT: the live lane's
-/// `pass` builds its runner inside that note (`aterm_secrets::converge::noting`), so the runner
-/// reads the note's word in `aterm_secrets::converge::START_NOTE_ENV`, as `aterm init
-/// --converge` does; a runner that found the lock held ends the pass `Ended::Held`, with its
-/// CPU where this target measures a wait, and is no ended pass.
-/// NEGATIVE CONTROL: a `pass` that starts its runner outside `noting` leaves the variable unset:
-/// the runner writes `""` where `"c=retry-held+timer,h=1,hc=7,w=1000,m=index,n=1"` is wanted.
+/// pass (`window_pass`, the one `spawn_lane` hands the lane) hands that note to `pass`, which
+/// builds its runner inside it (`aterm_secrets::converge::noting`), so the runner reads the
+/// note's word in `aterm_secrets::converge::START_NOTE_ENV`, as `aterm init --converge` does, and
+/// the pass ends as its runner did.
+/// NEGATIVE CONTROLS: a `pass` that starts its runner outside `noting` leaves the variable
+/// unset: the runner writes `""` where `"c=input-repair,m=index,n=1"` is wanted. A `window_pass`
+/// that hands `pass` `StartNote::default()` in place of the lane's note does the same: `""` where
+/// that word is wanted.
 #[cfg(unix)]
 #[test]
 fn the_window_pass_starts_its_runner_under_its_note() {
@@ -124,7 +100,7 @@ fn the_window_pass_starts_its_runner_under_its_note() {
     std::fs::write(
         &runner,
         format!(
-            "#!{}\nprintf '%s' \"${START_NOTE_ENV}\" > '{}'\nexit 75\n",
+            "#!{}\nprintf '%s' \"${START_NOTE_ENV}\" > '{}'\nexit 0\n",
             sh.display(),
             said.display()
         ),
@@ -132,31 +108,104 @@ fn the_window_pass_starts_its_runner_under_its_note() {
     .unwrap();
     std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
     let note = StartNote {
-        causes: Causes::TIMER.with(Causes::RETRY_HELD),
-        held: 1,
-        held_cpu_ms: 7,
-        waited_ms: 1000,
+        causes: Causes::INPUT_REPAIR,
         moved: MarkMoved::INDEX,
         moves: 1,
     };
-    let (ended, cpu) = pass(
-        &runner,
+    let ended = window_pass(&runner)(
         aterm_secrets::converge::WINDOW,
         RepositoryWork::Refresh,
         &note,
     );
-    assert_eq!(ended, Ended::Held);
-    assert_eq!(
-        cpu.is_some(),
-        cfg!(all(
-            target_pointer_width = "64",
-            any(target_vendor = "apple", target_os = "linux")
-        ))
-    );
+    assert_eq!(ended, Ended::Ran);
     assert_eq!(
         std::fs::read_to_string(&said).unwrap(),
-        "c=retry-held+timer,h=1,hc=7,w=1000,m=index,n=1"
+        "c=input-repair,m=index,n=1"
     );
+}
+
+/// A WINDOW PASS THAT MEETS THE LOCK ANOTHER PROCESS HOLDS WAITS FOR IT AND RUNS ONCE IT IS LET
+/// GO: the live lane's `pass` starts one runner, which waits for `align.lock` in the kernel as
+/// `aterm init --converge --trigger window` does (`aterm_machines::sync::wait_lock`; here
+/// `lockf`, which takes the same BSD lock on the same file). While the holder keeps it the lane
+/// stays in that one pass: no second runner starts and no retry is waited out. Once it is let
+/// go the runner takes the lock and ends, the pass ran, and the lane's next wait is the
+/// recheck ([`crate::secrets_join::MEND_EVERY`]), not a retry five seconds on.
+/// NEGATIVE CONTROL: a runner that ends at once for the held lock (exit 75, as each did before
+/// runners waited) ends the pass while the lock is still held, and the lane's next wait is a
+/// retry ([`aterm_secrets::converge::FIRST_RETRY_MS`]) where the recheck is wanted.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_window_pass_meeting_a_held_lock_waits_for_it_and_runs_once_it_is_let_go() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let converge = dir.path().join("converge");
+    aterm_uds::private_file::ensure_private_dir(&converge).unwrap();
+    let holder = aterm_uds::private_file::PrivateLock::take(
+        &converge,
+        "align.lock",
+        std::time::Duration::ZERO,
+        "held by the test",
+    )
+    .expect("the lock is free");
+    let started = dir.path().join("started");
+    let runner = dir.path().join("runner");
+    let stand_in = |path: &str| aterm_uds::deadline::stand_in(std::path::Path::new(path));
+    std::fs::write(
+        &runner,
+        format!(
+            "#!{}\necho started >> '{}'\nexec {} -k '{}' {}\n",
+            stand_in("/bin/sh").display(),
+            started.display(),
+            stand_in("/usr/bin/lockf").display(),
+            converge.join("align.lock").display(),
+            stand_in("/usr/bin/true").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let starts = || {
+        std::fs::read_to_string(&started)
+            .map(|said| said.lines().count())
+            .unwrap_or(0)
+    };
+    std::thread::scope(|scope| {
+        let lane_thread = scope.spawn(|| {
+            let mut ends = Vec::new();
+            let mut waits = Vec::new();
+            lane(
+                &mut |trigger, work, note| {
+                    let ended = pass(&runner, trigger, work, note);
+                    ends.push(ended.clone());
+                    ended
+                },
+                &mut |_| {},
+                &mut |every| {
+                    waits.push(every);
+                    None
+                },
+                &mut || 0,
+            );
+            (ends, waits)
+        });
+        aterm_spec::wait::until_while_descendants_work("the window's runner starts", || {
+            (starts() == 1).then_some(())
+        });
+        assert!(
+            !lane_thread.is_finished(),
+            "the pass waits for the lock while it is held"
+        );
+        assert_eq!(starts(), 1, "and starts no second runner");
+        drop(holder);
+        aterm_spec::wait::until_while_descendants_work(
+            "the runner takes the lock once it is let go and ends",
+            || lane_thread.is_finished().then_some(()),
+        );
+        let (ends, waits) = lane_thread.join().expect("the lane");
+        assert_eq!(ends, [Ended::Ran], "one pass, which ran");
+        assert_eq!(waits, [crate::secrets_join::MEND_EVERY], "then the recheck");
+    });
+    assert_eq!(starts(), 1);
 }
 
 /// AN INPUT WAKE CARRIES WHAT MOVED THE INPUTS' MARK: the live lane's wait (`until_moved`)
@@ -245,19 +294,11 @@ fn actual_terminal_children_queue_readback_in_both_window_and_setup_paths() {
         ("/usr/bin/false", Ended::Failed(Some(1))),
     ] {
         let mut notified = false;
-        let (result, cpu) = pass_starting(
+        let result = pass_starting(
             || aterm_uds::spawnfd::command(program).spawn(),
             || notified = true,
         );
         assert_eq!(result, expected);
-        assert_eq!(
-            cpu.is_some(),
-            cfg!(all(
-                target_pointer_width = "64",
-                any(target_vendor = "apple", target_os = "linux")
-            )),
-            "the reap measures the pass's CPU where this target can"
-        );
         assert!(
             notified,
             "a failed child may have completed part of the work too"
@@ -278,7 +319,7 @@ fn actual_terminal_children_queue_readback_in_both_window_and_setup_paths() {
             || Err(std::io::ErrorKind::NotFound.into()),
             || notified = true
         ),
-        (Ended::Unstarted(_), None)
+        Ended::Unstarted(_)
     ));
     assert!(!notified, "a failed start is no completion");
 }
@@ -458,26 +499,21 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
     assert_eq!(calls, 2);
 }
 
-/// A Git readiness wait retries on unchanged inputs without a failure log. Once the
-/// prerequisite arrives and the pass settles, only the ordinary recheck remains.
+/// A Git readiness wait retries on unchanged inputs without a failure log, backing off. Once
+/// the prerequisite arrives and the pass settles, only the ordinary recheck remains; a pass that
+/// ran at once (its runner having waited for the lock, or not) owes nothing sooner.
+/// NEGATIVE CONTROL: a lane that retries every unfinished pass after the first pause waits
+/// `[first, first, …]` where `[first, 2 × first, …]` is wanted.
 #[cfg(unix)]
 #[test]
 fn unfinished_work_retries_quietly_until_its_prerequisite_is_ready() {
     let first = std::time::Duration::from_millis(aterm_secrets::converge::FIRST_RETRY_MS);
     for (ends, expected) in [
         (
-            vec![
-                Ended::Unfinished,
-                Ended::Held,
-                Ended::Unfinished,
-                Ended::Ran,
-            ],
-            vec![first, first, 2 * first, crate::secrets_join::MEND_EVERY],
+            vec![Ended::Unfinished, Ended::Unfinished, Ended::Ran],
+            vec![first, 2 * first, crate::secrets_join::MEND_EVERY],
         ),
-        (
-            vec![Ended::Held, Ended::Ran],
-            vec![first, crate::secrets_join::MEND_EVERY],
-        ),
+        (vec![Ended::Ran], vec![crate::secrets_join::MEND_EVERY]),
     ] {
         let total = ends.len();
         let passes = std::cell::Cell::new(0);
@@ -570,12 +606,11 @@ fn the_secrets_stage_starts_a_setup_pass() {
     assert_eq!(asked, [aterm_secrets::converge::SETUP]);
 }
 
-/// A pass that ran, or met another pass's lock, says nothing (its runner logs its own line);
-/// one that failed or did not start says so.
+/// A pass that ran says nothing (its runner logs its own line); one that failed or did not
+/// start says so.
 #[test]
 fn only_a_pass_that_did_not_run_right_is_logged_by_the_lane() {
     assert_eq!(ended_line(&Ended::Ran), None);
-    assert_eq!(ended_line(&Ended::Held), None);
     assert_eq!(ended_line(&Ended::Unfinished), None);
     assert!(ended_line(&Ended::Failed(Some(1))).is_some_and(|line| line.contains("exit 1")));
     assert!(

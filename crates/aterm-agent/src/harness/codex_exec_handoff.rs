@@ -86,6 +86,39 @@ impl ExecCommand {
     }
 }
 
+// A tab's sid takes the minted form or a legacy tab's, and the legacy one is the longer, so the
+// bound `mover_key` puts on a tab's sid takes both.
+const _: () = assert!(aterm_types::tab_id::LEN <= aterm_types::tab_id::LEGACY_LEN);
+
+/// The session the shared account pool knows a codex exec run's move by when the run is
+/// admitted as a process of its tab rather than as the tab's claimed leader: `<tab>/<pid>-<h>`,
+/// where `h` is the first 12 lowercase hex digits of
+/// SHA-256(`codex-exec-mover\0<pid>\0<birth>\0<uniqueid>`), over the run's decimal pid, kernel
+/// birth and unique id ([`ExecSource`]). A process the kernel later gives the same pid is
+/// another key.
+///
+/// `None` unless `tab` is a plain tab sid: non-empty, no longer than a legacy tab's sid
+/// ([`aterm_types::tab_id::LEGACY_LEN`], 22 bytes, the longer of the two forms a tab's sid takes),
+/// ASCII alphanumerics and `-`. A key is then at most 46 bytes of printable ASCII with no space,
+/// so the pool's word reader ([`super::accounts::WORD_MAX`]) keeps it whole; its `/` is in no
+/// plain sid, so it never names a tab and no per-tab record key
+/// ([`super::upgrade::Agent::record_key`]) takes it.
+#[must_use]
+pub fn mover_key(tab: &str, pid: u32, birth: u64, uniqueid: u64) -> Option<String> {
+    let plain = !tab.is_empty()
+        && tab.len() <= aterm_types::tab_id::LEGACY_LEN
+        && tab.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-');
+    plain.then(|| {
+        let digest = aterm_digest::Sha256::digest(
+            format!("codex-exec-mover\0{pid}\0{birth}\0{uniqueid}").as_bytes(),
+        );
+        format!(
+            "{tab}/{pid}-{}",
+            aterm_codec::hex::encode_lower(&digest[..6])
+        )
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub socket: String,
@@ -321,7 +354,7 @@ mod tests;
 
 #[path = "codex_exec_source.rs"]
 mod source;
-pub use source::ExecSource;
+pub use source::{CaptureMiss, ExecSource};
 
 #[path = "codex_exec_transaction.rs"]
 pub mod transaction;

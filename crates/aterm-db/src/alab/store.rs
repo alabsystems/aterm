@@ -116,6 +116,17 @@ fn observed_records(view: &View, actor: astream_wire::sync::Actor) -> usize {
         .count()
 }
 
+/// This Mac's Commons uuid, 32 hex: the suffix of every owned row it writes.
+fn own_uuid(session: &Session<'_>) -> Result<String> {
+    let actor = session.actor();
+    session
+        .members()?
+        .iter()
+        .find(|binding| binding.actor() == actor)
+        .map(|binding| keys::uuid32(binding.machine()))
+        .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))
+}
+
 /// The Commons uuids of the current members.
 fn live_uuids(session: &Session<'_>) -> Result<BTreeSet<String>> {
     Ok(session
@@ -425,6 +436,26 @@ pub struct Observed {
     pub findings: Vec<Finding>,
     /// Records appended: 0 or 1.
     pub records: usize,
+    /// The sightings, by their place in what the pass was handed, whose account's birth or this
+    /// Mac's first row of it the quota refused ([`observe::Plan::waiting`]).
+    pub waiting: Vec<usize>,
+}
+
+impl Observed {
+    /// What of `handed`, the sightings this pass was handed, it took: none where it read no
+    /// registry, else each but those it left `waiting`.
+    #[must_use]
+    pub fn took(&self, handed: &[Sighting]) -> Vec<Sighting> {
+        if self.quiet.is_some() {
+            return Vec::new();
+        }
+        handed
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| !self.waiting.contains(at))
+            .map(|(_, s)| s.clone())
+            .collect()
+    }
 }
 
 /// What one discovery pass decided and wrote.
@@ -435,6 +466,23 @@ pub struct Discovered {
     pub findings: Vec<Finding>,
     /// Records appended: 0 or 1.
     pub records: usize,
+}
+
+/// Refuse an automatic pass's `rows` (one record each) the rules every table keeps stop
+/// ([`Compiled::rules`], [`crate::att::Author::Derived`]), judged once over the whole pass
+/// against `view`, before its first record.
+///
+/// # Errors
+/// The rules refuse a row; the refusal names its collection, row and column, never a value.
+fn authored(
+    compiled: &Compiled,
+    view: &View,
+    rows: &mut [Vec<crate::database::Change>],
+) -> Result<()> {
+    match compiled.rules(rows, view, crate::att::Author::Derived)? {
+        Some(refused) => Err(refused.into()),
+        None => Ok(()),
+    }
 }
 
 /// What a seed pass wrote.
@@ -615,7 +663,9 @@ impl Registry {
                         "the registry's history here is incomplete; seeds wait for a complete scan",
                     ));
                 }
-                let packed = pack(seeds::rows_for(&view.cells)?)?;
+                let mut rows = seeds::rows_for(&view.cells)?;
+                authored(compiled, &view, &mut rows)?;
+                let packed = pack(rows)?;
                 let packed_len = packed.len();
                 for (index, mut changes) in packed.into_iter().enumerate() {
                     crate::att::conform(compiled.table, &mut changes)?;
@@ -702,6 +752,18 @@ impl Registry {
         .is_some_and(|declaration| declaration.declared))
     }
 
+    /// This Mac's Commons uuid, 32 hex, the suffix of its owned rows: what `check` reads this
+    /// Mac's own `account-obs` rows by.
+    ///
+    /// # Errors
+    /// As [`Self::view`], or this Mac is not in its own Commons roster.
+    pub fn own_uuid(&self) -> Result<String> {
+        let compiled = self.generation();
+        application::observe_store(&self.paths, descriptor(compiled), |session, _, _| {
+            own_uuid(session)
+        })
+    }
+
     /// The Commons uuids of the current members, what `check` calls live.
     ///
     /// # Errors
@@ -752,7 +814,8 @@ impl Registry {
                 }
                 let mut migrated = 0;
                 if heard {
-                    let rows = roster_migration(session, &view, now_ms)?;
+                    let mut rows = roster_migration(session, &view, now_ms)?;
+                    authored(compiled, &view, &mut rows)?;
                     for mut changes in pack(rows)? {
                         crate::att::conform(compiled.table, &mut changes)?;
                         if !quota_room(session, &log, &view, 0) {
@@ -775,6 +838,7 @@ impl Registry {
                 }
                 let lineage = || former(&origin, session);
                 let mut plan = planned(session, trust, &view, probe, lineage, heard, now_ms)?;
+                authored(compiled, &view, std::slice::from_mut(&mut plan.changes))?;
                 crate::att::conform(compiled.table, &mut plan.changes)?;
                 if plan.changes.is_empty() {
                     return Ok(Registered {
@@ -853,13 +917,7 @@ impl Registry {
                 if !view.complete {
                     return Ok(quiet(discover::Outcome::Incomplete));
                 }
-                let actor = session.actor();
-                let uuid = session
-                    .members()?
-                    .iter()
-                    .find(|binding| binding.actor() == actor)
-                    .map(|binding| keys::uuid32(binding.machine()))
-                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let uuid = own_uuid(session)?;
                 let empty = crate::typed::owned::OwnedRead::default();
                 let obs = view.owned.get(MAILBOX_OBS.name).unwrap_or(&empty);
                 let input = discover::Input {
@@ -873,6 +931,7 @@ impl Registry {
                     changes,
                 } = discover::plan(&input, &view.cells, obs)?;
                 let mut changes = changes;
+                authored(compiled, &view, std::slice::from_mut(&mut changes))?;
                 crate::att::conform(compiled.table, &mut changes)?;
                 if changes.is_empty() {
                     return Ok(Discovered {
@@ -931,6 +990,7 @@ impl Registry {
             marked: 0,
             findings: Vec::new(),
             records: 0,
+            waiting: Vec::new(),
         };
         if let Err(outcome) = self.admitted(config)? {
             return Ok(quiet(match outcome {
@@ -951,12 +1011,7 @@ impl Registry {
                     return Ok(quiet("incomplete"));
                 }
                 let actor = session.actor();
-                let uuid = session
-                    .members()?
-                    .iter()
-                    .find(|binding| binding.actor() == actor)
-                    .map(|binding| keys::uuid32(binding.machine()))
-                    .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
+                let uuid = own_uuid(session)?;
                 let empty = crate::typed::owned::OwnedRead::default();
                 let obs = view.owned.get(ACCOUNT_OBS.name).unwrap_or(&empty);
                 let input = observe::Input {
@@ -972,8 +1027,10 @@ impl Registry {
                     born,
                     marked,
                     rested: _,
+                    waiting,
                 } = observe::plan(&input, &view.cells, obs)?;
                 let mut changes = changes;
+                authored(compiled, &view, std::slice::from_mut(&mut changes))?;
                 crate::att::conform(compiled.table, &mut changes)?;
                 let done = |records| Observed {
                     quiet: None,
@@ -981,6 +1038,7 @@ impl Registry {
                     marked,
                     findings: findings.clone(),
                     records,
+                    waiting: waiting.clone(),
                 };
                 if changes.is_empty() {
                     return Ok(done(0));

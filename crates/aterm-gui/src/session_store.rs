@@ -677,15 +677,15 @@ pub(crate) struct SessionHandoff {
         deserialize_with = "lenient_rows"
     )]
     pub machine_names: Vec<String>,
-    /// The workers aterm closed once their tasks concluded
-    /// ([`crate::retired_workers::RetiredWorkers::carry_rows`]): the successor answers `result`
-    /// and `await task` for them as this process did, and drops their result files as they age.
+    /// The launch of the last agent each session ran (`harness_host::last_launch_rows`, one row
+    /// per session that has one): the successor keeps them, so a session that ends there keeps in
+    /// its row in the machine's session table the launch of an agent that exited here (ST-15).
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "lenient_rows"
     )]
-    pub retired_workers: Vec<String>,
+    pub last_launches: Vec<String>,
 }
 
 /// Final screen payload carried for an exited `--hold` pane.
@@ -916,7 +916,9 @@ impl SessionHandoff {
             mirror_dropped: store.mirror.draw_tombstones(),
             mirror_served: store.mirror.served(),
             machine_names: crate::tab_label::machine_names_for_handoff(),
-            retired_workers: store.retired_workers.carry_rows(std::time::Instant::now()),
+            last_launches: crate::harness_host::last_launch_rows(
+                handles.iter().map(|h| h.sid.as_str()),
+            ),
             sessions: handles
                 .into_iter()
                 .map(|h| {
@@ -1084,7 +1086,7 @@ pub(crate) enum ExitReason {
     CtlClose,
     UiClose,
     WindowClose,
-    #[cfg(test)]
+    /// A quit ended it for good: its layout does not bring it back (`App::retire_tasks_at_quit`).
     AppQuit,
     /// aterm's reaper of workers' tabs closed it once its task concluded (`App::reap_workers`).
     Reaper,
@@ -1092,7 +1094,7 @@ pub(crate) enum ExitReason {
 }
 
 impl ExitReason {
-    #[cfg(test)]
+    /// Every reason, in its declared order.
     pub const ALL: [ExitReason; 7] = [
         ExitReason::ShellExit,
         ExitReason::CtlClose,
@@ -1111,11 +1113,16 @@ impl ExitReason {
             ExitReason::CtlClose => "ctl-close",
             ExitReason::UiClose => "ui-close",
             ExitReason::WindowClose => "window-close",
-            #[cfg(test)]
             ExitReason::AppQuit => "app-quit",
             ExitReason::Reaper => "reaper",
             ExitReason::Unknown => "unknown",
         }
+    }
+
+    /// The reason whose wire token is `word` ([`Self::as_str`]).
+    #[must_use]
+    pub(crate) fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.as_str() == word)
     }
 }
 
@@ -1182,9 +1189,9 @@ impl ExitActor {
 }
 
 /// Single membership-change entry in the bounded roster lifecycle journal:
-/// the registry's membership feed. An exit's code and closer are the
-/// closed-session index's ([`crate::session_log::ClosedExit`]), which
-/// `exits` reads; the roster's copies were deleted in phase 6 (6G-9).
+/// the registry's membership feed. An exit's code and closer are its row's in the machine's
+/// session table ([`crate::session_table`]), which `exits` reads; the roster's copies were
+/// deleted in phase 6 (6G-9).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RosterRecord {
     pub seq: u64,
@@ -1213,7 +1220,7 @@ pub(crate) struct SessionStore {
     history_lost: HashMap<u64, u64>,
     harness_posture: crate::autopilot::HarnessPosture,
     closed_logs: crate::session_log::ClosedLogs,
-    retired_workers: crate::retired_workers::RetiredWorkers,
+    table: Arc<crate::session_table::SessionTable>,
     journal_retirements: Option<crate::session_log_journal::Retirements>,
     journal_durable: crate::crash_journal::Durable,
     input_replies: crate::control::InputReplies,
@@ -1237,6 +1244,36 @@ pub(crate) struct Deregistered {
     pub(crate) reason: Option<ExitReason>,
     /// Its shell's exit code, where one was read.
     pub(crate) exit_code: Option<i32>,
+    /// What the close left for the session's row in the machine's session table
+    /// ([`crate::session_table::row_at_close`]); `None` when nothing was recorded.
+    pub(crate) ended: Option<Ended>,
+}
+
+/// What a session's close read of it under its timeline's lock, for its row in the machine's
+/// session table ([`crate::session_table::row_at_close`]): the close's attribution, the log's
+/// open and totals, and the task record as it stood.
+#[derive(Clone, Debug)]
+pub(crate) struct Ended {
+    /// The local id it was routed by in this process.
+    pub(crate) local: u64,
+    /// Why it ended.
+    pub(crate) out: ExitReason,
+    /// Who ended it.
+    pub(crate) by: ExitActor,
+    /// The act of aterm's own that ended it, if one did (`tab_marks::close_why`).
+    pub(crate) why: Option<&'static str>,
+    /// Its shell's exit code, where one was read.
+    pub(crate) exit_code: Option<i32>,
+    /// Wall ms of the end.
+    pub(crate) ended_ms: u64,
+    /// Wall ms of the log's start, for a session no open placed.
+    pub(crate) started_ms: Option<u64>,
+    /// What the tab's close wrote, where an open placed it.
+    pub(crate) tab: Option<crate::session_log::TabClosed>,
+    /// The log's epoch at the end.
+    pub(crate) ep: u32,
+    /// The task record as it stood.
+    pub(crate) task: Option<crate::task_record::TaskRecord>,
 }
 
 /// Creates a new empty shared [`Store`].
@@ -1507,7 +1544,6 @@ impl SessionStore {
     }
 
     /// Returns the exit code recorded by [`Self::note_exit_code`] for `local_id`.
-    #[cfg(all(test, unix))]
     pub(crate) fn noted_exit_code(&self, local_id: u64) -> Option<i32> {
         self.exit_codes.get(&local_id).copied()
     }
@@ -1555,15 +1591,28 @@ impl SessionStore {
             let mut tl = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let at = tl.slog().now();
             let task = crate::tab_marks::task_end(&tl);
-            tl.slog_mut().close_tab(
+            let why = crate::tab_marks::close_why(reason);
+            let tab = tl.slog_mut().close_tab(
                 crate::session_log::TabClose {
                     out: crate::session_log::exit_out(reason),
                     by: crate::session_log::exit_actor(&actor),
-                    why: crate::tab_marks::close_why(reason),
+                    why,
                     task: task.as_deref(),
                 },
                 at,
             );
+            let ended = Ended {
+                local: local_id,
+                out: reason,
+                by: actor.clone(),
+                why,
+                exit_code,
+                ended_ms: at.wall_ms,
+                started_ms: tl.slog().opened_wall(),
+                tab,
+                ep: tl.slog().log().ep(),
+                task: tl.task().cloned(),
+            };
             tl.slog_mut().close_session(
                 crate::session_log::exit_out(reason),
                 crate::session_log::exit_actor(&actor),
@@ -1576,14 +1625,19 @@ impl SessionStore {
                 retirements.retire(&sid, &h.ctx.timeline, tl.slog());
             }
             mirror.retire(sid.as_str(), tl.slog_mut());
-            (reason, at.mono_ms)
+            (reason, at.mono_ms, ended)
         });
+        let (resolved, ended) = match resolved {
+            Some((reason, t_ms, ended)) => (Some((reason, t_ms)), Some(ended)),
+            None => (None, None),
+        };
         let mut closed = Deregistered {
             sid,
             exit_seq: None,
             freed: Vec::new(),
             reason: resolved.map(|(reason, _)| reason),
             exit_code,
+            ended,
         };
         if let Some((reason, t_ms)) = resolved {
             self.by_id.remove(&closed.sid);
@@ -1598,12 +1652,8 @@ impl SessionStore {
             );
             closed.freed = self.closed_logs.link(crate::session_log::ClosedExit {
                 seq,
-                t_ms,
                 sid: closed.sid.clone(),
                 local_id,
-                reason,
-                exit_code,
-                actor,
             });
             closed.exit_seq = Some(seq);
         }
@@ -1659,16 +1709,16 @@ impl SessionStore {
         &self.closed_logs
     }
 
-    /// The workers aterm closed once their tasks concluded ([`crate::retired_workers`]).
-    pub(crate) const fn retired_workers(&self) -> &crate::retired_workers::RetiredWorkers {
-        &self.retired_workers
+    /// The machine's session table ([`crate::session_table`]): every ended session's row. A
+    /// store no launch gave one ([`Self::set_table`]) keeps its rows in memory.
+    pub(crate) fn table(&self) -> Arc<crate::session_table::SessionTable> {
+        Arc::clone(&self.table)
     }
 
-    /// [`Self::retired_workers`], to keep or drop a row.
-    pub(crate) const fn retired_workers_mut(
-        &mut self,
-    ) -> &mut crate::retired_workers::RetiredWorkers {
-        &mut self.retired_workers
+    /// Hold `table` as the machine's session table, before the first session registers: a launch
+    /// gives it the table over `<state>/sessions/` ([`crate::session_table::SessionTable::at`]).
+    pub(crate) fn set_table(&mut self, table: Arc<crate::session_table::SessionTable>) {
+        self.table = table;
     }
 
     /// Returns the bus session-log mirror state.

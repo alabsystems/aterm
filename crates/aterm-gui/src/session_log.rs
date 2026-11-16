@@ -730,6 +730,8 @@ pub(crate) struct SessionLog {
     keys: keys::KeyWitness,
     /// Where the session's tab took its place, as its `tab act=open` said ([`tab::TabPlace`]).
     tab: Option<tab::TabPlace>,
+    /// Who opened the placed tab (its open mark's `by=`), taken with the place at its close.
+    tab_opened_by: Option<aterm_slog::Actor>,
     /// What the tab spent, for its close's totals ([`tab::TabSpend`]).
     spend: tab::TabSpend,
 }
@@ -825,6 +827,7 @@ impl SessionLog {
             program_cursor: None,
             keys: keys::KeyWitness::default(),
             tab: None,
+            tab_opened_by: None,
             spend: tab::TabSpend::default(),
         }
     }
@@ -875,7 +878,6 @@ pub(crate) const fn exit_out(reason: crate::session_store::ExitReason) -> Sessio
         ExitReason::CtlClose => SessionOut::CtlClose,
         ExitReason::UiClose => SessionOut::UiClose,
         ExitReason::WindowClose => SessionOut::WindowClose,
-        #[cfg(test)]
         ExitReason::AppQuit => SessionOut::AppQuit,
         ExitReason::Reaper => SessionOut::Reaper,
         ExitReason::Unknown => SessionOut::Unknown,
@@ -1238,7 +1240,7 @@ impl SessionLog {
         );
     }
 
-    /// The lineage a seamless update's leaf names for the shell it hands over (the same session, so no record): kept unless this log already has one.
+    /// The lineage a leaf names for the shell that holds its tab ID, a seamless update's leaf or a cold restore's kept leaf (the same tab ID, so no record): kept unless this log already has one.
     pub(crate) fn seed_lineage(&mut self, lineage: Option<&str>) {
         if self.lineage.is_none() {
             self.lineage = lineage.and_then(ShortId::new);
@@ -3431,7 +3433,7 @@ pub(crate) mod keys;
 pub(crate) use keys::{FrameKeys, KeyClass, KeyFrame};
 #[path = "session_log_tab.rs"]
 mod tab;
-pub(crate) use tab::{TabAsked, TabClose, TabPlace, TreeSpent};
+pub(crate) use tab::{TabAsked, TabClose, TabClosed, TabPlace, TabTotals, TreeSpent};
 
 #[path = "session_log_carry.rs"]
 mod carry;

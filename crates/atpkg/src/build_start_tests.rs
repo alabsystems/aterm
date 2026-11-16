@@ -477,6 +477,101 @@ fn a_record_past_the_cap_is_rewritten_to_half_of_it_newest_kept() {
     );
 }
 
+/// A LEGACY TAB'S LINES STAY IN THE RECORD: a tab opened before the t form builds under its
+/// `s-` ID, and an earlier build left its lines in the record. A read gives them to the tab's
+/// window, a rewrite (which keeps only the lines it reads) carries them over, and the tab's
+/// next build appends another. NEGATIVE CONTROL: a line whose session is a loose `s-` word is
+/// read by nobody and goes with the rewrite.
+#[test]
+fn a_read_and_a_rewrite_keep_the_line_of_a_tab_opened_before_the_t_form() {
+    let (_directory, base, record) = scratch();
+    let now = aterm_time::unix_millis().unwrap();
+    // The lines as an earlier build's writer left them, byte for byte: the object's keys in
+    // the order every build's writer gives them. CONTROL: for a tab ID, which the writer always
+    // took, these are the writer's bytes.
+    let stored = |session: &str, tree: &str| {
+        format!(
+            "{{\"at_ms\":{now},\"pid\":3,\"session\":\"{session}\",\"v\":1,\"workspace\":{}}}",
+            aterm_json::to_string(base.join(tree).to_str().unwrap()).unwrap()
+        )
+    };
+    assert_eq!(
+        Start {
+            session: TAB.to_owned(),
+            workspace: base.join("legacy tree"),
+            build: None,
+            pid: 3,
+            at_ms: now,
+        }
+        .line()
+        .unwrap(),
+        stored(TAB, "legacy tree") + "\n",
+        "CONTROL: the stored lines are not in the writer's bytes"
+    );
+    // Past the cap by young pairs of one workspace, which a rewrite sheds first.
+    let mut text = String::new();
+    let mut at = 0_u64;
+    while text.len() as u64 <= CAP {
+        at += 1;
+        text.push_str(&start(at, &base.join("shared"), now).line().unwrap());
+    }
+    let legacy = stored(LEGACY, "legacy tree");
+    text.push_str(&legacy);
+    text.push('\n');
+    let loose = [
+        "s-1",
+        "s-0123456789abcdef012",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
+    ];
+    for session in loose {
+        text.push_str(&stored(session, "loose tree"));
+        text.push('\n');
+    }
+    std::fs::write(&record, &text).unwrap();
+    let want = Start {
+        session: LEGACY.to_owned(),
+        workspace: base.join("legacy tree"),
+        build: None,
+        pid: 3,
+        at_ms: now,
+    };
+    let loosely_named = |starts: &[Start]| {
+        starts
+            .iter()
+            .filter(|start| start.workspace == base.join("loose tree"))
+            .count()
+    };
+    let before = read(&record);
+    assert!(before.contains(&want), "a read before any rewrite");
+    assert_eq!(loosely_named(&before), 0, "CONTROL: no loose word is a tab");
+
+    compact(&record, Some(now));
+    let size = std::fs::metadata(&record).unwrap().len();
+    assert!(size <= KEEP_MAX, "the rewrite ran: {size} bytes");
+    let lines = lines_of(&record);
+    assert_eq!(
+        lines.iter().filter(|line| **line == legacy).count(),
+        1,
+        "the legacy tab's line, as it was written"
+    );
+    assert!(
+        lines.iter().all(|line| !line.contains("loose tree")),
+        "CONTROL: a line no reader reads goes with the rewrite"
+    );
+    assert!(read(&record).contains(&want), "a read after the rewrite");
+
+    // The tab's next build leaves its line under the same ID.
+    let next = Start {
+        workspace: base.join("next tree"),
+        at_ms: now + 1,
+        ..want.clone()
+    };
+    append(&record, &next).unwrap();
+    let after = read(&record);
+    assert!(after.contains(&want) && after.contains(&next), "{after:?}");
+}
+
 /// ONE REWRITER, AND NONE WAITS: while another holds the lock beside the record, an append past
 /// the cap writes its line and returns without a rewrite. NEGATIVE CONTROL: once the lock is
 /// let go, the next append rewrites.

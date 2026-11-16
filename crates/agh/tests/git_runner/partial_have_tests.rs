@@ -357,7 +357,12 @@ fn checkout_closure_fetches_real_blob_objects_with_and_without_a_cache() {
         gh.fx()
             .children_run()
             .iter()
-            .filter(|child| child.args.iter().any(|arg| arg == "--depth=1"))
+            .filter(|child| {
+                child.args.iter().any(|arg| arg == "--depth=1")
+                    // Native refetch exports checked cache DATA locally; only
+                    // the remote body request counts as a provider fetch.
+                    && !child.args.iter().any(|arg| arg == "--refetch")
+            })
             .count()
     };
     for (label, cache, fetches) in [

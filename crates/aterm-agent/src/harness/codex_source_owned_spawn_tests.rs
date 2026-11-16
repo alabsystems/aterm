@@ -9,6 +9,41 @@ fn starter(fixture: &Fixture) -> worker::Starter {
     fixture.starter.clone()
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn child_exit_observation_preserves_original_unreaped_custody() {
+    let mut fixture = Fixture::new(true);
+    let admitted = worker::Admitted::assumed(starter(&fixture));
+    let mut running = fixture
+        .reservation
+        .take()
+        .unwrap()
+        .spawn(admitted, fixture.home.path(), BirthAttempt::new().unwrap())
+        .unwrap();
+    assert!(running.observe_child_exit_status().unwrap().is_none());
+    fixture.scope.cancellation().cancel();
+    assert!(fixture.scope.cancelled());
+    // App withdrawal ends admission, not the native parent's actual wait custody.
+    assert!(running.observe_child_exit_status().unwrap().is_none());
+    drop(running.take_stdin().unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = running.observe_child_exit_status().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owned echo child did not exit after stdin EOF"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert_eq!(status.code(), Some(0));
+    // A repeated guarded observation and normal stop require unreaped custody.
+    assert_eq!(running.observe_child_exit_status().unwrap(), Some(status));
+    running.stop().unwrap();
+    assert!(running.observe_child_exit_status().is_err());
+}
+
 #[test]
 fn required_backend_control_refuses_without_a_native_watcher_before_birth() {
     assert!(aterm_uds::tether::executable().is_none());

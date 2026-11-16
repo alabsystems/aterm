@@ -33,7 +33,7 @@ fn a_late_program_answer_owns_one_observation_wake() {
     let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.with_classified(id, t0, |_| ());
     observer.sessions.reschedule(id, t0 + floor);
     observer.agent_observe(
         id,
@@ -349,7 +349,10 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
         "a read 100 ms after the last is deferred"
     );
     let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, "", t1);
-    assert!(obs.agents[&1].followup, "and a follow-up is armed");
+    assert!(
+        obs.sessions.agent(&1).expect("agent watch").followup,
+        "and a follow-up is armed"
+    );
     assert!(obs.agent_zone_wanted(
         1,
         g(2),
@@ -370,7 +373,7 @@ fn the_rate_floor_defers_a_read_and_arms_a_followup() {
         "",
         t2,
     );
-    assert!(obs.agents[&1].followup);
+    assert!(obs.sessions.agent(&1).expect("agent watch").followup);
     assert!(
         obs.agent_zone_wanted(
             1,
@@ -446,7 +449,10 @@ fn unchanged_zone_reads_charge_the_agent_rate_floor() {
         early,
     );
     assert!(deferred.publish.is_none());
-    assert!(obs.agents[&1].followup, "the changed frame remains owed");
+    assert!(
+        obs.sessions.agent(&1).expect("agent watch").followup,
+        "the changed frame remains owed"
+    );
 
     let due = redrawn_at + super::AGENT_MIN_INTERVAL;
     assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, false, due));
@@ -516,7 +522,10 @@ fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
         "",
         transitioned_at,
     );
-    assert_eq!(obs.agents[&1].program_seen, Some(new));
+    assert_eq!(
+        obs.sessions.agent(&1).expect("agent watch").program_seen,
+        Some(new)
+    );
 }
 
 /// A foreground group change after an unchanged zone read schedules an immediate follow-up.
@@ -727,7 +736,7 @@ fn a_burst_past_the_block_reads_cap_is_read_at_the_next_owed_look() {
         .next_wake()
         .expect("the rest owes a look");
     assert!(
-        wake <= t1 + app.session_status.min_interval,
+        wake <= t1 + app.session_status.sessions.min_interval(),
         "owed within one interval: {:?}",
         wake.saturating_duration_since(t1)
     );
@@ -761,7 +770,8 @@ fn the_sweeps_capped_read_leaves_a_group_moves_look_immediate() {
     FRONT.with(|f| f.set(SHELL));
     let step = app
         .session_status
-        .min_interval
+        .sessions
+        .min_interval()
         .max(super::AGENT_MIN_INTERVAL);
     crate::term_lock(&term).process(prompt);
     let t0 = Instant::now();
@@ -1401,16 +1411,29 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.with_classified(id, t0, |_| ());
     observer.sessions.reschedule(id, t0 + floor);
 
     assert!(observer.program_due(id, true, None, generation, t0));
     observer.note_program_request(id, pgid, t0);
     assert!(model.fire("Start", &mut modeled));
     assert!(buggy.fire("Start", &mut old));
-    assert_eq!(observer.agents[&id].resolved_at, Some(t0));
     assert_eq!(
-        i64::from(observer.agents[&id].resolve_attempts),
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .resolved_at,
+        Some(t0)
+    );
+    assert_eq!(
+        i64::from(
+            observer
+                .sessions
+                .agent(&id)
+                .expect("agent watch")
+                .resolve_attempts
+        ),
         modeled["attempts"]
     );
     assert!(!buggy.check_invariant("UnnamedGroupOwnsRetry", &old));
@@ -1456,7 +1479,13 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     observer.note_program_request(id, pgid, first_retry);
     assert!(model.fire("Retry", &mut modeled));
     assert_eq!(
-        i64::from(observer.agents[&id].resolve_attempts),
+        i64::from(
+            observer
+                .sessions
+                .agent(&id)
+                .expect("agent watch")
+                .resolve_attempts
+        ),
         modeled["attempts"]
     );
 
@@ -1504,7 +1533,14 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     observer.note_program_request(id, pgid, second_retry);
     assert!(model.fire("Retry", &mut modeled));
-    assert_eq!(observer.agents[&id].resolve_attempts, 3);
+    assert_eq!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .resolve_attempts,
+        3
+    );
     assert!(observer.knows(id));
     observer.sessions.reschedule(id, second_retry + floor);
     observer.agent_observe(
@@ -1555,7 +1591,13 @@ fn an_unnamed_static_group_retries_promptly_then_backs_off_without_spinning() {
     );
     assert!(model.fire("Resolve", &mut modeled));
     assert_eq!(
-        i64::from(observer.agents[&id].resolve_attempts),
+        i64::from(
+            observer
+                .sessions
+                .agent(&id)
+                .expect("agent watch")
+                .resolve_attempts
+        ),
         modeled["attempts"]
     );
     assert_eq!(observer.next_wake(), None);
@@ -1649,9 +1691,22 @@ fn a_frame_during_shell_confirmation_retains_its_name_recheck() {
         shell_at,
     );
     let confirm = shell_at + PROGRAM_NAME_CONFIRM;
-    assert_eq!(observer.agents[&id].deferred_name_recheck_at, Some(confirm));
+    assert_eq!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .deferred_name_recheck_at,
+        Some(confirm)
+    );
     observer.note_program_request(id, pgid, confirm);
-    assert!(observer.agents[&id].name_confirmed);
+    assert!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .name_confirmed
+    );
     observer.agent_observe(
         id,
         later,
@@ -1675,7 +1730,14 @@ fn a_frame_during_shell_confirmation_retains_its_name_recheck() {
         confirm + Duration::from_millis(1),
     );
     let due = confirm + PROGRAM_NAMED_RECHECK_FLOOR;
-    assert_eq!(observer.agents[&id].deferred_name_recheck_at, Some(due));
+    assert_eq!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .deferred_name_recheck_at,
+        Some(due)
+    );
     assert!(!observer.program_due(id, false, Some("sh"), later, due - Duration::from_millis(1)));
     assert!(observer.program_due(id, false, Some("sh"), later, due));
 }
@@ -1693,7 +1755,7 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
     let later = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.with_classified(id, t0, |_| ());
     observer.sessions.reschedule(id, t0 + floor);
 
     observer.note_program_request(id, pgid, t0);
@@ -1710,7 +1772,11 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         t0,
     );
     assert!(
-        !observer.agents[&id].name_confirmed,
+        !observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .name_confirmed,
         "the group-change sweep's old Claude name is not this group's answer"
     );
     let shell_at = t0 + floor;
@@ -1868,7 +1934,14 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         later_confirm + PROGRAM_RECHECK,
     );
     assert!(model.fire("AgentLeaves", &mut modeled));
-    assert!(observer.agents[&id].deferred_name_recheck_at.is_some());
+    assert!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .deferred_name_recheck_at
+            .is_some()
+    );
     assert_eq!(modeled["confirm_armed"], 1);
     observer.agent_observe(
         id,
@@ -1882,7 +1955,14 @@ fn a_named_shell_rechecks_once_after_a_later_static_claude_frame() {
         later_confirm + PROGRAM_RECHECK + floor,
     );
     assert!(model.fire("GroupLeaves", &mut modeled));
-    assert_eq!(observer.agents[&id].deferred_name_recheck_at, None);
+    assert_eq!(
+        observer
+            .sessions
+            .agent(&id)
+            .expect("agent watch")
+            .deferred_name_recheck_at,
+        None
+    );
     assert_eq!(modeled["confirm_armed"], 0);
     assert_eq!(observer.next_wake(), None);
 }
@@ -2775,7 +2855,7 @@ fn a_waiting_fronts_wait_is_read_again_on_a_still_screen() {
     let still = crate::control::ScreenGen { epoch: 0, seq: 1 };
     let policy = StatusPolicy::default();
     let mut observer = StatusObserver::new(policy, floor);
-    observer.sessions.ensure(id, policy, t0);
+    observer.sessions.with_classified(id, t0, |_| ());
     observer.sessions.reschedule(id, t0 + floor);
     let rows = || Some(vec!["atpkg: waiting for memory".into()]);
     observer.note_program_request(id, pgid, t0);
@@ -2925,7 +3005,14 @@ fn a_reply_drawn_under_a_status_line_is_published_busy_while_its_title_runs() {
         Some("idle"),
         "the finished frame publishes at once: its done row is the end drawn"
     );
-    assert!(obs.agents[&1].rest_at.is_none(), "the settle is over");
+    assert!(
+        obs.sessions
+            .agent(&1)
+            .expect("agent watch")
+            .rest_at
+            .is_none(),
+        "the settle is over"
+    );
 }
 
 /// With its query answered Claude Code's title carries no glyph, and its program-status report is
@@ -2989,7 +3076,14 @@ fn a_reply_drawn_under_a_status_line_is_published_busy_while_its_report_runs() {
         Some("idle"),
         "the finished frame publishes at once: its done row is the end drawn"
     );
-    assert!(obs.agents[&1].rest_at.is_none(), "the settle is over");
+    assert!(
+        obs.sessions
+            .agent(&1)
+            .expect("agent watch")
+            .rest_at
+            .is_none(),
+        "the settle is over"
+    );
 }
 
 /// Never stuck busy: a title that rests with no later frame publishes the screen's idle once the
@@ -3003,7 +3097,7 @@ fn a_title_at_rest_with_no_later_frame_is_published_idle_by_the_settle() {
     let g = crate::control::ScreenGen { epoch: 0, seq: 2 };
     let program = Some("claude".to_string());
     let t0 = Instant::now();
-    obs.sessions.ensure(1, StatusPolicy::default(), t0);
+    obs.sessions.with_classified(1, t0, |_| ());
     assert_eq!(
         read_titled(&mut obs, 2, &held, "claude", "◑ Claude Code", t0),
         Some("busy")
@@ -3046,7 +3140,13 @@ fn a_title_at_rest_with_no_later_frame_is_published_idle_by_the_settle() {
         read_titled(&mut obs, 2, &held, "claude", "✳ Claude Code", due),
         Some("idle")
     );
-    assert!(obs.agents[&1].rest_at.is_none());
+    assert!(
+        obs.sessions
+            .agent(&1)
+            .expect("agent watch")
+            .rest_at
+            .is_none()
+    );
 }
 
 /// Muse Code takes the same rule from its own spinner's title: its idle composer under the
@@ -3208,7 +3308,7 @@ fn a_kimi_box_awaiting_its_record_is_read_again_until_it_stops_asking() {
         let t0 = Instant::now();
         let policy = StatusPolicy::default();
         let mut obs = StatusObserver::new(policy, floor);
-        obs.sessions.ensure(id, policy, t0);
+        obs.sessions.with_classified(id, t0, |_| ());
         obs.sessions.reschedule(id, t0);
         let observe = |obs: &mut StatusObserver, at: Instant| {
             obs.agent_observe(
@@ -3350,7 +3450,7 @@ fn a_kimi_box_whose_screen_moved_is_read_again_off_a_read_begun_since() {
             "",
             at,
         );
-        obs.agents[&id].kimi_again
+        obs.sessions.agent(&id).expect("agent watch").kimi_again
     };
     let read = t0 + crate::kimi_record::SETTLE;
     crate::kimi_record::tests::hold_read(
@@ -3443,7 +3543,7 @@ fn a_settled_kimi_box_whose_program_read_input_is_judged_again_though_its_screen
     assert!(wanted(&mut obs, past), "PRECONDITION: read again");
     let _ = observe(&mut obs, past);
     assert!(
-        !obs.agents[&id].kimi_again,
+        !obs.sessions.agent(&id).expect("agent watch").kimi_again,
         "PRECONDITION: past READ_FOR the read-only box settles"
     );
     obs.note_input(id, InputLook::for_testing(1, 0, true), 300);
@@ -3502,7 +3602,11 @@ fn a_settled_kimi_box_is_judged_again_at_the_sweep_after_its_program_reads_input
     let past = t0 + crate::kimi_record::READ_FOR;
     let _ = app.observe_session_statuses(past);
     assert!(
-        !app.session_status.agents[&sid].kimi_again,
+        !app.session_status
+            .sessions
+            .agent(&sid)
+            .expect("agent watch")
+            .kimi_again,
         "PRECONDITION: past READ_FOR it settles"
     );
     let settled = shown(&app);
@@ -3573,7 +3677,8 @@ fn a_kimi_box_under_looks_that_cannot_tell_lends_nothing_and_settles() {
             wall += 250;
         }
         assert_eq!(
-            !obs.agents[&id].kimi_again, settles,
+            !obs.sessions.agent(&id).expect("agent watch").kimi_again,
+            settles,
             "{id}: settled past READ_FOR"
         );
         obs.retire(id);
@@ -3589,7 +3694,13 @@ fn the_sweep_looks_at_the_tabs_input_for_its_read() {
     let (mut app, sid, pty) = app_with_pty_stub();
     let sink = std::sync::Arc::clone(&app.pool.get(sid).expect("pooled").ctx.sink);
     let t0 = Instant::now();
-    let seen = |app: &App| app.session_status.agents[&sid].input;
+    let seen = |app: &App| {
+        app.session_status
+            .sessions
+            .agent(&sid)
+            .expect("agent watch")
+            .input
+    };
     paint(&app, sid, &busy_screen(0));
     let ahead = crate::kimi_record::wall_ms();
     let _ = app.observe_session_statuses(t0);
@@ -3674,7 +3785,7 @@ fn a_tabs_input_counts_read_from_the_look_that_found_it_so() {
     let look = |driven, read| InputLook::for_testing(1, driven, read);
     let mut obs = StatusObserver::new(StatusPolicy::default(), super::AGENT_MIN_INTERVAL);
     let id = 90_005;
-    let ms = |obs: &StatusObserver| obs.agents[&id].input.ms;
+    let ms = |obs: &StatusObserver| obs.sessions.agent(&id).expect("agent watch").input.ms;
     obs.note_input(id, look(0, true), 100);
     assert_eq!(ms(&obs), 100, "the first look is its own time");
     obs.note_input(id, look(0, true), 200);
@@ -3695,7 +3806,8 @@ fn a_tabs_input_counts_read_from_the_look_that_found_it_so() {
     );
     obs.note_input(id, look(3, false), 50);
     assert_eq!(ms(&obs), 700, "a wall clock stepped back");
-    let moment = |obs: &StatusObserver| obs.agents[&id].input.moment();
+    let moment =
+        |obs: &StatusObserver| obs.sessions.agent(&id).expect("agent watch").input.moment();
     assert_eq!(moment(&obs), 700, "the moment judged against");
     obs.note_input(id, InputLook::blind_for_testing(1, 4), 800);
     assert_eq!(
@@ -3739,7 +3851,7 @@ fn a_kimi_tabs_unread_input_is_looked_at_again() {
     ] {
         let policy = StatusPolicy::default();
         let mut obs = StatusObserver::new(policy, floor);
-        obs.sessions.ensure(id, policy, t0);
+        obs.sessions.with_classified(id, t0, |_| ());
         obs.sessions.reschedule(id, t0 + floor);
         let observe = |obs: &mut StatusObserver, rows: Option<Vec<String>>, at| {
             let _ = obs.agent_observe(
@@ -3822,7 +3934,9 @@ fn a_kimi_box_is_seen_anew_when_its_rows_change_or_its_tab_takes_input() {
             "",
             at,
         );
-        obs.agents[&id]
+        obs.sessions
+            .agent(&id)
+            .expect("agent watch")
             .kimi_box
             .map(crate::kimi_record::Seen::since)
     };

@@ -204,6 +204,16 @@ impl Read {
             Err(links) => replay::witnessed(Cow::Borrowed(&links), self.refused, acknowledged),
         }
     }
+
+    /// This read's records after the prefix `held` witnesses, which a store kept across sessions
+    /// holds ([`replay::witnessed_after`]); `None` where the read's chain does not continue it.
+    pub(super) fn witnessed_after(
+        self,
+        acknowledged: impl Into<Boundary>,
+        held: super::Witness,
+    ) -> Result<Option<Replay>> {
+        replay::witnessed_after(&self.links, self.refused, acknowledged, held)
+    }
 }
 
 /// The identified records of the table journal in `dir` under `anchor` and `limits`, as a read

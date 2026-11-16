@@ -333,6 +333,12 @@ pub(crate) struct Operations {
     login_rotation_prepare: Option<Arc<renewal::LoginRotationPreparation>>,
     /// What a lost login's decision read and selected, for each wall turn of the claimed process.
     login_rotation_reads: renewal::LoginRotationLedgers,
+    /// The provider reads a usage-limit handoff still admits each asking process, for
+    /// codex-rotation's and codex-exec-handoff's jobs alike: one pace per process, kept across
+    /// the jobs a person's input, a new wall turn or a new claim revision replaces, until the
+    /// kernel shows the process gone ([`renewal::note_ask`], [`renewal::observe_paced`]). Not
+    /// the lost login's ledgers, which are per wall turn: this bound holds across wall turns.
+    rotation_paces: aterm_agent::harness::codex_rotation::Paces<renewal::ProcessKey>,
     by_id: BTreeMap<String, Arc<Mutex<Operation>>>,
     completed: std::collections::VecDeque<String>,
     coordinated_connections: std::collections::BTreeSet<u64>,

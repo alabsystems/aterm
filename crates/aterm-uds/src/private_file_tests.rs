@@ -55,6 +55,139 @@ fn a_waiter_takes_a_held_lock_once_it_is_let_go() {
     assert!(free.is_ok());
 }
 
+/// [`PrivateLock::wait_until_free`] on `<dir>/.lock` on a thread of its own that takes no lock
+/// ([`crate::file_lock::takes_nothing`]): the receiver of its one "found held" and the receiver
+/// of its answer.
+#[cfg(target_os = "macos")]
+fn wait_until_free_of(
+    dir: &Path,
+) -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Receiver<io::Result<()>>,
+) {
+    let (watching, watched) = std::sync::mpsc::channel();
+    let (freed, answer) = std::sync::mpsc::channel();
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = freed.send(crate::file_lock::takes_nothing(|| {
+            PrivateLock::wait_until_free(&dir, ".lock", move || watching.send(()).unwrap())
+        }));
+    });
+    (watched, answer)
+}
+
+/// A wait until a lock is free takes nothing: a waiter in the kernel for the lock takes it as
+/// its holder lets go and holds it (whether the wait read the lock free before the woken
+/// waiter ran, or reads it held and waits on through its hold), and the wait answers once that
+/// waiter lets go, if not before, with nothing then holding it. NEGATIVE CONTROL: a wait that
+/// takes the lock and lets it go
+/// (`wait_for(..).map(drop)`) is refused its take on its thread
+/// ([`crate::file_lock::takes_nothing`]) and fails "the wait failed".
+#[cfg(target_os = "macos")]
+#[test]
+fn a_wait_until_free_takes_nothing_from_a_waiter_at_the_release() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    let first = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+    let (watched, answer) = wait_until_free_of(&dir);
+    watched
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never found the lock held");
+    let (waiting, heard) = std::sync::mpsc::channel();
+    let (took, taken) = std::sync::mpsc::channel();
+    {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = took.send(PrivateLock::wait_for(&dir, ".lock", move || {
+                waiting.send(()).unwrap();
+            }));
+        });
+    }
+    heard
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the waiter never found the lock held");
+    drop(first);
+    let second = taken
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the waiter never took the lock as its holder let go")
+        .expect("the waiter's wait failed");
+    assert_eq!(
+        PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY)
+            .err()
+            .map(|e| e.kind()),
+        Some(io::ErrorKind::WouldBlock),
+        "the waiter holds it"
+    );
+    drop(second);
+    answer
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never answered once the lock was free")
+        .expect("the wait failed");
+    let _free =
+        PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).expect("the wait holds the lock");
+}
+
+/// A free lock is awaited at once: no wait, and `held` never runs.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_wait_until_free_of_a_free_lock_answers_at_once() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    PrivateLock::wait_until_free(&dir, ".lock", || panic!("a free lock is never held")).unwrap();
+    let _free = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+}
+
+/// A holder that ends holding the lock, its descriptor closed with no unlock (a killed
+/// runner's), lets it go, and the wait hears that. NEGATIVE CONTROL: a wait that heard only an
+/// explicit unlock would never answer here, and the one-minute hang detector fails it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_wait_until_free_hears_a_holder_close_without_unlocking() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    file_in(&dir, ".lock", b"", 0o600);
+    let (holder, _) = super::open_private(&dir, ".lock").unwrap();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a holder that dies holding the lock: its close, never an unlock, lets it go"
+    )]
+    let locked = holder.try_lock();
+    locked.unwrap();
+    let (watched, answer) = wait_until_free_of(&dir);
+    watched
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never found the lock held");
+    drop(holder);
+    answer
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never heard the holder's close")
+        .expect("the wait failed");
+}
+
+/// A lock file that leaves its name while the wait runs ends the wait: the next holder takes
+/// the file at that name, which nothing holds, though the old one is still held. NEGATIVE
+/// CONTROL: a wait that heard only releases would never answer here, and the one-minute hang
+/// detector fails it.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_lock_file_gone_from_its_name_ends_a_wait_until_free() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    let first = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY).unwrap();
+    let (watched, answer) = wait_until_free_of(&dir);
+    watched
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never found the lock held");
+    std::fs::remove_file(dir.join(".lock")).unwrap();
+    answer
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the wait never heard the lock file go")
+        .expect("the wait failed");
+    let _next = PrivateLock::take(&dir, ".lock", Duration::ZERO, BUSY)
+        .expect("the lock at the name is free");
+    drop(first);
+}
+
 #[test]
 fn lock_wait_stops_when_hook_or_backoff_exhausts_the_budget() {
     for release_in_hook in [true, false] {

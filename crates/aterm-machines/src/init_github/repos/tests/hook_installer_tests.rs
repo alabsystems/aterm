@@ -31,8 +31,9 @@ fn the_hook_installer_uses_only_its_execution_accounts_git_path() {
     sys.stat_of(store.join("12/bin/git").to_str().unwrap(), exec);
     sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
     sys.stat_of(crate::items::github::CLT_GIT, exec);
+    // The installer finds the git setup runs, the managed build's own, first on its PATH.
     for (who, bin) in [
-        (&alice, prefix.join("bin")),
+        (&alice, store.join("12/bin")),
         (
             &bob,
             PathBuf::from("/Library/Developer/CommandLineTools/usr/bin"),
@@ -129,7 +130,7 @@ fn a_hook_installer_on_a_mac_without_developer_tools_cannot_ask_for_them() {
             "PATH".to_owned(),
             format!(
                 "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-                prefix.join("bin").display()
+                store.join("12/bin").display()
             ),
         )));
         assert!(
@@ -183,6 +184,16 @@ fn clone_carrying(carries: bool) -> (Fake, User, Repo, String, String) {
     (sys, who, repo, clone_key, installer)
 }
 
+/// Make the required dependency's download fail as an unavailable remote does. `download` is
+/// that download's command line exactly as the code builds it
+/// (`crate::init_github::dependencies::tests::download`), so no flag the command gains disarms
+/// the model and lets the scripted success through.
+fn fail_download(sys: &Fake, download: String) {
+    sys.simulate(move |_, command| {
+        (command.display() == download).then(|| Ran::exit(128, "synthetic unavailable dependency"))
+    });
+}
+
 #[test]
 fn a_required_dependency_failure_does_not_suppress_the_new_parents_advisory_installer() {
     let (sys, who, mut repo, _, installer) = clone_carrying(true);
@@ -190,16 +201,25 @@ fn a_required_dependency_failure_does_not_suppress_the_new_parents_advisory_inst
     let parent = Path::new(&who.home).join("new");
     script_existing(&sys, &who, &parent, "new");
     crate::init_github::dependencies::tests::declarations(&sys, &who, &parent, &["vendor/library"]);
-    crate::init_github::dependencies::tests::download(&sys, &who, &parent, "vendor/library", 1);
+    let download =
+        crate::init_github::dependencies::tests::download(&sys, &who, &parent, "vendor/library", 1);
     sys.on(&installer, Ran::ok(INSTALLED));
-    sys.simulate(|_, command| {
-        command
-            .display()
-            .contains(" clone --no-checkout ")
-            .then(|| Ran::exit(128, "synthetic unavailable dependency"))
-    });
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    fail_download(&sys, download);
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        None,
+    );
     assert_eq!(cloned.failed.len(), 1, "{:?}", cloned.failed);
+    assert!(
+        cloned.failed[0].ends_with("synthetic unavailable dependency"),
+        "the dependency's own download failed: {:?}",
+        cloned.failed
+    );
     assert!(sys.stat(&parent).is_ok());
     assert!(sys.stat(&parent.join("vendor/library")).is_err());
     assert_eq!(
@@ -222,20 +242,29 @@ fn a_clone_whose_staging_stayed_and_whose_dependency_failed_says_both() {
     let parent = Path::new(&who.home).join("new");
     script_existing(&sys, &who, &parent, "new");
     crate::init_github::dependencies::tests::declarations(&sys, &who, &parent, &["vendor/library"]);
-    crate::init_github::dependencies::tests::download(&sys, &who, &parent, "vendor/library", 1);
+    let download =
+        crate::init_github::dependencies::tests::download(&sys, &who, &parent, "vendor/library", 1);
     sys.on(&installer, Ran::ok(INSTALLED));
     sys.scratch_close_fails(
         &Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0),
         Some(io::ErrorKind::PermissionDenied),
     );
-    sys.simulate(|_, command| {
-        command
-            .display()
-            .contains(" clone --no-checkout ")
-            .then(|| Ran::exit(128, "synthetic unavailable dependency"))
-    });
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    fail_download(&sys, download);
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        None,
+    );
     assert_eq!(cloned.failed.len(), 2, "{:?}", cloned.failed);
+    assert!(
+        cloned.failed[0].ends_with("synthetic unavailable dependency"),
+        "the dependency's own download failed: {:?}",
+        cloned.failed
+    );
     assert!(
         cloned.failed[1].ends_with(
             "repository published, but its private empty staging directory could not be removed"
@@ -287,7 +316,15 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
                 sys.time_out(&installer);
             }
         }
-        let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+        let cloned = clone_all(
+            &sys,
+            &who,
+            std::slice::from_ref(&repo),
+            &[],
+            &std::collections::BTreeSet::new(),
+            None,
+            None,
+        );
         assert_eq!(cloned.hooks, std::slice::from_ref(&outcome));
         assert!(cloned.failed.is_empty(), "{:?}", cloned.failed);
         assert_eq!(cloned.cloned.len(), 1, "the clone stands: {outcome}");
@@ -328,7 +365,15 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
         }
     };
     let guard = CloneGuard::new(&current);
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), Some(&guard));
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        Some(&guard),
+        None,
+    );
     assert_eq!(
         cloned.hooks,
         [format!(
@@ -345,7 +390,15 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
         &Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0),
         Some(io::ErrorKind::PermissionDenied),
     );
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        None,
+    );
     assert_eq!(cloned.cloned.len(), 1);
     assert_eq!(
         cloned.failed,
@@ -360,7 +413,15 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
     );
 
     let (sys, who, repo, _, installer) = clone_carrying(false);
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        None,
+    );
     assert_eq!((cloned.cloned.len(), cloned.hooks.len()), (1, 0));
     assert!(!sys.calls().contains(&installer), "{:?}", sys.calls());
 
@@ -372,7 +433,15 @@ fn a_clone_the_setup_published_runs_its_own_hook_installer_once() {
     sys.on_stat(&clone_key, &destination.join("scripts"), directory(who.uid));
     sys.on_write(&clone_key, &destination.join(HOOK_INSTALLER), b"racer's\n");
     sys.on(&installer, Ran::ok(INSTALLED));
-    let cloned = clone_all(&sys, &who, std::slice::from_ref(&repo), None);
+    let cloned = clone_all(
+        &sys,
+        &who,
+        std::slice::from_ref(&repo),
+        &[],
+        &std::collections::BTreeSet::new(),
+        None,
+        None,
+    );
     assert_eq!(cloned.cloned.len(), 1, "found in place: done");
     assert!(cloned.hooks.is_empty(), "{:?}", cloned.hooks);
     assert!(

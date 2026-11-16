@@ -36,6 +36,8 @@ fn a_hashed_stardust_field_moves_the_stardust_words() {
         beside_caret: None,
         edge_cut: false,
         still: None,
+        shown: false,
+        caret_hid: false,
     });
     sky.minted = 1;
     let base = words(&sky, t0);

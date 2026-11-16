@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 static CHECKOUT_FIRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -924,4 +924,174 @@ fn a_failed_route_socket_is_a_loss_the_park_is_told() {
     });
     stop.store(true, Ordering::Release);
     drop(watch);
+}
+
+static LEASE_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+fn lease_told() {
+    LEASE_TOLD.fetch_add(1, Ordering::SeqCst);
+}
+
+static LEASE_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+fn lease_waiting() {
+    LEASE_WAITING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A park on another pass's repository lease is told once that pass lets the lease go: the
+/// lease watch waits in the kernel, taking nothing, until `align.lock` is free, counts the
+/// release in its folder, the fact the park's mark reads ([`lease_releases`]), and tells the
+/// park. A park that starts while the lease is held joins that waiting thread, and a park that
+/// ended before the release is not told. NEGATIVE CONTROL: while the lease is held the watch
+/// waits on it and has told no park, and no release is counted in its folder (the count is the
+/// folder's, so another test's lease watch moves none of it).
+#[test]
+fn a_lease_release_wakes_a_park() {
+    use aterm_uds::private_file::PrivateLock;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("converge");
+    aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+    // Another pass's lease, as the converge pass holds it.
+    let held = PrivateLock::take(&dir, aterm_machines::sync::LOCK, Duration::ZERO, "held").unwrap();
+    let ended = Arc::new(AtomicBool::new(false));
+    watch_lease_at(
+        &dir,
+        Arc::clone(&ended),
+        Arc::new(AtomicBool::new(false)),
+        lease_told,
+        lease_waiting,
+    )
+    .unwrap();
+    until("the lease watch never found the lease held", || {
+        LEASE_WAITING.load(Ordering::SeqCst) == 1
+    });
+    // That park ends; the next one joins the thread already waiting.
+    ended.store(true, Ordering::Release);
+    let lost = Arc::new(AtomicBool::new(false));
+    watch_lease_at(
+        &dir,
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&lost),
+        lease_told,
+        lease_waiting,
+    )
+    .unwrap();
+    assert_eq!(LEASE_TOLD.load(Ordering::SeqCst), 0, "told while held");
+    assert_eq!(lease_releases_at(&dir), 0, "a release counted while held");
+    assert_eq!(
+        LEASE_WAITING.load(Ordering::SeqCst),
+        1,
+        "the second park started a thread of its own"
+    );
+    drop(held);
+    until("the lease's release was never told", || {
+        LEASE_TOLD.load(Ordering::SeqCst) == 1
+    });
+    assert_eq!(lease_releases_at(&dir), 1, "the release was not counted");
+    assert!(!lost.load(Ordering::Acquire));
+    // The watch holds nothing: the stage the park runs next takes the lease.
+    assert!(
+        PrivateLock::take(&dir, aterm_machines::sync::LOCK, Duration::ZERO, "held").is_ok(),
+        "the lease watch holds the lease"
+    );
+}
+
+/// The takes the lease watch's thread had tried when it told its park
+/// ([`aterm_uds::file_lock::takes_tried_here`], read on that thread); `u64::MAX` until then.
+static RUNNER_WATCH_TAKES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+static RUNNER_LEASE_TOLD: AtomicUsize = AtomicUsize::new(0);
+
+/// The park's tell, which the lease watch makes on its own thread: what that thread tried to
+/// take is read there, before the tell is counted.
+fn runner_lease_told() {
+    RUNNER_WATCH_TAKES.store(aterm_uds::file_lock::takes_tried_here(), Ordering::SeqCst);
+    RUNNER_LEASE_TOLD.fetch_add(1, Ordering::SeqCst);
+}
+
+static RUNNER_LEASE_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+fn runner_lease_waiting() {
+    RUNNER_LEASE_WAITING.fetch_add(1, Ordering::SeqCst);
+}
+
+/// A lease watch never holds the lease ahead of a background runner waiting at its release
+/// (`aterm_machines::sync::wait_lock`, which waits in the kernel as the stand-in here does):
+/// the runner takes the lease as its holder lets it go and holds it, the watch is never lost,
+/// the park is told, with the release counted in the lease's folder, once the lease is free,
+/// and the watch's thread tried no take from its start to its tell
+/// ([`aterm_uds::file_lock::takes_tried_here`]). NEGATIVE CONTROL, deterministic in every
+/// interleaving: the watch as it was before (`PrivateLock::wait_for(..).map(drop)` in place
+/// of `takes_nothing(|| PrivateLock::wait_until_free(..))`) tries the lease before it finds it
+/// held and again as it blocks in the kernel, ahead of the runner wherever the kernel wakes it
+/// first, so its thread has tried two takes by its tell, whichever of the two took the lease
+/// first, and fails "the lease watch tried to take the lease"; that watch kept inside
+/// `takes_nothing` is refused its first try and fails "the lease watch was lost".
+#[test]
+fn a_lease_watch_never_holds_the_lock_ahead_of_a_waiting_runner() {
+    use aterm_uds::private_file::PrivateLock;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let dir = scratch.path().join("converge");
+    aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+    // The pass that holds the lease while the Repositories stage parks on it.
+    let holder =
+        PrivateLock::take(&dir, aterm_machines::sync::LOCK, Duration::ZERO, "held").unwrap();
+    let lost = Arc::new(AtomicBool::new(false));
+    watch_lease_at(
+        &dir,
+        Arc::new(AtomicBool::new(false)),
+        Arc::clone(&lost),
+        runner_lease_told,
+        runner_lease_waiting,
+    )
+    .unwrap();
+    until("the lease watch never found the lease held", || {
+        RUNNER_LEASE_WAITING.load(Ordering::SeqCst) == 1 || lost.load(Ordering::Acquire)
+    });
+    assert!(!lost.load(Ordering::Acquire), "the lease watch was lost");
+    // A background runner waiting in the kernel for the lease, as a started pass waits.
+    let (waiting, heard) = std::sync::mpsc::channel();
+    let (took, taken) = std::sync::mpsc::channel();
+    {
+        let dir = dir.clone();
+        std::thread::spawn(move || {
+            let _ = took.send(PrivateLock::wait_for(
+                &dir,
+                aterm_machines::sync::LOCK,
+                move || waiting.send(()).unwrap(),
+            ));
+        });
+    }
+    heard
+        .recv_timeout(HANG)
+        .expect("the runner never found the lease held");
+    drop(holder);
+    let ran = taken
+        .recv_timeout(HANG)
+        .expect("the runner never took the lease as its holder let it go")
+        .expect("the runner's wait for the lease failed");
+    assert_eq!(
+        PrivateLock::take(&dir, aterm_machines::sync::LOCK, Duration::ZERO, "held")
+            .err()
+            .map(|why| why.kind()),
+        Some(io::ErrorKind::WouldBlock),
+        "the runner does not hold the lease"
+    );
+    assert!(!lost.load(Ordering::Acquire), "the lease watch was lost");
+    drop(ran);
+    until("the lease coming free was never told", || {
+        RUNNER_LEASE_TOLD.load(Ordering::SeqCst) == 1
+    });
+    assert!(!lost.load(Ordering::Acquire), "the lease watch was lost");
+    assert_eq!(
+        RUNNER_WATCH_TAKES.load(Ordering::SeqCst),
+        0,
+        "the lease watch tried to take the lease"
+    );
+    assert_eq!(lease_releases_at(&dir), 1, "the release was not counted");
+    // Nothing holds the lease: the stage the park runs next takes it.
+    assert!(
+        PrivateLock::take(&dir, aterm_machines::sync::LOCK, Duration::ZERO, "held").is_ok(),
+        "the lease watch holds the lease"
+    );
 }

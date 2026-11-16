@@ -215,7 +215,7 @@ fn external_session_renews_once_without_rotating_browser_credentials() {
     assert!(!proton.refresh_if_needed().unwrap());
     assert!(
         proton
-            .with_verification(|p| p.messages("0", 10), |_| panic!("not a human challenge"))
+            .with_renewal(|p| p.messages("0", 10))
             .unwrap()
             .is_empty()
     );
@@ -228,22 +228,35 @@ fn external_session_renews_once_without_rotating_browser_credentials() {
     );
 }
 
+/// A HUMAN VERIFICATION PROTON ASKS FOR IS A STOP, NEVER ANSWERED: Proton's code 9001 on a read
+/// of an external (browser) session ends the read with the stop's words; no code is requested
+/// or sent (nothing but the one read reaches the transport), the session is not renewed (a
+/// renewal would return to the page that asked), and nothing is tried again.
+/// NEGATIVE CONTROL: with `with_renewal` retrying the read after a 9001 (the branch's first
+/// form, which handed the challenge to a verifier and retried), the transport is asked twice:
+/// `` left: (2, 0) ``.
 #[test]
-fn external_verification_renews_the_browser_session_before_requesting_a_code() {
+fn external_verification_never_renews_the_browser_session() {
     let state = std::sync::Arc::new(std::sync::Mutex::new(ChannelState {
         responses: [reply(422, r#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#),
             reply(200, r#"{"Code":1000,"Messages":[]}"#)].into(),
         ..Default::default()
     }));
     let mut proton = Proton::with_transport(Box::new(Channel(state.clone())));
-    proton
-        .with_verification(
-            |p| p.messages("0", 10),
-            |_| panic!("browser renewal should resolve the challenge"),
-        )
-        .unwrap();
+    let error = proton.with_renewal(|p| p.messages("0", 10)).unwrap_err();
+    assert!(error.ends_with(super::HUMAN_VERIFICATION_STOP), "{error}");
+    assert!(!error.contains("private-token"), "{error}");
     let state = state.lock().unwrap();
-    assert_eq!((state.requests, state.renewals), (2, 1));
+    assert_eq!(
+        (state.requests, state.renewals),
+        (1, 0),
+        "a verification is answered by nothing: no code, no renewal, no retry"
+    );
+    drop(state);
+    assert_eq!(
+        proton.last_failure().unwrap().recovery(),
+        crate::proton_error::Recovery::Stop
+    );
 }
 
 #[test]
@@ -294,14 +307,15 @@ fn revoked_access_token_renews_once_and_retries_only_the_read() {
             renewals += 1;
             Ok(())
         },
-        |_| panic!("Expired tokens are not ownership challenges"),
     );
     assert!(result.is_err());
     assert_eq!((reads, renewals), (2, 1));
 }
 
+/// A verification Proton asks for at a renewal ends the renewal and the read with it: the read is
+/// not made again, and nothing answers the verification.
 #[test]
-fn refresh_challenge_is_verified_before_retrying_the_original_read() {
+fn a_verification_at_a_renewal_ends_the_read() {
     let mut proton = Proton::empty();
     proton.access = Secret::new("old-access".into());
     let mut reads = 0;
@@ -309,33 +323,16 @@ fn refresh_challenge_is_verified_before_retrying_the_original_read() {
     let result = proton.with_recovery(
         |session| {
             reads += 1;
-            if reads == 1 {
-                session.process_response("/core/v4/addresses", 401, None, br#"{"Code":401}"#)
-            } else {
-                assert!(
-                    session.verification.is_none(),
-                    "consumed refresh proof must not leak onto the retried read"
-                );
-                session.process_response("/core/v4/addresses", 200, None, br#"{"Code":1000}"#)
-            }
+            session.process_response("/core/v4/addresses", 401, None, br#"{"Code":401}"#)
         },
         |session| {
             renewals += 1;
-            if renewals == 1 {
-                session.process_response("/auth/v4/refresh", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#).map(|_| ())
-            } else {
-                assert_eq!(
-                    session.verification.as_ref().map(|v| v.token.expose()),
-                    Some("proof")
-                );
-                Ok(())
-            }
+            session.process_response("/auth/v4/refresh", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#).map(|_| ())
         },
-        |_| Ok(crate::human::Verified { token: Secret::new("proof".into()), method: "ownership-email".into() }),
     );
-    assert!(result.is_ok());
-    assert!(proton.verification.is_none());
-    assert_eq!((reads, renewals), (2, 2));
+    let error = result.unwrap_err();
+    assert!(error.ends_with(super::HUMAN_VERIFICATION_STOP), "{error}");
+    assert_eq!((reads, renewals), (1, 1));
 }
 
 #[test]
@@ -352,7 +349,6 @@ fn invalid_refresh_token_does_not_loop_through_another_refresh() {
                     br#"{"Code":10013}"#
                 ),
                 |_| panic!("A rejected refresh token must not trigger another renewal"),
-                |_| panic!("A rejected refresh token is not a verification challenge"),
             )
             .is_err()
     );
@@ -366,76 +362,46 @@ fn valid_saved_access_token_does_not_force_a_refresh_or_verification() {
         refresh: Secret::new("refresh".into()),
         expires: aterm_time::unix_secs().unwrap().saturating_add(3600),
     };
-    let session = Proton::resume(credentials, |_| {
-        panic!("An unexpired token needs no verification")
-    })
-    .unwrap()
-    .unwrap();
+    let session = Proton::resume(credentials).unwrap().unwrap();
     assert_eq!(session.access.expose(), "access");
     assert!(!session.credentials_dirty);
 }
 
+/// A verification's stop keeps the operation and the code it ended, never its token; whatever
+/// methods Proton offers, none is tried, and an incorrect password is no verification.
 #[test]
-fn verification_failure_keeps_the_original_operation_and_code() {
+fn verification_stops_keep_the_original_operation_and_code() {
+    for details in [
+        r#"{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}"#,
+        r#"{"HumanVerificationMethods":["captcha","sms"],"HumanVerificationToken":"private-token"}"#,
+        r#"{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"bad\r\ntoken"}"#,
+        r#"{}"#,
+    ] {
+        let mut proton = Proton::empty();
+        let mut calls = 0;
+        let body = format!(r#"{{"Code":9001,"Details":{details}}}"#);
+        let error = proton
+            .with_renewal(|proton| {
+                calls += 1;
+                proton.process_response("/core/v4/addresses", 422, None, body.as_bytes())
+            })
+            .unwrap_err();
+        assert_eq!(calls, 1, "{details}: tried again");
+        assert!(error.contains("account addresses"), "{error}");
+        assert!(error.contains("9001"), "{error}");
+        assert!(error.ends_with(super::HUMAN_VERIFICATION_STOP), "{error}");
+        assert!(!error.contains("private-token"), "{error}");
+        assert_eq!(
+            proton.last_failure().unwrap().kind,
+            crate::proton_error::Kind::Verification
+        );
+    }
     let mut proton = Proton::empty();
-    let error = proton.with_verification(
-        |proton| proton.process_response("/core/v4/addresses", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#),
-        |_| Err("Recovery mailbox unavailable".into()),
-    ).unwrap_err();
-    assert!(error.contains("account addresses"));
-    assert!(error.contains("9001"));
-    assert!(error.contains("Recovery mailbox unavailable"));
-    assert!(!error.contains("private-token"));
-    assert_eq!(
-        proton.last_failure().unwrap().kind,
-        crate::proton_error::Kind::Verification
-    );
-}
-
-#[test]
-fn verification_retries_once_and_never_retries_credentials() {
-    let mut proton = Proton::empty();
-    let mut calls = 0;
-    let result = proton.with_verification(
-        |proton| {
-            calls += 1;
-            if calls == 2 {
-                assert_eq!(
-                    proton.verification.as_ref().map(|v| v.token.expose()),
-                    Some("proof")
-                );
-            }
-            proton.process_response("/auth/v4", 422, None, br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"private-token"}}"#)
-        },
-        |_| Ok(crate::human::Verified { token: Secret::new("proof".into()), method: "ownership-email".into() }),
-    );
-    assert!(result.is_err());
-    assert_eq!(calls, 2);
-    assert!(
-        proton.verification.is_none(),
-        "single-use verification proof must be cleared once recovery finishes"
-    );
-    let result = proton.with_verification(
-        |proton| proton.process_response("/auth/v4", 422, None, br#"{"Code":8002}"#),
-        |_| panic!("Incorrect passwords must not trigger ownership verification"),
-    );
-    assert!(result.unwrap_err().contains("credentials"));
-    let result = proton.with_verification(
-        |proton| {
-            proton.process_response(
-                "/auth/v4",
-                422,
-                None,
-                br#"{"Code":9001,"Details":{"HumanVerificationMethods":["ownership-email"],"HumanVerificationToken":"bad\r\ntoken"}}"#,
-            )
-        },
-        |_| panic!("Control-character challenge tokens must not trigger verification"),
-    );
-    assert!(
-        result
-            .unwrap_err()
-            .contains("no supported verification challenge")
-    );
+    let error = proton
+        .with_renewal(|proton| proton.process_response("/auth/v4", 422, None, br#"{"Code":8002}"#))
+        .unwrap_err();
+    assert!(error.contains("credentials"), "{error}");
+    assert!(!error.contains(super::HUMAN_VERIFICATION_STOP), "{error}");
 }
 
 #[test]

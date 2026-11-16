@@ -11,7 +11,7 @@ use aterm_secrets::{
     client::{Paths, load_records},
     commons::binding::Request,
     fsx,
-    membership_log::{Entrant, EpochAudience, Inserted, Log, Record, encode_records},
+    membership_log::{Entrant, EpochAudience, Inserted, Log, Record, read_records},
     text::{Audience, Entry},
 };
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -116,12 +116,12 @@ fn a_warm_membership_load_uses_bounded_stream_scratch() {
     let paths = Paths::for_home(home.path());
     fsx::ensure_private_dir(&paths.dir).unwrap();
     let log = large_history();
-    let wire = encode_records(log.records());
+    let wire = read_records(log.records()).unwrap();
     assert!(wire.len() > 3 * 1024 * 1024);
     fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
     let warm = load_records(&paths).unwrap();
     assert_eq!(warm.complete_inventory().len(), log.held_count());
-    assert_eq!(warm.encode(), wire);
+    assert_eq!(warm.read_encoded().unwrap(), wire);
     drop(warm);
 
     LIVE.with(|live| live.set(0));

@@ -228,7 +228,8 @@ impl Records<'_> {
     /// bytes, [`Spool::done`]) and the run each record the append held. A spool file that does
     /// not read, and a spooled record its reader refuses, is said and left where it is. A record
     /// the spool took that it no longer lists is not appended again: another landing of this
-    /// clone appended it.
+    /// clone appended it. Failed spool cleanup is reported without changing the successful
+    /// append result or preventing cleanup of the other records.
     ///
     /// # Errors
     /// The append failed: [`Unwritten`] says whether the spool keeps every record of this run
@@ -304,8 +305,19 @@ impl Records<'_> {
         }
         match (self.append)(root, &appended, (self.now)()) {
             Ok(()) => {
+                let mut unremoved = Vec::new();
                 for record in &appended {
-                    let _ = self.spool.done(record);
+                    if let Err(why) = self.spool.done(record) {
+                        unremoved.push(format!("{} ({why})", record.path));
+                    }
+                }
+                if !unremoved.is_empty() {
+                    say(&format!(
+                        "verify land: the journal append succeeded, but {} spool entries were \
+                         not removed: {}",
+                        unremoved.len(),
+                        unremoved.join(", ")
+                    ));
                 }
                 self.tally.made.clear();
                 Ok(())

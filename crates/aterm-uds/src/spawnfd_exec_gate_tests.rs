@@ -26,6 +26,10 @@ fn native_execs_refuse_process_reads_and_reopen_after_failure() {
         use std::os::unix::process::CommandExt as _;
         // This token models a held read without entering the kernel. The bypass therefore
         // demonstrates actual replacement safely, rather than creating a kernel deadlock.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the ungated control: it shows the bypass the gate refuses"
+        )]
         let error = std::process::Command::new(&marker).arg(BYPASS).exec();
         panic!("the ungated control did not replace the helper: {error}");
     }

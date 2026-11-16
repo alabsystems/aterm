@@ -53,7 +53,6 @@ fn declarations_with(sys: &Fake, who: &User, parent: &Path, paths: &[&str], off:
             .display(),
         Ran::ok(&format!("100644 blob {OLD}\t.gitmodules\0")),
     );
-    nothing_named(sys, git());
     sys.on(
         &checkout::Programs::default()
             .off(git())
@@ -128,14 +127,6 @@ fn declarations_with(sys: &Fake, who: &User, parent: &Path, paths: &[&str], off:
     );
 }
 
-/// The repository `git` runs in names no hook or filter driver ([`checkout::Programs::named`]).
-fn nothing_named(sys: &Fake, git: Cmd) {
-    sys.on(
-        &checkout::Programs::listing(git).display(),
-        Ran::exit(1, ""),
-    );
-}
-
 /// `path` a finished checkout of alice's `name` at `pin`, there before the pass, its index
 /// written.
 pub(in crate::init_github) fn existing(sys: &Fake, who: &User, path: &Path, name: &str, pin: &str) {
@@ -153,34 +144,18 @@ fn existing_as(
     off: NoLazyFetch,
 ) {
     let git = || local(sys, who, Some(path), off);
-    let ordinary = || checkout::git(sys, who, Some(path));
-    sys.on(
-        &ordinary().args(repos::WORKTREE_READ).display(),
-        Ran::ok(&format!(
-            "true\n\n{}\n{}\n",
-            path.display(),
-            repos::tests::fake_index(path).display()
-        )),
-    );
-    sys.on(
-        &ordinary()
-            .args(["config", "--get-all", "remote.origin.url"])
-            .display(),
-        Ran::ok(&format!("https://github.com/{owner}/{name}.git\n")),
-    );
-    sys.on(
-        &ordinary()
-            .args(["rev-parse", "--is-shallow-repository"])
-            .display(),
-        Ran::ok("false\n"),
+    // Its record of facts: the top of its worktree at its origin, neither shallow nor partial.
+    let origin = format!("https://github.com/{owner}/{name}.git");
+    checkout::facts::tests::script(
+        sys,
+        who,
+        path,
+        &repos::tests::fake_index(path),
+        &[("remote.origin.url", origin.as_str())],
     );
     // A finished checkout's HEAD names a commit that is there; its index is where the checkout
     // that wrote it put it.
-    repos::tests::script_head(sys, who, path, Ran::ok(&format!("{pin}\n")));
-    sys.on(
-        &super::super::repos::partial_listing(ordinary()).display(),
-        Ran::exit(1, ""),
-    );
+    repos::tests::script_head(sys, who, path, Some(pin));
     sys.on(
         &git().args(["rev-parse", "--show-toplevel"]).display(),
         Ran::ok(&path.to_string_lossy()),
@@ -204,12 +179,6 @@ fn existing_as(
             ])
             .display(),
         Ran::ok(""),
-    );
-    sys.on(
-        &ordinary()
-            .args(["rev-parse", "--git-path", "objects/info/alternates"])
-            .display(),
-        Ran::ok(".git/objects/info/alternates\n"),
     );
 }
 
@@ -263,23 +232,9 @@ fn download_as(
     );
     let stage =
         Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
-    let command = network(sys, who, None, &dependency, NoLazyFetch::Flag)
+    let key = download_command(sys, who, &dependency, NoLazyFetch::Flag, &stage)
         .unwrap()
-        .budget(BUDGET)
-        .args([
-            "clone",
-            "--no-checkout",
-            "--no-recurse-submodules",
-            "--no-single-branch",
-            "--tags",
-            "--origin",
-            "origin",
-            "--template=",
-            "--",
-            &dependency.url(),
-        ])
-        .arg(&stage);
-    let key = command.display();
+        .display();
     sys.on(&key, Ran::ok(""));
     sys.on_stat(&key, &stage, directory(who));
     sys.on_stat(&key, &stage.join(".git"), directory(who));
@@ -1289,14 +1244,18 @@ fn dirty_branched_partial_unknown_and_linked_dependencies_stay_unfinished_and_un
         sys.file(path.join("work.rs").to_str().unwrap(), b"owner work");
         existing(&sys, &who, &path, "library", OLD);
         if mode == "partial" {
-            sys.simulate(|_, command| {
-                (command.display().contains("config --get-regexp")
-                    && command.display().contains("partialclone"))
-                .then(|| Ran::ok("remote.origin.promisor true\n"))
+            // Its record's config listing names a promisor remote.
+            let listing = checkout::facts::config_listing(&sys, &who, &path).display();
+            sys.simulate(move |_, command| {
+                (command.display() == listing).then(|| {
+                    Ran::ok(&checkout::facts::tests::listing_of(&[
+                        ("remote.origin.url", "https://github.com/alice/library.git"),
+                        ("remote.origin.promisor", "true"),
+                    ]))
+                })
             });
         }
         let git = || local(&sys, &who, Some(&path), NoLazyFetch::Flag);
-        nothing_named(&sys, git());
         sys.on(
             &checkout::Programs::default()
                 .off(git())
@@ -1382,7 +1341,6 @@ fn an_existing_clean_detached_recorded_pin_is_fetched_then_aligned_without_recur
     );
     existing(&sys, &who, &path, "library", OLD);
     let git = || local(&sys, &who, Some(&path), NoLazyFetch::Flag);
-    nothing_named(&sys, git());
     sys.on(
         &checkout::Programs::default()
             .off(git())
@@ -1572,4 +1530,406 @@ fn changed_gitlinks_urls_index_and_off_host_routes_refuse_publication() {
         assert!(sys.stat(&parent.join("vendor/library")).is_err(), "{mode}");
         assert!(sys.guarded_renames().is_empty(), "{mode}");
     }
+}
+
+/// WHAT A PARENT'S COMMIT DECLARES OF A REQUIRED GITLINK IS READ ONCE WHILE THE PARENT'S RECORD
+/// STANDS: with the parent's record kept (a pass's, [`System::checkout_records`]), a second
+/// readiness read of the same commit runs neither `ls-tree` nor `config --blob` again, while
+/// the parent's `.gitmodules` diff and the gitlink's index entry, the person's, are read each
+/// time ([`resolve`]).
+/// NEGATIVE CONTROL: once a file the parent's record comes from changes (a `git config` in the
+/// parent), the next read runs both `ls-tree`s and both `config --blob` reads again, as the
+/// first did.
+#[test]
+fn a_gitlink_declaration_is_read_once_while_the_parents_record_stands() {
+    use crate::port::Live;
+    use crate::port::spawns::Spawns;
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
+    let live = Live::new();
+    let scratch = Scratch::new(&live, "required-gitlink-record").unwrap();
+    let mut who = user("fixture", live.euid());
+    who.home = scratch.path().to_string_lossy().into_owned();
+    let parent = scratch.path().join("parent");
+    let child = parent.join("vendor/library");
+    live.create_dir_all(&child, 0o700).unwrap();
+    let run = |path: &Path, args: &[&str]| {
+        let command = local(&live, &who, Some(path), off)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(checkout::NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args.iter().copied());
+        text(&live, command, "synthetic local git fixture failed").unwrap()
+    };
+    run(
+        &child,
+        &["init", "--template=", "--initial-branch=owner-work"],
+    );
+    live.write_file(&child.join("library.rs"), b"required source\n", 0o600)
+        .unwrap();
+    run(&child, &["add", "--", "library.rs"]);
+    run(&child, &["commit", "-m", "fixture dependency"]);
+    run(
+        &child,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/library.git",
+        ],
+    );
+    let pin = run(&child, &["rev-parse", "HEAD"]).trim().to_owned();
+    run(&parent, &["init", "--template=", "--initial-branch=main"]);
+    run(
+        &parent,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/parent.git",
+        ],
+    );
+    live.write_file(
+        &parent.join(".gitmodules"),
+        b"[submodule \"vendor/library\"]\npath = vendor/library\nurl = https://github.com/alice/library.git\n",
+        0o600,
+    )
+    .unwrap();
+    run(&parent, &["add", "--", ".gitmodules"]);
+    run(
+        &parent,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{pin},vendor/library"),
+        ],
+    );
+    run(&parent, &["commit", "-m", "fixture parent"]);
+    let repo = Repo {
+        owner: "alice".into(),
+        name: "parent".into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: vec!["vendor/library".into()],
+    };
+    let sys = Spawns::new(&live);
+    // The parent's `ls-tree`s, `config --blob` reads, `diff`s and `ls-files` so far.
+    let reads = || {
+        let record = sys.record();
+        let count = |word: &str| {
+            record
+                .iter()
+                .filter(|(cmd, _)| {
+                    cmd.args
+                        .windows(2)
+                        .any(|pair| pair[0] == "-C" && pair[1] == parent.as_os_str())
+                        && cmd.args.iter().any(|arg| arg == word)
+                })
+                .count()
+        };
+        (
+            count("ls-tree"),
+            count("--blob"),
+            count("diff"),
+            count("ls-files"),
+        )
+    };
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert_eq!(reads(), (2, 2, 1, 1), "{:?}", ran_lines(&sys));
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert_eq!(
+        reads(),
+        (2, 2, 2, 2),
+        "the record answers: {:?}",
+        ran_lines(&sys)
+    );
+    run(&parent, &["config", "aterm.fixture", "changed"]);
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+    assert_eq!(
+        reads(),
+        (4, 4, 3, 3),
+        "control: read again: {:?}",
+        ran_lines(&sys)
+    );
+}
+
+/// A STALLED DEPENDENCY DOWNLOAD IS A NETWORK FAILURE, IN THE DEPENDENCY'S OWN RECORD: a required
+/// dependency's clone that made no progress for its window ([`crate::port::RunFailed::Stalled`])
+/// fails the repair as the network's, saying it made no progress, places nothing at the
+/// dependency's path, and ends the dependency's own destination record (`parent/vendor/library`)
+/// failed as the network's, at its transfer. NEGATIVE CONTROL: the same clone with progress
+/// places the dependency, and its record passes through placing and ends ready, placed and
+/// usable, its staging gone.
+#[test]
+fn a_stalled_dependency_download_is_a_network_failure_in_its_own_record() {
+    use crate::repository_progress::{FailureKind, OutcomeReason};
+    for stalled in [true, false] {
+        let (sys, who, repo, parent) = fixture(&["vendor/library"]);
+        let key = download(&sys, &who, &parent, "vendor/library", 0);
+        if stalled {
+            sys.stall(&key);
+        }
+        let result = repair(&sys, &who, &parent, &repo, &|| Ok(()));
+        let destination = parent.join("vendor/library");
+        let observed = sys.repository_observations();
+        let record = observed
+            .iter()
+            .filter(|row| row.destination == destination)
+            .collect::<Vec<_>>();
+        assert!(
+            record.iter().all(|row| row.name == "parent/vendor/library"),
+            "stalled={stalled}: {record:?}"
+        );
+        let last = record.last().unwrap();
+        if stalled {
+            let failure = result.unwrap_err();
+            assert!(failure.is_network(), "{failure}");
+            assert!(
+                failure.to_string().contains("(no progress for "),
+                "{failure}"
+            );
+            assert!(sys.stat(&destination).is_err());
+            assert_eq!(last.phase, Phase::Failed);
+            assert!(!last.usable && !last.placed);
+            let outcome = last.outcome.as_ref().unwrap();
+            assert_eq!(outcome.stage, Phase::Connecting);
+            assert_eq!(outcome.reason, OutcomeReason::Failed(FailureKind::Network));
+        } else {
+            result.unwrap();
+            assert!(ready(&sys, &who, &parent, &repo).unwrap());
+            assert!(record.iter().any(|row| row.phase == Phase::Placing));
+            assert_eq!(last.phase, Phase::Ready);
+            assert!(last.usable && last.placed && last.staging.is_none());
+        }
+    }
+}
+
+/// A DEPENDENCY PUBLISHED WHOSE STAGING COULD NOT BE REMOVED IS PLACED IN ITS RECORD: the repair
+/// fails (this Mac's fault, not the network's), but the dependency is at its path, so its record
+/// ends failed at placing with the checkout placed and no staging. NEGATIVE CONTROL: a download
+/// that stalled before its publish ends the record failed with nothing placed.
+#[test]
+fn a_published_dependency_whose_staging_stayed_is_placed_in_its_record() {
+    use crate::repository_progress::{FailureKind, OutcomeReason};
+    for published in [true, false] {
+        let (sys, who, repo, parent) = fixture(&["vendor/library"]);
+        let key = download(&sys, &who, &parent, "vendor/library", 0);
+        if published {
+            sys.scratch_close_fails(
+                &Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0),
+                Some(io::ErrorKind::PermissionDenied),
+            );
+        } else {
+            sys.stall(&key);
+        }
+        let failure = repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap_err();
+        let destination = parent.join("vendor/library");
+        let observed = sys.repository_observations();
+        let last = observed
+            .iter()
+            .rfind(|row| row.destination == destination)
+            .unwrap();
+        assert_eq!(last.phase, Phase::Failed, "published={published}");
+        assert_eq!(last.placed, published, "published={published}: {last:?}");
+        assert_eq!(sys.stat(&destination).is_ok(), published);
+        let outcome = last.outcome.as_ref().unwrap();
+        if published {
+            assert!(!failure.is_network(), "{failure}");
+            assert_eq!(
+                failure.to_string(),
+                "required dependency published but its empty staging could not be removed"
+            );
+            assert!(last.staging.is_none(), "{last:?}");
+            assert_eq!(outcome.stage, Phase::Placing);
+            assert_eq!(outcome.reason, OutcomeReason::Failed(FailureKind::Local));
+        } else {
+            assert!(failure.is_network(), "{failure}");
+            assert_eq!(outcome.stage, Phase::Connecting);
+        }
+    }
+}
+
+/// A DEPENDENCY FETCH THAT KEEPS REPORTING PROGRESS OUTLIVES THE OLD BUDGET: a required
+/// dependency whose checkout lacks an object at its pin is fetched, with this host's git, from a
+/// stand-in for GitHub: the SSH transport its own config names through the admitted rewrite,
+/// which writes Git's progress meter once a second for eight seconds or more (eight `sleep 1`s,
+/// which never return early) before it serves a copy of the dependency with git's own
+/// upload-pack. Under a five-second stall window the fetch runs to its end and the dependency is
+/// ready: the fetch is bounded by its progress, never by a wall clock. The window is the ticks'
+/// hang detector: a tick whose `sleep` a loaded Mac starts up to four seconds late still lands
+/// inside it.
+/// NEGATIVE CONTROLS: the same fetch bounded by a wall clock, as the old 30-minute budget bounded
+/// it ([`System::run_complete_stdout`] under a one-second budget), is ended at that budget; and a
+/// transport that writes nothing and does no work (`sleep 60`) under a one-second window is
+/// stopped as a stall, a network failure that says it made no progress, the dependency left as
+/// it was. The minute that transport sleeps is the hang detector: a fetch the window did not
+/// stop ends then on what Git said, which fails the assertion on its reason.
+#[test]
+fn a_dependency_fetch_that_keeps_reporting_progress_outlives_the_old_budget() {
+    use crate::port::{Live, RunFailed};
+    use std::time::Instant;
+    // Git's progress meter, eight times a second apart, on one line of a config.
+    const METER: &str = r"i=1; while [ $i -le 8 ]; do printf 'Receiving objects: %3d%% (%d/8)\r' $((i * 100 / 8)) $i >&2; /bin/sleep 1; i=$((i + 1)); done";
+    let off = crate::items::github::need_native_git_barring_lazy_fetch();
+    let sys = Live::stalling_after(Duration::from_secs(5));
+    let scratch = Scratch::new(&sys, "required-transfer-window").unwrap();
+    let mut who = user("fixture", sys.euid());
+    who.home = scratch.path().to_string_lossy().into_owned();
+    let parent = scratch.path().join("parent");
+    let child = parent.join("vendor/library");
+    let donor = scratch.path().join("donor.git");
+    sys.create_dir_all(&child, 0o700).unwrap();
+    let run = |path: &Path, args: &[&str]| {
+        let command = local(&sys, &who, Some(path), off)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(checkout::NO_SIDE_RUNS)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args.iter().copied());
+        text(&sys, command, "synthetic local git fixture failed").unwrap()
+    };
+    run(&child, &["init", "--template=", "--initial-branch=main"]);
+    sys.write_file(&child.join("library.rs"), b"required source\n", 0o600)
+        .unwrap();
+    run(&child, &["add", "--", "library.rs"]);
+    run(&child, &["commit", "-m", "fixture dependency"]);
+    let pin = run(&child, &["rev-parse", "HEAD"]).trim().to_owned();
+    let blob = run(&child, &["rev-parse", &format!("{pin}:library.rs")])
+        .trim()
+        .to_owned();
+    run(
+        scratch.path(),
+        &[
+            "clone",
+            "--bare",
+            "--no-hardlinks",
+            "--",
+            child.to_str().unwrap(),
+            donor.to_str().unwrap(),
+        ],
+    );
+    run(
+        &child,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/library.git",
+        ],
+    );
+    // GitHub's stand-in: the admitted SSH rewrite reaches a transport the dependency's own
+    // config names, which the simple variant hands only the host and Git's command, and which
+    // serves the donor's copy with git's own upload-pack.
+    run(
+        &child,
+        &[
+            "config",
+            "url.git@github.com:.insteadOf",
+            "https://github.com/",
+        ],
+    );
+    run(&child, &["config", "ssh.variant", "simple"]);
+    let serve = format!(
+        "exec '{}' -c uploadpack.allowAnySHA1InWant=true upload-pack '{}'",
+        local(&sys, &who, None, off).program.display(),
+        donor.display()
+    );
+    let transport = |body: &str| {
+        run(
+            &child,
+            &[
+                "config",
+                "core.sshCommand",
+                &format!("f() {{ {body}; }}; f"),
+            ],
+        );
+    };
+    run(&parent, &["init", "--template=", "--initial-branch=main"]);
+    run(
+        &parent,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/alice/parent.git",
+        ],
+    );
+    sys.write_file(
+        &parent.join(".gitmodules"),
+        b"[submodule \"vendor/library\"]\npath = vendor/library\nurl = https://github.com/alice/library.git\n",
+        0o600,
+    )
+    .unwrap();
+    run(&parent, &["add", "--", ".gitmodules"]);
+    run(
+        &parent,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{pin},vendor/library"),
+        ],
+    );
+    run(&parent, &["commit", "-m", "fixture parent"]);
+    let repo = Repo {
+        owner: "alice".into(),
+        name: "parent".into(),
+        default_branch: Some("main".into()),
+        size_kib: 0,
+        fork: false,
+        archived: false,
+        required_submodules: vec!["vendor/library".into()],
+    };
+    // The dependency stands at its pin without the pin's file: its fetch is owed.
+    sys.remove(&child.join(".git/objects").join(&blob[..2]).join(&blob[2..]))
+        .unwrap();
+    assert!(!ready(&sys, &who, &parent, &repo).unwrap());
+
+    transport("/bin/sleep 60");
+    let silent = Live::stalling_after(Duration::from_secs(1));
+    let stalled = repair(&silent, &who, &parent, &repo, &|| Ok(())).unwrap_err();
+    assert!(stalled.is_network(), "{stalled}");
+    assert_eq!(
+        stalled.to_string(),
+        "cannot fetch the required dependency's recorded commit (no progress for 1s)"
+    );
+    assert!(!ready(&sys, &who, &parent, &repo).unwrap());
+
+    transport(&format!("{METER}; {serve}"));
+    let started = Instant::now();
+    repair(&sys, &who, &parent, &repo, &|| Ok(())).unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(8),
+        "eight one-second sleeps ran"
+    );
+    assert!(ready(&sys, &who, &parent, &repo).unwrap());
+
+    let dependency = resolve(&sys, &who, &parent, &repo, "vendor/library", off).unwrap();
+    let budget = Duration::from_secs(1);
+    assert!(matches!(
+        sys.run_complete_stdout(
+            &fetch_command(&sys, &who, &child, &dependency, off)
+                .unwrap()
+                .budget(budget)
+        ),
+        Err(RunFailed::TimedOut(at)) if at == budget
+    ));
+}
+
+/// Each run `sys` recorded, its arguments as one line.
+fn ran_lines(sys: &crate::port::spawns::Spawns<'_>) -> Vec<String> {
+    sys.record().iter().map(|(cmd, _)| cmd.display()).collect()
 }

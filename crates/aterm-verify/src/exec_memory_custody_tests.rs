@@ -158,7 +158,7 @@ fn stage_memory_survives_until_direct_and_pool_nested_workers_both_end() {
             admit_quiet: admit,
             admit_memory: admit,
         },
-        &early,
+        crate::StageAdmission::Conservative(&early),
         || stage(&ctx, &spec),
     );
     let held_after_stage = held(&ledger);

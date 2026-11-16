@@ -45,7 +45,14 @@ dependencies = [
 
 [[package]]
 name = "alab-policy"
-version = "0.0.0"
+version = "0.8.1"
+
+[[package]]
+name = "alab-wire"
+version = "0.8.1"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "amacs"
@@ -109,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "astream-aead"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "getrandom",
  "ring",
@@ -118,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "astream-broker"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "astream-aead",
  "astream-cap",
@@ -129,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "astream-cap"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "astream-digest",
  "astream-sys",
@@ -138,27 +145,27 @@ dependencies = [
 
 [[package]]
 name = "astream-digest"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "astream-effects"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "astream-sys"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "astream-term"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "astream-wire"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.203.0"
+version = "0.204.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -906,6 +913,7 @@ name = "aterm-gui"
 version = "0.0.0"
 dependencies = [
  "alab-policy",
+ "alab-wire",
  "amacs",
  "amacs-files",
  "astream-broker",
@@ -1199,6 +1207,7 @@ dependencies = [
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-vitals",
  "aterm-vz",
  "aterm-vz-agent",
  "atpkg",

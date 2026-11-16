@@ -992,24 +992,24 @@ struct ForwardHost {
 
 impl ForwardHost {
     /// The line that tells a client its host went away, or `None` while the host serves on.
-    /// A look waits `within` on a host that queues its connect and never answers. `client_left`
-    /// ends that wait within [`HANGUP_POLL`](crate::control::HANGUP_POLL): the line then has
-    /// nobody to read it, and there is none.
-    fn gone_line(&self, client_left: impl Fn() -> bool) -> Option<String> {
-        self.gone_line_with_clock(std::time::Instant::now, client_left)
+    /// Once connected, a probe waits `within` for its reply. `abandoned` ends that reply wait
+    /// within [`HANGUP_POLL`](crate::control::HANGUP_POLL): the exchange no longer needs a host
+    /// verdict, and no gone line is sent. It is also checked before connecting and after the look.
+    fn gone_line(&self, abandoned: impl Fn() -> bool) -> Option<String> {
+        self.gone_line_with_clock(std::time::Instant::now, abandoned)
     }
 
     fn gone_line_with_clock(
         &self,
         started: impl FnOnce() -> std::time::Instant,
-        client_left: impl Fn() -> bool,
+        abandoned: impl Fn() -> bool,
     ) -> Option<String> {
         let pid = self.pid?;
-        if client_left() {
+        if abandoned() {
             return None;
         }
-        let serves = self.serves(pid, started, &client_left);
-        (!serves && !client_left())
+        let serves = self.serves(pid, started, &abandoned);
+        (!serves && !abandoned())
             .then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
     }
 
@@ -1118,11 +1118,14 @@ fn relay_bidirectional(
             let ready = || readable_unless_stopped(child, stop);
             match copy_host_to_client(&mut from_host, &mut to_client, ready) {
                 HostLeg::HostEnded => {
-                    // Asked before the look and through its wait: a client that hangs up
-                    // meanwhile ends the relay now, not when the look's wait runs out.
-                    let client_left =
-                        || client_gone.load(SeqCst) || aterm_uds::hangup::peer_closed(client);
-                    if let Some(line) = host.gone_line(client_left) {
+                    // A failed forward can stop this relay while its client stays connected.
+                    // Stop or hang-up abandons the look before, during and after its reply wait.
+                    let abandoned = || {
+                        stop.load(SeqCst)
+                            || client_gone.load(SeqCst)
+                            || aterm_uds::hangup::peer_closed(client)
+                    };
+                    if let Some(line) = host.gone_line(abandoned) {
                         let _ = to_client.write_all(line.as_bytes());
                         let _ = to_client.flush();
                     }

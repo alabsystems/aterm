@@ -69,9 +69,19 @@ fn the_sweep_releases_only_the_fifos_whose_owner_has_ended() {
     let earlier = format!("{gone_pid}-{gone_birth}-s-0123456789abcdef0123");
     mkfifo(&at(&earlier));
     link(&earlier, "s-0123456789abcdef0123");
-    // An ended owner's FIFO whose name ends in no tab ID is not a hold's: it stays.
+    // An ended owner's FIFO whose name ends in no tab ID is not a hold's: it stays. A loose
+    // `s-` word (a digit short or over, upper case, a bare `s-1`) is no earlier ID either.
     let not_a_tab = format!("{gone_pid}-{gone_birth}-s-0123456789abcdef012");
     mkfifo(&at(&not_a_tab));
+    // (The upper-case one spells its own digits: on a case-insensitive volume it would otherwise
+    // be the earlier ID's own file.)
+    let loose: Vec<String> = ["s-0123456789abcdef01234", "s-FEDCBA98765432100123", "s-1"]
+        .iter()
+        .map(|sid| format!("{gone_pid}-{gone_birth}-{sid}"))
+        .collect();
+    for name in &loose {
+        mkfifo(&at(name));
+    }
 
     sweep_dead(dir.path());
     zombie.wait().expect("reap");
@@ -89,6 +99,7 @@ fn the_sweep_releases_only_the_fifos_whose_owner_has_ended() {
         unread,
         not_a_tab,
     ];
+    kept.extend(loose);
     kept.sort();
     assert_eq!(left, kept);
 }

@@ -59,26 +59,28 @@ pub(crate) fn bundle(root: &Path, bytes: &[u8]) -> std::path::PathBuf {
 }
 
 #[cfg(unix)]
+fn context(root: &Path) -> Ctx {
+    Ctx::new(
+        root.to_owned(),
+        Scope::workspace(),
+        EnvSnapshot::default(),
+        root.join("scratch"),
+    )
+}
+
+#[cfg(unix)]
 #[test]
-fn offline_admission_checks_assertions_and_vm_authority_before_a_private_copy() {
-    for (debug, expected, release_gate, vm, allowed) in [
-        (true, Profile::Debug, false, false, true),
-        (false, Profile::Debug, false, false, false),
-        (true, Profile::Release, true, true, false),
-        (true, Profile::Debug, true, true, false),
-        (false, Profile::Release, true, false, false),
-        (false, Profile::Release, true, true, true),
+fn offline_admission_checks_assertions_before_a_private_copy() {
+    // A release image's admission, and a debug image's refusal under a release gate, have tests
+    // of their own below.
+    for (debug, expected, release_gate, allowed) in [
+        (true, Profile::Debug, false, true),
+        (false, Profile::Debug, false, false),
+        (true, Profile::Release, true, false),
     ] {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let app = bundle(tmp.path(), &executable(debug));
-        let mut ctx = Ctx::new(
-            tmp.path().to_owned(),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            tmp.path().join("scratch"),
-        )
-        .with_release(release_gate);
-        ctx.virtual_machine = if vm { || Some(true) } else { || Some(false) };
+        let ctx = context(tmp.path()).with_release(release_gate);
         let starts = Cell::new(0);
         let result = MeasureArtifact::for_profile(&app, expected).and_then(|artifact| {
             artifact.admit(&ctx)?;
@@ -89,7 +91,7 @@ fn offline_admission_checks_assertions_and_vm_authority_before_a_private_copy() 
         assert_eq!(
             result.is_ok(),
             allowed,
-            "debug={debug} expected={expected:?} release_gate={release_gate} vm={vm}: {result:?}"
+            "debug={debug} expected={expected:?} release_gate={release_gate}: {result:?}"
         );
         assert_eq!(
             starts.get(),
@@ -106,12 +108,7 @@ fn offline_admission_checks_assertions_and_vm_authority_before_a_private_copy() 
         let tmp = aterm_tempfile::tempdir().unwrap();
         let app = bundle(tmp.path(), &bytes);
         let starts = Cell::new(0);
-        let ctx = Ctx::new(
-            tmp.path().to_owned(),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            tmp.path().join("scratch"),
-        );
+        let ctx = context(tmp.path());
         let result = MeasureArtifact::for_profile(&app, Profile::Debug)
             .and_then(|artifact| artifact.with_admission(&ctx, |_| starts.set(starts.get() + 1)));
         assert!(result.is_err());
@@ -120,53 +117,92 @@ fn offline_admission_checks_assertions_and_vm_authority_before_a_private_copy() 
     }
 }
 
+/// A release cut runs on a Mac's own hardware: its release image is admitted for the scratch world
+/// its measurement makes, under the release gate, `--as-release` and an ordinary run alike.
 #[cfg(unix)]
 #[test]
-fn file_content_replacement_and_alias_drift_revoke_admission_before_start() {
-    for same_bytes in [true, false] {
-        let tmp = aterm_tempfile::tempdir().unwrap();
-        let bytes = executable(true);
-        let app = bundle(tmp.path(), &bytes);
-        let artifact = MeasureArtifact::for_profile(&app, Profile::Debug).unwrap();
-        let ctx = Ctx::new(
-            tmp.path().to_owned(),
-            Scope::workspace(),
-            EnvSnapshot::default(),
-            tmp.path().join("scratch"),
-        );
-        let replacement = tmp.path().join("replacement");
-        if same_bytes {
-            std::fs::write(&replacement, bytes).unwrap();
-            std::fs::rename(replacement, artifact.bin("aterm")).unwrap();
-        } else {
-            let mut bytes = bytes;
-            bytes[255] = 1;
-            std::fs::write(artifact.bin("aterm"), bytes).unwrap();
-        }
-        let starts = Cell::new(0);
-        assert!(
-            artifact
-                .with_admission(&ctx, |_| starts.set(starts.get() + 1))
-                .is_err()
-        );
-        assert_eq!(starts.get(), 0);
-    }
+fn a_release_image_is_admitted_on_hardware_for_its_scratch_world_measurement() {
     let tmp = aterm_tempfile::tempdir().unwrap();
-    let app = bundle(tmp.path(), &executable(true));
-    let artifact = MeasureArtifact::for_profile(&app, Profile::Debug).unwrap();
-    let ctx = Ctx::new(
-        tmp.path().to_owned(),
-        Scope::workspace(),
-        EnvSnapshot::default(),
-        tmp.path().join("scratch"),
-    );
-    std::fs::remove_file(artifact.bin("aterm-gui")).unwrap();
-    std::fs::write(artifact.bin("aterm-gui"), executable(false)).unwrap();
-    assert!(
-        artifact
-            .with_admission(&ctx, |_| panic!("an unadmitted alias must not start"))
-            .is_err()
-    );
+    let release =
+        MeasureArtifact::for_profile(&bundle(tmp.path(), &executable(false)), Profile::Release)
+            .unwrap();
+    for (release_gate, as_release) in [(true, false), (true, true), (false, true), (false, false)] {
+        let mut ctx = context(tmp.path()).with_release(release_gate);
+        ctx.checkers_in_tests = as_release;
+        assert_eq!(
+            release.admit(&ctx),
+            Ok(()),
+            "release={release_gate} as_release={as_release}"
+        );
+        let _copy = Snapshot::prepare(&release.app, release.executable.as_ref().unwrap()).unwrap();
+        assert!(!ctx.scratch.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_debug_image_still_cannot_qualify_a_release() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let debug =
+        MeasureArtifact::for_profile(&bundle(tmp.path(), &executable(true)), Profile::Debug)
+            .unwrap();
+    assert_eq!(debug.admit(&context(tmp.path())), Ok(()));
+    for (release_gate, as_release) in [(true, false), (false, true), (true, true)] {
+        let mut ctx = context(tmp.path()).with_release(release_gate);
+        ctx.checkers_in_tests = as_release;
+        assert_eq!(
+            debug.admit(&ctx),
+            Err("debug bundle validation cannot qualify a release".into()),
+            "release={release_gate} as_release={as_release}"
+        );
+    }
+}
+
+/// Admission rests on custody, not on a platform: the image it admitted, once swapped for the
+/// same bytes in a new file, changed in place or aliased to another file, is refused before
+/// anything starts, a release image on the release path as a debug image at a desk.
+#[cfg(unix)]
+#[test]
+fn file_replacement_and_alias_drift_revoke_admission_before_start() {
+    for (debug, profile, release_gate) in [
+        (true, Profile::Debug, false),
+        (false, Profile::Release, true),
+    ] {
+        for swap in ["same bytes, new file", "changed in place", "alias"] {
+            let tmp = aterm_tempfile::tempdir().unwrap();
+            let bytes = executable(debug);
+            let artifact =
+                MeasureArtifact::for_profile(&bundle(tmp.path(), &bytes), profile).unwrap();
+            let ctx = context(tmp.path()).with_release(release_gate);
+            assert_eq!(artifact.admit(&ctx), Ok(()), "{profile:?} {swap}: before");
+            match swap {
+                "same bytes, new file" => {
+                    let replacement = tmp.path().join("replacement");
+                    std::fs::write(&replacement, &bytes).unwrap();
+                    std::fs::rename(replacement, artifact.bin("aterm")).unwrap();
+                }
+                "changed in place" => {
+                    let mut bytes = bytes;
+                    bytes[255] = 1;
+                    std::fs::write(artifact.bin("aterm"), bytes).unwrap();
+                }
+                _ => {
+                    std::fs::remove_file(artifact.bin("aterm-gui")).unwrap();
+                    std::fs::write(artifact.bin("aterm-gui"), &bytes).unwrap();
+                }
+            }
+            let starts = Cell::new(0);
+            let refused = artifact
+                .with_admission(&ctx, |_| starts.set(starts.get() + 1))
+                .expect_err(swap);
+            assert_eq!(starts.get(), 0, "{profile:?} {swap}");
+            assert!(
+                refused.contains("no longer matches its admitted file")
+                    || refused.contains("is not the admitted bundle executable"),
+                "{profile:?} {swap}: {refused}"
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -176,29 +212,11 @@ fn changing_the_requested_profile_cannot_override_the_held_compile_facts() {
     let app = bundle(tmp.path(), &executable(true));
     let mut artifact = MeasureArtifact::for_profile(&app, Profile::Debug).unwrap();
     artifact.profile = Profile::Release;
-    let mut ctx = Ctx::new(
-        tmp.path().to_owned(),
-        Scope::workspace(),
-        EnvSnapshot::default(),
-        tmp.path().join("scratch"),
-    )
-    .with_release(true);
-    ctx.virtual_machine = || Some(true);
+    let ctx = context(tmp.path()).with_release(true);
     assert!(
         artifact
             .with_admission(&ctx, |_| panic!(
                 "caller mutation must not override immutable assertions"
-            ))
-            .is_err()
-    );
-    let release_root = tmp.path().join("release");
-    let app = bundle(&release_root, &executable(false));
-    let release = MeasureArtifact::for_profile(&app, Profile::Release).unwrap();
-    ctx.virtual_machine = || None;
-    assert!(
-        release
-            .with_admission(&ctx, |_| panic!(
-                "an unread VM fact grants no release/scratch-world authority"
             ))
             .is_err()
     );

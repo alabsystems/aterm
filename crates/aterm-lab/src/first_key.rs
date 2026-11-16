@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `first-key`: the first key a window takes after a quiet, arm against arm (ATERM-KI-1027-4,
-//! `docs/measured/idle-memory-rest-2026-10-29.md`).
+//! `first-key`: the first key a window takes after a quiet, arm against arm.
 //!
 //! One windowed private instance (110x32) of the aterm given runs every press. Each arm names the
 //! window's `idle_rest_secs` and any `aterm.toml` lines of its own; the arms take turns press by
@@ -43,6 +42,17 @@
 //! quantiles.
 //! Exit 0 once every press ran or was dropped, 3 when the run could not: the
 //! instance did not come up, a control call was refused, or a key was not booked in a minute.
+//!
+//! The lane never touches its window as a person does: its keys are `hwkey` bursts and its line
+//! clear a control request, neither of which attends a window, and the one native focus is at
+//! the start. So under the default `motion` every press whose quiet is 40 s or longer meets a
+//! window whose attention has lapsed, with the stats deck drawn still, in an arm that rests the
+//! window and in one that does not; and no press is the touch that ends a lapse. Each press's
+//! row says what it met (`attended`, from `trail status`), and the summary counts the presses
+//! per arm.
+//! An arm that keeps the deck moving through its quiet, as every awake arm had it before
+//! windows had an attention (`docs/measured/idle-memory-rest-2026-10-29.md`), says so with
+//! `--arm-toml 'NAME=motion = "full"'`, which also turns the load shed off for that arm.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
@@ -110,6 +120,7 @@ const COLUMNS: &[&str] = &[
     "present_submit_cpu_ms",
     "present_submit_faults",
     "present_encode_ms",
+    "attended",
 ];
 
 /// The index of `name` in [`COLUMNS`].
@@ -466,6 +477,25 @@ pub fn summarize(rows: &[Row]) -> String {
             q3(&column(&cold, "present_ms")),
             rows.len() - normal - warn - critical,
         );
+    }
+    // What each arm's presses met, a burst press's four rows counted once: rows from before
+    // the column say nothing of it.
+    for name in &names {
+        let met: std::collections::BTreeMap<&str, bool> = of(name)
+            .iter()
+            .filter_map(|r| {
+                let attended = r.get("attended")?.parse().ok()?;
+                Some((r.get("press")?.as_str(), attended))
+            })
+            .collect();
+        if !met.is_empty() {
+            let _ = writeln!(
+                out,
+                "{name}: {} of {} presses met an attended window",
+                met.values().filter(|attended| **attended).count(),
+                met.len()
+            );
+        }
     }
     let burst = |name: &str| of(name).first().is_some_and(|r| is_burst(r));
     let above = |v: &[f64], t: f64| v.iter().filter(|&&x| x > t).count() as u64;
@@ -891,11 +921,12 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             // back) or its tab printed: the press is not the state under test, so it is dropped
             // and counted rather than measured, and the next press waits for its own state.
             let line = format!(
-                "{press}\t{}\tresting={} pet_deep={} focused={}",
+                "{press}\t{}\tresting={} pet_deep={} focused={} attended={}",
                 arm.name,
                 status.get("resting").map_or("?", String::as_str),
                 status.get("pet_deep").map_or("?", String::as_str),
-                status.get("focused").map_or("?", String::as_str)
+                status.get("focused").map_or("?", String::as_str),
+                status.get("attended").map_or("?", String::as_str)
             );
             eprintln!("first-key: dropped press {line}");
             let dropped_tsv = o.out.join("dropped.tsv");
@@ -1044,6 +1075,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             get(&m, "max_present_latency_submit_cpu_ms"),
             get(&m, "max_present_latency_submit_faults"),
             get(&m, "max_present_latency_encode_ms"),
+            status.get("attended").cloned().unwrap_or_default(),
         ];
         debug_assert_eq!(values.len(), COLUMNS.len());
         eprintln!(

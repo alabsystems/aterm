@@ -2696,7 +2696,7 @@ impl ReplyWriter for TcpStream {
 fn record_reply_len(records: &[crate::membership_log::Record]) -> io::Result<usize> {
     records.iter().try_fold(0usize, |length, record| {
         length
-            .checked_add(record.bytes().len())
+            .checked_add(record.wire_len())
             .filter(|length| *length <= crate::membership_log::MAX_RECORDS_STREAM)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "record reply is too large"))
     })
@@ -2784,14 +2784,19 @@ fn write_reply_to(
 
 /// Coalesce across record boundaries, keeping exactly one bounded partial chunk. Complete
 /// chunks of an existing record are sent directly, without copying their immutable bytes.
-fn record_chunks(
+/// Send `records`' bytes in chunks of [`WRITE_CHUNK`]. A record an open through the vault's head
+/// shelved is read back for its send and not kept ([`crate::membership_log::Record::wire_bytes`]);
+/// one that does not read back as it was fails the reply, which then falls short of the length
+/// its head declared.
+pub(crate) fn record_chunks(
     records: &[crate::membership_log::Record],
     mut send_chunk: impl FnMut(&[u8]) -> io::Result<()>,
 ) -> io::Result<()> {
     let mut partial = [0u8; WRITE_CHUNK];
     let mut used = 0;
     for record in records {
-        let mut bytes = record.bytes();
+        let read = record.wire_bytes()?;
+        let mut bytes = &read[..];
         if used != 0 {
             let take = (WRITE_CHUNK - used).min(bytes.len());
             partial[used..used + take].copy_from_slice(&bytes[..take]);
@@ -4441,7 +4446,10 @@ fn apply_pulled_records(
     };
     if reply.status == 400 {
         let part = received.readable();
-        let part_len: usize = part.iter().map(|record| record.bytes().len()).sum();
+        let part_len: usize = part
+            .iter()
+            .map(crate::membership_log::Record::wire_len)
+            .sum();
         if !part.is_empty() && part_len < length {
             reply = apply_records(
                 shared,
@@ -4560,7 +4568,7 @@ fn persist_records(
 
 /// Take strictly staged records into `name`'s store and its file
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rules 1 and 4). The file holds the log's
-/// complete records only ([`crate::membership_log::Store::encode_held`]); a record waiting on a
+/// complete records only ([`crate::membership_log::Store::read_held`]); a record waiting on a
 /// parent is held in memory only, under the store's bounds. The store is tried on a copy, which
 /// shares every record's bytes with the slot's ([`crate::membership_log::Record`]). A POST that
 /// adds only waiting records writes nothing and wakes nobody, since a server serves complete

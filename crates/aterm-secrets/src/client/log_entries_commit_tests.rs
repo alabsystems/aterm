@@ -4,6 +4,7 @@
 use super::*;
 use crate::commons::binding::Request;
 use crate::crossing::fixture::LEGACY;
+use crate::membership_log::encode_records;
 
 fn entrant(tag: u8, label: &str) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let writer = [tag; 32];

@@ -11,8 +11,8 @@ use crate::ledger::GitCli;
 
 /// Record an explicit instruction to ship despite the FAIL of `check` in `report`: the journaled
 /// release's record of `check` (the bundle's for measure, the tree's for a check that reads no
-/// bundle), a FAIL under the current build-inputs seal read from `report` (its SHA-256
-/// unchanged), is rewritten as accepted ([`crate::check_record::accept`]). Only a check that
+/// bundle), a FAIL (for measure also a NOT RUN) under the current build-inputs seal read from
+/// `report` (its SHA-256 unchanged), is rewritten as accepted ([`crate::check_record::accept`]). Only a check that
 /// runs the product's tests or measurements is accepted
 /// ([`crate::check_record::acceptable`]). The other checks are judged when the records are
 /// read: the release proceeds only once each of them has its own ok record or its own

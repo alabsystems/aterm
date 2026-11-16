@@ -673,6 +673,52 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether this kernel starts a program run through a symbolic link knowing it by its real
+/// path. Linux's `/proc/self/exe` names the file the link resolves to. macOS's
+/// `_NSGetExecutablePath` names the path the program was started by, the link's own: on m38 on
+/// 2026-11-15 a RUNTIME_PREFIX git started through a link to it looked for its exec path beside
+/// the link. Only where this holds is a PATH entry laid as a link ([`path_entry`]).
+pub const STARTS_AT_REAL_PATH: bool = cfg!(target_os = "linux");
+
+/// What atpkg lays at a PATH entry, given the shim [`shim_executable_to_env`] rendered there
+/// for `target`: where `starts_at_real_path` ([`STARTS_AT_REAL_PATH`]) and that shim would only
+/// exec `target`, a symbolic link to `target` in the shim's place, else the shim. It only execs
+/// when its body is the shim head and one exec line (`sh_exec_only`: no exported
+/// environment, prelude, launch, route or build hop), the entry has the program's own file name
+/// (so `argv[0]` names the program, as the store path the shim execs did), the program is no
+/// agent program (whose primary [`crate::activate::reconcile_agents`] lays with a prelude), and
+/// the program is a regular file with an execute bit in this platform's native executable format
+/// ([`crate::macho::is_native_executable`]): a `#!` script's interpreter, and a shell running a
+/// file with no header, would take the link's path for the script's.
+#[must_use]
+pub fn path_entry(
+    shim: crate::lay::Executable,
+    target: &Path,
+    starts_at_real_path: bool,
+) -> crate::lay::Executable {
+    if starts_at_real_path && only_execs(&shim, target) {
+        crate::lay::Executable::link(shim.path, target)
+    } else {
+        shim
+    }
+}
+
+/// Whether `shim` would only exec `target`, a native program ([`path_entry`]).
+fn only_execs(shim: &crate::lay::Executable, target: &Path) -> bool {
+    let name = shim.path.file_name();
+    shim.link.is_none()
+        && target.is_absolute()
+        && name.is_some()
+        && name == target.file_name()
+        && !name
+            .and_then(OsStr::to_str)
+            .is_some_and(crate::stub::is_agent_program)
+        && shim.body == super::sh_exec_only(target).as_bytes()
+        && crate::metadata_io::read_head_with_meta(target, 8).is_ok_and(|(head, meta)| {
+            meta.permissions().mode() & 0o111 != 0 && crate::macho::is_native_executable(&head)
+        })
+}
+
 /// Install a bin shim at `shim` forwarding to `target`, exporting `env` first (empty: the plain shim).
 pub fn install_shim_to_env(
     shim: &Path,
@@ -890,6 +936,10 @@ pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
         Ok(closed) => closed,
         Err(still) => return run_in_place_of_exec(command, still),
     };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the gated exec itself: `_closed` holds the exec gate on macOS"
+    )]
     command.exec()
 }
 

@@ -163,15 +163,30 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     if fields.len() != expected_fields {
         return DENIED.into();
     }
-    let (Some(id), Some(cap)) = (fields.get("id"), fields.get("cap")) else {
-        return DENIED.into();
-    };
     let Some(pid) = crate::control::serving_peer_pid() else {
         return DENIED.into();
     };
     let Some(current) = ExecSource::capture(pid) else {
         return DENIED.into();
     };
+    serve_current(ctx, master, (verb, &fields), current)
+}
+
+/// The id/cap verb `verb` with its `fields`, of the process captured as `current`: everything the
+/// verb decides once its process is captured. A verb of the operation its process armed is an ask
+/// of its series, whatever it is answered ([`renewal::note_ask`]), a `reserve` its run retries
+/// every 250 ms while the selection's commit is refused among them; a process that armed none
+/// asks nothing of its own here.
+fn serve_current(
+    ctx: &Arc<crate::SessionCtx>,
+    master: i32,
+    (verb, fields): (&str, &BTreeMap<&str, &str>),
+    current: ExecSource,
+) -> String {
+    let (Some(id), Some(cap)) = (fields.get("id"), fields.get("cap")) else {
+        return DENIED.into();
+    };
+    let pid = current.process.pid;
     let Some(generation) = current.exec_generation else {
         return DENIED.into();
     };
@@ -189,6 +204,11 @@ pub(super) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
     let Some(operation) = operation else {
         return DENIED.into();
     };
+    renewal::note_ask(
+        ctx,
+        ProcessKey::of(&current.process),
+        i64::try_from(now_ms() / 1000).unwrap_or(i64::MAX),
+    );
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = meta.supervisor_authority(crate::metrics::now_us());
     let mut launch = operation.lock().unwrap_or_else(|p| p.into_inner());
@@ -489,13 +509,33 @@ fn arm(ctx: &Arc<crate::SessionCtx>, master: i32, fields: &BTreeMap<&str, &str>)
     let Some(source) = ExecSource::capture(pid) else {
         return DENIED.into();
     };
-    let Some(generation) = source.exec_generation else {
-        return DENIED.into();
-    };
     let Some(env) = environment() else {
         return DENIED.into();
     };
+    arm_captured(
+        ctx,
+        (proof, source, env),
+        (intent, checkpoint),
+        (target_account, target_user),
+    )
+}
+
+/// An `arm` of `intent` and `checkpoint` that names the destination `target_account` and
+/// `target_user`, by the claimed process `proof`, captured as `source`, served in `env`:
+/// everything the step decides once the process is captured. Every such ask is one of its
+/// process's series, whatever it is answered ([`renewal::note_ask`]).
+fn arm_captured(
+    ctx: &Arc<crate::SessionCtx>,
+    (proof, source, env): (crate::self_claim::Proven, ExecSource, Env),
+    (intent, checkpoint): (codex_renewal::Intent, String),
+    (target_account, target_user): (&str, &str),
+) -> String {
     let key = ProcessKey::of(&source.process);
+    renewal::note_ask(ctx, key, env.now);
+    let Some(generation) = source.exec_generation else {
+        return DENIED.into();
+    };
+    let pid = source.process.pid;
     forget_gone(&ctx.fenced_writes.native);
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     let authority = meta.supervisor_authority(crate::metrics::now_us());

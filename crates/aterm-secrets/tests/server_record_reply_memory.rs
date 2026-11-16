@@ -13,7 +13,7 @@ use aterm_secrets::{
     envelope, fsx,
     membership_log::{
         Body, Entrant, EpochAudience, Inserted, Log, MAX_RECORDS_STREAM, Record, RecordId, Store,
-        encode_records,
+        read_records,
     },
     server::{self, Options, Running},
     text::{Audience, Entry},
@@ -138,7 +138,7 @@ impl Fixture {
                 .unwrap();
             assert_eq!(log.insert(record).unwrap(), Inserted::Held);
         }
-        let mut wire = encode_records(log.records());
+        let mut wire = read_records(log.records()).unwrap();
         assert!(wire.len() > VALUES * VALUE_BYTES);
         let parent = log
             .draft(
@@ -161,7 +161,7 @@ impl Fixture {
             )
             .sign(&writer, incarnation)
             .unwrap();
-        wire.extend_from_slice(child.bytes());
+        wire.extend_from_slice(child.wire_bytes().unwrap().as_ref());
         let keys = [envelope::signer_public(&signer).unwrap()];
         let expected = Store::for_vault(NAME)
             .unwrap()
@@ -170,7 +170,7 @@ impl Fixture {
         assert_eq!(expected.complete_inventory().len(), VALUES + 2);
         assert_eq!(expected.len(), VALUES + 3);
         assert!(expected.contains(child.id()));
-        assert!(expected.complete_bytes(child.id()).is_none());
+        assert!(!expected.holds(child.id()));
         fsx::write_atomic(
             &directory.path().join(format!("{NAME}.records")),
             &wire,
@@ -208,14 +208,12 @@ impl Fixture {
 
     fn expected(&self, have: &[RecordId]) -> Expected {
         let records = self.expected.missing(have);
-        let wire = encode_records(&records);
+        let wire = read_records(&records).unwrap();
         Expected {
             status: if wire.is_empty() { 204 } else { 200 },
             length: wire.len(),
             digest: Sha256::digest(&wire),
-            need: have
-                .iter()
-                .any(|id| self.expected.complete_bytes(id).is_none()),
+            need: have.iter().any(|id| !self.expected.holds(id)),
         }
     }
 }

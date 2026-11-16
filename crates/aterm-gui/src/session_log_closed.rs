@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Process-local index of recently closed sessions for `exits`, `log` and `brief`: each close's exit, linked in its roster record's store write, and its log and skeleton once attached.
+//! Process-local index of recently closed sessions for `log`, `brief` and the edge grants a closed session's readers present: each close's slot, linked in its roster record's store write, and its log and skeleton once attached. Who ended a session, why and when is its row in the machine's session table ([`crate::session_table`]), which `exits` reads and which outlives this process.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use aterm_session::{EdgeTable, LaunchNonce, Op, SessionId};
 use aterm_slog::Log;
-
-use crate::session_store::{ExitActor, ExitReason};
 
 /// Maximum number of closed sessions retained in the index.
 pub(crate) const CLOSED_INDEX_CAP: usize = 512;
@@ -22,25 +20,16 @@ pub(crate) const CLOSED_SKELETON_BYTES: usize = 64 * 1024;
 /// hash table's slot).
 const EDGE_ROW_HEAP: usize = 128;
 
-/// A close as the roster's `Exited` record says it: the facts an `exits` row
-/// answers, linked in that record's store write.
+/// A close as the roster's `Exited` record says it, linked in that record's store write: which
+/// session it was, by its stable and its process-local id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClosedExit {
-    /// The roster seq of its `Exited` record: the `exits` row id.
+    /// The roster seq of its `Exited` record.
     pub(crate) seq: u64,
-    /// The close's process-clock reading (its session close's `mono`), on
-    /// [`crate::turn_ledger::now_ms`]'s clock.
-    pub(crate) t_ms: u64,
     /// The session it was.
     pub(crate) sid: SessionId,
     /// The process-local id it was routed by.
     pub(crate) local_id: u64,
-    /// Why it closed.
-    pub(crate) reason: ExitReason,
-    /// The child's exit status, when the close recovered one.
-    pub(crate) exit_code: Option<i32>,
-    /// Who closed it, raw (a sid nobody minted included): held in RAM only.
-    pub(crate) actor: ExitActor,
 }
 
 /// One close's slot: its exit, and its log once attached.
@@ -314,13 +303,17 @@ impl ClosedLogs {
             .as_ref()
     }
 
-    /// The exits linked after roster seq `since`, oldest first (`control_session::cmd_exits`).
-    pub(crate) fn exits_since(
-        &self,
-        since: u64,
-    ) -> impl DoubleEndedIterator<Item = &ClosedExit> + ExactSizeIterator {
-        let from = self.slots.partition_point(|s| s.exit.seq <= since);
-        self.slots.range(from..).map(|s| &s.exit)
+    /// Whether a close of session `sid`, routed in this process by local id `local`, is among
+    /// the slots, its log attached or not.
+    pub(crate) fn closed(&self, local: u64, sid: &str) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.exit.local_id == local && s.exit.sid.as_str() == sid)
+    }
+
+    /// The closes linked, oldest first (the disk worktree step's roster reads them).
+    pub(crate) fn exits(&self) -> impl DoubleEndedIterator<Item = &ClosedExit> {
+        self.slots.iter().map(|s| &s.exit)
     }
 
     /// Returns cloned edge-grant tables for all attached entries.

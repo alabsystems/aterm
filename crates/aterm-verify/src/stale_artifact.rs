@@ -105,9 +105,10 @@ fn names_stale(head: &str) -> bool {
         || head.contains("found possibly newer version of crate")
 }
 
-/// The artifact files one line of a diagnostic names: what follows a `: ` to the line's end
-/// (`crate `a`: /path`, `candidate #1: /path`; a path may hold spaces), and what stands in
-/// quotes, each an absolute path of a library or metadata file.
+/// The artifact files one line of a diagnostic names: what follows the first `: ` that an
+/// absolute path follows, to the line's end (`crate `a`: /path`, `candidate #1: /path`; on
+/// Windows `candidate #1: C:\path`, whose drive's colon no space follows; a path may hold
+/// spaces), and what stands in quotes, each an absolute path of a library or metadata file.
 fn named_artifacts(line: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut keep = |text: &str| {
@@ -116,8 +117,12 @@ fn named_artifacts(line: &str) -> Vec<PathBuf> {
             out.push(path.to_path_buf());
         }
     };
-    if let Some((_, rest)) = line.split_once(": /") {
-        keep(&format!("/{rest}"));
+    if let Some(rest) = line
+        .match_indices(": ")
+        .map(|(at, sep)| &line[at + sep.len()..])
+        .find(|rest| Path::new(rest).is_absolute())
+    {
+        keep(rest);
     }
     for quote in ['\'', '`', '"'] {
         for (index, piece) in line.split(quote).enumerate() {

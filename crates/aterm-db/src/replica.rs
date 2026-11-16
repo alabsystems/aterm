@@ -46,6 +46,9 @@ pub const MAX_RECORDS: usize = 8192;
 pub const MAX_PROOFS: usize = MAX_RECORDS * 2 + aterm_secrets::commons::constraints::MAX_BINDINGS;
 /// The records of one batch, each way; also the bound of a round's history-key needs.
 pub const BATCH: usize = 16;
+/// How many table stores a replica keeps between sessions ([`Replica`]'s `stores`): a round
+/// repairs one table at a time, and the regular turn returns to a few.
+const KEPT_STORES: usize = 4;
 /// A full batch may continue before the ordinary table scan resumes.
 const TABLE_BURST: usize = 4;
 /// An initiator asks for the peer's table witnesses ([`witness`]) on its first round with a peer,
@@ -802,6 +805,13 @@ pub struct Replica {
     /// already holds the device's signing identity (`Endpoint`'s `identity`) and the runtime's
     /// serve its own bootstrap.
     kept: Mutex<Option<Arc<Bootstrap>>>,
+    /// The table stores this replica's rounds keep between their batches and from one round to
+    /// the next ([`Round::open`]), the most recently kept first, at most [`KEPT_STORES`]: each
+    /// batch and round reopens what it holds of a table, its classification judged again, where
+    /// an open replayed every record (a 2,000-record repair into a 6,000-record table took
+    /// 70.7 s of opens before, `replica::tests::reuse`). A store is taken out while a session
+    /// holds it, so two rounds of one table never share one.
+    stores: Mutex<Vec<crate::table::store::kept::Kept>>,
     /// The bootstraps [`Self::bootstrap`] opened afresh, where none it kept stood.
     #[cfg(test)]
     bootstrap_opens: std::sync::atomic::AtomicUsize,
@@ -850,6 +860,7 @@ impl Replica {
             witnesses: true,
             offers: Arc::default(),
             kept: Mutex::new(Some(Arc::new(bootstrap))),
+            stores: Mutex::default(),
             #[cfg(test)]
             bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -929,6 +940,7 @@ impl Replica {
             witnesses: true,
             offers: Arc::default(),
             kept: Mutex::new(None),
+            stores: Mutex::default(),
             #[cfg(test)]
             bootstrap_opens: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -2011,6 +2023,31 @@ impl Inventory {
 /// `observation` and `legacy_observation`).
 type Opened = ([u8; 64], Option<[u8; 64]>);
 
+/// A table store a round opened ([`Round::open`]): kept between sessions, or opened once.
+enum OpenStore {
+    Kept(crate::table::store::kept::Kept),
+    Once(Store),
+}
+
+impl std::ops::Deref for OpenStore {
+    type Target = Store;
+    fn deref(&self) -> &Store {
+        match self {
+            Self::Kept(kept) => kept,
+            Self::Once(store) => store,
+        }
+    }
+}
+
+impl std::ops::DerefMut for OpenStore {
+    fn deref_mut(&mut self) -> &mut Store {
+        match self {
+            Self::Kept(kept) => kept,
+            Self::Once(store) => store,
+        }
+    }
+}
+
 struct Round<'a> {
     replica: &'a Replica,
     /// When this side began the round, before its probe: a peer builds its mark after this.
@@ -2366,6 +2403,62 @@ impl Round<'_> {
         }
     }
 
+    /// Table `id`'s store, opened in `session` as [`Self::store`] opens it, kept between this
+    /// replica's sessions where that open is one primary store at one folder: no Commons, or a
+    /// Commons table in the primary directory with no recovery store (the catalog, or an
+    /// application table whose recovery claim is absent or pending). What this replica kept of
+    /// it is reopened, its classification judged again in this session
+    /// ([`crate::table::store::kept`]); [`Self::keep`] keeps it again. Any other open is
+    /// [`Self::store`]'s, kept by nothing. A Commons writer's open that refuses is
+    /// [`Self::store`]'s enrollment, which may join.
+    fn open(&self, session: &Session<'_>, id: Digest) -> Result<OpenStore> {
+        let (scope, path) = &self.tables[&id];
+        let dir = match &self.commons {
+            None => path.clone(),
+            Some((directory, _)) => {
+                let primary = !directory.is_recovery()
+                    && (*scope == directory.catalog_scope()
+                        || matches!(
+                            directory.recovery().enrollment(session, *scope),
+                            Ok(Enrollment::Absent | Enrollment::Pending)
+                        ));
+                if !primary {
+                    return self.store(session, id).map(OpenStore::Once);
+                }
+                directory.path(*scope)?
+            }
+        };
+        let kept = {
+            let mut stores = self.stores.lock().unwrap_or_else(|p| p.into_inner());
+            stores
+                .iter()
+                .position(|kept| kept.is_at(&dir))
+                .map(|at| stores.remove(at))
+        };
+        match crate::table::store::kept::Kept::open(session, &dir, *scope, kept) {
+            Ok(kept) => Ok(OpenStore::Kept(kept)),
+            Err(_) if self.commons.is_some() && session.has_control_writer() => {
+                self.store(session, id).map(OpenStore::Once)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Keep `opened` for this replica's next open of its table ([`Self::open`]), its journal let
+    /// go so it can cross network I/O; a store that cannot be kept is dropped.
+    fn keep(&self, opened: OpenStore) {
+        let OpenStore::Kept(kept) = opened else {
+            return;
+        };
+        let Some(kept) = kept.keep() else {
+            return;
+        };
+        let mut stores = self.stores.lock().unwrap_or_else(|p| p.into_inner());
+        stores.retain(|other| !other.is_at(kept.data_dir()));
+        stores.insert(0, kept);
+        stores.truncate(KEPT_STORES);
+    }
+
     fn prepare_proofs(
         &self,
         session: &Session<'_>,
@@ -2377,14 +2470,17 @@ impl Round<'_> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
-        let store = self.store(session, id)?;
-        keys.iter()
+        let store = self.open(session, id)?;
+        let wires = keys
+            .iter()
             .map(|key| {
                 store
                     .proof_wire_unchecked(session, key)?
                     .ok_or_else(|| Error::new("table conflict disappeared"))
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        self.keep(store);
+        Ok(wires)
     }
 
     /// Selected identities may become withheld while the peer sends its batch.
@@ -2399,11 +2495,12 @@ impl Round<'_> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let store = self.store(session, id)?;
+        let store = self.open(session, id)?;
         let wires = store.replication_wires_unchecked(ids);
         if wires.len() != ids.len() {
             return Err(Error::snapshot_changed());
         }
+        self.keep(store);
         Ok(wires)
     }
 
@@ -3263,7 +3360,7 @@ impl Round<'_> {
         let read = self.local_gated(peer, gate, |session| {
             let sampled_at = Instant::now();
             let observed_at_ms = aterm_time::unix_millis().unwrap_or(0);
-            let store = match self.store(session, id) {
+            let store = match self.open(session, id) {
                 Ok(store) => store,
                 Err(error) if error.is_snapshot_changed() => return Err(error),
                 Err(error) => {
@@ -3294,6 +3391,7 @@ impl Round<'_> {
                 store.fence(),
             );
             inventory.snapshot = snapshot;
+            self.keep(store);
             Ok(Some(inventory))
         });
         Self::table_read(read, refusal, cause)
@@ -3475,7 +3573,7 @@ impl Round<'_> {
             if ready != Some(true) {
                 return Ok(None);
             }
-            let store = match self.store(session, id) {
+            let store = match self.open(session, id) {
                 Ok(store) => store,
                 Err(error) if error.is_snapshot_changed() => return Err(error),
                 Err(error) => {
@@ -3485,7 +3583,9 @@ impl Round<'_> {
                 }
             };
             report.recovery |= store.is_recovery();
-            Ok(Some(store.proof_inventory_unchecked()))
+            let proofs = store.proof_inventory_unchecked();
+            self.keep(store);
+            Ok(Some(proofs))
         });
         let local = Self::table_read(local, &mut local_error, &mut local_cause)?;
         let remote = exchange_inventory(stream, side, local.as_ref(), MAX_PROOFS, || {
@@ -3567,8 +3667,10 @@ impl Round<'_> {
                 })
                 .map_err(|error| at("storage admission", error))?;
             if absent {
-                self.local_write(peer, |session| self.store(session, id).map(drop))
-                    .map_err(|error| at("storage enrollment", error))?;
+                self.local_write(peer, |session| {
+                    self.open(session, id).map(|store| self.keep(store))
+                })
+                .map_err(|error| at("storage enrollment", error))?;
             }
         }
         if !self
@@ -3656,7 +3758,7 @@ impl Round<'_> {
                         return Ok(Vec::new());
                     }
                     let store = self
-                        .store(session, id)
+                        .open(session, id)
                         .map_err(|error| at("batch preparation", error))?;
                     let mut ordered = ordered.borrow_mut();
                     let order = ordered.get_or_insert_with(|| store.causal_order_of(&ids));
@@ -3664,6 +3766,7 @@ impl Round<'_> {
                     if wires.len() != take {
                         return Err(at("batch preparation", Error::snapshot_changed()));
                     }
+                    self.keep(store);
                     Ok(wires)
                 };
                 let received = match side {
@@ -3834,13 +3937,37 @@ impl Round<'_> {
         #[cfg(test)]
         let mut retained_after = None;
         let verdicts = self.local_write(peer, |session| {
-            let mut store = match self.store(session, id) {
+            let mut store = match self.open(session, id) {
                 Ok(store) => store,
                 Err(error) => {
                     refusal = Some(BatchDeferral::new(batch, "storage", error));
                     return Ok(vec![false; n]);
                 }
             };
+            // An operation batch commits as one checkpoint group ([`Store::ingest_batch`]):
+            // one permit, journal commit and custody witness for the batch, where each record's
+            // own append flushed the journal and the witness (16 records took 100 ms of a
+            // 145 ms batch, `replica::tests::reuse`). The group refuses as a whole, before it
+            // writes anything, where one record would be refused; the records are then judged
+            // one by one, as before, so each keeps its own verdict. A group whose write is
+            // uncertain fences the store, and each record after it is refused there.
+            if matches!(kind, BatchKind::Operation) {
+                let borrowed: Vec<&[u8]> = wires.iter().map(|(_, wire)| wire.as_slice()).collect();
+                if let Ok(receipts) = store.ingest_batch(session, &borrowed)
+                    && receipts.len() == n
+                    && receipts
+                        .iter()
+                        .zip(&wires)
+                        .all(|(receipt, (record, _))| receipt.id == *record)
+                {
+                    #[cfg(test)]
+                    {
+                        retained_after = store.inventory(session).ok().map(Iterator::count);
+                    }
+                    self.keep(store);
+                    return Ok(vec![true; n]);
+                }
+            }
             let verdicts = wires
                 .iter()
                 .map(|(record, wire)| {
@@ -3878,6 +4005,7 @@ impl Round<'_> {
                     .then(|| store.inventory(session).ok().map(Iterator::count))
                     .flatten();
             }
+            self.keep(store);
             Ok(verdicts)
         })?;
         if repair.batch_deferral.is_none() {
@@ -4091,6 +4219,23 @@ pub fn reconcile_inventory(
     local: Option<astream_wire::sync::rbsr::Snapshot>,
     authorize: impl Fn() -> Result<()>,
 ) -> Result<Option<BTreeSet<Digest>>> {
+    reconcile_inventory_within(stream, side, local, RECONCILE_REMOTE_RECORDS, authorize)
+}
+
+/// [`reconcile_inventory`], admitting a peer inventory of at most `remote_records` identities: the
+/// control journal's and the membership log's own bounds, where a table's is
+/// [`RECONCILE_REMOTE_RECORDS`].
+///
+/// # Errors
+/// As [`reconcile_inventory`]; a peer that states more than `remote_records` identities is refused
+/// before its inventory is read.
+pub(crate) fn reconcile_inventory_within(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    local: Option<astream_wire::sync::rbsr::Snapshot>,
+    remote_records: u64,
+    authorize: impl Fn() -> Result<()>,
+) -> Result<Option<BTreeSet<Digest>>> {
     use astream_wire::sync::rbsr::{
         codec::{MAX_FRAME_BYTES, Message},
         exchange::{ExchangeError, Limits, Responder, reconcile},
@@ -4140,7 +4285,7 @@ pub fn reconcile_inventory(
         Message::decode(&control::receive_frame(stream, MAX_FRAME_BYTES)?).map_err(refused)
     }
     let limits = Limits {
-        remote_records: RECONCILE_REMOTE_RECORDS,
+        remote_records,
         messages: RECONCILE_MESSAGES,
     };
     let held: BTreeSet<Digest> = local.ids().copied().collect();

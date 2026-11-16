@@ -1028,7 +1028,13 @@ pub fn environment(
         if unsealed_env(text) {
             continue;
         }
-        let value = if text == "PATH" {
+        // Windows names a variable in any case, and its own `PATH` `Path`.
+        let path = if cfg!(windows) {
+            text.eq_ignore_ascii_case("PATH")
+        } else {
+            text == "PATH"
+        };
+        let value = if path {
             let mut seen: Vec<PathBuf> = Vec::new();
             for dir in std::env::split_paths(&value) {
                 if !seen.contains(&dir) {

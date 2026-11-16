@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_seal as seal;
 
-use super::{CRATES, Drift, MANIFEST, VENDOR, drift, run, vendored, verdict, write};
+use super::{CRATES, Drift, MANIFEST, VENDOR, drift, pinned_source, run, vendored, verdict, write};
 use crate::exit;
 
 /// The aterm checkout this test binary was built from.
@@ -21,6 +21,33 @@ fn tree(root: &Path, files: &[(&str, &str)]) {
         std::fs::create_dir_all(at.parent().unwrap()).unwrap();
         std::fs::write(at, text).unwrap();
     }
+}
+
+/// Run git in `dir` with the caller's repository redirects removed; its stdout, trimmed.
+fn git(dir: &Path, args: &[&str]) -> String {
+    use aterm_uds::output::CommandOutput as _;
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .args([
+            "-c",
+            "user.name=aterm-verify test",
+            "-c",
+            "user.email=verify@invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output_owned()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Every file under `dir`, by path from it.
@@ -202,6 +229,149 @@ fn vendor_out_refuses_a_crate_with_a_dependency_outside_the_set() {
 }
 
 #[test]
+fn a_crate_under_an_excluded_vendored_workspace_takes_that_workspaces_version_and_lints() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    // aterm's root: version 0.202.0 and its own lints, `three` taken by path from a copy of
+    // another repository that the root excludes, `two` from crates/ like any member.
+    tree(
+        root.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"vendor/up\"]\n\n\
+                 [workspace.package]\nversion = \"0.202.0\"\nedition = \"2024\"\n\
+                 license = \"Apache-2.0\"\n\n[workspace.dependencies]\n\
+                 two = { path = \"crates/two\" }\n\
+                 three = { path = \"vendor/up/crates/three\" }\n\n\
+                 [workspace.lints.clippy]\nall = { level = \"warn\", priority = -1 }\n",
+            ),
+            (
+                "crates/two/Cargo.toml",
+                "[package]\nname = \"two\"\nversion.workspace = true\nedition.workspace = true\n\n\
+                 [lints]\nworkspace = true\n\n[dependencies]\nthree = { workspace = true }\n",
+            ),
+            ("crates/two/src/lib.rs", "//! Two.\n"),
+            // The vendored repository's own workspace root, with its own version and lints.
+            (
+                "vendor/up/Cargo.toml",
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.package]\n\
+                 version = \"0.8.0\"\nedition = \"2024\"\nlicense = \"Apache-2.0\"\n\n\
+                 [workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+            ),
+            (
+                "vendor/up/crates/three/Cargo.toml",
+                "[package]\nname = \"three\"\nversion.workspace = true\n\
+                 edition.workspace = true\nlicense.workspace = true\n\n\
+                 [lints]\nworkspace = true\n",
+            ),
+            (
+                "vendor/up/crates/three/src/lib.rs",
+                "//! Three.\n\nmod inner;\n",
+            ),
+            ("vendor/up/crates/three/src/inner.rs", "pub fn inner() {}\n"),
+        ],
+    );
+    let want = vendored(root.path(), &["three", "two"]).expect("three and two vendor");
+    assert_eq!(
+        want.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            MANIFEST,
+            "three/Cargo.toml",
+            "three/src/inner.rs",
+            "three/src/lib.rs",
+            "two/Cargo.toml",
+            "two/src/lib.rs",
+        ]
+    );
+    let three = String::from_utf8(want["three/Cargo.toml"].clone()).unwrap();
+    for line in [
+        "# Written by `targo --unverified verify vendor-out` from aterm's \
+         vendor/up/crates/three/Cargo.toml: rerun it there, never",
+        "version = \"0.8.0\"",
+        "license = \"Apache-2.0\"",
+        "[lints.rust]",
+        "unsafe_code = \"forbid\"",
+        "# vendors it from (the workspace of aterm's vendor/up/Cargo.toml), beside the files they \
+         read.",
+    ] {
+        assert!(three.lines().any(|l| l == line), "{line} in:\n{three}");
+    }
+    for gone in ["0.202.0", "clippy", "priority"] {
+        assert!(!three.contains(gone), "{gone} in:\n{three}");
+    }
+    // A member still inherits from aterm's root, and its dependency on the vendored crate is a
+    // path to that crate's copy.
+    let two = String::from_utf8(want["two/Cargo.toml"].clone()).unwrap();
+    for line in [
+        "# Written by `targo --unverified verify vendor-out` from aterm's crates/two/Cargo.toml: \
+         rerun it there, never",
+        "version = \"0.202.0\"",
+        "all = { level = \"warn\", priority = -1 }",
+        "three = { path = \"../three\" }",
+        "# The copy's one target. Its tests and doctests run in aterm, beside the files",
+    ] {
+        assert!(two.lines().any(|l| l == line), "{line} in:\n{two}");
+    }
+    assert!(!two.contains("forbid"), "{two}");
+
+    // Without its own workspace root the vendored crate has none: aterm's root excludes it, and
+    // cargo passes over a root that excludes a crate, so it is refused rather than given aterm's
+    // version and lints. A manifest there with no [workspace] table changes nothing.
+    std::fs::remove_file(root.path().join("vendor/up/Cargo.toml")).unwrap();
+    for manifest in [
+        None,
+        Some("[package]\nname = \"up\"\nversion = \"0.1.0\"\n"),
+    ] {
+        if let Some(text) = manifest {
+            tree(root.path(), &[("vendor/up/Cargo.toml", text)]);
+        }
+        let why = vendored(root.path(), &["three"]).unwrap_err();
+        assert!(
+            why.starts_with("no workspace takes in vendor/up/crates/three (Cargo.toml excludes it")
+                && why.contains("needs its own root manifest"),
+            "{manifest:?}: {why}"
+        );
+    }
+    // Unless the root also names it among its members, which cargo honours over the exclusion:
+    // then the root's workspace is its own.
+    let top = std::fs::read_to_string(root.path().join("Cargo.toml")).unwrap();
+    tree(
+        root.path(),
+        &[(
+            "Cargo.toml",
+            &top.replace(
+                "members = [\"crates/*\"]",
+                "members = [\"crates/*\", \"vendor/up/crates/three\"]",
+            ),
+        )],
+    );
+    let member = vendored(root.path(), &["three"]).unwrap();
+    let three = String::from_utf8(member["three/Cargo.toml"].clone()).unwrap();
+    assert!(
+        three.lines().any(|l| l == "version = \"0.202.0\""),
+        "{three}"
+    );
+
+    // A root that takes the crate from a registry, or from a path outside the checkout, holds
+    // no source of it to copy.
+    for spec in ["\"1\"", "{ path = \"../elsewhere/three\" }"] {
+        let other = aterm_tempfile::tempdir().unwrap();
+        tree(
+            other.path(),
+            &[(
+                "Cargo.toml",
+                &format!("[workspace]\n\n[workspace.dependencies]\nthree = {spec}\n"),
+            )],
+        );
+        let why = vendored(other.path(), &["three"]).unwrap_err();
+        assert!(
+            why.contains("the root's [workspace.dependencies]") && why.contains("three"),
+            "{spec}: {why}"
+        );
+    }
+}
+
+#[test]
 fn check_names_a_stale_copy_and_nothing_for_a_fresh_one() {
     let root = aterm_tempfile::tempdir().unwrap();
     checkout(root.path(), "");
@@ -302,4 +472,58 @@ fn check_names_a_stale_copy_and_nothing_for_a_fresh_one() {
     assert_eq!(run(&args(true), &repo()), exit::FAILED);
     assert_eq!(run(&args(false), &repo()), exit::PASS);
     assert_eq!(run(&args(true), &repo()), exit::PASS);
+}
+
+/// vendor-out reads nothing from a checkout whose pinned copy does not hold its pin: a hand edit of
+/// `vendor/alab-harness` is refused as forge's `[OB-1]` refuses it, never relayed as the tag. A
+/// copy that holds lets the crates be read (and here refused for want of a root manifest).
+#[test]
+fn vendor_out_relays_no_pinned_copy_that_does_not_hold_its_pin() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    tree(
+        root,
+        &[
+            // The file that makes forge's roster describe this checkout.
+            ("crates/aterm-forge/src/provenance.rs", "//! The roster.\n"),
+            (
+                "vendor/alab-harness/crates/alab-policy/src/lib.rs",
+                "//! Policy.\n",
+            ),
+        ],
+    );
+    git(root, &["add", "-f", "."]);
+    let pinned = git(root, &["write-tree", "--prefix=vendor/alab-harness/"]);
+    tree(
+        root,
+        &[(
+            "vendor/alab-harness.pin",
+            &format!("tag=v0.8.1\ntree={pinned}\n"),
+        )],
+    );
+    git(root, &["add", "-f", "vendor/alab-harness.pin"]);
+    git(root, &["commit", "-q", "--no-verify", "-m", "pin"]);
+
+    let (code, line) = pinned_source(root, &["alab-policy"]).unwrap_err();
+    assert!(
+        code == exit::FAILED && line.starts_with("REFUSED — Cargo.toml"),
+        "{line}"
+    );
+
+    tree(
+        root,
+        &[(
+            "vendor/alab-harness/crates/alab-policy/src/lib.rs",
+            "//! Edited by hand.\n",
+        )],
+    );
+    let (code, line) = pinned_source(root, &["alab-policy"]).unwrap_err();
+    assert!(
+        code == exit::FAILED
+            && line.starts_with("REFUSED — [OB-1] the working copy changes `vendor/alab-harness`")
+            && line.contains("vendor/alab-harness/crates/alab-policy/src/lib.rs")
+            && line.ends_with("; nothing was copied"),
+        "{line}"
+    );
 }

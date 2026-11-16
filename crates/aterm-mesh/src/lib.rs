@@ -8,10 +8,11 @@
 //! is sealed at rest under a `rest.key` beside it, guarded by a secret of its own, and served on a
 //! local socket. A record this Mac originates is signed by its node key ([`relay::Origin`]) and
 //! numbered in astream's incarnation layout, so a sequence number never repeats; it then travels
-//! to every Mac over the neighbour links (`aterm_net::fleet::link`), one push relay per neighbour
-//! per log ([`relay`]), and each broker appends it once, from whichever neighbour delivers it
-//! first. The overlay ([`overlay`]) keeps the neighbours; the membership log decides who is an
-//! origin and whose streams are refused ([`logs::Standings`]).
+//! to every current seat the overlay can reach over the neighbour links
+//! (`aterm_net::fleet::link`), one push relay per neighbour per log ([`relay`]), and each broker
+//! appends it once, from whichever neighbour delivers it first. The overlay ([`overlay`]) keeps
+//! the neighbours; the membership log decides who is an origin and whose streams are refused
+//! ([`logs::Standings`]).
 //!
 //! Tables move over the relay (B7b): the egress ([`egress`]) publishes every record that enters a
 //! store from this Mac, the ingest consumer ([`ingest`]) hands each record another Mac originated

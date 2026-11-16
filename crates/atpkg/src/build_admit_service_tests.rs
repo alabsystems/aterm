@@ -19,6 +19,8 @@ const ACTOR: &str = "ATPKG_NATIVE_SESSION_WORLD";
 const REAL: &str = "ATPKG_NATIVE_SESSION_REAL";
 const FENCED: &str = "ATPKG_NATIVE_SESSION_FENCED";
 const MONITOR: &str = "ATPKG_NATIVE_SESSION_MONITOR";
+/// How long the driver waits on the owner's wake path between two ticks.
+const WAKE: Duration = Duration::from_millis(50);
 
 #[test]
 fn monitor_reader_if_requested() {
@@ -96,32 +98,31 @@ impl Driver {
         )
         .unwrap();
     }
+    /// Ticks until `found`, for as long as what this process started works: the builds it
+    /// waits on are other processes' work, and a loaded Mac stretches a compile past any wall
+    /// minute (`aterm_spec::wait::until_while_descendants_work`). Between ticks it waits on
+    /// the owner's own wake path, a moment at a time so the builds' progress is read.
     fn until(&mut self, why: &str, found: impl Fn(&Self) -> bool) {
-        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-        loop {
+        aterm_spec::wait::until_while_descendants_work(why, || {
             self.tick();
             if found(self) {
-                return;
+                return Some(());
             }
             assert!(!self.owner.is_empty(), "{why}: {:?}", self.done);
-            assert!(Instant::now() < deadline, "native session hang: {why}");
-            self.owner.wait(deadline).unwrap();
-        }
+            self.owner.wait(Instant::now() + WAKE).unwrap();
+            None
+        });
     }
     fn ready(&mut self, paths: &[&Path]) {
-        aterm_spec::wait::until_within(
-            aterm_spec::wait::MUST_HAPPEN,
-            "session fixture readiness",
-            || {
-                self.tick();
-                assert!(
-                    self.done.is_empty(),
-                    "premature completion: {:?}",
-                    self.done
-                );
-                paths.iter().all(|p| p.join("ready").exists()).then_some(())
-            },
-        );
+        aterm_spec::wait::until_while_descendants_work("session fixture readiness", || {
+            self.tick();
+            assert!(
+                self.done.is_empty(),
+                "premature completion: {:?}",
+                self.done
+            );
+            paths.iter().all(|p| p.join("ready").exists()).then_some(())
+        });
     }
     fn outcome(&self, attempt: Attempt) -> &std::io::Result<JobOutcome> {
         &self

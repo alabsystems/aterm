@@ -41,12 +41,12 @@ pub(crate) struct ActRequest {
     pub(crate) value: Option<String>,
 }
 
-/// The Settings actions only a person's own click or key presses, each with the buttons its
+/// The actions only a person's own click or key presses, each with the buttons its
 /// refusal names. `act` refuses them by the action's prefix before any view is read, so a page
 /// that does not show the button yet refuses it the same way; every press of a native control
 /// no person is known to stand behind (a control client's key or click, an accessibility
 /// client's request) is refused them as it is dispatched ([`App::person_only_press_refusal`]).
-const PERSON_ONLY_PREFIXES: [(&str, &str); 3] = [
+const PERSON_ONLY_PREFIXES: [(&str, &str); 4] = [
     (
         crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX,
         "Settings ▸ Security's macOS access buttons",
@@ -59,6 +59,11 @@ const PERSON_ONLY_PREFIXES: [(&str, &str); 3] = [
     (
         crate::native_settings::NAME_PRESS_PREFIX,
         "Settings' machine-name buttons",
+    ),
+    // Write puts the page's staged edits into the registry every Mac shares: a person's act.
+    (
+        crate::native_tables::WRITE,
+        "the Tables page's Write button and command",
     ),
 ];
 
@@ -97,6 +102,7 @@ pub(crate) enum OpenRequest {
     SystemState,
     Workers,
     Tables,
+    Navigator { split: bool },
     Settings(crate::native_settings::SettingsRoute),
     Markdown(String),
     Editor(String),
@@ -200,6 +206,7 @@ pub(crate) fn parse_open(rest: &str) -> Result<OpenRequest, String> {
         WireOpenAppRequest::SystemState => Ok(OpenRequest::SystemState),
         WireOpenAppRequest::Workers => Ok(OpenRequest::Workers),
         WireOpenAppRequest::Tables => Ok(OpenRequest::Tables),
+        WireOpenAppRequest::Navigator { split } => Ok(OpenRequest::Navigator { split }),
         WireOpenAppRequest::Allocation { split } => Ok(OpenRequest::Allocation { split }),
         WireOpenAppRequest::Settings { route } => {
             let route = if route == "/" {
@@ -318,28 +325,31 @@ impl App {
             .compiled
             .semantic(&key)
             .is_none_or(|node| node.offscreen)
-            && match self
+            && (self
                 .native_runtime
-                .view_state_mut(request.view)
-                .as_deref_mut()
-            {
-                Some(crate::native_app::AppViewState::About(state)) => {
-                    state.reveal_listed_control(&key)
-                }
-                Some(crate::native_app::AppViewState::Settings(state)) => {
-                    state.reveal_listed_control(&key)
-                }
-                Some(crate::native_app::AppViewState::SystemState(state)) => {
-                    state.reveal_listed_control(&key)
-                }
-                Some(crate::native_app::AppViewState::Workers(state)) => {
-                    state.reveal_listed_control(&key)
-                }
-                Some(crate::native_app::AppViewState::Tables(state)) => {
-                    state.reveal_listed_control(&key)
-                }
-                _ => false,
-            }
+                .reveal_navigator_control(request.view, &key)
+                || match self
+                    .native_runtime
+                    .view_state_mut(request.view)
+                    .as_deref_mut()
+                {
+                    Some(crate::native_app::AppViewState::About(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
+                    Some(crate::native_app::AppViewState::Settings(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
+                    Some(crate::native_app::AppViewState::SystemState(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
+                    Some(crate::native_app::AppViewState::Workers(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
+                    Some(crate::native_app::AppViewState::Tables(state)) => {
+                        state.reveal_listed_control(&key)
+                    }
+                    _ => false,
+                })
         {
             self.invalidate_native_view_cache(
                 wid,
@@ -437,6 +447,14 @@ impl App {
                 }),
             OpenRequest::Workers => self.open_workers_tab().map(|()| "app workers".to_string()),
             OpenRequest::Tables => self.open_tables_tab().map(|()| "app tables".to_string()),
+            // The reply says what it did: a tab with no room for the list opens a tab.
+            OpenRequest::Navigator { split } => self.open_navigator(split).map(|split| {
+                if split {
+                    "app navigator split".to_string()
+                } else {
+                    "app navigator".to_string()
+                }
+            }),
             OpenRequest::Settings(route) => self
                 .open_settings_tab(route)
                 .then(|| format!("app settings {}", route.path()))

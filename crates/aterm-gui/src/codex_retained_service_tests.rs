@@ -3,6 +3,34 @@
 
 use super::*;
 
+#[cfg(debug_assertions)]
+#[test]
+fn stderr_origin_is_separate_from_stdout_and_drains_after_scope_cancellation() {
+    let lifetime = account_work::Lifetime::default();
+    let scope = lifetime.enter().unwrap();
+    let mixed = Arc::new(Mutex::new(VecDeque::new()));
+    let capture = Arc::new(stderr_diagnostics::Capture::new());
+    drain(
+        io::Cursor::new(b"fatal runtime error: stack overflow, aborting\n"),
+        scope.clone(),
+        mixed.clone(),
+    )
+    .unwrap();
+    scope.cancellation().cancel();
+    assert!(scope.cancelled());
+    drain(
+        stderr_diagnostics::Stderr::new(io::Cursor::new(b"ordinary stderr\n"), capture.clone()),
+        scope,
+        mixed.clone(),
+    )
+    .unwrap();
+    let report = capture.report(Duration::from_secs(10)).to_string();
+    assert!(report.contains("stderr-kind=unknown capture=eof"));
+    let drained = lifetime.pause().unwrap().wait();
+    assert!(mixed.lock().unwrap().len() > b"ordinary stderr\n".len());
+    drained.resume().unwrap();
+}
+
 #[test]
 fn callback_checks_the_actual_receiver_and_keeps_its_socket_out_of_children() {
     use aterm_uds::spawnfd::{Child, Stdio};

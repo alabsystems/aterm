@@ -61,11 +61,13 @@ const XCODE_DEVELOPER: &str = "/Applications/Xcode.app/Contents/Developer";
 pub const SYSTEM_GIT: &str = "/usr/bin/git";
 
 /// The git installed for the runs here: a live build in the account's `atpkg` store first,
-/// which the default toolset updates independently of the operating system. Without one,
-/// the distribution's git ([`SYSTEM_GIT`]) or, on a Mac, the tools' own ([`CLT_GIT`]), then
-/// the selected Xcode's. Never macOS's `/usr/bin/git` shim, which asks a person to install
-/// the Command Line Tools. Native links resolve to a nonempty executable target.
-/// Read without a child process; `None` when none is there.
+/// which the default toolset updates independently of the operating system, run as the build's
+/// own git (`store/git/<build>/bin/git`), never through the PATH entry atpkg lays for people to
+/// type (on macOS a `/bin/sh` script that execs it). Without one, the distribution's git
+/// ([`SYSTEM_GIT`]) or, on a Mac, the tools' own ([`CLT_GIT`]), then the selected Xcode's.
+/// Never macOS's `/usr/bin/git` shim, which asks a person to install the Command Line Tools.
+/// Native links resolve to a nonempty executable target. Read without a child process; `None`
+/// when none is there.
 #[must_use]
 pub fn installed_git(sys: &dyn System) -> Option<PathBuf> {
     installed_git_for(sys, None)
@@ -165,51 +167,52 @@ pub fn installed_git_for(sys: &dyn System, user_home: Option<&Path>) -> Option<P
     installed_git_reading(sys, user_home).map(GitInstallation::program)
 }
 
-/// The admitted Git command and the immutable payload its package selects. They are the
-/// same path for native Git. A managed shim can be repaired without replacing its payload.
+/// The admitted Git: the program setup starts and, for a managed build, the PATH entry atpkg
+/// laid for it, whose presence admits the build. Setup starts a managed build's own `bin/git`
+/// (git itself in a build packed since FL-165, built with `RUNTIME_PREFIX`, so it finds its
+/// helpers and templates from the path it runs from; an earlier build's wrapper script,
+/// ATERM-KI-1112-94, until a newer build is installed), never the entry: on macOS that entry
+/// is a `/bin/sh` script that execs the build's `bin/git` (atpkg's
+/// `platform::STARTS_AT_REAL_PATH` holds on Linux only), so started through it every git would
+/// be a shell first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitExecution {
-    /// The command setup actually starts, including a managed package's shim.
+    /// The git setup starts: a managed build's own (`store/git/<build>/bin/git`), whose path
+    /// changes when activation selects another build, or native Git.
     pub program: PathBuf,
-    /// The selected package payload, or the native executable itself.
-    pub payload: PathBuf,
+    /// The PATH entry atpkg laid for a managed build (a script or a link that starts
+    /// `program`); `None` for native Git.
+    pub entry: Option<PathBuf>,
 }
 
-/// Observe the selected command and payload through the same ordinary admission as
+/// Observe the selected command and its PATH entry through the same ordinary admission as
 /// [`installed_git`], without starting a program or granting execution authority.
 #[must_use]
 pub fn installed_git_execution(sys: &dyn System) -> Option<GitExecution> {
     installed_git_reading(sys, None).map(GitInstallation::execution)
 }
 
-/// The selected Git's admitted executable identity, without starting it. A managed build's
-/// immutable payload path changes when activation replaces the build behind its stable shim.
-#[must_use]
-pub fn installed_git_identity(sys: &dyn System) -> Option<PathBuf> {
-    installed_git_execution(sys).map(|git| git.payload)
-}
-
 enum GitInstallation {
     Native(PathBuf),
-    Managed { shim: PathBuf, payload: PathBuf },
+    Managed { entry: PathBuf, program: PathBuf },
 }
 
 impl GitInstallation {
     fn program(self) -> PathBuf {
         match self {
-            Self::Native(path) | Self::Managed { shim: path, .. } => path,
+            Self::Native(program) | Self::Managed { program, .. } => program,
         }
     }
 
     fn execution(self) -> GitExecution {
         match self {
-            Self::Native(path) => GitExecution {
-                program: path.clone(),
-                payload: path,
+            Self::Native(program) => GitExecution {
+                program,
+                entry: None,
             },
-            Self::Managed { shim, payload } => GitExecution {
-                program: shim,
-                payload,
+            Self::Managed { entry, program } => GitExecution {
+                program,
+                entry: Some(entry),
             },
         }
     }
@@ -288,8 +291,24 @@ fn atpkg_installed_git(sys: &dyn System, home: &Path) -> Option<GitInstallation>
         return None;
     }
     sys.admit_runtime(&store_git.join(&build)).ok()?;
-    let shim = prefix.join("bin/git");
-    exec_file(&shim).then_some(GitInstallation::Managed { shim, payload })
+    // The build is admitted only once atpkg laid its PATH entry, as a person's `git` finds it;
+    // setup then starts the build's own git, not the entry.
+    let entry = prefix.join("bin/git");
+    let laid = exec_file(&entry) || links_to(sys, &entry, &payload);
+    laid.then_some(GitInstallation::Managed {
+        entry,
+        program: payload,
+    })
+}
+
+/// Whether `entry` is a symbolic link that resolves to `payload`: the PATH entry atpkg lays for
+/// a program where the kernel starts a program through a link at its real path (Linux), in place
+/// of a shim that execs it.
+fn links_to(sys: &dyn System, entry: &Path, payload: &Path) -> bool {
+    sys.stat(entry).is_ok_and(|s| s.symlink)
+        && sys
+            .canonicalize(entry)
+            .is_ok_and(|real| sys.canonicalize(payload).is_ok_and(|want| real == want))
 }
 
 /// [`installed_git`], or where none is installed the one it looks for first ([`CLT_GIT`],

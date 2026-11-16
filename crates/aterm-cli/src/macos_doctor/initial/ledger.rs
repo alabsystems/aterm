@@ -56,12 +56,14 @@ pub(super) const PARK_PAUSE: aterm_types::retry_schedule::Backoff =
         std::time::Duration::from_secs(24 * 60 * 60),
     );
 
-/// How long a stage may run with no end before the run's next reading parks it: twice the
-/// longest budget any one step of a stage keeps (a GitHub clone's 30 minutes), so a step that
-/// is slow but alive ends first. It counts the Mac's awake time ([`awake_secs`]) where the
-/// stage's begin and the reading share a boot, so a lid closed mid-clone adds nothing; the wall
-/// clock otherwise. A trade-off: a Repositories stage that clones for more than an hour reads
-/// parked until it ends, which then clears the park by itself.
+/// How long a stage may run with no end before the run's next reading parks it: an hour. No
+/// repository transfer keeps a wall-clock budget (a clone, a checkout's fetch and merge, a
+/// required dependency's fetch or clone, a develop checkout's vendor/astream update): each ends
+/// after `aterm_machines::port::TRANSFER_STALL` without progress, so one that is slow but steady
+/// may run past the hour. It counts the Mac's awake time ([`awake_secs`]) where the stage's begin
+/// and the reading share a boot, so a lid closed mid-clone adds nothing; the wall clock
+/// otherwise. A trade-off: a Repositories stage that clones for more than an hour reads parked
+/// until it ends, which then clears the park by itself.
 pub(super) const HANG_LIMIT: u64 = 60 * 60;
 
 const STAGES: usize = Stage::ALL.len();

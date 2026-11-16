@@ -33,38 +33,10 @@ fn refreshed(input: Input) -> Candidate {
     }
 }
 
-/// What `body` answers, and the `aterm_log` records (level and message) written on this
-/// thread while it ran. The capture is this test binary's one logger: installing it fails
-/// loudly where another is already installed, and it keeps nothing outside a `body`.
+/// What `body` answers, and the `aterm_log` records at info or more severe it wrote on this
+/// thread ([`crate::test_log::logged_on_this_thread`]).
 fn logged_on_this_thread<T>(body: impl FnOnce() -> T) -> (T, Vec<String>) {
-    use std::cell::RefCell;
-    thread_local! {
-        static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-    }
-    struct Capture;
-    impl aterm_log::Log for Capture {
-        fn enabled(&self, _: &aterm_log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &aterm_log::Record<'_>) {
-            LINES.with(|lines| {
-                if let Some(lines) = lines.borrow_mut().as_mut() {
-                    lines.push(format!("{} {}", record.level(), record.args()));
-                }
-            });
-        }
-        fn flush(&self) {}
-    }
-    static CAPTURE: Capture = Capture;
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        aterm_log::set_logger(&CAPTURE).expect("this test binary installs no other logger");
-        aterm_log::set_max_level(aterm_log::LevelFilter::Info);
-    });
-    LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
-    let answer = body();
-    let logged = LINES.with(|lines| lines.borrow_mut().take().unwrap_or_default());
-    (answer, logged)
+    crate::test_log::logged_on_this_thread(aterm_log::Level::Info, body)
 }
 
 fn sized(id: u64, name: &str, size: u64) -> Value {

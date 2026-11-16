@@ -814,3 +814,56 @@ fn the_window_tells_a_workers_close_unless_a_quit_keeps_it_for_the_next_launch()
         );
     });
 }
+
+/// A CONCLUSION TOLD AFTER ITS WORKER'S TAB CLOSED TELLS THE WORKER'S ROW (tracker ST-15): a done
+/// worker's mail of its end is in hand when its tab closes, so its row says its manager was not
+/// told and the budget keeps it for that manager; once the send finishes, the row, on disk too,
+/// says it was. CONTROL: the row the close left says not told.
+#[test]
+fn a_conclusion_told_after_the_workers_tab_closed_tells_its_row() {
+    let _lane = crate::message_inbox::own_lane_for_test();
+    crate::fabric::with_link_reset(|| {
+        crate::fabric::note_bridge_supervised();
+        let rows = aterm_tempfile::Builder::new()
+            .prefix("aterm-mail-row")
+            .tempdir()
+            .expect("scratch dir");
+        let store = new_store();
+        crate::session_table::SessionTable::at(rows.path().to_path_buf()).serve(&store);
+        let (worker, manager) = (registered(&store, 1), registered(&store, 2));
+        mark_with(
+            &worker.ctx,
+            1,
+            TaskState::Done,
+            Some(manager.ctx.self_id.as_str()),
+            None,
+        );
+        let end = owed(&worker.ctx, &store).expect("the conclusion is owed");
+
+        crate::session_table::close_leaving_row(
+            &store,
+            1,
+            crate::session_store::ExitReason::UiClose,
+            crate::session_store::ExitActor::Human,
+        )
+        .expect("a close");
+        let table = store.read().unwrap().table();
+        assert!(table.flush());
+        let sid = &worker.ctx.self_id;
+        assert!(
+            !table.row(sid).expect("its row").told_end,
+            "CONTROL: not told at the close"
+        );
+        assert_eq!(end.send(), [Ok("OK 1".to_owned())]);
+        assert!(table.flush());
+        assert!(table.head(sid).expect("its row").told_end);
+        let text = std::fs::read_to_string(rows.path().join(format!("{}.toml", sid.as_str())))
+            .expect("its row's file");
+        assert!(
+            crate::session_table::Row::decode(&text, None)
+                .expect("it reads")
+                .told_end,
+            "{text}"
+        );
+    });
+}

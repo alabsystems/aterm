@@ -485,6 +485,10 @@ unsafe fn exec_detached(
     let forked = unsafe { libc::fork() };
     match forked {
         0 => unsafe {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "a forked child's exec: it has one thread, so nothing in it can hold the exec"
+            )]
             libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
             exec_failed(log, reporter_fd)
         },

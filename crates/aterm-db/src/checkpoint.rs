@@ -183,9 +183,11 @@ pub(crate) fn cut_at(history: &History<'_>, frontier: &BTreeMap<Actor, Tip>) -> 
 
 /// A body this replica computed itself: the only one [`crate::table::store::Store::sign_checkpoint`]
 /// signs, so a Mac never signs a body it was handed.
+#[cfg(unix)] // computed and seconded for the unix-only signing pass (`att::checkpoint`)
 #[derive(Clone, Debug)]
 pub(crate) struct Computed(Body);
 
+#[cfg(unix)]
 impl Computed {
     /// The body.
     pub(crate) const fn body(&self) -> &Body {
@@ -194,6 +196,7 @@ impl Computed {
 }
 
 /// The checkpoint this replica would sign: [`propose`]'s body, recomputed at its frontier.
+#[cfg(unix)]
 pub(crate) fn compute(
     history: &History<'_>,
     writers: &BTreeSet<Actor>,
@@ -207,6 +210,7 @@ pub(crate) fn compute(
 ///
 /// # Errors
 /// As [`verify`].
+#[cfg(unix)]
 pub(crate) fn second(history: &History<'_>, body: &Body) -> Result<Computed> {
     verify(history, body)?;
     Ok(Computed(body.clone()))

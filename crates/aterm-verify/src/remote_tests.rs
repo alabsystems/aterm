@@ -411,6 +411,23 @@ fn github_spellings_share_a_route_and_unsupported_urls_never_become_git_fallback
     for source in ["/tmp/origin.git", "../origin.git", "repo with spaces"] {
         assert_eq!(kind(source), Ok(Kind::Local(source.into())));
     }
+    // A drive's colon is a local path's on Windows alone; elsewhere git reads `C:\…` as the
+    // ssh host `C`. A colon past the drive, and a drive-relative path, are refused everywhere.
+    for source in [r"C:\Users\me\origin.git", "c:/Users//me/origin.git"] {
+        if cfg!(windows) {
+            assert_eq!(kind(source), Ok(Kind::Local(source.into())));
+        } else {
+            assert!(kind(source).is_err(), "{source}");
+        }
+    }
+    for source in [
+        "C:origin.git",
+        r"C:\Users\me\origin.git:stream",
+        "host:origin.git",
+        r"\\server\share:origin.git",
+    ] {
+        assert!(kind(source).is_err(), "{source}");
+    }
 }
 
 /// What `agh repo fetch-main` prints: the ref and the commit its fetch wrote there.
@@ -691,11 +708,9 @@ fn github_push_is_one_write_of_the_exact_graph_and_lease() {
             Ok(out(0, ""))
         };
         assert!(matches!(
-            Remote::open(root.path(), "origin", &run).unwrap().push(
-                "refs/aterm/record",
-                before,
-                AFTER
-            ),
+            Remote::open(root.path(), "origin", &run)
+                .unwrap()
+                .push_with(WriteRunner(&run), "refs/aterm/record", before, AFTER),
             Ok(Pushed::Done)
         ));
         assert_eq!(calls.get(), 1);
@@ -718,11 +733,9 @@ fn a_rejected_write_is_typed_and_an_untyped_failure_never_replays() {
             calls.set(calls.get() + 1);
             Ok(out(code, ""))
         };
-        let result = Remote::open(root.path(), "origin", &run).unwrap().push(
-            "refs/heads/main",
-            Some(BEFORE),
-            AFTER,
-        );
+        let result = Remote::open(root.path(), "origin", &run)
+            .unwrap()
+            .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER);
         if code == 9 {
             assert!(matches!(result, Ok(Pushed::Rejected(_))))
         } else {
@@ -765,11 +778,9 @@ fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
                 stderr: refused.stderr.clone(),
             })
         };
-        Remote::open(root.path(), "origin", &run).unwrap().push(
-            "refs/heads/main",
-            Some(BEFORE),
-            AFTER,
-        )
+        Remote::open(root.path(), "origin", &run)
+            .unwrap()
+            .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER)
     };
     for kind in [Kind::CouldNotRun, Kind::RateLimited, Kind::Server] {
         let error = Error::new(kind, "the network went away before the send");
@@ -880,7 +891,7 @@ fn only_exact_structured_presend_intent_refusals_allow_observation() {
         Ok(refused_out(&valid))
     };
     assert!(matches!(Remote::open(root.path(), "origin", &run).unwrap()
-        .push("refs/heads/main", Some(BEFORE), AFTER),
+        .push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER),
         Ok(Pushed::Blocked { intent, .. }) if intent.as_str() == INTENT));
     assert_eq!(calls.get(), 1);
 }
@@ -1011,7 +1022,7 @@ fn local_transport_allows_only_the_file_protocol_even_if_configuration_changes()
     let remote = Remote::open(root.path(), "origin", &run).unwrap();
     assert_eq!(remote.fetch("refs/heads/main"), Ok(Some(BEFORE.into())));
     assert!(matches!(
-        remote.push("refs/heads/main", Some(BEFORE), AFTER),
+        remote.push_with(WriteRunner(&run), "refs/heads/main", Some(BEFORE), AFTER),
         Ok(Pushed::Done)
     ));
     assert_eq!(operations.get(), 3);

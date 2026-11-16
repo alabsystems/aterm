@@ -897,7 +897,7 @@ fn deck_inks_hold_on_every_built_in_band() {
 }
 
 /// Each built-in theme's name and the inks solved on its band.
-fn built_in_bands() -> Vec<(&'static str, VitalsInks)> {
+pub(crate) fn built_in_bands() -> Vec<(&'static str, VitalsInks)> {
     aterm_types::scheme::builtin_names()
         .into_iter()
         .map(|name| {

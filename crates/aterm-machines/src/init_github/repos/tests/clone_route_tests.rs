@@ -19,6 +19,12 @@ fn repo() -> Repo {
     }
 }
 
+/// Whether `call` is a step of a new clone ([`clone_advertised`]): the `git init` that starts it
+/// or the fetch that fills it.
+fn starts_a_clone(call: &str) -> bool {
+    call.contains(" init --quiet --template=") || fetches_advertised(call)
+}
+
 fn isolated<'s>(sys: &'s Live, config: &str) -> (Scratch<'s>, User, Cmd) {
     crate::items::github::need_native_git();
     let scratch = Scratch::new(sys, "github-clone-route").unwrap();
@@ -116,7 +122,7 @@ fn an_ssh_rewrite_clones_with_the_persons_own_url() {
     let calls = sys.calls();
     let network: Vec<_> = calls
         .iter()
-        .filter(|call| call.contains("--symref") || call.contains(" clone "))
+        .filter(|call| call.contains("--symref") || fetches_advertised(call))
         .collect();
     assert_eq!(network.len(), 2);
     for call in network {
@@ -144,7 +150,7 @@ fn the_current_check_precedes_each_final_route_admission() {
         let (repo, _, _) = script_clone_named_route(&sys, &who, "new", 0, false, true);
         assert!(clone_one_guarded(&sys, &who, &repo, &current).is_err());
         let calls = sys.calls();
-        assert!(!calls.iter().any(|call| call.contains(" clone ")));
+        assert!(!calls.iter().any(|call| starts_a_clone(call)));
         assert_eq!(
             calls
                 .iter()
@@ -175,6 +181,6 @@ fn a_route_changed_after_listing_is_refused_before_the_clone() {
             .count(),
         1
     );
-    assert!(!calls.iter().any(|call| call.contains(" clone ")));
+    assert!(!calls.iter().any(|call| starts_a_clone(call)));
     assert!(sys.stat(&Path::new(&who.home).join("new")).is_err());
 }

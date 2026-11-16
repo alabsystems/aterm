@@ -847,11 +847,65 @@ fn a_record_file_reads_as_the_records_it_holds() {
     let file = dir.path().join("records");
     std::fs::write(
         &file,
-        aterm_secrets::membership_log::encode_records([&genesis]),
+        aterm_secrets::membership_log::read_records([&genesis]).unwrap(),
     )
     .expect("the store file");
     assert_eq!(
         crate::presence::membership_of_records(&file),
         Some(Held::membership(&BTreeSet::from([*genesis.id()])))
+    );
+}
+
+/// LT-B8, on two Macs: where a seat says it listens is read from its own signed presence row, and
+/// an address beyond one LAN (100.64.0.0/10, globally routed) is one another seat may dial, since
+/// the row authenticated it; its loopback, IPv6 link-local and documentation addresses are not,
+/// and a Mac lists no address of its own.
+#[test]
+fn a_seat_is_dialable_at_the_overlay_addresses_its_signed_row_names() {
+    let lab = Lab::new();
+    let macs = lab_of(&lab, 2);
+    let (a, b) = (&macs[0], &macs[1]);
+    let named: Vec<std::net::SocketAddr> = [
+        "10.0.0.5:7480",
+        "100.64.0.7:7480",
+        "127.0.0.1:7480",
+        "192.0.2.1:7480",
+        "[2606:4700::1111]:7480",
+        "[fe80::1]:7480",
+    ]
+    .iter()
+    .map(|at| at.parse().expect("an address"))
+    .collect();
+    let rows = named.clone();
+    let ps = [
+        present_with(
+            a,
+            Arc::new(move || Facts {
+                addresses: rows.clone(),
+                ..facts()
+            }),
+        ),
+        present(b),
+    ];
+    round(
+        &lab,
+        &ps.iter().collect::<Vec<_>>(),
+        &[&a.principal, &b.principal],
+    );
+    let want: Vec<(String, std::net::SocketAddr)> = [named[0], named[1], named[4]]
+        .into_iter()
+        .map(|at| (a.principal.clone(), at))
+        .collect();
+    assert_eq!(
+        b.mesh().seat_addresses(),
+        want,
+        "B dials A where A's row says"
+    );
+    assert!(
+        a.mesh()
+            .seat_addresses()
+            .iter()
+            .all(|(seat, _)| *seat == b.principal),
+        "A lists no address of its own"
     );
 }

@@ -52,7 +52,7 @@
 //!   placed; the next sign-in a person launches then skips the rung once and asks them
 //!   ([`Record::by`], [`Skip::Refused`]), so a refusing profile never leaves the machine without
 //!   a way in. A stop for a person (`needs-sign-in`, `needs-you`) or no route ready goes on to
-//!   the person. Cloudflare's bot check that did not clear ends the sign-in `bot-check`, naming
+//!   the person. Cloudflare's bot check ends the sign-in `bot-check` at its first read, naming
 //!   it, with no need: no person is asked to pass one (design R-13).
 //! - **A stop is heard on every rung**: the caller's Ctrl-C (or a hangup) ends the browser's
 //!   download ([`super::headless_fetch::run_stoppable`]), keeps grok from starting after it,
@@ -1704,8 +1704,8 @@ impl Approver for NeedApprover<'_, '_> {
 /// [`Ladder::ready`] and no [`Skip`] holds (`ready`), for at most [`AUTO_WITHIN`], then the
 /// person ([`NeedApprover`]) only where it stopped for one (`needs-sign-in`, `needs-you`), no
 /// route was ready, or the rung was skipped. Its refusal ends the sign-in: it never falls
-/// through to approving anything else. Cloudflare's bot check that did not clear
-/// ([`Approval::BotCheck`]) ends it too, with no need raised: nobody is asked to pass one.
+/// through to approving anything else. Cloudflare's bot check ([`Approval::BotCheck`]) ends it
+/// too, with no need raised: nobody is asked to pass one.
 struct LadderApprover<'a, 'b> {
     auto: &'a mut dyn Auto,
     begun: &'a super::sign_in_ladder::Begun,

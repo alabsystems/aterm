@@ -83,10 +83,13 @@ pub(crate) const LAUNCHER: &str = "IFS= read -r command; eval \"$command\"";
 pub(crate) const CLEAR: &[u8] = b"\x1b[2J\x1b[3J\x1b[H";
 pub(crate) type Wire = aterm_agent::RelayClient<aterm_uds::CtlStream>;
 
+#[path = "output_cadence_native.rs"]
+mod cadence_native;
 #[path = "title_drift_calibration.rs"]
 mod calibration;
 #[path = "title_drift_producer.rs"]
 mod producer;
+pub(crate) use cadence_native::cmd as cadence_native_cmd;
 pub(crate) use calibration::cmd as memory_cmd;
 pub(crate) use producer::main as producer_main;
 
@@ -1513,6 +1516,32 @@ fn exercise_fixture(
     prepared: PreparedFixture,
     raw: &mut Raw,
 ) -> Result<Taken, String> {
+    exercise_fixture_with_input(
+        inst,
+        build,
+        case,
+        work,
+        files,
+        prepared,
+        raw,
+        |typing, _, _, work, _| post(typing, work.keys(), work.key_ms),
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the functional cadence check shares the complete native fixture and supplies its input action"
+)]
+fn exercise_fixture_with_input(
+    inst: &Instance,
+    build: &Build,
+    case: Case,
+    work: &Work,
+    files: &producer::Files,
+    prepared: PreparedFixture,
+    raw: &mut Raw,
+    input: impl FnOnce(&mut Wire, &mut Wire, &Targets, &Work, &mut Raw) -> Result<String, String>,
+) -> Result<Taken, String> {
     let PreparedFixture {
         mut typing,
         mut source,
@@ -1530,7 +1559,7 @@ fn exercise_fixture(
         .and_then(aterm_json::Value::as_u64)
         .ok_or("producer first-output clock missing")?;
     let key_start_ns = crate::sys::monotonic_ns();
-    let key_result = post(&mut typing, work.keys(), work.key_ms);
+    let key_result = input(&mut typing, &mut source, &t, work, raw);
     let key_end_ns = crate::sys::monotonic_ns();
     raw.note(
         "key_rpc_clock_monotonic_ns",

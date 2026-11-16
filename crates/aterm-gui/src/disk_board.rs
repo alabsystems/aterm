@@ -756,11 +756,6 @@ impl Shelf {
         }
     }
 
-    /// Read [`DiskFactsRaw`] for `home` at `now` from this shelf.
-    pub(crate) fn deck_facts(&self, home: &VolumeKey, now: &Clock) -> DiskFactsRaw {
-        self.board_lock().deck_facts(home, now)
-    }
-
     /// Whether the disk watch is active on this shelf.
     pub(crate) fn watched(&self) -> bool {
         self.board_lock().watched

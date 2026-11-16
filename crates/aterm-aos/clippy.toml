@@ -18,6 +18,7 @@
 # Purity: the crate holds no thread, file or socket (design §1). A step that
 # slept, spawned or read a file would not replay; those doors are banned too.
 disallowed-methods = [
+  { path = "std::os::unix::process::CommandExt::exec", reason = "replace the process through aterm_uds::spawnfd's exec, which closes the exec gate first (clippy.toml: the exec gate)", allow-invalid = true },
   { path = "std::net::TcpListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
   { path = "std::net::TcpListener::incoming", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)" },
   { path = "std::os::unix::net::UnixListener::accept", reason = "accept through aterm_uds so the accepted stream's blocking mode is explicit (clippy.toml: one sanctioned accept)", allow-invalid = true },

@@ -532,7 +532,6 @@ fn count_until_closed(stream: &CtlStream) -> usize {
 
 #[cfg(target_vendor = "apple")]
 fn exec_dialer_stand_in_if_asked() -> bool {
-    use std::os::unix::process::CommandExt as _;
     if std::env::var_os(EXEC_DIALER_FD).is_some() {
         let stream = CtlStream::from(crate::test_alone::handed(EXEC_DIALER_FD));
         let execd = std::env::var_os(EXEC_DIALER_EXECD).expect("the marker's path");
@@ -569,7 +568,7 @@ fn exec_dialer_stand_in_if_asked() -> bool {
     let mut image = std::process::Command::new(std::env::current_exe().expect("this binary"));
     image.args(std::env::args_os().skip(1));
     crate::test_alone::hand(&mut image, EXEC_DIALER_FD, fd);
-    let error = image.exec();
+    let error = aterm_update::exec_keeping_sigpipe(&mut image);
     panic!("exec the new image: {error}");
 }
 

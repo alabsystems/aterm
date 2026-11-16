@@ -23,8 +23,8 @@ use crate::land_run::Filed as RunFiled;
 /// The prefix of a run record's spool file.
 const RUNS: &str = "runs.";
 
-/// The prefix of a file [`Dir`]'s `done` takes a record aside to: no record's name spells it.
-const CLAIM: &str = ".claim.";
+/// Writers and cleanup share this lock; it is never renamed or removed.
+const LOCK: &str = ".lock";
 
 /// Where a clone keeps its records until an append holds them.
 pub trait Spool {
@@ -48,7 +48,7 @@ pub trait Spool {
     /// next append.
     ///
     /// # Errors
-    /// It could not be removed, or a newer record it took aside could not be put back.
+    /// The spool could not be locked, or its record could not be read or removed.
     fn done(&self, record: &Signed) -> Result<(), String>;
 }
 
@@ -117,6 +117,21 @@ pub fn kept_as(path: &str, today: u64) -> Result<(u64, bool, bool), String> {
 }
 
 impl Dir {
+    fn lock(&self) -> Result<aterm_toolchain::record_lock::RecordLock, String> {
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("the spool {} was not made: {e}", self.dir.display()))?;
+        let path = self.dir.join(LOCK);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("{} was not opened: {e}", path.display()))?;
+        aterm_toolchain::record_lock::RecordLock::lock(file, 0)
+            .map_err(|e| format!("{} was not locked: {e}", path.display()))
+    }
+
     /// The spool in `dir`.
     #[must_use]
     pub fn at(dir: impl Into<PathBuf>) -> Self {
@@ -171,8 +186,7 @@ impl Spool for Dir {
     fn put(&self, record: &Signed) -> Result<(), String> {
         let (day, _, fail) = kept_as(&record.path, 0)?;
         let file = self.dir.join(file_of(&record.path)?);
-        std::fs::create_dir_all(&self.dir)
-            .map_err(|e| format!("the spool {} was not made: {e}", self.dir.display()))?;
+        let _lock = self.lock()?;
         self.expire(day);
         if fail && file.exists() {
             return Ok(());
@@ -216,49 +230,36 @@ impl Spool for Dir {
         Ok(pending)
     }
 
-    /// The record at `record`'s path is taken aside first, by one rename to a name no reader
-    /// takes for a record ([`CLAIM`]), so no put lands between the comparison and the removal:
-    /// its bytes are `record`'s, and it is removed; or they are not, and it goes back, kept first
-    /// where it is a verdict FAIL (as [`Spool::put`] keeps one), else only where no later put
-    /// took the path meanwhile, whose record is newer.
     fn done(&self, record: &Signed) -> Result<(), String> {
-        static CLAIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        self.done_with(record, |path| {
+            aterm_uds::atomic_file::read_regular(path, crate::land_record::MAX_BYTES)
+                .map(|(bytes, _)| bytes)
+        })
+    }
+}
+
+impl Dir {
+    /// Hold the writers' lock across comparison and removal. No put can replace the record
+    /// between them, and an interruption before removal leaves it at its canonical path,
+    /// visible to the next append. An unreadable or different record is never removed.
+    fn done_with(
+        &self,
+        record: &Signed,
+        read: impl FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+    ) -> Result<(), String> {
         let name = file_of(&record.path)?;
         let file = self.dir.join(&name);
-        let claim = self.dir.join(format!(
-            "{CLAIM}{}.{}.{name}",
-            std::process::id(),
-            CLAIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
-        match std::fs::rename(&file, &claim) {
-            Ok(()) => {}
+        let _lock = self.lock()?;
+        let held = match read(&file) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(format!("{} was not removed: {e}", file.display())),
-        }
-        let held = aterm_uds::atomic_file::read_regular(&claim, crate::land_record::MAX_BYTES);
-        if held.is_ok_and(|(bytes, _)| bytes == record.bytes) {
-            return std::fs::remove_file(&claim)
-                .map_err(|e| format!("{} was not removed: {e}", claim.display()));
-        }
-        let (_, _, fail) = kept_as(&record.path, 0)?;
-        let restored = if fail {
-            std::fs::rename(&claim, &file)
-        } else {
-            match std::fs::hard_link(&claim, &file) {
-                Ok(()) => std::fs::remove_file(&claim),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::fs::remove_file(&claim)
-                }
-                Err(e) => Err(e),
-            }
+            Err(e) => return Err(format!("{} was not read: {e}", file.display())),
         };
-        restored.map_err(|e| {
-            format!(
-                "a newer record at {} was not put back from {}: {e}",
-                file.display(),
-                claim.display()
-            )
-        })
+        if held == record.bytes {
+            std::fs::remove_file(&file)
+                .map_err(|e| format!("{} was not removed: {e}", file.display()))?;
+        }
+        Ok(())
     }
 }
 

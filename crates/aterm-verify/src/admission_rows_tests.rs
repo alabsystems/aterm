@@ -69,7 +69,7 @@ fn staged_rows(
                 admit_quiet: admit,
                 admit_memory: admit,
             },
-            &early,
+            crate::StageAdmission::Conservative(&early),
             || {
                 crate::memory::current().expect("a metered stage").book(
                     4242,

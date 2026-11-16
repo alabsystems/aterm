@@ -311,21 +311,21 @@ fn history(paths: &client::Paths) -> History {
         1,
     )
     .unwrap();
-    let mut full = genesis.bytes().to_vec();
+    let mut full = genesis.wire_bytes().unwrap().to_vec();
     let mut log = Log::new(genesis).unwrap();
     let (draft, key) = log
         .draft_epoch(&writer, 2, EpochAudience::Everyone, 1)
         .unwrap();
     let epoch = draft.sign(&WRITER, INCARNATION).unwrap();
     let epoch_id = *epoch.id();
-    full.extend_from_slice(epoch.bytes());
+    full.extend_from_slice(epoch.wire_bytes().unwrap().as_ref());
     assert_eq!(log.insert(epoch).unwrap(), Inserted::Held);
     let wrap = log
         .draft_wrap(&writer, 3, epoch_id, &key, recipient.recipient())
         .unwrap()
         .sign(&WRITER, INCARNATION)
         .unwrap();
-    full.extend_from_slice(wrap.bytes());
+    full.extend_from_slice(wrap.wire_bytes().unwrap().as_ref());
     assert_eq!(log.insert(wrap).unwrap(), Inserted::Held);
     let prefix = full.clone();
     let mut tail = Vec::new();
@@ -342,8 +342,8 @@ fn history(paths: &client::Paths) -> History {
             .unwrap()
             .sign(&WRITER, INCARNATION)
             .unwrap();
-        tail.extend_from_slice(record.bytes());
-        full.extend_from_slice(record.bytes());
+        tail.extend_from_slice(record.wire_bytes().unwrap().as_ref());
+        full.extend_from_slice(record.wire_bytes().unwrap().as_ref());
         assert_eq!(log.insert(record).unwrap(), Inserted::Held);
     }
     assert_eq!(log.held_count(), VALUES + 3);
@@ -366,7 +366,7 @@ fn history(paths: &client::Paths) -> History {
     assert_eq!(decode_records(&tail).unwrap().len(), VALUES);
     let complete = Store::for_vault(NAME).unwrap().recovering(&full);
     assert_eq!(complete.complete_inventory().len(), VALUES + 3);
-    assert_eq!(complete.encode_held(), full);
+    assert_eq!(complete.read_held().unwrap(), full);
     let parent = log
         .draft(
             &writer,
@@ -451,7 +451,7 @@ impl Fixture {
             &history.full
         };
         let mut wire = initial.to_vec();
-        wire.extend_from_slice(history.waiting.bytes());
+        wire.extend_from_slice(history.waiting.wire_bytes().unwrap().as_ref());
         fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
         host.expected(initial);
         let fixture = Self {
@@ -479,11 +479,7 @@ impl Fixture {
                 .recipient(),
             fixture.history.local.recipient()
         );
-        assert!(
-            loaded
-                .complete_bytes(fixture.history.waiting.id())
-                .is_none()
-        );
+        assert!(!loaded.holds(fixture.history.waiting.id()));
         assert!(
             loaded
                 .log()
@@ -492,7 +488,13 @@ impl Fixture {
                 .unwrap()
                 .is_empty()
         );
-        assert!(client::load_records(&fixture.paths).unwrap().encode() == wire);
+        assert!(
+            client::load_records(&fixture.paths)
+                .unwrap()
+                .read_encoded()
+                .unwrap()
+                == wire
+        );
         fixture
     }
 
@@ -615,11 +617,17 @@ fn ciphertext_sync_has_bounded_gross_allocations_for_none_whole_and_large_past()
             past.history.complete.complete_inventory()
         );
         assert_eq!(grown.len(), VALUES + 4);
-        assert!(grown.complete_bytes(past.history.waiting.id()).is_none());
+        assert!(!grown.holds(past.history.waiting.id()));
         let mut expected_file = past.history.full.clone();
-        expected_file.extend_from_slice(past.history.waiting.bytes());
-        assert!(grown.encode() == expected_file);
-        assert!(client::load_records(&past.paths).unwrap().encode() == expected_file);
+        expected_file.extend_from_slice(past.history.waiting.wire_bytes().unwrap().as_ref());
+        assert!(grown.read_encoded().unwrap() == expected_file);
+        assert!(
+            client::load_records(&past.paths)
+                .unwrap()
+                .read_encoded()
+                .unwrap()
+                == expected_file
+        );
         past.host.expected(&past.history.tail);
         measured.push(("past", past.pass(Some(&past.history.tail), true)));
         past.pass(None, false);

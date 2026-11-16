@@ -788,3 +788,37 @@ fn a_block_has_one_reading_and_decisiveness_follows_it() {
     assert!(!decisive(&[both, refused]));
     assert!(!decisive(&[both, disk]));
 }
+
+/// A FULL DISK A TEST INJECTS IS NOT ITS MACHINE'S: a case that logged the code's ENOSPC handling
+/// (aterm-link's fabric sim injects a full disk and logs each refusal) and then failed on an
+/// assertion of its own is the tree's FAIL, as on 2026-11-15 when `verify land` read the sim's
+/// `each_found_bug_is_reached_again_with_its_rule_off` red as "the child ran out of disk" and
+/// reported the landing COULD NOT RUN. NEGATIVE CONTROL: the same block whose panic itself names
+/// the full disk reads disk, and its binary NOT RUN.
+#[test]
+fn a_full_disk_a_case_logged_before_its_own_panic_is_the_trees_red() {
+    let sentence = crate::exec::ENOSPC_SENTENCE;
+    let block = |panic: &str| {
+        format!(
+            "aterm-link: could not persist the asks journal: {sentence} (os error 28)\n\
+             aterm-link: post 2 reservation refused, left queued: {sentence} (os error 28)\n\
+             \nthread 's::found' panicked at src/s.rs:9:5:\n{panic}\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\
+             aterm-link: presence could not come up: {sentence} (os error 28)\n"
+        )
+    };
+    let log = |block: &str| {
+        format!(
+            "{HEADER}\nrunning 1 test\ntest s::found ... FAILED\n\nfailures:\n\n\
+             ---- s::found stdout ----\n{block}\n\nfailures:\n    s::found\n\n\
+             test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.01s\n\nerror: test failed, to rerun pass `-p x --lib`\n"
+        )
+    };
+    let own = block("found rows that no longer reach their bug with its rule off");
+    assert!(!marks(&own).disk, "{own}");
+    assert!(!out_of_disk(&log(&own)), "{}", log(&own));
+    let full = block(&format!("writing the pin: {sentence} (os error 28)"));
+    assert!(marks(&full).disk, "{full}");
+    assert!(out_of_disk(&log(&full)), "{}", log(&full));
+}

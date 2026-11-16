@@ -53,6 +53,22 @@ fn zap_gates_and_glob_match_like_brew() {
     ));
 }
 
+#[test]
+fn glob_helpers_bound_pathological_inputs() {
+    let deeply_nested = format!("{}x{}", "{".repeat(100), "}".repeat(100));
+    let expanded = brace_expand(&deeply_nested);
+    assert_eq!(expanded.len(), 1);
+    assert!(expanded[0].contains('{'));
+
+    let long_literal = "a".repeat(5_000);
+    assert!(!segment_matches(&long_literal, &long_literal));
+
+    let segments = vec!["x"; 513];
+    let mut found = Vec::new();
+    glob_walk(std::path::Path::new("/"), &segments, &mut found);
+    assert!(found.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn cask_link_round_trip_and_conflict_pre_scan() {

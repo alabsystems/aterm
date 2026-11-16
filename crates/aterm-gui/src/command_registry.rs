@@ -103,6 +103,8 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         ),
         M::Overview => spec("view.overview", S::App, A::Owner, C::Any),
         M::Workers => spec("view.workers", S::App, A::Owner, C::Any),
+        M::Navigator => spec("view.navigator", S::App, A::Owner, C::Any),
+        M::NavigatorSplit => spec("view.navigator_split", S::App, A::Owner, C::Any),
         M::Allocation => spec("app.allocation.open", S::Window, A::LocalUi, C::Any),
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
         M::Copy => spec("selection.copy", S::View, A::Clipboard, C::Any),

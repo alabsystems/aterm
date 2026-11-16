@@ -47,6 +47,7 @@ fn seen(email: &str) -> Observation {
         src: ObservedSrc::Profile,
         path: PathBuf::from("/home/someone/.claude.json"),
         mtime: Some(1),
+        plan: None,
     })
 }
 

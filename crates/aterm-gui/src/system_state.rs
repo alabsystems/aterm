@@ -2007,7 +2007,8 @@ fn row_view_as(
                 Some(Chip::Failed | Chip::NeedsYou | Chip::Waiting)
             );
         if !current_error {
-            row.chip = previous.standing.settled().then_some(Chip::LastKnown);
+            row.chip =
+                (previous.standing.settled() && !previous.on_offer()).then_some(Chip::LastKnown);
             row.standing = Some(Standing::Unknown);
         }
         // The value cell and reserved page caption carry history/checking;
@@ -2040,9 +2041,12 @@ fn row_view_as(
             row.install_tools = false;
         }
     } else if checking {
+        // A row read again keeps the standing of the reading it holds until the new one lands:
+        // `rows=`, `setup=` and the busy headline's count say what it was last read as, so a
+        // re-read never hides a settled row as one still to come. Its chip and value alone say
+        // that the reading is the last one and a newer one is on its way.
         if row.chip == Some(Chip::InPlace) {
             row.chip = Some(Chip::LastKnown);
-            row.standing = Some(Standing::Unknown);
             if let RowValue::One(value) = &row.value {
                 row.value = RowValue::LastKnown(value.clone());
             }

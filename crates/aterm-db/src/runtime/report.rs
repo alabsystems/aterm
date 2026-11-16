@@ -495,6 +495,7 @@ fn stage(phase: crate::control::Phase) -> aterm_types::network_state::RepairStag
         Phase::ControlInventory
         | Phase::InventorySend
         | Phase::InventoryReceive
+        | Phase::InventoryReconcile
         | Phase::ControlBatch
         | Phase::BatchSend
         | Phase::BatchReceive

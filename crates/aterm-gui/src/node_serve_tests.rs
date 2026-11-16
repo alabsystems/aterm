@@ -19,7 +19,7 @@ use aterm_net::fleet_member::{
 };
 use aterm_secrets::age;
 use aterm_secrets::commons::binding::Request;
-use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, encode_records};
+use aterm_secrets::membership_log::{Body, Entrant, Log, NodeStanding, Record, read_records};
 use aterm_uds::stop::Stop;
 
 use super::{
@@ -1356,7 +1356,7 @@ fn lab_log(file: &Path, founders: &[(u8, &NodeIdentity)], out: u8) -> Arc<LocalL
         NodeStanding::Removed(actor(out)),
         "the lab must hold the removed Mac's node key out"
     );
-    std::fs::write(file, encode_records([&genesis, &removal])).expect("the record store");
+    std::fs::write(file, read_records([&genesis, &removal]).unwrap()).expect("the record store");
     Arc::new(LocalLog::founded_at(file.to_path_buf(), *genesis.id()))
 }
 

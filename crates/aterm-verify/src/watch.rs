@@ -3,9 +3,9 @@
 
 //! The follower: judges origin/main's newest tip after the landings that made it, one pass at a
 //! time, and says what it found as a GitHub commit status on that commit. A pass runs every row
-//! to its end (a red stops no later row), and nothing preempts it. A red pass starts one repair
-//! worker, unless one is still working or could not finish the same reds, which bisects over
-//! first-parent landings and fixes forward. The verdict is the status; nothing else is kept.
+//! to its end (a red stops no later row), and nothing preempts it. A one-shot pass returns repair
+//! context to its caller. The persistent follower starts an independent repair worker unless one
+//! still works or could not finish the same reds. The verdict is the status; nothing else is kept.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -24,10 +24,12 @@ judged, with the verifier built from that tip, and posts the verdict as a commit
 x86_64 compat compile, verify release --tree, verify cells, verify appkit on a Mac with a\n\
 desk session, ship's export and cut checks, the inputs recheck) to their ends: a red stops\n\
 no later row, and no other work preempts it. Reds are named by package, target and test.\n\
-A red pass starts one Claude Code repair worker in DIR (default: this repository's main\n\
+A persistent follower's red starts one Claude Code repair worker in DIR (default: this repository's main\n\
 checkout) unless the last one still works or could not finish the same reds; it bisects over\n\
-first-parent landings and fixes forward.\n\
---once judges one tip and ends. No hook, gate or publication.\n\
+first-parent landings and fixes forward independently while the follower continues.\n\
+--once judges one tip and returns repair context to its caller: use native subagents or work\n\
+directly, with your own shell tools for commands. It starts and retires no agent sessions.\n\
+No hook, gate or publication.\n\
 verify watch --install [--workspace DIR] [--interval SECONDS] [--repair-cwd DIR] installs it\n\
 as this user's LaunchAgent, replacing an earlier install.\n";
 
@@ -35,6 +37,8 @@ as this user's LaunchAgent, replacing an earlier install.\n";
 const DESCRIPTION_CHARS: usize = 140;
 /// How many first-parent commits before a red tip a pass reads for the last green one.
 const WALK: usize = 100;
+/// Leave room for the persistent worker's instructions within the control task's 64 KiB limit.
+const MAX_REPAIR_CONTEXT_BYTES: usize = 60 * 1024;
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -48,6 +52,14 @@ struct Options {
 }
 
 impl Options {
+    fn repair_mode<'a>(&self, worker: &'a mut Option<Repair>) -> RepairMode<'a> {
+        if self.once {
+            RepairMode::Caller
+        } else {
+            RepairMode::Persistent(worker)
+        }
+    }
+
     /// The folder a repair worker starts in. A worktree is removed once its branch lands, so
     /// the default is the main checkout of `cwd`'s repository, never `cwd` itself.
     fn repair_cwd(&self, cwd: &Path) -> Result<PathBuf, String> {
@@ -333,14 +345,105 @@ impl Status {
         matches!(self.state.as_str(), "success" | "failure" | "error")
     }
 
-    /// The repair worker a failure names: a tab ID, or the `s-` ID of a worker started before
-    /// the `t` form.
+    /// The repair worker a verdict carries: a tab ID, or the `s-` ID of an older worker.
     fn worker(&self) -> Option<&str> {
-        let rest = self.description.split_once("repair ")?.1;
+        if !matches!(self.state.as_str(), "success" | "failure") {
+            return None;
+        }
+        let rest = self.description.strip_prefix("repair ").or_else(|| {
+            if self.state != "failure" {
+                return None;
+            }
+            let (count, rest) = self.description.split_once(" red, repair ")?;
+            (!count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())).then_some(rest)
+        })?;
         let sid = rest.split([':', ' ', ';']).next()?;
         let named = aterm_types::tab_id::is_tab_id(sid) || aterm_types::tab_id::is_legacy(sid);
-        (self.state == "failure" && named).then_some(sid)
+        named.then_some(sid)
     }
+
+    fn repair(&self) -> Option<Repair> {
+        let sid = self.worker()?;
+        let prefix = format!("repair {sid} assigned=");
+        let assignment = self
+            .description
+            .strip_prefix(&prefix)
+            .and_then(|tail| tail.split_once(';').map(|(hash, _)| hash))
+            .filter(|hash| {
+                hash.len() == 64
+                    && hash
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            .map(str::to_owned);
+        Some(Repair {
+            sid: sid.to_owned(),
+            assignment,
+        })
+    }
+
+    /// Only this producer header establishes that a failure assigned no worker.
+    fn worker_free_failure(&self) -> bool {
+        self.state == "failure"
+            && self
+                .description
+                .split_once(" red:")
+                .is_some_and(|(count, _)| {
+                    !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+                })
+    }
+}
+
+/// Immutable worker custody. The status header is `repair <sid> assigned=<64 hex>; …`.
+/// Its full hash precedes clipped human detail. Old or malformed assignments retain the SID
+/// with unknown assignment: prose equality is never evidence that the worker tried a red.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Repair {
+    sid: String,
+    assignment: Option<String>,
+}
+
+impl Repair {
+    fn header(&self) -> String {
+        format!(
+            "repair {} assigned={}; ",
+            self.sid,
+            self.assignment.as_deref().unwrap_or("?")
+        )
+    }
+}
+
+/// The original repair inputs: its known green frontier, if any, and canonical full red keys.
+/// The same labels after a later green are a new failure for a worker that already failed.
+fn assignment(green: Option<&str>, rows: &[Row]) -> String {
+    let mut keys: Vec<_> = rows
+        .iter()
+        .filter(|row| row.outcome == "red")
+        .flat_map(|row| {
+            row.red_items
+                .iter()
+                .map(move |red| (row.id.as_str(), red.as_str()))
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut hash = aterm_digest::Sha256::new();
+    hash.update(b"aterm-follower-repair-assignment\0");
+    match green {
+        Some(green) => {
+            hash.update([1]);
+            hash.update((green.len() as u64).to_le_bytes());
+            hash.update(green.as_bytes());
+        }
+        None => hash.update([0]),
+    }
+    for (row, red) in keys {
+        for field in [row, red] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+    }
+    aterm_codec::hex::encode_lower(&hash.finalize())
 }
 
 /// Where a repair worker's task stands, as `aterm ctl @<sid> task` says it.
@@ -366,9 +469,9 @@ fn task_state(record: &str) -> Worker {
     match (word("state="), word("why=")) {
         (Some("working"), _) | (Some("stalled"), Some("startup" | "held")) => Worker::Working,
         (Some("failed" | "stalled"), _) => Worker::Failed,
-        (Some(_), _) => Worker::Ended,
+        (Some("done" | "exited"), _) => Worker::Ended,
         (None, _) if record.split_whitespace().eq(["OK", "task", "-"]) => Worker::Ended,
-        (None, _) => Worker::Working,
+        _ => Worker::Working,
     }
 }
 
@@ -379,6 +482,8 @@ trait World {
     fn statuses(&mut self, commit: &str) -> Result<Vec<Status>, String>;
     /// Post `status` on `commit`.
     fn post(&mut self, commit: &str, status: &Status) -> Result<(), String>;
+    /// Return a one-shot pass's repair context to its caller.
+    fn caller_repair(&mut self, context: &str) -> Result<(), String>;
     /// Where the worker `sid`'s task stands.
     fn worker(&mut self, sid: &str) -> Worker;
     /// End the agent of `sid`, a worker that no longer holds the repair place, so ended workers
@@ -386,6 +491,17 @@ trait World {
     fn retire(&mut self, sid: &str);
     /// Start a repair worker on `task`: its sid.
     fn spawn(&mut self, task: &str) -> Result<String, String>;
+}
+
+/// A one-shot caller owns its repair; only the persistent follower manages an agent session.
+enum RepairMode<'a> {
+    Caller,
+    Persistent(&'a mut Option<Repair>),
+}
+
+fn write_caller_repair(output: &mut dyn std::io::Write, context: &str) -> std::io::Result<()> {
+    writeln!(output, "{context}")?;
+    output.flush()
 }
 
 /// The live world: GitHub through the verifier's linked agh, routed by the clone's own remote,
@@ -444,27 +560,36 @@ impl Live {
 }
 
 /// The follower's statuses, `(state, description)` newest first, in GitHub's answer to
-/// `GET /repos/{owner}/{repo}/commits/{sha}/statuses`; `None` where the answer is no list.
+/// `GET /repos/{owner}/{repo}/commits/{sha}/statuses`; `None` where the list or its relevant
+/// fields are malformed, so unread evidence never becomes an absent follower status.
 pub fn follower_statuses(answer: &aterm_json::Value) -> Option<Vec<(String, String)>> {
-    let text =
-        |row: &aterm_json::Value, key: &str| row[key].as_str().unwrap_or_default().to_owned();
-    Some(
-        answer
-            .as_array()?
-            .iter()
-            .filter(|row| row["context"].as_str() == Some(CONTEXT))
-            .map(|row| (text(row, "state"), text(row, "description")))
-            .collect(),
-    )
+    let mut statuses = Vec::new();
+    for row in answer.as_array()? {
+        let context = row["context"].as_str()?;
+        if context.is_empty() {
+            return None;
+        }
+        if context != CONTEXT {
+            continue;
+        }
+        let state = row["state"].as_str()?;
+        let description = row["description"].as_str()?;
+        if !matches!(state, "pending" | "success" | "failure" | "error") {
+            return None;
+        }
+        statuses.push((state.to_owned(), description.to_owned()));
+    }
+    Some(statuses)
 }
 
 impl World for Live {
     fn statuses(&mut self, commit: &str) -> Result<Vec<Status>, String> {
         let path = format!("repos/{}/commits/{commit}/statuses", self.slug);
-        let body = self.agh(&["api", &path])?;
+        let body = self.agh(&["api", &path, "--all"])?;
         let value: aterm_json::Value =
             aterm_json::from_slice(&body).map_err(|e| format!("{path}: {e}"))?;
-        let rows = follower_statuses(&value).ok_or_else(|| format!("{path}: no list"))?;
+        let rows =
+            follower_statuses(&value).ok_or_else(|| format!("{path}: not a valid status list"))?;
         Ok(rows
             .into_iter()
             .map(|(state, description)| Status { state, description })
@@ -497,6 +622,11 @@ impl World for Live {
         }
     }
 
+    fn caller_repair(&mut self, context: &str) -> Result<(), String> {
+        write_caller_repair(&mut std::io::stdout().lock(), context)
+            .map_err(|error| error.to_string())
+    }
+
     fn retire(&mut self, sid: &str) {
         // `quiet=60`: a tab a person typed in during the last minute is theirs, and stays.
         if let Err(why) = Self::ctl(&[&format!("@{sid}"), "signal", "term", "quiet=60"], &[]) {
@@ -505,6 +635,9 @@ impl World for Live {
     }
 
     fn spawn(&mut self, task: &str) -> Result<String, String> {
+        eprintln!(
+            "verify watch: the persistent follower needs an independent repair session while it continues judging main"
+        );
         let cwd = format!("cwd={}", self.repair_cwd.display());
         let reply = Self::ctl(
             &[
@@ -533,11 +666,27 @@ fn host() -> String {
     aterm_uds::process::kernel_host_name().unwrap_or_else(|| "this Mac".into())
 }
 
+/// Put stable controller selectors before the human host name so clipping a long host never
+/// loses them. Missing identities remain absent; the read above a claim never mints a node.
+fn pending_status(host: &str, node: Option<&str>, session: Option<&str>) -> Status {
+    let mut description = "judging".to_owned();
+    if let Some(node) = node.filter(|node| aterm_net::fleet::is_node_id(node)) {
+        description.push_str(&format!(" node={node}"));
+    }
+    if let Some(session) = session.filter(|session| {
+        aterm_types::tab_id::is_tab_id(session) || aterm_types::tab_id::is_legacy(session)
+    }) {
+        description.push_str(&format!(" session={session}"));
+    }
+    description.push_str(&format!(" on {host}"));
+    Status::new("pending", description)
+}
+
 /// One turn: fetch main, and judge its newest tip unless a follower already has.
 fn attempt(
     opts: &Options,
     world: &mut dyn World,
-    worker: &mut Option<String>,
+    worker: &mut Option<Repair>,
 ) -> Result<Start, String> {
     let root = &opts.workspace;
     // verify watch follows the invoking checkout's arbitrary remote, which may be private. URL
@@ -550,9 +699,12 @@ fn attempt(
             done.state, done.description
         )));
     }
+    let node = aterm_types::dirs::state_dir()
+        .and_then(|dir| aterm_net::fleet_member::read_node_id(&dir).ok().flatten());
+    let session = std::env::var("ATERM_SESSION_ID").ok();
     world.post(
         &tip,
-        &Status::new("pending", format!("judging on {}", host())),
+        &pending_status(&host(), node.as_deref(), session.as_deref()),
     )?;
     let Some(sample) = judge(root, &tip).unwrap_or_else(|why| {
         Some(Sample {
@@ -563,18 +715,33 @@ fn attempt(
         // The controller was stopped: the tip keeps its pending status and is judged again.
         return Ok(Start::Judged);
     };
-    let before: Vec<String> = git(
+    let history = git(
         root,
         &[
             "rev-list",
             "--first-parent",
-            &format!("--max-count={WALK}"),
-            &format!("{tip}^"),
+            &format!("--max-count={}", WALK + 2),
+            &tip,
         ],
     )
-    .map(|text| text.lines().map(str::to_owned).collect())
-    .unwrap_or_default();
-    let status = conclude(world, &tip, &before, &sample, worker, &opts.workspace)?;
+    .and_then(|text| {
+        let shallow = match git(root, &["rev-parse", "--is-shallow-repository"])?.as_str() {
+            "false" => false,
+            "true" => true,
+            _ => return Err("cannot decide whether follower history is shallow".into()),
+        };
+        Ok((text, shallow))
+    });
+    let (before, history_complete) = first_parent_history(history);
+    let status = conclude(
+        world,
+        &tip,
+        &before,
+        history_complete,
+        &sample,
+        opts.repair_mode(worker),
+        &opts.workspace,
+    )?;
     println!(
         "verify watch: {tip} {}: {}",
         status.state, status.description
@@ -587,30 +754,44 @@ fn attempt(
     Ok(Start::Judged)
 }
 
+/// The query includes the tip so a true root is distinguishable from an unread `tip^`.
+/// An extra ancestor exposes truncation; shallow history never establishes the absence of workers.
+fn first_parent_history(result: Result<(String, bool), String>) -> (Vec<String>, bool) {
+    match result {
+        Ok((text, shallow)) => {
+            if text.lines().next().is_none() {
+                return (Vec::new(), false);
+            }
+            let mut before: Vec<String> = text.lines().skip(1).map(str::to_owned).collect();
+            let complete = !shallow && before.len() <= WALK;
+            before.truncate(WALK);
+            (before, complete)
+        }
+        Err(why) => {
+            eprintln!("verify watch: first-parent history could not be read: {why}");
+            (Vec::new(), false)
+        }
+    }
+}
+
 /// What the commits before a red tip say: the newest green, the oldest red since it, and the
-/// newest failure, which names the repair worker last started.
+/// newest verdict that carries a repair worker. Caller-only failures do not replace that custody.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Before {
     green: Option<String>,
     oldest_red: Option<String>,
-    failure: Option<Status>,
+    /// The newest failure or the green frontier that carries a worker.
+    repair: Option<Repair>,
     /// Every status was read back to the green, or to the end of the commits given. Where not,
     /// a worker no status read names may still work.
     complete: bool,
 }
 
-impl Before {
-    /// The repair worker the newest failure names.
-    fn worker(&self) -> Option<&str> {
-        self.failure.as_ref().and_then(Status::worker)
-    }
-}
-
 /// Read the follower's statuses of `before` (first-parent commits, newest first) back to the
 /// newest green. A read that fails ends the walk with what it found.
-fn walk(world: &mut dyn World, before: &[String]) -> Before {
+fn walk(world: &mut dyn World, before: &[String], history_complete: bool) -> Before {
     let mut found = Before {
-        complete: true,
+        complete: history_complete,
         ..Before::default()
     };
     for commit in before {
@@ -630,12 +811,21 @@ fn walk(world: &mut dyn World, before: &[String]) -> Before {
         match status.state.as_str() {
             "success" => {
                 found.green = Some(commit.clone());
+                if found.repair.is_none() {
+                    found.repair = status.repair();
+                }
+                found.complete = true;
                 break;
             }
             "failure" => {
                 found.oldest_red = Some(commit.clone());
-                if found.failure.is_none() {
-                    found.failure = Some(status);
+                let repair = status.repair();
+                if repair.is_none() && !status.worker_free_failure() {
+                    found.complete = false;
+                    break;
+                }
+                if found.repair.is_none() {
+                    found.repair = repair;
                 }
             }
             _ => {}
@@ -644,7 +834,8 @@ fn walk(world: &mut dyn World, before: &[String]) -> Before {
     found
 }
 
-/// Post `sample`'s verdict on `tip`. A red pass names one repair worker in its failure: the one
+/// Post `sample`'s verdict on `tip`. A caller gets repair context without managing any worker.
+/// A persistent red names one repair worker in its failure: the one
 /// `worker` or the newest failure names while it works, or while it could not finish these same
 /// reds (a fresh one would meet what stopped it); else a new one, the ended one retired. Where
 /// the statuses could not be read back to a worker or a green, none is started: one may work.
@@ -652,56 +843,92 @@ fn conclude(
     world: &mut dyn World,
     tip: &str,
     before: &[String],
+    history_complete: bool,
     sample: &Sample,
-    worker: &mut Option<String>,
+    mode: RepairMode<'_>,
     root: &Path,
 ) -> Result<Status, String> {
     let status = match sample.state.as_str() {
-        "pass" => Status::new(
-            "success",
-            format!(
-                "pass on {}: {}",
-                host(),
-                sample
-                    .rows
-                    .iter()
-                    .map(|row| row.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-        ),
+        "pass" => {
+            let repair = match mode {
+                RepairMode::Persistent(worker) => worker.clone(),
+                RepairMode::Caller => None,
+            }
+            .or_else(|| walk(world, before, history_complete).repair);
+            let header = repair.as_ref().map_or_else(String::new, Repair::header);
+            Status::new(
+                "success",
+                format!(
+                    "{header}pass on {}: {}",
+                    host(),
+                    sample
+                        .rows
+                        .iter()
+                        .map(|row| row.id.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            )
+        }
         "red" => {
             let reds = reds(&sample.rows);
-            let failure = |sid: Option<&str>| {
-                let repair = sid.map_or_else(String::new, |sid| format!(", repair {sid}"));
+            let failure = |repair: Option<&Repair>| {
+                let header = repair.map_or_else(String::new, Repair::header);
                 Status::new(
                     "failure",
-                    format!("{} red{repair}: {}", reds.len(), reds.join("; ")),
+                    format!("{header}{} red: {}", reds.len(), reds.join("; ")),
                 )
             };
-            let earlier = walk(world, before);
-            let named = worker
-                .clone()
-                .or_else(|| earlier.worker().map(str::to_owned));
-            let held = named.map(|sid| {
-                let state = world.worker(&sid);
-                (sid, state)
-            });
-            *worker = match held {
-                Some((sid, Worker::Working)) => Some(sid),
-                Some((sid, Worker::Failed))
-                    if earlier.failure.as_ref() == Some(&failure(Some(&sid))) =>
-                {
-                    Some(sid)
+            let earlier = walk(world, before, history_complete);
+            let worker = match mode {
+                RepairMode::Caller => {
+                    let context = repair_context(tip, &earlier, &sample.rows, root);
+                    let written = world.caller_repair(&format!(
+                        "Use your harness's native subagents for same-machine delegation, or work directly; \
+                         use your own shell/background tools for commands.\n\n{context}"
+                    ));
+                    // This pass owns no worker. The next persistent follower finds existing
+                    // custody in the worker-bearing failure, beyond this caller-only status.
+                    let status = failure(None);
+                    let posted = world.post(tip, &status);
+                    return match (posted, written) {
+                        (Err(post), Err(write)) => {
+                            Err(format!("{post}; caller repair output: {write}"))
+                        }
+                        (Err(post), Ok(())) => Err(post),
+                        (Ok(()), Err(write)) => Err(format!("caller repair output: {write}")),
+                        (Ok(()), Ok(())) => Ok(status),
+                    };
                 }
-                None if !earlier.complete => None,
+                RepairMode::Persistent(worker) => worker,
+            };
+            let named = worker.clone().or_else(|| earlier.repair.clone());
+            let held = named.map(|repair| {
+                let state = world.worker(&repair.sid);
+                (repair, state)
+            });
+            let current = assignment(earlier.green.as_deref(), &sample.rows);
+            *worker = match held {
+                Some((repair, Worker::Working)) => Some(repair),
+                Some((repair, Worker::Failed))
+                    if repair
+                        .assignment
+                        .as_ref()
+                        .is_none_or(|assigned| *assigned == current) =>
+                {
+                    Some(repair)
+                }
+                unknown if !earlier.complete => unknown.map(|(repair, _)| repair),
                 ended => {
-                    if let Some((sid, _)) = ended {
-                        world.retire(&sid);
+                    if let Some((repair, _)) = ended {
+                        world.retire(&repair.sid);
                     }
                     let task = repair_task(tip, &earlier, &sample.rows, root);
                     match world.spawn(&task) {
-                        Ok(sid) => Some(sid),
+                        Ok(sid) => Some(Repair {
+                            sid,
+                            assignment: Some(current),
+                        }),
                         Err(why) => {
                             eprintln!("verify watch: no repair worker started: {why}");
                             None
@@ -709,7 +936,7 @@ fn conclude(
                     }
                 }
             };
-            failure(worker.as_deref())
+            failure(worker.as_ref())
         }
         _ => {
             let row = sample
@@ -758,10 +985,10 @@ fn clip(text: &str, chars: usize) -> String {
     clipped
 }
 
-/// The repair worker's task: the red tip, the last green tip, and every red. The bisect runs
+/// Bounded context shared by the caller and the persistent follower's repair worker. The bisect runs
 /// between the tip, which these reds were seen on, and the green, the one tip known good; the
 /// oldest red since the green may have been red for other tests, so it is only named.
-fn repair_task(tip: &str, earlier: &Before, rows: &[Row], root: &Path) -> String {
+fn repair_context(tip: &str, earlier: &Before, rows: &[Row], root: &Path) -> String {
     let (green_line, range) = match &earlier.green {
         Some(green) => (
             format!("The last green first-parent tip is {green}."),
@@ -775,29 +1002,54 @@ fn repair_task(tip: &str, earlier: &Before, rows: &[Row], root: &Path) -> String
     let oldest = earlier.oldest_red.as_ref().map_or_else(String::new, |red| {
         format!(" The oldest red tip since then is {red}; its reds may be other ones.")
     });
-    let mut task = format!(
+    let mut context = format!(
         "The follower (`verify watch`, commit status context {CONTEXT}) judged origin/main red at {tip}. \
          {green_line}{oldest}\n\nRed, by row, then package, target and test:\n"
     );
-    for row in rows.iter().filter(|row| row.outcome == "red") {
-        for red in &row.red_items {
-            task.push_str(&format!("- {}: {red}\n", row.id));
-        }
-    }
-    task.push_str(&format!(
+    let instructions = format!(
         "\nFind the landing that turned each red and fix it forward:\n\
          1. Work in a new worktree of your own under ~/.ubd, never in the follower's checkout {}.\n\
          2. Run each red test on origin/main first. Where every one passes there, a landing since {tip} \
          fixed them: name it and end.\n\
          3. Bisect over first-parent landings only, running only the red tests, one at a time: \
          `{range}`, then `git bisect run targo --unverified test -p <package> <target> -- <test> --exact`.\n\
-         4. Fix forward on a branch and land it with `targo --unverified verify land`. Revert nothing.\n\
+         4. Fix forward on a branch and land it with `targo --unverified verify land`. Revert nothing.\n\n\
          A red that does not reproduce is read for a product cause first. Delete a test only where its \
-         own timing is the shown cause, never only because its red did not reproduce. Where no cause \
-         is found, end with `Could not finish: <why>`: this follower starts no other worker on the \
-         same reds.\n",
+         own timing is the shown cause, never only because its red did not reproduce.\n",
         root.display()
-    ));
+    );
+    let notice = "\nMore red details remain in this pass's row logs.\n";
+    let mut room =
+        MAX_REPAIR_CONTEXT_BYTES.saturating_sub(context.len() + instructions.len() + notice.len());
+    for (row, red) in rows
+        .iter()
+        .filter(|row| row.outcome == "red")
+        .flat_map(|row| row.red_items.iter().map(move |red| (row, red)))
+    {
+        let line = format!("- {}: {red}\n", row.id);
+        if line.len() > room {
+            let mut end = room;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            context.push_str(&line[..end]);
+            context.push_str(notice);
+            break;
+        }
+        context.push_str(&line);
+        room -= line.len();
+    }
+    context.push_str(&instructions);
+    context
+}
+
+/// The independently supervised worker also needs the protocol that holds its failed reds.
+fn repair_task(tip: &str, earlier: &Before, rows: &[Row], root: &Path) -> String {
+    let mut task = repair_context(tip, earlier, rows, root);
+    task.push_str(
+        "Where no cause is found, end with `Could not finish: <why>`: this follower starts no \
+         other worker on the same reds.\n",
+    );
     task
 }
 

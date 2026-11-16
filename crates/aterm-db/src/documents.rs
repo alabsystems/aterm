@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 pub(crate) mod application;
 #[cfg(unix)]
 pub(crate) mod log;
+#[cfg(any(unix, test))] // read by the unix-only log and the checkpoint
 pub(crate) mod materialized;
 
 pub(crate) type Cells = BTreeMap<(String, String), Cell>;

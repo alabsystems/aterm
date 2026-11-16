@@ -65,10 +65,15 @@ pub fn without_addresses(text: &str) -> String {
         .join(" ")
 }
 
-/// Set to `1` beside [`WINDOW_ENV`] by an account's token capture this Mac's upkeep started with
-/// nobody there (plan package FL-138; `setup_token::OpenerRoute::unattended`): the window's code
-/// page, where no mailbox the window reads gives the code, ends the sign-in at once instead of
-/// waiting for a person to type it, and the window sends no login email nobody would read.
+/// Set to `1` beside [`WINDOW_ENV`] by a sign-in in aterm's window that nobody at a terminal of
+/// their own started: this Mac's upkeep's renewal of a row, an agent's or a script's `accounts
+/// renew` (`cli::RenewBrowser::Window`'s `unattended`), and an account's token capture the
+/// upkeep, an agent or the token step after such a sign-in runs (plan package FL-138;
+/// `setup_token::OpenerRoute::unattended`). The window ends at the read that finds any check,
+/// naming it, with nothing pressed (`signin_window::SignIn::unattended`), as the headless drives
+/// do; its code page, where no mailbox the window reads gives the code, ends the sign-in at once
+/// instead of waiting for a person to type it, and the window sends no login email nobody would
+/// read. Every renewal removes it from its provider's environment and sets it only so.
 pub const UNATTENDED_ENV: &str = "ATERM_OPEN_URL_UNATTENDED";
 
 /// Whether nobody started the sign-in this opener runs: `var` holds [`UNATTENDED_ENV`] as `1`.
@@ -134,16 +139,20 @@ pub enum MetWord {
     /// The sign-in had no desktop session to open aterm's window on
     /// ([`super::headless_oauth::WINDOW_NO_DESKTOP`]).
     WindowNoDesktop,
-    /// Cloudflare's check stood in aterm's sign-in window until the sign-in's deadline, or, in a
-    /// sign-in nobody started, for the wait one that clears by itself takes
+    /// Cloudflare's bot check met a page in aterm's sign-in window, which pressed nothing on it
+    /// from then on: in a sign-in nobody started, at the read that found it; in one a person
+    /// started, standing until the sign-in's deadline, or until the person closed the window or
+    /// the run otherwise ended before its callback
     /// ([`super::headless_oauth::WINDOW_BOT_CHECK`]).
     WindowBotCheck,
     /// Cloudflare's block page answered in aterm's sign-in window
     /// ([`super::headless_oauth::WINDOW_BLOCK_PAGE`]).
     WindowBlockPage,
-    /// The consent page in aterm's sign-in window held its `Authorize` behind a human check
-    /// (hCaptcha) until the sign-in's deadline, or, in a sign-in nobody started, at the read that
-    /// found it ([`super::headless_oauth::WINDOW_HUMAN_CHECK`]).
+    /// A page in aterm's sign-in window carried a human check (the consent page's hCaptcha,
+    /// whether `Authorize` stood enabled or not), which the window pressed nothing on from then
+    /// on: in a sign-in nobody started, at the read that found it; in one a person started,
+    /// standing until the sign-in's deadline, or until the run otherwise ended before its callback
+    /// ([`super::headless_oauth::WINDOW_HUMAN_CHECK`]).
     WindowHumanCheck,
     /// A person closed aterm's sign-in window before the sign-in finished
     /// ([`super::headless_oauth::WINDOW_CLOSED`]).
@@ -151,14 +160,14 @@ pub enum MetWord {
     /// The consent page in aterm's sign-in window named another account
     /// ([`super::headless_oauth::WINDOW_WRONG_ACCOUNT`]).
     WindowWrongAccount,
-    /// Cloudflare's bot check, which did not clear
-    /// ([`super::headless_oauth::BOT_CHECK_UNCLEARED`]).
+    /// Cloudflare's bot check, met on its first read with nothing pressed
+    /// ([`super::headless_oauth::BOT_CHECK_MET`]).
     BotCheck,
     /// Cloudflare's block page ([`super::headless_oauth::BLOCK_PAGE_MET`]).
     BlockPage,
     /// A page in aterm's headless browser, a token's consent page on the account's profile or a
-    /// page of a headless sign-in, carried a human check's widget (hCaptcha, reCAPTCHA or
-    /// Turnstile) until the drive's deadline, so nothing on it was pressed
+    /// page of a headless sign-in, carried a human check's widget (hCaptcha, reCAPTCHA,
+    /// Turnstile or Arkose), so the drive ended on its first read with nothing on it pressed
     /// ([`super::headless_oauth::TOKEN_HUMAN_CHECK`],
     /// [`super::headless_oauth::HUMAN_CHECK_MET`]).
     HumanCheck,
@@ -586,6 +595,15 @@ impl Met {
         self.word.stops()
     }
 
+    /// Whether a renewal that ended having met it is held for a person, on no clock, and never
+    /// tried again by itself (`cli::Renewal::BotCheck`): it met a bot protection
+    /// ([`MetWord::is_bot_protection`]), a block page included, or what a person at this Mac's
+    /// desk clears ([`Self::takes_a_person`]).
+    #[must_use]
+    pub const fn holds_the_renewal(&self) -> bool {
+        self.word.is_bot_protection() || self.takes_a_person()
+    }
+
     /// Whether the sign-in ended at aterm's own window, which had no desktop to open on or
     /// returned no callback: the opener opens no other browser after it.
     #[must_use]
@@ -650,8 +668,9 @@ impl Met {
             MetWord::WindowClosed => super::headless_oauth::WINDOW_CLOSED.to_owned(),
             MetWord::WindowWrongAccount => super::headless_oauth::WINDOW_WRONG_ACCOUNT.to_owned(),
             MetWord::WindowBotCheck => format!(
-                "Cloudflare's check{on} did not clear in aterm's sign-in window; aterm never \
-                 operates it, and a person at this Mac may complete it"
+                "it met Cloudflare's bot check{on} in aterm's sign-in window; aterm pressed \
+                 nothing there and never tries to pass it, and a person at this Mac may \
+                 complete it"
             ),
             MetWord::WindowBlockPage => {
                 format!("it met Cloudflare's block page{on} in aterm's sign-in window")
@@ -917,6 +936,17 @@ fn read_outcome_record(path: &Path) -> Option<(OutcomePhase, Option<Met>)> {
         (_, None) => return None,
     };
     Some((phase, met))
+}
+
+/// Whether the named Chrome profile `profile` opens the authorization page after the headless
+/// mailbox sign-in ended having met `met`: only where a profile is named, the run is not held to
+/// the headless browser (`force_headless`), and the headless page met no check
+/// ([`MetWord::is_bot_protection`]). A page that carried a check is opened in no other browser
+/// after it, whose cookies or fingerprint the check might accept.
+fn profile_follows(met: Option<&Met>, force_headless: bool, profile: Option<&str>) -> bool {
+    !force_headless
+        && profile.is_some_and(|p| !p.trim().is_empty())
+        && !met.is_some_and(|met| met.word.is_bot_protection())
 }
 
 /// A failed headless attempt is diagnostic while the named-profile opener continues.
@@ -3441,11 +3471,11 @@ fn html_attr<'a>(tag: &'a str, attr_name: &str) -> Option<Option<&'a str>> {
     None
 }
 
-fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
+pub(super) fn extract_attr(tag: &str, attr_name: &str) -> Option<String> {
     html_attr(tag, attr_name).flatten().map(decode_html_amp)
 }
 
-fn has_html_attr(tag: &str, attr_name: &str) -> bool {
+pub(super) fn has_html_attr(tag: &str, attr_name: &str) -> bool {
     html_attr(tag, attr_name).is_some()
 }
 
@@ -3674,11 +3704,17 @@ struct SubmitChoice {
 }
 
 /// Parses an OAuth consent page into `(HTTP method, resolved action URL, optional form body)`.
+/// A page that carries a check ([`super::headless_oauth::check_in_html`]) has none; nor has a
+/// form that holds a disabled control a person's step would enable, a link back to the page
+/// itself, or a refresh to it.
 #[must_use]
 pub fn parse_html_approval_action(
     html: &str,
     base_url: &str,
 ) -> Option<(String, String, Option<String>)> {
+    if super::headless_oauth::check_in_html(base_url, html).is_some() {
+        return None;
+    }
     if let Ok(doc) = aterm_json::from_str::<Value>(html)
         && let Some(parsed) = parse_json_approval_action(&doc, base_url)
     {
@@ -3717,6 +3753,7 @@ pub fn parse_html_approval_action(
             .to_ascii_uppercase();
         let mut fields = Vec::new();
         let mut saw_submit = false;
+        let mut held = false;
         let mut chosen_submit: Option<SubmitChoice> = None;
         let mut scan = &form_html[tag_end + 1..];
         while !scan.is_empty() {
@@ -3750,9 +3787,6 @@ pub fn parse_html_approval_action(
                 String::new()
             };
             scan = after_open;
-            if has_html_attr(ctrl_tag, "disabled") {
-                continue;
-            }
             let ctrl_type = extract_attr(ctrl_tag, "type")
                 .unwrap_or_else(|| {
                     if is_button {
@@ -3762,6 +3796,19 @@ pub fn parse_html_approval_action(
                     }
                 })
                 .to_ascii_lowercase();
+            if has_html_attr(ctrl_tag, "disabled") {
+                // A disabled button that would go on with the form holds it until a step of the
+                // page's enables it (a check's answer, most often): the form is not submitted
+                // around it. A disabled `Deny`, `Back` or `Cancel` holds nothing.
+                let goes_on = !is_negative_form_token(&button_text)
+                    && ["name", "value", "aria-label", "title", "alt"]
+                        .iter()
+                        .filter_map(|key| extract_attr(ctrl_tag, key))
+                        .all(|said| !is_negative_form_token(&said));
+                held |= goes_on
+                    && (is_button || matches!(ctrl_type.as_str(), "submit" | "image" | "button"));
+                continue;
+            }
             if matches!(ctrl_type.as_str(), "reset" | "button") {
                 continue;
             }
@@ -3821,7 +3868,7 @@ pub fn parse_html_approval_action(
                 ));
             }
         }
-        if saw_submit && chosen_submit.is_none() {
+        if held || (saw_submit && chosen_submit.is_none()) {
             continue;
         }
         let mut submit_score = 1u8;
@@ -3923,7 +3970,8 @@ pub fn parse_html_approval_action(
             {
                 let resolved = resolve_relative_url(base_url, href_trimmed);
                 let r_low = resolved.to_ascii_lowercase();
-                let is_neg = has_negative_url_keyword(&r_low)
+                let is_neg = same_page(&resolved, base_url)
+                    || has_negative_url_keyword(&r_low)
                     || (!anchor_text.is_empty() && is_negative_form_token(&anchor_text));
                 if !is_neg
                     && (r_low.contains("approve")
@@ -3941,10 +3989,18 @@ pub fn parse_html_approval_action(
         }
         scan = after_open;
     }
-    if let Some(refresh_url) = extract_meta_refresh_url(html, base_url) {
+    if let Some(refresh_url) = extract_meta_refresh_url(html, base_url)
+        && !same_page(&refresh_url, base_url)
+    {
         return Some(("GET".to_owned(), refresh_url, None));
     }
     None
+}
+
+/// Whether `url` names the page at `base` again: the same address without its fragment.
+fn same_page(url: &str, base: &str) -> bool {
+    let bare = |u: &str| u.split('#').next().unwrap_or("").to_owned();
+    bare(url) == bare(base)
 }
 
 #[derive(Debug)]
@@ -4758,6 +4814,17 @@ fn follow_until_page_or_callback_until(
         }
         let resp = exchange(&method, &current_url, cookies, body.as_deref())?;
         deadline.left()?;
+        // A fetched page that carries a check ends the sign-in, named, with nothing on it
+        // submitted or followed, whatever its status.
+        if !matches!(resp.status, 301..=303 | 307 | 308)
+            && let Some(check) = super::headless_oauth::check_in_html(&current_url, &resp.body)
+        {
+            super::headless_oauth::note_met(
+                check.word(),
+                super::login_drive::https_host(&current_url).as_deref(),
+            );
+            return Err(super::headless_oauth::sign_in_check_words(&check));
+        }
         if matches!(resp.status, 301..=303 | 307 | 308) {
             let Some(loc) = resp.location else {
                 return Err("redirect response omitted Location header");
@@ -5006,6 +5073,22 @@ fn drives_page_first(
         || mailbox_cfg.reads_relay_for(email)
 }
 
+/// Whether a mailbox sign-in whose HTTP engine ended with `first_err` goes on in a headless
+/// browser (`has_headless_browser`) on the same authorization page. A check the HTTP engine met
+/// ([`super::headless_oauth::is_sign_in_check_words`]) ends the sign-in there: the page is not
+/// loaded again in another engine, whose own read of it a check may let past, and the HTTP
+/// engine's note of what it met stands. So do a destination only a person's browser serves and
+/// a listener that refused the code.
+fn continues_in_a_headless_browser(first_err: &str, has_headless_browser: bool) -> bool {
+    has_headless_browser
+        && !super::headless_oauth::is_sign_in_check_words(first_err)
+        && !matches!(
+            first_err,
+            "this OAuth destination needs the manual browser"
+                | "the local OAuth callback listener rejected the authorization code"
+        )
+}
+
 fn authorize_with_mailbox_until(
     authorize_url: &str,
     mailbox_cfg: &super::headless_oauth::MailboxConfig,
@@ -5064,12 +5147,7 @@ fn authorize_with_mailbox_until(
         match first_res {
             Ok(()) => return Ok(()),
             Err(first_err) => {
-                if matches!(
-                    first_err,
-                    "this OAuth destination needs the manual browser"
-                        | "the local OAuth callback listener rejected the authorization code"
-                ) || !has_headless_browser
-                {
+                if !continues_in_a_headless_browser(first_err, has_headless_browser) {
                     return Err(first_err);
                 }
                 deadline.left()?;
@@ -5223,7 +5301,9 @@ fn authorize_using_with_page_until(
             Ok(StepOutcome::CallbackDelivered) => return Ok(()),
             Ok(StepOutcome::Page { url, body }) => (url, body),
             Err(err) => {
-                if err == "the local OAuth callback listener rejected the authorization code" {
+                if err == "the local OAuth callback listener rejected the authorization code"
+                    || super::headless_oauth::is_sign_in_check_words(err)
+                {
                     return Err(err);
                 }
                 last_err = err;
@@ -5259,7 +5339,9 @@ fn authorize_using_with_page_until(
                     page = (url, body);
                 }
                 Err(err) => {
-                    if err == "the local OAuth callback listener rejected the authorization code" {
+                    if err == "the local OAuth callback listener rejected the authorization code"
+                        || super::headless_oauth::is_sign_in_check_words(err)
+                    {
                         return Err(err);
                     }
                     last_err = err;
@@ -5446,7 +5528,11 @@ fn met_because(why: &str) -> Met {
 /// the waiting CLI (`headless_oauth::callback_offered`): the CLI may hold the code and be
 /// exchanging it, so the record then stops no provider and only the CLI's own exit says.
 fn note_refused(outcome_path: Option<&Path>, why: &str) {
-    let met = met_because(why);
+    note_refused_with(outcome_path, met_because(why));
+}
+
+/// [`note_refused`] of what was met, `met`, already taken.
+fn note_refused_with(outcome_path: Option<&Path>, met: Met) {
     if let Some(path) = outcome_path {
         let phase = if super::headless_oauth::callback_offered() {
             OutcomePhase::Continuing
@@ -5555,12 +5641,18 @@ fn open_reporting_to(args: Vec<OsString>, outcome_path: Option<&Path>) -> u8 {
             ) {
                 Ok(()) => return 0,
                 Err(why) => {
-                    if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
-                        note_failed(why);
+                    let met = super::headless_oauth::take_met().map(|met| met.because(why));
+                    if !profile_follows(met.as_ref(), force_headless, profile.as_deref()) {
+                        note_refused_with(
+                            outcome_path,
+                            met.unwrap_or_else(|| {
+                                Met::new(MetWord::NotAuthorized, None).because(why)
+                            }),
+                        );
                         eprintln!("{OPENER}: not authorized: {why}");
                         return 1;
                     }
-                    continuing_met = super::headless_oauth::take_met().map(|met| met.because(why));
+                    continuing_met = met;
                 }
             }
         } else if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {

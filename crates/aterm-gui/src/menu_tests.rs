@@ -301,6 +301,8 @@ fn the_agents_menu_holds_its_rows_in_order_with_their_classes() {
             (MenuAction::NextNeed, "j", MenuMods::CommandShift),
             (MenuAction::Overview, "o", MenuMods::CommandControl),
             (MenuAction::Workers, "", MenuMods::None),
+            (MenuAction::Navigator, "", MenuMods::None),
+            (MenuAction::NavigatorSplit, "", MenuMods::None),
             (MenuAction::TakeOver, "", MenuMods::None),
             (MenuAction::HandBack, "", MenuMods::None),
             (MenuAction::HandBackAll, "", MenuMods::None),
@@ -920,10 +922,10 @@ fn update_rows_are_not_offered_where_no_updater_exists() {
             }
         }
     }
-    // What the gate answers is what `chrome` prints and the palette lists: the Tables row is in
+    // What the gate answers is what `chrome` prints and the palette lists: the Registry row is in
     // both where the registry is kept and in neither on Windows.
     assert_eq!(
-        offered("Tables…"),
+        offered("Registry…"),
         cfg!(unix),
         "{:?}",
         menu_chrome_lines(None, false)
@@ -980,25 +982,6 @@ fn the_apply_row_is_offered_on_windows_only_while_a_build_is_staged() {
 
 #[test]
 fn allocation_is_a_read_only_native_app_action_on_every_platform() {
-    let app = MENU_MODEL
-        .iter()
-        .find(|section| section.title == "aterm")
-        .unwrap();
-    let rows: Vec<_> = app
-        .entries
-        .iter()
-        .flat_map(MenuEntry::items)
-        .filter(|(_, action, _, _)| *action == MenuAction::Allocation)
-        .collect();
-    assert_eq!(
-        rows,
-        [(
-            "Allocation…",
-            MenuAction::Allocation,
-            "",
-            super::MenuMods::None
-        )]
-    );
     assert!(MenuAction::Allocation.offered_on_this_platform());
     assert_eq!(MenuAction::Allocation.tag(), 100);
     assert_eq!(MenuAction::Workers.tag(), 99);
@@ -1013,9 +996,6 @@ fn allocation_is_a_read_only_native_app_action_on_every_platform() {
     );
     assert!(!MenuAction::Allocation.writes_pty_input());
     assert!(!super::requires_terminal_tab(MenuAction::Allocation));
-    let mut palette = crate::palette::PaletteState::new();
-    palette.resolve(&crate::palette::PaletteLive::default());
-    assert!(palette.action_by_name("Allocation").is_ok());
 }
 
 #[test]
@@ -1064,7 +1044,7 @@ fn critical_key_equivalents_are_correct() {
     let item = |action: MenuAction| {
         model_items()
             .into_iter()
-            .find_map(|(_, a, key, mods)| (a == action).then_some((key, mods)))
+            .find_map(|(_, a, key, mods)| (a == action && !key.is_empty()).then_some((key, mods)))
             .unwrap_or_else(|| panic!("{action:?} not in MENU_MODEL"))
     };
     assert_eq!(

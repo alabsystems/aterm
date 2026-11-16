@@ -3523,7 +3523,8 @@ fn renewal_by(
 #[cfg(unix)]
 fn kimi_bot_check() -> super::super::login_drive::Outcome {
     super::super::login_drive::Outcome::BotCheck(
-        "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 s"
+        "the sign-in page `www.kimi.ai/code/authorize_device` carries Cloudflare's bot check; \
+         aterm pressed nothing there and never tries to pass it"
             .to_owned(),
     )
 }
@@ -3628,7 +3629,8 @@ fn codex_auth_json(email: &str) -> Vec<u8> {
 #[cfg(unix)]
 fn bot_check_of(cli: Cli) -> super::super::login_drive::Outcome {
     super::super::login_drive::Outcome::BotCheck(format!(
-        "Cloudflare's bot check on `{}` did not clear in 90 s",
+        "the sign-in page `{}` carries Cloudflare's bot check; aterm pressed nothing there and \
+         never tries to pass it",
         vendor_host(cli)
     ))
 }

@@ -1001,7 +1001,8 @@ impl Mesh {
     }
 
     /// Publish `payload` on `subject` of `log` as this Mac: signed by its node key and numbered
-    /// under the log's incarnation lease, so the relay carries it to every Mac.
+    /// under the log's incarnation lease, so the relay carries it to every current seat the overlay
+    /// can reach.
     /// # Errors
     /// [`io::ErrorKind::InvalidInput`] for a subject this Mac does not own;
     /// [`io::ErrorKind::WouldBlock`] while a rebuilt Mac's lease waits for its first neighbour's
@@ -1504,6 +1505,20 @@ impl Mesh {
         if let Some(bell) = self.wake.lock_or_recover().as_ref().and_then(Weak::upgrade) {
             bell.ring();
         }
+    }
+
+    /// Where each current seat other than this Mac says it listens: every address its newest
+    /// presence row names (a row its node key signed, as presence reads every row), that a
+    /// fleet dial heard from an authenticated source may go to ([`crate::presence::dialable`]),
+    /// a shared-space or globally routed one included (LT-B8). Each dial of one proves the node
+    /// again. None where presence does not run on this mesh or the standings are unread.
+    #[must_use]
+    pub fn seat_addresses(&self) -> Vec<(String, std::net::SocketAddr)> {
+        self.presence
+            .lock_or_recover()
+            .upgrade()
+            .map(|presence| presence.seat_addresses())
+            .unwrap_or_default()
     }
 
     /// Forget every seat's advance on presence's board, where presence runs on this mesh

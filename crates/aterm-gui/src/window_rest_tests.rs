@@ -144,3 +144,95 @@ fn a_frame_or_an_occlusion_never_stirs_and_every_person_event_does() {
         assert_eq!(stirs(&event), stirred, "{event:?}");
     }
 }
+
+/// A window is attended until the whole of its attention has passed since the last touch and
+/// not a millisecond longer; the touch that ends a lapse says so; `None` is always attended.
+/// Output (a stir) attends nothing.
+#[test]
+fn a_window_is_attended_for_its_attention_after_a_touch_and_output_attends_nothing() {
+    use super::ATTENTION;
+    let t0 = Instant::now();
+    let mut rest = Rest::new(t0);
+    assert!(rest.attended(), "a new window");
+    assert!(!rest.settle_attended(t0 + ATTENTION - Duration::from_millis(1), Some(ATTENTION)));
+    assert!(rest.attended(), "a millisecond short of its attention");
+    assert!(
+        !rest.stir(t0 + ATTENTION - Duration::from_millis(1)),
+        "output"
+    );
+    assert!(
+        rest.settle_attended(t0 + ATTENTION, Some(ATTENTION)),
+        "the output a millisecond ago attended nothing"
+    );
+    assert!(!rest.attended());
+    assert!(!rest.settle_attended(t0 + ATTENTION * 2, Some(ATTENTION)));
+    assert!(rest.settle_attended(t0 + ATTENTION * 2, None), "no bound");
+    assert!(rest.attended());
+    assert!(rest.settle_attended(t0 + ATTENTION * 2, Some(ATTENTION)));
+
+    let touched = t0 + ATTENTION * 3;
+    assert!(rest.touch(touched), "the touch ends the lapse");
+    assert!(rest.attended(), "at once, before any settle");
+    assert!(!rest.touch(touched), "a second touch ends none");
+    assert!(
+        !rest.settle_attended(
+            touched + ATTENTION - Duration::from_millis(1),
+            Some(ATTENTION)
+        ),
+        "its attention starts over at the touch"
+    );
+    assert!(rest.settle_attended(touched + ATTENTION, Some(ATTENTION)));
+}
+
+/// The `Resized` that reports the size aterm itself asked for is its own, each time it
+/// arrives; a resize to another size is not, and forgets the size asked, so a drag away from
+/// that size and back is a person's at every step. No other event is aterm's own.
+#[test]
+fn only_the_resize_aterm_asked_for_is_its_own() {
+    use aterm_window::dpi::PhysicalSize;
+    let resized = |w, h| WindowEvent::Resized(PhysicalSize::new(w, h));
+    let mut rest = Rest::new(Instant::now());
+    assert!(!rest.own(&resized(800, 600)), "nothing was asked");
+    rest.own_resize((800, 600));
+    assert!(!rest.own(&key()), "a key");
+    assert!(!rest.own(&WindowEvent::Focused(true)), "the focus arriving");
+    assert!(rest.own(&resized(800, 600)), "the size asked");
+    assert!(rest.own(&resized(800, 600)), "reported again");
+    assert!(!rest.own(&resized(801, 600)), "a drag away from it");
+    assert!(!rest.own(&resized(800, 600)), "and back");
+}
+
+/// An unattended window's deck holds still whatever reading lands; after the touch that
+/// attends it again it holds until a reading lands after that touch.
+#[test]
+fn an_unattended_window_holds_its_deck_until_a_reading_lands_after_the_next_touch() {
+    use super::ATTENTION;
+    let t0 = Instant::now();
+    let mut rest = Rest::new(t0);
+    assert!(rest.deck_moves(Some(t0)));
+    assert!(rest.settle_attended(t0 + ATTENTION, Some(ATTENTION)));
+    assert!(
+        !rest.deck_moves(Some(t0 + ATTENTION + Duration::from_secs(1))),
+        "unattended, whatever lands"
+    );
+    assert!(
+        !rest.stir(t0 + ATTENTION + Duration::from_secs(2)),
+        "output"
+    );
+    assert!(
+        !rest.deck_moves(Some(t0 + ATTENTION + Duration::from_secs(3))),
+        "output brings no motion back"
+    );
+    let touched = t0 + ATTENTION * 2;
+    assert!(rest.touch(touched));
+    assert!(!rest.deck_moves(Some(touched)), "the touch's own frame");
+    assert!(
+        rest.deck_moves(Some(touched + Duration::from_millis(300))),
+        "the reading after the touch"
+    );
+    assert!(!rest.touch(touched + Duration::from_secs(1)));
+    assert!(
+        rest.deck_moves(Some(touched + Duration::from_millis(300))),
+        "a touch of an attended window holds nothing"
+    );
+}

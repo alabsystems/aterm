@@ -662,3 +662,122 @@ fn a_cleanup_read_cannot_erase_a_newer_workflows_claim_or_pending_task() {
         }
     }
 }
+
+/// A CHECK'S HOLD IS THE ACCOUNT'S OWN RECORD AND HOLDS EVERY ROUTE: a bot protection's stop of
+/// the row's sign-in ([`accounts::note_sign_in_stop`], kept as the account's
+/// [`accounts::CheckStop`]) holds it with no ledger line of it at all, as after the ledger
+/// dropped one, and whatever route the ladder takes, a root decision's preparation included
+/// ([`route_stops`]). One rule ends it, the stricter one: a login made for the row or a signed-in
+/// `accounts browser` window, never a later end that made no login (another account signed in, a
+/// hand run that failed). A stop no bot protection made (a window a person closed) is passed by
+/// a preparation and holds any other route for the person's wait.
+/// NEGATIVE CONTROL: with `route_stops` dropping the check for a prepared route (main's first
+/// form), `` a prepared route passed the check (true) ``; with a later end on record that made no
+/// login lifting it (the vendor renewal's rule this branch first had), `` a later end lifted the
+/// check ``.
+#[test]
+fn a_checks_hold_is_the_accounts_own_record_and_holds_every_route() {
+    use crate::harness::open_url::MetWord;
+    let stop = |fixture: &Fixture, word: MetWord| {
+        fixture
+            .store
+            .transact_pool_logins_within(&[], &fixture.path, NOW, &mut None, |raw, _, logins| {
+                accounts::admit_workflow(logins, "work")?;
+                Ok(accounts::note_sign_in_stop(
+                    logins,
+                    raw.row("work").expect("the fixture's row"),
+                    false,
+                    word,
+                    "profile: its page carried a check",
+                    NOW,
+                ))
+            })
+            .unwrap();
+    };
+    let fixture = Fixture::new(Cli::Kimi, 0);
+    stop(&fixture, MetWord::BotCheck);
+    assert!(
+        !fixture
+            .store
+            .tail(accounts::LEDGER_KEEP_ROWS)
+            .unwrap()
+            .iter()
+            .any(|event| event.why.ends_with(" bot-check")),
+        "the fixture's ledger holds the check's line"
+    );
+    let records = fixture.records();
+    assert_eq!(
+        check_standing_at(&fixture.store, &fixture.raw, &records.logins),
+        Some(NOW),
+        "the dropped check"
+    );
+    let later = NOW + 30 * 86_400;
+    for prepared in [false, true] {
+        assert!(
+            page_holds(
+                route_stops(&fixture.store, &fixture.raw, &records.logins, prepared),
+                &fixture.raw,
+                &records.state,
+                later
+            ),
+            "a prepared route passed the check ({prepared})"
+        );
+    }
+
+    // Later ends on record that made no login leave it standing.
+    let checked = || check_standing_at(&fixture.store, &fixture.raw, &fixture.records().logins);
+    fixture
+        .store
+        .transact_pool_logins_within(&[], &fixture.path, NOW + 60, &mut None, |raw, _, logins| {
+            let row = raw.row("work").expect("the fixture's row");
+            let mut event = accounts::Event::new(NOW + 60, accounts::Kind::WrongAccount, "work")
+                .because("signed in as another account");
+            event.workflow = accounts::current_workflow(row, logins);
+            accounts::admit_workflow(logins, "work")?;
+            Ok(vec![event])
+        })
+        .unwrap();
+    assert_eq!(
+        checked(),
+        Some(NOW),
+        "a later end lifted the check: another account"
+    );
+    fixture
+        .store
+        .transact_pool_logins_within(&[], &fixture.path, NOW + 90, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "work")?;
+            Ok(accounts::note_hand_sign_in_attempt(
+                logins,
+                "work",
+                accounts::AttemptOutcome::Failed,
+                "by hand: its provider exited 1",
+                NOW + 90,
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        checked(),
+        Some(NOW),
+        "a later end lifted the check: a failed hand run"
+    );
+
+    // A person's own stop: a prepared route passes it; any other waits out the person's wait.
+    let fixture = Fixture::new(Cli::Kimi, 0);
+    stop(&fixture, MetWord::WindowClosed);
+    let records = fixture.records();
+    let holds = |prepared: bool, at: i64| {
+        page_holds(
+            route_stops(&fixture.store, &fixture.raw, &records.logins, prepared),
+            &fixture.raw,
+            &records.state,
+            at,
+        )
+    };
+    assert!(holds(false, NOW + 1));
+    assert!(!holds(true, NOW + 1));
+    assert!(!holds(false, NOW + PERSON_BACKOFF_SECS));
+    assert_eq!(
+        check_standing_at(&fixture.store, &fixture.raw, &records.logins),
+        None
+    );
+}

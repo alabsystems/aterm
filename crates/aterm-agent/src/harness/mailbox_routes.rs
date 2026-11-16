@@ -649,12 +649,68 @@ fn read_record(record: &Path) -> BTreeMap<String, Failures> {
         .collect()
 }
 
+/// The checks the record holds: each login's digest and the word of the check its sign-in page
+/// carried (`block_page`, `bot_check`, `human_check`), on lines of their own.
+fn read_checks(record: &Path) -> BTreeMap<String, String> {
+    let text = super::accounts::read_bounded(record, LOGIN_RECORD_MAX)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            if words.next() != Some("c1") {
+                return None;
+            }
+            let digest = words.next()?.to_owned();
+            let kind = words.next()?;
+            super::headless_oauth::CheckMet::parse(kind)?;
+            Some((digest, kind.to_owned()))
+        })
+        .collect()
+}
+
 fn write_record(record: &Path, entries: &BTreeMap<String, Failures>) {
-    let text: String = entries
+    write_record_with(record, entries, &read_checks(record));
+}
+
+fn write_record_with(
+    record: &Path,
+    entries: &BTreeMap<String, Failures>,
+    checks: &BTreeMap<String, String>,
+) {
+    let mut text: String = entries
         .iter()
         .map(|(digest, f)| format!("v1 {digest} {} {}\n", f.count, f.last))
         .collect();
+    for (digest, kind) in checks {
+        text.push_str(&format!("c1 {digest} {kind}\n"));
+    }
     let _ = super::atomic_write::write_atomic_mode(record, &text, Some(0o600));
+}
+
+/// The check `login`'s sign-in page on `source` ([`login_source`]) carried, where the record
+/// holds one ([`note_login_check`]), or the check a page on `source` carried where no login was
+/// named (the empty login), which holds every login there: such a login is not signed in there
+/// again by aterm, on any clock. Only a person clears it, by removing its line from the record.
+#[must_use]
+pub fn login_check(record: Option<&Path>, source: &str, login: &str) -> Option<String> {
+    let mut checks = read_checks(record?);
+    checks
+        .remove(&login_digest(source, login))
+        .or_else(|| checks.remove(&login_digest(source, "")))
+}
+
+/// Records that `login`'s sign-in page on `source` ([`login_source`]) carried the check
+/// `kind` (a [`super::headless_oauth::CheckMet::parse`] word), held with no wait
+/// ([`login_check`]); with no login named (`login` empty) it holds every login on `source`.
+pub fn note_login_check(record: Option<&Path>, source: &str, login: &str, kind: &str) {
+    let Some(record) = record else {
+        return;
+    };
+    let mut checks = read_checks(record);
+    checks.insert(login_digest(source, login), kind.to_owned());
+    write_record_with(record, &read_record(record), &checks);
 }
 
 /// Until when (unix seconds) `login` is not tried on `source` ([`login_source`]), where its

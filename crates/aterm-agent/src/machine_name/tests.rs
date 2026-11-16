@@ -202,6 +202,344 @@ fn an_existing_local_name_reads_no_registry_roster_or_nickname_source() {
     );
 }
 
+/// The name a first read made from a bound row a person nicknamed `MissBunny`.
+fn mirrored(root: &aterm_tempfile::TempDir) -> MachineName {
+    let (mirror, origin) = ensure_from(
+        root.path(),
+        || registry_name(86, Some(("MissBunny", NickClass::Chosen))),
+        unread,
+        never,
+        NOW,
+    )
+    .expect("the first name");
+    assert_eq!(origin, Origin::Registry);
+    assert_eq!(
+        seen(&mirror),
+        Some(Some("MissBunny")),
+        "it saw the row it came from"
+    );
+    mirror
+}
+
+/// What `name` saw of its row: `None` never looked, `Some(None)` saw no chosen nickname.
+fn seen(name: &MachineName) -> Option<Option<&str>> {
+    match &name.row {
+        file::RowSeen::Never => None,
+        file::RowSeen::Saw(nick) => Some(nick.as_ref().map(Nickname::as_str)),
+    }
+}
+
+/// The name kept in `root` once a read has followed this Mac's row while it holds the chosen
+/// nickname `row` (`None`: none chosen).
+fn follow(root: &aterm_tempfile::TempDir, row: Option<&str>, at: u64) -> MachineName {
+    registry::with_row(row, || follow_registry(root.path(), at)).expect("follows the row");
+    file::read(root.path())
+        .expect("reads")
+        .expect("a kept name")
+}
+
+/// A local nickname rename to `word` while this Mac's row holds `row`.
+fn renick(root: &aterm_tempfile::TempDir, word: &str, row: Option<&str>, at: u64) -> MachineName {
+    let to = NickTo::Word(Nickname::parse(word).expect("a nickname"));
+    registry::with_row(row, || {
+        set_nick(root.path(), &to, ByKind::Person, unread, at, false)
+    })
+    .expect("a rename here")
+    .name
+}
+
+#[test]
+fn an_owner_write_of_the_row_nickname_renames_this_mac() {
+    let root = state();
+    let mirror = mirrored(&root);
+    let name = follow(&root, Some("Heron"), NOW + 1);
+    assert_eq!(name.title(), "m86 Heron");
+    assert_eq!(
+        (name.nick_class, name.rev, name.by),
+        (NickClass::Chosen, mirror.rev + 1, None),
+        "a chosen nickname, by no author here: the registry keeps who wrote it"
+    );
+    assert_eq!(
+        (name.num, name.class, name.since, name.act),
+        (mirror.num, mirror.class, mirror.since, mirror.act),
+        "the number and its claim stay as they were"
+    );
+    assert_eq!(seen(&name), Some(Some("Heron")));
+    assert_eq!(
+        whats(&name),
+        [
+            (
+                Why::Registry,
+                Some(num(86)),
+                Some(num(86)),
+                Some("MissBunny".to_owned()),
+                "Heron".to_owned()
+            ),
+            whats(&mirror)[0].clone()
+        ]
+    );
+    assert_eq!(
+        registry::with_row(Some("Heron"), || follow_registry(root.path(), NOW + 2)).expect("reads"),
+        None,
+        "a row read again changes nothing"
+    );
+}
+
+/// The common Mac: its row's nickname was empty or an automatic path's when its name was made,
+/// so it drew a noun; a person's first write to the row from any Mac renames it.
+#[test]
+fn a_mac_whose_row_held_no_chosen_nickname_follows_the_first_one_written() {
+    for row in [None, Some(("Kestrel", NickClass::Auto))] {
+        let root = state();
+        let (drawn, _) = ensure_from(root.path(), || registry_name(86, row), unread, never, NOW)
+            .expect("a first name");
+        assert_eq!(seen(&drawn), Some(None), "{row:?}");
+        assert_eq!(follow(&root, None, NOW + 1), drawn, "{row:?}");
+        assert_eq!(
+            follow(&root, Some("Heron"), NOW + 2).title(),
+            "m86 Heron",
+            "{row:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rename_whose_row_write_is_on_its_way_is_not_undone() {
+    let root = state();
+    mirrored(&root);
+    let renamed = renick(&root, "Bunny", Some("MissBunny"), NOW + 1);
+    assert_eq!(
+        follow(&root, Some("MissBunny"), NOW + 2),
+        renamed,
+        "the row still holds the nickname the rename replaced"
+    );
+    let written = follow(&root, Some("Bunny"), NOW + 3);
+    assert_eq!(
+        (written.title(), written.rev, written.history.len()),
+        ("m86 Bunny".to_owned(), renamed.rev, renamed.history.len()),
+        "the rename's own row write changes no name and records nothing"
+    );
+    assert_eq!(seen(&written), Some(Some("Bunny")));
+    assert_eq!(
+        follow(&root, Some("Heron"), NOW + 4).title(),
+        "m86 Heron",
+        "a later write from another Mac is followed"
+    );
+}
+
+/// The row holds this Mac's own earlier write when a newer rename commits: the rename starts
+/// from the row as it stands, so that write never undoes it.
+#[test]
+fn an_earlier_own_write_does_not_undo_a_newer_rename() {
+    let root = state();
+    mirrored(&root);
+    renick(&root, "Otter", Some("MissBunny"), NOW + 1);
+    let newer = renick(&root, "Zebra", Some("Otter"), NOW + 2);
+    assert_eq!(seen(&newer), Some(Some("Otter")));
+    assert_eq!(follow(&root, Some("Otter"), NOW + 3), newer);
+    assert_eq!(follow(&root, Some("Zebra"), NOW + 4).title(), "m86 Zebra");
+}
+
+/// An edit that leaves the nickname (a number alone) starts from the nickname the row was given
+/// and no read followed yet, so it keeps it rather than writing the old one back over it.
+#[test]
+fn a_number_rename_keeps_a_row_nickname_no_read_followed_yet() {
+    let root = state();
+    mirrored(&root);
+    let to = NameTo {
+        num: num(87),
+        nick: None,
+    };
+    let renamed = registry::with_row(Some("Heron"), || {
+        set_name(
+            root.path(),
+            &to,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 1,
+            false,
+        )
+    })
+    .expect("a number rename")
+    .name;
+    assert_eq!(renamed.title(), "m87 Heron");
+    assert_eq!(
+        whats(&renamed)
+            .iter()
+            .map(|what| what.0)
+            .take(2)
+            .collect::<Vec<_>>(),
+        [Why::Named, Why::Registry]
+    );
+}
+
+/// A rename to the nickname the row was given, which no read followed yet, asks for nothing the
+/// name does not hold once it follows: the file takes the row's change and the rename says so.
+#[test]
+fn a_rename_to_the_row_nickname_no_read_followed_changes_nothing_it_asked() {
+    let root = state();
+    mirrored(&root);
+    let to = NickTo::Word(Nickname::parse("Heron").expect("a nickname"));
+    let set = registry::with_row(Some("Heron"), || {
+        set_nick(root.path(), &to, ByKind::Person, unread, NOW + 1, false)
+    })
+    .expect("a rename here");
+    assert!(!set.changed, "the request changed nothing");
+    assert_eq!(set.name.title(), "m86 Heron");
+    assert_eq!(whats(&set.name)[0].0, Why::Registry);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(set.name));
+}
+
+/// An undo whose read followed the row takes back the newest change that read showed, though an
+/// owner write no earlier read followed was waiting in the row; one whose read did not follow is
+/// refused, as any undo of a name changed after its read is.
+#[test]
+fn an_undo_read_through_the_follow_takes_back_what_it_showed() {
+    let root = state();
+    mirrored(&root);
+    let unfollowed = renick(&root, "Bunny", Some("MissBunny"), NOW + 1);
+    let undo = |seen: Option<&Change>, at| {
+        registry::with_row(Some("Heron"), || {
+            undo_last(
+                root.path(),
+                seen,
+                no_labels,
+                ByKind::Person,
+                unread,
+                at,
+                false,
+            )
+        })
+    };
+    let why = undo(unfollowed.history.first(), NOW + 2).expect_err("a stale read");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Unseen)
+    );
+    let read = registry::with_row(Some("Heron"), || follow_registry(root.path(), NOW + 3))
+        .expect("follows")
+        .expect("the row moved");
+    let undone = undo(read.history.first(), NOW + 4).expect("an undo").name;
+    assert_eq!(undone.title(), "m86 Bunny", "the row's change taken back");
+    assert_eq!(whats(&undone)[0].0, Why::Undone);
+}
+
+/// A row holding this Mac's own nickname, a drawn noun included, renames nothing and leaves a
+/// drawn noun drawn, whatever the file saw before.
+#[test]
+fn a_row_holding_this_macs_own_nickname_renames_nothing() {
+    let root = state();
+    let (drawn, _) = ensure_from(root.path(), || registry_name(86, None), unread, never, NOW)
+        .expect("a drawn noun");
+    assert_eq!(drawn.nick_class, NickClass::Auto);
+    for before in [
+        file::RowSeen::Never,
+        file::RowSeen::Saw(None),
+        file::RowSeen::Saw(Some(Nickname::parse("MissBunny").expect("a nickname"))),
+    ] {
+        file::replace(root.path(), |name| {
+            name.row = before.clone();
+            Ok(())
+        })
+        .expect("a row seen before");
+        let name = follow(&root, Some(drawn.nick.as_str()), NOW + 1);
+        assert_eq!(
+            (name.title(), name.nick_class, name.rev, name.history.len()),
+            (
+                drawn.title(),
+                NickClass::Auto,
+                drawn.rev,
+                drawn.history.len()
+            ),
+            "{before:?}"
+        );
+        assert_eq!(seen(&name), Some(Some(drawn.nick.as_str())), "{before:?}");
+    }
+}
+
+/// A file that never looked at the row (an earlier build's) with a chosen nickname only marks
+/// the row's value seen, so a value older than that choice does not replace it, and follows the
+/// next one; a drawn noun follows at once.
+#[test]
+fn a_name_that_never_looked_follows_a_chosen_row_only_once_it_moves() {
+    for (class, first) in [
+        (NickClass::Chosen, "unnumbered Bunny"),
+        (NickClass::Auto, "unnumbered MissBunny"),
+    ] {
+        let root = state();
+        let mut kept = MachineName::unnumbered(Nickname::parse("Bunny").expect("a nickname"), NOW);
+        kept.nick_class = class;
+        file::read_or_create(root.path(), || Ok(kept.clone()))
+            .expect("a name an earlier build made");
+        let looked = follow(&root, Some("MissBunny"), NOW + 1);
+        assert_eq!(
+            (looked.title(), seen(&looked)),
+            (first.to_owned(), Some(Some("MissBunny")))
+        );
+        let name = follow(&root, Some("Heron"), NOW + 2);
+        assert_eq!(
+            name.title(),
+            "unnumbered Heron",
+            "the nickname only, never the number"
+        );
+        assert_eq!(whats(&name)[0].0, Why::Registry);
+    }
+}
+
+/// A row that holds no chosen nickname (empty, an automatic write's, conflicted) renames
+/// nothing, and the same word written to it again later is followed.
+#[test]
+fn a_row_with_no_chosen_nickname_renames_nothing() {
+    let root = state();
+    let mirror = mirrored(&root);
+    let emptied = follow(&root, None, NOW + 1);
+    assert_eq!(
+        (emptied.title(), emptied.rev, emptied.history.len()),
+        (mirror.title(), mirror.rev, mirror.history.len())
+    );
+    assert_eq!(seen(&emptied), Some(None));
+    renick(&root, "Otter", None, NOW + 2);
+    assert_eq!(
+        follow(&root, Some("MissBunny"), NOW + 3).title(),
+        "m86 MissBunny"
+    );
+}
+
+/// No row of this Mac's (no lab, a name kept elsewhere) leaves the file as it is.
+#[test]
+fn no_row_of_this_macs_leaves_the_file_as_it_is() {
+    let root = state();
+    let mirror = mirrored(&root);
+    assert_eq!(follow_registry(root.path(), NOW + 1).expect("reads"), None);
+    assert_eq!(file::read(root.path()).expect("reads"), Some(mirror));
+}
+
+/// A dry run's read follows nothing into the file, though its preview starts from the row.
+#[test]
+fn a_dry_run_leaves_the_file_as_it_is() {
+    let root = state();
+    let mirror = mirrored(&root);
+    let to = NameTo {
+        num: num(87),
+        nick: None,
+    };
+    let preview = registry::with_row(Some("Heron"), || {
+        set_name(
+            root.path(),
+            &to,
+            no_labels,
+            ByKind::Person,
+            unread,
+            NOW + 1,
+            true,
+        )
+    })
+    .expect("a preview");
+    assert_eq!(preview.name.title(), "m87 Heron");
+    assert_eq!(file::read(root.path()).expect("reads"), Some(mirror));
+}
+
 #[test]
 fn pending_or_invalid_bound_registry_names_refuse_first_creation_without_fallback() {
     for source in [

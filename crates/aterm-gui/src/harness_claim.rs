@@ -34,6 +34,11 @@ use std::path::Path;
 use std::sync::PoisonError;
 
 use aterm_agent::harness::contract::{ChildWord, Claim, Row};
+
+/// The claimant's identity a record stream's state is keyed on (pid and kernel start). The type
+/// stays in [`crate::self_claim`] until that module goes; stream code names it from here.
+#[cfg_attr(not(unix), allow(unused_imports))]
+pub(crate) use crate::self_claim::Proven;
 use aterm_uds::process::{Birth, Lineage};
 
 /// A proven scoped claim: the process the kernel named, what it claimed, and the vendor process

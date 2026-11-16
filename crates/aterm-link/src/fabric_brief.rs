@@ -116,8 +116,9 @@ pub(crate) struct Session {
     /// own exit), or a later one, when that one's ghost sweep retired the row it left live.
     exited_inc: Option<u64>,
     /// The offset of the first record of a successor on its node whose restore names it
-    /// (`restore prev=<sid>`, [`restores`]): a new shell stands in the pane it held, after a
-    /// relaunch (a crash's or a quit's) or a reopened tab. Whether it died is [`restore_says_died`].
+    /// (`restore prev=<sid>`, [`restores`]): a new shell under a new sid stands in the pane it
+    /// held, after a relaunch (a crash's or a quit's) that could not keep its tab ID, or a
+    /// reopened tab. Whether it died is [`restore_says_died`].
     successor: Option<u64>,
     /// The greatest seq of a body offered to each of its spaces, whether or not the space took
     /// it (one outside this build's bus class is held unfolded): a derived record is numbered
@@ -318,10 +319,13 @@ const RESTORE_WORD: &[u8] = b"k=restore";
 
 /// The session a successor's record names as the one it restores: the `open - restore` or
 /// `amend - restore` with `prev=<sid>` that a restore's new shell writes on its own session
-/// node (aterm-gui's `note_restored`) when it fills the pane the old session held: at every
-/// cold relaunch, a crash's or a clean quit's, and when a closed tab is reopened, so the record
-/// alone says nothing of how the old session ended ([`restore_says_died`]). A seamless update
-/// keeps the session's own sid and names no `prev=`.
+/// node (aterm-gui's `note_restored`) when it fills the pane the old session held under a new
+/// sid: at a cold relaunch, a crash's or a clean quit's, whose restore could not keep the
+/// leaf's tab ID (a sid that is no tab ID, an ID a tab of the relaunch holds or a live instance
+/// on that Mac serves), and when a closed tab is reopened, so the record alone says nothing of
+/// how the old session ended ([`restore_says_died`]). A seamless update, and a cold relaunch
+/// that keeps the tab ID, keep the session's own sid and name no `prev=`; after a kept tab's
+/// cold relaunch its newest seq space is the relaunch's live run.
 fn restores(rec: &Rec) -> Option<&str> {
     (rec.node == Node::SESSION && rec.k == Kind::Restore && matches!(rec.op, Op::Open | Op::Amend))
         .then(|| rec.f.get_str(Key::Prev))

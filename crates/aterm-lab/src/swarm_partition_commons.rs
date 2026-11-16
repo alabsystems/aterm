@@ -607,7 +607,7 @@ impl Plane {
             return;
         }
         if let Ok(store) = aterm_secrets::client::load_records(&a1.paths) {
-            let wire = store.encode();
+            let wire = store.read_encoded().unwrap();
             for name in ["a2", "b1", "b2"] {
                 if let Some(mac) = self.mac(name) {
                     let _ = aterm_secrets::client::save_records(&mac.paths, &wire);

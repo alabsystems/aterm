@@ -284,8 +284,16 @@ struct Decided {
     /// The one judgment.
     decision: Decision,
     /// For [`Decision::Token`], the read to serve from.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "served from by the unix run alone")
+    )]
     read: Option<Read>,
     /// The build in atpkg's store the run's program resolved to, the one file it serves.
+    #[cfg_attr(
+        not(unix),
+        expect(dead_code, reason = "served from by the unix run alone")
+    )]
     build: Option<PathBuf>,
     /// The fallback it journals.
     noted: Option<(TokenEntry, &'static str)>,

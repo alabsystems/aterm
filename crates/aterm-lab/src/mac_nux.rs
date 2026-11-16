@@ -7568,6 +7568,7 @@ pub fn cmd_nux(args: &[String]) -> Res {
         // base's Accessibility grant.
         person: (ask.person || ask.reader || reads_tree).then(|| GUEST_HELPER.to_owned()),
         lan_allow: runnable.contains(&Scenario::LanAllowed),
+        shape: None,
     };
     let tart = crate::mac::tart_to_run()?;
     pull_room(&tart, &ask.image, &crate::mac::prep_name(&ask.image, &prep))?;

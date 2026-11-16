@@ -25,6 +25,12 @@
 //! no seam. Only files a release build compiles are read: each crate root and what a `mod` on a
 //! release-compiled line loads from one, so a test file, an integration test, a debug-only module
 //! and the census's own source are not. A glob import (`use aterm_pty::*`) is not followed.
+//!
+//! Beside `crates/`, it reads the crates of each repository aterm vendors whole and links
+//! ([`VENDORED`]: alab-policy, from alab-harness): aterm's release build compiles them too, and
+//! their seams (`alab_policy::classify::MEASURED_SUBSTITUTION_BYPASSES`) are named from
+//! `crates/`. The census corpus holds no file under `vendor/`, so this rule reads those itself,
+//! from the checkout's paths.
 
 use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -35,8 +41,13 @@ use super::{Finding, Rule, SourceFile, Tree};
 use crate::items::unmasked_lines;
 use crate::lex::Lexed;
 
-/// The crates the rule reads.
+/// The crates the rule reads from the census corpus.
 const SOURCE: &[&str] = &["crates/"];
+
+/// The crates of the repositories aterm vendors whole and links by path, which its release build
+/// compiles as it does `crates/` (each a roster row of aterm-forge's provenance pinned by tree
+/// id). The corpus leaves `vendor/` out, so the rule reads these files itself.
+pub(super) const VENDORED: &[&str] = &["vendor/alab-harness/crates/"];
 
 pub(super) const SEAM_CALLER: Rule = Rule {
     id: "seam-caller",
@@ -80,8 +91,9 @@ struct Sources<'a> {
 }
 
 impl<'a> Sources<'a> {
-    fn of(tree: &Tree<'a>) -> Self {
-        let files: Vec<&SourceFile> = tree.corpus.under(SOURCE).collect();
+    /// The corpus's files under [`SOURCE`], then `vendored` ([`vendored_files`]).
+    fn of(tree: &Tree<'a>, vendored: &'a [SourceFile]) -> Self {
+        let files: Vec<&SourceFile> = tree.corpus.under(SOURCE).chain(vendored).collect();
         let compiled = files.iter().map(|_| OnceCell::new()).collect();
         Self { files, compiled }
     }
@@ -97,8 +109,35 @@ impl<'a> Sources<'a> {
     }
 }
 
+/// The `.rs` files of the checkout under [`VENDORED`], in path order, each read through the tree
+/// (the corpus's copy where it holds one, else the checkout's); a file that does not read is a
+/// finding of its own, since the rule cannot judge what it does not read.
+fn vendored_files(tree: &Tree<'_>, out: &mut Vec<Finding>) -> Vec<SourceFile> {
+    let mut files = Vec::new();
+    for rel in tree
+        .corpus
+        .paths()
+        .iter()
+        .filter(|rel| rel.ends_with(".rs") && VENDORED.iter().any(|v| rel.starts_with(v)))
+    {
+        match tree.text(rel) {
+            Some(text) => files.push(SourceFile::outside(rel.clone(), text.into_owned())),
+            None => out.push(Finding {
+                rule: SEAM_CALLER.id,
+                path: rel.clone(),
+                line: 0,
+                detail: "this vendored source does not read, so the rule cannot judge the seams \
+                         it declares or names"
+                    .to_string(),
+            }),
+        }
+    }
+    files
+}
+
 fn seam_caller(tree: &Tree<'_>, out: &mut Vec<Finding>) {
-    let sources = Sources::of(tree);
+    let vendored = vendored_files(tree, out);
+    let sources = Sources::of(tree, &vendored);
     let shipped = released_files(&sources);
     let read =
         |file: &SourceFile| shipped.contains(&file.rel) && !file.rel.starts_with(CENSUS_CRATE);

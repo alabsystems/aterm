@@ -7,6 +7,7 @@ use agh::fx::NativePushTiming;
 use agh::git::NativePushPhase;
 use aterm_json::json;
 use std::error::Error;
+use std::io::{Seek as _, Write as _};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -23,9 +24,10 @@ pub(crate) fn git(root: &Path, args: &[&str]) -> Result<String, Box<dyn Error>> 
         .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
         .env("GIT_AUTHOR_DATE", "@1700000000 +0000")
         .env("GIT_COMMITTER_DATE", "@1700000000 +0000");
-    let out = aterm_uds::deadline::output_until_complete_stdout(
+    let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut command,
-        Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+        "journal benchmark fixture git",
     )?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
@@ -38,17 +40,33 @@ pub(crate) fn path(path: &Path) -> Result<&str, Box<dyn Error>> {
         .ok_or_else(|| "fixture path is not UTF-8".into())
 }
 
+fn with_input(
+    command: &mut aterm_uds::spawnfd::Command,
+    input: &[u8],
+    limit: usize,
+) -> Result<std::process::Output, Box<dyn Error>> {
+    // Fixture input is synthetic. A file lets the child consume it while the same
+    // progress window watches the child and its output, without a blocking writer.
+    let mut stdin = aterm_tempfile::tempfile()?;
+    stdin.write_all(input)?;
+    stdin.rewind()?;
+    Ok(
+        aterm_uds::deadline::output_from_while_process_progressing_complete_with_limit(
+            command,
+            stdin.into(),
+            Duration::from_secs(60),
+            "journal benchmark fixture git input",
+            limit,
+        )?,
+    )
+}
+
 pub(crate) fn object_kind(root: &Path, oid: &str) -> Result<String, Box<dyn Error>> {
     let mut command = aterm_uds::fixture_git::git();
     command
         .current_dir(root)
         .args(["cat-file", "--batch-check=%(objecttype)"]);
-    let out = aterm_uds::deadline::output_with_input_until(
-        &mut command,
-        aterm_uds::secret::Secret::new(format!("{oid}\n").as_bytes()),
-        Instant::now() + Duration::from_secs(60),
-        1024,
-    )?;
+    let out = with_input(&mut command, format!("{oid}\n").as_bytes(), 1024)?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
     }
@@ -165,12 +183,7 @@ pub(crate) fn retained_history(root: &Path) -> Result<(), Box<dyn Error>> {
         .current_dir(root)
         .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(["fast-import", "--quiet", "--date-format=raw"]);
-    let out = aterm_uds::deadline::output_with_input_until(
-        &mut command,
-        aterm_uds::secret::Secret::new(stream.as_bytes()),
-        Instant::now() + Duration::from_secs(60),
-        4096,
-    )?;
+    let out = with_input(&mut command, stream.as_bytes(), 4096)?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned().into());
     }

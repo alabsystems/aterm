@@ -2,10 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! Provider reads produce observations on a worker. Only a fresh, proven host
-//! request may publish them as a native restart receipt.
+//! request may publish them as a native restart receipt. The reads run under the
+//! asking process's read pace, which its tab keeps for this control and the exec
+//! handoff's alike ([`observe_paced`]), and to which every ask is noted ([`note_ask`]).
+//! A read out for longer than one can take is taken for one that will not end
+//! ([`READ_LAPSES`]).
 
 use super::*;
 use aterm_agent::harness::{accounts_pool, codex_rotation as pool, relaunch};
+use std::collections::BTreeSet;
 use std::time::Instant;
 
 const WAITING: &str = "OK codex-rotation state=waiting\n";
@@ -16,6 +21,124 @@ const OBSERVATION_MS: u64 = 60_000;
 /// observation is [`OBSERVATION_MS`] old: one published with less than this left could lapse
 /// before that commit.
 const COMMIT_MARGIN_MS: u64 = 10_000;
+/// How long a usage-limit job's read may be out, and its observation hold the process's read
+/// pace, before it is taken for one that will not end. An observation's provider reads end
+/// within [`OBSERVATION_MS`]; what it does around them (the kernel's and the records' reads, each
+/// lock among them waited on for a few seconds at most) takes far less than the half minute more.
+/// Past it the job's next ask starts another read ([`answer`], and the exec handoff's alike),
+/// which gets a new pace in place of the held one ([`pool::Paces::of`]), and what the read that
+/// was taken to never end answers, should it end, changes nothing ([`observed`]). So no one
+/// wedged read stops its process's reads until a person's key, a new wall turn or claim revision,
+/// or an aterm restart replaces its job.
+pub(in crate::native_act) const READ_LAPSES: Duration =
+    Duration::from_millis(OBSERVATION_MS + 30_000);
+
+/// A process as its tab keeps what it asks a usage-limit handoff for: its read pace, both
+/// controls', and an exec handoff's preparation and operation (`exec_handoff::Table`). Its pid and
+/// kernel birth: a same-PID execve keeps both, so the successor an exec move execs is still the
+/// process that armed it and keeps its pace, and a pid the kernel gives a later process is
+/// another key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::native_act) struct ProcessKey {
+    pid: u32,
+    birth: u64,
+}
+
+impl ProcessKey {
+    pub(in crate::native_act) fn of(process: &Process) -> Self {
+        Self {
+            pid: process.pid,
+            birth: process.birth,
+        }
+    }
+
+    /// Whether the kernel shows this process gone: its pid absent or exited, or held by a
+    /// process of another birth. A read that fails shows nothing, and the process is not gone.
+    pub(in crate::native_act) fn gone(self) -> bool {
+        let pid = i32::try_from(self.pid).unwrap_or(-1);
+        aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 != self.birth)
+            || matches!(
+                aterm_uds::process::process_presence(pid),
+                aterm_uds::process::ProcessPresence::Absent
+                    | aterm_uds::process::ProcessPresence::Exited
+            )
+    }
+}
+
+/// The read pace `ctx`'s tab keeps for the process `process` at `now`, or a new one in place of
+/// one an observation has held for longer than [`READ_LAPSES`] ([`pool::Paces::of`]). Takes the
+/// tab's table on the calling thread, never under a job's progress lock.
+fn read_pace(ctx: &crate::SessionCtx, process: ProcessKey, now: Instant) -> Arc<pool::KeptPace> {
+    ctx.fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .rotation_paces
+        .of(process, now, READ_LAPSES)
+}
+
+/// The process `process` asks a usage-limit handoff at `now` (Unix seconds), noted to its read
+/// pace before the ask is answered ([`pool::KeptPace::asks`]): every request of
+/// `codex-rotation` (`prepare`, and `commit`, `status`, `consume` and `complete` of a receipt)
+/// and of `codex-exec-handoff` (`prepare`, `arm`, and each verb of the operation it armed),
+/// whatever it is answered, a gate's refusal, a read that is out, a selection published again
+/// and a published receipt's or an armed operation's answer among them. The paces of the
+/// processes the kernel shows gone are forgotten first, by the rule the exec handoff's table
+/// forgets its processes by ([`ProcessKey::gone`]), read with the table unlocked: a gone process
+/// does not come back.
+pub(in crate::native_act) fn note_ask(ctx: &crate::SessionCtx, process: ProcessKey, now: i64) {
+    let kept = ctx
+        .fenced_writes
+        .native
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .rotation_paces
+        .processes()
+        .collect::<Vec<_>>();
+    let gone = kept
+        .into_iter()
+        .filter(|key| key.gone())
+        .collect::<BTreeSet<_>>();
+    if !gone.is_empty() {
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rotation_paces
+            .forget(&gone);
+    }
+    read_pace(ctx, process, Instant::now()).asks(now);
+}
+
+/// Run `observe` on a new thread named `name`, under the read pace `ctx`'s tab keeps for the
+/// process `process`, then `done` with what it answered and the pace released. The pace is
+/// fetched on the calling thread ([`read_pace`]), so the tab's table is never taken under a job's
+/// progress lock. One observation holds the pace at a time ([`pool::KeptPace::observe`]): one
+/// that finds it held reads nothing and answers `Ok(None)`, so its job is asked again, and only
+/// one that has held it for longer than [`READ_LAPSES`] is given up on, its process paced anew,
+/// so that at most two observations of a process are out at once. A panicking observation
+/// answers `probe-panicked`, and the pace it held is the next observation's as it left it. The
+/// one way a usage-limit control's worker reaches a pace.
+pub(in crate::native_act) fn observe_paced<T>(
+    ctx: &crate::SessionCtx,
+    name: &str,
+    process: ProcessKey,
+    observe: impl FnOnce(&mut pool::ReadPace) -> Result<Option<T>, &'static str> + Send + 'static,
+    done: impl FnOnce(Result<Option<T>, &'static str>) + Send + 'static,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    let kept = read_pace(ctx, process, Instant::now());
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let result = kept
+                .observe(Instant::now(), |pace| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observe(pace)))
+                        .unwrap_or(Err("probe-panicked"))
+                })
+                .unwrap_or(Ok(None));
+            done(result);
+        })
+}
 
 #[derive(Debug)]
 pub(in crate::native_act) struct Preparation {
@@ -30,7 +153,8 @@ pub(in crate::native_act) struct Preparation {
 
 #[derive(Debug)]
 enum Progress {
-    Reading,
+    /// A read is out, started at this time.
+    Reading(Instant),
     Retry(Instant),
     NotNeeded,
     Selected(Box<Selection>),
@@ -134,6 +258,7 @@ fn observe(
     resume: &self_claimed::Resume,
     job: &Preparation,
     fixture_roots: Option<Vec<Vec<u8>>>,
+    pace: &mut pool::ReadPace,
 ) -> Result<Option<pool::Proposal>, &'static str> {
     let home = env.home.as_deref().ok_or("home")?;
     let seat = accounts_pool::Seat {
@@ -202,6 +327,7 @@ fn observe(
             &job.intent,
             &FixtureUsage { live, roots },
             Duration::from_millis(OBSERVATION_MS),
+            pace,
         );
     }
     #[cfg(not(debug_assertions))]
@@ -212,6 +338,7 @@ fn observe(
         &job.intent,
         &live,
         Duration::from_millis(OBSERVATION_MS),
+        pace,
     )
 }
 
@@ -237,29 +364,53 @@ fn progress_after_observation(
     }
 }
 
+/// The job's `progress` once the read it started at `since` answered `result` at `now`, where
+/// `current` says the job is still its session's: written only while that read is still the one
+/// out. A read [`answer`] took for one that will not end ([`READ_LAPSES`]) and started another in
+/// place of changes nothing should it end after all.
+fn observed(
+    progress: &mut Progress,
+    since: Instant,
+    result: Result<Option<pool::Proposal>, &'static str>,
+    current: bool,
+    now: Instant,
+) {
+    if matches!(progress, Progress::Reading(at) if *at == since) {
+        *progress = progress_after_observation(result, current, now);
+    }
+}
+
+/// Start `job`'s read, the one its ask started at `since`.
 fn start(
     ctx: &Arc<crate::SessionCtx>,
     env: &Env,
     resume: &self_claimed::Resume,
     job: &Arc<Preparation>,
+    since: Instant,
 ) {
     let weak = Arc::downgrade(ctx);
     let fixture_roots = ctx.native_policy.quota_fixture_roots();
     let env = env.clone();
     let resume = resume.clone();
+    let reader = Arc::clone(job);
     let worker = Arc::clone(job);
-    if std::thread::Builder::new()
-        .name("codex-quota-probe".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                observe(&env, &resume, &worker, fixture_roots)
-            }))
-            .unwrap_or(Err("probe-panicked"));
+    if observe_paced(
+        ctx,
+        "codex-quota-probe",
+        ProcessKey::of(&job.process),
+        move |pace| observe(&env, &resume, &reader, fixture_roots, pace),
+        move |result| {
             let current = weak.upgrade().is_some_and(|ctx| worker.current(&ctx));
-            *worker.progress.lock().unwrap_or_else(|p| p.into_inner()) =
-                progress_after_observation(result, current, Instant::now());
-        })
-        .is_err()
+            observed(
+                &mut worker.progress.lock().unwrap_or_else(|p| p.into_inner()),
+                since,
+                result,
+                current,
+                Instant::now(),
+            );
+        },
+    )
+    .is_err()
     {
         *job.progress.lock().unwrap_or_else(|p| p.into_inner()) =
             Progress::Retry(Instant::now() + Duration::from_millis(RETRY_MS));
@@ -335,28 +486,40 @@ pub(super) fn prepare(
         &job.progress,
         Instant::now(),
         |selected| publish(ctx, env, proof, resume, &job, selected, &index),
-        || start(ctx, env, resume, &job),
+        |since| start(ctx, env, resume, &job, since),
     )
 }
 
 /// What an ask at `now` is answered from its job's progress, and whether it starts a read of the
-/// accounts' usage, which [`ask`] does once the progress is unlocked. A selection is published
-/// by `publish`. One whose publication fails is kept, and the first ask [`RETRY_MS`] later
-/// publishes it again: a busy receipt writer, a taken sign-in turn or a changed claim is nothing
-/// a new read of the provider answers, so a failed publication starts none, and an ask before
-/// then publishes nothing. A selection within [`COMMIT_MARGIN_MS`] of its observation's end is
-/// not published: it is dropped, and the next ask reads again. A selection the records refute
-/// fails its publication like any other, and so waits until then for its next read.
+/// accounts' usage, which [`ask`] does once the progress is unlocked. A read that is out answers
+/// `waiting` and starts none, until it has been out for longer than [`READ_LAPSES`]: it is then
+/// taken for one that will not end, and the ask starts another in its place. A selection is
+/// published by `publish`. One whose publication fails is kept, and the first ask [`RETRY_MS`]
+/// later publishes it again: a busy receipt writer, a taken sign-in turn or a changed claim is
+/// nothing a new read of the provider answers, so a failed publication starts none, and an ask
+/// before then publishes nothing. A selection within [`COMMIT_MARGIN_MS`] of its observation's
+/// end is not published: it is dropped, and the next ask reads again. A selection the records
+/// refute fails its publication like any other, and so waits until then for its next read.
 fn answer(
     progress: &mut Progress,
     now: Instant,
     publish: impl FnOnce(&Selection) -> Result<Receipt, &'static str>,
 ) -> (String, bool) {
     match progress {
-        Progress::Reading => (WAITING.into(), false),
+        Progress::Reading(since) if now.saturating_duration_since(*since) <= READ_LAPSES => {
+            (WAITING.into(), false)
+        }
+        Progress::Reading(_) => {
+            aterm_log::warn!(
+                "codex rotation: a read has been out for longer than {READ_LAPSES:?}; it is \
+                 taken for one that will not end, and another starts"
+            );
+            *progress = Progress::Reading(now);
+            (WAITING.into(), true)
+        }
         Progress::Retry(at) if now < *at => (WAITING.into(), false),
         Progress::Retry(_) => {
-            *progress = Progress::Reading;
+            *progress = Progress::Reading(now);
             (WAITING.into(), true)
         }
         Progress::NotNeeded => ("OK codex-rotation state=not-needed\n".into(), false),
@@ -386,13 +549,14 @@ fn answer(
 }
 
 /// Answer an ask at `now` from its job's progress and, where that answer starts a read of the
-/// accounts' usage, run `read`, once and with the progress unlocked: a read that cannot start
+/// accounts' usage, run `read`, once and with the progress unlocked, with `now`, the time the
+/// read is out from, by which its answer is written ([`observed`]): a read that cannot start
 /// writes the progress itself.
 fn ask(
     progress: &Mutex<Progress>,
     now: Instant,
     publish: impl FnOnce(&Selection) -> Result<Receipt, &'static str>,
-    read: impl FnOnce(),
+    read: impl FnOnce(Instant),
 ) -> String {
     let (reply, starts) = answer(
         &mut progress.lock().unwrap_or_else(|p| p.into_inner()),
@@ -400,7 +564,7 @@ fn ask(
         publish,
     );
     if starts {
-        read();
+        read(now);
     }
     reply
 }
@@ -639,7 +803,8 @@ pub(super) fn retire_ready(
     .map(Option::flatten)
 }
 
-/// The exec source uses the same provider reader and pool as TUI recovery.
+/// The exec source uses the same provider reader and pool as TUI recovery, under the asking
+/// process's read pace `pace` ([`observe_paced`]).
 #[cfg(unix)]
 pub(in crate::native_act) fn observe_exec(
     env: &Env,
@@ -647,6 +812,7 @@ pub(in crate::native_act) fn observe_exec(
     source: &aterm_agent::harness::codex_exec_handoff::ExecSource,
     intent: &Intent,
     fixture_roots: Option<Vec<Vec<u8>>>,
+    pace: &mut pool::ReadPace,
 ) -> Result<
     Option<pool::Proposal<aterm_agent::harness::codex_exec_handoff::ExecCommand>>,
     &'static str,
@@ -674,6 +840,7 @@ pub(in crate::native_act) fn observe_exec(
             intent,
             &FixtureUsage { live, roots },
             Duration::from_millis(OBSERVATION_MS),
+            pace,
         );
     }
     #[cfg(not(debug_assertions))]
@@ -684,6 +851,7 @@ pub(in crate::native_act) fn observe_exec(
         intent,
         &live,
         Duration::from_millis(OBSERVATION_MS),
+        pace,
     )
 }
 

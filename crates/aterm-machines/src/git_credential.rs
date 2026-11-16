@@ -11,11 +11,19 @@
 //! [`Git::replace_keychain_block`]: the block an earlier `aterm init` wrote to git's global
 //! settings ([`global_files`]) gives way to a reset and aterm's helper, so the person's own git
 //! asks no keychain either.
+//!
+//! A converge pass reads the route once ([`Records`], kept beside its record of checkout facts):
+//! the settings of every file git reads, which the keychain item's probe and the vault's pass
+//! both judge, and what aterm's helper hands back, which each reader of the route compares with
+//! the token. Each is read again where a file it came from, or the vault entry the helper hands
+//! back, changed.
 
+use crate::checkout::facts::observe;
 use crate::model::User;
 use crate::port::{Cmd, Secret, System};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 /// The name of git's login-keychain helper (`git-credential-osxkeychain`), which the block an
@@ -49,21 +57,27 @@ const REQUEST: &[u8] = b"protocol=https\nhost=github.com\n\n";
 /// The bound on one git run: a helper answers at once, so a hang is what it catches.
 const BUDGET: Duration = Duration::from_secs(60);
 
-/// What [`Git::keychain_in_effect`] reads: every credential setting, and every conditional
-/// include's file (`git config --get-regexp` prints keys with their section and name
-/// lowercased).
-const SETTINGS: &str = r"^(credential\..*|includeif\..*\.path)$";
+/// What [`Git::keychain_in_effect`] reads: every credential setting, every conditional
+/// include's file, and every include, whose file a record of the read must watch ([`Records`],
+/// [`kept_from`]; `git config --get-regexp` prints keys with their section and name lowercased).
+const SETTINGS: &str = r"^(credential\..*|include\.path|includeif\..*\.path)$";
+
+/// The key of an unconditional include, which [`SETTINGS`] lists for [`Records`] alone.
+const INCLUDE: &str = "include.path";
 
 /// git's bound on nested includes (`MAX_INCLUDE_DEPTH`): a deeper chain is git's own error.
 const INCLUDE_DEPTH: usize = 10;
 
 /// aterm's own GitHub HTTPS credential helper: `aterm secrets git-credential`, run by the
-/// installed command selected for this account, over the vault's token or the token file
-/// init.toml's `[github]` names. It reads files and never the login keychain, and answers `get`
-/// alone.
+/// installed command selected for this account, over the secrets registry's `gh:dev` entry
+/// ([`crate::init_github::TOKEN_ENTRY`]). It reads the registry and never the login keychain,
+/// and answers `get` alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Helper {
     value: String,
+    /// The installed command it runs ([`Helper::target`]'s spelling): none for a test's
+    /// stand-in, whose answer no record keeps.
+    launcher: Option<PathBuf>,
 }
 
 impl Helper {
@@ -138,11 +152,13 @@ impl Helper {
     /// nonempty executable installed command.
     pub(crate) fn vault(sys: &dyn System, user: &User) -> Option<Self> {
         let (launcher, _) = Self::target(sys, user).ok()?;
+        let value = format!(
+            "!{} secrets git-credential",
+            crate::port::shell_word(&launcher.to_string_lossy())
+        );
         Some(Self {
-            value: format!(
-                "!{} secrets git-credential",
-                crate::port::shell_word(&launcher.to_string_lossy())
-            ),
+            value,
+            launcher: Some(launcher),
         })
     }
 
@@ -156,6 +172,7 @@ impl Helper {
     pub(crate) fn stand_in(value: &str) -> Self {
         Self {
             value: value.to_owned(),
+            launcher: None,
         }
     }
 }
@@ -281,7 +298,8 @@ impl Git {
 
     /// Whether aterm's route ([`pinned`] with `helper`) hands back exactly `token` at github.com
     /// for `user`: a `git credential fill` asked as a clone asks (no account), which runs no
-    /// helper but `helper`. With no helper (no launcher), it does not, and nothing runs.
+    /// helper but `helper`, once a pass ([`Self::handed_back`]). With no helper (no launcher),
+    /// it does not, and nothing runs.
     ///
     /// # Errors
     /// git could not run whole, or answered no single password or one too long.
@@ -295,13 +313,104 @@ impl Git {
         let Some(helper) = helper else {
             return Ok(Lookups::Not(Helper::unavailable(sys, user)));
         };
-        Ok(match self.fill(sys, user, helper)? {
-            Some(held) if held.bytes() == token.bytes() => Lookups::Ready,
+        Ok(match self.handed_back(sys, user, helper)? {
+            Some(held) if held == digest(token.bytes()) => Lookups::Ready,
             Some(_) => Lookups::Not(
                 "aterm's GitHub helper hands back another credential than the token".into(),
             ),
             None => Lookups::Not("aterm's GitHub helper hands back no token".into()),
         })
+    }
+
+    /// The SHA-256 of the token aterm's route with `helper` hands back at github.com
+    /// ([`Self::fill`]), or `None` where it hands back none: the pass's record where every file
+    /// the answer comes from and the vault entry aterm's helper reads stand as they did when it
+    /// was read ([`Self::answer_watch`], [`entry_state`]), else asked again (and kept, where
+    /// [`System::checkout_records`] keeps a record, `helper` is aterm's own and it handed one
+    /// back while nothing it comes from changed). Only its digest is kept, never the token.
+    ///
+    /// # Errors
+    /// As [`Self::fill`].
+    fn handed_back(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        helper: &Helper,
+    ) -> Result<Option<[u8; 32]>, String> {
+        let records = sys.checkout_records();
+        let key = (self.reader(user), helper.value.clone());
+        if let Some(records) = &records
+            && let Some(kept) = records.route().answers.current(sys, &key)
+            && entry_state(sys, user) == Some(kept.value.entry)
+        {
+            return Ok(Some(kept.value.password));
+        }
+        let before = records
+            .as_ref()
+            .zip(helper.launcher.as_deref())
+            .map(|(_, launcher)| {
+                let watch = self.answer_watch(sys, user, launcher);
+                let seen = observe(sys, &watch);
+                (watch, seen, entry_state(sys, user))
+            });
+        let password = match self.fill(sys, user, helper) {
+            Ok(held) => held.map(|held| digest(held.bytes())),
+            Err(why) => {
+                if let Some(records) = &records {
+                    records.route().answers.put(key, None);
+                }
+                return Err(why);
+            }
+        };
+        if let Some(records) = &records {
+            let kept = match (password, before) {
+                (Some(password), Some((watch, seen, Some(entry))))
+                    if observe(sys, &watch) == seen && entry_state(sys, user) == Some(entry) =>
+                {
+                    Some(Kept {
+                        value: Answer { password, entry },
+                        watch,
+                        seen,
+                    })
+                }
+                _ => None,
+            };
+            records.route().answers.put(key, kept);
+        }
+        Ok(password)
+    }
+
+    /// Who reads with this git as `user`: what a record of the route is kept by.
+    fn reader(&self, user: &User) -> Reader {
+        Reader {
+            uid: user.uid,
+            home: user.home.clone(),
+            program: self.program.clone(),
+            env: self.env.clone(),
+        }
+    }
+
+    /// The files git reads its settings from as `user` wherever it runs, as far as they can be
+    /// named before a read: the system's and the account's
+    /// ([`crate::checkout::facts::config_files`]), the files this git's build keeps under its
+    /// prefix, and the program ([`crate::checkout::facts::program_files`]). A read whose
+    /// settings come from any other file, or include one, is never kept ([`kept_from`]).
+    fn settings_watch(&self, sys: &dyn System, user: &User) -> Vec<PathBuf> {
+        let mut watch: Vec<PathBuf> =
+            crate::checkout::facts::config_files(Path::new(&user.home)).into();
+        watch.extend(crate::checkout::facts::program_files(sys, &self.program));
+        watch
+    }
+
+    /// What the answer of aterm's helper run by `launcher` comes from, beside the vault entry
+    /// it hands back ([`entry_state`]): the files git's settings come from
+    /// ([`Self::settings_watch`]), the account's installed-command declaration, and the
+    /// launcher, observed where it resolves.
+    fn answer_watch(&self, sys: &dyn System, user: &User, launcher: &Path) -> Vec<PathBuf> {
+        let mut watch = self.settings_watch(sys, user);
+        watch.push(aterm_types::installed_command::path(Path::new(&user.home)));
+        watch.push(launcher.to_owned());
+        watch
     }
 
     /// The token aterm's route hands back at github.com, or `None` when it holds none: git then
@@ -482,9 +591,63 @@ impl Git {
         judge(&every, &conditional)
     }
 
-    /// The settings [`SETTINGS`] names, read as `user`, each with the file it is in: from
-    /// every file git reads (`None`), or from `file` and what it includes.
+    /// The settings [`SETTINGS`] names but [`INCLUDE`], read as `user`, each with the file it is
+    /// in: from every file git reads (`None`, once a pass: [`Self::every_setting`]), or from
+    /// `file` and what it includes.
     fn settings(
+        &self,
+        sys: &dyn System,
+        user: &User,
+        file: Option<&Path>,
+    ) -> Result<Vec<Setting>, String> {
+        match file {
+            None => self.every_setting(sys, user),
+            Some(file) => self.listed(sys, user, Some(file)).map(without_includes),
+        }
+    }
+
+    /// The settings of every file git reads as `user` ([`Self::settings`]): the pass's record
+    /// where every file they come from stands as it did when they were read
+    /// ([`Self::settings_watch`]), else read again (and kept, where
+    /// [`System::checkout_records`] keeps a record and nothing they come from is outside what it
+    /// watches, [`kept_from`]). A config file git reads that holds no key [`SETTINGS`] names and
+    /// is none of those watched (a repository's own, where the reading process runs inside one)
+    /// is not watched: a key written there while a pass runs is read by the next pass, which
+    /// starts with no record ([`crate::port::CheckoutRecords::new_pass`]).
+    fn every_setting(&self, sys: &dyn System, user: &User) -> Result<Vec<Setting>, String> {
+        let records = sys.checkout_records();
+        let reader = self.reader(user);
+        if let Some(records) = &records
+            && let Some(kept) = records.route().settings.current(sys, &reader)
+        {
+            return Ok(without_includes(kept.value.clone()));
+        }
+        let before = records.as_ref().map(|_| {
+            let watch = self.settings_watch(sys, user);
+            let seen = observe(sys, &watch);
+            (watch, seen)
+        });
+        let read = self.listed(sys, user, None);
+        if let Some(records) = &records {
+            let kept = match (&read, before) {
+                (Ok(every), Some((watch, seen)))
+                    if kept_from(every, &watch) && observe(sys, &watch) == seen =>
+                {
+                    Some(Kept {
+                        value: every.clone(),
+                        watch,
+                        seen,
+                    })
+                }
+                _ => None,
+            };
+            records.route().settings.put(reader, kept);
+        }
+        read.map(without_includes)
+    }
+
+    /// Every setting [`SETTINGS`] names, read as `user` ([`Self::read`]).
+    fn listed(
         &self,
         sys: &dyn System,
         user: &User,
@@ -504,7 +667,7 @@ impl Git {
         parse(text).ok_or_else(|| "git's credential settings are not configuration".into())
     }
 
-    /// The `git config` run [`Self::settings`] makes.
+    /// The `git config` run [`Self::listed`] makes.
     fn read(&self, user: &User, file: Option<&Path>) -> Cmd {
         let mut cmd = self
             .cmd(Some(user))
@@ -514,6 +677,149 @@ impl Git {
         }
         cmd.args(["--get-regexp", SETTINGS])
     }
+}
+
+/// One pass's record of aterm's credential route, which [`crate::port::CheckoutRecords`] keeps
+/// beside its record of checkout facts and empties with it as a pass begins: the settings a read
+/// of every file git reads found ([`Git::keychain_block`], [`Git::keychain_in_effect`]), and the
+/// digest of what aterm's helper handed back ([`Git::lookups`]), each by the account and the git
+/// that read it. Each is reused only while every file it came from stands as it did before the
+/// read ([`observe`]), and an answer only while the vault entry aterm's helper hands back does
+/// too ([`entry_state`]); any change, or a file that cannot be observed as it was, reads it
+/// again. A read of settings that could rest on anything else (a file it does not watch, a
+/// conditional include, an include of a file it does not watch, a file that changed while it
+/// ran) is never kept ([`kept_from`]).
+#[derive(Default)]
+pub(crate) struct Records {
+    settings: Shelf<Reader, Vec<Setting>>,
+    answers: Shelf<(Reader, String), Answer>,
+}
+
+impl Records {
+    /// Forget every record.
+    pub(crate) fn clear(&self) {
+        self.settings.clear();
+        self.answers.clear();
+    }
+}
+
+/// Who read a record of the route: the account (its home, where git finds its global files),
+/// the git program and the variables a test adds ([`Git`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Reader {
+    uid: u32,
+    home: String,
+    program: PathBuf,
+    env: Vec<(String, String)>,
+}
+
+/// What aterm's helper handed back to one `git credential fill`.
+#[derive(Clone, Copy)]
+struct Answer {
+    /// The SHA-256 of the token.
+    password: [u8; 32],
+    /// The vault entry it hands back, as [`entry_state`] read it before and after the fill.
+    entry: [u8; 32],
+}
+
+/// One record: what was read, the files it came from, and their metadata before the read.
+struct Kept<T> {
+    value: T,
+    watch: Vec<PathBuf>,
+    seen: [u8; 32],
+}
+
+/// The records of one kind, by who read them.
+struct Shelf<K, T>(Mutex<BTreeMap<K, Arc<Kept<T>>>>);
+
+impl<K, T> Default for Shelf<K, T> {
+    fn default() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+}
+
+impl<K: Ord, T> Shelf<K, T> {
+    fn held(&self) -> MutexGuard<'_, BTreeMap<K, Arc<Kept<T>>>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The record kept under `key`, where every file it came from stands as it was read.
+    fn current(&self, sys: &dyn System, key: &K) -> Option<Arc<Kept<T>>> {
+        let kept = self.held().get(key).cloned()?;
+        (observe(sys, &kept.watch) == kept.seen).then_some(kept)
+    }
+
+    /// Keep `kept` under `key`, or forget what was kept there (`None`).
+    fn put(&self, key: K, kept: Option<Kept<T>>) {
+        match kept {
+            Some(kept) => {
+                self.held().insert(key, Arc::new(kept));
+            }
+            None => {
+                self.held().remove(&key);
+            }
+        }
+    }
+
+    fn clear(&self) {
+        self.held().clear();
+    }
+}
+
+/// Whether a read of every file git reads, which found `every`, may be kept against `watch`: each
+/// setting is in a file it names (`--show-origin`'s `file:<path>`, an absolute path), no
+/// conditional include (`includeIf.<condition>.path`) is among them, whose condition this
+/// cannot judge, and each include (`include.path`) names a file it watches by an absolute path,
+/// which git reads as one more file this watches: a managed GNU Git's own system file includes
+/// `/etc/gitconfig` so. An include of any other file, or of one git resolves against something
+/// else (`~/`, `%(prefix)/`, a path relative to the file that names it), is not kept.
+fn kept_from(every: &[Setting], watch: &[PathBuf]) -> bool {
+    let watched = |file: &Path| file.is_absolute() && watch.iter().any(|kept| kept == file);
+    every.iter().all(|setting| {
+        !(setting.key.starts_with("includeif.") && setting.key.ends_with(".path"))
+            && setting
+                .origin
+                .strip_prefix("file:")
+                .map(Path::new)
+                .is_some_and(watched)
+            && (setting.key != INCLUDE
+                || setting.value.as_deref().map(Path::new).is_some_and(watched))
+    })
+}
+
+/// `settings` but each include ([`INCLUDE`]), which [`SETTINGS`] lists for [`kept_from`] alone:
+/// what the route's judges read.
+fn without_includes(mut settings: Vec<Setting>) -> Vec<Setting> {
+    settings.retain(|setting| setting.key != INCLUDE);
+    settings
+}
+
+/// The vault entry aterm's helper hands back ([`crate::init_github::TOKEN_ENTRY`]) as `user`'s
+/// store holds it now: the digest of its bytes, or of its absence; `None` where it cannot be
+/// read, which no record is kept or reused on.
+fn entry_state(sys: &dyn System, user: &User) -> Option<[u8; 32]> {
+    crate::port::no_core_dumps();
+    let entry = sys
+        .vault_entry(Path::new(&user.home), crate::init_github::TOKEN_ENTRY)
+        .ok()?;
+    let mut state = aterm_digest::Sha256::new();
+    match entry {
+        Some(bytes) => {
+            state.update(b"held\0");
+            state.update(bytes.as_slice());
+        }
+        None => {
+            state.update(b"absent\0");
+        }
+    }
+    Some(state.finalize())
+}
+
+/// The SHA-256 of `bytes`.
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    let mut digest = aterm_digest::Sha256::new();
+    digest.update(bytes);
+    digest.finalize()
 }
 
 /// The two files the `git config --global` of an earlier `aterm init` could have written, in

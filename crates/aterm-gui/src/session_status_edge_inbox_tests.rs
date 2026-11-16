@@ -98,8 +98,8 @@ impl Bed {
     fn requested_at(&self) -> Option<Instant> {
         self.app
             .session_status
-            .agents
-            .get(&self.session)
+            .sessions
+            .agent(&self.session)
             .and_then(|w| w.resolved_at)
     }
 

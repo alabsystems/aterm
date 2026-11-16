@@ -127,19 +127,73 @@ mod native {
         )
     }
 
-    const SNAPSHOT: &str = r#"(() => {
+    /// The read of the mail page before each step: its address, the signed-in profile, whether
+    /// the inbox is up, a refusal its text shows (`credentials`) or a verification it asks for
+    /// (`verification`, which aterm treats as a check), and the check it carries: before the
+    /// inbox is up, [`browser::CHECK_PAGE_JS`]'s `checkPageOf()` (any widget, shown or not,
+    /// Proton's own captcha frame among them, and its `Human verification` heading); once it is
+    /// up, `mailboxCheckPageOf()`, which no message's subject or body can trip. It reads and
+    /// touches nothing.
+    fn snapshot_js() -> String {
+        format!(
+            r#"(() => {{
+      {check}
       const buttons=Array.from(document.querySelectorAll('button'));
       const profile=document.title.includes('@') ? document.title : buttons.map(b=>b.getAttribute('aria-label') || '').find(s=>s.includes('@')) || '';
       const ready=!!document.querySelector('[data-testid="sidebar:compose"]') || buttons.some(b=>/New message|Compose/.test(b.getAttribute('aria-label') || b.innerText));
-      let gate='';
-      if(!ready) {
-        const text=String(document.body?.innerText || '');
-        gate=/incorrect password|invalid credentials/i.test(text)?'credentials':
-          /verify.{0,20}(identity|account)|security check|human verification/i.test(text)?'verification':
-          Array.from(document.querySelectorAll('iframe[src*="captcha"], [data-testid*="captcha"]')).some(n=>n.getBoundingClientRect().width>100 && n.getBoundingClientRect().height>40)?'captcha':'';
-      }
-      return {url:location.href,profile,ready,gate};
-    })()"#;
+      const text=String(document.body?.innerText || '');
+      const gate=ready?'':/incorrect password|invalid credentials/i.test(text)?'credentials':
+        /verify.{{0,20}}(identity|account)|security check|human verification/i.test(text)?'verification':'';
+      return {{url:location.href,profile,ready,gate,check:ready?mailboxCheckPageOf():checkPageOf()}};
+    }})()"#,
+            check = browser::CHECK_PAGE_JS
+        )
+    }
+
+    /// The file in a mail browser profile that says its sign-in page carried a check
+    /// ([`check_met_error`]): aterm signs that profile in, renews it and relaunches it no more
+    /// on any clock, and only a person clears it, by removing the file.
+    const CHECK_MET_FILE: &str = "check-met";
+
+    /// The words every error about a met check ends with ([`check_met_error`], [`is_check_met`]).
+    const CHECK_MET_WORDS: &str = "aterm pressed nothing there and never tries to pass it";
+
+    /// The error a mail sign-in that met `check` ends with: its kind and name, never the page's
+    /// text.
+    fn check_met_error(check: &browser::CheckMet) -> String {
+        format!(
+            "Proton's sign-in page carries {}; {CHECK_MET_WORDS}",
+            check.named()
+        )
+    }
+
+    /// Whether `message` is a met check's error ([`check_met_error`]).
+    pub(super) fn is_check_met(message: &str) -> bool {
+        message.ends_with(CHECK_MET_WORDS)
+    }
+
+    /// The check a mail page answer names: a `check` word ([`browser::CheckMet::parse`]), a
+    /// `state` that is one with its `check` name, or a `verification` gate (a human check by
+    /// the general name).
+    fn answered_check(answer: &Value) -> Option<browser::CheckMet> {
+        if let Some(check) = answer
+            .get("check")
+            .and_then(Value::as_str)
+            .and_then(browser::CheckMet::parse)
+        {
+            return Some(check);
+        }
+        if let Some(state @ ("block_page" | "bot_check" | "human_check")) =
+            answer.get("state").and_then(Value::as_str)
+        {
+            return browser::CheckMet::of_value(&json!({
+                "kind": state,
+                "name": answer.get("check").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+        (answer.get("gate").and_then(Value::as_str) == Some("verification"))
+            .then(|| browser::CheckMet::HumanCheck("captcha".into()))
+    }
 
     pub struct Credentials<'a> {
         pub email: &'a str,
@@ -318,6 +372,25 @@ mod native {
             }))
         }
 
+        /// The error a profile whose sign-in page carried a check ([`CHECK_MET_FILE`]) ends with,
+        /// where it did.
+        fn check_held(profile: &Path) -> Option<String> {
+            let kind = std::fs::read_to_string(profile.join(CHECK_MET_FILE)).ok()?;
+            let check = browser::CheckMet::parse(kind.trim())
+                .unwrap_or_else(|| browser::CheckMet::HumanCheck("captcha".into()));
+            Some(check_met_error(&check))
+        }
+
+        /// Records that this profile's sign-in page carried `check`, held with no wait
+        /// ([`CHECK_MET_FILE`]), and answers its error.
+        fn met(&self, check: &browser::CheckMet) -> String {
+            let _ = crate::harness::atomic_write::write_atomic(
+                &self.profile_path.join(CHECK_MET_FILE),
+                &check.page_word(),
+            );
+            check_met_error(check)
+        }
+
         pub fn has_session(home: &Path, email: &str) -> bool {
             Self::profile_path(home, email)
                 .join("mail-session-ready")
@@ -355,6 +428,10 @@ mod native {
                 return Err("Mail operation deadline expired".into());
             }
             let profile = Self::profile_path(home, credentials.email);
+            // A profile whose sign-in page carried a check is not launched again.
+            if let Some(why) = Self::check_held(&profile) {
+                return Err(why);
+            }
             let executable = if end.is_some() {
                 browser::find_headless_browser(Some(home))
                     .ok_or("No headless browser installed for bounded mail connection")?
@@ -373,6 +450,10 @@ mod native {
         }
 
         fn authenticate(&mut self, mut progress: impl FnMut(&str)) -> Result<(), String> {
+            // A profile whose sign-in page carried a check is filled and pressed nothing more.
+            if let Some(why) = Self::check_held(&self.profile_path) {
+                return Err(why);
+            }
             let credentials = self
                 .credentials
                 .clone()
@@ -389,10 +470,15 @@ mod native {
                 if Instant::now() >= deadline {
                     return Err("Headless Proton sign-in did not reach the inbox".into());
                 }
-                let snapshot = self.evaluate(SNAPSHOT)?;
+                let snapshot = self.evaluate(&snapshot_js())?;
                 if snapshot.is_null() {
                     std::thread::sleep(self.within(Duration::from_millis(250))?);
                     continue;
+                }
+                // A check on the page ends the sign-in at once, with nothing on it touched, and
+                // holds the profile ([`CHECK_MET_FILE`]).
+                if let Some(check) = answered_check(&snapshot) {
+                    return Err(self.met(&check));
                 }
                 let page_url = snapshot["url"].as_str().unwrap_or("");
                 if !page_url.starts_with("https://mail.proton.me/")
@@ -432,19 +518,10 @@ mod native {
                         return Ok(());
                     }
                 }
-                if snapshot["ready"].as_bool() != Some(true) {
-                    match snapshot["gate"].as_str() {
-                        Some("credentials") => {
-                            return Err("Proton rejected the headless browser credentials".into());
-                        }
-                        Some("verification" | "captcha") => {
-                            return Err(
-                                "Proton requested additional verification in the headless browser"
-                                    .into(),
-                            );
-                        }
-                        _ => {}
-                    }
+                if snapshot["ready"].as_bool() != Some(true)
+                    && snapshot["gate"].as_str() == Some("credentials")
+                {
+                    return Err("Proton rejected the headless browser credentials".into());
                 }
                 let now = aterm_time::unix_secs().ok_or("Invalid system clock")?;
                 let totp = totp_secret.and_then(|secret| browser::generate_totp_at(secret, now));
@@ -453,6 +530,9 @@ mod native {
                     submitted,
                 );
                 let state = self.evaluate(&script)?;
+                if let Some(check) = answered_check(&state) {
+                    return Err(self.met(&check));
+                }
                 let phase = state["state"].as_str().unwrap_or("loading");
                 if phase != last_state {
                     progress(match phase {
@@ -805,7 +885,10 @@ mod native {
 
     pub(super) fn transport_error(message: String) -> aterm_mail::proton::ApiError {
         use aterm_mail::proton_error::Kind;
-        let kind = if message.contains("rejected the headless browser credentials") {
+        // A met check stops: nothing renews, retries or relaunches past it.
+        let kind = if is_check_met(&message) {
+            Kind::Refused
+        } else if message.contains("rejected the headless browser credentials") {
             Kind::Credentials
         } else if message.contains("verification") || message.contains("second factor") {
             Kind::Verification
@@ -853,6 +936,10 @@ mod native {
         fn renew(&mut self) -> Result<(), aterm_mail::proton::ApiError> {
             let mut run = || -> Result<(), String> {
                 let session = self.session()?;
+                // A profile whose sign-in page carried a check is not returned to.
+                if let Some(why) = HeadlessMail::check_held(&session.profile_path) {
+                    return Err(why);
+                }
                 session.api_headers.clear();
                 session.navigate("https://mail.proton.me/")?;
                 session.authenticate(|_| {})

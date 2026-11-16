@@ -32,7 +32,7 @@
 )]
 mod sdk_consts;
 
-use aterm_sysprobe::{identity, jobs, kproc, room, rusage};
+use aterm_sysprobe::{identity, jobs, kproc, room, rusage, self_cpu};
 
 /// Every table's rows.
 fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
@@ -42,6 +42,7 @@ fn rows() -> impl Iterator<Item = &'static (&'static str, i64)> {
         .chain(identity::SDK_ROWS)
         .chain(rusage::SDK_ROWS)
         .chain(room::SDK_ROWS)
+        .chain(self_cpu::SDK_ROWS)
         .chain(aterm_uds::holders::SDK_ROWS)
 }
 

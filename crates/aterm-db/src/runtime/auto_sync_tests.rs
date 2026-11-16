@@ -1193,7 +1193,7 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
     }
     let genesis_out = root.path().join("rt.genesis");
     test_sign_genesis(&m1, &genesis_out, &created.signer).unwrap();
-    let seeded_records = load_records(&m1).unwrap().encode();
+    let seeded_records = load_records(&m1).unwrap().read_encoded().unwrap();
     for p in [&m2, &m3, &m4] {
         save_records(p, &seeded_records).unwrap();
     }
@@ -1268,7 +1268,7 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
         Evidence::Phrase,
     )
     .unwrap();
-    save_records(&m5, &load_records(&m1).unwrap().encode()).unwrap();
+    save_records(&m5, &load_records(&m1).unwrap().read_encoded().unwrap()).unwrap();
 
     let (rt_a1, att_a1) = start_paths(&m1, "a1", port_a);
     let (rt_a5, att_a5) = start_paths(&m5, "a5", port_a);
@@ -1363,7 +1363,7 @@ fn two_loopback_islands_write_admit_and_remove_then_join_and_match_inventories()
             closed.extend(aterm_secrets::client::vault_pass_at(paths, at).unwrap());
         }
         for from in holders {
-            let records = load_records(from).unwrap().encode();
+            let records = load_records(from).unwrap().read_encoded().unwrap();
             for to in holders {
                 save_records(to, &records).unwrap();
             }

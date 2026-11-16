@@ -447,7 +447,7 @@ pub(super) fn how_it_ended(
         }
         (Renewal::BotCheck | Renewal::NeedsPerson, Some(met)) => met,
         (Renewal::BotCheck, None) => {
-            "it met Cloudflare's bot check, which did not clear".to_owned()
+            "it met Cloudflare's bot check; aterm pressed nothing there".to_owned()
         }
         (Renewal::NeedsPerson, None) => "its page waited on a person".to_owned(),
         (Renewal::Deferred, met) => {
@@ -807,6 +807,7 @@ impl Ladder {
     /// What the vault's last refresh found, where it started no earlier than `since`, has
     /// ended, and no observed change has made it stale since: a reading of the vault fresher
     /// than `since` (plan package FL-138's token upkeep reads one before it makes a token).
+    #[cfg(unix)] // read by the unix-only token upkeep (`accounts_sync::upkeep_tokens`)
     pub(super) fn vault_seen_since(&self, since: Instant) -> Option<Vault> {
         self.vault
             .as_ref()
@@ -979,6 +980,7 @@ pub(super) fn spaced_until(
 
 /// What [`space_token_capture`] found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(unix)] // read by the unix-only token upkeep (`accounts_sync::upkeep_tokens`)
 pub(super) enum TokenSpacing {
     /// The capture may start now: its start is this Mac's last sign-in start.
     Started,
@@ -996,6 +998,7 @@ pub(super) enum TokenSpacing {
 /// [`SPACING_S`] holds it ([`spaced_until`]), and its own start is recorded as this Mac's last.
 /// Both are read and written under the sign-in lock, taken without waiting and let go before
 /// the capture runs: a token is made under its account's lock, never `signin.lock`.
+#[cfg(unix)] // read by the unix-only token upkeep (`accounts_sync::upkeep_tokens`)
 pub(super) fn space_token_capture(
     store: &super::accounts::Store,
     label: &str,

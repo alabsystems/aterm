@@ -28,6 +28,12 @@ pub(crate) enum Mutant {
     /// Read an acknowledged log of another lineage as one with no Commons epoch, nothing to
     /// judge by, as `trusted_commons_log`'s `Ok(None)` did for both before PF4.
     LineageIsNoJudgement,
+    /// Read `atdb/7`'s ALPN as `atdb/8`, so this build speaks `atdb/8`'s range-reconciled control
+    /// and membership frames to a peer that speaks `atdb/7`'s whole lists.
+    RangesOnReconcile,
+    /// Reconcile the control journal by range alone on `atdb/8`, with no update chain agreed by
+    /// its frontier first, as a store with no causal chains does.
+    ControlRangesOnly,
 }
 
 thread_local! {

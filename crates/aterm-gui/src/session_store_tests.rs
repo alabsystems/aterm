@@ -1430,10 +1430,10 @@ fn attributed_deregister_records_reason_actor_clock_and_exit_code() {
     store.register(h.clone());
     let before = crate::turn_ledger::now_ms();
     store.note_exit_code(7, Some(3));
-    assert_eq!(
-        store.deregister_local_as(7, ExitReason::CtlClose, ExitActor::Sid("s-caller".into())),
-        Some(h.sid.clone())
-    );
+    let closed = store
+        .deregister_closing(7, ExitReason::CtlClose, ExitActor::Sid("s-caller".into()))
+        .expect("a close");
+    assert_eq!(closed.sid, h.sid);
     let rec = store
         .roster_since(0)
         .find(|r| r.change == RosterChange::Exited)
@@ -1442,14 +1442,12 @@ fn attributed_deregister_records_reason_actor_clock_and_exit_code() {
     assert_eq!(rec.sid, sid);
     assert_eq!(rec.local_id, 7);
     assert_eq!(rec.reason, ExitReason::CtlClose);
-    // The closer and the code are the closed index's (6G-9).
-    let exit = store
-        .closed_logs()
-        .exits_since(0)
-        .next()
-        .expect("the close was indexed");
-    assert_eq!((exit.seq, exit.t_ms), (rec.seq, rec.t_ms));
-    assert_eq!(exit.actor, ExitActor::Sid("s-caller".into()));
+    // The closer and the code are the close's, which its row in the session table keeps (6G-9,
+    // ST-15).
+    assert_eq!(closed.exit_seq, Some(rec.seq));
+    let exit = closed.ended.expect("the close's end");
+    assert_eq!((exit.local, exit.out), (7, ExitReason::CtlClose));
+    assert_eq!(exit.by, ExitActor::Sid("s-caller".into()));
     assert_eq!(exit.exit_code, Some(3));
     assert!(
         rec.t_ms >= before && rec.t_ms <= crate::turn_ledger::now_ms(),
@@ -1479,12 +1477,15 @@ fn unattributed_deregister_infers_shell_exit_from_the_exited_state_only() {
     let alive = handle(2, None);
     store.register(exited.clone());
     store.register(alive.clone());
-    store.deregister_local(1);
-    store.deregister_local(2);
-    let reasons: Vec<(String, ExitReason, ExitActor)> = store
-        .closed_logs()
-        .exits_since(0)
-        .map(|e| (e.sid.as_str().to_string(), e.reason, e.actor.clone()))
+    let reasons: Vec<(String, ExitReason, ExitActor)> = [1, 2]
+        .into_iter()
+        .map(|local| {
+            let closed = store
+                .deregister_closing(local, ExitReason::Unknown, ExitActor::Unknown)
+                .expect("a close");
+            let end = closed.ended.expect("its end");
+            (closed.sid.as_str().to_string(), end.out, end.by)
+        })
         .collect();
     assert_eq!(
         reasons,
@@ -1519,30 +1520,31 @@ fn unattributed_deregister_infers_shell_exit_from_the_exited_state_only() {
 fn an_explicit_reason_outranks_the_exited_state() {
     let mut store = SessionStore::default();
     store.register(handle_in_state(4, None, SessionState::Exited));
-    store.deregister_local_as(4, ExitReason::UiClose, ExitActor::Human);
-    let rec = store.closed_logs().exits_since(0).next().unwrap();
-    assert_eq!(
-        (rec.reason, &rec.actor),
-        (ExitReason::UiClose, &ExitActor::Human)
-    );
+    let rec = store
+        .deregister_closing(4, ExitReason::UiClose, ExitActor::Human)
+        .and_then(|closed| closed.ended)
+        .expect("its end");
+    assert_eq!((rec.out, &rec.by), (ExitReason::UiClose, &ExitActor::Human));
 }
 
 #[test]
 fn a_noted_exit_code_is_consumed_exactly_once() {
     let mut store = SessionStore::default();
+    let code_of = |store: &mut SessionStore| {
+        store
+            .deregister_closing(9, ExitReason::Unknown, ExitActor::Unknown)
+            .and_then(|closed| closed.ended)
+            .expect("its end")
+            .exit_code
+    };
     store.register(handle(9, None));
     store.note_exit_code(9, None);
-    store.deregister_local(9);
+    let mut codes = vec![code_of(&mut store)];
     store.register(handle(9, None));
     store.note_exit_code(9, Some(7));
-    store.deregister_local(9);
+    codes.push(code_of(&mut store));
     store.register(handle(9, None));
-    store.deregister_local(9);
-    let codes: Vec<Option<i32>> = store
-        .closed_logs()
-        .exits_since(0)
-        .map(|e| e.exit_code)
-        .collect();
+    codes.push(code_of(&mut store));
     assert_eq!(codes, vec![None, Some(7), None]);
 }
 
@@ -1550,10 +1552,11 @@ fn a_noted_exit_code_is_consumed_exactly_once() {
 fn attributed_exits_stay_bounded_and_page_by_seq() {
     let mut store = SessionStore::default();
     let n = ROSTER_JOURNAL_CAP as u64 + 5;
+    let mut last = None;
     for i in 0..n {
         store.register(handle(i, None));
         store.note_exit_code(i, Some(i32::try_from(i % 256).unwrap()));
-        store.deregister_local_as(i, ExitReason::CtlClose, ExitActor::Sid(format!("s-{i}")));
+        last = store.deregister_closing(i, ExitReason::CtlClose, ExitActor::Sid(format!("s-{i}")));
     }
     let exits: Vec<&RosterRecord> = store
         .roster_since(0)
@@ -1562,13 +1565,10 @@ fn attributed_exits_stay_bounded_and_page_by_seq() {
     assert_eq!(exits.len(), ROSTER_JOURNAL_CAP / 2);
     let newest = exits.last().unwrap();
     assert_eq!(newest.seq, store.roster_seq());
-    let indexed = store
-        .closed_logs()
-        .exits_since(0)
-        .next_back()
-        .expect("the newest close is indexed");
-    assert_eq!(indexed.seq, newest.seq);
-    assert_eq!(indexed.actor, ExitActor::Sid(format!("s-{}", n - 1)));
+    let last = last.expect("the newest close");
+    assert_eq!(last.exit_seq, Some(newest.seq));
+    let indexed = last.ended.expect("its end");
+    assert_eq!(indexed.by, ExitActor::Sid(format!("s-{}", n - 1)));
     assert_eq!(
         indexed.exit_code,
         Some(i32::try_from((n - 1) % 256).unwrap())

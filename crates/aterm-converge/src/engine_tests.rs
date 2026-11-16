@@ -1750,3 +1750,172 @@ fn every_row_carries_the_time_the_engine_spent_on_it() {
         assert_eq!(streamed, expected, "{mode:?}");
     }
 }
+
+/// An item that logs its probes, its applies and the end of its row ([`Item::row_ended`]).
+struct Ends {
+    id: &'static str,
+    probes: std::sync::Mutex<Vec<Probe>>,
+    activation: Option<Arc<Relaunch>>,
+    events: Events,
+}
+
+impl Ends {
+    fn new(
+        id: &'static str,
+        probes: Vec<Probe>,
+        events: &Events,
+        activation: Option<&Arc<Relaunch>>,
+    ) -> Self {
+        Self {
+            id,
+            probes: std::sync::Mutex::new(probes),
+            activation: activation.cloned(),
+            events: Arc::clone(events),
+        }
+    }
+
+    fn log(&self, what: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{what} {}", self.id));
+    }
+}
+
+impl Item for Ends {
+    fn id(&self) -> String {
+        self.id.into()
+    }
+    fn family(&self) -> &'static str {
+        "test"
+    }
+    fn layer(&self) -> Layer {
+        Layer::Workstation
+    }
+    fn class(&self) -> Class {
+        Class::Preference
+    }
+    fn title(&self) -> String {
+        self.id.into()
+    }
+    fn probe(&self) -> Probe {
+        self.log("probe");
+        let mut probes = self.probes.lock().unwrap();
+        if probes.len() > 1 {
+            probes.remove(0)
+        } else {
+            probes[0].clone()
+        }
+    }
+    fn apply(&self) -> Result<(), String> {
+        self.log("apply");
+        Ok(())
+    }
+    fn explain(&self, probe: &Probe) -> Explain {
+        explained(probe)
+    }
+    fn activation(&self) -> Option<Arc<dyn Activation + '_>> {
+        self.activation
+            .clone()
+            .map(|activation| activation as Arc<dyn Activation>)
+    }
+    fn row_ended(&self) {
+        self.log("ended");
+    }
+}
+
+/// The engine ends each row once it is done with it ([`Item::row_ended`]), whatever became of
+/// the change its probe found, so an item can let go of what that probe kept for an apply that
+/// never came (a lease on a lock other runs wait for): after the read-back of a change it made,
+/// and at once for a change held back, one standing aside, one the journal refused, and one only
+/// planned. Each row ends once, before the caller sees it. NEGATIVE CONTROL: a row awaiting an
+/// activation is not ended at its apply; it ends only after the activation ran and its
+/// read-back read it, as the made row ends only after its own read-back.
+#[test]
+fn the_engine_ends_each_row_after_the_last_thing_it_does_with_it() {
+    let events = Events::default();
+    let dock = relaunch("relaunch.dock", &events);
+    let lock = StoodAside::Lock("another pass holds the lock".into());
+    let mut items: Vec<Box<dyn Item>> = vec![Box::new(Ends::new(
+        "made",
+        vec![change(), ok()],
+        &events,
+        None,
+    ))];
+    items.extend(crate::scope::held_back(
+        vec![Box::new(Ends::new("held", vec![change()], &events, None))],
+        "held for the test",
+    ));
+    items.extend(crate::scope::standing_aside(
+        vec![Box::new(Ends::new("aside", vec![change()], &events, None))],
+        &lock,
+    ));
+    items.push(Box::new(Ends::new(
+        "refused",
+        vec![change()],
+        &events,
+        None,
+    )));
+    items.push(Box::new(Ends::new(
+        "activated",
+        vec![change(), ok()],
+        &events,
+        Some(&dock),
+    )));
+    let rows = recorded(&items, Mode::Apply, &events, &["refused"]);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.id.as_str(), row.outcome))
+            .collect::<Vec<_>>(),
+        [
+            ("made", Outcome::Changed),
+            ("held", Outcome::Blocked),
+            ("aside", Outcome::Blocked),
+            ("refused", Outcome::Failed),
+            ("activated", Outcome::Changed),
+        ]
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "probe made",
+            "journal made",
+            "apply made",
+            "probe made",
+            "ended made",
+            "row made",
+            "probe held",
+            "ended held",
+            "row held",
+            "probe aside",
+            "ended aside",
+            "row aside",
+            "probe refused",
+            "ended refused",
+            "row refused",
+            "probe activated",
+            "journal activated",
+            "apply activated",
+            "pending relaunch.dock",
+            "journal relaunch.dock",
+            "activate relaunch.dock",
+            "probe activated",
+            "ended activated",
+            "row activated",
+        ]
+    );
+    // A plan makes nothing and ends the row it planned.
+    events.lock().unwrap().clear();
+    let planned: Vec<Box<dyn Item>> = vec![Box::new(Ends::new(
+        "planned",
+        vec![change()],
+        &events,
+        None,
+    ))];
+    let rows = recorded(&planned, Mode::Plan, &events, &[]);
+    assert_eq!(rows[0].outcome, Outcome::Planned, "{rows:?}");
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["probe planned", "ended planned", "row planned"]
+    );
+}

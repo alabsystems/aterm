@@ -5,7 +5,10 @@
 //! replace the TUI record requirement; account policy remains the shared pool's.
 //! A selected proposal is not a commit, launcher capability or execution grant.
 //! A tab keeps one preparation and one operation for each process that asks
-//! ([`ProcessKey`]), so no run's handoff takes another run's place.
+//! ([`ProcessKey`]), so no run's handoff takes another run's place. Its reads
+//! run under the asking process's read pace, the one `codex-rotation` keeps for
+//! that process too ([`renewal::observe_paced`]), to which every request of the
+//! lane is noted: `prepare`, `arm` and each verb of the operation it armed.
 
 use super::*;
 use aterm_agent::harness::{
@@ -14,6 +17,7 @@ use aterm_agent::harness::{
     codex_exec_handoff::{ExecCommand, ExecSource},
     codex_renewal, codex_rotation,
 };
+use renewal::ProcessKey;
 use std::collections::BTreeSet;
 use std::time::Instant;
 
@@ -72,36 +76,6 @@ fn no_wall_stands(reads: u32) -> Duration {
     }
 }
 
-/// A process as its tab keeps its exec handoff ([`Table`]): its pid and kernel birth. A
-/// same-PID execve keeps both, so the successor a move execs is still the process that armed it,
-/// and a pid the kernel gives a later process is another key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct ProcessKey {
-    pid: u32,
-    birth: u64,
-}
-
-impl ProcessKey {
-    fn of(process: &Process) -> Self {
-        Self {
-            pid: process.pid,
-            birth: process.birth,
-        }
-    }
-
-    /// Whether the kernel shows this process gone: its pid absent or exited, or held by a
-    /// process of another birth. A read that fails shows nothing, and the process is not gone.
-    fn gone(self) -> bool {
-        let pid = i32::try_from(self.pid).unwrap_or(-1);
-        aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 != self.birth)
-            || matches!(
-                aterm_uds::process::process_presence(pid),
-                aterm_uds::process::ProcessPresence::Absent
-                    | aterm_uds::process::ProcessPresence::Exited
-            )
-    }
-}
-
 #[derive(Debug)]
 struct Preparation {
     source: ExecSource,
@@ -119,9 +93,9 @@ struct Preparation {
 
 #[derive(Debug)]
 enum Progress {
-    /// A read is out. Before it, this many reads in a row of the wait it was started in said
-    /// there is no wall to leave.
-    Reading(u32),
+    /// A read is out, started at the time this holds. Before it, this many reads in a row of the
+    /// wait it was started in said there is no wall to leave.
+    Reading(u32, Instant),
     Retry(Instant),
     NotNeeded(NoneComing),
     Selected(Box<codex_rotation::Proposal<ExecCommand>>, Instant),
@@ -508,20 +482,36 @@ fn forget_gone(native: &Mutex<Operations>) {
 }
 
 /// What an ask at `now` is answered from its job's progress, and whether it starts a read of the
-/// session's login, which [`ask`] does once the progress is unlocked.
+/// session's login, which [`ask`] does once the progress is unlocked. A read that is out answers
+/// `waiting` and starts none, until it has been out for longer than [`renewal::READ_LAPSES`]: it
+/// is then taken for one that will not end, and the ask starts another in its place, of the same
+/// wait.
 fn answer(progress: &mut Progress, intent: &codex_renewal::Intent, now: Instant) -> (String, bool) {
     match progress {
-        Progress::Reading(_) => (WAITING.into(), false),
+        Progress::Reading(_, since)
+            if now.saturating_duration_since(*since) <= renewal::READ_LAPSES =>
+        {
+            (WAITING.into(), false)
+        }
+        Progress::Reading(earlier, _) => {
+            aterm_log::warn!(
+                "codex exec handoff: a read has been out for longer than {:?}; it is taken for \
+                 one that will not end, and another starts",
+                renewal::READ_LAPSES
+            );
+            *progress = Progress::Reading(*earlier, now);
+            (WAITING.into(), true)
+        }
         Progress::Retry(at) if now < *at => (WAITING.into(), false),
         Progress::Retry(_) => {
-            *progress = Progress::Reading(0);
+            *progress = Progress::Reading(0, now);
             (WAITING.into(), true)
         }
         Progress::NotNeeded(none) => {
             if none.stands(now) {
                 return (NOT_NEEDED.into(), false);
             }
-            *progress = Progress::Reading(none.reads);
+            *progress = Progress::Reading(none.reads, now);
             (WAITING.into(), true)
         }
         Progress::Selected(proposal, observed)
@@ -548,13 +538,14 @@ fn answer(progress: &mut Progress, intent: &codex_renewal::Intent, now: Instant)
 }
 
 /// Answer an ask at `now` from its job's progress and, where that answer starts a read of the
-/// session's login, run `read`, once and with the progress unlocked: a read that cannot start
+/// session's login, run `read`, once and with the progress unlocked, with `now`, the time the
+/// read is out from, by which its answer is written ([`observed`]): a read that cannot start
 /// writes the progress itself.
 fn ask(
     progress: &Mutex<Progress>,
     intent: &codex_renewal::Intent,
     now: Instant,
-    read: impl FnOnce(),
+    read: impl FnOnce(Instant),
 ) -> String {
     let (reply, starts) = answer(
         &mut progress.lock().unwrap_or_else(|p| p.into_inner()),
@@ -562,9 +553,25 @@ fn ask(
         now,
     );
     if starts {
-        read();
+        read(now);
     }
     reply
+}
+
+/// The job's `progress` once the read it started at `since` came back at `now` with `result`
+/// ([`progress_after_observation`]): written only while that read is still the one out. A read
+/// [`answer`] took for one that will not end and started another in place of changes nothing
+/// should it end after all.
+fn observed(
+    progress: &mut Progress,
+    since: Instant,
+    result: Result<Option<codex_rotation::Proposal<ExecCommand>>, &'static str>,
+    current: bool,
+    now: Instant,
+) {
+    if matches!(progress, Progress::Reading(_, at) if *at == since) {
+        *progress = progress_after_observation(progress, result, current, now);
+    }
 }
 
 /// The job's progress once the read `before` was waiting on came back at `now`; `current` says
@@ -584,7 +591,7 @@ fn progress_after_observation(
             Some(end) => {
                 aterm_log::info!("codex exec handoff: none is coming: {}", end.as_str());
                 let earlier = match before {
-                    Progress::Reading(earlier) => *earlier,
+                    Progress::Reading(earlier, _) => *earlier,
                     _ => 0,
                 };
                 Progress::NotNeeded(NoneComing {
@@ -634,6 +641,18 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
             return NOT_NEEDED.into();
         }
     };
+    serve_captured(ctx, (proof, source, env), intent)
+}
+
+/// A `prepare` of `intent` by the claimed process `proof`, captured as `source`, served in `env`:
+/// everything the lane decides once the process is captured. Every such ask is one of its
+/// process's series, whatever it is answered ([`renewal::note_ask`]).
+fn serve_captured(
+    ctx: &Arc<crate::SessionCtx>,
+    (proof, source, env): (crate::self_claim::Proven, ExecSource, Env),
+    intent: codex_renewal::Intent,
+) -> String {
+    renewal::note_ask(ctx, ProcessKey::of(&source.process), env.now);
     if ctx.fabric.hold().is_some() || !renewal::human_grace_ready(ctx, &env) {
         return WAITING.into();
     }
@@ -666,22 +685,32 @@ pub(crate) fn serve(ctx: &Arc<crate::SessionCtx>, master: i32, line: &str) -> St
         .job_for(asked);
     drop(meta);
     let reader = Arc::clone(&job);
-    ask(&job.progress, &job.intent, Instant::now(), move || {
-        start(ctx, env, reader);
+    ask(&job.progress, &job.intent, Instant::now(), move |since| {
+        start(ctx, env, reader, since);
     })
 }
 
-fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
+/// Start `job`'s read, the one its ask started at `since`.
+fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>, since: Instant) {
     let weak = Arc::downgrade(ctx);
     let roots = ctx.native_policy.quota_fixture_roots();
+    let reader = Arc::clone(&job);
     let worker = Arc::clone(&job);
-    if std::thread::Builder::new()
-        .name("codex-exec-quota-probe".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                renewal::observe_exec(&env, &worker.mover, &worker.source, &worker.intent, roots)
-            }))
-            .unwrap_or(Err("probe-panicked"));
+    if renewal::observe_paced(
+        ctx,
+        "codex-exec-quota-probe",
+        ProcessKey::of(&job.source.process),
+        move |pace| {
+            renewal::observe_exec(
+                &env,
+                &reader.mover,
+                &reader.source,
+                &reader.intent,
+                roots,
+                pace,
+            )
+        },
+        move |result| {
             let current = weak.upgrade().is_some_and(|ctx| {
                 let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
                 let authority = meta.supervisor_authority(crate::metrics::now_us());
@@ -698,10 +727,16 @@ fn start(ctx: &Arc<crate::SessionCtx>, env: Env, job: Arc<Preparation>) {
                         .exec
                         .holds(&worker)
             });
-            let mut progress = worker.progress.lock().unwrap_or_else(|p| p.into_inner());
-            *progress = progress_after_observation(&progress, result, current, Instant::now());
-        })
-        .is_err()
+            observed(
+                &mut worker.progress.lock().unwrap_or_else(|p| p.into_inner()),
+                since,
+                result,
+                current,
+                Instant::now(),
+            );
+        },
+    )
+    .is_err()
     {
         *job.progress.lock().unwrap_or_else(|p| p.into_inner()) =
             Progress::Retry(Instant::now() + Duration::from_secs(5));

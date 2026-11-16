@@ -151,11 +151,16 @@ fn a_program_is_no_claude_code_only_where_its_image_and_record_were_read() {
 /// `claude_program_by` naming the program from one layout read and classifying its refusal
 /// from a second, a layout that fails once and then answers that it is Claude Code's gives
 /// `not-claude`, and the read count is 2. CONTROLS: the layout read and answering is the
-/// program, or `not-claude`; an image or record unread keeps its own code.
+/// program, or `not-claude`; an image or record unread keeps its own code. The install is
+/// absolute as this platform spells a path (a kernel names a process's image so), on no disk.
 #[test]
 fn a_layout_not_read_is_never_the_answer_that_a_program_is_no_claude_code() {
-    let native = Path::new("/s/home/.local/share/claude/versions");
-    let image = Path::new("/s/home/.local/share/claude/versions/2.1.399");
+    let root = if cfg!(windows) { r"C:\s" } else { "/s" };
+    let native: PathBuf = [root, "home", ".local", "share", "claude", "versions"]
+        .iter()
+        .collect();
+    let image = native.join("2.1.399");
+    let (native, image) = (native.as_path(), image.as_path());
     let argv = words(&["claude", "--verbose"]);
     // A layout that fails its first read and answers every later one with `then`.
     let program = |registered: Result<bool, NotRead>, then: bool| {

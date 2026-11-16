@@ -84,11 +84,12 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
   import --compare-sheet <csv>\n\
                     what importing the sheet would do, by count, key and column, and how its\n\
                     password flags meet the registry's secret cells: never a value\n\
-  check             preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
+  check [--tsv]     preferences, labels, logins, aliases and mailboxes, then every conflict,\n\
                     dangling\n\
                     reference and unique clash, what this Mac's self-registration decides\n\
                     now and why (registration; its findings join lab), writing nothing, and\n\
-                    whether this Mac's journal is on\n\
+                    whether this Mac's journal is on. --tsv prints each finding of lab and\n\
+                    findings in words, a line each\n\
   adopt [--dry-run|--apply] [--findings]\n\
                     bind the Macs the vault's swarm roster names to their machine rows, by fleet\n\
                     node, host, then label or alias; never births a row. --findings lists each\n\
@@ -174,6 +175,8 @@ pub fn main_entry(words: &[String], vendors: Option<&dyn Vendors>) -> ExitCode {
     };
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     match run(&paths, words, vendors, &mut amacs_wait, now_ms) {
+        // `check --tsv`: its lines, printed as they are.
+        Ok(Value::String(text)) => aterm_uds::stdout::answer_exit("aterm db alab", &text, 0),
         Ok(value) => match aterm_json::to_string(&value) {
             Ok(text) => aterm_uds::stdout::answer_exit(
                 "aterm db alab",
@@ -238,6 +241,8 @@ fn exit_of(report: &Value) -> u8 {
 
 #[derive(Default)]
 struct Args {
+    /// `check --tsv`: each finding in words, a line each.
+    tsv: bool,
     apply: bool,
     dry_run: bool,
     review: bool,
@@ -372,6 +377,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
             }
             ("import", "--digest") => args.digest = true,
+            ("check", "--tsv") => args.tsv = true,
             ("import", "--compare-sheet") => {
                 if args.compare.is_some() {
                     return Err(Error::new("duplicate --compare-sheet"));
@@ -595,34 +601,12 @@ pub fn run_io(
             };
             // No import has run where no source row is: what `check` reads is the Macs' own rows.
             let imported = !view.project(&registry::SOURCE).rows.is_empty();
-            // Two live phone rows whose numbers are one number, by key only: a number as the
-            // generation here holds it, a sealed one opened to be compared. Where none opens
-            // (this Mac holds no key of the table), no duplicate is named.
-            let phone = handle.compiled().collection(PHONE.name)?;
-            let numbers =
-                att::open_ordinary(&handle, phone, "number", &view.cells).unwrap_or_default();
-            let duplicates = duplicate_numbers(&view.project(phone), &numbers);
-            let (mut lab, generic) = checks::lab(handle.compiled().table, &view.cells);
-            lab.extend(checks::facts(
-                view.owned
-                    .get(registry::MACHINE_FACTS.name)
-                    .unwrap_or(&Default::default()),
-                &Registry::at(paths.clone()).live_uuids()?,
-                &view.project(&MACHINE),
-            ));
-            lab.extend(checks::mailbox_obs(
-                view.owned
-                    .get(registry::MAILBOX_OBS.name)
-                    .unwrap_or(&Default::default()),
-                &view.project(&registry::ADDRESS),
-                &view.project(&registry::MAILBOX),
-            ));
-            lab.extend(checks::account_obs(
-                view.owned
-                    .get(registry::ACCOUNT_OBS.name)
-                    .unwrap_or(&Default::default()),
-                &view.project(&registry::ACCOUNT),
-            ));
+            let Checked {
+                mut lab,
+                seen,
+                duplicates,
+                findings,
+            } = checked(paths, &handle, &view, &usage)?;
             let registration = match vendors.and_then(|vendors| vendors.this_mac()) {
                 None => Value::Null,
                 Some(mac) => {
@@ -642,36 +626,18 @@ pub fn run_io(
             });
             // The generated exports against what this Mac's verified store holds (design §7).
             let exports = super::export::check(paths, vendors, now_ms / 1000);
-            let table = handle.compiled().table;
-            let mut findings: Vec<Value> = generic.iter().map(att::command::finding_json).collect();
-            findings.extend(
-                att::capacity(table, &view, &usage)
-                    .iter()
-                    .map(|found| att::command::capacity_json(table, found, &usage.actor)),
-            );
-            // A later generation whose sealed tokens do not open under its key
-            // (`roll::Registry::unopened`); named by id, never a value.
-            findings.extend(
-                Registry::at(paths.clone())
-                    .unopened()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(unopened_json),
-            );
+            let lab = lab_json(&lab, &seen, &duplicates);
+            if args.tsv {
+                let mut all = lab;
+                all.extend(findings);
+                return Ok(Value::String(att::command::tsv(&all)));
+            }
             Ok(json!({
                 "complete": view.complete,
                 "refused": view.refused.iter().map(|id| aterm_codec::hex::encode_lower(id)).collect::<Vec<_>>(),
                 "registry": if imported { "imported" } else { "not imported" },
                 "next": (!imported).then_some("aterm db alab import --dry-run, then --apply"),
-                "lab": lab.iter().map(|f| json!({
-                    "finding": f.kind,
-                    "collection": f.collection,
-                    "pks": f.pks.iter().map(|pk| att::command::safe_key(pk)).collect::<Vec<_>>(),
-                })).chain(duplicates.iter().map(|pks| json!({
-                    "finding": "duplicate-number",
-                    "collection": PHONE.name,
-                    "pks": pks,
-                }))).collect::<Vec<_>>(),
+                "lab": lab,
                 "findings": findings,
                 "registration": registration,
                 "journal": journal,
@@ -685,6 +651,141 @@ pub fn run_io(
         "prefer" | "unprefer" => prefer(paths, &args, verb == "prefer", now_ms),
         _ => Err(Error::new("unknown alab verb (see `aterm db alab --help`)")),
     }
+}
+
+/// What `aterm db alab check` finds of the registry as `view` (with its `usage`) holds it, apart
+/// from this Mac's registration preview, which reads this Mac's own probe.
+pub struct Checked {
+    /// The lab's rules ([`checks::lab`], [`checks::facts`], [`checks::mailbox_obs`],
+    /// [`checks::account_obs`]).
+    pub lab: Vec<checks::Finding>,
+    /// [`checks::observed`] over this Mac's kept sightings, each with the line that says which
+    /// logins it means.
+    pub seen: Vec<checks::Seen>,
+    /// Live phone rows whose numbers are one number, by key.
+    pub duplicates: Vec<Vec<String>>,
+    /// The table's own findings as `check` reports them: every conflict, dangling reference,
+    /// unique clash and value this build cannot read, each collection whose Macs state different
+    /// versions of its columns, then what the table's capacity asks, then each later generation
+    /// whose sealed tokens do not open: every finding `aterm db table check` reports, and more.
+    pub findings: Vec<Value>,
+}
+
+/// [`Checked`] of the registry `handle` reads at `paths`, as `view` and `usage` hold it: what
+/// `aterm db alab check` reports and the Tables page's Check view lists, each read once here.
+///
+/// # Errors
+/// The registry's members or its phone table cannot be read.
+pub fn checked(
+    paths: &Paths,
+    handle: &Handle,
+    view: &att::View,
+    usage: &att::Usage,
+) -> Result<Checked> {
+    // Two live phone rows whose numbers are one number, by key only: a number as the
+    // generation here holds it, a sealed one opened to be compared. Where none opens (this Mac
+    // holds no key of the table), no duplicate is named.
+    let phone = handle.compiled().collection(PHONE.name)?;
+    let numbers = att::open_ordinary(handle, phone, "number", &view.cells).unwrap_or_default();
+    let duplicates = duplicate_numbers(&view.project(phone), &numbers);
+    let table = handle.compiled().table;
+    let (mut lab, generic) = checks::lab(table, &view.cells);
+    lab.extend(checks::facts(
+        view.owned
+            .get(registry::MACHINE_FACTS.name)
+            .unwrap_or(&Default::default()),
+        &Registry::at(paths.clone()).live_uuids()?,
+        &view.project(&MACHINE),
+    ));
+    lab.extend(checks::mailbox_obs(
+        view.owned
+            .get(registry::MAILBOX_OBS.name)
+            .unwrap_or(&Default::default()),
+        &view.project(&registry::ADDRESS),
+        &view.project(&registry::MAILBOX),
+    ));
+    lab.extend(checks::account_obs(
+        view.owned
+            .get(registry::ACCOUNT_OBS.name)
+            .unwrap_or(&Default::default()),
+        &view.project(&registry::ACCOUNT),
+    ));
+    // What this Mac saw or used against what the registry holds: its kept sightings
+    // (`observe::kept`), each a registry row and one of this Mac's own `account-obs` rows.
+    let seen = match super::observe::kept::local() {
+        Some(dir) => {
+            let now_ms = aterm_time::unix_millis().unwrap_or(0);
+            let uuid = Registry::at(paths.clone()).own_uuid().ok();
+            checks::observed(
+                &super::observe::kept::load(&dir).observed(now_ms),
+                uuid.as_deref(),
+                &view.cells,
+                view.owned
+                    .get(registry::ACCOUNT_OBS.name)
+                    .unwrap_or(&Default::default()),
+                now_ms,
+            )
+        }
+        None => Vec::new(),
+    };
+    let mut findings: Vec<Value> = generic.iter().map(att::command::finding_json).collect();
+    // A collection whose Macs state different versions of its columns, as `aterm db table
+    // check` reports it.
+    findings.extend(att::command::schema_findings(table, view));
+    findings.extend(
+        att::capacity(table, view, usage)
+            .iter()
+            .map(|found| att::command::capacity_json(table, found, &usage.actor)),
+    );
+    // A later generation whose sealed tokens do not open under its key
+    // (`roll::Registry::unopened`); named by id, never a value.
+    findings.extend(
+        Registry::at(paths.clone())
+            .unopened()
+            .unwrap_or_default()
+            .iter()
+            .map(unopened_json),
+    );
+    Ok(Checked {
+        lab,
+        seen,
+        duplicates,
+        findings,
+    })
+}
+
+/// The lab's findings as `check` reports them, each row by its safe key, then what this Mac saw
+/// that the registry does not hold, each with the `line` that says which logins it means, then
+/// the phone rows that hold one number.
+pub fn lab_json(
+    lab: &[checks::Finding],
+    seen: &[checks::Seen],
+    duplicates: &[Vec<String>],
+) -> Vec<Value> {
+    let finding = |f: &checks::Finding| {
+        json!({
+            "finding": f.kind,
+            "collection": f.collection,
+            "pks": f.pks.iter().map(|pk| att::command::safe_key(pk)).collect::<Vec<_>>(),
+        })
+    };
+    lab.iter()
+        .map(finding)
+        .chain(seen.iter().map(|s| {
+            let mut out = finding(&s.finding);
+            if let Some(object) = out.as_object_mut() {
+                object.insert("line".into(), Value::from(s.line.as_str()));
+            }
+            out
+        }))
+        .chain(duplicates.iter().map(|pks| {
+            json!({
+                "finding": "duplicate-number",
+                "collection": PHONE.name,
+                "pks": pks,
+            })
+        }))
+        .collect()
 }
 
 /// `check`'s finding for a later registry generation whose `Secret` tokens do not open under its

@@ -1,0 +1,24 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# alab-policy: the deciders every ALab harness shares, moved out of aterm's
+# supervisor (aterm's harness interface design, section 3). HX-21 makes it the
+# one copy of aterm's own alab-policy crate: aterm vendors a tag of it in that
+# crate's place, and claude-code-alab takes aterm's relay of the copy. sleeps,
+# git_config and claude_code are not the one copy yet: aterm-agent keeps its
+# own whole copies of them until HX-21c's aterm half (src/lib.rs). They read
+# only the data they are handed: no dependencies, no unsafe code and no input
+# or output (clippy.toml bans the std doors to files, processes, the
+# environment, the network, the clock and sleep).
+
+[package]
+name = "alab-policy"
+description = "The turn-end readers an ALab harness judges an agent's reply with: needs, credentials, Land's check, the go-ahead, Cruise's carry, the press guard, whether a shell command only reads, the words each act types, the phase, wall and reset vocabulary a screen reader reports in, the policy keys and timings it decides under, the machine's sleeps inside a turn's done row, the git-config hazard check and Claude Code's shell startup; std only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true

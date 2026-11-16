@@ -96,9 +96,22 @@ pub enum Why {
     Drawn,
     /// The change before it taken back ([`crate::machine_name::undo_last`]).
     Undone,
-    /// This Mac's bound registry row named it. No writer records it yet: the file's grammar takes
-    /// it so that this build reads the History of a later one that follows the registry row.
+    /// This Mac's own registry row's nickname, written by a person or a program from any Mac,
+    /// renamed it ([`crate::machine_name::follow_registry`]).
     Registry,
+}
+
+/// What a name file last saw of this Mac's own lab registry row's nickname
+/// ([`MachineName::row`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RowSeen {
+    /// No read of this build looked at the row: a file an earlier build wrote, or one made while
+    /// no row was this Mac's.
+    #[default]
+    Never,
+    /// The row's chosen nickname (a person's or a program's), or `None` where the cell was
+    /// empty, an automatic path wrote it, or it was conflicted.
+    Saw(Option<Nickname>),
 }
 
 /// One change to the name, as History lists it: when, what it was and became, who made it and
@@ -116,7 +129,8 @@ pub struct Change {
     pub nick_from: Option<Nickname>,
     /// The nickname after it, as the title showed it.
     pub nick_to: Nickname,
-    /// Who made it; `None` for the first name.
+    /// Who made it; `None` for the first name and for a change this Mac's registry row made
+    /// ([`Why::Registry`]), whose author the registry keeps.
     pub by: Option<By>,
     /// Why.
     pub why: Why,
@@ -225,12 +239,17 @@ pub struct MachineName {
     pub cap: Option<Cap>,
     /// Up to [`WAS_MAX`] earlier NAMEs, newest first.
     pub was: Vec<Was>,
-    /// Who made the last change; `None` for the file's first write.
+    /// Who made the last change; `None` for the file's first write and after a change this
+    /// Mac's registry row made ([`Why::Registry`]), whose author the registry keeps.
     pub by: Option<By>,
     /// The nickname.
     pub nick: Nickname,
     /// How it was set.
     pub nick_class: NickClass,
+    /// What this file last saw of this Mac's own lab registry row's nickname: a read follows
+    /// the row only once it says something else ([`crate::machine_name::follow_registry`]), so
+    /// the row still holding the value a rename replaced undoes nothing.
+    pub row: RowSeen,
     /// A migration that has not finished.
     pub migration: Option<Migration>,
     /// The newest [`FLEETS_MAX`] fleets' kept claims, newest first.
@@ -258,6 +277,7 @@ impl MachineName {
             by: None,
             nick,
             nick_class: NickClass::Auto,
+            row: RowSeen::Never,
             migration: None,
             fleets: Vec::new(),
             history: Vec::new(),
@@ -456,6 +476,10 @@ struct Wire {
     act: u64,
     nick: String,
     nick_class: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    row_seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    row_nick: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -716,6 +740,11 @@ impl Wire {
             act: name.act,
             nick: name.nick.as_str().to_owned(),
             nick_class: nick_class_word(name.nick_class).to_owned(),
+            row_seen: name.row != RowSeen::Never,
+            row_nick: match &name.row {
+                RowSeen::Saw(Some(nick)) => Some(nick.as_str().to_owned()),
+                RowSeen::Never | RowSeen::Saw(None) => None,
+            },
             migration: name
                 .migration
                 .map(|migration| migration_word(migration).to_owned()),
@@ -816,6 +845,14 @@ impl Wire {
                 "auto" => NickClass::Auto,
                 "chosen" => NickClass::Chosen,
                 other => return Err(format!("nick_class `{other}` is none of auto, chosen")),
+            },
+            row: match (self.row_seen, self.row_nick.as_deref()) {
+                (false, None) => RowSeen::Never,
+                (false, Some(_)) => return Err("row_nick without row_seen".to_owned()),
+                (true, word) => RowSeen::Saw(
+                    word.map(|word| Nickname::parse(word).map_err(|e| format!("row_nick: {e}")))
+                        .transpose()?,
+                ),
             },
             migration: self
                 .migration

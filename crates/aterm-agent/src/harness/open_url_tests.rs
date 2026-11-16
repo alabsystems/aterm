@@ -5492,15 +5492,14 @@ const BOT_AUTHORIZE: &str = concat!(
 );
 const BOT_CALLBACK: &str = "http://127.0.0.1:9123/callback?code=made-up&state=st_bot_1";
 
-/// Drives [`BOT_AUTHORIZE`] in a stand-in browser answering `state`, reading every `poll`, a bot
-/// check standing at most `bot_stall` (the deadline a one-minute hang detector): the drive's
-/// result, the callbacks delivered, the page reads made and what the drive met.
+/// Drives [`BOT_AUTHORIZE`] in a stand-in browser answering `state`, reading every `poll` (the
+/// deadline a one-minute hang detector): the drive's result, the callbacks delivered, the page
+/// reads made and what the drive met.
 fn drive_bot_check(
     state: impl Fn(usize) -> Value + Send + 'static,
-    bot_stall: Duration,
     poll: Duration,
 ) -> (Result<(), &'static str>, Vec<String>, usize, Option<Met>) {
-    drive_oauth_client(scripted_oauth_browser(state), bot_stall, poll, |_, _| {
+    drive_oauth_client(scripted_oauth_browser(state), poll, |_, _| {
         Err("no mailbox in a test")
     })
 }
@@ -5510,7 +5509,6 @@ fn drive_oauth_client(
         super::super::headless_oauth::CdpClient,
         std::thread::JoinHandle<usize>,
     ),
-    bot_stall: Duration,
     poll: Duration,
     mailbox: impl FnMut(
         &mut super::super::headless_oauth::CdpClient,
@@ -5523,7 +5521,6 @@ fn drive_oauth_client(
         BOT_AUTHORIZE,
         Some("one@example.com"),
         (aterm_spec::wait::MUST_HAPPEN, poll),
-        bot_stall,
         mailbox,
         |cb| {
             delivered.push(cb.to_owned());
@@ -5550,7 +5547,6 @@ fn oauth_control_eof_records_a_hostless_outcome_before_the_first_page() {
         BOT_AUTHORIZE,
         None,
         (aterm_spec::wait::MUST_HAPPEN, Duration::ZERO),
-        aterm_spec::wait::MUST_HAPPEN,
         |_, _| panic!("no page or mailbox was reached"),
         |_| panic!("no callback was reached"),
     );
@@ -5601,12 +5597,9 @@ fn oauth_terminal_setup_and_evaluate_failures_record_browser_control() {
             };
             Some(aterm_json::json!({"result": result}))
         });
-        let (result, callbacks, _, met) = drive_oauth_client(
-            peer,
-            aterm_spec::wait::MUST_HAPPEN,
-            Duration::ZERO,
-            |_, _| panic!("no mailbox was reached"),
-        );
+        let (result, callbacks, _, met) = drive_oauth_client(peer, Duration::ZERO, |_, _| {
+            panic!("no mailbox was reached")
+        });
         assert!(result.is_err(), "{fault}");
         assert!(callbacks.is_empty(), "{fault}");
         assert_eq!(
@@ -5636,16 +5629,11 @@ fn oauth_magic_link_navigation_failures_record_browser_control() {
             };
             Some(aterm_json::json!({"result": result}))
         });
-        let (result, callbacks, reads, met) = drive_oauth_client(
-            peer,
-            aterm_spec::wait::MUST_HAPPEN,
-            Duration::ZERO,
-            |_, _| {
-                Ok(MailboxCredential::MagicLink(
-                    "https://claude.com/verify?token=made-up".into(),
-                ))
-            },
-        );
+        let (result, callbacks, reads, met) = drive_oauth_client(peer, Duration::ZERO, |_, _| {
+            Ok(MailboxCredential::MagicLink(
+                "https://claude.com/verify?token=made-up".into(),
+            ))
+        });
         assert!(result.is_err(), "{state}");
         assert!(callbacks.is_empty());
         assert_eq!(reads, 1);
@@ -5672,20 +5660,18 @@ fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
         };
         Some(aterm_json::json!({"result": result}))
     });
-    let (result, callbacks, reads, met) = drive_oauth_client(
-        peer,
-        aterm_spec::wait::MUST_HAPPEN,
-        Duration::ZERO,
-        |_, _| panic!("no mailbox was reached"),
-    );
-    assert_eq!(result, Ok(()));
-    assert_eq!(callbacks.len(), 1);
-    assert_eq!(reads, 3);
-    assert_eq!(met, None);
+    let (result, callbacks, reads, met) = drive_oauth_client(peer, Duration::ZERO, |_, _| {
+        panic!("no mailbox was reached")
+    });
+    // A bot check ends the drive on that read, named: it is not a browser that failed, and no
+    // read after it is made.
+    assert_eq!(result, Err(super::super::headless_oauth::BOT_CHECK_MET));
+    assert!(callbacks.is_empty());
+    assert_eq!(reads, 1);
+    assert_eq!(met, Some(Met::new(MetWord::BotCheck, Some("claude.com"))));
     for state in ["wrong_account", "needs_mailbox", "callback"] {
         let (result, _, _, met) = drive_bot_check(
             move |_| aterm_json::json!({"state": state, "url": "https://claude.com/login"}),
-            aterm_spec::wait::MUST_HAPPEN,
             Duration::ZERO,
         );
         assert!(result.is_err(), "{state}");
@@ -5693,55 +5679,23 @@ fn oauth_recoverable_bot_read_and_semantic_failures_are_not_browser_control() {
     }
 }
 
-/// A Claude sign-in waits on Cloudflare's bot check without charging its reads to the step cap,
-/// and one that stands ends the drive on the page it met: the headless drive opens nothing
-/// after it, even where a window sign-in is there to be had (here, the substituted one, which
-/// is never asked). CONTROLS: a
-/// check that clears after three reads, or after more reads than the drive's steps, reaches the
-/// callback; a page that only loads, or loads on another host between two reads of a check,
+/// A Claude sign-in that meets Cloudflare's bot check or a block page ends on its first read of
+/// it, named, with nothing pressed, and opens nothing after it, even where a window sign-in is
+/// there to be had (here, the substituted one, which is never asked): a check that would have
+/// cleared by itself is not waited for, however it reloads. CONTROL: a page that only loads
 /// counts its steps and ends `stall`.
 #[test]
-fn a_claude_bot_check_waits_and_ends_the_headless_drive_on_the_page_it_met() {
+fn a_claude_bot_check_ends_the_headless_drive_on_its_first_read() {
     use super::super::headless_oauth::{
-        BLOCK_PAGE_MET, BOT_CHECK_UNCLEARED, VisibleDone, set_visible_sign_in_for_tests,
+        BLOCK_PAGE_MET, BOT_CHECK_MET, VisibleDone, set_visible_sign_in_for_tests,
         take_visible_sign_ins_for_tests,
     };
     let _there = set_visible_sign_in_for_tests(Ok(VisibleDone::Delivered));
     let _ = take_visible_sign_ins_for_tests();
     let at = |state: &str, url: &str| aterm_json::json!({"state": state, "url": url});
-    let short = Duration::from_millis(500);
     let tick = Duration::from_millis(20);
-    assert!(BOT_CHECK_UNCLEARED.contains("Cloudflare") && !BOT_CHECK_UNCLEARED.contains("person"));
+    assert!(BOT_CHECK_MET.contains("Cloudflare") && !BOT_CHECK_MET.contains("person"));
     let checked = move |_: usize| at("bot_check", "https://claude.ai/login");
-    let reloading = move |n: usize| {
-        if n.is_multiple_of(2) {
-            at("loading", "https://claude.ai/login?__cf_chl_rt_tk=made-up")
-        } else {
-            at("bot_check", "https://claude.ai/login")
-        }
-    };
-    for (what, state) in [
-        (
-            "standing",
-            Box::new(checked) as Box<dyn Fn(usize) -> Value + Send>,
-        ),
-        ("reloading", Box::new(reloading)),
-    ] {
-        let (res, delivered, _, met) = drive_bot_check(state, short, tick);
-        assert_eq!(res, Err(BOT_CHECK_UNCLEARED), "{what}");
-        assert!(delivered.is_empty(), "{what}");
-        let met = met.expect(what);
-        assert_eq!(
-            met,
-            Met::new(MetWord::BotCheck, Some("claude.ai")),
-            "{what}"
-        );
-        assert!(
-            met.stopped() && !met.ended_at_the_sign_in_window(),
-            "{what}"
-        );
-    }
-
     let clears = move |n: usize| {
         if n <= 3 {
             at("bot_check", "https://claude.ai/login")
@@ -5749,33 +5703,31 @@ fn a_claude_bot_check_waits_and_ends_the_headless_drive_on_the_page_it_met() {
             at("callback", BOT_CALLBACK)
         }
     };
-    let (res, delivered, reads, met) = drive_bot_check(clears, aterm_spec::wait::MUST_HAPPEN, tick);
-    assert_eq!(res, Ok(()));
-    assert_eq!(delivered, vec![BOT_CALLBACK.to_owned()]);
-    assert_eq!(reads, 4);
-    assert_eq!(met, None);
-
-    let clears_late = move |n: usize| {
-        if n > 300 {
-            at("callback", BOT_CALLBACK)
-        } else if n.is_multiple_of(2) {
-            at("loading", "https://claude.ai/login")
-        } else {
-            at("bot_check", "https://claude.ai/login")
-        }
-    };
-    let (res, _, reads, _) =
-        drive_bot_check(clears_late, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
-    assert_eq!(
-        res,
-        Ok(()),
-        "a bot check's reads, and its reloads between them, are not the drive's steps"
-    );
-    assert_eq!(reads, 301);
+    for (what, state) in [
+        (
+            "standing",
+            Box::new(checked) as Box<dyn Fn(usize) -> Value + Send>,
+        ),
+        ("would clear", Box::new(clears)),
+    ] {
+        let (res, delivered, reads, met) = drive_bot_check(state, tick);
+        assert_eq!(res, Err(BOT_CHECK_MET), "{what}");
+        assert!(delivered.is_empty(), "{what}");
+        assert_eq!(reads, 1, "{what}: it ends on its first read");
+        let met = met.expect(what);
+        assert_eq!(
+            met,
+            Met::new(MetWord::BotCheck, Some("claude.ai")),
+            "{what}"
+        );
+        assert!(
+            met.stopped() && met.word.is_bot_protection() && !met.ended_at_the_sign_in_window(),
+            "{what}"
+        );
+    }
 
     let blocked = move |_: usize| at("block_page", "https://claude.ai/login");
-    let (res, _, reads, met) =
-        drive_bot_check(blocked, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
+    let (res, _, reads, met) = drive_bot_check(blocked, Duration::ZERO);
     assert_eq!(res, Err(BLOCK_PAGE_MET));
     assert_eq!(reads, 1, "a block page ends the drive at once");
     assert_eq!(met, Some(Met::new(MetWord::BlockPage, Some("claude.ai"))));
@@ -5785,33 +5737,12 @@ fn a_claude_bot_check_waits_and_ends_the_headless_drive_on_the_page_it_met() {
     );
 
     let loading = move |_: usize| at("loading", "https://claude.com/cai/oauth/authorize?x=1");
-    let elsewhere = move |n: usize| {
-        if n.is_multiple_of(2) {
-            at("loading", "https://claude.com/cai/oauth/authorize?x=1")
-        } else {
-            at("bot_check", "https://claude.ai/login")
-        }
-    };
-    for (what, state) in [
-        (
-            "loading",
-            Box::new(loading) as Box<dyn Fn(usize) -> Value + Send>,
-        ),
-        ("another host between", Box::new(elsewhere)),
-    ] {
-        let (res, _, _, met) =
-            drive_bot_check(state, aterm_spec::wait::MUST_HAPPEN, Duration::ZERO);
-        assert_eq!(
-            res,
-            Err("headless browser OAuth exceeded maximum steps without reaching callback"),
-            "{what}"
-        );
-        assert_eq!(
-            met,
-            Some(Met::new(MetWord::Stall, Some("claude.com"))),
-            "{what}"
-        );
-    }
+    let (res, _, _, met) = drive_bot_check(loading, Duration::ZERO);
+    assert_eq!(
+        res,
+        Err("headless browser OAuth exceeded maximum steps without reaching callback")
+    );
+    assert_eq!(met, Some(Met::new(MetWord::Stall, Some("claude.com"))));
 }
 
 /// The opener's outcome file holds one closed word and a host it keeps, and nothing else is
@@ -6113,8 +6044,9 @@ fn the_sign_in_window_opens_only_on_its_grant() {
 }
 
 /// WHAT STOPPED A SIGN-IN IN ATERM'S WINDOW HAS ITS OWN WORD: a session with no desktop,
-/// Cloudflare's check that did not clear and its block page each end the opener with a closed
-/// word the renewal reads back from the outcome file, whose words say what a person can do.
+/// Cloudflare's bot check, at which it pressed nothing, and its block page each end the opener
+/// with a closed word the renewal reads back from the outcome file, whose words say what a
+/// person can do.
 /// Each is the opener's terminal failure: no other browser opens after it, and no headless
 /// retry is due. The missing desktop and the check are a person's to clear; the block page is
 /// not.
@@ -6140,7 +6072,8 @@ fn a_sign_in_stopped_in_the_sign_in_window_names_what_stopped_it() {
             MetWord::WindowBotCheck,
             Some("claude.ai"),
             true,
-            "Cloudflare's check on claude.ai did not clear in aterm's sign-in window",
+            "it met Cloudflare's bot check on claude.ai in aterm's sign-in window; aterm pressed \
+             nothing there",
         ),
         (
             VisibleStop::BlockPage(host()),
@@ -6759,6 +6692,171 @@ fn a_relay_only_mailbox_drives_the_page_first() {
     assert!(
         !drives_page_first(&MailboxConfig::default(), Some("work@example.test")),
         "CONTROL: no mailbox"
+    );
+}
+
+/// THE HTTP ENGINE SUBMITS NOTHING ON A PAGE THAT CARRIES A CHECK: an hCaptcha beside a
+/// disabled `Authorize`, a hidden reCAPTCHA response field beside an enabled one, a Turnstile
+/// or an Arkose frame, or Cloudflare's words, yield no action; a form a disabled control the
+/// step would go on with holds is never submitted around it, and one beside a disabled
+/// declining or secondary control is posted as it would be; a link or a refresh back to the
+/// page itself is none.
+/// NEGATIVE CONTROL: the same consent page with no check is posted; with every disabled button
+/// holding its form (the branch's first form), the page beside a disabled `Deny` is not: `` a
+/// disabled secondary control held the form ``.
+#[test]
+fn the_http_engine_submits_nothing_on_a_check_page() {
+    const BASE: &str = "https://claude.ai/oauth/authorize?state=st";
+    let form = |inside: &str, button: &str| {
+        format!(
+            "<html><body><form method=post action=/oauth/authorize/approve><input type=hidden name=state value=st>{inside}{button}</form></body></html>"
+        )
+    };
+    let enabled = "<button type=submit>Authorize</button>";
+    let disabled = "<button type=submit disabled>Authorize</button>";
+    for widget in [
+        "<div class=h-captcha data-sitekey=fixture></div>",
+        "<textarea name=g-recaptcha-response style=display:none></textarea>",
+        "<div class=\"cf-turnstile\"></div>",
+        "<iframe src=\"https://client-api.arkoselabs.com/fc/x\" hidden></iframe>",
+        "<label><input type=checkbox> I'm not a robot</label>",
+    ] {
+        for button in [enabled, disabled] {
+            let html = form(widget, button);
+            assert!(
+                super::super::headless_oauth::check_in_html(BASE, &html).is_some(),
+                "{html}"
+            );
+            assert_eq!(parse_html_approval_action(&html, BASE), None, "{html}");
+        }
+    }
+    let words = form(
+        "<p>Verifying you are human. This may take a few seconds.</p>",
+        enabled,
+    );
+    assert_eq!(parse_html_approval_action(&words, BASE), None);
+    // A disabled button holds its form, check or none.
+    assert_eq!(parse_html_approval_action(&form("", disabled), BASE), None);
+    assert_eq!(
+        parse_html_approval_action(
+            &form("", "<button type=button disabled>Continue</button>"),
+            BASE
+        ),
+        None
+    );
+    // A link or a refresh to the page itself is no action.
+    let itself = format!("<html><body><a href=\"{BASE}#again\">Continue</a></body></html>");
+    assert_eq!(parse_html_approval_action(&itself, BASE), None);
+    let refresh =
+        format!("<html><head><meta http-equiv=refresh content=\"0; url={BASE}\"></head></html>");
+    assert_eq!(parse_html_approval_action(&refresh, BASE), None);
+    // A disabled control the step would not go on with (a declining or secondary one) holds
+    // nothing: the approval beside it is posted, and the declining one is never sent.
+    for secondary in [
+        "<button type=submit name=decision value=deny disabled>Deny</button>",
+        "<button type=button disabled>Back</button>",
+        "<input type=submit name=cancel value=Cancel disabled>",
+    ] {
+        let html = form(
+            secondary,
+            "<button type=submit name=decision value=allow>Allow access</button>",
+        );
+        let (method, _, body) = parse_html_approval_action(&html, BASE)
+            .unwrap_or_else(|| panic!("a disabled secondary control held the form: {html}"));
+        assert_eq!(method, "POST", "{html}");
+        assert!(
+            body.as_deref()
+                .is_none_or(|b| !b.contains("deny") && !b.contains("cancel")),
+            "{body:?}"
+        );
+    }
+    // NEGATIVE CONTROL.
+    let (method, action, body) =
+        parse_html_approval_action(&form("", enabled), BASE).expect("the plain page is posted");
+    assert_eq!(method, "POST");
+    assert_eq!(action, "https://claude.ai/oauth/authorize/approve");
+    assert_eq!(body.as_deref(), Some("state=st"));
+}
+
+/// A CHECK ONE ENGINE MET IS FOLLOWED BY NO OTHER BROWSER: where the HTTP engine's attempt
+/// ended on a check (its words), no headless browser is launched at the same page, and where the
+/// headless drive ended on one, the person's Chrome profile is not opened at it either; an
+/// ordinary failure goes on as before.
+/// NEGATIVE CONTROL: with `continues_in_a_headless_browser` reading only the manual-browser and
+/// listener words (the branch's first form), a check's words continue: `` ... continued ``;
+/// with `profile_follows` reading no met note, a check opens the profile: `` a check opened the
+/// profile ``.
+#[test]
+fn a_check_one_engine_met_is_followed_by_no_other_browser() {
+    use super::super::headless_oauth::{BLOCK_PAGE_MET, BOT_CHECK_MET, HUMAN_CHECK_MET};
+    for why in [BLOCK_PAGE_MET, BOT_CHECK_MET, HUMAN_CHECK_MET] {
+        assert!(
+            !continues_in_a_headless_browser(why, true),
+            "{why} continued"
+        );
+    }
+    for why in [
+        "this OAuth destination needs the manual browser",
+        "the local OAuth callback listener rejected the authorization code",
+    ] {
+        assert!(!continues_in_a_headless_browser(why, true), "{why}");
+    }
+    // CONTROL: an ordinary failure continues where a headless browser exists.
+    assert!(continues_in_a_headless_browser(
+        "timed out waiting for OAuth",
+        true
+    ));
+    assert!(!continues_in_a_headless_browser(
+        "timed out waiting for OAuth",
+        false
+    ));
+
+    for word in [MetWord::BotCheck, MetWord::BlockPage, MetWord::HumanCheck] {
+        let met = Met::new(word, Some("claude.ai"));
+        assert!(
+            !profile_follows(Some(&met), false, Some("Profile 1")),
+            "a check opened the profile: {word:?}"
+        );
+    }
+    // CONTROL: an ordinary end, or none, opens the named profile.
+    let stall = Met::new(MetWord::Stall, Some("claude.ai"));
+    assert!(profile_follows(Some(&stall), false, Some("Profile 1")));
+    assert!(profile_follows(None, false, Some("Profile 1")));
+    assert!(!profile_follows(None, true, Some("Profile 1")));
+    assert!(!profile_follows(None, false, Some("  ")));
+    assert!(!profile_follows(None, false, None));
+}
+
+/// A FETCHED PAGE THAT CARRIES A CHECK ENDS THE HTTP SIGN-IN AT ONCE, named and recorded, with
+/// nothing submitted and no later attempt: the one fetch of it is the last.
+#[test]
+fn a_check_page_ends_the_http_sign_in_at_once() {
+    const AUTH: &str = "https://claude.ai/oauth/authorize?client_id=c&redirect_uri=http%3A%2F%2Flocalhost%3A9123%2Fcallback&state=st";
+    let page = "<html><body><form method=post action=/approve><div class=h-captcha data-sitekey=fixture></div><button type=submit>Authorize</button></form></body></html>";
+    let mut fetched = Vec::new();
+    let mut exchange =
+        |method: &str, url: &str, _: &mut BTreeMap<String, String>, _: Option<&str>| {
+            fetched.push(format!("{method} {url}"));
+            Ok(HttpResponse {
+                status: 200,
+                location: None,
+                body: page.to_owned(),
+            })
+        };
+    let clock = Instant::now;
+    let _ = super::super::headless_oauth::take_met();
+    let ended = authorize_using_with_page_until(
+        AUTH,
+        Some("ada@x.example"),
+        |_, _| panic!("no mail is read past a check"),
+        &mut exchange,
+        Deadline::new(aterm_spec::wait::MUST_HAPPEN, &clock),
+    );
+    assert_eq!(ended, Err(super::super::headless_oauth::HUMAN_CHECK_MET));
+    assert_eq!(fetched.len(), 1, "{fetched:?}");
+    assert_eq!(
+        super::super::headless_oauth::take_met(),
+        Some(Met::new(MetWord::HumanCheck, Some("claude.ai")))
     );
 }
 

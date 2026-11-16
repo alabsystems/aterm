@@ -14,7 +14,7 @@ use alab_policy::vocab::{ApiCause, Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 24, "0.24");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 25, "0.25");
 
 #[derive(Debug, Clone, Copy)]
 struct Frame {

@@ -736,37 +736,6 @@ fn a_closed_workers_task_files_are_removed_and_no_other() {
     assert!(other.exists());
 }
 
-/// A WORKER aterm CLOSED KEEPS ITS RESULTS WHILE ITS RETIRED ROW STANDS: its close removes its task
-/// file alone, and its row's end removes the results, and only its own. CONTROL: a person's close
-/// takes both at once (`a_closed_workers_task_files_are_removed_and_no_other`).
-#[cfg(unix)]
-#[test]
-fn a_reaped_workers_results_outlive_its_task_file_until_its_row_goes() {
-    let scratch = aterm_tempfile::Builder::new()
-        .prefix("aterm-task-reaped")
-        .tempdir()
-        .expect("scratch dir");
-    let dir = scratch.path().join("tasks");
-    let gone = SessionId::new("s-0c");
-    let path = TaskSeed::new(b"one".to_vec())
-        .write_in(&dir, &gone)
-        .expect("written");
-    let results = [
-        touch(&dir, "s-0c-3.result.md"),
-        touch(&dir, "s-0c-3.result.src"),
-    ];
-    let other = touch(&dir, "s-0f-3.result.md");
-    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::TaskFile);
-    assert!(!path.exists(), "its task file goes with its tab");
-    assert!(results.iter().all(|r| r.exists()), "its results stay");
-    retire_files_in(&dir, std::slice::from_ref(&gone), Retire::Results);
-    assert!(
-        results.iter().all(|r| !r.exists()),
-        "its row went: so do they"
-    );
-    assert!(other.exists(), "another session's stays");
-}
-
 /// A QUIT removes the task file of every worker it still holds
 /// ([`retire_task_files_at_quit`]): the final exit path closes no session one
 /// by one, so no close would.
@@ -3500,7 +3469,7 @@ fn layout_of(sid: &SessionId, row: Option<&str>) -> crate::restore::RestoreManif
 /// A done worker on `handle`, as its done edge leaves it: its task file, and a snapshot of the
 /// one reply `Fixed the parser.` under its own session ID, which its record names. Returns the
 /// task file, the snapshot and what `result` answers.
-fn done_worker(
+pub(crate) fn done_worker(
     handle: &crate::session_store::SessionHandle,
     scratch: &Path,
 ) -> (
@@ -3695,12 +3664,7 @@ fn a_result_a_tab_came_back_with_goes_with_its_tab() {
         answer,
         "a record a late mark points back at the result reads it"
     );
-    retire_task_file(
-        &closed_store(),
-        &reopened.sid,
-        &carried_of(&reopened),
-        false,
-    );
+    retire_task_file(&closed_store(), &reopened.sid, &carried_of(&reopened));
     assert!(
         !snap.path.exists() && !sidecar.exists(),
         "reopened: removed with its tab"
@@ -3710,48 +3674,31 @@ fn a_result_a_tab_came_back_with_goes_with_its_tab() {
     let (closed, _, snap, sidecar, _) = came_back();
     let carried = carried_of(&closed);
     assert_eq!(carried, std::slice::from_ref(&snap.path));
-    retire_task_file(&closed_store(), &closed.sid, &carried, false);
+    retire_task_file(&closed_store(), &closed.sid, &carried);
     assert!(!snap.path.exists() && !sidecar.exists(), "closed: removed");
 
-    // CONTROL: a retired row keeps it, and takes it when the row goes.
+    // CONTROL: the row its close left in the machine's session table keeps it, and it goes
+    // when the row does.
     let (reaped, store, snap, sidecar, _) = came_back();
     let carried = carried_of(&reaped);
-    let retired = closed_store();
-    retired
-        .write()
-        .unwrap()
-        .retired_workers_mut()
-        .keep(crate::retired_workers::Retired {
-            sid: reaped.sid.clone(),
-            local: Some(1),
-            window: None,
-            title: "reaped".to_string(),
-            last_words: None,
-            record: reaped
-                .ctx
-                .timeline
-                .lock()
-                .unwrap()
-                .task()
-                .cloned()
-                .expect("its record"),
-            closed_unix_ms: 1,
-        });
-    retire_task_file(&retired, &reaped.sid, &carried, true);
+    let rows = aterm_tempfile::tempdir().expect("the table's folder");
+    crate::session_table::SessionTable::at(rows.path().to_path_buf()).serve(&store);
+    let table = store.read().unwrap().table();
+    assert!(table.loaded_within(std::time::Duration::from_secs(60)));
+    crate::session_table::close_leaving_row(
+        &store,
+        reaped.local_id,
+        crate::session_store::ExitReason::CtlClose,
+        crate::session_store::ExitActor::Ctl,
+    )
+    .expect("a close");
+    retire_task_file(&store, &reaped.sid, &carried);
     assert!(
         snap.path.exists() && sidecar.exists(),
         "its row answers for it"
     );
-    retire_result_files(&store, &reaped.sid, carried.first().map(PathBuf::as_path));
-    assert!(
-        snap.path.exists() && sidecar.exists(),
-        "a record the store still holds names it: it stays"
-    );
-    retire_result_files(
-        &closed_store(),
-        &reaped.sid,
-        carried.first().map(PathBuf::as_path),
-    );
+    assert!(table.remove(&reaped.sid));
+    assert!(table.flush());
     assert!(
         !snap.path.exists() && !sidecar.exists(),
         "its row went: removed"
@@ -3825,7 +3772,6 @@ fn a_result_a_tab_came_back_with_crosses_every_process_until_its_tab_ends() {
         &crate::session_store::new_store(),
         &back.sid,
         &carried_results_of(&back),
-        false,
     );
     assert!(
         snapshot_pair(&own).iter().all(|file| !file.exists()),
@@ -3861,7 +3807,6 @@ fn a_result_a_tab_came_back_with_crosses_every_process_until_its_tab_ends() {
             &crate::session_store::new_store(),
             &successor.sid,
             &carried_results_of(&successor),
-            false,
         );
         assert!(
             snapshot_pair(&earlier)
@@ -3912,7 +3857,7 @@ fn a_file_a_mark_named_under_another_id_goes_with_the_last_tab_that_named_it() {
         };
         let store = crate::session_store::new_store();
         store.write().unwrap().register(then.clone());
-        retire_task_file(&store, &first.sid, &carried_results_of(first), false);
+        retire_task_file(&store, &first.sid, &carried_results_of(first));
         assert!(
             snapshot_pair(&snap).iter().all(|file| file.exists()),
             "owner_first = {owner_first}: the tab still open answers for it, so it stays"
@@ -3921,7 +3866,6 @@ fn a_file_a_mark_named_under_another_id_goes_with_the_last_tab_that_named_it() {
             &crate::session_store::new_store(),
             &then.sid,
             &carried_results_of(then),
-            false,
         );
         assert!(
             snapshot_pair(&snap)
@@ -4003,9 +3947,9 @@ fn a_file_a_mark_named_stays_while_its_owner_lives_in_another_process() {
             "PRECONDITION: the alias's tab answers for the file it named"
         );
         if owner_gone {
-            // The owner's tab closed in its own process with a retired row standing: its task file
-            // went, its results stay.
-            retire_task_file(&crate::session_store::new_store(), &owner.sid, &[], true);
+            // The owner's tab closed in its own process, its row standing in that process's table:
+            // its task file went, the result its row names stays.
+            std::fs::remove_file(&task).expect("the owner's task file");
         }
         assert_eq!(
             task.exists(),
@@ -4016,14 +3960,13 @@ fn a_file_a_mark_named_stays_while_its_owner_lives_in_another_process() {
             &crate::session_store::new_store(),
             &alias.sid,
             &carried_results_of(&alias),
-            false,
         );
         assert_eq!(
             snapshot_pair(&snap).iter().all(|file| file.exists()),
             !owner_gone,
             "owner_gone = {owner_gone}: the alias's close leaves the file while its owner lives"
         );
-        retire_task_file(&crate::session_store::new_store(), &owner.sid, &[], false);
+        retire_task_file(&crate::session_store::new_store(), &owner.sid, &[]);
     }
 }
 
@@ -4123,7 +4066,7 @@ fn a_file_another_record_names_outlives_a_tab_that_also_named_it() {
 
     // The alias's tab closes: its session is out of the store, the owner's is in it.
     store.write().unwrap().register(owner_back.clone());
-    retire_task_file(&store, &alias_back.sid, &carried_of(&alias_back), false);
+    retire_task_file(&store, &alias_back.sid, &carried_of(&alias_back));
     assert!(
         snap.path.exists() && sidecar.exists(),
         "the owner's record names it: it stays"
@@ -4138,7 +4081,6 @@ fn a_file_another_record_names_outlives_a_tab_that_also_named_it() {
         &crate::session_store::new_store(),
         &owner_back.sid,
         &carried_of(&owner_back),
-        false,
     );
     assert!(
         !snap.path.exists() && !sidecar.exists(),
@@ -4176,8 +4118,8 @@ fn a_file_another_record_names_outlives_a_tab_that_also_named_it() {
         std::fs::remove_file(path).expect("removed");
     }
     let emptied = crate::session_store::new_store();
-    retire_task_file(&emptied, &owner.sid, &[], false);
-    retire_task_file(&emptied, &alias.sid, &[], false);
+    retire_task_file(&emptied, &owner.sid, &[]);
+    retire_task_file(&emptied, &alias.sid, &[]);
 }
 
 /// A RESTORE SWEEPS WHAT ITS LAYOUT LEFT, AND NO OTHER FILE: after a crash no quit removed
@@ -4267,11 +4209,10 @@ fn a_restore_sweeps_what_its_layout_left_and_no_other() {
         std::fs::remove_file(path).expect("removed");
     }
     let emptied = crate::session_store::new_store();
-    retire_task_file(&emptied, &kept.sid, &[], false);
+    retire_task_file(&emptied, &kept.sid, &[]);
     retire_task_file(
         &emptied,
         &restored.sid,
         std::slice::from_ref(&back_snap.path),
-        false,
     );
 }

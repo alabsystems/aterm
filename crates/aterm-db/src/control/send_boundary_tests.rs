@@ -69,14 +69,31 @@ fn responder_fetches_current_payloads_after_receiving_updates() {
         let theirs: Vec<_> = b.inventory().unwrap().into_iter().collect();
         let (sent, answered) = std::thread::scope(|scope| {
             let responder = scope.spawn(|| {
-                exchange_batches(&mut right, &b, Side::Responder, &theirs, |_| {}).unwrap()
+                exchange_batches(
+                    &mut right,
+                    &b,
+                    Side::Responder,
+                    &theirs,
+                    RECORDS_PER_ROUND,
+                    |_| {},
+                )
+                .unwrap()
             });
-            let sent = exchange_batches(&mut left, &a, Side::Initiator, &ours, |_| {}).unwrap();
+            let sent = exchange_batches(
+                &mut left,
+                &a,
+                Side::Initiator,
+                &ours,
+                RECORDS_PER_ROUND,
+                |_| {},
+            )
+            .unwrap();
             (sent, responder.join().unwrap())
         });
         let outgoing = usize::from(!withdraw);
-        assert_eq!(sent, (1, outgoing, 0));
-        assert_eq!(answered, (outgoing, 1, 0));
+        let counts = |turn: &Turn| (turn.sent, turn.received, turn.deferred);
+        assert_eq!(counts(&sent), (1, outgoing, 0));
+        assert_eq!(counts(&answered), (outgoing, 1, 0));
         assert_eq!(
             b.received.lock().unwrap().as_slice(),
             std::slice::from_ref(&a.outgoing)

@@ -51,14 +51,17 @@ fn native_google_retry_recovers_its_encrypted_completion_before_starting_another
             &self,
             req: &Request<'_>,
             recovery: crate::harness::agy_signin::RecoveryKey,
-        ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, String> {
+        ) -> Result<
+            crate::harness::agy_signin::VerifiedGoogleGrant,
+            crate::harness::agy_signin::GoogleSignInEnd,
+        > {
             self.keys.borrow_mut().push(recovery.0);
             let first = self.calls.get() == 0;
             self.calls.set(self.calls.get() + 1);
             let (result, fresh) =
                 crate::harness::agy_signin::recovery_publication_fixture(req, recovery, first);
             self.fresh.set(self.fresh.get() + usize::from(fresh));
-            result
+            result.map_err(Into::into)
         }
     }
     let world = World::new(Cli::Agy);
@@ -144,7 +147,10 @@ fn native_google_publication_retains_and_rechecks_its_typed_proof() {
             &self,
             req: &Request<'_>,
             _recovery: crate::harness::agy_signin::RecoveryKey,
-        ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, String> {
+        ) -> Result<
+            crate::harness::agy_signin::VerifiedGoogleGrant,
+            crate::harness::agy_signin::GoogleSignInEnd,
+        > {
             self.called.set(true);
             let state = self.world.store.dir.parent().unwrap();
             let another = self.world.root.path().join("other-google-state");
@@ -240,6 +246,77 @@ fn native_google_publication_retains_and_rechecks_its_typed_proof() {
             );
         }
     }
+}
+
+/// AGY'S NATIVE GOOGLE SIGN-IN THAT MET A CHECK HOLDS THE ROW AS ONE: where Google's page
+/// carried a check (`google_direct::Error::SecurityCheck`, nothing on it pressed), the drive
+/// ends `bot-check` on Google's host, and the row is held on no clock as a check met (the
+/// account's `accounts::CheckStop`, read by `accounts_sync::check_standing_at`), never retried on
+/// the ladder's backoff as an ordinary failure. Any other end of the native route is a failure in its own words.
+/// NEGATIVE CONTROL: with every end of the native route taken for `Unverified` (the branch's
+/// first form), the row is not held: `` a native Google check did not hold the row ``.
+#[cfg(unix)]
+#[test]
+fn a_native_google_check_holds_the_row_as_one() {
+    use crate::harness::agy_signin::{GoogleLoginError, GoogleSignInEnd};
+    let checked = GoogleLoginError::Approval(crate::harness::google_direct::Error::SecurityCheck);
+    assert!(matches!(
+        GoogleSignInEnd::of(&checked),
+        GoogleSignInEnd::Check(_)
+    ));
+    assert!(matches!(
+        GoogleSignInEnd::of(&GoogleLoginError::Configuration),
+        GoogleSignInEnd::Failed(_)
+    ));
+    struct Checked;
+    impl AccountsHost for Checked {
+        fn stdin_is_terminal(&self) -> bool {
+            false
+        }
+        fn auth_status(&self, _: &str) -> Result<Captured, String> {
+            unreachable!()
+        }
+        fn unaskable(&self) -> Option<String> {
+            None
+        }
+        fn login(&self, _: Option<&str>) -> Result<i32, String> {
+            unreachable!()
+        }
+        fn now(&self) -> i64 {
+            NOW
+        }
+        fn vendor_sign_in(&self, _: &Request<'_>) -> Drove {
+            panic!("native Google must not use the generic sign-in driver")
+        }
+        fn native_google_sign_in(
+            &self,
+            _: &Request<'_>,
+            _: crate::harness::agy_signin::RecoveryKey,
+        ) -> Result<crate::harness::agy_signin::VerifiedGoogleGrant, GoogleSignInEnd> {
+            Err(GoogleSignInEnd::of(&GoogleLoginError::Approval(
+                crate::harness::google_direct::Error::SecurityCheck,
+            )))
+        }
+    }
+    let world = World::new(Cli::Agy);
+    let state = world.store.dir.parent().unwrap();
+    aterm_secrets::fsx::write_atomic(&state.join("google-identities.toml"),
+        b"[[identities]]\nid='one'\nemail='owner@example.test'\n[[bindings]]\nprovider='agy'\naccount='main'\nidentity='one'\nexpected_email='owner@example.test'\n", 0o600).unwrap();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let result = run_accounts_login_for(Cli::Agy, &world.env, &Checked, "main", &mut out, &mut err);
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out),
+        String::from_utf8_lossy(&err)
+    );
+    assert_ne!(result, ExitCode::SUCCESS, "{said}");
+    let logins = world.store.load_logins(NOW).unwrap().0;
+    let row = world.raw.row("main").unwrap();
+    assert!(
+        crate::harness::accounts_sync::check_standing_at(&world.store, row, &logins).is_some(),
+        "a native Google check did not hold the row: {said}"
+    );
 }
 
 struct World {

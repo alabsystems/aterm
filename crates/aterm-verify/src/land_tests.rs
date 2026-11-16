@@ -9,6 +9,98 @@ use aterm_land_trailer::{Interrupted, KEYS};
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+fn remote_step(
+    root: &Path,
+    git: &dyn Fn(&Path) -> Command,
+    tool: crate::remote::Tool,
+    args: &[std::ffi::OsString],
+    until: Instant,
+    _mode: RemoteMode,
+) -> Result<std::process::Output, String> {
+    crate::remote::run(root, git, tool, args, until)
+}
+
+#[test]
+fn an_ended_intent_wait_starts_no_observation() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let plumbing = Git {
+        root: root.path(),
+        make: &git_cmd,
+    };
+    let intent = agh::IntentId::parse("67-000000000000").unwrap();
+    for interrupted in [false, true] {
+        let step = |_: &Path,
+                    _: &dyn Fn(&Path) -> Command,
+                    _,
+                    _: &[std::ffi::OsString],
+                    _,
+                    _: RemoteMode| {
+            panic!("an ended wait must not start another remote step")
+        };
+        let pause = |_| panic!("an ended wait must not pause");
+        let interrupt = || interrupted.then_some(15);
+        let wire = Wire::new(&plumbing, &step, &pause, &|_| {}, &interrupt);
+        let until = if interrupted {
+            Instant::now() + Duration::from_secs(60)
+        } else {
+            Instant::now() - Duration::from_secs(1)
+        };
+        assert!(wire.wait_for_intent(&intent, until).is_err());
+        let unsettled = wire.unsettled.take();
+        if interrupted {
+            assert!(unsettled.is_none());
+        } else {
+            assert!(unsettled.unwrap().contains(intent.as_str()));
+        }
+    }
+}
+
+#[test]
+fn intent_observations_share_the_waits_absolute_deadline() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let plumbing = Git {
+        root: root.path(),
+        make: &git_cmd,
+    };
+    let until = Instant::now() + Duration::from_secs(60);
+    let reads = Cell::new(0);
+    let pauses = Cell::new(0);
+    let step = |_: &Path,
+                _: &dyn Fn(&Path) -> Command,
+                tool,
+                _: &[std::ffi::OsString],
+                deadline,
+                mode: RemoteMode| {
+        assert_eq!(mode, RemoteMode::Read, "intent observations only read");
+        assert_eq!(
+            deadline, until,
+            "no observation may acquire a fresh deadline"
+        );
+        let stdout = if tool == crate::remote::Tool::Git {
+            "https://github.com/fixture/repo.git\n".to_owned()
+        } else {
+            reads.set(reads.get() + 1);
+            format!(
+                r#"{{"id":"67-000000000000","repo":"fixture/repo","op":"ref.update-atomic","key":"atomic refs","open":{}}}"#,
+                reads.get() < 3
+            )
+        };
+        Ok(std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        })
+    };
+    let pause = |_| pauses.set(pauses.get() + 1);
+    let wire = Wire::new(&plumbing, &step, &pause, &|_| {}, &|| None);
+    wire.wait_for_intent(&agh::IntentId::parse("67-000000000000").unwrap(), until)
+        .unwrap();
+    assert_eq!(reads.get(), 3);
+    assert_eq!(pauses.get(), 2);
+}
+
 #[path = "land_rejudge_tests.rs"]
 mod rejudge;
 
@@ -1038,15 +1130,7 @@ fn land_rechecking(
     judge: impl FnMut(&str, usize, Poll<'_>) -> Ran,
     recheck: impl FnMut(&str) -> Judged,
 ) -> Landed {
-    land_wired(
-        world,
-        git,
-        &crate::remote::run,
-        &no_retry,
-        branch,
-        judge,
-        recheck,
-    )
+    land_wired(world, git, &remote_step, &no_retry, branch, judge, recheck)
 }
 
 /// The pause seam of a landing whose remote never fails: no step is made again.
@@ -1082,7 +1166,7 @@ fn land_reaching(
     land_seamed(
         world,
         &git_cmd,
-        &crate::remote::run,
+        &remote_step,
         &no_retry,
         reach,
         judge,
@@ -1371,7 +1455,7 @@ fn land_fixing(world: &World) -> (i32, Vec<String>, Vec<Vec<String>>) {
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );
@@ -1619,7 +1703,7 @@ fn a_landing_asked_for_a_commit_lands_it_or_nothing() {
                 autofix: &mut |_: &Path, _: &[String]| Ok(()),
                 hand_over: &mut |_, _, _| panic!("nothing is handed over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &crate::remote::run,
+                remote: &remote_step,
                 pause: &no_retry,
             },
         );
@@ -1683,7 +1767,7 @@ fn a_push_reported_failed_that_main_took_is_landed() {
         root: &world.work,
         make: &git_cmd,
     };
-    let wire = || Wire::new(&plumbing, &crate::remote::run, &no_retry, &|_| {}, &|| None);
+    let wire = || Wire::new(&plumbing, &remote_step, &no_retry, &|_| {}, &|| None);
     assert_eq!(
         wire().settle(&landing, &onto, "refused"),
         Err("refused".to_owned())
@@ -2026,7 +2110,7 @@ fn an_already_landed_checkout_resumes_without_absorbing_main_or_losing_new_work(
                 autofix: &mut |_: &Path, _: &[String]| Ok(()),
                 hand_over: &mut |_, _, _| panic!("an already-landed checkout hands nothing over"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &crate::remote::run,
+                remote: &remote_step,
                 pause: &no_retry,
             },
         )
@@ -4679,7 +4763,7 @@ fn a_refused_merge_commit_aborts_the_merge_cleanly() {
                 panic!("a refused merge hands nothing over")
             },
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );
@@ -5071,7 +5155,7 @@ fn land_kept(
 #[test]
 fn every_run_end_writes_one_record() {
     use crate::land_record::tests::NOW;
-    let remote: &RemoteStep<'_> = &crate::remote::run;
+    let remote: &RemoteStep<'_> = &remote_step;
     // Every record the runs below leave, journal and spool, for the census.
     let mut planted = Vec::new();
 
@@ -5176,12 +5260,12 @@ fn every_run_end_writes_one_record() {
     let world = self::world();
     commit(&world.work, "a/x.txt", "a2\n");
     let moves = std::cell::Cell::new(0);
-    let racing: &RemoteStep<'_> = &|root, git, tool, args, until| {
+    let racing: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
         if args.iter().any(|word| word == "push") {
             moves.set(moves.get() + 1);
             rival_moves(&world, "b/y.txt", &format!("b moved {}\n", moves.get()));
         }
-        crate::remote::run(root, git, tool, args, until)
+        remote_step(root, git, tool, args, until, mode)
     };
     let (code, said) = land_kept(&world, store.records('4'), |_| Ran::Ended(green()), racing);
     assert_eq!(code, STOPPED, "{said:#?}");
@@ -5300,7 +5384,12 @@ fn every_run_end_writes_one_record() {
             "  re-judges by cause: none".to_owned(),
             "  rounds by cause: none".to_owned(),
             format!("  composes: {COMPOSES}; aborts: none"),
-            "  main movements with no record: 0 of 0".to_owned(),
+            "  main tips with no receipt: 0 of 0".to_owned(),
+            format!(
+                "  receipted landings with no run record: 0 of 0 since {} (the earliest run \
+                 record read)",
+                aterm_types::rfc3339::format_rfc3339(NOW - 60)
+            ),
         ]
     );
 }
@@ -5352,7 +5441,7 @@ fn a_resumed_landing_records_as_the_run_that_handed_it_over() {
                 recheck: &mut |_: &Path, _: &Path, _: &str, _: &Delta| panic!("nothing runs"),
                 hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff"),
                 say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-                remote: &crate::remote::run,
+                remote: &remote_step,
                 pause: &no_retry,
             },
         );
@@ -5466,7 +5555,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
             Err("the landing was interrupted while it built the checkout's verifier".into())
         },
         &green,
-        &crate::remote::run,
+        &remote_step,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5493,7 +5582,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
         records,
         &mut |_: &Path| Ok(own_image()),
         &green,
-        &crate::remote::run,
+        &remote_step,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5514,7 +5603,7 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
         store.records('3'),
         &mut |_: &Path| panic!("nothing is built after the interrupt"),
         &green,
-        &crate::remote::run,
+        &remote_step,
     );
     assert_eq!(code, exit::COULD_NOT_RUN, "{said:#?}");
     once(&said);
@@ -5529,12 +5618,12 @@ fn an_interrupt_stops_the_landing_before_it_changes_anything() {
     let judged = commit(&world.work, "shared.txt", &shared);
     let signal = store.signal.clone();
     let moved = std::cell::Cell::new(false);
-    let racing: &RemoteStep<'_> = &|root, git, tool, args, until| {
+    let racing: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
         if args.iter().any(|word| word == "push") && !moved.replace(true) {
             rival_moves_line(&world, 8, "eight");
             signal.set(Some(15));
         }
-        crate::remote::run(root, git, tool, args, until)
+        remote_step(root, git, tool, args, until, mode)
     };
     let (code, said) = land_built(
         &world,
@@ -5582,7 +5671,7 @@ fn a_landing_that_panics_writes_its_end_record() {
             &world,
             store.records('1'),
             |_| panic!("a scripted fault mid-judgment"),
-            &crate::remote::run,
+            &remote_step,
         )
     }));
     assert!(ran.is_err(), "the panic goes on past the record");
@@ -5720,7 +5809,7 @@ fn a_landing_stops_at_its_first_red() {
             autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );

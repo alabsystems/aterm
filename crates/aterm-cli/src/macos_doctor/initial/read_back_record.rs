@@ -270,10 +270,7 @@ pub(in crate::macos_doctor) fn parse(
     };
     let mut rows: Vec<(Observation, Fence)> = Vec::new();
     for entry in record["rows"].as_array().into_iter().flatten() {
-        let Some(fence) = JournalMark::parse(&entry["journal"])
-            .map(Fence)
-            .and_then(|fence| advanced_fence(fence, journal))
-        else {
+        let Some(fence) = entry.get("journal").and_then(JournalMark::parse).map(Fence) else {
             continue;
         };
         let Some(seen) = (|| {
@@ -290,9 +287,14 @@ pub(in crate::macos_doctor) fn parse(
         })() else {
             continue;
         };
-        if kept(&seen) && !rows.iter().any(|(row, _)| row.subject == seen.subject) {
-            rows.push((seen, fence));
+        // Discard unusable or duplicate cache rows before taking the history reader's lock.
+        if !kept(&seen) || rows.iter().any(|(row, _)| row.subject == seen.subject) {
+            continue;
         }
+        let Some(fence) = advanced_fence(fence, journal) else {
+            continue;
+        };
+        rows.push((seen, fence));
     }
     rows
 }
@@ -310,11 +312,12 @@ fn places() -> Result<(PathBuf, PathBuf), String> {
 /// the private rows' last read-back: those read back settled ([`kept`]) whose fence still
 /// holds now (no change journaled since that read started, by any aterm process, that may be
 /// to such a row: [`no_change_since`]), under the current run revision. A successful write
-/// returns the advanced fences in `rows`; an unchanged record is not rewritten.
+/// returns the advanced fences in `rows`; an unchanged record is not rewritten. Each subject
+/// may occur at most once: an ambiguous snapshot is refused.
 ///
 /// # Errors
-/// The record cannot be written, or the revision read: the next launch's rows are then unread,
-/// which says nothing done.
+/// The input repeats a subject, the record cannot be written, or the revision cannot be read.
+/// An error leaves the caller's fences unchanged.
 pub fn remember_private_read_back(rows: &mut [(Observation, Fence)]) -> Result<(), String> {
     let (path, journal) = places()?;
     let revision = initial_setup_revision()?;
@@ -327,6 +330,15 @@ fn remember_in(
     revision: u64,
     rows: &mut [(Observation, Fence)],
 ) -> Result<(), String> {
+    let mut subjects = std::collections::HashSet::with_capacity(rows.len());
+    for (seen, _) in rows.iter() {
+        let subject = seen.subject.setup_word();
+        if !subjects.insert(subject) {
+            return Err(format!(
+                "private read-back snapshot repeats subject {subject}"
+            ));
+        }
+    }
     let value = record(revision, rows, journal);
     // A pass with no new journal bytes or readings has nothing to publish.
     let previous = crate::macos_doctor::read_record_bytes(path)

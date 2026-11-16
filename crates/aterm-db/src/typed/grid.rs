@@ -11,7 +11,8 @@
 //!   build does not know, then the row's key, `=pk`. A header starting with `=` is read-only:
 //!   the key, bounded JSON, import coordinates and unknown columns.
 //! - **Cells.** A value is shown in its type's plain spelling: a set as its present members, a
-//!   list as `a, b`, a record as JSON, an address and a phone number as they are, and a secret
+//!   list as `a, b`, a record as JSON, a day as its date (`2026-11-14`, read back from that or
+//!   from its number), an address and a phone number as they are, and a secret
 //!   cell as the name of the secret-store entry that holds its value, read-only: the value is
 //!   written through the store, never typed into a grid. A conflicted cell shows `⚠ a ‖ b`;
 //!   editing it to one value resolves it.
@@ -106,7 +107,8 @@ fn compact(value: &Value) -> String {
     aterm_json::to_string(value).unwrap_or_default()
 }
 
-/// One value as a cell shows it: `""` for null, a plain scalar as itself, a secret reference as
+/// One value as a cell shows it: `""` for null, a day as its date ([`day_date`]), a plain
+/// scalar as itself, a secret reference as
 /// its store entry's name, a list of plain scalars as `a, b` (as JSON when an item holds a
 /// comma), anything else as JSON. A value that fails its type or the guards (another writer's
 /// build stored it) is shown raw ([`raw_shown`]): a sealed token or a credential never shows,
@@ -123,6 +125,11 @@ pub fn show(ty: &Ty, x: &Value) -> String {
             Value::String(text) => text,
             other => compact(&other),
         };
+    }
+    if matches!(ty, Ty::Day)
+        && let Some(date) = x.as_u64().and_then(day_date)
+    {
+        return date;
     }
     match (x.clone(), ty) {
         (Value::Null, _) => String::new(),
@@ -331,11 +338,16 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
             .parse::<i64>()
             .map(Value::from)
             .map_err(|_| "this column holds an integer"),
-        Ty::Uint | Ty::Time | Ty::Day => text
+        Ty::Uint | Ty::Time => text
             .trim()
             .parse::<u64>()
             .map(Value::from)
             .map_err(|_| "this column holds a whole number"),
+        // A day as the date it shows as, or as its number (a day past 9999 shows as that).
+        Ty::Day => date_day(text.trim())
+            .or_else(|| text.trim().parse::<u64>().ok())
+            .map(Value::from)
+            .ok_or("this column holds a date, as 2026-11-14"),
         Ty::Label => crate::machines::Label::parse(text.trim())
             .map(|label| Value::String(label.canonical()))
             .map_err(|_| "a machine label is m<N> or m<N>-xxxx"),
@@ -351,6 +363,42 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
             .map(Value::Array),
         _ => json(text),
     }
+}
+
+/// The last day a four-digit year names, 9999-12-31, as days since 1970-01-01.
+const LAST_DATE: i64 = aterm_stamp::civil::days_from_civil(9999, 12, 31);
+
+/// A day (days since 1970-01-01) as the date every surface shows it, `2026-11-14`; `None` past
+/// 9999-12-31, which shows as its number.
+pub fn day_date(days: u64) -> Option<String> {
+    let days = i64::try_from(days).ok().filter(|d| *d <= LAST_DATE)?;
+    let (year, month, day) = aterm_stamp::civil::civil_from_days(days);
+    Some(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// The day a date names: `YYYY-MM-DD` from 1970-01-01 to 9999-12-31, a day its month has.
+fn date_day(text: &str) -> Option<u64> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let part = |range: std::ops::Range<usize>| {
+        let digits = text.get(range)?;
+        digits
+            .bytes()
+            .all(|b| b.is_ascii_digit())
+            .then(|| digits.parse::<i64>().ok())
+            .flatten()
+    };
+    let (year, month, day) = (part(0..4)?, part(5..7)?, part(8..10)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let days = aterm_stamp::civil::days_from_civil(year, month, day);
+    // A day past its month's end (`2026-02-30`) names another date: no date.
+    (aterm_stamp::civil::civil_from_days(days) == (year, month, day))
+        .then(|| u64::try_from(days).ok())
+        .flatten()
 }
 
 /// A set cell's members: comma-separated, or a JSON list of texts (how a set whose member holds

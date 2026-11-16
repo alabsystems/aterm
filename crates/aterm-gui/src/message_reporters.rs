@@ -4468,10 +4468,6 @@ pub(crate) fn program_check_stuck(workers: u64, limit: Option<u64>) -> Message {
         "syspolicyd has stood at the kernel's thread limit for five minutes ({workers} pool \
              threads against {limit}), and it and tccd each hold what the other needs."
     ))
-    .line(
-        "Builds and tests in a tab kept across an aterm update make macOS check aterm's \
-             earlier copy at every program they start. Start them from a new tab.",
-    )
     .key(PROGRAM_CHECK_STUCK_KEY)
 }
 

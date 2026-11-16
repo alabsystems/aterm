@@ -21,6 +21,10 @@ pub fn exec_keeping_sigpipe(command: &mut aterm_uds::spawnfd::StdCommand) -> io:
         }
     };
     let saved = sigpipe_disposition();
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the gated exec itself: `_closed` holds the exec gate"
+    )]
     let error = command.exec();
     if let Some(saved) = saved.as_ref() {
         restore_sigpipe(saved);

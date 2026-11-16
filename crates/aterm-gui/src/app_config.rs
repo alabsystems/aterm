@@ -96,12 +96,9 @@ pub(crate) const DEFAULT_SCROLLBAR: bool = cfg!(windows);
 /// Whether new tabs keep Rewind's screen history when `temporal_recording` is unset.
 pub(crate) const DEFAULT_TEMPORAL_RECORDING: bool = true;
 
-/// Seconds untouched before a window rests when `idle_rest_secs` is unset: 0, so no window rests
-/// unless the person sets it. 30 is the measured candidate: a resting window's footprint fell by
-/// about 195 MiB, but over 212 rested and 210 awake first keys the rested key's p95 measured 1.64
-/// ms over an awake window's, past the 1 ms the rest's design allows, in the first submit after
-/// the GPU goes quiet. It stays 0 until a warm-up at the wake meets that bar (ATERM-KI-1027-4,
-/// `docs/measured/idle-memory-rest-2026-10-29.md`).
+/// Seconds untouched before a window rests when `idle_rest_secs` is unset.
+/// Zero keeps windows awake by default. The measured pre-warm trial missed the first-key
+/// latency limits, so rest remains available only through the explicit setting.
 pub(crate) const DEFAULT_IDLE_REST_SECS: f32 = 0.0;
 
 /// `mb` mebibytes in bytes.

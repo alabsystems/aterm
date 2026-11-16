@@ -1331,7 +1331,7 @@ fn a_log_admitted_mac_reads_an_older_log_epochs_row_through_a_history_handoff() 
     client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
     save_records(
         &lab.paths[1],
-        &load_records(&lab.paths[0]).unwrap().encode(),
+        &load_records(&lab.paths[0]).unwrap().read_encoded().unwrap(),
     )
     .unwrap();
     let b1 = lab.bootstrap(0);
@@ -1383,7 +1383,7 @@ fn a_log_admitted_mac_reads_an_older_log_epochs_row_through_a_history_handoff() 
     let (m3, e3) = entrant("m3", 0x33);
     let actor3 = e3.request.binding().actor();
     admit_member_in_log(&lab.paths[0], e3, Evidence::Phrase).unwrap();
-    let records = load_records(&lab.paths[0]).unwrap().encode();
+    let records = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[1], &records).unwrap();
     save_records(&m3, &records).unwrap();
     let b3 = Bootstrap::required(&m3).unwrap();
@@ -1462,7 +1462,7 @@ fn removal_lab(
     admit_member_in_log(&lab.paths[0], entrant, Evidence::Phrase).unwrap();
     save_records(
         &lab.paths[1],
-        &load_records(&lab.paths[0]).unwrap().encode(),
+        &load_records(&lab.paths[0]).unwrap().read_encoded().unwrap(),
     )
     .unwrap();
     let dir = lab._home.path().join("table-m1");
@@ -1546,9 +1546,9 @@ fn a_removal_mints_one_audience_once_the_gate_holds() {
 /// appends, and the open stands with the write still pending.
 #[test]
 fn an_open_whose_seal_append_is_uncertain_fails_with_its_error() {
-    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    use aterm_secrets::{client::save_records, membership_log::read_records};
     let (lab, removal, _, dir, scope) = removal_lab(true);
-    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal[..1]).unwrap()).unwrap();
     let b1 = lab.bootstrap(1);
     let session = Session::open(&b1).unwrap();
     let kept = store::Store::open(&session, &dir, scope)
@@ -1563,7 +1563,7 @@ fn an_open_whose_seal_append_is_uncertain_fails_with_its_error() {
     );
     drop((held, session));
 
-    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal).unwrap()).unwrap();
     let session = Session::open(&b1).unwrap();
     store::APPEND_FAILS.with(|fails| fails.set(true));
     let opened = store::Store::open(&session, &dir, scope);
@@ -1590,10 +1590,10 @@ fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads
             trusted_commons_log,
         },
         commons::bootstrap::{Bootstrap, Device},
-        membership_log::{Entrant, Evidence, encode_records},
+        membership_log::{Entrant, Evidence, read_records},
     };
     let (lab, removal, recipient4, dir, scope) = removal_lab(true);
-    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal[..1]).unwrap()).unwrap();
     let b1 = lab.bootstrap(1);
     let fold_epoch = |paths: &Paths, id: &Digest| {
         trusted_commons_log(paths, lab.bootstrap(1).trust())
@@ -1616,7 +1616,7 @@ fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads
     assert!(kept.is_write_pending(), "{kept}");
     drop(session);
 
-    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal).unwrap()).unwrap();
     let session = Session::open(&b1).unwrap();
     let new = *session.access.basis();
     assert_ne!(new, old);
@@ -1685,7 +1685,7 @@ fn under_the_fold_a_pending_write_applies_under_the_new_everyone_epoch_and_reads
     let actor5 = e5.request.binding().actor();
     admit_member_in_log(&lab.paths[0], e5, Evidence::Phrase).unwrap();
     turn_fold_on(&m5);
-    let records = load_records(&lab.paths[0]).unwrap().encode();
+    let records = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[1], &records).unwrap();
     save_records(&m5, &records).unwrap();
     let b5 = Bootstrap::required(&m5).unwrap();
@@ -1760,9 +1760,9 @@ fn sealed_under(
 /// with `TABLES_DONT_WAIT` on, seals the write at once under the epoch that wraps the removed Mac.
 #[test]
 fn a_table_write_on_a_mac_holding_a_remove_stays_pending_until_the_new_epoch_arrives() {
-    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    use aterm_secrets::{client::save_records, membership_log::read_records};
     let (lab, removal, recipient4, dir, scope) = removal_lab(false);
-    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal[..1]).unwrap()).unwrap();
     let b1 = lab.bootstrap(1);
     let session = Session::open(&b1).unwrap();
     let old = *session.access.basis();
@@ -1792,7 +1792,7 @@ fn a_table_write_on_a_mac_holding_a_remove_stays_pending_until_the_new_epoch_arr
     assert_eq!(held.pending_epochs(&session).unwrap().len(), 1);
     drop((held, session));
 
-    save_records(&lab.paths[1], &encode_records(&removal)).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal).unwrap()).unwrap();
     let session = Session::open(&b1).unwrap();
     let new = *session.access.basis();
     assert_ne!(new, old, "the rotation moved the epoch");
@@ -1816,9 +1816,9 @@ fn a_table_write_on_a_mac_holding_a_remove_stays_pending_until_the_new_epoch_arr
 /// `Remove` would keep pending lands at once, under the epoch still wrapped to the removed Mac.
 #[test]
 fn a_table_write_lands_under_the_old_epoch_when_the_wait_is_off() {
-    use aterm_secrets::{client::save_records, membership_log::encode_records};
+    use aterm_secrets::{client::save_records, membership_log::read_records};
     let (lab, removal, recipient4, dir, scope) = removal_lab(false);
-    save_records(&lab.paths[1], &encode_records(&removal[..1])).unwrap();
+    save_records(&lab.paths[1], &read_records(&removal[..1]).unwrap()).unwrap();
     let b1 = lab.bootstrap(1);
     let session = Session::open(&b1).unwrap();
     let old = *session.access.basis();

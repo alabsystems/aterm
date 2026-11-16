@@ -12,6 +12,9 @@ use std::sync::Mutex;
 pub(crate) struct Spawns<'a> {
     live: &'a Live,
     record: Mutex<Vec<(Cmd, Option<Vec<u8>>)>>,
+    /// This wrapper's own record of checkout facts ([`System::checkout_records`]), apart from
+    /// the one every [`Live`] of the process shares, which another test's pass may empty.
+    records: std::sync::Arc<super::CheckoutRecords>,
 }
 
 impl<'a> Spawns<'a> {
@@ -20,6 +23,7 @@ impl<'a> Spawns<'a> {
         Self {
             live,
             record: Mutex::new(Vec::new()),
+            records: std::sync::Arc::default(),
         }
     }
 
@@ -40,6 +44,9 @@ impl<'a> Spawns<'a> {
 }
 
 impl System for Spawns<'_> {
+    fn checkout_records(&self) -> Option<std::sync::Arc<super::CheckoutRecords>> {
+        Some(std::sync::Arc::clone(&self.records))
+    }
     fn scoped_path_metadata(&self, path: &Path) -> io::Result<super::ScopedPathMetadata> {
         self.live.scoped_path_metadata(path)
     }
@@ -86,6 +93,36 @@ impl System for Spawns<'_> {
     }
     fn read_file(&self, path: &Path) -> io::Result<Vec<u8>> {
         self.live.read_file(path)
+    }
+    fn read_head(&self, path: &Path, max: usize) -> io::Result<Vec<u8>> {
+        self.live.read_head(path, max)
+    }
+    fn file_id(&self, path: &Path) -> io::Result<super::FileId> {
+        self.live.file_id(path)
+    }
+    fn file_version(&self, path: &Path) -> io::Result<[u8; 32]> {
+        self.live.file_version(path)
+    }
+    fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
+        self.live.read_link(path)
+    }
+    fn owned_file_metadata(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<super::OwnedFileMetadata> {
+        self.live.owned_file_metadata(path, uid, max, private)
+    }
+    fn read_owned_file_observed(
+        &self,
+        path: &Path,
+        uid: u32,
+        max: usize,
+        private: bool,
+    ) -> io::Result<super::OwnedFileRead> {
+        self.live.read_owned_file_observed(path, uid, max, private)
     }
     fn admit_runtime(&self, root: &Path) -> Result<(), String> {
         self.live.admit_runtime(root)

@@ -3,7 +3,6 @@
 
 //! Explicit Google federation from a native vendor login, without changing its default policy.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -639,12 +638,7 @@ fn run(
     let mut password_sent = false;
     let mut identifier_sent = false;
     let mut totp_sent = false;
-    let mut mail_code: Option<aterm_secrets::SecretBytes> = None;
-    let mut mail_code_sent = false;
-    let mut seen_mail_codes = BTreeSet::new();
-    let started = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok());
     let mut page_proved = false;
-    let mut bot_since: Option<Instant> = None;
     let mut gate = Gate {
         hosts: handoff.hosts,
         completion: handoff.completion,
@@ -763,10 +757,11 @@ fn run(
                     continue;
                 }
             };
+            // A check on the popup ends the drive at once, with nothing on it touched.
+            if let Some(check) = oauth::check_met(&view) {
+                return Approval::BotCheck(oauth::check_reason(&check, &view.url));
+            }
             if inner.admits_google(&view.url, handoff.hosts) {
-                if oauth::bot_check(&view) {
-                    return Approval::BotCheck("Google sign-in requires a security check".into());
-                }
                 let mut act = |password: Option<&str>, totp: Option<&str>| {
                     let otp = if totp_sent {
                         None
@@ -788,15 +783,6 @@ fn run(
                         },
                         identifier_sent,
                         password_sent,
-                        identity.verification_email().map(|target| {
-                            (
-                                target,
-                                mail_code
-                                    .as_ref()
-                                    .and_then(aterm_secrets::SecretBytes::as_str),
-                            )
-                        }),
-                        mail_code_sent,
                     ));
                     browser.evaluate(page, script.as_str().unwrap_or_default(), true)
                 };
@@ -810,6 +796,9 @@ fn run(
                     Ok(Err(error)) => return quiet(error),
                     Err(error) => return quiet(error),
                 };
+                if let Some(check) = value.as_str().and_then(action_check) {
+                    return Approval::BotCheck(oauth::check_reason(&check, &view.url));
+                }
                 match value.as_str() {
                     Some("credentials") => {
                         credentials = match Credentials::load(identity, home) {
@@ -824,31 +813,6 @@ fn run(
                     Some("totp") => totp_sent = true,
                     Some("totp_rejected") => {
                         return quiet("Google rejected the submitted authenticator code");
-                    }
-                    Some("mailbox") => {
-                        match verification_mail(
-                            identity,
-                            approver,
-                            started,
-                            handoff.deadline,
-                            &mut seen_mail_codes,
-                        ) {
-                            Ok(code) => mail_code = Some(aterm_secrets::SecretBytes::from(code)),
-                            Err(why) => return quiet(why),
-                        }
-                    }
-                    Some("mailbox_unconfigured") => {
-                        return quiet("Google verification mailbox is not configured");
-                    }
-                    Some("mailbox_refused") => {
-                        return quiet("Google verification destination does not match its binding");
-                    }
-                    Some("mailcode") => {
-                        mail_code_sent = true;
-                        mail_code = None;
-                    }
-                    Some("mailcode_rejected") => {
-                        return quiet("Google rejected the submitted verification code");
                     }
                     Some("challenge") => {
                         return quiet("Google sign-in requires an unsupported verification step");
@@ -876,14 +840,10 @@ fn run(
             Ok(page) => page,
             Err(error) => return quiet(error),
         };
-        if oauth::bot_check(&page) {
-            if bot_since.get_or_insert_with(Instant::now).elapsed() >= oauth::VENDOR_STALL {
-                return Approval::BotCheck("Vendor sign-in requires a security check".into());
-            }
-            std::thread::sleep(Duration::from_millis(200));
-            continue;
+        // A check on the vendor's page ends the drive at once, with nothing on it touched.
+        if let Some(check) = oauth::check_met(&page) {
+            return Approval::BotCheck(oauth::check_reason(&check, &page.url));
         }
-        bot_since = None;
         let loopback = outer.callback_port.is_some()
             && (page.url.starts_with("http://127.0.0.1:")
                 || page.url.starts_with("http://localhost:"));
@@ -907,6 +867,7 @@ fn run(
         page_proved |= oauth::shows_email(&page, &gate);
         let step = oauth::vendor_step(&page, &gate);
         match &step {
+            Step::Check(check) => return Approval::BotCheck(oauth::check_reason(check, &page.url)),
             Step::Done => {
                 // The device CLI still has to consume its grant. Never infer that from a browser success page.
                 if handoff.completion != crate::ai::connector::Completion::Device {
@@ -919,15 +880,15 @@ fn run(
                     Step::FillEmail => gate.email,
                     _ => None,
                 };
-                let script = format!(
-                    "(() => {{if(location.href !== {})return {{ok:false}};return {};}})()",
-                    json!(&page.url),
-                    oauth::vendor_act_js(&step, value)
-                );
-                let acted = browser
-                    .evaluate(&root, &script, true)
-                    .is_ok_and(|result| result.get("ok").and_then(Value::as_bool) == Some(true));
-                if acted {
+                // The act reads the page for a check and holds to the read's address and document
+                // in the same evaluation, before it touches anything.
+                let answer = browser
+                    .evaluate(&root, &oauth::vendor_act_js(&step, value, &page), true)
+                    .unwrap_or(Value::Null);
+                if let Some(check) = answer.get("check").and_then(oauth::CheckMet::of_value) {
+                    return Approval::BotCheck(oauth::check_reason(&check, &page.url));
+                }
+                if answer.get("ok").and_then(Value::as_bool) == Some(true) {
                     oauth::note_acted(&mut gate, &page, &step);
                 }
             }
@@ -939,14 +900,19 @@ fn run(
                 if selections >= 3 {
                     return quiet("Vendor did not open its Google sign-in");
                 }
-                if choose_google(&mut browser, &root, &page.url).unwrap_or(false) {
-                    selected_google = true;
-                    last_selection = Some(Instant::now());
-                    selections += 1;
+                match choose_google(&mut browser, &root, &page.url) {
+                    Ok(Chosen::Pressed) => {
+                        selected_google = true;
+                        last_selection = Some(Instant::now());
+                        selections += 1;
+                    }
+                    Ok(Chosen::Check(check)) => {
+                        return Approval::BotCheck(oauth::check_reason(&check, &page.url));
+                    }
+                    Ok(Chosen::Waiting) | Err(_) => {}
                 }
             }
             Step::Refuse(why) => return Approval::Refused(why.clone()),
-            Step::Blocked(why) => return Approval::BotCheck(why.clone()),
             Step::Stop(_) | Step::Mailbox => {
                 return quiet("Vendor federation requires an unimplemented verification step");
             }
@@ -965,116 +931,19 @@ fn read_page(
         .map(|value| oauth::page_of(&value))
 }
 
-fn verification_mail(
-    identity: &Identity,
-    approver: &VendorApprover,
-    started: Option<i64>,
-    deadline: login_drive::Deadline<'_>,
-    seen: &mut BTreeSet<String>,
-) -> Result<String, &'static str> {
-    verification_mail_from(
-        identity,
-        approver.home.as_deref(),
-        approver
-            .mailbox_source
-            .as_ref()
-            .or(approver.mailbox.as_ref()),
-        started,
-        deadline,
-        seen,
-    )
-}
-
-pub(super) fn verification_mail_from(
-    identity: &Identity,
-    home: Option<&Path>,
-    source: Option<&oauth::MailboxConfig>,
-    started: Option<i64>,
-    deadline: login_drive::Deadline<'_>,
-    seen: &mut BTreeSet<String>,
-) -> Result<String, &'static str> {
-    let target = identity
-        .verification_email()
-        .ok_or("Google verification mailbox is not configured")?;
-    let mut config = verification_config_from(identity, home, source)?;
-    config.senders = vec!["accounts.google.com".into(), "google.com".into()];
-    config.required_account = Some(identity.email().to_owned());
-    config.since = Some(started.ok_or("Verification mail clock is unavailable")?);
-    config.strict_since = true;
-    // The code-only relay has no account-body witness. Use a full-message reader here.
-    config.relay_enabled = false;
-    if deadline.expired() {
-        return Err("Google verification mail deadline expired");
-    }
-    match oauth::poll_mailbox_config_until(
-        &config,
-        Some(target),
-        deadline.limited(Duration::from_secs(60)),
-        false,
-        seen,
-    )? {
-        oauth::MailboxCredential::Otp(code)
-            if code.len() == 6 && code.bytes().all(|byte| byte.is_ascii_digit()) =>
-        {
-            Ok(code)
-        }
-        _ => Err("Google verification message contains no admitted numeric code"),
-    }
-}
-
-#[cfg(test)]
-fn verification_config(
-    identity: &Identity,
-    approver: &VendorApprover,
-) -> Result<oauth::MailboxConfig, &'static str> {
-    verification_config_from(
-        identity,
-        approver.home.as_deref(),
-        approver
-            .mailbox_source
-            .as_ref()
-            .or(approver.mailbox.as_ref()),
-    )
-}
-
-fn verification_config_from(
-    identity: &Identity,
-    home: Option<&Path>,
-    source: Option<&oauth::MailboxConfig>,
-) -> Result<oauth::MailboxConfig, &'static str> {
-    let target = identity
-        .verification_email()
-        .ok_or("Google verification mailbox is not configured")?;
-    let explicitly_routed = source.is_some_and(|config| {
-        config.route_for(Some(target)).is_some()
-            || super::mail_recovery::accounts(config)
-                .iter()
-                .any(|account| account.eq_ignore_ascii_case(target))
-    });
-    // A saved grant for this exact address outranks an unrelated legacy catch-all mailbox,
-    // but never overrides an explicit route (including one that is currently unavailable).
-    if !explicitly_routed
-        && let Some(home) = home
-        && aterm_mail::oauth::session::shared(home, target)
-            .map_err(|_| "Stored Google verification mail authorization is unavailable")?
-            .is_some()
-    {
-        return Ok(oauth::MailboxConfig {
-            user: Some(target.into()),
-            imap_url: Some("imaps://imap.gmail.com/INBOX".into()),
-            ..Default::default()
-        });
-    }
-    source
-        .filter(|config| config.is_configured_for(Some(target)))
-        .cloned()
-        .ok_or("Google verification mailbox is unavailable")
-}
-
+/// The script that presses the vendor's `Continue with Google` button on the page at `url`, all
+/// in one evaluation: it first reads the page for a check (`check`, with nothing touched),
+/// ticks an unticked terms box that is not a human check's, and presses the button only where
+/// its centre shows the button itself (`pressed`). The press is made in the evaluation that
+/// read no check, never by a later command: a widget or overlay a page drew after the read
+/// could take a press sent after it.
 fn select_google(url: &str) -> String {
     format!(
         r#"(() => {{
         if(location.href !== {url}) return false;
+        {check}
+        const met = checkMet();
+        if(met) return {{check: met}};
         const visible = e => e && !e.disabled && e.getClientRects().length;
         const button = [...document.querySelectorAll('button, [role=button]')].find(e => e.getClientRects().length && /^continue with google$/i.test(e.innerText.trim()));
         if(!button) return false;
@@ -1086,27 +955,59 @@ fn select_google(url: &str) -> String {
         if(!visible(button)) return false;
         button.scrollIntoView({{block:'center'}});
         const rect=button.getBoundingClientRect();
-        return {{x:rect.x+rect.width/2,y:rect.y+rect.height/2}};
+        const x=rect.x+rect.width/2, y=rect.y+rect.height/2;
+        const hit=document.elementFromPoint(x,y);
+        if(!hit || !(hit===button || button.contains(hit))) return false;
+        button.click();
+        return {{pressed: true}};
     }})()"#,
-        url = json!(url)
+        url = json!(url),
+        check = oauth::CHECK_PAGE_JS,
     )
+}
+
+/// What [`choose_google`] did.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Chosen {
+    /// It pressed the vendor's `Continue with Google` button.
+    Pressed,
+    /// It pressed nothing yet (no button, or a terms box ticked first).
+    Waiting,
+    /// The page carries a check: nothing was pressed and nothing will be.
+    Check(oauth::CheckMet),
 }
 
 fn choose_google(
     browser: &mut MemoryBrowser<'_>,
     page: &BrowserPage,
     url: &str,
-) -> Result<bool, super::google_browser::Error> {
+) -> Result<Chosen, super::google_browser::Error> {
     let value = browser.evaluate(page, &select_google(url), true)?;
-    let Some((x, y)) = value
-        .get("x")
-        .and_then(Value::as_f64)
-        .zip(value.get("y").and_then(Value::as_f64))
-    else {
-        return Ok(false);
-    };
-    browser.click(page, x, y)?;
-    Ok(true)
+    if let Some(check) = value.get("check").and_then(oauth::CheckMet::of_value) {
+        return Ok(Chosen::Check(check));
+    }
+    Ok(chosen_of(&value))
+}
+
+/// What [`select_google`]'s answer `value` says it did, where it names no check: it pressed
+/// only where it answered so.
+fn chosen_of(value: &Value) -> Chosen {
+    if value.get("pressed").and_then(Value::as_bool) == Some(true) {
+        Chosen::Pressed
+    } else {
+        Chosen::Waiting
+    }
+}
+
+/// The check a [`google_action`] answer `check:<kind>:<name>` names; any other `check:` answer
+/// is a human check by the general name, so an unknown one still stops the drive.
+pub(super) fn action_check(answer: &str) -> Option<oauth::CheckMet> {
+    let rest = answer.strip_prefix("check:")?;
+    let (kind, name) = rest.split_once(':').unwrap_or((rest, ""));
+    Some(
+        oauth::CheckMet::of_value(&json!({"kind": kind, "name": name}))
+            .unwrap_or_else(|| oauth::CheckMet::HumanCheck("captcha".into())),
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -1122,21 +1023,23 @@ pub(super) fn google_action(
     authenticator: Authenticator<'_>,
     identifier_sent: bool,
     password_sent: bool,
-    mail: Option<(&str, Option<&str>)>,
-    mail_sent: bool,
 ) -> String {
     format!(
         r#"(() => {{
         if(location.origin !== 'https://accounts.google.com') return 'refused';
+        {check}
+        const met=checkMet();
+        if(met) return 'check:'+met.kind+':'+met.name;
+        if(document.querySelector('#captchaimg,input[name=ca]')) return 'check:human_check:captcha';
+        if(document.querySelector('#idvPin,input[name=idvPin]')) return 'check:block_page:Google';
         const visible=e=>e&&!e.disabled&&e.getClientRects().length;
         if(/\/(?:signup|recovery|changepassword)(?:\/|$)/i.test(location.pathname)||/\/challenge\/(?:sms|ipp)(?:\/|$)/i.test(location.pathname))return 'challenge';
         if([...document.querySelectorAll('input[type=password][autocomplete=new-password]')].some(visible))return 'challenge';
-        if([...document.querySelectorAll('iframe[src*=recaptcha],#captchaimg,input[name=ca]')].some(visible)) return 'challenge';
         const email={email};
         const identities=[...document.querySelectorAll('[data-email],[data-identifier],#profileIdentifier')].filter(visible);
         const exact=e=>String(e.getAttribute('data-email')||e.getAttribute('data-identifier')||e.textContent).trim().toLowerCase()===email.toLowerCase();
         const choice=identities.find(e=>e.hasAttribute('data-identifier')&&exact(e));
-        if(choice && !document.querySelector('input[type=password]') && /accountchooser|selectaccount/i.test(location.pathname)) {{choice.click();return 'wait';}}
+        if(choice && !document.querySelector('input[type=password]') && /accountchooser|selectaccount/i.test(location.pathname)) {{if(choice.dataset.atermGoogleChoiceSent==='true')return 'wait';choice.dataset.atermGoogleChoiceSent='true';choice.click();return 'wait';}}
         const fill=(field,value,next)=>{{const button=[...document.querySelectorAll(next)].find(visible);if(!button)return false;Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(field,value);field.dispatchEvent(new Event('input',{{bubbles:true}}));field.dispatchEvent(new Event('change',{{bubbles:true}}));button.click();return true;}};
         const identifier=document.querySelector('#identifierId');
         if(visible(identifier)) return {identifier_sent}?'wait':(fill(identifier,email,'#identifierNext')?'identifier':'wait');
@@ -1144,25 +1047,6 @@ pub(super) fn google_action(
         if(field) {{if(!identities.some(exact)||({password_sent}&&field.getAttribute('aria-invalid')==='true'))return 'refused';if({password_sent})return 'wait';const password={password};if(password===null)return 'credentials';return fill(field,password,'#passwordNext')?'password':'wait';}}
         const totp=document.querySelector('#totpPin,input[name=totpPin]');
         if(visible(totp)) {{if(!identities.some(exact))return 'refused';if({totp_sent})return totp.getAttribute('aria-invalid')==='true'?'totp_rejected':'wait';const otp={otp};return otp?(fill(totp,otp,'#totpNext')?'totp':'wait'):({password}===null?'credentials':'challenge');}}
-        const mailField=[...document.querySelectorAll('#idvPin,input[name=idvPin]')].find(visible);
-        if(mailField) {{
-            if(!identities.some(exact))return 'refused';
-            const recipient={recipient};
-            if(!recipient)return 'mailbox_unconfigured';
-            const prompt=(mailField.closest('form')||document.body).innerText;
-            const hints=prompt.match(/[a-zA-Z0-9.*•_%+\-]+@[a-zA-Z0-9.*•\-]+/g)||[];
-            const compatible=hint=>{{
-                hint=hint.replace(/\.+$/,'');
-                if(!/[a-z0-9]/i.test(hint.split('@')[0]))return false;
-                const pattern=hint.toLowerCase().replace(/[.+?^${{}}()|[\]\\]/g,'\\$&').replace(/[*•]+/g,'.*');
-                return new RegExp('^'+pattern+'$').test(recipient.toLowerCase());
-            }};
-            if(!/email|e-mail/i.test(prompt)||!hints.some(compatible))return 'mailbox_refused';
-            if({mail_sent})return mailField.getAttribute('aria-invalid')==='true'?'mailcode_rejected':'wait';
-            const code={mail_code};
-            if(!code)return 'mailbox';
-            return fill(mailField,code,'#idvPreregisteredEmailNext,#idvPinNext')?'mailcode':'wait';
-        }}
         if(/\/challenge\//.test(location.pathname))return 'challenge';
         if(/\/oauth\//.test(location.pathname) && identities.some(exact)) {{
             const approve=document.querySelector('#submit_approve_access');
@@ -1177,8 +1061,7 @@ pub(super) fn google_action(
             _ => None,
         }),
         totp_sent = matches!(authenticator, Authenticator::Submitted),
-        recipient = json!(mail.map(|(target, _)| target)),
-        mail_code = json!(mail.and_then(|(_, code)| code))
+        check = oauth::CHECK_PAGE_JS,
     )
 }
 

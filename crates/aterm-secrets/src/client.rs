@@ -1172,7 +1172,7 @@ impl StateLock {
         }
         let config = reads.config()?;
         let (vault, store) = records_store_selected(&reads, config)?;
-        let store = records_cache::read(paths, vault, store)?;
+        let store = records_cache::read(paths, vault, store, &|| reads.identity().ok().flatten())?;
         if let Some(config) = config {
             retained_history::acknowledge_under(&reads, &store, config)?;
         }
@@ -5182,7 +5182,13 @@ fn records_store_for(
 /// be read, or this build's ALab genesis digest is malformed.
 pub fn load_records(paths: &Paths) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store(paths)?;
-    records_cache::read(paths, vault, store)
+    let identity = std::cell::OnceCell::new();
+    let of = || {
+        identity
+            .get_or_init(|| read_identity(paths).ok().flatten())
+            .as_ref()
+    };
+    records_cache::read(paths, vault, store, &of)
 }
 
 /// This Mac's membership store as an authority decision reads it: [`load_records`], projected
@@ -5238,7 +5244,9 @@ fn acknowledged_read(paths: &Paths, ahead: bool) -> crate::Result<AcknowledgedRe
 fn acknowledged_under(reads: &Reads<'_>, ahead: bool) -> crate::Result<AcknowledgedRecords> {
     let config = reads.config()?;
     let (vault, store) = records_store_selected(reads, config)?;
-    let raw = records_cache::read(reads.paths(), vault, store)?;
+    let raw = records_cache::read(reads.paths(), vault, store, &|| {
+        reads.identity().ok().flatten()
+    })?;
     let Some(config) = config else {
         return Ok(AcknowledgedRecords {
             acknowledged: raw,
@@ -5263,7 +5271,9 @@ fn load_records_for(
     config: &Config,
 ) -> crate::Result<crate::membership_log::Store> {
     let (vault, store) = records_store_selected(reads, Some(config))?;
-    records_cache::read(reads.paths(), vault, store)
+    records_cache::read(reads.paths(), vault, store, &|| {
+        reads.identity().ok().flatten()
+    })
 }
 
 /// Verify and merge `records` into `paths.records_file()` under the client state lock, returning
@@ -5646,10 +5656,7 @@ fn retain_commons_records_with(
     }
     let held: Vec<bool> = decoded
         .iter()
-        .map(|r| {
-            r.as_ref()
-                .is_some_and(|rec| known.complete_bytes(rec.id()).is_some())
-        })
+        .map(|r| r.as_ref().is_some_and(|rec| known.holds(rec.id())))
         .collect();
     if decoded.iter().zip(&held).all(|(r, &h)| r.is_none() || h) {
         if held.iter().any(|&h| h) {
@@ -5681,10 +5688,7 @@ fn retain_commons_records_with(
         .map_or(0, crate::membership_log::Log::held_count);
     let held_before: Vec<bool> = decoded
         .iter()
-        .map(|r| {
-            r.as_ref()
-                .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
-        })
+        .map(|r| r.as_ref().is_some_and(|rec| store.holds(rec.id())))
         .collect();
     let complete =
         |id: &crate::membership_log::RecordId| store.log().and_then(|log| log.get(id)).is_some();
@@ -5714,18 +5718,15 @@ fn retain_commons_records_with(
         } else {
             write_records(paths, &store)?;
         }
-    } else if decoded.iter().any(|r| {
-        r.as_ref()
-            .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
-    }) {
+    } else if decoded
+        .iter()
+        .any(|r| r.as_ref().is_some_and(|rec| store.holds(rec.id())))
+    {
         aterm_durable::durable_dir(&paths.dir).map_err(|e| Error::new(e.to_string()))?;
     }
     Ok(decoded
         .iter()
-        .map(|r| {
-            r.as_ref()
-                .is_some_and(|rec| store.complete_bytes(rec.id()).is_some())
-        })
+        .map(|r| r.as_ref().is_some_and(|rec| store.holds(rec.id())))
         .collect())
 }
 
@@ -5843,7 +5844,10 @@ fn judge_received_records(
         Some(records) if batch_valid(&records) => (Some(records), true),
         _ => {
             let part = received.readable();
-            let part_len: usize = part.iter().map(|record| record.bytes().len()).sum();
+            let part_len: usize = part
+                .iter()
+                .map(crate::membership_log::Record::wire_len)
+                .sum();
             let part = (!part.is_empty() && part_len < received.byte_len() && batch_valid(&part))
                 .then_some(part);
             (part, false)
@@ -5919,7 +5923,7 @@ impl PeerRecords {
 /// One records pass: pull from the source and its peers (beside the source where nothing waits,
 /// after a long poll of it that failed), keep what verifies, and post each server that said it
 /// lacks this Mac's frontier what [`Reposted::due`] makes it due: the complete records past what
-/// it last judged; the store's complete records (`encode_held`) where it judged none, none for
+/// it last judged; the store's complete records (`read_held`) where it judged none, none for
 /// [`REPOST_AGAIN`], or answers another boot id than its last judging pass heard (at most once per
 /// [`REPOST_AGAIN`]); or nothing where it judged this frontier within [`REPOST_AGAIN`] and has not
 /// restarted since.

@@ -258,9 +258,21 @@ fn process_stat(pid: i32) -> char {
         .unwrap_or('?')
 }
 
-/// The tail of the instance log, for failure diagnostics.
+pub(super) const LOG_TAIL_BYTES: u64 = 16 * 1024;
+
+/// Up to fifteen lines from the last bounded chunk of an instance log, for failure diagnostics.
 pub fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let tail = (|| -> std::io::Result<Vec<u8>> {
+        let mut file = std::fs::File::open(log)?;
+        let offset = file.metadata()?.len().saturating_sub(LOG_TAIL_BYTES);
+        file.seek(SeekFrom::Start(offset))?;
+        let mut tail = Vec::new();
+        file.take(LOG_TAIL_BYTES).read_to_end(&mut tail)?;
+        Ok(tail)
+    })()
+    .unwrap_or_default();
+    let body = String::from_utf8_lossy(&tail);
     let lines: Vec<&str> = body.lines().collect();
     let start = lines.len().saturating_sub(15);
     lines[start..].join("\n")

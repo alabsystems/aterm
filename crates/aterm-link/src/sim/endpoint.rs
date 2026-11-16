@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
+use aterm_types::fabric_grammar::ANSWER_KINDS;
+
 use super::lock;
 
 /// The endpoint's rules, each switchable for a negative control.
@@ -116,6 +118,9 @@ pub(crate) struct Session {
     /// after the offset with what the broker held of the lane at that offset as the bridge
     /// answered, in order, until the world takes them ([`Endpoint::take_fetched`]).
     fetched: Vec<Fetched>,
+    /// Each answer or `expired` the session read by a fetch, which leaves no row: the laws
+    /// that ask what a session was handed read these beside its rows.
+    pub(crate) read_by_fetch: Vec<FetchRead>,
     /// The broadcast topics it follows (`topic add <t> since=<s>`), each with its `since=`,
     /// as `topic ls` names them.
     pub(crate) topics: BTreeMap<String, String>,
@@ -127,6 +132,24 @@ pub(crate) struct Session {
 /// record of the session's lane the broker held there the moment the bridge answered
 /// ([`super::bus::Broker::at`]: the bridge reads nothing between its read and its answer).
 pub(crate) type Fetched = (u64, String, Option<super::bus::At>);
+
+/// An answer or `expired` a session read by a fetch ([`Session::read_by_fetch`]).
+#[derive(Clone, Debug)]
+pub(crate) struct FetchRead {
+    pub(crate) off: u64,
+    /// The ask it names (`re=`) is a record of the log the endpoint was last told: a log replaced
+    /// since below that offset gives it to another record, and the read answers none of it. A
+    /// replacement that keeps the ask keeps the read, the answer's own record given up or not.
+    pub(crate) ask_on_log: bool,
+    /// A log replaced since took the read's own offset: the read came before every record of the
+    /// log now past that fork, wherever their offsets fall against its own.
+    pub(crate) off_replaced: bool,
+    pub(crate) kind: String,
+    /// The ask it names (`re=`).
+    pub(crate) re: u64,
+    /// What its `from=` names before any `@`: the answer's sender, or the node for an `expired`.
+    pub(crate) from: String,
+}
 
 /// A session log's ring in the simulation.
 fn log_limits() -> aterm_slog::Limits {
@@ -151,6 +174,7 @@ impl Session {
             addressed_head: None,
             fetches: Vec::new(),
             fetched: Vec::new(),
+            read_by_fetch: Vec::new(),
             topics: BTreeMap::new(),
             seen_id: 0,
         }
@@ -172,6 +196,10 @@ impl Session {
         let kept = |off: u64| off < fork;
         for r in &mut self.rows {
             r.on_log &= kept(r.off);
+        }
+        for r in &mut self.read_by_fetch {
+            r.ask_on_log &= kept(r.re);
+            r.off_replaced |= !kept(r.off);
         }
         for r in &mut self.receipts {
             r.earlier |= !kept(r.off);
@@ -1051,6 +1079,24 @@ impl EpState {
                 .collect();
             if !answer.contains(&"more=1") {
                 session.fetches.retain(|o| *o != off);
+            }
+            // A record's answer opens with its `from=`; a chunk of a body cut in lines is none of
+            // the world's answers, whose bodies are a marker each.
+            let whole = answer.first().is_some_and(|t| t.starts_with("from="))
+                && field("more").is_none()
+                && field("at").is_none();
+            let kind = field("kind").filter(|k| ANSWER_KINDS.contains(k) || *k == "expired");
+            let re = field("re").and_then(crate::parse_uint::<u64>);
+            let from = field("from").and_then(|f| f.split('@').next());
+            if let (true, Some(kind), Some(re), Some(from)) = (whole, kind, re, from) {
+                session.read_by_fetch.push(FetchRead {
+                    off,
+                    ask_on_log: true,
+                    off_replaced: false,
+                    kind: kind.to_string(),
+                    re,
+                    from: from.to_string(),
+                });
             }
             session.fetched.push((off, answer.join(" "), held));
             return "OK\n".to_string();

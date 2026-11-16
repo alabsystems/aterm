@@ -227,6 +227,7 @@ fn complete_and_partial_source_caches_preserve_real_payload_and_native_transfer_
         &["push", "-q", remote.to_str().unwrap(), "HEAD:main"],
     );
     let target = host_git(&work, &["rev-parse", "HEAD"]);
+    let current = host_git(&work, &["rev-parse", "HEAD:current"]);
     let complete = world.path().join("complete.git");
     host_git(
         world.path(),
@@ -255,9 +256,17 @@ fn complete_and_partial_source_caches_preserve_real_payload_and_native_transfer_
     let mut complete_request = None;
     for (cache, full) in [(&complete, true), (&partial, false)] {
         if !full {
-            // A partial cache cannot repair an incomplete authoritative source.
+            // A complete ancestor may supply its original historical DATA, but
+            // cannot repair an absent new body that neither source supplies.
             // This refusal uses its own receiver; the positive case below starts
             // only after restoring the exact test-owned provider object.
+            std::fs::write(&remote_old, &remote_old_bytes).unwrap();
+            let remote_new = remote
+                .join("objects")
+                .join(&current[..2])
+                .join(&current[2..]);
+            let remote_new_bytes = std::fs::read(&remote_new).unwrap();
+            std::fs::remove_file(&remote_new).unwrap();
             let refused = world.path().join("partial-incomplete-source-receiver.git");
             host_git(
                 world.path(),
@@ -287,13 +296,14 @@ fn complete_and_partial_source_caches_preserve_real_payload_and_native_transfer_
             assert_eq!(store_bytes(&refused), receiver_before);
             assert!(
                 !gh.fx().children_run().iter().any(|spec| {
-                    spec.args
-                        .iter()
-                        .any(|arg| arg == "update-ref" || arg == "pack-objects")
+                    spec.args.iter().any(|arg| arg == "pack-objects")
+                        || (spec.args.iter().any(|arg| arg == "update-ref")
+                            && spec.cwd.as_deref().and_then(Path::file_name)
+                                != Some(std::ffi::OsStr::new("cache-ancestor-export.git")))
                 }),
                 "incomplete source cannot publish objects or refs"
             );
-            std::fs::write(&remote_old, &remote_old_bytes).unwrap();
+            std::fs::write(&remote_new, &remote_new_bytes).unwrap();
             host_git(
                 &remote,
                 &["fsck", "--full", "--strict", "--no-dangling", &target],
@@ -353,13 +363,21 @@ fn complete_and_partial_source_caches_preserve_real_payload_and_native_transfer_
             .enumerate()
             .filter(|(_, spec)| spec.args.iter().any(|arg| arg == "--refetch"))
             .collect();
-        assert_eq!(whole.len(), usize::from(full));
+        assert_eq!(whole.len(), 1);
         if let Some((ordinal, spec)) = whole.first() {
             let spans = spans.lock().unwrap();
             let returned = spans.iter().find(|span| span.ordinal == *ordinal).unwrap();
             assert_eq!((returned.code, returned.error), (Some(0), None));
-            assert!(spec.args.iter().any(|arg| arg == target.as_str()));
-            complete_request = Some((spec.program.clone(), spec.args.clone()));
+            if full {
+                assert!(spec.args.iter().any(|arg| arg == target.as_str()));
+                complete_request = Some((spec.program.clone(), spec.args.clone()));
+            } else {
+                assert!(
+                    spec.args.iter().any(|arg| {
+                        arg == format!("+{middle}:refs/agh/cache-ancestor").as_str()
+                    })
+                );
+            }
         }
         let mixed = calls
             .iter()
@@ -387,7 +405,7 @@ fn complete_and_partial_source_caches_preserve_real_payload_and_native_transfer_
         assert_eq!(
             exact_root,
             usize::from(!full),
-            "incomplete cache uses the authoritative full-history root"
+            "incomplete cache completes the authoritative root with a checked ancestor"
         );
     }
     // Replace the receiver while cache hydration is in flight, before the

@@ -387,7 +387,7 @@ fn compaction_keeps_every_count_and_reloads_a_replaced_file() {
         "the reader has read the file"
     );
     let before = journal(dir.path()).len();
-    let inode = |path: &Path| line_log::identity_of(&std::fs::metadata(path).unwrap());
+    let inode = |path: &Path| line_log::identity_at(path).unwrap();
     let old = inode(&dir.path().join(crate::JOURNAL));
     // The next append passes the bound: the journal is rewritten with each tab's last count.
     writer.compact_at = 1;
@@ -426,7 +426,7 @@ fn a_journal_of_live_records_is_not_rewritten_for_its_size() {
     let mut store = Store::open(dir.path()).unwrap();
     store.compact_at = 1;
     let inode = |path: &Path| {
-        let id = line_log::identity_of(&std::fs::metadata(path).unwrap());
+        let id = line_log::identity_at(path).unwrap();
         (id.dev, id.ino)
     };
     let path = dir.path().join(crate::JOURNAL);
@@ -512,7 +512,7 @@ fn compaction_keeps_every_row_a_newer_build_wrote_as_written() {
             .is_some_and(|rec| matches!(rec.body, Body::Attach { .. }))
     };
     let inode = |path: &Path| {
-        let id = line_log::identity_of(&std::fs::metadata(path).unwrap());
+        let id = line_log::identity_at(path).unwrap();
         (id.dev, id.ino)
     };
     let old = inode(&dir.path().join(crate::JOURNAL));
@@ -1508,7 +1508,7 @@ fn claims_survive_reopen_and_compaction() {
         store.attach(AT + n, TAB_A, Verb::Send, NODE, BY).unwrap();
     }
     let inode = |path: &Path| {
-        let id = line_log::identity_of(&std::fs::metadata(path).unwrap());
+        let id = line_log::identity_at(path).unwrap();
         (id.dev, id.ino)
     };
     let path = dir.path().join(crate::JOURNAL);
@@ -2410,4 +2410,367 @@ fn a_request_kept_while_its_cleanup_was_cut_leaves_cleaning() {
         store.begin_clean(AT + 12, &id, "human", false, &every_tab),
         Err(ActRefusal::Kept)
     ));
+}
+
+/// A tab opened before the `t` form, which keeps its `s-` ID until aterm restores or closes it.
+const LEGACY_TAB: &str = "s-0123456789abcdef0123";
+/// Another such tab: an agent's, which asks for requests of its own.
+const LEGACY_ASKER: &str = "s-fedcba98765432100123";
+/// A fleet drive whose requester is a legacy tab on the driving Mac.
+const LEGACY_BY: &str = "fleet:87be5228:s-fedcba98765432100123";
+
+/// The journal a build before the `t` form left, each row the bytes that build wrote (no row
+/// goes through this build's encoder, and each is held to be the one line its record has): a
+/// fleet drive from a legacy tab opened a request and was given a legacy tab, and a local legacy
+/// tab opened one of its own.
+fn earlier_journal(dir: &Path) -> (String, String) {
+    let fleet = "r-20261109-1411-87be5228-01".to_owned();
+    let local = "r-20261109-1411-local-01".to_owned();
+    let lines = [
+        format!(
+            "t={AT} op=open req={fleet} via=fleet-shell form=shell node={NODE} host=m114 \
+             by={LEGACY_BY} program=claude model=opus-5.5 account=- why_src=none"
+        ),
+        format!(
+            "t={} op=tab req={fleet} tab={LEGACY_TAB} by={LEGACY_BY}",
+            AT + 1
+        ),
+        format!(
+            "t={} op=attach req={fleet} tab={LEGACY_TAB} verb=turn n=1 by={LEGACY_BY}",
+            AT + 2
+        ),
+        format!(
+            "t={AT} op=open req={local} via=ctl-spawn form=agent:claude node=- host=m72 \
+             by={LEGACY_ASKER} program=- model=- account=- why_src=none"
+        ),
+        format!(
+            "t={} op=tab req={local} tab={TAB_A} by={LEGACY_ASKER}",
+            AT + 3
+        ),
+    ];
+    for line in &lines {
+        let rec = Rec::parse(line).unwrap_or_else(|| panic!("no record: {line}"));
+        assert_eq!(&rec.line(), line, "not the line its record has");
+    }
+    std::fs::write(dir.join(crate::JOURNAL), lines.join("\n") + "\n").unwrap();
+    (fleet, local)
+}
+
+/// A Mac updated over tabs opened before the `t` form: the journal names them by their `s-` IDs,
+/// as a tab (`tab=`), as a local requester (`by=`) and inside a fleet drive's token
+/// (`by=fleet:<head>:`). Every such row is read, so each request is still its requester's and
+/// each tab still its request's: the requester's next verb counts on from the stored one, and
+/// the tab's leaving concludes the request. NEGATIVE CONTROL: a row whose `s-` word is loose is
+/// skipped and counted, and names no tab.
+#[test]
+fn a_journal_an_earlier_build_wrote_for_legacy_tabs_is_folded_whole() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (fleet, local) = earlier_journal(dir.path());
+    let mut store = Store::open(dir.path()).unwrap();
+    assert_eq!(store.skipped(), 0, "every row an earlier build wrote reads");
+    assert_eq!(store.get(&fleet).unwrap().open.by, LEGACY_BY);
+    assert_eq!(store.get(&fleet).unwrap().state(), State::Running);
+    assert_eq!(store.get(&local).unwrap().open.by, LEGACY_ASKER);
+    assert_eq!(
+        store.owner(LEGACY_TAB),
+        Some((fleet.clone(), NODE.to_owned(), LEGACY_BY.to_owned()))
+    );
+    assert_eq!(
+        store.owner(TAB_A),
+        Some((local.clone(), String::new(), LEGACY_ASKER.to_owned()))
+    );
+    // The requester's next verb is its own, and counts on from the stored one.
+    assert!(
+        store
+            .attach(AT + 4, LEGACY_TAB, Verb::Turn, NODE, LEGACY_BY)
+            .unwrap()
+    );
+    assert!(
+        String::from_utf8(journal(dir.path()))
+            .unwrap()
+            .contains(&format!(
+                "op=attach req={fleet} tab={LEGACY_TAB} verb=turn n=2 by={LEGACY_BY}"
+            ))
+    );
+    // NEGATIVE CONTROL: another legacy tab of the same Mac is not that requester.
+    assert!(
+        !store
+            .attach(
+                AT + 5,
+                LEGACY_TAB,
+                Verb::Turn,
+                NODE,
+                &format!("fleet:87be5228:{LEGACY_TAB}")
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .left(
+                AT + 6,
+                LEGACY_TAB,
+                &closed_by(LEGACY_BY, "shell-exit", Some(0))
+            )
+            .unwrap(),
+        Some(Out::Done)
+    );
+    // NEGATIVE CONTROL: loose `s-` words are no tab and no requester.
+    append_raw(
+        dir.path(),
+        &[
+            format!("t={} op=tab req={local} tab=s-1 by={LEGACY_ASKER}", AT + 7).into_bytes(),
+            format!(
+                "t={} op=tab req={local} tab={TAB_B} by=s-0123456789ABCDEF0123",
+                AT + 7
+            )
+            .into_bytes(),
+            format!(
+                "t={} op=tab req={local} tab={TAB_C} by=fleet:87be5228:s-0123456789abcdef01234",
+                AT + 7
+            )
+            .into_bytes(),
+        ],
+    );
+    let mut fresh = Store::open(dir.path()).unwrap();
+    assert_eq!(fresh.skipped(), 3);
+    assert_eq!(fresh.owner("s-1"), None);
+    assert_eq!(fresh.owner(TAB_B), None);
+    assert_eq!(fresh.owner(TAB_C), None);
+    assert_eq!(
+        fresh.get(&fleet).unwrap().state(),
+        State::Concluded(Out::Done)
+    );
+    assert_eq!(
+        fresh.get(&fleet).unwrap().tabs[0]
+            .verbs
+            .get(&Verb::Turn)
+            .copied(),
+        Some(2)
+    );
+    assert_eq!(fresh.get(&local).unwrap().tabs.len(), 1);
+}
+
+/// This build compacts a journal an earlier build wrote for legacy tabs. It reads a legacy
+/// tab's `attach` as one, so the superseded ones go and the last carries the count, and every
+/// other row naming a legacy tab stays as it was written, in its place. NEGATIVE CONTROL: the
+/// journal is not rewritten before the superseded rows are half of it.
+#[test]
+fn a_compaction_keeps_a_legacy_tabs_rows_and_drops_its_superseded_attaches() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (fleet, _) = earlier_journal(dir.path());
+    let before = String::from_utf8(journal(dir.path())).unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    store.compact_at = 1;
+    let path = dir.path().join(crate::JOURNAL);
+    let inode = |path: &Path| {
+        let id = line_log::identity_at(path).unwrap();
+        (id.dev, id.ino)
+    };
+    let first = inode(&path);
+    assert!(
+        store
+            .attach(AT + 10, LEGACY_TAB, Verb::Turn, NODE, LEGACY_BY)
+            .unwrap()
+    );
+    assert_eq!(inode(&path), first, "CONTROL: rewritten for one stale row");
+    for n in 1..40 {
+        assert!(
+            store
+                .attach(AT + 10 + n, LEGACY_TAB, Verb::Turn, NODE, LEGACY_BY)
+                .unwrap()
+        );
+    }
+    assert_ne!(inode(&path), first, "never compacted");
+    let text = String::from_utf8(journal(dir.path())).unwrap();
+    let rest = |text: &str| -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.contains(" op=attach "))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        rest(&text),
+        rest(&before),
+        "a stored row was lost or changed"
+    );
+    let attach = format!("op=attach req={fleet} tab={LEGACY_TAB} verb=turn n=");
+    assert_eq!(
+        text.matches(" op=attach ").count(),
+        text.matches(&attach).count()
+    );
+    assert!(text.matches(&attach).count() < 40, "{text}");
+    assert!(!text.contains(&format!("{attach}1 ")), "{text}");
+    assert!(
+        text.contains(&format!("{attach}41 by={LEGACY_BY}")),
+        "{text}"
+    );
+    let mut fresh = Store::open(dir.path()).unwrap();
+    assert_eq!(fresh.skipped(), 0);
+    assert_eq!(
+        fresh.owner(LEGACY_TAB),
+        Some((fleet.clone(), NODE.to_owned(), LEGACY_BY.to_owned()))
+    );
+    assert_eq!(
+        fresh.get(&fleet).unwrap().tabs[0].verbs.get(&Verb::Turn),
+        Some(&41)
+    );
+}
+
+/// A shell still running in a tab opened before the `t` form asks under its `s-` ID. Its
+/// request is opened under that ID, so its own `req=` joins it and no other tab's does, and the
+/// tab its spawn made is recorded as that requester's. NEGATIVE CONTROL: a loose `s-` word is
+/// no requester: its request is opened by `-`, which nothing joins.
+#[test]
+fn a_live_legacy_shell_opens_a_request_and_joins_it_by_req() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let mut store = Store::open(dir.path()).unwrap();
+    let from = |by: &str| {
+        let mut intake = local_agent(Some("build it"), None, None);
+        intake.from.by = by.to_owned();
+        intake
+    };
+    let refusal = |result: Result<(), Refusal>| result.map_err(|refusal| refusal.to_string());
+    let id = store.open_request(AT, from(LEGACY_ASKER)).unwrap();
+    assert_eq!(store.get(&id).unwrap().open.by, LEGACY_ASKER);
+    assert_eq!(
+        refusal(store.join(&id, "", LEGACY_TAB, Via::CtlSpawn)),
+        Err("another requester's request".to_owned()),
+        "CONTROL: another legacy tab"
+    );
+    assert_eq!(
+        refusal(store.join(&id, "", LEGACY_ASKER, Via::CtlSpawn)),
+        Ok(())
+    );
+    store
+        .tab(AT + 1, &id, TAB_A, LEGACY_ASKER, true, None)
+        .unwrap();
+    // A fleet drive from a legacy tab is its own requester too.
+    let driven = store
+        .open_request(AT, fleet_shell(LEGACY_BY, "driven"))
+        .unwrap();
+    assert_eq!(store.get(&driven).unwrap().open.by, LEGACY_BY);
+    assert_eq!(
+        refusal(store.join(
+            &driven,
+            NODE,
+            &format!("fleet:87be5228:{LEGACY_TAB}"),
+            Via::FleetShell
+        )),
+        Err("another requester's request".to_owned()),
+        "CONTROL: another legacy tab of the driving Mac"
+    );
+    assert_eq!(
+        refusal(store.join(&driven, NODE, LEGACY_BY, Via::FleetShell)),
+        Ok(())
+    );
+    store.refused(AT + 1, &driven, true).unwrap();
+    for loose in [
+        "s-1",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
+        "fleet:87be5228:s-1",
+    ] {
+        let none = store.open_request(AT + 2, from(loose)).unwrap();
+        assert_eq!(store.get(&none).unwrap().open.by, "-", "CONTROL: {loose}");
+        assert_eq!(
+            refusal(store.join(&none, "", loose, Via::CtlSpawn)),
+            Err("another requester's request".to_owned()),
+            "CONTROL: {loose}"
+        );
+        assert!(
+            store
+                .tab(AT + 3, &id, loose, LEGACY_ASKER, false, None)
+                .is_err(),
+            "CONTROL: {loose} is no tab"
+        );
+    }
+    // The next process reads all of it back.
+    let mut fresh = Store::open(dir.path()).unwrap();
+    assert_eq!(fresh.skipped(), 0);
+    assert_eq!(
+        fresh.owner(TAB_A),
+        Some((id.clone(), String::new(), LEGACY_ASKER.to_owned()))
+    );
+    let text = String::from_utf8(journal(dir.path())).unwrap();
+    assert!(
+        text.contains(&format!("op=tab req={id} tab={TAB_A} by={LEGACY_ASKER}")),
+        "{text}"
+    );
+}
+
+/// A legacy tab's footprint is its request's: the folder it claims names it, a folder born under
+/// it names it, and a command a person ran in a legacy tab of their own counts as a touch.
+/// NEGATIVE CONTROL: a loose `s-` word names no tab in a claim and is no touch.
+#[cfg(unix)]
+#[test]
+fn a_legacy_tab_claims_and_touches_as_any_tab_does() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let (fleet, _) = earlier_journal(dir.path());
+    let mut store = Store::open(dir.path()).unwrap();
+    let from_tab = |tab, path| ClaimAsk {
+        tab: Some(tab),
+        ..named(None, path, "", LOCAL)
+    };
+    assert_eq!(
+        store
+            .claim(AT + 10, from_tab(LEGACY_TAB, "/Users//a/x"))
+            .unwrap(),
+        Claimed::New(fleet.clone())
+    );
+    store
+        .born(
+            AT + 11,
+            &[Born {
+                tab: Some(LEGACY_TAB.to_owned()),
+                ..born(&fleet, "/Users//a/y", Some(true))
+            }],
+        )
+        .unwrap();
+    let touch = |path: &str, tab: &str| Touch {
+        id: fleet.clone(),
+        path: path.to_owned(),
+        tab: tab.to_owned(),
+        blk: 1,
+        why: TouchWhy::PersonTab,
+    };
+    // NEGATIVE CONTROL: a folder born under a loose word is claimed, and names no tab.
+    store
+        .born(
+            AT + 11,
+            &[Born {
+                tab: Some("s-1".to_owned()),
+                ..born(&fleet, "/Users//a/z", Some(true))
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .touched(AT + 12, &[touch("/Users//a/x", "s-1")])
+            .unwrap(),
+        0,
+        "CONTROL: a loose word is no tab"
+    );
+    assert_eq!(
+        store
+            .touched(AT + 12, &[touch("/Users//a/x", LEGACY_ASKER)])
+            .unwrap(),
+        1
+    );
+    let fresh = Store::open(dir.path()).unwrap();
+    assert_eq!(fresh.skipped(), 0);
+    let request = fresh.get(&fleet).unwrap();
+    assert_eq!(
+        request.claim("/Users//a/x").unwrap().claim.tab.as_deref(),
+        Some(LEGACY_TAB)
+    );
+    assert_eq!(
+        request.claim("/Users//a/y").unwrap().claim.tab.as_deref(),
+        Some(LEGACY_TAB)
+    );
+    assert_eq!(
+        request.claim("/Users//a/z").unwrap().claim.tab,
+        None,
+        "CONTROL: a loose word names no tab"
+    );
+    assert!(request.touched.contains("/Users//a/x"));
 }

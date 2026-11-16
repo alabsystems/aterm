@@ -113,6 +113,10 @@ pub fn build_dir_path(value: &str, root: &Path) -> Option<PathBuf> {
 /// checks are two scopes, so neither's growth is what the other claims.
 #[must_use]
 pub fn scope_of(ctx: &Ctx) -> String {
+    scope_building(ctx, builds)
+}
+
+fn scope_building(ctx: &Ctx, builds: impl Fn(Check) -> bool) -> String {
     let building = || ctx.checks.iter().copied().filter(|c| builds(*c));
     let mut checks: Vec<&str> = building().map(Check::name).collect();
     checks.sort_unstable();
@@ -162,6 +166,10 @@ pub fn scope_of(ctx: &Ctx) -> String {
 /// the selection.
 #[must_use]
 pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
+    selection_building(ctx, builds)
+}
+
+fn selection_building(ctx: &Ctx, builds: impl Fn(Check) -> bool) -> atpkg::admit_disk::Selection {
     let building: Vec<Check> = ctx.checks.iter().copied().filter(|c| builds(*c)).collect();
     let has = |check: Check| building.contains(&check);
     let mut words: Vec<String> = building
@@ -231,7 +239,24 @@ pub fn selection_of(ctx: &Ctx) -> atpkg::admit_disk::Selection {
 /// The captured native layout is invalid, or a recognized shared cache is unsafe, replaced,
 /// or on another volume. No caller path is silently substituted after such a refusal.
 pub fn run_of(ctx: &Ctx) -> Result<Option<atpkg::admit_disk::Run>, String> {
-    if !ctx.checks.iter().any(|c| builds(*c)) || !crate::plan::has_compiler_stage(ctx) {
+    run_building(ctx, crate::plan::has_compiler_stage(ctx), builds)
+}
+
+/// Project disk work from the same invocation that will execute the prepared cells.
+pub(crate) fn run_planned(
+    plan: &crate::RunPlan<'_>,
+) -> Result<Option<atpkg::admit_disk::Run>, String> {
+    run_building(plan.context(), plan.has_compiler_stage(), |check| {
+        plan.builds(check)
+    })
+}
+
+fn run_building(
+    ctx: &Ctx,
+    compiler: bool,
+    builds: impl Fn(Check) -> bool,
+) -> Result<Option<atpkg::admit_disk::Run>, String> {
+    if !ctx.checks.iter().any(|c| builds(*c)) || !compiler {
         return Ok(None);
     }
     let leaf = main_leaf(ctx)?;
@@ -251,7 +276,7 @@ pub fn run_of(ctx: &Ctx) -> Result<Option<atpkg::admit_disk::Run>, String> {
     };
     Ok(Some(atpkg::admit_disk::Run {
         what: format!("verify {}{scope}", names.join(" ")),
-        scope: scope_of(ctx),
+        scope: scope_building(ctx, &builds),
         dirs,
         record: ctx.state_dir().join(FOOTPRINT),
         cold: COLD_BYTES,
@@ -262,7 +287,7 @@ pub fn run_of(ctx: &Ctx) -> Result<Option<atpkg::admit_disk::Run>, String> {
             .filter(|_| measured)
             .map(|state| atpkg::admit_disk::Machinewide {
                 record: state.join(MACHINE_FOOTPRINT),
-                selection: selection_of(ctx),
+                selection: selection_building(ctx, &builds),
             }),
     }))
 }
@@ -299,7 +324,23 @@ impl Disk {
 /// # Errors
 /// As [`run_of`] and [`answer`].
 pub fn admit(ctx: &Ctx, mode: atpkg::admit_disk::Admit) -> Result<Disk, String> {
-    let Some(run) = run_of(ctx)? else {
+    admit_live_run(ctx, run_of(ctx)?, mode)
+}
+
+/// Admit only the compiler work the bound invocation actually owes.
+pub(crate) fn admit_planned(
+    plan: &crate::RunPlan<'_>,
+    mode: atpkg::admit_disk::Admit,
+) -> Result<Disk, String> {
+    admit_live_run(plan.context(), run_planned(plan)?, mode)
+}
+
+fn admit_live_run(
+    ctx: &Ctx,
+    run: Option<atpkg::admit_disk::Run>,
+    mode: atpkg::admit_disk::Admit,
+) -> Result<Disk, String> {
+    let Some(run) = run else {
         return Ok(Disk::Unclaimed);
     };
     let Some(ledger) = aterm_capacity::Ledger::user() else {

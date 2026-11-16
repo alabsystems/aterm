@@ -197,13 +197,23 @@ fn node(byte: u8) -> NodeIdentity {
     NodeIdentity::from_seed(&format!("{byte:02x}").repeat(16), &[byte; 32]).unwrap()
 }
 
-/// Two database endpoints meet on the newest database protocol both offer: version 7 is this
-/// build (`atdb/7`, range-reconciled table inventories), 6 the duplex build before it, 5 is
+/// Two database endpoints meet on the newest database protocol both offer: version 8 is this
+/// build (`atdb/8`, range-reconciled control, membership and table inventories), 7 the build
+/// before it (`atdb/7`, range-reconciled table inventories), 6 the duplex build before that, 5 is
 /// delta-frontier repair, 4 is 0.153 (`atdb/4`), 3 and 2 the builds
 /// before it, and 1 a fleet endpoint that offers no database protocol.
 #[test]
 fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() {
     for (listener_version, dialer_version, expected) in [
+        (8, 8, ALPN_DATABASE_RANGES),
+        (8, 7, ALPN_DATABASE_RECONCILE),
+        (7, 8, ALPN_DATABASE_RECONCILE),
+        (8, 6, ALPN_DATABASE_DUPLEX),
+        (6, 8, ALPN_DATABASE_DUPLEX),
+        (8, 4, ALPN_DATABASE_FRONTIER),
+        (4, 8, ALPN_DATABASE_FRONTIER),
+        (8, 1, ALPN_NODES),
+        (1, 8, ALPN_NODES),
         (7, 7, ALPN_DATABASE_RECONCILE),
         (7, 6, ALPN_DATABASE_DUPLEX),
         (6, 7, ALPN_DATABASE_DUPLEX),
@@ -255,7 +265,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
         let (listened, dialed) = over_loopback(
             move |tcp| {
                 let me = node(1);
-                let mut accepted = if listener_version == 7 {
+                let mut accepted = if listener_version == 8 {
                     server_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if listener_version >= 2 {
                     let mut config = (*database_server_config()).clone();
@@ -300,7 +310,7 @@ fn database_repair_negotiates_its_order_and_falls_back_with_legacy_node_peers() 
             },
             move |tcp| {
                 let me = node(2);
-                let mut dialed = if dialer_version == 7 {
+                let mut dialed = if dialer_version == 8 {
                     client_handshake_database_as(tcp, &secret(7), Some(&me), HANG)
                 } else if dialer_version >= 2 {
                     let mut config = (*database_client_config()).clone();
@@ -1067,9 +1077,160 @@ fn only_loopback_private_and_link_local_sources_are_served() {
         "::",
         "::ffff:8.8.8.8",
     ] {
+        let ip = refused.parse().unwrap();
+        assert!(!is_fleet_source(ip), "{refused} is refused");
         assert!(
-            !is_fleet_source(refused.parse().unwrap()),
-            "{refused} is refused"
+            !is_fleet_dial(ip, Provenance::Unproved),
+            "{refused} heard unauthenticated is not dialled"
+        );
+        assert!(
+            !admits_source(ip, None),
+            "{refused} is refused by a listener that serves its LAN alone"
+        );
+    }
+    // Of those, the ones beyond one LAN (CGNAT and globally routed) are dialled when an
+    // authenticated source named them (LT-B8); the rest stay refused however they were heard.
+    for overlay in [
+        "8.8.8.8",
+        "172.15.255.255",
+        "172.32.0.1",
+        "192.169.0.1",
+        "100.64.0.1",
+        "2606:4700::1111",
+        "::ffff:8.8.8.8",
+    ] {
+        assert!(
+            is_fleet_dial(overlay.parse().unwrap(), Provenance::Proved),
+            "{overlay} named by an authenticated source is dialled"
+        );
+    }
+    for never in [
+        "198.51.100.7",
+        "224.0.0.251",
+        "255.255.255.255",
+        "0.0.0.0",
+        "2001:db8::1",
+        "fec0::1",
+        "ff02::1",
+        "::",
+    ] {
+        assert!(
+            !is_fleet_dial(never.parse().unwrap(), Provenance::Proved),
+            "{never} is refused even from an authenticated source"
+        );
+    }
+}
+
+/// LT-B8: an address beyond one LAN in the shared space 100.64.0.0/10 (a Tailscale-style
+/// overlay's), or a globally routed one, is dialled when it arrives through an authenticated
+/// source (a seat's origin-signed presence row, the node job's address cache), and an
+/// unauthenticated one (a Bonjour advert) naming the very same address is still refused, as is a
+/// connection from it to a listener that no authenticated source told of it. Loopback,
+/// link-local, private and unique-local addresses keep the meaning they have for an advert, and
+/// multicast, broadcast, unspecified, reserved, documentation, benchmarking, IETF protocol, 6to4
+/// and non-global IPv6 ranges stay refused however they were heard.
+///
+/// Negative controls, each run against this test and then reverted: with [`is_fleet_dial`]
+/// ignoring its provenance and returning [`is_fleet_source`] alone, it fails with
+/// `100.64.0.1 from an authenticated presence row is dialable`; with the provenance ignored the
+/// other way (every overlay address dialled however heard), it fails with
+/// `100.64.0.1 from an unauthenticated advert is refused`.
+#[test]
+fn cgnat_address_from_authenticated_presence_is_dialable() {
+    for cgnat in [
+        "100.64.0.1",
+        "100.100.100.100",
+        "100.127.255.254",
+        "::ffff:100.64.0.1",
+    ] {
+        let ip: IpAddr = cgnat.parse().unwrap();
+        assert!(
+            is_fleet_dial(ip, Provenance::Proved),
+            "{cgnat} from an authenticated presence row is dialable"
+        );
+        assert!(
+            !is_fleet_dial(ip, Provenance::Unproved),
+            "{cgnat} from an unauthenticated advert is refused"
+        );
+        assert!(!is_fleet_source(ip), "{cgnat} is no LAN source");
+        // The listener's side of the same rule: a connection from the address is admitted to
+        // its proofs only while an authenticated source names it.
+        let named: ProvedSources = Arc::new(move |at| at == ip.to_canonical());
+        let elsewhere: ProvedSources = Arc::new(|at: IpAddr| at == IpAddr::from([100, 64, 9, 9]));
+        assert!(
+            admits_source(ip, Some(&named)),
+            "{cgnat} named by a seat's row"
+        );
+        assert!(!admits_source(ip, None), "{cgnat} with no proved sources");
+        assert!(
+            !admits_source(ip, Some(&elsewhere)),
+            "{cgnat} named by no seat's row"
+        );
+    }
+    // Globally routed unicast addresses are dialable from an authenticated source alone too.
+    for global in ["8.8.8.8", "100.128.0.1", "2606:4700::1111", "2a00:1450::1"] {
+        let ip: IpAddr = global.parse().unwrap();
+        assert!(
+            is_fleet_dial(ip, Provenance::Proved),
+            "{global} from an authenticated presence row is dialable"
+        );
+        assert!(
+            !is_fleet_dial(ip, Provenance::Unproved),
+            "{global} from an unauthenticated advert is refused"
+        );
+    }
+    // The LAN reads as it did, whoever named it.
+    for lan in [
+        "10.0.0.1",
+        "192.168.1.20",
+        "169.254.10.10",
+        "127.0.0.1",
+        "fd12::1",
+        "fe80::1",
+    ] {
+        let ip: IpAddr = lan.parse().unwrap();
+        assert!(
+            is_fleet_dial(ip, Provenance::Unproved),
+            "{lan} from an advert"
+        );
+        assert!(is_fleet_dial(ip, Provenance::Proved), "{lan} from a row");
+        assert!(admits_source(ip, None), "{lan} at a LAN listener");
+    }
+    // No source, authenticated or not, makes these dialable.
+    for never in [
+        "0.0.0.0",
+        "0.1.2.3",
+        "255.255.255.255",
+        "224.0.0.251",
+        "239.255.255.250",
+        "240.0.0.1",
+        "192.0.0.9",
+        "192.0.2.1",
+        "198.51.100.7",
+        "203.0.113.5",
+        "198.18.0.1",
+        "198.19.255.254",
+        "::",
+        "::1.2.3.4",
+        "64:ff9b::808:808",
+        "2001::1",
+        "2001:1ff::1",
+        "2001:db8::1",
+        "2002:c0a8:0101::1",
+        "3fff::1",
+        "3fff:fff::1",
+        "fec0::1",
+        "ff02::1",
+        "ff0e::1",
+    ] {
+        let ip: IpAddr = never.parse().unwrap();
+        assert!(
+            !is_fleet_dial(ip, Provenance::Proved),
+            "{never} is refused even from an authenticated source"
+        );
+        assert!(
+            !admits_source(ip, Some(&(Arc::new(|_| true) as ProvedSources))),
+            "{never} is refused at a listener whatever a row names"
         );
     }
 }
@@ -1824,7 +1985,7 @@ fn stalled_policy_keeps_listener_and_slot_limits(stall_deny: bool, slots: usize,
             serve_offering_with_ask_within(
                 &listener,
                 (&listening(slots, HANG), Arc::new(offer), Arc::new(deny)),
-                None,
+                (None, None),
                 &running,
                 HANG,
                 echo,
@@ -1975,7 +2136,7 @@ fn a_socket_that_proves_nothing_costs_no_deny_lookup() {
                     Arc::new(|| (FleetScope::Facts, &[FleetOp::Survey][..])),
                     Arc::new(deny),
                 ),
-                None,
+                (None, None),
                 &running,
                 HANG,
                 echo,
@@ -2382,7 +2543,7 @@ fn a_heard_change_turns_the_link_listener_now_and_once_more() {
                     Arc::new(move || offering),
                     Arc::new(move || Arc::clone(&empty)),
                 ),
-                None,
+                (None, None),
                 &stop,
                 Locality::Link(crate::lan::Scope::Loopback),
                 HANG,
@@ -2472,7 +2633,7 @@ fn a_change_heard_while_connections_queue_is_judged_before_the_next_accept() {
                     Arc::new(move || offering),
                     Arc::new(move || Arc::clone(&empty)),
                 ),
-                None,
+                (None, None),
                 &stop,
                 Locality::Link(crate::lan::Scope::Loopback),
                 HANG,
@@ -2910,7 +3071,7 @@ impl Asked {
                         Arc::new(move || offering),
                         Arc::new(move || Arc::clone(&empty)),
                     ),
-                    serves_ask.then_some(ask),
+                    (serves_ask.then_some(ask), None),
                     &running,
                     Locality::Fleet,
                     HANG,

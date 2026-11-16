@@ -465,11 +465,32 @@ fn an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_captur
         app.diskwalk.facts_now(t0, false, true),
         "the first service reads the facts"
     );
+    let (status, _status) = std::sync::mpsc::channel();
+    let (statuses, _statuses) = std::sync::mpsc::channel();
+    let (policy, _policy) = std::sync::mpsc::channel();
+    let (setup, _setup) = std::sync::mpsc::channel();
+    let (dims, _dims) = std::sync::mpsc::channel();
+    let (grid, _grid) = std::sync::mpsc::channel();
     for wake in [
         crate::Wake::DiskWalk,
         crate::Wake::Vitals,
         crate::Wake::SiblingScan(Vec::new()),
         crate::Wake::FleetRead,
+        crate::Wake::ReadSessionStatus {
+            session: 0,
+            reply: status,
+        },
+        crate::Wake::ReadSessionStatuses { reply: statuses },
+        crate::Wake::ReadHarnessPolicy {
+            session: 0,
+            reply: policy,
+        },
+        crate::Wake::ReadSetupStatus { reply: setup },
+        crate::Wake::ReadWindowDims { reply: dims },
+        crate::Wake::ReadPaneGrid {
+            session: 0,
+            reply: grid,
+        },
     ] {
         let said = format!("{wake:?}");
         app.note_wake_activity(&wake);
@@ -491,5 +512,48 @@ fn an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_captur
     assert!(
         app.diskwalk.facts_deadline(true).is_some(),
         "a session's cwd may have moved: the disk walker is owed a read of the panes' facts"
+    );
+}
+
+/// What each control read's handler (the function its `Wake` arm calls) leaves of the desk: the
+/// restore image captured after it equals the one captured before it, and each answered.
+#[test]
+fn a_control_reads_handler_leaves_the_restore_image_as_it_found_it() {
+    let app = App::headless_for_test();
+    assert!(app.pool.get(0).is_some(), "the fixture's own session");
+    let before = app.capture_restore_manifest();
+    type Read<'a> = &'a dyn Fn(&App) -> bool;
+    let reads: [(&str, Read<'_>); 6] = [
+        ("status", &|app| app.session_status_record(0).is_ok()),
+        ("sessions", &|app| {
+            app.session_statuses_record().starts_with("OK 1\n")
+        }),
+        ("harness policy", &|app| app.harness_policy_facts(0).is_ok()),
+        ("setup status", &|app| {
+            !app.cached_setup_status_fields().is_empty()
+        }),
+        ("dims", &|app| app.window_dims_snapshot().is_some()),
+        ("pane grid", &|app| app.pane_grid_of(0).is_some()),
+    ];
+    for (verb, read) in reads {
+        assert!(read(&app), "{verb} answers for the fixture's session");
+        assert_eq!(
+            app.capture_restore_manifest(),
+            before,
+            "{verb} wrote nothing a restore image reads"
+        );
+    }
+    app.pool
+        .get(0)
+        .expect("session 0")
+        .ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .user_title = Some("moved".to_string());
+    assert_ne!(
+        app.capture_restore_manifest(),
+        before,
+        "NEGATIVE CONTROL: a session's pinned title is in the image, so the comparison can fail"
     );
 }

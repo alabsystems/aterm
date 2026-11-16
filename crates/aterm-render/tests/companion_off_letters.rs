@@ -24,6 +24,18 @@ pub const COMPANIONS: [&str; 4] = [
     "flat rainbow + cat",
 ];
 
+/// The companions a shipped setting draws: `cursor_pet`'s cat and dog beside the rainbow. The
+/// other two of [`COMPANIONS`] lay the ribbon in a body only a seam selects
+/// (`EffectsPipeline::set_ribbon_shape`: underline, flat).
+pub const SHIPPED: [&str; 2] = ["rainbow + cat", "rainbow + dog"];
+
+/// Whether a sweep over the pages judges `style` on `look`: a shipped companion on every page, a
+/// body no setting selects on dark alone. Ten runs a sweep where every pair was sixteen; the six
+/// left out are the underline and the flat body on the three other pages.
+pub fn swept(style: &str, look: Look) -> bool {
+    SHIPPED.contains(&style) || look.name == DARK.name
+}
+
 /// How a replay's keys reach the terminal and when its frames render.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Drive {
@@ -922,6 +934,9 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
     };
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
+            if !swept(style, look) {
+                continue;
+            }
             for output in outputs {
                 let boxed = boxes_on_glyphs(&run(style, look, &[], output), enter, 0..=12);
                 assert_eq!(
@@ -981,6 +996,9 @@ fn steam_runs() -> Vec<((&'static str, &'static str), Look, &'static str, Drive)
     for rows in STEAM_ROWS {
         for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
             for style in COMPANIONS {
+                if !swept(style, look) {
+                    continue;
+                }
                 for drive in [Drive::Ctl, Drive::Console] {
                     runs.push((rows, look, style, drive));
                 }
@@ -1813,6 +1831,9 @@ fn last_heights(judged: &[Judged], ms: u64, ch: i32) -> Vec<f64> {
 fn the_companion_is_drawn_whole_past_the_row_above_s_last_letter() {
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
+            if !swept(style, look) {
+                continue;
+            }
             let (judged, ch) = context_coats(style, look, &[]);
             // From its landing on the prompt's row: the replay's cat starts in the window's
             // corner and flies down across the page to the prompt, a flight between rows.
@@ -1899,6 +1920,9 @@ fn a_seat_under_the_line_reads_its_own_row() {
     let under = 5..=usize::from(crate::trail_letters_read::ROWS);
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
+            if !swept(style, look) {
+                continue;
+            }
             for bar in [false, true] {
                 let judged = context_unworded(style, look, bar, &[]);
                 assert!(
@@ -2062,6 +2086,9 @@ fn a_seat_past_a_line_s_end_keeps_the_body_whole() {
     };
     for look in [DARK, SOLARIZED_DARK, DEFAULT_LIGHT, GITHUB_LIGHT] {
         for style in COMPANIONS {
+            if !swept(style, look) {
+                continue;
+            }
             for output in [ENTER_OUTPUT, b"the quick brown fox.\r\n$ "] {
                 let (judged, ch, enter) = enter_bottom_coats(style, look, &[], output);
                 let (h, boxed) = heights(&judged, enter, ch);
@@ -2278,6 +2305,9 @@ fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
     );
     for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
         for style in COMPANIONS {
+            if !swept(style, look) {
+                continue;
+            }
             let frames = held(style, look, &[]);
             let met: Vec<_> = frames.iter().filter(|f| !f.1.is_empty()).collect();
             assert!(
@@ -2714,8 +2744,8 @@ fn judge_the_wall(part: WallPart) {
     for (f, face) in faces.iter().enumerate() {
         let window = face.face.is_none();
         let seated = seated_at(face.cell);
-        // The window's face draws every companion on every page, another face the cat and the
-        // dog on dark; each replays what follows a line that seats the companion where it was
+        // The window's face draws the shipped companions on every page and the bodies no
+        // setting selects on dark ([`swept`]), another face the cat and the dog on dark; each replays what follows a line that seats the companion where it was
         // measured (the window's face on the bundled 13 x 29 alone).
         let (styles, looks): (&[&str], &[Look]) = if window {
             (&COMPANIONS, &PAGES)
@@ -2740,6 +2770,9 @@ fn judge_the_wall(part: WallPart) {
                 for drive in [Drive::Ctl, Drive::Console] {
                     for &look in looks {
                         for &style in styles {
+                            if !swept(style, look) {
+                                continue;
+                            }
                             runs.push((f, style, look, (room, then), drive, None));
                         }
                     }
@@ -3028,6 +3061,9 @@ fn the_margin_keeps_the_companion_off_the_line() {
     for scene in [Scene::FoldRest, Scene::FocusWrap, Scene::StatusWrap] {
         for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
             for style in COMPANIONS {
+                if !swept(style, look) {
+                    continue;
+                }
                 let met = hits(style, look, scene, &[]);
                 assert!(
                     met.is_empty(),
@@ -3283,6 +3319,9 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
         for cols in [72, 71, 70] {
             for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
                 for style in COMPANIONS {
+                    if !swept(style, look) {
+                        continue;
+                    }
                     runs.push((drive, cols, style, look, &[]));
                     runs.push((drive, cols, style, look, &[HIDE]));
                 }
@@ -3384,6 +3423,9 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
             };
             for &look in looks {
                 for style in COMPANIONS {
+                    if !swept(style, look) {
+                        continue;
+                    }
                     runs.push((drive, cols, style, look, &[]));
                 }
             }
@@ -3571,6 +3613,9 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
         for cols in [72, 71, 70] {
             for look in [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT] {
                 for style in COMPANIONS {
+                    if !swept(style, look) {
+                        continue;
+                    }
                     runs.push((drive, cols, style, look, &[]));
                 }
             }

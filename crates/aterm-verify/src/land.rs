@@ -217,11 +217,11 @@ pub const PANICKED: i32 = 101;
 pub const RETRIES: usize = 5;
 /// The pause before a failed remote step is made again; each further failure in a row doubles it.
 pub const RETRY_PAUSE: Duration = Duration::from_secs(2);
-/// The hang detector on one write of main ([`Wire::write`]): the longest credential grant agh
-/// issues ([`agh::git::GRANT_MAX`]), beyond agh's own wall bound on each of its git children
-/// ([`agh::git::GIT_BUDGET`]). agh opens its write's durable intent before its re-verification
-/// of the pushed history and settles it when it ends, so agh ends its own write first: a write
-/// this tool killed would leave that intent open and refuse every later write of the repository.
+/// The work window on one write of main ([`Wire::write`]): the longest credential grant agh
+/// issues ([`agh::git::GRANT_MAX`]). Expiry requests cancellation and retains the native owner
+/// through settlement; neither this window nor agh's per-child bound ([`agh::git::GIT_BUDGET`])
+/// establishes a deadline for the complete operation's cleanup. Killing the owner before it
+/// records its outcome would leave its durable intent open.
 const WRITE: Duration = agh::git::GRANT_MAX;
 const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 /// Where a passed judgment is kept until its landing is on main ([`Git::keep`]): a ref of this
@@ -568,7 +568,7 @@ pub struct Seams<'a> {
     /// Say a line to the person.
     pub say: &'a mut dyn FnMut(&str),
     /// One remote step of the push phase (each push, and each read of main once a judgment
-    /// passed): [`crate::remote::run`] in production.
+    /// passed), with an explicit read or mutation lifetime: [`live_remote`] in production.
     pub(crate) remote: &'a RemoteStep<'a>,
     /// Wait out the pause before a failed remote step is made again ([`RETRY_PAUSE`]), and each
     /// tick of a wait on another writer's open intent.
@@ -576,15 +576,22 @@ pub struct Seams<'a> {
 }
 
 /// How the push phase runs one remote step: a git or agh command for the checkout at the path,
-/// its git made by the maker, ended as hung at the instant ([`crate::remote::run`]'s shape).
+/// its git made by the maker, with an explicit lifetime policy and work deadline.
 pub(crate) type RemoteStep<'a> = dyn Fn(
         &Path,
         &dyn Fn(&Path) -> Command,
         crate::remote::Tool,
         &[std::ffi::OsString],
         Instant,
+        RemoteMode,
     ) -> Result<std::process::Output, String>
     + 'a;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RemoteMode {
+    Read,
+    Mutation,
+}
 
 /// Who lands: the person's `land` words, which a handoff carries for the receiver to parse
 /// again, and this image's sha256, read before any build.
@@ -1399,14 +1406,13 @@ impl<'a> Wire<'a> {
             tool,
             args,
             Instant::now() + NETWORK,
+            RemoteMode::Read,
         )
     }
 
-    /// One step of a write of main through the seam: ended as hung [`WRITE`] after it starts,
-    /// which agh's own bounds come before. It runs to its end whatever interrupt the landing
-    /// takes meanwhile, and holds the interrupt's watchdog until it ends
-    /// (`exec::group::hold`), so the landing then records its end: a write an interrupt ended
-    /// would leave its outcome unknown.
+    /// One mutation with its own [`WRITE`] work window. Expiry or interruption requests native
+    /// cancellation; the actual owner runs through settlement before the step returns. Hold
+    /// the landing's interrupt watchdog through that cleanup (`exec::group::hold`).
     fn write(
         &self,
         tool: crate::remote::Tool,
@@ -1419,6 +1425,7 @@ impl<'a> Wire<'a> {
             tool,
             args,
             Instant::now() + WRITE,
+            RemoteMode::Mutation,
         )
     }
 
@@ -1495,7 +1502,6 @@ impl<'a> Wire<'a> {
         let run = |tool, args: &[std::ffi::OsString]| self.run(tool, args);
         let remote = crate::remote::Remote::open(self.git.root, REMOTE, &run)?;
         let write = |tool, args: &[std::ffi::OsString]| self.write(tool, args);
-        let writer = crate::remote::Remote::open(self.git.root, REMOTE, &write)?;
         let unknown = |why: String| {
             *self.unsettled.borrow_mut() = Some(format!(
                 "the write of {landing} to {MAIN} ended with an unknown outcome; where agh \
@@ -1507,8 +1513,13 @@ impl<'a> Wire<'a> {
         push_after_intents(
             budget,
             &|| {
-                let pushed = writer
-                    .push(&format!("refs/heads/{MAIN}"), Some(onto), landing)
+                let pushed = remote
+                    .push_with(
+                        crate::remote::WriteRunner(&write),
+                        &format!("refs/heads/{MAIN}"),
+                        Some(onto),
+                        landing,
+                    )
                     .or_else(|why| match self.observe(landing, onto) {
                         Ok(PushObservation::Landed) => Ok(crate::remote::Pushed::Done),
                         Ok(PushObservation::Moved(_) | PushObservation::Unchanged) => {
@@ -1528,33 +1539,16 @@ impl<'a> Wire<'a> {
                 Ok(pushed)
             },
             &|intent| {
-                // Another writer's write is bounded by agh as this tool's is ([`WRITE`]): an
-                // intent open past that has no write running.
+                (self.say)(&format!(
+                    "verify land: waiting up to {}s for agh atomic intent {} to close; this push \
+                     sent nothing",
+                    WRITE.as_secs(),
+                    intent.as_str()
+                ));
+                // Bound this wait without inferring whether the other owner is still alive
+                // or whether its write was applied from the age of its intent alone.
                 let until = Instant::now() + WRITE;
-                remote.wait_for_intent(intent, &|| {
-                    if let Some(signal) = (self.interrupt)() {
-                        return Err(format!(
-                            "the wait on another writer's atomic intent ended: the landing took \
-                             signal {signal}"
-                        ));
-                    }
-                    let left = until.saturating_duration_since(Instant::now());
-                    if left.is_zero() {
-                        *self.unsettled.borrow_mut() = Some(format!(
-                            "agh intent {} stayed open for {}s, longer than any agh write runs: \
-                             it is orphaned, and it is retracted once its write is known not to \
-                             have landed (`agh intent list --open`)",
-                            intent.as_str(),
-                            WRITE.as_secs()
-                        ));
-                        return Err(format!(
-                            "another writer's atomic intent stayed open for {}s",
-                            WRITE.as_secs()
-                        ));
-                    }
-                    (self.pause)(left.min(Duration::from_millis(100)));
-                    Ok(())
-                })
+                self.wait_for_intent(intent, until)
             },
             // The refused attempt sent nothing. Where main is unchanged the same expected-ref
             // push runs again; this is not replay of an unknown write.
@@ -1562,6 +1556,48 @@ impl<'a> Wire<'a> {
             &|why| self.settle(landing, onto, why),
             &|why| self.again(&self.unsent, "the push", why),
         )
+    }
+
+    fn wait_for_intent(&self, intent: &agh::IntentId, until: Instant) -> Result<(), String> {
+        let remaining = || {
+            if let Some(signal) = (self.interrupt)() {
+                return Err(format!(
+                    "the wait on another writer's atomic intent ended: the landing took \
+                             signal {signal}"
+                ));
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                *self.unsettled.borrow_mut() = Some(format!(
+                    "agh intent {} stayed open for this wait's {}s budget: its outcome \
+                     remains unresolved; retract it only once its write is known not \
+                     to have landed (`agh intent list --open`)",
+                    intent.as_str(),
+                    WRITE.as_secs()
+                ));
+                return Err(format!(
+                    "another writer's atomic intent stayed open for {}s",
+                    WRITE.as_secs()
+                ));
+            }
+            Ok(left)
+        };
+        let run = |tool, args: &[std::ffi::OsString]| {
+            remaining()?;
+            (self.step)(
+                self.git.root,
+                self.git.make,
+                tool,
+                args,
+                until.min(Instant::now() + NETWORK),
+                RemoteMode::Read,
+            )
+        };
+        let remote = crate::remote::Remote::open(self.git.root, REMOTE, &run)?;
+        remote.wait_for_intent(intent, &|| {
+            (self.pause)(remaining()?.min(Duration::from_millis(100)));
+            Ok(())
+        })
     }
 
     /// Where a push of `landing` onto `onto` git reported failed (`why`) left main, fetched: a
@@ -2717,6 +2753,31 @@ fn walks_spec_tables(file: &str, text: &str) -> bool {
     }
 }
 
+/// Whether `file` is one of this crate's own landing or cone rule sources, or their tests:
+/// `crates/aterm-verify/src/land*.rs` and `changed*.rs`. They spell a spec table's name and
+/// the tracker documents' paths to choose, judge and resolve them, and in fixture trees, and
+/// open none of the checkout's: the search for readers passes them over, as
+/// [`aterm_census::no_reach::searched`] passes census's own. Counted, each made this crate a
+/// reader of every member's spec table and of `docs/PLAN.md` and `docs/STATUS.md`, and a
+/// landing that shared one of those with main was judged again for it. Every other file of
+/// this crate is searched like any member's.
+fn rule_source(file: &str) -> bool {
+    file.strip_prefix("crates/aterm-verify/src/")
+        .is_some_and(|name| name.starts_with("land") || name.starts_with("changed"))
+}
+
+/// Whether `file` of a tree, whose text is `text`, counts as a reader of no-reach `path`
+/// ([`Git::readers`]): [`aterm_census::no_reach::may_read`] says it may read it, or `path` is a
+/// member's spec table and the file may walk every member's ([`walks_spec_tables`]); never a
+/// file the search does not read ([`aterm_census::no_reach::searched`]) or one of this
+/// crate's rule sources ([`rule_source`]).
+fn reads(file: &str, text: &str, path: &str) -> bool {
+    aterm_census::no_reach::searched(file)
+        && !rule_source(file)
+        && (aterm_census::no_reach::may_read(file, text, path)
+            || (spec_table(path) && walks_spec_tables(file, text)))
+}
+
 /// The checkout's git.
 struct Git<'a> {
     root: &'a Path,
@@ -2984,9 +3045,10 @@ impl Git<'_> {
     /// Every file of `tree` that may read no-reach `path` ([`aterm_census::no_reach::may_read`]:
     /// a Rust file, or a crate's Markdown, naming one of the path's
     /// [`aterm_census::no_reach::needles`] in code; for a member's spec table also each such
-    /// file that may walk every member's, [`walks_spec_tables`]), in Git's order. Each is a
-    /// file of this repository's own tree: a submodule's sources are not searched, nor
-    /// census's own ([`aterm_census::no_reach::searched`]).
+    /// file that may walk every member's, [`walks_spec_tables`]), in Git's order ([`reads`]).
+    /// Each is a file of this repository's own tree: a submodule's sources are not searched,
+    /// nor census's own ([`aterm_census::no_reach::searched`]), nor this crate's rule sources
+    /// ([`rule_source`]).
     fn readers(&self, tree: &str, path: &str) -> Result<Vec<String>, String> {
         // No pathspec: a person's GIT_LITERAL_PATHSPECS or GIT_NOGLOB_PATHSPECS would make one
         // such as `*.rs` match nothing, and an empty search name no reader. The file names are
@@ -3023,7 +3085,7 @@ impl Git<'_> {
         for found in out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty()) {
             let found = String::from_utf8_lossy(found);
             let file = found.strip_prefix(&prefix).unwrap_or(&found);
-            if !aterm_census::no_reach::searched(file) {
+            if !aterm_census::no_reach::searched(file) || rule_source(file) {
                 continue;
             }
             let text = self.complete(&["cat-file", "blob", &format!("{tree}:{file}")], LOCAL)?;
@@ -3034,9 +3096,7 @@ impl Git<'_> {
                 ));
             }
             let text = String::from_utf8_lossy(&text.stdout);
-            if aterm_census::no_reach::may_read(file, &text, path)
-                || (spec_table(path) && walks_spec_tables(file, &text))
-            {
+            if reads(file, &text, path) {
                 readers.push(file.to_owned());
             }
         }
@@ -4648,15 +4708,24 @@ fn with_live_seams<R>(
 
 /// One remote step of the push phase ([`Seams::remote`]): [`crate::remote::run`], ended at the
 /// interrupt the landing took ([`interrupted`]), so a read of main or a wait on another writer
-/// ends at it; a write of main holds the watchdog ([`Wire::write`]), so it runs to its end.
+/// ends at it. An explicitly tagged mutation requests cancellation from the raw signal and
+/// retains its native owner through settlement while the watchdog is held ([`Wire::write`]).
 fn live_remote(
     root: &Path,
     git: &dyn Fn(&Path) -> Command,
     tool: crate::remote::Tool,
     args: &[std::ffi::OsString],
     until: Instant,
+    mode: RemoteMode,
 ) -> Result<std::process::Output, String> {
-    crate::remote::run_unless(root, git, tool, args, until, &mut interrupted)
+    match mode {
+        RemoteMode::Read => {
+            crate::remote::run_unless(root, git, tool, args, until, &mut interrupted)
+        }
+        RemoteMode::Mutation => {
+            crate::remote::run_mutation(root, git, tool, args, until, &mut taken)
+        }
+    }
 }
 
 /// Wait out a pause of the push phase ([`Seams::pause`]): a retry's, or a tick of a wait on

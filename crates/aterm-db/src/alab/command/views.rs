@@ -234,9 +234,9 @@ pub struct ViewIo<'a> {
     pub open: &'a mut dyn FnMut(&Path, usize) -> Result<()>,
     pub read_stdin: &'a mut dyn FnMut() -> Result<zeroize::Zeroizing<Vec<u8>>>,
     pub store: &'a dyn Store,
-    /// How many Macs reading the vault hold the roll into the secret store back, for the
-    /// `emails` view's count line.
-    pub holding: &'a dyn Fn() -> Result<usize>,
+    /// What holds the roll into the secret store back, counted by kind, for the `emails` view's
+    /// count line.
+    pub holding: &'a dyn Fn() -> Result<aterm_secrets::client::Holding>,
     pub now_ms: u64,
 }
 
@@ -352,16 +352,30 @@ fn secret_cells(table: &typed::Table, view: &typed::view::View) -> (usize, usize
 
 /// The owner's one line on the registry's secrets: how many cells name a store entry, how many
 /// the table still holds sealed, and how many Macs reading the vault hold the roll that moves
-/// them back (`aterm_secrets::client::fleet_holding`). Counts only; where the holding cannot be
-/// read it says so.
-fn secrets_line((references, sealed): (usize, usize), holding: &Result<usize>) -> String {
+/// them back and why, by kind (`aterm_secrets::client::fleet_holding`): an unheard Mac is a
+/// different act for the owner from one on an older build. Counts only; where the holding cannot
+/// be read it says so.
+fn secrets_line(
+    (references, sealed): (usize, usize),
+    holding: &Result<aterm_secrets::client::Holding>,
+) -> String {
     let held = match holding {
-        Ok(0) => "no Mac holds the move into the secret store back".to_owned(),
-        Ok(macs) => format!(
-            "{} reading the vault {} the move into the secret store back",
-            plural(*macs, "Mac"),
-            if *macs == 1 { "holds" } else { "hold" }
-        ),
+        Ok(holding) if holding.clear() => {
+            "no Mac holds the move into the secret store back".to_owned()
+        }
+        Ok(holding) => {
+            let macs = holding.macs();
+            let head = if macs == 0 {
+                "the move into the secret store waits".to_owned()
+            } else {
+                format!(
+                    "{} reading the vault {} the move into the secret store back",
+                    plural(macs, "Mac"),
+                    if macs == 1 { "holds" } else { "hold" }
+                )
+            };
+            format!("{head}: {}", holding.reasons().join(", "))
+        }
         Err(error) => format!("which Macs hold the move back is unknown: {error}"),
     };
     format!(
@@ -1234,7 +1248,6 @@ pub fn main_entry(words: &[String]) -> Option<std::process::ExitCode> {
     let now_ms = aterm_time::unix_millis().unwrap_or(0);
     let holding = || {
         aterm_secrets::client::fleet_holding(&paths, now_ms)
-            .map(|holding| holding.macs())
             .map_err(|error| Error::new(&error.to_string()))
     };
     let mut view_io = ViewIo {

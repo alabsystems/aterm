@@ -27,7 +27,16 @@
 //! Observation spends at most [`OBSERVE_RESERVE`] records of this Mac's quota, and none of
 //! registration's reserve.
 //!
-//! [`plan`] is pure over the registry; `Registry::observe_accounts` runs it under the writer.
+//! What a Mac observes is three kinds of sighting: a CLI's login place (`idle`), a tab running
+//! one (`running`), and an account signed in to one of aterm's own browser profiles (`idle` from
+//! [`BROWSER`]); [`how`] says which in a person's words. Of one account's sightings a browser's
+//! speaks last. A sighting never writes a `preference` row: which Mac an account is assigned to is
+//! the owner's, and seeing it elsewhere changes nothing of that.
+//!
+//! [`plan`] is pure over the registry; `Registry::observe_accounts` runs it under the writer. A
+//! pass that cannot run (a writer that is fenced, a registry not read) leaves its sightings in
+//! this Mac's [`kept`] file, so they are registered once it authors again; so does a sighting
+//! whose birth or first row the quota refused ([`Plan::waiting`]), for a pass with room.
 
 use super::{
     checks::Finding,
@@ -69,8 +78,31 @@ pub const CLIS: &[&str] = &[
 ];
 /// The states an `account-obs` row takes.
 pub const STATES: &[&str] = &["running", "idle", "signed-out"];
-/// The sources an `account-obs` row takes, as the journal's `seen` words.
-pub const SOURCES: &[&str] = &["profile", "auth-file", "cli-log", "vault-token"];
+/// The sources an `account-obs` row takes: the journal's `seen` words, and `browser`, an account
+/// signed in to one of aterm's own browser profiles (`accounts/browsers`), which no CLI's file
+/// names and the journal does not hear.
+pub const SOURCES: &[&str] = &["profile", "auth-file", "cli-log", "vault-token", BROWSER];
+
+/// The source of a sighting made in one of aterm's own browser profiles.
+pub const BROWSER: &str = "browser";
+
+/// How a Mac's row says it holds an account, in a person's words: used by a tab, signed in at a
+/// CLI's login place, signed in only in one of aterm's own browser profiles, or signed out.
+#[must_use]
+pub fn how(state: &str, src: &str) -> &'static str {
+    match (state, src) {
+        ("running", _) => "used by a tab",
+        ("signed-out", _) => "signed out",
+        (_, BROWSER) => "browser only",
+        _ => "signed in",
+    }
+}
+
+/// Whether `s` was made in a browser profile: of the sightings of one account, every other kind
+/// speaks first, since a CLI's login or a tab says more of it than a browser's session does.
+pub(crate) fn browser_only(s: &Sighting) -> bool {
+    s.src == BROWSER
+}
 
 /// One login this Mac observed. No `Debug`: it holds the login email.
 #[derive(Clone, PartialEq, Eq)]
@@ -116,6 +148,10 @@ pub struct Plan {
     pub marked: usize,
     /// Rows whose change waits for a record an account's birth or first row writes.
     pub rested: usize,
+    /// The sightings, by their place in [`Input::sightings`], whose account's birth or this
+    /// Mac's first row of it the quota refused: what the registry does not hold yet, which a
+    /// pass after a roll gives its whole quota again is handed again ([`kept`]).
+    pub waiting: Vec<usize>,
 }
 
 fn automatic(
@@ -160,8 +196,17 @@ fn service(provider: &str) -> &'static str {
 }
 
 /// An observed account's birth: its provider, realm, login address, `status=active`, its
-/// default label, the service and `row=live`, every cell automatic.
-fn account_birth(pk: &str, realm: &str, login: &str) -> Result<Vec<Change>> {
+/// default label, the service and `row=live`, every cell automatic. The label is left empty
+/// (which reads as the default) where `taken`, the labels live accounts and this pass's births
+/// hold, already holds it: `label` is unique among live accounts, and the rules every write
+/// passes would refuse the birth, and with it every later pass that plans it again
+/// (`typed::check::unique_clash`). A label it writes joins `taken`.
+fn account_birth(
+    pk: &str,
+    realm: &str,
+    login: &str,
+    taken: &mut BTreeSet<String>,
+) -> Result<Vec<Change>> {
     let provider = keys::provider_of_realm(realm)
         .ok_or_else(|| crate::Error::new("account-obs: a realm no provider runs"))?;
     let mut out = vec![
@@ -180,10 +225,24 @@ fn account_birth(pk: &str, realm: &str, login: &str) -> Result<Vec<Change>> {
         )?,
         automatic(&ACCOUNT, pk, LIFECYCLE, Value::from("live"))?,
     ];
-    if let Ok(label) = keys::default_account_label(realm, pk) {
+    if let Ok(label) = keys::default_account_label(realm, pk)
+        && taken.insert(label.clone())
+    {
         out.push(automatic(&ACCOUNT, pk, "label", Value::from(label))?);
     }
     Ok(out)
+}
+
+/// Every label any live account's `label` cell holds, each candidate of a conflicted one too.
+fn live_labels(accounts: &cell::Projection) -> BTreeSet<String> {
+    accounts
+        .rows
+        .values()
+        .filter(|row| row.live())
+        .filter_map(|row| row.fields.get("label"))
+        .flat_map(cell::Field::candidates)
+        .filter_map(|candidate| candidate.value.x.as_str().map(str::to_owned))
+        .collect()
 }
 
 /// The tab count as the row's change rule reads it: none, one, or two or more.
@@ -283,6 +342,25 @@ fn matched(
     }
 }
 
+/// What the registry holds of one sighting, as a pass would match it.
+pub(crate) enum Holds {
+    /// The account row it is of.
+    Row(String),
+    /// No row: a pass would give birth to it under this key.
+    Unborn(String),
+    /// It matches no one row (several say it, its address's key is taken, or it does not read).
+    Unmatched,
+}
+
+/// [`Holds`] of `s` in the registry `index` and `accounts` describe.
+pub(crate) fn holds(s: &Sighting, index: &AddressIndex, accounts: &cell::Projection) -> Holds {
+    match matched(s, index, accounts) {
+        Ok(Matched::Row(pk)) => Holds::Row(pk),
+        Ok(Matched::Born { pk, .. }) => Holds::Unborn(pk),
+        Ok(Matched::Held(_)) | Err(_) => Holds::Unmatched,
+    }
+}
+
 /// One `account-obs` row's value.
 fn obs_row(n: u64, account: &str, s: &Sighting, first_at: u64, at: u64) -> Value {
     let mut row = Map::new();
@@ -301,8 +379,11 @@ fn obs_row(n: u64, account: &str, s: &Sighting, first_at: u64, at: u64) -> Value
 /// One pass over the registry this Mac holds: each sighting's account found by address or born,
 /// and this Mac's first `account-obs` row of it written. A row that exists is rewritten, where
 /// what it says changed or its rest period passed, only beside a birth or a first row: alone it
-/// writes nothing and is counted in `rested`. A sighting of a word this build does not know is
-/// skipped.
+/// writes nothing and is counted in `rested`. A sighting older than this Mac's row of its
+/// account says nothing newer of it, and leaves the account to its other sightings. A sighting
+/// of a word this build does not know, or whose realm or address does not read, is skipped: one
+/// such sighting kept on disk would otherwise refuse every later pass. A sighting whose birth or
+/// first row the quota refuses is named in `waiting`.
 ///
 /// # Errors
 /// A change does not fit its column.
@@ -310,6 +391,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
     let addresses = cell::project(&ADDRESS, cells);
     let index = AddressIndex::of(&addresses);
     let accounts = cell::project(&ACCOUNT, cells);
+    let mut labels = live_labels(&accounts);
     let today = day_of(input.now_ms);
     let mut out = Plan::default();
     let mut births: Vec<Change> = Vec::new();
@@ -318,14 +400,24 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
     let mut riders: Vec<Change> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut quota_spent = false;
-    for s in input.sightings {
+    // The account each sighting is of, and the accounts whose birth or first row a pass with
+    // no room would refuse.
+    let mut of: Vec<(usize, String)> = Vec::new();
+    let mut unwritten: BTreeSet<String> = BTreeSet::new();
+    // Each account's strongest sighting speaks for it: a browser's after every other.
+    let mut ordered: Vec<(usize, &Sighting)> = input.sightings.iter().enumerate().collect();
+    ordered.sort_by_key(|(_, s)| browser_only(s));
+    for (at_input, s) in ordered {
         if !CLIS.contains(&s.cli.as_str())
             || !STATES.contains(&s.state.as_str())
             || !SOURCES.contains(&s.src.as_str())
         {
             continue;
         }
-        let account = match matched(s, &index, &accounts)? {
+        let Ok(found) = matched(s, &index, &accounts) else {
+            continue;
+        };
+        let account = match found {
             Matched::Held(finding) => {
                 if !out.findings.contains(&finding) {
                     out.findings.push(finding);
@@ -337,25 +429,36 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
                 if seen.contains(&pk) {
                     pk
                 } else if input.room {
+                    let Ok(account) = account_birth(&pk, &s.realm, &login, &mut labels) else {
+                        continue;
+                    };
                     if let Some(addr) = &addr {
                         births.extend(address_birth(&login, addr)?);
                     }
-                    births.extend(account_birth(&pk, &s.realm, &login)?);
+                    births.extend(account);
                     out.born += 1;
                     pk
                 } else {
                     quota_spent = true;
+                    unwritten.insert(pk.clone());
                     pk
                 }
             }
         };
+        of.push((at_input, account.clone()));
+        let key = format!("{account}.{}", input.uuid);
+        let mine = obs.rows.get(&key).map(|row| &row.value);
+        // A sighting older than the row (a kept one passed late) says nothing newer of it; a
+        // newer sighting of the account through another login still may.
+        if mine.is_some_and(|row| row.get("at").and_then(Value::as_u64).unwrap_or(0) > s.at_ms) {
+            continue;
+        }
         if !seen.insert(account.clone()) {
             continue;
         }
-        let key = format!("{account}.{}", input.uuid);
-        let mine = obs.rows.get(&key).map(|row| &row.value);
         let said = |row: &Value, col: &str| row.get(col).and_then(Value::as_str).map(str::to_owned);
         let Some(row) = mine else {
+            unwritten.insert(account.clone());
             marks.push(Change {
                 collection: ACCOUNT_OBS.name.into(),
                 key,
@@ -399,6 +502,15 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
             pks: Vec::new(),
         });
     }
+    if !input.room {
+        out.waiting = of
+            .iter()
+            .filter(|(_, account)| unwritten.contains(account))
+            .map(|(at_input, _)| *at_input)
+            .collect();
+        out.waiting.sort_unstable();
+        out.waiting.dedup();
+    }
     if !input.room || (births.is_empty() && marks.is_empty()) {
         out.born = 0;
         out.rested = riders.len();
@@ -410,6 +522,9 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
     out.changes.extend(riders);
     Ok(out)
 }
+
+#[cfg(unix)]
+pub mod kept;
 
 #[cfg(all(test, unix))]
 mod tests;

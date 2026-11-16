@@ -501,3 +501,79 @@ fn listener_rest_wakeups() {
     stop.set();
     thread.join().expect("supervisor thread");
 }
+
+/// One field of a text `metrics` fragment.
+fn text_field<'a>(text: &'a str, key: &str) -> &'a str {
+    let at = text
+        .find(&format!(" {key}="))
+        .unwrap_or_else(|| panic!("no {key}= in {text}"));
+    let value = &text[at + key.len() + 2..];
+    value.split(' ').next().unwrap_or(value)
+}
+
+#[test]
+fn the_request_ledger_counts_each_line_under_its_peer_and_its_verb() {
+    for _ in 0..3 {
+        note_request("zq ledger law", Some("status"));
+    }
+    note_request("zq ledger law", Some("lease"));
+    note_request("zq ledger law", None);
+    let text = crate::metrics::wire::render_text(|s| {
+        emit_metrics(&crate::metrics::wire::ReadCtx::now(), s);
+    });
+    let ledger = text_field(&text, "control_requests");
+    let mine: Vec<&str> = ledger
+        .split(',')
+        .filter(|pair| pair.starts_with("zq%20ledger%20law/"))
+        .collect();
+    assert_eq!(
+        mine,
+        [
+            "zq%20ledger%20law/status:3",
+            "zq%20ledger%20law/lease:1",
+            "zq%20ledger%20law/unknown:1"
+        ],
+        "busiest first, then by name: {ledger}"
+    );
+}
+
+#[test]
+fn a_peer_is_named_by_its_lane_then_its_program_and_an_aterm_command_by_its_subcommand_words() {
+    const OWN: u32 = 100;
+    let comm = |pid: u32| match pid {
+        OWN | 7 | 8 | 9 => Some("aterm".to_string()),
+        20 => Some("claude".to_string()),
+        _ => None,
+    };
+    let words = |argv: &[&str]| Some(argv.iter().map(|w| w.as_bytes().to_vec()).collect());
+    let argv = |pid: u32| match pid {
+        7 => words(&["/opt/aterm", "harness", "tap"]),
+        8 => words(&["aterm", "ctl", "@self", "status"]),
+        9 => words(&["aterm", "ctl", "status", "extra", "words"]),
+        20 => words(&["claude", "code", "run"]),
+        _ => None,
+    };
+    let label = |lane, pid| peer_label(lane, pid, OWN, &comm, &argv);
+    assert_eq!(label(Some("fleet"), Some(20)), "fleet", "the lane wins");
+    assert_eq!(label(None, None), "indirect");
+    assert_eq!(label(None, Some(OWN)), "self");
+    assert_eq!(label(None, Some(999)), "unreadable");
+    assert_eq!(
+        label(None, Some(20)),
+        "claude",
+        "another program's argv is not read"
+    );
+    assert_eq!(label(None, Some(7)), "aterm harness tap");
+    assert_eq!(
+        label(None, Some(8)),
+        "aterm ctl",
+        "a selector ends the words"
+    );
+    assert_eq!(
+        label(None, Some(9)),
+        "aterm ctl status",
+        "two words at most"
+    );
+    let unread = |_: u32| None;
+    assert_eq!(peer_label(None, Some(7), OWN, &comm, &unread), "aterm");
+}

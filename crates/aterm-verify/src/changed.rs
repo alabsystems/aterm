@@ -1304,11 +1304,13 @@ fn with_shared_inputs(
         })
         .map(|member| member.name.as_str())
         .collect();
+    // A path under `root` as Git spells it, `/` between its parts: a literal's target is folded
+    // into this host's separators, which on Windows are `\`.
     let relative = |path: &Path| -> Option<String> {
         path.strip_prefix(root)
             .ok()
             .and_then(Path::to_str)
-            .map(str::to_string)
+            .map(|path| normalize_manifest_dir(path.to_string()))
     };
     // Each path's member once, and one trie walk per source for every path its text spells: a
     // pair-by-pair `text.contains` over thousands of paths and sources ran for hours on an

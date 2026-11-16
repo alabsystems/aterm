@@ -2487,7 +2487,10 @@ fn github_waits_for_a_vault_join_that_waits_to_be_let_in() {
     let port: Arc<dyn SecretsOps> = ops.clone();
     let step = items(&sys, &context, port, Mode::Apply, None).unwrap();
     let mut all = step.items;
-    all.extend(crate::init_github::items(&sys, &context, step.waited_on.as_deref()).unwrap());
+    all.extend(
+        crate::init_github::items(&sys, &context, step.waited_on.as_deref(), Mode::Apply, &[])
+            .unwrap(),
+    );
     let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
     assert!(
         matches!(rows[0].stood_aside, Some(StoodAside::Waiting(_))),
@@ -2504,7 +2507,10 @@ fn github_waits_for_a_vault_join_that_waits_to_be_let_in() {
     let port: Arc<dyn SecretsOps> = ops.clone();
     let step = items(&sys, &context, port, Mode::Apply, None).unwrap();
     let mut all = step.items;
-    all.extend(crate::init_github::items(&sys, &context, step.waited_on.as_deref()).unwrap());
+    all.extend(
+        crate::init_github::items(&sys, &context, step.waited_on.as_deref(), Mode::Apply, &[])
+            .unwrap(),
+    );
     let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
     github_after(&rows);
 }
@@ -2567,7 +2573,7 @@ fn a_held_waiting_vault_with_its_subscriber_down_leaves_github_its_own_row() {
         let step = items_at(&sys, &context, port, Mode::Apply, None, Here::Session).unwrap();
         let mut all = step.items;
         let after = after.unwrap_or(step.waited_on.as_deref());
-        all.extend(crate::init_github::items(&sys, &context, after).unwrap());
+        all.extend(crate::init_github::items(&sys, &context, after, Mode::Apply, &[]).unwrap());
         let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
         assert_eq!(ops.installs(), 0, "{rows:?}");
         rows
@@ -2651,7 +2657,10 @@ fn a_held_vaults_row_and_githubs_wait_judge_by_one_reading_of_the_subscriber() {
         let port: Arc<dyn SecretsOps> = ops.clone();
         let step = items_at(&sys, &context, port, Mode::Apply, None, Here::Session).unwrap();
         let mut all = step.items;
-        all.extend(crate::init_github::items(&sys, &context, step.waited_on.as_deref()).unwrap());
+        all.extend(
+            crate::init_github::items(&sys, &context, step.waited_on.as_deref(), Mode::Apply, &[])
+                .unwrap(),
+        );
         let rows = engine::run(&all, Mode::Apply, &sys, &context, &mut NoJournal);
         let github = rows
             .iter()

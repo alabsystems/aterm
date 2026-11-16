@@ -736,6 +736,7 @@ pub fn stream_until_stopped_observing_exit(
 ) -> io::Result<Option<std::process::ExitStatus>> {
     input_unix::stream_until_stopped_observing_exit(
         cmd,
+        None,
         deadline,
         spawned,
         output,
@@ -759,9 +760,33 @@ pub fn output_while_process_progressing_complete_with_limit(
     waiting_on: impl Into<String>,
     limit: usize,
 ) -> Result<Output, CompleteProgressError> {
+    output_from_while_process_progressing_complete_with_limit(
+        cmd,
+        Stdio::null(),
+        window,
+        waiting_on,
+        limit,
+    )
+}
+
+/// As [`output_while_process_progressing_complete_with_limit`], with explicit owned stdin.
+/// The caller supplies a file or manages its pipe writer; this collector never writes input.
+/// A successful result requires actual EOF on both output streams, not a retained tail.
+///
+/// # Errors
+/// The same errors as [`output_while_process_progressing_complete_with_limit`].
+#[cfg(unix)]
+pub fn output_from_while_process_progressing_complete_with_limit(
+    cmd: &mut Command,
+    stdin: Stdio,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    limit: usize,
+) -> Result<Output, CompleteProgressError> {
     let mut probe = ProcessProgressProbe::default();
     progress_complete_with(
         cmd,
+        stdin,
         window,
         waiting_on.into(),
         limit,
@@ -772,8 +797,13 @@ pub fn output_while_process_progressing_complete_with_limit(
 }
 
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one collector binds stdin, limits, progress evidence and cancellation"
+)]
 fn progress_complete_with(
     cmd: &mut Command,
+    stdin: Stdio,
     window: Duration,
     waiting_on: String,
     limit: usize,
@@ -796,8 +826,9 @@ fn progress_complete_with(
     let stalled = Cell::new(false);
     let mut progress = ProgressWindow::new(window, now());
     let mut streams = [Vec::new(), Vec::new()];
-    let result = stream_until_stopped_observing_exit(
+    let result = input_unix::stream_until_stopped_observing_exit(
         cmd,
+        Some(stdin),
         None,
         |born| {
             started.set(true);

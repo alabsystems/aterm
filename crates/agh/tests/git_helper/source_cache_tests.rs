@@ -35,6 +35,7 @@ fn source_object_cache_fetch_retains_all_historical_blobs_without_sharing_cache_
     crate::git_runner::host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
     crate::git_runner::host_git(&bare, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
     let target = crate::git_runner::host_git(&work, &["rev-parse", "HEAD"]);
+    let current = crate::git_runner::host_git(&work, &["rev-parse", "HEAD:current"]);
     let shallow_receiver = world.root.path().join("shallow-receiver.git");
     let remote_url = format!("file://{}", bare.display());
     crate::git_runner::host_git(
@@ -56,18 +57,15 @@ fn source_object_cache_fetch_retains_all_historical_blobs_without_sharing_cache_
     let shallow_bytes = std::fs::read(shallow_receiver.join("shallow")).unwrap();
     let shallow_config = std::fs::read(shallow_receiver.join("config")).unwrap();
     let shallow_refs = crate::git_runner::host_git(&shallow_receiver, &["show-ref"]);
-    // Exercise CLI refusal when the selected incomplete-cache plan cannot
-    // acquire the full history from the authoritative source.
-    let remote_historical = bare
-        .join("objects")
-        .join(&historical[..2])
-        .join(&historical[2..]);
+    // Cached ancestors may supply their original historical DATA. An uncached
+    // new body still requires the authoritative source and must refuse if absent.
+    let remote_current = bare.join("objects").join(&current[..2]).join(&current[2..]);
     assert!(
-        remote_historical.is_file(),
-        "tiny native push exposes its historical loose object"
+        remote_current.is_file(),
+        "tiny native push exposes its new loose object"
     );
-    let remote_historical_bytes = std::fs::read(&remote_historical).unwrap();
-    std::fs::remove_file(&remote_historical).unwrap();
+    let remote_current_bytes = std::fs::read(&remote_current).unwrap();
+    std::fs::remove_file(&remote_current).unwrap();
     let receiver = world.root.path().join("receiver.git");
     crate::git_runner::host_git(
         world.root.path(),
@@ -188,7 +186,7 @@ fn source_object_cache_fetch_retains_all_historical_blobs_without_sharing_cache_
         receiver_before
     );
     // Change only the owned provider input before a distinct positive receiver.
-    std::fs::write(&remote_historical, &remote_historical_bytes).unwrap();
+    std::fs::write(&remote_current, &remote_current_bytes).unwrap();
     crate::git_runner::host_git(
         &bare,
         &["fsck", "--full", "--strict", "--no-dangling", &target],

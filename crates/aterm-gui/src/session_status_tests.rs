@@ -436,7 +436,7 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
             (at, wrote),
             &wake,
         );
-        observer.rollout_asked.get(&SESSION).map(|ask| ask.at)
+        observer.sessions.rollout(&SESSION).map(|ask| ask.at)
     };
     assert_eq!(
         sweep("codex", group + 1, now),
@@ -567,8 +567,8 @@ fn the_sweep_asks_for_a_resting_codex_tabs_rollout_on_the_slow_clock_and_again_w
     let asked = |app: &mut crate::App, at: Instant| {
         let _ = app.observe_session_statuses(at);
         app.session_status
-            .rollout_asked
-            .get(&session)
+            .sessions
+            .rollout(&session)
             .is_some_and(|ask| ask.at == at)
     };
     let mut asks = Vec::new();
@@ -691,7 +691,7 @@ fn the_sweep_owes_a_settle_read_after_a_counted_codex_tabs_screen_moves() {
             &wake,
         );
         assert!(
-            observer.rollout_asked.contains_key(&SESSION),
+            observer.sessions.rollout(&SESSION).is_some(),
             "the released claim's process fronts its tab"
         );
         observer.next_wake()
@@ -2903,7 +2903,7 @@ fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
 /// a settled prompt, so its slot's own FSM owes no wake and every wake below is the ask's.
 #[test]
 fn a_pair_read_stays_owed_through_sweeps_that_miss_it() {
-    use crate::codex_rollout_tap::{Ask, RECHECK, due};
+    use crate::codex_rollout_tap::{Ask, RECHECK};
     use crate::session_log::transcript::ReadWait;
     const SESSION: u64 = 7598;
     let interval = Duration::from_millis(250);
@@ -2925,13 +2925,7 @@ fn a_pair_read_stays_owed_through_sweeps_that_miss_it() {
     // A sweep at `at` of the tab, its last output at `wrote`.
     let sweep = |observer: &mut StatusObserver, at: Instant, wrote: Option<Instant>| {
         observer.observe(SESSION, &at_prompt, at);
-        due(
-            &mut observer.rollout_asked,
-            SESSION,
-            Some(target.clone()),
-            None,
-            (at, wrote),
-        )
+        observer.rollout_action(SESSION, Some(target.clone()), None, (at, wrote))
     };
     let wait = ReadWait {
         since: 9_000,
@@ -4158,7 +4152,8 @@ fn a_look_reads_the_foreground_group_once() {
     let t0 = Instant::now();
     let sweeps = 4u32;
     for turn in 0..sweeps {
-        let _ = app.observe_session_statuses(t0 + app.session_status.min_interval * turn);
+        let _ =
+            app.observe_session_statuses(t0 + app.session_status.sessions.min_interval() * turn);
     }
     assert_eq!(
         READS.with(Cell::get),

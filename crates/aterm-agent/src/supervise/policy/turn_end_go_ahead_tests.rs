@@ -14,10 +14,14 @@ use alab_policy::go_ahead::{
 
 /// alab-policy's go-ahead table (`alab_policy::corpus::go_ahead`'s `table` and `guard_corpus`
 /// read it).
-const GO_AHEAD_TABLE: &str = include_str!("../../../../alab-policy/fixtures/go-ahead-table.txt");
+const GO_AHEAD_TABLE: &str = include_str!(
+    "../../../../../vendor/alab-harness/crates/alab-policy/fixtures/go-ahead-table.txt"
+);
 /// alab-policy's record of the base's guard (`alab_policy::corpus::guard_base`'s generator wrote
 /// it at 246d1ddc2f).
-const GUARD_BASE: &str = include_str!("../../../../alab-policy/fixtures/go-ahead-guard-base.txt");
+const GUARD_BASE: &str = include_str!(
+    "../../../../../vendor/alab-harness/crates/alab-policy/fixtures/go-ahead-guard-base.txt"
+);
 
 /// The incident's last reply (2026-10-29), two days into the park.
 const INCIDENT: &str = "Nothing has changed. The build is waiting only for your go-ahead.\n\nNEEDS YOU: \

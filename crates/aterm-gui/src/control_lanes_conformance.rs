@@ -29,6 +29,9 @@ struct Gate {
     /// Push streams held on their subscription lanes, and their releases.
     push: usize,
     push_open: usize,
+    /// Record streams held on their stream lanes, and their releases.
+    stream: usize,
+    stream_open: usize,
 }
 
 /// Test `LaneService` stub supporting gated `work`/`wait`.
@@ -100,6 +103,12 @@ impl Stub {
         self.moved.notify_all();
     }
 
+    fn end_stream(&self) {
+        let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.stream_open += 1;
+        self.moved.notify_all();
+    }
+
     fn pushes(&self) -> usize {
         self.gate
             .lock()
@@ -149,6 +158,9 @@ impl LaneService for Stub {
     ) -> Option<ServeDisposition> {
         if request.line().starts_with("subscribe") {
             return Some(ServeDisposition::Subscribe { request, scope });
+        }
+        if request.line() == "stream" {
+            return Some(ServeDisposition::Stream { request });
         }
         let reply = match request.line() {
             "quit" => return Some(ServeDisposition::Close),
@@ -208,6 +220,23 @@ impl LaneService for Stub {
         }
         gate.push_open -= 1;
         gate.push -= 1;
+        self.moved.notify_all();
+    }
+
+    fn stream(&self, _request: Request, stream: &CtlStream, _buffered: Vec<u8>) {
+        let mut writer = stream;
+        let _ = writer.write_all(b"OK stream\n");
+        let mut gate = self.gate.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.stream += 1;
+        self.moved.notify_all();
+        while gate.stream_open == 0 {
+            gate = self
+                .moved
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        gate.stream_open -= 1;
+        gate.stream -= 1;
         self.moved.notify_all();
     }
 
@@ -361,6 +390,7 @@ fn project(census: Census, flight: (usize, usize), facts: Facts) -> State {
     state.insert("parked", count(census.parked));
     state.insert("spared", count(census.spared));
     state.insert("placing", count(census.placing));
+    state.insert("streaming", count(census.streams));
     state.insert("queued", 0);
     state.insert("open", count(census.open));
     state.insert("arrivals", facts.arrivals);
@@ -411,6 +441,79 @@ fn model_limits() -> LaneLimits {
         open: 3,
         subscriptions: 1,
     }
+}
+
+/// A connection that opens a record stream moves whole to a stream lane and keeps its place
+/// and its claim there (the model's `Stream`); with every stream lane taken the verb is refused
+/// at once and the connection stays where it was; the stream's end is the connection's
+/// (`StreamClose`), its claims released then and not before.
+#[test]
+fn a_record_stream_keeps_its_place_and_its_claim_until_it_ends() {
+    let model = control_lane_tenure_model();
+    let rig = Rig::new(model_limits());
+    let mut facts = Facts::default();
+    let observe =
+        |rig: &Rig, facts: Facts, what: &str, want: &dyn Fn(Census, (usize, usize)) -> bool| {
+            let census = rig.settle(what, |c, f| want(c, f) && c.rpc == f.0 && c.waits == f.1);
+            project(census, rig.stub.in_flight(), facts)
+        };
+    let s0 = observe(&rig, facts, "empty", &|c, _| {
+        c == Census {
+            parking: true,
+            subscription_threads: 1,
+            ..Census::default()
+        }
+    });
+    let mut a = rig.idle().expect("A admitted");
+    facts.arrivals += 1;
+    let s1 = observe(&rig, facts, "A parked", &|c, _| c.parked == 1 && c.rpc == 0);
+    assert_path(&model, &s0, &["Admit", "Finish"], &s1);
+    assert_eq!(a.request("claim"), "OK claim");
+    let who = a.request("who");
+    let a_id: u64 = who.trim_start_matches("OK ").parse().expect("a serial");
+    let s2 = observe(&rig, facts, "A parked after claim", &|c, _| {
+        c.parked == 1 && c.rpc == 0 && c.spared == 1
+    });
+    assert_path(&model, &s1, &["Wake", "Pick", "Finish", "Spare"], &s2);
+
+    assert_eq!(a.request("stream"), "OK stream");
+    let s3 = observe(&rig, facts, "A streaming", &|c, _| {
+        c.streams == 1 && c.parked == 0 && c.rpc == 0 && c.open == 1 && c.spared == 0
+    });
+    assert_path(&model, &s2, &["Unspare", "Wake", "Pick", "Stream"], &s3);
+    assert!(
+        rig.stub.released().is_empty(),
+        "the flip moved the tenure: A's claim stands"
+    );
+    assert!(rig.stub.has_live_claim(a_id));
+
+    // The one stream lane is taken: B's verb is refused at once and B serves on.
+    let mut b = rig.idle().expect("B admitted");
+    facts.arrivals += 1;
+    let s4 = observe(&rig, facts, "B parked", &|c, _| {
+        c.parked == 1 && c.rpc == 0 && c.streams == 1
+    });
+    assert_path(&model, &s3, &["Admit", "Finish"], &s4);
+    let picked = model.successors("Wake", &s4);
+    let picked = model.successors("Pick", &picked[0]);
+    assert!(
+        model.successors("Stream", &picked[0]).is_empty(),
+        "the model opens no stream past its stream lanes"
+    );
+    assert_eq!(b.request("stream"), "ERR busy streams");
+    assert_eq!(b.request("ping"), "OK ping", "B is still in request mode");
+    let s5 = observe(&rig, facts, "B parked again", &|c, _| {
+        c.parked == 1 && c.rpc == 0 && c.streams == 1 && c.open == 2
+    });
+    assert_path(&model, &s4, &["Wake", "Pick", "Finish"], &s5);
+
+    rig.stub.end_stream();
+    assert_eq!(a.line(), "<EOF>");
+    let s6 = observe(&rig, facts, "A's stream ended", &|c, _| {
+        c.streams == 0 && c.open == 1 && c.parked == 1
+    });
+    assert_path(&model, &s5, &["StreamClose"], &s6);
+    assert_eq!(rig.stub.released(), vec![a_id], "A's claim ended with it");
 }
 
 #[test]

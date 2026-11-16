@@ -739,9 +739,10 @@ fn serve_connections(
         let result = end.and_then(|end| execute(&request, &body, end));
         // A later caller may have refreshed the registered password. Do not
         // retain rejected bootstrap credentials in a long-lived owner.
-        let retire = result
-            .as_ref()
-            .is_err_and(|error| error.kind == Kind::Credentials);
+        // A met check retires the owner too: it signs that mailbox in no more.
+        let retire = result.as_ref().is_err_and(|error| {
+            error.kind == Kind::Credentials || super::native::is_check_met(&error.message)
+        });
         let (header, body) = match result {
             Ok(reply) => reply,
             Err(error) => (

@@ -27,10 +27,10 @@ mod native;
 mod repos;
 mod selection;
 mod source;
-pub use checkout_inputs::RepositoryCheckoutMetadata;
+pub use checkout_inputs::{PassWrites, RepositoryCheckoutMetadata, Wrote};
 pub use credentials::{sync_vault_git_credentials, vault_git_credentials};
 pub use inventory::{RepositoryCatalog, RepositoryCatalogChanges, RepositoryCatalogVisibility};
-pub use native::{InitialRepositoryInputs, RepositoryReadback, RepositoryRun};
+pub use native::{InitialRepositoryInputs, RepositoryReadback, RepositoryRun, RepositorySteps};
 pub(crate) use native::{automatic_inventory_counts, automatic_inventory_counts_captured};
 pub use selection::{RepositoryCredentialWithdrawal, RepositorySelection};
 pub use source::{
@@ -57,6 +57,15 @@ pub fn git_installed(sys: &dyn System) -> bool {
 /// ([`crate::checkout::lazy_fetch::before_the_option`]).
 #[cfg(any(test, debug_assertions))]
 pub use crate::checkout::lazy_fetch::before_the_option as git_before_no_lazy_fetch;
+
+/// Whether `call`, a command as a test double records it ([`crate::port::Fake::calls`]),
+/// downloads a repository: a new clone's one fetch of what GitHub advertised, or a required
+/// dependency's `git clone`.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn acquires_repository(call: &str) -> bool {
+    repos::fetches_advertised(call) || call.contains(" clone ")
+}
 
 /// Whether the selected private inventory's Git requirements are met. Unlike the
 /// metadata-only [`git_installed`], this may ask the selected executable whether
@@ -154,6 +163,8 @@ pub(crate) fn vault_clones(sys: &dyn System, ctx: &Ctx) -> Result<VaultClones, S
 
 /// Reconcile using locally captured inputs, checking their materialization
 /// identity after inventory and before effects. The check never leases network work.
+/// `steps` names the items the run binds: acquisition, the refresh of what was here before it,
+/// or both, acquisition first.
 /// # Errors
 /// As [`run_initial_repositories`], or the captured version is no longer ready.
 pub fn run_initial_repositories_captured(
@@ -161,10 +172,11 @@ pub fn run_initial_repositories_captured(
     ctx: &Ctx,
     mode: crate::model::Mode,
     work: aterm_secrets::converge::RepositoryWork,
+    steps: RepositorySteps,
     inputs: InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<RepositoryRun, String> {
-    native::run_captured(sys, ctx, mode, work, inputs, Box::new(current))
+    native::run_captured(sys, ctx, mode, work, steps, inputs, Box::new(current))
 }
 
 /// Reconciles repositories after the selected secrets stage has synchronized.
@@ -252,8 +264,9 @@ pub(crate) fn helper(sys: &dyn System, user: &User) -> Option<Helper> {
 }
 
 /// The stage's id, as `aterm init --only` spells it. Each of its items' ids starts with it and
-/// a dot ([`names_item`]): `init.github.native@<user>`, `init.github.keychain@<user>`, and the
-/// clone tuning beside them ([`crate::clone_tuning::ID`]).
+/// a dot ([`names_item`]): `init.github.native@<user>` (acquisition),
+/// `init.github.refresh@<user>`, `init.github.keychain@<user>`, and the clone tuning beside
+/// them ([`crate::clone_tuning::ID`]).
 pub const ID: &str = "init.github";
 
 /// Whether `id` names an item of this stage: [`ID`], a dot, then the item's own name. The
@@ -270,6 +283,15 @@ pub(crate) fn keychain_row(row: &crate::model::ItemReport) -> bool {
     row.id
         .strip_prefix(ID)
         .is_some_and(|item| item.starts_with(".keychain@"))
+}
+
+/// Whether `row` is the refresh of the checkouts already here (`init.github.refresh@<user>`), a
+/// row of its own after acquisition: no reading of presence or standing counts it.
+#[must_use]
+pub fn refresh_row(row: &crate::model::ItemReport) -> bool {
+    row.id
+        .strip_prefix(ID)
+        .is_some_and(|item| item.starts_with(".refresh@"))
 }
 
 /// Whether the token aterm's helper ([`helper`]) would hand back is on this machine, read in
@@ -290,10 +312,16 @@ pub(super) fn settings_managed(sys: &dyn System, user: &User) -> Result<bool, St
 }
 
 /// The repository stage `aterm init` runs: the first launch's own ([`native`]) unless init.toml's
-/// `[github]` turns it off. It waits for the item `secrets` names, when one does: the secrets vault
-/// this run joins, or this Mac waits to be let into, delivers the token entry it reads
+/// `[github]` turns it off, its acquisition and then the refresh of what was here before it. It
+/// waits for the item `secrets` names, when one does: the secrets vault this run joins, or this
+/// Mac waits to be let into, delivers the token entry it reads
 /// ([`crate::init_secrets::Secrets::waited_on`]). The keychain item ([`keychain`]) comes first
-/// and waits for nothing: it asks GitHub nothing.
+/// and waits for nothing: it asks GitHub nothing. Run as an apply (`mode`), the stage decides
+/// the repository lease before it reads anything, and stands aside while another pass holds it;
+/// a plan never takes the lease. `only` is the run's `--only` words (none: every row): where
+/// they name the acquisition's row but not the refresh's, the refresh is not built, and the
+/// acquisition lets its lease go at its own row's end rather than leave it to a refresh the run
+/// would never start ([`RepositorySteps::named_by`]).
 ///
 /// # Errors
 /// The local profile cannot be admitted or decoded. Its contents are never quoted.
@@ -301,40 +329,39 @@ pub fn items(
     sys: &dyn System,
     ctx: &Ctx,
     secrets: Option<&str>,
+    mode: crate::model::Mode,
+    only: &[String],
 ) -> Result<Vec<Box<dyn Item>>, String> {
-    items_for_work(
+    let steps = match ctx.users.as_slice() {
+        [user] => RepositorySteps::named_by(only, &user.name),
+        // `stage_items` refuses a run that does not name exactly one user.
+        _ => RepositorySteps::Both,
+    };
+    stage_items(
         sys,
         ctx,
         secrets,
+        mode,
         aterm_secrets::converge::RepositoryWork::Refresh,
+        steps,
+        None,
+        None,
     )
 }
 
-/// Build the same default or explicit stage for an owned acquisition/refresh job.
-pub(crate) fn items_for_work(
+/// The same default or explicit stage for an owned job: the items `steps` names, run in `mode`,
+/// within the enclosing pass's `execution` where one is given.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stage's selection, its run's mode and the enclosing pass's lease"
+)]
+pub(crate) fn stage_items(
     sys: &dyn System,
     ctx: &Ctx,
     secrets: Option<&str>,
+    mode: crate::model::Mode,
     work: aterm_secrets::converge::RepositoryWork,
-) -> Result<Vec<Box<dyn Item>>, String> {
-    items_for_execution(sys, ctx, secrets, work, None)
-}
-
-pub(crate) fn items_for_execution(
-    sys: &dyn System,
-    ctx: &Ctx,
-    secrets: Option<&str>,
-    work: aterm_secrets::converge::RepositoryWork,
-    execution: Option<crate::sync::repository_refresh::Execution>,
-) -> Result<Vec<Box<dyn Item>>, String> {
-    items_for_execution_with_withdrawal_guard(sys, ctx, secrets, work, execution, None)
-}
-
-pub(crate) fn items_for_execution_with_withdrawal_guard(
-    sys: &dyn System,
-    ctx: &Ctx,
-    secrets: Option<&str>,
-    work: aterm_secrets::converge::RepositoryWork,
+    steps: RepositorySteps,
     execution: Option<crate::sync::repository_refresh::Execution>,
     withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
 ) -> Result<Vec<Box<dyn Item>>, String> {
@@ -344,52 +371,61 @@ pub(crate) fn items_for_execution_with_withdrawal_guard(
     let withdrawal = RepositoryCredentialWithdrawal::capture(sys, ctx);
     let withdrawal_unread = withdrawal.is_err();
     if let Ok(Some(withdrawal)) = withdrawal {
-        return Ok(vec![native::withdrawal_item(
-            user,
-            withdrawal,
-            withdrawal_current,
-        )]);
+        // A withdrawal retires the credential's checkouts: there is nothing here to refresh.
+        return Ok(if steps == RepositorySteps::Refresh {
+            Vec::new()
+        } else {
+            vec![native::withdrawal_item(
+                user,
+                withdrawal,
+                withdrawal_current,
+            )]
+        });
     }
     let profile = profile(sys, user)?.unwrap_or_default();
     match asked(profile.github)? {
         Asked::Off => {
             // A failed cleanup observation is a Native blocker, not a failure to build
             // every other setup group and not permission to retire an unknown intent.
-            Ok(if withdrawal_unread {
-                vec![native::item(
+            Ok(if withdrawal_unread && steps != RepositorySteps::Refresh {
+                native::items(
                     user,
                     secrets.map(str::to_owned),
                     false,
+                    mode,
                     work,
+                    RepositorySteps::Acquisition,
                     execution,
                     withdrawal_current,
-                )]
+                )
             } else {
                 Vec::new()
             })
         }
-        Asked::Default => Ok(vec![
-            keychain::item(user),
-            native::item(
+        asked => {
+            let default = matches!(asked, Asked::Default);
+            // An explicit `[github]` profile's checkouts are left as they are: no refresh.
+            let steps = match steps {
+                RepositorySteps::Refresh if !default => return Ok(Vec::new()),
+                RepositorySteps::Both if !default => RepositorySteps::Acquisition,
+                steps => steps,
+            };
+            let mut items = Vec::new();
+            if steps != RepositorySteps::Refresh {
+                items.push(keychain::item(user));
+            }
+            items.extend(native::items(
                 user,
                 secrets.map(str::to_owned),
-                true,
+                default,
+                mode,
                 work,
+                steps,
                 execution,
                 withdrawal_current,
-            ),
-        ]),
-        Asked::Scoped(_) => Ok(vec![
-            keychain::item(user),
-            native::item(
-                user,
-                secrets.map(str::to_owned),
-                false,
-                work,
-                execution,
-                withdrawal_current,
-            ),
-        ]),
+            ));
+            Ok(items)
+        }
     }
 }
 

@@ -4,8 +4,25 @@
 use aterm_session::{EdgeToken, Op};
 
 use super::{Scope, caller_actor, caller_actor_of, cmd_exits, turn_by, typed_by};
-use crate::session_store::{ExitActor, ExitReason, RosterChange, new_store, test_handle};
+use crate::session_store::{ExitActor, ExitReason, Store, new_store, test_handle};
 use crate::turn_ledger::TurnBy;
+
+/// Close session `local` of `store` as a tab's close does, leaving its row in the store's session
+/// table, which `exits` reads (tracker ST-15).
+fn close(store: &Store, local: u64, reason: ExitReason, actor: ExitActor) {
+    crate::session_table::close_leaving_row(store, local, reason, actor).expect("a close");
+}
+
+/// The `(id, t)` of each row of `store`'s table, oldest first.
+fn row_ids(store: &Store) -> Vec<(u64, u64)> {
+    let table = store.read().unwrap_or_else(|p| p.into_inner()).table();
+    table
+        .exits_since(0)
+        .expect("a memory table is loaded")
+        .iter()
+        .map(|head| (head.id, head.ended_ms))
+        .collect()
+}
 
 #[test]
 fn no_exits_is_ok_zero() {
@@ -26,34 +43,28 @@ fn no_exits_is_ok_zero() {
 fn formats_every_reason_actor_and_exit_code() {
     let store = new_store();
     let mut sids = Vec::new();
-    {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        for (i, reason) in ExitReason::ALL.iter().enumerate() {
-            let local = i as u64 + 10;
-            let h = test_handle(local);
-            sids.push(h.sid.as_str().to_string());
+    for (i, reason) in ExitReason::ALL.iter().enumerate() {
+        let local = i as u64 + 10;
+        let h = test_handle(local);
+        sids.push(h.sid.as_str().to_string());
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
             g.register(h);
-            let actor = match i % 3 {
-                0 => ExitActor::Sid(format!("s-driver{i}")),
-                1 => ExitActor::Human,
-                _ => ExitActor::Unknown,
-            };
             if i % 2 == 0 {
                 g.note_exit_code(local, Some(i32::try_from(i).unwrap()));
             }
-            g.deregister_local_as(local, *reason, actor);
         }
+        let actor = match i % 3 {
+            0 => ExitActor::Sid(format!("s-driver{i}")),
+            1 => ExitActor::Human,
+            _ => ExitActor::Unknown,
+        };
+        close(&store, local, *reason, actor);
     }
     let reply = cmd_exits(&store, "", &[]);
     let lines: Vec<&str> = reply.lines().collect();
     assert_eq!(lines[0], format!("OK {}", ExitReason::ALL.len()));
-    let ledger: Vec<(u64, u64)> = {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        g.roster_since(0)
-            .filter(|r| r.change == RosterChange::Exited)
-            .map(|r| (r.seq, r.t_ms))
-            .collect()
-    };
+    let ledger = row_ids(&store);
     for (i, reason) in ExitReason::ALL.iter().enumerate() {
         let (seq, t) = ledger[i];
         let by = match i % 3 {
@@ -84,33 +95,36 @@ fn exits_n_formats_only_n_rows() {
     use crate::work_counts::take_ring_rows_formatted;
 
     let store = new_store();
-    {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        for local in 1..=8 {
+    for local in 1..=8 {
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
             g.register(test_handle(local));
             if local % 2 == 0 {
                 g.note_exit_code(local - 1, Some(i32::try_from(local).unwrap()));
-                g.deregister_local_as(local - 1, ExitReason::UiClose, ExitActor::Human);
             }
+        }
+        if local % 2 == 0 {
+            close(&store, local - 1, ExitReason::UiClose, ExitActor::Human);
         }
     }
     let oracle = |since: u64, n: usize| -> String {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        let mut rows: Vec<String> = g
-            .closed_logs()
+        let table = store.read().unwrap_or_else(|p| p.into_inner()).table();
+        let mut rows: Vec<String> = table
             .exits_since(since)
+            .expect("a memory table is loaded")
+            .iter()
             .map(|r| {
                 let exit_code = r
                     .exit_code
                     .map_or_else(|| "-".to_string(), |c| c.to_string());
                 format!(
                     "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={} left=-",
-                    r.seq,
-                    r.t_ms,
+                    r.id,
+                    r.ended_ms,
                     r.sid.as_str(),
-                    r.local_id,
-                    r.reason.as_str(),
-                    crate::control::pct_encode(r.actor.as_wire()),
+                    r.local.expect("this process's row"),
+                    r.out.as_str(),
+                    crate::control::pct_encode(&r.by),
                 )
             })
             .collect();
@@ -145,12 +159,12 @@ fn exits_n_formats_only_n_rows() {
 #[test]
 fn window_cursor_and_usage() {
     let store = new_store();
-    {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        for local in 1..=3 {
-            g.register(test_handle(local));
-            g.deregister_local_as(local, ExitReason::UiClose, ExitActor::Human);
-        }
+    for local in 1..=3 {
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(test_handle(local));
+        close(&store, local, ExitReason::UiClose, ExitActor::Human);
     }
     let all = cmd_exits(&store, "", &[]);
     let ids: Vec<u64> = all
@@ -204,14 +218,10 @@ fn closed(sid: &str, left: usize) -> aterm_vitals::left::ClosedTab {
 #[test]
 fn an_exit_that_left_two_processes_reads_left_2() {
     let store = new_store();
-    let sid = {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        let h = test_handle(1);
-        let sid = h.sid.as_str().to_string();
-        g.register(h);
-        g.deregister_local_as(1, ExitReason::UiClose, ExitActor::Human);
-        sid
-    };
+    let h = test_handle(1);
+    let sid = h.sid.as_str().to_string();
+    store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+    close(&store, 1, ExitReason::UiClose, ExitActor::Human);
     let reply = cmd_exits(&store, "", &[closed(&sid, 5), closed(&sid, 2)]);
     let row = reply.lines().nth(1).expect("one exit row");
     assert!(row.ends_with(" by=human left=2"), "{row}");
@@ -223,12 +233,12 @@ fn an_exit_that_left_two_processes_reads_left_2() {
 #[test]
 fn an_exit_with_no_record_reads_left_dash() {
     let store = new_store();
-    {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        for local in 1..=2 {
-            g.register(test_handle(local));
-            g.deregister_local_as(local, ExitReason::UiClose, ExitActor::Human);
-        }
+    for local in 1..=2 {
+        store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(test_handle(local));
+        close(&store, local, ExitReason::UiClose, ExitActor::Human);
     }
     let reply = cmd_exits(&store, "", &[closed("s-another", 3)]);
     let rows: Vec<&str> = reply.lines().skip(1).collect();
@@ -305,8 +315,8 @@ fn caller_actor_is_the_edge_source_never_the_target_and_the_client_kind_for_owne
         let mut g = store.write().unwrap_or_else(|p| p.into_inner());
         g.register(caller);
         g.register(target);
-        g.deregister_local_as(2, ExitReason::CtlClose, by);
     }
+    close(&store, 2, ExitReason::CtlClose, by);
     let reply = cmd_exits(&store, "", &[]);
     let row = reply.lines().nth(1).expect("one exit row");
     assert!(row.contains(&format!(" sid={target_sid} ")), "{row}");

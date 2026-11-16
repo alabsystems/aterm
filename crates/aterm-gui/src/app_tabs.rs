@@ -1338,6 +1338,32 @@ impl App {
         instance: crate::tab_model::AppInstanceId,
         state: crate::native_app::AppViewState,
     ) -> Result<crate::tab_model::ViewId, NativeTabInstallError> {
+        self.seat_native_view(wid, axis, instance, state, None)
+    }
+
+    /// Attach a view of an existing native app first beside everything the active tab holds
+    /// (left of it, or above it), with `ratio` of the tab: a sidebar's place
+    /// ([`crate::tab_model::Tab::seat_first`]).
+    pub(crate) fn seat_native_first(
+        &mut self,
+        wid: WindowId,
+        axis: crate::tab_model::SplitAxis,
+        instance: crate::tab_model::AppInstanceId,
+        state: crate::native_app::AppViewState,
+        ratio: f32,
+    ) -> Result<crate::tab_model::ViewId, NativeTabInstallError> {
+        self.seat_native_view(wid, axis, instance, state, Some(ratio))
+    }
+
+    /// [`Self::split_active_with_native`] (`first` `None`) or [`Self::seat_native_first`].
+    fn seat_native_view(
+        &mut self,
+        wid: WindowId,
+        axis: crate::tab_model::SplitAxis,
+        instance: crate::tab_model::AppInstanceId,
+        state: crate::native_app::AppViewState,
+        first: Option<f32>,
+    ) -> Result<crate::tab_model::ViewId, NativeTabInstallError> {
         let (tab_id, prior_projection) = self
             .windows
             .get(&wid)
@@ -1362,7 +1388,10 @@ impl App {
             .get_mut(&wid)
             .as_deref_mut()
             .and_then(|window| window.tab_set.active_mut())
-            .is_some_and(|tab| tab.split_focused(axis, view));
+            .is_some_and(|tab| match first {
+                Some(ratio) => tab.seat_first(axis, view, ratio),
+                None => tab.split_focused(axis, view),
+            });
         if !split {
             self.native_runtime.remove_view(view);
             self.view_store.remove(view);
@@ -5216,14 +5245,13 @@ impl App {
                     .and_then(crate::tab_model::View::terminal_session)
             })
             .collect::<Vec<_>>();
-        let (tab, was_last, was_workers) = {
+        let (tab, was_last) = {
             let mut route_guard_ws = self
                 .windows
                 .get_mut(&wid)
                 .ok_or_else(|| "unknown window".to_string())?;
             let ws = &mut **route_guard_ws;
             let was_last = ws.tab_set.len() == 1;
-            let was_workers = ws.tab_set.home() == Some(tab_id);
             let tab = ws
                 .tab_set
                 .remove(tab_id)
@@ -5235,20 +5263,10 @@ impl App {
                 ws.pending_close = true;
             }
             align_terminal_projection_to_active(ws, &self.view_store);
-            (tab, was_last, was_workers)
+            (tab, was_last)
         };
         if was_last {
             self.stash_deferred_close_attribution(wid);
-        }
-        // The Workers tab closes only with no worker left for it: its Finished rows leave the
-        // window's page with it, or the sync would open it again for them; what they left stays
-        // for their managers to read, as Clear Finished keeps it.
-        if was_workers {
-            self.store
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .retired_workers_mut()
-                .unlist_window(wid);
         }
         self.retiring_edit_leaves_in(wid, |app| {
             tab.root.visit(&mut |&view| {
@@ -5554,6 +5572,8 @@ impl App {
             .write()
             .unwrap_or_else(|p| p.into_inner())
             .set_state(session, session_store::SessionState::Exited);
+        // The list is of live sessions: a pane kept open on a program that exited is no row.
+        self.navigator_mark_row(session);
         if let Some(ended) = self.pool.get(session) {
             ended.ctx.fabric.close();
         }
@@ -6643,10 +6663,12 @@ impl App {
             (held, store.instance_watchers())
         };
         // The close's last visit, before the log closes: a command the engine finished since the
-        // sweep's last visit is logged, not lost uncounted (unit J1-1, SMOKE-3c).
-        let closing = closing.map(|(term, ctx)| {
+        // sweep's last visit is logged, not lost uncounted (unit J1-1, SMOKE-3c). What its row
+        // keeps of its terminal is read then too: its title and its folder.
+        let (closing, at_close) = closing.map_or((None, None), |(term, ctx)| {
             crate::session_status::last_visit(&term, &ctx);
-            ctx
+            let at = crate::session_table::AtClose::read(&term, &ctx);
+            (Some(ctx), Some(at))
         });
         // Where its task stood, for the request that may own the tab (ATERM-KI-1109-3).
         let task_end = closing.as_ref().and_then(|ctx| {
@@ -6692,6 +6714,9 @@ impl App {
         let (stable, exit_seq) = match deregistered {
             Some(closed) => {
                 drop(closed.freed);
+                if let (Some(ended), Some(at)) = (closed.ended.as_ref(), at_close.as_ref()) {
+                    self.leave_row(crate::session_table::row_at_close(&closed.sid, ended, at));
+                }
                 if let Some(reason) = closed.reason {
                     crate::requests_host::left(crate::requests_host::TabLeft {
                         sid: closed.sid.clone(),
@@ -6766,23 +6791,40 @@ impl App {
 }
 
 impl App {
+    /// EVERY END LEAVES A ROW (tracker ST-15): `row`, of a session the registry just let go, goes
+    /// to the machine's session table ([`crate::session_table`]), before its close sweeps the tasks
+    /// directory, so the result it names is kept with it. Not in a seamless update's candidate
+    /// before its Commit (`incoming_handoff_pending`): the predecessor resumes with that session.
+    /// Not yet where a quit has taken its layout (`Self::quit_capture`): the run's end writes it
+    /// once its layout says the session is not brought back (`Self::retire_tasks_at_quit`).
+    fn leave_row(&mut self, row: crate::session_table::Row) {
+        if self.incoming_handoff_pending {
+            return;
+        }
+        if self.quit_capture.is_some() {
+            self.quit_closed_tasks.note_row(row);
+            return;
+        }
+        let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
+        table.write(row);
+    }
+
     /// What the close of worker session `stable`, out of the store now, removes from the tasks
     /// directory, `carried_results` the results its record named under other session IDs:
     ///
     /// - Nothing in a seamless update's candidate before its Commit (`incoming_handoff_pending`,
     ///   which the Commit lifts). A worker session it closes then is one it adopted (a window
     ///   that could not attach, `Self::retire_unattached_restored_window`), the handoff is
-    ///   withheld, and the predecessor resumes with a record that names these files, as
-    ///   [`Self::forget_retired_workers_at_quit`] leaves a retired row's. The pool's own test,
-    ///   `Session::predecessor_owns`, cannot be asked here: the view's detach has dropped the
-    ///   session from the pool.
+    ///   withheld, and the predecessor resumes with a record that names these files. The pool's
+    ///   own test, `Session::predecessor_owns`, cannot be asked here: the view's detach has
+    ///   dropped the session from the pool.
     /// - Nothing yet where a quit has taken its layout (`Self::quit_capture`, the last window
     ///   closing): the layout's task row names this tab's result, so the session is noted
     ///   (`task_launch::QuitClosed`) and the run's end removes its files but those the layout it
     ///   writes names (`Self::retire_tasks_at_quit`).
-    /// - Otherwise its task file and `carried_results`, but a file another record names, and its
-    ///   own results unless a retired row answers for them (a worker aterm closed keeps them while
-    ///   that row stands).
+    /// - Otherwise its task file, its own results and `carried_results`, but a file another
+    ///   record names and the result its row names ([`Self::leave_row`]), which lives as long as
+    ///   that row.
     fn retire_closed_task_files(
         &mut self,
         stable: &aterm_session::SessionId,
@@ -6795,14 +6837,7 @@ impl App {
             self.quit_closed_tasks.note(stable.clone(), carried_results);
             return;
         }
-        let kept = self
-            .store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers()
-            .by_sid(stable)
-            .is_some();
-        crate::task_launch::retire_task_file(&self.store, stable, &carried_results, kept);
+        crate::task_launch::retire_task_file(&self.store, stable, &carried_results);
     }
 }
 
@@ -6857,3 +6892,7 @@ mod shell_start_exit_tests;
 #[cfg(test)]
 #[path = "app_tabs_end_seen_tests.rs"]
 mod end_seen_tests;
+
+#[cfg(test)]
+#[path = "app_tabs_session_row_tests.rs"]
+mod session_row_tests;

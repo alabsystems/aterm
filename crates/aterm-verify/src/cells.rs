@@ -397,9 +397,10 @@ pub fn run(ctx: &Ctx, r: &mut Report) {
     run_prepared(ctx, r, None);
 }
 
-/// One invocation's inputs and terminal results for cells whose captured toolchain is unready.
-/// No resolved graph or readiness result is reused by another invocation.
-pub(crate) struct PreparedRun {
+/// One invocation's captured inputs and resolved compiler or terminal plans.
+/// No graph or prerequisite result is reused by another invocation.
+pub(crate) struct PreparedRun<'ctx> {
+    ctx: &'ctx Ctx,
     inputs: Result<Inputs, String>,
 }
 
@@ -409,7 +410,7 @@ struct Inputs {
     cells: Vec<Cell>,
     stock: Result<rustup::Stock, rustup::Unready>,
     members: Option<Result<Members, String>>,
-    cached: Vec<(Cell, CellOutcome, std::time::Duration)>,
+    plans: Option<Vec<PreparedCell>>,
 }
 
 fn inputs(ctx: &Ctx) -> Result<Inputs, String> {
@@ -428,7 +429,7 @@ fn inputs(ctx: &Ctx) -> Result<Inputs, String> {
         cells,
         stock: stock_of(ctx),
         members: None,
-        cached: Vec::new(),
+        plans: None,
     })
 }
 
@@ -450,54 +451,74 @@ fn validate_members(
     Ok(())
 }
 
-/// Capture the existing cell inputs without resolving any cell graph.
-pub(crate) fn prepare(ctx: &Ctx) -> PreparedRun {
+/// One cell's captured precompiler decision and the time spent resolving it.
+struct PreparedCell {
+    cell: Cell,
+    plan: CellPlan,
+    resolved: Duration,
+}
+
+/// Capture one invocation's source context and stock snapshot. `resolve` fills its plans once.
+pub(crate) fn prepare(ctx: &Ctx) -> PreparedRun<'_> {
     PreparedRun {
+        ctx,
         inputs: inputs(ctx),
     }
 }
 
-impl PreparedRun {
-    pub(crate) fn needs_resolution(&self) -> bool {
-        self.inputs.as_ref().is_ok_and(|inputs| {
-            inputs.cells.iter().any(|cell| {
-                cell.triple != inputs.host && serving(&inputs.stock, &cell.triple, true).is_err()
-            })
-        })
+impl PreparedRun<'_> {
+    pub(crate) fn for_context(&self, ctx: &Ctx) -> Result<(), String> {
+        if std::ptr::eq(self.ctx, ctx) {
+            Ok(())
+        } else {
+            Err("the prepared cells belong to another invocation's source context".into())
+        }
     }
 
-    /// Resolve only unready cells under the caller's ordinary resource claim. The same
-    /// immutable stock snapshot prevents this walk from reaching a compiler command.
-    pub(crate) fn resolve_unready(&mut self, ctx: &Ctx) {
+    /// Resolve each selected cell once with the captured context, without compiling it.
+    pub(crate) fn resolve(&mut self) {
+        let ctx = self.ctx;
         let result = self
             .inputs
             .as_mut()
             .map_err(|why| why.clone())
             .and_then(|inputs| {
-                for cell in &inputs.cells {
-                    if cell.triple == inputs.host
-                        || serving(&inputs.stock, &cell.triple, true).is_ok()
-                    {
-                        continue;
-                    }
-                    if cell_ended(ctx).is_some() {
-                        break;
-                    }
-                    validate_members(ctx, &mut inputs.members)?;
-                    let started = Instant::now();
-                    // This walk reaches no compiler command, so it has no call to note.
-                    let outcome = check_cell(
-                        ctx,
-                        &inputs.stock,
-                        cell,
-                        &inputs.policy,
-                        &mut inputs.members,
-                        &mut Vec::new(),
-                    );
-                    inputs
-                        .cached
-                        .push((cell.clone(), outcome, started.elapsed()));
+                if inputs.plans.is_some() {
+                    return Ok(());
                 }
+                if cell_ended(ctx).is_none() {
+                    validate_members(ctx, &mut inputs.members)?;
+                }
+                let mut plans = Vec::with_capacity(inputs.cells.len());
+                for cell in &inputs.cells {
+                    let started = Instant::now();
+                    let plan = if let Some(why) = cell_ended(ctx) {
+                        CellPlan::Terminal(CellOutcome::CouldNotRun {
+                            status: "NOT-STARTED".into(),
+                            detail: vec![why],
+                        })
+                    } else if cell.triple == inputs.host {
+                        CellPlan::Terminal(CellOutcome::Skipped {
+                            why: "this machine's own triple, judged by its own build".into(),
+                            fix: "targo --unverified verify lint test".into(),
+                        })
+                    } else {
+                        plan_cell(
+                            ctx,
+                            &inputs.stock,
+                            cell,
+                            &inputs.policy,
+                            &mut inputs.members,
+                            &inputs.host,
+                        )
+                    };
+                    plans.push(PreparedCell {
+                        cell: cell.clone(),
+                        plan,
+                        resolved: started.elapsed(),
+                    });
+                }
+                inputs.plans = Some(plans);
                 Ok(())
             });
         if let Err(why) = result {
@@ -505,22 +526,50 @@ impl PreparedRun {
         }
     }
 
-    /// Incomplete prerequisite observations, not check results or a reason to halt native work.
-    pub(crate) fn unavailable(&self, ctx: &Ctx) -> Vec<(String, String, String)> {
+    /// Only fully resolved unselected cells, with no oracle work, omit compiler resources.
+    /// Errors and an unavailable plan stay conservative and never masquerade as an empty graph.
+    pub(crate) fn needs_compiler(&self, ctx: &Ctx) -> Result<bool, String> {
+        self.for_context(ctx)?;
+        let Ok(inputs) = &self.inputs else {
+            return Ok(true);
+        };
+        let Some(plans) = &inputs.plans else {
+            return Ok(true);
+        };
+        Ok(
+            owes_win32_oracles(&inputs.cells, &ctx.scope, ctx.cells_pulled)
+                || plans.iter().any(|entry| {
+                    !matches!(
+                        entry.plan,
+                        CellPlan::Terminal(CellOutcome::Unselected | CellOutcome::Skipped { .. })
+                    )
+                }),
+        )
+    }
+
+    /// Incomplete prerequisite observations, not check results or native-stage dependencies.
+    pub(crate) fn unavailable(&self) -> Vec<(String, String, String)> {
         let Ok(inputs) = &self.inputs else {
             return Vec::new();
         };
         let mut unavailable = inputs
-            .cached
+            .plans
             .iter()
-            .filter_map(|(cell, outcome, _)| match outcome {
-                CellOutcome::CouldNotRun { status, detail } if status == "NO-TOOLCHAIN" => {
-                    Some((cell.name.clone(), cell.triple.clone(), detail.join("\n")))
+            .flatten()
+            .filter_map(|entry| match &entry.plan {
+                CellPlan::Terminal(CellOutcome::CouldNotRun { status, detail })
+                    if status == "NO-TOOLCHAIN" =>
+                {
+                    Some((
+                        entry.cell.name.clone(),
+                        entry.cell.triple.clone(),
+                        detail.join("\n"),
+                    ))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if owes_win32_oracles(&inputs.cells, &ctx.scope, ctx.cells_pulled) {
+        if owes_win32_oracles(&inputs.cells, &self.ctx.scope, self.ctx.cells_pulled) {
             for triple in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
                 if let Err(unready) = serving(&inputs.stock, triple, false) {
                     unavailable.push(("win32 oracles".into(), triple.into(), unready.to_string()));
@@ -531,25 +580,31 @@ impl PreparedRun {
     }
 }
 
-pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedRun>) {
-    let prepared = prepared.unwrap_or_else(|| PreparedRun {
-        inputs: inputs(ctx),
-    });
-    let mut inputs = match prepared.inputs {
+pub(crate) fn run_prepared<'ctx>(
+    ctx: &'ctx Ctx,
+    r: &mut Report,
+    prepared: Option<PreparedRun<'ctx>>,
+) {
+    let mut prepared = prepared.unwrap_or_else(|| prepare(ctx));
+    if let Err(why) = prepared.for_context(ctx) {
+        r.cannot_run(format!("cells — {why}"));
+        return;
+    }
+    prepared.resolve();
+    let Inputs {
+        policy,
+        host: _,
+        cells,
+        stock,
+        members: _,
+        plans,
+    } = match prepared.inputs {
         Ok(inputs) => inputs,
         Err(why) => {
             r.cannot_run(format!("cells — {why}"));
             return;
         }
     };
-    let Inputs {
-        policy,
-        host,
-        cells,
-        stock,
-        members,
-        cached,
-    } = &mut inputs;
     if ctx.cells_pulled {
         r.raw(format!(
             "cells: pulled by the selection, so one cell per other OS and one of this OS for its \
@@ -562,48 +617,34 @@ pub(crate) fn run_prepared(ctx: &Ctx, r: &mut Report, prepared: Option<PreparedR
                 .join(", ")
         ));
     }
-    if let Err(why) = validate_members(ctx, members) {
-        r.cannot_run(format!("cells — {why}"));
+    let Some(plans) = plans else {
+        r.cannot_run("cells — the invocation has no resolved cell plans");
         return;
-    }
-    for cell in cells.iter() {
-        // A cell that failed ends a run whose halt is armed before the next cell starts.
+    };
+    for entry in plans {
         crate::red_now(ctx, crate::checks::Check::Cells, r);
+        let cell = &entry.cell;
         let label = format!("cell {} ({})", cell.name, cell.triple);
         let started = Instant::now();
+        let mut calls = Vec::new();
         let outcome = if let Some(why) = cell_ended(ctx) {
             CellOutcome::CouldNotRun {
-                status: "NOT-STARTED".to_string(),
+                status: "NOT-STARTED".into(),
                 detail: vec![why],
             }
-        } else if cell.triple == *host {
-            CellOutcome::Skipped {
-                why: "this machine's own triple, judged by its own build".to_string(),
-                fix: "targo --unverified verify lint test".to_string(),
-            }
-        } else if let Some((_, outcome, _)) = cached.iter().find(|(known, _, _)| known == cell) {
-            outcome.clone()
         } else {
-            let mut calls = Vec::new();
-            let outcome = check_cell(ctx, stock, cell, policy, members, &mut calls);
-            crate::event_log::emit(
-                ctx.events.as_ref(),
-                &cell_event(cell, started.elapsed(), &calls),
-            );
-            close_passed(ctx, cell, &outcome);
-            outcome
+            run_cell(ctx, cell, entry.plan, &mut calls)
         };
-        let prepared = cached
-            .iter()
-            .find(|(known, _, _)| known == cell)
-            .map_or(std::time::Duration::ZERO, |(_, _, took)| *took);
-        let took = format!("{label}: {}s", (started.elapsed() + prepared).as_secs());
+        let elapsed = started.elapsed() + entry.resolved;
+        crate::event_log::emit(ctx.events.as_ref(), &cell_event(cell, elapsed, &calls));
+        close_passed(ctx, cell, &outcome);
+        let took = format!("{label}: {}s", elapsed.as_secs());
         record_cell(r, &label, took, outcome);
     }
-    if owes_win32_oracles(cells, &ctx.scope, ctx.cells_pulled) {
-        win32_oracles(ctx, r, stock);
+    if owes_win32_oracles(&cells, &ctx.scope, ctx.cells_pulled) {
+        win32_oracles(ctx, r, &stock);
     }
-    audit_policy(ctx, r, policy, cells);
+    audit_policy(ctx, r, &policy, &cells);
 }
 
 /// The checkout's stock pin as the `rustup` row (looked up on the run's `PATH`) holds it: the one
@@ -1175,28 +1216,54 @@ pub(crate) fn cell_dir(ctx: &Ctx, cell: &str) -> PathBuf {
     crate::plan::cells_dir(ctx).join(cell)
 }
 
-/// One cell, end to end: its graph, its shims, its toolchain (the stock pin, `stock`), the lint of
-/// its roots, and (off wasm32) the all-targets pass over its workspace members; of [`narrows`] a
-/// selection, the lint and that pass of the selected members, in a cone run with the dependents in
-/// this cell's graph of what the change touched ([`wanted_in_cell`]). A pin that cannot serve the
-/// cell ([`serving`]) is a COULD NOT RUN (`NO-TOOLCHAIN`) naming what provides the missing piece
-/// (provision's rustup row adds every cell's std and clippy to the pin,
-/// [`crate::rustup::CELL_TARGETS`]).
-fn check_cell(
+/// A cell's complete precompiler decision. Compiling consumes the same resolved inputs once.
+#[derive(Debug)]
+enum CellPlan {
+    Terminal(CellOutcome),
+    Compile(Box<CellCompilation>),
+}
+
+/// The inputs already resolved for one cell's compiler calls. No execution repeats metadata.
+#[derive(Debug)]
+struct CellCompilation {
+    extra: Vec<String>,
+    graph_names: BTreeSet<String>,
+    proc_macros: BTreeSet<String>,
+    host_deps: BTreeSet<String>,
+    tests: Option<MemberGraph>,
+    wanted: BTreeSet<String>,
+    judged: BTreeSet<String>,
+    narrow: bool,
+    shim_args: Vec<String>,
+    shimmed: Vec<String>,
+    test_shim_args: Vec<String>,
+    test_shimmed: Vec<String>,
+    toolchain: rustup::Toolchain,
+    member_names: BTreeSet<String>,
+    lint_only: bool,
+}
+
+/// Resolve a cell's graph, selection, shim policy and captured compiler prerequisites.
+/// Graph queries keep their existing bounded resolver; no compiling Cargo command runs here.
+fn plan_cell(
     ctx: &Ctx,
     stock: &Result<rustup::Stock, rustup::Unready>,
     cell: &Cell,
     policy: &[Shim],
     members: &mut Option<Result<Members, String>>,
-    calls: &mut Vec<CargoCall>,
-) -> CellOutcome {
-    let failed = |status: &str, detail: Vec<String>| CellOutcome::Failed {
-        status: status.to_string(),
-        detail,
+    captured_host: &str,
+) -> CellPlan {
+    let failed = |status: &str, detail: Vec<String>| {
+        CellPlan::Terminal(CellOutcome::Failed {
+            status: status.to_string(),
+            detail,
+        })
     };
-    let could_not = |status: &str, detail: Vec<String>| CellOutcome::CouldNotRun {
-        status: status.to_string(),
-        detail,
+    let could_not = |status: &str, detail: Vec<String>| {
+        CellPlan::Terminal(CellOutcome::CouldNotRun {
+            status: status.to_string(),
+            detail,
+        })
     };
     let members = match members.get_or_insert_with(|| member_names(ctx)) {
         Ok(m) => &*m,
@@ -1222,7 +1289,7 @@ fn check_cell(
     let selects = ctx.cells_pulled || matches!(ctx.scope, crate::scope::Scope::Packages(_));
     let changed = matches!(ctx.scope, crate::scope::Scope::Changed(_));
     if selects && !changed && selected_in(&own, &ctx.scope).is_empty() {
-        return CellOutcome::Unselected;
+        return CellPlan::Terminal(CellOutcome::Unselected);
     }
     let proc_macros: BTreeSet<String> = graph
         .nodes
@@ -1264,7 +1331,7 @@ fn check_cell(
         .map(|graph| &graph.dependencies);
     let wanted = wanted_in_cell(&graph_names, inputs, &ctx.scope);
     if selects && wanted.is_disjoint(&own) {
-        return CellOutcome::Unselected;
+        return CellPlan::Terminal(CellOutcome::Unselected);
     }
     // A patched crate's name can stand for two packages (the windows-sys facades), so neither `-p`
     // nor a read by name could say which was compiled: that selection takes the whole graph.
@@ -1280,7 +1347,7 @@ fn check_cell(
         own.difference(&not_owed).cloned().collect()
     };
     if narrow && judged.is_empty() {
-        return CellOutcome::Unselected;
+        return CellPlan::Terminal(CellOutcome::Unselected);
     }
 
     let (mut shim_args, mut shimmed) = (Vec::new(), Vec::new());
@@ -1301,10 +1368,59 @@ fn check_cell(
     }
 
     let toolchain = match serving(stock, &cell.triple, true) {
-        Ok(toolchain) => toolchain,
+        Ok(toolchain) => toolchain.clone(),
         Err(unready) => return could_not("NO-TOOLCHAIN", vec![unready.to_string()]),
     };
 
+    let lint_only = lint_only_in_run(ctx.cells_pulled, &cell.triple, || {
+        Ok(captured_host.to_owned())
+    });
+    CellPlan::Compile(Box::new(CellCompilation {
+        extra,
+        graph_names,
+        proc_macros,
+        host_deps,
+        tests,
+        wanted,
+        judged,
+        narrow,
+        shim_args,
+        shimmed,
+        test_shim_args,
+        test_shimmed,
+        toolchain,
+        member_names: members.names.clone(),
+        lint_only,
+    }))
+}
+
+/// Consume a resolved cell under its caller's compiler-resource claim.
+fn run_cell(ctx: &Ctx, cell: &Cell, plan: CellPlan, calls: &mut Vec<CargoCall>) -> CellOutcome {
+    let plan = match plan {
+        CellPlan::Terminal(outcome) => return outcome,
+        CellPlan::Compile(plan) => plan,
+    };
+    let CellCompilation {
+        extra,
+        graph_names,
+        proc_macros,
+        host_deps,
+        tests,
+        wanted,
+        judged,
+        narrow,
+        shim_args,
+        shimmed,
+        test_shim_args,
+        test_shimmed,
+        toolchain,
+        member_names,
+        lint_only,
+    } = *plan;
+    let could_not = |status: &str, detail: Vec<String>| CellOutcome::CouldNotRun {
+        status: status.to_string(),
+        detail,
+    };
     let target_dir = cell_dir(ctx, &cell.name);
     let cwd = ctx.scratch.join(format!("cells-{}", cell.name));
     if let Err(e) = std::fs::create_dir_all(&cwd) {
@@ -1316,7 +1432,7 @@ fn check_cell(
     let cargo = CellCargo {
         ctx,
         triple: &cell.triple,
-        toolchain,
+        toolchain: &toolchain,
         cwd: &cwd,
         target_dir: &target_dir,
         shim_args: &shim_args,
@@ -1339,7 +1455,7 @@ fn check_cell(
         calls,
         LINT_CALL,
         &cargo.lint(&packages),
-        &members.names,
+        &member_names,
         &built,
     );
     let mut red = Red::default();
@@ -1412,7 +1528,6 @@ fn check_cell(
         ));
     }
 
-    let lint_only = lint_only_in_run(ctx.cells_pulled, &cell.triple, || host_triple(ctx));
     if let (None, Some(tests), false) = (&red.status, &tests, lint_only) {
         let test_cargo = CellCargo {
             shim_args: &test_shim_args,
@@ -1428,7 +1543,7 @@ fn check_cell(
         } else {
             test_cargo.all_targets(&tests.excluded)
         };
-        let run = cargo_call(ctx, calls, ALL_TARGETS_CALL, &check, &members.names, &built);
+        let run = cargo_call(ctx, calls, ALL_TARGETS_CALL, &check, &member_names, &built);
         let read = match read_cargo_run_with_discovery(
             &run,
             &cell.triple,
@@ -1505,7 +1620,7 @@ const LINT_CALL: &str = "lint";
 /// The all-targets pass's name in a cell's event ([`CargoCall::call`]).
 const ALL_TARGETS_CALL: &str = "all-targets";
 
-/// One compiling cargo call a cell made ([`check_cell`]): its lint or its all-targets check.
+/// One compiling cargo call a cell made ([`run_cell`]): its lint or its all-targets check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CargoCall {
     /// Which pass: [`LINT_CALL`] or [`ALL_TARGETS_CALL`].
@@ -1567,7 +1682,7 @@ fn close_passed(ctx: &Ctx, cell: &Cell, outcome: &CellOutcome) {
     }
 }
 
-/// The `cell-finished` event of a cell this run checked: its name and triple, its whole wall
+/// The `cell-finished` event of a resolved cell row: its name and triple, its whole wall
 /// (resolving its graphs included) and each compiling cargo call it made, in order, with that
 /// call's wall, CPU and peak memory, `null` where its tree was not read. A cell that reached no
 /// such call (nothing selected in its graph, no toolchain) has none. An observation only: the

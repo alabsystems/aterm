@@ -275,7 +275,12 @@ fn the_arm_gives_its_read_the_groups_last_image() {
 
 #[test]
 // Where a process's start is read ([`start_us_of`]); elsewhere no image is tracked.
-#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
 fn a_reread_of_an_unchanged_process_keeps_its_image() {
     let pid = i32::try_from(std::process::id()).expect("a pid");
     let fresh = read(pid, None);
@@ -332,6 +337,59 @@ fn a_reread_of_an_unchanged_process_keeps_its_image() {
             "{why}: read afresh"
         );
     }
+}
+
+/// A leader's start is read on the start clock, to within the start record's tick: a child
+/// spawned after a reading of [`start_clock_us`] reads a start ([`start_us_of`]) no more than
+/// [`start_tick_us`] before that reading, and none after a reading made once its start was
+/// read; this process reads one before the first reading, and an ended child and pids 0 and 1
+/// read none. On macOS, Linux (and Android) and Windows, each its own clock (the wall clock, the
+/// boot clock, the wall clock), where a start is read at all. NEGATIVE CONTROL (run, Windows):
+/// the start read in whole seconds (`birth.seconds * 1_000_000`) fails "a child spawned after the
+/// reading".
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+))]
+#[test]
+fn a_child_spawned_after_a_start_clock_reading_reads_its_start_after_it() {
+    use aterm_uds::spawnfd::Stdio;
+    let tick = start_tick_us().expect("the start record's tick");
+    let before = start_clock_us().expect("the start clock");
+    #[cfg(unix)]
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn /bin/sleep");
+    #[cfg(windows)]
+    let mut child = aterm_uds::spawnfd::command("cmd")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cmd");
+    let pid = i32::try_from(child.id()).expect("a pid");
+    let started = start_us_of(pid);
+    let after = start_clock_us().expect("the start clock again");
+    let _ = child.kill();
+    let _ = child.wait();
+    let started = started.expect("a live child's start");
+    assert!(
+        started.saturating_add(tick) >= before,
+        "a child spawned after the reading: {started} + {tick} >= {before}"
+    );
+    assert!(started <= after, "read by then: {started} <= {after}");
+    let own = i32::try_from(std::process::id()).expect("a pid");
+    let mine = start_us_of(own).expect("this process's start");
+    assert!(mine <= before, "this process: {mine} <= {before}");
+    assert_eq!(start_us_of(pid), None, "an ended child");
+    assert_eq!(start_us_of(1), None, "never pid 1");
+    assert_eq!(start_us_of(0), None, "never pid 0");
+    drop(child);
 }
 
 #[test]

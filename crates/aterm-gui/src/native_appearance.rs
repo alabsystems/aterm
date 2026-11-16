@@ -550,6 +550,8 @@ pub(crate) fn surface_is_dark(bg: [u8; 3]) -> bool {
 pub(crate) const ACCENT_WASH_SELECTED: f32 = 0.13;
 /// The deepest accent wash that still carries accent ink.
 pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
+/// How far a row the pointer is over mixes its ground toward the text ink.
+pub(crate) const ROW_HOVER_WASH: f32 = 0.09;
 const ACCENT_INK_FLOOR: f32 = 3.0;
 // Keep headroom above the 4.5 floor for small painted accent labels.
 const ACCENT_TEXT_TARGET: f32 = 5.0;
@@ -818,14 +820,30 @@ fn solve_roles(
         reason = "an OkLCh hue in degrees, [0, 360), fits f32"
     )]
     let hue = |token: Option<f64>, fallback: f32| token.map_or(fallback, |h| h as f32);
+    // A STATUS WORD IN THE DANGER INK ALSO STANDS ON A ROW'S WASHES: a list row that is selected,
+    // pressed, pointed at, or selected in a list the keys left paints its wash under the word
+    // (`native_ui`'s navigation button). Floored on the page and the card alone, `stuck` on a
+    // selected navigator row and `Failed` on a selected Workers row read near 4:1.
     let danger = ensure_contrast_on(
         status_seed(
             dark,
             preferences.high_contrast,
             hue(tokens.danger_hue, DANGER_HUE_DEGREES),
         ),
-        &grounds,
-        4.5,
+        &[
+            surface,
+            elevated,
+            mix_srgb(elevated, accent, ACCENT_WASH_SELECTED),
+            mix_srgb(elevated, accent, ACCENT_WASH_PRESSED),
+            mix_srgb(elevated, text_primary, ROW_HOVER_WASH),
+            mix_srgb(elevated, text_tertiary, ACCENT_WASH_SELECTED),
+        ],
+        // A small painted word reads under its computed ratio (its strokes blend into the
+        // wash), so the word keeps the accent ink's headroom over 4.5, with High Contrast on
+        // or off: its seed there differs only in chroma and reads no higher by itself. It is
+        // not held to the accent ink's 7 under High Contrast: on a mid-tone theme (Nord) no
+        // red reaches 7 on a row's wash, and the ink would fall to white.
+        ACCENT_TEXT_TARGET,
     );
     let success = ensure_contrast_on(
         status_seed(

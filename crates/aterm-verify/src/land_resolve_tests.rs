@@ -488,28 +488,45 @@ fn a_spec_key_of_one_or_two_columns_must_be_unique() {
     assert!(refused.contains("reordered"), "{refused}");
 }
 
-/// THE SPEC-TABLE RULE READS NO CRATE'S SPEC TABLE: `verify land`'s backstop
-/// ([`aterm_census::no_reach::may_read`]) does not count the rule's own source as reading a
-/// member's `SPECS.md`, so a landing whose branch and moved main both changed one is judged by a
-/// round, not interrupted and judged again in full. NEGATIVE CONTROL: the same source with the
-/// rule's suffix written without its separator, a bare table name, reads as a walk of every
-/// crate's table.
+/// THE LAND'S RULE SOURCES READ NO MEMBER'S SPEC TABLE AND NO TRACKER DOCUMENT: the search
+/// `verify land` counts readers by ([`super::super::reads`], which [`super::super::Git`]'s
+/// `readers` applies to each file) passes over this crate's landing and cone rule sources and
+/// their tests, so a landing whose branch and moved main both changed a member's `SPECS.md`,
+/// `docs/PLAN.md` or `docs/STATUS.md` is not judged again for them. Read here as the live tree
+/// holds them: the rule's source, the land's and the cone's, and this file with its fixture
+/// paths. NEGATIVE CONTROL: each of those texts in a file of this crate that is no rule source
+/// is a reader of every member's table, and the rule's source there of the tracker documents
+/// too; census's search alone ([`aterm_census::no_reach::may_read`]) counts the land's source,
+/// whose strings spell a bare table name, wherever this crate holds it.
 #[test]
-fn the_spec_table_rule_reads_no_members_spec_table() {
-    const FILE: &str = "crates/aterm-verify/src/land_resolve.rs";
-    let source = include_str!("land_resolve.rs");
-    for table in ["crates/aterm-gui/SPECS.md", "crates/atpkg/SPECS.md"] {
-        assert!(
-            !aterm_census::no_reach::may_read(FILE, source, table),
-            "{table}"
-        );
+fn the_lands_rule_sources_read_no_members_spec_table() {
+    let reads = super::super::reads;
+    let sources = [
+        ("land_resolve.rs", include_str!("land_resolve.rs")),
+        ("land.rs", include_str!("land.rs")),
+        ("changed.rs", include_str!("changed.rs")),
+        (
+            "land_resolve_tests.rs",
+            include_str!("land_resolve_tests.rs"),
+        ),
+    ];
+    let tables = ["crates/aterm-gui/SPECS.md", "crates/atpkg/SPECS.md"];
+    let elsewhere = "crates/aterm-verify/src/perf/rule.rs";
+    for (name, source) in sources {
+        let file = format!("crates/aterm-verify/src/{name}");
+        for path in tables.into_iter().chain(["docs/PLAN.md", "docs/STATUS.md"]) {
+            assert!(!reads(&file, source, path), "{file} reads {path}");
+        }
+        for table in tables {
+            assert!(reads(elsewhere, source, table), "{name} elsewhere: {table}");
+        }
     }
-    let suffix = "\"/SPECS.md\"";
-    let bare = source.replacen(suffix, &suffix.replacen('/', "", 1), 1);
-    assert_ne!(bare, source, "the rule's suffix is in its source");
+    for tracker in ["docs/PLAN.md", "docs/STATUS.md"] {
+        assert!(reads(elsewhere, sources[0].1, tracker), "{tracker}");
+    }
     assert!(aterm_census::no_reach::may_read(
-        FILE,
-        &bare,
-        "crates/aterm-gui/SPECS.md"
+        "crates/aterm-verify/src/land.rs",
+        sources[1].1,
+        tables[0]
     ));
 }

@@ -15250,7 +15250,8 @@ impl AutoRenewPermit {
                     })
                     // A bot protection this process met and has not recorded holds on no clock
                     // (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3). A person's own
-                    // choice is judged by its door, which knows whether they are at this desk.
+                    // choice is judged by its door, which knows whether they are at this desk
+                    // and holds one nobody is at the desk for by the same pending check.
                     || guard.unrecorded_checks.contains_key(label)))
         {
             return None;
@@ -16503,10 +16504,13 @@ fn upkeep_opens_window(
 /// What opens the page of a sign-in the upkeep starts for a row with a mailbox or a proven
 /// headless profile: aterm's own window where this run may open it (`window`,
 /// [`upkeep_opens_window`]), else nothing a person sees, the opener signing in headlessly or
-/// not at all.
-fn upkeep_browser(window: bool, opener: PathBuf) -> super::cli::RenewBrowser {
+/// not at all. The window is told that nobody started it (`unattended`: the upkeep's own
+/// ladder, or a saved choice or Next selection with nobody at this desk), so it ends at the read
+/// that finds any check (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3); only a click
+/// whose person is at this desk now opens one that waits for them on a check.
+fn upkeep_browser(window: bool, unattended: bool, opener: PathBuf) -> super::cli::RenewBrowser {
     if window {
-        super::cli::RenewBrowser::Window { opener }
+        super::cli::RenewBrowser::Window { opener, unattended }
     } else {
         super::cli::RenewBrowser::Remote {
             opener: Some(opener),
@@ -17485,6 +17489,11 @@ fn upkeep_tokens(
         let env = quiet_env(&home_owned, &state_owned, &config, now);
         let host = token_host(scope);
         let (mut said, mut refused) = (Vec::new(), Vec::new());
+        // A check the token's page carried that could not be recorded on the account is held
+        // in this process until it is ([`hold_for_a_person`]).
+        let mut unrecorded = |check: PendingCheck| {
+            lock(&guard).unrecorded_checks.insert(label.clone(), check);
+        };
         if let Some(code) = super::accounts_tokens::backfill_run(
             &env,
             host.as_ref(),
@@ -17492,8 +17501,8 @@ fn upkeep_tokens(
             &finding,
             home_mac,
             routes,
-            &mut said,
-            &mut refused,
+            (&mut said, &mut refused),
+            &mut unrecorded,
         ) {
             log(&backfill_line(
                 &label,
@@ -18953,6 +18962,29 @@ fn standing_stops<'a>(
     }
 }
 
+/// What stands against `raw`'s sign-in by the ladder's route ([`standing_stops`]), `prepared`
+/// for a root decision's preparation: a request, not a retry, which passes a stop no bot
+/// protection made. A bot protection's stop holds a preparation as it holds every route: no
+/// grant, generation or configuration of the issuer's sends the row back to the page that
+/// carried one (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3), only what ends the
+/// check does (a login made for the row, a signed-in `accounts browser` window).
+fn route_stops<'a>(
+    store: &accounts::Store,
+    raw: &accounts::Row,
+    logins: &'a accounts::Logins,
+    prepared: bool,
+) -> Stops<'a> {
+    let stops = standing_stops(store, raw, logins);
+    if prepared {
+        Stops {
+            check: stops.check,
+            page: None,
+        }
+    } else {
+        stops
+    }
+}
+
 /// Whether `stops`, what stands on `raw`'s record ([`standing_stops`]), still hold its background
 /// sign-in. A bot protection's stop holds on no clock: nothing tries a sign-in again into a check,
 /// a block page or a human check with nobody there
@@ -19063,8 +19095,12 @@ pub(crate) enum PersonHold {
 /// check), so the next row's page meets it too; the pool waits until a person answers each
 /// stop that stands, by a login made for its row or a signed-in `accounts browser` window
 /// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3, and the owner's ruling of 2026-11-04
-/// against signing every account in from one machine). A Claude row's stop holds that row's
-/// account alone, as its ladder's routes are its account's ([`page_holds`]).
+/// against signing every account in from one machine). Google's stop pages on agy's native route
+/// and Kimi Code's Google federation ("unusual traffic", "Verify it's you", "This browser or app
+/// may not be secure") hold the pool alike: each answers this Mac's sign-in from its browser, and
+/// the next account's sign-in from the same browser goes back to the page that stopped this one.
+/// A Claude row's stop holds that row's account alone, as its ladder's routes are its account's
+/// ([`page_holds`]).
 pub(crate) fn person_hold(
     store: &accounts::Store,
     raw_roster: &Roster,
@@ -19158,24 +19194,15 @@ fn ladder_route_in_context(
     };
     let mut inputs = inputs_of(&read, observed_vault);
     let at = clock();
-    let stops = if preparation.is_none() {
-        standing_stops(store, &raw, logins)
-    } else {
-        Stops {
-            check: None,
-            page: None,
-        }
-    };
+    let stops = route_stops(store, &raw, logins, preparation.is_some());
     // A bot protection's stop that the row's token in use here lifted ([`page_holds`]) lets the
     // vault route record that token and nothing else: no route that loads a page goes on from it.
     let only_the_vault =
         stops.check.is_some() && accounts::on_token_here(&raw, &records.state, now).is_some();
     // A bot protection this process met and could not record yet holds the row until it is on
-    // record, which this pass tries again ([`hold_for_a_person`]).
-    let pending = preparation
-        .is_none()
-        .then(|| lock(renew_guard).unrecorded_checks.get(&row.label).cloned())
-        .flatten();
+    // record, which this pass tries again ([`hold_for_a_person`]), for every route, a
+    // preparation's included.
+    let pending = lock(renew_guard).unrecorded_checks.get(&row.label).cloned();
     if let Some(pending) = pending {
         if write_check_stop(store, &pending) != CheckWrite::Busy {
             lock(renew_guard).unrecorded_checks.remove(&row.label);
@@ -19184,10 +19211,10 @@ fn ladder_route_in_context(
     }
     {
         let mut guard = lock(renew_guard);
+        if page_holds(stops, &raw, &records.state, now) {
+            return LadderStep::Held;
+        }
         if preparation.is_none() {
-            if page_holds(stops, &raw, &records.state, now) {
-                return LadderStep::Held;
-            }
             guard.ladder.page_ended(&row.label);
         }
         if guard.ladder.held(&row.label, &inputs, at) {
@@ -19780,6 +19807,45 @@ pub(super) fn write_check_stop(store: &accounts::Store, check: &PendingCheck) ->
     }
 }
 
+/// Ends the account's [`accounts::CheckStop`] a token step's check wrote
+/// (`accounts_tokens::CheckedRow::hold_after`), at `(at, now)`: the check's second and this
+/// write's, once the token was made over that step's record by a person's own run at a terminal
+/// on this Mac (`accounts_tokens::CheckedRow::end_after`), so the check's two records end
+/// together. Only a check of the account `row` names whose second is the record's ends: a later
+/// check of the account (a sign-in's met since) keeps the stop standing, as does one of another
+/// account. Whether it ended; nothing is written where it did not.
+pub(super) fn end_token_check(
+    store: &accounts::Store,
+    roster_path: &Path,
+    row: &accounts::Row,
+    (at, now): (i64, i64),
+) -> bool {
+    store
+        .transact_pool_logins_within(
+            &accounts::LOCK_LADDER,
+            roster_path,
+            now,
+            &mut None,
+            |raw, _, logins| {
+                let current = raw
+                    .row(&row.label)
+                    .ok_or_else(|| "the row left the roster".to_owned())?;
+                let binding = logins
+                    .labels
+                    .get_mut(&row.label)
+                    .filter(|binding| {
+                        binding.check_stop.as_ref().is_some_and(|check| {
+                            check.at == at && accounts::checked_account(check, current)
+                        })
+                    })
+                    .ok_or_else(|| "no check of the token step stands".to_owned())?;
+                binding.check_stop = None;
+                Ok(Vec::new())
+            },
+        )
+        .is_ok()
+}
+
 /// Holds `check`'s row for a person where a bot protection stopped its run, of any CLI's pool,
 /// and the run's own record may not have landed: the check alone is recorded
 /// ([`write_check_stop`]), or, where the records cannot be written now, this process keeps it
@@ -20067,8 +20133,32 @@ fn spawn_row_renewal(
             // by one (docs/DESIGN-claude-sign-in-sitting-2026-11-12.md §3), its token in use here
             // or not, since every route here loads a page; failing retires the choice, and a Next
             // selection goes on to its next row.
-            if !at_desk && left_to_a_person(&store, &raw_workflow, logins) {
-                return RenewalDispatch::Failed;
+            if !at_desk {
+                // A bot protection this process met and could not record yet holds it too, as
+                // it holds the ladder's every route ([`hold_for_a_person`]): this pass tries to
+                // record it, and the choice fails either way unless a login made since ended it.
+                let pending = renew_guard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unrecorded_checks
+                    .get(&next_row.label)
+                    .cloned();
+                if let Some(pending) = pending {
+                    let written = write_check_stop(&store, &pending);
+                    if written != CheckWrite::Busy {
+                        renew_guard
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .unrecorded_checks
+                            .remove(&next_row.label);
+                    }
+                    if written != CheckWrite::Moot {
+                        return RenewalDispatch::Failed;
+                    }
+                }
+                if left_to_a_person(&store, &raw_workflow, logins) {
+                    return RenewalDispatch::Failed;
+                }
             }
             let has_mailbox = mailbox_dir.is_some()
                 || has_configured_mailbox_for_row_with(
@@ -20540,7 +20630,11 @@ fn spawn_row_renewal(
                 let browser = if has_mailbox || has_headless_profile {
                     // The window where this run opens it ([`upkeep_opens_window`]), decided
                     // before the run started; a scripted run is handed the same choice.
-                    upkeep_browser(opens_window, opener.map_err(|error| error.to_string())?)
+                    upkeep_browser(
+                        opens_window,
+                        unattended.is_some() || !at_desk,
+                        opener.map_err(|error| error.to_string())?,
+                    )
                 } else {
                     let Some(b) = non_headless_fallback.clone() else {
                         return Err(opener.err().map_or_else(
@@ -20768,13 +20862,22 @@ fn spawn_row_renewal(
                 );
                 let host = super::cli::LiveAccounts::background(scope.clone());
                 let (mut said, mut refused) = (Vec::new(), Vec::new());
+                // A check its page carried that could not be recorded on the account is held
+                // in this process until it is ([`hold_for_a_person`]).
+                let mut unrecorded = |check: PendingCheck| {
+                    ladder_guard
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .unrecorded_checks
+                        .insert(next_label.clone(), check);
+                };
                 if super::accounts_tokens::after_sign_in(
                     &env,
                     &host,
                     &next_label,
                     signed_in,
-                    &mut said,
-                    &mut refused,
+                    (&mut said, &mut refused),
+                    &mut unrecorded,
                 )
                 .is_some()
                     && let Some((_, _, _, log)) = &unattended

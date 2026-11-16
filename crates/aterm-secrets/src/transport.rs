@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(any(unix, test))]
-mod records_body;
+pub(crate) mod records_body;
 
 /// Where a vault is.
 #[derive(Clone, PartialEq, Eq)]
@@ -1569,6 +1569,7 @@ fn records_answer(
 
 /// The digest a records reply's [`RECORDS_HEADS_HEADER`] states: none unless it is exactly 64
 /// lowercase hex digits.
+#[cfg(any(unix, test))] // read by the unix-only records reception
 fn records_heads(value: Option<&str>) -> Option<[u8; 32]> {
     let value = value.filter(|text| aterm_codec::hex::is_lower(text, 64))?;
     let mut digest = [0u8; 32];

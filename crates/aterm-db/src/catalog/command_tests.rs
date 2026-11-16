@@ -395,7 +395,10 @@ fn membership_history_is_reported_without_admin_or_table_initialization() {
     use aterm_secrets::{client, commons::roster::Role};
     let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Reader]);
     client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
-    let encoded = client::load_records(&lab.paths[0]).unwrap().encode();
+    let encoded = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &encoded).unwrap();
     lab.bootstrap(1);
     assert!(client::admin_cached(&lab.paths[1]).is_err());
@@ -449,7 +452,10 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
     use aterm_secrets::{client, commons::roster::Role, text::Audience};
     let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Reader]);
     client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
-    let encoded = client::load_records(&lab.paths[0]).unwrap().encode();
+    let encoded = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &encoded).unwrap();
     lab.bootstrap(1);
     // The writer signs two edits, and the reader takes the second's record without the
@@ -461,7 +467,10 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
             .unwrap();
         client::admin_publish(&lab.paths[0], &admin, &doc).unwrap();
     }
-    let after = client::load_records(&lab.paths[0]).unwrap().encode();
+    let after = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     let held_before = frames(&encoded);
     let signed: Vec<&[u8]> = frames(&after)
         .into_iter()
@@ -473,10 +482,7 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
 
     let store = client::load_records(&lab.paths[1]).unwrap();
     let log = store.log().unwrap();
-    let held: Vec<u8> = log
-        .records()
-        .flat_map(|record| record.bytes().iter().copied())
-        .collect();
+    let held = aterm_secrets::membership_log::read_records(log.records()).unwrap();
     let census = frames(&held);
     let observed = &status(&lab.paths[1])["membership_history"];
     let waiting = observed["waiting_records"].as_u64().unwrap();
@@ -489,7 +495,7 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
     );
     assert_eq!(
         observed["record_bytes"],
-        json!(bytes(&frames(&store.encode()))),
+        json!(bytes(&frames(&store.read_encoded().unwrap()))),
         "every retained record, the waiting ones too"
     );
     assert!(
@@ -1431,7 +1437,7 @@ fn readiness_reports_an_unbound_log_recipient_as_pending_without_granting_access
     };
     let lab = crate::table::tests::Lab::with_enrolled(&[Role::Writer, Role::Writer], 1);
     seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
-    let seeded = load_records(&lab.paths[0]).unwrap().encode();
+    let seeded = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[1], &seeded).unwrap();
     let bootstrap = lab.bootstrap(1);
     let request = bootstrap.request().unwrap();
@@ -1446,7 +1452,10 @@ fn readiness_reports_an_unbound_log_recipient_as_pending_without_granting_access
     assert_eq!(observed["state"], json!("enrollment-pending"), "{observed}");
     assert_eq!(observed["ready"], json!(false));
     assert_eq!(observed["role"], Value::Null);
-    assert_eq!(load_records(&lab.paths[1]).unwrap().encode(), seeded);
+    assert_eq!(
+        load_records(&lab.paths[1]).unwrap().read_encoded().unwrap(),
+        seeded
+    );
     assert!(!lab.paths[1].dir.join("commons/tables").exists());
 }
 
@@ -2029,7 +2038,7 @@ fn commons_status_reports_membership_inactive_when_superseded_by_another_recipie
     let lab = crate::table::tests::Lab::with_foundation(&[Role::Writer, Role::Writer]);
     aterm_secrets::client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2"))
         .unwrap();
-    let seeded = load_records(&lab.paths[0]).unwrap().encode();
+    let seeded = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[1], &seeded).unwrap();
 
     let trust = lab.bootstrap(0).trust();
@@ -2083,10 +2092,10 @@ fn commons_status_reports_membership_inactive_when_superseded_by_another_recipie
     .unwrap();
     save_records(
         &lab.paths[0],
-        &load_records(&lab.paths[1]).unwrap().encode(),
+        &load_records(&lab.paths[1]).unwrap().read_encoded().unwrap(),
     )
     .unwrap();
-    let merged = load_records(&lab.paths[0]).unwrap().encode();
+    let merged = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&m3_a, &merged).unwrap();
     save_records(&m3_b, &merged).unwrap();
 

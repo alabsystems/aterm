@@ -20,7 +20,7 @@ use aterm_secrets::client::{
 use aterm_secrets::commons::binding::Pending;
 use aterm_secrets::commons::bootstrap::{Bootstrap, Device};
 use aterm_secrets::commons::journal::Journal;
-use aterm_secrets::membership_log::{Body, Entrant, EpochAudience, Evidence, encode_records};
+use aterm_secrets::membership_log::{Body, Entrant, EpochAudience, Evidence, read_records};
 use aterm_uds::stop::Stop;
 
 use super::super::{sharing_held, spawn_node_vault_pass};
@@ -98,7 +98,7 @@ fn a_gap_on_m2(root: &Path) -> Lab {
         let doc = admin.doc.clone();
         admin_publish_approved(&m1, &admin, &doc, std::slice::from_ref(&keys[0])).unwrap();
     }
-    save_records(&m2, &load_records(&m1).unwrap().encode()).unwrap();
+    save_records(&m2, &load_records(&m1).unwrap().read_encoded().unwrap()).unwrap();
     sync(&m2, None).unwrap();
 
     let m5 = Paths::for_home(&root.join("m5"));
@@ -124,7 +124,7 @@ fn a_gap_on_m2(root: &Path) -> Lab {
     let no_wrap = minted
         .iter()
         .filter(|record| !matches!(record.body(), Body::Wrap { .. }));
-    save_records(&m2, &encode_records(no_wrap)).unwrap();
+    save_records(&m2, &read_records(no_wrap).unwrap()).unwrap();
     let lab = Lab { m2, m5: recipient };
     assert!(!lab.healed(), "the fixture leaves a gap");
     lab

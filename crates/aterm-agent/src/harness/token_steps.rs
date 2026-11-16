@@ -9,15 +9,23 @@
 //! the account (FL-137), a closed window, no desktop, a code page nobody typed a code on where
 //! the window read no mailbox, the window's deadline) leaves one record in [`STEPS_FILE`], and
 //! the step is held with no clock. Nothing tries it again until something changes
-//! ([`Stopped::holds`]): a new Claude Code or aterm build, the account's window store, a mailbox
-//! configuration file or its saved Google mail grant written after the stop, a token made after
-//! the stop, or, for a code page nobody typed a code on, aterm's window reading the account's
-//! mailbox now (the vault's mailbox entries included, which carry no time to date them by). The
-//! account's next sign-in, in aterm's window or on its headless profile, and a
-//! person's `aterm harness accounts token <label>` run the step whatever the record says: a stop
-//! that holds replaces the record, a token made (which passed the page) clears it, and any other
-//! end (a person's Ctrl-C, a browser that did not start, a page that did not load) leaves it as it
-//! was, since it says nothing of the check that stood.
+//! ([`Stopped::holds`]): for a check (a block page, Cloudflare's bot check, a human check)
+//! nothing but a person's act, as only a person lifts one: a person at a terminal of their own on
+//! this Mac (their `aterm harness accounts token <label>`, or the token step after their own
+//! sign-in in aterm's window, where they may complete a check and aterm presses nothing on one)
+//! runs the step whatever the record says, and the token made then clears it; no token another
+//! Mac made, no new build, file or time lets aterm back onto the page by itself, and no sign-in
+//! nobody at a terminal started (the upkeep's, an agent's) runs the step over it, in aterm's
+//! window or on the headless profile. For any other stop: a token made after it, a new Claude
+//! Code or aterm build, the account's window store, a mailbox configuration file or its saved
+//! Google mail grant written after the stop, or, for a code page nobody typed a code on, aterm's
+//! window reading the account's mailbox now (the vault's mailbox entries included, which carry no
+//! time to date them by); the account's next sign-in in aterm's window runs it whatever such a
+//! record says. A stop that holds replaces the record, except that a check's record stands
+//! through a later stop no bot protection made (a window a person closed has not passed the
+//! check, [`put`]); a token made (which passed the page) clears it; and any other end (a
+//! person's Ctrl-C, a browser that did not start, a page that did not load) leaves it as it was,
+//! since it says nothing of the check that stood.
 //!
 //! A record is the stop's closed word, when it was met, and the Claude Code and aterm builds that
 //! met it: never a reason line, a host, an address, a code or a token byte. No earlier build reads
@@ -89,17 +97,25 @@ impl Stopped {
         })
     }
 
-    /// Whether the step stays held: nothing in `since` changed after the stop. A build counts as
-    /// changed only where both its versions are known and differ; a window store, mailbox
-    /// configuration file or Google mail grant written after the stop, or a token made after it,
-    /// ends the hold too, and so does aterm's window reading the account's mailbox now where the
-    /// stop was a code page nobody typed a code on, which only a mailbox the window reads lets
-    /// through. No time by itself ends it: there is no clock here.
+    /// Whether the step stays held: nothing in `since` changed after the stop. A check
+    /// ([`MetWord::is_bot_protection`]) holds whatever `since` says: only a person's own act at a
+    /// terminal on this Mac runs the step over it, and the token that run makes clears the
+    /// record ([`put`]). No new build, file or time, and no token another Mac made (the vault's
+    /// token says nothing of this Mac's browser or the page it met), lets aterm back onto a page
+    /// that carried one by itself. For any other stop a token made after it ends the hold; a
+    /// build counts as changed only where both its versions are known and differ; a window
+    /// store, mailbox configuration file or Google mail grant written after the stop ends it
+    /// too, and so does aterm's window reading the account's mailbox now where the stop was a
+    /// code page nobody typed a code on, which only a mailbox the window reads lets through. No
+    /// time by itself ends it: there is no clock here.
     #[must_use]
     pub fn holds(&self, since: &Since<'_>) -> bool {
         let moved = |then: &str, now: Option<&str>| {
             now.is_some_and(|now| !then.is_empty() && !now.is_empty() && then != now)
         };
+        if self.word.is_bot_protection() {
+            return true;
+        }
         !(moved(&self.cli, since.cli)
             || moved(&self.aterm, since.aterm)
             || written_after(self.at, since)
@@ -159,9 +175,12 @@ impl Stopped {
                  account"
                     .to_owned()
             }
-            MetWord::WindowBotCheck | MetWord::BotCheck => {
-                "Cloudflare's check did not clear".to_owned()
-            }
+            MetWord::WindowBotCheck => "a page in aterm's sign-in window carried Cloudflare's \
+                                        bot check, and aterm pressed nothing there"
+                .to_owned(),
+            MetWord::BotCheck => "a page on the account's headless browser profile carried \
+                                  Cloudflare's bot check, and aterm pressed nothing there"
+                .to_owned(),
             MetWord::WindowBlockPage | MetWord::BlockPage => {
                 "Cloudflare's block page stood before the consent page".to_owned()
             }
@@ -187,14 +206,34 @@ impl Stopped {
     /// account's row has a label: when, what stopped it, and what tries it again.
     #[must_use]
     pub fn words(&self, step: Option<&str>) -> String {
-        let person = step.map_or_else(String::new, |step| format!(", or by `{step}`"));
         format!(
-            "stopped {}: {}; it is tried again only at the account's next sign-in in aterm's \
-             sign-in window or on its headless browser profile, with a new Claude Code or aterm \
-             build{person}",
+            "stopped {}: {}; {}",
             date(self.at),
-            self.what()
+            self.what(),
+            self.again(step)
         )
+    }
+
+    /// What tries the step again ([`Self::holds`]), `step` being the person's own run where the
+    /// account's row has a label: a check's record only a person's act at a terminal on this Mac,
+    /// their own sign-in in aterm's sign-in window or that run, whatever build comes next; any
+    /// other stop the next sign-in in the window or on the headless browser profile, with a new
+    /// Claude Code or aterm build.
+    #[must_use]
+    pub fn again(&self, step: Option<&str>) -> String {
+        let person = step.map_or_else(String::new, |step| format!(", or by `{step}`"));
+        if self.word.is_bot_protection() {
+            format!(
+                "it is tried again only by a person at a terminal on this Mac, who meets the \
+                 check in aterm's sign-in window: at their own sign-in of the account there\
+                 {person}"
+            )
+        } else {
+            format!(
+                "it is tried again only at the account's next sign-in in aterm's sign-in window \
+                 or on its headless browser profile, with a new Claude Code or aterm build{person}"
+            )
+        }
     }
 
     /// The record as a report's JSON carries it: its word and when.
@@ -277,9 +316,12 @@ fn rows(store: &Store) -> io::Result<Vec<aterm_json::Value>> {
 
 /// Sets the account `key`'s record to `step`, or clears it (`None`), under `tokens.lock`
 /// (waiting for it as `accounts.lock`'s takers do), writing the file whole, atomically, mode
-/// 0600; nothing is written where the record already says it. Every other account's row is
-/// kept as the file holds it, a row this build does not read included (a later build's word),
-/// so no account's hold is dropped by another's write.
+/// 0600; nothing is written where the record already says it, or where it is a check's
+/// ([`MetWord::is_bot_protection`]) and `step` is a stop no bot protection made: a window a
+/// person closed in front of a check, or a later run that stopped elsewhere, has not passed it,
+/// so only a token made (`None`) or another check's record replaces a check's. Every other
+/// account's row is kept as the file holds it, a row this build does not read included (a later
+/// build's word), so no account's hold is dropped by another's write.
 ///
 /// # Errors
 /// The lock stays held; the file is there and does not read, and so is left as it is (every
@@ -296,7 +338,11 @@ pub fn put(store: &Store, key: &str, step: Option<&Stopped>) -> io::Result<()> {
     let held: Vec<&aterm_json::Value> = rows.iter().filter(|row| mine(row)).collect();
     let says = match held.as_slice() {
         [] => step.is_none(),
-        [row] => Stopped::of_json(row).is_some_and(|(_, now)| Some(&now) == step),
+        [row] => Stopped::of_json(row).is_some_and(|(_, held)| {
+            Some(&held) == step
+                || (held.word.is_bot_protection()
+                    && step.is_some_and(|step| !step.word.is_bot_protection()))
+        }),
         _ => false,
     };
     if says {

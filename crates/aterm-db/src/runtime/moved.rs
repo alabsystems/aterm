@@ -229,14 +229,15 @@ impl Moves {
         let Ok(watch) = FileWatch::platform(
             "commons-moved",
             Box::new(move |key| {
-                #[cfg(test)]
-                if key == CLAIMS {
-                    claims_told.fetch_add(1, Ordering::AcqRel);
-                }
                 // Which file changed is not kept: a look reads them all.
                 let _ = key;
                 rang.store(true, Ordering::Release);
                 bell.ring();
+                #[cfg(test)]
+                if key == CLAIMS {
+                    // Publish completion after both the state flag and the doorbell.
+                    claims_told.fetch_add(1, Ordering::Release);
+                }
             }),
         ) else {
             return moves;

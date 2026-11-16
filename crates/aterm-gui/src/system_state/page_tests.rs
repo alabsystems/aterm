@@ -372,6 +372,7 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     let view = open(&mut app, Line::Mac);
     let before = compile_in(&app, &view, 900.0, 644.0);
     let old_rows = page::page_rows(&app);
+    let complete_hero = drawn(&app).2;
     let caps = Subject::Setting(Setting::CapsLock);
     let vault = Subject::Setting(Setting::Secrets);
     let source = complete.plan.as_ref().unwrap().vault_url.clone();
@@ -392,7 +393,14 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     let during = compile_in(&app, &view, 900.0, 644.0);
     let (retained_lines, _, hero) = drawn(&app);
     assert_eq!(hero.headline, CHECKING);
-    assert_eq!(hero.sub, "Showing last useful results");
+    assert_eq!(
+        hero.sub,
+        format!(
+            "{} of {} as last read",
+            complete_hero.done, complete_hero.total
+        )
+    );
+    assert!(hero.as_last_read);
     for line in retained_lines {
         assert_eq!(
             line.mark,
@@ -405,9 +413,18 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     }
     assert_eq!(
         (hero.done, hero.total),
-        (0, 0),
-        "past checks grant no current progress"
+        (complete_hero.done, complete_hero.total),
+        "the display keeps confirmed history while new readings are pending"
     );
+    let progress = semantic(&during, "system-state/progress");
+    assert_eq!(progress.label, "Setup progress as last read");
+    #[allow(clippy::cast_precision_loss, reason = "a count of rows")]
+    let retained_progress = SemanticValue::Number {
+        value: complete_hero.done as f64,
+        minimum: 0.0,
+        maximum: complete_hero.total as f64,
+    };
+    assert_eq!(progress.value, retained_progress);
     assert!(!app.headline().set_up);
     for old in old_rows
         .iter()
@@ -422,12 +439,85 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
             "retaining the same value keeps the open row's footprint"
         );
     }
+    let mut queued = checking.clone();
+    for (_, _, waiting) in &mut queued.observing {
+        *waiting = true;
+    }
+    app.publish(queued);
+    let queued_frame = compile_in(&app, &view, 900.0, 644.0);
+    for old in old_rows
+        .iter()
+        .filter(|row| row.subject.group() == Group::Input || row.subject.group() == Group::Desktop)
+    {
+        let key = format!("system-state/row/{}", row_slug(old.subject));
+        assert_eq!(
+            semantic(&queued_frame, &key).rect,
+            semantic(&before, &key).rect,
+            "queuing a check preserves the same row footprint"
+        );
+    }
+    app.publish(checking.clone());
     let held = app.reviewed_row(caps);
     assert!(matches!(held.value, RowValue::LastKnown(_)));
     assert_eq!(held.chip, Some(Chip::LastKnown));
     assert!(!held.settled(), "history supplies no current readiness");
     assert!(held.label.contains("Last read:"));
     assert!(!held.install_tools && !held.turn_on_sync);
+
+    for (access, note) in [
+        (
+            Access::FullDiskAccess,
+            aterm_types::macos_setup::ACCESS_OFFERED,
+        ),
+        (
+            Access::Debugger,
+            aterm_types::macos_setup::DEBUGGER_NOT_ASKED,
+        ),
+    ] {
+        let subject = Subject::Access(access);
+        let mut offered = complete.clone();
+        let grant = offered
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == subject)
+            .unwrap();
+        grant.standing = Standing::NotNeeded;
+        grant.now = None;
+        grant.note = Some(note.to_owned());
+        let mut offered_app = reading(&offered);
+        let offered_hero = drawn(&offered_app).2;
+        assert!(offered_hero.done < offered_hero.total);
+        offered.last_known = std::mem::take(&mut offered.observed);
+        offered.observing = offered
+            .last_known
+            .iter()
+            .map(|row| {
+                (
+                    row.subject,
+                    row.subject.uses_vault_source().then(|| source.clone()),
+                    false,
+                )
+            })
+            .collect();
+        offered_app.publish(offered);
+        let held = offered_app.reviewed_row(subject);
+        assert!(matches!(held.value, RowValue::LastKnown(_)));
+        assert_ne!(
+            held.chip,
+            Some(Chip::LastKnown),
+            "an offered grant was never confirmed"
+        );
+        assert!(!held.settled() && held.open.is_none());
+        let permissions = line_of(&offered_app, Line::Permissions);
+        assert_ne!(permissions.mark, Mark::Done);
+        assert!(!permissions.phrase.contains("Granted"));
+        let historical = drawn(&offered_app).2;
+        assert_eq!(
+            (historical.done, historical.total),
+            (offered_hero.done, offered_hero.total)
+        );
+        assert!(!offered_app.headline().set_up);
+    }
 
     checking.observing.clear();
     app.publish(checking.clone());
@@ -457,6 +547,11 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
         matches!(app.reviewed_row(caps).value, RowValue::LastKnown(_)),
         "an attempted Unknown response does not erase the useful display"
     );
+    assert_eq!(
+        (drawn(&app).2.done, drawn(&app).2.total),
+        (complete_hero.done, complete_hero.total),
+        "an unanswered new reading leaves the explicitly historical count intact"
+    );
     for standing in [Standing::Failed, Standing::Waiting, Standing::NeedsYou] {
         checking.unconfirmed_observations.clear();
         checking.observed = vec![Observation {
@@ -480,6 +575,10 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
             Mark::Done,
             "a current problem outranks the last useful group check"
         );
+        assert!(
+            drawn(&app).2.done < complete_hero.done,
+            "a current problem is not counted complete from history"
+        );
     }
     let mut off = checking.clone();
     off.plan
@@ -495,7 +594,7 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     let mut partial = checking.clone();
     partial.observed.clear();
     partial.last_known.retain(|row| row.subject == caps);
-    app.publish(partial);
+    app.publish(partial.clone());
     let incomplete = drawn(&app)
         .0
         .into_iter()
@@ -509,6 +608,75 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     assert!(!incomplete.phrase.to_lowercase().contains("checking"));
     assert!(!app.headline().set_up);
 
+    partial.last_known.extend(
+        complete
+            .observed
+            .iter()
+            .filter(|row| matches!(row.subject, Subject::Access(_)))
+            .cloned(),
+    );
+    app.publish(partial.clone());
+    let (before_lines, _, before_hero) = drawn(&app);
+    let partial_before = compile_in(&app, &view, 900.0, 644.0);
+    let granted = before_lines
+        .iter()
+        .find(|line| line.line == Line::Permissions)
+        .unwrap();
+    assert!(granted.phrase.starts_with("Granted · as last read"));
+    partial.observing = complete
+        .observed
+        .iter()
+        .map(|row| {
+            (
+                row.subject,
+                row.subject.uses_vault_source().then(|| source.clone()),
+                false,
+            )
+        })
+        .collect();
+    app.publish(partial);
+    let (during_lines, _, during_hero) = drawn(&app);
+    let partial_during = compile_in(&app, &view, 900.0, 644.0);
+    for key in [
+        "system-state/line/mac/switch",
+        "system-state/line/permissions/switch",
+        "system-state/row/caps-lock",
+    ] {
+        assert_eq!(
+            semantic(&partial_during, key).rect,
+            semantic(&partial_before, key).rect,
+            "checking partial history preserves the header and row footprint: {key}"
+        );
+    }
+    assert_eq!(
+        (during_hero.done, during_hero.total),
+        (before_hero.done, before_hero.total),
+        "starting a check preserves a partial historical count"
+    );
+    for line in [Line::Mac, Line::Permissions] {
+        let before = before_lines
+            .iter()
+            .find(|shown| shown.line == line)
+            .unwrap();
+        let during = during_lines
+            .iter()
+            .find(|shown| shown.line == line)
+            .unwrap();
+        assert_eq!((during.mark, during.word), (before.mark, before.word));
+        assert!(during.phrase.ends_with("checking"));
+        assert!(
+            during.phrase.starts_with(
+                before
+                    .phrase
+                    .split(" · current reading unavailable")
+                    .next()
+                    .unwrap()
+            ),
+            "checking preserves the last useful group summary: {during:?}"
+        );
+    }
+    assert!(!app.headline().set_up);
+
     let mut other_source = complete.clone();
     other_source.observing = vec![(vault, Some("https://other.invalid/vault".into()), false)];
     let other = reading(&other_source);
@@ -517,14 +685,91 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
         Some(Chip::InPlace),
         "another vault's progress cannot mark this source as checking"
     );
+    let mut only_other_vault = complete.clone();
+    only_other_vault.observed.clear();
+    only_other_vault.last_known = vec![
+        complete
+            .observed
+            .iter()
+            .find(|row| row.subject == vault)
+            .unwrap()
+            .clone(),
+    ];
+    only_other_vault.observed_vault_url = Some("https://other.invalid/vault".into());
+    let foreign = reading(&only_other_vault);
+    let foreign_hero = drawn(&foreign).2;
+    assert_eq!((foreign_hero.done, foreign_hero.total), (0, 0));
+    assert!(
+        !foreign_hero.as_last_read,
+        "another vault's history supplies no display progress"
+    );
     other_source.observing = vec![(vault, Some(source), true)];
     assert_eq!(
         drawn(&reading(&other_source)).2.headline,
         "Waiting to read this Mac…"
     );
+    let trackpad = Subject::Setting(Setting::TrackpadScrolling);
+    for width in [480.0, 600.0, 900.0] {
+        let mut not_needed = complete.clone();
+        let absent_trackpad = not_needed
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == trackpad)
+            .unwrap();
+        absent_trackpad.standing = Standing::NotNeeded;
+        absent_trackpad.now = None;
+        let mut not_needed_app = reading(&not_needed);
+        let not_needed_view = open(&mut not_needed_app, Line::Mac);
+        let first = compile_in(&not_needed_app, &not_needed_view, width, 644.0);
+        let first_hero = drawn(&not_needed_app).2;
+        not_needed.last_known = std::mem::take(&mut not_needed.observed);
+        not_needed.observing = not_needed
+            .last_known
+            .iter()
+            .map(|row| {
+                (
+                    row.subject,
+                    row.subject
+                        .uses_vault_source()
+                        .then(|| complete.plan.as_ref().unwrap().vault_url.clone()),
+                    false,
+                )
+            })
+            .collect();
+        not_needed_app.publish(not_needed.clone());
+        let pending = compile_in(&not_needed_app, &not_needed_view, width, 644.0);
+        let key = format!("system-state/row/{}", row_slug(trackpad));
+        assert_eq!(
+            semantic(&pending, &key).rect,
+            semantic(&first, &key).rect,
+            "a confirmed not-needed row reserves the same check footprint at {width}"
+        );
+        let pending_hero = drawn(&not_needed_app).2;
+        assert_eq!(
+            (pending_hero.done, pending_hero.total),
+            (first_hero.done, first_hero.total)
+        );
+        assert!(!not_needed_app.headline().set_up);
+        // One completed result may arrive while the other rows are still being read.
+        let previous = not_needed
+            .last_known
+            .iter()
+            .find(|row| row.subject == trackpad)
+            .unwrap()
+            .clone();
+        not_needed.observed = vec![previous];
+        not_needed_app.publish(not_needed);
+        let partial = compile_in(&not_needed_app, &not_needed_view, width, 644.0);
+        assert_eq!(
+            semantic(&partial, &key).rect,
+            semantic(&first, &key).rect,
+            "a newly reconfirmed not-needed row keeps the same historical group footprint"
+        );
+        assert_eq!(line_of(&not_needed_app, Line::Mac).word, "as last read");
+    }
     app.publish(complete);
     assert_eq!(app.reviewed_row(caps).chip, Some(Chip::InPlace));
-    assert_ne!(drawn(&app).2.sub, "Showing last useful results");
+    assert!(!drawn(&app).2.as_last_read);
 }
 
 #[test]

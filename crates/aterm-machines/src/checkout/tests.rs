@@ -661,3 +661,53 @@ fn an_unreachable_origin_reads_offline_and_a_refusing_one_does_not() {
         b"git@github.com: Permission denied (publickey).\nfatal: Could not read from remote"
     ));
 }
+
+/// A failure's line ends with Git's own reason: its last `fatal:` or `error:` line, past its
+/// progress meter and its closing advice, with each remote it names written `origin`, a path
+/// it quotes cut to its file name, and no credential. NEGATIVE CONTROL: what it wrote is no
+/// reason where it wrote only space.
+#[test]
+fn git_says_its_reason_without_a_url_or_credential() {
+    let secret = ["ghp", "fixturevalue"].join("_");
+    let cases = [
+        (
+            format!(
+                "fatal: unable to access 'https://alice:{secret}@github.com/alice/x.git/': \
+                 Could not resolve host: github.com\n"
+            ),
+            "fatal: unable to access origin: Could not resolve host: github.com".to_owned(),
+        ),
+        (
+            "Receiving objects:  10% (1/10)\rReceiving objects:  20% (2/10)\r\
+             error: RPC failed; curl 92 HTTP/2 stream 5 was not closed cleanly\n\
+             fatal: early EOF\n"
+                .to_owned(),
+            "fatal: early EOF".to_owned(),
+        ),
+        (
+            "fatal: '/nonexistent/aterm-fixture/origin.git' does not appear to be a git \
+             repository\nfatal: Could not read from remote repository.\n\nPlease make sure \
+             you have the correct access rights\nand the repository exists.\n"
+                .to_owned(),
+            "fatal: Could not read from remote repository.".to_owned(),
+        ),
+        (
+            "fatal: 'git@github.com:alice/x.git' rejected {secret}\n".replace("{secret}", &secret),
+            "fatal: origin rejected [token]".to_owned(),
+        ),
+        (
+            "fatal: could not create work tree dir '/Users//alice/x': Permission denied\n"
+                .to_owned(),
+            "fatal: could not create work tree dir 'x': Permission denied".to_owned(),
+        ),
+    ];
+    for (stderr, said) in cases {
+        assert_eq!(git_said(stderr.as_bytes()).as_deref(), Some(said.as_str()));
+    }
+    assert_eq!(git_said(b" \n\r\n"), None);
+    let ran = crate::port::Ran::exit(128, "");
+    assert_eq!(
+        git_failed("cannot read origin", &ran),
+        "cannot read origin (git exited 128, saying nothing)"
+    );
+}

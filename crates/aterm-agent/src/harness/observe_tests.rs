@@ -228,6 +228,7 @@ fn unicorn_seen() -> Observation {
         src: ObservedSrc::Profile,
         path: PathBuf::from("/home/someone/.claude.json"),
         mtime: Some(1),
+        plan: None,
     })
 }
 
@@ -737,6 +738,7 @@ fn observed_of(cli: ObservedCli, email: &str, src: ObservedSrc) -> Observation {
         src,
         path: PathBuf::from("/home/someone/login-file"),
         mtime: Some(1),
+        plan: None,
     })
 }
 
@@ -1316,6 +1318,7 @@ fn kimi_seen(region: Region, email: &str) -> Observation {
         src: ObservedSrc::AuthFile,
         path: PathBuf::from("/home/someone/.kimi-code/credentials/kimi-code.json"),
         mtime: Some(1),
+        plan: None,
     })
 }
 
@@ -1395,4 +1398,74 @@ fn a_key_only_login_keeps_the_belief_unverified() {
         ),
         Sighted::default()
     );
+}
+
+/// A Codex `auth.json` whose tokens' claims name `email` and the ChatGPT plan `plan`.
+fn codex_auth_on(email: &str, plan: &str) -> String {
+    let part = |bytes: &[u8]| {
+        aterm_codec::base64::encode(bytes)
+            .unwrap()
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_")
+    };
+    let claims = format!(
+        r#"{{"email":"{email}","https://api.openai.com/auth":{{"chatgpt_account_id":"{ACCOUNT_ID}","chatgpt_user_id":"{USER_ID}","chatgpt_plan_type":"{plan}"}}}}"#
+    );
+    let token = format!(
+        "{}.{}.fixture",
+        part(br#"{"alg":"none"}"#),
+        part(claims.as_bytes())
+    );
+    format!(
+        r#"{{"auth_mode":"chatgpt","tokens":{{"id_token":"{token}","access_token":"{token}"}}}}"#
+    )
+}
+
+/// The plan an observer keeps is the plan word its file states, from the read that names the
+/// account: Claude Code's `organizationType` and the plan claim of a Codex login's tokens, each
+/// only where it is a word of the plan vocabulary. A Claude Code row on its vault token keeps
+/// none (its directory's profile may be another account's), and a file that states no plan
+/// (Claude Code's without the field, Muse Code's) keeps none.
+/// NEGATIVE CONTROL: with `codex` dropping the account's plan (as before), the Codex login has
+/// none: `` left: None right: Some("pro") ``.
+#[test]
+fn an_observer_keeps_the_plan_word_its_file_states() {
+    let home = home("plan");
+    let profile_on = |organization: &str| {
+        format!(
+            r#"{{"oauthAccount":{{"emailAddress":"{UNICORN}","accountUuid":"{UUID}","organizationType":"{organization}"}}}}"#
+        )
+    };
+    let file = home.path().join(".claude.json");
+    let plan_of = |text: &str| {
+        write(&file, text);
+        seen(&claude(&[], home.path(), AuthRoute::Stored, None)).plan
+    };
+    assert_eq!(plan_of(&profile_on("claude_team")), Some("team"));
+    assert_eq!(plan_of(&profile_on("claude_max")), Some("max"));
+    assert_eq!(plan_of(&profile_on("claude_zero")), None, "no plan word");
+    assert_eq!(plan_of(&profile(UNICORN)), None, "no plan stated");
+
+    let codex_file = home.path().join(".codex/auth.json");
+    let codex_plan = |text: &str| {
+        write(&codex_file, text);
+        let who = codex_who(&[]);
+        seen(&codex(&process(&[], None), home.path(), &who)).plan
+    };
+    assert_eq!(codex_plan(&codex_auth_on(BRONTO, "pro")), Some("pro"));
+    assert_eq!(
+        codex_plan(&codex_auth_on(BRONTO, "Business")),
+        Some("business")
+    );
+    assert_eq!(codex_plan(&codex_auth_on(BRONTO, "zq-unknown")), None);
+    assert_eq!(codex_plan(&codex_auth(BRONTO)), None, "no plan claim");
+
+    write(
+        &home.path().join(".config/muse/auth.json"),
+        &muse_auth(UNICORN, "oauth"),
+    );
+    let stored = env(&[("HOME", home.path().to_str().unwrap())]);
+    let got = muse(&process(&stored, None), home.path());
+    assert_eq!(seen(&got).plan, None, "Muse Code states no plan");
 }

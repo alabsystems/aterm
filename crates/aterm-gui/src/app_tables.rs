@@ -14,7 +14,7 @@ impl crate::App {
         self.open_tables_tab_at(None)
     }
 
-    /// aterm ▸ Tables… and its palette row (`MenuAction::Tables`).
+    /// aterm ▸ Registry… and its palette row (`MenuAction::Tables`).
     pub(crate) fn open_tables_from_menu(&mut self) {
         if let Err(why) = self.open_app(crate::app_control::OpenRequest::Tables) {
             self.pending_action_refusal = Some(why);

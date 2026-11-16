@@ -276,6 +276,74 @@ fn write_json(path: &Path, value: &Value) -> Result<(), Fail> {
     write(path, &bytes)
 }
 
+const SIP_STATUS_COMMAND: &str = "csrutil status";
+
+/// References describing this probe, not authenticated image or executable identities.
+struct SipProbe<'a> {
+    tart: &'a str,
+    requested_image: &'a str,
+    selected_base: &'a str,
+    guest: &'a str,
+}
+
+/// Retain the complete bounded probe result before applying the existing stdout-only SIP gate.
+/// `capture` uses the runtime's complete-output guard; its error supplies neither complete
+/// streams nor a process status. A refusal to write the evidence cannot admit guest setup.
+fn require_sip_on(
+    record: &Path,
+    probe: &SipProbe<'_>,
+    capture: impl FnOnce() -> Result<std::process::Output, String>,
+) -> Result<(), Fail> {
+    let identity = json!({
+        "tart_path_reference": probe.tart,
+        "requested_image_reference": probe.requested_image,
+        "selected_base_reference": probe.selected_base,
+        "vm_name_reference": probe.guest,
+        "argv": [probe.tart, "exec", probe.guest, "/bin/sh", "-c", SIP_STATUS_COMMAND],
+    });
+    let out = match capture() {
+        Ok(out) => out,
+        Err(error) => {
+            write_json(
+                &record.join("sip.json"),
+                &json!({
+                    "schema": "aterm-mac-runtime-probe-v1", "probe": identity,
+                    "output_complete": false, "success": null, "exit": null, "signal": null,
+                    "stdout_file": null, "stderr_file": null,
+                    "stdout_bytes": null, "stderr_bytes": null, "error": &error,
+                }),
+            )?;
+            return Err(error.into());
+        }
+    };
+    write(&record.join("sip.stdout"), &out.stdout)?;
+    write(&record.join("sip.stderr"), &out.stderr)?;
+    write_json(
+        &record.join("sip.json"),
+        &json!({
+            "schema": "aterm-mac-runtime-probe-v1", "probe": identity,
+            "output_complete": true, "success": out.status.success(),
+            "exit": out.status.code(), "signal": out.status.signal(),
+            "stdout_file": "sip.stdout", "stderr_file": "sip.stderr",
+            "stdout_bytes": out.stdout.len(), "stderr_bytes": out.stderr.len(), "error": null,
+        }),
+    )?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(Fail::die(format!(
+            "guest `{SIP_STATUS_COMMAND}`: {}: {text}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    if !crate::mac::sip_on(&text) {
+        return Err(not_run(
+            "runtime requires a SIP-on image; it performs no privileged guest preparation",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CaptureReceipt {
@@ -994,12 +1062,16 @@ fn run_in(ask: &Ask) -> Res {
         repo,
     )?;
     vm.boot()?;
-    let sip = vm.sh("csrutil status", crate::mac::STEP)?;
-    if !crate::mac::sip_on(&sip) {
-        return Err(not_run(
-            "runtime requires a SIP-on image; it performs no privileged guest preparation",
-        ));
-    }
+    require_sip_on(
+        &ask.record,
+        &SipProbe {
+            tart: &tart,
+            requested_image: &ask.image,
+            selected_base: &base,
+            guest: &vm.name,
+        },
+        || vm.exec_output(SIP_STATUS_COMMAND, crate::mac::STEP),
+    )?;
     if let Some(pid) = vm.pid() {
         admitted.credit("mac-runtime", &[pid]);
     }

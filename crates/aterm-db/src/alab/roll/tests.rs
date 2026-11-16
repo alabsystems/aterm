@@ -1529,7 +1529,12 @@ fn set_password(lab: &Lab, n: usize, address: &str, value: &str, store: &Memory)
         open: &mut open,
         read_stdin: &mut read,
         store,
-        holding: &|| Ok(usize::from(store.admit().is_err())),
+        holding: &|| {
+            Ok(aterm_secrets::client::Holding {
+                older: usize::from(store.admit().is_err()),
+                ..aterm_secrets::client::Holding::default()
+            })
+        },
         now_ms: now_ms(),
     };
     crate::alab::command::views::run(
@@ -2146,7 +2151,12 @@ fn secrets_line(lab: &Lab, n: usize, store: &Memory) -> String {
         open: &mut open,
         read_stdin: &mut read,
         store,
-        holding: &|| Ok(usize::from(store.admit().is_err())),
+        holding: &|| {
+            Ok(aterm_secrets::client::Holding {
+                older: usize::from(store.admit().is_err()),
+                ..aterm_secrets::client::Holding::default()
+            })
+        },
         now_ms: now_ms(),
     };
     let value = crate::alab::command::views::run(
@@ -2193,7 +2203,8 @@ fn the_owner_reads_one_line_counting_secret_references_sealed_cells_and_holding_
     assert_eq!(
         before,
         "secrets: 0 cells name a secret-store entry, 1 cell still sealed in the table; \
-         1 Mac reading the vault holds the move into the secret store back"
+         1 Mac reading the vault holds the move into the secret store back: 1 Mac runs an older \
+         aterm"
     );
     store.floor(|| Ok(()));
     a.roll_with(true, now_ms(), &store).unwrap();

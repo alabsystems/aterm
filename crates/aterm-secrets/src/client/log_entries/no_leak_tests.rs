@@ -6,6 +6,7 @@
 
 use super::super::log_entries_tests::{member_key, two_macs};
 use super::*;
+use crate::membership_log::encode_records;
 
 /// m22 and m7 share the host list `[m22 m7]`. m22 takes m7 out (a `Remove`, no rotation yet) and
 /// seats m9, and the vault text then names the list `[m22]`, m7 having left `[machines]`: the next

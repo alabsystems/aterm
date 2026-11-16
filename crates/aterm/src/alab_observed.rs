@@ -23,10 +23,16 @@
 //! tab, once a day and when its file names another account, and marked `idle` through the same
 //! queue. The sweep hands each login at every look and the queue keeps what a pass took
 //! ([`Queue::passed`]): a swept login goes to the registry once a day, and again at each look
-//! until a pass of it succeeds, in whichever process looks.
+//! until a pass of it succeeds, in whichever process looks. The sweep also hands each account
+//! signed in to one of aterm's own browser profiles, `idle` from `browser`; of one login's
+//! sightings a CLI's or a tab's word stands over a browser's.
+//!
+//! What a pass is handed is kept on disk until a pass whose plan ran takes it
+//! (`aterm_db::alab::observe::kept`): on a Mac whose writer is fenced every pass refuses, and
+//! its sightings, a tab's included, wait there for the first pass after it authors again.
 
 use aterm_agent::harness::journal::LoginState;
-use aterm_agent::harness::journal::ObservedLogin;
+use aterm_agent::harness::journal::{ObservedLogin, ObservedSrc};
 use aterm_agent::harness::observe::sweep::{IDLE_REFRESH_S, OnToken};
 use aterm_db::alab::{Observed, observe::Sighting};
 use std::{
@@ -118,7 +124,10 @@ impl Queue {
             src: login.src.word(),
             at: login.at,
         });
-        if login.at >= entry.at {
+        // A browser profile's sighting of a login a CLI's file or a tab also names says less of
+        // it: the CLI's word stands.
+        let weaker = login.src == ObservedSrc::Browser && entry.src != ObservedSrc::Browser.word();
+        if login.at >= entry.at && !weaker {
             entry.state = login.state.word();
             entry.src = login.src.word();
             entry.at = login.at;
@@ -238,7 +247,13 @@ pub(crate) fn take_up(login: &ObservedLogin) {
     }
     let spawned = std::thread::Builder::new()
         .name("aterm-lab-observed".into())
-        .spawn(move || run(queue, pass));
+        .spawn(move || {
+            run(
+                queue,
+                aterm_db::alab::observe::kept::local().as_deref(),
+                pass,
+            )
+        });
     if spawned.is_err() {
         if let Ok(mut queue) = queue.lock() {
             queue.running = false;
@@ -247,9 +262,16 @@ pub(crate) fn take_up(login: &ObservedLogin) {
     }
 }
 
-/// A pass's thread: wait out the rest period, take what gathered, pass it, and go again while
-/// more gathered meanwhile.
-fn run(queue: &Mutex<Queue>, pass: fn(&[Sighting]) -> Result<Observed, String>) {
+/// A pass's thread: wait out the rest period, take what gathered, pass it with every sighting
+/// still pending in this Mac's kept file under `kept` (`aterm_db::alab::observe::kept`), and go
+/// again while more gathered meanwhile. A pass that refuses (a fenced writer, a registry not
+/// read) leaves what it was handed pending there, for the first pass that runs its plan, in this
+/// process or the next. With no `kept`, what gathered alone is passed.
+fn run(
+    queue: &Mutex<Queue>,
+    kept: Option<&Path>,
+    pass: fn(&[Sighting]) -> Result<Observed, String>,
+) {
     /// Clears `running` however the thread ends, a panic in a pass included: a thread that died
     /// with it set would leave every later sighting of this process unpassed.
     struct Running<'a>(&'a Mutex<Queue>);
@@ -274,15 +296,28 @@ fn run(queue: &Mutex<Queue>, pass: fn(&[Sighting]) -> Result<Observed, String>) 
             Ok(mut queue) => queue.take(now),
             Err(_) => return,
         };
-        let done = pass(&sightings);
+        let (handed, done) = match kept {
+            Some(dir) => aterm_db::alab::observe::kept::through(
+                dir,
+                &sightings,
+                now.saturating_mul(1_000),
+                pass,
+            ),
+            None => {
+                let done = pass(&sightings);
+                (sightings, done)
+            }
+        };
         log_pass(&done);
         let Ok(mut queue) = queue.lock() else {
             return;
         };
-        // Only a pass whose plan ran took its sightings: one that failed, or read no registry
-        // (`quiet`), leaves each swept login to be handed again at the sweep's next look.
-        if done.is_ok_and(|done| done.quiet.is_none()) {
-            queue.took(&sightings, now);
+        // Only what a pass took is taken (`Observed::took`): one that failed, or read no
+        // registry (`quiet`), and a sighting whose birth or first row the quota refused, leave
+        // each swept login to be handed again at the sweep's next look, and stay pending in the
+        // kept file.
+        if let Ok(done) = &done {
+            queue.took(&done.took(&handed), now);
         }
         queue.last = Some(Instant::now());
         if queue.by.is_empty() {

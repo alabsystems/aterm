@@ -32,6 +32,13 @@ path = "src/guest/main.rs"
 name = "aterm-lab-standin"
 path = "src/standin/main.rs"
 
+# Guest-only SD-72 qualification. Normal host tests never execute its CPU workload.
+[[bin]]
+name = "aterm-self-cpu-fixture"
+path = "src/self_cpu_fixture/main.rs"
+test = false
+bench = false
+
 [dependencies]
 # The turn-end readers and the texts the policy types, which the lab's scenes and proofs read
 # and drive.
@@ -74,6 +81,8 @@ aterm-png = { workspace = true }
 # parse the capture holds to the real build-slot, and the reader the watch sets
 # beside the holder scan. Already in the graph through aterm-uds.
 aterm-sysprobe = { workspace = true }
+# The guest fixture and its host-side verifier use the production conservative CPU model.
+aterm-vitals = { workspace = true }
 # The far end's own screen, replayed from a link take (`predict-live`): the
 # engine aterm draws with, so the oracle is the instance's own fold.
 aterm-core = { workspace = true }

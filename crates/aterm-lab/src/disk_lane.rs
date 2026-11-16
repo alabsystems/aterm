@@ -670,6 +670,6 @@ fn lane(inst: &Instance, home: &Path, mirror: &Path, v: &mut Verdict) -> Result<
     Ok(())
 }
 
-fn aterm_control_pct(s: &str) -> String {
+pub(crate) fn aterm_control_pct(s: &str) -> String {
     s.replace('%', "%25").replace(' ', "%20")
 }

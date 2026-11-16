@@ -96,7 +96,10 @@ impl Lab {
             &self.signer,
         )
         .unwrap();
-        let seed = client::load_records(&self.paths[0]).unwrap().encode();
+        let seed = client::load_records(&self.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         client::save_records(&self.paths[1], &seed).unwrap();
     }
     pub(crate) fn exchange(&self, peer: &Endpoint) -> (Result<Report>, Result<Report>) {
@@ -184,7 +187,10 @@ fn frontier_log_enrollment_carries_the_source_mark_and_retries_without_new_recor
         &lab.signer,
     )
     .unwrap();
-    let seed = client::load_records(&lab.paths[0]).unwrap().encode();
+    let seed = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &seed).unwrap();
     std::fs::write(
         lab.paths[0].records_file().with_extension("crossed"),
@@ -214,7 +220,7 @@ fn frontier_log_enrollment_carries_the_source_mark_and_retries_without_new_recor
 
 #[test]
 fn frontier_large_log_enrollment_reopens_selected_witness() {
-    use aterm_secrets::membership_log::{Body, LEGACY_RECORDS, encode_records};
+    use aterm_secrets::membership_log::{Body, LEGACY_RECORDS, read_records};
     let lab = Lab::new(true);
     client::test_sign_genesis(
         &lab.paths[0],
@@ -223,7 +229,7 @@ fn frontier_large_log_enrollment_reopens_selected_witness() {
     )
     .unwrap();
     let initial = client::load_records(&lab.paths[0]).unwrap();
-    client::save_records(&lab.paths[1], &initial.encode()).unwrap();
+    client::save_records(&lab.paths[1], &initial.read_encoded().unwrap()).unwrap();
     let mut log = initial.log().unwrap().clone();
     let bootstrap = lab.bootstrap(0);
     let request = bootstrap.request().unwrap();
@@ -246,7 +252,7 @@ fn frontier_large_log_enrollment_reopens_selected_witness() {
             Ok::<(), aterm_secrets::Error>(())
         })
         .unwrap();
-    client::save_records(&lab.paths[0], &encode_records(log.records())).unwrap();
+    client::save_records(&lab.paths[0], &read_records(log.records()).unwrap()).unwrap();
     let pending = lab.pending();
     let owner = Endpoint::from_bootstrap(&lab.bootstrap(0))
         .unwrap()
@@ -283,7 +289,7 @@ fn frontier_large_log_enrollment_reopens_selected_witness() {
     let witness = bootstrap.log_witness().unwrap().unwrap();
     assert!(witness.held_count() > LEGACY_RECORDS);
     assert_eq!(
-        aterm_secrets::membership_log::decode_records(&encode_records(witness.records()))
+        aterm_secrets::membership_log::decode_records(&read_records(witness.records()).unwrap())
             .unwrap()
             .len(),
         witness.held_count()

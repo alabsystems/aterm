@@ -15,8 +15,8 @@
 //!   nothing. The one act is a press of `Authorize` ([`press_js`]), which judges the page again
 //!   as it presses: the document the read was made in and no other, no check in it, the
 //!   account still shown, and an enabled button whose whole label is `authorize`. A press that
-//!   finds any of those changed presses nothing; one that pressed is never made again
-//!   ([`drive_until`]).
+//!   finds the page moved or the account not shown presses nothing; one that finds a check
+//!   ends the drive on it; one that pressed is never made again ([`drive_until`]).
 //! - **Authorize only where the page shows the account.** It is pressed only where the page
 //!   names the account's exact email as the one signed in ([`super::shows_email`]). A page that
 //!   names another account ends the drive naming it ([`MetWord::ConsentWrongAccount`]); a page
@@ -29,14 +29,14 @@
 //!   page reaches before the one press, by a request, in its address or in an event (a grant the
 //!   profile already held, which skips the consent page), is handed over nowhere, and ends the
 //!   drive as a page that did not show the account ([`MetWord::ConsentUnproven`]).
-//! - **Checks are never operated.** Cloudflare's check is waited on as the headless sign-in
-//!   waits on it ([`super::BotCheckClock`], its stall unchanged), and its block page ends the
-//!   drive. A human check's widget in the page (hCaptcha, reCAPTCHA or Turnstile, as aterm's
-//!   sign-in window reads them) is read only as present: nothing on such a page is pressed,
-//!   filled or followed, whether its `Authorize` stands disabled or not (an invisible check
-//!   runs on the press of the button it is bound to, and nobody is at this profile to answer
-//!   one). It is waited on until the drive's deadline, which then ends naming it
-//!   ([`MetWord::HumanCheck`]), a read the deadline cut short included.
+//! - **A check ends the drive on its first read.** A page that carries one ([`check_met`]: a
+//!   block page, Cloudflare's bot check, or a human check's widget anywhere in it, its open
+//!   shadow roots and same-origin frames included, as the shared predicate reads them) ends the
+//!   drive at once, naming it, with nothing on it pressed, filled or followed, whether its
+//!   `Authorize` stands disabled or not: an invisible check runs on the press of the button it
+//!   is bound to, and nobody is at this profile to answer one. The drive does not wait for a
+//!   check to clear, since one that cleared by itself would let software past it, and a press
+//!   that meets a check at the press ends it the same way ([`Pressed::Check`]).
 //! - **The callback.** A loopback callback is handed to the waiting `setup-token`'s listener, and
 //!   a hosted one to its code file (`headless_oauth::deliver_claude_callback`): nothing is typed
 //!   into its terminal.
@@ -44,10 +44,10 @@
 use super::super::auth_deadline::Deadline;
 use super::super::open_url::{CLAUDE_PIN, MailboxFlow, MetWord};
 use super::{
-    BLOCK_PAGE_MET, BOT_CHECK_JS, BOT_CHECK_UNCLEARED, BotCheckClock, CdpClient, Field, Gate, Page,
-    SIGNED_IN_WORDS, TOKEN_CONSENT_UNPROVEN, TOKEN_HUMAN_CHECK, another_account, block_page,
-    bot_check, browser_control_failed, callback_delivery_result, close_flow_page,
-    navigate_flow_tab, note_met, oauth_out_of_time, open_flow_tab, page_of, shows_email, take_met,
+    CHECK_PAGE_JS, CdpClient, CheckMet, Field, Gate, Page, SIGNED_IN_WORDS, TOKEN_CONSENT_UNPROVEN,
+    TOKEN_HUMAN_CHECK, another_account, browser_control_failed, callback_delivery_result,
+    check_met, close_flow_page, navigate_flow_tab, note_met, open_flow_tab, page_of, shows_email,
+    sign_in_check_words, sign_in_out_of_time, take_met,
 };
 use aterm_json::{Value, json};
 use std::path::Path;
@@ -116,40 +116,12 @@ impl<'a> TokenRequest<'a> {
     }
 }
 
-/// Reads a token's consent page: [`super::VENDOR_PAGE_JS`]'s [`Page`], with whether a human
-/// check's widget is in it (`humanCheck`, [`super::HUMAN_CHECK_WIDGETS`]). It reads only that
-/// the widget is there, and sets and presses nothing.
-pub(in crate::harness) const TOKEN_PAGE_JS: &str = concat!(
-    "(() => { const page = ",
-    vendor_page_js!(),
-    ";\n  page.humanCheck = !!document.querySelector(\"",
-    human_check_widgets!(),
-    "\");\n  return page;\n})()"
-);
-
-/// One read of a token's consent page ([`TOKEN_PAGE_JS`]).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(in crate::harness) struct ConsentPage {
-    /// The page as the vendor drive reads it.
-    pub(in crate::harness) page: Page,
-    /// Whether a human check's widget is in it.
-    pub(in crate::harness) human_check: bool,
-}
-
-/// Reads [`TOKEN_PAGE_JS`]'s answer.
-#[must_use]
-pub(in crate::harness) fn consent_page_of(value: &Value) -> ConsentPage {
-    ConsentPage {
-        page: page_of(value),
-        human_check: value
-            .get("humanCheck")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    }
-}
+/// Reads a token's consent page: [`super::VENDOR_PAGE_JS`]'s [`Page`], the check it carries
+/// (`checkPageOf()`, the one predicate every drive reads) included. It sets and presses nothing.
+pub(in crate::harness) const TOKEN_PAGE_JS: &str = super::VENDOR_PAGE_JS;
 
 /// What the drive does on one read of a token's consent page ([`consent_step`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::harness) enum Consent {
     /// Read it again.
     Wait,
@@ -159,32 +131,27 @@ pub(in crate::harness) enum Consent {
     WrongAccount,
     /// The page does not show the account as the one signed in, or asks for a sign-in.
     Unproven,
-    /// A human check's widget is in the page.
-    HumanCheck,
+    /// The page carries a check ([`check_met`]): the drive ends on it.
+    Check(CheckMet),
 }
 
 fn is_authorize(label: &str) -> bool {
     label.trim() == "authorize"
 }
 
-/// The step on `seen`, a page that is neither Cloudflare's check nor its block page, for the
-/// account `gate` names, `spent` saying whether the one press was made already: another
-/// account named refuses; a human check's widget in the page is waited on, before the press or
-/// after it, with nothing pressed; once the press was made, the drive only reads; an enabled
-/// `Authorize` is pressed only where the page shows the account ([`shows_email`]); a page that
-/// asks for an email, a code or a password is no consent of the account's.
+/// The step on `page` for the account `gate` names, `spent` saying whether the one press was
+/// made already: a check the page carries ([`check_met`]) ends the drive, before the press or
+/// after it, with nothing pressed; another account named refuses; once the press was made, the
+/// drive only reads; an enabled `Authorize` is pressed only where the page shows the account
+/// ([`shows_email`]); a page that asks for an email, a code or a password is no consent of the
+/// account's.
 #[must_use]
-pub(in crate::harness) fn consent_step(
-    seen: &ConsentPage,
-    gate: &Gate<'_>,
-    spent: bool,
-) -> Consent {
-    let page = &seen.page;
+pub(in crate::harness) fn consent_step(page: &Page, gate: &Gate<'_>, spent: bool) -> Consent {
+    if let Some(check) = check_met(page) {
+        return Consent::Check(check);
+    }
     if another_account(page, gate) {
         return Consent::WrongAccount;
-    }
-    if seen.human_check {
-        return Consent::HumanCheck;
     }
     if spent {
         return Consent::Wait;
@@ -237,12 +204,13 @@ const PRESSED: &str = "pressed";
 
 /// Presses `Authorize` on the consent page read at `at`, for the account `email`, judging the
 /// page again as [`consent_step`] judged it: only in the document at `at`, and in no other; only
-/// while neither Cloudflare's check or block page nor a human check's widget is in it; only
-/// while its text names `email` beside its signed-in words and names no other address but the
-/// vendor's ([`shows_email`]); and only the first enabled, shown button whose whole label is
+/// while it carries no check (`checkPageOf()`, the shared predicate); only while its text names
+/// `email` beside its signed-in words and names no other address but the vendor's
+/// ([`shows_email`]); and only the first enabled, shown button whose whole label is
 /// `authorize`. It answers what it did and the address of the document it ran in: [`PRESSED`],
-/// or, with nothing pressed, `moved`, `unready` (a check), `unshown` (the account is not shown)
-/// or `absent` (no such button). `None` where `at` or `email` is no string a script can hold.
+/// or, with nothing pressed, `moved`, `check` (with the check's word as `check`), `unshown`
+/// (the account is not shown) or `absent` (no such button). `None` where `at` or `email` is no
+/// string a script can hold.
 #[must_use]
 pub(in crate::harness) fn press_js(at: &str, email: &str) -> Option<String> {
     let literal = |value: &str| aterm_json::to_string(&Value::String(value.to_owned())).ok();
@@ -260,11 +228,10 @@ pub(in crate::harness) fn press_js(at: &str, email: &str) -> Option<String> {
   const here = String(window.location && window.location.href || "");
   const answer = (did) => ({{ at: here, did }});
   if (here !== {at}) return answer("moved");
-{bot}
-  const title = String(document.title || "");
+{check}
+  const met = checkPageOf();
+  if (met) return {{ at: here, did: "check", check: met }};
   const text = String(document.body && document.body.innerText || "");
-  if (botCheckOf(title, text, botCheckMarkers()) || botCheckTitles.includes(title.trim().toLowerCase()) || blockPageOf(text)) return answer("unready");
-  if (document.querySelector("{widgets}")) return answer("unready");
   const lower = text.toLowerCase();
   const email = {email}, signedIn = {signed_in}, senders = {senders};
   const emails = lower.split(/[^a-z0-9@._%+-]+/).map(w => w.replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, "")).filter(w => {{
@@ -281,8 +248,7 @@ pub(in crate::harness) fn press_js(at: &str, email: &str) -> Option<String> {
   return answer("{pressed}");
 }})()"#,
         at = literal(at)?,
-        bot = BOT_CHECK_JS,
-        widgets = human_check_widgets!(),
+        check = CHECK_PAGE_JS,
         email = literal(&email.trim().to_ascii_lowercase())?,
         signed_in = list(SIGNED_IN_WORDS)?,
         senders = list(SENDERS)?,
@@ -291,13 +257,16 @@ pub(in crate::harness) fn press_js(at: &str, email: &str) -> Option<String> {
 }
 
 /// What one press of `Authorize` ([`press_js`]) came to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Pressed {
     /// It pressed, on the page the read judged: the one proof a callback is handed over on.
     Yes,
-    /// It answered that it pressed nothing (the page moved, a check came, the account is no
-    /// longer shown, no `Authorize` stands).
+    /// It answered that it pressed nothing (the page moved, the account is no longer shown, no
+    /// `Authorize` stands).
     No,
+    /// It pressed nothing: the page carries this check, read at the press. The drive ends on it,
+    /// and presses nothing again.
+    Check(CheckMet),
     /// No answer came: whether it pressed is not known, so no press is made again, and no
     /// callback is handed over on it.
     Unanswered,
@@ -314,13 +283,18 @@ fn press(
         return Pressed::No;
     };
     match cdp.call(Some(session), "Runtime.evaluate", evaluate(&script), within) {
-        Ok(answer) => {
-            if answer.pointer("/result/value/did").and_then(Value::as_str) == Some(PRESSED) {
-                Pressed::Yes
-            } else {
-                Pressed::No
-            }
-        }
+        Ok(answer) => match answer.pointer("/result/value/did").and_then(Value::as_str) {
+            Some(PRESSED) => Pressed::Yes,
+            // A check met at the press is one whatever its word: an unknown word is a human
+            // check by the general name, so it still ends the drive.
+            Some("check") => Pressed::Check(
+                answer
+                    .pointer("/result/value/check")
+                    .and_then(CheckMet::of_value)
+                    .unwrap_or_else(|| CheckMet::HumanCheck("captcha".into())),
+            ),
+            _ => Pressed::No,
+        },
         Err(_) => Pressed::Unanswered,
     }
 }
@@ -399,24 +373,25 @@ fn paused_callback(
     }
 }
 
-/// How a drive whose deadline came at `now` ends, noted for [`take_met`]: on the human check or
-/// the unproven page that stood at its last read, else as the headless sign-in's drive ends
-/// ([`oauth_out_of_time`]).
-fn out_of_time(
-    bot: &BotCheckClock,
-    (human, unproven): (Option<Instant>, Option<Instant>),
-    last_host: Option<&str>,
-    now: Instant,
-) -> &'static str {
-    if human.is_some() {
-        note_met(MetWord::HumanCheck, last_host);
-        return TOKEN_HUMAN_CHECK;
-    }
-    if unproven.is_some() {
+/// How a drive whose deadline came ends, noted for [`take_met`]: on the unproven page that stood
+/// at its last read (`unproven`), else as the headless sign-in's drive ends
+/// ([`sign_in_out_of_time`]). A check is never waited on, so none stands at the deadline.
+fn out_of_time(unproven: bool, last_host: Option<&str>) -> &'static str {
+    if unproven {
         note_met(MetWord::ConsentUnproven, last_host);
         return TOKEN_CONSENT_UNPROVEN;
     }
-    oauth_out_of_time(bot, last_host, now)
+    sign_in_out_of_time(last_host)
+}
+
+/// Ends the drive on `check`, met on `last_host`, noted for [`take_met`]: nothing on its page
+/// was pressed, and nothing is pressed again.
+fn met_check(check: &CheckMet, last_host: Option<&str>) -> &'static str {
+    note_met(check.word(), last_host);
+    match check {
+        CheckMet::HumanCheck(_) => TOKEN_HUMAN_CHECK,
+        other => sign_in_check_words(other),
+    }
 }
 
 /// Ends the drive on a callback that came with no press of `Authorize` behind it: nothing is
@@ -427,10 +402,9 @@ fn unpressed(last_host: Option<&str>) -> &'static str {
 }
 
 /// Drives `request`'s consent page in the browser `cdp` drives (the module's summary says how),
-/// reading every `poll` until `deadline`; Cloudflare's check may stand for `bot_stall`, a page
-/// that does not show the account for `proof_stall`, and a human check until `deadline`.
-/// `deliver` hands a callback to the waiting `setup-token`. What it met is noted for
-/// [`take_met`].
+/// reading every `poll` until `deadline`; a page that does not show the account may stand for
+/// `proof_stall`, and a check ends the drive on its first read. `deliver` hands a callback to
+/// the waiting `setup-token`. What it met is noted for [`take_met`].
 ///
 /// # Errors
 /// The page met what aterm never passes, did not show the account, named another, reached its
@@ -440,14 +414,23 @@ pub(in crate::harness) fn drive_until(
     cdp: &mut CdpClient,
     request: &TokenRequest<'_>,
     (deadline, poll): (Deadline<'_>, Duration),
-    stalls: (Duration, Duration),
+    proof_stall: Duration,
     deliver: impl FnMut(&str) -> Result<u16, &'static str>,
 ) -> Result<(), &'static str> {
     let _ = take_met();
     let (target_id, session) = open_flow_tab(cdp, deadline)?;
     let served = hold_listener(cdp, &session, &request.flow, deadline)
         .and_then(|()| navigate_flow_tab(cdp, &session, request.url, deadline))
-        .and_then(|()| serve_page(cdp, &session, request, (deadline, poll), stalls, deliver));
+        .and_then(|()| {
+            serve_page(
+                cdp,
+                &session,
+                request,
+                (deadline, poll),
+                proof_stall,
+                deliver,
+            )
+        });
     close_flow_page(cdp, &target_id);
     served
 }
@@ -458,12 +441,10 @@ fn serve_page(
     session: &str,
     request: &TokenRequest<'_>,
     (deadline, poll): (Deadline<'_>, Duration),
-    (bot_stall, proof_stall): (Duration, Duration),
+    proof_stall: Duration,
     mut deliver: impl FnMut(&str) -> Result<u16, &'static str>,
 ) -> Result<(), &'static str> {
     let gate = consent_gate(&request.email);
-    let mut bot = BotCheckClock::default();
-    let mut human: Option<Instant> = None;
     let mut unproven: Option<Instant> = None;
     // `pressed`: the press answered that it pressed `Authorize` on the page the read judged, the
     // one proof a callback is handed over on; `unanswered`: a press whose answer never came, after
@@ -474,14 +455,8 @@ fn serve_page(
         let _ = deadline.pause(poll);
     };
     loop {
-        let now = deadline.now();
         let Ok(within) = deadline.remaining() else {
-            return Err(out_of_time(
-                &bot,
-                (human, unproven),
-                last_host.as_deref(),
-                now,
-            ));
+            return Err(out_of_time(unproven.is_some(), last_host.as_deref()));
         };
         let read = match cdp.call(
             Some(session),
@@ -491,25 +466,16 @@ fn serve_page(
         ) {
             Ok(read) => read,
             Err(why) => {
-                let now = deadline.now();
                 // A read the deadline cut short ends the drive as the deadline does, naming
                 // what stood.
                 if deadline.expired() {
-                    return Err(out_of_time(
-                        &bot,
-                        (human, unproven),
-                        last_host.as_deref(),
-                        now,
-                    ));
+                    return Err(out_of_time(unproven.is_some(), last_host.as_deref()));
                 }
-                // A read the page replaced under it (a navigation, a check reloading itself),
-                // or one made while a check or an unproven page stood, is read again; any other
-                // failure ends the drive.
-                let stands = bot.held(now).is_some() || human.is_some() || unproven.is_some();
-                if why != "browser execution context changed" && !stands {
+                // A read the page replaced under it (a navigation), or one made while an
+                // unproven page stood, is read again; any other failure ends the drive.
+                if why != "browser execution context changed" && unproven.is_none() {
                     return Err(browser_control_failed(why));
                 }
-                bot.unread(now);
                 pause();
                 continue;
             }
@@ -518,8 +484,8 @@ fn serve_page(
             .pointer("/result/value")
             .cloned()
             .unwrap_or(Value::Null);
-        let seen = consent_page_of(&value);
-        let url = seen.page.url.as_str();
+        let seen = page_of(&value);
+        let url = seen.url.as_str();
         // A callback, by a request the browser paused on its way to the listener, by the page's
         // own address or by an event, is handed over only after the one press, and only by
         // aterm: the listener had none of it from the browser ([`hold_listener`]).
@@ -542,35 +508,20 @@ fn serve_page(
             }
             last_host = Some(host);
         }
-        if block_page(&seen.page) {
-            note_met(MetWord::BlockPage, last_host.as_deref());
-            return Err(BLOCK_PAGE_MET);
-        }
         let now = deadline.now();
-        if bot_check(&seen.page) {
-            (human, unproven) = (None, None);
-            if bot.check(url, now) >= bot_stall {
-                note_met(MetWord::BotCheck, last_host.as_deref());
-                return Err(BOT_CHECK_UNCLEARED);
-            }
-            pause();
-            continue;
-        }
-        let step = consent_step(&seen, &gate, pressed || unanswered);
-        let idle =
-            step == Consent::Wait && seen.page.buttons.is_empty() && seen.page.inputs.is_empty();
-        bot.other(url, idle, now);
-        if bot.held(now).is_some() {
-            pause();
-            continue;
-        }
-        match step {
+        match consent_step(&seen, &gate, pressed || unanswered) {
+            // A check ends the drive on its first read: nothing on its page is pressed, and the
+            // drive does not wait for it to clear.
+            Consent::Check(check) => return Err(met_check(&check, last_host.as_deref())),
             Consent::Press => {
-                (human, unproven) = (None, None);
+                unproven = None;
                 match deadline.left() {
                     Ok(within) => match press(cdp, session, (url, &request.email), within) {
                         Pressed::Yes => pressed = true,
                         Pressed::No => {}
+                        Pressed::Check(check) => {
+                            return Err(met_check(&check, last_host.as_deref()));
+                        }
                         Pressed::Unanswered => unanswered = true,
                     },
                     Err(_) => continue,
@@ -581,19 +532,13 @@ fn serve_page(
                 return Err(WRONG_ACCOUNT);
             }
             Consent::Unproven => {
-                human = None;
                 let since = *unproven.get_or_insert(now);
                 if now.saturating_duration_since(since) >= proof_stall {
                     note_met(MetWord::ConsentUnproven, last_host.as_deref());
                     return Err(TOKEN_CONSENT_UNPROVEN);
                 }
             }
-            // It stands until the deadline, which then names it ([`out_of_time`]).
-            Consent::HumanCheck => {
-                unproven = None;
-                human.get_or_insert(now);
-            }
-            Consent::Wait => (human, unproven) = (None, None),
+            Consent::Wait => unproven = None,
         }
         pause();
     }

@@ -899,6 +899,13 @@ impl Cursor {
         self.pending = None;
     }
 
+    /// Whether a selection cycle is under way: a page read now continues it, so what that page
+    /// finds is only part of what the cycle finds.
+    #[must_use]
+    pub(crate) const fn mid_cycle(&self) -> bool {
+        self.cycle.is_some()
+    }
+
     pub(crate) fn scope(&mut self, value: &impl std::fmt::Debug) {
         let mut snapshot = Snapshot::new();
         let scope = snapshot.feed(value).then(|| snapshot.finish());

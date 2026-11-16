@@ -70,6 +70,34 @@ use verbs::{Noun, Verb};
 /// `aterm agh`, argv0 `agh` and the dev shim: the arguments after the program's name.
 #[must_use = "handle or propagate the command's exit status"]
 pub fn main_entry(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
+    #[cfg(unix)]
+    {
+        main_entry_inner(args, Arc::new(std::sync::atomic::AtomicBool::new(false)))
+    }
+    #[cfg(not(unix))]
+    {
+        main_entry_inner(args)
+    }
+}
+
+/// Run the CLI with an owner's cooperative native Git stop request.
+///
+/// Native Git commands use `stop` for both the owner's request and the CLI's stop signals.
+/// The Git owner retires its actual child and returns through intent settlement before this
+/// entry returns. The flag does not cancel HTTP requests or change other verbs' signal policy.
+#[must_use = "handle or propagate the command's exit status"]
+#[cfg(unix)]
+pub fn main_entry_with_git_stop(
+    args: Vec<std::ffi::OsString>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::process::ExitCode {
+    main_entry_inner(args, stop)
+}
+
+fn main_entry_inner(
+    args: Vec<std::ffi::OsString>,
+    #[cfg(unix)] stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::process::ExitCode {
     aterm_uds::secret::no_core_dumps();
     let mut ctx = Ctx::production();
     let mut text = Vec::with_capacity(args.len());
@@ -95,7 +123,6 @@ pub fn main_entry(args: Vec<std::ffi::OsString>) -> std::process::ExitCode {
                 | ["ref", "delete"]
         )
     ) {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let requested = stop.clone();
         if !aterm_uds::process::take_stop_signals("agh-stop", move |_| {
             requested.store(true, std::sync::atomic::Ordering::Release);

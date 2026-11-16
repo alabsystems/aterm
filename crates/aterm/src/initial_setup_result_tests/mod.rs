@@ -52,6 +52,9 @@ mod keeper_hint_tests;
 #[path = "status_observation_tests.rs"]
 mod status_observation_tests;
 
+#[path = "repositories_stage_reading_tests.rs"]
+mod repositories_stage_reading_tests;
+
 use super::*;
 use aterm_cli::macos_doctor::{
     InitialSetupObservation, InitialSetupSnapshot, InitialSetupSnapshotError,
@@ -793,6 +796,9 @@ struct Script {
     /// Replies bound to each reading when it starts, before a held read
     /// can be overtaken by a choice.
     readings: VecDeque<Vec<Observation>>,
+    /// A batch the next reading hands over first, before it waits on [`Self::hold`], as the
+    /// live reader hands over the rows read in this process before the repositories' read.
+    ahead: Vec<Observation>,
     /// The wall clock each reading is stamped with ([`SetupIo::now_secs`]).
     now_secs: u64,
     /// The rows the next reading's private reader is not admitted to: they come back withheld.
@@ -911,6 +917,7 @@ impl Script {
         reads: Vec::new(),
         read_checks: Vec::new(),
         readings: VecDeque::new(),
+        ahead: Vec::new(),
         now_secs: READ_AT,
         not_admitted: Vec::new(),
         hold: false,
@@ -1186,7 +1193,8 @@ impl TestIo {
         subjects: &[Subject],
         network: bool,
         admission: aterm_cli::macos_doctor::ObservationRead,
-    ) -> Vec<Observation> {
+        keep: &mut dyn FnMut(Vec<Observation>),
+    ) {
         let mut script = script();
         script
             .reads
@@ -1196,23 +1204,31 @@ impl TestIo {
             aterm_cli::macos_doctor::ObservationRead::ExplicitCheck
         ));
         let reading = script.readings.pop_front().unwrap_or_default();
+        let ahead = std::mem::take(&mut script.ahead);
         let not_admitted = std::mem::take(&mut script.not_admitted);
         let panics = std::mem::take(&mut script.panic_read);
         SCRIPT_MOVED.notify_all();
-        drop(wait_while(script, |script| script.hold));
-        assert!(!panics, "injected reader unwind");
+        drop(script);
         // A private row its reader was not admitted to comes back withheld, as the live
         // reader returns it.
-        reading
-            .into_iter()
-            .map(|seen| {
-                if not_admitted.contains(&seen.subject) {
-                    Observation::withheld(seen.subject)
-                } else {
-                    seen
-                }
-            })
-            .collect()
+        let admitted = |reading: Vec<Observation>| -> Vec<Observation> {
+            reading
+                .into_iter()
+                .map(|seen| {
+                    if not_admitted.contains(&seen.subject) {
+                        Observation::withheld(seen.subject)
+                    } else {
+                        seen
+                    }
+                })
+                .collect()
+        };
+        if !ahead.is_empty() {
+            keep(admitted(ahead));
+        }
+        drop(wait_while(self::script(), |script| script.hold));
+        assert!(!panics, "injected reader unwind");
+        keep(admitted(reading));
     }
 
     fn save_stop(revision: u64) -> Result<(), String> {
@@ -4249,11 +4265,11 @@ fn queued_observation_intents_keep_a_draft_check_across_a_focus_refresh() {
     let queued = setup_readings();
     // Keep the second source's actual reader held after A finishes, so
     // the completed source cannot hide inside a whole-batch progress bit.
-    SETUP_IO.write().unwrap().read = |plan, subjects, network, admission| {
+    SETUP_IO.write().unwrap().read = |plan, subjects, network, admission, keep| {
         if plan.vault_url.ends_with("/draft-b") {
             change(|script| script.hold = true);
         }
-        TestIo::read(plan, subjects, network, admission)
+        TestIo::read(plan, subjects, network, admission, keep);
     };
     release_readings();
     wait_until("the explicit other-source Check starts", || {
@@ -4999,7 +5015,11 @@ fn an_interrupted_pass_retires_held_readings_before_releasing_its_leases() {
         assert_eq!(SETUP_WAKES.count(), wakes, "no false recovery wake");
         let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
         assert!(!refresh.forced);
-        assert_eq!(refresh.subjects, Subject::all());
+        assert_eq!(
+            refresh.subjects,
+            [preference],
+            "the pass's end reads again only the rows of the stage that ran"
+        );
         observe_rows(refresh);
         assert!(
             OBSERVED_ROWS
@@ -5386,8 +5406,21 @@ fn preference_readings_retire_cached_and_held_reads() {
         );
         assert_eq!(ready, admitted, "{withdrawal}");
         assert!(OBSERVED_ROWS.lock().unwrap().rows.contains(&vault));
-        let refresh = OBSERVE_QUEUE.lock().unwrap().next.take().unwrap();
-        assert_eq!(refresh.subjects.contains(&caps), !admitted, "{withdrawal}");
+        // The stage's row is read again unless its own run read it back; the pass's end reads
+        // no row of a stage that did not run (the Dock's stage leaves Caps Lock's reading).
+        let refresh = OBSERVE_QUEUE.lock().unwrap().next.take();
+        assert_eq!(
+            refresh
+                .as_ref()
+                .is_some_and(|refresh| refresh.subjects.contains(&stage_subject)),
+            !admitted,
+            "{withdrawal}"
+        );
+        assert!(
+            withdrawal != "scope"
+                || !refresh.is_some_and(|refresh| refresh.subjects.contains(&caps)),
+            "a stage that did not run is not read again"
+        );
         assert_eq!(
             native.calls(),
             paid_commands,

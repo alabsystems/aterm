@@ -27,7 +27,7 @@ use aterm_secrets::age::Identity;
 use aterm_secrets::commons::binding::Request;
 use aterm_secrets::membership_log::{
     Body, Draft, Entrant, EpochAudience, Evidence, Inserted, Kind, Log, MemberId, Record, RecordId,
-    Store, decode_records, encode_records, node_proof_message,
+    Store, decode_records, node_proof_message, read_records,
 };
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use std::collections::{BTreeMap, BTreeSet};
@@ -229,7 +229,7 @@ fn census(bytes: &[u8], log: &Log) -> Result<()> {
         let mut count = |key: String| {
             let entry = kinds.entry(key).or_default();
             entry.0 += 1;
-            entry.1 += r.bytes().len();
+            entry.1 += r.wire_len();
         };
         count(format!("{:?}", r.kind()));
         edges += r.parents().len();
@@ -792,7 +792,7 @@ fn sign_log(mix: Mix) -> Result<Log> {
 /// Sign a log of the shape `name` and write its records file to `out`.
 fn build_log(name: &str, out: &str) -> Result<()> {
     let log = timed("sign", || sign_log(shape(name)?))?;
-    let stream = encode_records(log.records());
+    let stream = read_records(log.records())?;
     std::fs::write(out, &stream)?;
     println!(
         "wrote {} records, {} bytes, {} members to {out}",

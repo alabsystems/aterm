@@ -4,13 +4,14 @@
 //! Private vault repository inventory and native cloning through [`crate::git_credential`].
 //! An explicit init.toml profile can instead ask `agh` for that account's live inventory.
 
+use super::checkout_inputs::{PassWrites, Wrote};
 use super::{
     Asked, Github, INPUT_MAX, TokenUnread, asked, decode, get, identity, keychain, read_token,
     repos,
 };
 use crate::engine::Place;
 use crate::git_credential::{Git, Lookups};
-use crate::init_observe::{LastReading, Reading, Wait};
+use crate::init_observe::{LastReading, Reading, RepositoryCounts, Wait};
 use crate::items::{Ctx, Item};
 use crate::model::{ItemReport, Mode, Probe, User};
 use crate::port::{GithubError, GithubFailure, Secret, System};
@@ -18,8 +19,10 @@ use crate::sync::repository_refresh::{Admission, Execution, RepositoryPass, Tick
 use aterm_converge::{Class, Layer, Remedy, Requires, StoodAside};
 use aterm_secrets::converge::RepositoryWork;
 use aterm_types::macos_setup::FailureKind;
+use std::collections::BTreeSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 /// The repositories the signed-in account owns, private ones included. Its forks and archived
@@ -34,28 +37,13 @@ const GITHUB_STEP: &str = "github.settings";
 /// Preserved checkout work is separate from the settings remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
 
-/// What a local read of the private inventory found ([`automatic_inventory_counts`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct InventoryCounts {
-    /// Repositories present with their required dependencies.
-    pub(crate) present: usize,
-    /// Matching checkouts without a commit that no current empty-remote proof covers. A local
-    /// read cannot tell an empty remote from one with commits: only a read of the remote does.
-    pub(crate) unborn: usize,
-    /// Repositories the inventory selects.
-    pub(crate) total: usize,
-}
-
-impl InventoryCounts {
-    /// Every selected repository has a matching checkout here, ready or without a commit.
-    #[must_use]
-    pub(crate) const fn all_here(&self) -> bool {
-        self.present + self.unborn == self.total
-    }
-}
+/// The line of a row that stood aside because another pass holds the repository lease
+/// ([`Wait::OtherPass`]).
+const OTHER_PASS: &str = "another aterm pass holds this account's repository lease (align.lock); \
+                          this row reads again once it lets go";
 
 /// A nonempty automatic selection can publish a count with every repository here
-/// ([`InventoryCounts::all_here`]) only after the captured default source's pinned credential
+/// ([`RepositoryCounts::all_here`]) only after the captured default source's pinned credential
 /// route also works. Empty selection checks no sign-in.
 /// Missing work is left to the native
 /// batch's ordinary route check, rather than invoking the helper twice before cloning.
@@ -65,7 +53,7 @@ impl InventoryCounts {
 pub(crate) fn automatic_inventory_counts(
     sys: &dyn System,
     ctx: &Ctx,
-) -> Result<Option<InventoryCounts>, String> {
+) -> Result<Option<RepositoryCounts>, String> {
     if !super::uses_vault_inventory(sys, ctx)? {
         return Ok(None);
     }
@@ -80,7 +68,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     ctx: &Ctx,
     captured: &InitialRepositoryInputs,
     readback: Option<&RepositoryReadback>,
-) -> Result<Option<InventoryCounts>, String> {
+) -> Result<Option<RepositoryCounts>, String> {
     captured.validate_default_context(sys, ctx)?;
     if captured.local.is_err()
         && let Some(selection) = super::RepositorySelection::capture(sys, ctx)?
@@ -88,11 +76,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     {
         captured.validate_selection(sys, ctx)?;
         selection.ensure_current(sys)?;
-        return Ok(Some(InventoryCounts {
-            present: 0,
-            unborn: 0,
-            total: 0,
-        }));
+        return Ok(Some(RepositoryCounts::default()));
     }
     let local = captured.local.as_ref().map_err(|block| block.why.clone())?;
     let inventory = local
@@ -105,12 +89,7 @@ pub(crate) fn automatic_inventory_counts_captured(
             proof.user == captured.user && proof.source.as_ref() == captured.source.as_ref()
         })
         .map_or(&[][..], |proof| proof.empty.as_slice());
-    let standing = repos::partition_with_empty(sys, &captured.user, listed, empty)?;
-    let counts = InventoryCounts {
-        present: standing.present.len(),
-        unborn: standing.unborn.len(),
-        total: listed.len(),
-    };
+    let counts = repos::partition_with_empty(sys, &captured.user, listed, empty)?.counts();
     // capture_ready released the shared materialization lock before any helper runs.
     let lookups = if !listed.is_empty() && counts.all_here() {
         let helper = super::helper(sys, &captured.user);
@@ -137,8 +116,70 @@ pub(crate) fn automatic_inventory_counts_captured(
     Ok(Some(counts))
 }
 
+/// Which of the stage's repository items a run binds. Acquisition always runs before the
+/// refresh: a missing repository never waits behind fetches of the ones already here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepositorySteps {
+    /// Acquisition ([`NativeRepositories`]), then the refresh of the checkouts that were here
+    /// before it ([`RepositoryRefresh`]): System State's stage and `aterm init`.
+    Both,
+    /// Acquisition alone: the converge pass's `sync.clone`, and an `aterm init` whose `--only`
+    /// names the acquisition's row but not the refresh's ([`Self::named_by`]).
+    Acquisition,
+    /// The refresh alone: the converge pass's `sync.refresh`, after `sync.clone`.
+    Refresh,
+}
+
+impl RepositorySteps {
+    const fn acquires(self) -> bool {
+        matches!(self, Self::Both | Self::Acquisition)
+    }
+
+    const fn refreshes(self) -> bool {
+        matches!(self, Self::Both | Self::Refresh)
+    }
+
+    /// The steps an `aterm init` run whose `--only` words are `only` binds for `user`'s
+    /// repositories: acquisition alone where the words select its row
+    /// (`init.github.native@<user>`) but not the refresh's (`init.github.refresh@<user>`), so
+    /// the acquisition hands its lease to no refresh, which that run would never start, and
+    /// lets it go itself ([`NativeRepositories::release_lease`]); both otherwise (no words
+    /// keep every row, and the run's selection drops the ones its words do not name).
+    pub(super) fn named_by(only: &[String], user: &str) -> Self {
+        let selected = |id: &str| {
+            only.iter()
+                .any(|word| aterm_converge::selects(word, id, FAMILY, Some(Layer::Workstation)))
+        };
+        if selected(acquisition_id(user).as_str()) && !selected(refresh_id(user).as_str()) {
+            Self::Acquisition
+        } else {
+            Self::Both
+        }
+    }
+}
+
+/// The family both repository rows share, which `--only github` names.
+const FAMILY: &str = "github";
+
+/// The acquisition's row id for `user` ([`NativeRepositories`]): `init.github.native@<user>`.
+fn acquisition_id(user: &str) -> String {
+    format!("{}.native@{user}", super::ID)
+}
+
+/// The refresh's row id for `user` ([`RepositoryRefresh`]): `init.github.refresh@<user>`.
+fn refresh_id(user: &str) -> String {
+    format!("{}.refresh@{user}", super::ID)
+}
+
 pub(super) fn run(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<RepositoryRun, String> {
-    run_with(sys, ctx, mode, RepositoryWork::Refresh, None)
+    run_with(
+        sys,
+        ctx,
+        mode,
+        RepositoryWork::Refresh,
+        RepositorySteps::Both,
+        None,
+    )
 }
 
 pub(super) fn run_captured(
@@ -146,32 +187,58 @@ pub(super) fn run_captured(
     ctx: &Ctx,
     mode: Mode,
     work: RepositoryWork,
+    steps: RepositorySteps,
     inputs: InitialRepositoryInputs,
     current: Box<dyn Fn() -> Result<bool, String> + Send + Sync>,
 ) -> Result<RepositoryRun, String> {
-    run_with(sys, ctx, mode, work, Some(Captured { inputs, current }))
+    run_with(
+        sys,
+        ctx,
+        mode,
+        work,
+        steps,
+        Some(Captured { inputs, current }),
+    )
 }
 
-/// `aterm init`'s repository item for `user` with no `[github]` token source in init.toml: the
+/// `aterm init`'s repository items for `user` with no `[github]` token source in init.toml: the
 /// same stage the first launch runs, after the secrets item `after` names when one does (the
-/// vault writes the token it reads). With no `[github]` table at all (`unasked`), a Mac with no
-/// token is no stage of this run.
-pub(super) fn item(
+/// vault writes the token it reads), its acquisition and then, where `steps` says so, the
+/// refresh of what was here before it. With no `[github]` table at all (`unasked`), a Mac with
+/// no token is no stage of this run. An apply (`mode`) decides the repository lease before
+/// either item reads anything; a plan never takes it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stage's selection, its run's mode and the enclosing pass's lease"
+)]
+pub(super) fn items(
     user: &User,
     after: Option<String>,
     unasked: bool,
+    mode: Mode,
     work: RepositoryWork,
+    steps: RepositorySteps,
     execution: Option<Execution>,
     withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
-) -> Box<dyn Item> {
-    Box::new(NativeRepositories {
+) -> Vec<Box<dyn Item>> {
+    let core = Arc::new(NativeRepositories {
         after,
         unasked,
+        mode,
         work,
         execution,
         local_current: withdrawal_current,
+        refresh_follows: steps == RepositorySteps::Both,
         ..NativeRepositories::new(user.clone(), None)
-    })
+    });
+    let mut items: Vec<Box<dyn Item>> = Vec::new();
+    if steps.acquires() {
+        items.push(Box::new(Acquisition(Arc::clone(&core))));
+    }
+    if steps.refreshes() {
+        items.push(Box::new(RepositoryRefresh::new(core)));
+    }
+    items
 }
 
 pub(super) fn withdrawal_item(
@@ -231,6 +298,7 @@ fn run_with(
     ctx: &Ctx,
     mode: Mode,
     work: RepositoryWork,
+    steps: RepositorySteps,
     captured: Option<Captured>,
 ) -> Result<RepositoryRun, String> {
     let [user] = ctx.users.as_slice() else {
@@ -239,6 +307,13 @@ fn run_with(
     // Candidate observation cannot replace the ordinary Native blocker's typed report.
     // Only a successful local withdrawal reading bypasses the paired repository stage.
     if let Ok(Some(withdrawal)) = super::RepositoryCredentialWithdrawal::capture(sys, ctx) {
+        if !steps.acquires() {
+            // A withdrawal retires the credential's checkouts: there is nothing to refresh.
+            return Ok(RepositoryRun {
+                rows: Vec::new(),
+                readback: None,
+            });
+        }
         // Preserve the enclosing caller's independent holds even though an empty selection
         // cannot satisfy the ordinary paired token capture.
         let current: Box<dyn Fn() -> Result<bool, String> + Send + Sync> = match captured {
@@ -250,31 +325,35 @@ fn run_with(
             readback: None,
         });
     }
-    if mode == Mode::Apply {
+    if mode == Mode::Apply && steps.acquires() {
         // What a clone killed mid-way left (design §6.5): never a clone still running.
         repos::sweep_staging(sys, user);
     }
     // The keychain block goes first, whatever GitHub says below.
     let keychain = keychain::Keychain::new(user.clone());
-    let item = NativeRepositories {
+    let item = Arc::new(NativeRepositories {
+        mode,
         work,
         observe_remote: mode == Mode::Apply || work == RepositoryWork::Refresh,
+        refresh_follows: steps == RepositorySteps::Both,
         ..NativeRepositories::new(user.clone(), captured)
-    };
+    });
+    let refresh = RepositoryRefresh::new(Arc::clone(&item));
     let place = || Place {
         layer: Layer::Workstation,
         class: Class::Install,
         requires: Requires::Account,
         remedy: Remedy::Command("aterm init".into()),
     };
-    let bound = crate::engine::bind(
-        [
-            (&keychain as &dyn Item, place()),
-            (&item as &dyn Item, place()),
-        ],
-        sys,
-        ctx,
-    );
+    let mut items: Vec<(&dyn Item, Place)> = Vec::new();
+    if steps.acquires() {
+        items.push((&keychain as &dyn Item, place()));
+        items.push((&*item as &dyn Item, place()));
+    }
+    if steps.refreshes() {
+        items.push((&refresh as &dyn Item, place()));
+    }
+    let bound = crate::engine::bind(items, sys, ctx);
     let rows = if mode == Mode::Apply {
         let mut journal = sys.journal()?;
         aterm_converge::run(&bound, mode, journal.as_mut())
@@ -282,7 +361,7 @@ fn run_with(
         aterm_converge::run(&bound, mode, &mut aterm_converge::ReadOnly)
     }
     .map_err(|why| why.to_string())?;
-    let readback = if mode == Mode::Apply {
+    let readback = if mode == Mode::Apply && steps.acquires() {
         item.readback(sys)?
     } else {
         None
@@ -326,16 +405,44 @@ impl std::fmt::Debug for RepositoryReadback {
     }
 }
 
+/// The stage's acquisition (`init.github.native@<user>`): it clones missing repositories, gives
+/// matching checkouts without a commit their origin's first commit, and repairs required
+/// dependencies, whatever the caller's [`RepositoryWork`]. It alone reads presence and standing
+/// for System State's GitHub repositories row and `sync.clone`. The refresh of checkouts already
+/// here is a row of its own after it ([`RepositoryRefresh`]), over this same captured input and
+/// lease.
 struct NativeRepositories {
     user: User,
-    /// The caller's scheduling intent; it grants no authority over the captured source.
+    /// The run's mode. An apply decides the repository lease before either item's probe reads a
+    /// checkout or a remote ([`Self::lease_free`]); a plan never takes the lease, and reads
+    /// instead whether another owner works the repositories now.
+    mode: Mode,
+    /// The caller's scheduling intent, which only [`RepositoryRefresh`] reads; it grants no
+    /// authority over the captured source.
     work: RepositoryWork,
     /// An apply acquires missing work; a Refresh also admits read-only remote observation.
     /// A Plan/Repair readback alone cannot turn unseen remote state into missing work.
     observe_remote: bool,
     execution: Option<Execution>,
+    /// The shared refresh ticket [`RepositoryRefresh`] holds between its admission and finish.
     refresh: Mutex<Option<ActiveRefresh>>,
-    lease: Mutex<Option<Arc<RepositoryPass>>>,
+    /// The repository lease an apply holds: acquisition's until its read-back, or the end of
+    /// its row where no read-back comes ([`Item::row_ended`]), or, where the refresh follows it
+    /// in this run ([`Self::refresh_follows`]), until the refresh row ends.
+    lease: Mutex<Option<Lease>>,
+    /// Whether this run binds the refresh after this acquisition: the acquisition then leaves
+    /// its lease to the refresh, so no other pass takes the lock between the two rows.
+    refresh_follows: bool,
+    /// Why the last probe stood aside before it read anything: another pass holds the lease
+    /// ([`Item::read_aside`]).
+    lease_aside: Mutex<Option<StoodAside>>,
+    /// Set by an apply that went through: the probe after it is its read-back, which decides no
+    /// lease and ends the one the apply held.
+    applied: AtomicBool,
+    /// The checkouts here (ready or needing dependencies) when acquisition began: the only ones
+    /// [`RepositoryRefresh`] refreshes. `None` where no acquisition ran, which leaves every
+    /// checkout here to it.
+    before: Mutex<Option<BTreeSet<PathBuf>>>,
     /// How many repositories the last probe found and whether it signed in, for
     /// System State.
     reading: LastReading,
@@ -351,6 +458,9 @@ struct NativeRepositories {
     /// The apply reuses the probe's inventory and verdicts. Completion reuses only the
     /// inventory: every checkout and required dependency is read again after the batch.
     carried: Mutex<Option<Carried>>,
+    /// What the last probe read of the checkouts, whatever it decided: whether the private
+    /// inventory is empty, and its partition. The refresh after it reads no worktree again.
+    last: Mutex<Option<(bool, repos::Partition)>>,
     /// What the last apply's clones made of their hook installers ([`repos::Cloned::hooks`]),
     /// which the read-back's row says.
     hooks: Mutex<Vec<String>>,
@@ -386,6 +496,14 @@ pub struct InitialRepositoryInputs {
 struct ActiveRefresh {
     pass: Arc<RepositoryPass>,
     ticket: Ticket,
+}
+
+/// The repository lease a run holds ([`NativeRepositories::lease`]).
+struct Lease {
+    pass: Arc<RepositoryPass>,
+    /// The shared refresh record's epochs as this run found them when it took the lock itself;
+    /// `None` for an enclosing pass's lease, whose execution carries its own request.
+    observed: Option<aterm_secrets::converge::RefreshVersion>,
 }
 
 #[derive(Clone)]
@@ -704,20 +822,29 @@ impl NativeRepositories {
         })
     }
 
+    /// A stage for `user`. It begins no record of checkout facts: it reads through the one its
+    /// pass's owner began ([`crate::port::CheckoutRecords::new_pass`]), so `sync.clone`'s stage
+    /// and `sync.refresh`'s after it read each checkout once between them.
     fn new(user: User, captured: Option<Captured>) -> Self {
         Self {
             user,
+            mode: Mode::Plan,
             work: RepositoryWork::Refresh,
             observe_remote: true,
             execution: None,
             refresh: Mutex::new(None),
             lease: Mutex::new(None),
+            refresh_follows: false,
+            lease_aside: Mutex::new(None),
+            applied: AtomicBool::new(false),
+            before: Mutex::new(None),
             reading: LastReading::default(),
             captured,
             prepared: OnceLock::new(),
             after: None,
             unasked: false,
             carried: Mutex::new(None),
+            last: Mutex::new(None),
             hooks: Mutex::new(Vec::new()),
             selection: Mutex::new(None),
             aside: Mutex::new(None),
@@ -726,6 +853,15 @@ impl NativeRepositories {
             local_withdrawal: None,
             local_current: None,
         }
+    }
+
+    /// Whether this run's last probe read an empty private inventory, and the checkouts it
+    /// read, whatever it decided.
+    fn last_read(&self) -> Option<(bool, repos::Partition)> {
+        self.last
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The inventory and verdicts the step before left for this one, taken.
@@ -790,10 +926,10 @@ impl NativeRepositories {
 
 impl Item for NativeRepositories {
     fn id(&self) -> String {
-        format!("{}.native@{}", super::ID, self.user.name)
+        acquisition_id(&self.user.name)
     }
     fn family(&self) -> &'static str {
-        "github"
+        FAMILY
     }
     fn title(&self) -> String {
         "GitHub repositories from synced development credentials".into()
@@ -803,6 +939,7 @@ impl Item for NativeRepositories {
     }
 
     fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        *self.last.lock().unwrap_or_else(PoisonError::into_inner) = None;
         *self
             .selection
             .lock()
@@ -819,6 +956,11 @@ impl Item for NativeRepositories {
         // What the last apply's clones made of their hook installers: whatever this read says,
         // the switch turned off since included, its row says that too.
         let hooks = std::mem::take(&mut *self.hooks.lock().unwrap_or_else(PoisonError::into_inner));
+        *self
+            .lease_aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        let read_back = self.applied.swap(false, Ordering::SeqCst);
         let read = (|| -> Probe {
             self.reading.set(None);
             if let Some(withdrawal) = &self.local_withdrawal {
@@ -836,6 +978,14 @@ impl Item for NativeRepositories {
                 return Probe::NotApplicable {
                     why: "repository setup is disabled in init.toml's [github] table".into(),
                 };
+            }
+            // The lease is decided before anything else is read: a row another pass holds it
+            // from reads no checkout and asks GitHub nothing, and stands aside until that pass
+            // lets go. A read-back decides nothing: its apply held the lease. A system that
+            // keeps no repository record cannot say, and reads on: an apply that needs the lease
+            // fails there with that reason.
+            if !read_back && matches!(self.lease_free(sys), Ok(false)) {
+                return self.held_elsewhere();
             }
             let paired = self.read(sys);
             if paired.is_err()
@@ -891,9 +1041,6 @@ impl Item for NativeRepositories {
                     self.ensure_current(sys).map_err(Block::from)?;
                     return Ok((plan, standing, None));
                 }
-                if let Some(why) = repos::named(&standing.git_waits) {
-                    return Err(Block::of(Wait::GitReadiness)(why));
-                }
                 let lookups = self.lookups(sys, &plan)?;
                 self.ensure_current(sys).map_err(Block::from)?;
                 if lookups.ready() && self.observe_remote && !standing.unborn.is_empty() {
@@ -902,14 +1049,14 @@ impl Item for NativeRepositories {
                     let mut preserved = Vec::new();
                     for candidate in &standing.unborn {
                         plan.empty.retain(|proof| !proof.is_for(&candidate.0));
+                        // A read that fails withholds nothing else: the checkout stays owed, and
+                        // acquisition reads its remote again, failing only its own line.
                         match repos::observe_unborn(sys, &self.user, candidate, &recorded, &|| {
                             self.ensure_current(sys)
-                        })
-                        .map_err(|why| Block::of(Wait::Unreached)(why.to_string()))?
-                        {
-                            repos::UnbornObservation::Empty(empty) => plan.empty.push(*empty),
-                            repos::UnbornObservation::Owed => {}
-                            repos::UnbornObservation::Preserved(why) => {
+                        }) {
+                            Ok(repos::UnbornObservation::Empty(empty)) => plan.empty.push(*empty),
+                            Ok(repos::UnbornObservation::Owed) | Err(_) => {}
+                            Ok(repos::UnbornObservation::Preserved(why)) => {
                                 preserved.push((candidate.1.clone(), why))
                             }
                         }
@@ -933,14 +1080,14 @@ impl Item for NativeRepositories {
                         super::develop_checkouts(sys, &self.user).map_err(Block::from)?;
                     let mut preserved = Vec::new();
                     for (repo, path) in &standing.unborn {
-                        let why = repos::local_unborn(
+                        // A local read that fails leaves the checkout owed: acquisition reads it
+                        // again with its remote, failing only its own line.
+                        if let Ok(Some(why)) = repos::local_unborn(
                             sys,
                             &self.user,
                             &(repo.clone(), path.clone()),
                             &recorded,
-                        )
-                        .map_err(Block::from)?;
-                        if let Some(why) = why {
+                        ) {
                             preserved.push((path.clone(), format!("~/{}: {why}", repo.name)));
                         }
                     }
@@ -951,6 +1098,17 @@ impl Item for NativeRepositories {
                         .notes
                         .extend(preserved.into_iter().map(|(_, why)| why));
                     self.ensure_current(sys).map_err(Block::from)?;
+                }
+                *self.last.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((plan.empty_inventory, standing.clone()));
+                // A dependency waiting for a capable Git holds back only its own repair: the row
+                // waits for Git where nothing else is left to acquire.
+                if standing.missing.is_empty()
+                    && standing.dependencies.is_empty()
+                    && standing.unborn.is_empty()
+                    && let Some(why) = repos::named(&standing.git_waits)
+                {
+                    return Err(Block::of(Wait::GitReadiness)(why));
                 }
                 // Signed in, with no repository left that fits: the row waits for room instead of
                 // a pass that would clone nothing.
@@ -991,12 +1149,9 @@ impl Item for NativeRepositories {
                 };
             };
             let ready = lookups.ready();
-            let count = plan.repositories.len();
-            let present = standing.present.len();
-            let missing = count.saturating_sub(present);
+            let counts = standing.counts();
             self.reading.set(Some(Reading::Repositories {
-                present,
-                count,
+                counts,
                 signed_in: ready,
             }));
             let mut notes = plan.notes.clone();
@@ -1004,9 +1159,9 @@ impl Item for NativeRepositories {
             let probe = if let Lookups::Not(why) = &lookups {
                 Probe::Blocked {
                     why: format!(
-                        "{missing} of {count} repositories missing, and aterm's GitHub route does \
-                     not hand back the synced token: {why}; aterm never keeps the token in the \
-                     login keychain"
+                        "{}; aterm's GitHub route does not hand back the synced token: {why}; \
+                         aterm never keeps the token in the login keychain",
+                        counts.summary()
                     ),
                 }
             } else if standing.missing.is_empty()
@@ -1017,14 +1172,15 @@ impl Item for NativeRepositories {
                 Probe::Person {
                     step: REPOSITORIES_STEP.into(),
                     how: format!(
-                        "{present} of {count} repositories ready; preserved work or dependency metadata blocks completion: {}",
+                        "{}; preserved work or dependency metadata blocks completion: {}",
+                        counts.summary(),
                         repos::named(&standing.notes).unwrap_or_default()
                     ),
                 }
-            } else if missing == 0 {
+            } else if counts.ready == counts.total() {
                 let mut now = format!(
-                    "{count} matching worktrees present; aterm's GitHub route hands back the synced \
-                 token"
+                    "{}; aterm's GitHub route hands back the synced token",
+                    counts.summary()
                 );
                 if let Some(left) = repos::named(&notes) {
                     now.push_str(&format!("; left as they are: {left}"));
@@ -1032,10 +1188,12 @@ impl Item for NativeRepositories {
                 Probe::Ok { now }
             } else {
                 Probe::Change {
-                from: format!("{missing} of {count} repositories missing or needing required dependencies"),
-                to: "clone missing repositories and their required dependencies through aterm's GitHub route; preserve existing work"
-                    .into(),
-            }
+                    from: counts.summary(),
+                    to: "clone missing repositories, give checkouts without a commit their \
+                         first, and repair required dependencies through aterm's GitHub route; \
+                         preserve existing work"
+                        .into(),
+                }
             };
             let probe = if matches!(probe, Probe::Ok { .. }) {
                 match super::RepositorySelection::acknowledgment_due(sys, &self.user) {
@@ -1043,11 +1201,10 @@ impl Item for NativeRepositories {
                         *self
                             .acknowledge
                             .lock()
-                            .unwrap_or_else(PoisonError::into_inner) =
-                            self.work == RepositoryWork::Repair;
+                            .unwrap_or_else(PoisonError::into_inner) = true;
                         Probe::Change {
                             from: "the delivered development credential has no consumer acknowledgment yet".into(),
-                            to: "confirm the paired credential route under this pass's repository intent".into(),
+                            to: "confirm the paired credential route".into(),
                         }
                     }
                     Ok(false) => probe,
@@ -1059,43 +1216,64 @@ impl Item for NativeRepositories {
             self.carry(Carried::Probed(plan, standing));
             probe
         })();
-        let read = repos::with_hooks(read, &hooks);
-        if let Err(why) = self.finish_refresh(sys, matches!(read, Probe::Ok { .. })) {
-            return Probe::Blocked { why };
+        // A change keeps the lease the probe took for the apply that follows; a row the engine
+        // ends without that apply lets it go then (`row_ended`). A read-back ends the lease its
+        // apply held, and so does a probe no apply follows, or each leaves it to the refresh
+        // that follows.
+        if read_back || !matches!(read, Probe::Change { .. }) {
+            self.release_lease();
         }
-        read
+        repos::with_hooks(read, &hooks)
     }
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         self.apply_guarded(sys, ctx, &|| Ok(()))
     }
 
-    fn refresh_guarded(
+    fn apply_guarded(
         &self,
         sys: &dyn System,
         ctx: &Ctx,
-        current: &(dyn Fn() -> Result<(), String> + Sync),
-    ) -> Option<Result<(), String>> {
-        if self.work != RepositoryWork::Refresh {
-            return None;
-        }
-        if let Err(why) = current().and_then(|()| self.ensure_current(sys)) {
-            return Some(Err(why));
-        }
-        match configuration(sys, &self.user) {
-            Ok(None) => Some(self.apply_guarded(sys, ctx, current)),
-            Ok(Some(_)) => None,
-            Err(why) => Some(Err(why)),
-        }
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let applied = self.apply_owed(sys, ctx, authorized);
+        // The engine reads back only an apply that went through and did not stand aside.
+        self.applied.store(
+            applied.is_ok() && self.stood_aside().is_none(),
+            Ordering::SeqCst,
+        );
+        applied
     }
 
-    fn refresh_changes(&self, sys: &dyn System, _ctx: &Ctx) -> bool {
-        self.local_withdrawal.is_none()
-            && self.work == RepositoryWork::Refresh
-            && matches!(configuration(sys, &self.user), Ok(None))
+    fn stood_aside(&self) -> Option<StoodAside> {
+        self.aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
-    fn apply_guarded(
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.lease_aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
+    }
+
+    /// The row ended with nothing after its last probe: the lease that probe or its apply kept
+    /// for what did not follow (an apply the engine did not make, a read-back it skipped after a
+    /// stand-aside) goes now, or passes to the refresh bound after it.
+    fn row_ended(&self) {
+        self.release_lease();
+    }
+}
+
+impl NativeRepositories {
+    /// [`Item::apply_guarded`]: what the probe found owed, under the lease it took.
+    fn apply_owed(
         &self,
         sys: &dyn System,
         ctx: &Ctx,
@@ -1176,27 +1354,14 @@ impl Item for NativeRepositories {
             self.carry(Carried::Applied(plan));
             return Ok(());
         }
-        let work = self.begin_refresh(sys)?;
-        let result = self.apply_batch(sys, ctx, authorized, work);
+        let result = self.apply_batch(sys, ctx, authorized);
         if result.is_err() {
-            self.finish_refresh(sys, false)?;
+            // No read-back follows a failed apply to end (or hand on) the lease.
+            self.release_lease();
         }
         result
     }
 
-    fn stood_aside(&self) -> Option<StoodAside> {
-        self.aside
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
-        self.reading.detail()
-    }
-}
-
-impl NativeRepositories {
     fn withdrawal_current(&self) -> Result<(), String> {
         if let Some(current) = &self.local_current
             && !current()?
@@ -1258,12 +1423,92 @@ impl NativeRepositories {
         Ok(())
     }
 
+    /// What every effect of a batch checks first: the caller's authorization, the stage still
+    /// on, the captured source current, and `[develop]`'s checkouts as `recorded` read them.
+    fn batch_current(
+        &self,
+        sys: &dyn System,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+        recorded: &BTreeSet<PathBuf>,
+    ) -> Result<(), String> {
+        authorized()?;
+        if !super::settings_managed(sys, &self.user)? {
+            return Err("repository setup was disabled in init.toml during this pass".into());
+        }
+        self.ensure_current(sys)?;
+        authorized()?;
+        if *recorded != super::develop_checkouts(sys, &self.user)? {
+            return Err("develop checkout selection changed during this pass".into());
+        }
+        Ok(())
+    }
+
+    /// The record of the pass's own writes to the watched checkouts ([`PassWrites`]), under
+    /// the repository lease this run holds: none without one.
+    fn own_writes(&self, sys: &dyn System) -> Option<PassWrites> {
+        let pass = self
+            .lease
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|lease| Arc::clone(&lease.pass))?;
+        PassWrites::new(sys, &self.user, pass)
+    }
+
+    /// Repair the required dependencies of each of `dependencies`, checking `current` first:
+    /// each failure's line, and whether any failed on the network. A stop leaves the rest. With
+    /// `writes`, each repair is recorded as the pass's own write ([`PassWrites::around`]).
+    fn repair_dependencies(
+        &self,
+        sys: &dyn System,
+        dependencies: &[(repos::Repo, PathBuf)],
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+        writes: Option<&PassWrites>,
+    ) -> Result<(Vec<String>, bool), (String, Vec<String>)> {
+        let mut failed = Vec::new();
+        let mut network_failed = false;
+        for (repo, path) in dependencies {
+            if let Err(why) = current() {
+                return Err((why, failed));
+            }
+            let mut progress = crate::repository_progress::Progress::new(&repo.name, path.clone());
+            progress.placed = true;
+            progress.enter(crate::repository_progress::Phase::Dependencies);
+            sys.repository_progress(&progress);
+            let repair = || {
+                (
+                    super::dependencies::repair(sys, &self.user, path, repo, current),
+                    Wrote::Made,
+                )
+            };
+            let repaired = match writes {
+                Some(writes) => writes.around(sys, path, repair),
+                None => repair().0,
+            };
+            progress.usable = repaired.is_ok();
+            match &repaired {
+                Ok(()) => progress.enter(crate::repository_progress::Phase::Ready),
+                Err(why) => why.record_progress(&mut progress),
+            }
+            sys.repository_progress(&progress);
+            if let Err(why) = repaired {
+                network_failed |= why.is_network();
+                failed.push(format!("~/{}: {why}", repo.name));
+            }
+        }
+        Ok((failed, network_failed))
+    }
+
+    /// Acquire what the probe found owed: clone the missing repositories and give each matching
+    /// checkout without a commit its origin's first commit, in one pool ([`repos::clone_all`]),
+    /// then repair required dependencies. No checkout already here is fetched: that is
+    /// [`RepositoryRefresh`]'s, after this. A dependency waiting for a capable Git holds back
+    /// only its own repair; the row then stands aside waiting for Git.
     fn apply_batch(
         &self,
         sys: &dyn System,
         _ctx: &Ctx,
         authorized: &(dyn Fn() -> Result<(), String> + Sync),
-        work: RepositoryWork,
     ) -> Result<(), String> {
         authorized()?;
         self.ensure_current(sys)?;
@@ -1287,35 +1532,29 @@ impl NativeRepositories {
             }
         };
         let recorded = super::develop_checkouts(sys, &self.user)?;
-        let current = || {
-            authorized()?;
-            if !super::settings_managed(sys, &self.user)? {
-                return Err("repository setup was disabled in init.toml while cloning".into());
-            }
-            self.ensure_current(sys)?;
-            authorized()?;
-            if recorded != super::develop_checkouts(sys, &self.user)? {
-                return Err(
-                    "develop checkout selection changed while repositories were being refreshed"
-                        .into(),
-                );
-            }
-            Ok(())
-        };
+        let current = || self.batch_current(sys, authorized, &recorded);
         current()?;
         if plan.empty_inventory {
             self.carry(Carried::Applied(plan));
             return Ok(());
-        }
-        if let Some(why) = repos::named(&standing.git_waits) {
-            self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
-            return Err(why);
         }
         if let Lookups::Not(why) = self.lookups(sys, &plan)? {
             return Err(format!(
                 "aterm's GitHub route does not hand back the synced token: {why}; no repository \
                  was cloned"
             ));
+        }
+        // The default source's acquisition holds the repository lease, and so does an explicit
+        // profile's that writes into a checkout already here: the probe took it, and an apply
+        // made without that probe takes it now. Another pass holding it stands this row aside,
+        // as the probe would have: it is no failure.
+        if (configuration(sys, &self.user)?.is_none() || !standing.unborn.is_empty())
+            && !self.take_lease(sys)?
+        {
+            self.reading.set(Some(Reading::Waits(Wait::OtherPass)));
+            *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(StoodAside::Lock(OTHER_PASS.into()));
+            return Ok(());
         }
         // Show locally verified checkouts alongside acquisitions. These observations
         // describe this selected inventory; they authorize no repository effect.
@@ -1326,109 +1565,54 @@ impl NativeRepositories {
             progress.enter(crate::repository_progress::Phase::Ready);
             sys.repository_progress(&progress);
         }
-        let mut failed = Vec::new();
-        let mut network_failed = false;
         // A fresh Refresh probe has already observed its empty origins; repair uses only
         // this item's actual readback. A newly constructed item has neither observation.
         if !standing.unborn.is_empty() {
             standing =
                 repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
-            if !standing.unborn.is_empty() {
-                self.retain_repository_lease(sys)?;
-            }
             for candidate in &standing.unborn {
                 plan.empty.retain(|proof| !proof.is_for(&candidate.0));
-                match repos::acquire_unborn(
-                    sys,
-                    &self.user,
-                    std::slice::from_ref(candidate),
-                    &recorded,
-                    &current,
-                ) {
-                    Ok(empty) => plan.empty.extend(empty),
-                    Err(why) => {
-                        network_failed |= why.is_network();
-                        failed.push(why.to_string());
-                    }
-                }
-            }
-            standing =
-                repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
-        }
-        if work == RepositoryWork::Refresh && configuration(sys, &self.user)?.is_none() {
-            let refreshed =
-                repos::refresh_existing(sys, &self.user, &standing, &recorded, &current)?;
-            network_failed |= refreshed.network_failed;
-            failed.extend(refreshed.failed);
-            // A refreshed parent may declare different gitlinks. Never hydrate
-            // dependencies from the pre-refresh parent's cached verdict.
-            if refreshed.moved {
-                standing =
-                    repos::partition_with_empty(sys, &self.user, &plan.repositories, &plan.empty)?;
-                if let Some(why) = repos::named(&standing.git_waits) {
-                    self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
-                    failed.push(why);
-                }
             }
         }
-        if standing.missing.is_empty()
-            && standing.dependencies.is_empty()
-            && standing.unborn.is_empty()
-        {
-            if failed.is_empty() {
-                current()?;
-                self.acknowledge_credential(sys, &plan.token, &current)?;
-                current()?;
-            }
-            if network_failed
-                && let Err(why) = super::RepositorySelection::recover_refused_credential(
-                    sys,
-                    &self.user,
-                    &plan.token,
-                    &current,
-                )
-            {
-                failed.push(format!("credential recovery is unfinished: {why}"));
-            }
-            self.carry(Carried::Applied(plan));
-            return if failed.is_empty() {
-                Ok(())
-            } else {
-                Err(failed.join("; "))
-            };
-        }
+        // What the refresh after this row may fetch: only what was here before it.
+        *self.before.lock().unwrap_or_else(PoisonError::into_inner) = Some(
+            standing
+                .present
+                .iter()
+                .chain(&standing.dependencies)
+                .map(|(_, path)| path.clone())
+                .collect(),
+        );
         let guard = repos::CloneGuard::new(&current);
-        let mut cloned = repos::clone_all(sys, &self.user, &standing.missing, Some(&guard));
+        let writes = self.own_writes(sys);
+        let mut cloned = repos::clone_all(
+            sys,
+            &self.user,
+            &standing.missing,
+            &standing.unborn,
+            &recorded,
+            Some(&guard),
+            writes.as_ref(),
+        );
         plan.empty.append(&mut cloned.empty);
-        network_failed |= cloned.network_failed;
-        cloned.failed.extend(failed);
+        let mut network_failed = cloned.network_failed;
         let home = Path::new(&self.user.home);
         // Read once the clones and dependencies have taken their room.
         let room =
             |left: &[String]| repos::short_of_room(sys.volume(home).as_ref(), left, CHECK_AGAIN);
-        for (repo, path) in &standing.dependencies {
-            if let Err(why) = current() {
+        match self.repair_dependencies(sys, &standing.dependencies, &current, writes.as_ref()) {
+            Ok((failed, network)) => {
+                network_failed |= network;
+                cloned.failed.extend(failed);
+            }
+            Err((why, failed)) => {
+                cloned.failed.extend(failed);
                 return Err(repos::stopped_after_clones(
                     why,
                     cloned.failed,
                     room(&cloned.left),
                     &cloned.hooks,
                 ));
-            }
-            let mut progress = crate::repository_progress::Progress::new(&repo.name, path.clone());
-            progress.placed = true;
-            progress.enter(crate::repository_progress::Phase::Dependencies);
-            sys.repository_progress(&progress);
-            let repaired = super::dependencies::repair(sys, &self.user, path, repo, &current);
-            progress.usable = repaired.is_ok();
-            match &repaired {
-                Ok(()) => progress.enter(crate::repository_progress::Phase::Ready),
-                Err(why) => why.record_progress(&mut progress),
-            }
-            sys.repository_progress(&progress);
-            if let Err(why) = repaired {
-                network_failed |= why.is_network();
-                cloned.failed.push(format!("~/{}: {why}", repo.name));
             }
         }
         let room = room(&cloned.left);
@@ -1458,7 +1642,8 @@ impl NativeRepositories {
             self.reading.set(Some(Reading::Waits(Wait::DiskSpace)));
             failed.push(why);
         }
-        let acknowledged = if failed.is_empty() {
+        let git_wait = repos::named(&standing.git_waits);
+        let acknowledged = if failed.is_empty() && git_wait.is_none() {
             current()
                 .and_then(|()| self.acknowledge_credential(sys, &plan.token, &current))
                 .and_then(|()| current())
@@ -1469,13 +1654,23 @@ impl NativeRepositories {
         // every local destination and required dependency again against this same inventory.
         self.carry(Carried::Applied(plan));
         acknowledged?;
-        if failed.is_empty() {
-            *self.hooks.lock().unwrap_or_else(PoisonError::into_inner) = cloned.hooks;
-            Ok(())
-        } else {
+        if !failed.is_empty() {
+            if let Some(why) = git_wait {
+                self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
+                failed.push(why);
+            }
             failed.extend(cloned.hooks);
-            Err(failed.join("; "))
+            return Err(failed.join("; "));
         }
+        *self.hooks.lock().unwrap_or_else(PoisonError::into_inner) = cloned.hooks;
+        if let Some(why) = git_wait {
+            // Everything else was acquired; the dependencies that wait for Git are read again
+            // once it is ready. The read-back is not run: it would read the same wait.
+            self.reading.set(Some(Reading::Waits(Wait::GitReadiness)));
+            *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
+                Some(StoodAside::Waiting(why));
+        }
+        Ok(())
     }
 
     fn refresh_scope(
@@ -1488,15 +1683,10 @@ impl NativeRepositories {
         }
     }
 
-    fn begin_refresh(&self, sys: &dyn System) -> Result<RepositoryWork, String> {
+    /// Admit this run's refresh against the shared refresh record ([`RepositoryPass::admit`]),
+    /// holding the lease and the ticket until [`Self::finish_refresh`].
+    fn begin_refresh(&self, sys: &dyn System) -> Result<Admitted, String> {
         use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
-        if configuration(sys, &self.user)?.is_some() {
-            return Ok(self.work);
-        }
-        if self.work == RepositoryWork::Repair {
-            self.retain_repository_lease(sys)?;
-            return Ok(RepositoryWork::Repair);
-        }
         let scope = self.refresh_scope(sys)?;
         let execution = self.execution.clone().or_else(|| {
             self.captured
@@ -1506,76 +1696,153 @@ impl NativeRepositories {
         let execution = match execution {
             Some(execution) => execution,
             None => {
-                let access = sys.repository_pass()?;
+                // The lease this run's acquisition or this refresh's probe took, or a new one;
+                // none while another pass holds it, which this refresh then waits for.
+                if !self.take_lease(sys)? {
+                    return Ok(Admitted::Held);
+                }
+                let (pass, observed) = self
+                    .lease
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_ref()
+                    .and_then(|lease| Some((Arc::clone(&lease.pass), lease.observed?)))
+                    .ok_or("this run's repository lease carries no refresh observation")?;
                 Execution {
                     request: RepositoryRequest::Refresh(RefreshRequest::after(
                         Some(scope),
-                        access.observed.version,
+                        observed,
                     )),
-                    pass: access
-                        .pass
-                        .ok_or("another repository/converge pass holds align.lock")?,
+                    pass,
                 }
             }
         };
         let RepositoryRequest::Refresh(request) = execution.request else {
-            *self.lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(execution.pass);
-            return Ok(RepositoryWork::Repair);
+            return Ok(Admitted::Fulfilled);
         };
-        let (work, ticket) =
-            match execution
-                .pass
-                .admit(request, scope, sys.now().saturating_mul(1000))?
-            {
-                Admission::Refresh(ticket) => (RepositoryWork::Refresh, Some(ticket)),
-                Admission::Fulfilled => (RepositoryWork::Repair, None),
-                Admission::Waiting => {
-                    return Err("repository refresh is waiting for its shared retry".into());
-                }
-            };
-        *self.lease.lock().unwrap_or_else(PoisonError::into_inner) =
-            Some(Arc::clone(&execution.pass));
-        *self.refresh.lock().unwrap_or_else(PoisonError::into_inner) =
-            ticket.map(|ticket| ActiveRefresh {
-                pass: execution.pass,
-                ticket,
-            });
-        Ok(work)
+        let ticket = match execution
+            .pass
+            .admit(request, scope, sys.now().saturating_mul(1000))?
+        {
+            Admission::Refresh(ticket) => ticket,
+            Admission::Fulfilled => return Ok(Admitted::Fulfilled),
+            Admission::Waiting => return Ok(Admitted::Waiting),
+        };
+        *self.lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(Lease {
+            pass: Arc::clone(&execution.pass),
+            observed: None,
+        });
+        *self.refresh.lock().unwrap_or_else(PoisonError::into_inner) = Some(ActiveRefresh {
+            pass: execution.pass,
+            ticket,
+        });
+        Ok(Admitted::Refresh)
     }
 
-    fn retain_repository_lease(&self, sys: &dyn System) -> Result<(), String> {
-        if self
-            .lease
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some()
-        {
-            return Ok(());
-        }
-        let execution = self.execution.as_ref().or_else(|| {
+    /// The enclosing pass's execution, which carries its lease: given to this run, or with its
+    /// captured inputs.
+    fn enclosing(&self) -> Option<&Execution> {
+        self.execution.as_ref().or_else(|| {
             self.captured
                 .as_ref()
                 .and_then(|capture| capture.inputs.execution.as_ref())
-        });
-        let pass = match execution {
-            Some(execution) => Arc::clone(&execution.pass),
-            None => sys
-                .repository_pass()?
-                .pass
-                .ok_or("another repository/converge pass holds align.lock")?,
-        };
-        *self.lease.lock().unwrap_or_else(PoisonError::into_inner) = Some(pass);
-        Ok(())
+        })
     }
 
+    /// Whether this run may work the account's repositories now, decided before a probe reads a
+    /// checkout or a remote. Within an enclosing pass, which holds the lease, it may. An apply
+    /// takes this account's repository lease ([`Self::take_lease`]) and keeps it for what
+    /// follows in its row, or in the refresh row after it ([`Item::row_ended`]); a plan never
+    /// takes it and reads instead whether another owner works the repositories now
+    /// ([`System::repository_pass_running`]). `false`: another pass holds it.
+    ///
+    /// # Errors
+    /// As [`Self::take_lease`].
+    fn lease_free(&self, sys: &dyn System) -> Result<bool, String> {
+        if self.enclosing().is_some() {
+            return Ok(true);
+        }
+        match self.mode {
+            Mode::Apply => self.take_lease(sys),
+            Mode::Plan => Ok(!sys.repository_pass_running()),
+        }
+    }
+
+    /// Take the repository lease for this run unless it holds one: the enclosing pass's where
+    /// there is one, else this account's own (`align.lock`, [`System::repository_pass`]), with
+    /// the shared refresh record's epochs as this run found them. `false`: another pass holds
+    /// it, and nothing was taken.
+    ///
+    /// # Errors
+    /// The system keeps no repository record, or the lock cannot be admitted.
+    fn take_lease(&self, sys: &dyn System) -> Result<bool, String> {
+        let mut held = self.lease.lock().unwrap_or_else(PoisonError::into_inner);
+        if held.is_some() {
+            return Ok(true);
+        }
+        let lease = match self.enclosing() {
+            Some(execution) => Lease {
+                pass: Arc::clone(&execution.pass),
+                observed: None,
+            },
+            None => {
+                let access = sys.repository_pass()?;
+                let Some(pass) = access.pass else {
+                    return Ok(false);
+                };
+                Lease {
+                    pass,
+                    observed: Some(access.observed.version),
+                }
+            }
+        };
+        *held = Some(lease);
+        Ok(true)
+    }
+
+    /// The probe's answer while another pass holds the repository lease: unusable for now, and
+    /// standing aside on that lock ([`Item::read_aside`]), with System State's reading
+    /// ([`Wait::OtherPass`]). The engine journals no failure for it.
+    fn held_elsewhere(&self) -> Probe {
+        self.reading.set(Some(Reading::Waits(Wait::OtherPass)));
+        *self
+            .lease_aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(StoodAside::Lock(OTHER_PASS.into()));
+        Probe::Unusable {
+            why: OTHER_PASS.into(),
+        }
+    }
+
+    /// End the lease an acquisition's probe or apply held, at its read-back, its failure or the
+    /// end of its row ([`Item::row_ended`]), unless the refresh after it in this run takes the
+    /// lease over ([`Self::refresh_follows`]).
+    fn release_lease(&self) {
+        if !self.refresh_follows {
+            self.end_lease();
+        }
+    }
+
+    /// End whatever repository lease this run holds.
+    fn end_lease(&self) {
+        drop(
+            self.lease
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+    }
+
+    /// End the refresh [`Self::begin_refresh`] admitted, `complete` where it refreshed every
+    /// checkout it took, and let its lease go.
     fn finish_refresh(&self, sys: &dyn System, complete: bool) -> Result<(), String> {
-        let _lease = self
-            .lease
+        let active = self
+            .refresh
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        let active = self
-            .refresh
+        let _lease = self
+            .lease
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
@@ -1599,6 +1866,449 @@ impl NativeRepositories {
             sys.now().saturating_mul(1000),
         )?;
         current
+    }
+}
+
+/// What [`NativeRepositories::begin_refresh`] admitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admitted {
+    /// This run refreshes, under the ticket it now holds.
+    Refresh,
+    /// Another producer's refresh already answered this request: nothing to fetch.
+    Fulfilled,
+    /// The shared refresh failed and waits for its retry, which another run makes.
+    Waiting,
+    /// Another pass holds the repository lease: this run refreshes nothing until it lets go.
+    Held,
+}
+
+/// [`NativeRepositories`] as a boxed item that shares its state with its
+/// [`RepositoryRefresh`] ([`items`]).
+struct Acquisition(Arc<NativeRepositories>);
+
+impl Item for Acquisition {
+    fn id(&self) -> String {
+        self.0.id()
+    }
+    fn family(&self) -> &'static str {
+        self.0.family()
+    }
+    fn title(&self) -> String {
+        self.0.title()
+    }
+    fn after(&self) -> Vec<String> {
+        self.0.after()
+    }
+    fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
+        self.0.probe(sys, ctx)
+    }
+    fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        self.0.apply(sys, ctx)
+    }
+    fn apply_guarded(
+        &self,
+        sys: &dyn System,
+        ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        self.0.apply_guarded(sys, ctx, current)
+    }
+    fn stood_aside(&self) -> Option<StoodAside> {
+        self.0.stood_aside()
+    }
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.0.read_aside()
+    }
+    fn detail(&self, sys: &dyn System, ctx: &Ctx) -> Option<String> {
+        self.0.detail(sys, ctx)
+    }
+    fn row_ended(&self) {
+        self.0.row_ended();
+    }
+}
+
+/// The refresh of the default source's checkouts already here (`init.github.refresh@<user>`), a
+/// row of its own after acquisition: it fast-forwards each clean checkout that is behind its
+/// origin ([`repos::refresh_existing`]), only those that were here before this run's acquisition
+/// began, and reads and repairs the required dependencies of each it moved. It alone admits and
+/// finishes the shared refresh ([`RepositoryPass::admit`]). Its fault fails only its own row,
+/// and a shared refresh waiting for its retry stands only this row aside: neither holds back an
+/// acquisition, which has run by then. Another pass holding the repository lease stands it
+/// aside too, decided before its probe reads anything ([`NativeRepositories::lease_free`]). A
+/// Repair run, an explicit `[github]` profile and a stage turned off refresh nothing.
+struct RepositoryRefresh {
+    core: Arc<NativeRepositories>,
+    aside: Mutex<Option<StoodAside>>,
+    /// Why the last probe stood aside before it read anything: another pass holds the lease
+    /// ([`Item::read_aside`]).
+    lease_aside: Mutex<Option<StoodAside>>,
+    /// What this row waits on, where it stood aside: another pass's lease, or the shared
+    /// refresh's retry ([`Wait::OtherPass`], [`Wait::SharedRetry`]).
+    reading: LastReading,
+    /// The checkouts the probe read, for the refresh that follows it.
+    probed: Mutex<Option<repos::Partition>>,
+    /// Whether the refresh ran: the probe after it is its read-back.
+    ran: std::sync::atomic::AtomicBool,
+    /// The checkouts as the refresh that ran left them: the probe's own read where it moved
+    /// none, else the read the refresh made after moving one. Its read-back counts them.
+    left: Mutex<Option<repos::Partition>>,
+}
+
+impl RepositoryRefresh {
+    fn new(core: Arc<NativeRepositories>) -> Self {
+        Self {
+            core,
+            aside: Mutex::new(None),
+            lease_aside: Mutex::new(None),
+            reading: LastReading::default(),
+            probed: Mutex::new(None),
+            ran: std::sync::atomic::AtomicBool::new(false),
+            left: Mutex::new(None),
+        }
+    }
+
+    /// Why this run refreshes nothing, or `None` where it refreshes.
+    fn idle(&self, sys: &dyn System) -> Result<Option<&'static str>, String> {
+        let core = &self.core;
+        if core.local_withdrawal.is_some() {
+            return Ok(Some(
+                "a repository credential withdrawal runs; no checkout is refreshed",
+            ));
+        }
+        if core.work != RepositoryWork::Refresh {
+            return Ok(Some(
+                "this run repairs local checkouts and reads no remote head of one already here",
+            ));
+        }
+        if !super::settings_managed(sys, &core.user)? {
+            return Ok(Some(
+                "repository setup is disabled in init.toml's [github] table",
+            ));
+        }
+        if configuration(sys, &core.user)?.is_some() {
+            return Ok(Some(
+                "an explicit [github] profile's checkouts are left as they are",
+            ));
+        }
+        Ok(None)
+    }
+
+    /// `standing`'s checkouts here that this run's acquisition found here when it began, or all
+    /// of them where no acquisition ran.
+    fn earlier(&self, standing: &mut repos::Partition) {
+        let before = self
+            .core
+            .before
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(before) = before.as_ref() {
+            standing.present.retain(|(_, path)| before.contains(path));
+            standing
+                .dependencies
+                .retain(|(_, path)| before.contains(path));
+        }
+    }
+
+    /// The checkouts this refresh would take now.
+    fn read(&self, sys: &dyn System) -> Result<(Plan, repos::Partition), Block> {
+        let plan = self.core.plan(sys)?;
+        let mut standing =
+            repos::partition_with_empty(sys, &self.core.user, &plan.repositories, &plan.empty)
+                .map_err(Block::from)?;
+        self.earlier(&mut standing);
+        Ok((plan, standing))
+    }
+
+    /// What the probe reads: whether the private inventory is empty, and the checkouts the
+    /// refresh would take. Before the refresh runs, this run's acquisition's last read stands
+    /// for them where it read them (its read-back, or its probe where it changed nothing); the
+    /// read-back after the refresh counts what the refresh left ([`Self::left`]). No worktree
+    /// is read again between the two items or for the refresh's read-back: a pass over every
+    /// checkout here runs each worktree's reads once per acquisition read.
+    fn probe_read(&self, sys: &dyn System) -> Result<(bool, repos::Partition), Block> {
+        let reused = if self.ran.load(std::sync::atomic::Ordering::SeqCst) {
+            self.left
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .map(|standing| (false, standing))
+        } else {
+            self.core
+                .last_read()
+                .map(|(empty_inventory, mut standing)| {
+                    self.earlier(&mut standing);
+                    (empty_inventory, standing)
+                })
+        };
+        if let Some(read) = reused {
+            self.core.ensure_current(sys).map_err(Block::from)?;
+            return Ok(read);
+        }
+        let (plan, standing) = self.read(sys)?;
+        Ok((plan.empty_inventory, standing))
+    }
+
+    /// Refresh, then end the run's lease, whatever the refresh did: it is the last row that
+    /// holds it.
+    fn refresh(
+        &self,
+        sys: &dyn System,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let refreshed = self.refresh_admitted(sys, authorized);
+        self.core.end_lease();
+        refreshed
+    }
+
+    fn refresh_admitted(
+        &self,
+        sys: &dyn System,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self.left.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.ran.store(true, std::sync::atomic::Ordering::SeqCst);
+        authorized()?;
+        self.core.ensure_current(sys)?;
+        match self.core.begin_refresh(sys)? {
+            Admitted::Refresh => {}
+            Admitted::Fulfilled => {
+                // Nothing was fetched: the checkouts stand as the probe read them.
+                *self.left.lock().unwrap_or_else(PoisonError::into_inner) = self
+                    .probed
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                return Ok(());
+            }
+            Admitted::Waiting => {
+                self.reading.set(Some(Reading::Waits(Wait::SharedRetry)));
+                *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = Some(
+                    StoodAside::Waiting("repository refresh waits for its shared retry".into()),
+                );
+                return Ok(());
+            }
+            Admitted::Held => {
+                self.reading.set(Some(Reading::Waits(Wait::OtherPass)));
+                *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some(StoodAside::Lock(OTHER_PASS.into()));
+                return Ok(());
+            }
+        }
+        let refreshed = self.refresh_batch(sys, authorized);
+        let finished = self.core.finish_refresh(sys, refreshed.is_ok());
+        refreshed.and(finished)
+    }
+
+    fn refresh_batch(
+        &self,
+        sys: &dyn System,
+        authorized: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Result<(), String> {
+        let core = &self.core;
+        let recorded = super::develop_checkouts(sys, &core.user)?;
+        let current = || core.batch_current(sys, authorized, &recorded);
+        current()?;
+        let plan = core.plan(sys).map_err(|block| block.why)?;
+        if plan.empty_inventory {
+            return Ok(());
+        }
+        // The probe's read, which the engine ran just before this refresh, where it left one.
+        let probed = self
+            .probed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        let standing = match probed {
+            Some(standing) => standing,
+            None => self.read(sys).map_err(|block| block.why)?.1,
+        };
+        if let Lookups::Not(why) = core.lookups(sys, &plan)? {
+            return Err(format!(
+                "aterm's GitHub route does not hand back the synced token: {why}; no checkout \
+                 was refreshed"
+            ));
+        }
+        let writes = core.own_writes(sys);
+        let refreshed = repos::refresh_existing(
+            sys,
+            &core.user,
+            &standing,
+            &recorded,
+            &current,
+            writes.as_ref(),
+        )?;
+        let mut failed = refreshed.failed;
+        let mut network_failed = refreshed.network_failed;
+        // A refreshed parent may declare different gitlinks. Never repair dependencies from
+        // the pre-refresh parent's cached verdict.
+        let left = if refreshed.moved {
+            let (_, moved) = self.read(sys).map_err(|block| block.why)?;
+            if let Some(why) = repos::named(&moved.git_waits) {
+                failed.push(why);
+            }
+            match core.repair_dependencies(sys, &moved.dependencies, &current, writes.as_ref()) {
+                Ok((repairs, network)) => {
+                    network_failed |= network;
+                    failed.extend(repairs);
+                }
+                Err((why, repairs)) => {
+                    failed.extend(repairs);
+                    failed.insert(0, why);
+                    return Err(failed.join("; "));
+                }
+            }
+            moved
+        } else {
+            standing
+        };
+        *self.left.lock().unwrap_or_else(PoisonError::into_inner) = Some(left);
+        if network_failed
+            && let Err(why) = super::RepositorySelection::recover_refused_credential(
+                sys,
+                &core.user,
+                &plan.token,
+                &current,
+            )
+        {
+            failed.push(format!("credential recovery is unfinished: {why}"));
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    }
+}
+
+impl Item for RepositoryRefresh {
+    fn id(&self) -> String {
+        refresh_id(&self.core.user.name)
+    }
+    fn family(&self) -> &'static str {
+        FAMILY
+    }
+    fn title(&self) -> String {
+        "GitHub repositories already here, fast-forwarded where clean and behind".into()
+    }
+    fn after(&self) -> Vec<String> {
+        self.core.after()
+    }
+
+    fn probe(&self, sys: &dyn System, _ctx: &Ctx) -> Probe {
+        let probe = self.probe_standing(sys);
+        // A refresh that will not run leaves no lease the acquisition before it held.
+        if !matches!(probe, Probe::Ok { .. }) {
+            self.core.end_lease();
+        }
+        probe
+    }
+
+    fn apply(&self, _sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
+        Err("the repository refresh plans no change; it runs as a refresh".into())
+    }
+
+    fn refresh_guarded(
+        &self,
+        sys: &dyn System,
+        _ctx: &Ctx,
+        current: &(dyn Fn() -> Result<(), String> + Sync),
+    ) -> Option<Result<(), String>> {
+        match self.idle(sys) {
+            Ok(None) => Some(self.refresh(sys, current)),
+            Ok(Some(_)) => None,
+            Err(why) => Some(Err(why)),
+        }
+    }
+
+    fn refresh_changes(&self, sys: &dyn System, _ctx: &Ctx) -> bool {
+        matches!(self.idle(sys), Ok(None))
+    }
+
+    fn stood_aside(&self) -> Option<StoodAside> {
+        self.aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn read_aside(&self) -> Option<StoodAside> {
+        self.lease_aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn detail(&self, _sys: &dyn System, _ctx: &Ctx) -> Option<String> {
+        self.reading.detail()
+    }
+
+    /// The last row that holds the run's lease ended: whatever it did, or did not get to do
+    /// (a refresh the engine did not run), the lease goes.
+    fn row_ended(&self) {
+        self.core.end_lease();
+    }
+}
+
+impl RepositoryRefresh {
+    /// The probe's reading: whether this run refreshes, and of how many checkouts. Before it
+    /// reads a checkout, a run that has not refreshed yet decides the repository lease
+    /// ([`NativeRepositories::lease_free`]): the one this run's acquisition left it, else its
+    /// own; while another pass holds it the row stands aside on it, having read nothing. The
+    /// read-back after the refresh decides nothing.
+    fn probe_standing(&self, sys: &dyn System) -> Probe {
+        self.reading.set(None);
+        *self
+            .lease_aside
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        match self.idle(sys) {
+            Ok(None) => {}
+            Ok(Some(why)) => return Probe::NotApplicable { why: why.into() },
+            Err(why) => return Probe::Blocked { why },
+        }
+        if !self.ran.load(Ordering::SeqCst) && matches!(self.core.lease_free(sys), Ok(false)) {
+            self.reading.set(Some(Reading::Waits(Wait::OtherPass)));
+            *self
+                .lease_aside
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(StoodAside::Lock(OTHER_PASS.into()));
+            return Probe::Unusable {
+                why: OTHER_PASS.into(),
+            };
+        }
+        *self.probed.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        let (empty_inventory, standing) = match self.probe_read(sys) {
+            Ok(read) => read,
+            Err(block) if block.why.is_empty() => {
+                return Probe::NotApplicable {
+                    why: "no checkout is refreshed while repository setup waits".into(),
+                };
+            }
+            Err(block) => {
+                return Probe::NotApplicable {
+                    why: format!(
+                        "no checkout is refreshed while repository setup waits: {}",
+                        block.why
+                    ),
+                };
+            }
+        };
+        let here = standing.present.len() + standing.dependencies.len();
+        if empty_inventory || here == 0 {
+            return Probe::NotApplicable {
+                why: "no checkout of the private inventory was here before this run".into(),
+            };
+        }
+        *self.probed.lock().unwrap_or_else(PoisonError::into_inner) = Some(standing);
+        let checkouts = if here == 1 { "checkout" } else { "checkouts" };
+        Probe::Ok {
+            now: format!(
+                "{here} {checkouts} here; a refresh fast-forwards each clean one that is behind \
+                 its origin"
+            ),
+        }
     }
 }
 

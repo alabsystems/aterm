@@ -5,16 +5,15 @@
 //! their identities and exact commits. Optional submodules are never visited.
 
 use super::repos::{self, Repo};
-use crate::checkout::{self, NoLazyFetch, Remote};
+use crate::checkout::{self, AcquisitionFailure, NoLazyFetch, Remote};
 use crate::model::User;
 use crate::port::{Cmd, Scratch, System};
+use crate::repository_progress::{Phase, Progress};
 use aterm_json::Value;
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-const BUDGET: Duration = Duration::from_secs(1800);
 
 /// [`checkout::git`] that cannot fetch an object lazily, the way `off` says this git keeps it
 /// from doing so ([`checkout::lazy_fetch::guarded`]: `--no-lazy-fetch` where git takes it, the
@@ -206,7 +205,7 @@ fn resolve(
     off: NoLazyFetch,
 ) -> Result<Dependency, String> {
     directories(sys, user, parent, path)?;
-    repos::verify_existing(sys, user, &repo.owner, repo, parent)?;
+    let facts = repos::verify_existing_head(sys, user, &repo.owner, repo, parent)?;
     let git = || local(sys, user, Some(parent), off);
     let revision = text(
         sys,
@@ -218,30 +217,41 @@ fn resolve(
         return Err("cannot read the parent commit for required dependencies".into());
     }
     // All tracked reads belong to one commit. The admitted identity compares selected
-    // pins/URLs, so an unrelated parent commit does not discard a dependency download.
-    let modules = format!("{revision}:.gitmodules");
-    let pin = tree_entry(
-        &read(
-            sys,
-            git().args(["ls-tree", "-z", revision, "--", path]),
-            "cannot read the required dependency's tracked commit",
-        )?,
-        path,
-        "160000",
-    )?;
-    tree_entry(
-        &read(
-            sys,
-            git().args(["ls-tree", "-z", revision, "--", ".gitmodules"]),
-            "cannot read the parent's tracked .gitmodules",
-        )?,
-        ".gitmodules",
-        "100644",
-    )?;
+    // pins/URLs, so an unrelated parent commit does not discard a dependency download. What
+    // the commit declares is read once a record of the parent's facts
+    // ([`checkout::Facts::gitlink`]): a commit's tree does not change while the record stands.
+    let kept = facts.gitlink(revision, path);
+    let pin = match &kept {
+        Some((pin, _)) => pin.clone(),
+        None => {
+            let pin = tree_entry(
+                &read(
+                    sys,
+                    git().args(["ls-tree", "-z", revision, "--", path]),
+                    "cannot read the required dependency's tracked commit",
+                )?,
+                path,
+                "160000",
+            )?;
+            tree_entry(
+                &read(
+                    sys,
+                    git().args(["ls-tree", "-z", revision, "--", ".gitmodules"]),
+                    "cannot read the parent's tracked .gitmodules",
+                )?,
+                ".gitmodules",
+                "100644",
+            )?;
+            pin
+        }
+    };
     // An edited declaration or staged gitlink is the person's intent, not permission to
-    // overwrite it using the tree the automatic pass initially saw. The worktree's copy is
-    // compared as it is on disk: no filter driver the parent names runs on it.
-    let programs = checkout::Programs::named(sys, git())
+    // overwrite it using the tree the automatic pass initially saw, so both are read each time.
+    // The worktree's copy is compared as it is on disk: no filter driver the parent's config
+    // names now (its record's, read again where a file it comes from changed:
+    // [`checkout::Facts::programs`]) runs on it.
+    let programs = checkout::Facts::of(sys, user, parent)
+        .and_then(|now| now.programs())
         .map_err(|why| format!("the parent: {why}; required dependencies were left untouched"))?;
     read(
         sys,
@@ -264,12 +274,38 @@ fn resolve(
     if index != format!("160000 {pin} 0\t{path}\0") {
         return Err("the required gitlink has staged changes; left untouched".into());
     }
+    let url = match kept {
+        Some((_, url)) => url,
+        None => {
+            let url = declared_url(sys, &git, &format!("{revision}:.gitmodules"), path)?;
+            facts.keep_gitlink(revision, path, &pin, &url);
+            url
+        }
+    };
+    let (owner, name) = dependency_identity(&url, repo)?;
+    Ok(Dependency {
+        path: path.into(),
+        pin,
+        owner,
+        name,
+        declared_url: url,
+    })
+}
+
+/// The one URL the tracked `.gitmodules` at `modules` (`<commit>:.gitmodules`) declares for
+/// the one submodule whose path is `path`, read with `git`, a command in the parent.
+fn declared_url(
+    sys: &dyn System,
+    git: &dyn Fn() -> Cmd,
+    modules: &str,
+    path: &str,
+) -> Result<String, String> {
     let declarations = text(
         sys,
         git().args([
             "config",
             "--blob",
-            &modules,
+            modules,
             "--no-includes",
             "--null",
             "--get-regexp",
@@ -299,7 +335,7 @@ fn resolve(
         git().args([
             "config",
             "--blob",
-            &modules,
+            modules,
             "--no-includes",
             "--null",
             "--get-all",
@@ -307,18 +343,10 @@ fn resolve(
         ]),
         "cannot read the tracked submodule URL",
     )?;
-    let url = url
-        .strip_suffix('\0')
+    url.strip_suffix('\0')
         .filter(|url| !url.contains('\0') && !url.contains('\n'))
-        .ok_or("required dependency must have exactly one tracked URL")?;
-    let (owner, name) = dependency_identity(url, repo)?;
-    Ok(Dependency {
-        path: path.into(),
-        pin,
-        owner,
-        name,
-        declared_url: url.into(),
-    })
+        .map(str::to_owned)
+        .ok_or_else(|| "required dependency must have exactly one tracked URL".to_owned())
 }
 
 /// Work at its recorded pin is never checked out again. Missing checkout objects can be
@@ -418,10 +446,12 @@ fn state(
     // A checkout may lazily fetch missing blobs in a partial clone. Moving only a
     // complete, self-contained dependency keeps network work in the admitted fetch below.
     complete_storage(sys, user, &path)?;
-    // Its files are compared as they are on disk: no filter driver it names (git-lfs, say)
-    // runs on one, so a stat-dirty file a driver would clean reads as changed, and the
-    // dependency is left as it is.
-    let programs = checkout::Programs::named(sys, git())
+    // Its files are compared as they are on disk: no filter driver it names now (git-lfs, say;
+    // its record's, read again where a file it comes from changed) runs on one, so a
+    // stat-dirty file a driver would clean reads as changed, and the dependency is left as it
+    // is.
+    let programs = checkout::Facts::of(sys, user, &path)
+        .and_then(|now| now.programs())
         .map_err(|why| format!("required dependency: {why}; left untouched"))?;
     let status = read(
         sys,
@@ -565,6 +595,70 @@ fn checkout_objects(
     .map_err(|_| "cannot inspect the required dependency's checkout objects".into())
 }
 
+/// The fetch of `dependency`'s recorded commit, with every object its checkout needs, into the
+/// repository at `path`, over the admitted route ([`network`]): a transfer, which writes Git's
+/// progress meter ([`fetch_objects`]).
+fn fetch_command(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    dependency: &Dependency,
+    off: NoLazyFetch,
+) -> Result<Cmd, String> {
+    Ok(network(sys, user, Some(path), dependency, off)?.args([
+        "fetch",
+        "--progress",
+        // Negotiating an already-present commit can leave missing associated objects
+        // missing. A refetch obtains the closure as a fresh download would.
+        "--refetch",
+        "--no-recurse-submodules",
+        "--no-tags",
+        "--",
+        &dependency.url(),
+        &dependency.pin,
+    ]))
+}
+
+/// The clone of `dependency` into `into`, its private staging, over the admitted route
+/// ([`network`]), with no checkout: a transfer, which writes Git's progress meter.
+fn download_command(
+    sys: &dyn System,
+    user: &User,
+    dependency: &Dependency,
+    off: NoLazyFetch,
+    into: &Path,
+) -> Result<Cmd, String> {
+    Ok(network(sys, user, None, dependency, off)?
+        .args([
+            "clone",
+            "--progress",
+            "--no-checkout",
+            "--no-recurse-submodules",
+            "--no-single-branch",
+            "--tags",
+            "--origin",
+            "origin",
+            "--template=",
+            "--",
+            &dependency.url(),
+        ])
+        .arg(into))
+}
+
+/// Enter `phase` on the acquisition's record and publish it.
+fn stage(sys: &dyn System, progress: &mut Progress, phase: Phase) {
+    progress.enter(phase);
+    sys.repository_progress(progress);
+}
+
+/// Fetch what the checkout of `dependency`'s recorded commit needs into the repository at
+/// `path`, its progress reported to `progress`. The fetch is a transfer, bounded by its progress
+/// rather than a wall clock ([`checkout::acquisition_transfer`]): a large dependency over a slow
+/// link finishes, and one whose link stopped carrying it fails as the network's.
+///
+/// # Errors
+/// The route was refused, the authorization or the dependency changed, the fetch failed or
+/// stalled (a network failure), or what it brought still lacks the checkout's objects.
 fn fetch_objects(
     sys: &dyn System,
     user: &User,
@@ -572,25 +666,16 @@ fn fetch_objects(
     dependency: &Dependency,
     current: &(dyn Fn() -> Result<(), String> + Sync),
     off: NoLazyFetch,
-) -> Result<(), crate::checkout::AcquisitionFailure> {
-    let command = network(sys, user, Some(path), dependency, off)?
-        .budget(BUDGET)
-        .args([
-            "fetch",
-            // Negotiating an already-present commit can leave missing associated objects
-            // missing. A refetch obtains the closure as a fresh download would.
-            "--refetch",
-            "--no-recurse-submodules",
-            "--no-tags",
-            "--",
-            &dependency.url(),
-            &dependency.pin,
-        ]);
+    progress: &mut Progress,
+) -> Result<(), AcquisitionFailure> {
+    let command = fetch_command(sys, user, path, dependency, off)?;
     current()?;
-    crate::checkout::acquisition_read(
+    stage(sys, progress, Phase::Connecting);
+    checkout::acquisition_transfer(
         sys,
         &command,
         "cannot fetch the required dependency's recorded commit",
+        progress,
     )?;
     current()?;
     if !checkout_objects(sys, user, path, &dependency.pin, off)? {
@@ -635,14 +720,17 @@ fn checkout_pin(
 }
 
 /// Acquire only selected dependencies. Missing ones publish from private staging; an
-/// interrupted download therefore exposes no half checkout at the required path.
+/// interrupted download therefore exposes no half checkout at the required path. Each
+/// acquisition is a destination record of its own (`<parent>/<path>`), so System State shows a
+/// long dependency download as it moves; the record ends ready or failed, so no reader takes an
+/// acquisition that ended for one still running.
 pub(super) fn repair(
     sys: &dyn System,
     user: &User,
     parent: &Path,
     repo: &Repo,
     authorized: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(), crate::checkout::AcquisitionFailure> {
+) -> Result<(), AcquisitionFailure> {
     if repo.required_submodules.is_empty() {
         return Ok(());
     }
@@ -680,141 +768,191 @@ pub(super) fn repair(
             "cannot initialize the selected required submodule",
         )?;
         current()?;
-        match state(sys, user, parent, &dependency, off)? {
-            State::Ready => continue,
-            State::ObjectsMissing => {
-                current()?;
-                let inner = parent.join(path);
-                complete_storage(sys, user, &inner)?;
-                fetch_objects(sys, user, &inner, &dependency, &current, off)?;
+        let found = state(sys, user, parent, &dependency, off)?;
+        if found == State::Ready {
+            continue;
+        }
+        let mut progress = Progress::new(&format!("{}/{path}", repo.name), parent.join(path));
+        progress.placed = found != State::Missing;
+        let acquired = acquire(
+            sys,
+            user,
+            parent,
+            &dependency,
+            found,
+            &current,
+            off,
+            &mut progress,
+        );
+        match &acquired {
+            Ok(()) => {
+                progress.staging = None;
+                progress.placed = true;
+                progress.usable = true;
+                progress.enter(Phase::Ready);
             }
-            State::Lagging => {
-                current()?;
-                let inner = parent.join(path);
-                // Inspect availability only in a complete object store: a partial clone's
-                // read could otherwise fetch implicitly, outside the admitted route.
-                complete_storage(sys, user, &inner)?;
-                let available = checkout_objects(sys, user, &inner, &dependency.pin, off)?;
-                current()?;
-                if !available {
-                    fetch_objects(sys, user, &inner, &dependency, &current, off)?;
-                }
-                current()?;
-                match state(sys, user, parent, &dependency, off)? {
-                    State::Ready => continue,
-                    State::Lagging => {}
-                    State::Missing | State::ObjectsMissing => {
-                        return Err(
-                            "required dependency disappeared before alignment; left untouched"
-                                .into(),
-                        );
-                    }
-                }
-                let moving = || -> Result<(), String> {
-                    current()?;
-                    if state(sys, user, parent, &dependency, off)? != State::Lagging {
-                        return Err(
-                            "required dependency changed before checkout; left untouched".into(),
-                        );
-                    }
-                    Ok(())
-                };
-                let _boundary = sys.update_boundary().hold(
-                    aterm_types::update_boundary::GuardedItem::ClonePublishRename,
-                    &moving,
-                )?;
-                checkout_pin(sys, user, &parent.join(path), &dependency, off)?;
+            Err(failure) => failure.record_progress(&mut progress),
+        }
+        sys.repository_progress(&progress);
+        acquired?;
+    }
+    Ok(())
+}
+
+/// Bring `dependency`, `found` anything but ready, to its recorded commit, each stage reported
+/// to `progress`: fetch what its checkout lacks (`ObjectsMissing`); fetch what it lacks, then
+/// check out the recorded commit from a clean recorded pin (`Lagging`); or clone it into private
+/// staging, check it out there and publish it with no replacement (`Missing`). Every transfer is
+/// bounded by its progress, never by a wall clock ([`checkout::acquisition_transfer`]).
+///
+/// # Errors
+/// A check failed, the authorization or the dependency changed, a transfer failed or stalled (a
+/// network failure), or a step on this Mac failed; what is there is left as it was.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one dependency's acquisition: where it goes, how it was found, its checks and its \
+              record"
+)]
+fn acquire(
+    sys: &dyn System,
+    user: &User,
+    parent: &Path,
+    dependency: &Dependency,
+    found: State,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+    off: NoLazyFetch,
+    progress: &mut Progress,
+) -> Result<(), AcquisitionFailure> {
+    let path = &dependency.path;
+    match found {
+        State::Ready => return Ok(()),
+        State::ObjectsMissing => {
+            current()?;
+            let inner = parent.join(path);
+            complete_storage(sys, user, &inner)?;
+            fetch_objects(sys, user, &inner, dependency, current, off, progress)?;
+        }
+        State::Lagging => {
+            current()?;
+            let inner = parent.join(path);
+            // Inspect availability only in a complete object store: a partial clone's
+            // read could otherwise fetch implicitly, outside the admitted route.
+            complete_storage(sys, user, &inner)?;
+            let available = checkout_objects(sys, user, &inner, &dependency.pin, off)?;
+            current()?;
+            if !available {
+                fetch_objects(sys, user, &inner, dependency, current, off, progress)?;
             }
-            State::Missing => {
-                current()?;
-                let mut staging = Scratch::new_in(sys, Path::new(&user.home), "github-clone")
-                    .map_err(|_| "cannot allocate private required-dependency staging")?;
-                let marking = staging.path().join(".owner.new");
-                let _owner = sys
-                    .exclusive(&marking, Duration::ZERO)
-                    .map_err(|_| "cannot mark private required-dependency staging")?;
-                sys.rename(&marking, &staging.path().join(".owner"))
-                    .map_err(|_| "cannot publish private required-dependency staging ownership")?;
-                let clone = staging.path().join("repo");
-                current()?;
-                crate::checkout::acquisition_read(
-                    sys,
-                    &network(sys, user, None, &dependency, off)?
-                        .budget(BUDGET)
-                        .args([
-                            "clone",
-                            "--no-checkout",
-                            "--no-recurse-submodules",
-                            "--no-single-branch",
-                            "--tags",
-                            "--origin",
-                            "origin",
-                            "--template=",
-                            "--",
-                            &dependency.url(),
-                        ])
-                        .arg(&clone),
-                    "required dependency download failed; existing worktrees left untouched",
-                )?;
-                current()?;
-                // The clone just ran to its end, without a checkout: it has no index until
-                // `checkout_pin` writes one, which `repos::finished` would read as cut off.
-                repos::verify_origin(
-                    sys,
-                    user,
-                    &dependency.owner,
-                    &dependency.repository(),
-                    &clone,
-                )?;
-                complete_storage(sys, user, &clone)?;
-                if !checkout_objects(sys, user, &clone, &dependency.pin, off)? {
-                    fetch_objects(sys, user, &clone, &dependency, &current, off)?;
-                }
-                current()?;
-                checkout_pin(sys, user, &clone, &dependency, off)?;
-                current()?;
-                let _boundary = sys.update_boundary().hold(
-                    aterm_types::update_boundary::GuardedItem::ClonePublishRename,
-                    &current,
-                )?;
-                if state(sys, user, parent, &dependency, off)? != State::Missing {
+            current()?;
+            match state(sys, user, parent, dependency, off)? {
+                State::Ready => return Ok(()),
+                State::Lagging => {}
+                State::Missing | State::ObjectsMissing => {
                     return Err(
-                        "required dependency destination appeared during download; left untouched"
-                            .into(),
+                        "required dependency disappeared before alignment; left untouched".into(),
                     );
                 }
-                // Only create admitted absent ancestors; never traverse a link or remove a
-                // nonempty destination. No-replace publication wins no race against user work.
-                let destination = parent.join(path);
-                let mut at = parent.to_owned();
-                let parts = Path::new(path).components().collect::<Vec<_>>();
-                for part in &parts[..parts.len() - 1] {
-                    at.push(part);
-                    current()?;
-                    if matches!(sys.stat(&at), Err(error) if error.kind() == io::ErrorKind::NotFound)
-                    {
-                        sys.create_dir_all(&at, 0o700)
-                            .map_err(|_| "cannot create required dependency parent")?;
-                        sys.chown(&at, user.uid, user.gid)
-                            .map_err(|_| "cannot own required dependency parent")?;
-                    }
-                }
-                current()?;
-                sys.remove_empty_dir(&destination).map_err(
-                    |_| "required dependency destination is no longer empty; left untouched",
-                )?;
-                sys.rename_noreplace(&clone, &destination).map_err(
-                    |_| "cannot publish required dependency without replacing existing work",
-                )?;
-                staging.close().map_err(
-                    |_| "required dependency published but its empty staging could not be removed",
-                )?;
             }
+            let moving = || -> Result<(), String> {
+                current()?;
+                if state(sys, user, parent, dependency, off)? != State::Lagging {
+                    return Err(
+                        "required dependency changed before checkout; left untouched".into(),
+                    );
+                }
+                Ok(())
+            };
+            let _boundary = sys.update_boundary().hold(
+                aterm_types::update_boundary::GuardedItem::ClonePublishRename,
+                &moving,
+            )?;
+            stage(sys, progress, Phase::Checkout);
+            checkout_pin(sys, user, &inner, dependency, off)?;
         }
-        current()?;
-        if state(sys, user, parent, &dependency, off)? != State::Ready {
-            return Err("required dependency remains outside its recorded gitlink commit".into());
+        State::Missing => {
+            current()?;
+            let mut staging = Scratch::new_in(sys, Path::new(&user.home), "github-clone")
+                .map_err(|_| "cannot allocate private required-dependency staging")?;
+            let marking = staging.path().join(".owner.new");
+            let _owner = sys
+                .exclusive(&marking, Duration::ZERO)
+                .map_err(|_| "cannot mark private required-dependency staging")?;
+            sys.rename(&marking, &staging.path().join(".owner"))
+                .map_err(|_| "cannot publish private required-dependency staging ownership")?;
+            let clone = staging.path().join("repo");
+            progress.staging = Some(clone.clone());
+            current()?;
+            let command = download_command(sys, user, dependency, off, &clone)?;
+            stage(sys, progress, Phase::Connecting);
+            checkout::acquisition_transfer(
+                sys,
+                &command,
+                "required dependency download failed; existing worktrees left untouched",
+                progress,
+            )?;
+            current()?;
+            stage(sys, progress, Phase::Verifying);
+            // The clone just ran to its end, without a checkout: it has no index until
+            // `checkout_pin` writes one, which `repos::finished` would read as cut off.
+            repos::verify_origin(
+                sys,
+                user,
+                &dependency.owner,
+                &dependency.repository(),
+                &clone,
+            )?;
+            complete_storage(sys, user, &clone)?;
+            if !checkout_objects(sys, user, &clone, &dependency.pin, off)? {
+                fetch_objects(sys, user, &clone, dependency, current, off, progress)?;
+            }
+            current()?;
+            stage(sys, progress, Phase::Checkout);
+            checkout_pin(sys, user, &clone, dependency, off)?;
+            current()?;
+            let _boundary = sys.update_boundary().hold(
+                aterm_types::update_boundary::GuardedItem::ClonePublishRename,
+                current,
+            )?;
+            if state(sys, user, parent, dependency, off)? != State::Missing {
+                return Err(
+                    "required dependency destination appeared during download; left untouched"
+                        .into(),
+                );
+            }
+            stage(sys, progress, Phase::Placing);
+            // Only create admitted absent ancestors; never traverse a link or remove a
+            // nonempty destination. No-replace publication wins no race against user work.
+            let destination = parent.join(path);
+            let mut at = parent.to_owned();
+            let parts = Path::new(path).components().collect::<Vec<_>>();
+            for part in &parts[..parts.len() - 1] {
+                at.push(part);
+                current()?;
+                if matches!(sys.stat(&at), Err(error) if error.kind() == io::ErrorKind::NotFound) {
+                    sys.create_dir_all(&at, 0o700)
+                        .map_err(|_| "cannot create required dependency parent")?;
+                    sys.chown(&at, user.uid, user.gid)
+                        .map_err(|_| "cannot own required dependency parent")?;
+                }
+            }
+            current()?;
+            sys.remove_empty_dir(&destination).map_err(
+                |_| "required dependency destination is no longer empty; left untouched",
+            )?;
+            sys.rename_noreplace(&clone, &destination).map_err(
+                |_| "cannot publish required dependency without replacing existing work",
+            )?;
+            // Published: whatever fails after this, the checkout is at its path, not in staging.
+            progress.staging = None;
+            progress.placed = true;
+            staging.close().map_err(
+                |_| "required dependency published but its empty staging could not be removed",
+            )?;
         }
+    }
+    current()?;
+    if state(sys, user, parent, dependency, off)? != State::Ready {
+        return Err("required dependency remains outside its recorded gitlink commit".into());
     }
     Ok(())
 }

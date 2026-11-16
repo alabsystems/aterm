@@ -13,13 +13,13 @@ use super::{
 use crate::{
     alab::{
         Registry,
-        registry::{ADDRESS, CLI, MACHINE},
+        registry::{ADDRESS, CLI, MACHINE, MACHINE_FACTS},
     },
     table::tests::{Lab, repair_commons_first},
     typed::{
         grid::{
             self as sheet,
-            tests::{MC, add_row, machine, put, record, type_in},
+            tests::{MC, add_row, elem, machine, put, record, type_in},
         },
         keys,
     },
@@ -84,6 +84,48 @@ fn repair_registry(lab: &Lab, rounds: usize) {
     repair_commons_first(lab, rounds, table.digest());
 }
 
+/// `command` signed as the session's next record with an explicit clock claim, on the installation
+/// chain and the complete observed frontier, and not yet ingested.
+fn seal_history_at(
+    session: &crate::table::Session<'_>,
+    store: &crate::table::store::Store,
+    scope: crate::table::Scope,
+    command: &Command,
+    authored_ms: u64,
+) -> Result<Vec<u8>> {
+    let evidence = store.metadata_evidence(session)?;
+    let headers: Vec<_> = evidence
+        .iter()
+        .filter(|op| op.catalog_eligible)
+        .map(|op| &op.header)
+        .collect();
+    let previous = headers
+        .iter()
+        .filter(|header| header.actor == session.actor())
+        .max_by_key(|header| header.sequence);
+    let mut parents: BTreeSet<_> = headers.iter().map(|header| header.id).collect();
+    for header in &headers {
+        for parent in header.parents.iter().chain(header.previous.iter()) {
+            parents.remove(parent);
+        }
+    }
+    if let Some(previous) = previous {
+        parents.insert(previous.id);
+    }
+    let parents: Vec<_> = parents.into_iter().collect();
+    crate::table::fixture::seal_at(
+        session,
+        scope,
+        crate::crypto::Causal {
+            sequence: previous.map_or(1, |header| header.sequence + 1),
+            previous: previous.map(|header| header.id),
+            parents: &parents,
+        },
+        &command.encode()?,
+        authored_ms,
+    )
+}
+
 /// Append an authenticated operation with an explicit signed clock claim, preserving the
 /// installation chain and the complete observed frontier.
 fn append_history_at(handle: &Handle, command: Command, authored_ms: u64) -> Digest {
@@ -92,37 +134,7 @@ fn append_history_at(handle: &Handle, command: Command, authored_ms: u64) -> Dig
         false,
         handle.descriptor(),
         |session, store, scope| {
-            let evidence = store.metadata_evidence(session)?;
-            let headers: Vec<_> = evidence
-                .iter()
-                .filter(|op| op.catalog_eligible)
-                .map(|op| &op.header)
-                .collect();
-            let previous = headers
-                .iter()
-                .filter(|header| header.actor == session.actor())
-                .max_by_key(|header| header.sequence);
-            let mut parents: BTreeSet<_> = headers.iter().map(|header| header.id).collect();
-            for header in &headers {
-                for parent in header.parents.iter().chain(header.previous.iter()) {
-                    parents.remove(parent);
-                }
-            }
-            if let Some(previous) = previous {
-                parents.insert(previous.id);
-            }
-            let parents: Vec<_> = parents.into_iter().collect();
-            let wire = crate::table::fixture::seal_at(
-                session,
-                scope,
-                crate::crypto::Causal {
-                    sequence: previous.map_or(1, |header| header.sequence + 1),
-                    previous: previous.map(|header| header.id),
-                    parents: &parents,
-                },
-                &command.encode()?,
-                authored_ms,
-            )?;
+            let wire = seal_history_at(session, store, scope, &command, authored_ms)?;
             Ok(store.ingest(session, &wire)?.id)
         },
     )
@@ -1905,6 +1917,298 @@ fn a_write_may_name_a_seed_row_no_pass_has_written_here() {
     );
 }
 
+/// A table's history reads in pages. Paging with a cursor serves every entry once, in history's
+/// order; the filters keep a page to one collection, row, column, writer or kind; each entry
+/// carries the kind aterm-db decides (a facts-only record is aterm's, a mixed record the first
+/// kind that holds, a revert explicit whatever it restores) and says when it projects nothing
+/// (an owned row at a key not its signer's, an automatic record past its writer's quota). The
+/// revision probe answers the page's revision until a record arrives; a peer's late record
+/// sorts inside the range already served, so the next page asked at the old revision says it
+/// moved and starts again from the top, where a page asked without one would skip that record.
+/// NEGATIVE CONTROL: with `history::page` never setting `moved` (`let moved = false;`), the page
+/// after the cursor resumes past the late record: `` assertion failed: next.moved ``.
+#[test]
+fn history_reads_one_page_after_a_cursor_and_reports_a_moved_revision() {
+    use crate::{
+        alab::registry::{MACHINE_FACTS, SELF_QUOTA},
+        att::history::{Ask, EntryKind, Filter, Inert, Writer},
+        typed::cell::{CellKey, CellValue},
+    };
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let facts = |machine: [u8; 16]| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: keys::uuid32(&machine),
+        value: Some(json!({"r": 1, "n": 1, "mac": MC, "label": "m9"})),
+    };
+    let marked = |col: &str, value: CellValue| {
+        cell::change(
+            &MACHINE,
+            CellKey {
+                pk: MC,
+                col,
+                elem: None,
+            },
+            &value,
+        )
+        .unwrap()
+    };
+    let source = "sr-0123456789abcdef";
+    let own = vec![facts(lab.machine(0))];
+    let foreign = vec![facts(lab.machine(1))];
+    let imported = vec![marked(
+        "location",
+        CellValue::imported(1, json!("rack c"), source),
+    )];
+    // The page's own closure let the last flagged cell win: import here.
+    let mixed = vec![
+        marked("note", CellValue::automatic(1, json!("seen"))),
+        marked("status", CellValue::imported(1, json!("parked"), source)),
+    ];
+    let explicit = vec![put(&MACHINE, MC, "location", json!("rack d"))];
+    // No cell's source: a value that does not read as a cell, and a collection this build does
+    // not compile.
+    let not_a_source = vec![Change {
+        collection: MACHINE.name.into(),
+        key: format!("{MC}.note"),
+        value: Some(json!({"r": 1, "x": "seen", "s": "not-a-source"})),
+    }];
+    let uncompiled = vec![Change {
+        collection: "later".into(),
+        key: "k".into(),
+        value: Some(json!({"s": source})),
+    }];
+    registry
+        .write(vec![
+            not_a_source.clone(),
+            uncompiled.clone(),
+            machine(MC),
+            own.clone(),
+            imported.clone(),
+            mixed.clone(),
+            foreign.clone(),
+            explicit.clone(),
+        ])
+        .unwrap();
+    let written = |history: &[Entry], changes: &[Change]| {
+        history
+            .iter()
+            .find(|entry| entry.changes == changes)
+            .unwrap()
+            .clone()
+    };
+    let target = written(&handle.history().unwrap(), &explicit).operation;
+    // The revert restores the imported `rack c`, a value that carries a source.
+    handle.revert([91; 16], target).unwrap();
+    // Enough automatic records to pass this Mac's quota.
+    registry
+        .write(
+            (0..SELF_QUOTA)
+                .map(|n| {
+                    vec![marked(
+                        "note",
+                        CellValue::automatic(1, json!(format!("seen {n}"))),
+                    )]
+                })
+                .collect(),
+        )
+        .unwrap();
+
+    let history = handle.history().unwrap();
+    let kind = |changes: &[Change]| written(&history, changes).kind;
+    assert_eq!(kind(&machine(MC)), EntryKind::Explicit);
+    assert_eq!(
+        kind(&own),
+        EntryKind::Aterm,
+        "a facts-only record is aterm's"
+    );
+    assert_eq!(kind(&imported), EntryKind::Import);
+    assert_eq!(kind(&mixed), EntryKind::Aterm, "the first kind that holds");
+    assert_eq!(kind(&explicit), EntryKind::Explicit);
+    assert_eq!(kind(&not_a_source), EntryKind::Explicit, "no cell's source");
+    assert_eq!(kind(&uncompiled), EntryKind::Explicit, "no cell's source");
+    let revert = history
+        .iter()
+        .find(|entry| entry.reverts == Some(target))
+        .unwrap();
+    assert!(
+        revert
+            .changes
+            .iter()
+            .any(|change| change.value.as_ref().is_some_and(|v| v.get("s").is_some())),
+        "the revert restores an imported value"
+    );
+    assert_eq!(revert.kind, EntryKind::Explicit, "a revert is explicit");
+    assert_eq!(written(&history, &own).inert, None);
+    assert_eq!(written(&history, &foreign).inert, Some(Inert::Rows));
+    let view = handle.view().unwrap();
+    assert!(!view.quota.over.is_empty());
+    for entry in &history {
+        assert_eq!(
+            entry.inert == Some(Inert::Quota),
+            view.quota.over.contains(&entry.operation),
+            "an entry is inert by quota exactly where the view's quota says so"
+        );
+    }
+
+    // Pages of two, each after the last one's cursor, serve the whole history once, in order.
+    let first = Ask::first(Filter::default(), 2);
+    let mut ask = Some(first.clone());
+    let mut served = Vec::new();
+    let mut revision = None;
+    while let Some(asked) = ask {
+        let page = handle.history_page(&asked).unwrap();
+        assert!(!page.moved);
+        assert!(page.entries.len() <= 2);
+        assert_eq!(*revision.get_or_insert(page.revision), page.revision);
+        if page.next.is_some() {
+            assert_eq!(page.next, page.entries.last().map(Entry::cursor));
+        }
+        served.extend(page.entries.iter().cloned());
+        ask = asked.after(&page);
+    }
+    assert_eq!(served, history);
+    let revision = revision.unwrap();
+    assert_eq!(handle.revision().unwrap(), revision);
+
+    // The filters, applied before a page is cut.
+    let only = |filter: Filter| {
+        handle
+            .history_page(&Ask::first(filter, usize::MAX))
+            .unwrap()
+            .entries
+    };
+    let aterm = only(Filter {
+        kind: Some(EntryKind::Aterm),
+        ..Filter::default()
+    });
+    assert_eq!(
+        aterm,
+        history
+            .iter()
+            .filter(|entry| entry.kind == EntryKind::Aterm)
+            .cloned()
+            .collect::<Vec<_>>()
+    );
+    let facts_rows = only(Filter {
+        collection: Some(MACHINE_FACTS.name.into()),
+        ..Filter::default()
+    });
+    assert_eq!(
+        facts_rows
+            .iter()
+            .map(|e| e.changes.clone())
+            .collect::<Vec<_>>(),
+        [own.clone(), foreign.clone()]
+    );
+    let locations = only(Filter {
+        collection: Some(MACHINE.name.into()),
+        row: Some(MC.into()),
+        column: Some("location".into()),
+        ..Filter::default()
+    });
+    assert_eq!(
+        locations.len(),
+        4,
+        "the machine's birth, the import, the edit, the revert"
+    );
+    assert_eq!(
+        only(Filter {
+            writer: Some(Writer::Machine(lab.machine(1))),
+            ..Filter::default()
+        }),
+        []
+    );
+    assert_eq!(
+        only(Filter {
+            writer: Some(Writer::Machine(lab.machine(0))),
+            ..Filter::default()
+        }),
+        history
+    );
+    let one = handle
+        .history_page(&Ask::first(
+            Filter {
+                column: Some("location".into()),
+                ..Filter::default()
+            },
+            1,
+        ))
+        .unwrap();
+    assert_eq!(one.entries, locations[..1]);
+    assert_eq!(one.next, Some(locations[0].cursor()));
+
+    // A peer's record that sorts inside what was served: it observed only the records the peer
+    // held, and its writer's clock runs behind, so it lands before the cursor.
+    repair_new_registry(&lab);
+    let peer = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let last_before = append_history_at(
+        &handle,
+        Command::Write {
+            request: [92; 16],
+            changes: vec![put(&MACHINE, MC, "label", json!("m10"))],
+        },
+        u64::MAX / 2,
+    );
+    append_history_at(
+        &handle,
+        Command::Write {
+            request: [93; 16],
+            changes: vec![put(&MACHINE, MC, "label", json!("m11"))],
+        },
+        u64::MAX / 2,
+    );
+    let late = append_history_at(
+        &peer,
+        Command::Write {
+            request: [94; 16],
+            changes: vec![put(&MACHINE, MC, "location", json!("rack e"))],
+        },
+        0,
+    );
+    let before = handle.history().unwrap();
+    let at = before
+        .iter()
+        .position(|entry| entry.operation == last_before)
+        .unwrap();
+    let served = handle
+        .history_page(&Ask::first(Filter::default(), at + 1))
+        .unwrap();
+    assert_eq!(served.entries, before[..=at]);
+    let old = served.revision;
+    assert_ne!(old, revision, "two records arrived");
+    assert_eq!(handle.revision().unwrap(), old);
+    repair_registry(&lab, 2);
+    let moved = handle.revision().unwrap();
+    assert_ne!(moved, old, "the peer's record arrived");
+    let after = handle.history().unwrap();
+    let landed = after
+        .iter()
+        .position(|entry| entry.operation == late)
+        .unwrap();
+    assert!(
+        landed <= at,
+        "the late record sorts inside the range served"
+    );
+    let next = handle
+        .history_page(&Ask::first(Filter::default(), 3).after(&served).unwrap())
+        .unwrap();
+    assert!(next.moved);
+    assert_eq!(next.revision, moved);
+    assert_eq!(next.entries, after[..3], "a moved page starts from the top");
+    // A reader that does not say its revision is served after the cursor, past the late record.
+    let blind = handle
+        .history_page(&Ask {
+            revision: None,
+            ..Ask::first(Filter::default(), 3).after(&served).unwrap()
+        })
+        .unwrap();
+    assert!(!blind.moved);
+    assert!(!blind.entries.iter().any(|entry| entry.operation == late));
+}
+
 /// Seal, on Mac `from`, a typed write whose causal parent never arrives anywhere, and give it to
 /// Mac `to`: the record a slow or partitioned peer leaves waiting (`Log::awaited`).
 fn withhold_on(lab: &Lab, from: usize, to: usize, changes: Vec<crate::database::Change>) {
@@ -2055,6 +2359,83 @@ fn an_unreadable_or_unrestated_wait_holds_back_every_row() {
     assert_eq!(view.holds_back(&rows), None);
 }
 
+/// `aterm db alab check` reports every finding `aterm db table check` reports of the registry,
+/// so the Tables page's Check view, which lists alab's, misses none: two Macs that state one
+/// version of the machine table's columns apart from each other are a `schema-split` in both,
+/// and alab's `--tsv` says it in words.
+/// NEGATIVE CONTROL: with `alab::command::checked` not extending its findings by
+/// `command::schema_findings`, alab names no split: `` alab check reports what table check
+/// reports ``.
+#[test]
+fn alab_check_reports_every_finding_table_check_reports() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![machine(MC)]).unwrap();
+    repair_new_registry(&lab);
+    // Each Mac states the machine table's columns at one version, each its own way, before
+    // either sees the other's.
+    for (n, note) in ["here", "there"].into_iter().enumerate() {
+        let mut row = MACHINE.schema_row();
+        row.as_object_mut()
+            .and_then(|row| row.get_mut("x"))
+            .and_then(Value::as_object_mut)
+            .expect("a schema row's columns")
+            .insert("note".to_owned(), json!(note));
+        Registry::at(lab.paths[n].clone())
+            .write(vec![vec![crate::database::Change {
+                collection: crate::typed::SCHEMA.to_owned(),
+                key: MACHINE.name.to_owned(),
+                value: Some(row),
+            }]])
+            .unwrap();
+    }
+    repair_registry(&lab, 2);
+    let Output::Json(table) = run(&lab.paths[0], &["check", "alab/registry"]) else {
+        panic!("check prints JSON");
+    };
+    let alab = crate::alab::command::run(
+        &lab.paths[0],
+        &["check".to_owned()],
+        None,
+        &mut |_| panic!("check opens no review"),
+        0,
+    )
+    .unwrap();
+    let split = json!({"finding": "schema-split", "collection": MACHINE.name,
+        "version": MACHINE.version});
+    let table = table["findings"].as_array().unwrap();
+    assert!(table.contains(&split), "{table:?}");
+    let reported = alab["findings"].as_array().unwrap();
+    for found in table {
+        assert!(
+            reported.contains(found),
+            "alab check reports what table check reports: {found} in {reported:?}"
+        );
+    }
+    let Value::String(tsv) = crate::alab::command::run(
+        &lab.paths[0],
+        &["check".to_owned(), "--tsv".to_owned()],
+        None,
+        &mut |_| panic!("check opens no review"),
+        0,
+    )
+    .unwrap() else {
+        panic!("check --tsv prints lines");
+    };
+    let line = format!(
+        "schema-split\tmachine\t\t\t{}\tversion {}",
+        crate::typed::check::said("schema-split"),
+        MACHINE.version
+    );
+    assert!(tsv.lines().any(|l| l == line), "{tsv}");
+    // `aterm db table check --tsv` says it in the same words.
+    let Output::Text(table_tsv) = run(&lab.paths[0], &["check", "alab/registry", "--tsv"]) else {
+        panic!("check --tsv prints lines");
+    };
+    assert!(table_tsv.lines().any(|l| l == line), "{table_tsv}");
+}
+
 /// A typed table's checkpoint pass (tracker LT-B10B): fenced while a member reports a build that
 /// cannot read `ATCKP1`; past the fence, Mac 0 proposes a checkpoint of the records at least 14
 /// days old and Mac 1, which recomputes the same body from its own replica, seconds it, so both
@@ -2168,4 +2549,1542 @@ fn a_registry_checkpoint_waits_on_the_fence_then_two_seats_sign_one_body() {
         after.refused, before.refused,
         "a checkpoint is never refused"
     );
+}
+
+/// The names `names` gives the operations of `held`, in order; `?` for one it does not name.
+fn named(names: &[(&'static str, Digest)], held: &[Held]) -> Vec<&'static str> {
+    held.iter()
+        .map(|held| {
+            names
+                .iter()
+                .find(|(_, id)| *id == held.operation)
+                .map_or("?", |(name, _)| *name)
+        })
+        .collect()
+}
+
+/// What `operation` wrote at `key` of `collection`, what that replaced and what it had not
+/// seen, each as [`named`] names it.
+fn wrote_at(
+    handle: &Handle,
+    names: &[(&'static str, Digest)],
+    operation: Digest,
+    collection: &str,
+    key: &str,
+) -> [Vec<&'static str>; 3] {
+    let wrote = handle.wrote(operation).unwrap();
+    let cell = wrote
+        .iter()
+        .find(|cell| cell.collection == collection && cell.key == key)
+        .unwrap_or_else(|| panic!("the operation wrote {key}"));
+    [
+        named(names, &cell.wrote),
+        named(names, &cell.replaced),
+        named(names, &cell.unseen),
+    ]
+}
+
+/// A sealed secret token of an earlier build, which no store here opens.
+fn sealed_token() -> String {
+    let token = format!(
+        "sec1:{}:{}",
+        "ab".repeat(32),
+        aterm_secrets::b64::encode_padded(&[7; 40])
+    );
+    assert!(crate::typed::secret::is_sealed(&token));
+    token
+}
+
+/// `changes` signed by `handle`'s Mac as its next record of the handle's generation and never
+/// ingested there: the operation and its wire, which only a roll's archived row then carries.
+fn sealed_record(
+    handle: &Handle,
+    request: u8,
+    changes: Vec<Change>,
+    authored_ms: u64,
+) -> (Digest, Vec<u8>) {
+    application::with_store(
+        &handle.paths,
+        false,
+        handle.descriptor(),
+        |session, store, scope| {
+            let command = Command::Write {
+                request: [request; 16],
+                changes,
+            };
+            let wire = seal_history_at(session, store, scope, &command, authored_ms)?;
+            Ok((session.authenticate(scope, &wire)?.header().id, wire))
+        },
+    )
+    .unwrap()
+}
+
+/// `handle`'s Mac archives `record`, the first generation's operation whose wire is `wire`, as a
+/// roll does: the operation that archived it, authored at `request` seconds.
+fn archive(handle: &Handle, request: u8, record: Digest, wire: &[u8]) -> Digest {
+    let pk = keys::archived_pk(&record);
+    let archived = |col: &str, x: Value| {
+        cell::change(
+            &registry::ARCHIVED,
+            cell::CellKey {
+                pk: &pk,
+                col,
+                elem: None,
+            },
+            &cell::CellValue::owner(registry::ARCHIVED.version, x),
+        )
+        .unwrap()
+    };
+    append_history_at(
+        handle,
+        Command::Write {
+            request: [request; 16],
+            changes: vec![
+                archived("generation", json!(1)),
+                archived("wire", json!(aterm_secrets::b64::encode_padded(wire))),
+                archived("row", json!("live")),
+            ],
+        },
+        u64::from(request) * 1_000,
+    )
+}
+
+/// The cover cell that makes the Mac `by` a roller of the first generation: the word a carried
+/// history stands on (`alab::roll::rollers`), which any Writer may write for itself.
+fn cover(by: &str) -> Change {
+    cell::change(
+        &registry::ROLL,
+        cell::CellKey {
+            pk: &keys::roll_pk(1, by),
+            col: "from",
+            elem: None,
+        },
+        &cell::CellValue::owner(registry::ROLL.version, json!(1)),
+    )
+    .unwrap()
+}
+
+/// One history row in which the Mac `by` states that `operation` of the first generation, by
+/// `actor` on `machine` at the clock `ms`, made `changes`, each spelled as a carried entry's
+/// body spells it (`alab::history`): any statement, true or not, as any roller may write one.
+fn stated(
+    by: &str,
+    operation: Digest,
+    (actor, machine): (&[u8], &[u8; 16]),
+    ms: u64,
+    trimmed: bool,
+    changes: Value,
+) -> Change {
+    let body = json!({
+        "v": 1, "by": by, "o": hex::encode_lower(&operation), "g": 1,
+        "a": hex::encode_lower(actor), "m": hex::encode_lower(machine),
+        "t": ms, "h": [ms, 0], "q": null, "r": null, "z": trimmed, "c": changes,
+    });
+    cell::change(
+        &registry::HISTORY,
+        cell::CellKey {
+            pk: &keys::history_pk(by, &operation),
+            col: "entry",
+            elem: None,
+        },
+        &cell::CellValue::owner(
+            registry::HISTORY.version,
+            json!(aterm_secrets::b64::encode_padded(
+                &aterm_json::to_vec(&body).unwrap()
+            )),
+        ),
+    )
+    .unwrap()
+}
+
+/// A cell lists every value it held with the write that put each there, and a write lists what
+/// it replaced and the writes it had not seen. Mac 0 writes a row (`born`); Mac 1 then sets its
+/// status (`parked`) while Mac 0, concurrently and with a clock claim older than Mac 1's, sets
+/// another status and takes a set member out (`lost`). The status then lists the three writes in
+/// history order, each with its writer, machine, clocks and stored value as history shows them,
+/// and the two concurrent ones stand. Neither of those is "earlier" (their order is the digest's
+/// where their clocks tie), so each names the other as unseen and `born` as what it replaced;
+/// `born` replaced and missed nothing. After both meet, Mac 0 sets the status again (`later`):
+/// it alone stands, it replaced both and missed neither, and the two still name each other. A
+/// peer that holds the same operations answers the same.
+/// NEGATIVE CONTROL: with `Reader::wrote` calling unseen only a write earlier in history order
+/// (`(other.hlc, other.id) < (write.hlc, write.id)` in place of `!observes(other, operation)`),
+/// only the later of the two concurrent writes names the other; here `lost` was the earlier:
+/// `` left: [["lost"], ["born"], []] right: [["lost"], ["born"], ["parked"]] ``. With every
+/// observed write called replaced (`Reader::tops`' test against the ones already found
+/// removed), `later` replaced `born` too: `` left: [["later"], ["born", "lost", "parked"], []] ``.
+#[test]
+fn a_cell_lists_every_value_it_held_and_a_write_lists_what_it_had_not_seen() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let born = append_history_at(
+        &here,
+        Command::Write {
+            request: [81; 16],
+            changes: machine(MC),
+        },
+        2_000,
+    );
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let parked = append_history_at(
+        &there,
+        Command::Write {
+            request: [82; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        3_000,
+    );
+    let lost = append_history_at(
+        &here,
+        Command::Write {
+            request: [83; 16],
+            changes: vec![
+                put(&MACHINE, MC, "status", json!("lost")),
+                take_out(MC, "clis", "codex"),
+            ],
+        },
+        1_000,
+    );
+    repair_registry(&lab, 2);
+    let mut names = vec![("born", born), ("parked", parked), ("lost", lost)];
+    let status = format!("{MC}.status");
+    let codex = format!("{MC}.clis.codex");
+    let stored = |word: &str| put(&MACHINE, MC, "status", json!(word)).value;
+    let standing = |held: &[Held]| {
+        held.iter()
+            .filter(|held| held.stands)
+            .map(|held| held.operation)
+            .collect::<BTreeSet<_>>()
+    };
+
+    // The three writes, in history's order, each as history shows it.
+    let history = here.history().unwrap();
+    let order: Vec<Digest> = history
+        .iter()
+        .map(|entry| entry.operation)
+        .filter(|id| [born, parked, lost].contains(id))
+        .collect();
+    assert_eq!(order[0], born, "both observed born");
+    let values = here.cell_values(MACHINE.name, &status).unwrap();
+    assert_eq!(
+        values.iter().map(|held| held.operation).collect::<Vec<_>>(),
+        order
+    );
+    for held in &values {
+        let entry = history
+            .iter()
+            .find(|entry| entry.operation == held.operation)
+            .unwrap();
+        assert_eq!(
+            (held.source, held.actor, held.machine, held.hlc),
+            (Source::Log, entry.actor, entry.machine, entry.hlc)
+        );
+        assert_eq!(
+            (held.reverts, held.withheld, held.inert),
+            (None, false, None)
+        );
+        let (claimed, word) = match held.operation {
+            id if id == born => (2_000, "active"),
+            id if id == parked => (3_000, "parked"),
+            _ => (1_000, "lost"),
+        };
+        assert_eq!((held.authored_ms, &held.value), (claimed, &stored(word)));
+    }
+    let machine_of = |id: Digest| {
+        values
+            .iter()
+            .find(|held| held.operation == id)
+            .unwrap()
+            .machine
+    };
+    assert!(machine_of(parked).is_some());
+    assert_ne!(machine_of(parked), machine_of(lost), "two Macs wrote");
+    assert_eq!(standing(&values), BTreeSet::from([parked, lost]));
+
+    // Each concurrent write replaced born and had not seen the other.
+    assert_eq!(
+        wrote_at(&here, &names, lost, MACHINE.name, &status),
+        [vec!["lost"], vec!["born"], vec!["parked"]]
+    );
+    assert_eq!(
+        wrote_at(&here, &names, parked, MACHINE.name, &status),
+        [vec!["parked"], vec!["born"], vec!["lost"]]
+    );
+    // A set's member is its own register: lost took it out, and nothing stood beside that.
+    assert_eq!(
+        wrote_at(&here, &names, lost, MACHINE.name, &codex),
+        [vec!["lost"], vec!["born"], vec![]]
+    );
+    assert_eq!(
+        here.wrote(parked).unwrap().len(),
+        1,
+        "parked wrote one cell"
+    );
+    // born wrote the row's six cells, replaced nothing and missed nothing.
+    let first = here.wrote(born).unwrap();
+    assert_eq!(first.len(), 6);
+    assert!(first.iter().all(|cell| {
+        named(&names, &cell.wrote) == ["born"] && cell.replaced.is_empty() && cell.unseen.is_empty()
+    }));
+
+    // A later write that saw both: it alone stands, and it replaced both.
+    let later = append_history_at(
+        &here,
+        Command::Write {
+            request: [84; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("active"))],
+        },
+        4_000,
+    );
+    repair_registry(&lab, 2);
+    names.push(("later", later));
+    let values = here.cell_values(MACHINE.name, &status).unwrap();
+    assert_eq!(
+        values.iter().map(|held| held.operation).collect::<Vec<_>>(),
+        [order.as_slice(), &[later]].concat()
+    );
+    assert_eq!(standing(&values), BTreeSet::from([later]));
+    let concurrent: Vec<&str> = order[1..]
+        .iter()
+        .map(|id| if *id == lost { "lost" } else { "parked" })
+        .collect();
+    assert_eq!(
+        wrote_at(&here, &names, later, MACHINE.name, &status),
+        [vec!["later"], concurrent, vec![]]
+    );
+    assert_eq!(
+        wrote_at(&here, &names, parked, MACHINE.name, &status),
+        [vec!["parked"], vec!["born"], vec!["lost"]]
+    );
+    // A peer answers the same, a cell nothing wrote lists nothing, and an operation this table
+    // does not hold is refused.
+    assert_eq!(there.cell_values(MACHINE.name, &status).unwrap(), values);
+    assert_eq!(there.wrote(lost).unwrap(), here.wrote(lost).unwrap());
+    assert!(
+        here.cell_values(MACHINE.name, &format!("{MC}.nickname"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(here.wrote([9; 32]).is_err());
+}
+
+/// A secret never leaves a cell's values: a write to a secret column is listed with no value
+/// whatever it holds, and so is a write to any column whose value holds a sealed token, in the
+/// cell's values and in what a later write replaced.
+/// NEGATIVE CONTROL: with `shown` asking no secret rule (`alab::history::secret_change` not
+/// asked), the stored values are listed: `a secret left the read`.
+#[test]
+fn a_cells_values_never_carry_a_secret() {
+    const PLAIN: &str = "plain-words-in-a-secret-column";
+    let token = sealed_token();
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let password = "ad-0000000000000001.password".to_owned();
+    let secret = |x: &str| Change {
+        collection: ADDRESS.name.to_owned(),
+        key: password.clone(),
+        value: Some(cell::CellValue::owner(2, json!(x)).encode()),
+    };
+    let write = |request: u8, changes: Vec<Change>| {
+        append_history_at(
+            &handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let born = write(1, machine(MC));
+    let sealed = write(2, vec![secret(&token)]);
+    let plain = write(3, vec![secret(PLAIN)]);
+    // Any writer may store any value: a token in a column that is no secret's.
+    let location = format!("{MC}.location");
+    let stray = write(
+        4,
+        vec![Change {
+            collection: MACHINE.name.to_owned(),
+            key: location.clone(),
+            value: Some(cell::CellValue::owner(1, json!(token)).encode()),
+        }],
+    );
+    let moved = write(5, vec![put(&MACHINE, MC, "location", json!("rack c"))]);
+
+    let passwords = handle.cell_values(ADDRESS.name, &password).unwrap();
+    let locations = handle.cell_values(MACHINE.name, &location).unwrap();
+    let replaced = handle.wrote(moved).unwrap();
+    let shown = format!(
+        "{passwords:?}{locations:?}{replaced:?}{:?}{:?}{:?}",
+        handle.wrote(sealed).unwrap(),
+        handle.wrote(plain).unwrap(),
+        handle.wrote(stray).unwrap()
+    );
+    assert!(
+        !shown.contains(&token) && !shown.contains(PLAIN),
+        "a secret left the read"
+    );
+    let listed = |held: &[Held]| {
+        held.iter()
+            .map(|held| {
+                (
+                    held.operation,
+                    held.value.clone(),
+                    held.withheld,
+                    held.stands,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(&passwords),
+        [(sealed, None, true, false), (plain, None, true, true)]
+    );
+    let rack = |x: &str| put(&MACHINE, MC, "location", json!(x)).value;
+    assert_eq!(
+        listed(&locations),
+        [
+            (born, rack("rack a"), false, false),
+            (stray, None, true, false),
+            (moved, rack("rack c"), false, true)
+        ]
+    );
+    assert_eq!(listed(&replaced[0].replaced), [(stray, None, true, false)]);
+}
+
+/// An owned row's values are whole rows at its writer's key: Mac 0 writes its facts row twice,
+/// and Mac 1 writes a row at Mac 0's key. The key lists Mac 0's two rows, the later standing,
+/// and the second replaced the first; Mac 1's row, which no reader keeps, is not listed, is no
+/// write to that key, and stays in history marked inert.
+/// NEGATIVE CONTROL: with `Reader::records` keeping every change (`owned::kept` not asked), the
+/// row Mac 1 forged is listed at Mac 0's key: `` left: [("first", 1, false), ("forged", 9, false),
+/// ("second", 2, true)] right: [("first", 1, false), ("second", 2, true)] ``.
+#[test]
+fn an_owned_rows_values_are_its_own_macs_whole_rows() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let me = keys::uuid32(&lab.machine(0));
+    let row = |n: u64, label: &str| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: me.clone(),
+        value: Some(json!({"r": 1, "n": n, "mac": "mc-0000000000000000", "label": label})),
+    };
+    let write = |handle: &Handle, request: u8, change: Change| {
+        append_history_at(
+            handle,
+            Command::Write {
+                request: [request; 16],
+                changes: vec![change],
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let first = write(&here, 1, row(1, "m9"));
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let forged = write(&there, 2, row(9, "m1"));
+    repair_registry(&lab, 2);
+    let second = write(&here, 3, row(2, "m10"));
+    repair_registry(&lab, 2);
+    let names = [("first", first), ("forged", forged), ("second", second)];
+
+    for handle in [&here, &there] {
+        let values = handle.cell_values(MACHINE_FACTS.name, &me).unwrap();
+        let listed: Vec<_> = named(&names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| {
+                let n = held.value.as_ref().and_then(|row| row["n"].as_u64());
+                (name, n.unwrap(), held.stands)
+            })
+            .collect();
+        assert_eq!(listed, [("first", 1, false), ("second", 2, true)]);
+        assert_eq!(values[1].value, row(2, "m10").value, "the whole row");
+        assert!(
+            values
+                .iter()
+                .all(|held| held.machine == Some(lab.machine(0)) && held.source == Source::Log)
+        );
+    }
+    let wrote = here.wrote(second).unwrap();
+    assert_eq!(wrote.len(), 1);
+    assert_eq!(
+        (wrote[0].collection.as_str(), wrote[0].key.as_str()),
+        (MACHINE_FACTS.name, me.as_str())
+    );
+    assert_eq!(
+        wrote_at(&here, &names, second, MACHINE_FACTS.name, &me),
+        [vec!["second"], vec!["first"], vec![]]
+    );
+    assert!(
+        here.wrote(forged).unwrap().is_empty(),
+        "a row no reader keeps is no write to that key"
+    );
+    let history = here.history().unwrap();
+    let inert = history.iter().find(|entry| entry.operation == forged);
+    assert_eq!(inert.unwrap().inert, Some(Inert::Rows));
+}
+
+/// A revert is listed as a write with the operation it reverted and the value it restored, a
+/// revert back to absence with no value, and each stands; a revert this log refuses (its keys
+/// are not its target's) is no write and is not listed.
+/// NEGATIVE CONTROL: with `Reader::held` leaving `reverts` out (`None` for every write), the
+/// revert reads as a plain write: `` left: [("born", None, false), ("moved", None, false),
+/// ("back", None, true)] right: [("born", None, false), ("moved", None, false), ("back",
+/// Some("moved"), true)] ``.
+#[test]
+fn a_revert_is_listed_with_its_target_and_a_refused_one_is_not() {
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |request: u8, changes: Vec<Change>| {
+        append_history_at(
+            &handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let born = write(1, machine(MC));
+    let moved = write(2, vec![put(&MACHINE, MC, "location", json!("rack b"))]);
+    let called = write(3, vec![put(&MACHINE, MC, "nickname", json!("spare"))]);
+    let back = handle.revert([91; 16], moved).unwrap();
+    let uncalled = handle.revert([92; 16], called).unwrap();
+    let names = [
+        ("born", born),
+        ("moved", moved),
+        ("called", called),
+        ("back", back),
+        ("uncalled", uncalled),
+    ];
+    let name = |id: Digest| names.iter().find(|(_, held)| *held == id).unwrap().0;
+    let listed = |key: &str| {
+        let values = handle.cell_values(MACHINE.name, key).unwrap();
+        let rows: Vec<_> = named(&names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name_of, held)| (name_of, held.reverts.map(name), held.stands))
+            .collect();
+        (rows, values)
+    };
+    let location = format!("{MC}.location");
+    let nickname = format!("{MC}.nickname");
+    let check = || {
+        let (rows, values) = listed(&location);
+        assert_eq!(
+            rows,
+            [
+                ("born", None, false),
+                ("moved", None, false),
+                ("back", Some("moved"), true)
+            ]
+        );
+        assert_eq!(values[2].value, values[0].value, "the value it restored");
+        assert!(values[2].value.is_some());
+        let (rows, values) = listed(&nickname);
+        assert_eq!(
+            rows,
+            [("called", None, false), ("uncalled", Some("called"), true)]
+        );
+        assert_eq!(
+            (&values[1].value, values[1].withheld),
+            (&None, false),
+            "back to absence"
+        );
+    };
+    check();
+    assert_eq!(
+        wrote_at(&handle, &names, back, MACHINE.name, &location),
+        [vec!["back"], vec!["moved"], vec![]]
+    );
+    // A revert whose keys are not its target's is refused by every reader: no write.
+    let refused = append_history_at(
+        &handle,
+        Command::Revert {
+            request: [93; 16],
+            operation: back,
+            changes: vec![
+                put(&MACHINE, MC, "location", json!("rack z")),
+                put(&MACHINE, MC, "nickname", json!("junk")),
+            ],
+        },
+        9_000,
+    );
+    check();
+    assert!(handle.wrote(refused).is_err());
+}
+
+/// A set's member is its own register. Mac 0 writes a row with two members; then Mac 0 takes
+/// one out while Mac 1, concurrently, puts it in again. That member lists the three writes, the
+/// two concurrent ones standing and each unseen by the other; the other member lists only the
+/// row's first write.
+/// NEGATIVE CONTROL: with `Reader::records` matching a change by its row and column, the member
+/// dropped from both keys, the member nothing else wrote lists the other member's writes too:
+/// `` assertion `left == right` failed: the other member left: 3 right: 1 ``.
+#[test]
+fn a_set_members_values_are_its_own_register() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |handle: &Handle, request: u8, changes: Vec<Change>| {
+        append_history_at(
+            handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let born = write(&here, 1, machine(MC));
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let out = write(&here, 2, vec![take_out(MC, "clis", "codex")]);
+    let again = write(&there, 3, vec![elem(&MACHINE, MC, "clis", "codex")]);
+    repair_registry(&lab, 2);
+    let names = [("born", born), ("out", out), ("again", again)];
+
+    let claude = here
+        .cell_values(MACHINE.name, &format!("{MC}.clis.claude"))
+        .unwrap();
+    assert_eq!(claude.len(), 1, "the other member");
+    assert_eq!((claude[0].operation, claude[0].stands), (born, true));
+    let codex = format!("{MC}.clis.codex");
+    let values = here.cell_values(MACHINE.name, &codex).unwrap();
+    let mut listed: Vec<_> = named(&names, &values)
+        .into_iter()
+        .zip(&values)
+        .map(|(name, held)| {
+            let x = cell::CellValue::decode(held.value.as_ref().unwrap())
+                .unwrap()
+                .x;
+            (name, x, held.stands)
+        })
+        .collect();
+    assert_eq!(listed[0], ("born", json!(true), false));
+    listed.sort_by_key(|(name, ..)| *name);
+    assert_eq!(
+        listed,
+        [
+            ("again", json!(true), true),
+            ("born", json!(true), false),
+            ("out", json!(false), true)
+        ]
+    );
+    assert_eq!(
+        wrote_at(&here, &names, out, MACHINE.name, &codex),
+        [vec!["out"], vec!["born"], vec!["again"]]
+    );
+    assert_eq!(
+        wrote_at(&here, &names, again, MACHINE.name, &codex),
+        [vec!["again"], vec!["born"], vec!["out"]]
+    );
+}
+
+/// An automatic record past its writer's quota never projects, so it never stands, replaced
+/// nothing and is in no write's replaced or unseen list: it is listed in its cell's values,
+/// marked. Mac 0 writes a row; Mac 1 spends its quota and then writes the row's location
+/// automatically, past it; Mac 0, having seen that, sets the location. Mac 0's write replaced the
+/// row's first value, not the one that never counted.
+/// NEGATIVE CONTROL: with `Record::counts` answering `true` for every record, the owner's write
+/// replaced the past-quota one: `` left: [["target"], ["excess"], []] right: [["target"],
+/// ["born"], []] ``.
+#[test]
+fn a_write_past_its_quota_is_listed_and_replaced_nothing() {
+    let (_lab, handle, target, excess) = quota_revert_pair(false);
+    let view = handle.view().unwrap();
+    let born = view
+        .ops
+        .iter()
+        .find(|op| op.changes == machine(MC))
+        .unwrap();
+    let names = [("born", born.id), ("target", target), ("excess", excess)];
+    let location = format!("{MC}.location");
+    let values = handle.cell_values(MACHINE.name, &location).unwrap();
+    assert_eq!(
+        named(&names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| (name, held.inert, held.stands))
+            .collect::<Vec<_>>(),
+        [
+            ("born", None, false),
+            ("excess", Some(Inert::Quota), false),
+            ("target", None, true)
+        ]
+    );
+    assert_eq!(
+        wrote_at(&handle, &names, target, MACHINE.name, &location),
+        [vec!["target"], vec!["born"], vec![]]
+    );
+    assert_eq!(
+        wrote_at(&handle, &names, excess, MACHINE.name, &location),
+        [vec!["excess"], vec![], vec![]]
+    );
+}
+
+/// A cell's values read through a registry roll. The roll restates a register as one carried
+/// value and carries the old log's entries as history rows; in the new generation the cell lists
+/// the old generation's writes under their own operations, with the writers and clocks that log
+/// gave them, the last standing, a write that held a sealed token still with no value, and a
+/// write of the new generation replaced the one that stood. A revert of that write restores the
+/// carried register: it is listed with its target and the one value the register holds, and it
+/// stands, not the write the register names. A carried candidate no history row names is listed
+/// under its operation with the writer and clocks of the record that restated it, with no value
+/// where it holds a sealed token; a revert that restores a register of two candidates is listed
+/// as that register. An owned row archived as its signed record, which no history
+/// row names, is listed with the clocks of the record that archived it, and so is an earlier
+/// row of that key archived after it, which does not stand; the key's first row of the new
+/// generation replaced the one that stood, not the one archived last. A row retired and made
+/// live again in the new generation re-asserts its label: the carried write stands.
+/// NEGATIVE CONTROL: with `Reader::held` listing a restatement as its own record's write (the
+/// carried register not read), the roll's record is listed after the carried entries: `` left:
+/// ["born", "stray", "moved", "?"] right: ["born", "stray", "moved"] ``. With `Reader::cell`
+/// leaving out the archived rows, the owned key lists nothing: `` left: [] right: ["facts"] ``.
+/// With `Reader::archived` keeping only the archived row that stands, the earlier row is not
+/// listed: `` left: [("facts", Restated { by: … }, 6000, true)] right: [("facts", Restated { by:
+/// … }, 6000, true), ("older", Restated { by: … }, 8000, false)] ``. With `Reader::standing`
+/// reading a revert's restored register as a restatement's (its `!reverted` test removed), the
+/// write the register names stands and not the revert: `` left: [false, false, true, false,
+/// false] right: [false, false, false, false, true] ``. With `restored` answering the register
+/// itself, the revert's value is `{"k": [{"o": …, "v": …}]}`: `the value it restored`. With
+/// `Reader::held` listing a restatement's candidate as stored (`shown` not asked), the token is
+/// listed: `` left: (Some(Object {"r": Number(1), "x": String("sec1:…")}), false) right: (None,
+/// true) ``. With `shown` reading a restored register of several candidates as a value of no
+/// known type (`raw`), the operations it names read as credentials and the revert as refused:
+/// `` left: (…, Some(…), true, true) right: (…, Some(…), false, true) ``. With `Reader::wrote` leaving
+/// out the archived rows, the new row replaced nothing: `` left: [["fresh"], [], []] right:
+/// [["fresh"], ["facts"], []] ``. With `Reader::reassert` marking nothing, the carried label
+/// does not stand: `` left: [("born", Carried { generation: 1, trimmed: false }, false)] ``.
+#[test]
+fn a_cells_values_read_through_a_registry_roll() {
+    use crate::table::tests::repair_commons;
+    let pk = "mc-0000000000000001";
+    let token = sealed_token();
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let macs: Vec<_> = lab.paths.iter().cloned().map(Registry::at).collect();
+    for registry in &macs {
+        registry.open().unwrap();
+    }
+    repair_commons(&lab, 6);
+    let first = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |handle: &Handle, request: u8, changes: Vec<Change>| {
+        append_history_at(
+            handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let stored = |column: &str, x: &str| Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{pk}.{column}"),
+        value: Some(cell::CellValue::owner(1, json!(x)).encode()),
+    };
+    let born = write(&first, 1, machine(pk));
+    // Any writer may store any value: a sealed token in a column that is no secret's.
+    let stray = append_history_at(
+        &first,
+        Command::Write {
+            request: [21; 16],
+            changes: vec![stored("location", &token)],
+        },
+        1_500,
+    );
+    let moved = write(
+        &first,
+        2,
+        vec![put(&MACHINE, pk, "location", json!("rack b"))],
+    );
+    // Two facts rows of Mac 0 signed for the first generation and never ingested there: no
+    // roll carries their history.
+    let me = keys::uuid32(&lab.machine(0));
+    let facts_row = |n: u64, label: &str| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: me.clone(),
+        value: Some(json!({"r": 1, "n": n, "mac": pk, "label": label})),
+    };
+    let (facts, wire) = sealed_record(&first, 3, vec![facts_row(2, "m9")], 3_000);
+    let (older, older_wire) = sealed_record(&first, 13, vec![facts_row(1, "m8")], 3_000);
+    repair_commons(&lab, 6);
+    let now = || aterm_time::unix_millis().unwrap();
+    macs[0].roll(true, now()).unwrap();
+    repair_commons(&lab, 6);
+    macs[1].release(now()).unwrap();
+    repair_commons(&lab, 6);
+    assert!(macs[0].roll(true, now()).unwrap().sealed);
+    repair_commons(&lab, 6);
+    assert_eq!(macs[0].generation().generation, 2);
+    let rolled = Handle::at(lab.paths[0].clone(), macs[0].generation());
+
+    let location = format!("{pk}.location");
+    let rack = |x: &str| put(&MACHINE, pk, "location", json!(x)).value;
+    let listed = |names: &[(&'static str, Digest)]| {
+        let values = rolled.cell_values(MACHINE.name, &location).unwrap();
+        let rows: Vec<_> = values
+            .iter()
+            .map(|held| {
+                (
+                    held.source,
+                    held.authored_ms,
+                    held.value.clone(),
+                    held.stands,
+                )
+            })
+            .collect();
+        (named(names, &values), rows, values)
+    };
+    let carried = Source::Carried {
+        generation: 1,
+        trimmed: false,
+    };
+    let mut names = vec![
+        ("born", born),
+        ("stray", stray),
+        ("moved", moved),
+        ("facts", facts),
+        ("older", older),
+    ];
+    let (order, rows, values) = listed(&names);
+    assert_eq!(order, ["born", "stray", "moved"]);
+    assert_eq!(
+        rows,
+        [
+            (carried, 1_000, rack("rack a"), false),
+            (carried, 1_500, None, false),
+            (carried, 2_000, rack("rack b"), true)
+        ]
+    );
+    assert!(
+        values
+            .iter()
+            .all(|held| held.machine == Some(lab.machine(0)))
+    );
+    assert_eq!(
+        values.iter().map(|held| held.withheld).collect::<Vec<_>>(),
+        [false, true, false]
+    );
+    let mut shown = format!("{values:?}");
+
+    // A write of the new generation replaced the carried candidate.
+    let later = write(
+        &rolled,
+        4,
+        vec![put(&MACHINE, pk, "location", json!("rack c"))],
+    );
+    names.push(("later", later));
+    let (order, rows, _) = listed(&names);
+    assert_eq!(order, ["born", "stray", "moved", "later"]);
+    assert_eq!(
+        rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+        [false, false, false, true]
+    );
+    assert_eq!((rows[3].0, &rows[3].2), (Source::Log, &rack("rack c")));
+    assert_eq!(
+        wrote_at(&rolled, &names, later, MACHINE.name, &location),
+        [vec!["later"], vec!["moved"], vec![]]
+    );
+
+    // A revert of it restores the carried register: the revert stands, with the value restored.
+    let undone = rolled.revert([94; 16], later).unwrap();
+    names.push(("undone", undone));
+    let (order, rows, values) = listed(&names);
+    assert_eq!(order, ["born", "stray", "moved", "later", "undone"]);
+    assert_eq!(
+        rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+        [false, false, false, false, true]
+    );
+    assert_eq!(
+        (values[4].source, values[4].reverts),
+        (Source::Log, Some(later))
+    );
+    assert_eq!(values[4].value, rack("rack b"), "the value it restored");
+    assert_eq!(
+        wrote_at(&rolled, &names, undone, MACHINE.name, &location),
+        [vec!["undone"], vec!["later"], vec![]]
+    );
+    shown.push_str(&format!("{values:?}{:?}", rolled.wrote(undone).unwrap()));
+
+    // A carried candidate no history row names: the restating record's writer and clocks.
+    let restate = |request: u8, column: &str, origin: u8, value: &Value| {
+        let restating = write(
+            &rolled,
+            request,
+            vec![Change {
+                collection: MACHINE.name.to_owned(),
+                key: format!("{pk}.{column}"),
+                value: Some(json!({"k": [{"o": hex::encode_lower(&[origin; 32]), "v": value}]})),
+            }],
+        );
+        let values = rolled
+            .cell_values(MACHINE.name, &format!("{pk}.{column}"))
+            .unwrap();
+        let last = values.last().unwrap().clone();
+        assert_eq!(
+            (last.operation, last.source, last.authored_ms, last.stands),
+            (
+                [origin; 32],
+                Source::Restated { by: restating },
+                u64::from(request) * 1_000,
+                true
+            )
+        );
+        (
+            last,
+            format!("{values:?}{:?}", rolled.wrote(restating).unwrap()),
+        )
+    };
+    let spare = put(&MACHINE, pk, "nickname", json!("spare")).value.unwrap();
+    let (nickname, _) = restate(5, "nickname", 7, &spare);
+    assert_eq!(
+        (nickname.value.as_ref(), nickname.withheld),
+        (Some(&spare), false)
+    );
+    // One that holds a sealed token is listed with no value.
+    let (status, text) = restate(7, "status", 8, &stored("status", &token).value.unwrap());
+    assert_eq!((status.value, status.withheld), (None, true));
+    shown.push_str(&text);
+    assert!(!shown.contains(&token), "a sealed token left the read");
+    // A revert that restores a register of several candidates is listed as that register: each
+    // candidate as stored, the operations it names as they are.
+    let other = put(&MACHINE, pk, "nickname", json!("other")).value.unwrap();
+    let register = json!({"k": [
+        {"o": hex::encode_lower(&[7; 32]), "v": spare},
+        {"o": hex::encode_lower(&[9; 32]), "v": other},
+    ]});
+    let nicknames = format!("{pk}.nickname");
+    write(
+        &rolled,
+        14,
+        vec![Change {
+            collection: MACHINE.name.to_owned(),
+            key: nicknames.clone(),
+            value: Some(register.clone()),
+        }],
+    );
+    let solo = write(
+        &rolled,
+        15,
+        vec![put(&MACHINE, pk, "nickname", json!("solo"))],
+    );
+    let both = rolled.revert([96; 16], solo).unwrap();
+    let values = rolled.cell_values(MACHINE.name, &nicknames).unwrap();
+    let last = values.last().unwrap();
+    assert_eq!(
+        (last.operation, last.reverts, last.refused, last.stands),
+        (both, Some(solo), false, true)
+    );
+    assert_eq!(last.value, Some(register), "the register it restored");
+
+    // An owned row that stands as an archived record no history row names.
+    assert!(
+        rolled
+            .cell_values(MACHINE_FACTS.name, &me)
+            .unwrap()
+            .is_empty()
+    );
+    let facts_listed = |names: &[(&'static str, Digest)]| {
+        let values = rolled.cell_values(MACHINE_FACTS.name, &me).unwrap();
+        let rows: Vec<_> = named(names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| (name, held.source, held.authored_ms, held.stands))
+            .collect();
+        (rows, values)
+    };
+    let archiving = archive(&rolled, 6, facts, &wire);
+    let (rows, values) = facts_listed(&names);
+    assert_eq!(named(&names, &values), ["facts"]);
+    assert_eq!(
+        rows,
+        [("facts", Source::Restated { by: archiving }, 6_000, true)]
+    );
+    assert_eq!(values[0].value, facts_row(2, "m9").value);
+
+    // An earlier row of the same key, archived after it: listed, and it does not stand.
+    let again = archive(&rolled, 8, older, &older_wire);
+    let (rows, values) = facts_listed(&names);
+    assert_eq!(
+        rows,
+        [
+            ("facts", Source::Restated { by: archiving }, 6_000, true),
+            ("older", Source::Restated { by: again }, 8_000, false)
+        ]
+    );
+    assert_eq!(values[1].value, facts_row(1, "m8").value);
+
+    // The key's first row of this generation replaced the archived row that stood, which is
+    // not the one archived last, and missed nothing.
+    let fresh = write(&rolled, 9, vec![facts_row(3, "m10")]);
+    names.push(("fresh", fresh));
+    assert_eq!(
+        wrote_at(&rolled, &names, fresh, MACHINE_FACTS.name, &me),
+        [vec!["fresh"], vec!["facts"], vec![]]
+    );
+    let (rows, _) = facts_listed(&names);
+    assert_eq!(
+        rows.iter()
+            .map(|(name, _, _, stands)| (*name, *stands))
+            .collect::<Vec<_>>(),
+        [("facts", false), ("older", false), ("fresh", true)]
+    );
+
+    // A row retired and made live again re-asserts its label: the carried write stands.
+    let label = (MACHINE.name.to_owned(), format!("{pk}.label"));
+    write(
+        &rolled,
+        10,
+        vec![put(&MACHINE, pk, "row", json!("retired"))],
+    );
+    let revived = write(&rolled, 11, vec![put(&MACHINE, pk, "row", json!("live"))]);
+    assert_eq!(
+        rolled.view().unwrap().cells[&label]
+            .candidates
+            .iter()
+            .map(|candidate| candidate.operation)
+            .collect::<Vec<_>>(),
+        [revived],
+        "the label stands under the re-entry"
+    );
+    let values = rolled.cell_values(&label.0, &label.1).unwrap();
+    assert_eq!(
+        named(&names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| (name, held.source, held.stands))
+            .collect::<Vec<_>>(),
+        [("born", carried, true)]
+    );
+}
+
+/// A claim's re-entry is no write to the claim's cell: the writes it re-asserts stand. Mac 0
+/// writes a machine row with a label (`born`), retires the row and makes it live again
+/// (`revived`), each a write of the `row` cell alone. The view then holds the label under
+/// `revived`, which wrote nothing there; the label lists its one write, `born`, standing, and
+/// `revived` wrote only the `row` cell. The same holds where the row comes back by a revert of
+/// its retirement. A later write of the label replaced `born` and alone stands.
+/// NEGATIVE CONTROL: with `Reader::reassert` marking nothing (returning at once), no listed
+/// value of the label stands though the cell shows it: `` left: [("born", false)] right:
+/// [("born", true)] ``.
+#[test]
+fn a_claims_reentry_stands_as_the_writes_it_reasserts() {
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |request: u8, changes: Vec<Change>| {
+        append_history_at(
+            &handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let row = |state: &str| vec![put(&MACHINE, MC, "row", json!(state))];
+    let mut first = machine(MC);
+    first[0] = put(&MACHINE, MC, "label", json!("m7"));
+    let born = write(1, first);
+    write(2, row("retired"));
+    let revived = write(3, row("live"));
+    let mut names = vec![("born", born), ("revived", revived)];
+    let label = (MACHINE.name.to_owned(), format!("{MC}.label"));
+    let candidates = || {
+        handle.view().unwrap().cells[&label]
+            .candidates
+            .iter()
+            .map(|candidate| candidate.operation)
+            .collect::<Vec<_>>()
+    };
+    let listed = |names: &[(&'static str, Digest)]| {
+        let values = handle.cell_values(&label.0, &label.1).unwrap();
+        named(names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| (name, held.stands))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        candidates(),
+        [revived],
+        "the label stands under the re-entry"
+    );
+    assert_eq!(listed(&names), [("born", true)]);
+    let wrote = handle.wrote(revived).unwrap();
+    assert_eq!(
+        wrote
+            .iter()
+            .map(|cell| cell.key.as_str())
+            .collect::<Vec<_>>(),
+        [format!("{MC}.row")],
+        "the re-entry wrote the row cell alone"
+    );
+
+    // The row comes back by a revert of its retirement.
+    let retired = write(4, row("retired"));
+    let back = handle.revert([95; 16], retired).unwrap();
+    assert_eq!(candidates(), [back], "the label stands under the revert");
+    assert_eq!(listed(&names), [("born", true)]);
+
+    // A later write of the label replaced the write that stood.
+    let renamed = write(6, vec![put(&MACHINE, MC, "label", json!("m8"))]);
+    names.push(("renamed", renamed));
+    assert_eq!(listed(&names), [("born", false), ("renamed", true)]);
+    assert_eq!(
+        wrote_at(&handle, &names, renamed, &label.0, &label.1),
+        [vec!["renamed"], vec!["born"], vec![]]
+    );
+}
+
+/// No string another surface refuses to show leaves a cell's values. A credential-shaped string
+/// that another build stored in a text column, in a cell's import source, in a column this
+/// build does not compile and in an owned row's field is listed as the refusal mark, the rest
+/// of the value as stored and the write marked; a value of a column this build does not compile
+/// whose name is a secret's is listed with no value; and a set member whose key is
+/// credential-shaped is named by the mark.
+/// NEGATIVE CONTROL: with `shown` listing every value the secret rule passes as stored
+/// (`grid::raw_shown` not asked), the string is listed where the mark belongs: `` left: […
+/// (stray, Some(Object({"r": Number(1), "x": String("ghp_…")})), false, false) …] ``. With an
+/// unknown column of a secret's name read as any other (`typed::secret_named` not asked), its
+/// value is listed: `` left: (Some(Object({"r": Number(3), "x": Object({"entry": String("(refused
+/// value: not shown)"), "vault": String("alab")})})), false, true) right: (None, true, false)
+/// ``. With `Reader::wrote` naming a key as stored (`keys::safe_key` not asked), no cell's key
+/// is the mark: `` the member's key is the mark left: [] ``.
+#[test]
+fn a_cells_values_never_show_a_refused_string() {
+    // In halves, so the export guard never reads a token here.
+    const CREDENTIAL: &str = concat!("ghp", "_0123456789abcdefghijklmnopqrstuvwxyzAB");
+    const MEMBER: &str = concat!("sk", "-0123456789abcdef");
+    const ENTRY: &str = "alab-address-app_password-ad-0000000000000001.0123456789abcdef";
+    assert!(crate::typed::guard::credential_shaped(CREDENTIAL));
+    assert!(crate::typed::guard::credential_shaped(MEMBER));
+    let lab = Lab::new(&[Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let me = keys::uuid32(&lab.machine(0));
+    let stored = |collection: &str, key: String, value: Value| Change {
+        collection: collection.to_owned(),
+        key,
+        value: Some(value),
+    };
+    let write = |request: u8, changes: Vec<Change>| {
+        append_history_at(
+            &handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let location = format!("{MC}.location");
+    let nickname = format!("{MC}.nickname");
+    let gadget = format!("{MC}.gadget");
+    let password = "ad-0000000000000001.app_password".to_owned();
+    let born = write(1, machine(MC));
+    // Any writer may store any value: what an older or modified build's guards let through.
+    let stray = write(
+        2,
+        vec![
+            stored(
+                MACHINE.name,
+                location.clone(),
+                cell::CellValue::owner(1, json!(CREDENTIAL)).encode(),
+            ),
+            stored(
+                MACHINE.name,
+                nickname.clone(),
+                cell::CellValue::imported(1, json!("spare"), CREDENTIAL).encode(),
+            ),
+            stored(
+                MACHINE.name,
+                gadget.clone(),
+                json!({"r": 9, "x": {"serial": CREDENTIAL, "slot": 2}}),
+            ),
+            stored(
+                ADDRESS.name,
+                password.clone(),
+                json!({"r": 3, "x": {"vault": "alab", "entry": ENTRY}}),
+            ),
+            stored(
+                MACHINE.name,
+                format!("{MC}.clis.{MEMBER}"),
+                cell::CellValue::owner(1, json!(true)).encode(),
+            ),
+            stored(
+                MACHINE_FACTS.name,
+                me.clone(),
+                json!({"r": 1, "n": 1, "mac": MC, "label": "m9", "note": CREDENTIAL}),
+            ),
+        ],
+    );
+    let moved = write(3, vec![put(&MACHINE, MC, "location", json!("rack c"))]);
+    assert!(handle.view().unwrap().refused.is_empty());
+
+    let one = |collection: &str, key: &str| {
+        let mut values = handle.cell_values(collection, key).unwrap();
+        let last = values.pop().unwrap();
+        assert_eq!(last.operation, stray, "{key}");
+        last
+    };
+    let refused = json!(sheet::REFUSED);
+    let locations = handle.cell_values(MACHINE.name, &location).unwrap();
+    assert_eq!(
+        locations
+            .iter()
+            .map(|held| (
+                held.operation,
+                held.value.clone(),
+                held.withheld,
+                held.refused
+            ))
+            .collect::<Vec<_>>(),
+        [
+            (
+                born,
+                put(&MACHINE, MC, "location", json!("rack a")).value,
+                false,
+                false
+            ),
+            (stray, Some(json!({"r": 1, "x": refused})), false, true),
+            (
+                moved,
+                put(&MACHINE, MC, "location", json!("rack c")).value,
+                false,
+                false
+            ),
+        ]
+    );
+    let source = one(MACHINE.name, &nickname);
+    assert_eq!(
+        (source.value, source.withheld, source.refused),
+        (
+            Some(json!({"r": 1, "x": "spare", "s": refused})),
+            false,
+            true
+        )
+    );
+    let unknown = one(MACHINE.name, &gadget);
+    assert_eq!(
+        (unknown.value, unknown.withheld, unknown.refused),
+        (
+            Some(json!({"r": 9, "x": {"serial": refused, "slot": 2}})),
+            false,
+            true
+        )
+    );
+    let named_secret = one(ADDRESS.name, &password);
+    assert_eq!(
+        (
+            named_secret.value,
+            named_secret.withheld,
+            named_secret.refused
+        ),
+        (None, true, false)
+    );
+    let row = one(MACHINE_FACTS.name, &me);
+    assert_eq!(
+        (row.value, row.withheld, row.refused),
+        (
+            Some(json!({"r": 1, "n": 1, "mac": MC, "label": "m9", "note": refused})),
+            false,
+            true
+        )
+    );
+    let wrote = handle.wrote(stray).unwrap();
+    assert_eq!(wrote.len(), 6);
+    assert_eq!(
+        wrote
+            .iter()
+            .filter(|cell| cell.key == sheet::REFUSED)
+            .map(|cell| (cell.collection.as_str(), cell.wrote[0].value.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            MACHINE.name,
+            Some(cell::CellValue::owner(1, json!(true)).encode())
+        )],
+        "the member's key is the mark"
+    );
+    let replaced = handle.wrote(moved).unwrap();
+    assert_eq!(replaced[0].replaced, [locations[1].clone()]);
+    let shown = format!("{locations:?}{wrote:?}{replaced:?}");
+    assert!(
+        ![CREDENTIAL, MEMBER, ENTRY]
+            .iter()
+            .any(|refused| shown.contains(refused)),
+        "a refused string left the read"
+    );
+}
+
+/// An owned row's values read through a registry roll: a carried history entry is its roller's
+/// word, and never stands in for a signed record. In the first generation Mac 0 writes its
+/// facts row twice (`early`, which holds a sealed token, then `seen`) and Mac 1 writes a row at
+/// Mac 0's key (`forged`). After the roll the key lists `early` as the history states it, with
+/// no value and never standing, and `seen` once, standing: the record the roll archived, with
+/// the clocks its history entry states; `forged` is not listed. Mac 1 then makes itself a roller
+/// and states three entries at Mac 0's key in Mac 0's name: a row nothing signed (`claimed`), a
+/// trimmed entry (`trimmed`) and another row under the digest of a record Mac 0 signed
+/// (`facts`). Each is listed apart and does not stand. Once `facts` is archived, its value,
+/// writer and machine are the signed record's, and it stands; an archived row no entry names
+/// (`sealed`, which holds a token) is listed with no value, as Mac 0's and at the record of Mac 1
+/// that archived it. Mac 0's first row of the new generation replaced `facts`. A typed cell's
+/// entry stated with a sealed token is listed with no value.
+/// NEGATIVE CONTROL: with `Reader::cell` listing the carried entries before the archived rows,
+/// the statement stands in for the signed record: `` left: [("early", "Stated", false),
+/// ("seen", "Stated", false)] right: [("early", "Stated", false), ("seen", "Carried", true)] ``.
+/// With `Reader::cell` not passing over an entry already listed (`seen` not asked in its last
+/// loop), the archived row is listed again as stated: `` left: [("early", "Stated", false),
+/// ("seen", "Carried", true), ("seen", "Stated", false)] ``. With `Reader::stated` not asking
+/// `owned::kept`, the forged row is listed: `` left: [("early", "Stated", false), ("seen",
+/// "Carried", true), ("forged", "Stated", false)] ``. With `Reader::stated` judging an entry
+/// stated with no value as a row with none (`keyed` not given), the secret's row is not listed:
+/// `` left: [("seen", "Carried", true)] right: [("early", "Stated", false), ("seen", "Carried",
+/// true)] ``. With `Reader::restated` giving an archived row the machine of the record that
+/// archived it, Mac 1 reads as the writer of Mac 0's row: `an archived row is its signer's`.
+/// With `Reader::restated` listing the row as stored (`shown` not asked), the token is listed:
+/// `` left: (Some(Object({… "serial": String("sec1:…")})), false, Restated { by: … }) right:
+/// (None, true, Restated { by: … }) ``; with `Reader::stated` doing so, the typed cell's:
+/// `` left: (Some(Object({"r": Number(1), "x": String("sec1:…")})), false) right: (None, true)
+/// ``. With `Reader::wrote` leaving out the archived rows, the new row replaced nothing:
+/// `` left: [["fresh"], [], []] right: [["fresh"], ["facts"], []] ``.
+#[test]
+fn an_owned_rows_values_read_through_a_registry_roll() {
+    use crate::table::tests::repair_commons;
+    let pk = "mc-0000000000000001";
+    let token = sealed_token();
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let macs: Vec<_> = lab.paths.iter().cloned().map(Registry::at).collect();
+    for registry in &macs {
+        registry.open().unwrap();
+    }
+    repair_commons(&lab, 6);
+    let first = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let write = |handle: &Handle, request: u8, changes: Vec<Change>| {
+        append_history_at(
+            handle,
+            Command::Write {
+                request: [request; 16],
+                changes,
+            },
+            u64::from(request) * 1_000,
+        )
+    };
+    let me = keys::uuid32(&lab.machine(0));
+    let at_me = |row: Value| Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: me.clone(),
+        value: Some(row),
+    };
+    let facts_row = |n: u64, label: &str| json!({"r": 1, "n": n, "mac": pk, "label": label});
+    let secret_row =
+        |n: u64| json!({"r": 1, "n": n, "mac": pk, "label": "m8", "serial": token.as_str()});
+    let born = write(&first, 1, machine(pk));
+    let early = write(&first, 2, vec![at_me(secret_row(1))]);
+    let seen = write(&first, 3, vec![at_me(facts_row(2, "m9"))]);
+    repair_commons(&lab, 6);
+    let forged = write(
+        &Handle::at(lab.paths[1].clone(), &REGISTRY),
+        4,
+        vec![at_me(facts_row(9, "m1"))],
+    );
+    repair_commons(&lab, 6);
+    // Two more rows of Mac 0, signed for the first generation and never ingested there.
+    let (facts, wire) = sealed_record(&first, 5, vec![at_me(facts_row(5, "m10"))], 5_000);
+    let (sealed, sealed_wire) = sealed_record(&first, 6, vec![at_me(secret_row(4))], 6_000);
+    let author = first
+        .view()
+        .unwrap()
+        .ops
+        .iter()
+        .find(|op| op.id == born)
+        .unwrap()
+        .actor;
+    let mut names = vec![
+        ("early", early),
+        ("seen", seen),
+        ("forged", forged),
+        ("facts", facts),
+        ("sealed", sealed),
+    ];
+    let kind = |source: Source| match source {
+        Source::Log => "Log",
+        Source::Carried { generation: 1, .. } => "Carried",
+        Source::Stated { generation: 1, .. } => "Stated",
+        Source::Restated { .. } => "Restated",
+        _ => "?",
+    };
+    let listed = |handle: &Handle, names: &[(&'static str, Digest)]| {
+        let values = handle.cell_values(MACHINE_FACTS.name, &me).unwrap();
+        let rows: Vec<_> = named(names, &values)
+            .into_iter()
+            .zip(&values)
+            .map(|(name, held)| (name, kind(held.source), held.stands))
+            .collect();
+        (rows, values)
+    };
+    let (rows, values) = listed(&first, &names);
+    assert_eq!(rows, [("early", "Log", false), ("seen", "Log", true)]);
+    assert_eq!((&values[0].value, values[0].withheld), (&None, true));
+    let mut shown = format!("{values:?}");
+
+    let now = || aterm_time::unix_millis().unwrap();
+    macs[0].roll(true, now()).unwrap();
+    repair_commons(&lab, 6);
+    macs[1].release(now()).unwrap();
+    repair_commons(&lab, 6);
+    assert!(macs[0].roll(true, now()).unwrap().sealed);
+    repair_commons(&lab, 6);
+    assert_eq!(macs[0].generation().generation, 2);
+    let rolled = Handle::at(lab.paths[0].clone(), macs[0].generation());
+    let there = Handle::at(lab.paths[1].clone(), macs[1].generation());
+
+    // The roll's own history and archive: the signed row once, the secret's row with no value.
+    let (rows, values) = listed(&rolled, &names);
+    assert_eq!(
+        rows,
+        [("early", "Stated", false), ("seen", "Carried", true)]
+    );
+    assert_eq!(
+        (&values[0].value, values[0].withheld, values[0].source),
+        (
+            &None,
+            true,
+            Source::Stated {
+                generation: 1,
+                trimmed: false
+            }
+        )
+    );
+    assert_eq!(
+        (values[1].value.as_ref(), values[1].authored_ms),
+        (Some(&facts_row(2, "m9")), 3_000)
+    );
+    assert!(
+        values
+            .iter()
+            .all(|held| held.machine == Some(lab.machine(0)) && held.actor == author)
+    );
+    shown.push_str(&format!("{values:?}"));
+
+    // Mac 1 makes itself a roller and states history at Mac 0's key, in Mac 0's name.
+    let whom = (author.as_slice(), &lab.machine(0));
+    let by = keys::uuid32(&lab.machine(1));
+    let (claimed, trimmed, typed) = ([5; 32], [6; 32], [7; 32]);
+    let at_key = |row: Value| json!([{"c": MACHINE_FACTS.name, "k": me.as_str(), "x": row}]);
+    write(
+        &there,
+        31,
+        vec![
+            cover(&by),
+            stated(&by, claimed, whom, 1, false, at_key(facts_row(99, "m2"))),
+            stated(
+                &by,
+                trimmed,
+                whom,
+                2,
+                true,
+                json!([{"c": MACHINE_FACTS.name, "k": me.as_str()}]),
+            ),
+            stated(&by, facts, whom, 3, false, at_key(facts_row(77, "m3"))),
+            stated(
+                &by,
+                typed,
+                whom,
+                4,
+                false,
+                json!([{"c": MACHINE.name, "k": format!("{pk}.location"),
+                    "x": {"r": 1, "x": token.as_str()}}]),
+            ),
+        ],
+    );
+    repair_commons(&lab, 6);
+    names.extend([("claimed", claimed), ("trimmed", trimmed), ("typed", typed)]);
+    let (rows, values) = listed(&rolled, &names);
+    assert_eq!(
+        rows,
+        [
+            ("claimed", "Stated", false),
+            ("trimmed", "Stated", false),
+            ("facts", "Stated", false),
+            ("early", "Stated", false),
+            ("seen", "Carried", true)
+        ]
+    );
+    assert_eq!(
+        (&values[1].value, values[1].withheld, values[1].source),
+        (
+            &None,
+            false,
+            Source::Stated {
+                generation: 1,
+                trimmed: true
+            }
+        )
+    );
+    assert_eq!(values[2].value, Some(facts_row(77, "m3")));
+
+    // Mac 1 archives the two signed records. The one a statement names is the record's own row,
+    // writer and machine, and it stands; the other is Mac 0's too, at the record that archived
+    // it, with no value.
+    archive(&there, 32, facts, &wire);
+    let archiving = archive(&there, 33, sealed, &sealed_wire);
+    repair_commons(&lab, 6);
+    for handle in [&rolled, &there] {
+        let (rows, values) = listed(handle, &names);
+        assert_eq!(
+            rows,
+            [
+                ("claimed", "Stated", false),
+                ("trimmed", "Stated", false),
+                ("facts", "Carried", true),
+                ("early", "Stated", false),
+                ("seen", "Carried", false),
+                ("sealed", "Restated", false)
+            ]
+        );
+        assert_eq!(values[2].value, Some(facts_row(5, "m10")));
+        assert_eq!(
+            (&values[5].value, values[5].withheld, values[5].source),
+            (&None, true, Source::Restated { by: archiving })
+        );
+        assert!(
+            [&values[2], &values[5]]
+                .iter()
+                .all(|held| held.machine == Some(lab.machine(0)) && held.actor == author),
+            "an archived row is its signer's"
+        );
+        shown.push_str(&format!("{values:?}"));
+    }
+
+    // Mac 0's first row of the new generation replaced the archived row that stood.
+    let fresh = write(&rolled, 34, vec![at_me(facts_row(6, "m11"))]);
+    names.push(("fresh", fresh));
+    assert_eq!(
+        wrote_at(&rolled, &names, fresh, MACHINE_FACTS.name, &me),
+        [vec!["fresh"], vec!["facts"], vec![]]
+    );
+    let (rows, _) = listed(&rolled, &names);
+    assert_eq!(
+        (rows[2], rows.last().unwrap()),
+        (("facts", "Carried", false), &("fresh", "Log", true))
+    );
+
+    // A typed cell's entry stated with a sealed token is listed with no value.
+    let locations = rolled
+        .cell_values(MACHINE.name, &format!("{pk}.location"))
+        .unwrap();
+    let stated_token = locations
+        .iter()
+        .find(|held| held.operation == typed)
+        .unwrap();
+    assert_eq!((&stated_token.value, stated_token.withheld), (&None, true));
+    shown.push_str(&format!("{locations:?}{:?}", rolled.wrote(fresh).unwrap()));
+    assert!(!shown.contains(&token), "a sealed token left the read");
 }

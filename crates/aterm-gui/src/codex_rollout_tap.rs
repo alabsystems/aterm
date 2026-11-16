@@ -112,12 +112,8 @@ impl RolloutAsk {
 /// wait's [`ReadWait::read_ms`] as it was, so unless the rows it applied or an act logged since
 /// move the wait, only the tap's own cadence reads again. No wait clears the pair read, and a
 /// session with no ask takes none.
-pub(crate) fn pair_wait(
-    asked: &mut HashMap<u64, RolloutAsk>,
-    session: u64,
-    wait: Option<(ReadWait, Instant)>,
-) {
-    let Some(ask) = asked.get_mut(&session) else {
+pub(crate) fn pair_wait(asked: &mut Option<Box<RolloutAsk>>, wait: Option<(ReadWait, Instant)>) {
+    let Some(ask) = asked.as_mut() else {
         return;
     };
     ask.pair = match wait {
@@ -158,27 +154,26 @@ pub(crate) enum Ask {
 /// [`rest_recheck`] (15 s while it wrote in the last ten minutes, then 60 s), at the first sweep
 /// at or after that interval, and no timer is armed for it.
 pub(crate) fn due(
-    asked: &mut HashMap<u64, RolloutAsk>,
-    session: u64,
+    asked: &mut Option<Box<RolloutAsk>>,
     target: Option<TapTarget>,
     look: Option<Look>,
     (now, output): (Instant, Option<Instant>),
 ) -> Ask {
     let Some(target) = target else {
-        return if asked.remove(&session).is_some() {
+        return if asked.take().is_some() {
             Ask::Stop
         } else {
             Ask::Nothing
         };
     };
-    let prior = asked.get(&session).copied();
+    let prior = asked.as_deref().copied();
     let screen = look.map(|l| l.screen);
     let settle = match look {
         Some(l) if l.counted && prior.is_none_or(|p| p.screen != screen) => now.checked_add(SETTLE),
         Some(l) if l.counted => prior.and_then(|p| p.settle),
         _ => None,
     };
-    if let Some(prior) = asked.get_mut(&session)
+    if let Some(prior) = asked.as_mut()
         && now.saturating_duration_since(prior.at) < RECHECK
     {
         prior.owed |= output != prior.output
@@ -193,7 +188,7 @@ pub(crate) fn due(
     // `RECHECK` was first to see still ends the rest. A trailing read noted owed ends it
     // whatever this sweep sees: the tests beside it imply that one only while the output
     // instant moves forward.
-    if let Some(prior) = asked.get_mut(&session)
+    if let Some(prior) = asked.as_mut()
         && output == prior.output
         && screen == prior.read
         && !prior.owed
@@ -210,19 +205,20 @@ pub(crate) fn due(
         prior.settle = settle;
         return Ask::Nothing;
     }
-    asked.insert(
-        session,
-        RolloutAsk {
-            at: now,
-            owed: false,
-            output,
-            screen,
-            read: screen,
-            settle: settle.filter(|at| *at > now),
-            wait: prior.and_then(|p| p.wait),
-            pair: prior.and_then(|p| p.pair).filter(|at| *at > now),
-        },
-    );
+    let next = RolloutAsk {
+        at: now,
+        owed: false,
+        output,
+        screen,
+        read: screen,
+        settle: settle.filter(|at| *at > now),
+        wait: prior.and_then(|p| p.wait),
+        pair: prior.and_then(|p| p.pair).filter(|at| *at > now),
+    };
+    match asked {
+        Some(current) => **current = next,
+        None => *asked = Some(Box::new(next)),
+    }
     Ask::Read(target)
 }
 

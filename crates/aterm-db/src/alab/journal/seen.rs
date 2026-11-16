@@ -314,9 +314,10 @@ impl Seen {
         });
     }
 
-    /// Test seam: what a peer reads of the sign-in words of the Mac `uuid` from what that Mac
-    /// publishes, its `events` in the order an `ev` batch holds them and then its `use` rows
-    /// (each an account's key and its row), folded by the code [`Self::of`] folds a window with.
+    /// Test seam: what a peer reads of the Mac `uuid` (its sign-in words, and the plans it saw)
+    /// from what that Mac publishes, its `events` in the order an `ev` batch holds them and then
+    /// its `use` rows (each an account's key and its row), folded by the code [`Self::of`] folds
+    /// a window with.
     #[cfg(any(test, debug_assertions))]
     pub(super) fn of_published(
         uuid: &str,
@@ -330,6 +331,7 @@ impl Seen {
         }
         for (account, row) in uses {
             seen.sign_use(account.as_str(), uuid, row);
+            seen.fold_use(account.as_str(), uuid, row);
         }
         seen.drop_withdrawn();
         seen

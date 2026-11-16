@@ -8,10 +8,11 @@
 //! **The row** ([`PresenceRow`]) holds this Mac's build, its interface addresses, and the digest
 //! and count of its membership log and of its lab tables ([`Held`]). The node service writes it
 //! every 30 seconds ([`EVERY`]) through [`Mesh::publish`], so it is signed by the node key and
-//! numbered under the log's incarnation lease, and the relay carries it to every Mac. A `now`
-//! subject keeps the row with the highest sequence number (`aterm_metrics::rules`, AS1's
-//! monotone `Last`), so a late, older row never replaces a newer one on any broker, and a
-//! restarted Mac's first row wins at once: its incarnation is new, so its number is higher.
+//! numbered under the log's incarnation lease, and the relay carries it to every current seat the
+//! overlay can reach. A `now` subject keeps the row with the highest sequence number
+//! (`aterm_metrics::rules`, AS1's monotone `Last`), so a late, older row never replaces a newer
+//! one on any broker, and a restarted Mac's first row wins at once: its incarnation is new, so its
+//! number is higher.
 //!
 //! **Up is read from rows, never from a probe.** One tail of this Mac's own `metrics.log` takes
 //! every presence row as it lands, from a relay or from this Mac's own publisher, and the
@@ -1027,9 +1028,10 @@ pub struct Facts {
 pub type ReadFacts = Arc<dyn Fn() -> Facts + Send + Sync>;
 
 /// This Mac's fleet addresses with the node listener's `port`: each address of an interface that
-/// is up and not loopback which a peer on its LAN can dial (a private or link-local IPv4
-/// address, a unique-local IPv6 one; an IPv6 link-local address dials only by a zone the peer's
-/// own interface names, so it travels as nothing a peer could use), sorted, at most
+/// is up and not loopback which another seat can dial ([`dialable`]): a private or link-local
+/// IPv4 address and a unique-local IPv6 one for a peer on its LAN, then a shared-space
+/// (100.64.0.0/10, a Tailscale-style overlay's) or globally routed one for a seat beyond it, which
+/// dials it because this signed row named it (LT-B8). Sorted LAN first, each once, at most
 /// [`ADDRESSES_MAX`].
 #[must_use]
 pub fn fleet_addresses(port: u16) -> Vec<SocketAddr> {
@@ -1042,16 +1044,25 @@ pub fn fleet_addresses(port: u16) -> Vec<SocketAddr> {
         .filter(|ip| dialable(*ip))
         .map(|ip| SocketAddr::new(ip, port))
         .collect();
-    addresses.sort_unstable();
+    addresses.sort_unstable_by_key(|at| (!aterm_net::fleet::is_fleet_source(at.ip()), *at));
     addresses.dedup();
     addresses.truncate(ADDRESSES_MAX);
     addresses
 }
 
-/// Whether a peer on this Mac's LAN can dial `ip` ([`fleet_addresses`]).
-fn dialable(ip: IpAddr) -> bool {
+/// Whether another seat can dial `ip` when a seat's signed row names it ([`fleet_addresses`],
+/// [`crate::Mesh::seat_addresses`]): an address a fleet dial heard from an authenticated source
+/// may go to ([`aterm_net::fleet::is_fleet_dial`] with
+/// [`Provenance::Proved`](aterm_net::fleet::Provenance::Proved)), never loopback (a row's loopback
+/// address is its writer's, not the reader's), and never an IPv6 link-local one, which dials
+/// only by a zone the dialer's own interface names, so it travels as nothing a peer could use.
+#[must_use]
+pub fn dialable(ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
     let v6_link_local = matches!(ip, IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80);
-    !ip.is_loopback() && !v6_link_local && aterm_net::fleet::is_fleet_source(ip)
+    !ip.is_loopback()
+        && !v6_link_local
+        && aterm_net::fleet::is_fleet_dial(ip, aterm_net::fleet::Provenance::Proved)
 }
 
 /// What this Mac's vault holds of the membership log: every record its store holds
@@ -1563,6 +1574,30 @@ impl Shared {
                 principal,
                 key,
             })
+            .collect()
+    }
+
+    /// [`crate::Mesh::seat_addresses`].
+    pub(crate) fn seat_addresses(&self) -> Vec<(String, SocketAddr)> {
+        let mesh = &self.mesh;
+        let Some(seats) = mesh.seats_by_principal() else {
+            return Vec::new();
+        };
+        let board = self.board.lock_or_recover();
+        seats
+            .into_keys()
+            .filter(|principal| *principal != mesh.me.principal)
+            .filter_map(|principal| {
+                let (_, row) = board.row(&principal)?;
+                Some(
+                    row.addresses
+                        .iter()
+                        .filter(|at| dialable(at.ip()))
+                        .map(|at| (principal.clone(), *at))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
             .collect()
     }
 

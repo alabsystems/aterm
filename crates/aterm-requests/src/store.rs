@@ -2410,9 +2410,7 @@ impl Store {
             0o600,
             Some(aterm_durable::Flush::Ordered),
         )?;
-        self.seen = Some(line_log::identity_of(&std::fs::symlink_metadata(
-            &self.journal,
-        )?));
+        self.seen = Some(line_log::identity_at(&self.journal)?);
         self.fold.stale = 0;
         Ok(())
     }
@@ -2420,8 +2418,8 @@ impl Store {
     /// Read what was appended since this store last read, without the lock: only whole lines
     /// are taken, so a row being written is read next time.
     fn refresh(&mut self) -> io::Result<()> {
-        let meta = match std::fs::symlink_metadata(&self.journal) {
-            Ok(meta) => meta,
+        let now = match line_log::identity_at(&self.journal) {
+            Ok(now) => now,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 if self.seen.is_some() {
                     self.reset();
@@ -2430,12 +2428,11 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
-        let now = line_log::identity_of(&meta);
         if self.seen == Some(now) {
             return Ok(());
         }
-        let (file, meta) = aterm_uds::regular_file::open(&self.journal)?;
-        let now = line_log::identity_of(&meta);
+        let (file, _) = aterm_uds::regular_file::open(&self.journal)?;
+        let now = line_log::identity_of(&file)?;
         self.take(now, read_of(&file))
     }
 
@@ -2493,11 +2490,9 @@ impl Store {
     /// such a row, and the next append would finish it, so a read made to mint an id must hold
     /// it already.
     fn refresh_said_held(&mut self) -> io::Result<()> {
-        match std::fs::symlink_metadata(&self.said) {
+        match line_log::identity_at(&self.said) {
             // A store that read the tier up to its end read it to a newline ([`whole_lines`]).
-            Ok(meta)
-                if meta.len() > 0 && self.said_fold.seen != Some(line_log::identity_of(&meta)) =>
-            {
+            Ok(now) if now.len > 0 && self.said_fold.seen != Some(now) => {
                 let mut held_said = line_log::hold(&self.said)?;
                 let len = held_said.identity()?.len;
                 if len > 0 && held_said.read_from(len - 1, 1)? != b"\n" {
@@ -2515,19 +2510,19 @@ impl Store {
     /// Read what the content tier gained since this store last read it, without the lock, as
     /// [`Self::refresh`] reads the journal.
     fn refresh_said(&mut self) -> io::Result<()> {
-        let meta = match std::fs::symlink_metadata(&self.said) {
-            Ok(meta) => meta,
+        let now = match line_log::identity_at(&self.said) {
+            Ok(now) => now,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.said_fold = SaidFold::default();
                 return Ok(());
             }
             Err(error) => return Err(error),
         };
-        if self.said_fold.seen == Some(line_log::identity_of(&meta)) {
+        if self.said_fold.seen == Some(now) {
             return Ok(());
         }
-        let (file, meta) = aterm_uds::regular_file::open(&self.said)?;
-        let now = line_log::identity_of(&meta);
+        let (file, _) = aterm_uds::regular_file::open(&self.said)?;
+        let now = line_log::identity_of(&file)?;
         let tail = whole_lines(self.said_fold.seen, now, read_of(&file))?;
         if tail.restart {
             self.said_fold.of.clear();
@@ -2550,12 +2545,12 @@ impl Store {
 /// Either log could not be read (a missing one has no rows).
 pub fn lines_of(dir: &Path, id: &str) -> io::Result<(Vec<String>, Vec<String>)> {
     let rows = |path: &Path, of: &dyn Fn(&str) -> Option<String>| -> io::Result<Vec<String>> {
-        let (file, meta) = match aterm_uds::regular_file::open(path) {
+        let (file, _) = match aterm_uds::regular_file::open(path) {
             Ok(opened) => opened,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error),
         };
-        let tail = whole_lines(None, line_log::identity_of(&meta), read_of(&file))?;
+        let tail = whole_lines(None, line_log::identity_of(&file)?, read_of(&file))?;
         Ok(tail
             .lines()
             .filter_map(|line| std::str::from_utf8(line).ok())

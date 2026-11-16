@@ -24,8 +24,10 @@ pub mod provenance;
 pub mod resolve;
 pub mod serde_attrs;
 pub mod survey;
+mod tree_pin;
 
 pub use direct_vendor::astream_pin;
+pub use tree_pin::{TreePin, TreePinError, tree_pins};
 
 /// Exit codes matching `aterm-verify`.
 pub mod exit {

@@ -152,28 +152,25 @@ fn cleanup_after_timely_authorization_preserves_its_success() {
     );
 }
 
+/// Expiry at the next evaluate ends the drive as a stall on the last host it read: no check is
+/// ever waited on, so none can be standing when the deadline comes.
 #[test]
-fn expiry_at_the_next_evaluate_keeps_an_observed_bot_check() {
+fn expiry_at_the_next_evaluate_names_the_last_host() {
     let start = Instant::now();
     let now = Cell::new(start);
     let clock = || now.get();
     let deadline = Deadline::new(Duration::from_secs(10), &clock);
-    let mut bot = BotCheckClock::default();
-    bot.check("https://claude.ai/login", start);
     now.set(deadline.end());
     let _ = take_met();
-    assert_eq!(
-        oauth_time_left(deadline, &bot, false, Some("claude.ai")),
-        Err(BOT_CHECK_UNCLEARED)
-    );
+    assert!(oauth_time_left(deadline, Some("claude.ai")).is_err());
     assert_eq!(
         take_met(),
         Some(super::super::open_url::Met::new(
-            MetWord::BotCheck,
+            MetWord::Stall,
             Some("claude.ai")
         ))
     );
-    assert!(oauth_time_left(deadline, &BotCheckClock::default(), false, None).is_err());
+    assert!(oauth_time_left(deadline, None).is_err());
     assert_eq!(
         take_met(),
         Some(super::super::open_url::Met::new(MetWord::Stall, None))

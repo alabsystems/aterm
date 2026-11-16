@@ -31,6 +31,9 @@ const PROFILE: &str = ".config/aterm/init.toml";
 const PROFILE_MAX: usize = 64 * 1024;
 const MANIFEST_MAX: usize = 1024 * 1024;
 const SUBMODULE: &str = "vendor/astream";
+/// How long init gives the checkout's tools (`targo --unverified verify provision`), which may
+/// build and download what the lock names. vendor/astream's update keeps no wall clock: it is a
+/// transfer, bounded by its progress ([`Submodules::update`]).
 const LONG_BUDGET: Duration = Duration::from_secs(1800);
 /// Doctor's wait for a checkout's tools `--check` before stopping it.
 const DOCTOR_BUDGET: Duration = Duration::from_secs(120);
@@ -686,7 +689,36 @@ struct Submodules {
 struct Needs {
     recurse: bool,
     update: bool,
+    /// vendor/astream is checked out (initialized), whether or not at the recorded commit.
+    placed: bool,
     kept: Option<String>,
+}
+
+/// A run [`Submodules::update`] makes, as a failure of it names it.
+#[derive(Clone, Copy)]
+enum Step {
+    /// `git fetch --progress` in a checked-out vendor/astream that lags.
+    Fetch,
+    /// `git submodule update --init --checkout --progress -- vendor/astream`.
+    Update,
+}
+
+impl Step {
+    /// The run, as a failure names it.
+    const fn command(self) -> &'static str {
+        match self {
+            Self::Fetch => "git fetch in vendor/astream",
+            Self::Update => "git submodule update --init --checkout -- vendor/astream",
+        }
+    }
+
+    /// Why a run that reached its remote failed, as far as init can tell.
+    const fn refused(self) -> &'static str {
+        match self {
+            Self::Fetch => "no access to its remote",
+            Self::Update => "no access to its remote, or no such commit there",
+        }
+    }
 }
 
 impl Submodules {
@@ -788,8 +820,171 @@ impl Submodules {
         }))
     }
 
+    /// The commit the checkout's index records for vendor/astream, its gitlink: the one `git
+    /// submodule update` checks out.
+    ///
+    /// # Errors
+    /// git could not be run, or its index holds no single gitlink at vendor/astream.
+    fn recorded(&self, sys: &dyn System) -> Result<String, String> {
+        let listed = sys
+            .run_complete_stdout(
+                &self
+                    .git(sys)
+                    .args(["ls-files", "--stage", "-z", "--", SUBMODULE]),
+            )
+            .map_err(|_| "cannot run git ls-files in the checkout")?;
+        let unread = || "cannot read the commit the checkout records for vendor/astream".to_owned();
+        if !listed.success() {
+            return Err(unread());
+        }
+        let listed = std::str::from_utf8(&listed.stdout).map_err(|_| unread())?;
+        let mut entries = listed.split('\0').filter(|entry| !entry.is_empty());
+        let (Some(entry), None) = (entries.next(), entries.next()) else {
+            return Err(unread());
+        };
+        let Some((meta, path)) = entry.split_once('\t') else {
+            return Err(unread());
+        };
+        match meta.split(' ').collect::<Vec<_>>().as_slice() {
+            ["160000", commit, "0"]
+                if path == SUBMODULE
+                    && matches!(commit.len(), 40 | 64)
+                    && commit.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                Ok((*commit).to_owned())
+            }
+            _ => Err(unread()),
+        }
+    }
+
+    /// Whether one of the refs of vendor/astream, checked out at `inner`, reaches `commit`: the
+    /// test `git submodule update` makes before it fetches (`rev-list -n 1 <commit> --not --all`
+    /// printing nothing). A commit vendor/astream does not hold is not reached.
+    ///
+    /// # Errors
+    /// git could not be run.
+    fn reaches(&self, sys: &dyn System, inner: &Path, commit: &str) -> Result<bool, String> {
+        let ran = sys
+            .run_complete_stdout(
+                &checkout::git(sys, &self.user, Some(inner))
+                    .args(["rev-list", "-n", "1", commit, "--not", "--all"]),
+            )
+            .map_err(|_| "cannot run git rev-list in vendor/astream")?;
+        Ok(ran.success() && ran.stdout.trim_ascii().is_empty())
+    }
+
+    /// Bring vendor/astream to the commit the checkout records. One not checked out yet
+    /// (`placed` false) is cloned by `git submodule update --init --checkout --progress --
+    /// vendor/astream`, which hands `--progress` to its clone. One checked out that only lags is
+    /// fetched by init itself first, where none of its refs reaches that commit
+    /// ([`Submodules::reaches`]): the update's own fetch takes no `--progress`, so with its
+    /// standard error no terminal it writes no meter, and its remote, asked for no progress,
+    /// sends no `remote:` lines either, leaving a slow fetch nothing to show but its process
+    /// tree's work. init's `git fetch --progress` shows both, and the update then finds the
+    /// commit and fetches nothing. Where even that fetch leaves the commit unreached (one on no
+    /// branch of its remote), the update's own fetch of that one commit follows, shown by its
+    /// process tree's work alone. Each run is a transfer, bounded by its progress rather than a
+    /// wall clock ([`System::run_repository`]), so a slow link finishes it and one that stopped
+    /// carrying it fails as the network's. It reports to a destination record of its own
+    /// (`<checkout>/vendor/astream`), placed and usable from its start where vendor/astream is
+    /// checked out, which ends ready or failed. A remote it cannot reach stands the item aside
+    /// offline.
+    ///
+    /// # Errors
+    /// The recorded commit or what reaches it could not be read, git could not be run, or a
+    /// transfer failed or stalled.
+    fn update(&self, sys: &dyn System, placed: bool) -> Result<(), String> {
+        use crate::repository_progress::{FailureKind, Phase, Progress};
+        let inner = self.path.join(SUBMODULE);
+        let fetch = placed && !self.reaches(sys, &inner, &self.recorded(sys)?)?;
+        let folder = self.path.file_name().map_or_else(
+            || self.spelled.clone(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let mut progress = Progress::new(&format!("{folder}/{SUBMODULE}"), inner.clone());
+        progress.placed = placed;
+        progress.usable = placed;
+        let mut ended = None;
+        if fetch {
+            progress.enter(Phase::Fetching);
+            sys.repository_progress(&progress);
+            let fetched = sys.run_repository(
+                &checkout::network(sys, &self.user, Some(&inner))
+                    .args(checkout::NO_SIDE_RUNS)
+                    .args(["fetch", "--progress", "--no-recurse-submodules"]),
+                &mut progress,
+            );
+            if !matches!(&fetched, Ok(ran) if ran.success()) {
+                ended = Some((Step::Fetch, fetched));
+            }
+        }
+        let (step, ran) = match ended {
+            Some(ended) => ended,
+            None => {
+                progress.enter(if placed {
+                    Phase::Updating
+                } else {
+                    Phase::Connecting
+                });
+                sys.repository_progress(&progress);
+                let ran = sys.run_repository(
+                    &checkout::lazily(checkout::network(sys, &self.user, Some(&self.path)))
+                        .args(checkout::NO_SIDE_RUNS)
+                        .args([
+                            "submodule",
+                            "update",
+                            "--init",
+                            "--checkout",
+                            "--progress",
+                            "--",
+                            SUBMODULE,
+                        ]),
+                    &mut progress,
+                );
+                (Step::Update, ran)
+            }
+        };
+        let (failed, result) = match ran {
+            Ok(ran) if ran.success() => (None, Ok(())),
+            Ok(ran) if checkout::unreachable(&ran.stderr) => {
+                self.stood.set(Some(StoodAside::Offline(format!(
+                    "{}: cannot reach vendor/astream's remote (offline); the next `aterm init` \
+                     checks it out",
+                    self.spelled
+                ))));
+                (Some(FailureKind::Network), Ok(()))
+            }
+            Ok(_) => (
+                Some(FailureKind::Network),
+                Err(format!("{} failed ({})", step.command(), step.refused())),
+            ),
+            Err(failed) if failed.is_stall() => (
+                Some(FailureKind::Network),
+                Err(format!(
+                    "{} stopped: {failed}, its remote having stopped sending",
+                    step.command()
+                )),
+            ),
+            Err(_) => (
+                Some(FailureKind::Local),
+                Err(format!("cannot run {}", step.command())),
+            ),
+        };
+        match failed {
+            None => {
+                progress.placed = true;
+                progress.usable = true;
+                progress.enter(Phase::Ready);
+            }
+            Some(kind) => progress.fail(kind),
+        }
+        sys.repository_progress(&progress);
+        result
+    }
+
     fn needs(&self, sys: &dyn System) -> Result<Option<Needs>, String> {
         let (state, recurse) = self.read(sys)?;
+        let placed = !matches!(state, Submodule::Uninitialized);
         let (update, kept) = match state {
             Submodule::Absent => return Ok(None),
             Submodule::Uninitialized => (true, None),
@@ -806,6 +1001,7 @@ impl Submodules {
         Ok(Some(Needs {
             recurse: !recurse,
             update,
+            placed,
             kept,
         }))
     }
@@ -888,36 +1084,7 @@ impl Item for Submodules {
             }
         }
         if needs.update {
-            let ran = sys
-                .run_complete_stdout(
-                    &checkout::lazily(checkout::network(sys, &self.user, Some(&self.path)))
-                        .budget(LONG_BUDGET)
-                        .args(checkout::NO_SIDE_RUNS)
-                        .args([
-                            "submodule",
-                            "update",
-                            "--init",
-                            "--checkout",
-                            "--",
-                            SUBMODULE,
-                        ]),
-                )
-                .map_err(|_| "cannot run git submodule update in the checkout")?;
-            if !ran.success() {
-                if checkout::unreachable(&ran.stderr) {
-                    self.stood.set(Some(StoodAside::Offline(format!(
-                        "{}: cannot reach vendor/astream's remote (offline); the next `aterm \
-                         init` checks it out",
-                        self.spelled
-                    ))));
-                    return Ok(());
-                }
-                return Err(
-                    "git submodule update --init --checkout -- vendor/astream failed (no access \
-                     to its remote, or no such commit there)"
-                        .into(),
-                );
-            }
+            self.update(sys, needs.placed)?;
         }
         Ok(())
     }

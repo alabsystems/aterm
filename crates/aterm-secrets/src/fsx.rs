@@ -692,7 +692,7 @@ pub struct FileStamp {
 }
 
 impl FileStamp {
-    fn of(meta: &std::fs::Metadata) -> Self {
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
         Self {
             dev: meta.dev(),
@@ -1114,10 +1114,25 @@ pub(crate) const SETTLED: std::time::Duration = std::time::Duration::from_secs(2
 /// made after `now` moves a stamp a later `lstat` shows, on a clock that ticks this coarsely or
 /// finer. Only then may a reader keep what it read while the path's [`Seen`] stands.
 pub(crate) fn settled(seen: &Seen, now: std::time::SystemTime) -> bool {
-    now.duration_since(std::time::UNIX_EPOCH)
+    stamp_settled(&seen.stamp, now)
+}
+
+/// The time a read judges by whether the file it is about to read had settled
+/// ([`stamp_settled`]): the clock, and in a test as much later as [`as_if_later`] puts it.
+pub(crate) fn read_began() -> std::time::SystemTime {
+    asked_now()
+}
+
+/// Whether the file whose stamp is `stamp` had stood [`SETTLED_NS`] unchanged at `began`, a time
+/// taken before its bytes were read: a write after that takes a later time on a clock that ticks
+/// this coarsely or finer, so no other bytes ever show this stamp. One taken within its file's
+/// own tick may later show other bytes, written in place at the same length.
+pub(crate) fn stamp_settled(stamp: &FileStamp, began: std::time::SystemTime) -> bool {
+    began
+        .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|since| i128::try_from(since.as_nanos()).ok())
-        .is_some_and(|now| seen.stamp.mtime_ns.max(seen.stamp.ctime_ns) <= now - SETTLED_NS)
+        .is_some_and(|now| stamp.mtime_ns.max(stamp.ctime_ns) <= now - SETTLED_NS)
 }
 
 /// What one `lstat` each showed of a journal's folder and of the files a read of it reads

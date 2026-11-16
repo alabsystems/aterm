@@ -338,7 +338,7 @@ fn alias(paths: &Paths, noun: Noun, list: &[&str]) -> Value {
         open: &mut open,
         read_stdin: &mut read_stdin,
         store: &store,
-        holding: &|| Ok(0),
+        holding: &|| Ok(aterm_secrets::client::Holding::default()),
         now_ms: NOW,
     };
     views::run(paths, noun, &words(list), &mut io).unwrap()

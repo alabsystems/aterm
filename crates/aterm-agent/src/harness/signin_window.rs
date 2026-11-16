@@ -64,21 +64,23 @@
 //!   store is emptied ([`Desk::forget`]) so its next sign-in starts at the sign-in page: that
 //!   forgets a session in aterm's window alone, and signs nothing out anywhere. Only a run
 //!   that proved the session records the store as the account's ([`Desk::note_signed_in`]).
-//! - **Cloudflare's check is never operated.** A page that is its check is waited on with
-//!   nothing read from its controls, pressed or filled: it may clear by itself, and a person
-//!   at the desk may complete it. One that stands until the deadline ends the sign-in naming
-//!   Cloudflare ([`Stop::BotCheck`]); in a sign-in nobody started ([`SignIn::unattended`]),
-//!   nobody completes it, so one that stands for [`UNATTENDED_BOT_CHECK`] ends it.
-//! - **The consent page's human check is never operated.** Claude's consent page may carry an
-//!   hCaptcha and keep `Authorize` disabled until it is answered. It comes and goes (measured
-//!   2026-11-12: in this window it stood for the whole four minutes in three sign-ins of one
-//!   account, and in two further loads of the page; hours later two accounts' sign-ins met
-//!   none, found `Authorize` enabled and finished by themselves). The flow reads only that the check's widget is in the page and that
-//!   `Authorize` is disabled, waits, and presses `Authorize` once the page enables it: after
-//!   the check passed by itself, or a person at the desk completed it in the window. One
-//!   that stands until the deadline ends the sign-in naming it ([`Stop::HumanCheck`]), and
-//!   the row is left to a person at this Mac. A sign-in nobody started ends at the read that
-//!   first finds one: nobody would complete it, and none measured cleared by itself.
+//! - **A check is never operated, and after one nothing is.** A page that carries a check
+//!   (`super::headless_oauth::check_met`: Cloudflare's bot check, a block page, or a human
+//!   check's widget such as the hCaptcha Claude's consent page may hold `Authorize` behind,
+//!   whether `Authorize` stands enabled or not, since an invisible check runs on the press of
+//!   its button) is pressed, filled and followed nothing. Each act tests for one again in the
+//!   same evaluation as the act, in the document the read was made in, and answers it with
+//!   nothing done. From the first such page on, the run presses, fills and opens nothing more:
+//!   it only reads, waiting for a person at the desk, who completes the check and presses the
+//!   page's own buttons themselves, and the flow ends from the callback their press leads to
+//!   ([`Done::Delivered`], [`Done::Callback`]). A block page ends the sign-in at once
+//!   ([`Stop::BlockPage`]); a check that stands until the deadline ends it naming the check
+//!   ([`Stop::BotCheck`], [`Stop::HumanCheck`]), a stop that no clock retries. A sign-in
+//!   nobody started ([`SignIn::unattended`]) has nobody at the desk to complete one, so every
+//!   check ends it at the read that finds it: nothing waits on a check for it to clear. The
+//!   consent page's hCaptcha comes and goes (measured 2026-11-12: in this window it stood for the
+//!   whole four minutes in three sign-ins of one account, and in two further loads of the page;
+//!   hours later two accounts' sign-ins met none and finished by themselves).
 //! - **The callback.** A loopback flow's callback is a navigation the window follows: the
 //!   page requests `http://localhost:<port>/callback` itself, the waiting `claude auth login`
 //!   answers it and sends the page on to its success page, and seeing that page ends the flow
@@ -90,7 +92,8 @@
 //! and [`Window`] is the desk that talks to the window's host. No test opens a window.
 
 use super::headless_oauth::{
-    MAILBOX_TIMEOUT, MailboxConfig, MailboxCredential, Marker, Page, VisibleDone, VisibleStop,
+    CheckMet, MAILBOX_TIMEOUT, MailboxConfig, MailboxCredential, Marker, Page, VisibleDone,
+    VisibleStop,
 };
 use super::open_url::MailboxFlow;
 use std::collections::BTreeSet;
@@ -107,13 +110,6 @@ const TICK: Duration = Duration::from_millis(500);
 
 /// How long one sign-in in the window may take, the opening of the window included.
 pub(super) const WITHIN: Duration = Duration::from_secs(240);
-
-/// How long a sign-in nobody started ([`SignIn::unattended`]) waits on Cloudflare's check
-/// before it ends naming it ([`Stop::BotCheck`]): long enough for a check that clears by itself,
-/// the bound aterm's headless drive, which nobody watches either, waits on one
-/// ([`super::headless_oauth::VENDOR_STALL`]), and never the whole [`WITHIN`], whose rest serves
-/// only a person at the desk.
-const UNATTENDED_BOT_CHECK: Duration = super::headless_oauth::VENDOR_STALL;
 
 /// How long a loopback callback may stand in the page's address before the waiting sign-in's
 /// listener has plainly not answered it ([`Stop::ListenerSilent`]).
@@ -191,7 +187,7 @@ pub(super) enum Field {
 }
 
 /// How setting a field ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Filled {
     /// The field holds the value, read back.
     Kept,
@@ -199,9 +195,23 @@ pub(super) enum Filled {
     NotKept,
     /// The page has no such field.
     NoField,
-    /// Nothing was set: the document is no longer the one the read before was made in, or
-    /// it is Cloudflare's page. The next read decides, and this is counted against nothing.
+    /// Nothing was set: the document is no longer the one the read before was made in. The
+    /// next read decides, and this is counted against nothing.
     Moved,
+    /// Nothing was set: the page carries this check, read at the set.
+    Check(CheckMet),
+}
+
+/// How a press ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Pressed {
+    /// The button was there, enabled, and pressed, in the document the read was made in.
+    Yes,
+    /// Nothing was pressed: no such button, a field that does not hold what the press needs,
+    /// or another document.
+    No,
+    /// Nothing was pressed: the page carries this check, read at the press.
+    Check(CheckMet),
 }
 
 /// What one read of the window's page found.
@@ -224,13 +234,20 @@ pub(super) struct Facts {
     /// The marks of Cloudflare's challenge machinery on it.
     pub markers: Vec<Marker>,
     /// The texts of its enabled, visible buttons, in document order; none is read from a page
-    /// that is Cloudflare's check or block page.
+    /// that is Cloudflare's check or a block page.
     pub buttons: Vec<String>,
     /// The texts of its visible buttons that are disabled.
     pub disabled: Vec<String>,
     /// The human check the page carries, where it carries one (`hCaptcha`, `reCAPTCHA`,
-    /// `Turnstile`): only that its widget is in the page. Nothing of it is read or touched.
+    /// `Turnstile`, `Arkose`, `captcha`): only that its widget is in the page. Nothing of it is
+    /// read or touched.
     pub check: Option<String>,
+    /// The check the page carries as its reader judged it
+    /// (`super::headless_oauth::CHECK_PAGE_JS`'s `checkPageOf()`), where it carries one.
+    pub met: Option<CheckMet>,
+    /// The document that was read (`performance.timeOrigin`): every act is made in it and in
+    /// no other.
+    pub doc: String,
     /// Its login-code field, where it has one: whether it holds a value.
     pub code: Option<bool>,
 }
@@ -256,13 +273,15 @@ pub(super) trait Desk {
     fn open(&mut self, url: &str, within: Duration) -> Result<(), DeskError>;
     /// Reads the window's page.
     fn facts(&mut self) -> Result<Facts, DeskError>;
-    /// Presses `button` in the document at `at` (the address the read before gave), and in
-    /// no other; whether it was there, enabled and pressed. `Continue with email` is pressed
-    /// only while the email field holds `email`, and `Verify email address` only while the
-    /// code field holds a value, each read at the press.
-    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<bool, DeskError>;
-    /// Sets `field` of the document at `at` (the address the read before gave), and of no
-    /// other, to `value`, and reads it back.
+    /// Presses `button` in the document at `at` (the address the read before gave, in the
+    /// document it read), and in no other, unless the page carries a check, read at the press
+    /// ([`Pressed::Check`]). `Continue with email` is pressed only while the email field holds
+    /// `email`, and `Verify email address` only while the code field holds a value, each read
+    /// at the press.
+    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<Pressed, DeskError>;
+    /// Sets `field` of the document at `at` (the address the read before gave, in the document
+    /// it read), and of no other, to `value`, and reads it back, unless the page carries a
+    /// check, read at the set ([`Filled::Check`]).
     fn fill(&mut self, field: Field, value: &str, at: &str) -> Result<Filled, DeskError>;
     /// Opens `url` in the window.
     fn go(&mut self, url: &str) -> Result<(), DeskError>;
@@ -303,8 +322,11 @@ pub(super) enum Linked {
     Code(zeroize::Zeroizing<String>),
     /// The page stands at the link and shows no code yet.
     Waiting,
-    /// The page went on from the link by itself: a link that signs its store in.
+    /// The page went on from the link by itself: a link that signs its store in. A page that
+    /// carries a check never counts as one.
     Moved,
+    /// The link's page, a document of the flow's own wherever it stands, carries this check.
+    Check(CheckMet),
 }
 
 /// Where a sign-in stands, said once as it gets there and named by a sign-in that ran out of
@@ -313,9 +335,9 @@ pub(super) enum Linked {
 pub(super) enum Phase {
     /// The window is open and its page has not loaded.
     Opening,
-    /// Cloudflare's check stands; nothing is pressed.
+    /// Cloudflare's check was met; nothing is pressed in this run from then on.
     BotCheck,
-    /// The consent page holds its `Authorize` behind a human check; nothing is pressed.
+    /// A page carried a human check; nothing is pressed in this run from then on.
     HumanCheck,
     /// A Claude page with none of the controls this flow presses.
     Waiting,
@@ -353,12 +375,13 @@ impl Phase {
         match self {
             Self::Opening => "its page had not loaded",
             Self::BotCheck => {
-                "Cloudflare's check stood, which aterm never operates (it may clear by itself, \
-                 and a person at this Mac may complete it)"
+                "Cloudflare's check met the sign-in, which aterm never operates, and after it \
+                 aterm pressed nothing (a person at this Mac may complete it and the sign-in)"
             }
             Self::HumanCheck => {
-                "the consent page held Authorize behind a human check, which aterm never \
-                 operates (a person at this Mac may complete it in the window)"
+                "a page of the sign-in carried a human check, which aterm never operates, and \
+                 after it aterm pressed nothing (a person at this Mac may complete it and the \
+                 sign-in in the window)"
             }
             Self::Waiting => "its page showed none of the sign-in's buttons",
             Self::EmailSent => "Continue with email was pressed and no code page followed",
@@ -402,12 +425,13 @@ pub(super) enum Done {
 pub(super) enum Stop {
     /// This process has no desktop session to open a window in.
     NoDesktop,
-    /// Cloudflare's check stood until the deadline, on this host.
+    /// Cloudflare's check met the sign-in, on this host, and nobody finished it by the
+    /// deadline.
     BotCheck(Option<String>),
-    /// Cloudflare's block page answered, on this host.
+    /// A block page answered, on this host.
     BlockPage(Option<String>),
-    /// The consent page held its `Authorize` behind a human check until the deadline, on
-    /// this host.
+    /// A page of the sign-in carried a human check, on this host, and nobody finished it by
+    /// the deadline.
     HumanCheck(Option<String>),
     /// The consent page names an address that is not the account's: the window's store is
     /// signed in to Claude as another account.
@@ -575,13 +599,15 @@ pub(super) struct SignIn<'a> {
     pub email: &'a str,
     /// How long it may take, the opening of its window included.
     pub within: Duration,
-    /// Nobody started it: this Mac's upkeep did (plan package FL-138,
-    /// [`super::open_url::UNATTENDED_ENV`]). Where the window reads no mailbox of the account,
+    /// Nobody at a terminal of their own started it: this Mac's upkeep's sign-in or token
+    /// capture (plan package FL-138), or an agent's or a script's
+    /// ([`super::open_url::UNATTENDED_ENV`]). Where the window reads no mailbox of the account,
     /// it never presses `Continue with email`, which mails a code nobody would type, and a code
     /// page ends it at once ([`Stop::NobodyForCode`]); a mailbox it dropped ends it as the
-    /// deadline would ([`Stop::MailboxDropped`]). The consent page's human check ends it at the
-    /// read that finds it ([`Stop::HumanCheck`]), and Cloudflare's check once it has stood for
-    /// [`UNATTENDED_BOT_CHECK`] ([`Stop::BotCheck`]): nobody waits for a person.
+    /// deadline would ([`Stop::MailboxDropped`]). Every check ends it at the read that finds
+    /// it, or at the act that met one, with nothing pressed: a human check
+    /// ([`Stop::HumanCheck`]), Cloudflare's check ([`Stop::BotCheck`]) and a block page
+    /// ([`Stop::BlockPage`]). Nothing waits on a check for it to clear.
     pub unattended: bool,
 }
 
@@ -611,13 +637,11 @@ struct Progress {
     email_fills: usize,
     unread: usize,
     phase: Option<Phase>,
-    bot_host: Option<String>,
-    bot_stands: bool,
-    /// When this run first read Cloudflare's check: a sign-in nobody started waits on it from
-    /// then for [`UNATTENDED_BOT_CHECK`] in all, a check that comes back included.
-    bot_since: Option<Instant>,
-    /// Whether the consent page's human check holds `Authorize` at the last read.
-    human_stands: bool,
+    /// The check this run met and the host it met it on: from then on the run presses, fills
+    /// and opens nothing, and only reads (for a person's own finish, which ends at the
+    /// callback). Never cleared in the run, and every end of it before a callback is this
+    /// check's ([`Progress::end`]).
+    met: Option<(CheckMet, Option<String>)>,
     callback_at: Option<Instant>,
     mailbox_at: Option<Instant>,
     /// Where the page was when `Verify email address` was pressed.
@@ -639,13 +663,14 @@ impl Progress {
             desk.say(match phase {
                 Phase::Opening => "the sign-in window is opening the Claude sign-in",
                 Phase::BotCheck => {
-                    "the page shows Cloudflare's check; aterm never operates it and is waiting \
-                     for it to clear (a person at this Mac may complete it)"
+                    "the page shows Cloudflare's check; aterm never operates it and presses \
+                     nothing more in this sign-in (a person at this Mac may complete it and the \
+                     sign-in)"
                 }
                 Phase::HumanCheck => {
-                    "the consent page holds Authorize behind a human check (hCaptcha); aterm \
-                     never operates it and is waiting (a person at this Mac may complete it in \
-                     the window)"
+                    "the page carries a human check; aterm never operates it and presses \
+                     nothing more in this sign-in (a person at this Mac may complete it and the \
+                     sign-in in the window)"
                 }
                 Phase::Waiting => "waiting for the sign-in page",
                 Phase::EmailSent => "pressed Continue with email",
@@ -716,12 +741,66 @@ impl Progress {
                 .is_some_and(|at| at != super::headless_oauth::url_place(url))
     }
 
-    fn out_of_time(&self) -> Stop {
-        if self.bot_stands {
-            return Stop::BotCheck(self.bot_host.clone());
+    /// Notes that the run met `check` on `host`: it presses, fills and opens nothing from now
+    /// on, and a block page ends it at once. In a sign-in nobody started (`unattended`), nobody
+    /// is at the desk to complete a check, so every check ends it at the read that finds it,
+    /// naming the check: nothing waits on one for it to clear.
+    fn meet(
+        &mut self,
+        check: CheckMet,
+        host: Option<String>,
+        unattended: bool,
+        desk: &mut dyn Desk,
+    ) -> Result<(), Halt> {
+        match check {
+            CheckMet::BlockPage => return Err(Stop::BlockPage(host).into()),
+            CheckMet::BotCheck if unattended => return Err(Stop::BotCheck(host).into()),
+            CheckMet::HumanCheck(_) if unattended => return Err(Stop::HumanCheck(host).into()),
+            CheckMet::BotCheck | CheckMet::HumanCheck(_) => {}
         }
-        if self.human_stands {
-            return Stop::HumanCheck(self.bot_host.clone());
+        let phase = if check == CheckMet::BotCheck {
+            Phase::BotCheck
+        } else {
+            Phase::HumanCheck
+        };
+        if self.met.is_none() {
+            self.met = Some((check, host));
+        }
+        self.enter(phase, desk);
+        Ok(())
+    }
+
+    /// The stop of the check this run met, where it met one.
+    fn met_stop(&self) -> Option<Stop> {
+        self.met.as_ref().map(|(check, host)| match check {
+            CheckMet::BotCheck => Stop::BotCheck(host.clone()),
+            CheckMet::HumanCheck(_) => Stop::HumanCheck(host.clone()),
+            CheckMet::BlockPage => Stop::BlockPage(host.clone()),
+        })
+    }
+
+    /// The stop a run that ends with `stop` ends with: once it met a check, every end of it
+    /// before a callback is that check's (a person who closed the window in front of it, the
+    /// window's host lost, reads that kept failing, the account work paused), so no end lets a
+    /// check's hold lapse into a page stop or a failure that a clock would try again
+    /// (`super::open_url::Met::stopped`). A check met since, and an end the callback led to
+    /// (a person passed the check and the page went on), keep their own.
+    fn end(&self, stop: Stop) -> Stop {
+        match stop {
+            Stop::BotCheck(_)
+            | Stop::HumanCheck(_)
+            | Stop::BlockPage(_)
+            | Stop::ListenerSilent
+            | Stop::InvalidCallback => stop,
+            other => self.met_stop().unwrap_or(other),
+        }
+    }
+
+    /// The stop a run whose deadline came ends with: the check it met, which no clock retries
+    /// (`super::open_url::Met::stopped`), else where it stood.
+    fn out_of_time(&self) -> Stop {
+        if let Some(stop) = self.met_stop() {
+            return stop;
         }
         match (self.phase, self.mailbox_dropped) {
             (Some(Phase::CodeNoMailbox), Some(why)) => Stop::MailboxDropped(why),
@@ -776,13 +855,6 @@ fn account_named(text: &str, email: &str) -> Account {
     }
 }
 
-/// Whether `page` is Cloudflare's check: its title is the interstitial's, or its words stand
-/// beside one of its marks ([`super::headless_oauth::bot_check`]).
-fn is_bot_check(page: &Page) -> bool {
-    super::headless_oauth::CHALLENGE_TITLES.contains(&page.title.trim())
-        || super::headless_oauth::bot_check(page)
-}
-
 /// A sign-in code as the mailbox gives it: short, letters and digits only.
 fn usable_code(code: &str) -> bool {
     (4..=12).contains(&code.len()) && code.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -813,9 +885,6 @@ fn step(
     (now, left): (Instant, Duration),
 ) -> Result<Option<Done>, Halt> {
     let url = facts.url.as_str();
-    // Whether a human check holds the page is said anew by each read: one that held the
-    // consent page says nothing of a page that has since left it.
-    did.human_stands = false;
     // This flow's own callback, in the document's address or in the one the web view is on
     // its way to. Nothing else is read from an address no document has reached.
     let callback = [url, facts.active.as_str()]
@@ -829,7 +898,6 @@ fn step(
         if now.saturating_duration_since(first) >= CALLBACK_SETTLE {
             return Err(Stop::ListenerSilent.into());
         }
-        did.bot_stands = false;
         did.enter(Phase::Callback, desk);
         return Ok(None);
     }
@@ -840,6 +908,11 @@ fn step(
     }
     if local_address(url) || local_address(&facts.active) {
         return Err(Stop::InvalidCallback.into());
+    }
+    // After a check the run only reads: a person at the desk finishes the sign-in, and the
+    // callback their press leads to is read above.
+    if did.met.is_some() {
+        return Ok(None);
     }
     if let Some(code) = facts.load_failed {
         // After Authorize the navigation that failed is the callback's: the waiting
@@ -865,51 +938,33 @@ fn step(
         title: facts.title.to_lowercase(),
         text: facts.text.clone(),
         markers: facts.markers.clone(),
+        check: facts
+            .met
+            .clone()
+            .or_else(|| facts.check.clone().map(CheckMet::HumanCheck)),
         ..Page::default()
     };
-    if super::headless_oauth::block_page(&page) {
-        return Err(Stop::BlockPage(host).into());
-    }
-    if is_bot_check(&page) {
-        // Nobody started this sign-in, so nobody completes the check: it is waited on only as
-        // long as one that clears by itself takes.
-        let since = *did.bot_since.get_or_insert(now);
-        if run.unattended && now.saturating_duration_since(since) >= UNATTENDED_BOT_CHECK {
-            return Err(Stop::BotCheck(host).into());
-        }
-        did.bot_stands = true;
-        did.bot_host = host;
-        did.enter(Phase::BotCheck, desk);
-        return Ok(None);
-    }
-    did.bot_stands = false;
     let shows = |button: Button| facts.buttons.iter().any(|shown| button.is(shown));
 
-    // A consent page that carries a human check keeps its Authorize disabled until the check
-    // is answered. aterm never operates one: it waits, with nothing read from the check and
-    // nothing pressed, and presses Authorize once the page itself enables it (the check
-    // passed by itself, or a person at the desk completed it).
-    did.human_stands = !did.authorized
-        && !shows(Button::Authorize)
-        && facts.check.is_some()
-        && facts.disabled.iter().any(|held| Button::Authorize.is(held));
-    if did.human_stands {
-        // A page aterm would not authorize once the check cleared ends now: nobody is asked
-        // to complete a check for nothing.
-        match account_named(&facts.text, run.email) {
-            Account::Named => {}
-            Account::Other => return Err(Stop::WrongAccount.into()),
-            Account::Unnamed if did.vouches_unnamed(desk) => {}
-            Account::Unnamed => return Err(Stop::UnknownSession.into()),
+    // A page that carries a check is pressed, filled and followed nothing, whatever state its
+    // buttons are in (an invisible check runs on the press of the button it is bound to), and
+    // from it on the run only reads: a person at the desk completes the check and presses the
+    // page's own buttons, and the flow ends from the callback.
+    if let Some(check) = super::headless_oauth::check_met(&page) {
+        if matches!(check, CheckMet::HumanCheck(_))
+            && (shows(Button::Authorize)
+                || facts.disabled.iter().any(|held| Button::Authorize.is(held)))
+        {
+            // A consent page aterm would not authorize ends now: nobody is asked to complete
+            // a check for nothing.
+            match account_named(&facts.text, run.email) {
+                Account::Named => {}
+                Account::Other => return Err(Stop::WrongAccount.into()),
+                Account::Unnamed if did.vouches_unnamed(desk) => {}
+                Account::Unnamed => return Err(Stop::UnknownSession.into()),
+            }
         }
-        // Nobody started this sign-in, so nobody completes the check, and it has not been seen
-        // to clear by itself while it stood (it stood the whole four minutes in each of five
-        // loads measured): it ends at the read that finds it.
-        if run.unattended {
-            return Err(Stop::HumanCheck(host).into());
-        }
-        did.bot_host = host;
-        did.enter(Phase::HumanCheck, desk);
+        did.meet(check, host, run.unattended, desk)?;
         return Ok(None);
     }
 
@@ -923,9 +978,13 @@ fn step(
             Account::Unnamed if did.vouches_unnamed(desk) => {}
             Account::Unnamed => return Err(Stop::UnknownSession.into()),
         }
-        if desk.press(Button::Authorize, run.email, url)? {
-            did.authorized = true;
-            did.enter(Phase::Authorized, desk);
+        match desk.press(Button::Authorize, run.email, url)? {
+            Pressed::Yes => {
+                did.authorized = true;
+                did.enter(Phase::Authorized, desk);
+            }
+            Pressed::No => {}
+            Pressed::Check(check) => did.meet(check, host, run.unattended, desk)?,
         }
         return Ok(None);
     }
@@ -943,14 +1002,23 @@ fn step(
         // The address the code is mailed to is the account's, set here and read back at the
         // press: a field that holds another address is never continued with.
         match desk.fill(Field::Email, run.email, url)? {
-            Filled::Kept => {
-                if desk.press(Button::ContinueWithEmail, run.email, url)? {
+            Filled::Kept => match desk.press(Button::ContinueWithEmail, run.email, url)? {
+                Pressed::Yes => {
                     did.continued = true;
                     did.enter(Phase::EmailSent, desk);
                     return Ok(None);
                 }
-            }
+                Pressed::No => {}
+                Pressed::Check(check) => {
+                    did.meet(check, host, run.unattended, desk)?;
+                    return Ok(None);
+                }
+            },
             Filled::Moved => {}
+            Filled::Check(check) => {
+                did.meet(check, host, run.unattended, desk)?;
+                return Ok(None);
+            }
             ended => {
                 did.email_fills += 1;
                 if did.email_fills >= MAX_FILLS {
@@ -998,10 +1066,23 @@ fn code_step(
             did.enter(Phase::CodeTyped, desk);
             return Ok(());
         }
-        if shows_verify && desk.press(Button::VerifyEmailAddress, run.email, url)? {
-            did.verified = true;
-            did.verified_at = Some(super::headless_oauth::url_place(url));
-            did.enter(Phase::Verifying, desk);
+        if shows_verify {
+            match desk.press(Button::VerifyEmailAddress, run.email, url)? {
+                Pressed::Yes => {
+                    did.verified = true;
+                    did.verified_at = Some(super::headless_oauth::url_place(url));
+                    did.enter(Phase::Verifying, desk);
+                }
+                Pressed::No => {}
+                Pressed::Check(check) => {
+                    did.meet(
+                        check,
+                        super::login_drive::https_host(url),
+                        run.unattended,
+                        desk,
+                    )?;
+                }
+            }
         }
         return Ok(());
     }
@@ -1086,6 +1167,16 @@ fn code_step(
             }
             // The page was read again since: the code is held for the next read.
             Ok(Filled::Moved) => did.held = Some(Held::Code(code)),
+            // The page carries a check: the code is scrubbed, and nothing more is set.
+            Ok(Filled::Check(check)) => {
+                drop(code);
+                did.meet(
+                    check,
+                    super::login_drive::https_host(url),
+                    run.unattended,
+                    desk,
+                )?;
+            }
             Ok(Filled::NoField) => {
                 return Err(Stop::Desk(
                     "the page asks for a login code and shows no field for one".into(),
@@ -1127,11 +1218,27 @@ fn code_step(
                     did.enter(Phase::LinkWait, desk);
                 }
                 // A link that went on by itself has signed its store in, if it did anything:
-                // the window's page asks for the authorization again, once.
+                // the window's page asks for the authorization again, once, never after a
+                // check.
                 Ok(Linked::Moved) => {
-                    desk.go(run.authorize_url)?;
-                    did.link_opened = true;
-                    did.enter(Phase::MagicLink, desk);
+                    if did.met.is_none() {
+                        desk.go(run.authorize_url)?;
+                        did.link_opened = true;
+                        did.enter(Phase::MagicLink, desk);
+                    }
+                }
+                // The link's page carries a check. It is shown to nobody, so no person can
+                // complete it: the sign-in ends now, naming it, with the link scrubbed and the
+                // window's page sent nowhere.
+                Ok(Linked::Check(check)) => {
+                    let host = super::login_drive::https_host(&link);
+                    drop(link);
+                    return Err(match check {
+                        CheckMet::BlockPage => Stop::BlockPage(host),
+                        CheckMet::BotCheck => Stop::BotCheck(host),
+                        CheckMet::HumanCheck(_) => Stop::HumanCheck(host),
+                    }
+                    .into());
                 }
                 Err(error) => {
                     did.held = Some(Held::Link(link));
@@ -1149,7 +1256,7 @@ fn steps(run: &SignIn<'_>, desk: &mut dyn Desk, end: Instant) -> Result<Done, St
     did.enter(Phase::Opening, desk);
     loop {
         if desk.cancelled() {
-            return Err(Stop::Cancelled);
+            return Err(did.end(Stop::Cancelled));
         }
         let now = desk.now();
         let left = end.saturating_duration_since(now);
@@ -1173,12 +1280,14 @@ fn steps(run: &SignIn<'_>, desk: &mut dyn Desk, end: Instant) -> Result<Done, St
                 match stepped {
                     Ok(Some(done)) => return Ok(done),
                     Ok(None) => None,
-                    Err(Halt::Stop(stop)) => return Err(stop),
+                    Err(Halt::Stop(stop)) => return Err(did.end(stop)),
+                    // Only an act fails inside a decision; the next read judges the page again,
+                    // its check first, before any act is sent.
                     Err(Halt::Unread(why)) => Some(why),
                 }
             }
             Err(DeskError::Unread(why)) => Some(why),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(did.end(error.into())),
         };
         // A read that failed and an act that failed are counted together: either may not
         // fail the next time, and neither is tried for the whole sign-in.
@@ -1187,7 +1296,7 @@ fn steps(run: &SignIn<'_>, desk: &mut dyn Desk, end: Instant) -> Result<Done, St
             Some(why) => {
                 did.unread += 1;
                 if did.unread >= MAX_UNREAD {
-                    return Err(Stop::Desk(why));
+                    return Err(did.end(Stop::Desk(why)));
                 }
             }
         }
@@ -1228,8 +1337,10 @@ pub(super) fn drive(run: &SignIn<'_>, desk: &mut dyn Desk) -> Result<Done, Stop>
 }
 
 /// The page reader's helpers, shared by every script: which controls are usable, a button's
-/// text, the email field, the code field (one field, or one box per character), and a set
-/// through the field's own value setter with the events a page's framework listens for.
+/// text, the email field, the code field (one field, or one box per character), a set through
+/// the field's own value setter with the events a page's framework listens for, and the
+/// document (`docOf()`). Every script splices the one check predicate in before them
+/// (`super::headless_oauth::CHECK_PAGE_JS`).
 const CONTROLS_JS: &str = r#"
   const shown = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
   const usable = (el) => Boolean(el) && !el.disabled && !el.hidden && el.type !== "hidden" &&
@@ -1251,17 +1362,7 @@ const CONTROLS_JS: &str = r#"
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
   };
-  const humanCheck = () => {
-    if (document.querySelector("textarea[name='h-captcha-response'], iframe[src*='hcaptcha.com']")) return "hCaptcha";
-    if (document.querySelector("textarea[name='g-recaptcha-response'], iframe[src*='recaptcha']")) return "reCAPTCHA";
-    if (document.querySelector("input[name='cf-turnstile-response'], iframe[src*='challenges.cloudflare.com']")) return "Turnstile";
-    return null;
-  };
-  const challenged = () => {
-    const title = String(document.title || "");
-    const text = String(document.body && document.body.innerText || "");
-    return botCheckOf(title, text, botCheckMarkers()) || botCheckTitles.includes(title.trim().toLowerCase()) || blockPageOf(text);
-  };
+  const docOf = () => String(window.performance && window.performance.timeOrigin || "");
 "#;
 
 /// What every script starts with: the hosts whose `https` documents are this flow's own
@@ -1286,36 +1387,38 @@ fn own_js(pinned: &[&str]) -> Option<String> {
 }
 
 /// Reads the page: of a document that is not the flow's own, its address alone; of one that
-/// is, its address, its title, the start of its text, Cloudflare's marks and, unless the page
-/// is Cloudflare's check or block page, its enabled buttons' texts and whether its code field
-/// holds a value. It sets and presses nothing.
+/// is, its address, its document, its title, the start of its text, Cloudflare's marks, the
+/// check it carries (`checkPageOf()`) and, unless that check is Cloudflare's or a block page,
+/// its buttons' texts and whether its code field holds a value. It sets and presses nothing.
 fn facts_script(pinned: &[&str]) -> Option<String> {
     Some(format!(
         r#"(() => {{
 {own}
   if (!own) return JSON.stringify({{ at: here, foreign: true }});
-{bot}{controls}
+{check}{controls}
+  const met = checkPageOf();
   const out = {{
     at: here,
+    doc: docOf(),
     title: String(document.title || ""),
     text: String(document.body && document.body.innerText || "").slice(0, 6000),
     markers: botCheckMarkers(),
     buttons: [],
     disabled: [],
-    check: null,
+    check: met && met.startsWith("human_check:") ? met.slice("human_check:".length) : null,
+    met,
     code: null,
   }};
-  if (challenged()) return JSON.stringify(out);
+  if (met && !met.startsWith("human_check")) return JSON.stringify(out);
   out.buttons = enabledButtons().map(labelOf).filter(Boolean).slice(0, 40);
   out.disabled = Array.from(document.querySelectorAll("button, [role='button'], input[type='submit']"))
     .filter(el => shown(el) && !usable(el)).map(labelOf).filter(Boolean).slice(0, 10);
-  out.check = humanCheck();
   const code = codeFields();
   if (code.length) out.code = code.every(f => String(f.value || "").length > 0) ? "filled" : "empty";
   return JSON.stringify(out);
 }})()"#,
         own = own_js(pinned)?,
-        bot = super::headless_oauth::BOT_CHECK_JS,
+        check = super::headless_oauth::CHECK_PAGE_JS,
         controls = CONTROLS_JS,
     ))
 }
@@ -1323,16 +1426,18 @@ fn facts_script(pinned: &[&str]) -> Option<String> {
 /// Reads the login code a sign-in link's page shows, the shape of its text and its address:
 /// the one run of six digits in it (digits a page shows apart, by spaces or hyphens, read
 /// together), and for each of its first words its length, or for a word with a digit in it
-/// how many characters it has. Nothing is read from a document that is not the flow's own or
-/// from Cloudflare's check, and nothing is pressed.
+/// how many characters it has. Nothing is read from a document that is not the flow's own,
+/// and of one that carries a check only that check (its shape `check:<word>`); nothing is
+/// pressed.
 fn link_code_script(pinned: &[&str]) -> Option<String> {
     Some(format!(
         r#"(() => {{
 {own}
   const out = {{ at: here, code: null, shape: "" }};
   if (!own) {{ out.shape = "foreign"; return JSON.stringify(out); }}
-{bot}{controls}
-  if (challenged()) {{ out.shape = "challenge"; return JSON.stringify(out); }}
+{check}{controls}
+  const met = checkPageOf();
+  if (met) {{ out.shape = "check:" + met; return JSON.stringify(out); }}
   const text = String(document.body && document.body.innerText || "");
   out.shape = text.split(/\s+/).filter(Boolean).slice(0, 60)
     .map(w => /[0-9]/.test(w) ? "<" + w.length + ">" : String(w.length)).join(" ");
@@ -1343,17 +1448,18 @@ fn link_code_script(pinned: &[&str]) -> Option<String> {
   return JSON.stringify(out);
 }})()"#,
         own = own_js(pinned)?,
-        bot = super::headless_oauth::BOT_CHECK_JS,
+        check = super::headless_oauth::CHECK_PAGE_JS,
         controls = CONTROLS_JS,
     ))
 }
 
-/// What a [`link_code_script`] answer holds: the code, the text's shape, and the address of
-/// the document that was read.
+/// What a [`link_code_script`] answer holds: the code, the text's shape, the address of the
+/// document that was read, and the check it carries.
 struct LinkRead {
     code: Option<zeroize::Zeroizing<String>>,
     shape: String,
     at: String,
+    check: Option<CheckMet>,
 }
 
 /// The [`LinkRead`] an answer holds; an answer that is none holds nothing.
@@ -1366,12 +1472,14 @@ fn parse_link_code(answer: &str) -> LinkRead {
             .unwrap_or_default()
             .to_owned()
     };
+    let shape = text("shape");
     LinkRead {
         code: value
             .get("code")
             .and_then(Value::as_str)
             .map(|code| zeroize::Zeroizing::new(code.to_owned())),
-        shape: text("shape"),
+        check: shape.strip_prefix("check:").and_then(CheckMet::parse),
+        shape,
         at: text("at"),
     }
 }
@@ -1382,10 +1490,17 @@ fn literal(text: &str) -> Option<String> {
 }
 
 /// Presses the first enabled button whose whole text is `button`'s, in the document at `at`
-/// and in no other, unless the page is Cloudflare's: `Continue with email` only while the
-/// email field holds `email`, `Verify email address` only while the code field holds a value.
-/// It answers what it did and the address of the document it ran in ([`parse_act`]).
-fn press_script(button: Button, email: &str, at: &str, pinned: &[&str]) -> Option<String> {
+/// read as `doc` and in no other, unless the page carries a check (`checkPageOf()`, read in
+/// the same evaluation before any control is: answered `check:<word>` with nothing pressed):
+/// `Continue with email` only while the email field holds `email`, `Verify email address`
+/// only while the code field holds a value. It answers what it did and the address of the
+/// document it ran in ([`parse_act`]).
+fn press_script(
+    button: Button,
+    email: &str,
+    (at, doc): (&str, &str),
+    pinned: &[&str],
+) -> Option<String> {
     let title = literal(&button.title().to_ascii_lowercase())?;
     let email = match button {
         Button::ContinueWithEmail => literal(&email.to_ascii_lowercase())?,
@@ -1398,8 +1513,10 @@ fn press_script(button: Button, email: &str, at: &str, pinned: &[&str]) -> Optio
   const answer = (did) => JSON.stringify({{ at: here, did }});
   if (!own) return answer("foreign");
   if (here !== {expected}) return answer("moved");
-{bot}{controls}
-  if (challenged()) return answer("unready");
+{check}{controls}
+  if (docOf() !== {doc}) return answer("moved");
+  const met = checkPageOf();
+  if (met) return answer("check:" + met);
   const title = {title}, email = {email}, code = {code};
   const hit = enabledButtons().find(b => labelOf(b).toLowerCase() === title);
   if (!hit) return answer("absent");
@@ -1416,15 +1533,23 @@ fn press_script(button: Button, email: &str, at: &str, pinned: &[&str]) -> Optio
 }})()"#,
         own = own_js(pinned)?,
         expected = literal(at)?,
-        bot = super::headless_oauth::BOT_CHECK_JS,
+        doc = literal(doc)?,
+        check = super::headless_oauth::CHECK_PAGE_JS,
         controls = CONTROLS_JS,
     ))
 }
 
-/// Sets `field` of the document at `at`, and of no other, to `value` and reads it back: an
-/// email as it stands, case apart; a code without the spaces or hyphens a page may show it
-/// with. It answers what it did and the address of the document it ran in ([`parse_act`]).
-fn fill_script(field: Field, value: &str, at: &str, pinned: &[&str]) -> Option<String> {
+/// Sets `field` of the document at `at` read as `doc`, and of no other, to `value` and reads it
+/// back, unless the page carries a check (`checkPageOf()`, read in the same evaluation before
+/// any field is: answered `check:<word>` with nothing set): an email as it stands, case apart;
+/// a code without the spaces or hyphens a page may show it with. It answers what it did and
+/// the address of the document it ran in ([`parse_act`]).
+fn fill_script(
+    field: Field,
+    value: &str,
+    (at, doc): (&str, &str),
+    pinned: &[&str],
+) -> Option<String> {
     let value = literal(value)?;
     let body = match field {
         Field::Email => {
@@ -1451,13 +1576,16 @@ fn fill_script(field: Field, value: &str, at: &str, pinned: &[&str]) -> Option<S
   const answer = (did) => JSON.stringify({{ at: here, did }});
   if (!own) return answer("foreign");
   if (here !== {expected}) return answer("moved");
-{bot}{controls}
-  if (challenged()) return answer("unready");
+{check}{controls}
+  if (docOf() !== {doc}) return answer("moved");
+  const met = checkPageOf();
+  if (met) return answer("check:" + met);
   const value = {value};{body}
 }})()"#,
         own = own_js(pinned)?,
         expected = literal(at)?,
-        bot = super::headless_oauth::BOT_CHECK_JS,
+        doc = literal(doc)?,
+        check = super::headless_oauth::CHECK_PAGE_JS,
         controls = CONTROLS_JS,
     ))
 }
@@ -1521,6 +1649,15 @@ fn parse_facts(answer: &str, active: &str) -> Result<Facts, DeskError> {
             .get("check")
             .and_then(Value::as_str)
             .map(|name| super::one_line(name, 16)),
+        met: value
+            .get("met")
+            .and_then(Value::as_str)
+            .and_then(CheckMet::parse),
+        doc: value
+            .get("doc")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         code: match value.get("code") {
             Some(Value::Null) | None => None,
             Some(held) => Some(held.as_str() == Some("filled")),
@@ -1930,6 +2067,8 @@ pub(super) struct Window<'a> {
     linked: Option<zeroize::Zeroizing<String>>,
     /// Since when the aside page has stood somewhere other than its link.
     moved_at: Option<Instant>,
+    /// The document the last read was made in: every act is made in it and in no other.
+    doc: String,
     /// How many refused navigations the trace has said.
     refusals_said: usize,
     seen_otps: BTreeSet<String>,
@@ -1962,6 +2101,7 @@ impl<'a> Window<'a> {
             flow: None,
             linked: None,
             moved_at: None,
+            doc: String::new(),
             refusals_said: 0,
             seen_otps: BTreeSet::new(),
             scope,
@@ -2080,6 +2220,7 @@ impl Desk for Window<'_> {
     fn facts(&mut self) -> Result<Facts, DeskError> {
         let (answer, active) = self.eval(facts_script(self.pinned()))?;
         let mut facts = parse_facts(&answer, &active)?;
+        self.doc.clone_from(&facts.doc);
         let (failed, refused) = self
             .host
             .as_mut()
@@ -2129,15 +2270,23 @@ impl Desk for Window<'_> {
         Ok(facts)
     }
 
-    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<bool, DeskError> {
+    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<Pressed, DeskError> {
         if !self.admits(at) {
-            return Ok(false);
+            return Ok(Pressed::No);
         }
-        let (answer, _) = self.eval(press_script(button, email, at, self.pinned()))?;
+        let script = press_script(button, email, (at, &self.doc), self.pinned());
+        let (answer, _) = self.eval(script)?;
         let (did, was_at) = parse_act(&answer)
             .ok_or_else(|| DeskError::Unread("the page's answer was not a press's".into()))?;
         self.trace(&format!("press {}: {did}", button.title()));
-        Ok(did == "pressed" && was_at == at)
+        if let Some(check) = did.strip_prefix("check:").and_then(CheckMet::parse) {
+            return Ok(Pressed::Check(check));
+        }
+        Ok(if did == "pressed" && was_at == at {
+            Pressed::Yes
+        } else {
+            Pressed::No
+        })
     }
 
     fn fill(&mut self, field: Field, value: &str, at: &str) -> Result<Filled, DeskError> {
@@ -2151,10 +2300,14 @@ impl Desk for Window<'_> {
         if !self.admits(at) {
             return Ok(Filled::Moved);
         }
-        let (answer, _) = self.eval(fill_script(field, value, at, self.pinned()))?;
+        let script = fill_script(field, value, (at, &self.doc), self.pinned());
+        let (answer, _) = self.eval(script)?;
         let (did, was_at) = parse_act(&answer)
             .ok_or_else(|| DeskError::Unread("the page's answer was not a set's".into()))?;
         self.trace(&format!("fill {field:?}: {did}"));
+        if let Some(check) = did.strip_prefix("check:").and_then(CheckMet::parse) {
+            return Ok(Filled::Check(check));
+        }
         Ok(match did.as_str() {
             "filled" if was_at == at => Filled::Kept,
             "untaken" if was_at == at => Filled::NotKept,
@@ -2203,7 +2356,12 @@ impl Desk for Window<'_> {
             let ours = self.admits(&read.at);
             let at_link = ours && super::headless_oauth::url_place(&read.at) == place;
             let now = Instant::now();
-            let found = if at_link {
+            let found = if let Some(check) = read.check.clone().filter(|_| ours) {
+                // A document of the flow's own that carries a check, wherever it stands, is
+                // that check: never a code, and never one that went on by itself.
+                self.moved_at = None;
+                Some(Linked::Check(check))
+            } else if at_link {
                 self.moved_at = None;
                 read.code.map(Linked::Code)
             } else if ours {
@@ -2221,6 +2379,7 @@ impl Desk for Window<'_> {
                         Linked::Code(_) => "a login code",
                         Linked::Waiting => "no login code yet",
                         Linked::Moved => "it went on by itself",
+                        Linked::Check(_) => "it carries a check",
                     },
                     read.shape
                 ));

@@ -43,6 +43,7 @@ impl Fixture {
             src: ObservedSrc::AuthFile,
             path: self.place.clone(),
             mtime: Some(mtime),
+            plan: None,
         })
     }
 
@@ -446,6 +447,7 @@ fn a_record_of_a_removed_home_goes_and_a_foreign_file_reads_empty() {
         src: ObservedSrc::AuthFile,
         path: elsewhere.join("auth.json"),
         mtime: Some(NOW),
+        plan: None,
     });
     fx.store.observe(&there, NOW);
     assert_eq!(fx.store.kept().len(), 2);

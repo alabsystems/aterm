@@ -1,10 +1,64 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Deadline-bounded exclusive file-lock contention waits on Unix and Windows.
+//! Deadline-bounded exclusive file-lock contention waits on Unix and Windows; on macOS, a wait
+//! for a lock to come free that takes nothing (`wait_unlocked`); and a thread's rule that it
+//! takes no lock at all ([`takes_nothing`]).
 
 use std::io;
 use std::time::{Duration, Instant};
+
+std::thread_local! {
+    /// Whether this thread runs inside [`takes_nothing`].
+    static TAKES_NOTHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(any(test, debug_assertions))]
+std::thread_local! {
+    /// How many takes this thread tried through this module ([`takes_tried_here`]).
+    static TAKES_TRIED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Run `run` with every lock this module would take on this thread refused: a watcher's rule. A
+/// thread that waits for a lock to come free must never hold it, even for a moment, since the
+/// holder's own waiters would then wait behind it (`aterm-cli`'s repository lease watch, which
+/// waits with `PrivateLock::wait_until_free` on macOS). A take refused here is an error,
+/// `PermissionDenied`, made before the lock is tried. The rule this thread had before is
+/// restored as `run` returns or unwinds.
+pub fn takes_nothing<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TAKES_NOTHING.set(self.0);
+        }
+    }
+    let _restore = Restore(TAKES_NOTHING.replace(true));
+    run()
+}
+
+/// Test support: how many takes this thread has tried through this module (a `PrivateLock`, a
+/// [`LockFile`], [`lock_exclusive_until`]), those [`takes_nothing`] refused included, from its
+/// start: the witness that a thread which must take nothing never tried to, whatever rule it
+/// ran under.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn takes_tried_here() -> u64 {
+    TAKES_TRIED.get()
+}
+
+/// Where every take this module makes starts: [`takes_nothing`]'s refusal, where this thread
+/// runs inside it, and in a test build a count of the try ([`takes_tried_here`]).
+fn refused_here() -> io::Result<()> {
+    #[cfg(any(test, debug_assertions))]
+    TAKES_TRIED.set(TAKES_TRIED.get() + 1);
+    if TAKES_NOTHING.get() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "this thread takes no lock (aterm_uds::file_lock::takes_nothing)",
+        ));
+    }
+    Ok(())
+}
 
 /// Acquire an exclusive lock on an already validated file, waiting only for
 /// actual lock contention until `deadline`. A first attempt is always made,
@@ -14,7 +68,8 @@ use std::time::{Duration, Instant};
 ///
 /// # Errors
 /// Returns `WouldBlock` with `busy` when the lock remains held at the deadline,
-/// or the original error of attempting the lock.
+/// or the original error of attempting the lock; [`takes_nothing`]'s refusal on a thread
+/// inside it.
 pub fn lock_exclusive_until(file: &std::fs::File, deadline: Instant, busy: &str) -> io::Result<()> {
     lock_exclusive_until_with(file, deadline, busy, || {})
 }
@@ -38,9 +93,10 @@ pub fn lock_exclusive_until_with(
 /// waits again). The caller must explicitly unlock before closing or transferring ownership.
 ///
 /// # Errors
-/// The lock's own error.
+/// The lock's own error, or [`takes_nothing`]'s refusal on a thread inside it.
 #[cfg(unix)]
 pub(crate) fn lock_exclusive_blocking(file: &std::fs::File) -> io::Result<()> {
+    refused_here()?;
     crate::keep_out_of_children(file)?;
     loop {
         #[expect(
@@ -54,6 +110,113 @@ pub(crate) fn lock_exclusive_blocking(file: &std::fs::File) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Wait, taking nothing, until no open file description holds a lock on `file`'s vnode. A
+/// kqueue hears each `flock` release there (`NOTE_FUNLOCK`, which an unlock, the last close of
+/// a description that held a lock, and so its holder's death, each post), and `fcntl(F_GETLK)`,
+/// which on macOS reads `flock` holders (as no process's, `l_pid` -1) and takes nothing, says
+/// after each one, and once before the first wait, whether the lock is still held: a waiter
+/// that holds it by the time of a read keeps this wait going until it lets go in turn. The
+/// kernel only wakes a waiter at the release, which takes the lock once it runs, so a read made
+/// first finds the lock free and ends the wait with that waiter about to take it. The watch is
+/// armed before the first read, so a release after any read is heard, and no clock wakes the
+/// thread meanwhile. `held` runs once, where the lock was found held, before the first wait.
+/// The vnode leaving its name (deleted, renamed or revoked) ends the wait as well: the next
+/// holder opens the file at that name, which nothing then holds. `file` itself is never locked
+/// here.
+///
+/// # Errors
+/// `kqueue(2)`'s, `kevent(2)`'s (but for an interrupted wait, which is waited again) or
+/// `fcntl(2)`'s.
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+pub(crate) fn wait_unlocked(file: &std::fs::File, held: impl FnOnce()) -> io::Result<()> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // What ends the wait with the vnode gone from its name.
+    const GONE: u32 = libc::NOTE_DELETE | libc::NOTE_RENAME | libc::NOTE_REVOKE;
+    // SAFETY: `kqueue()` takes no arguments and returns a new descriptor or -1.
+    let raw = unsafe { libc::kqueue() };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh descriptor this process exclusively owns; a kqueue is never
+    // inherited by a fork's child.
+    let queue = unsafe { OwnedFd::from_raw_fd(raw) };
+    let ident = libc::uintptr_t::try_from(file.as_raw_fd())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let watch = libc::kevent {
+        ident,
+        filter: libc::EVFILT_VNODE,
+        flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+        fflags: libc::NOTE_FUNLOCK | GONE,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    // SAFETY: one initialized change entry, live for the call; no event list requested.
+    let armed = unsafe {
+        libc::kevent(
+            queue.as_raw_fd(),
+            &raw const watch,
+            1,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+        )
+    };
+    if armed < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut held = Some(held);
+    while locked(file)? {
+        if let Some(held) = held.take() {
+            held();
+        }
+        // SAFETY: `kevent` is plain data; all-zero is a valid value for the call to fill.
+        let mut heard: libc::kevent = unsafe { std::mem::zeroed() };
+        // SAFETY: one output slot, live for the call; a null timeout waits with no clock.
+        let got = unsafe {
+            libc::kevent(
+                queue.as_raw_fd(),
+                std::ptr::null(),
+                0,
+                &raw mut heard,
+                1,
+                std::ptr::null(),
+            )
+        };
+        if got < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        } else if got > 0 && heard.fflags & GONE != 0 {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Whether any open file description holds a lock on `file`'s vnode, read with
+/// `fcntl(F_GETLK)` over the whole file for an exclusive lock: on macOS a `flock` holder
+/// answers it, this process's own others included, and nothing is taken. `file` holds none.
+///
+/// # Errors
+/// `fcntl(2)`'s.
+#[cfg(target_os = "macos")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn locked(file: &std::fs::File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `flock` is plain data; all-zero is a valid value (`l_start` and `l_len` 0 name
+    // the whole file).
+    let mut probe = unsafe { std::mem::zeroed::<libc::flock>() };
+    probe.l_type = libc::F_WRLCK;
+    probe.l_whence = libc::SEEK_SET as libc::c_short;
+    // SAFETY: F_GETLK reads and fills the one `flock` it is given, live for the call.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &raw mut probe) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(probe.l_type != libc::F_UNLCK)
 }
 
 /// Shared contention wait; `None` retains an unrepresentable duration's unbounded wait.
@@ -75,6 +238,7 @@ pub(crate) fn lock_exclusive_with_clock(
     now: impl Fn() -> Instant,
     mut sleep: impl FnMut(Duration),
 ) -> io::Result<()> {
+    refused_here()?;
     crate::keep_out_of_children(file)?;
     let remaining = || {
         deadline.map_or(Duration::MAX, |deadline| {
@@ -166,7 +330,7 @@ impl LockFile {
     /// # Errors
     /// `WouldBlock` with `busy` when another holder kept it past `deadline`; `InvalidData` when
     /// `path` holds anything but a regular file; the open's and the lock's own error, a link at
-    /// `path` included.
+    /// `path` included; [`takes_nothing`]'s refusal on a thread inside it.
     pub fn take(path: &std::path::Path, deadline: Instant, busy: &str) -> io::Result<Self> {
         Self::lock(open_or_make(path)?, path, deadline, busy)
     }

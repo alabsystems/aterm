@@ -700,6 +700,79 @@ fn a_client_hang_up_ends_the_look_at_a_host_that_never_answers() {
     join_after_hang_up(relay, "the relay to end on its client's hang-up").expect("the relay");
 }
 
+/// A forward write can fail while its client still waits on the connection. Once stopped,
+/// the real relay abandons its pending host look instead of waiting for its admission bound.
+#[test]
+fn a_relay_stop_ends_the_host_probe_while_its_client_stays_connected() {
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    let dir = crate::test_scratch::short_dir("stopped-host-probe");
+    let sock = dir.path().join("host.sock");
+    let listener =
+        aterm_uds::kept_out(|| aterm_uds::CtlListener::bind(&sock)).expect("bind silent host");
+    let host = ForwardHost {
+        sock: sock.to_string_lossy().into_owned(),
+        token: "tok".into(),
+        pid: Some(std::process::id()),
+        listener: aterm_uds::listener::listener_at(&sock),
+        // Expiration cannot satisfy the one-minute detector below.
+        within: 2 * hang,
+    };
+    let (client, relay_client) = aterm_uds::kept_out(CtlStream::pair).expect("client pair");
+    let (relay_host, host_end) = aterm_uds::kept_out(CtlStream::pair).expect("host pair");
+    let (finished, done) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = relay_bidirectional(&relay_client, &relay_host, host);
+        let _ = finished.send(result);
+    });
+    hang_up(host_end);
+    let accepted = aterm_uds::accept(
+        &listener,
+        aterm_uds::AcceptWait::Until(std::time::Instant::now() + hang),
+        aterm_uds::AcceptedMode::Blocking,
+    );
+    let mut probe = String::new();
+    let proof = match &accepted {
+        Ok((stream, _)) => stream
+            .set_read_timeout(Some(hang))
+            .and_then(|()| BufReader::new(stream).read_line(&mut probe)),
+        Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+    };
+    // Keep the client connected: only the failed write to the closed host can stop the relay.
+    let sent = (&client).write_all(b"x");
+    let result = done.recv_timeout(hang);
+    // Unblock and join even an implementation that ignored the stop, before any assertion.
+    if let Ok((stream, _)) = accepted {
+        hang_up(stream);
+    }
+    if result.is_err() {
+        aterm_uds::hangup::hang_up(&client);
+    }
+    drop(listener);
+    let joined = worker.join();
+    let output = if result.is_ok() && joined.is_ok() {
+        read_to_end_of_file(&client, |read| {
+            format!("the stopped relay sent {:?}", String::from_utf8_lossy(read))
+        })
+    } else {
+        Vec::new()
+    };
+    hang_up(client);
+    proof.expect("the host probe wrote its handshake");
+    assert_eq!(
+        probe, "TOKEN tok version\n",
+        "the real relay reached its host"
+    );
+    sent.expect("the still-connected client wrote its byte");
+    joined.expect("the relay worker joined");
+    result
+        .expect("a relay stop must finish the pending look")
+        .expect("relay");
+    assert!(
+        output.is_empty(),
+        "a stopped relay sends no gone line: {output:?}"
+    );
+}
+
 #[test]
 fn one_proxy_hop_preserves_guard_until_original_client_ack() {
     struct Guard(std::sync::Arc<std::sync::atomic::AtomicBool>);

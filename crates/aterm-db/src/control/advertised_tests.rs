@@ -30,7 +30,10 @@ fn publish_node(lab: &enrollment::tests::Lab, node: &NodeIdentity) {
     );
     client::save_records(
         &lab.paths[1],
-        &client::load_records(&lab.paths[0]).unwrap().encode(),
+        &client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
     )
     .unwrap();
 }

@@ -141,7 +141,7 @@ pub enum Handed {
         source: Option<RecordsBound>,
         /// The `Admit`'s id.
         admit: RecordId,
-        /// The records, genesis first ([`crate::membership_log::Store::encode`]).
+        /// The records, genesis first ([`crate::membership_log::Store::read_encoded`]).
         records: Vec<u8>,
     },
 }

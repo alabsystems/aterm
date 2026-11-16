@@ -963,19 +963,18 @@ fn owed_area(owed: &Result<OwedClone, String>, token: bool) -> Area {
     const NAME: &str = "repos";
     match owed {
         Err(why) => Area::unread(NAME, why, "aterm doctor"),
-        Ok(OwedClone::Verified { present, total }) => Area::ok(
-            NAME,
-            format!("{present}/{total} vault repositories verified on this machine"),
-        ),
-        Ok(OwedClone::Unobserved {
-            present,
-            unborn,
-            total,
-        }) => Area::ok(
+        Ok(OwedClone::Verified(counts)) => Area::ok(
             NAME,
             format!(
-                "{present}/{total} vault repositories verified on this machine, {unborn} more \
-                 checked out without a commit: the vault's sync reads their remotes"
+                "vault repositories: {}, verified on this machine",
+                counts.summary()
+            ),
+        ),
+        Ok(OwedClone::Unobserved(counts)) => Area::ok(
+            NAME,
+            format!(
+                "vault repositories: {}: the vault's sync reads their remotes",
+                counts.summary()
             ),
         ),
         Ok(OwedClone::Nothing(_)) if token => Area::due(

@@ -282,6 +282,53 @@ fn a_page_stop_holds_its_row_until_six_hours_or_a_persons_window() {
     );
 }
 
+/// A CHECK HOLDS ITS ROW ON NO CLOCK: a sign-in that ended on a page's human check (recorded
+/// `blocked` with its page, and as the account's [`accounts::CheckStop`]) is not tried again by
+/// the upkeep six hours on, or any time on, past a restart too. CONTROL: a person's signed-in
+/// browser window ends the hold.
+#[cfg(unix)]
+#[test]
+fn a_check_holds_its_row_until_a_persons_window_on_no_clock() {
+    let desk = Desk::new("m30");
+    hand_roster(&desk, false);
+    let store = desk.store();
+    fs::create_dir_all(crate::harness::headless_oauth::browser_profile_dir(
+        &store.dir,
+        Some("w3"),
+    ))
+    .unwrap();
+    let aterm = || Bench {
+        browser: true,
+        ..Bench::ending(Renewal::Failed)
+    };
+    check_stopped(&desk, crate::harness::open_url::MetWord::HumanCheck, NOW);
+    let attempt = attempt_of(&desk, "w3").unwrap();
+    assert_eq!(
+        (attempt.outcome, attempt.stop),
+        (
+            accounts::AttemptOutcome::Blocked,
+            Some(crate::harness::open_url::MetWord::HumanCheck)
+        )
+    );
+    for later in [60, PERSON_BACKOFF_SECS + 1, 10 * PERSON_BACKOFF_SECS] {
+        assert!(!aterm().pass(&desk, NOW + later), "held {later}s on");
+    }
+    let at = NOW + 10 * PERSON_BACKOFF_SECS + 1;
+    store
+        .transact_pool_logins_within(&[], &desk.roster(), at, &mut None, |_, _, logins| {
+            accounts::admit_workflow(logins, "w3")?;
+            Ok(vec![
+                accounts::Event::new(at, accounts::Kind::SignIn, "w3")
+                    .because("claude.ai window done session-kept"),
+            ])
+        })
+        .unwrap();
+    assert!(
+        aterm().pass(&desk, at + 1),
+        "CONTROL: a person's signed-in window ends it"
+    );
+}
+
 /// A wait a page did not set stands whatever the record says: a failed sign-in waits on its own
 /// backoff, as a `Blocked` record's end says nothing of it.
 #[cfg(unix)]
@@ -1446,10 +1493,14 @@ fn desk_with_a_mail_folder() -> Desk {
 }
 
 /// THE UPKEEP'S RUN IS HANDED THE WINDOW IT CHOSE, scripted or live: at this Mac's own desk a
-/// row whose mail folder gives the code is handed aterm's own window. The same row is handed
-/// the headless route where the run carries another machine's mark, and so is a row whose
-/// only mailbox is a webmail inbox, which a headless browser alone reads: the window would
-/// wait four minutes for a code nobody types.
+/// row whose mail folder gives the code is handed aterm's own window, told that nobody started
+/// the sign-in (`ATERM_OPEN_URL_UNATTENDED`), so the window ends at the read of any check and
+/// waits on none for a person who is not there. The same row is handed the headless route where
+/// the run carries another machine's mark, and so is a row whose only mailbox is a webmail
+/// inbox, which a headless browser alone reads: the window would wait four minutes for a code
+/// nobody types.
+/// NEGATIVE CONTROL: with `upkeep_browser` handing the window as a person's (`unattended:
+/// false`), `` the upkeep's window was not told nobody started it ``.
 #[cfg(unix)]
 #[test]
 fn the_upkeeps_run_is_handed_the_window_only_where_the_window_reads_the_rows_mailbox() {
@@ -1460,8 +1511,14 @@ fn the_upkeeps_run_is_handed_the_window_only_where_the_window_reads_the_rows_mai
     };
     assert!(bench.pass(&desk, NOW), "the mailbox route started");
     assert!(
-        matches!(bench.handed().as_slice(), [RenewBrowser::Window { .. }]),
-        "{:?}",
+        matches!(
+            bench.handed().as_slice(),
+            [RenewBrowser::Window {
+                unattended: true,
+                ..
+            }]
+        ),
+        "the upkeep's window was not told nobody started it: {:?}",
         bench.handed()
     );
 
@@ -1825,8 +1882,14 @@ fn a_claude_row_a_check_stopped_waits_for_a_person_at_every_door() {
     );
     let (_, started, said) = renew_w3(&desk, (false, MetWord::WindowHumanCheck), false, later);
     assert!(
-        matches!(started.as_slice(), [RenewBrowser::Window { .. }]),
-        "CONTROL: a person's renewal opens the sign-in window once: {started:?} {said}"
+        matches!(
+            started.as_slice(),
+            [RenewBrowser::Window {
+                unattended: false,
+                ..
+            }]
+        ),
+        "CONTROL: a person's renewal opens the sign-in window once, for them: {started:?} {said}"
     );
     assert_eq!(runs(), "window=1\n");
 
@@ -1883,7 +1946,8 @@ fn a_claude_row_a_check_stopped_waits_for_a_person_at_every_door() {
         let (ended, tried) = super::cli_pool_tests::a_vendor_rows_stop_is_tried(
             cli,
             super::super::login_drive::Outcome::BotCheck(
-                "Cloudflare's bot check did not clear in 90 s".to_owned(),
+                "the sign-in page carries Cloudflare's bot check; aterm pressed nothing there"
+                    .to_owned(),
             ),
         );
         assert_eq!(ended, Renewal::BotCheck, "{cli:?}");
@@ -2949,7 +3013,9 @@ fn fleet_token(key: &str, email: &str) -> aterm_secrets::claude_token::Standing 
 /// whose meta says the window minted it (`minted_by = window`, which the fleet serves), and one
 /// log line with no address. The next tick, an hour later and a day later, make none. On a Mac
 /// whose capture meets the consent page's human check, nothing is written, one step record is
-/// left, and a new process 25 hours later runs nothing.
+/// left beside the account's check, and a new process 25 hours later runs nothing, held by that
+/// record alone once a login made for the row has ended the account's check and the upkeep's
+/// record of the gap's run is gone (as a new Claude Code build lets it through).
 /// NEGATIVE CONTROL: with `step_held` reading no record (`steps.get(..)` as `None`), the new
 /// process runs the stopped capture again: `` the held step ran again ``.
 #[cfg(target_os = "macos")]
@@ -3040,6 +3106,18 @@ fn a_signed_in_row_with_no_fleet_token_gets_one_with_nobody_there_once_and_a_che
     for at in [ripe + 1, ripe + 3_600] {
         held.pass(at);
     }
+    assert_eq!(held.world.runs(), 1);
+    // The check is the account's too. A login made for the row ends that, and a new build lets
+    // the upkeep's record of the gap's run through: neither holds what follows.
+    let store = held.desk.store();
+    let mut logins = store.load_logins(T0).expect("the logins").0;
+    let binding = logins.labels.get_mut("work").expect("the row's binding");
+    assert!(
+        binding.check_stop.take().is_some(),
+        "the account's check was not recorded"
+    );
+    store.save_logins(&logins).expect("the login");
+    crate::harness::token_steps::put_tried(&store, WORK_KEY, None).expect("the run's record");
     // A new process, 25 hours later: only the record holds it.
     let held = Tier {
         bench: Tier::bench(),
@@ -3573,4 +3651,72 @@ fn a_mac_not_seated_in_the_vault_makes_no_token_and_says_so_once() {
         .filter(|line| line.contains("vault-not-seated"))
         .collect();
     assert_eq!(said.len(), 1, "{said:?}");
+}
+
+/// A SAVED CHOICE A TICK RESUMES WITH NOBODY AT THIS DESK DOES NOT SIGN IN A ROW WHOSE CHECK
+/// THIS PROCESS KEEPS UNRECORDED (sitting design §3): a bot protection this process met while
+/// the account's records stayed busy ([`AutoRenewGuard::unrecorded_checks`]) holds the pin's door
+/// as it holds the ladder's every route; the choice fails, and the pass writes the check, which
+/// then holds the row on record. CONTROL: with nothing kept, the same choice starts the row's
+/// sign-in.
+/// NEGATIVE CONTROL: with the pin's door reading only the records (`left_to_a_person`, the
+/// merge's form), `` a saved choice signed in a row whose check this process keeps ``.
+#[cfg(unix)]
+#[test]
+fn a_saved_choice_with_nobody_here_holds_a_check_this_process_keeps() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for kept in [true, false] {
+        let desk = desk_with_a_mail_folder();
+        let store = desk.store();
+        let records = store
+            .read_account_records(Some(&desk.roster()), NOW)
+            .unwrap();
+        let guard = Arc::new(Mutex::new(AutoRenewGuard::default()));
+        if kept {
+            guard.lock().unwrap().unrecorded_checks.insert(
+                "w3".to_owned(),
+                PendingCheck {
+                    roster_path: desk.roster(),
+                    row: records.roster.row("w3").unwrap().clone(),
+                    generation: records.logins.get("w3").map(|b| b.renewal_generation),
+                    at: NOW,
+                },
+            );
+        }
+        let started = AtomicBool::new(false);
+        let spawn = |_work: Box<dyn FnOnce() + Send>| {
+            started.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        let at = NOW + 60;
+        let request = store.request_pin("w3", at).unwrap();
+        let dispatch = renew_requested_pin_at(
+            Cli::Claude,
+            (&desk.home, &desk.state, &desk.roster()),
+            request,
+            at,
+            (&guard, &spawn, None),
+            None,
+            false,
+        );
+        if kept {
+            assert_eq!(
+                (dispatch, started.load(Ordering::SeqCst)),
+                (RenewalDispatch::Failed, false),
+                "a saved choice signed in a row whose check this process keeps"
+            );
+            assert!(
+                guard.lock().unwrap().unrecorded_checks.is_empty(),
+                "written by the pass"
+            );
+            assert!(check_stands(&desk, at), "and held on record");
+        } else {
+            assert!(!check_stands(&desk, at));
+            assert_eq!(
+                (dispatch, started.load(Ordering::SeqCst)),
+                (RenewalDispatch::Started, true),
+                "CONTROL: a saved choice with nothing kept"
+            );
+        }
+    }
 }

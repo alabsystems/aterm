@@ -21,6 +21,7 @@ pub mod alab;
 pub mod att;
 #[cfg(unix)]
 pub mod catalog;
+#[cfg(any(unix, test))] // its one reader, the signed table checkpoint (`att`), is unix's
 pub(crate) mod checkpoint;
 #[cfg(unix)]
 pub mod cli;

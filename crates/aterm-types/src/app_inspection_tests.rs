@@ -166,6 +166,15 @@ fn open_request_is_parsed_but_not_canonicalized_or_authorized() {
     assert!(parse_open_app("app system-state /extra").is_err());
     assert_eq!(parse_open_app("app tables"), Ok(OpenAppRequest::Tables));
     assert!(parse_open_app("app tables /extra").is_err());
+    assert_eq!(
+        parse_open_app("app navigator"),
+        Ok(OpenAppRequest::Navigator { split: false })
+    );
+    assert_eq!(
+        parse_open_app("app navigator split"),
+        Ok(OpenAppRequest::Navigator { split: true })
+    );
+    assert!(parse_open_app("app navigator left").is_err());
     assert!(parse_open_app("app system-state\nact app/v1").is_err());
     assert_eq!(
         parse_open_app("app settings"),

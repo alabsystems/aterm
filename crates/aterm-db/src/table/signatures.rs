@@ -143,6 +143,28 @@ thread_local! {
     static HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many Ed25519 signatures this thread verified, through any cache.
+    static VERIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`VERIFIED`]'s count on this thread.
+#[cfg(test)]
+pub(super) fn test_verified() -> usize {
+    VERIFIED.get()
+}
+
+/// Drop every success the process-wide cache holds, as reading a table past its bound does. A
+/// lost entry only loses reuse, so tests running beside this one answer as before.
+#[cfg(test)]
+pub(super) fn test_forget() {
+    if let Ok(mut entries) = CACHE.entries.lock() {
+        entries.known.clear();
+        entries.order.clear();
+    }
+}
+
 /// [`HASHED`]'s count on this thread.
 #[cfg(test)]
 pub(super) fn test_hashed() -> usize {
@@ -222,6 +244,8 @@ impl Cache {
         #[cfg(test)]
         self.checks
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        VERIFIED.set(VERIFIED.get() + 1);
         crypto::verify(signer, DOMAIN, &wire[..signed_end], &wire[signed_end..])?;
         if self.capacity > 0
             && let Ok(mut entries) = self.entries.try_lock()

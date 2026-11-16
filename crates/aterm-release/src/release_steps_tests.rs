@@ -2635,6 +2635,35 @@ fn the_next_cut_promotes_the_exact_prefrozen_cutter_and_says_so() {
     );
 }
 
+/// The observer's stdout as m86 read it on 2026-11-16: the refresh's gate timing and
+/// event lines come first, the answer last. NEGATIVE CONTROL: the former reader trimmed
+/// the whole output and required one bare commit, so every observation of this output
+/// failed ('returned no full lowercase commit') and the supervisor prepared nothing for
+/// 4 h 22 min; the first assertion fails against it.
+#[cfg(unix)]
+#[test]
+fn the_prefreeze_observer_answer_is_its_one_marked_line() {
+    use super::*;
+    let commit = "3db0d7cd188eabaccf5b73ab822a12eb472f6b6d";
+    let gates = concat!(
+        "  timing     native Git ref advertisement: wall 4.378s · self CPU 0.477s · child CPU 2.489s (inclusive)\n",
+        "release-event: {\"event\":\"cut-gate-finished\",\"gate\":\"native Git ref advertisement\"}\n",
+        "  timing     native Git object operation: wall 61.357s · self CPU 1.897s · child CPU 33.298s (inclusive)\n",
+    );
+    let answered = format!("{gates}{}\n", observed_main_line(commit));
+    assert_eq!(observed_main(answered.as_bytes()).as_deref(), Ok(commit));
+
+    let unmarked = format!("{gates}{commit}\n");
+    assert!(observed_main(unmarked.as_bytes()).is_err());
+    let twice = format!("{answered}{}\n", observed_main_line(commit));
+    assert!(observed_main(twice.as_bytes()).is_err());
+    let short = format!("{gates}{}\n", observed_main_line(&commit[..12]));
+    assert!(observed_main(short.as_bytes()).is_err());
+    let upper = observed_main_line(&commit.to_uppercase());
+    assert!(observed_main(upper.as_bytes()).is_err());
+    assert!(observed_main(&[0xff, 0xfe]).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn prefreeze_handoff_waits_ninety_seconds_with_progress_but_refuses_a_stall() {

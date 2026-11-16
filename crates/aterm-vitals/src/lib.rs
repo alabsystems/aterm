@@ -24,6 +24,7 @@ pub mod program_check;
 pub mod ring;
 pub mod runq;
 pub mod scheduling;
+pub mod self_cpu;
 pub mod services;
 pub mod situation;
 pub mod starts;

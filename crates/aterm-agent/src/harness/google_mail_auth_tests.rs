@@ -118,7 +118,6 @@ fn google_observed_password_need_and_email_code_follow_distinct_paths() {
                 Deadline::new(Duration::from_secs(60), &clock),
                 Duration::ZERO,
             ),
-            Duration::from_secs(60),
             |_, _| {
                 mailbox_calls += 1;
                 Err("fixture mailbox callback")
@@ -247,7 +246,6 @@ fn google_totp_step_up_uses_route_totp_without_password_and_records_no_spurious_
             Deadline::new(Duration::from_secs(60), &clock),
             Duration::ZERO,
         ),
-        Duration::from_secs(60),
         |_, _| panic!("authenticator challenge must not read mailbox"),
         |url| {
             delivered.push(url.to_owned());
@@ -524,4 +522,45 @@ fn google_password_script_live_browser_enforces_origin_identity_and_one_submissi
             "{kind}/{identity}/{fallback}: code submission must be gated before fallback"
         );
     }
+}
+
+/// GOOGLE'S STEP SCRIPT READS THE PAGE FOR A CHECK BEFORE IT TOUCHES ANYTHING: the account
+/// choice, the password and the fallback all follow the shared predicate; Google's own captcha
+/// and its "Verify it's you" field are checks; the account choice is pressed once per
+/// document; and the mailed code's field is never one this script hands on to be filled.
+#[test]
+fn google_step_reads_the_check_before_it_touches_anything() {
+    let js = google_mail_auth::step_js(
+        "FALLBACK()",
+        Some("ada@x.example"),
+        Some("fixture-only"),
+        false,
+        true,
+    );
+    assert!(js.contains(CHECK_PAGE_JS));
+    let met = js
+        .find("if (met) return {state:met.kind,check:met.name,url};")
+        .expect("the check");
+    let captcha = js
+        .find("return {state:'human_check',check:'captcha',url};")
+        .expect("captcha");
+    let verify = js
+        .find("return {state:'block_page',check:'Google',url};")
+        .expect("Verify it's you");
+    for touch in [
+        "choice.click()",
+        "setter.call(field",
+        "next.click()",
+        "FALLBACK()",
+    ] {
+        let at = js.rfind(touch).expect(touch);
+        assert!(
+            met < at && captcha < at && verify < at,
+            "{touch} before the check"
+        );
+    }
+    assert!(js.contains(
+        "if (choice.dataset.atermGoogleChoiceSent === 'true') return {state:'consent_pressed',url};"
+    ));
+    assert!(!js.contains("idvPin')).some(visible)"));
 }

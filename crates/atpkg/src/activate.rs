@@ -515,13 +515,12 @@ pub(crate) fn reconcile_aliases(
             let env = primary_read.env;
             let shim = layout.shim(&alias);
             let alias_read = platform::read_shim(&shim);
+            // What stands is held to what `install_shim_env` below would lay, a link included.
             if alias_read.target.as_deref() == Some(wanted.as_path())
                 && alias_read.env == env
                 && (cfg!(not(unix))
-                    || alias_read.body.as_deref().is_some_and(|have| {
-                        platform::shim_executable_to_env(&shim, &wanted, &env)
-                            .is_ok_and(|want| have.as_bytes() == want.body)
-                    }))
+                    || platform::shim_executable_env(&target_bin, tool, &shim, &env)
+                        .is_ok_and(|want| want.is_laid()))
             {
                 continue;
             }

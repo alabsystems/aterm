@@ -76,9 +76,12 @@ fn genuine_provider_lists_a_real_checkout() {
         for name in crate::changed::GIT_REDIRECTS {
             command.env_remove(name);
         }
-        let output =
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap();
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            aterm_spec::wait::MUST_HAPPEN,
+            "the selected Git provider's result",
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "{}",
@@ -90,10 +93,12 @@ fn genuine_provider_lists_a_real_checkout() {
     std::fs::write(temp.path().join("provider-input"), b"real input\n").unwrap();
     run(&["add", "--", "provider-input"]);
     assert_eq!(run(&["ls-files", "-z"]), b"provider-input\0");
-    assert_eq!(
-        crate::checkout_root(temp.path()),
-        Some(temp.path().canonicalize().unwrap())
-    );
+    let root = crate::checkout_root(temp.path()).expect("git names the checkout's root");
+    // Git for Windows names the resolved directory with `/` and no `\\?\` (`C:/Users/…`),
+    // where canonicalize spells the same directory `\\?\C:\Users\…`.
+    #[cfg(windows)]
+    let root = root.canonicalize().unwrap();
+    assert_eq!(root, temp.path().canonicalize().unwrap());
 }
 
 #[cfg(unix)]
@@ -110,8 +115,12 @@ fn missing_provider_refuses_landing_before_checkout_or_publication() {
         ])
         .env("ATV_GIT_PROVIDER_MISSING_CASE", "1")
         .env("PATH", temp.path());
-    let output =
-        aterm_uds::deadline::output_within(&mut child, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut child,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the missing-provider actor's result",
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -168,8 +177,12 @@ fn a_callers_tool_path_cannot_select_the_provider_for_the_process() {
         .env("PATH", invocation.parent().unwrap())
         .env("ATV_GIT_PROVIDER_EXPECTED", &invocation)
         .env("ATV_GIT_PROVIDER_CALLER_PATH", caller.parent().unwrap());
-    let output =
-        aterm_uds::deadline::output_within(&mut child, aterm_spec::wait::MUST_HAPPEN).unwrap();
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut child,
+        aterm_spec::wait::MUST_HAPPEN,
+        "the caller-path actor's provider selection",
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",

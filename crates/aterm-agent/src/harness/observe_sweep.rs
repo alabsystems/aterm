@@ -20,6 +20,18 @@
 //!
 //! A place that names no account (signed out, key-only, routed, unread) is not noted and keeps
 //! what it last said, so a file caught mid-write is no change.
+//!
+//! Each look also hands the registry every account signed in to one of aterm's own browser
+//! profiles ([`browser_logins`]), `idle` from the source `browser`: an account the person signed
+//! in to by hand in `accounts browser`'s window, which no CLI's file may name. Those are no `seen`
+//! notes; the journal hears what CLIs and tabs run.
+//!
+//! Where a place's file states its account's plan ([`super::Observed::plan`]), the sweep notes a
+//! `plan-seen` with the plan word once per account per change of word: the word last noted of
+//! each account is kept in the same file, so neither a later look nor another process notes it
+//! again until the file states another word. Of two places that name one account the newer file
+//! speaks for its plan, so the word does not flap between them and a stale file never restates
+//! a word the newer one no longer states.
 
 use super::{Observation, Process};
 use crate::harness::accounts::{self, AuthRoute, Cli, ProcessLogin, Roster, Row, TokenEntry};
@@ -307,11 +319,178 @@ pub fn places<'a>(
     out
 }
 
+/// Every account signed in to one of aterm's own browser profiles on this Mac
+/// (`<harness state>/accounts/browsers/` and `…/vendor-browsers/`), by what aterm itself records
+/// of each profile, as [`LoginState::Idle`] logins with no tab from [`ObservedSrc::Browser`]:
+///
+/// - a profile a roster row of `rosters` owns (the one its headless sign-ins run in and
+///   `accounts browser` opens, [`headless_oauth::row_browser_profile`]) is that row's CLI and
+///   account (its expected identity address, else its email); a vendor row's only where the
+///   profile is its own under `vendor-browsers/`, not Claude Code's that it is lent;
+/// - a Claude Code profile no row owns is the account its directory is named for, where the name
+///   spells one address one to one ([`profile_email`]); a vendor profile no row owns names no
+///   vendor, and is left out;
+/// - a profile still marked unproven ([`headless_oauth::PROFILE_UNPROVEN_MARK`], made for a
+///   sign-in that never succeeded) is signed in to nothing.
+///
+/// No cookie, stored value or file the browser wrote is read: only the profiles' directory
+/// names, the mark aterm keeps in them and the rosters. An account two profiles name is handed
+/// once.
+#[must_use]
+pub fn browser_logins(
+    harness_state: &Path,
+    user_home: &Path,
+    rosters: &[(Cli, Roster)],
+    now: i64,
+) -> Vec<ObservedLogin> {
+    let mut out: Vec<ObservedLogin> = Vec::new();
+    for seen in browser_profiles(harness_state, user_home, rosters, now) {
+        if !out.contains(&seen.login) {
+            out.push(seen.login);
+        }
+    }
+    out
+}
+
+/// One of aterm's own browser profiles signed in to an account ([`browser_profiles`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserLogin {
+    /// The login, as [`browser_logins`] hands it.
+    pub login: ObservedLogin,
+    /// The profile's directory.
+    pub profile: PathBuf,
+    /// The label of the roster row that owns the profile; `None` for a Claude Code profile no
+    /// row owns, read from its directory's name.
+    pub row: Option<String>,
+}
+
+/// Every signed-in profile [`browser_logins`] reads, one per profile in the order it reads
+/// them (each row's in roster order, then the unowned Claude Code profiles by name), with the
+/// profile and the row that owns it: what `accounts observed` lists beside the login places.
+#[must_use]
+pub fn browser_profiles(
+    harness_state: &Path,
+    user_home: &Path,
+    rosters: &[(Cli, Roster)],
+    now: i64,
+) -> Vec<BrowserLogin> {
+    use crate::harness::headless_oauth;
+    let Ok(at) = u64::try_from(now) else {
+        return Vec::new();
+    };
+    let proven = |dir: &Path| {
+        dir.is_dir()
+            && std::fs::symlink_metadata(dir.join(headless_oauth::PROFILE_UNPROVEN_MARK))
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+    };
+    let mut owned: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut out: Vec<BrowserLogin> = Vec::new();
+    let mut push = |cli: Cli, region, email: &str, profile: &Path, row: Option<&str>| {
+        let Some((realm, email)) = journal::observed_claims(cli.into(), region, email) else {
+            return;
+        };
+        out.push(BrowserLogin {
+            login: ObservedLogin {
+                cli: cli.into(),
+                realm,
+                email,
+                state: LoginState::Idle,
+                tab: None,
+                at,
+                src: ObservedSrc::Browser,
+            },
+            profile: profile.to_path_buf(),
+            row: row.map(str::to_owned),
+        });
+    };
+    for (cli, roster) in rosters {
+        let store = accounts::Store::at_for(harness_state, *cli, user_home);
+        let shared = store.shared_dir();
+        let vendors = shared.join(headless_oauth::VENDOR_PROFILES_DIR);
+        for row in &roster.rows {
+            let Some(email) = row.email.as_deref().filter(|email| !email.is_empty()) else {
+                continue;
+            };
+            let profile = headless_oauth::row_browser_profile(
+                *cli,
+                &store.dir,
+                &shared,
+                &row.label,
+                Some(email),
+            );
+            // A vendor row lent Claude Code's profile of its address (`vendor_profile_dir`,
+            // while it has none of its own) is not signed in to its vendor by Claude Code's
+            // sign-in there, and that profile stays the Claude Code account's.
+            if *cli != Cli::Claude && !profile.starts_with(&vendors) {
+                continue;
+            }
+            // A row's profile is the row's, proven or not: its name is never read for another.
+            if proven(&profile) {
+                push(
+                    *cli,
+                    row.vendor.region,
+                    row.expected_identity_email().unwrap_or(email),
+                    &profile,
+                    Some(&row.label),
+                );
+            }
+            owned.insert(profile);
+        }
+    }
+    let own = accounts::Store::at(harness_state)
+        .dir
+        .join(headless_oauth::BROWSER_PROFILES_DIR);
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&own)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| Some(entry.ok()?.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    for dir in dirs {
+        if owned.contains(&dir) || !proven(&dir) {
+            continue;
+        }
+        if let Some(email) = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(profile_email)
+        {
+            push(Cli::Claude, None, &email, &dir, None);
+        }
+    }
+    out
+}
+
+/// The address a browser profile's directory `name` spells one to one: `<local>-at-<domain>`
+/// with one `-at-` and a domain whose last label is a top-level one (letters, or `xn--`
+/// punycode), whose address [`crate::harness::headless_oauth::sanitize_profile_key`] names
+/// `name` again. A label's profile, one named with a digest (`<key>-<8 hex>`: a `+` address,
+/// or one cut at 64 characters) and one whose name two addresses could spell name none.
+#[must_use]
+pub fn profile_email(name: &str) -> Option<String> {
+    let (local, domain) = name.split_once("-at-")?;
+    let top = domain.rsplit_once('.').map(|(_, top)| top)?;
+    let top_level = top.starts_with("xn--") || top.bytes().all(|b| b.is_ascii_alphabetic());
+    if local.is_empty() || domain.contains("-at-") || top.is_empty() || !top_level {
+        return None;
+    }
+    let email = format!("{local}@{domain}");
+    (crate::harness::headless_oauth::sanitize_profile_key(&email) == name).then_some(email)
+}
+
+/// The key of the file's plan memory ([`Swept::render`]): no place key is one, since every place
+/// key is a CLI word, a space and a file.
+const PLANS_KEY: &str = "plans";
+
 /// What the sweep last noted of each login place, by the place (`<cli> <file>`): the account it
-/// named (`<realm> <claims email>`) and when it was noted, Unix seconds.
+/// named (`<realm> <claims email>`) and when it was noted, Unix seconds; and the plan word last
+/// noted of each account.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Swept {
     places: BTreeMap<String, (String, i64)>,
+    plans: BTreeMap<String, String>,
 }
 
 impl Swept {
@@ -348,6 +527,16 @@ impl Swept {
         }
     }
 
+    /// Take back the plan word a sweep kept of `account`, whose `plan-seen` the journal did not
+    /// take: the account holds what `before` held, so the word is due again.
+    #[cfg(unix)]
+    fn take_back_plan(&mut self, before: &Self, account: &str) {
+        match before.plans.get(account) {
+            Some(word) => self.plans.insert(account.to_owned(), word.clone()),
+            None => self.plans.remove(account),
+        };
+    }
+
     /// The file's text.
     #[must_use]
     pub fn render(&self) -> String {
@@ -357,6 +546,14 @@ impl Swept {
             last.insert("account".into(), Value::from(account.as_str()));
             last.insert("at".into(), Value::from(*at));
             places.insert(place.clone(), Value::Object(last));
+        }
+        if !self.plans.is_empty() {
+            let plans = self
+                .plans
+                .iter()
+                .map(|(account, word)| (account.clone(), Value::from(word.as_str())))
+                .collect();
+            places.insert(PLANS_KEY.into(), Value::Object(plans));
         }
         format!("{}\n", Value::Object(places))
     }
@@ -370,13 +567,28 @@ impl Swept {
         };
         let places = file
             .iter()
+            .filter(|(place, _)| place.as_str() != PLANS_KEY)
             .filter_map(|(place, last)| {
                 let account = last.get("account")?.as_str()?.to_owned();
                 let at = last.get("at")?.as_i64()?;
                 Some((place.clone(), (account, at)))
             })
             .collect();
-        Self { places }
+        // A word outside the plan vocabulary is no memory: its account's plan is due again.
+        let plans = file
+            .get(PLANS_KEY)
+            .and_then(Value::as_object)
+            .map(|plans| {
+                plans
+                    .iter()
+                    .filter_map(|(account, word)| {
+                        let word = journal::plan_word(word.as_str()?)?;
+                        Some((account.clone(), word.to_owned()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { places, plans }
     }
 }
 
@@ -408,8 +620,9 @@ pub fn save(harness_state: &Path, swept: &Swept) -> std::io::Result<()> {
     aterm_uds::private_file::write_private(&dir, SWEPT_FILE, swept.render().as_bytes())
 }
 
-/// What one sweep gives: the journal notes that are due, and every login the places name, for
-/// the registry's `account-obs` rows.
+/// What one sweep gives: the journal notes that are due (each place's `seen`, then each
+/// account's `plan-seen`), and every login the places name, for the registry's `account-obs`
+/// rows.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sweep {
     pub notes: Vec<Note>,
@@ -421,9 +634,10 @@ pub struct Sweep {
 /// One sweep of `places` at `now`: for each place that names an account, the login as
 /// [`LoginState::Idle`] with no tab (where a tab of this process runs it, the registry's queue
 /// counts it running), and, where the place is due ([`Swept::due`]), a `seen` note that names
-/// no tab and no harness. An account two places name is noted and handed once a sweep. Keys
-/// come from the installed journal sink; a place whose account it cannot key gives nothing and
-/// is left due.
+/// no tab and no harness. An account two places name is noted and handed once a sweep. Then a
+/// `plan-seen` of each account whose newest file states a plan word that is not the word last
+/// noted of it. Keys come from the installed journal sink; a place whose account it cannot
+/// key gives nothing and is left due.
 #[must_use]
 pub fn sweep(places: &[Place<'_>], swept: &mut Swept, now: i64) -> Sweep {
     let mut out = Sweep::default();
@@ -432,6 +646,8 @@ pub fn sweep(places: &[Place<'_>], swept: &mut Swept, now: i64) -> Sweep {
     };
     let mut handed: BTreeSet<String> = BTreeSet::new();
     let mut noted: BTreeSet<String> = BTreeSet::new();
+    // Each account's newest file, and the plan-seen of the word it states, where it states one.
+    let mut stated: BTreeMap<String, (Option<i64>, Option<Note>)> = BTreeMap::new();
     for place in places {
         let Some(observed) = place.seen.seen() else {
             continue;
@@ -446,6 +662,15 @@ pub fn sweep(places: &[Place<'_>], swept: &mut Swept, now: i64) -> Sweep {
         };
         let at = format!("{} {}", observed.cli.id(), observed.path.display());
         let account = format!("{realm} {email}");
+        if stated
+            .get(&account)
+            .is_none_or(|(mtime, _)| observed.mtime > *mtime)
+        {
+            let note = observed
+                .plan
+                .map(|plan| journal::plan_note(observed.cli, key, plan, observed.src, t));
+            stated.insert(account.clone(), (observed.mtime, note));
+        }
         if handed.insert(account.clone()) {
             out.logins.push(ObservedLogin {
                 cli: observed.cli,
@@ -473,12 +698,24 @@ pub fn sweep(places: &[Place<'_>], swept: &mut Swept, now: i64) -> Sweep {
         ));
         out.of.push(account);
     }
+    for (account, (_, note)) in stated {
+        let Some((note, plan)) = note.and_then(|note| Some((note, note.plan?))) else {
+            continue;
+        };
+        if swept.plans.get(&account).is_some_and(|held| held == plan) {
+            continue;
+        }
+        swept.plans.insert(account.clone(), plan.to_owned());
+        out.notes.push(note);
+        out.of.push(account);
+    }
     out
 }
 
 /// This Mac's sweep at `now`, whole: read every login place `rosters`, `user_home` and
 /// `on_token` name, hand each login to the registry through the installed sink, and note what
-/// is due against the file under `harness_state`. Returns how many notes the journal took.
+/// is due against the file under `harness_state`; then hand each account signed in to one of
+/// aterm's own browser profiles ([`browser_logins`]). Returns how many notes the journal took.
 #[cfg(unix)]
 pub fn run(
     harness_state: &Path,
@@ -488,13 +725,17 @@ pub fn run(
     now: i64,
 ) -> usize {
     let places = places(rosters, user_home, on_token);
-    run_through(
+    let noted = run_through(
         harness_state,
         &places,
         now,
         &mut journal::note_taken,
         &mut journal::observed,
-    )
+    );
+    for login in browser_logins(harness_state, user_home, rosters, now) {
+        journal::observed(&login);
+    }
+    noted
 }
 
 /// [`run`] over `places`, through `note` (which says whether the journal took the note) and
@@ -529,6 +770,8 @@ fn run_through(
     for (each, account) in out.notes.iter().zip(&out.of) {
         if note(each) {
             taken += 1;
+        } else if each.plan.is_some() {
+            swept.take_back_plan(&before, account);
         } else {
             swept.take_back(&before, account, now);
         }

@@ -41,6 +41,9 @@ pub(super) struct Fence<'a> {
     processes: Processes<'a>,
     told: Cell<bool>,
     kept: Option<RefCell<Vec<RetainedCheck>>>,
+    /// A process in what this fence is asked of is expected, and its caller says why it stays
+    /// ([`Self::expected`]): the pass's one explanation is a debug line, not a warning.
+    expected: bool,
 }
 
 impl<'a> Fence<'a> {
@@ -49,7 +52,16 @@ impl<'a> Fence<'a> {
             processes,
             told: Cell::new(false),
             kept: None,
+            expected: false,
         }
+    }
+
+    /// A fence asked of a folder a person may be working in (a standing worktree, its build
+    /// directory): a shell, an editor or a language server there is no fault of the pass, and
+    /// the caller records the keep itself, so the explanation is logged at debug level.
+    pub(super) fn expected(mut self) -> Self {
+        self.expected = true;
+        self
     }
 
     pub(super) fn with_reporting(mut self) -> Self {
@@ -127,7 +139,11 @@ impl<'a> Fence<'a> {
                 self.note(subject, reason.clone());
                 // One bounded explanation per pass, including a failed or incomplete scan.
                 if !self.told.replace(true) {
-                    aterm_log::warn!("build cache cleanup check stopped: {reason}");
+                    if self.expected {
+                        aterm_log::debug!("build cache cleanup check stopped: {reason}");
+                    } else {
+                        aterm_log::warn!("build cache cleanup check stopped: {reason}");
+                    }
                 }
                 false
             }

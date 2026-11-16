@@ -77,28 +77,29 @@ impl Holding {
         self.macs() == 0 && self.here == 0
     }
 
-    /// The refusal this holding makes: how many Macs hold the put back and why.
+    /// Why each holds the puts back, one clause per kind with a count, in the order the kinds
+    /// are declared; empty where nothing holds them.
     #[must_use]
-    pub fn refusal(&self) -> Error {
-        let floor = self.release.map_or_else(
-            || "a release that writes no secret file, and none is named yet".to_owned(),
-            |release| format!("aterm {release} or later"),
-        );
+    pub fn reasons(&self) -> Vec<String> {
         let mut why = Vec::new();
-        for (count, words) in [
-            (self.older, "run an older aterm"),
-            (self.silent, "reported no version"),
-            (self.unheard, "were not heard in the last 7 days"),
+        for (count, one, many) in [
+            (self.older, "runs an older aterm", "run an older aterm"),
+            (self.silent, "reported no version", "reported no version"),
+            (
+                self.unheard,
+                "was not heard in the last 7 days",
+                "were not heard in the last 7 days",
+            ),
             (
                 self.outside,
+                "reads the vault from outside the Commons roster",
                 "read the vault from outside the Commons roster",
             ),
         ] {
-            if count > 0 {
-                why.push(format!(
-                    "{count} {} {words}",
-                    if count == 1 { "Mac" } else { "Macs" }
-                ));
+            match count {
+                0 => {}
+                1 => why.push(format!("1 Mac {one}")),
+                _ => why.push(format!("{count} Macs {many}")),
             }
         }
         if self.here > 0 {
@@ -113,9 +114,19 @@ impl Holding {
                 if self.here == 1 { "runs" } else { "run" },
             ));
         }
+        why
+    }
+
+    /// The refusal this holding makes: how many Macs hold the put back and why.
+    #[must_use]
+    pub fn refusal(&self) -> Error {
+        let floor = self.release.map_or_else(
+            || "a release that writes no secret file, and none is named yet".to_owned(),
+            |release| format!("aterm {release} or later"),
+        );
         Error::new(format!(
             "no registry secret is written until every Mac reading the vault runs {floor}: {}",
-            why.join(", ")
+            self.reasons().join(", ")
         ))
     }
 }

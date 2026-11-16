@@ -980,8 +980,8 @@ fn a_sign_in_makes_the_accounts_token_only_where_none_is_in_use() {
                 host,
                 "work",
                 SignedIn::Window,
-                &mut out,
-                &mut err,
+                (&mut out, &mut err),
+                &mut |_| {},
             )
         });
         let said = String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
@@ -1101,8 +1101,8 @@ fn a_sign_ins_own_run_never_replaces_a_token_the_vault_holds() {
                 &host,
                 "work",
                 SignedIn::Window,
-                &mut out,
-                &mut err,
+                (&mut out, &mut err),
+                &mut |_| {},
             )
         });
         let said = String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err);
@@ -1243,8 +1243,8 @@ fn a_sign_in_outside_the_window_is_offered_the_token_step_and_makes_none() {
                 host,
                 "work",
                 SignedIn::Elsewhere,
-                &mut out,
-                &mut err,
+                (&mut out, &mut err),
+                &mut |_| {},
             )
         });
         assert!(ran.is_none() && err.is_empty(), "the offer ran the verb");
@@ -1412,6 +1412,7 @@ fn token_preflight_waits_for_its_native_vault_writer() {
                 &mut out,
                 &mut err,
                 || Instant::now() - age,
+                &mut |_| {},
             )
         });
         assert_eq!(
@@ -2865,11 +2866,14 @@ struct StepHost {
     cli: RefCell<String>,
     /// The capture's hang detector ([`AccountsHost::token_hang`]).
     hang: Duration,
+    /// Whether a person runs the verb at a terminal of their own
+    /// ([`crate::harness::cli::person_at_terminal`]); nobody, unless a test says so.
+    person: Cell<bool>,
 }
 
 impl AccountsHost for StepHost {
     fn stdin_is_terminal(&self) -> bool {
-        false
+        self.person.get()
     }
     fn auth_status(&self, login: &str) -> Result<Captured, String> {
         panic!("a token step runs no `claude auth status` (under {login:?})")
@@ -2913,14 +2917,21 @@ impl AccountsHost for StepHost {
 /// package FL-136; sitting design §3 and S1): a capture in aterm's sign-in window whose consent
 /// page held Authorize behind a human check leaves one record in `tokens-steps.json` (its word,
 /// when, and the builds that met it; no host, address, code or token byte) and one
-/// `token-stopped` note, and posts no need. A pass a week later, or a month later, runs nothing;
-/// a new Claude Code build runs it once, and the next pass on that build nothing; a person's own
-/// run goes at once, one that ends on a stop that holds nothing (a browser that did not start)
-/// leaves the record as it was, and the capture that makes the token clears it.
-/// The pass is this Mac's token upkeep's (plan package FL-138: `backfill_due`, then
-/// `backfill_run`, by aterm's window with nobody there).
-/// NEGATIVE CONTROL: with `step_held` reading no record (`steps.get(..)` as `None`), the pass a
-/// day later runs: `` a pass 1 days later ran the step ``; with `mint` writing the record on
+/// `token-stopped` note, and posts no need. A pass a week later, or a month later, runs nothing,
+/// and neither does one on a new Claude Code build: a build is no person at the check, so no
+/// pass goes back to it; a person's own run goes at once, one that ends on a stop that holds
+/// nothing (a browser that did not start) leaves the record as it was, and the capture that
+/// makes the token clears it. The refusal says only a person's act tries it again. The pass is
+/// this Mac's token upkeep's (plan package FL-138: `backfill_due`, then `backfill_run`, by
+/// aterm's window with nobody there). The check is the account's too (`CheckedRow::hold_after`),
+/// so the row is left to a person at every door with nobody there; once a login made for the row
+/// has ended that, the step's own record alone holds every later pass.
+/// NEGATIVE CONTROL: with `Stopped::again` giving a check the words of any other stop (the
+/// branch's first form), the refusal promises a new build: `` with a new Claude Code or aterm
+/// build ``; with `step_held` reading no record (`steps.get(..)` as `None`), or with
+/// `Stopped::holds` letting a new build through a check's record (the branch's first form), the
+/// pass on 2.1.319 runs, where the upkeep's record of the gap's run lets the new build through
+/// too: `` a new Claude Code build went back to the check ``; with `mint` writing the record on
 /// every end, the browser that did not start clears it: `` a stop that holds nothing cleared
 /// the record ``.
 #[test]
@@ -2938,6 +2949,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         now: Cell::new(NOW),
         cli: RefCell::new("2.1.318".to_owned()),
         hang: aterm_spec::wait::MUST_HAPPEN,
+        person: Cell::new(false),
     };
     let env = scratch.env();
     let store = scratch.store();
@@ -2963,7 +2975,14 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
             assert_eq!(finding.gap, Gap::None);
             let (mut out, mut err) = (Vec::new(), Vec::new());
             let code = backfill_run(
-                &env, host, "work", &finding, false, window, &mut out, &mut err,
+                &env,
+                host,
+                "work",
+                &finding,
+                false,
+                window,
+                (&mut out, &mut err),
+                &mut |_| {},
             )
             .expect("still due");
             Some(Ran {
@@ -2980,9 +2999,16 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
     assert!(!ran.ok, "{}", ran.err);
     assert!(ran.err.contains("human check"), "{}", ran.err);
     assert!(
-        ran.err
-            .contains("tried again only at the account's next sign-in in aterm's sign-in window"),
+        ran.err.contains(
+            "tried again only by a person at a terminal on this Mac, who meets the check in \
+             aterm's sign-in window"
+        ),
         "{}",
+        ran.err
+    );
+    assert!(
+        !ran.err.contains("with a new Claude Code or aterm build"),
+        "a check's refusal promised a new build tries it again: {}",
         ran.err
     );
     assert_eq!(world.runs(), 1);
@@ -3000,6 +3026,28 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         assert!(!text.contains("NEEDS YOU"), "{text}");
     }
     assert_eq!(tasks(), tasks_before, "the stop posted a sign-in task");
+    // The check is the account's too: every door with nobody there leaves the row to a person.
+    let check = store
+        .load_logins(i64::try_from(NOW).unwrap())
+        .expect("the logins")
+        .0
+        .labels
+        .get("work")
+        .and_then(|binding| binding.check_stop.clone());
+    assert!(
+        check.is_some_and(|check| check.at >= i64::try_from(NOW).unwrap()),
+        "the account's check was not recorded"
+    );
+    // A login made for the row ends the account's check, and only the step's own record holds
+    // what follows: each control below is that record's alone.
+    let mut logins = store
+        .load_logins(i64::try_from(NOW).unwrap())
+        .expect("the logins")
+        .0;
+    if let Some(binding) = logins.labels.get_mut("work") {
+        binding.check_stop = None;
+    }
+    store.save_logins(&logins).expect("the login");
 
     // No clock: a week later, and a month later, nothing runs.
     for days in [1, 7, 30] {
@@ -3011,20 +3059,18 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
     }
     assert_eq!(world.runs(), 1, "a pass with no event reached the page");
 
-    // A new Claude Code build is an event: it runs the step once, which the check stops again,
-    // and the next pass on that build runs nothing.
+    // A new Claude Code build is no person at the check: no pass goes back to it.
     host.cli.replace("2.1.319".to_owned());
-    let ran = pass(&host).expect("a new Claude Code build runs the step");
-    assert!(!ran.ok, "{}", ran.err);
-    assert_eq!(world.runs(), 2);
-    let steps = record();
-    assert_eq!(steps.len(), 1, "{steps:?}");
-    assert_eq!(steps[KEY].cli, "2.1.319");
-    let kinds: Vec<_> = notes().iter().map(|note| note.kind).collect();
-    assert_eq!(kinds, ["token-stopped"]);
-    host.now.set(NOW + 60 * 86_400);
-    assert!(pass(&host).is_none(), "the same build ran the step twice");
-    assert_eq!(world.runs(), 2);
+    for days in [0, 60] {
+        host.now.set(NOW + days * 86_400);
+        assert!(
+            pass(&host).is_none(),
+            "a new Claude Code build went back to the check"
+        );
+    }
+    assert_eq!(world.runs(), 1);
+    assert_eq!(record()[KEY].cli, "2.1.318");
+    assert!(notes().is_empty(), "a held pass noted something");
 
     // The record holds no host, address, code or token byte, and no reason line.
     let raw = std::fs::read_to_string(store.shared_dir().join(STEPS_FILE)).expect("the record");
@@ -3041,12 +3087,13 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         assert!(!raw.contains(held), "the record holds {held:?}: {raw}");
     }
 
-    // A person's own run goes at once, held or not. One that ends on a stop that holds nothing
-    // leaves the record as it was, and the step held.
+    // A person's own run at a terminal of their own goes at once, held or not. One that ends on
+    // a stop that holds nothing leaves the record as it was, and the step held.
     let person_run = |mode: &str| {
         world.play(mode);
         let mut out = Vec::new();
         let mut err = Vec::new();
+        host.person.set(true);
         let code = journal::with_keyer(keyer, || {
             run_accounts(
                 &AccountsCmd::Token {
@@ -3059,6 +3106,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
                 &mut err,
             )
         });
+        host.person.set(false);
         (code, out, err)
     };
     let (code, out, err) = person_run("window-browser-start");
@@ -3069,7 +3117,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         String::from_utf8_lossy(&out),
         String::from_utf8_lossy(&err)
     );
-    assert_eq!(world.runs(), 3);
+    assert_eq!(world.runs(), 2);
     let steps = record();
     assert_eq!(
         steps.len(),
@@ -3077,7 +3125,7 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         "a stop that holds nothing cleared the record"
     );
     assert_eq!(steps[KEY].word, MetWord::WindowHumanCheck);
-    assert_eq!(steps[KEY].cli, "2.1.319");
+    assert_eq!(steps[KEY].cli, "2.1.318");
     assert!(
         !notes().iter().any(|note| note.kind == "token-stopped"),
         "a stop that holds nothing was noted as one"
@@ -3096,10 +3144,335 @@ fn a_token_step_a_check_stopped_leaves_one_record_and_waits_for_an_event_not_a_c
         "{out}{err}"
     );
     assert!(!out.contains(&token[..24]) && !err.contains(&token[..24]));
-    assert_eq!(world.runs(), 4);
+    assert_eq!(world.runs(), 3);
     assert!(record().is_empty(), "the token's capture left the record");
     let kinds: Vec<_> = notes().iter().map(|note| note.kind).collect();
     assert_eq!(kinds, ["token-minted"]);
+}
+
+/// The account `work`'s check on record ([`accounts::CheckStop`]), by its second, read a day on
+/// (a load caps every stamp at its own clock).
+fn check_at(store: &accounts::Store) -> Option<i64> {
+    store
+        .load_logins(i64::try_from(NOW + 86_400).unwrap())
+        .expect("the logins")
+        .0
+        .labels
+        .get("work")
+        .and_then(|binding| binding.check_stop.as_ref())
+        .map(|check| check.at)
+}
+
+/// Ends `work`'s account check as a login made for the row does.
+fn signed_in_again(store: &accounts::Store) {
+    let mut logins = store
+        .load_logins(i64::try_from(NOW).unwrap())
+        .expect("the logins")
+        .0;
+    if let Some(binding) = logins.labels.get_mut("work") {
+        binding.check_stop = None;
+    }
+    store.save_logins(&logins).expect("the login");
+}
+
+/// `accounts token work` as `aterm harness` routes it on `host`, under the test keyer.
+fn step_run(env: &Env, host: &StepHost, mode: TokenMode) -> Ran {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = journal::with_keyer(keyer, || {
+        run_accounts(
+            &AccountsCmd::Token {
+                name: "work".to_owned(),
+                mode,
+            },
+            env,
+            host,
+            &mut out,
+            &mut err,
+        )
+    });
+    Ran {
+        ok: format!("{code:?}") == format!("{:?}", ExitCode::SUCCESS),
+        out: String::from_utf8_lossy(&out).into_owned(),
+        err: String::from_utf8_lossy(&err).into_owned(),
+    }
+}
+
+/// WHO IS THERE DECIDES HOW THE TOKEN'S PAGE RUNS, NOT WHERE THE SIGN-IN RAN (sitting design §3):
+/// a sign-in in aterm's window that nobody at a terminal started (this Mac's upkeep's, an
+/// agent's) makes its token there with the window told nobody is there
+/// (`ATERM_OPEN_URL_UNATTENDED`), so the consent page's human check ends that capture at once;
+/// once a login made for the row has ended the account's check, the step's own record of the
+/// check still holds the next such sign-in, whose step is offered with nothing run, and an
+/// agent's run of the verb, which is told the person's step. CONTROL: a person's own sign-in in
+/// the window, at a terminal of theirs, makes the token whatever the record says, in a window not
+/// told nobody is there, and the token made clears the record.
+/// NEGATIVE CONTROL: with `after_sign_in` mapping every window sign-in to the person's route
+/// (`SignedIn::Window => Via::Desk`, the merge's form), `` the window was not told nobody is
+/// there ``; with it reading the check's record only after a headless sign-in, `` a sign-in
+/// nobody started was not offered the step `` (the run's own read refuses it, so neither alone
+/// lets the page load again: `` a sign-in nobody started went back to the check `` takes both);
+/// with `run_with_clock` reading no check's record for a run nobody at a terminal started,
+/// `` an agent's run went back to the check ``.
+#[test]
+fn who_is_there_decides_how_the_tokens_page_runs_not_where_the_sign_in_ran() {
+    use crate::harness::open_url::MetWord;
+    use crate::harness::token_steps;
+    let scratch = Scratch::new("after-window-nobody");
+    let lab = Lab::new();
+    let world = World::new("window-human-check", false);
+    let host = step_host(&lab, &world);
+    let (env, store) = (scratch.env(), scratch.store());
+    let after = |host: &StepHost| -> (Option<bool>, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = journal::with_keyer(keyer, || {
+            after_sign_in(
+                &env,
+                host,
+                "work",
+                SignedIn::Window,
+                (&mut out, &mut err),
+                &mut |_| {},
+            )
+        });
+        (
+            code.map(|code| code == ExitCode::SUCCESS),
+            String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err),
+        )
+    };
+    let told_nobody = || {
+        std::fs::read_to_string(world.home().join("env"))
+            .expect("the stand-in's env")
+            .lines()
+            .any(|line| line == "ATERM_OPEN_URL_UNATTENDED=1")
+    };
+
+    // The upkeep's sign-in in the window: its token's page meets the human check.
+    let (code, said) = after(&host);
+    assert_eq!(code, Some(false), "{said}");
+    assert_eq!(world.runs(), 1);
+    assert!(told_nobody(), "the window was not told nobody is there");
+    assert_eq!(
+        token_steps::read(&store).unwrap()[KEY].word,
+        MetWord::WindowHumanCheck
+    );
+    assert!(check_at(&store).is_some(), "the account's check");
+
+    // A login made for the row ends the account's check; the step's record still holds.
+    signed_in_again(&store);
+    world.play("renew-window-token");
+    let (code, said) = after(&host);
+    assert_eq!(
+        code, None,
+        "a sign-in nobody started was not offered the step: {said}"
+    );
+    assert!(
+        said.contains("`aterm harness accounts token work` run by a person at this Mac"),
+        "{said}"
+    );
+    assert_eq!(
+        world.runs(),
+        1,
+        "a sign-in nobody started went back to the check"
+    );
+    let ran = step_run(&env, &host, TokenMode::Make);
+    assert_eq!(world.runs(), 1, "an agent's run went back to the check");
+    assert!(!ran.ok, "{}", ran.out);
+    assert!(
+        ran.err
+            .contains("tried again only by a person at a terminal on this Mac"),
+        "{}",
+        ran.err
+    );
+
+    // CONTROL: a person's own sign-in in the window makes it, in a window not told nobody is
+    // there, and the token made clears the record.
+    host.person.set(true);
+    let (code, said) = after(&host);
+    host.person.set(false);
+    assert_eq!(code, Some(true), "{said}");
+    assert_eq!(world.runs(), 2);
+    assert!(!told_nobody(), "a person's window was told nobody is there");
+    assert!(token_steps::read(&store).unwrap().is_empty());
+}
+
+/// ONE CHECK, ONE LIFETIME (sitting design §3): a token step's check is the account's too
+/// (`CheckedRow::hold_after`), and the token a person's own run makes over the step's record,
+/// having passed the very page that carried it, ends both: the step's record and the account's
+/// check it wrote, so no door with nobody there holds the row for a check a person passed. A
+/// check of the account met since (a sign-in's, later than the step's) is not that one and
+/// stands. NEGATIVE CONTROL: with the token's success ending only the step's record (the merge's
+/// form), `` the person's token left the account's check standing ``.
+#[test]
+fn a_token_a_person_made_over_a_checks_record_ends_the_accounts_check_too() {
+    use crate::harness::token_steps;
+    for later_check in [false, true] {
+        let scratch = Scratch::new("step-check-ends");
+        let lab = Lab::new();
+        let world = World::new("window-human-check", false);
+        let host = step_host(&lab, &world);
+        let (env, store) = (scratch.env(), scratch.store());
+        let window = NobodyRoutes {
+            window: true,
+            headless: false,
+        };
+        let Backfill::Due(finding) =
+            journal::with_keyer(keyer, || backfill_due(&env, &host, "work", false, window))
+        else {
+            panic!("no token is due");
+        };
+        let code = journal::with_keyer(keyer, || {
+            backfill_run(
+                &env,
+                &host,
+                "work",
+                &finding,
+                false,
+                window,
+                (&mut Vec::new(), &mut Vec::new()),
+                &mut |_| {},
+            )
+        });
+        assert_ne!(code, Some(ExitCode::SUCCESS));
+        let stopped = token_steps::read(&store).unwrap()[KEY].clone();
+        let step_at = i64::try_from(stopped.at).unwrap();
+        assert_eq!(check_at(&store), Some(step_at), "the account's check");
+        let roster = env.accounts_roster_for(Cli::Claude).expect("the roster");
+        if later_check {
+            store
+                .transact_pool_logins_within(
+                    &[],
+                    &roster,
+                    step_at + 60,
+                    &mut None,
+                    |raw, _, logins| {
+                        accounts::note_check_stop(logins, raw.row("work").unwrap(), step_at + 60);
+                        Ok(Vec::new())
+                    },
+                )
+                .unwrap();
+            assert_eq!(check_at(&store), Some(step_at + 60), "the later check");
+        }
+        // The person's run, two minutes on.
+        host.now.set(NOW + 120);
+        world.play("renew-window-token");
+        host.person.set(true);
+        let ran = step_run(&env, &host, TokenMode::Make);
+        host.person.set(false);
+        assert!(ran.ok, "{}{}", ran.out, ran.err);
+        assert!(token_steps::read(&store).unwrap().is_empty());
+        let records = store
+            .read_account_records(Some(&roster), i64::try_from(NOW + 120).unwrap())
+            .unwrap();
+        let held = crate::harness::accounts_sync::left_to_a_person(
+            &store,
+            records.raw_roster.row("work").unwrap(),
+            &records.logins,
+        );
+        if later_check {
+            assert_eq!(
+                check_at(&store),
+                Some(step_at + 60),
+                "CONTROL: a later check of the account ended with the token's"
+            );
+            assert!(held);
+        } else {
+            assert_eq!(
+                check_at(&store),
+                None,
+                "the person's token left the account's check standing"
+            );
+            assert!(
+                !held,
+                "the row is left to a person for a check a person passed"
+            );
+        }
+    }
+}
+
+/// THE ONE HOLD READER FAILS CLOSED WITH NOBODY THERE (sitting design §3): where the account's
+/// records do not read, what stands on them is unknown and a check may be among it, so this
+/// Mac's upkeep finds no token due and an agent's run of the verb is refused, with nothing run.
+/// CONTROL: a person's own run at a terminal asks nothing of the records and goes on.
+/// NEGATIVE CONTROL: with `left_to_a_person_here` holding nothing on records it cannot read (the
+/// merge's form), `` the upkeep found a token due on records it could not read ``.
+#[test]
+fn records_that_do_not_read_hold_the_token_step_with_nobody_there() {
+    let scratch = Scratch::new("records-unread");
+    let lab = Lab::new();
+    let world = World::new("renew-window-token", false);
+    let host = step_host(&lab, &world);
+    let (env, store) = (scratch.env(), scratch.store());
+    let window = NobodyRoutes {
+        window: true,
+        headless: false,
+    };
+    assert!(
+        matches!(
+            journal::with_keyer(keyer, || backfill_due(&env, &host, "work", false, window)),
+            Backfill::Due(_)
+        ),
+        "CONTROL: due on records that read"
+    );
+    store.ensure().expect("the store");
+    aterm_uds::private_file::write_private(&store.dir, accounts::LOGINS_FILE, b"{").unwrap();
+    assert!(
+        store
+            .read_account_records(env.accounts_roster_for(Cli::Claude).as_deref(), 0)
+            .is_err(),
+        "the records still read"
+    );
+    assert!(
+        matches!(
+            journal::with_keyer(keyer, || backfill_due(&env, &host, "work", false, window)),
+            Backfill::Nothing
+        ),
+        "the upkeep found a token due on records it could not read"
+    );
+    let ran = step_run(&env, &host, TokenMode::Make);
+    assert!(!ran.ok, "{}", ran.out);
+    assert_eq!(world.runs(), 0, "an agent's run reached the page");
+}
+
+/// A CHECK A TOKEN'S PAGE CARRIED THAT THE ACCOUNT'S RECORDS COULD NOT TAKE IS HANDED TO THE
+/// CALLER (sitting design §3): where `accounts.lock` stays held past its ladder, the check is not
+/// on the account, so the capture answers it for the upkeep to hold in its process until a pass
+/// has written it (`AutoRenewGuard::unrecorded_checks`), and says so. CONTROL: with the lock
+/// free, the check is on record and nothing is handed over.
+/// NEGATIVE CONTROL: with `hold_after` writing only its line on a busy store (the merge's form),
+/// `` the busy store's check was dropped ``.
+#[test]
+fn a_check_the_accounts_records_could_not_take_is_handed_to_the_caller() {
+    use crate::harness::open_url::MetWord;
+    use crate::harness::token_steps;
+    let scratch = Scratch::new("check-busy");
+    let (env, store) = (scratch.env(), scratch.store());
+    store.ensure().expect("the store");
+    let stopped = token_steps::Stopped::new(MetWord::WindowBotCheck, NOW, "2.1.318", "").unwrap();
+    token_steps::put(&store, KEY, Some(&stopped)).unwrap();
+    for busy in [true, false] {
+        let checked = CheckedRow::before(&env, &store, (Some("work"), KEY), NOW).expect("the row");
+        assert_eq!(checked.step_check_at, Some(NOW));
+        let mut err = Vec::new();
+        let handed = {
+            let _held = busy.then(|| store.acquire().expect("the test holds accounts.lock"));
+            checked.hold_after(&store, KEY, NOW, &mut err)
+        };
+        let err = String::from_utf8_lossy(&err).into_owned();
+        if busy {
+            let handed = handed.expect("the busy store's check was dropped");
+            assert_eq!(handed.at, i64::try_from(NOW).unwrap());
+            assert_eq!(handed.row.label, "work");
+            assert!(
+                err.contains("could not be recorded on the account"),
+                "{err}"
+            );
+            assert_eq!(check_at(&store), None);
+        } else {
+            assert!(handed.is_none(), "CONTROL: {err}");
+            assert!(err.is_empty(), "{err}");
+            assert_eq!(check_at(&store), Some(i64::try_from(NOW).unwrap()));
+        }
+    }
 }
 
 /// A standing of the account's token made at `minted_at` by Claude Code `cli` to end at
@@ -3193,7 +3566,14 @@ fn upkeep_pass(env: &Env, host: &StepHost, routes: NobodyRoutes) -> Option<Ran> 
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = backfill_run(
-            env, host, "work", &finding, false, routes, &mut out, &mut err,
+            env,
+            host,
+            "work",
+            &finding,
+            false,
+            routes,
+            (&mut out, &mut err),
+            &mut |_| {},
         )
         .expect("still due");
         Some(Ran {
@@ -3213,6 +3593,7 @@ fn step_host(lab: &Lab, world: &World) -> StepHost {
         now: Cell::new(NOW),
         cli: RefCell::new("2.1.318".to_owned()),
         hang: aterm_spec::wait::MUST_HAPPEN,
+        person: Cell::new(false),
     }
 }
 
@@ -3251,6 +3632,7 @@ fn an_upkeep_run_opens_no_page_where_a_stop_held_the_step_after_it_looked() {
                 &mut out,
                 &mut err,
                 Instant::now,
+                &mut |_| {},
             );
             (code, String::from_utf8_lossy(&err).into_owned())
         })
@@ -3411,11 +3793,16 @@ fn a_gap_the_upkeep_ran_is_held_on_record_whatever_its_end_and_route_until_somet
 /// consent page that names no account, nothing is pressed and the record names that; on one
 /// that carries a Turnstile, nothing is pressed, and its record holds the step until an event;
 /// and a page that goes to its callback with nothing pressed has that callback handed to the
-/// listener nowhere, with no token written. With no proven profile the step is offered and
-/// nothing runs.
+/// listener nowhere, with no token written. A check on the token's page is the account's check
+/// too, with the login as it was. A check's record holds the next headless sign-in's run too,
+/// though the login that sign-in made ended the account's check: nobody is at the profile to
+/// answer one, so that run offers the step and opens nothing, until a person's act clears the
+/// record. With no proven profile the step is offered and nothing runs.
 /// NEGATIVE CONTROL: with `consent_step` pressing an enabled `Authorize` whatever `shows_email`
 /// says, the unnamed page is pressed: `` the page that names nobody was pressed ``; with
-/// `consent_step` reading no human check, the Turnstile page ends as no check: `` Turnstile: ``.
+/// `consent_step` reading no human check, the Turnstile page ends as no check: `` Turnstile: ``;
+/// with `check_holds` holding nothing, the next headless sign-in goes back to the check: `` a
+/// headless run went back to the check ``.
 #[test]
 fn a_headless_login_makes_its_token_on_the_same_profile() {
     use crate::harness::open_url::MetWord;
@@ -3430,6 +3817,7 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
         now: Cell::new(NOW),
         cli: RefCell::new("2.1.318".to_owned()),
         hang: aterm_spec::wait::MUST_HAPPEN,
+        person: Cell::new(false),
     };
     let env = scratch.env();
     let store = scratch.store();
@@ -3456,7 +3844,14 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     let after = || {
         journal::with_keyer(keyer, || {
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = after_sign_in(&env, &host, "work", SignedIn::Headless, &mut out, &mut err);
+            let code = after_sign_in(
+                &env,
+                &host,
+                "work",
+                SignedIn::Headless,
+                (&mut out, &mut err),
+                &mut |_| {},
+            );
             let (out, err) = (
                 String::from_utf8_lossy(&out).into_owned(),
                 String::from_utf8_lossy(&err).into_owned(),
@@ -3468,6 +3863,18 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     let browsed = || std::fs::read_to_string(world.home().join("browser-log")).unwrap_or_default();
     let record = || token_steps::read(&store).expect("the steps file reads");
     let success = Some(format!("{:?}", ExitCode::SUCCESS));
+    // The next sign-in of the row is a login made for it, which ends the account's check; the
+    // token step's own record is left as it was.
+    let signed_in_again = || {
+        let mut logins = store
+            .load_logins(i64::try_from(NOW).unwrap())
+            .expect("the logins")
+            .0;
+        if let Some(binding) = logins.labels.get_mut("work") {
+            binding.check_stop = None;
+        }
+        store.save_logins(&logins).expect("the login");
+    };
     let _ = notes();
 
     // CONTROL: with no proven profile the step is offered, and nothing runs.
@@ -3497,7 +3904,16 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     );
     assert_eq!(world.runs(), 1);
     assert!(writes.borrow().is_empty(), "a token was written");
-    assert_eq!(bound(), bound_before, "the login moved");
+    // The login stays as it was, and the check is the account's too (`CheckedRow::hold_after`).
+    let mut checked = bound();
+    let check = checked
+        .get_mut("work")
+        .and_then(|binding| binding.check_stop.take());
+    assert!(
+        check.is_some_and(|check| check.at >= i64::try_from(NOW).unwrap()),
+        "the account's check was not recorded"
+    );
+    assert_eq!(checked, bound_before, "the login moved");
     let steps = record();
     assert_eq!(steps.len(), 1, "{steps:?}");
     assert_eq!(steps[KEY].word, MetWord::BotCheck);
@@ -3510,6 +3926,24 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
             .any(|method| method == "act" || method.starts_with("Input.")),
         "a press or an input was sent at the check: {log}"
     );
+    // The next headless sign-in makes no run at the check: the step is offered instead.
+    let held = |what: &str| {
+        let (code, out, err) = after();
+        assert_eq!(code, None, "{what}: {out}{err}");
+        assert!(
+            out.contains("carried a check the last time"),
+            "{what}: {out}"
+        );
+        assert!(
+            out.contains("`aterm harness accounts token work`"),
+            "{what}: {out}"
+        );
+    };
+    signed_in_again();
+    held("Cloudflare");
+    assert_eq!(world.runs(), 1, "a headless run went back to the check");
+    // A person's act clears the record.
+    token_steps::put(&store, KEY, None).expect("the record clears");
 
     // CONTROL: a consent page that names no address presses nothing.
     world.play("headless-unnamed");
@@ -3567,6 +4001,10 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
     }
     host.now.set(NOW);
     assert_eq!(world.runs(), 3);
+    signed_in_again();
+    held("Turnstile");
+    assert_eq!(world.runs(), 3, "a headless run went back to the check");
+    token_steps::put(&store, KEY, None).expect("the record clears");
 
     // A page that goes to its callback with nothing pressed: the listener has nothing.
     world.play("headless-callback");
@@ -3630,7 +4068,8 @@ fn a_headless_login_makes_its_token_on_the_same_profile() {
 /// A CAPTURE'S OWN HANG HOLDS NO STEP (FL-136): where the capture's hang detector runs out
 /// before Claude Code showed an address to open (so aterm's sign-in window never opened), the
 /// run says so and leaves no record and no `token-stopped` note: the hang is no page anyone met,
-/// and nothing of it is the window's deadline. A record an earlier stop left is kept as it was.
+/// and nothing of it is the window's deadline. A record an earlier check left is kept as it was
+/// by the hang of a person's own run over it.
 /// The window's own deadline, which its opener records, still holds the step; the capture's
 /// hang holds nothing.
 /// NEGATIVE CONTROL: with `held_by` taking every hang on the window's route for its deadline,
@@ -3678,6 +4117,9 @@ fn a_captures_own_hang_holds_no_step() {
     let earlier =
         Stopped::new(MetWord::WindowHumanCheck, NOW - 60, "2.1.318", "").expect("a record");
     token_steps::put(&store, KEY, Some(&earlier)).expect("the record");
+    // A check's record holds every run nobody at a terminal started; a person's own runs the
+    // capture over it.
+    host.person.set(true);
     let ran = make();
     assert!(!ran.ok && ran.err.contains("hang detector"), "{}", ran.err);
     let steps = token_steps::read(&store).expect("the steps file reads");

@@ -1979,7 +1979,7 @@ fn node(desk: &Mutex<Desk>, line: &Line<'_>) -> Result<NodeTaken> {
             ));
         }
     }
-    let encoded = crate::membership_log::store::encode_records([&record]);
+    let encoded = crate::membership_log::read_records([&record])?;
     client::save_records_unlocked(&paths, &encoded)?;
     let store = client::load_records(&paths)?;
     if !store.holds(record.id()) {
@@ -2032,7 +2032,8 @@ pub fn node_record(paths: &Paths, node_key: &[u8; 32]) -> Result<Option<Vec<u8>>
                 && matches!(record.body(), Body::Node { node_key: bound, .. } if bound == node_key)
         })
         .last()
-        .map(|record| record.bytes().to_vec()))
+        .map(|record| record.wire_bytes().map(std::borrow::Cow::into_owned))
+        .transpose()?)
 }
 
 /// The machine name an Allowed carries for a request asking under `asked`.

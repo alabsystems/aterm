@@ -204,7 +204,7 @@ impl Remote {
             .and_then(|answer| answer.json())
             .map_err(|error| words(&self.client, &error))?;
         let statuses = aterm_verify::watch::follower_statuses(&answer)
-            .ok_or("GitHub's answer for a commit's statuses is not a list")?;
+            .ok_or("GitHub's answer for a commit's statuses is not a valid status list")?;
         Ok(statuses.into_iter().next())
     }
     /// The immutable repository captured when this source was admitted.

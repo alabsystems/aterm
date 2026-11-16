@@ -2637,6 +2637,10 @@ impl<T> BoundedConnectionQueue<T> {
 #[path = "control_lanes.rs"]
 mod control_lanes;
 
+#[cfg(unix)]
+#[path = "control_stream.rs"]
+mod control_stream;
+
 const CONTROL_WORKERS: usize = 8;
 const CONTROL_WAIT_WORKERS: usize = 64;
 const CONTROL_INLINE_WAITS: usize = CONTROL_WORKERS - ARTIFACT_HANDOFF_LIMIT - 1;
@@ -2973,6 +2977,19 @@ impl control_lanes::LaneService for ControlWorkerContext {
         );
     }
 
+    fn stream(&self, request: Request, stream: &CtlStream, buffered: Vec<u8>) {
+        #[cfg(unix)]
+        control_stream::serve(
+            &request,
+            &self.store,
+            stream,
+            buffered,
+            &control_stream::awake_now,
+        );
+        #[cfg(not(unix))]
+        let _ = (request, stream, buffered);
+    }
+
     fn release(&self, id: u64) {
         release_source_connection_claims(
             &self.store,
@@ -3010,7 +3027,8 @@ impl ControlWorkerContext {
             &self.sock_dir,
             &self.recovery_count_admission,
         ) {
-            ServeDisposition::Close => {
+            // No claim is proven on a bridge connection, so no stream opens on one.
+            ServeDisposition::Close | ServeDisposition::Stream { .. } => {
                 aterm_uds::hangup::hang_up(&stream);
             }
             ServeDisposition::Subscribe { request, scope } => {
@@ -3244,8 +3262,8 @@ pub(crate) fn attach_fleet_connection(
     .is_ok()
 }
 
-/// Whether this window hosts session `sid`, or keeps the row of a retired worker that was it
-/// ([`crate::retired_workers`]): what a fleet drive naming `sid` needs of the window node serve
+/// Whether this window hosts session `sid`, or the machine's session table keeps its row
+/// ([`crate::session_table`]): what a fleet drive naming `sid` needs of the window node serve
 /// hands it to (`node_serve::serve_window_relay_with`). False before the control server is up.
 #[cfg(unix)]
 pub(crate) fn hosts_or_keeps(sid: &SessionId) -> bool {
@@ -3253,7 +3271,7 @@ pub(crate) fn hosts_or_keeps(sid: &SessionId) -> bool {
         return false;
     };
     let store = context.store.read().unwrap_or_else(|p| p.into_inner());
-    store.by_sid(sid).is_some() || store.retired_workers().by_sid(sid).is_some()
+    store.by_sid(sid).is_some() || store.table().holds(sid)
 }
 
 /// [`crate::fabric::lift_ungranted_remote_holds`] over this instance's sessions: how many it lifted.
@@ -3854,22 +3872,7 @@ pub(crate) fn spawn(
             #[cfg(not(test))]
             if windowed {
                 let live = Arc::downgrade(&store);
-                let _ = crate::qos::spawn_lane_thread(
-                    "aterm-window-presence",
-                    crate::qos::Role::Background,
-                    move || {
-                        let Ok(env) = aterm_agent::harness::cli::Env::from_process() else {
-                            return;
-                        };
-                        while live.strong_count() != 0 {
-                            if let Some(now) = aterm_time::unix_secs() {
-                                let _ =
-                                    aterm_agent::survey_facts::record_window_last(&env.state, now);
-                            }
-                            std::thread::sleep(std::time::Duration::from_secs(60));
-                        }
-                    },
-                );
+                crate::window_presence::start(move || live.strong_count() != 0);
             }
             if crate::build_info::binary_signature_reads_the_file() {
                 let _ = crate::qos::spawn_lane_thread(
@@ -4009,6 +4012,11 @@ fn relay_candidate(request: &Request, scope: Scope) -> Option<Sid<'_>> {
         Target::Meta => return None,
     }
     let head = request.head();
+    // A record stream is the claim's own connection: the session it names is hosted here or the
+    // verb is refused here, however it is spelled, and it is never forwarded.
+    if head.verb == "stream" {
+        return None;
+    }
     match head.selector {
         Some(Selector::Sid(sid)) => Some(sid),
         None if head.verb == "subscribe" => {
@@ -4203,6 +4211,9 @@ fn dispatch_app_verb(
         JsonAsk::Refuse(refusal) => return refusal.into(),
         JsonAsk::Emit(body) => {
             return match verb {
+                "metrics" if body.trim() == "cadence" => {
+                    control_query::cmd_metrics_cadence(proxy, aim.session(), true)
+                }
                 "metrics" => control_query::cmd_metrics_json(active_term, &body),
                 "telemetry" => crate::telemetry_host::cmd(&body, true),
                 _ => no_handler(verb),
@@ -4279,6 +4290,9 @@ fn dispatch_app_verb(
         "find" => control_input::cmd_find(proxy, rest),
         "pane" => control_input::cmd_pane(proxy, rest),
         "pointer" => control_input::cmd_pointer(proxy, rest),
+        "metrics" if rest.trim() == "cadence" => {
+            control_query::cmd_metrics_cadence(proxy, aim.session(), false)
+        }
         "metrics" => control_query::cmd_metrics(active_term, rest),
         _ => no_handler(verb),
     };
@@ -5061,11 +5075,11 @@ fn dispatch_await_task(
         Ok(args) => args,
         Err(usage) => return usage,
     };
-    /// A target resolved: a live session's local id, session, `rev` edge and fact edge, or a
-    /// retired worker's row ([`crate::retired_workers`]), its end read at once.
+    /// A target resolved: a live session's local id, session, `rev` edge and fact edge, or an
+    /// ended session's row ([`crate::session_table`]), its end read at once.
     enum Held {
         Live(u64, Arc<SessionCtx>, Option<u64>, Option<u64>),
-        Retired(String),
+        Ended(String),
     }
     let mut held: Vec<Held> = Vec::new();
     for target in &args.targets {
@@ -5085,13 +5099,19 @@ fn dispatch_await_task(
             if sel.is_self() {
                 return NO_ACTIVE_TERMINAL.to_string();
             }
-            // A worker the reaper closed once its task concluded answers with its end, as a
-            // wait armed before its close read it: `state=closed`, its conclusion, news.
-            if let Some((sid, record)) = retired_record(store, &sel, scope) {
-                let mut row =
-                    crate::task_record::await_row(sid.as_str(), Some(&record), "-", "-", "-", true);
-                row.push_str(" task_news=1");
-                held.push(Held::Retired(row));
+            // An ended session answers from its row with its end, as a wait armed before its
+            // close read it: `state=closed`, its task's conclusion, news.
+            if let Some(row) = ended_record(store, &sel, scope) {
+                let mut line = crate::task_record::await_row(
+                    row.sid.as_str(),
+                    row.task.as_ref(),
+                    "-",
+                    "-",
+                    "-",
+                    true,
+                );
+                line.push_str(" task_news=1");
+                held.push(Held::Ended(line));
                 continue;
             }
             return format!("ERR no such session @{}\n", target.selector);
@@ -5124,7 +5144,7 @@ fn dispatch_await_task(
                     fact_since: *fact_since,
                 })
             }
-            Held::Retired(row) => control_session::Awaited::Retired(row.clone()),
+            Held::Ended(row) => control_session::Awaited::Ended(row.clone()),
         })
         .collect();
     control_session::await_tasks(
@@ -5147,6 +5167,10 @@ fn note_mirror_word(store: &Store, generation: Option<crate::fabric::BridgeGener
         }
     });
 }
+
+/// `stream` where no claim can be proven: a record stream is the claim's own Unix connection.
+#[cfg(not(unix))]
+const STREAM_UNSUPPORTED: &str = "ERR unsupported: stream needs a Unix control socket\n";
 
 fn no_handler(verb: &str) -> String {
     format!("ERR {verb} has no handler\n")
@@ -5691,7 +5715,7 @@ fn closed_session_reply_with(
 ) -> String {
     const NO_SUCH: &str = "ERR no such session\n";
     if matches!(verb, "result" | "task") {
-        return retired_reply(selector, verb, rest, store, scope)
+        return ended_reply(selector, verb, rest, store, scope)
             .unwrap_or_else(|| NO_SUCH.to_string());
     }
     if !matches!(verb, "log" | "brief") {
@@ -5786,37 +5810,44 @@ fn earlier_log_reply(
     }
 }
 
-/// The final task record of a worker whose tab aterm closed once its task concluded
-/// ([`crate::retired_workers`]), named by its sid or the local id it had, with its sid, for a
-/// `scope` that may read it: an owner-class caller (a fleet drive's line is served as Owner), or
-/// an edge the closed session's log grants `ReadScreen`, the op of `result`, `task` and `await`
-/// on a live session. `None` where no row names it or `scope` may not read it.
-fn retired_record(
+/// The row of an ended session in the machine's session table ([`crate::session_table`]), named
+/// by its sid or by the local id it had in this process, for a `scope` that may read it: an
+/// owner-class caller (a fleet drive's line is served as Owner), or an edge the closed session's
+/// log in this process grants `ReadScreen`, the op of `result`, `task` and `await` on a live
+/// session (an edge is this process's grant, so after a relaunch it reads no row). `None` where no
+/// row names it or `scope` may not read it.
+fn ended_record(
     store: &Store,
     selector: &Selector,
     scope: Scope,
-) -> Option<(SessionId, crate::task_record::TaskRecord)> {
-    let guard = store.read().unwrap_or_else(|p| p.into_inner());
-    let retired = guard.retired_workers();
-    let row = match selector {
-        Selector::Sid(sid) => retired.by_sid(&SessionId::new(sid.as_str())),
-        Selector::Local(id) => retired.by_local(*id),
-        Selector::SelfTok | Selector::Invalid(_) => None,
-    }?;
-    let may = match scope {
-        Scope::Edge(presented) => guard
-            .closed_logs()
-            .by_sid(&row.sid)
-            .is_some_and(|log| log.read().edge_may_read(&presented)),
-        _ => scope.is_owner_class(),
+) -> Option<crate::session_table::Row> {
+    let (table, may_edge) = {
+        let guard = store.read().unwrap_or_else(|p| p.into_inner());
+        let table = guard.table();
+        let head = match selector {
+            Selector::Sid(sid) => table.head(&SessionId::new(sid.as_str())),
+            Selector::Local(id) => table.by_local(*id),
+            Selector::SelfTok | Selector::Invalid(_) => None,
+        }?;
+        let may = match scope {
+            Scope::Edge(presented) => guard
+                .closed_logs()
+                .by_sid(&head.sid)
+                .is_some_and(|log| log.read().edge_may_read(&presented)),
+            _ => scope.is_owner_class(),
+        };
+        if !may {
+            return None;
+        }
+        (table, head.sid)
     };
-    may.then(|| (row.sid.clone(), row.record.clone()))
+    table.row(&may_edge)
 }
 
-/// `result` and the read form of `task` for a worker whose tab aterm closed once its task
-/// concluded ([`retired_record`]): its manager reads what it left after the reaper took its tab.
+/// `result` and the read form of `task` for an ended session, from its row ([`ended_record`]):
+/// its final task record, with no agent, program or attention, and the result its row keeps.
 /// `None` where no row names it for `scope`, or for any other form.
-fn retired_reply(
+fn ended_reply(
     selector: Option<&Selector>,
     verb: &str,
     rest: &str,
@@ -5826,11 +5857,12 @@ fn retired_reply(
     if !(verb == "result" || verb == "task" && rest.trim().is_empty()) {
         return None;
     }
-    let (_, record) = retired_record(store, selector?, scope)?;
-    Some(if verb == "result" {
-        crate::task_record::retired_result(&record, rest)
-    } else {
-        crate::task_record::retired_task_reply(&record)
+    let row = ended_record(store, selector?, scope)?;
+    Some(match (verb, row.task.as_ref()) {
+        ("result", Some(record)) => crate::task_record::ended_result(record, rest),
+        ("result", None) => "ERR result unavailable why=no-task\n".to_string(),
+        (_, Some(record)) => crate::task_record::ended_task_reply(record),
+        (_, None) => "OK task -\n".to_string(),
     })
 }
 
@@ -5905,7 +5937,17 @@ fn journal_view_reply(
 
 enum ServeDisposition {
     Close,
-    Subscribe { request: Request, scope: Scope },
+    Subscribe {
+        request: Request,
+        scope: Scope,
+    },
+    /// A record stream opened (`stream @<sid> v=1`, [`control_stream`]): nothing is answered
+    /// yet; the lanes move the whole connection to a stream lane, or answer `ERR busy streams`
+    /// and keep it in request mode.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Stream {
+        request: Request,
+    },
 }
 
 enum PendingHandoff {
@@ -6236,6 +6278,9 @@ fn read_ack_until(
 
 thread_local! {
     static SERVING_CONNECTION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The connection this thread last named for the request ledger, and that name.
+    static SERVING_PEER_LABEL: std::cell::RefCell<Option<(u64, String)>> =
+        const { std::cell::RefCell::new(None) };
     static CONNECTION_CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static INPUT_COMMITTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static TURN_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -6716,6 +6761,42 @@ pub(crate) fn serving_peer_pid() -> Option<u32> {
     {
         None
     }
+}
+
+/// The request ledger's name for the peer this thread serves
+/// ([`crate::control_listener::peer_label`]), read once for each connection.
+fn serving_peer_label(scope: Scope) -> String {
+    let lane = match scope {
+        #[cfg(any(unix, test))]
+        Scope::Fleet { .. } => Some("fleet"),
+        #[cfg(any(unix, test))]
+        Scope::Bridge => Some("bridge"),
+        Scope::Owner | Scope::Edge(_) => None,
+    };
+    let read = || {
+        crate::control_listener::peer_label(
+            lane,
+            serving_peer_pid(),
+            std::process::id(),
+            &|pid| {
+                i32::try_from(pid)
+                    .ok()
+                    .and_then(crate::quit_safety::process_name)
+            },
+            &aterm_sysprobe::kproc::argv,
+        )
+    };
+    let Some(connection) = serving_connection() else {
+        return read();
+    };
+    SERVING_PEER_LABEL.with_borrow_mut(|kept| match kept {
+        Some((of, label)) if *of == connection => label.clone(),
+        _ => {
+            let label = read();
+            *kept = Some((connection, label.clone()));
+            label
+        }
+    })
 }
 
 /// Marks the verb on this thread as COMMITTED to input it has begun, until dropped.
@@ -7396,18 +7477,17 @@ fn drive_admission(
         };
         let spawned = |sid: &SessionId| drive_may_close(store, sid, &driver.node);
         let shell = |sid: &SessionId| drive_owns_shell(store, sid, &driver.node);
-        let retired = |sid: &SessionId| {
+        let ended = |sid: &SessionId| {
             store
                 .read()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_workers()
-                .by_sid(sid)
-                .is_some()
+                .table()
+                .holds(sid)
         };
         // A line the gate passes was admitted by the lock and is served: its row. One the gate
         // refuses in its own words (no such session, a close of a tab that is not the driver's)
         // was decided by no lock and does nothing here: it has none.
-        return match drive_gate(request.line(), &hosts, &spawned, &shell, &retired) {
+        return match drive_gate(request.line(), &hosts, &spawned, &shell, &ended) {
             Ok(DriveLine::Fleet) => {
                 note(
                     DriveKind::Read,
@@ -7607,12 +7687,12 @@ fn drive_gate(
     hosts: &dyn Fn(&SessionId) -> bool,
     spawned: &dyn Fn(&SessionId) -> bool,
     shell: &dyn Fn(&SessionId) -> bool,
-    retired: &dyn Fn(&SessionId) -> bool,
+    ended: &dyn Fn(&SessionId) -> bool,
 ) -> Result<DriveLine, String> {
     const SID: &str = "a drive names a session the driven Mac hosts by its sid (`survey --host` \
                        lists them)";
-    const RETIRED: &str = "a worker whose tab the driven Mac closed once its task concluded \
-                           answers only @<sid> result and await task";
+    const ENDED: &str = "a session that ended on the driven Mac answers only @<sid> result and \
+                         await task";
     const HOLD_SID: &str = "a drive's hold names a session the driven Mac hosts by its bare sid, \
                             with no @: hold <sid> on|off [reason=<pct>]";
     const HOLD: &str = "hold <sid> on|off [reason=<pct>]";
@@ -7638,17 +7718,17 @@ fn drive_gate(
         let sid = SessionId::new(sid);
         (names_tab(sid.as_str()) && hosts(&sid)).then_some(sid)
     };
-    // A worker the reaper closed keeps a row ([`crate::retired_workers`]) its manager's reads
-    // answer from, a manager on another Mac's too.
+    // An ended session keeps a row ([`crate::session_table`]) its manager's reads answer from, a
+    // manager on another Mac's too.
     let kept = |sid: &str| {
         let sid = SessionId::new(sid);
-        names_tab(sid.as_str()) && retired(&sid)
+        names_tab(sid.as_str()) && ended(&sid)
     };
     // The hosted session the line's selector names, or why it names none.
     let session = || match selector {
         Some(Selector::Sid(sid)) => match hosted(sid.as_str()) {
             Some(sid) => Ok(sid),
-            None if kept(sid.as_str()) => Err(drive_refused(RETIRED, verb)),
+            None if kept(sid.as_str()) => Err(drive_refused(ENDED, verb)),
             None => Err(drive_refused(SID, selected)),
         },
         _ => Err(drive_refused(SID, selected)),
@@ -8604,6 +8684,30 @@ fn lab_custody_allowed(
 #[path = "control_lab_custody_tests.rs"]
 mod lab_custody_tests;
 
+/// A `stream` VERB, where the request loop decides it ([`serve_request_line`]): after the drive
+/// admission and the fleet's verb gate (which close a fleet caller's connection on it, `stream`
+/// being no fleet verb) and after forwarding (which never takes it, [`relay_candidate`]), beside
+/// the subscribe flip and before dispatch, which so never sees the verb, however it is spelled.
+/// `None` is a refusal written to `out`, the connection kept; `Some(_)` opens the stream
+/// ([`control_stream::open`]). Off Unix no claim can be proven, so every spelling is refused.
+fn stream_verb(
+    request: Request,
+    scope: Scope,
+    store: &Store,
+    out: &mut control_lanes::Outbox,
+) -> Option<ServeDisposition> {
+    #[cfg(unix)]
+    {
+        control_stream::open(request, scope, store, out)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (request, scope, store);
+        out.extend_from_slice(STREAM_UNSUPPORTED.as_bytes());
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve_request_line(
     request: Request,
@@ -8618,6 +8722,10 @@ fn serve_request_line(
     sock_dir: &std::path::Path,
     recovery_count_admission: &crate::keeper_link::RecoveryCountAdmission,
 ) -> Option<ServeDisposition> {
+    crate::control_listener::note_request(
+        &serving_peer_label(scope),
+        request.form().map(|form| form.row.name),
+    );
     // Before drive attribution, forwarding, subscribe, askpass, frames or dispatch:
     // no ID or history/since anchor can escape while an old journal is offerable.
     if let Some(refusal) = recovery_count_refusal(recovery_count_admission) {
@@ -8760,6 +8868,9 @@ fn serve_request_line(
     }
     if head.verb == "subscribe" && head.selector.is_none() {
         return Some(ServeDisposition::Subscribe { request, scope });
+    }
+    if head.verb == "stream" {
+        return stream_verb(request, scope, store, out);
     }
     if let Some(len) = request.post_frame() {
         if !run_post_bin(&request, len, reader, active, store, scope, out) {
@@ -12035,6 +12146,10 @@ fn typing_momentum_reading(
 #[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "control_ended_row_tests.rs"]
+mod ended_row_tests;
 
 #[cfg(test)]
 #[path = "fleet_access_model_tests.rs"]

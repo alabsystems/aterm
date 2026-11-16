@@ -23,8 +23,8 @@ pub use record::{
 pub use stamp::{ProgramStamp, stamp_path};
 pub(crate) use table::LEGACY_CEILING;
 pub use table::{
-    AccountState, Anchor, DocPin, GROK_SIGNIN_GATE, Login, NEVER_INDEX_PINNED, Profile, SigninGate,
-    VENDORS, VendorSpec, Warm, is_vendor, served_here, spec,
+    AccountState, Anchor, DocPin, Login, NEVER_INDEX_PINNED, Profile, VENDORS, VendorSpec, Warm,
+    is_vendor, served_here, spec,
 };
 pub use version::{BuildDate, VENDOR_BUILD_BASE, Version, is_vendor_build};
 

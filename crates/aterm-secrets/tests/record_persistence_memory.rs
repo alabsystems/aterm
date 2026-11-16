@@ -9,7 +9,7 @@ use aterm_secrets::{
     SecretBytes, client,
     commons::bootstrap::Bootstrap,
     fsx,
-    membership_log::{Body, EpochAudience, Inserted, MemberId, Record, Store, encode_records},
+    membership_log::{Body, EpochAudience, Inserted, MemberId, Record, Store, read_records},
     text::{Audience, Entry},
 };
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -173,16 +173,22 @@ fn fixture(home: &std::path::Path) -> Fixture {
         .draft_delete(&actor, authored + 101, epoch_id, &key, "gone")
         .unwrap();
     assert_eq!(log.insert(sign(delete)).unwrap(), Inserted::Held);
-    let wire = encode_records(log.records());
+    let wire = read_records(log.records()).unwrap();
     assert!(wire.len() > VALUES * VALUE_BYTES);
     fsx::write_atomic(&paths.records_file(), &wire, 0o600).unwrap();
     let initial = client::load_records(&paths).unwrap();
-    assert_eq!(initial.encode(), wire);
+    assert_eq!(initial.read_encoded().unwrap(), wire);
     assert_eq!(initial.complete_inventory().len(), initial.len());
-    assert_eq!(client::load_records(&paths).unwrap().encode(), wire);
+    assert_eq!(
+        client::load_records(&paths)
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
+        wire
+    );
     // Prime the actual state-lock/save path without adding or rewriting records.
     assert_eq!(
-        client::save_records(&paths, log.genesis().bytes()).unwrap(),
+        client::save_records(&paths, log.genesis().wire_bytes().unwrap().as_ref()).unwrap(),
         0
     );
     let delta = sign(log.draft(
@@ -194,10 +200,15 @@ fn fixture(home: &std::path::Path) -> Fixture {
     ));
     assert!(!initial.contains(delta.id()));
     let mut expected = initial.clone();
-    assert_eq!(expected.ingest(delta.bytes()).unwrap(), 1);
+    assert_eq!(
+        expected
+            .ingest(delta.wire_bytes().unwrap().as_ref())
+            .unwrap(),
+        1
+    );
     let mut expected_wire = wire.clone();
-    expected_wire.extend_from_slice(delta.bytes());
-    assert_eq!(expected.encode(), expected_wire);
+    expected_wire.extend_from_slice(delta.wire_bytes().unwrap().as_ref());
+    assert_eq!(expected.read_encoded().unwrap(), expected_wire);
     assert!(expected_wire.len() > wire.len());
     assert_eq!(expected.complete_inventory().len(), expected.len());
     Fixture {
@@ -224,7 +235,7 @@ fn a_warm_public_record_save_uses_bounded_persistence_scratch() {
     PEAK.with(|peak| peak.set(0));
     ACTIVE.with(|active| assert!(!active.replace(true)));
     let measuring = Measuring;
-    let added = client::save_records(&f.paths, f.delta.bytes()).unwrap();
+    let added = client::save_records(&f.paths, f.delta.wire_bytes().unwrap().as_ref()).unwrap();
     drop(measuring);
     let live = LIVE.with(Cell::get);
     let peak = PEAK.with(Cell::get);
@@ -240,12 +251,15 @@ fn a_warm_public_record_save_uses_bounded_persistence_scratch() {
         f.expected_wire
     );
     let fresh = client::load_records(&f.paths).unwrap();
-    assert_eq!(fresh.encode(), f.expected_wire);
+    assert_eq!(fresh.read_encoded().unwrap(), f.expected_wire);
     assert_eq!(fresh.len(), f.initial.len() + 1);
     assert_eq!(fresh.inventory(), f.expected.inventory());
     assert_eq!(fresh.complete_inventory(), f.expected.complete_inventory());
     for id in f.initial.inventory() {
-        assert_eq!(fresh.get_bytes(&id), f.initial.get_bytes(&id));
+        assert_eq!(
+            fresh.record(&id).map(|r| r.wire_bytes().unwrap()),
+            f.initial.record(&id).map(|r| r.wire_bytes().unwrap())
+        );
     }
     let log = fresh.log().unwrap();
     assert_eq!(log.membership().members()[&f.actor].name, "after-save");

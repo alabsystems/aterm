@@ -289,7 +289,7 @@ impl Landing<'_> {
                 self.run(contract_of(&image.path), Entry::Resume(Box::new(handoff)))
             },
             say: &mut |line: &str| self.log.borrow_mut().said.push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         };
         let own = Own {

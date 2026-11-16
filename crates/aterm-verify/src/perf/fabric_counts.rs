@@ -246,17 +246,19 @@ fn attach_sessions(group: &str) -> Option<u64> {
 /// The wait-tally formats (an attach round's `wait.format`: `aterm_link::wait_tally::FORMAT`)
 /// whose `lane_meta` row counts the bridge's `@<sid> meta` calls and whose
 /// `lane_sessions_status` row its `sessions status` batches, under those names: v=4, the format
-/// of E05's committed arms, through v=7, the bridge's when this lane was written, and v=8, which
-/// split the subject budget's reads out of `request` (critic item G04; no bump between them
-/// touched a `lane_` row). The report leaves out every row that counted nothing, so in a
+/// of E05's committed arms, through v=7, the bridge's when this lane was written, v=8, which
+/// split the subject budget's reads out of `request` (critic item G04), and v=9, which added the
+/// post group's counts `posts_per_append` and `posts_per_write` (ATERM-KI-1111-5; no bump between
+/// them touched a `lane_` row). The report leaves out every row that counted nothing, so in a
 /// format that renamed or split either row, a read by the old name would pass E05's law at 0. A
 /// round in any other format is refused until those rows are checked and its format added here.
-const WAIT_FORMATS: [&str; 5] = [
+const WAIT_FORMATS: [&str; 6] = [
     "wait-tally v=4",
     "wait-tally v=5",
     "wait-tally v=6",
     "wait-tally v=7",
     "wait-tally v=8",
+    "wait-tally v=9",
 ];
 
 /// A tally row's count: a row the tally never counted is absent, which is 0.

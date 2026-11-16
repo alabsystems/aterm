@@ -358,6 +358,7 @@ impl App {
         if changed {
             self.refresh_meta_dependent_chrome(session);
             self.rebuild_teams();
+            self.navigator_mark_row(session);
             if field != MetaField::Title {
                 self.refresh_presence_session(session);
                 self.mark_status_dirty();

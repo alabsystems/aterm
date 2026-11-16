@@ -6,6 +6,7 @@
 
 use super::*;
 use aterm_converge::{Effect, Explain};
+use aterm_machines::init_observe::RepositoryCounts;
 
 const SECRETS: &str = aterm_types::macos_setup::SECRETS_VAULT_ROW;
 
@@ -521,9 +522,8 @@ fn tools_put_the_command_line_tools_first() {
     assert_eq!(who(&switch), Some(Who::Person));
 }
 
-/// Repositories wait on the Command Line Tools, then on the token; cloned is ok; a stage the
-/// plan does not select is off; a stage parked after two crashes waits for a person's Check
-/// again.
+/// Repositories wait on the Command Line Tools, then on the token; current verified contents
+/// are ok. An unselected stage is off, and a parked stage retries by itself.
 #[test]
 fn repos_say_what_they_wait_on() {
     let pending = setup_with(vec![stage("GitHub repositories", "pending", "")], false);
@@ -547,10 +547,10 @@ fn repos_say_what_they_wait_on() {
             &cloned,
             true,
             true,
-            &Ok(OwedClone::Verified {
-                present: 3,
-                total: 3
-            })
+            &Ok(OwedClone::Verified(RepositoryCounts {
+                ready: 3,
+                ..RepositoryCounts::default()
+            }))
         )
         .level,
         Level::Ok
@@ -559,11 +559,11 @@ fn repos_say_what_they_wait_on() {
         &cloned,
         true,
         true,
-        &Ok(OwedClone::Unobserved {
-            present: 50,
+        &Ok(OwedClone::Unobserved(RepositoryCounts {
+            ready: 50,
             unborn: 3,
-            total: 53,
-        }),
+            ..RepositoryCounts::default()
+        })),
     );
     assert_eq!(
         unborn.level,
@@ -571,8 +571,8 @@ fn repos_say_what_they_wait_on() {
         "an empty remote checked out is no clone owed: {unborn:?}"
     );
     assert!(
-        unborn.says.contains("3 more checked out without a commit"),
-        "{unborn:?}"
+        unborn.next.is_none(),
+        "an empty remote checked out owes no clone step: {unborn:?}"
     );
     assert_eq!(
         repos_area(&cloned, true, true, &none_owed()).level,

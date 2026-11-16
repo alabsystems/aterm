@@ -866,6 +866,145 @@ fn a_handle_names_its_volume_by_its_guid() {
     }
 }
 
+/// Turn off the last-write-time updates the writes through `file` make (`SetFileTime` with
+/// 0xFFFFFFFF_FFFFFFFF as the last write): a write through it leaves that time as it was, as a
+/// write in the clock step of the write before it does, and the call itself changes nothing of
+/// the file.
+fn keep_write_time(file: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Each time a `FILETIME` (two `DWORD`s, low first: one little-endian `u64`), or null to
+        /// leave it as it is.
+        fn SetFileTime(
+            file: *mut core::ffi::c_void,
+            creation: *const u64,
+            access: *const u64,
+            write: *const u64,
+        ) -> i32;
+    }
+    let off = u64::MAX;
+    // SAFETY: `file` keeps its handle open across the call; the creation and access times are
+    // null (left as they are), and `off` is a readable `FILETIME`'s eight bytes that outlive the
+    // call.
+    let ok = unsafe {
+        SetFileTime(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &raw const off,
+        )
+    };
+    assert_ne!(ok, 0, "SetFileTime: {}", std::io::Error::last_os_error());
+}
+
+/// A WRITE THE TIMES DO NOT SHOW MOVES THE CHANGE-JOURNAL COUNTER: a write of as many bytes
+/// through a handle that leaves the file's last-write time as it was (as a write in the clock
+/// step of the write before it leaves it), read while that handle is still open and with no other
+/// change made to the file, reads a greater `usn` in the same journal through a facts-only
+/// handle; the handle's close then writes a record of its own. CONTROLS: the handle opened and
+/// its time updates turned off, nothing written, reads the listed `usn`; and after the write
+/// fstat's size and last write read as the listing's, so only the counter tells it. A directory
+/// opened as itself has a counter too. The temp volume is NTFS, which keeps a change journal.
+#[test]
+fn a_write_the_times_do_not_show_moves_the_change_journal_counter() {
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let path = root.join("notes.md");
+    write(&path, "one");
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let facts = || {
+        aterm_dirfd::openat(
+            &pinned,
+            "notes.md",
+            OFlags::PATH | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("facts")
+    };
+    let listed = aterm_dirfd::usn(facts())
+        .expect("read")
+        .expect("the temp volume keeps a change journal");
+    let stat = aterm_dirfd::fstat(facts()).expect("stat");
+    assert_eq!(aterm_dirfd::usn(facts()), Ok(Some(listed)), "unchanged");
+    let mut held = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("opened to write");
+    keep_write_time(&held);
+    assert_eq!(
+        aterm_dirfd::usn(facts()),
+        Ok(Some(listed)),
+        "opened, its time updates off, nothing written"
+    );
+    held.write_all(b"two").expect("written");
+    let written = aterm_dirfd::fstat(facts()).expect("stat");
+    assert_eq!(
+        (written.size, written.last_write),
+        (stat.size, stat.last_write),
+        "the write's size and time"
+    );
+    let moved = aterm_dirfd::usn(facts()).expect("read").expect("a journal");
+    assert_eq!(moved.journal, listed.journal);
+    assert!(moved.usn > listed.usn, "{moved:?} after {listed:?}");
+    drop(held);
+    let closed = aterm_dirfd::usn(facts()).expect("read").expect("a journal");
+    assert!(
+        closed.usn > moved.usn,
+        "the close: {closed:?} after {moved:?}"
+    );
+    assert_eq!(read(&path), "two");
+    let folder = aterm_dirfd::usn(&pinned).expect("read").expect("a journal");
+    assert_eq!(folder.journal, listed.journal);
+}
+
+/// A REWRITE WITH ITS TIME PUT BACK MOVES THE CHANGE-JOURNAL COUNTER: a rewrite of as many bytes
+/// whose modified time is then put back where the write before left it (as a copy that keeps a
+/// file's times leaves it) reads a greater `usn` in the same journal, through a facts-only
+/// handle; the put-back is itself a change the journal records. CONTROL: fstat's size and last
+/// write read the rewrite as no change.
+#[test]
+fn a_rewrite_with_its_time_put_back_moves_the_change_journal_counter() {
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let path = root.join("notes.md");
+    write(&path, "one");
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let facts = || {
+        aterm_dirfd::openat(
+            &pinned,
+            "notes.md",
+            OFlags::PATH | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .expect("facts")
+    };
+    let listed = aterm_dirfd::usn(facts())
+        .expect("read")
+        .expect("the temp volume keeps a change journal");
+    let stat = aterm_dirfd::fstat(facts()).expect("stat");
+    let modified = std::fs::symlink_metadata(&path)
+        .expect("metadata")
+        .modified()
+        .expect("modified");
+    write(&path, "two");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("opened")
+        .set_modified(modified)
+        .expect("modified time put back");
+    let rewritten = aterm_dirfd::fstat(facts()).expect("stat");
+    assert_eq!(
+        (rewritten.size, rewritten.last_write),
+        (stat.size, stat.last_write),
+        "the rewrite's size and time"
+    );
+    let moved = aterm_dirfd::usn(facts()).expect("read").expect("a journal");
+    assert_eq!(moved.journal, listed.journal);
+    assert!(moved.usn > listed.usn, "{moved:?} after {listed:?}");
+}
+
 #[test]
 fn a_name_swapped_after_the_listing_is_refused_and_both_files_stay() {
     let tmp = scratch();

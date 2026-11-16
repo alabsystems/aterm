@@ -2521,6 +2521,178 @@ fn journal_read_failures_keep_facts_and_retry_the_same_file_metadata() {
     assert_eq!(tail.seen, Some((0, seen.1)));
 }
 
+thread_local! {
+    /// How many times [`counted_gather`] ran on this thread, and the sessions it was last
+    /// handed.
+    static GATHERS: std::cell::RefCell<(usize, Vec<(u64, String)>)> =
+        const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+/// A gather that counts its calls and keeps the sessions it was handed: it reads no board, no
+/// record and no aterm.toml.
+fn counted_gather(
+    live: &[(u64, String)],
+    _home: Option<&Path>,
+) -> aterm_vitals::sys::held::Holdings {
+    GATHERS.with_borrow_mut(|(calls, last)| {
+        *calls += 1;
+        *last = live.to_vec();
+    });
+    aterm_vitals::sys::held::Holdings::default()
+}
+
+/// `sys disk held`'s rows ([`HoldingsRead`], DC-09b) are gathered on the probe thread at its
+/// pace: never while every window is hidden, at once when one shows, again after
+/// [`HELD_EVERY`] with a Disk lens open and after [`HELD_IDLE_EVERY`] with none, each gather
+/// handed the sessions of the reading that made it ([`Request::live_ids`]); the rows' age is the
+/// whole seconds since their gather, and none before it; and a reader with no gather (a unit
+/// test's) gathers nothing. CONTROLS: each wait ends in the gather that
+/// follows it, so dropping the hidden test or either pace fails it, and a gather handed
+/// another reading's sessions fails the last one.
+#[test]
+fn the_probe_thread_gathers_holdings_on_its_pace_and_never_while_hidden() {
+    let calls = || GATHERS.with_borrow(|(calls, _)| *calls);
+    let handed = || GATHERS.with_borrow(|(_, last)| last.clone());
+    let live = vec![(7_u64, "s-ab12".to_owned()), (8, "s-cd34".to_owned())];
+    let mut read = HoldingsRead::new(Some(counted_gather));
+    let t0 = Instant::now();
+    assert_eq!(read.rows(), None, "nothing before the first gather");
+    assert_eq!(read.age_s(t0), None, "and no age");
+
+    read.refresh(true, true, t0, &live);
+    assert_eq!(calls(), 0, "never gathered while every window hides");
+    assert_eq!(read.read_at, None);
+    read.refresh(false, false, t0, &live);
+    assert_eq!(calls(), 1, "gathered once a window shows");
+    assert_eq!(read.read_at, Some(t0));
+    assert!(read.rows().is_some());
+    let later = t0 + Duration::from_millis(7_900);
+    assert_eq!(read.age_s(later), Some(7), "the rows' age, whole seconds");
+    assert_eq!(read.age_s(t0), Some(0));
+    assert_eq!(handed(), live, "handed the reading's sessions");
+
+    let early = t0 + HELD_EVERY - Duration::from_millis(1);
+    read.refresh(true, false, early, &live);
+    assert_eq!(calls(), 1, "not again inside HELD_EVERY with a lens open");
+    read.refresh(false, false, t0 + HELD_EVERY, &live);
+    assert_eq!(calls(), 1, "nor inside HELD_IDLE_EVERY with none");
+    read.refresh(true, false, t0 + HELD_EVERY, &live);
+    assert_eq!(calls(), 2, "CONTROL: then gathered");
+    assert_eq!(read.read_at, Some(t0 + HELD_EVERY));
+
+    let idle = t0 + HELD_EVERY + HELD_IDLE_EVERY;
+    read.refresh(false, false, idle - Duration::from_millis(1), &live);
+    assert_eq!(calls(), 2, "an idle gather waits out HELD_IDLE_EVERY");
+    read.refresh(false, true, idle, &live);
+    assert_eq!(calls(), 2, "and is not made while hidden, however long");
+    read.refresh(false, false, idle, &live[..1]);
+    assert_eq!(calls(), 3, "CONTROL: then gathered");
+    assert_eq!(handed(), live[..1], "handed that reading's sessions");
+
+    let mut inert = HoldingsRead::new(None);
+    inert.refresh(true, false, t0, &live);
+    assert_eq!(calls(), 3, "a reader with no gather gathers nothing");
+    assert_eq!((inert.read_at, inert.rows()), (None, None));
+}
+
+/// A gather whose rows are the sessions it was handed, one each: its key and its id.
+fn echo_gather(live: &[(u64, String)], _home: Option<&Path>) -> aterm_vitals::sys::held::Holdings {
+    use aterm_vitals::sys::held::{Bytes, Class, Holding, Holdings, Mark, Next, Worktree};
+    let rows = live.iter().map(|(key, sid)| Holding {
+        project: sid.clone(),
+        worktree: Worktree::Checkout,
+        path: String::new(),
+        keys: vec![*key],
+        mark: Mark::AtWork,
+        tab: None,
+        exe: None,
+        bytes: Bytes::Measured(0),
+        class: Class::Kept,
+        next: Next::Nothing,
+    });
+    Holdings {
+        rows: rows.collect(),
+        ..Holdings::default()
+    }
+}
+
+/// A READING CARRIES THE HOLDINGS ITS READER GATHERED (DC-09b): the probe thread's reader hands
+/// its gather the request's [`Request::live_ids`], every session aterm's table holds, and the
+/// reading's disk facts carry the rows it gathered and their age. NEGATIVE CONTROLS: the request
+/// names one of its two sessions in `session_ids` alone, so a reader that handed the gather
+/// those would carry one row; and a reader with no gather (every other unit test's) carries no
+/// rows and no age.
+#[test]
+fn a_reading_carries_the_holdings_gathered_from_its_live_sessions() {
+    let live = vec![(7_u64, "s-ab12".to_owned()), (8, "s-cd34".to_owned())];
+    let req = Request {
+        self_pid: std::process::id(),
+        cadence_ms: 1_000,
+        session_ids: live[..1].to_vec(),
+        live_ids: live.clone(),
+        ..Request::default()
+    };
+    let mut bare = Reader::new(Arc::default());
+    let disk = bare.read(&req).facts.disk.clone().expect("the disk facts");
+    assert_eq!(
+        (disk.held, disk.held_age_s),
+        (None, None),
+        "CONTROL: no gather, no rows"
+    );
+
+    let mut reader = Reader::new(Arc::default());
+    reader.holdings = HoldingsRead::new(Some(echo_gather));
+    let disk = reader
+        .read(&req)
+        .facts
+        .disk
+        .clone()
+        .expect("the disk facts");
+    let held = disk.held.expect("the gathered rows");
+    let handed: Vec<(u64, String)> = held
+        .rows
+        .iter()
+        .map(|h| (h.keys[0], h.project.clone()))
+        .collect();
+    assert_eq!(handed, live, "handed live_ids, not session_ids");
+    let age = disk.held_age_s.expect("the rows' age");
+    assert!(age <= 60, "gathered in this reading: {age} s");
+}
+
+/// EVERY SESSION THE TABLE HOLDS REACHES THE GATHER (DC-09b): [`Request::live_ids`] is `sys disk
+/// held`'s live set, each session of aterm's table with its local key and id, one with no pooled
+/// terminal among them. NEGATIVE CONTROL: `session_ids` leaves that session out, so a gather
+/// handed those would call its holdings gone.
+#[test]
+fn the_request_hands_the_gather_every_session_the_table_holds() {
+    let app = crate::App::headless_for_test();
+    let session = crate::stub_session(71);
+    crate::App::register_session(&app.store, &session, None);
+    let req = app.vitals_request(FOCUSED_PERIOD, false);
+    let mut table: Vec<(u64, String)> = {
+        let store = app.store.read().unwrap_or_else(PoisonError::into_inner);
+        store
+            .live_handles()
+            .map(|h| (h.local_id, h.sid.as_str().to_owned()))
+            .collect()
+    };
+    table.sort_unstable();
+    let mut live = req.live_ids.clone();
+    live.sort_unstable();
+    assert_eq!(live, table, "the table's sessions");
+    assert!(
+        live.len() >= 2,
+        "the window's and the unpooled one: {live:?}"
+    );
+    assert!(live.iter().any(|(key, _)| *key == 71), "{live:?}");
+    let pooled = req.session_ids.iter().any(|(key, _)| *key == 71);
+    assert!(
+        !pooled,
+        "CONTROL: it has no pooled terminal, so session_ids leaves it out"
+    );
+    drop(session);
+}
+
 /// Each journal row reads as its writer in `aterm_agent::harness` wrote it ([`deed_read`]), the
 /// rows made by the writers themselves: what it records, its bytes, the free space it read,
 /// whether the chart marks it a removal, and whose it is (its session). A `stopped` row (its
@@ -3422,6 +3594,79 @@ fn watched_board() -> (Shelf, VolumeKey) {
     (shelf, key)
 }
 
+/// THE DISK FACTS CARRY THE BUDGET'S CAP ONLY WHERE THE WATCH SIZED ONE (DC-09b): the cap the
+/// Disk lens ticks on its bar is DC-04's budget cap as the board last sized it on the home
+/// volume (`disk.cap_used_gib` as written, or 80% of the volume unwritten), read under the
+/// guard that reads the level; before the watch's first look, before a sizing, with the budget
+/// off, for a process that sizes no volume and on another volume there is none. The cap is a
+/// reading: with used space over it the level is the watch's own. CONTROLS: the unsized, off
+/// and other-volume readings are `None` on the board that reads `Some` once sized, so a cap
+/// read that is dropped, or one that ignores the budget's state, fails it; with the harness
+/// off no clock is read and the facts are the default.
+#[test]
+fn the_disk_facts_carry_the_budgets_cap_only_where_the_watch_sized_one() {
+    use aterm_agent::harness::disk::budget::Sizing;
+    use aterm_agent::harness::disk::{Cap, Rebuildable};
+    let (shelf, key) = watched_board();
+    let home = Path::new("/Users//x");
+    let survey = Where::default();
+    let facts = |of: &VolumeKey| disk_facts(&shelf, Some(of), Clock::read, &survey, home);
+    let before = facts(&key).level;
+    assert_eq!(facts(&key).cap, None, "no look yet: the budget is warming");
+    shelf.publish(|b| b.budget_look(Cap::Written(466), Some(key.spelled())));
+    assert_eq!(facts(&key).cap, None, "looked and not sized: no cap");
+    shelf.publish(|b| {
+        b.budget_sized(Sizing {
+            volume: key.spelled(),
+            total: 2_000 * GB,
+            used: 1_959 * GB,
+            sized: Rebuildable {
+                bytes: 400 * GB,
+                partial: false,
+            },
+            sized_unix: 1_792_000_000,
+        });
+    });
+    let sized = facts(&key);
+    assert_eq!(sized.cap, Some(466 << 30), "the cap as written");
+    assert_eq!(
+        sized.level,
+        Some(DiskLevel::Low),
+        "used space is over the cap, and the level is the watch's own"
+    );
+    assert_eq!(sized.level, before, "as it was before any cap");
+    assert!(sized.watch && sized.warn == Some(69 * GB), "{sized:?}");
+    shelf.publish(|b| b.budget_look(Cap::Unwritten, Some(key.spelled())));
+    assert_eq!(
+        facts(&key).cap,
+        Some(1_600 * GB),
+        "unwritten: 80% of the volume"
+    );
+
+    shelf.publish(|b| b.budget_look(Cap::Off, Some(key.spelled())));
+    assert_eq!(facts(&key).cap, None, "CONTROL: the budget off");
+    shelf.publish(|b| b.budget_look(Cap::Written(466), None));
+    assert_eq!(facts(&key).cap, None, "CONTROL: this process sizes none");
+    shelf.publish(|b| b.budget_look(Cap::Written(466), Some(key.spelled())));
+    let other = VolumeKey::Container("disk7".to_owned());
+    assert_eq!(facts(&other).cap, None, "CONTROL: another volume");
+    assert_eq!(
+        facts(&key).cap,
+        Some(466 << 30),
+        "CONTROL: and its own again"
+    );
+
+    shelf.publish(|b| b.watched = false);
+    let off = disk_facts(
+        &shelf,
+        Some(&key),
+        || panic!("no clock is read with the harness off"),
+        &survey,
+        home,
+    );
+    assert_eq!(off, DiskFacts::default());
+}
+
 #[test]
 fn the_disk_row_with_the_harness_off() {
     let (shelf, key) = watched_board();
@@ -3518,7 +3763,7 @@ fn the_newest_rows_win_and_the_survey_works_with_the_harness_off() {
         cut: false,
     };
     let pass_ms = 1_792_000_000_000;
-    let raw = shelf.deck_facts(&key, &Clock::read());
+    let raw = shelf.board_lock().deck_facts(&key, &Clock::read());
     let newer = deck_disk(raw.clone(), Some(survey_at(pass_ms + 1)), true, home);
     assert_eq!(
         (newer.hogs[0].path.as_str(), newer.hogs_at, newer.sizing),

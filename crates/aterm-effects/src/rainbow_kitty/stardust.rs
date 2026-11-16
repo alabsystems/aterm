@@ -200,10 +200,11 @@ pub const SCINT_F_MIN: f32 = 8.0;
 /// Upper bound of the seeded chime tremolo, Hz.
 pub const SCINT_F_MAX: f32 = 12.0;
 
-/// How long a pixel of paper rests after a star is born on it, seconds: no other star is stood
-/// within reach of it sooner ([`Stardust::stand`]). A star on paper darkens its pixels once and
-/// lets them go once, two turns of the flash law; a third of a second and a frame between births
-/// keeps any pixel at three such stars a second or fewer, whatever the hand does.
+/// How long a pixel of paper rests after a star is born on it or the caret crosses it, seconds:
+/// no star is stood within reach of it within this, before or after ([`Stardust::stand`],
+/// [`Stardust::note_caret`]). A star on paper darkens its pixels once and lets them go once, two
+/// turns of the flash law, as the caret's block does a cell it crosses; a third of a second and a
+/// frame between them keeps any pixel at three such a second or fewer, whatever the hand does.
 pub const PAPER_REST_S: f32 = 1.0 / 3.0 + 0.017;
 
 /// How many places along its flight, and how many steps to each side of the first clear one, a
@@ -212,9 +213,9 @@ pub const STAND_TRIES: u32 = 8;
 /// The heights [`Stardust::stand`] looks along: the first place's own and those above it.
 pub const STAND_ROWS: u32 = 3;
 
-/// The births [`Stardust::stand`] remembers: more than a full pool born inside one
+/// The births and crossings [`Stardust::stand`] remembers: more than a full pool born inside two
 /// [`PAPER_REST_S`].
-pub const STOOD_CAP: usize = 96;
+pub const STOOD_CAP: usize = 192;
 
 /// The m2's integer arm floor, px (§5.2, §5.5: "m2 … (2 ↔ 3 px)").
 pub const M2_ARM_MIN_PX: i32 = 2;
@@ -978,6 +979,14 @@ pub struct Star {
     /// same pixels in turn, sixteen to twenty times a second at a fast hand. Stood still, the grain
     /// is born once where its flight would have shown it and only cools.
     pub still: Option<(i32, i32)>,
+    /// Whether this star has been drawn: one not yet drawn may be stood elsewhere unseen
+    /// ([`Stardust::restand_crossed`]).
+    pub shown: bool,
+    /// On paper, the caret's block kept this star out after it had shown ([`Paint::kept_out`]),
+    /// so it is left out for the rest of its life: read every frame, a star the caret typed past
+    /// went out and came back once the caret had gone on, two more turns of the flash law on
+    /// pixels the caret had just turned.
+    pub caret_hid: bool,
 }
 
 const _: () = assert!(
@@ -1305,6 +1314,14 @@ impl Star {
             return self.origin();
         }
         self.pos_at_age(self.age_s(now))
+    }
+
+    /// Whether the caret's block keeps this star out now, read at the reach of `arms` at their
+    /// peak as a paint reads it ([`Paint::kept_out`]).
+    #[inline]
+    fn kept_out_by_caret(&self, ctx: &Ctx<'_>, (arm_lo, arm_hi): (i32, i32)) -> bool {
+        let at = self.pos(ctx.now, ctx.cfg.reduced_motion);
+        ctx.near_paper_caret(at, arm_hi.max(arm_lo) + 1)
     }
 
     #[inline]
@@ -1883,8 +1900,11 @@ pub struct Stardust {
     /// The marks' lights' keys ([`SkyMark::lights`]).
     mark_lights: Vec<u64>,
     paper_ink: PaperInkMemo,
-    /// Where paper's stars were stood within the last [`PAPER_REST_S`] ([`Self::stand`]).
+    /// Where paper's stars were stood and the caret crossed within the last two [`PAPER_REST_S`]
+    /// ([`Self::stand`], [`Self::note_caret`]).
     stood: Vec<Stood>,
+    /// The caret's cell when paper last saw it ([`Self::note_caret`]).
+    caret_cell: Option<(u16, u16)>,
     /// A test's negative control: a dark star kept off the caret's row
     /// beside it decided every frame from the caret then, as looks9 round 3
     /// decided it ([`Self::beside_caret`]).
@@ -2019,13 +2039,112 @@ pub fn with_paper_stars_flying<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// One star stood on paper: its centre and reach, px, and its birth ([`Stardust::stand`]).
-#[derive(Clone, Copy, Debug)]
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    static PAPER_CARET_AS_WAS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test's negative control: `f` run with paper's stars minding the caret as they did before
+/// [`Stardust::note_caret`] and [`Star::caret_hid`]: its crossings book no rest and stand no
+/// unseen star elsewhere, and a star its block hid after it showed comes back once it has gone.
+/// Debug and test builds only; the flag is this thread's and is put back as it was when `f`
+/// returns or panics.
+#[cfg(any(test, debug_assertions))]
+pub fn with_paper_caret_as_was<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            PAPER_CARET_AS_WAS.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(PAPER_CARET_AS_WAS.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether [`with_paper_caret_as_was`] holds on this thread: always `false` in a release build.
+#[inline]
+fn paper_caret_as_was() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        PAPER_CARET_AS_WAS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
+/// What darkened a box of paper and let it go ([`Stardust::stand`]): a star stood there (its
+/// centre's box out to its reach) or the caret's crossing of a cell. The box is window px, every
+/// bound inclusive, with when it darkened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Stood {
-    x: i32,
-    y: i32,
-    reach: i32,
+    x0: i32,
+    x1: i32,
+    y0: i32,
+    y1: i32,
     born: Instant,
+}
+
+impl Stood {
+    /// A star stood at `(x, y)` reaching `reach` px, born `born`.
+    #[inline]
+    const fn star((x, y): (i32, i32), reach: i32, born: Instant) -> Self {
+        Self {
+            x0: x - reach,
+            x1: x + reach,
+            y0: y - reach,
+            y1: y + reach,
+            born,
+        }
+    }
+
+    /// The caret's crossing of the cells `from..=to` of `row` at `at`: their whole box, cut to the
+    /// grid; `None` where none of them is on it.
+    #[inline]
+    const fn cells(row: u16, (from, to): (u16, u16), geom: Geom, at: Instant) -> Option<Self> {
+        let last = geom.cols as i32 - 1;
+        let (lo, hi) = if from < to { (from, to) } else { (to, from) };
+        if row as usize >= geom.rows || lo as i32 > last {
+            return None;
+        }
+        let hi = if hi as i32 > last { last } else { hi as i32 };
+        let (cw, ch) = (geom.cw as i32, geom.ch as i32);
+        let y0 = geom.origin_y as i32 + row as i32 * ch;
+        Some(Self {
+            x0: geom.origin_x as i32 + lo as i32 * cw,
+            x1: geom.origin_x as i32 + (hi + 1) * cw - 1,
+            y0,
+            y1: y0 + ch - 1,
+            born: at,
+        })
+    }
+
+    /// Whether `at` lies within [`PAPER_REST_S`] of this box's darkening, before it or after: a
+    /// star stood again after the caret crossed its place ([`Stardust::restand_crossed`]) is
+    /// older than stars stood since.
+    #[inline]
+    fn within_rest(&self, at: Instant) -> bool {
+        let apart = if at >= self.born {
+            at.duration_since(self.born)
+        } else {
+            self.born.duration_since(at)
+        };
+        apart.as_secs_f32() < PAPER_REST_S
+    }
+
+    /// Whether a star at `(x, y)` reaching `reach` px reaches a pixel of this box.
+    #[inline]
+    const fn meets(&self, (x, y): (i32, i32), reach: i32) -> bool {
+        x + reach >= self.x0 && x - reach <= self.x1 && y + reach >= self.y0 && y - reach <= self.y1
+    }
+
+    /// Shift the box `dy` px down.
+    #[inline]
+    const fn shift_y(&mut self, dy: i32) {
+        self.y0 += dy;
+        self.y1 += dy;
+    }
 }
 
 impl Default for Stardust {
@@ -2058,6 +2177,7 @@ impl Stardust {
             mark_lights: Vec::with_capacity(STAR_POOL_MAX * 8),
             paper_ink: PaperInkMemo::EMPTY,
             stood: Vec::with_capacity(STOOD_CAP),
+            caret_cell: None,
             #[cfg(test)]
             beside_caret_each_frame: false,
         }
@@ -2123,6 +2243,7 @@ impl Stardust {
     /// cell may have been laid this frame (T2).
     #[inline]
     pub fn on_event(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, ribbon: &Ribbon) {
+        self.note_caret(at, ctx);
         match *ev {
             Event::Typed { cells, class, .. } => {
                 self.note_cadence(at, cells);
@@ -2170,17 +2291,101 @@ impl Stardust {
         self.stars.push(star);
     }
 
+    /// Book `stood` with the rest, dropping the oldest where it is full.
+    #[inline]
+    fn book(&mut self, stood: Stood) {
+        if self.stood.len() == STOOD_CAP {
+            self.stood.remove(0);
+        }
+        self.stood.push(stood);
+    }
+
+    /// Book the caret's crossing on paper as a star's stand is booked ([`Stood`],
+    /// [`Self::stand`]): the block that leaves one cell and enters another darkens the pixels of
+    /// one and lets the other's go, the two turns of the flash law a star's birth and cooling
+    /// make, and the letters typed or erased on the way turn their cells' ink. Along its row the
+    /// crossing is every cell from where paper last saw the caret to where it stands, so two
+    /// Backspaces that share a tick book what each on its own tick books; to another row, the cell
+    /// it left and the one it entered. No star then stands within reach of them for
+    /// [`PAPER_REST_S`] either side of the crossing ([`Self::restand_crossed`] moves one already
+    /// stood there unseen). Under held Backspace on the faces Windows and Linux load, an erase
+    /// star born in the caret's cell stood unseen beside its block and showed once the caret had
+    /// gone on, on pixels the caret had crossed twice within half a second, typing and erasing;
+    /// a second star stood there once the first's rest, counted from its birth, had run out:
+    /// eight turns in a second (ATERM-KI-1115-12548).
+    #[inline]
+    fn note_caret(&mut self, at: Instant, ctx: &Ctx<'_>) {
+        if ctx.cfg.dark_theme || paper_caret_as_was() {
+            self.caret_cell = None;
+            return;
+        }
+        let (row, col) = ctx.caret;
+        let crossed = match self.caret_cell.replace((row, col)) {
+            Some(was) if was == (row, col) => return,
+            Some((was_row, was_col)) if was_row == row => [Some((row, (was_col, col))), None],
+            Some((was_row, was_col)) => {
+                [Some((was_row, (was_col, was_col))), Some((row, (col, col)))]
+            }
+            None => [Some((row, (col, col))), None],
+        };
+        for (row, cols) in crossed.into_iter().flatten() {
+            if let Some(stood) = Stood::cells(row, cols, ctx.geom, at) {
+                self.book(stood);
+                self.restand_crossed(stood, ctx);
+            }
+        }
+    }
+
+    /// Stand elsewhere each star on paper not yet drawn whose place `crossed` reaches, and let go
+    /// one with no rested place left or born a [`PAPER_REST_S`] or more before the crossing: the
+    /// caret came to it before it showed (a star beside the caret stands unseen,
+    /// [`Paint::kept_out`]), so it would show once the caret had left, on pixels the caret had
+    /// just turned. Moved or let go before it is drawn, it turns nothing; and two Backspaces whose
+    /// echoes share one tick stand their stars clear of the cells the caret crossed, as the pair
+    /// does with each echo on a tick of its own.
+    fn restand_crossed(&mut self, crossed: Stood, ctx: &Ctx<'_>) {
+        let mut i = 0;
+        while i < self.stars.len() {
+            let star = self.stars[i];
+            let Some((dx, dy)) = star.still else {
+                i += 1;
+                continue;
+            };
+            let origin = star.origin();
+            let place = (origin.0 + dx, origin.1 + dy);
+            let reach = star.class.arms(ctx.geom.ch as f32).1 + 1;
+            if star.shown || !crossed.meets(place, reach) {
+                i += 1;
+                continue;
+            }
+            let own = Stood::star(place, reach, star.born);
+            if let Some(j) = self.stood.iter().position(|s| *s == own) {
+                self.stood.remove(j);
+            }
+            let mut moved = star;
+            moved.still = None;
+            // The registry holds what a star born up to a rest ago needs ([`Self::stand`]).
+            if crossed.within_rest(star.born) && self.stand(&mut moved, ctx) {
+                self.stars[i] = moved;
+                i += 1;
+            } else {
+                self.stars.remove(i);
+            }
+        }
+    }
+
     /// Stand a newborn star still on paper ([`Star::still`]); a dark page's star flies and is left
     /// as it is. `false` when paper has no rested place for it.
     ///
     /// The star stands at a seeded point of its own flight (the slipstream's drift, a throw, a
     /// shed fragment's drag), so a line's dust lies strewn along it as the flying grains did in
     /// any one frame; a star with no flight stands where it was born. The place must be rested:
-    /// no star born within [`PAPER_REST_S`] may reach a pixel this one reaches, so no pixel is
-    /// darkened and let go more than three times a second however fast grains are dealt. A place
-    /// that is not rested is passed over for the next point of the flight, then for steps to each
-    /// side of it along the row, [`STAND_TRIES`] of each, then for the same steps one star's
-    /// height up at a time, [`STAND_ROWS`] heights in all.
+    /// no star born, and no cell the caret crossed, within [`PAPER_REST_S`] either side of this
+    /// one's birth may reach a pixel it reaches, so no pixel is darkened and let go more than
+    /// three times a second however fast grains are dealt. A place that is not rested is passed
+    /// over for the next point of the flight, then for steps to each side of it along the row,
+    /// [`STAND_TRIES`] of each, then for the same steps one star's height up at a time,
+    /// [`STAND_ROWS`] heights in all.
     fn stand(&mut self, star: &mut Star, ctx: &Ctx<'_>) -> bool {
         if ctx.cfg.dark_theme {
             return true;
@@ -2191,7 +2396,7 @@ impl Stardust {
         }
         let at = star.born;
         self.stood
-            .retain(|s| at.saturating_duration_since(s.born).as_secs_f32() < PAPER_REST_S);
+            .retain(|s| at.saturating_duration_since(s.born).as_secs_f32() < 2.0 * PAPER_REST_S);
         let geom = ctx.geom;
         let reach = star.class.arms(geom.ch as f32).1 + 1;
         let origin = star.origin();
@@ -2243,20 +2448,13 @@ impl Stardust {
             if first.is_none() {
                 first = Some(p);
             }
-            let rested = !self.stood.iter().any(|s| {
-                (p.0 - s.x).abs() <= reach + s.reach && (p.1 - s.y).abs() <= reach + s.reach
-            });
+            let rested = !self
+                .stood
+                .iter()
+                .any(|s| s.meets(p, reach) && s.within_rest(at));
             if rested {
                 star.still = Some((p.0 - origin.0, p.1 - origin.1));
-                if self.stood.len() == STOOD_CAP {
-                    self.stood.remove(0);
-                }
-                self.stood.push(Stood {
-                    x: p.0,
-                    y: p.1,
-                    reach,
-                    born: at,
-                });
+                self.book(Stood::star(p, reach, at));
                 return true;
             }
         }
@@ -2431,6 +2629,7 @@ impl Stardust {
     /// Draw the sky.
     #[inline]
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
+        self.note_caret(ctx.now, ctx);
         self.reduced = ctx.cfg.reduced_motion;
         self.cell_h = ctx.geom.ch as f32;
         let mut gi = 0;
@@ -2475,6 +2674,9 @@ impl Stardust {
             si += 1;
         }
         let ch = ctx.geom.ch as f32;
+        // On paper a star the caret's block hid after it showed is left out for its life
+        // ([`Star::caret_hid`]).
+        let hides_for_life = !ctx.cfg.dark_theme && !paper_caret_as_was();
         let table = relative_luminance_table();
         let mut i = 0usize;
         const ALL_CLASSES: [StarClass; 3] = [StarClass::M1, StarClass::M2, StarClass::M3];
@@ -2506,6 +2708,13 @@ impl Stardust {
                 if !self.beside_caret_each_frame && star.beside_caret == Some(true) {
                     continue;
                 }
+                if star.caret_hid {
+                    continue;
+                }
+                if star.shown && hides_for_life && star.kept_out_by_caret(ctx, arms) {
+                    self.stars[si - 1].caret_hid = true;
+                    continue;
+                }
                 let Some(paint) =
                     Paint::of_kept(star, &self.probe, &self.shade, &self.keep_out, ctx, arms)
                 else {
@@ -2521,6 +2730,9 @@ impl Stardust {
                 if left == 0 {
                     self.sky_index = index;
                     return;
+                }
+                if let Some(star) = self.stars.get_mut(si - 1) {
+                    star.shown = true;
                 }
                 let share = (left / (n - turn)).max(M3_QUADS).min(left);
                 let star_cap = frame.out.len() + share;
@@ -2750,6 +2962,7 @@ impl Stardust {
         self.probe.clear();
         self.glints.clear();
         self.stood.clear();
+        self.caret_cell = None;
         self.minted = 0;
         self.last_typed = None;
         self.ioi_ms = STREAM_IOI_MAX_MS;
@@ -2777,7 +2990,7 @@ impl Stardust {
                 s.y >= 0.0
             });
             for s in &mut self.stood {
-                s.y -= dy as i32;
+                s.shift_y(-(dy as i32));
             }
         }
         self.veil.retain_mut(|v| {
@@ -3239,6 +3452,8 @@ impl Stardust {
             beside_caret: None,
             edge_cut: false,
             still: None,
+            shown: false,
+            caret_hid: false,
         };
         if !self.stand(&mut star, ctx) {
             return false;
@@ -3277,6 +3492,8 @@ impl Stardust {
             beside_caret: None,
             edge_cut: false,
             still: None,
+            shown: false,
+            caret_hid: false,
         };
         if self.settle(&mut star, spec.fixed, ctx) && self.stand(&mut star, ctx) {
             self.sow(star);

@@ -180,6 +180,7 @@ pub const KINDS: &[&str] = &[
     "token-differ",
     "token-stopped",
     "seen",
+    "plan-seen",
 ];
 /// Every window word a note can carry.
 pub const WINDOWS: &[&str] = &["5h", "7d", "7d-model"];
@@ -198,6 +199,34 @@ pub const SOURCES: &[&str] = &[
     "cli-log",
     "vault-token",
 ];
+/// Every plan word a note can carry ([`plan_word`]): Claude Code's plans as its profile names
+/// them ([`super::profile::PlanWord`]) and the ChatGPT plans a Codex login's claims name. It
+/// holds every plan the registry seeds (`aterm_db::alab::seeds::PLANS`, `<provider>-<word>`),
+/// since the accounts relation compares the word it reads with a person's plan row by that key.
+pub const PLANS: &[&str] = &[
+    "free",
+    "go",
+    "plus",
+    "pro",
+    "prolite",
+    "max",
+    "team",
+    "business",
+    "enterprise",
+    "edu",
+];
+
+/// The plan word of a CLI's stated plan `text`, where it is one of [`PLANS`] (case aside): a
+/// plan outside the vocabulary (Claude Code's `other`, a ChatGPT plan type not listed) is no
+/// plan word, so nothing is noted of it.
+#[must_use]
+pub fn plan_word(text: &str) -> Option<&'static str> {
+    PLANS
+        .iter()
+        .copied()
+        .find(|word| word.eq_ignore_ascii_case(text.trim()))
+}
+
 /// Every reset-resolution word a note can carry.
 pub const RESES: &[&str] = &["exact", "hour"];
 /// Every reason word a note can carry.
@@ -359,6 +388,8 @@ pub struct Note {
     pub tab: Option<Tab>,
     /// The harness word of that tab's session (`[a-z0-9-]`, 16 bytes at most).
     pub harness: Option<&'static str>,
+    /// The plan word a `plan-seen` carries, one of [`PLANS`].
+    pub plan: Option<&'static str>,
 }
 
 impl Note {
@@ -390,6 +421,7 @@ impl Note {
             to: None,
             tab: None,
             harness: None,
+            plan: None,
         }
     }
 }
@@ -533,10 +565,14 @@ pub enum ObservedSrc {
     CliLog,
     /// The vault token entry a token route runs on.
     VaultToken,
+    /// One of aterm's own browser profiles signed in to the account
+    /// ([`super::observe::sweep::browser_logins`]): the registry's word only, never a `seen`
+    /// note's, since the journal hears what CLIs and tabs run.
+    Browser,
 }
 
 impl ObservedSrc {
-    /// The source word, one of [`SOURCES`].
+    /// The source word, one of [`SOURCES`] (`browser` the registry's alone).
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
@@ -544,6 +580,7 @@ impl ObservedSrc {
             Self::AuthFile => "auth-file",
             Self::CliLog => "cli-log",
             Self::VaultToken => "vault-token",
+            Self::Browser => "browser",
         }
     }
 }
@@ -602,6 +639,22 @@ pub fn idle_seen_note(
 ) -> Note {
     let mut note = Note::worded(t, "seen", account, cli.into().id(), src.word());
     note.why = Some(why.word());
+    note
+}
+
+/// The note of the plan `plan` (one of [`PLANS`]) that `cli`'s login file names for `account`,
+/// read from `src` at `t`: a `plan-seen`, made once per account per change of word
+/// ([`super::observe::sweep`]).
+#[must_use]
+pub fn plan_note(
+    cli: impl Into<ObservedCli>,
+    account: Key,
+    plan: &'static str,
+    src: ObservedSrc,
+    t: u64,
+) -> Note {
+    let mut note = Note::worded(t, "plan-seen", account, cli.into().id(), src.word());
+    note.plan = Some(plan);
     note
 }
 
@@ -1252,6 +1305,7 @@ pub fn probe_note(
                 to: None,
                 tab: None,
                 harness: None,
+                plan: None,
             });
         }
     };

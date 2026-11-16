@@ -235,9 +235,13 @@ pub struct Proton {
     send_keys: Vec<(String, usize)>,
     /// The address list the last unlock read, kept for discovery ([`Proton::address_list`]).
     listed: Option<AddressList>,
-    verification: Option<crate::human::Verified>,
-    challenge: std::cell::RefCell<Option<crate::human::Challenge>>,
 }
+
+/// The words a Proton call ends with where Proton asked a person to prove they are one (its code
+/// 9001, a human verification): aterm requests, reads and sends no code, and tries nothing
+/// again; a person completes it in Proton's own app or page.
+pub const HUMAN_VERIFICATION_STOP: &str = "Proton asked for human verification; aterm never answers one, and a person completes it in \
+     Proton's own app or page";
 
 impl Proton {
     /// Observe header changes without evicting verified bodies on an unchanged poll.
@@ -297,19 +301,11 @@ impl Proton {
         session
     }
 
+    /// Signs `username` in with `password`. A human verification Proton asks for ends it
+    /// ([`HUMAN_VERIFICATION_STOP`]): aterm never answers one.
     pub fn sign_in(username: &str, password: &Secret) -> Result<Self, String> {
-        Self::sign_in_with_verifier(username, password, |_| {
-            Err("Proton requires human verification".into())
-        })
-    }
-
-    pub fn sign_in_with_verifier(
-        username: &str,
-        password: &Secret,
-        verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
-    ) -> Result<Self, String> {
         let mut session = Self::empty();
-        session.with_verification(|session| session.authenticate(username, password), verifier)?;
+        session.with_renewal(|session| session.authenticate(username, password))?;
         Ok(session)
     }
 
@@ -337,17 +333,12 @@ impl Proton {
             keys: Vec::new(),
             send_keys: Vec::new(),
             listed: None,
-            verification: None,
-            challenge: std::cell::RefCell::new(None),
         }
     }
 
     /// None means Proton explicitly rejected the saved refresh credentials.
     /// Network, verification and service errors retain the saved session.
-    pub fn resume(
-        credentials: crate::session::Credentials,
-        verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
-    ) -> Result<Option<Self>, String> {
+    pub fn resume(credentials: crate::session::Credentials) -> Result<Option<Self>, String> {
         let mut session = Self::empty();
         session.uid = credentials.uid;
         session.access = credentials.access;
@@ -356,7 +347,7 @@ impl Proton {
         if aterm_time::unix_secs().is_some_and(|now| now.saturating_add(60) < session.expires) {
             return Ok(Some(session));
         }
-        match session.with_verification(Self::refresh, verifier) {
+        match session.with_renewal(Self::refresh) {
             Ok(()) => Ok(Some(session)),
             Err(_)
                 if session
@@ -514,36 +505,30 @@ impl Proton {
         Ok(())
     }
 
-    /// Retry authentication or a read after one verification. A read may also
-    /// renew a rejected access token once without starting a new password login.
-    /// Do not wrap message submission: an uncertain send must not be retried.
-    pub fn with_verification<T>(
+    /// Runs `operation`, renewing a rejected access token once without starting a new
+    /// password login. A human verification Proton asks for (its code 9001) is a stop, never
+    /// answered ([`HUMAN_VERIFICATION_STOP`]): no code is requested, read or sent, and nothing
+    /// is tried again. Do not wrap message submission: an uncertain send must not be retried.
+    pub fn with_renewal<T>(
         &mut self,
         operation: impl FnMut(&mut Self) -> Result<T, String>,
-        verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
     ) -> Result<T, String> {
-        self.with_recovery(operation, Self::refresh, verifier)
+        self.with_recovery(operation, Self::refresh)
     }
 
     fn with_recovery<T>(
         &mut self,
         mut operation: impl FnMut(&mut Self) -> Result<T, String>,
         mut renew: impl FnMut(&mut Self) -> Result<(), String>,
-        verifier: impl FnOnce(&crate::human::Challenge) -> Result<crate::human::Verified, String>,
     ) -> Result<T, String> {
-        self.challenge.take();
-        self.verification = None;
         let first = operation(self);
-        let mut renewal_pending = first.is_err()
+        // Only an expired session is renewed. A verification Proton asks for is never answered
+        // by signing in again: a browser renewal returns to the page that asked, and a check on
+        // it is never driven past.
+        let renewal_pending = first.is_err()
             && (!self.access.expose().is_empty() || self.transport.is_some())
             && self.last_failure.borrow().as_ref().is_some_and(|failure| {
-                (failure.kind == crate::proton_error::Kind::SessionExpired
-                    || self.transport.is_some()
-                        && matches!(
-                            failure.kind,
-                            crate::proton_error::Kind::Verification
-                                | crate::proton_error::Kind::DeviceVerification
-                        ))
+                failure.kind == crate::proton_error::Kind::SessionExpired
                     && !matches!(
                         failure.operation,
                         crate::proton_error::Operation::SignIn
@@ -552,42 +537,12 @@ impl Proton {
                             | crate::proton_error::Operation::TwoFactor
                     )
             });
-        let needs_renewal = renewal_pending;
-        let mut attempt = |session: &mut Self| {
-            if renewal_pending {
-                renew(session)?;
-                session.verification = None;
-                renewal_pending = false;
-            }
-            operation(session)
-        };
-        let result = if needs_renewal {
-            self.paused.take();
-            self.challenge.take();
-            attempt(self)
-        } else {
-            first
-        };
-        match result {
-            Ok(value) => Ok(value),
-            Err(error) => {
-                let Some(challenge) = self.challenge.take() else {
-                    return Err(error);
-                };
-                let verified = verifier(&challenge).map_err(|reason| {
-                    format!("{error}; verification could not complete: {reason}")
-                })?;
-                if !challenge.methods.contains(&verified.method) {
-                    return Err("Verification method was not offered".into());
-                }
-                self.verification = Some(verified);
-                self.paused.take();
-                self.retry_at.set(None);
-                let retried = attempt(self);
-                self.verification = None;
-                retried
-            }
+        if !renewal_pending {
+            return first;
         }
+        self.paused.take();
+        renew(self)?;
+        operation(self)
     }
 
     fn authenticate(&mut self, username: &str, password: &Secret) -> Result<(), String> {
@@ -848,14 +803,6 @@ impl Proton {
             .header("Accept", "application/json")
             .header("Content-Type", "application/json")
             .limit(32 * 1024 * 1024);
-        if let Some(token) = &self.verification {
-            request = request
-                .secret_header(
-                    "x-pm-human-verification-token",
-                    aterm_uds::secret::Secret::new(token.token.expose().as_bytes()),
-                )
-                .header("x-pm-human-verification-token-type", &token.method);
-        }
         // Proton's refresh endpoint authenticates the credentials in its body.
         // An expired access token must not become the refresh request's bearer.
         if !self.access.expose().is_empty() && path != "/auth/v4/refresh" {
@@ -939,57 +886,9 @@ impl Proton {
         if !(200..300).contains(&status) || code != 1000 {
             let failure = crate::proton_error::Failure::response(path, status, code, retry_after);
             let reason = self.fail(failure);
-            if code == 9001
-                && parsed["Details"]["HumanVerificationMethods"]
-                    .as_array()
-                    .is_some_and(|methods| {
-                        methods
-                            .iter()
-                            .any(|method| method.as_str().is_some_and(crate::human::supported))
-                    })
-                && let Some(token) =
-                    parsed["Details"]["HumanVerificationToken"]
-                        .as_str()
-                        .filter(|s| {
-                            !s.is_empty() && s.len() <= 8192 && !s.chars().any(char::is_control)
-                        })
-            {
-                let methods = parsed["Details"]["HumanVerificationMethods"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_str)
-                    .filter(|method| crate::human::supported(method))
-                    .map(str::to_owned)
-                    .collect();
-                *self.challenge.borrow_mut() = Some(crate::human::Challenge {
-                    token: Secret::new(token.to_owned()),
-                    methods,
-                });
-            }
-            if code == 9001 && self.challenge.borrow().is_none() {
-                let mut methods = String::new();
-                if let Some(values) = parsed["Details"]["HumanVerificationMethods"].as_array() {
-                    for name in values.iter().filter_map(Value::as_str) {
-                        if matches!(
-                            name,
-                            "captcha" | "email" | "sms" | "ownership-email" | "ownership-sms"
-                        ) {
-                            if !methods.is_empty() {
-                                methods.push_str(", ");
-                            }
-                            methods.push_str(name);
-                        }
-                    }
-                }
-                let methods = if methods.is_empty() {
-                    "none supplied"
-                } else {
-                    methods.as_str()
-                };
-                return Err(format!(
-                    "{reason}; no supported verification challenge (methods: {methods})"
-                ));
+            // Proton asks a person to prove they are one: aterm stops, and answers nothing.
+            if code == 9001 {
+                return Err(format!("{reason}; {HUMAN_VERIFICATION_STOP}"));
             }
             return Err(reason);
         }

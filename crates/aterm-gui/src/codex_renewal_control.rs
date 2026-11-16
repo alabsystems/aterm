@@ -20,6 +20,7 @@ pub(super) use service::Service;
 #[path = "codex_rotation_control.rs"]
 mod rotation;
 pub(super) use rotation::Preparation as RotationPreparation;
+pub(super) use rotation::{ProcessKey, READ_LAPSES, note_ask, observe_paced};
 #[path = "codex_login_rotation_control.rs"]
 mod login_rotation;
 pub(super) use login_rotation::{
@@ -543,6 +544,15 @@ fn serve_claimed(
     purpose: renewal::Purpose,
     host: &Arc<dyn login_rotation::Host>,
 ) -> String {
+    // Every request of a usage-limit move is an ask of its process's series, whatever it is
+    // answered below ([`rotation::note_ask`]): its `prepare`, and each `status` and `commit` of
+    // a receipt it was given, which its session asks for as long as that receipt is ready (up to
+    // two minutes) and asks no `prepare` meanwhile.
+    if purpose == renewal::Purpose::WeeklyQuota
+        && let Some(process) = Process::observe(proof.pid)
+    {
+        note_ask(ctx, ProcessKey::of(&process), env.now);
+    }
     let Some(current) = record(&copy) else {
         return "OK codex-renewal state=waiting\n".into();
     };

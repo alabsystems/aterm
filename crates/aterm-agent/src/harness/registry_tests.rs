@@ -58,6 +58,26 @@ fn roster() -> (Vec<u8>, Vec<u8>) {
     (bytes, sig)
 }
 
+/// `tool`'s executable inside a build's or a checkout's folder, as this platform names it
+/// ([`atpkg::store::ToolName::exe_file`]: `bin/claude-alab.exe` on Windows).
+fn bin(tool: &str) -> std::path::PathBuf {
+    let name = atpkg::store::ToolName::new(tool).expect("a tool name");
+    std::path::Path::new("bin").join(name.exe_file())
+}
+
+/// Point `program`'s `current` at the build folder `dir`, as activation does: a symbolic link
+/// on unix, a junction on Windows ([`atpkg::platform::atomic_symlink`]).
+fn point_current(layout: &atpkg::store::Layout, program: &str, dir: &std::path::Path) {
+    let current = layout.program_current(program);
+    #[cfg(unix)]
+    {
+        let _ = std::fs::remove_file(&current);
+        std::os::unix::fs::symlink(dir, &current).expect("current");
+    }
+    #[cfg(windows)]
+    atpkg::platform::atomic_symlink(dir, &current).expect("current");
+}
+
 fn scratch() -> (aterm_tempfile::TempDir, atpkg::store::Layout) {
     let dir = aterm_tempfile::tempdir().expect("a scratch prefix");
     let layout = atpkg::store::Layout {
@@ -79,8 +99,8 @@ enum Fault {
 }
 
 /// Install `id`'s `build` exposing `tool` with the `[harness]` table `table` in its signed
-/// manifest, as an install leaves it: the tree, its ready marker, the kept records, and the
-/// active `bin/` link.
+/// manifest, as an install leaves it: the tree, its ready marker, the kept records, the active
+/// `bin/` shim (a link on unix, the `.cmd` atpkg lays on Windows) and `current`.
 fn install(
     layout: &atpkg::store::Layout,
     id: &str,
@@ -91,15 +111,26 @@ fn install(
 ) {
     let dir = layout.build_dir(id, build);
     std::fs::create_dir_all(dir.join("bin")).expect("the build's bin");
-    let exe = dir.join("bin").join(tool);
+    let exe = dir.join(bin(tool));
     std::fs::write(&exe, format!("#!/bin/sh\necho {id} {build}\n")).expect("the tool");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("mode");
     }
+    // Where the filesystem keeps no modes (Windows), a stage keeps the archive's beside the
+    // build, and the tree folds with them: the tool is executable there too.
+    let modes = atpkg::tree::DeclaredModes::from([(
+        bin(tool).to_string_lossy().replace('\\', "/").into_bytes(),
+        0o755,
+    )]);
+    atpkg::store::write_declared_modes(&dir, &modes).expect("the declared modes");
     atpkg::store::mark_build_ready(&dir).expect("ready");
-    let root = atpkg::tree::tree_root(&dir).expect("the tree folds");
+    let root = atpkg::tree::tree_root_declared(
+        &dir,
+        &atpkg::store::declared_modes(&dir).expect("the declared modes"),
+    )
+    .expect("the tree folds");
     let manifest = format!(
         "schema = 1\nprogram = \"{id}\"\nversion = \"1.0.0\"\nbuild_number = {build}\n\
          exposes = [\"{tool}\"]\n\n{table}\n\n[[artifact]]\ntarget = \"{}\"\nkind = \"binary\"\n\
@@ -128,14 +159,13 @@ fn install(
         std::fs::write(&exe, "#!/bin/sh\necho forged\n").expect("the tampered tool");
     }
     std::fs::create_dir_all(layout.prefix.join("bin")).expect("bin");
-    let shim = layout.prefix.join("bin").join(tool);
+    let shim = layout.shim(&atpkg::store::ToolName::new(tool).expect("a tool name"));
     let _ = std::fs::remove_file(&shim);
     #[cfg(unix)]
     std::os::unix::fs::symlink(&exe, &shim).expect("the shim");
-    let current = layout.program_current(id);
-    let _ = std::fs::remove_file(&current);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&dir, &current).expect("current");
+    #[cfg(windows)]
+    atpkg::platform::install_shim_to(&shim, &exe).expect("the shim");
+    point_current(layout, id, &dir);
 }
 
 /// A `[harness]` table for `id` exposing `tool` and leading `leads`.
@@ -258,7 +288,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     assert!(r.rows().iter().any(|row| row.id == "claude-code-alab"));
     let exe = layout
         .build_dir("claude-code-alab", 3)
-        .join("bin/claude-alab");
+        .join(bin("claude-alab"));
     assert!(
         r.admits_image(&layout, entry.row, &exe),
         "its own build runs as it"
@@ -373,7 +403,7 @@ fn a_row_comes_only_from_a_record_whose_signed_manifest_and_tree_root_verify() {
     assert!(r.leader_of("kimi").is_none());
     let seed = Registry::seeds();
     let kimi_row = seed.entry("kimi-alab").expect("the seed").row;
-    let swapped = layout.build_dir("kimi-alab", 9).join("bin/kimi-alab");
+    let swapped = layout.build_dir("kimi-alab", 9).join(bin("kimi-alab"));
     assert!(
         !seed.admits_image(&layout, kimi_row, &swapped),
         "a seed's image rule refuses a build whose record fails"
@@ -444,7 +474,8 @@ fn a_second_harness_for_a_led_word_is_refused() {
         .expect("a harness's own next build leads its own word");
 }
 
-/// Write `declaration` as `checkout`'s `alab-harness.toml`, and `bin/<tool>` beside it.
+/// Write `declaration` as `checkout`'s `alab-harness.toml`, and `tool`'s executable ([`bin`])
+/// beside it.
 fn checkout_at(
     layout: &atpkg::store::Layout,
     name: &str,
@@ -453,7 +484,7 @@ fn checkout_at(
 ) -> std::path::PathBuf {
     let checkout = layout.prefix.join(name);
     std::fs::create_dir_all(checkout.join("bin")).expect("a checkout");
-    std::fs::write(checkout.join("bin").join(tool), "#!/bin/sh\n").expect("its tool");
+    std::fs::write(checkout.join(bin(tool)), "#!/bin/sh\n").expect("its tool");
     if let Some(declaration) = declaration {
         std::fs::write(
             checkout.join(atpkg::harness_record::DECLARATION_FILE),
@@ -551,7 +582,7 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
     assert!(agy.leads.is_empty(), "it leads nothing");
     assert_eq!(agy.images, [Image::Checkout(checkout.clone())]);
     assert!(
-        listed.admits_image(&layout, agy.row, &checkout.join("bin/agy-alab")),
+        listed.admits_image(&layout, agy.row, &checkout.join(bin("agy-alab"))),
         "its checkout claims"
     );
     let grok = listed
@@ -562,7 +593,7 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
         grok.images
             .contains(&Image::Checkout(grok_checkout.clone()))
     );
-    let claimant = grok_checkout.join("bin/grok-alab");
+    let claimant = grok_checkout.join(bin("grok-alab"));
     assert!(
         listed.admits_image(&layout, grok.row, &claimant),
         "its checkout claims"
@@ -597,7 +628,7 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
         &layout,
         "claude-code-alab",
         &claude_checkout,
-        &[std::path::PathBuf::from("bin/claude-alab")],
+        &[bin("claude-alab")],
     )
     .expect("the link");
     let linked = registry(&layout, &[], &trust(&[]));
@@ -613,7 +644,11 @@ fn a_linked_build_needs_a_verified_row_or_the_persons_dev_list() {
     );
     assert_eq!(entry.leads, ["claude"], "the signed record's words");
     assert_eq!(entry.name, "Claude Dev", "the checkout's name");
-    assert!(linked.admits_image(&layout, entry.row, &claude_checkout.join("bin/claude-alab")));
+    assert!(linked.admits_image(
+        &layout,
+        entry.row,
+        &claude_checkout.join(bin("claude-alab"))
+    ));
 
     // A dev-listed link leading an installed row's word loses it, unless aterm.toml names it.
     let aaa = checkout_at(
@@ -761,6 +796,28 @@ fn env_strip_only_adds_and_spares_protected_names() {
     }
 }
 
+/// Put `path`'s modification time back to the epoch's first second, a folder's too: through a
+/// read handle on unix, and on Windows through one opened to write attributes, with backup
+/// semantics so a folder opens at all.
+fn backdate(path: &std::path::Path) {
+    #[cfg(unix)]
+    let file = std::fs::File::open(path);
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        /// `FILE_WRITE_ATTRIBUTES`: what setting a file's times needs.
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        /// `FILE_FLAG_BACKUP_SEMANTICS`: what opening a folder needs.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    };
+    let _ = file
+        .and_then(|f| f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1)));
+}
+
 /// A SPAWN'S GLANCE SEES EVERY CHANGE THAT CAN MOVE THE STRIP LIST: a harness build and its
 /// record landing, its `current` link moving, a link made, and a link's declaration edited each
 /// move the glance a spawn takes before it starts a shell, so the window reads the registry
@@ -772,13 +829,14 @@ fn env_strip_only_adds_and_spares_protected_names() {
 fn a_spawns_glance_moves_with_what_the_strip_list_is_read_from() {
     let (_dir, layout) = scratch();
     std::fs::create_dir_all(layout.prefix.join("store")).expect("the store");
-    // Each glanced file's modification time is put back first, so a change made within the
-    // clock tick of the last one still moves the glance on a filesystem with coarse times.
+    // Each glanced file of the scratch store has its modification time put back first, so a
+    // change made within the clock tick of the last one still moves the glance on a filesystem
+    // with coarse times.
     let glance = || {
         for (path, _) in &Glance::of(Some(&layout)).0 {
-            let _ = std::fs::File::open(path).and_then(|f| {
-                f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
-            });
+            if path.starts_with(&layout.prefix) {
+                backdate(path);
+            }
         }
         let before = Glance::of(Some(&layout));
         before.with_declarations(&Fingerprint::of(Some(&layout), config(&["agy-alab"], &[])))
@@ -794,20 +852,20 @@ fn a_spawns_glance_moves_with_what_the_strip_list_is_read_from() {
     assert!(seen.holds());
 
     let current = layout.program_current("agy-alab");
-    std::fs::remove_file(&current).expect("the old link");
+    // The old link goes and the new one comes: unlinked and made again on unix; on Windows the
+    // junction is replaced as activation replaces it.
     #[cfg(unix)]
-    std::os::unix::fs::symlink(&next, &current).expect("current moves");
+    {
+        std::fs::remove_file(&current).expect("the old link");
+        std::os::unix::fs::symlink(&next, &current).expect("current moves");
+    }
+    #[cfg(windows)]
+    atpkg::platform::atomic_symlink(&next, &current).expect("current moves");
     assert!(!seen.holds(), "current moved");
 
     let checkout = checkout_at(&layout, "agy-checkout", "agy-alab", Some(AGY_ALAB));
     let seen = glance();
-    atpkg::linkmode::link(
-        &layout,
-        "agy-alab",
-        &checkout,
-        &[std::path::PathBuf::from("bin/agy-alab")],
-    )
-    .expect("the link");
+    atpkg::linkmode::link(&layout, "agy-alab", &checkout, &[bin("agy-alab")]).expect("the link");
     assert!(!seen.holds(), "a link was made");
     let seen = glance();
     assert!(seen.holds());
@@ -868,13 +926,7 @@ fn an_install_cedes_a_word_the_person_gave_a_link() {
         "claude",
         Some(&table("aaa-alab", "claude", &["claude"], "")),
     );
-    atpkg::linkmode::link(
-        &layout,
-        "aaa-alab",
-        &aaa,
-        &[std::path::PathBuf::from("bin/claude")],
-    )
-    .expect("the link");
+    atpkg::linkmode::link(&layout, "aaa-alab", &aaa, &[bin("claude")]).expect("the link");
     let build = atpkg::harness_record::harness_table_of(&table(
         "claude-code-alab",
         "claude-alab",
@@ -921,13 +973,7 @@ fn an_install_cedes_a_word_the_person_gave_a_link() {
         "claude",
         Some(&table("aaa-alab", "claude", &["claude"], "")),
     );
-    atpkg::linkmode::link(
-        &fresh,
-        "aaa-alab",
-        &aaa,
-        &[std::path::PathBuf::from("bin/claude")],
-    )
-    .expect("the link");
+    atpkg::linkmode::link(&fresh, "aaa-alab", &aaa, &[bin("claude")]).expect("the link");
     let refused = atpkg::harness_record::admit_install_under(
         &fresh,
         "claude-code-alab",
@@ -974,20 +1020,15 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
         &layout,
         "claude-code-alab",
         &claude_checkout,
-        &[std::path::PathBuf::from("bin/claude-alab")],
+        &[bin("claude-alab")],
     )
     .expect("the link");
     let agy_checkout = checkout_at(&layout, "agy-checkout", "agy-alab", Some(AGY_ALAB));
-    atpkg::linkmode::link(
-        &layout,
-        "agy-alab",
-        &agy_checkout,
-        &[std::path::PathBuf::from("bin/agy-alab")],
-    )
-    .expect("the link");
+    atpkg::linkmode::link(&layout, "agy-alab", &agy_checkout, &[bin("agy-alab")])
+        .expect("the link");
     let old = layout.build_dir("kimi-alab", 8);
     std::fs::create_dir_all(old.join("bin")).expect("build 8");
-    let old_exe = old.join("bin/kimi-alab");
+    let old_exe = old.join(bin("kimi-alab"));
     std::fs::write(&old_exe, "#!/bin/sh\necho kimi-alab 8\n").expect("build 8's tool");
     atpkg::store::mark_build_ready(&old).expect("build 8 ready");
     install(&layout, "kimi-alab", "kimi-alab", 9, KIMI_ALAB, Fault::None);
@@ -999,7 +1040,7 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
         contract_of(read(&r, "claude-code-alab@4242", &v3)),
         Some(SCOPED)
     );
-    let built = claude_checkout.join("bin/claude-alab");
+    let built = claude_checkout.join(bin("claude-alab"));
     assert!(
         atpkg::harness_record::admits_seed_image(&layout, "claude-code-alab", &built),
         "its checkout's build proves its contract 3 claim"
@@ -1029,12 +1070,12 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
     );
     let unready = layout.build_dir("kimi-alab", 7);
     std::fs::create_dir_all(unready.join("bin")).expect("build 7");
-    std::fs::write(unready.join("bin/kimi-alab"), "x").expect("build 7's tool");
+    std::fs::write(unready.join(bin("kimi-alab")), "x").expect("build 7's tool");
     assert!(
         !atpkg::harness_record::admits_seed_image(
             &layout,
             "kimi-alab",
-            &unready.join("bin/kimi-alab")
+            &unready.join(bin("kimi-alab"))
         ),
         "a build that is not ready"
     );
@@ -1047,7 +1088,7 @@ fn a_seed_ids_contract_3_claim_stands_over_a_link_or_a_record_and_falls_with_its
         !atpkg::harness_record::admits_seed_image(
             &layout,
             "agy-alab",
-            &agy_checkout.join("bin/agy-alab")
+            &agy_checkout.join(bin("agy-alab"))
         ),
         "contract 3's rule admits nothing for an id that is no seed id"
     );
@@ -1131,7 +1172,7 @@ fn each_harness_declaration_makes_its_row_with_the_agent_the_name_table_reads() 
             &[Scope::Relaunch, Scope::Upgrade][..],
             "{id}"
         );
-        let exe = layout.build_dir(id, build).join("bin").join(id);
+        let exe = layout.build_dir(id, build).join(bin(id));
         assert!(
             r.admits_image(&layout, entry.row, &exe),
             "{id} runs from its own build"
@@ -1188,7 +1229,7 @@ fn each_harness_declaration_makes_its_row_with_the_agent_the_name_table_reads() 
         .entry("quiet-alab")
         .expect("leading nothing is allowed, whatever its id reads as");
     assert_eq!(quiet.row.program, Program::Generic);
-    let exe = more.build_dir("quiet-alab", 1).join("bin/quiet-alab");
+    let exe = more.build_dir("quiet-alab", 1).join(bin("quiet-alab"));
     assert!(r.admits_image(&more, quiet.row, &exe));
     assert!(
         matches!(read_in(r.rows(), "quiet-alab@4242", &v4), Words::Scoped(_)),
@@ -1239,13 +1280,8 @@ fn a_read_and_the_generation_it_was_installed_as_are_one_value() {
 
     let declaration = table("quiet-alab", "quiet-alab", &[], "");
     let checkout = checkout_at(&layout, "quiet-checkout", "quiet-alab", Some(&declaration));
-    atpkg::linkmode::link(
-        &layout,
-        "quiet-alab",
-        &checkout,
-        &[std::path::PathBuf::from("bin/quiet-alab")],
-    )
-    .expect("the link");
+    atpkg::linkmode::link(&layout, "quiet-alab", &checkout, &[bin("quiet-alab")])
+        .expect("the link");
     let (moved, next) = read();
     assert_eq!(next, at + 1, "a new read, the next generation");
     assert!(

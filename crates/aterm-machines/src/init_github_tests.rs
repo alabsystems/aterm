@@ -37,18 +37,25 @@ fn checked(text: &[u8]) -> Result<Asked, String> {
 fn the_native_stage_is_the_default_and_init_toml_scopes_or_turns_it_off() {
     let (sys, context) = fixture();
     let ids = |sys: &Fake| -> Vec<String> {
-        items(sys, &context, None)
+        items(sys, &context, None, crate::model::Mode::Plan, &[])
             .unwrap()
             .iter()
             .map(|item| item.id())
             .collect()
     };
-    let native: &[&str] = &["init.github.keychain@alice", "init.github.native@alice"];
+    // The default stage refreshes the checkouts already here after acquisition; an explicit
+    // profile's checkouts are left as they are.
+    let native: &[&str] = &[
+        "init.github.keychain@alice",
+        "init.github.native@alice",
+        "init.github.refresh@alice",
+    ];
+    let scoped: &[&str] = &["init.github.keychain@alice", "init.github.native@alice"];
     assert_eq!(ids(&sys), native);
     for (text, want) in [
         (&b"[github]\nenabled = false\n"[..], &[][..]),
         (b"[develop]\ncheckouts = []\n", native),
-        (b"[github]\naccount = 'alice'\n", native),
+        (b"[github]\naccount = 'alice'\n", scoped),
     ] {
         let (sys, _context) = fixture();
         let path = "/Users//alice/.config/aterm/init.toml";

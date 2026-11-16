@@ -102,3 +102,33 @@ fn a_fifo_at_the_path_is_refused_at_once() {
         .expect("the take of a FIFO returned (a hang detector)");
     assert_eq!(taken.map_err(|e| e.kind()), Err(io::ErrorKind::InvalidData));
 }
+
+/// A thread inside [`takes_nothing`] is refused a take before the lock is tried, and each try,
+/// refused or not, counts on that thread alone ([`takes_tried_here`]): a fresh thread has tried
+/// none, and the rule ends as `takes_nothing` returns. NEGATIVE CONTROL: the same take outside
+/// the rule gets the lock, so the refusal is the rule's and not the file's.
+#[test]
+fn a_thread_that_takes_nothing_is_refused_each_take_and_each_try_counts() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("watched.lock");
+    let here = takes_tried_here();
+    std::thread::spawn(move || {
+        assert_eq!(takes_tried_here(), 0, "a fresh thread has tried no take");
+        let refused = takes_nothing(|| LockFile::take(&path, Instant::now(), "busy").map(drop));
+        assert_eq!(
+            refused.map_err(|e| e.kind()),
+            Err(io::ErrorKind::PermissionDenied)
+        );
+        assert_eq!(takes_tried_here(), 1, "a refused take is a try");
+        let held = LockFile::take(&path, Instant::now(), "busy").expect("a take outside the rule");
+        assert_eq!(takes_tried_here(), 2);
+        drop(held);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(
+        takes_tried_here(),
+        here,
+        "another thread's tries are its own"
+    );
+}

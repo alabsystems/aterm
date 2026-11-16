@@ -216,6 +216,50 @@ impl std::fmt::Display for GoogleLoginError {
     }
 }
 
+/// Why agy's native Google sign-in ended without a verified grant, as its renewal records it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoogleSignInEnd {
+    /// Google's page carried a check ([`super::google_direct::Error::SecurityCheck`]): nothing on
+    /// it was pressed, and the row is held for a person on no clock (`bot-check`), never opened
+    /// again by the upkeep.
+    Check(String),
+    /// Any other end, in its own words.
+    Failed(String),
+}
+
+impl GoogleSignInEnd {
+    /// The end `error` names.
+    #[must_use]
+    pub fn of(error: &GoogleLoginError) -> Self {
+        match error {
+            GoogleLoginError::Approval(super::google_direct::Error::SecurityCheck) => {
+                Self::Check(error.to_string())
+            }
+            _ => Self::Failed(error.to_string()),
+        }
+    }
+}
+
+impl From<&str> for GoogleSignInEnd {
+    fn from(why: &str) -> Self {
+        Self::Failed(why.to_owned())
+    }
+}
+
+impl From<String> for GoogleSignInEnd {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl std::fmt::Display for GoogleSignInEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Check(why) | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
 /// A completed native run with a configured expected account, still awaiting canonical proof.
 pub struct UnverifiedGoogleGrant {
     native: UnverifiedGrant,
@@ -920,13 +964,11 @@ fn run_google_at_scoped(
         recovery,
         (deadline, &cancelled),
         |request, deadline| {
-            let mailbox = super::headless_oauth::discover_mailbox_config(Some(home), Some(state));
             let context = super::google_direct::Context {
                 work: work.clone(),
                 identity,
                 home,
                 state,
-                mailbox: mailbox.as_ref(),
                 current: &current,
             };
             match super::google_direct::approve(request, &context, deadline) {

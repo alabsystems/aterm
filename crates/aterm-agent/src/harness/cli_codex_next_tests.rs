@@ -3381,7 +3381,7 @@ impl Pool {
             law_auth(&auth, &account, moved.then_some(LAW_MOVED_TO));
             reader.answers.insert(auth, (account, row.label == label));
         }
-        let proposal = crate::harness::codex_rotation::prepare(
+        let proposal = crate::harness::codex_rotation::prepare_once(
             &self.seat(),
             session,
             &Identity::from_native(&account_of(label), "user"),

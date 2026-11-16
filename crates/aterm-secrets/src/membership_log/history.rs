@@ -122,7 +122,11 @@ impl<'a> HistoryView<'a> {
                 return Err(Error::new("complete membership history is unavailable"));
             };
             if !std::ptr::eq(record, expected)
-                && (record.id() != expected.id() || record.bytes() != expected.bytes())
+                && (record.id() != expected.id()
+                    || !matches!(
+                        (record.wire_bytes(), expected.wire_bytes()),
+                        (Ok(a), Ok(b)) if a == b
+                    ))
             {
                 return Err(Error::new("membership history record changed"));
             }

@@ -343,8 +343,8 @@ fn with_wait_format(format: Option<&str>) -> Value {
 /// renamed or split in a later format would read as absent and pass E05's law at 0.
 #[test]
 fn a_tally_round_in_an_unknown_wait_format_is_refused() {
-    let why = counts(&with_wait_format(Some("wait-tally v=9"))).unwrap_err();
-    assert!(why.contains("`wait-tally v=9`"), "{why}");
+    let why = counts(&with_wait_format(Some("wait-tally v=10"))).unwrap_err();
+    assert!(why.contains("`wait-tally v=10`"), "{why}");
     let why = counts(&with_wait_format(None)).unwrap_err();
     assert!(why.contains("names no wait-tally format"), "{why}");
     for format in WAIT_FORMATS {

@@ -32,6 +32,9 @@ use crate::wire::scripted::ScriptedTransport;
 use crate::wire::{Endpoints, Method, OriginRole, Transport, WireBody, WireKind};
 use crate::write::{Outcome, WriteOp, settle_table};
 
+#[path = "client_native_stop_tests.rs"]
+mod native_stop_tests;
+
 /// The simulated clock's start (Unix seconds): `tests/common.rs`'s value, which this crate's
 /// graph does not hold (plan §4.8).
 const SIM_START: u64 = 1_760_000_000;

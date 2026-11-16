@@ -880,6 +880,38 @@ fn report_using(cargo: &crate::resolve::Cargo, pristine: &Pristine, root: &Path)
     }
 }
 
+/// What `[OB-1]` found of one roster row's tree pin ([`crate::tree_pin`]).
+#[derive(Debug, PartialEq, Eq)]
+enum TreePinVerdict {
+    /// It holds; the text goes on the row's line after its upstream.
+    Held(String),
+    /// A FAIL line, with the repair, is in the log.
+    Failed,
+    /// A COULD NOT RUN line is in the log; this is the reason the run reports.
+    CouldNotRun(String),
+}
+
+/// `[OB-1]`'s judgment of the tree pin `pin` of the roster directory `rel`: the index holds
+/// exactly the tree the pin names, and the working copy changes nothing under it. A pin that
+/// does not hold FAILs with `tools/pin`'s repair; without git it COULD NOT RUN.
+fn ob1_tree_pin(root: &Path, rel: &str, pin: &str, log: &mut String) -> TreePinVerdict {
+    match crate::tree_pin::hold(root, rel, pin) {
+        Ok(held) => TreePinVerdict::Held(format!(
+            ", pinned by {pin} to {} as tree {}: the index holds exactly that tree and the \
+             working copy changes nothing under it",
+            held.tag, held.tree
+        )),
+        Err(crate::TreePinError::Fail(why)) => {
+            let _ = writeln!(log, "  ✗ FAIL [OB-1] tree pin of `{rel}`: {why}");
+            TreePinVerdict::Failed
+        }
+        Err(crate::TreePinError::CouldNotRun(why)) => {
+            let _ = writeln!(log, "  ? COULD NOT RUN [OB-1] tree pin of `{rel}`: {why}");
+            TreePinVerdict::CouldNotRun(format!("[OB-1] {why}"))
+        }
+    }
+}
+
 /// `[OB-1]` Every vendored patch key resolves to a real `vendor/<dir>` with sources.
 fn ob1_patch_vendor_agreement(
     cargo: &crate::resolve::Cargo,
@@ -1095,11 +1127,26 @@ fn ob1_patch_vendor_agreement(
                 fails += 1;
                 continue;
             }
+            let tree_pin = match row.pin {
+                None => String::new(),
+                Some(pin) => match ob1_tree_pin(root, &rel, pin, log) {
+                    TreePinVerdict::Held(text) => text,
+                    TreePinVerdict::Failed => {
+                        fails += 1;
+                        continue;
+                    }
+                    TreePinVerdict::CouldNotRun(why) => {
+                        could_not_run.get_or_insert(why);
+                        continue;
+                    }
+                },
+            };
             let pin = submodule
                 .as_ref()
                 .filter(|_| dir == crate::direct_vendor::DIRECTORY)
                 .map(|p| format!(" at {}", p.commit))
-                .unwrap_or_default();
+                .unwrap_or_default()
+                + &tree_pin;
             let ob10 = if gitlinks.contains(&rel) {
                 "[OB-10] does not descend into it: it is a git submodule, another repository's \
                  working tree, so nothing beneath it can be tracked here or lost to an ignore \
@@ -1993,4 +2040,4 @@ fn ob10_gitignore(root: &Path, forks: &[VendoredFork], log: &mut String) -> usiz
 
 #[cfg(test)]
 #[path = "attest_tests.rs"]
-mod tests;
+pub(crate) mod tests;

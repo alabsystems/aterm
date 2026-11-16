@@ -59,6 +59,9 @@ struct Fake {
     linked: Vec<Linked>,
     /// How many presses and sets fail before one is carried out.
     act_errors: usize,
+    /// The act (counted from 0 over presses and sets) that answers that the page carries this
+    /// check, read at the act: one drawn between the read and the act.
+    act_check: Option<(usize, CheckMet)>,
     /// Where the page the last read gave is: every act is told that address.
     last_at: String,
     absent: Vec<Button>,
@@ -85,6 +88,7 @@ impl Fake {
             store_is_the_accounts: false,
             linked: vec![Linked::Waiting],
             act_errors: 0,
+            act_check: None,
             last_at: String::new(),
             absent: Vec::new(),
             cancel_after: None,
@@ -111,6 +115,15 @@ impl Fake {
         }
         Ok(())
     }
+
+    /// The check this act reads, where it is the one [`Fake::act_check`] names.
+    fn check_at_act(&self) -> Option<CheckMet> {
+        let nth = self.log.acted_at.len().checked_sub(1)?;
+        self.act_check
+            .as_ref()
+            .filter(|(at, _)| *at == nth)
+            .map(|(_, check)| check.clone())
+    }
 }
 
 impl Desk for Fake {
@@ -123,28 +136,37 @@ impl Desk for Fake {
     }
     fn facts(&mut self) -> Result<Facts, DeskError> {
         self.log.reads += 1;
-        let facts = (self.page)(&self.log)?;
+        let mut facts = (self.page)(&self.log)?;
+        if facts.doc.is_empty() {
+            DOC.clone_into(&mut facts.doc);
+        }
         self.last_at.clone_from(&facts.url);
         Ok(facts)
     }
-    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<bool, DeskError> {
+    fn press(&mut self, button: Button, email: &str, at: &str) -> Result<Pressed, DeskError> {
         assert_eq!(email, EMAIL, "a press is made for the account's own email");
         self.act(at)?;
+        if let Some(check) = self.check_at_act() {
+            return Ok(Pressed::Check(check));
+        }
         if self.absent.contains(&button) {
-            return Ok(false);
+            return Ok(Pressed::No);
         }
         self.log.pressed.push(button);
-        Ok(true)
+        Ok(Pressed::Yes)
     }
     fn fill(&mut self, field: Field, value: &str, at: &str) -> Result<Filled, DeskError> {
         self.act(at)?;
+        if let Some(check) = self.check_at_act() {
+            return Ok(Filled::Check(check));
+        }
         let nth = self.log.filled.iter().filter(|(f, _)| *f == field).count();
         self.log.filled.push((field, value.to_owned()));
         let ends = match field {
             Field::Code => &self.code_fills,
             Field::Email => &self.email_fills,
         };
-        Ok(*ends.get(nth).or(ends.last()).expect("a fill's end"))
+        Ok(ends.get(nth).or(ends.last()).expect("a fill's end").clone())
     }
     fn go(&mut self, url: &str) -> Result<(), DeskError> {
         // A sign-in link is spent by the first page that asks for it: the window's page is
@@ -466,7 +488,7 @@ fn a_sign_in_links_code_is_set_in_the_page_that_asked_for_it() {
 #[test]
 fn a_link_pages_answer_holds_its_code_its_texts_shape_and_its_address() {
     let script = link_code_script(PINNED).unwrap();
-    assert!(script.contains("challenged()"), "{script}");
+    assert!(script.contains("checkPageOf()"), "{script}");
     assert!(!script.contains(".click("), "the link's page is only read");
     let foreign = script
         .find(r#"if (!own) { out.shape = "foreign";"#)
@@ -696,15 +718,14 @@ fn a_code_a_person_typed_never_vouches_for_a_consent_page_that_names_nobody() {
         let mut desk = Fake::new(page);
         desk.store_is_the_accounts = true;
         if held {
-            // A person completes the check: the page's Authorize is enabled from the tenth read.
+            // A person completes the check and presses the page's own Authorize from the tenth
+            // read: aterm presses nothing on it.
             desk.page = Box::new(move |log: &Log| {
-                Ok(
-                    if log.reads >= 10 && !log.pressed.contains(&Button::Authorize) {
-                        consent_page(UNNAMED)
-                    } else {
-                        page(log)?
-                    },
-                )
+                Ok(if log.reads >= 10 {
+                    at(ANSWERED)
+                } else {
+                    page(log)?
+                })
             });
         }
         assert_eq!(
@@ -713,8 +734,8 @@ fn a_code_a_person_typed_never_vouches_for_a_consent_page_that_names_nobody() {
             "CONTROL: {held}"
         );
         assert_eq!(
-            desk.log.pressed.last(),
-            Some(&Button::Authorize),
+            desk.log.pressed.contains(&Button::Authorize),
+            !held,
             "CONTROL: {held}"
         );
         assert_eq!(desk.log.forgot, 0, "CONTROL: {held}");
@@ -912,25 +933,36 @@ fn a_consent_page_is_authorized_only_for_an_established_account() {
     assert!(!desk.log.pressed.contains(&Button::Authorize));
 }
 
-/// CLOUDFLARE'S CHECK IS WAITED ON AND NEVER OPERATED: while it stands nothing is pressed,
-/// filled or opened, whatever its page shows, and the progress words say aterm is waiting and
-/// that a person may complete it; once it clears the sign-in goes on.
+/// CLOUDFLARE'S CHECK IS NEVER OPERATED, AND AFTER IT NOTHING IS: while it stands and after it
+/// clears nothing is pressed, filled or opened, whatever its page shows, and the progress words
+/// say a person may complete it and the sign-in. A person who does reaches the callback, which
+/// ends the sign-in. CONTROL: a check that cleared by itself is not driven past: the sign-in's
+/// pages after it are pressed nothing, and it ends naming the check.
 #[test]
-fn a_bot_check_that_clears_is_waited_on_with_nothing_pressed() {
-    let pressed_during = std::rc::Rc::new(std::cell::Cell::new(0));
-    let seen = pressed_during.clone();
+fn a_bot_check_is_never_operated_and_nothing_is_pressed_after_it() {
     let mut desk = Fake::new(move |log: &Log| {
+        Ok(if log.reads <= 20 {
+            bot_check_page()
+        } else {
+            at(ANSWERED)
+        })
+    });
+    assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered));
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+    assert!(desk.log.went.is_empty());
+    let mut cleared = Fake::new(move |log: &Log| {
         if log.reads <= 20 {
-            seen.set(log.pressed.len() + log.filled.len() + log.went.len());
             Ok(bot_check_page())
         } else {
             whole_flow(log)
         }
     })
     .with_mail(|_| Ok(MailboxCredential::Otp("123456".into())));
-    assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered));
-    assert_eq!(pressed_during.get(), 0);
-    assert_eq!(desk.log.pressed.len(), 3);
+    assert_eq!(
+        run(AUTHORIZE, &mut cleared),
+        Err(Stop::BotCheck(Some("claude.ai".into())))
+    );
+    assert!(cleared.log.pressed.is_empty() && cleared.log.filled.is_empty());
     let said = desk.log.said.join("\n");
     assert!(said.contains("Cloudflare's check"), "{said}");
     assert!(said.contains("never operates it"), "{said}");
@@ -965,13 +997,20 @@ fn a_bot_check_that_never_clears_ends_naming_cloudflare() {
             VisibleStop::BotCheck(Some("claude.ai".into()))
         );
     }
-    // Its words in a help page, with none of its marks, are no check.
+    // Its words alone, with none of its marks, stop every act too: the rule fails closed.
     let mut desk = Fake::new(|_: &Log| {
         Ok(Facts {
             text: "If you see Verify you are human, wait.".into(),
             ..login_page()
         })
     });
+    assert_eq!(
+        run(AUTHORIZE, &mut desk),
+        Err(Stop::BotCheck(Some("claude.ai".into())))
+    );
+    assert!(desk.log.pressed.is_empty());
+    // CONTROL: the same page without them is pressed.
+    let mut desk = Fake::new(|_: &Log| Ok(login_page()));
     assert!(matches!(
         run(AUTHORIZE, &mut desk),
         Err(Stop::TimedOut(Phase::EmailSent))
@@ -989,10 +1028,12 @@ fn held_consent_page(text: &str) -> Facts {
     }
 }
 
-/// THE CONSENT PAGE'S HUMAN CHECK IS WAITED ON AND NEVER OPERATED: while it holds `Authorize`
-/// nothing is pressed or set, and one that stands until the deadline ends the sign-in naming
-/// it, for a person at this Mac. Once the page itself enables `Authorize` (a person completed
-/// the check) it is pressed, once. A held page that names another account ends at once.
+/// THE CONSENT PAGE'S HUMAN CHECK IS WAITED ON AND NEVER OPERATED: whether it holds `Authorize`
+/// disabled or not, nothing is pressed or set, and one that stands until the deadline ends the
+/// sign-in naming it, for a person at this Mac. A person completes the check and presses the
+/// page's own `Authorize`, and the flow ends from the callback; aterm presses it neither while
+/// the check stands nor after the page enabled it. A held page that names another account ends
+/// at once.
 #[test]
 fn a_human_check_on_the_consent_page_is_waited_on_and_never_operated() {
     const NAMED: &str = "Claude Code would like to connect. Logged in as one@example.com";
@@ -1024,18 +1065,31 @@ fn a_human_check_on_the_consent_page_is_waited_on_and_never_operated() {
         VisibleStop::HumanCheck(Some("claude.ai".into()))
     );
 
-    // A person completes the check at the fortieth read: the page enables Authorize.
+    // The check beside an enabled Authorize: nothing is pressed either.
+    let mut desk = Fake::new(|_: &Log| {
+        Ok(Facts {
+            check: Some("Turnstile".into()),
+            ..consent_page(NAMED)
+        })
+    });
+    assert_eq!(
+        run(AUTHORIZE, &mut desk),
+        Err(Stop::HumanCheck(Some("claude.ai".into())))
+    );
+    assert!(desk.log.pressed.is_empty());
+    // A person completes the check at the fortieth read and the page enables Authorize: aterm
+    // still presses nothing, and the person's own press reaches the callback.
     let mut desk = Fake::new(|log: &Log| {
-        Ok(if log.pressed.contains(&Button::Authorize) {
-            at(ANSWERED)
-        } else if log.reads < 40 {
+        Ok(if log.reads < 40 {
             held_consent_page(NAMED)
-        } else {
+        } else if log.reads < 50 {
             consent_page(NAMED)
+        } else {
+            at(ANSWERED)
         })
     });
     assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered));
-    assert_eq!(desk.log.pressed, [Button::Authorize]);
+    assert!(desk.log.pressed.is_empty(), "{:?}", desk.log.pressed);
 
     let mut desk = Fake::new(|_: &Log| {
         Ok(held_consent_page(
@@ -1243,6 +1297,96 @@ fn a_closed_window_a_cancellation_and_an_unreadable_desk_end_the_sign_in() {
     assert_eq!(desk.log.reads, MAX_UNREAD);
 }
 
+/// A CHECK THE RUN MET IS HOW IT ENDS, HOWEVER IT ENDS BEFORE A CALLBACK
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): a sign-in a person started meets
+/// Cloudflare's check or the consent page's human check, presses nothing, and then its window is
+/// closed, its host ends, its reads keep failing, or the account work is paused. Each ends naming
+/// the check it met, recorded as that check (`VisibleStop::BotCheck`, `VisibleStop::HumanCheck`),
+/// so its hold never lapses into a page stop or a failure that a clock goes back to. CONTROL: the
+/// same ends with no check met keep their own (the closed window `Closed`, the host `Desk`), and
+/// a person who passed the check and reached the callback ends as the listener left it.
+/// NEGATIVE CONTROL: with `steps` returning each stop as it came (no `Progress::end`), the closed
+/// window ends as `Closed`: `` a closed window lost the check ``.
+#[test]
+fn a_check_the_run_met_is_how_it_ends_however_it_ends_before_a_callback() {
+    const NAMED: &str = "Claude Code would like to connect. Logged in as one@example.com";
+    let claude = || Some("claude.ai".to_owned());
+    let mut desk = Fake::new(|log: &Log| {
+        if log.reads <= 2 {
+            Ok(bot_check_page())
+        } else {
+            Err(DeskError::Gone)
+        }
+    });
+    let stop = run(AUTHORIZE, &mut desk).unwrap_err();
+    assert_eq!(
+        stop,
+        Stop::BotCheck(claude()),
+        "a closed window lost the check"
+    );
+    assert_eq!(VisibleStop::from(stop), VisibleStop::BotCheck(claude()));
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    let mut desk = Fake::new(|log: &Log| {
+        if log.reads <= 2 {
+            Ok(held_consent_page(NAMED))
+        } else {
+            Err(DeskError::Ended)
+        }
+    });
+    let stop = run(AUTHORIZE, &mut desk).unwrap_err();
+    assert_eq!(
+        stop,
+        Stop::HumanCheck(claude()),
+        "a lost host lost the check"
+    );
+    assert_eq!(VisibleStop::from(stop), VisibleStop::HumanCheck(claude()));
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    let mut desk = Fake::new(|log: &Log| {
+        if log.reads <= 1 {
+            Ok(bot_check_page())
+        } else {
+            Err(DeskError::Unread("the page was busy".into()))
+        }
+    });
+    assert_eq!(
+        run(AUTHORIZE, &mut desk),
+        Err(Stop::BotCheck(claude())),
+        "reads that kept failing lost the check"
+    );
+
+    let mut desk = Fake::new(|_: &Log| Ok(bot_check_page()));
+    desk.cancel_after = Some(3);
+    assert_eq!(
+        run(AUTHORIZE, &mut desk),
+        Err(Stop::BotCheck(claude())),
+        "a pause of the account work lost the check"
+    );
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    // CONTROL: with no check met, the same ends keep their own.
+    let mut desk = Fake::new(|log: &Log| {
+        if log.reads <= 2 {
+            Ok(at(LOGIN))
+        } else {
+            Err(DeskError::Gone)
+        }
+    });
+    assert_eq!(run(AUTHORIZE, &mut desk), Err(Stop::Closed));
+
+    // CONTROL: a person who passed the check reached the callback, which nobody answered.
+    let mut desk = Fake::new(|log: &Log| {
+        Ok(if log.reads <= 2 {
+            bot_check_page()
+        } else {
+            at(CALLBACK)
+        })
+    });
+    assert_eq!(run(AUTHORIZE, &mut desk), Err(Stop::ListenerSilent));
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+}
+
 /// THE CODE IS VERIFIED ONLY ONCE IT IS IN THE FIELD: a code that did not take is set again a
 /// bounded number of times and `Verify email address` is never pressed over an empty field; a
 /// code page with no field for a code ends the sign-in; with no mailbox configured the page is
@@ -1308,14 +1452,14 @@ fn a_code_is_verified_only_once_the_field_holds_it() {
 /// mailbox the window reads, it never presses `Continue with email` (no login email is sent
 /// that nobody reads), and a code page ends it at the read that finds it, recorded as the code
 /// page's stop that holds a token step; a mailbox it dropped ends it as that mailbox's failure.
-/// The consent page's human check ends it at the read that finds it, and Cloudflare's check
-/// once it stood for [`UNATTENDED_BOT_CHECK`], well before the deadline: nothing on either is
-/// pressed or set.
-/// CONTROL: a sign-in a person started waits on the same code page, and an unattended one with
-/// a mailbox reads it and goes on.
+/// Every check ends it at the read that finds it, the consent page's human check and
+/// Cloudflare's check alike: nothing on either is pressed or set, and neither is waited on.
+/// CONTROL: a sign-in a person started waits on the same code page and on the same Cloudflare
+/// check (for the person at the desk) with nothing pressed, and an unattended one with a mailbox
+/// reads it and goes on.
 /// NEGATIVE CONTROL: with `step` waiting on the human check whatever `unattended` says, the
 /// held page is read until the deadline: `` the human check was waited on ``; with it waiting on
-/// Cloudflare's check to the deadline, `` Cloudflare's check was waited on to the deadline ``.
+/// Cloudflare's check, `` Cloudflare's check was waited on ``.
 #[test]
 fn a_sign_in_nobody_started_ends_at_once_at_a_code_page_no_mailbox_answers() {
     let mut desk = Fake::new(|log: &Log| {
@@ -1354,19 +1498,23 @@ fn a_sign_in_nobody_started_ends_at_once_at_a_code_page_no_mailbox_answers() {
     assert_eq!(desk.log.reads, 1, "the human check was waited on");
     assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
 
-    // Cloudflare's check: waited on as long as one that clears by itself takes, no longer.
+    // Cloudflare's check: nobody completes it either, and it is not waited on to clear.
     let mut desk = Fake::new(|_: &Log| Ok(bot_check_page()));
-    let began = desk.now;
     assert_eq!(
         run_as(AUTHORIZE, &mut desk, true),
         Err(Stop::BotCheck(Some("claude.ai".into())))
     );
-    let waited = desk.now - began;
-    assert!(waited >= UNATTENDED_BOT_CHECK, "{waited:?}");
-    assert!(
-        waited < WITHIN,
-        "Cloudflare's check was waited on to the deadline"
+    assert_eq!(desk.log.reads, 1, "Cloudflare's check was waited on");
+    assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
+
+    // CONTROL: a person's sign-in waits on the same check, for the person at the desk, with
+    // nothing pressed, until its deadline.
+    let mut desk = Fake::new(|_: &Log| Ok(bot_check_page()));
+    assert_eq!(
+        run_as(AUTHORIZE, &mut desk, false),
+        Err(Stop::BotCheck(Some("claude.ai".into())))
     );
+    assert!(desk.log.reads > 1);
     assert!(desk.log.pressed.is_empty() && desk.log.filled.is_empty());
 
     // CONTROL: a person's sign-in waits for them on the code page until its deadline.
@@ -1410,6 +1558,8 @@ fn a_page_read_is_parsed_whole_or_refused() {
             buttons: vec!["Continue with email".into(), "Continue with Google".into()],
             disabled: Vec::new(),
             check: None,
+            met: None,
+            doc: String::new(),
             code: Some(false),
         })
     );
@@ -1463,7 +1613,7 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
         literal("a\"b\\c\n</script>").unwrap(),
         r#""a\"b\\c\n</script>""#
     );
-    let fill = fill_script(Field::Code, "12\"; alert(1); \"", LOGIN, PINNED).unwrap();
+    let fill = fill_script(Field::Code, "12\"; alert(1); \"", (LOGIN, DOC), PINNED).unwrap();
     assert!(
         fill.contains(r#"const value = "12\"; alert(1); \"";"#),
         "{fill}"
@@ -1472,7 +1622,7 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
     let odd = press_script(
         Button::Authorize,
         EMAIL,
-        "https://claude.ai/\"; x(); \"",
+        ("https://claude.ai/\"; x(); \"", DOC),
         PINNED,
     )
     .unwrap();
@@ -1499,7 +1649,7 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
         .expect("the read's own-document test");
     assert!(foreign < read.find("document.title").expect("the read's title"));
     let at_check = read
-        .find("if (challenged()) return")
+        .find("if (met && !met.startsWith(\"human_check\")) return JSON.stringify(out);")
         .expect("the read's stop");
     assert!(foreign < at_check);
     assert!(
@@ -1514,16 +1664,20 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
         Button::VerifyEmailAddress,
         Button::Authorize,
     ] {
-        let press = press_script(button, EMAIL, LOGIN, PINNED).unwrap();
+        let press = press_script(button, EMAIL, (LOGIN, DOC), PINNED).unwrap();
         let foreign = press
             .find(r#"if (!own) return answer("foreign");"#)
             .expect("its own-document test");
         let moved = press
             .find(r#"if (here !== "https://claude.ai/login") return answer("moved");"#)
             .expect("its same-document test");
+        let same_doc = press
+            .find(r#"if (docOf() !== "1700000000000.5") return answer("moved");"#)
+            .expect("its same-document test");
         let stop = press
-            .find(r#"if (challenged()) return answer("unready");"#)
+            .find(r#"if (met) return answer("check:" + met);"#)
             .expect("its stop");
+        assert!(moved < same_doc && same_doc < stop, "{button:?}");
         let click = press.find("hit.click()").expect("its press");
         assert!(
             foreign < moved && moved < stop && stop < click,
@@ -1538,25 +1692,31 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
         assert_eq!(press.matches(".click()").count(), 1);
     }
     // `Continue with email` is pressed only over the account's own email, read at the press.
-    let press = press_script(Button::ContinueWithEmail, "One@Example.com", LOGIN, PINNED).unwrap();
+    let press = press_script(
+        Button::ContinueWithEmail,
+        "One@Example.com",
+        (LOGIN, DOC),
+        PINNED,
+    )
+    .unwrap();
     assert!(press.contains(r#"email = "one@example.com""#), "{press}");
     assert!(
-        press_script(Button::Authorize, EMAIL, CONSENT, PINNED)
+        press_script(Button::Authorize, EMAIL, (CONSENT, DOC), PINNED)
             .unwrap()
             .contains("email = null")
     );
     assert!(
-        press_script(Button::VerifyEmailAddress, EMAIL, LOGIN, PINNED)
+        press_script(Button::VerifyEmailAddress, EMAIL, (LOGIN, DOC), PINNED)
             .unwrap()
             .contains("code = true")
     );
     assert!(
-        press_script(Button::Authorize, EMAIL, CONSENT, PINNED)
+        press_script(Button::Authorize, EMAIL, (CONSENT, DOC), PINNED)
             .unwrap()
             .contains("code = false")
     );
     for field in [Field::Email, Field::Code] {
-        let fill = fill_script(field, "123456", LOGIN, PINNED).unwrap();
+        let fill = fill_script(field, "123456", (LOGIN, DOC), PINNED).unwrap();
         let foreign = fill
             .find(r#"if (!own) return answer("foreign");"#)
             .expect("its own-document test");
@@ -1564,7 +1724,7 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
             .find(r#"if (here !== "https://claude.ai/login") return answer("moved");"#)
             .expect("its same-document test");
         let stop = fill
-            .find(r#"if (challenged()) return answer("unready");"#)
+            .find(r#"if (met) return answer("check:" + met);"#)
             .expect("its stop");
         assert!(foreign < moved && moved < stop);
         // Every set follows the stop.
@@ -1586,6 +1746,11 @@ fn script_values_are_literals_and_every_script_acts_only_in_its_own_document() {
 
 /// The hosts a loopback sign-in's documents are read and acted in.
 const PINNED: &[&str] = &["claude.ai", "claude.com"];
+
+/// The document a script's acts are pinned to (`performance.timeOrigin`), and the one every
+/// page of a fake desk is read in, as the real window reads it (never empty): claude.ai routes
+/// its sign-in within one document.
+const DOC: &str = "1700000000000.5";
 
 /// A BUTTON IS ITS WHOLE TEXT: white space and letter case apart, never a part of a longer
 /// one's.
@@ -2021,11 +2186,12 @@ fn the_account_a_consent_page_names_is_read_from_its_addresses() {
     }
 }
 
-/// A HUMAN CHECK THAT HELD AN EARLIER PAGE IS NOT WHY A LATER ONE RAN OUT OF TIME: each read
-/// says anew whether the check holds the page, so a sign-in whose consent page gave way to a
-/// page that never loaded ends on that page, and one whose check still stands ends naming it.
+/// A HUMAN CHECK MET ONCE NAMES THE END: after it the run only reads, so a sign-in whose
+/// checked consent page gave way to a page that never loaded, or to one with none of the flow's
+/// buttons, ends naming the check it met, never as a page that timed out. The callback, which a
+/// person's completion reaches, still ends it on its own terms.
 #[test]
-fn a_human_check_names_the_end_only_while_it_stands() {
+fn a_human_check_met_once_names_the_end() {
     const NAMED: &str = "Claude Code would like to connect. Logged in as one@example.com";
     let mut desk = Fake::new(|log: &Log| {
         Ok(if log.reads < 10 {
@@ -2036,7 +2202,7 @@ fn a_human_check_names_the_end_only_while_it_stands() {
     });
     assert_eq!(
         run(AUTHORIZE, &mut desk),
-        Err(Stop::TimedOut(Phase::Opening))
+        Err(Stop::HumanCheck(Some("claude.ai".into())))
     );
     // The same for the callback's branch: the page left the check for the callback, which
     // the listener never answered.
@@ -2058,7 +2224,7 @@ fn a_human_check_names_the_end_only_while_it_stands() {
     });
     assert_eq!(
         run(AUTHORIZE, &mut desk),
-        Err(Stop::TimedOut(Phase::Waiting))
+        Err(Stop::HumanCheck(Some("claude.ai".into())))
     );
 }
 
@@ -2193,7 +2359,10 @@ fn a_session_that_is_not_the_accounts_is_forgotten() {
 /// A PRESS OR A SET THAT FAILED IS TRIED AGAIN, counted with the reads that failed: a few do
 /// not end the sign-in, and the code the mailbox gave once is held through them; as many in a
 /// row as end it on reads end it. A SET IN A DOCUMENT THAT MOVED IS COUNTED AGAINST NOTHING:
-/// the page is read again.
+/// the page is read again. Every page is read in one document ([`DOC`]), as claude.ai's are.
+/// NEGATIVE CONTROL: with an act that failed barring every later act in its document (the
+/// branch's first form, `unread_act_in`), the first flow reads to its deadline:
+/// `` left: Err(TimedOut(..)) ``.
 #[test]
 fn an_act_that_failed_is_tried_again_and_counted_with_the_reads() {
     let mut desk = Fake::new(whole_flow).with_mail(|_| Ok(MailboxCredential::Otp("123456".into())));
@@ -2230,6 +2399,56 @@ fn an_act_that_failed_is_tried_again_and_counted_with_the_reads() {
     });
     assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered));
     assert_eq!(desk.log.polls, 1);
+}
+
+/// A CHECK READ AT AN ACT ENDS EVERY ACT AFTER IT: where a press or a set answers that the page
+/// carries a check (one drawn between the read and the act), nothing was done there; the run
+/// latches the check, presses, sets and opens nothing more, and ends naming it at its deadline,
+/// for a person at this Mac. A block page read at an act ends the run at once.
+/// NEGATIVE CONTROL: with `did.meet` keeping no check it was handed (`self.met` never set), the
+/// flow goes on past act 0's check and delivers: `` act 0 `` (`left: Ok(Delivered)`); the same
+/// flow with no check at its acts finishes.
+#[test]
+fn a_check_read_at_an_act_ends_every_act_after_it() {
+    let flow = || Fake::new(whole_flow).with_mail(|_| Ok(MailboxCredential::Otp("123456".into())));
+    for nth in 0..5 {
+        for (check, stop) in [
+            (
+                CheckMet::HumanCheck("hCaptcha".into()),
+                Stop::HumanCheck(Some("claude.ai".into())),
+            ),
+            (CheckMet::BotCheck, Stop::BotCheck(Some("claude.ai".into()))),
+        ] {
+            let mut desk = flow();
+            desk.act_check = Some((nth, check));
+            let began = desk.now;
+            assert_eq!(run(AUTHORIZE, &mut desk), Err(stop), "act {nth}");
+            assert_eq!(
+                desk.log.acted_at.len(),
+                nth + 1,
+                "an act after the check at act {nth}"
+            );
+            assert!(
+                desk.now - began >= WITHIN,
+                "act {nth}: it ended before its deadline"
+            );
+            assert!(
+                desk.log.went.is_empty() && desk.log.links.is_empty(),
+                "act {nth}"
+            );
+        }
+    }
+    let mut desk = flow();
+    desk.act_check = Some((1, CheckMet::BlockPage));
+    assert_eq!(
+        run(AUTHORIZE, &mut desk),
+        Err(Stop::BlockPage(Some("claude.ai".into())))
+    );
+    assert_eq!(desk.log.acted_at.len(), 2);
+    // CONTROL: the same flow with no check at its acts finishes.
+    let mut desk = flow();
+    assert_eq!(run(AUTHORIZE, &mut desk), Ok(Done::Delivered));
+    assert_eq!(desk.log.acted_at.len(), 5);
 }
 
 /// ONE SIGN-IN WINDOW AT A TIME ON THIS MAC, a token's included: the window's turn is a lock
@@ -2582,16 +2801,16 @@ fn the_windows_desk_judges_each_answer_by_the_document_that_gave_it() {
 
     assert_eq!(
         desk.press(Button::ContinueWithEmail, EMAIL, LOGIN),
-        Ok(true)
+        Ok(Pressed::Yes)
     );
     // Pressed in another document than the one the press was made for: not this press.
-    assert_eq!(desk.press(Button::Authorize, EMAIL, LOGIN), Ok(false));
-    assert_eq!(desk.press(Button::Authorize, EMAIL, LOGIN), Ok(false));
+    assert_eq!(desk.press(Button::Authorize, EMAIL, LOGIN), Ok(Pressed::No));
+    assert_eq!(desk.press(Button::Authorize, EMAIL, LOGIN), Ok(Pressed::No));
     // A document that is not the flow's: nothing is sent.
     let sent = desk.host.as_ref().unwrap().next;
     assert_eq!(
         desk.press(Button::Authorize, EMAIL, "https://example.invalid/consent"),
-        Ok(false)
+        Ok(Pressed::No)
     );
     assert_eq!(
         desk.fill(Field::Code, "123456", "https://example.invalid/login"),

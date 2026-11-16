@@ -9,6 +9,7 @@ use crate::items::defaults::tests::user;
 use crate::port::{Fake, GithubResponse, Live, Ran, Stat};
 use std::path::PathBuf;
 
+mod advertised_clone_tests;
 mod clone_route_tests;
 mod default_branch_tests;
 mod hook_installer_tests;
@@ -64,28 +65,27 @@ fn json(body: &str) -> Result<GithubResponse, String> {
 /// `path` a finished checkout of alice's `name`: [`script_worktree`], with a HEAD commit and
 /// its index.
 pub(in crate::init_github) fn script_existing(sys: &Fake, who: &User, path: &Path, name: &str) {
-    script_existing_head(sys, who, path, name, Ran::ok(&format!("{A}\n")));
+    script_existing_head(sys, who, path, name, Some(A));
     script_index(sys, path);
 }
 
 /// `path` a top-level worktree of alice's `name` at its GitHub origin ([`script_worktree`])
-/// whose HEAD read hears `head`, its index unscripted.
-fn script_existing_head(sys: &Fake, who: &User, path: &Path, name: &str, head: Ran) {
+/// whose HEAD names `head` ([`script_head`]), its index unscripted.
+fn script_existing_head(sys: &Fake, who: &User, path: &Path, name: &str, head: Option<&str>) {
     script_worktree(sys, who, path, name);
     script_head(sys, who, path, head);
 }
 
 /// What [`verify_existing`] and [`crate::checkout::unborn`] hear of whether `path`'s HEAD
-/// names a commit it has ([`crate::checkout::head_commit`]).
-pub(in crate::init_github) fn script_head(sys: &Fake, who: &User, path: &Path, reply: Ran) {
-    sys.on(
-        &crate::checkout::head_commit(sys, who, path).display(),
-        reply,
-    );
+/// names a commit it has: the refs its record of facts reads
+/// ([`crate::checkout::facts::tests::script_refs`]), `main` and `origin/main` at `head`, or
+/// neither (a branch with no commit). Each scripted answer is heard in turn, the last again.
+pub(in crate::init_github) fn script_head(sys: &Fake, who: &User, path: &Path, head: Option<&str>) {
+    crate::checkout::facts::tests::script_refs(sys, who, path, head);
 }
 
-/// Where a scripted checkout at `path` keeps its index ([`WORKTREE_READ`]): in a git
-/// directory outside the worktree, as a linked worktree's is, so that no staging the fake
+/// Where a scripted checkout at `path` keeps its index (its record's `--git-path index`): in a
+/// git directory outside the worktree, as a linked worktree's is, so that no staging the fake
 /// allocates and no publish rename it checks for a collision meets it.
 pub(in crate::init_github) fn fake_index(path: &Path) -> PathBuf {
     Path::new("/fake-git-dirs")
@@ -98,66 +98,31 @@ pub(in crate::init_github) fn script_index(sys: &Fake, path: &Path) {
     sys.file(fake_index(path).to_str().unwrap(), b"DIRC");
 }
 
-/// `path` a top-level worktree of alice's `name` at its GitHub origin, its HEAD unscripted.
+/// `path` a top-level worktree of alice's `name` at its GitHub origin, `main` tracking origin's
+/// ([`crate::checkout::facts::tests::script`]), its refs unscripted ([`script_head`]).
 pub(in crate::init_github) fn script_worktree(sys: &Fake, who: &User, path: &Path, name: &str) {
-    for (args, output) in [
-        (
-            WORKTREE_READ.to_vec(),
-            format!(
-                "true\n\n{}\n{}\n",
-                path.display(),
-                fake_index(path).display()
-            ),
-        ),
-        // What `checkout::read` asks of a worktree it aligns.
-        (
-            vec!["rev-parse", "--is-inside-work-tree"],
-            "true\n".to_owned(),
-        ),
-        (vec!["rev-parse", "--show-prefix"], String::new()),
-        (
-            vec!["config", "--get-all", "remote.origin.url"],
-            format!("https://github.com/alice/{name}.git\n"),
-        ),
-        (
-            vec!["rev-parse", "--is-shallow-repository"],
-            "false\n".into(),
-        ),
-    ] {
-        sys.on(
-            &git(sys, who, Some(path)).args(args).display(),
-            Ran::ok(&output),
-        );
-    }
-    sys.on(
-        &partial_listing(git(sys, who, Some(path))).display(),
-        Ran::exit(1, ""),
+    let origin = format!("https://github.com/alice/{name}.git");
+    crate::checkout::facts::tests::script(
+        sys,
+        who,
+        path,
+        &fake_index(path),
+        &[
+            ("remote.origin.url", origin.as_str()),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ],
     );
 }
 
+/// What a read of the checkout at `path` asks beyond its record of facts: where git reaches
+/// origin, and the `status` that says whether its files hold the person's own work.
 fn script_read(sys: &Fake, who: &User, path: &Path, name: &str, status: &str) {
-    for (args, output) in [
-        (
-            vec!["ls-remote", "--get-url", "origin"],
-            format!("https://github.com/alice/{name}.git\n"),
-        ),
-        (
-            vec!["symbolic-ref", "--quiet", "HEAD"],
-            "refs/heads/main\n".to_owned(),
-        ),
-        (
-            vec!["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-            format!("{A}\n"),
-        ),
-    ] {
-        sys.on(
-            &git(sys, who, Some(path)).args(args).display(),
-            Ran::ok(&output),
-        );
-    }
     sys.on(
-        &crate::checkout::Programs::listing(git(sys, who, Some(path))).display(),
-        Ran::exit(1, ""),
+        &git(sys, who, Some(path))
+            .args(["ls-remote", "--get-url", "origin"])
+            .display(),
+        Ran::ok(&format!("https://github.com/alice/{name}.git\n")),
     );
     sys.on(
         &crate::checkout::Programs::default()
@@ -247,7 +212,7 @@ fn each_clone_a_pass_admits_holds_its_room_for_the_ones_after_it() {
         repo
     };
     let missing = [sized("one", 0), sized("two", 1)];
-    let cloned = clone_all(&sys, &who, &missing, None);
+    let cloned = clone_all(&sys, &who, &missing, &[], &BTreeSet::new(), None, None);
     let names: Vec<&str> = cloned
         .cloned
         .iter()
@@ -373,8 +338,7 @@ fn clone_failures_publish_typed_reasons_without_transport_or_callback_diagnostic
         let (repo, _, _) = script_clone(&sys, &who, false);
         let stderr = diagnostic.clone();
         sys.simulate(move |_, command| {
-            (network && command.args.iter().any(|arg| arg == "clone"))
-                .then(|| Ran::exit(128, &stderr))
+            (network && fetches_advertised(&command.display())).then(|| Ran::exit(128, &stderr))
         });
         let current = || {
             if network {
@@ -384,7 +348,15 @@ fn clone_failures_publish_typed_reasons_without_transport_or_callback_diagnostic
             }
         };
         let guard = CloneGuard::new(&current);
-        let result = clone_all(&sys, &who, &[repo], Some(&guard));
+        let result = clone_all(
+            &sys,
+            &who,
+            &[repo],
+            &[],
+            &BTreeSet::new(),
+            Some(&guard),
+            None,
+        );
         assert_eq!(result.failed.len(), 1);
         let observed = sys.repository_observations();
         let row = observed.last().unwrap();
@@ -414,6 +386,52 @@ fn clone_failures_publish_typed_reasons_without_transport_or_callback_diagnostic
     }
 }
 
+/// A STALLED CLONE IS A NETWORK FAILURE: a clone whose transfer made no progress for its window
+/// ([`crate::port::RunFailed::Stalled`]) fails its line and its row as the network's, counts
+/// toward the pass's network failures, and says it made no progress; it is never a local fault.
+/// NEGATIVE CONTROL: the same clone ended at a wall-clock deadline ([`Fake::time_out`]) fails as
+/// local, outside the network count.
+#[test]
+fn a_stalled_clone_is_a_network_failure() {
+    use crate::repository_progress::{FailureKind, OutcomeReason};
+    for stalled in [true, false] {
+        let (sys, who) = fixture();
+        let (repo, _, key) = script_clone(&sys, &who, false);
+        if stalled {
+            sys.stall(&key);
+        } else {
+            sys.time_out(&key);
+        }
+        let cloned = clone_all(&sys, &who, &[repo], &[], &BTreeSet::new(), None, None);
+        assert!(cloned.cloned.is_empty(), "stalled={stalled}");
+        assert_eq!(
+            cloned.failed.len(),
+            1,
+            "stalled={stalled}: {:?}",
+            cloned.failed
+        );
+        assert_eq!(cloned.network_failed, stalled, "{:?}", cloned.failed);
+        assert_eq!(
+            cloned.failed[0].contains("GitHub clone did not finish (no progress for"),
+            stalled,
+            "{:?}",
+            cloned.failed
+        );
+        let observed = sys.repository_observations();
+        let row = observed.last().unwrap();
+        assert_eq!(row.phase, Phase::Failed);
+        assert!(!row.usable && !row.placed);
+        assert_eq!(
+            row.outcome.as_ref().unwrap().reason,
+            OutcomeReason::Failed(if stalled {
+                FailureKind::Network
+            } else {
+                FailureKind::Local
+            })
+        );
+    }
+}
+
 /// A clone of github.com/alice/`name` into the `sequence`th staging directory the run
 /// allocates, scripted from its first read to its last.
 pub(in crate::init_github) fn script_clone_named(
@@ -427,34 +445,29 @@ pub(in crate::init_github) fn script_clone_named(
 }
 
 /// Where the `sequence`th clone of github.com/alice/`name` stages its repository, and the
-/// display of that clone's command, under which a script adds what the clone writes.
+/// display of that clone's one fetch of what GitHub advertised ([`fetch_command`]), under which
+/// a script adds what the clone writes.
 pub(in crate::init_github) fn clone_key(
     sys: &Fake,
     who: &User,
     name: &str,
     sequence: u64,
 ) -> (PathBuf, String) {
-    let staged =
-        Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence).join("repo");
-    let command = crate::checkout::network(sys, who, None)
-        .budget(CLONE_BUDGET)
-        .args([
-            "clone",
-            "--no-single-branch",
-            "--tags",
-            "--origin",
-            "origin",
-            "--template=",
-            "--progress",
-            "--",
-            &format!("https://github.com/alice/{name}.git"),
-        ])
-        .arg(&staged);
+    let staging = Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", sequence);
+    let staged = staged(&staging);
+    let command = fetch_command(
+        &crate::checkout::network(sys, who, None),
+        &staged,
+        &format!("https://github.com/alice/{name}.git"),
+        &staging.join(ADVERTISED),
+    );
     (staged, command.display())
 }
 
 /// [`script_clone_named`], its effective URL a same-repository SSH rewrite when `rewritten`:
-/// the person's own URL, which the clone keeps, under aterm's credential route.
+/// the person's own URL, which the clone keeps, under aterm's credential route. The display it
+/// hands back is the one the clone's content arrives under: its fetch ([`clone_key`]), or, for
+/// an `empty` remote, which fetches nothing, its `git init`.
 pub(in crate::init_github) fn script_clone_named_route(
     sys: &Fake,
     who: &User,
@@ -503,30 +516,44 @@ pub(in crate::init_github) fn script_clone_named_route(
         "refs/tags/*",
     ]);
     sys.on(&command.display(), Ran::ok(&remote));
-    let (staged, clone_key) = clone_key(sys, who, name, sequence);
-    sys.on(&clone_key, Ran::ok(""));
-    sys.on_stat(&clone_key, &staged, directory(who.uid));
-    sys.on_stat(&clone_key, &staged.join(".git"), directory(who.uid));
-    sys.on_stat(&clone_key, &staged.join(".git/objects"), directory(who.uid));
-    sys.on_write(&clone_key, &staged.join(".git/fixture"), b"complete clone");
-    script_existing_head(
-        sys,
-        who,
-        &staged,
-        name,
-        if empty {
-            Ran::exit(1, "")
-        } else {
-            Ran::ok(&format!("{A}\n"))
-        },
-    );
-    if !empty {
-        // A finished clone of a commit: git wrote its index as the clone ran.
-        sys.on_write(&clone_key, &fake_index(&staged), b"DIRC");
+    // What the clone runs in its staging ([`clone_advertised`]): its `git init`, which makes the
+    // repository, origin's configuration, and, for a remote with a commit, its fetch, origin's
+    // HEAD and the checkout that writes its index.
+    let (staged, fetch) = clone_key(sys, who, name, sequence);
+    let init = init_command(&route(), "sha1", Some("main"), &staged).display();
+    sys.on(&init, Ran::ok(""));
+    sys.on_stat(&init, &staged, directory(who.uid));
+    sys.on_stat(&init, &staged.join(".git"), directory(who.uid));
+    sys.on_stat(&init, &staged.join(".git/objects"), directory(who.uid));
+    sys.on_write(&init, &staged.join(".git/fixture"), b"complete clone");
+    let mut configured = vec![
+        ("remote.origin.url", url.to_owned()),
+        ("remote.origin.fetch", ORIGIN_FETCH.to_owned()),
+    ];
+    if empty {
+        configured.push(("branch.main.remote", "origin".to_owned()));
+        configured.push(("branch.main.merge", "refs/heads/main".to_owned()));
+    } else {
+        sys.on(&fetch, Ran::ok(""));
+        sys.on(
+            &origin_head_command(&route(), &staged, "main").display(),
+            Ran::ok(""),
+        );
+        let checkout = checkout_command(&route(), &staged, "main").display();
+        sys.on(&checkout, Ran::ok(""));
+        // A finished clone of a commit: git wrote its index as it checked it out.
+        sys.on_write(&checkout, &fake_index(&staged), b"DIRC");
     }
+    for (key, value) in &configured {
+        sys.on(
+            &config_command(&route(), &staged, key, value).display(),
+            Ran::ok(""),
+        );
+    }
+    script_existing_head(sys, who, &staged, name, (!empty).then_some(A));
     if empty {
         let destination = Path::new(&who.home).join(name);
-        script_existing_head(sys, who, &destination, name, Ran::exit(1, ""));
+        script_existing_head(sys, who, &destination, name, None);
         for (index, path) in [
             destination.clone(),
             destination.join(".git"),
@@ -546,18 +573,6 @@ pub(in crate::init_github) fn script_clone_named_route(
         }
         for (args, ran) in [
             (
-                vec!["symbolic-ref", "--quiet", "--short", "HEAD"],
-                Ran::ok("main\n"),
-            ),
-            (
-                vec!["show-ref", "--verify", "--quiet", "refs/heads/main"],
-                Ran::exit(1, ""),
-            ),
-            (
-                vec!["rev-parse", "--git-path", "objects/info/alternates"],
-                Ran::ok(".git/objects/info/alternates\n"),
-            ),
-            (
                 vec!["for-each-ref", "--format=%(objectname) %(refname)"],
                 Ran::ok(""),
             ),
@@ -569,12 +584,6 @@ pub(in crate::init_github) fn script_clone_named_route(
             sys.on(&git(sys, who, Some(&destination)).args(args).display(), ran);
         }
     }
-    sys.on(
-        &git(sys, who, Some(&staged))
-            .args(["rev-parse", "--git-path", "objects/info/alternates"])
-            .display(),
-        Ran::ok(".git/objects/info/alternates\n"),
-    );
     let head = git(sys, who, Some(&staged)).args(["rev-parse", "--verify", "HEAD^{commit}"]);
     sys.on(
         &head.display(),
@@ -596,12 +605,6 @@ pub(in crate::init_github) fn script_clone_named_route(
             .args(["for-each-ref", "--format=%(objectname) %(refname)"])
             .display(),
         Ran::ok(&refs),
-    );
-    sys.on(
-        &git(sys, who, Some(&staged))
-            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
-            .display(),
-        Ran::ok(""),
     );
     sys.on(
         &git(sys, who, Some(&staged))
@@ -633,7 +636,7 @@ pub(in crate::init_github) fn script_clone_named_route(
             .display(),
         Ran::ok(""),
     );
-    (repo, staged, clone_key)
+    (repo, staged, if empty { init } else { fetch })
 }
 
 /// A clone's publish rename is not repeated safely, so it holds the update boundary while
@@ -713,7 +716,7 @@ fn guarded_clones_carry_the_route_and_refuse_newer_versions() {
     for changed in [false, true] {
         let (sys, who) = fixture();
         let current = || {
-            if changed && sys.calls().iter().any(|call| call.contains(" clone ")) {
+            if changed && sys.calls().iter().any(|call| fetches_advertised(call)) {
                 Err("injected newer vault version".into())
             } else {
                 Ok(())
@@ -727,7 +730,7 @@ fn guarded_clones_carry_the_route_and_refuse_newer_versions() {
         let calls = sys.calls();
         let network: Vec<_> = calls
             .iter()
-            .filter(|call| call.contains("ls-remote --symref") || call.contains(" clone "))
+            .filter(|call| call.contains("ls-remote --symref") || fetches_advertised(call))
             .collect();
         assert_eq!(network.len(), 2, "{calls:?}");
         assert!(
@@ -779,7 +782,7 @@ fn a_clone_that_finds_the_repository_in_place_at_its_origin_is_done() {
         assert!(sys.read_file(&destination.join(".git/fixture")).is_err());
         assert!(sys.stat(&staged).is_err(), "{at_publish}");
         assert_eq!(
-            sys.calls().iter().any(|call| call.contains(" clone ")),
+            sys.calls().iter().any(|call| fetches_advertised(call)),
             at_publish,
             "{:?}",
             sys.calls()
@@ -799,7 +802,7 @@ fn a_racing_checkout_with_no_commit_is_never_in_place() {
         let (sys, who) = fixture();
         let (repo, _, clone_key) = script_clone(&sys, &who, false);
         let destination = Path::new(&who.home).join("new");
-        script_existing_head(&sys, &who, &destination, "new", Ran::exit(1, ""));
+        script_existing_head(&sys, &who, &destination, "new", None);
         if at_publish {
             sys.on_stat(&clone_key, &destination, directory(who.uid));
             sys.on_write(&clone_key, &destination.join(".git/racer"), b"racing clone");
@@ -831,10 +834,9 @@ fn failure_or_a_destination_created_during_clone_never_overwrites_owner_data() {
         let (sys, who) = fixture();
         let staged = Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
         if !race {
+            // The clone's record of facts cannot be read.
             sys.on(
-                &git(&sys, &who, Some(&staged))
-                    .args(["rev-parse", "--is-shallow-repository"])
-                    .display(),
+                &crate::checkout::facts::rev_parse(&sys, &who, &staged).display(),
                 Ran::exit(1, "failure includes secret-like bytes that must not escape"),
             );
         }
@@ -884,7 +886,7 @@ fn failure_or_a_destination_created_during_clone_never_overwrites_owner_data() {
         let error = clone_one(&sys, &who, "alice", &repo).unwrap_err();
         assert!(!error.contains(endpoint) || endpoint.is_empty());
         assert!(sys.calls().iter().all(|call| !call.contains("--symref")
-            && !call.contains(" clone ")
+            && !fetches_advertised(call)
             && !call.contains("scratch allocated")));
     }
     let (sys, who) = fixture();
@@ -904,14 +906,14 @@ fn failure_or_a_destination_created_during_clone_never_overwrites_owner_data() {
     assert!(
         sys.calls()
             .iter()
-            .all(|call| !call.contains(" clone ") && !call.contains("scratch allocated"))
+            .all(|call| !fetches_advertised(call) && !call.contains("scratch allocated"))
     );
 }
 
 /// A promisor remote whose name is not UTF-8 makes a partial clone as any other does, and
-/// [`verify_integrity`] refuses it: [`partial_listing`] reads the config in the C locale.
-/// Under the account's UTF-8 locale git's `.` matches no such byte, the remote went unlisted
-/// and the check passed. The controls: a repository with no promisor passes; this one's
+/// [`verify_integrity`] refuses it: the checkout's record lists its config in the C locale
+/// ([`crate::checkout::facts::config_listing`]). Under the account's UTF-8 locale git's `.`
+/// matches no such byte, the remote went unlisted and the check passed. The controls: a repository with no promisor passes; this one's
 /// remote is live (a read of an object the repository lacks, lazy fetches allowed, fetches it
 /// from there); and the same listing under the account's own locale misses it (a COULD NOT
 /// RUN where it does not, a host whose git matches those bytes there or lacks the locale).
@@ -975,7 +977,7 @@ fn a_promisor_remote_named_in_bytes_that_are_not_utf8_is_refused() {
         .run_complete_stdout(&git(&sys, &who, Some(&repo)).args([
             "config",
             "--get-regexp",
-            PARTIAL_KEYS,
+            r"^remote\..*\.promisor$",
         ]))
         .unwrap();
     if unlisted.status != Some(1) {
@@ -1081,11 +1083,12 @@ fn matching_real_dirty_worktree_on_an_alternate_branch_is_only_read() {
 /// A checkout in `~` that a `git clone` left unfinished (killed, or cut off by a power loss)
 /// is no repository present, whoever made it. One cut off after it fetched and before it
 /// wrote its files has a commit and no index (with its lock or without), and one whose
-/// branch names a commit it never fetched has a ref and no commit: each is left untouched
-/// under a note. One cut off before it fetched anything has an unborn HEAD, as an empty
-/// repository's clone has: no note, and it is the unfinished-checkout path's
+/// branch names a commit it never fetched has a ref git cannot read (its record's
+/// `for-each-ref` fails, as git 2.56's does on a ref to an object it lacks): each is left
+/// untouched under a note. One cut off before it fetched anything has an unborn HEAD, as an
+/// empty repository's clone has: no note, and it is the unfinished-checkout path's
 /// ([`Partition::unborn`]), which GitHub's advertisement decides ([`observe_unborn`]). The
-/// HEAD read fetches nothing. Before, a commit with no index read present.
+/// record's ref read fetches nothing. Before, a commit with no index read present.
 /// NEGATIVE CONTROL: a finished checkout, its commit and its index there, is present.
 #[test]
 fn a_checkout_a_clone_left_unfinished_is_not_present() {
@@ -1108,48 +1111,30 @@ fn a_checkout_a_clone_left_unfinished_is_not_present() {
         let path = Path::new(&who.home).join("partial");
         sys.stat_of(path.to_str().unwrap(), directory(who.uid));
         script_worktree(&sys, &who, &path, "partial");
-        // `checkout::unborn`'s reads of a HEAD that names no commit here: its branch, and
-        // whether a ref names one (exit 1: none; 128: one git cannot read).
-        let branch = |reference: Ran| {
-            sys.on(
-                &git(&sys, &who, Some(&path))
-                    .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
-                    .display(),
-                Ran::ok("main\n"),
-            );
-            sys.on(
-                &git(&sys, &who, Some(&path))
-                    .args(["show-ref", "--verify", "--quiet", "refs/heads/main"])
-                    .display(),
-                reference,
-            );
-        };
+        let refs = crate::checkout::facts::tests::main_refs(&sys, &who, &path).display();
         match case {
             Case::Finished => {
-                script_head(&sys, &who, &path, Ran::ok(&format!("{A}\n")));
+                script_head(&sys, &who, &path, Some(A));
                 script_index(&sys, &path);
             }
-            Case::Unborn => {
-                script_head(&sys, &who, &path, Ran::exit(1, ""));
-                branch(Ran::exit(1, ""));
-            }
+            Case::Unborn => script_head(&sys, &who, &path, None),
             Case::CommitNeverFetched => {
-                script_head(&sys, &who, &path, Ran::exit(1, ""));
-                // As git 2.56 says of a ref to a commit it lacks.
-                branch(Ran::exit(
-                    128,
-                    &format!("fatal: git show-ref: bad ref refs/heads/main ({A})\n"),
-                ));
+                // As git 2.56's `for-each-ref` says of a ref to an object it lacks.
+                sys.on(
+                    &refs,
+                    Ran::exit(
+                        128,
+                        &format!("fatal: missing object {A} for refs/heads/main\n"),
+                    ),
+                );
             }
             Case::CutInCheckout => {
-                script_head(&sys, &who, &path, Ran::ok(&format!("{A}\n")));
+                script_head(&sys, &who, &path, Some(A));
                 // The lock sits beside the index the worktree read named.
                 let lock = fake_index(&path).with_file_name("index.lock");
                 sys.file(lock.to_str().unwrap(), b"");
             }
-            Case::CutBeforeCheckout => {
-                script_head(&sys, &who, &path, Ran::ok(&format!("{A}\n")));
-            }
+            Case::CutBeforeCheckout => script_head(&sys, &who, &path, Some(A)),
         }
         let repo = Repo {
             owner: "alice".into(),
@@ -1161,10 +1146,7 @@ fn a_checkout_a_clone_left_unfinished_is_not_present() {
             required_submodules: Vec::new(),
         };
         let standing = partition(&sys, &who, std::slice::from_ref(&repo)).unwrap();
-        let noted = standing
-            .notes
-            .iter()
-            .any(|note| note.starts_with("~/partial"));
+        let noted = standing.notes.iter().any(|note| note.contains("~/partial"));
         assert_eq!(
             (
                 standing.present.len(),
@@ -1184,27 +1166,54 @@ fn a_checkout_a_clone_left_unfinished_is_not_present() {
             "{case:?}: {:?}",
             standing.notes
         );
-        let head = crate::checkout::head_commit(&sys, &who, &path).display();
         assert!(
-            sys.calls().contains(&head) && head.contains("GIT_NO_LAZY_FETCH=1 "),
-            "{case:?}: the HEAD read fetches nothing: {:?}",
+            sys.calls().contains(&refs) && refs.contains("GIT_NO_LAZY_FETCH=1 "),
+            "{case:?}: the ref read fetches nothing: {:?}",
             sys.calls()
         );
     }
 }
 
+/// A DELIBERATELY SHALLOW OR PARTIAL CHECKOUT THAT MATCHES IS PRESERVED: its record says it is
+/// shallow and a promisor remote's, and [`verify_existing`] admits it all the same, with no
+/// `fsck` and no fetch; only a new clone's [`verify_integrity`] refuses those.
+/// NEGATIVE CONTROL: [`verify_integrity`] over the same record refuses it.
 #[test]
 fn deliberately_shallow_or_partial_matching_existing_checkout_is_preserved_without_integrity_probes()
  {
     let (sys, who) = fixture();
     let path = Path::new(&who.home).join("existing");
-    script_existing(&sys, &who, &path, "existing");
-    sys.refuse_complete_stdout(
-        &git(&sys, &who, Some(&path))
-            .args(["rev-parse", "--is-shallow-repository"])
-            .display(),
-        "history intentionally unavailable",
+    let index = fake_index(&path);
+    sys.on(
+        &crate::checkout::facts::rev_parse(&sys, &who, &path).display(),
+        Ran::ok(&format!(
+            "true\n\n{}\ntrue\n{}\n{}\n",
+            path.display(),
+            index.display(),
+            index.with_file_name("objects/info/alternates").display()
+        )),
     );
+    sys.on(
+        &crate::checkout::facts::config_listing(&sys, &who, &path).display(),
+        Ran::ok(&crate::checkout::facts::tests::listing_of(&[
+            ("remote.origin.url", "https://github.com/alice/existing.git"),
+            ("remote.origin.promisor", "true"),
+            ("remote.origin.partialclonefilter", "blob:none"),
+        ])),
+    );
+    for (reference, target) in [
+        ("HEAD", "refs/heads/main\n"),
+        ("refs/remotes/origin/HEAD", "refs/remotes/origin/main\n"),
+    ] {
+        sys.on(
+            &git(&sys, &who, Some(&path))
+                .args(["symbolic-ref", "--quiet", reference])
+                .display(),
+            Ran::ok(target),
+        );
+    }
+    script_head(&sys, &who, &path, Some(A));
+    script_index(&sys, &path);
     let repo = Repo {
         owner: "alice".into(),
         name: "existing".into(),
@@ -1215,10 +1224,17 @@ fn deliberately_shallow_or_partial_matching_existing_checkout_is_preserved_witho
         required_submodules: Vec::new(),
     };
     verify_existing(&sys, &who, "alice", &repo, &path).unwrap();
-    assert!(sys.calls().iter().all(|call| !call.contains("shallow")
-        && !call.contains("partialclone")
-        && !call.contains("fsck")
-        && !call.contains("fetch")));
+    assert!(
+        verify_integrity(&sys, &who, &path).is_err(),
+        "control: the same record is no new clone's"
+    );
+    assert!(
+        sys.calls()
+            .iter()
+            .all(|call| !call.contains("fsck") && !call.contains(" fetch")),
+        "{:?}",
+        sys.calls()
+    );
 }
 
 #[test]
@@ -1240,10 +1256,35 @@ fn dirty_new_checkout_or_incorrect_tracking_is_never_published() {
     ] {
         let (sys, who) = fixture();
         let staged = Fake::scratch_path(Some(Path::new(&who.home)), "github-clone", 0).join("repo");
-        sys.on(
-            &git(&sys, &who, Some(&staged)).args(args).display(),
-            Ran::ok(bad),
-        );
+        let key = git(&sys, &who, Some(&staged))
+            .args(args.iter().copied())
+            .display();
+        if args[0] == "symbolic-ref" {
+            // Every read of origin's HEAD hears it, the clone's record's included, whose ref
+            // read then asks for `origin/other`, which the clone does not hold.
+            let refs = crate::checkout::facts::ref_listing(
+                &sys,
+                &who,
+                &staged,
+                &[
+                    "refs/heads/main".to_owned(),
+                    "refs/remotes/origin/other".to_owned(),
+                ],
+            )
+            .display();
+            sys.simulate(move |_, command| {
+                let shown = command.display();
+                if shown == key {
+                    Some(Ran::ok(bad))
+                } else if shown == refs {
+                    Some(Ran::ok(&format!("{A} commit refs/heads/main\n")))
+                } else {
+                    None
+                }
+            });
+        } else {
+            sys.on(&key, Ran::ok(bad));
+        }
         let (repo, _, _) = script_clone(&sys, &who, false);
         assert!(clone_one(&sys, &who, "alice", &repo).is_err());
         assert!(sys.stat(&Path::new(&who.home).join("new")).is_err());
@@ -1256,56 +1297,34 @@ fn dirty_new_checkout_or_incorrect_tracking_is_never_published() {
     }
 }
 
-/// A PARTITION READS A FINISHED CHECKOUT'S HEAD ONCE, AND ONE WITH NO COMMIT AS IT ALWAYS DID:
-/// the read that says a present checkout's HEAD names a commit ([`verify_existing`]'s, through
-/// `written`) is the one that says it is not unborn ([`crate::checkout::unborn_after`]), so a
-/// finished checkout costs a partition exactly three git commands (the worktree read, its
-/// origin, its HEAD), where it was four. A read that found no commit is made again by
-/// [`crate::checkout::unborn`], as before, then the two that read its branch: so a checkout whose
-/// first commit lands between the two reads is present, not a note that its branch exists
-/// without a readable commit.
-/// NEGATIVE CONTROL: a `standing` that judges whether the checkout is unborn from the first read
-/// whatever it found gives the checkout born between the reads a note (`~/existing: the
-/// checkout's branch exists without a readable commit`): `(0, 0)` present and unborn where
-/// `(1, 0)` is wanted.
+/// A PARTITION READS A CHECKOUT'S RECORD OF FACTS ONCE: the record [`verify_existing`] judges
+/// (its top, its origin, whether HEAD names a commit and its index is there) is the one that
+/// says whether the checkout is unborn ([`crate::checkout::Facts::unborn`]), so a checkout
+/// costs a partition the record's reads alone, a finished one and one with no commit alike: on
+/// this fake, which holds no HEAD file, five (the `rev-parse` batch, the config listing, HEAD's
+/// and origin's HEAD's `symbolic-ref`, the refs), where the old reads took three for a finished
+/// checkout and six for an unborn one.
+/// NEGATIVE CONTROL: a `standing` that asks [`crate::checkout::unborn`] in place of the record
+/// it judged reads the record twice: ten.
 #[test]
-fn a_partition_reads_a_finished_checkouts_head_once() {
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Head {
-        Commit,
-        Unborn,
-        BornBetweenReads,
-    }
-    for case in [Head::Commit, Head::BornBetweenReads, Head::Unborn] {
+fn a_partition_reads_a_checkouts_record_once() {
+    for unborn in [false, true] {
         let (sys, who) = fixture();
         let path = Path::new(&who.home).join("existing");
         sys.stat_of(path.to_str().unwrap(), directory(who.uid));
-        let here = |args: &[&str]| git(&sys, &who, Some(&path)).args(args).display();
-        let head = crate::checkout::head_commit(&sys, &who, &path).display();
-        let mut expected = vec![
-            here(&WORKTREE_READ),
-            here(&["config", "--get-all", "remote.origin.url"]),
-            head.clone(),
-        ];
-        // What the branch reads hear where the first HEAD read found no commit: `main`, and a
-        // ref that exists only once the commit has landed.
-        let branch = vec!["symbolic-ref", "--quiet", "--short", "HEAD"];
-        let reference = vec!["show-ref", "--verify", "--quiet", "refs/heads/main"];
-        sys.on(&here(&branch), Ran::ok("main\n"));
-        match case {
-            Head::Commit => script_existing(&sys, &who, &path, "existing"),
-            Head::Unborn => {
-                script_existing_head(&sys, &who, &path, "existing", Ran::exit(1, ""));
-                sys.on(&here(&reference), Ran::exit(1, ""));
-                expected.extend([head.clone(), here(&branch), here(&reference)]);
-            }
-            Head::BornBetweenReads => {
-                script_existing_head(&sys, &who, &path, "existing", Ran::exit(1, ""));
-                script_head(&sys, &who, &path, Ran::ok(&format!("{A}\n")));
-                sys.on(&here(&reference), Ran::ok(""));
-                expected.push(head.clone());
-            }
+        if unborn {
+            script_existing_head(&sys, &who, &path, "existing", None);
+        } else {
+            script_existing(&sys, &who, &path, "existing");
         }
+        let here = |args: &[&str]| git(&sys, &who, Some(&path)).args(args).display();
+        let expected = vec![
+            crate::checkout::facts::rev_parse(&sys, &who, &path).display(),
+            crate::checkout::facts::config_listing(&sys, &who, &path).display(),
+            here(&["symbolic-ref", "--quiet", "HEAD"]),
+            here(&["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
+            crate::checkout::facts::tests::main_refs(&sys, &who, &path).display(),
+        ];
         let repo = Repo {
             owner: "alice".into(),
             name: "existing".into(),
@@ -1317,11 +1336,10 @@ fn a_partition_reads_a_finished_checkouts_head_once() {
         };
         let before = sys.calls().len();
         let standing = partition(&sys, &who, std::slice::from_ref(&repo)).unwrap();
-        let unborn = case == Head::Unborn;
         assert_eq!(
             (standing.present.len(), standing.unborn.len()),
             (usize::from(!unborn), usize::from(unborn)),
-            "{case:?}: {:?}",
+            "{unborn}: {:?}",
             standing.notes
         );
         let within = format!("-C {}", path.display());
@@ -1330,11 +1348,6 @@ fn a_partition_reads_a_finished_checkouts_head_once() {
             .filter(|call| call.contains(&within))
             .cloned()
             .collect();
-        assert_eq!(ran, expected, "{case:?}");
-        assert_eq!(
-            ran.iter().filter(|call| **call == head).count(),
-            if case == Head::Commit { 1 } else { 2 },
-            "{case:?}: the HEAD reads"
-        );
+        assert_eq!(ran, expected, "{unborn}");
     }
 }

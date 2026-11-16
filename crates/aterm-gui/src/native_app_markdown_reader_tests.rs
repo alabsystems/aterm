@@ -211,7 +211,8 @@ fn canonical_document_identity_disambiguates_duplicate_basenames_without_splitti
             | AppKind::Recovery
             | AppKind::Allocation
             | AppKind::Workers
-            | AppKind::Tables => {
+            | AppKind::Tables
+            | AppKind::Navigator => {
                 unreachable!()
             }
         };

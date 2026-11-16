@@ -1330,7 +1330,7 @@ fn only_the_sync_lane_and_the_repositories_stage_write_no_private_row() {
             len: profile.len() as u64,
         },
     );
-    let github = crate::init_github::items(&sys, &alice, None).unwrap();
+    let github = crate::init_github::items(&sys, &alice, None, Mode::Plan, &[]).unwrap();
     let repositories: Vec<String> = github.iter().map(|item| item.id()).collect();
     assert_eq!(repositories.len(), 2, "{repositories:?}");
     let spotlight: Vec<String> = spotlight(&alice, crate::init_spotlight::Projects::Noted)
@@ -1433,7 +1433,7 @@ fn init_places_every_item_at_the_workstation_layer_run_at_the_console() {
             items: Vec::new(),
             waited_on: None,
         },
-        crate::init_github::items(&sys, &alice, None).unwrap(),
+        crate::init_github::items(&sys, &alice, None, Mode::Plan, &[]).unwrap(),
         &KeyboardRead::EMPTY,
         Selection::all(),
         &[],
@@ -1453,10 +1453,11 @@ fn init_places_every_item_at_the_workstation_layer_run_at_the_console() {
         .filter(|b| b.class() == Class::Install)
         .map(|b| b.id())
         .collect();
+    // An explicit `[github]` profile's checkouts are left as they are: no refresh row.
     assert_eq!(
         github.len(),
         2,
-        "the keychain block and the repository stage: {github:?}"
+        "the keychain block and the repositories' acquisition: {github:?}"
     );
     assert!(github.iter().all(|id| id.contains("github")), "{github:?}");
     let asked: Vec<String> = bound
@@ -1715,9 +1716,10 @@ fn converge_transports_unfinished_repository_work_without_claiming_completion() 
 /// --trigger subscriber` there with this run's flags, ends with that run's exit, and runs no
 /// pass here. A window's or a person's pass never hands off, and a hand-off that cannot be
 /// started, or that an app with no such pass refuses as usage, leaves this copy to run the
-/// pass, saying so in aterm.log.
+/// pass, saying so in aterm.log. One that started but whose end cannot be waited for ends this
+/// copy unsuccessfully (exit 1, said in aterm.log) with no pass here beside it.
 /// NEGATIVE CONTROL: a runner that never asks `installed_release_elsewhere` runs the
-/// subscriber's pass here, from the held copy.
+/// subscriber's pass here, from the held copy; and a hand-off that could not start does too.
 #[test]
 fn a_held_copys_subscriber_pass_runs_from_the_installed_app() {
     let app = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
@@ -1791,10 +1793,149 @@ fn a_held_copys_subscriber_pass_runs_from_the_installed_app() {
             ports.logged()
         );
     }
+
+    let unwaited = aterm_tempfile::tempdir().unwrap();
+    let mut ports = crate::sync::tests::Inert::new(unwaited.path());
+    ports.elsewhere = Some(app);
+    *ports.elsewhere_unwaited.lock().unwrap() = Some("Interrupted system call".to_owned());
+    assert_eq!(
+        converge_run(&["--converge", "--trigger", "subscriber"], &ports),
+        exit(1),
+        "a started pass this copy cannot wait for"
+    );
+    assert_eq!(
+        ports.ran_elsewhere.lock().unwrap().len(),
+        1,
+        "it was started"
+    );
+    assert!(ports.applies().is_empty(), "no second pass here");
+    assert!(crate::sync::read_record(unwaited.path()).is_none());
+    assert!(
+        ports
+            .logged()
+            .iter()
+            .any(|line| line
+                .contains("started but could not be waited for (Interrupted system call)")),
+        "{:?}",
+        ports.logged()
+    );
 }
 
-/// Exit 75 while another pass holds the lock (applying nothing), 1 for a failed row, 2 for
-/// a flag `--converge` does not take, before any port is read.
+/// A WAITING RUNNER ENDS WITH ITS STARTER, whichever process that is. A held copy's subscriber
+/// pass hands off to the installed app, whose runner watches the held copy as the starter that
+/// started it, not the subscriber. So while the installed app's pass goes on (waiting for the
+/// lock another pass holds, say), the held copy watches its own starter, the subscriber, and
+/// once that ends it stops waiting and ends at once (exit 75, one line in aterm.log), running
+/// no pass here: the installed app's runner then sees its own starter end and ends its wait,
+/// and no waiter outlives the subscriber that owed it. A starter gone before the hand-off, or
+/// one that ends as the watch on it begins (before the installed app's pass is started),
+/// starts no installed app's pass at all. NEGATIVE CONTROL: with the starter alive the held
+/// copy keeps waiting for the installed app's pass and ends with that pass's own exit once it
+/// ends.
+#[test]
+fn a_waiting_runner_ends_with_its_starter() {
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+    let app = PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm");
+    for starter_ends in [true, false] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let mut ports = crate::sync::tests::Inert::new(scratch.path());
+        ports.elsewhere = Some(app.clone());
+        *ports.elsewhere_exit.lock().unwrap() = Ok(Some(0));
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        *ports.elsewhere_release.lock().unwrap() = Some(released);
+        let exited = std::thread::scope(|scope| {
+            let handing_off =
+                scope.spawn(|| converge_run(&["--converge", "--trigger", "subscriber"], &ports));
+            // A hang detector of a minute, not a budget: until the hand-off started the installed
+            // app's pass and watches its own starter, or has ended. Where it fires, that pass is
+            // let go first, so the scope's join of the hand-off ends and the test fails rather
+            // than hangs.
+            let began = std::time::Instant::now();
+            while !((ports.watching_starter() && !ports.ran_elsewhere.lock().unwrap().is_empty())
+                || handing_off.is_finished())
+            {
+                if began.elapsed() >= HANG {
+                    let _ = release.send(());
+                    panic!("hang detector: the hand-off never started the installed app's pass");
+                }
+                aterm_uds::deadline::poll_yield();
+            }
+            assert!(
+                !handing_off.is_finished(),
+                "the held copy waits while the installed app's pass goes on"
+            );
+            if starter_ends {
+                assert!(ports.end_starter(), "the hand-off watched its starter");
+            } else {
+                release.send(()).unwrap();
+            }
+            // A hand-off that kept waiting once its starter ended fails here within the minute:
+            // the installed app's pass is let go, and it ends with that pass's exit, not 75.
+            crate::sync::tests::joined(handing_off, || {
+                let _ = release.send(());
+            })
+        });
+        if starter_ends {
+            assert_eq!(exited, exit(75), "the held copy ends with its starter");
+            assert!(
+                ports.logged().iter().any(|line| line.contains(
+                    "the program that started this copy ended; this copy ends, and the \
+                     installed app's pass"
+                )),
+                "{:?}",
+                ports.logged()
+            );
+        } else {
+            assert_eq!(exited, exit(0), "the installed app's pass's own exit");
+            assert!(ports.logged().is_empty(), "{:?}", ports.logged());
+        }
+        assert_eq!(ports.ran_elsewhere.lock().unwrap().len(), 1);
+        assert!(ports.applies().is_empty(), "no pass here");
+        assert!(crate::sync::read_record(scratch.path()).is_none());
+        // The installed app's pass a starter's end left waiting ends here, as the test's own.
+        drop(release);
+    }
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut gone = crate::sync::tests::Inert::new(scratch.path());
+    gone.elsewhere = Some(app.clone());
+    gone.starter_ended
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let mut ending = crate::sync::tests::Inert::new(scratch.path());
+    ending.elsewhere = Some(app);
+    ending
+        .starter_ends_once_watched
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for (ports, when) in [
+        (&gone, "before the hand-off"),
+        (&ending, "as its watch began"),
+    ] {
+        assert_eq!(
+            converge_run(&["--converge", "--trigger", "subscriber"], ports),
+            exit(75),
+            "{when}"
+        );
+        assert!(
+            ports.ran_elsewhere.lock().unwrap().is_empty(),
+            "a starter that ended {when} starts nothing"
+        );
+        assert!(ports.applies().is_empty(), "{when}");
+        assert!(
+            ports
+                .logged()
+                .iter()
+                .any(|line| line.contains("nothing was started")),
+            "{when}: {:?}",
+            ports.logged()
+        );
+    }
+    assert!(crate::sync::read_record(scratch.path()).is_none());
+}
+
+/// Exit 75 for a pass the lock kept from running, applying and recording nothing: a person's
+/// (`--trigger init`, the default) while another pass holds it, and a started one (`--trigger
+/// window`) whose starter ended before it could wait for it. 1 for a failed row, 2 for a flag
+/// `--converge` does not take, before any port is read.
 #[test]
 fn converge_exits_75_on_a_held_lock_1_on_a_failed_row_and_2_on_usage() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1802,6 +1943,15 @@ fn converge_exits_75_on_a_held_lock_1_on_a_failed_row_and_2_on_usage() {
     let held = crate::sync::try_lock(scratch.path()).unwrap().unwrap();
     assert_eq!(converge_run(&["--converge"], &ports), exit(75));
     assert_eq!(ports.applies(), Vec::<&str>::new());
+    let gone = crate::sync::tests::Inert::new(scratch.path());
+    gone.starter_ended
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        converge_run(&["--converge", "--trigger", "window"], &gone),
+        exit(75)
+    );
+    assert_eq!(gone.applies(), Vec::<&str>::new());
+    assert_eq!(crate::sync::read_record(scratch.path()), None);
     drop(held);
     *ports.fleet_done.lock().unwrap() = Err("the issuer did not answer".to_owned());
     assert_eq!(converge_run(&["--converge"], &ports), exit(1));
@@ -4078,7 +4228,8 @@ fn a_scoped_agent_check_reaches_its_advertised_workstation_selector() {
                 assert_eq!(status(&rows, Action::Check), code, "{selector}: {rows:?}");
                 if selector == "github" {
                     assert_eq!(fda_reads.get(), 0, "GitHub-only needs no FDA reading");
-                    assert_eq!(rows.len(), 2);
+                    // The keychain block, acquisition and the refresh of what is here.
+                    assert_eq!(rows.len(), 3);
                     assert!(rows.iter().all(|row| row.family == "github"));
                     assert!(
                         sys.calls()
@@ -4358,18 +4509,13 @@ fn the_clone_init_owes_runs_once_the_token_lands_with_no_second_init() {
     crate::init_github::scripted::converged(&sys, &user("alice", 501), "notes");
     let owed = owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap();
     assert!(matches!(owed, OwedClone::Due(_)), "{owed:?}");
-    clone_owed(
-        &sys,
-        state.path(),
-        aterm_secrets::converge::RepositoryWork::Refresh,
-    )
-    .unwrap();
+    clone_owed(&sys, state.path()).unwrap();
     assert_eq!(
         owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
-        OwedClone::Verified {
-            present: 1,
-            total: 1
-        },
+        OwedClone::Verified(crate::init_observe::RepositoryCounts {
+            ready: 1,
+            ..crate::init_observe::RepositoryCounts::default()
+        }),
         "the next pass verifies the inventory instead of cloning again"
     );
     assert!(
@@ -4395,18 +4541,13 @@ fn the_keychain_rows_trouble_does_not_hold_the_owed_clone() {
         crate::port::Ran::exit(128, "fatal: bad config line 1"),
     );
     crate::init_github::scripted::converged(&sys, &who, "notes");
-    clone_owed(
-        &sys,
-        state.path(),
-        aterm_secrets::converge::RepositoryWork::Refresh,
-    )
-    .unwrap();
+    clone_owed(&sys, state.path()).unwrap();
     assert_eq!(
         owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
-        OwedClone::Verified {
-            present: 1,
-            total: 1
-        },
+        OwedClone::Verified(crate::init_observe::RepositoryCounts {
+            ready: 1,
+            ..crate::init_observe::RepositoryCounts::default()
+        }),
     );
 }
 
@@ -4420,10 +4561,10 @@ fn fleet_inventory_clones_without_an_earlier_init_and_respects_holds() {
     crate::init_github::scripted::converged(&sys, &who, "notes");
     assert_eq!(
         owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
-        OwedClone::Verified {
-            present: 1,
-            total: 1
-        },
+        OwedClone::Verified(crate::init_observe::RepositoryCounts {
+            ready: 1,
+            ..crate::init_observe::RepositoryCounts::default()
+        }),
     );
     let bytes = aterm_json::to_vec(&aterm_json::json!({
         "schema":2,"account":"alice","repositories":[{
@@ -4620,10 +4761,33 @@ fn on_linux_init_runs_the_base_the_vault_and_github_and_the_mac_rows_are_not_app
     }
 }
 
-/// The ordinary `init --only github` producer shares the existing alignment
-/// lease too; it cannot slip past a subscriber's admitted repository wave.
+/// The ordinary `init --only github` producer shares the existing alignment lease too: it
+/// cannot slip past a subscriber's admitted repository wave. Another pass holding that lease is
+/// a typed wait, decided before anything is read: both repository rows stand aside on the lock
+/// (`StoodAside::Lock`, reading `Wait::OtherPass`), having read no checkout and run no remote
+/// head read or fetch, and the journal records no failure. CONTROL: once that pass lets go, the
+/// same run reads the checkout and refreshes it.
 #[test]
 fn plain_github_apply_respects_the_existing_repository_pass_lease() {
+    use crate::init_observe::Wait;
+    /// The ids the run journals as failed ([`aterm_converge::Journal::failed`]).
+    #[derive(Default)]
+    struct Failures(Vec<String>);
+    impl aterm_converge::Journal for Failures {
+        fn before_change(
+            &mut self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn failed(&mut self, id: &str, _: &str) -> Result<(), String> {
+            self.0.push(id.to_owned());
+            Ok(())
+        }
+    }
     let mut sys = Fake::root();
     sys.euid = 501;
     sys.linux = true;
@@ -4631,6 +4795,7 @@ fn plain_github_apply_respects_the_existing_repository_pass_lease() {
     let alice = user("alice", 501);
     sys.logged_in(&alice);
     crate::init_github::scripted::converged(&sys, &alice, "notes");
+    let checkout = format!("-C {}", Path::new(&alice.home).join("notes").display());
     let mut picked = options(&["--only".into(), "github".into()]).unwrap();
     picked.station = vec!["github".into()];
     let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
@@ -4645,7 +4810,7 @@ fn plain_github_apply_respects_the_existing_repository_pass_lease() {
             |_| panic!("GitHub-only init does not open a Secrets stage"),
         )
     };
-    let run = || {
+    let run = |journal: &mut Failures| {
         converge(
             &sys,
             &picked,
@@ -4660,29 +4825,57 @@ fn plain_github_apply_respects_the_existing_repository_pass_lease() {
                 present: &|| false,
                 on_held: &|_| {},
             },
-            &mut NoJournal,
+            journal,
             &mut Laps::start(),
         )
         .unwrap()
     };
+    let outcome =
+        |rows: &[ItemReport], id: &str| rows.iter().find(|row| row.id == id).map(|row| row.outcome);
     let held = sys.repository_pass().unwrap().pass.unwrap();
-    let rows = run();
+    let mut journal = Failures::default();
+    let rows = run(&mut journal);
+    for id in ["init.github.native@alice", "init.github.refresh@alice"] {
+        let row = rows.iter().find(|row| row.id == id).expect(id);
+        assert_eq!(row.outcome, Outcome::Blocked, "{rows:?}");
+        assert!(
+            matches!(row.stood_aside, Some(aterm_converge::StoodAside::Lock(_))),
+            "{row:?}"
+        );
+        assert_eq!(
+            crate::init_observe::Reading::of(row),
+            Some(crate::init_observe::Reading::Waits(Wait::OtherPass)),
+            "{row:?}"
+        );
+    }
     assert!(
-        rows.iter()
-            .any(|row| row.id == "init.github.native@alice" && row.outcome == Outcome::Failed),
-        "{rows:?}"
+        journal.0.is_empty(),
+        "no failure is journaled: {:?}",
+        journal.0
     );
+    let calls = sys.calls();
     assert!(
-        sys.calls()
-            .iter()
-            .all(|call| !call.contains("--symref") && !call.contains(" fetch "))
+        calls.iter().all(|call| !call.contains(&checkout)
+            && !call.contains("ls-remote")
+            && !call.contains(" fetch ")),
+        "{calls:#?}"
     );
     drop(held);
-    let rows = run();
-    assert!(
-        rows.iter()
-            .any(|row| row.id == "init.github.native@alice" && row.outcome == Outcome::Ok),
+    let rows = run(&mut journal);
+    assert_eq!(
+        outcome(&rows, "init.github.native@alice"),
+        Some(Outcome::Ok),
         "{rows:?}"
+    );
+    assert_eq!(
+        outcome(&rows, "init.github.refresh@alice"),
+        Some(Outcome::Ok),
+        "{rows:?}"
+    );
+    assert!(journal.0.is_empty(), "{:?}", journal.0);
+    assert!(
+        sys.calls().iter().any(|call| call.contains(&checkout)),
+        "the free lease reads the checkout"
     );
     let record = sys.repository_pass().unwrap().pass.unwrap().record();
     assert!(record.converged_ms.is_none());
@@ -4690,6 +4883,88 @@ fn plain_github_apply_respects_the_existing_repository_pass_lease() {
         crate::sync::due(Some(&record), "current", &[], 0),
         crate::sync::Due::NewBuild
     );
+}
+
+/// An `aterm init --only` that keeps the acquisition's row (`init.github.native@alice`) but not
+/// the refresh's lets the repository lease go as the acquisition's row ends: no refresh of this
+/// run would ever take it over, so no other pass waits on this run's lease for the rest of it.
+/// NEGATIVE CONTROL: with the refresh's row selected too (`--only github`), the acquisition's
+/// row ends with the lease still held, handed on to the refresh, whose own row lets it go.
+#[test]
+fn an_only_selection_without_the_refresh_row_releases_the_lease() {
+    const ACQUISITION: &str = "init.github.native@alice";
+    const REFRESH: &str = "init.github.refresh@alice";
+    for (word, handed_on) in [(ACQUISITION, false), ("github", true)] {
+        let mut sys = Fake::root();
+        sys.euid = 501;
+        sys.linux = true;
+        sys.terminal = true;
+        let alice = user("alice", 501);
+        sys.logged_in(&alice);
+        crate::init_github::scripted::converged(&sys, &alice, "notes");
+        let mut picked = options(&["--only".into(), word.into()]).unwrap();
+        picked.station = vec![word.into()];
+        let groups = |sys: &dyn System, ctx: &Ctx, mode: Mode, reading: &Reading<'_>| {
+            prepare_groups_with(
+                sys,
+                ctx,
+                mode,
+                None,
+                reading,
+                &alab_standing(),
+                no_grants,
+                |_| panic!("GitHub-only init does not open a Secrets stage"),
+            )
+        };
+        // Each repository row as it ended, and whether the repository lease was still held then.
+        let ended: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
+        let on_row = |row: &ItemReport| {
+            if row.id == ACQUISITION || row.id == REFRESH {
+                let held = sys.repository_pass().unwrap().pass.is_none();
+                ended.lock().unwrap().push((row.id.clone(), held));
+            }
+        };
+        let rows = converge(
+            &sys,
+            &picked,
+            &Front {
+                base: &|_| Base::none(),
+                groups: &groups,
+                full_disk_access: &|| panic!("repository init reads no workstation permission"),
+                targo: None,
+                cwd: None,
+                records: &NoRecords,
+                on_row: &on_row,
+                present: &|| false,
+                on_held: &|_| {},
+            },
+            &mut NoJournal,
+            &mut Laps::start(),
+        )
+        .unwrap();
+        let outcome = |id: &str| rows.iter().find(|row| row.id == id).map(|row| row.outcome);
+        assert_eq!(outcome(ACQUISITION), Some(Outcome::Ok), "{word}: {rows:?}");
+        let ended = ended.into_inner().unwrap();
+        if handed_on {
+            assert_eq!(outcome(REFRESH), Some(Outcome::Ok), "{word}: {rows:?}");
+            assert_eq!(
+                ended,
+                [(ACQUISITION.to_owned(), true), (REFRESH.to_owned(), false)],
+                "{word}: the acquisition hands its lease to the refresh, which lets it go"
+            );
+        } else {
+            assert_eq!(outcome(REFRESH), None, "{word}: {rows:?}");
+            assert_eq!(
+                ended,
+                [(ACQUISITION.to_owned(), false)],
+                "{word}: no refresh follows, so the acquisition lets its lease go"
+            );
+        }
+        assert!(
+            sys.repository_pass().unwrap().pass.is_some(),
+            "{word}: the run leaves no lease held"
+        );
+    }
 }
 
 #[test]
@@ -6799,7 +7074,7 @@ fn sign_out_runs_without_a_terminal_including_from_an_agent_tab() {
 fn an_invalid_init_toml_leaves_one_unread_row_and_the_rest_run() {
     let sys = alice_with_checkout(501, Some("[github\n"));
     let (ctx, _) = local_context(&sys).unwrap();
-    let read = crate::init_github::items(&sys, &ctx, None);
+    let read = crate::init_github::items(&sys, &ctx, None, Mode::Plan, &[]);
     assert!(
         read.as_ref().is_err_and(|why| why.contains("init.toml")),
         "the group cannot be built"

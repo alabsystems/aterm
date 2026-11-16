@@ -1435,8 +1435,7 @@ tests/line_run_differential.rs	the_differential_catches_a_screen_text_line_one_s
 tests/mem_budget.rs	engine_retained_heap_within_budget	(§4: move-to-bench)	
 tests/osc_param_tail.rs	a_hyperlink_uri_keeps_every_semicolon_and_is_never_silently_shortened	osc-semicolon-tail-preserved	
 tests/osc_param_tail.rs	a_title_keeps_every_semicolon_separated_field	osc-semicolon-tail-preserved	
-tests/perf_scaling.rs	engine_steady_state_processing_is_allocation_free	(§4: move-to-bench)	
-tests/perf_scaling.rs	engine_steady_state_processing_is_allocation_free	render-input-content-equality-and-clone	Warm full/damage-cache copies preserve cluster, combining and apron payloads without allocation; changed and removed payloads copy exactly.
+tests/perf_scaling.rs	engine_steady_state_processing_is_allocation_free	(§4: move-to-bench)	render-input-content-equality-and-clone: warm full/damage-cache copies preserve cluster, combining and apron payloads without allocation; changed and removed payloads copy exactly.
 tests/replay_corpus_probe.rs	every_corpus_folds_chunk_independently	process-chunk-invariance	
 tests/replay_corpus_probe.rs	every_corpus_record_conforms_to_coalesce_model	process-chunk-invariance	
 tests/replay_offset_determinism.rs	from_checkpoint_hydration_continues_the_mirror	checkpoint-roundtrip	

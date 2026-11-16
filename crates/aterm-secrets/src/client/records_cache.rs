@@ -16,12 +16,12 @@
 //! that bound, each Commons check in a repair round re-hashed it: 3.6 MB about 200 times a round,
 //! which held an idle 0.154.0 at two to four cores (2026-11-05, m117).
 
-use super::{Paths, fsx, sha256};
+use super::{Paths, fsx};
+use crate::age::Identity;
 use crate::{
     Error, SecretBytes,
-    membership_log::{MAX_RECORDS_STREAM, RecordBudgets, Store},
+    membership_log::{MAX_RECORDS_STREAM, RecordBudgets, Store, head},
 };
-use aterm_digest::Sha256;
 use std::{
     collections::VecDeque,
     io::{Read, Seek, SeekFrom},
@@ -52,8 +52,19 @@ const MOVED_READS: usize = 3;
 /// The entries every reader and the records writer of this process share.
 static CACHE: Cache = Cache::new();
 
-pub(super) fn read(paths: &Paths, vault: String, store: Store) -> crate::Result<Store> {
-    CACHE.read(paths, vault, store)
+/// This Mac's identity, as a read takes it from its caller: asked only where a read of the file
+/// looks for the vault's head or writes one, and where the caller holds no identity, `None`.
+pub(super) type IdentityOf<'i> = &'i dyn Fn() -> Option<&'i Identity>;
+
+/// The store of the records file at `paths`, read under `vault` and `store`'s context; `identity`
+/// is this Mac's, which the vault's head is sealed under ([`head`]).
+pub(super) fn read<'i>(
+    paths: &Paths,
+    vault: String,
+    store: Store,
+    identity: IdentityOf<'i>,
+) -> crate::Result<Store> {
+    CACHE.read_moving(paths, vault, store, identity, |_| {})
 }
 
 /// How many complete records the records file `stamp` names holds, where it holds exactly those
@@ -92,8 +103,8 @@ struct Entry {
     stamps: [Option<fsx::FileStamp>; STAMPS],
     bytes: Option<SecretBytes>,
     store: Store,
-    /// Its record/index, file, entry and context charge ([`MAX_BYTES`]).
-    kept: usize,
+    /// Its file, entry and context charge ([`MAX_BYTES`]), beside its store's ([`Entry::kept`]).
+    fixed: usize,
 }
 
 impl Cache {
@@ -123,17 +134,26 @@ impl Cache {
             .find_map(|entry| store.extends(&entry.store))
     }
 
+    /// A read as [`read`] makes one, taking this Mac's identity from `paths`.
+    #[cfg(test)]
     fn read(&self, paths: &Paths, vault: String, store: Store) -> crate::Result<Store> {
-        self.read_moving(paths, vault, store, |_| {})
+        let identity = std::cell::OnceCell::new();
+        let of = || {
+            identity
+                .get_or_init(|| super::read_identity(paths).ok().flatten())
+                .as_ref()
+        };
+        self.read_moving(paths, vault, store, &of, |_| {})
     }
 
     /// [`Self::read_noting`], started again while the file moves under it ([`MOVED_READS`]);
     /// `after_observation` is told which try it follows, from 0.
-    fn read_moving(
+    fn read_moving<'i>(
         &self,
         paths: &Paths,
         vault: String,
         store: Store,
+        identity: IdentityOf<'i>,
         after_observation: impl Fn(usize),
     ) -> crate::Result<Store> {
         // The first try takes the caller's own name and store, as one read does (an entry
@@ -148,6 +168,7 @@ impl Cache {
                 paths,
                 vault,
                 store,
+                identity,
                 || after_observation(attempt),
                 &mut opened,
             );
@@ -171,20 +192,28 @@ impl Cache {
         store: Store,
         after_observation: impl FnOnce(),
     ) -> crate::Result<Store> {
-        self.read_noting(paths, vault, store, after_observation, &mut None)
+        let identity = std::cell::OnceCell::new();
+        let of = || {
+            identity
+                .get_or_init(|| super::read_identity(paths).ok().flatten())
+                .as_ref()
+        };
+        self.read_noting(paths, vault, store, &of, after_observation, &mut None)
     }
 
     /// One read, which leaves in `opened` the data file it opened and the stamp it opened it
     /// under.
-    fn read_noting(
+    fn read_noting<'i>(
         &self,
         paths: &Paths,
         vault: String,
         store: Store,
+        identity: IdentityOf<'i>,
         after_observation: impl FnOnce(),
         opened: &mut Option<(std::path::PathBuf, fsx::FileStamp)>,
     ) -> crate::Result<Store> {
         let selected = crate::records_storage::selected(&paths.records_file())?;
+        let began = fsx::read_began();
         let Some(mut reader) = fsx::open_owned_reader(selected.path())? else {
             selected.confirm()?;
             return Ok(store);
@@ -214,6 +243,29 @@ impl Cache {
             selected.confirm()?;
             return Ok(entry.store.clone());
         }
+        // The vault's head, where one names this file as it is under this Mac's identity and
+        // this read's context: the records without the bodies nothing reads, and without
+        // verifying again what this Mac verified before it wrote the head.
+        let context = head::context(&store, &vault);
+        let head_path = crate::records_storage::head_path(&paths.records_file())?;
+        let identity = identity();
+        if std::fs::symlink_metadata(&head_path).is_ok()
+            && let Some(identity) = identity
+            && let Some((read, digest)) = head::open(
+                &head_path,
+                reader.file(),
+                stamp,
+                context,
+                identity,
+                store.clone(),
+            )
+        {
+            after_observation();
+            reader.check_unchanged()?;
+            selected.confirm()?;
+            self.keep(vault, keys, network, budgets, digest, stamp, None, &read);
+            return Ok(read);
+        }
         #[cfg(test)]
         self.observations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -239,7 +291,7 @@ impl Cache {
         self.hashes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let digest = match &observed {
-            Observed::Small(bytes) => sha256(bytes.as_slice()),
+            Observed::Small(bytes) => crate::membership_log::head::digest(bytes.as_slice()),
             Observed::Large(digest) => *digest,
         };
         let same = |entry: &Entry| same_context(entry) && entry.digest == digest;
@@ -251,7 +303,7 @@ impl Cache {
             entry.known_by(stamp);
             return Ok(entry.store.clone());
         }
-        let (store, bytes) = match observed {
+        let (mut store, bytes) = match observed {
             Observed::Small(bytes) => (store.recovering(bytes.as_slice()), Some(bytes)),
             Observed::Large(_) => {
                 reader
@@ -271,26 +323,68 @@ impl Cache {
         };
         reader.check_unchanged()?;
         selected.confirm()?;
+        // A resolve of what was read by this Mac's identity writes the head, where every record
+        // of the file was read.
+        if let Some(identity) = identity {
+            store.read_from(head::Origin::new(
+                &head_path,
+                stamp,
+                digest,
+                context,
+                identity.recipient().0,
+                began,
+            ));
+        }
+        self.keep(vault, keys, network, budgets, digest, stamp, bytes, &store);
+        Ok(store)
+    }
+
+    /// Keep `store`, read from the file `stamp` names whose SHA-256 is `digest` (its bytes too,
+    /// for a small file), as the entry of its context, letting the oldest entries go for its
+    /// room.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "an entry's context, the file it was read from, and the store read"
+    )]
+    fn keep(
+        &self,
+        vault: String,
+        keys: Option<Vec<[u8; 32]>>,
+        network: Option<crate::membership_log::RecordId>,
+        budgets: RecordBudgets,
+        digest: [u8; 32],
+        stamp: fsx::FileStamp,
+        bytes: Option<SecretBytes>,
+        store: &Store,
+    ) {
+        let same = |entry: &Entry| {
+            entry.vault == vault
+                && entry.keys == keys
+                && entry.network == network
+                && entry.budgets == budgets
+                && entry.digest == digest
+        };
         // The context keys and the cloned store each retain a lineage vector. Even an
         // empty records file must spend entry/context space, or zero-charge entries can
         // accumulate forever without triggering eviction.
         let lineage_bytes = keys.as_ref().map_or(0, |keys| {
             keys.capacity().saturating_mul(2 * size_of::<[u8; 32]>())
         });
-        let kept = store
-            .footprint()
-            .saturating_add(bytes.as_ref().map_or(0, SecretBytes::len))
+        let fixed = bytes
+            .as_ref()
+            .map_or(0, SecretBytes::len)
             .saturating_add(size_of::<Entry>())
             .saturating_add(vault.capacity())
             .saturating_add(lineage_bytes);
+        let kept = Entry::store_charge(store).saturating_add(fixed);
         if let Ok(mut entries) = self.entries.lock() {
             entries.retain(|entry| !same(entry));
             if kept <= self.budget {
-                let mut total: usize = entries.iter().map(|entry| entry.kept).sum();
+                let mut total: usize = entries.iter().map(Entry::kept).sum();
                 while kept > self.budget.saturating_sub(total)
                     && let Some(oldest) = entries.pop_front()
                 {
-                    total -= oldest.kept;
+                    total = total.saturating_sub(oldest.kept());
                 }
                 entries.push_back(Entry {
                     vault,
@@ -301,15 +395,32 @@ impl Cache {
                     stamps: Entry::known_only_by(stamp),
                     bytes,
                     store: store.clone(),
-                    kept,
+                    fixed,
                 });
             }
         }
-        Ok(store)
     }
 }
 
 impl Entry {
+    /// Its record/index, file, entry and context charge ([`MAX_BYTES`]), as it stands: its
+    /// store's is taken again at each count, since a shelved record read back since it was kept
+    /// is kept with it ([`Entry::store_charge`]).
+    fn kept(&self) -> usize {
+        Self::store_charge(&self.store).saturating_add(self.fixed)
+    }
+
+    /// What `store` is charged: what it keeps in memory ([`Store::footprint`], a shelved
+    /// record's bytes read back included), and, for a store read through the vault's head, the
+    /// records file it holds open to read shelved records back from ([`Store::shelf_len`]),
+    /// which a writer that replaces the file leaves on disk until the store goes. So the cache
+    /// keeps no more replaced files than whole stores of them.
+    fn store_charge(store: &Store) -> usize {
+        store
+            .footprint()
+            .saturating_add(usize::try_from(store.shelf_len()).unwrap_or(usize::MAX))
+    }
+
     /// The stamps of an entry first read from the file `stamp` names.
     fn known_only_by(stamp: fsx::FileStamp) -> [Option<fsx::FileStamp>; STAMPS] {
         let mut stamps = [None; STAMPS];
@@ -344,7 +455,7 @@ fn recover_observation(store: Store, input: impl Read, expected: [u8; 32]) -> cr
 fn observe(reader: &mut fsx::OwnedReader) -> crate::Result<Observed> {
     let mut small = (reader.len() <= MAX_INPUT_BYTES as u64)
         .then(|| Zeroizing::new(Vec::with_capacity(reader.len() as usize + 1)));
-    let mut digest = Sha256::new();
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buffer = Zeroizing::new([0; 16 * 1024]);
     let mut input = reader.file().take(MAX_RECORDS_STREAM as u64);
     loop {
@@ -366,25 +477,34 @@ fn observe(reader: &mut fsx::OwnedReader) -> crate::Result<Observed> {
     }
     Ok(match small {
         Some(mut bytes) => Observed::Small(SecretBytes::new(std::mem::take(&mut *bytes))),
-        None => Observed::Large(digest.finalize()),
+        None => Observed::Large(finish(digest)),
     })
+}
+
+/// The SHA-256 `digest` took, through ring's, which runs on the CPU's SHA-256 instructions: a
+/// long records file is hashed twice on a full read ([`observe`], [`recover_observation`]), and
+/// the portable `aterm_digest::Sha256` took about a third of such an open (ATERM-KI-1113-902).
+fn finish(digest: ring::digest::Context) -> [u8; 32] {
+    let mut out = [0; 32];
+    out.copy_from_slice(digest.finish().as_ref());
+    out
 }
 
 struct Hashed<R> {
     reader: R,
-    digest: Sha256,
+    digest: ring::digest::Context,
 }
 
 impl<R> Hashed<R> {
     fn new(reader: R) -> Self {
         Self {
             reader,
-            digest: Sha256::new(),
+            digest: ring::digest::Context::new(&ring::digest::SHA256),
         }
     }
 
     fn finish(self) -> [u8; 32] {
-        self.digest.finalize()
+        finish(self.digest)
     }
 }
 

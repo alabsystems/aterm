@@ -179,7 +179,7 @@ pub(super) struct Mark {
 }
 
 /// What one or more windows cost, as the bridge's tally and the broker counted it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct Spent {
     /// Each row's `(count, total)`, by [`TallyRow::index`].
     pub rows: [(u64, u64); wait_tally::ROWS],
@@ -189,6 +189,19 @@ pub(super) struct Spent {
     pub dir: bool,
     pub flushes: FlushCounts,
     pub windows: usize,
+}
+
+impl Default for Spent {
+    /// Written by hand: an array past 32 rows derives no `Default`.
+    fn default() -> Self {
+        Self {
+            rows: [(0, 0); wait_tally::ROWS],
+            at_ns: 0,
+            dir: false,
+            flushes: FlushCounts::default(),
+            windows: 0,
+        }
+    }
 }
 
 impl Spent {

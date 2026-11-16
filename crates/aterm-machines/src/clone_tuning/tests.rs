@@ -60,15 +60,18 @@ impl World {
         if let Some(git) = git {
             // Select the admitted managed tool for both the subject and controls,
             // while all Git configuration and repositories stay in the fixture home.
-            let prefix = git
-                .parent()
-                .and_then(Path::parent)
-                .expect("package bin/git");
+            let prefix = feature_prefix();
             let config = world.home.path().join(".config/aterm/aterm.toml");
             std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            let store = prefix.join("store/git");
             let prefix = aterm_toml::Value::String(prefix.to_string_lossy().into_owned());
             std::fs::write(config, format!("[packages]\nprefix = {prefix}\n")).unwrap();
-            assert_eq!(checkout::git(&world.sys, &world.who, None).program, git);
+            // Since FL-165 setup starts the admitted build's own git, never its PATH entry.
+            let program = checkout::git(&world.sys, &world.who, None).program;
+            assert!(
+                program.starts_with(&store) && program.ends_with("bin/git"),
+                "the build's own git under {store:?}, admitted by its entry {git:?}: {program:?}"
+            );
         }
         world.global("");
         world
@@ -266,12 +269,13 @@ impl World {
         record.write(&dir).unwrap();
     }
 
+    /// A read that keeps nothing, a plan's or the doctor's probe's.
     fn read(&self) -> Reading {
-        read(&self.sys, &self.ctx(), self.state(), &Holds::NONE).unwrap()
+        self.read_holding(&Holds::NONE)
     }
 
     fn read_holding(&self, holds: &Holds) -> Reading {
-        read(&self.sys, &self.ctx(), self.state(), holds).unwrap()
+        read(&self.sys, &self.ctx(), self.state(), holds, Keep::Nothing).unwrap()
     }
 
     /// [`apply`] with a self-test that must not run: the volume's result is kept.
@@ -286,6 +290,7 @@ impl World {
                 planned: &|| {},
                 lock_wait: LOCK_WAIT,
             },
+            None,
         )
     }
 
@@ -415,6 +420,7 @@ fn a_clone_found_in_place_converges_to_its_declaration_and_a_second_pass_changes
             planned: &|| {},
             lock_wait: LOCK_WAIT,
         },
+        None,
     )
     .unwrap();
     assert_eq!(
@@ -708,6 +714,7 @@ fn a_failed_self_test_withholds_the_cache_keys_and_is_kept() {
             planned: &|| {},
             lock_wait: LOCK_WAIT,
         },
+        None,
     )
     .unwrap();
     assert_eq!(said.said, "nothing tuned");
@@ -932,6 +939,7 @@ fn a_hold_github_off_or_an_explicit_profile_tunes_nothing() {
                 planned: &|| {},
                 lock_wait: LOCK_WAIT,
             },
+            None,
         )
         .unwrap(),
         Tuned {
@@ -1146,6 +1154,128 @@ fn a_newer_aterm_s_record_leaves_the_clones_to_it() {
     assert_eq!(std::fs::read(dir.join(RECORD)).unwrap(), newer.as_bytes());
 }
 
+/// A clone's declaration is read (`ls-tree`, `cat-file`, `config --blob`) only where origin's
+/// tip moved since an applying pass last read it there ([`DECLARATIONS`]): a second applying
+/// pass at the same tip, through a port with no record of checkout facts, as each converge pass
+/// starts, reads none of it and says the same; a fetch that moves the tip has it read again,
+/// and what the clone now declares said. NEGATIVE CONTROL: with what was kept removed, a pass at
+/// the same tip reads it.
+#[test]
+fn clone_tuning_reads_its_declaration_only_when_origins_tip_moved() {
+    use crate::port::spawns::Spawns;
+    let world = World::new();
+    let source = world.source("trust", &[(DECLARATION, TRUST)]);
+    let top = world.clone("trust", &source);
+    world.inventory(&["trust"]);
+    world.kept_self_test(true);
+    let start = index_format(&world, &top);
+    // One applying pass's reading, and how many times it listed the declaration in a commit's
+    // tree.
+    let pass = || {
+        let spawns = Spawns::new(&world.sys);
+        let reading = read(
+            &spawns,
+            &world.ctx(),
+            world.state(),
+            &Holds::NONE,
+            Keep::Declarations,
+        )
+        .unwrap();
+        let listed = spawns
+            .record()
+            .iter()
+            .filter(|(run, _)| {
+                run.args.iter().any(|arg| arg == "ls-tree")
+                    && run.args.iter().any(|arg| arg == DECLARATION)
+            })
+            .count();
+        (reading, listed)
+    };
+
+    let (first, listed) = pass();
+    assert_eq!(listed, 1, "the first pass reads the declaration");
+    assert_eq!(
+        due(&first),
+        format!("$HOME/trust: core.untrackedCache and feature.manyFiles unset, index format {start}")
+    );
+    let (again, listed) = pass();
+    assert_eq!(listed, 0, "origin's tip has not moved");
+    assert_eq!(again, first);
+
+    world.declare(
+        &source,
+        &top,
+        "[tuning]\n\tsuperproject = feature.manyFiles\n",
+    );
+    let (moved, listed) = pass();
+    assert_eq!(listed, 1, "origin's tip moved");
+    assert_eq!(due(&moved), "$HOME/trust: feature.manyFiles unset");
+    let (again, listed) = pass();
+    assert_eq!((again, listed), (moved.clone(), 0));
+
+    // The control: with nothing kept, a pass at the same tip reads the declaration again.
+    std::fs::remove_file(converge_dir(world.state()).join(DECLARATIONS)).unwrap();
+    let (control, listed) = pass();
+    assert_eq!(listed, 1, "control: nothing kept");
+    assert_eq!(control, moved);
+}
+
+/// A read that keeps nothing ([`Keep::Nothing`]: a plan's, `--check`'s, System State's and the
+/// doctor's probe's) leaves `<state>/converge` byte for byte as it was, after a fetch moved
+/// origin's tip so that it reads the declaration again. NEGATIVE CONTROL: the same read of an
+/// applying pass ([`Keep::Declarations`]) keeps what it read there.
+#[test]
+fn a_read_that_keeps_nothing_leaves_the_converge_folder_as_it_was() {
+    let world = World::new();
+    let source = world.source("trust", &[(DECLARATION, TRUST)]);
+    let top = world.clone("trust", &source);
+    world.inventory(&["trust"]);
+    world.kept_self_test(true);
+    let dir = converge_dir(world.state());
+    let reading =
+        |keep: Keep| read(&world.sys, &world.ctx(), world.state(), &Holds::NONE, keep).unwrap();
+    reading(Keep::Declarations);
+    world.declare(
+        &source,
+        &top,
+        "[tuning]\n\tsuperproject = feature.manyFiles\n",
+    );
+    let before = files(&dir);
+    assert!(before.contains_key(DECLARATIONS), "{:?}", before.keys());
+
+    let planned = reading(Keep::Nothing);
+    assert_eq!(due(&planned), "$HOME/trust: feature.manyFiles unset");
+    assert_eq!(
+        files(&dir),
+        before,
+        "a read that keeps nothing writes nothing"
+    );
+
+    // The control: an applying pass's read keeps the declaration it read at the new tip.
+    let applying = reading(Keep::Declarations);
+    assert_eq!(applying, planned);
+    assert_ne!(
+        files(&dir).get(DECLARATIONS),
+        before.get(DECLARATIONS),
+        "control: the applying pass keeps it"
+    );
+}
+
+/// Each file in `dir`, by name, and its bytes.
+fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(Result::unwrap)
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| {
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                std::fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
 /// An oversized `.gitmodules` is not read: its submodules are left, named, and the clone's own
 /// keys are still set.
 #[test]
@@ -1192,6 +1322,7 @@ fn a_repository_off_the_self_test_s_volume_gets_no_cache_key() {
         std::slice::from_ref(&top),
         &record,
         Some(dev + 1),
+        &mut Declarations::default(),
     );
     assert_eq!(
         current(&summary(&elsewhere, world.sys.machine())),
@@ -1202,7 +1333,14 @@ fn a_repository_off_the_self_test_s_volume_gets_no_cache_key() {
         )
     );
     // The control: on the self-test's volume, the same record tunes it.
-    let here = plan_all(&world.sys, world.reads(), &[top], &record, Some(dev));
+    let here = plan_all(
+        &world.sys,
+        world.reads(),
+        &[top],
+        &record,
+        Some(dev),
+        &mut Declarations::default(),
+    );
     due(&summary(&here, world.sys.machine()));
 }
 
@@ -1281,7 +1419,7 @@ fn a_hold_or_a_lock_taken_after_the_row_read_stands_its_apply_aside() {
 /// A clone whose config names a hook in bytes that are not UTF-8 is left as it is: aterm cannot
 /// pass that name to git to turn the hook off, so it writes nothing there and says why. Under a
 /// UTF-8 locale (the test's, and an aterm tab's) git's `.` matches no such byte, so this also
-/// holds [`checkout::Programs::listing`] to the C locale, where its expression finds the key;
+/// holds [`checkout::facts::config_listing`] to the C locale, where its expression finds the key;
 /// a plain git runs the hook.
 #[test]
 fn a_hook_named_in_bytes_that_are_not_utf8_leaves_the_clone_as_it_is() {
@@ -1344,6 +1482,7 @@ fn a_lock_taken_after_the_plan_leaves_the_clone_for_the_next_pass() {
                 planned: &|| std::fs::write(lock, "").unwrap(),
                 lock_wait: LOCK_WAIT,
             },
+            None,
         )
     };
     let held = |label: &str, lock: &str| {
@@ -1488,6 +1627,7 @@ fn another_aterm_tuning_now_stands_the_apply_aside() {
                 planned: &|| panic!("nothing is planned"),
                 lock_wait: Duration::ZERO,
             },
+            None,
         ),
         Ok(Tuned {
             said: NOTHING.into(),
@@ -1634,6 +1774,14 @@ fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
     let size = format!("{}\n", TRUST.len());
     let dirs = format!("{dir}\n{dir}\n", dir = dir.display());
     let index = format!("{}\n", dir.join("index").display());
+    // The record of the clone's facts ([`checkout::Facts::of`]): its top, not shallow, HEAD on
+    // `main` and origin's HEAD on `origin/main`, both at the tip. A fake holds no `.git` folder,
+    // so both HEADs are asked of `symbolic-ref`.
+    let top_level = format!(
+        "true\n\n{}\nfalse\n.git/index\n.git/objects/info/alternates\n",
+        top.display()
+    );
+    let refs = format!("{TIP} commit refs/heads/main\n{TIP} commit refs/remotes/origin/main\n");
     let given = Arc::new(Mutex::new(Vec::new()));
     let runs = Arc::clone(&given);
     sys.simulate(move |_, command| {
@@ -1659,8 +1807,10 @@ fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
             }
         }
         Some(match words.as_slice() {
+            ["rev-parse", "--is-inside-work-tree", ..] => Ran::ok(&top_level),
+            ["symbolic-ref", "--quiet", "HEAD"] => Ran::ok("refs/heads/main\n"),
             ["symbolic-ref", ..] => Ran::ok("refs/remotes/origin/main\n"),
-            ["rev-parse", "--verify", ..] => Ran::ok(&format!("{TIP}\n")),
+            ["for-each-ref", ..] => Ran::ok(&refs),
             ["rev-parse", "--path-format=absolute", "--git-dir", ..] => Ran::ok(&dirs),
             ["rev-parse", "--path-format=absolute", "--git-path", "index"] => Ran::ok(&index),
             ["ls-tree", ..] => Ran::ok(&listed),
@@ -1684,10 +1834,11 @@ fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
 }
 
 /// Every git run of a plan, its writes and git's self-test carries `GIT_NO_LAZY_FETCH`, and
-/// `--no-lazy-fetch` exactly where git takes it: under [`NoLazyFetch::Variable`] (a git before
+/// `--no-lazy-fetch` only where git takes it: under [`NoLazyFetch::Variable`] (a git before
 /// 2.45 seen to obey the variable, as Ubuntu 24.04's 2.43.0 is) no run passes the option the git
 /// would refuse, and the clone is planned, tuned and self-tested as under one that takes it.
-/// NEGATIVE CONTROL: under [`NoLazyFetch::Flag`] every run passes it.
+/// NEGATIVE CONTROL: under [`NoLazyFetch::Flag`] every run passes it but the reads of the
+/// clone's record of facts ([`record_read`]), which carry the variable alone.
 #[test]
 fn a_git_that_obeys_the_variable_alone_tunes_with_no_run_passing_the_option() {
     for off in [NoLazyFetch::Variable, NoLazyFetch::Flag] {
@@ -1704,7 +1855,14 @@ fn a_git_that_obeys_the_variable_alone_tunes_with_no_run_passing_the_option() {
                 at_s: 1,
             },
         );
-        let clones = plan_all(&sys, git, &[top], &record, Some(VOLUME));
+        let clones = plan_all(
+            &sys,
+            git,
+            &[top],
+            &record,
+            Some(VOLUME),
+            &mut Declarations::default(),
+        );
         assert_eq!(
             due(&summary(&clones, sys.machine())),
             "$HOME/trust: core.untrackedCache and feature.manyFiles unset, index format 2",
@@ -1741,24 +1899,57 @@ fn a_git_that_obeys_the_variable_alone_tunes_with_no_run_passing_the_option() {
                 .is_some_and(|(_, value)| value == "1")),
             "{shown:?}"
         );
-        let flagged = runs
-            .iter()
-            .filter(|run| run.args.iter().any(|arg| arg == "--no-lazy-fetch"))
-            .count();
+        assert!(runs.iter().any(record_read), "{shown:?}");
+        let flagged = |run: &Cmd| run.args.iter().any(|arg| arg == "--no-lazy-fetch");
         match off {
-            NoLazyFetch::Variable => assert_eq!(flagged, 0, "{shown:?}"),
-            NoLazyFetch::Flag => assert_eq!(flagged, runs.len(), "control: {shown:?}"),
+            NoLazyFetch::Variable => assert!(!runs.iter().any(flagged), "{shown:?}"),
+            NoLazyFetch::Flag => assert!(
+                runs.iter().all(|run| flagged(run) != record_read(run)),
+                "control: {shown:?}"
+            ),
         }
     }
 }
 
-/// The installed Git 2.56 control for named config hooks and config-lock waiting.
+/// Whether `run` is one of the reads of a repository's record of facts
+/// ([`checkout::Facts::of`]), which every reader of that record shares, so they carry
+/// `GIT_NO_LAZY_FETCH` alone (a git that takes `--no-lazy-fetch` obeys it too).
+fn record_read(run: &Cmd) -> bool {
+    let has = |word: &str| run.args.iter().any(|arg| arg == word);
+    has("--is-inside-work-tree")
+        || has(checkout::facts::KEYS)
+        || has("symbolic-ref")
+        || has("for-each-ref")
+}
+
+/// This host's tool home, whose managed Git the named-hook and config-lock controls run.
+fn feature_home() -> PathBuf {
+    aterm_uds::host::tool_home().unwrap_or_else(|| {
+        aterm_uds::host::could_not_run("no tool home for the managed Git controls")
+    })
+}
+
+/// The atpkg prefix of [`feature_home`], which a fixture's `[packages] prefix` names so that its
+/// account selects the same managed build ([`World::with_program`]).
+fn feature_prefix() -> PathBuf {
+    aterm_toolchain::atpkg_prefix(&feature_home(), None)
+}
+
+/// The installed Git 2.56 control for named config hooks and config-lock waiting: the managed
+/// build's own git that setup starts for [`feature_home`]'s account
+/// ([`crate::items::github::installed_git_for`], `store/git/<build>/bin/git`), never the PATH
+/// entry atpkg laid for it, as [`checkout::git`] starts it.
 /// Native Git remains the other fixtures' baseline; an older one need not have these features.
 fn feature_git() -> PathBuf {
-    let home = aterm_uds::host::tool_home().unwrap_or_else(|| {
-        aterm_uds::host::could_not_run("no tool home for the managed Git controls")
-    });
-    let git = aterm_toolchain::atpkg_prefix(&home, None).join("bin/git");
+    let store = feature_prefix().join("store");
+    let git = crate::items::github::installed_git_for(&Live::new(), Some(&feature_home()))
+        .filter(|git| git.starts_with(&store))
+        .unwrap_or_else(|| {
+            aterm_uds::host::could_not_run(format!(
+                "no managed Git build under {}, needed for named-hook and config-lock controls",
+                store.display()
+            ))
+        });
     let version = Live::new()
         .run_complete_stdout(&Cmd::new(&git).arg("--version"))
         .ok()
@@ -1806,7 +1997,7 @@ fn a_write_never_waits_on_a_config_lock() {
     let wrote = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("the write waited on the lock");
-    assert!(matches!(wrote, Err(Wrote::Locked)), "{wrote:?}");
+    assert!(matches!(wrote, Err(Unwritten::Locked)), "{wrote:?}");
     assert!(top.join(".git/config.lock").exists(), "never removed");
 }
 

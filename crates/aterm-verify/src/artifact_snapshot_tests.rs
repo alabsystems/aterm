@@ -153,9 +153,12 @@ fn a_callers_temporary_root_cannot_remove_a_retained_snapshot() {
         .args(["--exact", name, "--nocapture"])
         .env(RECORD, &record)
         .env("TMPDIR", caller.path());
-    let output =
-        aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
-            .unwrap();
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        std::time::Duration::from_secs(60),
+        "the snapshot's consumer test, run again as the actor",
+    )
+    .unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -207,8 +210,12 @@ fn the_proved_consumer_executes_the_private_image_after_original_bundle_replacem
         let binary = private.bin("aterm");
         let mut command = aterm_uds::spawnfd::command(&binary);
         command.arg("__snapshot_identity");
-        let output =
-            aterm_uds::deadline::output_within(&mut command, Duration::from_secs(60)).unwrap();
+        let output = aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            Duration::from_secs(60),
+            "the private image naming itself",
+        )
+        .unwrap();
         assert!(
             output.status.success(),
             "{}",

@@ -1652,6 +1652,7 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                     match sym.as_str() {
                         "xml" => spec.xml_block = parse_xml_shape(params, lines),
                         "yaml" => spec.yaml_block = parse_yaml_shape(params, lines),
+                        "extract_plist" => spec.plist_block = parse_plist_shape(params, lines),
                         _ => spec.json_block = parse_json_shape(params, lines),
                     }
                     json_capture = None;
@@ -1793,7 +1794,9 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                 {
                     return None;
                 }
-                if (sym == "json" || sym == "xml" || sym == "yaml") && opens {
+                if (sym == "json" || sym == "xml" || sym == "yaml" || sym == "extract_plist")
+                    && opens
+                {
                     json_capture = Some((sym.clone(), tail.to_string(), Vec::new()));
                 }
                 spec.strategy = Some(sym);
@@ -2112,6 +2115,48 @@ fn parse_yaml_shape(params: &str, lines: &[String]) -> Option<super::formula::Ya
         YamlShape::DigRegex(path)
     };
     Some(YamlBlock { has_regex, shape })
+}
+
+/// Reduce an `:extract_plist` strategy block body to
+/// data: `items["<bundle-id>"]&.short_version` /
+/// `.version`, optionally with the regex's first
+/// capture applied.
+fn parse_plist_shape(params: &str, lines: &[String]) -> Option<super::formula::PlistBlock> {
+    use super::formula::{PlistBlock, PlistProp};
+    let (root, has_regex) = block_params(params)?;
+    let joined = join_block_lines(lines);
+    let body = joined.trim();
+    let after = body.strip_prefix(root.as_str())?;
+    let (bundle_id, tail) = json_bracket_key(after)?;
+    let (prop, rest) = if let Some(r) = tail
+        .strip_prefix("&.short_version")
+        .or_else(|| tail.strip_prefix(".short_version"))
+    {
+        (PlistProp::Short, r)
+    } else if let Some(r) = tail
+        .strip_prefix("&.version")
+        .or_else(|| tail.strip_prefix(".version"))
+    {
+        (PlistProp::Bundle, r)
+    } else {
+        return None;
+    };
+    let regex = if rest.is_empty() {
+        false
+    } else if rest == "&.[](regex, 1)" || rest == ".[](regex, 1)" {
+        if !has_regex {
+            return None;
+        }
+        true
+    } else {
+        return None;
+    };
+    Some(PlistBlock {
+        has_regex,
+        bundle_id,
+        prop,
+        regex,
+    })
 }
 
 /// `["key"]` at the start of `s`: the key and the rest.

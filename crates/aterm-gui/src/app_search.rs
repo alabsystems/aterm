@@ -787,6 +787,7 @@ impl App {
                     | crate::native_app::AppKind::Allocation
                     | crate::native_app::AppKind::Workers => None,
                     crate::native_app::AppKind::Tables => Some("tables/find"),
+                    crate::native_app::AppKind::Navigator => Some(crate::navigator::FILTER),
                 });
             if let Some(action) = action {
                 let _ = self.dispatch_native_event(

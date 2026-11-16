@@ -400,13 +400,13 @@ struct FxDesk {
 
 /// The rows a park draws from the store rather than from a session
 /// (`SessionHandoff::from_store`): the bus mirror's closed sessions, whether
-/// a bridge served the mirror, and the workers whose tabs the reaper closed
-/// (`RetiredWorkers::carry_rows`).
+/// a bridge served the mirror, and the launch of the last agent each session
+/// ran (`harness_host::last_launch_rows`).
 #[derive(Default)]
 struct FxDrawn {
     mirror_dropped: Vec<String>,
     mirror_served: bool,
-    retired_workers: Vec<String>,
+    last_launches: Vec<String>,
 }
 
 fn fx_machine_names() -> Vec<String> {
@@ -1423,7 +1423,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         mirror_dropped: desk.drawn.mirror_dropped.clone(),
         mirror_served: desk.drawn.mirror_served,
         machine_names: fx_machine_names(),
-        retired_workers: desk.drawn.retired_workers.clone(),
+        last_launches: desk.drawn.last_launches.clone(),
     };
     let mut layout = desk.layout.clone();
     layout.fold_into_caps();
@@ -4274,30 +4274,33 @@ fn fx_carried_state_desk() -> FxDesk {
         behind.show.z_order = Some(1);
         behind.show.key = Some(false);
     }
+    // A plain shell whose Claude Code exited before the park: the harness's live publication
+    // ended with it, and the park carries its launch, so the row the session leaves when it
+    // ends in the successor still names it (tracker ST-15).
+    let exited = fx_agent(
+        4310,
+        "claude",
+        Some("0b22c0de-1111-4222-8333-444455556666"),
+        None,
+        "claude",
+    );
+    let last_launches = vec![
+        crate::harness_host::last_launch_row(&fx_record(1, "").sid, &exited)
+            .expect("the exited agent's launch writes"),
+    ];
+    assert_eq!(
+        last_launches
+            .iter()
+            .filter_map(|row| crate::harness_host::read_last_launch_row(row))
+            .collect::<Vec<_>>(),
+        [(fx_record(1, "").sid, exited)],
+        "the exited agent's launch reads back"
+    );
     let drawn_rows = FxDrawn {
         mirror_dropped: mailbox.mirror_dropped,
         mirror_served: mailbox.mirror_served,
-        // A worker the reaper closed once it finished (crate::retired_workers): the park
-        // carries its row, on no page, so its manager's `result` and `await task` still
-        // answer in the successor.
-        retired_workers: vec![format!(
-            "sid=s-{:020x} closed={} title=claude%20worker words=Done rev=2 state=done \
-             from=ctl since={} result_bytes=0 attention=0 age_ms=600000",
-            0x00ff_0000_0007_u64,
-            release_ms + 3_500_000,
-            release_ms + 2_900_000
-        )],
+        last_launches,
     };
-    assert_eq!(
-        crate::retired_workers::RetiredWorkers::default().adopt(
-            &drawn_rows.retired_workers,
-            None,
-            std::time::Instant::now(),
-            u64::try_from(release_ms + 3_600_000).unwrap(),
-        ),
-        1,
-        "the retired worker's row reads back"
-    );
     let mut desk = FxDesk {
         name: "carried-state",
         nonce_seed: 0x0100_0014,
@@ -5114,6 +5117,10 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
     // run, and no handoff writes it. v0.140.0 recorded the former fields' omission; older
     // immutable desks continue to hold the reader to those bytes (tests/fixtures/handoff/README.md).
     ("layout", "AgentRestore.gemini"),
+    // A closed worker's row went to the machine's session table on disk (tracker ST-15), which
+    // outlives every update, so no handoff carries it; older immutable desks still write it and
+    // the reader ignores it.
+    ("manifest", "SessionHandoff.retired_workers"),
     ("layout", "NativeLeafRestore.metadata"),
     ("meta", "ColorRepr.stack"),
     ("meta", "CursorStyle::Hidden"),

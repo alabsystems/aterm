@@ -9,7 +9,7 @@ use aterm_vitals::trend::TrendView;
 use aterm_vitals::words;
 
 use crate::stats_deck::{DeckGeom, DeckInput};
-use crate::stats_paint::{Bar, Hit, Instrument, Mark, Painter, a, panel};
+use crate::stats_paint::{Bar, Hit, Instrument, Mark, Painter, Rung, a, panel};
 use crate::widget::{DrawPrim, rgba};
 
 /// Minimum bottom padding in points required to show the sill.
@@ -182,6 +182,20 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
     let room = (right - x).max(0.0);
     let gap = p.px(COL_GAP_PT);
     let bracket_room = p.px(2.0);
+    // What stays of a folded column, memory's pressure cap and the disk's ◢, has a slot of
+    // its own after the columns kept: a column gap, then the mark and its pointer region.
+    // The slots come off the room before the shares are cut, whether a mark shows or not,
+    // so the marks end at or inside the Sill's right end and no lane moves when one comes
+    // or goes.
+    let cap_w = (2.0 * s).round();
+    let cap_slot = (!fold.minimal && !fold.memory && snap.mem.is_some()).then_some(cap_w + 2.0);
+    let wedge_slot = (!fold.minimal && !fold.disk && snap.volume.is_some())
+        .then(|| p.px(6.0).max(filling_side(rows[0].1)));
+    let slots: f32 = [cap_slot, wedge_slot]
+        .into_iter()
+        .flatten()
+        .map(|slot| gap + slot)
+        .sum();
     let (cpu_w, mem_w, disk_w) = if fold.minimal {
         (room.max(0.0).min(room), 0.0, 0.0)
     } else {
@@ -196,7 +210,7 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
             .sum();
         let share = |i: usize| {
             if cols[i] {
-                ((room - gaps - bracket_room) * weights[i] / total).floor()
+                ((room - slots - gaps - bracket_room) * weights[i] / total).floor()
             } else {
                 0.0
             }
@@ -263,19 +277,18 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                 &mut hits,
             );
             x += mem_w + gap;
-        } else if !fold.minimal {
+        } else if let Some(slot) = cap_slot {
             // Folded: only the pressure cap, and only at warn or above.
             if let Some(c) = pressure_ink(&inks, m) {
-                let cw = (2.0 * s).round();
                 p.prims
-                    .push(panel(x, rows[0].0, cw, rows[0].1, 0.0, rgba(c, 0xFF)));
+                    .push(panel(x, rows[0].0, cap_w, rows[0].1, 0.0, rgba(c, 0xFF)));
                 hits.push(Hit::row(
-                    (x, 0.0, cw + 2.0, band_h),
+                    (x, 0.0, slot, band_h),
                     Instrument::Memory,
                     Bar::Global,
                 ));
-                x += cw + gap;
             }
+            x += slot + gap;
         }
     }
 
@@ -327,10 +340,10 @@ fn sill_instruments(g: &DeckGeom, input: &DeckInput<'_>) -> (Vec<DrawPrim>, Vec<
                     bar,
                 ));
             }
-        } else if let Some(ink) = wedge.filter(|_| !fold.minimal) {
+        } else if let Some((slot, ink)) = wedge_slot.zip(wedge) {
             filling_mark(&mut p, x, rows[0].0, rows[0].1, ink);
             hits.push(Hit::row(
-                (x, 0.0, p.px(6.0), band_h),
+                (x, 0.0, slot, band_h),
                 Instrument::Disk,
                 Bar::Global,
             ));
@@ -390,8 +403,13 @@ fn groove(p: &mut Painter<'_>, x: f32, y: f32, w: f32, h: f32) {
         .push(panel(x, gy, w, gh, (gh / 2.0).floor(), a(track, 0.7)));
 }
 
+/// The side of the ◢ [`filling_mark`] draws by a lane `h` px tall.
+fn filling_side(h: f32) -> f32 {
+    (h + 2.0).round()
+}
+
 fn filling_mark(p: &mut Painter<'_>, x: f32, y: f32, h: f32, ink: Rgb) {
-    let side = (h + 2.0).round();
+    let side = filling_side(h);
     let c = rgba(ink, 0xFF);
     for i in 0..side as usize {
         let k = i as f32 + 1.0;
@@ -589,8 +607,23 @@ fn core_row(
     if let Some(gpu) = snap.gpu.as_ref() {
         x += cluster_gap;
         let tw = (6.0 * s).round().max(4.0);
+        // The tank always draws a 1 px rim. Where it is rounded the raster centres its
+        // line on the rect's edge and puts it on the rows `round(y - ½)` and `y + h`
+        // (`tray_raster`'s `rim_on_grid`): the row over a rect on row 0, the rect's own
+        // first row from row 1 on, and the row under its last; else it draws it inside
+        // the rect. So the tank's rect starts on row 1 or below and ends a row above the
+        // band's foot, and the rim stays on the card. Squares of 10 px and more draw the
+        // same rim (`Rung::Mid`); smaller ones draw none (every square at 1×), and there
+        // the rect ends a row above theirs, so the rim's bottom line is on their last row.
+        let ty = top.max(1.0);
+        let foot = if Rung::of(big) == Rung::Low {
+            top + big - 1.0
+        } else {
+            top + big
+        };
+        let foot = foot.min(band_h - 1.0);
         let m = Mark::of(&gpu.load, 1.0, words::LOAD_GATE);
-        p.tank((x, top, tw, big), m, None, gutter);
+        p.tank((x, ty, tw, foot - ty), m, None, gutter);
         hits.push(Hit::row(
             (x - 1.0, 0.0, tw + 2.0, band_h),
             Instrument::Gpu,

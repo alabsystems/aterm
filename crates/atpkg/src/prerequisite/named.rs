@@ -216,6 +216,10 @@ impl Session<'_> {
             return Err("named prerequisite bytes differ from the signed tree".into());
         }
         let tool = HeldTool {
+            #[cfg(unix)]
+            creator: std::process::id(),
+            #[cfg(unix)]
+            native_attempt: None,
             executable: physical.clone(),
             physical,
             image,

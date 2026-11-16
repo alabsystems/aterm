@@ -5,7 +5,8 @@
 //! `aterm_file::cli`'s, which cannot open custody because their crate cannot reach this one;
 //! `refresh` is here, beside the materializer it runs, and the write verbs (`set`, `add`, `rm`,
 //! `revert`, `resolve`) beside the publisher they give two seconds (the private `write`
-//! module, which [`main_entry`] alone runs: each makes an owner act).
+//! module, which [`main_entry`] runs, and `super::rename_nick` for a rename of this Mac asked for
+//! by name: each makes an owner act).
 
 use super::{
     materialize::{self, Outcome, Pass},

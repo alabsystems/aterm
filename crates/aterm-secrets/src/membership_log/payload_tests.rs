@@ -145,3 +145,51 @@ fn ciphertext_payloads_keep_signature_truncation_and_length_refusals() {
     }
     assert!(Record::decode(&vec![0; MAX_RECORD + 1]).is_err());
 }
+
+/// A shelved record of `bytes`, its frame their first four, read back from `path`.
+#[cfg(unix)]
+fn shelved_at(path: &std::path::Path, bytes: &[u8]) -> payload::Wire {
+    use std::sync::Arc;
+    std::fs::write(path, bytes).unwrap();
+    let file = std::fs::File::open(path).unwrap();
+    let source = Arc::new(payload::Source::new(file, bytes.len() as u64));
+    payload::Wire::Shelved(Arc::new(payload::Shelved::new(
+        digest(bytes),
+        bytes.len(),
+        bytes[..4].into(),
+        0,
+        source,
+    )))
+}
+
+/// A read-back that fails once (the file's bytes not as they were, a transient I/O error) is not
+/// kept: once the bytes read back again, every ask has them.
+#[cfg(unix)]
+#[test]
+fn a_failed_read_back_is_asked_again() {
+    use std::os::unix::fs::FileExt as _;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let path = dir.path().join("current");
+    let bytes: Vec<u8> = (0..=255u8).cycle().take(4096).collect();
+    let wire = shelved_at(&path, &bytes);
+    let writer = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+
+    writer.write_all_at(&[0; 16], 100).unwrap();
+    assert!(
+        wire.read().is_err(),
+        "bytes not as they were do not read back"
+    );
+    assert!(wire.bytes().is_empty(), "nor are they kept");
+    assert!(wire.is_shelved(), "a failed read keeps nothing");
+    assert_eq!(wire.resident(), 4);
+
+    writer.write_all_at(&bytes[100..116], 100).unwrap();
+    assert_eq!(
+        wire.bytes(),
+        &bytes[..],
+        "read again once they are, and kept"
+    );
+    assert_eq!(&*wire.read().unwrap(), &bytes[..]);
+    assert!(!wire.is_shelved());
+    assert_eq!(wire.resident(), 4 + bytes.len());
+}

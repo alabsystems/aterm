@@ -10,6 +10,9 @@ use sha2::Sha256;
 use super::*;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "capture_bounds_tests.rs"]
+mod capture_bounds;
 const ACTOR: &str = "program::tests::native_program_actor";
 
 fn deadline() -> Instant {
@@ -56,7 +59,12 @@ impl Fixture {
     fn new(loads: &[&str]) -> Self {
         // Own build output is a checked private ancestor, unlike world-writable
         // /tmp. No account state or unrelated checkout is created or changed.
-        let base = std::env::current_exe().unwrap().parent().unwrap().canonicalize().unwrap();
+        let base = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap();
         let directory = tempfile::Builder::new()
             .prefix("native-program-")
             .suffix(".noindex")
@@ -88,7 +96,11 @@ impl Fixture {
         let path = self.root.join("lib").join(name);
         fs::write(
             &path,
-            image(false, loads, vec![command(0x8000_001c, "@loader_path/../lib", 12)]),
+            image(
+                false,
+                loads,
+                vec![command(0x8000_001c, "@loader_path/../lib", 12)],
+            ),
         )
         .unwrap();
         fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
@@ -97,7 +109,10 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         if self.execution_attempted && !self.execution_proved {
-            eprintln!("preserved native image without execution proof: {}", self.root.display());
+            eprintln!(
+                "preserved native image without execution proof: {}",
+                self.root.display()
+            );
         } else {
             unsafe {
                 std::mem::ManuallyDrop::drop(&mut self.directory);
@@ -109,21 +124,33 @@ impl Drop for Fixture {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn native_program_retains_exact_transitive_runtime_and_detects_later_changes() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = Fixture::new(&["@rpath/a.dylib", "/usr/lib/libSystem.B.dylib"]);
     fixture.runtime("a.dylib", &["@rpath/b.dylib", "/usr/lib/libSystem.B.dylib"]);
     fixture.runtime("b.dylib", &["/usr/lib/libSystem.B.dylib"]);
     let pin = fixture.open().unwrap();
     assert_eq!(pin.observation().runtime.len(), 2);
-    assert_eq!(pin.observation().system_dependencies, ["/usr/lib/libSystem.B.dylib"]);
+    assert_eq!(
+        pin.observation().system_dependencies,
+        ["/usr/lib/libSystem.B.dylib"]
+    );
     assert_eq!(
         pin.runtime_environment().unwrap(),
-        [("DYLD_LIBRARY_PATH".into(), fixture.root.join("lib").into_os_string())]
+        [(
+            "DYLD_LIBRARY_PATH".into(),
+            fixture.root.join("lib").into_os_string()
+        )]
     );
     pin.validate(deadline()).unwrap();
     let path = fixture.root.join("lib/b.dylib");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    fs::write(&path, image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new())).unwrap();
+    fs::write(
+        &path,
+        image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()),
+    )
+    .unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o444)).unwrap();
     assert!(
         pin.validate(deadline()).is_err(),
@@ -133,12 +160,17 @@ fn native_program_retains_exact_transitive_runtime_and_detects_later_changes() {
 
 #[test]
 fn system_only_environment_keeps_actual_search_root_and_shadow_custody() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     let pin = fixture.open().unwrap();
     assert!(pin.runtime.is_empty());
     assert_eq!(pin.observation().loader_paths, [fixture.root.join("lib")]);
-    assert_eq!(pin.observation().system_dependencies, ["/usr/lib/libSystem.B.dylib"]);
+    assert_eq!(
+        pin.observation().system_dependencies,
+        ["/usr/lib/libSystem.B.dylib"]
+    );
     assert!(pin.runtime_environment().unwrap().is_empty());
     pin.validate(deadline()).unwrap();
     // A missing override does not discard the original namespace bookends.
@@ -159,10 +191,16 @@ fn system_only_environment_keeps_actual_search_root_and_shadow_custody() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn unrelated_outer_entries_do_not_change_selected_inputs_but_retargeting_does() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     let held = fixture.open().unwrap();
-    fs::write(fixture.directory.path().join("unrelated"), b"activity outside the SDK").unwrap();
+    fs::write(
+        fixture.directory.path().join("unrelated"),
+        b"activity outside the SDK",
+    )
+    .unwrap();
     held.validate(deadline()).unwrap();
     let outer = fixture.directory.path().to_owned();
     let backup = outer.with_extension("retargeted.noindex");
@@ -179,7 +217,9 @@ fn unrelated_outer_entries_do_not_change_selected_inputs_but_retargeting_does() 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn native_program_refuses_foreign_loader_selection_aliases_and_unbounded_images() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for loads in [
         &["@rpath/missing.dylib"][..],
         &["/foreign/code.dylib"][..],
@@ -190,7 +230,10 @@ fn native_program_refuses_foreign_loader_selection_aliases_and_unbounded_images(
     }
     let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     fixture.runtime("libSystem.B.dylib", &["/usr/lib/libSystem.B.dylib"]);
-    assert!(fixture.open().is_err(), "a selected sysroot cannot shadow OS runtime");
+    assert!(
+        fixture.open().is_err(),
+        "a selected sysroot cannot shadow OS runtime"
+    );
     for alteration in 0..8 {
         let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
         let mut digest = fixture.digest();
@@ -225,7 +268,11 @@ fn native_program_refuses_foreign_loader_selection_aliases_and_unbounded_images(
                 fs::set_permissions(&fixture.program, fs::Permissions::from_mode(0o755)).unwrap();
                 fs::write(
                     &fixture.program,
-                    image(true, &[], vec![command(0x27, "DYLD_INSERT_LIBRARIES=/foreign", 12)]),
+                    image(
+                        true,
+                        &[],
+                        vec![command(0x27, "DYLD_INSERT_LIBRARIES=/foreign", 12)],
+                    ),
                 )
                 .unwrap();
             }
@@ -250,8 +297,13 @@ fn native_program_refuses_foreign_loader_selection_aliases_and_unbounded_images(
     let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     assert!(HeldProgram::open(&fixture.root, &fixture.program, &[0; 32], deadline()).is_err());
     assert!(
-        HeldProgram::open(&fixture.root, &fixture.program, &fixture.digest(), Instant::now())
-            .is_err()
+        HeldProgram::open(
+            &fixture.root,
+            &fixture.program,
+            &fixture.digest(),
+            Instant::now()
+        )
+        .is_err()
     );
 }
 
@@ -360,7 +412,9 @@ fn native_program_actor() {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn actual_native_child_matches_original_held_image_not_equal_bytes_at_another_path() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut fixture = Fixture::new(&[]);
     fs::set_permissions(&fixture.program, fs::Permissions::from_mode(0o755)).unwrap();
     fs::copy(std::env::current_exe().unwrap(), &fixture.program).unwrap();
@@ -408,7 +462,11 @@ fn real_sdk_held_program_profile() {
             "actual-sdk-input tool={name} image={} runtime_files={} runtime_bytes={} policy={}",
             held.observation().executable.sha256,
             held.observation().runtime.len(),
-            held.observation().runtime.iter().map(|file| file.bytes).sum::<u64>(),
+            held.observation()
+                .runtime
+                .iter()
+                .map(|file| file.bytes)
+                .sum::<u64>(),
             held.observation().policy
         );
     }
@@ -417,13 +475,18 @@ fn real_sdk_held_program_profile() {
 fn write_output(path: &Path, bytes: &[u8], executable: bool) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
-    fs::set_permissions(path, fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 }))
-        .unwrap();
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(if executable { 0o555 } else { 0o444 }),
+    )
+    .unwrap();
 }
 
 #[test]
 fn produced_inputs_keep_original_output_root_across_compilation_and_hold_both_runtime_roots() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     fixture.runtime("sdk.dylib", &["/usr/lib/libSystem.B.dylib"]);
     let sdk = Arc::new(fixture.open().unwrap());
@@ -446,18 +509,30 @@ fn produced_inputs_keep_original_output_root_across_compilation_and_hold_both_ru
     );
     write_output(
         &deps.join("local.dylib"),
-        &image(false, &["@rpath/sdk.dylib"], vec![command(0x8000_001c, "@loader_path", 12)]),
+        &image(
+            false,
+            &["@rpath/sdk.dylib"],
+            vec![command(0x8000_001c, "@loader_path", 12)],
+        ),
         false,
     );
     let digest = Sha256::digest(fs::read(&program).unwrap()).into();
     let held = original
-        .program(Arc::clone(&sdk), &program, &digest, std::slice::from_ref(&deps), deadline())
+        .program(
+            Arc::clone(&sdk),
+            &program,
+            &digest,
+            std::slice::from_ref(&deps),
+            deadline(),
+        )
         .unwrap();
     assert_eq!(held.program(), program);
     assert_eq!(held.output_root(), output);
     assert_eq!(held.observation().policy, produced::RUNTIME_POLICY);
     assert_eq!(held.observation().runtime.len(), 2);
-    let mut prefix = evidence.create(OsStr::new("action.stderr"), 64, deadline()).unwrap();
+    let mut prefix = evidence
+        .create(OsStr::new("action.stderr"), 64, deadline())
+        .unwrap();
     assert_eq!(prefix.append(b"raw\0\xff", deadline()).unwrap(), 5);
     prefix.sync_prefix(deadline()).unwrap();
     held.validate(deadline()).unwrap();
@@ -472,7 +547,9 @@ fn produced_inputs_keep_original_output_root_across_compilation_and_hold_both_ru
 
 #[test]
 fn produced_inputs_refuse_aliased_ambiguous_shadowed_or_escaping_loader_inputs() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for altered in 0..7 {
         let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
         if altered == 3 {
@@ -489,10 +566,22 @@ fn produced_inputs_refuse_aliased_ambiguous_shadowed_or_escaping_loader_inputs()
         if altered == 4 {
             extra.push(command(0x8000_001c, "/foreign", 12));
         }
-        let load = if altered == 6 { "/usr/lib/libSystem.B.dylib" } else { "@rpath/runtime.dylib" };
+        let load = if altered == 6 {
+            "/usr/lib/libSystem.B.dylib"
+        } else {
+            "@rpath/runtime.dylib"
+        };
         write_output(&program, &image(true, &[load], extra), true);
-        let runtime = deps.join(if altered == 6 { "libSystem.B.dylib" } else { "runtime.dylib" });
-        write_output(&runtime, &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()), false);
+        let runtime = deps.join(if altered == 6 {
+            "libSystem.B.dylib"
+        } else {
+            "runtime.dylib"
+        });
+        write_output(
+            &runtime,
+            &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()),
+            false,
+        );
         match altered {
             0 => {
                 fs::hard_link(&program, output.join("program-alias")).unwrap();
@@ -509,9 +598,15 @@ fn produced_inputs_refuse_aliased_ambiguous_shadowed_or_escaping_loader_inputs()
             _ => unreachable!(),
         }
         let digest = Sha256::digest(fs::read(&program).unwrap()).into();
-        let roots = if altered == 5 { vec![fixture.root.join("lib")] } else { vec![deps] };
+        let roots = if altered == 5 {
+            vec![fixture.root.join("lib")]
+        } else {
+            vec![deps]
+        };
         assert!(
-            original.program(sdk, &program, &digest, &roots, deadline()).is_err(),
+            original
+                .program(sdk, &program, &digest, &roots, deadline())
+                .is_err(),
             "altered {altered}"
         );
     }
@@ -519,7 +614,9 @@ fn produced_inputs_refuse_aliased_ambiguous_shadowed_or_escaping_loader_inputs()
 
 #[test]
 fn produced_inputs_match_the_actual_original_child_image_and_reject_later_byte_changes() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
     let sdk = Arc::new(fixture.open().unwrap());
     let output = fixture.directory.path().join("outputs");
@@ -532,14 +629,19 @@ fn produced_inputs_match_the_actual_original_child_image_and_reject_later_byte_c
     fixture.program = program.clone();
     finish(actor(&mut fixture));
     let digest = fixture.digest();
-    let held = original.program(sdk, &program, &digest, &[], deadline()).unwrap();
+    let held = original
+        .program(sdk, &program, &digest, &[], deadline())
+        .unwrap();
     let child = actor(&mut fixture);
-    held.validate_loaded(process::read_identity(child.0.id()).unwrap(), deadline()).unwrap();
+    held.validate_loaded(process::read_identity(child.0.id()).unwrap(), deadline())
+        .unwrap();
     finish(child);
     // Actual native image, borrowed from its original input owner after child
     // retirement. This descriptor observation is not another execution grant.
     let borrowed = held.executable_descriptor(deadline()).unwrap();
-    let actual = fs::File::from(borrowed.try_clone_to_owned().unwrap()).metadata().unwrap();
+    let actual = fs::File::from(borrowed.try_clone_to_owned().unwrap())
+        .metadata()
+        .unwrap();
     assert_eq!(actual.dev(), held.observation().executable.device);
     assert_eq!(actual.ino(), held.observation().executable.inode);
     // SAFETY: these commands only observe flags on the live borrowed original.
@@ -559,7 +661,9 @@ fn produced_inputs_match_the_actual_original_child_image_and_reject_later_byte_c
 
 #[test]
 fn produced_descriptor_refuses_path_replacement_and_sdk_runtime_drift_before_borrow() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     for replaced_path in [true, false] {
         let fixture = Fixture::new(&["/usr/lib/libSystem.B.dylib"]);
         fixture.runtime("sdk.dylib", &["/usr/lib/libSystem.B.dylib"]);
@@ -571,11 +675,15 @@ fn produced_descriptor_refuses_path_replacement_and_sdk_runtime_drift_before_bor
         let bytes = image(true, &["@rpath/sdk.dylib"], Vec::new());
         write_output(&program, &bytes, true);
         let digest = Sha256::digest(&bytes).into();
-        let held = original.program(sdk, &program, &digest, &[], deadline()).unwrap();
+        let held = original
+            .program(sdk, &program, &digest, &[], deadline())
+            .unwrap();
         assert_eq!(held.observation().runtime.len(), 1);
         assert!(held.executable_descriptor(deadline()).is_ok());
         assert_eq!(
-            held.executable_descriptor(Instant::now()).unwrap_err().kind(),
+            held.executable_descriptor(Instant::now())
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::TimedOut
         );
         if replaced_path {
@@ -604,14 +712,25 @@ fn produced_evidence_preserves_binary_prefixes_and_enforces_shared_bounds_withou
     let mut first = evidence.create(OsStr::new("first"), 4, deadline()).unwrap();
     assert_eq!(first.append(b"\0\xffabcd", deadline()).unwrap(), 4);
     assert_eq!(first.bytes_written(), 4);
-    assert_eq!(first.append(b"z", deadline()).unwrap_err().kind(), io::ErrorKind::StorageFull);
-    let mut second = evidence.create(OsStr::new("second"), 4, deadline()).unwrap();
+    assert_eq!(
+        first.append(b"z", deadline()).unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+    let mut second = evidence
+        .create(OsStr::new("second"), 4, deadline())
+        .unwrap();
     assert_eq!(second.append(b"xyz", deadline()).unwrap(), 2);
-    assert_eq!(second.append(b"z", deadline()).unwrap_err().kind(), io::ErrorKind::StorageFull);
+    assert_eq!(
+        second.append(b"z", deadline()).unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
     assert!(evidence.create(OsStr::new("third"), 1, deadline()).is_err());
     first.sync_prefix(deadline()).unwrap();
     second.sync_prefix(deadline()).unwrap();
-    assert_eq!(fs::read(evidence.path().join("first")).unwrap(), b"\0\xffab");
+    assert_eq!(
+        fs::read(evidence.path().join("first")).unwrap(),
+        b"\0\xffab"
+    );
     assert_eq!(fs::read(evidence.path().join("second")).unwrap(), b"xy");
     assert!(
         produced::HeldOutputRoot::open_with_evidence(&root, &sdk, [2; 16], 6, 2, deadline())
@@ -636,9 +755,15 @@ fn produced_evidence_rejects_path_escapes_replaced_names_and_retargeted_director
     for name in ["", ".", "..", "../outside", "/absolute", "nul\0name"] {
         assert!(evidence.create(OsStr::new(name), 8, deadline()).is_err());
     }
-    let mut prefix = evidence.create(OsStr::new("prefix"), 8, deadline()).unwrap();
+    let mut prefix = evidence
+        .create(OsStr::new("prefix"), 8, deadline())
+        .unwrap();
     prefix.append(b"actual", deadline()).unwrap();
-    fs::rename(evidence.path().join("prefix"), evidence.path().join("original")).unwrap();
+    fs::rename(
+        evidence.path().join("prefix"),
+        evidence.path().join("original"),
+    )
+    .unwrap();
     fs::write(evidence.path().join("prefix"), b"forged").unwrap();
     assert!(prefix.append(b"x", deadline()).is_err());
     assert!(prefix.sync_prefix(deadline()).is_err());
@@ -667,8 +792,12 @@ fn produced_evidence_exit_actor() {
         deadline(),
     )
     .unwrap();
-    let mut prefix = evidence.create(OsStr::new("raw-prefix"), 64, deadline()).unwrap();
-    prefix.append(b"received\0\xff-before-unknown", deadline()).unwrap();
+    let mut prefix = evidence
+        .create(OsStr::new("raw-prefix"), 64, deadline())
+        .unwrap();
+    prefix
+        .append(b"received\0\xff-before-unknown", deadline())
+        .unwrap();
     prefix.sync_prefix(deadline()).unwrap();
     // Deliberately bypass every Rust destructor, as an owning-custody failure
     // can do. No successful-execution or retirement fact is written.
@@ -684,7 +813,11 @@ fn produced_evidence_survives_actual_writer_exit_without_destructors() {
     fixture.execution_attempted = true;
     let mut child = OwnedChild(
         Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "program::tests::produced_evidence_exit_actor", "--nocapture"])
+            .args([
+                "--exact",
+                "program::tests::produced_evidence_exit_actor",
+                "--nocapture",
+            ])
             .env_clear()
             .env("TRUST_EVIDENCE_EXIT_ACTOR", &root)
             .env("TRUST_EVIDENCE_EXIT_SDK_ROOT", &fixture.root)
@@ -728,7 +861,12 @@ fn produced_evidence_cannot_write_into_sdk_or_reclassify_source_roots() {
         )
         .is_err()
     );
-    assert!(!fixture.root.join(".trust-workload-evidence.noindex").exists());
+    assert!(
+        !fixture
+            .root
+            .join(".trust-workload-evidence.noindex")
+            .exists()
+    );
     let source = fixture.directory.path().join("source");
     fs::create_dir(&source).unwrap();
     fs::write(source.join("Cargo.toml"), b"original source marker").unwrap();
@@ -736,7 +874,10 @@ fn produced_evidence_cannot_write_into_sdk_or_reclassify_source_roots() {
         produced::HeldOutputRoot::open_with_evidence(&source, &sdk, [6; 16], 64, 1, deadline())
             .is_err()
     );
-    assert_eq!(fs::read(source.join("Cargo.toml")).unwrap(), b"original source marker");
+    assert_eq!(
+        fs::read(source.join("Cargo.toml")).unwrap(),
+        b"original source marker"
+    );
     assert!(!source.join(".trust-workload-evidence.noindex").exists());
 }
 
@@ -755,10 +896,20 @@ fn direct_load_override_is_refused(relative: bool) {
         library.to_str().unwrap().to_owned()
     };
     write_output(&program, &image(true, &[&load], Vec::new()), true);
-    write_output(&library, &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()), false);
+    write_output(
+        &library,
+        &image(false, &["/usr/lib/libSystem.B.dylib"], Vec::new()),
+        false,
+    );
     let digest = Sha256::digest(fs::read(&program).unwrap()).into();
     let clean = output
-        .program(Arc::clone(&sdk), &program, &digest, std::slice::from_ref(&deps), deadline())
+        .program(
+            Arc::clone(&sdk),
+            &program,
+            &digest,
+            std::slice::from_ref(&deps),
+            deadline(),
+        )
         .unwrap();
     assert_eq!(clean.observation().runtime.len(), 1);
     assert_eq!(clean.observation().runtime[0].path, library);
@@ -770,7 +921,11 @@ fn direct_load_override_is_refused(relative: bool) {
         &image(false, &["/usr/lib/libc++.1.dylib"], Vec::new()),
         false,
     );
-    assert!(output.program(sdk, &program, &digest, &[deps], deadline()).is_err());
+    assert!(
+        output
+            .program(sdk, &program, &digest, &[deps], deadline())
+            .is_err()
+    );
 }
 
 #[test]
@@ -814,14 +969,22 @@ fn native_current_code_actor() {
         "equal bytes cannot replace the actual original mapped vnode"
     );
     assert!(program.bind_current_code(&[], deadline()).is_err());
-    assert!(program.bind_current_code(&[std::ptr::null()], deadline()).is_err());
     assert!(
-        program.bind_current_code(&[libc::getpid as *const ()], deadline()).is_err(),
+        program
+            .bind_current_code(&[std::ptr::null()], deadline())
+            .is_err()
+    );
+    assert!(
+        program
+            .bind_current_code(&[libc::getpid as *const ()], deadline())
+            .is_err(),
         "system code is outside the owned main/driver closure"
     );
     let data = 19usize;
     assert!(
-        program.bind_current_code(&[(&data as *const usize).cast()], deadline()).is_err(),
+        program
+            .bind_current_code(&[(&data as *const usize).cast()], deadline())
+            .is_err(),
         "a data address cannot stand for builtin executable code"
     );
     // A new Darwin vnode does not acquire a validated code-signature cache
@@ -880,7 +1043,10 @@ fn native_current_code_actor() {
     }
     let mapping = Mapping(mapping, size);
     program
-        .validate_loaded(process::read_identity(std::process::id()).unwrap(), deadline())
+        .validate_loaded(
+            process::read_identity(std::process::id()).unwrap(),
+            deadline(),
+        )
         .unwrap();
     assert!(
         owner.validate(deadline()).is_err(),
@@ -898,15 +1064,20 @@ fn native_current_code_actor() {
     let current = program.bind_current_code(&anchors, deadline()).unwrap();
     fs::create_dir(root.join("unexpected-input")).unwrap();
     assert!(current.validate(deadline()).is_err());
-    fs::write(root.parent().unwrap().join("current-code-identity"), crate::schema::hex(&identity))
-        .unwrap();
+    fs::write(
+        root.parent().unwrap().join("current-code-identity"),
+        crate::schema::hex(&identity),
+    )
+    .unwrap();
     println!("CURRENT_CODE_ASSERTIONS_PASSED");
     std::io::stdout().flush().unwrap();
 }
 
 #[test]
 fn actual_current_code_binds_original_vnode_and_identity_survives_real_prefix_relocation() {
-    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut keys = Vec::new();
     let mut files = Vec::new();
     let mut fixtures = Vec::new();

@@ -510,7 +510,9 @@ fn an_unreviewed_vendor_directory_still_fails_the_astream_submodule_check() {
     assert!(!ok && log.contains("FAIL [OB-1]"), "{log}");
 }
 
-fn git(dir: &Path, args: &[&str]) -> String {
+/// Run git in `dir` with the caller's repository redirects removed, a fixed identity and no
+/// signing, asserting it succeeds; its trimmed stdout.
+pub(crate) fn git(dir: &Path, args: &[&str]) -> String {
     let out = command(aterm_uds::os_path!("git"))
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -533,6 +535,51 @@ fn git(dir: &Path, args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn a_roster_tree_pin_is_held_or_fails_with_the_repin_repair_or_could_not_run() {
+    let (_dir, root, tree) = crate::tree_pin::tests::pinned_repo("attest", "");
+    let mut log = String::new();
+    match ob1_tree_pin(&root, "vendor/up", "vendor/up.pin", &mut log) {
+        TreePinVerdict::Held(text) => assert!(
+            text.contains(&format!("pinned by vendor/up.pin to v0.8.0 as tree {tree}")),
+            "{text}"
+        ),
+        other => panic!("expected the pin to hold, got {other:?}: {log}"),
+    }
+    assert!(log.is_empty(), "{log}");
+    std::fs::write(root.join("vendor/up/crates/a/src/lib.rs"), "edited\n").unwrap();
+    assert_eq!(
+        ob1_tree_pin(&root, "vendor/up", "vendor/up.pin", &mut log),
+        TreePinVerdict::Failed
+    );
+    assert!(
+        log.contains("✗ FAIL [OB-1] tree pin of `vendor/up`:")
+            && log.contains("~/alab-harness/tools/pin"),
+        "{log}"
+    );
+    let outside = aterm_tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside.path().join(".git"),
+        "gitdir: /nonexistent/aterm-forge\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(outside.path().join("vendor")).unwrap();
+    std::fs::write(
+        outside.path().join("vendor/up.pin"),
+        format!("tag=v0.8.0\ntree={tree}\n"),
+    )
+    .unwrap();
+    let mut log = String::new();
+    match ob1_tree_pin(outside.path(), "vendor/up", "vendor/up.pin", &mut log) {
+        TreePinVerdict::CouldNotRun(why) => assert!(why.starts_with("[OB-1] "), "{why}"),
+        other => panic!("expected COULD NOT RUN, got {other:?}"),
+    }
+    assert!(
+        log.contains("? COULD NOT RUN [OB-1] tree pin of `vendor/up`:"),
+        "{log}"
+    );
 }
 
 #[test]

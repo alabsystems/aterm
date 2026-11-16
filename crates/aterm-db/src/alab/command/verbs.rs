@@ -957,7 +957,11 @@ pub(super) fn add(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> 
 /// `retire account|machine <name> [--why <text>]`: the row's lifecycle to `retired`, the reason
 /// added to its note (behind the importer's note guard, the owner's earlier note kept before it,
 /// refused before any write where the two would pass the note's bytes). The row
-/// stays, its key and history with it; no preference, login or Mac's roster row moves.
+/// stays, its key and history with it; no preference, login or Mac's roster row moves, so a row
+/// a live row names is refused until that row ends or names another
+/// (`typed::check::retired_referenced`): a machine a live preference names (`unprefer` ends
+/// it), an account a live preference, auth route or subaccount names (no verb ends a route or a
+/// subaccount: its `row` cell is set to `ended` in the table's grid, `aterm db table edit`).
 pub(super) fn retire(paths: &Paths, args: &Args) -> Result<Value> {
     let [what, name] = args.operands.as_slice() else {
         return Err(Error::new(

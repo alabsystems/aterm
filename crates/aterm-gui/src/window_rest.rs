@@ -1,37 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A resting window: one that nobody has touched, and whose visible content has not changed, for
-//! `idle_rest_secs` (ATERM-KI-1027-4, `docs/DESIGN-stats-deck-live-2026-10-24.md` §13).
+//! A window's quiet, attention and wake state.
 //!
-//! A resting window stops its classic caret blink on the visible phase, and its stats deck draws
-//! as an unfocused window's deck does: no live-edge motion. aterm takes one stream of readings
-//! for every reader, and the rest slows it to a reading every
-//! [`crate::vitals_host::BACKGROUND_PERIOD`] only while no page reads it: a Tab Control or
-//! Allocation page on screen keeps a focused window's cadence, and an open stats lens its own
-//! (`App::vitals_audience`, `Audience::cadence`). Otherwise the GPU gets several quiet
-//! seconds at a time, and the Apple driver frees the ~179 MB block it keeps for render passes a
-//! second or two after the last one (`docs/measured/idle-memory-window-2026-10-27.md`).
+//! [`Rest::stir`] restarts the quiet period and records a wake if the window was resting.
+//! [`Rest::settle`] applies the configured period; `None` keeps the window awake.
+//! [`Rest::deck_moves`] holds deck motion while resting and until a reading lands after a wake.
+//! A touch attends the window for [`ATTENTION`]; output alone does not attend it.
 //!
-//! The first person's event in the window ([`stirs`]) or the first output its active tab shows
-//! wakes it at once. Its deck moves again from the first reading that lands after the wake
-//! ([`Rest::deck_moves`]), not on the wake's own frame: a deck that went from still to moving
-//! there patched its dial and now box into the frame that shows the key's echo, which measured
-//! about 3 ms more key-to-present than an awake window's
-//! (`docs/measured/idle-memory-rest-2026-10-29.md`). Nothing wakes the loop to put a window to
-//! rest: while the window draws something, that drawing's own deadline wakes the loop, which
-//! then sees the rest is due; a window that draws nothing has nothing to stop.
+//! This state owns timestamps and creates no timer. The event loop chooses when to call it.
 
 use std::time::{Duration, Instant};
 
 use aterm_window::event::WindowEvent;
 
-/// One window's rest: when it was last stirred, whether it rests now, and when it last woke.
+/// How long after a person's last touch a window is attended ([`Rest::settle_attended`]).
+pub(crate) const ATTENTION: Duration = Duration::from_secs(40);
+
+/// One window's rest: when it was last stirred, whether it rests now, when it last woke (or
+/// was touched after its attention lapsed), when a person last touched it and whether it is
+/// attended now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Rest {
     stirred_at: Instant,
     resting: bool,
     woke_at: Option<Instant>,
+    touched_at: Instant,
+    attended: bool,
+    /// The inner size, `(width, height)` in device pixels, aterm last asked the window for on
+    /// behalf of a control client or a program ([`Self::own_resize`]).
+    own_size: Option<(u32, u32)>,
 }
 
 impl Rest {
@@ -41,7 +39,57 @@ impl Rest {
             stirred_at: now,
             resting: false,
             woke_at: None,
+            touched_at: now,
+            attended: true,
+            own_size: None,
         }
+    }
+
+    /// aterm itself asks the window for `size` (width, height, device pixels) on behalf of a
+    /// control client or a program: the `Resized` that reports that size is no person's touch
+    /// ([`Self::own`]).
+    pub(crate) const fn own_resize(&mut self, size: (u32, u32)) {
+        self.own_size = Some(size);
+    }
+
+    /// Whether `event` reports a change aterm itself made for a control client or a program: a
+    /// `Resized` to the size last given to [`Self::own_resize`]. A `Resized` to any other size
+    /// is somebody else's, and forgets that size: a person's drag away from it and back
+    /// touches at every step.
+    pub(crate) fn own(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::Resized(size) = event else {
+            return false;
+        };
+        let own = self.own_size == Some((size.width, size.height));
+        if !own {
+            self.own_size = None;
+        }
+        own
+    }
+
+    /// A person's touch at `now`: the window is attended and its attention starts over. True
+    /// when its attention had lapsed; the deck then holds still until a reading lands after
+    /// `now`, as after a wake ([`Self::deck_moves`]).
+    pub(crate) const fn touch(&mut self, now: Instant) -> bool {
+        self.touched_at = now;
+        let lapsed = !std::mem::replace(&mut self.attended, true);
+        if lapsed {
+            self.woke_at = Some(now);
+        }
+        lapsed
+    }
+
+    /// Settles whether the window is attended at `now`: touched less than `within` ago; `None`
+    /// is always attended. True when that changed.
+    pub(crate) fn settle_attended(&mut self, now: Instant, within: Option<Duration>) -> bool {
+        let attended =
+            within.is_none_or(|within| now.saturating_duration_since(self.touched_at) < within);
+        attended != std::mem::replace(&mut self.attended, attended)
+    }
+
+    /// Whether a person touched the window within its attention, as last settled.
+    pub(crate) const fn attended(&self) -> bool {
+        self.attended
     }
 
     /// A person's event or visible output at `now`: the window is awake and its quiet starts
@@ -70,11 +118,13 @@ impl Rest {
     }
 
     /// Whether the window's deck may move, given when the last reading `landed`: not while it
-    /// rests, and after a wake only once a reading has landed since. The wake asks that reading
-    /// at once, and its frame redraws the deck anyway, so the deck's motion comes back there
-    /// rather than in the frame of the key or output that woke the window.
+    /// rests or is unattended, and after a wake (or the touch that attends it again) only once
+    /// a reading has landed since. A focused window's wake or touch asks that reading at once,
+    /// and its frame redraws the deck anyway, so the deck's motion comes back there rather than
+    /// in the frame of the key or output that woke the window.
     pub(crate) fn deck_moves(&self, landed: Option<Instant>) -> bool {
         !self.resting
+            && self.attended
             && self
                 .woke_at
                 .is_none_or(|woke| landed.is_some_and(|at| at > woke))
@@ -117,3 +167,7 @@ pub(crate) const fn stirs(event: &WindowEvent) -> bool {
 #[cfg(test)]
 #[path = "window_rest_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "window_rest_attended_tests.rs"]
+mod attended_tests;

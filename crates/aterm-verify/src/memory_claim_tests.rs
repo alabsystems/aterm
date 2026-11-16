@@ -305,7 +305,7 @@ fn failed_memory_admission_never_starts_a_stage() {
                     admit_quiet: admit,
                     admit_memory: admit,
                 },
-                &early,
+                crate::StageAdmission::Conservative(&early),
                 || {
                     starts.set(starts.get() + 1);
                     stage(&ctx, &spec)

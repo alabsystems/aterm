@@ -1542,6 +1542,7 @@ impl Bridge {
     /// # Errors
     /// The send's; a link it could not write is judged down.
     fn send_pin_settle(&mut self) -> io::Result<()> {
+        self.flush_post_group();
         let waiting = self.fx.now();
         while self
             .conn
@@ -1706,6 +1707,7 @@ impl Bridge {
 
     /// [`Bridge::mirror_send`] inside its budget scope.
     fn mirror_send_scoped(&mut self) {
+        self.flush_post_group();
         let k = self.mirror.as_deref().map_or(0, |m| m.pin.slots.len());
         if k > 0 && !(self.mirror_key_on_the_media() && self.mirror_floor_covers()) {
             return;

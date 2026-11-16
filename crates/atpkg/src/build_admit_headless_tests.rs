@@ -10,7 +10,6 @@ use std::{io::Write as _, time::Duration};
 
 const ACTOR: &str = "ATPKG_HEADLESS_HOST_WORLD";
 pub(super) const WORKER: &str = "ATPKG_HEADLESS_WORKER_WORLD";
-const REAL: &str = "ATPKG_HEADLESS_REAL_BUILDS";
 pub(super) const STOP: &str = "ATPKG_HEADLESS_STOP_WORKER";
 
 #[test]
@@ -63,7 +62,6 @@ fn headless_host_actor_if_requested() {
         return;
     };
     let world = PathBuf::from(world);
-    let real = std::env::var_os(REAL).is_some();
     let machine = Fixed::new(concurrent_reading(256, 200, 128));
     let mut selected = cohort_seat(&world, &machine);
     selected.own = None;
@@ -141,9 +139,6 @@ fn headless_host_actor_if_requested() {
     for index in 0..2 {
         let job = world.join(index.to_string());
         std::fs::create_dir(&job).unwrap();
-        if real {
-            prepare_build(&job);
-        }
     }
     struct Release(PathBuf);
     impl Drop for Release {
@@ -176,34 +171,14 @@ fn headless_host_actor_if_requested() {
         let (cancel, cancellation) = Cancellation::channel(Duration::from_millis(100)).unwrap();
         let worker_world = job_world.clone();
         let worker = std::thread::spawn(move || {
-            let mut command = if real {
-                let mut command =
-                    spawnfd::transparent(std::env::var_os("CARGO").unwrap()).into_command();
-                command
-                    .args(["--unverified", "build", "--offline", "--target-dir"])
-                    .arg(worker_world.join("target.noindex"))
-                    .args([
-                        "--config",
-                        &format!(
-                            "build.build-dir='{}'",
-                            worker_world.join("build.noindex").display()
-                        ),
-                    ])
-                    .env(REAL, &worker_world)
-                    .env("CARGO_BUILD_JOBS", "1")
-                    .current_dir(&worker_world);
-                command
-            } else {
-                let mut command = spawnfd::command(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "build_admit::tests::headless::headless_worker_if_requested",
-                        "--test-threads=1",
-                    ])
-                    .env(WORKER, &worker_world);
-                command
-            };
+            let mut command = spawnfd::command(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "build_admit::tests::headless::headless_worker_if_requested",
+                    "--test-threads=1",
+                ])
+                .env(WORKER, &worker_world);
             command
                 .stdin(Stdio::from(input))
                 .stdout(Stdio::null())
@@ -253,30 +228,6 @@ fn headless_host_actor_if_requested() {
         "a refused one-shot leaves no waiting claim"
     );
     machine.set(concurrent_reading(256, 200, 128));
-    if real {
-        for (_, _, _, world) in &jobs {
-            std::fs::write(world.join("release"), b"host permits completion").unwrap();
-        }
-        for (job, _, _, world) in jobs {
-            aterm_spec::wait::until_within(
-                aterm_spec::wait::MUST_HAPPEN,
-                "actual Targo compile finishes",
-                || job.is_finished().then_some(()),
-            );
-            let (outcome, requests) = job.join().unwrap();
-            assert!(outcome.unwrap().succeeded());
-            assert!(requests.is_empty());
-            let mut program = spawnfd::command(world.join("target.noindex/debug/headless_probe"));
-            assert!(
-                aterm_uds::deadline::output_within(&mut program, aterm_spec::wait::MUST_HAPPEN)
-                    .unwrap()
-                    .status
-                    .success()
-            );
-        }
-        assert!(ledger.list().unwrap().is_empty());
-        return;
-    }
     let (second, mut second_input, _second_cancel, _) = jobs.pop().unwrap();
     let (first, _first_input, first_cancel, _) = jobs.pop().unwrap();
     first_cancel.request(CancelRequest::Terminate).unwrap();
@@ -322,11 +273,6 @@ fn independent_headless_jobs_run_without_a_global_front_and_cancel_in_isolation(
 }
 
 #[test]
-fn one_headless_host_runs_two_actual_targo_builds_concurrently() {
-    run_actor("real");
-}
-
-#[test]
 fn a_headless_job_cannot_claim_foreground_and_failure_reaps_its_root() {
     run_actor("foreground");
 }
@@ -342,9 +288,6 @@ fn run_actor(mode: &str) {
             "--nocapture",
         ])
         .env(ACTOR, world.path());
-    if mode == "real" {
-        command.env(REAL, "true");
-    }
     if mode == "foreground" {
         command.env(STOP, "1");
     }
@@ -361,6 +304,10 @@ fn run_actor(mode: &str) {
     );
 }
 
+/// A one-crate package in `world` whose build script, a real compiled program, writes `ready`
+/// and waits for `release` in the folder `ATPKG_HEADLESS_REAL_BUILDS` names: the two real
+/// `targo` builds the session's test holds at their barriers
+/// (`one_host_session_finishes_two_actual_targo_builds_after_clients_disconnect`).
 pub(super) fn prepare_build(world: &Path) {
     std::fs::create_dir(world.join("src")).unwrap();
     std::fs::write(

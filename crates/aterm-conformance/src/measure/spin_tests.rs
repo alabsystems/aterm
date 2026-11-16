@@ -430,13 +430,13 @@ fn the_pet_row_bounds_the_needle_by_the_frames_its_readings_owed() {
             ShapeVerdict::Fail,
         ),
         (
-            "its own two wakes a frame",
-            needle(20, (20, 0), 240),
+            "its own wake a frame",
+            needle(20, (20, 0), 220),
             ShapeVerdict::Pass,
         ),
         (
             "one wake beyond them",
-            needle(20, (20, 0), 241),
+            needle(20, (20, 0), 221),
             ShapeVerdict::Fail,
         ),
     ] {

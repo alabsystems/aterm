@@ -129,7 +129,7 @@ fn address_setup_failures_keep_their_typed_recovery_without_replay() {
         (Kind::Network, Recovery::RetryRead),
         (Kind::Timeout, Recovery::RetryRead),
         (Kind::Credentials, Recovery::Stop),
-        (Kind::Verification, Recovery::Verify),
+        (Kind::Verification, Recovery::Stop),
         (Kind::AccessDenied, Recovery::Stop),
     ] {
         let error = open_failure(vec![Reply::Key, Reply::Error(kind)]);

@@ -3,6 +3,279 @@
 
 use super::*;
 
+struct ShapeFake {
+    before: aterm_json::Value,
+    after: aterm_json::Value,
+    events: Vec<&'static str>,
+    sets: Vec<(Shape, bool)>,
+    boots: usize,
+    fail_get: Option<&'static str>,
+    fail_set: bool,
+    interval: Option<DiskInterval>,
+}
+
+fn disk_report(disk: aterm_json::Value) -> aterm_json::Value {
+    aterm_json::json!({"CPU":4,"Memory":8192,"Disk":disk,"Running":false,"State":"stopped"})
+}
+
+fn shape_fake(before: aterm_json::Value, after: aterm_json::Value) -> ShapeFake {
+    ShapeFake {
+        before,
+        after,
+        events: Vec::new(),
+        sets: Vec::new(),
+        boots: 0,
+        fail_get: None,
+        fail_set: false,
+        interval: None,
+    }
+}
+
+fn exercise_shape(vm: &mut ShapeFake) -> Result<(), Fail> {
+    let shape = Shape {
+        cpus: 4,
+        memory_mib: 8192,
+        disk_gb: 60,
+    };
+    configure_then_boot(
+        vm,
+        Some(shape),
+        |vm, shape| {
+            let interval = configure_shape(
+                vm,
+                shape,
+                |vm, phase| {
+                    if phase == "after" {
+                        assert_eq!(vm.events.last(), Some(&"set"));
+                    }
+                    vm.events.push(phase);
+                    if vm.fail_get == Some(phase) {
+                        return Err(Fail::die("unavailable complete Get"));
+                    }
+                    Ok(if phase == "before" {
+                        vm.before.clone()
+                    } else {
+                        vm.after.clone()
+                    })
+                },
+                |vm, shape, grow| {
+                    assert_eq!(vm.events.last(), Some(&"before"));
+                    vm.events.push("set");
+                    vm.sets.push((shape, grow));
+                    if vm.fail_set {
+                        Err(Fail::die("setter refused"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )?;
+            vm.interval = Some(interval);
+            Ok(())
+        },
+        |vm| {
+            assert_eq!(vm.events.last(), Some(&"after"));
+            vm.events.push("boot");
+            vm.boots += 1;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+fn equal_disk_bucket_never_resizes_and_reapplies_cpu_memory_each_boot() {
+    let mut vm = shape_fake(
+        disk_report(aterm_json::json!(60)),
+        disk_report(aterm_json::json!(60)),
+    );
+    for _ in 0..2 {
+        exercise_shape(&mut vm).unwrap();
+    }
+    assert_eq!(vm.boots, 2);
+    assert_eq!(
+        vm.sets,
+        vec![
+            (
+                Shape {
+                    cpus: 4,
+                    memory_mib: 8192,
+                    disk_gb: 60
+                },
+                false
+            );
+            2
+        ]
+    );
+    assert_eq!(
+        vm.events,
+        [
+            "before", "set", "after", "boot", "before", "set", "after", "boot"
+        ]
+    );
+    let interval = vm.interval.unwrap();
+    // The bucket does not reveal the ASIF sector rounding; only its reported interval is known.
+    assert_eq!(interval.reported_lower_bytes, 60_000_000_000);
+    assert_eq!(interval.capacity_upper_exclusive_bytes, 61_000_000_000);
+}
+
+#[test]
+fn only_a_smaller_disk_bucket_requests_growth_then_verifies_the_result() {
+    let mut vm = shape_fake(
+        disk_report(aterm_json::json!(59)),
+        disk_report(aterm_json::json!(60)),
+    );
+    exercise_shape(&mut vm).unwrap();
+    assert!(vm.sets[0].1);
+    assert_eq!(vm.boots, 1);
+    let mut unchanged = shape_fake(
+        disk_report(aterm_json::json!(59)),
+        disk_report(aterm_json::json!(59)),
+    );
+    assert!(exercise_shape(&mut unchanged).is_err());
+    assert_eq!(unchanged.boots, 0);
+}
+
+#[test]
+fn unknown_or_oversized_preconfiguration_never_sets_or_boots() {
+    for disk in [
+        aterm_json::json!(61),
+        aterm_json::json!(null),
+        aterm_json::json!("60"),
+        aterm_json::json!(60.5),
+        aterm_json::json!(-1),
+    ] {
+        let mut vm = shape_fake(disk_report(disk), disk_report(aterm_json::json!(60)));
+        assert!(exercise_shape(&mut vm).is_err());
+        assert!(vm.sets.is_empty());
+        assert_eq!(vm.boots, 0);
+    }
+    let mut missing = shape_fake(
+        aterm_json::json!({"Running":false,"State":"stopped"}),
+        disk_report(aterm_json::json!(60)),
+    );
+    assert!(exercise_shape(&mut missing).is_err());
+    assert!(missing.sets.is_empty());
+}
+
+#[test]
+fn every_failed_step_or_unproved_postcondition_blocks_boot() {
+    let report = disk_report(aterm_json::json!(60));
+    for (key, value) in [
+        ("CPU", aterm_json::json!(5)),
+        ("Memory", aterm_json::json!(8193)),
+        ("Disk", aterm_json::json!(61)),
+        ("Disk", aterm_json::json!(null)),
+        ("Running", aterm_json::json!(true)),
+        ("State", aterm_json::json!("suspended")),
+    ] {
+        let mut after = report.clone();
+        let _ = after.as_object_mut().unwrap().insert(key.to_owned(), value);
+        let mut vm = shape_fake(report.clone(), after);
+        assert!(exercise_shape(&mut vm).is_err());
+        assert_eq!(vm.boots, 0);
+    }
+    for failure in 0..3 {
+        let mut vm = shape_fake(report.clone(), report.clone());
+        match failure {
+            0 => vm.fail_get = Some("before"),
+            1 => vm.fail_set = true,
+            _ => vm.fail_get = Some("after"),
+        };
+        assert!(exercise_shape(&mut vm).is_err());
+        assert_eq!(vm.boots, 0);
+    }
+}
+
+#[test]
+fn bounded_boot_configures_before_each_boot() {
+    #[derive(Default)]
+    struct Fake {
+        configured: Option<Shape>,
+        configurations: usize,
+        boots: usize,
+    }
+    let shape = Shape {
+        cpus: 4,
+        memory_mib: 8192,
+        disk_gb: 60,
+    };
+    let mut vm = Fake::default();
+    for _ in 0..2 {
+        configure_then_boot(
+            &mut vm,
+            Some(shape),
+            |vm, observed| {
+                assert_eq!(observed, shape);
+                vm.configured = Some(observed);
+                vm.configurations += 1;
+                Ok(())
+            },
+            |vm| {
+                // Taking the configured state makes a later boot require a fresh configuration.
+                assert_eq!(vm.configured.take(), Some(shape));
+                vm.boots += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    }
+    assert_eq!((vm.configurations, vm.boots), (2, 2));
+}
+
+#[test]
+fn configuration_failure_never_boots() {
+    let mut booted = false;
+    let shape = Shape {
+        cpus: 4,
+        memory_mib: 8192,
+        disk_gb: 60,
+    };
+    let error = configure_then_boot(
+        &mut booted,
+        Some(shape),
+        |_, _| Err(Fail::exit(7, "configuration refused")),
+        |booted| {
+            *booted = true;
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.code, 7);
+    assert!(!booted);
+}
+
+#[test]
+fn bounded_preparation_cache_cannot_reuse_another_shape_or_an_unbounded_base() {
+    let shape = Shape {
+        cpus: 4,
+        memory_mib: 8192,
+        disk_gb: 60,
+    };
+    let names = [
+        None,
+        Some(shape),
+        Some(Shape { cpus: 5, ..shape }),
+        Some(Shape {
+            memory_mib: 8193,
+            ..shape
+        }),
+        Some(Shape {
+            disk_gb: 61,
+            ..shape
+        }),
+    ]
+    .map(|shape| {
+        prep_name(
+            IMAGE,
+            &Prep {
+                shape,
+                ..Prep::default()
+            },
+        )
+    });
+    let unique: std::collections::BTreeSet<_> = names.iter().collect();
+    assert_eq!(unique.len(), names.len());
+}
+
 #[test]
 fn the_grants_read_an_implicit_designated_requirement_too() {
     use std::io::Write as _;

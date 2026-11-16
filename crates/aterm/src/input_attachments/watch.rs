@@ -306,6 +306,8 @@ pub(super) struct Watch {
     failed: bool,
     #[cfg(test)]
     before_wait: Option<Box<dyn FnMut()>>,
+    #[cfg(test)]
+    before_hint: Option<Box<dyn FnMut()>>,
 }
 
 impl Watch {
@@ -322,6 +324,8 @@ impl Watch {
             failed: false,
             #[cfg(test)]
             before_wait: None,
+            #[cfg(test)]
+            before_hint: None,
         }
     }
 
@@ -364,7 +368,7 @@ impl Watch {
                 // and `armed` says so: the keeper then keeps its timer.
                 // Control also unparks this owner when it is stopped.
                 if !causes.is_empty() {
-                    return Woke::Hint(causes);
+                    return self.observed_hint(stopped, deadline, causes);
                 }
                 return self.park_until(stopped, deadline);
             };
@@ -375,7 +379,7 @@ impl Watch {
                 causes = causes.union(Causes::CONSOLE);
             }
             if !causes.is_empty() {
-                return Woke::Hint(causes);
+                return self.observed_hint(stopped, deadline, causes);
             }
             #[cfg(test)]
             if let Some(before_wait) = &mut self.before_wait {
@@ -400,7 +404,24 @@ impl Watch {
         }
     }
 
-    fn park_until(&self, stopped: &AtomicBool, deadline: Instant) -> Woke {
+    // Stop's caller stores its predicate before latching WAKE. It can do
+    // that after the loop's first stop sample but before take_pending reads
+    // that very wake. Recheck after consuming hints so stop wins that race.
+    fn observed_hint(&mut self, stopped: &AtomicBool, deadline: Instant, causes: Causes) -> Woke {
+        #[cfg(test)]
+        if let Some(before_hint) = &mut self.before_hint {
+            before_hint();
+        }
+        if stopped.load(Ordering::Acquire) {
+            Woke::Stopped
+        } else if Instant::now() >= deadline {
+            Woke::Deadline
+        } else {
+            Woke::Hint(causes)
+        }
+    }
+
+    fn park_until(&mut self, stopped: &AtomicBool, deadline: Instant) -> Woke {
         loop {
             if stopped.load(Ordering::Acquire) {
                 return Woke::Stopped;
@@ -410,7 +431,7 @@ impl Watch {
             };
             let causes = self.control.take_pending();
             if !causes.is_empty() {
-                return Woke::Hint(causes);
+                return self.observed_hint(stopped, deadline, causes);
             }
             // The pending predicate plus Thread's retained unpark token closes the
             // check-to-park gap. Spurious returns keep this same absolute deadline.
@@ -726,3 +747,7 @@ impl Drop for Native {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "watch_tests.rs"]
+mod tests;

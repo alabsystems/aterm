@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `metrics` verb's request grammar.
+//! The `metrics` verb's measurement bodies. The UI-owned `cadence` read dispatches separately.
 
 pub(crate) use aterm_control::wire::fields::{
     Cell, Decimal, FieldSink, FlagWords, JsonSink, TextSink,

@@ -436,24 +436,41 @@ impl crate::App {
     /// close. A seamless update's handover never comes here; its tabs go on in the successor, as
     /// the tabs of `carried` go on in the next launch, their programs left running in the keeper's
     /// custody (`App::carry_developer_tools_install_at_exit`), so they close nothing.
-    pub(crate) fn close_tabs_at_quit(&self, carried: &[u64]) {
-        let by =
-            crate::session_log::exit_actor(self.quit_by.as_ref().unwrap_or(&ExitActor::Unknown));
+    ///
+    /// Returns the row each session it closes would leave in the machine's session table
+    /// (`out=app-quit`, [`crate::session_table::row_at_close`]): the run's end writes those of the
+    /// sessions its layout does not bring back (`App::retire_tasks_at_quit`).
+    pub(crate) fn close_tabs_at_quit(&self, carried: &[u64]) -> Vec<crate::session_table::Row> {
+        let actor = self.quit_by.clone().unwrap_or(ExitActor::Unknown);
+        let by = crate::session_log::exit_actor(&actor);
+        let mut rows = Vec::new();
         for local in self.pool.ids() {
             if carried.contains(&local) {
                 continue;
             }
             self.note_tab_spent(local);
-            let Some(ctx) = self.pool.get(local).map(|s| Arc::clone(&s.ctx)) else {
+            let Some((ctx, term)) = self
+                .pool
+                .get(local)
+                .map(|s| (Arc::clone(&s.ctx), Arc::clone(&s.term)))
+            else {
                 continue;
             };
+            let at_close = crate::session_table::AtClose::read(&term, &ctx);
+            // A program that had exited left its code with the store, which a quit does not
+            // deregister from (`SessionStore::note_exit_code`).
+            let exit_code = self
+                .store
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .noted_exit_code(local);
             let mut tl = ctx
                 .timeline
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let at = tl.slog().now();
             let task = task_end(&tl);
-            tl.slog_mut().close_tab(
+            let tab = tl.slog_mut().close_tab(
                 crate::session_log::TabClose {
                     out: aterm_slog::SessionOut::AppQuit,
                     by,
@@ -462,7 +479,26 @@ impl crate::App {
                 },
                 at,
             );
+            let ended = crate::session_store::Ended {
+                local,
+                out: crate::session_store::ExitReason::AppQuit,
+                by: actor.clone(),
+                why: None,
+                exit_code,
+                ended_ms: at.wall_ms,
+                started_ms: tl.slog().opened_wall(),
+                tab,
+                ep: tl.slog().log().ep(),
+                task: tl.task().cloned(),
+            };
+            drop(tl);
+            rows.push(crate::session_table::row_at_close(
+                &ctx.self_id,
+                &ended,
+                &at_close,
+            ));
         }
+        rows
     }
 
     /// THE QUIT'S CLOSES, in the order every close takes (`SessionStore::deregister_closing`):
@@ -473,8 +509,13 @@ impl crate::App {
     /// session's close is the last record its log takes (a mark after it is refused,
     /// `Refused::SessionClosed`), so a tab close written after it would be lost, from the
     /// journal and the bus alike.
-    pub(crate) fn close_sessions_at_quit(&self, carried: &[u64]) {
-        self.close_tabs_at_quit(carried);
+    ///
+    /// The rows the tabs' closes leave are noted for the run's end ([`Self::close_tabs_at_quit`],
+    /// `task_launch::QuitClosed::note_row`).
+    pub(crate) fn close_sessions_at_quit(&mut self, carried: &[u64]) {
+        for row in self.close_tabs_at_quit(carried) {
+            self.quit_closed_tasks.note_row(row);
+        }
         #[cfg(unix)]
         crate::fabric_launch::bye_at_quit(&self.store);
         #[cfg(not(unix))]

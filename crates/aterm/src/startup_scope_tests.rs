@@ -648,6 +648,7 @@ fn the_secrets_lanes_end_leaves_workstation_running() {
         touched: Vec::new(),
         readback: None,
         readback_subjects: Vec::new(),
+        ran: Vec::new(),
         readback_owner: None,
         input_readback: false,
     };

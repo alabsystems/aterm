@@ -30,14 +30,53 @@ const QUALIFY_IMAGE: &str = "--aterm-resource-fixture-qualified";
 const QUALIFIED_IMAGE: &[u8] = b"actual resource fixture image ran\n";
 
 pub(crate) fn qualify_image(path: &Path) {
+    use aterm_uds::deadline::{ChildOutput, stream_until_stopped_observing_exit};
+    use std::cell::Cell;
+
     let mut command = spawnfd::command(path);
     command.arg(QUALIFY_IMAGE).env_clear();
-    let output = aterm_uds::deadline::output_until(&mut command, Instant::now() + HANG)
-        .unwrap_or_else(|error| panic!("qualifying {}: {error}", path.display()));
+    let pid = Cell::new(None);
+    let exited = Cell::new(None);
+    let mut stdout = Vec::with_capacity(QUALIFIED_IMAGE.len());
+    // Record process creation, witness bytes and natural exit on the owning waiter,
+    // including failures before complete output EOF.
+    let result = stream_until_stopped_observing_exit(
+        &mut command,
+        Some(Instant::now() + HANG),
+        |child| {
+            pid.set(Some(child));
+            eprintln!("qualification started: {} pid={child}", path.display());
+        },
+        |stream, bytes| match stream {
+            ChildOutput::Stdout => {
+                if bytes.len() > QUALIFIED_IMAGE.len() - stdout.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "qualification stdout exceeds its exact witness",
+                    ));
+                }
+                stdout.extend_from_slice(bytes);
+                Ok(())
+            }
+            ChildOutput::Stderr => io::stderr().write_all(bytes),
+        },
+        || false,
+        |status| exited.set(Some(status)),
+    );
+    let status = match result {
+        Ok(Some(status)) => status,
+        other => panic!(
+            "qualifying {}: {other:?}; pid={:?} natural_exit={:?} stdout={stdout:?}",
+            path.display(),
+            pid.get(),
+            exited.get(),
+        ),
+    };
     assert!(
-        output.status.success() && output.stdout == QUALIFIED_IMAGE,
-        "qualifying {}: {output:?}",
-        path.display()
+        status.success() && stdout == QUALIFIED_IMAGE,
+        "qualifying {}: pid={:?} status={status:?} stdout={stdout:?}",
+        path.display(),
+        pid.get(),
     );
 }
 

@@ -181,3 +181,40 @@ fn mailbox_identity_uses_complete_addresses() {
     assert!(!identity_matches("alice@proton.me", "alice@evil.test"));
     assert!(!identity_matches("alice@proton.me", "Inbox"));
 }
+
+/// A MAIL PAGE THAT CARRIES A CHECK STOPS ITS PROFILE ON NO CLOCK: the page reader's check word,
+/// a sign-in script's check state or Proton's verification gate is a met check; its error is
+/// a stop no renewal, retry or relaunch goes past, and the profile it marks is held until a
+/// person removes the mark. NEGATIVE CONTROL: a plain answer names none, and an unmarked
+/// profile holds nothing.
+#[test]
+fn a_mail_page_that_carries_a_check_holds_its_profile() {
+    use aterm_mail::proton_error::Kind;
+    for answer in [
+        json!({"check": "human_check:hCaptcha", "ready": false}),
+        json!({"state": "bot_check", "url": "https://account.proton.me/login"}),
+        json!({"state": "human_check", "check": "Turnstile"}),
+        json!({"gate": "verification", "ready": false}),
+    ] {
+        let check = answered_check(&answer).expect("a check");
+        let why = check_met_error(&check);
+        assert!(is_check_met(&why), "{why}");
+        assert_eq!(transport_error(why).kind, Kind::Refused, "{answer}");
+    }
+    for answer in [
+        json!({"check": null, "ready": true, "gate": ""}),
+        json!({"state": "submitted_login"}),
+        json!({"gate": "credentials"}),
+    ] {
+        assert_eq!(answered_check(&answer), None, "{answer}");
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let profile = HeadlessMail::profile_path(root.path(), "ada@x.example");
+    std::fs::create_dir_all(&profile).unwrap();
+    assert_eq!(HeadlessMail::check_held(&profile), None);
+    std::fs::write(profile.join(CHECK_MET_FILE), "human_check:hCaptcha").unwrap();
+    let held = HeadlessMail::check_held(&profile).expect("held");
+    assert!(held.contains("hCaptcha") && is_check_met(&held), "{held}");
+    assert!(snapshot_js().contains(super::browser::CHECK_PAGE_JS));
+    assert!(snapshot_js().contains("check:ready?mailboxCheckPageOf():checkPageOf()"));
+}

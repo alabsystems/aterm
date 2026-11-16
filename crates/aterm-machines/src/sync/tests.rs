@@ -148,6 +148,8 @@ pub(crate) struct Inert {
     github_after: Mutex<Option<GithubRead>>,
     /// What `sync.clone` reads ([`Ports::owed_clone`]).
     owed: Mutex<crate::init::OwedClone>,
+    /// What `sync.refresh`'s apply answers ([`Ports::refresh_repositories`]).
+    refreshed: Mutex<Result<crate::init::RepositoryRefreshed, String>>,
     /// What `sync.clone-tuning` reads ([`Ports::clone_tuning`]): every clone as it declares by
     /// default, so the other kinds' tests count none of it.
     tuning: Mutex<crate::clone_tuning::Reading>,
@@ -156,6 +158,8 @@ pub(crate) struct Inert {
     tuned: Mutex<Result<crate::clone_tuning::Tuned, String>>,
     /// Set once `sync.clone-tuning` is read, where a test watches for it.
     tuning_read: Mutex<Option<Arc<AtomicBool>>>,
+    /// What each read of `sync.clone-tuning` was asked to keep, in order.
+    tuning_keeps: Mutex<Vec<crate::clone_tuning::Keep>>,
     fabric: Mutex<FabricRead>,
     fabric_needs_node: bool,
     /// `sync.awake`'s read: right by default, so the other kinds' tests count none of it.
@@ -180,19 +184,36 @@ pub(crate) struct Inert {
     logged: Mutex<Vec<String>>,
     /// The installed release app's program elsewhere ([`Ports::installed_release_elsewhere`]).
     pub(crate) elsewhere: Option<PathBuf>,
-    /// Each run handed to another program, and how it ends.
+    /// Each run handed to another program, and how it ends: an `Err` is a run that could not
+    /// start ([`Ports::start_elsewhere`]).
     pub(crate) ran_elsewhere: Mutex<Vec<(PathBuf, Vec<String>)>>,
     pub(crate) elsewhere_exit: Mutex<Result<Option<i32>, String>>,
+    /// Where set, the next run handed elsewhere goes on until this gets a message or its sender
+    /// is dropped, as an installed app's pass waiting for the lock does; unset, it ends at once.
+    pub(crate) elsewhere_release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    /// Where set, the next run handed elsewhere starts and goes on as above, and then the wait
+    /// for it fails with this instead of its exit ([`ElsewhereRun`]).
+    pub(crate) elsewhere_unwaited: Mutex<Option<String>>,
     refreshed_subscribers: AtomicU32,
     /// Why System State holds the vault out ([`Ports::vault_held`]), and how often it was read.
     held: Mutex<Option<String>>,
     held_reads: AtomicU32,
     /// At each sync kind's read, whether another take of the pass's lock found it held.
     locked_at_reads: Mutex<Vec<bool>>,
-    sleeps: Mutex<Vec<Duration>>,
-    fixed_wait_ms: Option<u64>,
+    /// At each [`Ports::new_pass`], whether another take of the pass's lock found it held.
+    new_passes: Mutex<Vec<bool>>,
     /// The note this runner's starter gave it ([`Ports::start_note`]).
     start_note: Option<String>,
+    /// Whether this runner's starter has ended already ([`Ports::watch_starter`]).
+    pub(crate) starter_ended: AtomicBool,
+    /// Where set, this runner's starter ends the moment a [`Ports::watch_starter`] begins
+    /// watching it: the watch is [`StarterWatch::Watching`], and what it was handed has run.
+    pub(crate) starter_ends_once_watched: AtomicBool,
+    /// What a [`Ports::watch_starter`] was handed to call once the starter ends, while nothing
+    /// called it ([`Inert::end_starter`]).
+    starter_watch: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// How often the console was read ([`Ports::at_console`]).
+    console_reads: AtomicU32,
     /// What each [`Ports::spent`] reads, in order (nothing once they run out), and how often
     /// it was read.
     spent: Mutex<std::collections::VecDeque<Spent>>,
@@ -231,6 +252,9 @@ impl Inert {
             owed: Mutex::new(crate::init::OwedClone::Nothing(
                 "aterm init owes no clone".into(),
             )),
+            refreshed: Mutex::new(Ok(crate::init::RepositoryRefreshed::Ran(
+                "refreshed".into(),
+            ))),
             tuning: Mutex::new(crate::clone_tuning::Reading::Current(
                 "1 vault clone on this Mac, each as it declares".into(),
             )),
@@ -239,6 +263,7 @@ impl Inert {
                 aside: None,
             })),
             tuning_read: Mutex::new(None),
+            tuning_keeps: Mutex::new(Vec::new()),
             identity: Mutex::new(IdentityRead::Current(
                 "label m15 in [ai] and [fleet] machine".to_owned(),
             )),
@@ -283,10 +308,15 @@ impl Inert {
             elsewhere: None,
             ran_elsewhere: Mutex::new(Vec::new()),
             elsewhere_exit: Mutex::new(Ok(Some(0))),
+            elsewhere_release: Mutex::new(None),
+            elsewhere_unwaited: Mutex::new(None),
             locked_at_reads: Mutex::new(Vec::new()),
-            sleeps: Mutex::new(Vec::new()),
-            fixed_wait_ms: Some(0),
+            new_passes: Mutex::new(Vec::new()),
             start_note: None,
+            starter_ended: AtomicBool::new(false),
+            starter_ends_once_watched: AtomicBool::new(false),
+            starter_watch: Mutex::new(None),
+            console_reads: AtomicU32::new(0),
             spent: Mutex::new(std::collections::VecDeque::new()),
             spent_reads: AtomicU32::new(0),
         }
@@ -334,6 +364,21 @@ impl Inert {
         self.logged.lock().unwrap().clone()
     }
 
+    /// End this runner's starter as its watch sees it: call what the pass's
+    /// [`Ports::watch_starter`] was handed. Whether a pass was watching it.
+    pub(crate) fn end_starter(&self) -> bool {
+        let Some(ended) = self.starter_watch.lock().unwrap().take() else {
+            return false;
+        };
+        ended();
+        true
+    }
+
+    /// Whether a pass watches its starter now, as one does while it waits for the lock.
+    pub(crate) fn watching_starter(&self) -> bool {
+        self.starter_watch.lock().unwrap().is_some()
+    }
+
     fn pass(&self, trigger: Trigger, mode: Mode) -> Result<Pass, Stop> {
         converge(
             self,
@@ -349,10 +394,17 @@ impl Ports for Inert {
     fn background(&self, trigger: Trigger) {
         self.backgrounds.lock().unwrap().push(trigger);
     }
+    fn new_pass(&self) {
+        // Another take of the pass's lock, only where a pass made its lock file (as `read`).
+        let held = self.state.join(FileJournal::DIR).join(LOCK).exists()
+            && try_lock(&self.state).is_ok_and(|lock| lock.is_none());
+        self.new_passes.lock().unwrap().push(held);
+    }
     fn own_account(&self) -> bool {
         self.own
     }
     fn at_console(&self) -> Result<bool, String> {
+        self.console_reads.fetch_add(1, Ordering::SeqCst);
         Ok(self.console)
     }
     fn state_dir(&self) -> Option<PathBuf> {
@@ -366,16 +418,6 @@ impl Ports for Inert {
     }
     fn now_ms(&self) -> u64 {
         self.now.load(Ordering::SeqCst)
-    }
-    fn random_wait(&self, max: Duration) -> Duration {
-        match self.fixed_wait_ms {
-            Some(ms) => Duration::from_millis(ms).min(max),
-            None => random_duration_up_to(max, self.now_ms()),
-        }
-    }
-    fn sleep(&self, duration: Duration) {
-        self.dispatches.lock().unwrap().push("sleep");
-        self.sleeps.lock().unwrap().push(duration);
     }
     fn installed_release(&self) -> bool {
         self.installed
@@ -570,29 +612,25 @@ impl Ports for Inert {
     }
     fn clone_owed(
         &self,
-        work: aterm_secrets::converge::RepositoryWork,
         _execution: Option<repository_refresh::Execution>,
     ) -> Result<crate::init::CloneOwedOutcome, String> {
-        if matches!(
-            *self.owed.lock().unwrap(),
-            crate::init::OwedClone::Verified { .. }
-        ) {
-            assert_eq!(work, aterm_secrets::converge::RepositoryWork::Refresh);
-            self.applied("refresh checkouts");
-            return Ok(crate::init::CloneOwedOutcome {
-                said: "refreshed".into(),
-                readback: None,
-            });
-        }
         self.applied("clone");
-        *self.owed.lock().unwrap() = crate::init::OwedClone::Verified {
-            present: 1,
-            total: 1,
-        };
+        *self.owed.lock().unwrap() =
+            crate::init::OwedClone::Verified(crate::init_observe::RepositoryCounts {
+                ready: 1,
+                ..crate::init_observe::RepositoryCounts::default()
+            });
         Ok(crate::init::CloneOwedOutcome {
             said: "cloned".into(),
             readback: None,
         })
+    }
+    fn refresh_repositories(
+        &self,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<crate::init::RepositoryRefreshed, String> {
+        self.applied("refresh checkouts");
+        self.refreshed.lock().unwrap().clone()
     }
     fn forget_owed_clone(&self) -> Result<(), String> {
         self.applied("forget clone");
@@ -600,13 +638,20 @@ impl Ports for Inert {
             crate::init::OwedClone::Nothing("aterm init owes no clone".into());
         Ok(())
     }
-    fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
+    fn clone_tuning(
+        &self,
+        keep: crate::clone_tuning::Keep,
+    ) -> Result<crate::clone_tuning::Reading, String> {
         if let Some(read) = self.tuning_read.lock().unwrap().as_ref() {
             read.store(true, Ordering::SeqCst);
         }
+        self.tuning_keeps.lock().unwrap().push(keep);
         self.read(&self.tuning)
     }
-    fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
+    fn tune_clones(
+        &self,
+        _execution: Option<repository_refresh::Execution>,
+    ) -> Result<crate::clone_tuning::Tuned, String> {
         self.applied("tune clones");
         let tuned = self.tuned.lock().unwrap().clone();
         if matches!(&tuned, Ok(tuned) if tuned.aside.is_none()) {
@@ -680,6 +725,17 @@ impl Ports for Inert {
     fn start_note(&self) -> Option<String> {
         self.start_note.clone()
     }
+    fn watch_starter(&self, ended: Box<dyn FnOnce() + Send>) -> StarterWatch {
+        if self.starter_ended.load(Ordering::SeqCst) {
+            return StarterWatch::Ended;
+        }
+        if self.starter_ends_once_watched.load(Ordering::SeqCst) {
+            ended();
+            return StarterWatch::Watching(Box::new(()));
+        }
+        *self.starter_watch.lock().unwrap() = Some(ended);
+        StarterWatch::Watching(Box::new(()))
+    }
     fn spent(&self) -> Spent {
         self.spent_reads.fetch_add(1, Ordering::SeqCst);
         self.spent.lock().unwrap().pop_front().unwrap_or_default()
@@ -687,12 +743,20 @@ impl Ports for Inert {
     fn installed_release_elsewhere(&self) -> Option<PathBuf> {
         self.elsewhere.clone()
     }
-    fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String> {
+    fn start_elsewhere(&self, program: &Path, args: &[String]) -> Result<ElsewhereRun, String> {
         self.ran_elsewhere
             .lock()
             .unwrap()
             .push((program.to_path_buf(), args.to_vec()));
-        self.elsewhere_exit.lock().unwrap().clone()
+        let exit = self.elsewhere_exit.lock().unwrap().clone()?;
+        let release = self.elsewhere_release.lock().unwrap().take();
+        let unwaited = self.elsewhere_unwaited.lock().unwrap().take();
+        Ok(Box::new(move || -> Result<Option<i32>, String> {
+            if let Some(release) = release {
+                let _ = release.recv();
+            }
+            unwaited.map_or(Ok(exit), Err)
+        }))
     }
 }
 
@@ -993,8 +1057,8 @@ fn signing_files_stay_pending_until_the_automatic_pass_proves_a_signature() {
 }
 
 /// The clone an `aterm init` owes waits for the vault's GitHub token, then runs in the
-/// subscriber's pass once; later refresh work checks the acquired checkout without cloning it
-/// again. A plan only plans it.
+/// subscriber's pass once; `sync.refresh` refreshes what is here in each applying pass after it,
+/// and the waiting pass refreshes nothing. A plan only plans it.
 #[test]
 fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1020,14 +1084,17 @@ fn the_subscribers_pass_runs_the_clone_init_owes_once_its_token_lands() {
     assert!(applied.complete());
     let again = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     assert_eq!(row(&again.rows, CLONE).outcome, Outcome::Ok);
+    assert_eq!(row(&again.rows, REFRESH).outcome, Outcome::Ok);
     assert_eq!(clones(&ports), 1, "once");
     assert_eq!(
         ports
             .applies()
             .iter()
-            .filter(|kind| **kind == "refresh checkouts")
-            .count(),
-        1
+            .filter(|kind| matches!(**kind, "clone" | "refresh checkouts"))
+            .copied()
+            .collect::<Vec<_>>(),
+        ["clone", "refresh checkouts", "refresh checkouts"],
+        "the clone first, then a refresh in each applying pass"
     );
 }
 
@@ -1112,6 +1179,33 @@ fn the_pass_tunes_differing_clones_once_and_a_plan_only_plans_it() {
         3,
         "the failed, the raced and the tuning apply, then none"
     );
+}
+
+/// Only an applying pass's read of the clones keeps what it read of their declarations
+/// ([`crate::clone_tuning::Keep::Declarations`]): a plan's read keeps nothing, so `--check`
+/// writes nothing of clone tuning's. NEGATIVE CONTROL: the same pass applying asks its read to
+/// keep them.
+#[test]
+fn only_an_applying_pass_keeps_what_clone_tuning_read() {
+    use crate::clone_tuning::Keep;
+    for (mode, keep) in [
+        (Mode::Plan, Keep::Nothing),
+        (Mode::Apply, Keep::Declarations),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        let pass = ran(ports.pass(Trigger::Subscriber, mode));
+        let asked = ports.tuning_keeps.lock().unwrap().clone();
+        assert!(
+            !asked.is_empty(),
+            "{mode:?}: the row reads the clones: {:?}",
+            row(&pass.rows, CLONE_TUNING)
+        );
+        assert!(
+            asked.iter().all(|asked| *asked == keep),
+            "{mode:?}: {asked:?}"
+        );
+    }
 }
 
 /// The clones' tuning runs after the clone `aterm init` owes, over what that clone left.
@@ -1401,10 +1495,10 @@ fn the_fabric_is_turned_on_beside_a_window_and_a_persons_off_stands() {
     );
 }
 
-/// A pass meets another pass's lock and stops: exit 75's case, with nothing read, applied or
-/// recorded.
+/// A person's pass meets another pass's lock and stops: exit 75's case, with nothing read,
+/// applied or recorded, and no starter watched.
 #[test]
-fn a_held_lock_skips_the_pass() {
+fn a_held_lock_skips_a_persons_pass() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert::new(scratch.path());
     let held = try_lock(scratch.path()).unwrap().expect("free");
@@ -1412,14 +1506,191 @@ fn a_held_lock_skips_the_pass() {
         try_lock(scratch.path()).unwrap().is_none(),
         "a second take waits on none"
     );
-    let stopped = ports.pass(Trigger::Window, Mode::Apply);
+    let stopped = ports.pass(Trigger::Init, Mode::Apply);
     assert!(matches!(stopped, Err(Stop::Held)), "{stopped:?}");
     assert_eq!(ports.reads.load(Ordering::SeqCst), 0, "nothing read");
+    assert_eq!(ports.console_reads.load(Ordering::SeqCst), 0);
+    assert!(
+        !ports.watching_starter(),
+        "a person's pass watches no starter"
+    );
     assert!(ports.bases.lock().unwrap().is_empty());
     assert!(ports.applies().is_empty());
     assert_eq!(read_record(scratch.path()), None, "nothing recorded");
     drop(held);
-    ran(ports.pass(Trigger::Window, Mode::Apply));
+    ran(ports.pass(Trigger::Init, Mode::Apply));
+    assert!(read_record(scratch.path()).is_some(), "once it is let go");
+}
+
+/// A pass begins its record of checkout facts once, once it holds its lock
+/// ([`Ports::new_pass`]): its rows (`sync.clone`'s stage, then `sync.refresh`'s) share that one
+/// record, and a pass that meets another's lock empties nothing under the pass that holds it.
+/// NEGATIVE CONTROL: the person's pass that found the lock held began no record at all.
+#[test]
+fn a_pass_begins_its_record_of_checkout_facts_once_it_holds_its_lock() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let held = try_lock(scratch.path()).unwrap().expect("free");
+    let stopped = ports.pass(Trigger::Init, Mode::Apply);
+    assert!(matches!(stopped, Err(Stop::Held)), "{stopped:?}");
+    assert!(
+        ports.new_passes.lock().unwrap().is_empty(),
+        "a pass that found the lock held begins no record"
+    );
+    drop(held);
+    ran(ports.pass(Trigger::Init, Mode::Apply));
+    assert_eq!(
+        *ports.new_passes.lock().unwrap(),
+        [true],
+        "one record, begun under the pass's lock"
+    );
+}
+
+/// Until the pass `waiting` runs watches its starter, as it does once it found the lock held and
+/// before it waits for it, or has ended: a hang detector of a minute, not a budget.
+fn until_waiting<T>(ports: &Inert, waiting: &std::thread::ScopedJoinHandle<'_, T>) {
+    const HANG: Duration = Duration::from_secs(60);
+    let began = std::time::Instant::now();
+    while !(ports.watching_starter() || waiting.is_finished()) {
+        assert!(
+            began.elapsed() < HANG,
+            "hang detector: the pass never waited for the lock"
+        );
+        aterm_uds::deadline::poll_yield();
+    }
+}
+
+/// What the scoped thread `running` returned once it ended: a hang detector of a minute, not a
+/// budget. Where it has not ended by then, `let_go` first frees what it may still wait for (the
+/// lock, an installed app's pass), so the scope's own join of it ends and the test fails rather
+/// than hangs.
+pub(crate) fn joined<T>(running: std::thread::ScopedJoinHandle<'_, T>, let_go: impl FnOnce()) -> T {
+    const HANG: Duration = Duration::from_secs(60);
+    let began = std::time::Instant::now();
+    while !running.is_finished() {
+        if began.elapsed() >= HANG {
+            let_go();
+            panic!("hang detector: the thread never ended");
+        }
+        aterm_uds::deadline::poll_yield();
+    }
+    running.join().unwrap()
+}
+
+/// A STARTED RUNNER WAITS FOR A HELD LOCK AND RUNS ONCE IT IS LET GO: a pass a starter started
+/// (the subscriber's, the window's, setup's) that finds the lock another process's pass holds
+/// reads nothing, not even the console, and records nothing while it is held, with its starter
+/// watched; the moment the holder lets it go the same pass takes it and runs to its record, with
+/// no `converge held` line and no second start. NEGATIVE CONTROL: a person's pass (`--trigger
+/// init`) meeting the same lock stops at once, `Stop::Held`, as every trigger's did before.
+#[test]
+fn a_started_runner_waits_for_a_held_lock_and_runs_once_it_is_let_go() {
+    for trigger in [Trigger::Subscriber, Trigger::Window, Trigger::Setup] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        let dir = scratch.path().join(FileJournal::DIR);
+        aterm_uds::private_file::ensure_private_dir(&dir).unwrap();
+        let holder =
+            aterm_uds::private_file::PrivateLock::take(&dir, LOCK, Duration::ZERO, "the test")
+                .expect("the lock is free");
+        let pass = std::thread::scope(|scope| {
+            let waiting = scope.spawn(|| ports.pass(trigger, Mode::Apply));
+            until_waiting(&ports, &waiting);
+            assert!(
+                !waiting.is_finished(),
+                "{trigger:?}'s pass ended on a held lock"
+            );
+            assert_eq!(
+                ports.reads.load(Ordering::SeqCst),
+                0,
+                "nothing read while held"
+            );
+            assert_eq!(ports.console_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(ports.spent_reads.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                read_record(scratch.path()),
+                None,
+                "nothing recorded while held"
+            );
+            assert!(ports.logged().is_empty(), "{:?}", ports.logged());
+            drop(holder);
+            waiting.join().unwrap()
+        });
+        let pass = ran(pass);
+        assert!(!pass.rows.is_empty());
+        assert!(ports.reads.load(Ordering::SeqCst) > 0);
+        assert!(
+            read_record(scratch.path()).is_some(),
+            "it ran to its record"
+        );
+        let logged = ports.logged();
+        assert!(
+            logged.iter().all(|line| !line.starts_with("converge held")),
+            "{logged:?}"
+        );
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.starts_with("converge build=")),
+            "{logged:?}"
+        );
+    }
+
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert::new(scratch.path());
+    let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
+    assert!(matches!(
+        ports.pass(Trigger::Init, Mode::Apply),
+        Err(Stop::Held)
+    ));
+    assert!(!ports.watching_starter());
+    drop(lock);
+}
+
+/// A WAITING RUNNER WHOSE STARTER ENDED RUNS NOTHING: a started pass waiting for a held lock
+/// whose starter ends (a restarted subscriber, a quit window) stops, `Stop::Abandoned`, with
+/// nothing read or recorded and one `converge abandoned` line, so it outlives no cancelled lane;
+/// a starter gone before the wait begins is not waited on at all. Once let go, a pass whose
+/// starter lives runs. NEGATIVE CONTROL: the first test's passes, whose starter does not end,
+/// run once the lock is let go.
+#[test]
+fn a_waiting_runner_whose_starter_ended_runs_nothing() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = Inert {
+        start_note: Some("c=recheck".to_owned()),
+        ..Inert::new(scratch.path())
+    };
+    let mut lock = Some(try_lock(scratch.path()).unwrap().expect("the lock is free"));
+    let stopped = std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| ports.pass(Trigger::Subscriber, Mode::Apply));
+        until_waiting(&ports, &waiting);
+        assert!(ports.end_starter(), "the pass watched its starter");
+        // A pass that kept waiting once its starter ended fails here within the minute: the
+        // lock is let go, and it runs instead of stopping.
+        joined(waiting, || drop(lock.take()))
+    });
+    assert!(matches!(stopped, Err(Stop::Abandoned)), "{stopped:?}");
+    assert_eq!(ports.reads.load(Ordering::SeqCst), 0, "nothing read");
+    assert_eq!(ports.console_reads.load(Ordering::SeqCst), 0);
+    assert_eq!(read_record(scratch.path()), None, "nothing recorded");
+    assert_eq!(
+        ports.logged(),
+        ["converge abandoned build=0.145.0+gabc trigger=subscriber note=c=recheck"]
+    );
+
+    let gone = Inert::new(scratch.path());
+    gone.starter_ended.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        gone.pass(Trigger::Window, Mode::Apply),
+        Err(Stop::Abandoned)
+    ));
+    assert_eq!(
+        gone.logged(),
+        ["converge abandoned build=0.145.0+gabc trigger=window note=-"]
+    );
+    drop(lock);
+    gone.starter_ended.store(false, Ordering::SeqCst);
+    ran(gone.pass(Trigger::Window, Mode::Apply));
     assert!(read_record(scratch.path()).is_some(), "once it is let go");
 }
 
@@ -2454,12 +2725,27 @@ fn timed_row(id: &str, outcome: Outcome, elapsed_ms: u64, why: Option<&str>) -> 
     }
 }
 
+/// A count of gits by subcommand, for [`cost::line`]'s own laws: each `(word, n)` of
+/// [`crate::port::GIT_WORDS`] counted `n` times.
+fn git_by(counts: &[(&str, u64)]) -> crate::port::GitBy {
+    let mut by = crate::port::GitBy::default();
+    for (word, count) in counts {
+        let at = crate::port::GIT_WORDS
+            .iter()
+            .position(|known| known == word)
+            .unwrap();
+        by.0[at] = *count;
+    }
+    by
+}
+
 /// THE COST LINE SAYS WHAT THE PASS SPENT, THE NOTE OF ITS START AND EVERY CHANGED ROW: under a
 /// head of its own (`converge cost build=… trigger=…/…`) it carries `ms=`, `spawns=`, `git=`,
-/// `child_cpu_ms=`, `cpu_ms=`, `note=`, `changed_rows=` (every Changed row's id, in run order)
-/// and `slow=` (each row the engine spent at least [`cost::SLOW_MS`] on, longest first, then
-/// the rest summed), and nothing a row read: a row id that is not plain is written as its
-/// index, and no why reaches the line.
+/// `child_cpu_ms=`, `cpu_ms=`, `note=`, `changed_rows=` (every Changed row's id, in run order),
+/// `slow=` (each row the engine spent at least [`cost::SLOW_MS`] on, longest first, then the
+/// rest summed) and `git_by=` (the gits by subcommand, the most first, the order of
+/// [`crate::port::GIT_WORDS`] between equals), and nothing a row read: a row id that is not
+/// plain is written as its index, and no why reaches the line.
 /// NEGATIVE CONTROL: a `changed_rows` that names only the first Changed row reads `sync.fleet`
 /// alone.
 #[test]
@@ -2479,8 +2765,9 @@ fn the_cost_line_says_what_the_pass_spent_its_note_and_every_changed_row() {
     ];
     let spent = Spent {
         mono_ms: 1200,
-        spawns: 3,
-        gits: 2,
+        spawns: 5,
+        gits: 4,
+        git_by: git_by(&[("fetch", 1), ("rev-parse", 1), ("status", 2)]),
         child_cpu_ms: 240,
         cpu_ms: 25,
     };
@@ -2489,15 +2776,16 @@ fn the_cost_line_says_what_the_pass_spent_its_note_and_every_changed_row() {
         Trigger::Subscriber,
         Due::Recheck,
         spent,
-        Some("c=recheck+retry-held,h=11,w=52000"),
+        Some("c=recheck+retry-failed"),
         &rows,
     );
     assert_eq!(
         line,
-        "converge cost build=0.145.0+gabc trigger=subscriber/recheck ms=1200 spawns=3 git=2 \
-         child_cpu_ms=240 cpu_ms=25 note=c=recheck+retry-held,h=11,w=52000 \
+        "converge cost build=0.145.0+gabc trigger=subscriber/recheck ms=1200 spawns=5 git=4 \
+         child_cpu_ms=240 cpu_ms=25 note=c=recheck+retry-failed \
          changed_rows=sync.fleet,sync.clone,sync.requests,#5 \
-         slow=sync.identity:2000,sync.clone:1840,sync.fleet:400,#5:250,rest:120"
+         slow=sync.identity:2000,sync.clone:1840,sync.fleet:400,#5:250,rest:120 \
+         git_by=status:2,rev-parse:1,fetch:1"
     );
     assert!(!line.contains("Alice"), "no name reaches the line: {line}");
     assert!(
@@ -2521,7 +2809,7 @@ fn the_cost_line_says_what_the_pass_spent_its_note_and_every_changed_row() {
     assert!(
         line.ends_with(
             " note=- changed_rows=- slow=sync.r0:300,sync.r1:300,sync.r2:300,sync.r3:300,\
-             sync.r4:300,sync.r5:300,sync.r6:300,sync.r7:300,rest:600"
+             sync.r4:300,sync.r5:300,sync.r6:300,sync.r7:300,rest:600 git_by=-"
         ),
         "{line}"
     );
@@ -2536,16 +2824,18 @@ fn the_cost_line_says_what_the_pass_spent_its_note_and_every_changed_row() {
     assert_eq!(
         quiet,
         "converge cost build=b trigger=window/recheck ms=0 spawns=0 git=0 child_cpu_ms=0 \
-         cpu_ms=0 note=- changed_rows=- slow=-"
+         cpu_ms=0 note=- changed_rows=- slow=- git_by=-"
     );
 }
 
 /// A COST LINE IS ONE LOG RECORD, WHOLE: aterm.log keeps at most [`aterm_log::MAX_RECORD_BYTES`]
-/// of an INFO record, so where the whole line would be longer, `changed_rows` names the first
-/// Changed rows that fit and then `+<n>` for the rest, the most that fit and in run order; where
-/// naming none still does not fit, `slow` gives up its shortest rows to `rest`. The head, every
-/// number and the note stay whole, and at their largest are 438 bytes beside the build's name.
-/// NEGATIVE CONTROL: a line whose lists are never cut is 1204 bytes, which the log would cut
+/// of an INFO record, so where the whole line would be longer, `git_by` first names the most
+/// counted subcommands that fit and then `rest:<n>` for the others; where it names none,
+/// `changed_rows` names the first Changed rows that fit and then `+<n>` for the rest, the most
+/// that fit and in run order; where naming none still does not fit, `slow` gives up its shortest
+/// rows to `rest`. The head, every number and the note stay whole, and at their largest are 438
+/// bytes beside the build's name.
+/// NEGATIVE CONTROL: a line whose lists are never cut is 1202 bytes, which the log would cut
 /// inside `changed_rows`.
 #[test]
 fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
@@ -2555,6 +2845,7 @@ fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
         mono_ms: u64::MAX,
         spawns: u64::MAX,
         gits: u64::MAX,
+        git_by: crate::port::GitBy::default(),
         child_cpu_ms: u64::MAX,
         cpu_ms: u64::MAX,
     };
@@ -2567,10 +2858,39 @@ fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
         &[],
     );
     assert_eq!(
-        bare.len() - " changed_rows=- slow=-".len(),
+        bare.len() - " changed_rows=- slow=- git_by=-".len(),
         438,
         "the head, the numbers and the note at their largest: {bare}"
     );
+
+    // Gits of many subcommands: `git_by` gives up its least counted first, their sum `rest`.
+    let mut many = largest;
+    many.git_by = git_by(&[
+        ("rev-parse", 50),
+        ("config", 40),
+        ("for-each-ref", 30),
+        ("status", 20),
+        ("fetch", 10),
+        ("merge", 5),
+    ]);
+    let cut = cost::line(
+        "",
+        Trigger::Subscriber,
+        Due::NetworkMoved,
+        many,
+        Some(&note),
+        &[],
+    );
+    assert_eq!(
+        cut,
+        format!(
+            "{} git_by=rev-parse:50,config:40,rest:65",
+            bare.strip_suffix(" git_by=-").unwrap()
+        )
+    );
+    assert!(cut.len() <= CAP, "{} bytes: {cut}", cut.len());
+    let one_more = cut.replacen(",rest:65", ",for-each-ref:30,rest:35", 1);
+    assert!(one_more.len() > CAP, "the most that fit: {one_more}");
 
     // Forty Changed rows, each slow: the ids are cut from the end, the slow rows kept.
     let rows: Vec<ItemReport> = (0..40)
@@ -2587,10 +2907,11 @@ fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
         mono_ms: 61_000,
         spawns: 120,
         gits: 97,
+        git_by: crate::port::GitBy::default(),
         child_cpu_ms: 9_000,
         cpu_ms: 800,
     };
-    let note = "c=input-repair+retry-held,h=1,hc=35,w=5000,m=git-dir+index,n=1";
+    let note = "c=input-repair+retry-unfinished,m=git-dir+index,n=1";
     let line = cost::line(
         "0.201.0+g9c554c6",
         Trigger::Window,
@@ -2606,6 +2927,7 @@ fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
     );
     assert!(line.starts_with(&head), "{line}");
     let (changed, slow) = line[head.len()..].split_once(" slow=").unwrap();
+    let slow = slow.strip_suffix(" git_by=-").unwrap();
     let changed: Vec<&str> = changed.split(',').collect();
     let (left, named) = changed.split_last().unwrap();
     let left: usize = left.strip_prefix('+').unwrap().parse().unwrap();
@@ -2652,6 +2974,7 @@ fn a_cost_line_fits_one_log_record_cutting_its_lists_from_their_ends() {
     );
     assert!(line.len() <= CAP, "{} bytes: {line}", line.len());
     let (before, slow) = line.split_once(" slow=").unwrap();
+    let slow = slow.strip_suffix(" git_by=-").unwrap();
     assert!(
         before.ends_with(&format!(" note={note} changed_rows=+40")),
         "{line}"
@@ -2687,6 +3010,7 @@ fn a_pass_logs_its_ledger_line_as_it_was_and_what_it_spent_in_a_line_of_its_own(
             mono_ms: 100,
             spawns: 1,
             gits: 1,
+            git_by: crate::port::GitBy::default(),
             child_cpu_ms: 10,
             cpu_ms: 5,
         },
@@ -2694,6 +3018,7 @@ fn a_pass_logs_its_ledger_line_as_it_was_and_what_it_spent_in_a_line_of_its_own(
             mono_ms: 1300,
             spawns: 4,
             gits: 3,
+            git_by: crate::port::GitBy::default(),
             child_cpu_ms: 250,
             cpu_ms: 30,
         },
@@ -2737,7 +3062,7 @@ fn a_pass_logs_its_ledger_line_as_it_was_and_what_it_spent_in_a_line_of_its_own(
     let held = Inert::new(scratch.path());
     let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
     assert!(matches!(
-        held.pass(Trigger::Window, Mode::Apply),
+        held.pass(Trigger::Init, Mode::Apply),
         Err(Stop::Held)
     ));
     drop(lock);
@@ -2750,23 +3075,23 @@ fn a_pass_logs_its_ledger_line_as_it_was_and_what_it_spent_in_a_line_of_its_own(
     assert_eq!(held.logged().len(), 1, "the held start's own line alone");
 }
 
-/// EACH START SAYS WHAT CAUSED IT, AND A START THAT FOUND THE LOCK HELD IS NOT COUNTED AS A
-/// PASS: a pass that ran carries its starter's note as its cost line's `note=` (`-` with none);
-/// a pass that found the lock held writes one line of its own, whose head is `converge held`
-/// and never a pass line's `converge build=`, with the same note; a plan writes none.
-/// NEGATIVE CONTROL: a held start logged under the pass line's head (`converge build=… held`)
-/// is counted by the tally of pass lines below: 3 where 1 is wanted.
+/// EACH START SAYS WHAT CAUSED IT, AND A PERSON'S PASS THAT FOUND THE LOCK HELD IS NOT
+/// COUNTED AS A PASS: a pass that ran carries its starter's note as its cost line's `note=`
+/// (`-` with none); a person's pass that found the lock held writes one line of its own, whose
+/// head is `converge held` and never a pass line's `converge build=`, with its note; a plan
+/// writes none. NEGATIVE CONTROL: a held pass logged under the pass line's head (`converge
+/// build=… held`) is counted by the tally of pass lines below: 3 where 1 is wanted.
 #[test]
-fn a_start_says_its_note_and_a_held_start_has_a_line_of_its_own() {
+fn a_start_says_its_note_and_a_held_pass_has_a_line_of_its_own() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let ports = Inert {
-        start_note: Some("c=recheck+retry-held,h=2,w=10000".to_owned()),
+        start_note: Some("c=recheck+input-repair,m=head,n=2".to_owned()),
         ..Inert::new(scratch.path())
     };
     let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
     for _ in 0..2 {
         assert!(matches!(
-            ports.pass(Trigger::Subscriber, Mode::Apply),
+            ports.pass(Trigger::Init, Mode::Apply),
             Err(Stop::Held)
         ));
     }
@@ -2774,25 +3099,25 @@ fn a_start_says_its_note_and_a_held_start_has_a_line_of_its_own() {
     drop(lock);
     ran(ports.pass(Trigger::Subscriber, Mode::Apply));
     let logged = ports.logged();
-    let held = "converge held build=0.145.0+gabc trigger=subscriber \
-                note=c=recheck+retry-held,h=2,w=10000";
+    let held =
+        "converge held build=0.145.0+gabc trigger=init note=c=recheck+input-repair,m=head,n=2";
     let passes = logged
         .iter()
         .filter(|line| line.contains("converge build="))
         .count();
-    assert_eq!(passes, 1, "a tally of pass lines counts no held start");
+    assert_eq!(passes, 1, "a tally of pass lines counts no held pass");
     assert_eq!(logged.len(), 4, "{logged:?}");
     assert_eq!(logged[..2], [held, held]);
     assert!(logged[2].starts_with("converge build="), "{logged:?}");
     assert!(
-        logged[3].contains(" note=c=recheck+retry-held,h=2,w=10000 changed_rows="),
+        logged[3].contains(" note=c=recheck+input-repair,m=head,n=2 changed_rows="),
         "{logged:?}"
     );
 
     let unnoted = Inert::new(scratch.path());
     let lock = try_lock(scratch.path()).unwrap().expect("the lock is free");
     assert!(matches!(
-        unnoted.pass(Trigger::Window, Mode::Apply),
+        unnoted.pass(Trigger::Init, Mode::Apply),
         Err(Stop::Held)
     ));
     drop(lock);
@@ -2800,7 +3125,7 @@ fn a_start_says_its_note_and_a_held_start_has_a_line_of_its_own() {
     let logged = unnoted.logged();
     assert_eq!(
         logged[0],
-        "converge held build=0.145.0+gabc trigger=window note=-"
+        "converge held build=0.145.0+gabc trigger=init note=-"
     );
     assert!(logged[2].contains(" note=- changed_rows="), "{logged:?}");
 }
@@ -3030,8 +3355,7 @@ fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() 
                 from: "no node runs".into(),
                 to: "node running".into(),
             };
-            *ports.fleet_done.lock().unwrap() =
-                Ok(FleetDone::AtCapacity("issuer at capacity".into()));
+            *ports.fleet_done.lock().unwrap() = Err("issuer at capacity".into());
             let pass = ran(ports.pass(Trigger::Window, Mode::Apply));
             assert_eq!(row(&pass.rows, FABRIC).outcome, Outcome::Changed);
             assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Failed);
@@ -3040,18 +3364,20 @@ fn independent_fabric_runs_before_remote_work_and_node_hosting_waits_for_node() 
             let at = |kind| calls.iter().position(|call| *call == kind).unwrap();
             if needs_node {
                 assert!(at("node") < at(effect), "{calls:?}");
-                assert!(at("sleep") < at(effect), "{calls:?}");
+                assert!(at("fleet") < at(effect), "{calls:?}");
             } else {
                 assert!(at(effect) < at("peers-read"), "{calls:?}");
                 assert!(at(effect) < at("fleet"), "{calls:?}");
-                assert!(at(effect) < at("sleep"), "{calls:?}");
             }
         }
     }
 }
 
+/// A fleet join is tried once per pass, at once, whatever ended it: a join that did not land
+/// (an unreachable or busy issuer included) ends its row, and with it the pass's hold on the
+/// converge lock, for the starter's runner retry to try again. No pass waits on the issuer.
 #[test]
-fn fleet_handshakes_start_immediately_and_retry_only_reported_capacity() {
+fn a_fleet_join_is_tried_once_per_pass_and_a_failed_one_ends_its_row() {
     for trigger in [
         Trigger::Init,
         Trigger::Subscriber,
@@ -3059,351 +3385,155 @@ fn fleet_handshakes_start_immediately_and_retry_only_reported_capacity() {
         Trigger::Setup,
     ] {
         let scratch = aterm_tempfile::tempdir().unwrap();
-        let ports = Inert {
-            fixed_wait_ms: Some(45_000),
-            ..Inert::new(scratch.path())
-        };
+        let ports = Inert::new(scratch.path());
         let pass = ran(ports.pass(trigger, Mode::Apply));
         assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Changed);
-        assert!(
-            ports.sleeps.lock().unwrap().is_empty(),
-            "{trigger:?}: dial before waiting for a capacity response"
-        );
     }
-
-    // 2. Non-capacity error and Blocked stand-aside do NOT retry at capacity backoff.
-    let scratch_err = aterm_tempfile::tempdir().unwrap();
-    let err_ports = Inert::new(scratch_err.path());
-    *err_ports.fleet_done.lock().unwrap() = Err("the issuer did not answer".to_owned());
-    let err_pass = ran(err_ports.pass(Trigger::Subscriber, Mode::Apply));
-    assert_eq!(row(&err_pass.rows, FLEET).outcome, Outcome::Failed);
-    assert_eq!(
-        err_ports
-            .applies()
-            .iter()
-            .filter(|&&k| k == "fleet")
-            .count(),
-        1,
-        "non-capacity failure must not retry"
-    );
-
-    // 3. Permanently wedged capacity stops within FLEET_JOIN_RETRY_BUDGET (<= 10 min).
-    let scratch_cap = aterm_tempfile::tempdir().unwrap();
-    let cap_ports = Inert {
-        fixed_wait_ms: Some(120_000),
-        ..Inert::new(scratch_cap.path())
-    };
-    *cap_ports.fleet_done.lock().unwrap() = Ok(FleetDone::AtCapacity(
-        "fleet listener at 10.0.0.1:7100 closed during handshake".to_owned(),
-    ));
-    let cap_pass = ran(cap_ports.pass(Trigger::Subscriber, Mode::Apply));
-    let fleet_row = row(&cap_pass.rows, FLEET);
-    assert_eq!(fleet_row.outcome, Outcome::Failed);
-    assert_eq!(
-        fleet_row.why.as_deref(),
-        Some("fleet listener at 10.0.0.1:7100 closed during handshake; the next pass tries again")
-    );
-    let total_slept: Duration = cap_ports.sleeps.lock().unwrap().iter().copied().sum();
-    assert!(
-        total_slept <= FLEET_JOIN_RETRY_BUDGET,
-        "capacity retry sleep {total_slept:?} exceeded {FLEET_JOIN_RETRY_BUDGET:?}"
-    );
-    assert!(
-        cap_ports
-            .applies()
-            .iter()
-            .filter(|&&k| k == "fleet")
-            .count()
-            > 1,
-        "at-capacity refusal must retry with backoff"
-    );
+    for why in [
+        "fleet listener at 10.0.0.1:7100 closed during handshake",
+        "the issuer did not answer",
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let ports = Inert::new(scratch.path());
+        *ports.fleet_done.lock().unwrap() = Err(why.to_owned());
+        let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        let fleet = row(&pass.rows, FLEET);
+        assert_eq!(fleet.outcome, Outcome::Failed);
+        assert_eq!(
+            fleet.why.as_deref(),
+            Some(format!("{why}; the next pass tries again").as_str())
+        );
+        assert_eq!(
+            ports.applies().iter().filter(|&&k| k == "fleet").count(),
+            1,
+            "a failed join is the starter's to retry, never the pass's"
+        );
+        // The rows after it still run: a fleet that did not land holds no clone back.
+        assert_ne!(row(&pass.rows, CLONE).outcome, Outcome::Unknown);
+    }
 }
 
+/// C18 (§12.3): a simultaneous burst of 35 subscribers
+/// against an issuer with 16 connection slots all join within ten minutes. The retry that lands
+/// the rest is the starters' (`aterm_secrets::converge::RunnerRetry`, the pacing every starter
+/// shares) after a pass whose join failed, never a wait inside the pass: each subscriber here runs
+/// whole passes on a virtual clock, and starts the next one when its runner retry comes due.
 #[test]
 fn thirty_five_joins_against_sixteen_connections_all_land_within_ten_minutes() {
-    use std::sync::Condvar;
-
     const SUBSCRIBERS: usize = 35;
     const MAX_CONNECTIONS: usize = 16;
     const CONN_HOLD_MS: u64 = 5_000;
+    const BUDGET_MS: u64 = 10 * 60 * 1000;
 
-    struct SimState {
-        now_ms: u64,
-        active_runners: usize,
-        sleeping: Vec<u64>,
-        slot_free_at_ms: Vec<u64>,
+    struct Issuer {
+        now_ms: AtomicU64,
+        slot_free_at_ms: Mutex<Vec<u64>>,
     }
 
-    struct SimCluster {
-        state: Mutex<SimState>,
-        cvar: Condvar,
-        retry_at_capacity: bool,
+    /// One subscriber's runner: an [`Inert`] Mac whose fleet join dials the shared issuer.
+    struct Subscriber {
+        inner: Inert,
+        issuer: Arc<Issuer>,
+        joined: AtomicBool,
     }
 
-    impl SimCluster {
-        fn advance_if_all_parked(state: &mut SimState, cvar: &Condvar) {
-            if state.active_runners == state.sleeping.len()
-                && let Some(&next_ms) = state.sleeping.iter().min()
-            {
-                state.now_ms = state.now_ms.max(next_ms);
-                cvar.notify_all();
+    impl Subscriber {
+        fn join(&self) -> Result<FleetDone, String> {
+            let now = self.issuer.now_ms.load(Ordering::SeqCst);
+            let mut slots = self.issuer.slot_free_at_ms.lock().unwrap();
+            slots.retain(|&free_at| free_at > now);
+            if slots.len() >= MAX_CONNECTIONS {
+                return Err("fleet listener at 10.0.0.1:7100 closed during handshake".to_owned());
             }
+            slots.push(now + CONN_HOLD_MS);
+            self.joined.store(true, Ordering::SeqCst);
+            Ok(FleetDone::Synced("joined".to_owned()))
         }
 
-        fn run(retry_at_capacity: bool) -> (usize, usize, u64) {
-            let root = aterm_tempfile::tempdir().unwrap();
-            let cluster = Arc::new(Self {
-                state: Mutex::new(SimState {
-                    now_ms: 0,
-                    active_runners: SUBSCRIBERS,
-                    sleeping: Vec::new(),
-                    slot_free_at_ms: Vec::new(),
-                }),
-                cvar: Condvar::new(),
-                retry_at_capacity,
-            });
+        fn pass(&self) -> Outcome {
+            // Only a Mac in no fleet is started here, so its pass dials the issuer once.
+            *self.inner.fleet_done.lock().unwrap() = self.join();
+            row(
+                &ran(self.inner.pass(Trigger::Subscriber, Mode::Apply)).rows,
+                FLEET,
+            )
+            .outcome
+        }
+    }
 
-            struct RunnerGuard(Arc<SimCluster>);
-            impl Drop for RunnerGuard {
-                fn drop(&mut self) {
-                    let mut state = self.0.state.lock().unwrap_or_else(PoisonError::into_inner);
-                    state.active_runners -= 1;
-                    SimCluster::advance_if_all_parked(&mut state, &self.0.cvar);
-                }
-            }
-
-            struct SimSubscriber {
-                idx: usize,
-                dir: PathBuf,
-                cluster: Arc<SimCluster>,
-                rng: Mutex<u64>,
-                joined: AtomicBool,
-                first_attempt_ms: Mutex<Option<u64>>,
-            }
-
-            impl Ports for SimSubscriber {
-                fn background(&self, _trigger: Trigger) {}
-                fn own_account(&self) -> bool {
-                    true
-                }
-                fn at_console(&self) -> Result<bool, String> {
-                    Ok(true)
-                }
-                fn state_dir(&self) -> Option<PathBuf> {
-                    Some(self.dir.clone())
-                }
-                fn build(&self) -> String {
-                    "0.146.0+gsim".to_owned()
-                }
-                fn routes(&self) -> Vec<String> {
-                    vec!["10.0.0.10".to_owned()]
-                }
-                fn now_ms(&self) -> u64 {
-                    1_700_000_000_000 + self.cluster.state.lock().unwrap().now_ms
-                }
-                fn random_wait(&self, max: Duration) -> Duration {
-                    let max_ms = u64::try_from(max.as_millis()).unwrap_or(u64::MAX);
-                    if max_ms == 0 {
-                        return Duration::ZERO;
-                    }
-                    let mut s = self.rng.lock().unwrap();
-                    *s ^= *s << 13;
-                    *s ^= *s >> 7;
-                    *s ^= *s << 17;
-                    Duration::from_millis(*s % (max_ms + 1))
-                }
-                fn sleep(&self, duration: Duration) {
-                    let delta_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-                    if delta_ms == 0 {
-                        return;
-                    }
-                    let mut state = self.cluster.state.lock().unwrap();
-                    let wake_at = state.now_ms + delta_ms;
-                    state.sleeping.push(wake_at);
-                    while state.now_ms < wake_at {
-                        SimCluster::advance_if_all_parked(&mut state, &self.cluster.cvar);
-                        if state.now_ms >= wake_at {
-                            break;
-                        }
-                        state = self.cluster.cvar.wait(state).unwrap();
-                    }
-                    if let Some(pos) = state.sleeping.iter().position(|&t| t == wake_at) {
-                        state.sleeping.swap_remove(pos);
-                    }
-                }
-                fn installed_release(&self) -> bool {
-                    false
-                }
-                fn window_runs(&self) -> bool {
-                    false
-                }
-                fn swarm_enabled(&self) -> Result<bool, String> {
-                    Ok(true)
-                }
-                fn base(&self, _lock: BaseLock) -> Base {
-                    Base::none()
-                }
-                fn vault(&self) -> Result<VaultRead, String> {
-                    Ok(VaultRead::Runs("runs".to_owned()))
-                }
-                fn identity(&self) -> Result<IdentityRead, String> {
-                    Ok(IdentityRead::Current("label current".to_owned()))
-                }
-                fn sync_identity(&self) -> Result<String, String> {
-                    Ok("wrote label".to_owned())
-                }
-                fn fleet(&self) -> Result<FleetRead, String> {
-                    if self.joined.load(Ordering::SeqCst) {
-                        Ok(FleetRead::Current(
-                            "in the vault's default fleet".to_owned(),
-                        ))
-                    } else {
-                        Ok(FleetRead::Due("this Mac is in no fleet".to_owned()))
-                    }
-                }
-                fn sync_fleet(&self) -> Result<FleetDone, String> {
-                    let mut state = self.cluster.state.lock().unwrap();
-                    let now = state.now_ms;
-                    self.first_attempt_ms.lock().unwrap().get_or_insert(now);
-                    state.slot_free_at_ms.retain(|&free_at| free_at > now);
-                    if state.slot_free_at_ms.len() >= MAX_CONNECTIONS {
-                        let msg =
-                            "fleet listener at 10.0.0.1:7100 closed during handshake".to_owned();
-                        return if self.cluster.retry_at_capacity {
-                            Ok(FleetDone::AtCapacity(msg))
-                        } else {
-                            Err(msg)
-                        };
-                    }
-                    state.slot_free_at_ms.push(now + CONN_HOLD_MS);
-                    drop(state);
-                    self.joined.store(true, Ordering::SeqCst);
-                    Ok(FleetDone::Synced(format!("m{} joined", self.idx + 1)))
-                }
-                fn steward_revoke(&self) -> Result<StewardRevokeRead, String> {
-                    Ok(StewardRevokeRead::Idle("no admin key here".to_owned()))
-                }
-                fn apply_steward_revoke(&self) -> Result<String, String> {
-                    Err("no steward here".to_owned())
-                }
-                fn shared_data(&self) -> Result<SharedRead, String> {
-                    Ok(SharedRead::Visible("control record here".to_owned()))
-                }
-                fn requests(&self) -> Result<RequestsRead, String> {
-                    Ok(RequestsRead::Idle("off".to_owned()))
-                }
-                fn pass_requests(&self) -> Result<String, String> {
-                    Ok("0 posted".to_owned())
-                }
-                fn found_commons(&self) -> Result<SharedDone, String> {
-                    Ok(SharedDone::Done("founded".to_owned()))
-                }
-                fn accounts(&self) -> Result<AccountsRead, String> {
-                    Ok(AccountsRead::Current("in step".to_owned()))
-                }
-                fn resync_accounts(&self) -> Result<String, String> {
-                    Ok("synced".to_owned())
-                }
-                fn fabric(&self) -> Result<FabricRead, String> {
-                    Ok(FabricRead::NotApplicable("off".to_owned()))
-                }
-                fn renew_broker(&self) -> Result<String, String> {
-                    Ok("current".to_owned())
-                }
-                fn awake(&self) -> Result<AwakeRead, String> {
-                    Ok(AwakeRead::NotApplicable("not macOS".to_owned()))
-                }
-                fn keep_awake(&self) -> Result<String, String> {
-                    Ok("kept".to_owned())
-                }
-                fn awake_startup_off(&self) -> bool {
-                    false
-                }
-                fn turn_on_fabric(&self) -> Result<String, String> {
-                    Err("the fabric is off here".to_owned())
-                }
-                fn peers(&self, _look: bool) -> Result<PeersRead, String> {
-                    Ok(PeersRead::Joined("in vault alab".to_owned()))
-                }
-                fn join_peers(&self) -> Result<PeersDone, String> {
-                    Ok(PeersDone::Joined("joined".to_owned()))
-                }
-                fn log(&self, _line: &str) {}
-                fn installed_release_elsewhere(&self) -> Option<PathBuf> {
-                    None
-                }
-                fn run_elsewhere(
-                    &self,
-                    _program: &Path,
-                    _args: &[String],
-                ) -> Result<Option<i32>, String> {
-                    unreachable!("the capacity simulation has no installed app")
-                }
-            }
-
-            let mut handles = Vec::with_capacity(SUBSCRIBERS);
-            for idx in 0..SUBSCRIBERS {
-                let dir = root.path().join(format!("m{}", idx + 1));
+    /// Run the burst: every subscriber's first pass at t = 0, then, with `retry`, each pass the
+    /// starter's runner retry starts. Returns how many joined and when the last of them did.
+    fn burst(retry: bool) -> (usize, u64) {
+        let issuer = Arc::new(Issuer {
+            now_ms: AtomicU64::new(0),
+            slot_free_at_ms: Mutex::new(Vec::new()),
+        });
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let subscribers: Vec<_> = (0..SUBSCRIBERS)
+            .map(|idx| {
+                let dir = scratch.path().join(format!("m{}", idx + 1));
                 std::fs::create_dir_all(&dir).unwrap();
-                let cluster = Arc::clone(&cluster);
-                handles.push(std::thread::spawn(move || {
-                    let _guard = RunnerGuard(Arc::clone(&cluster));
-                    let seed = ((idx as u64) + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    let ports = SimSubscriber {
-                        idx,
-                        dir,
-                        cluster,
-                        rng: Mutex::new(seed),
-                        joined: AtomicBool::new(false),
-                        first_attempt_ms: Mutex::new(None),
-                    };
-                    let pass = ran(converge(
-                        &ports,
-                        Trigger::Subscriber,
-                        Mode::Apply,
-                        aterm_secrets::converge::RepositoryWork::Refresh,
-                        &mut |_| {},
-                    ));
-                    assert_eq!(
-                        *ports.first_attempt_ms.lock().unwrap(),
-                        Some(0),
-                        "every first handshake precedes any capacity wait"
-                    );
-                    row(&pass.rows, FLEET).outcome
-                }));
-            }
-
-            let mut changed = 0;
-            let mut failed = 0;
-            for handle in handles {
-                match handle.join().unwrap() {
-                    Outcome::Changed => changed += 1,
-                    Outcome::Failed => failed += 1,
-                    other => panic!("unexpected sync.fleet outcome: {other:?}"),
+                let inner = Inert::new(&dir);
+                *inner.fleet.lock().unwrap() = FleetRead::Due("this Mac is in no fleet".into());
+                Subscriber {
+                    inner,
+                    issuer: Arc::clone(&issuer),
+                    joined: AtomicBool::new(false),
                 }
+            })
+            .collect();
+        let mut retries: Vec<_> = (0..SUBSCRIBERS)
+            .map(|_| aterm_secrets::converge::RunnerRetry::default())
+            .collect();
+        let mut owed: Vec<bool> = vec![true; SUBSCRIBERS];
+        let mut last_join = 0;
+        loop {
+            let now = issuer.now_ms.load(Ordering::SeqCst);
+            for (idx, subscriber) in subscribers.iter().enumerate() {
+                if !owed[idx] {
+                    continue;
+                }
+                retries[idx].started();
+                let outcome = subscriber.pass();
+                let last = if outcome == Outcome::Failed {
+                    aterm_secrets::converge::Last::Failed
+                } else {
+                    assert_eq!(outcome, Outcome::Changed);
+                    last_join = now;
+                    aterm_secrets::converge::Last::Ended
+                };
+                retries[idx].reaped(last, now);
+                owed[idx] = false;
             }
-            let elapsed_ms = cluster.state.lock().unwrap().now_ms;
-            (changed, failed, elapsed_ms)
+            if !retry {
+                break;
+            }
+            let Some(next) = retries.iter().filter_map(|retry| retry.remaining(0)).min() else {
+                break;
+            };
+            let next = u64::try_from(next.as_millis()).unwrap();
+            assert!(next > now, "a runner retry is never due at once");
+            issuer.now_ms.store(next, Ordering::SeqCst);
+            for (idx, retry) in retries.iter().enumerate() {
+                owed[idx] = retry.due(next);
+            }
         }
+        let joined = subscribers
+            .iter()
+            .filter(|subscriber| subscriber.joined.load(Ordering::SeqCst))
+            .count();
+        (joined, last_join)
     }
 
-    // NEGATIVE CONTROL (§7.1, §12.3 C18): Without retry at capacity, a simultaneous 35-subscriber
-    // burst against 16 listener slots lands 16 and leaves 19 failed until the next 30-min pass.
-    let (no_retry_ok, no_retry_failed, _) = SimCluster::run(false);
-    assert_eq!(no_retry_ok, 16, "without retry only 16 slots succeed");
-    assert_eq!(
-        no_retry_failed, 19,
-        "without retry 19 of 35 subscribers fail at capacity"
-    );
+    // NEGATIVE CONTROL: one pass each, with no retry after it, lands only the 16 the issuer's
+    // slots take; the other 19 would wait for the next 30-minute recheck.
+    assert_eq!(burst(false).0, MAX_CONNECTIONS);
 
-    // Worst-case simultaneous burst (all 35 hit at t = 0) WITH C18 backoff retry:
-    // all 35 land within <= 10 min.
-    let (burst_ok, burst_failed, burst_ms) = SimCluster::run(true);
-    assert_eq!(burst_ok, SUBSCRIBERS);
-    assert_eq!(burst_failed, 0);
+    let (joined, last_ms) = burst(true);
+    assert_eq!(joined, SUBSCRIBERS, "the starters' retries land every join");
     assert!(
-        Duration::from_millis(burst_ms) <= FLEET_JOIN_RETRY_BUDGET,
-        "simultaneous 35-join burst took {burst_ms} ms (> 10 min)"
+        last_ms <= BUDGET_MS,
+        "the 35-join burst took {last_ms} ms (> 10 min)"
     );
 }
 #[test]
@@ -3665,6 +3795,9 @@ pub(crate) mod owed_clone {
         fn background(&self, trigger: Trigger) {
             self.inner.background(trigger);
         }
+        fn new_pass(&self) {
+            self.inner.new_pass();
+        }
         fn own_account(&self) -> bool {
             self.inner.own_account()
         }
@@ -3682,12 +3815,6 @@ pub(crate) mod owed_clone {
         }
         fn now_ms(&self) -> u64 {
             self.inner.now_ms()
-        }
-        fn random_wait(&self, max: Duration) -> Duration {
-            self.inner.random_wait(max)
-        }
-        fn sleep(&self, duration: Duration) {
-            self.inner.sleep(duration);
         }
         fn installed_release(&self) -> bool {
             self.inner.installed_release()
@@ -3755,10 +3882,15 @@ pub(crate) mod owed_clone {
         }
         fn clone_owed(
             &self,
-            _work: aterm_secrets::converge::RepositoryWork,
             _execution: Option<repository_refresh::Execution>,
         ) -> Result<crate::init::CloneOwedOutcome, String> {
             (self.clone)()
+        }
+        fn refresh_repositories(
+            &self,
+            execution: Option<repository_refresh::Execution>,
+        ) -> Result<crate::init::RepositoryRefreshed, String> {
+            self.inner.refresh_repositories(execution)
         }
         fn owed_clone_control(&self) -> Result<Option<String>, String> {
             match self.control {
@@ -3774,11 +3906,17 @@ pub(crate) mod owed_clone {
         fn forget_owed_clone(&self) -> Result<(), String> {
             (self.forget)()
         }
-        fn clone_tuning(&self) -> Result<crate::clone_tuning::Reading, String> {
-            self.inner.clone_tuning()
+        fn clone_tuning(
+            &self,
+            keep: crate::clone_tuning::Keep,
+        ) -> Result<crate::clone_tuning::Reading, String> {
+            self.inner.clone_tuning(keep)
         }
-        fn tune_clones(&self) -> Result<crate::clone_tuning::Tuned, String> {
-            self.inner.tune_clones()
+        fn tune_clones(
+            &self,
+            execution: Option<repository_refresh::Execution>,
+        ) -> Result<crate::clone_tuning::Tuned, String> {
+            self.inner.tune_clones(execution)
         }
         fn fabric(&self) -> Result<FabricRead, String> {
             self.inner.fabric()
@@ -3816,15 +3954,15 @@ pub(crate) mod owed_clone {
         fn installed_release_elsewhere(&self) -> Option<PathBuf> {
             self.inner.installed_release_elsewhere()
         }
-        fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String> {
-            self.inner.run_elsewhere(program, args)
+        fn start_elsewhere(&self, program: &Path, args: &[String]) -> Result<ElsewhereRun, String> {
+            self.inner.start_elsewhere(program, args)
         }
     }
 
     /// No Sync row acts on the vault while System State holds it (design §8.5, principle 4): a
     /// person who presses Stop after fleet registration holds every row after it, each reading
     /// the hold as it starts, so the pass neither starts the node, resyncs the AI accounts nor
-    /// begins cloning repositories from the vault.
+    /// begins cloning or refreshing repositories from the vault.
     #[test]
     fn a_stop_pressed_mid_pass_holds_every_row_after_it() {
         let scratch = aterm_tempfile::tempdir().unwrap();
@@ -3863,7 +4001,7 @@ pub(crate) mod owed_clone {
             pass.rows
         );
         assert_eq!(row(&pass.rows, FLEET).outcome, Outcome::Changed);
-        for id in [NODE, ACCOUNTS, CLONE, CLONE_TUNING] {
+        for id in [NODE, ACCOUNTS, CLONE, CLONE_TUNING, REFRESH] {
             let held = row(&pass.rows, id);
             assert_eq!(
                 (held.outcome, held.why.as_deref()),
@@ -4064,9 +4202,7 @@ pub(crate) mod owed_clone {
                 aterm_secrets::converge::RepositoryWork::Refresh,
             )
         };
-        let clone = || {
-            crate::init::clone_owed(sys, state, aterm_secrets::converge::RepositoryWork::Refresh)
-        };
+        let clone = || crate::init::clone_owed(sys, state);
         let ports = Hooked {
             inner: Inert::new(state),
             held: &held,
@@ -4201,13 +4337,7 @@ pub(crate) mod owed_clone {
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
         };
-        let clone = || {
-            crate::init::clone_owed(
-                &sys,
-                &state,
-                aterm_secrets::converge::RepositoryWork::Refresh,
-            )
-        };
+        let clone = || crate::init::clone_owed(&sys, &state);
         let ports = Hooked {
             inner: Inert::new(scratch.path()),
             held: &held,
@@ -4529,6 +4659,70 @@ pub(crate) mod owed_clone {
         }
     }
 
+    /// System State's GitHub repositories row and `sync.clone` count one partition alike: for
+    /// the same inventory and checkouts, the stage's acquisition reads the counts the private
+    /// inventory's count reads, its row names their summary, and `sync.clone`'s row names that
+    /// same summary. CONTROL: with another of them already here, all three read the new count.
+    #[test]
+    fn the_native_row_and_sync_clone_count_one_partition_alike() {
+        use crate::init_observe::{Reading, RepositoryCounts};
+        let listed = ["here", "new-a", "new-b"];
+        for present in [&["here"][..], &["here", "new-a"][..]] {
+            let scratch = aterm_tempfile::tempdir().unwrap();
+            let state = scratch.path().to_path_buf();
+            let (sys, alice) = crate::init_github::scripted::inventory(&listed, present);
+            let expected = RepositoryCounts {
+                ready: present.len(),
+                missing: listed.len() - present.len(),
+                ..RepositoryCounts::default()
+            };
+            let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&alice));
+            let rows =
+                crate::init_github::run_initial_repositories(&sys, &ctx, Mode::Plan).unwrap();
+            let stage = rows
+                .iter()
+                .find(|row| row.id.starts_with("init.github.native@"))
+                .expect("the acquisition's row");
+            assert_eq!(
+                Reading::of(stage),
+                Some(Reading::Repositories {
+                    counts: expected,
+                    signed_in: true,
+                }),
+                "{present:?}: {rows:?}"
+            );
+            assert_eq!(stage.from.as_deref(), Some(expected.summary().as_str()));
+            assert_eq!(
+                crate::init_github::automatic_inventory_counts(&sys, &ctx),
+                Ok(Some(expected))
+            );
+            let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
+                crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
+            };
+            let ports = Hooked {
+                inner: Inert::new(&state),
+                held: &|| None::<String>,
+                owed: &owed,
+                clone: &|| panic!("a plan clones nothing"),
+                control: None,
+                forget: &|| Ok(()),
+            };
+            let pass = ran(converge(
+                &ports,
+                Trigger::Subscriber,
+                Mode::Plan,
+                aterm_secrets::converge::RepositoryWork::Repair,
+                &mut |_| {},
+            ));
+            let clone = row(&pass.rows, CLONE);
+            assert_eq!(
+                clone.from,
+                Some(format!("vault repositories: {}", expected.summary())),
+                "{present:?}: {clone:?}"
+            );
+        }
+    }
+
     /// Every clone runs Apple's git, which `base.clt` installs and this pass never does: a clone
     /// owed while the Command Line Tools are missing waits for them as for the token, naming
     /// the step that installs them; the pass after they arrive runs it.
@@ -4544,13 +4738,7 @@ pub(crate) mod owed_clone {
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone(&sys, &state, &crate::init::Holds::NONE, readback)
         };
-        let clone = || {
-            crate::init::clone_owed(
-                &sys,
-                &state,
-                aterm_secrets::converge::RepositoryWork::Refresh,
-            )
-        };
+        let clone = || crate::init::clone_owed(&sys, &state);
         let forget = || crate::init::forget_owed_clone(&state);
         let ports = Hooked {
             inner: Inert::new(&state),
@@ -4625,14 +4813,14 @@ pub(crate) mod owed_clone {
                 aterm_secrets::converge::RepositoryWork::Repair,
             )
         };
-        assert!(matches!(
+        assert_eq!(
             read(None, &crate::init::Holds::NONE).unwrap(),
-            OwedClone::Unobserved {
-                present: 0,
+            OwedClone::Unobserved(crate::init_observe::RepositoryCounts {
+                ready: 0,
                 unborn: 1,
-                total: 1
-            }
-        ));
+                ..crate::init_observe::RepositoryCounts::default()
+            })
+        );
         assert_eq!(
             advertisements.load(Ordering::SeqCst),
             0,
@@ -4653,7 +4841,6 @@ pub(crate) mod owed_clone {
             let outcome = crate::init::clone_owed_captured(
                 &sys,
                 &state,
-                aterm_secrets::converge::RepositoryWork::Repair,
                 crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
                 || Ok(true),
             )?;
@@ -4661,17 +4848,17 @@ pub(crate) mod owed_clone {
                 .readback
                 .as_ref()
                 .expect("the actual empty admission returned its read-back");
-            assert!(matches!(
+            assert_eq!(
                 read(Some(proof), &crate::init::Holds::NONE)?,
-                OwedClone::Verified {
-                    present: 1,
-                    total: 1
-                }
-            ));
+                OwedClone::Verified(crate::init_observe::RepositoryCounts {
+                    ready: 1,
+                    ..crate::init_observe::RepositoryCounts::default()
+                })
+            );
             assert!(
                 matches!(
                     read(None, &crate::init::Holds::NONE)?,
-                    OwedClone::Unobserved { .. }
+                    OwedClone::Unobserved(_)
                 ),
                 "no durable completion substitutes for the item's proof"
             );
@@ -4686,13 +4873,13 @@ pub(crate) mod owed_clone {
                 };
                 assert!(!matches!(
                     read(Some(proof), &stopped),
-                    Ok(OwedClone::Verified { .. })
+                    Ok(OwedClone::Verified(_))
                 ));
                 sys.vault_remove(home, crate::init_github::TOKEN_ENTRY);
                 assert!(
                     !matches!(
                         read(Some(proof), &crate::init::Holds::NONE),
-                        Ok(OwedClone::Verified { .. })
+                        Ok(OwedClone::Verified(_))
                     ),
                     "an empty-remote proof cannot supply missing source authority"
                 );
@@ -4709,7 +4896,7 @@ pub(crate) mod owed_clone {
                 assert!(
                     !matches!(
                         read(Some(proof), &crate::init::Holds::NONE),
-                        Ok(OwedClone::Verified { .. })
+                        Ok(OwedClone::Verified(_))
                     ),
                     "a retargeted checkout cannot borrow the old proof"
                 );
@@ -4732,20 +4919,20 @@ pub(crate) mod owed_clone {
                 assert!(
                     !matches!(
                         read(Some(proof), &crate::init::Holds::NONE),
-                        Ok(OwedClone::Verified { .. })
+                        Ok(OwedClone::Verified(_))
                     ),
                     "a locally rewritten endpoint cannot borrow the raw origin's proof"
                 );
                 assert_eq!(advertisements.load(Ordering::SeqCst), before_rewrite_read);
                 assert!(!redirected.exists(), "read-back performs no acquisition");
                 repos.g(&work, &["config", "--local", "--unset-all", &rewrite_key]);
-                assert!(matches!(
+                assert_eq!(
                     read(Some(proof), &crate::init::Holds::NONE)?,
-                    OwedClone::Verified {
-                        present: 1,
-                        total: 1
-                    }
-                ));
+                    OwedClone::Verified(crate::init_observe::RepositoryCounts {
+                        ready: 1,
+                        ..crate::init_observe::RepositoryCounts::default()
+                    })
+                );
                 let held_work = home.join("held-unborn");
                 std::fs::rename(&work, &held_work).unwrap();
                 repos.clone_into(&empty, &work);
@@ -4757,7 +4944,7 @@ pub(crate) mod owed_clone {
                 assert!(
                     !matches!(
                         read(Some(proof), &crate::init::Holds::NONE),
-                        Ok(OwedClone::Verified { .. })
+                        Ok(OwedClone::Verified(_))
                     ),
                     "a same-path replacement cannot borrow the old proof"
                 );
@@ -4767,13 +4954,13 @@ pub(crate) mod owed_clone {
                     sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
                     sys.file_id_of(&path, live.file_id(&path).unwrap());
                 }
-                assert!(matches!(
+                assert_eq!(
                     read(Some(proof), &crate::init::Holds::NONE)?,
-                    OwedClone::Verified {
-                        present: 1,
-                        total: 1
-                    }
-                ));
+                    OwedClone::Verified(crate::init_observe::RepositoryCounts {
+                        ready: 1,
+                        ..crate::init_observe::RepositoryCounts::default()
+                    })
+                );
             } else {
                 // The second native batch succeeds, then a different current source lands
                 // before Synced's outer probe. The old receipt must not finish that item.
@@ -4788,7 +4975,7 @@ pub(crate) mod owed_clone {
                 );
                 assert!(!matches!(
                     read(Some(proof), &crate::init::Holds::NONE),
-                    Ok(OwedClone::Verified { .. })
+                    Ok(OwedClone::Verified(_))
                 ));
             }
             Ok(outcome)
@@ -4848,7 +5035,7 @@ pub(crate) mod owed_clone {
         assert!(
             matches!(
                 read(None, &crate::init::Holds::NONE).unwrap(),
-                OwedClone::Unobserved { .. }
+                OwedClone::Unobserved(_)
             ),
             "a later item needs its own current admission"
         );
@@ -4873,14 +5060,13 @@ pub(crate) mod owed_clone {
         );
     }
 
-    /// A Refresh pass, as every default pass is, reads the remote of a checkout without a
-    /// commit in `sync.clone`'s own refresh, so an empty remote checked out here reads in step,
-    /// pass after pass, rather than as a clone owed: each pass reads that remote once (a commit
-    /// there would be acquired, never assumed away) and no pass reports a change. A refresh that
-    /// proves nothing fails the row instead of reading in step. CONTROL: a plan, which runs no
-    /// refresh, plans the read as a change and reads no remote.
+    /// A checkout without a commit is acquisition's, never the refresh's: each Refresh pass's
+    /// `sync.clone` reads that remote once (a commit there would be acquired, never assumed
+    /// away) and its read-back verifies the empty one, and `sync.refresh` reads it no second
+    /// time. An acquisition that proves nothing fails the row instead of reading in step.
+    /// CONTROL: a plan plans the read as a change and reads no remote.
     #[test]
-    fn an_empty_remote_checked_out_reads_in_step_in_every_refresh_pass() {
+    fn an_empty_remote_checked_out_is_read_once_by_acquisition_in_every_refresh_pass() {
         let live = crate::port::Live::new();
         // `repos` holds the scratch home: dropping it removes the checkout.
         let EmptyRemote {
@@ -4908,7 +5094,6 @@ pub(crate) mod owed_clone {
             let outcome = crate::init::clone_owed_captured(
                 &sys,
                 &state,
-                refresh,
                 crate::init_github::InitialRepositoryInputs::capture(&sys, &ctx)?,
                 || Ok(true),
             )?;
@@ -4953,10 +5138,10 @@ pub(crate) mod owed_clone {
         for reads in 1..=2 {
             let applied = pass(Mode::Apply);
             let clone_row = row(&applied.rows, CLONE);
-            assert_eq!(clone_row.outcome, Outcome::Ok, "{applied:?}");
+            assert_eq!(clone_row.outcome, Outcome::Changed, "{applied:?}");
             assert_eq!(
                 clone_row.to.as_deref(),
-                Some("1/1 vault repositories verified on this machine"),
+                Some("vault repositories: 1 of 1 ready, verified on this machine"),
                 "{clone_row:?}"
             );
             assert!(applied.complete(), "{applied:?}");
@@ -4974,7 +5159,7 @@ pub(crate) mod owed_clone {
             clone_row
                 .why
                 .as_deref()
-                .is_some_and(|why| why.contains("refreshed, but it still reads")
+                .is_some_and(|why| why.contains("applied, but it still reads")
                     && why.contains("without a commit")),
             "{clone_row:?}"
         );
@@ -5006,24 +5191,37 @@ pub(crate) mod owed_clone {
 
     /// A Stop pressed once `sync.clone` has read what is owed (its clone may take half an hour)
     /// holds the clone, as System State's own Repositories stage reads the person's choice
-    /// before each clone: the apply reads the hold again as it begins.
+    /// before each clone: the apply reads the hold again as it begins. A clone owed, or a
+    /// checkout without a commit, is a clone held; with every repository here, nothing is
+    /// cloned and the row reads them as they are. Either way `sync.refresh`, after it, reads the
+    /// Stop and refreshes nothing.
     #[test]
     fn a_stop_pressed_as_sync_clone_starts_holds_its_clone() {
-        // What the row reads: a clone owed (its apply), and every repository here, unborn
-        // ones included or not (its refresh). A Stop holds each the same way.
-        let readings: [fn() -> OwedClone; 3] = [
-            || OwedClone::Due("the vault's GitHub token is here now".to_owned()),
-            || OwedClone::Unobserved {
-                present: 0,
-                unborn: 1,
-                total: 1,
-            },
-            || OwedClone::Verified {
-                present: 1,
-                total: 1,
-            },
+        let readings: [(fn() -> OwedClone, bool); 3] = [
+            (
+                || OwedClone::Due("the vault's GitHub token is here now".to_owned()),
+                true,
+            ),
+            (
+                || {
+                    OwedClone::Unobserved(crate::init_observe::RepositoryCounts {
+                        unborn: 1,
+                        ..crate::init_observe::RepositoryCounts::default()
+                    })
+                },
+                true,
+            ),
+            (
+                || {
+                    OwedClone::Verified(crate::init_observe::RepositoryCounts {
+                        ready: 1,
+                        ..crate::init_observe::RepositoryCounts::default()
+                    })
+                },
+                false,
+            ),
         ];
-        for reading in readings {
+        for (reading, owes) in readings {
             let scratch = aterm_tempfile::tempdir().unwrap();
             let state = scratch.path().to_path_buf();
             let stopped = AtomicBool::new(false);
@@ -5065,14 +5263,26 @@ pub(crate) mod owed_clone {
                 "a Stop pressed before sync.clone's clone began did not hold it: {:?}",
                 reading()
             );
-            let held_row = row(&pass.rows, CLONE);
+            let stopped_by = |row: &ItemReport| {
+                row.why
+                    .as_deref()
+                    .is_some_and(|why| why.contains("you stopped setup in System State"))
+            };
+            let clone_row = row(&pass.rows, CLONE);
+            if owes {
+                assert!(
+                    clone_row.outcome == Outcome::Blocked && stopped_by(clone_row),
+                    "{:?}: {clone_row:?}",
+                    reading()
+                );
+            } else {
+                assert_eq!(clone_row.outcome, Outcome::Ok, "{clone_row:?}");
+            }
+            let refresh_row = row(&pass.rows, REFRESH);
+            assert!(stopped_by(refresh_row), "{:?}: {refresh_row:?}", reading());
             assert!(
-                held_row.outcome == Outcome::Blocked
-                    && held_row
-                        .why
-                        .as_deref()
-                        .is_some_and(|why| why.contains("you stopped setup in System State")),
-                "{:?}: {held_row:?}",
+                !ports.inner.applies().contains(&"refresh checkouts"),
+                "{:?}",
                 reading()
             );
         }

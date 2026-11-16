@@ -221,17 +221,11 @@ impl Running {
         (self.exit.as_ref().map(Arc::as_ptr), self.due.next_at())
     }
 
-    /// Take the runner's outcome, and its exit's descriptor with it once it has ended. A
-    /// runner that found the lock held adds the CPU its reap measured to the next start's note.
+    /// Take the runner's outcome, and its exit's descriptor with it once it has ended.
     fn last(&mut self) -> Last {
-        let (last, cpu) = crate::converge::reap(&mut self.child);
+        let last = Last::of(&mut self.child);
         if self.child.is_none() {
             self.exit = None;
-        }
-        if last == Last::Held
-            && let Some(cpu) = cpu
-        {
-            self.due.held_spent(cpu);
         }
         last
     }

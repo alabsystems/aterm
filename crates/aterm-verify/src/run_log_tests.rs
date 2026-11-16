@@ -21,6 +21,45 @@ fn default_log_and_event_writes_use_a_quiet_directory_and_explicit_logs_keep_the
     assert!(!aterm_tempfile::is_quiet(&explicit.path));
 }
 
+/// THE CUT REACHES ONLY THE FILE ITS APPEND HANDLE HOLDS: [`cut_to_header`] cuts the held
+/// companion back to its role header, and its append handle still appends at the new end. On
+/// Windows, where the cut goes through a handle opened by the path (an append handle may not
+/// move its end of file there), a path that names another file, as a pair changed during
+/// admission does, is refused, and neither file is cut; unix cuts through the held descriptor
+/// and never opens the path. CONTROL: the held file's own path is cut.
+#[test]
+fn the_cut_reaches_only_the_file_its_append_handle_holds() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let held_path = dir.path().join("held.events");
+    let other_path = dir.path().join("other.events");
+    let body = format!("{PRIVATE_EVENTS_HEADER}a record\n");
+    std::fs::write(&held_path, &body).unwrap();
+    std::fs::write(&other_path, &body).unwrap();
+    let events = Role::Events.open(&held_path).unwrap();
+    #[cfg(windows)]
+    {
+        let refused = cut_to_header(&events, &other_path).expect_err("another file");
+        assert_eq!(refused.to_string(), "run log pair changed during admission");
+        assert_eq!(std::fs::read_to_string(&held_path).unwrap(), body);
+        assert_eq!(std::fs::read_to_string(&other_path).unwrap(), body);
+    }
+    cut_to_header(&events, &held_path).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&held_path).unwrap(),
+        PRIVATE_EVENTS_HEADER
+    );
+    (&events).write_all(b"next\n").unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&held_path).unwrap(),
+        format!("{PRIVATE_EVENTS_HEADER}next\n")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other_path).unwrap(),
+        body,
+        "the other file uncut"
+    );
+}
+
 fn paired(path: &Path) -> (Log, crate::event_log::EventLog) {
     let mut events = crate::event_log::EventLog::unrecorded();
     let mut log = open_paired_at(path, false, events.id()).unwrap();

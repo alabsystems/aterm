@@ -144,89 +144,6 @@ pub struct AccountState {
     pub under_home: &'static [&'static str],
 }
 
-/// A program that opens its vendor's sign-in page in the desk's browser on every signed-out
-/// launch (Grok Build: through LaunchServices, whatever its `PATH`): under aterm its twin signs
-/// the machine in once through `aterm harness signin --cli <cli> --wait` before an interactive
-/// launch, and runs the program only once that exits 0 ([`crate::platform`]'s sign-in block).
-/// Signed in is read the way the program reads it, from its environment and files alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SigninGate {
-    /// The word `aterm harness signin --cli` takes.
-    pub cli: &'static str,
-    /// Variables whose non-empty value signs a launch in ahead of any login file.
-    pub credential_env: &'static [&'static str],
-    /// The variable naming the login file the program then reads in place of its home's.
-    pub login_file_env: &'static str,
-    /// The variable naming the program's home.
-    pub home_env: &'static str,
-    /// The home under `$HOME` where [`Self::home_env`] is unset.
-    pub home_default: &'static str,
-    /// The login file in the home.
-    pub login_file: &'static str,
-    /// Options that answer and exit, or run one prompt and exit: a launch carrying one before
-    /// a literal `--` is never gated.
-    pub one_shot: &'static [&'static str],
-    /// The subcommands that start neither the program's interactive screen nor a sign-in of
-    /// its own (a local read or edit, help, version, and its own `login`/`logout`, which a
-    /// person types to sign in or out): a launch whose first word is one is never gated, nor is
-    /// one of [`VendorSpec::self_update_verbs`]. Every other subcommand is gated, an unknown one
-    /// too (fail closed: [`VendorSpec::yolo_skip`] names subcommands that take no permission
-    /// flag, among them ones that open the interactive screen, such as Grok Build's
-    /// `dashboard`).
-    pub local: &'static [&'static str],
-}
-
-/// Grok Build's sign-in gate: `GROK_AUTH`/`XAI_API_KEY`, else `GROK_AUTH_PATH`'s file, else
-/// `${GROK_HOME:-~/.grok}/auth.json` (aterm's `harness::grok_signin::signed_in`, the same
-/// order); its one-shot options are 1.0.70's `--help` and `--version` spellings and the
-/// one-prompt options of its `PagerArgs` (`crate::yolo::word_options`). Its local subcommands
-/// are those 1.0.70's `--help` describes as a local read or edit (`doctor` "without starting
-/// Grok", the `~/.grok` disk use, the configuration, a transcript export, persisted usage, MCP
-/// and memory configuration, leader processes, worktrees, a trace export that falls back to a
-/// local file without credentials), help, version, and its own `login` and `logout`. Gated:
-/// `dashboard` (the interactive screen, "Sign in to open the dashboard"), `sessions` (it
-/// restores one), `agent`, `models`, `plugin`, `setup`, `share`, `wrap`, the workers and hosts,
-/// and any word not named here.
-pub const GROK_SIGNIN_GATE: SigninGate = SigninGate {
-    cli: "grok",
-    credential_env: &["GROK_AUTH", "XAI_API_KEY"],
-    login_file_env: "GROK_AUTH_PATH",
-    home_env: "GROK_HOME",
-    home_default: ".grok",
-    login_file: "auth.json",
-    one_shot: &[
-        "-h",
-        "--help",
-        "-v",
-        "-V",
-        "--version",
-        "-p",
-        "--single",
-        "--print",
-        "--prompt-file",
-        "--prompt-json",
-    ],
-    local: &[
-        "login",
-        "logout",
-        "help",
-        "version",
-        "v",
-        "completions",
-        "doctor",
-        "du",
-        "disk-usage",
-        "inspect",
-        "export",
-        "usage",
-        "mcp",
-        "memory",
-        "leader",
-        "worktree",
-        "trace",
-    ],
-};
-
 /// One vendor-direct program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VendorSpec {
@@ -264,10 +181,6 @@ pub struct VendorSpec {
     pub yolo_flags: &'static [&'static str],
     /// The tokens that already decide this launch's permission posture, so the default yolo injection ([`crate::yolo`]) leaves the argv as typed.
     pub yolo_markers: &'static [&'static str],
-    /// Subcommands that default flag injection follows rather than precedes (e.g. muse's `exec` and `resume`).
-    pub yolo_after: &'static [&'static str],
-    /// First words (subcommands) the default injection never lands on.
-    pub yolo_skip: &'static [&'static str],
     /// Whether live upgrade moves running sessions onto newly landed builds ([`crate::activation_notice`]).
     pub live_upgrade: bool,
     /// Whether versions use the revision form `x.y.z-R<n>[.<s>]` rather than plain `x.y.z`.
@@ -276,8 +189,6 @@ pub struct VendorSpec {
     pub floor: Version,
     /// The newest legacy ALab index build of the program this code vouches for, or [`NEVER_INDEX_PINNED`].
     pub legacy_ceiling: u64,
-    /// Its twin's sign-in gate under aterm, for a program that opens a browser on every signed-out launch ([`SigninGate`]).
-    pub signin_gate: Option<SigninGate>,
 }
 
 impl VendorSpec {
@@ -441,13 +352,10 @@ const OPENAI_CODEX: VendorSpec = VendorSpec {
         "--approve-for-me",
         "--not-so-yolo",
     ],
-    yolo_after: &[],
-    yolo_skip: &[],
     live_upgrade: true,
     revision_versions: false,
     floor: floor(0, 156, 1),
     legacy_ceiling: LEGACY_CEILING,
-    signin_gate: None,
 };
 
 /// The agent programs, each fetched from its own vendor.
@@ -543,13 +451,10 @@ pub const VENDORS: &[VendorSpec] = &[
             "--continue",
             "-c",
         ],
-        yolo_after: &[],
-        yolo_skip: &[],
         live_upgrade: true,
         revision_versions: false,
         floor: floor(2, 1, 281),
         legacy_ceiling: LEGACY_CEILING,
-        signin_gate: None,
     },
     OPENAI_CODEX,
     VendorSpec {
@@ -588,13 +493,10 @@ pub const VENDORS: &[VendorSpec] = &[
             "--mode=",
             "--sandbox",
         ],
-        yolo_after: &[],
-        yolo_skip: &[],
         live_upgrade: true,
         revision_versions: false,
         floor: floor(1, 3, 6),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        signin_gate: None,
     },
     VendorSpec {
         program: "muse",
@@ -624,58 +526,14 @@ pub const VENDORS: &[VendorSpec] = &[
         ],
         shim_env: &[],
         warm: None,
+        // muse-alab's `run` sets the yolo default (HX-13a), and Muse Code has no update verb.
         self_update_verbs: &[],
-        yolo_flags: &[
-            "--disable-approval",
-            "--disable-sandbox",
-            "--trust-workspace",
-            "--disable-request-user-input",
-        ],
-        yolo_markers: &[
-            "--disable-approval",
-            "--disable-sandbox",
-            "--trust-workspace",
-            "--disable-request-user-input",
-            "--approval-mode",
-            "--approval-mode=",
-            "--permission-profile",
-            "--permission-profile=",
-            "--approval-judge",
-            "--approval-judge=",
-            "--sandbox-network",
-            "--sandbox-network=",
-            "--disable-write",
-            "--disable-shell",
-            "--config",
-            "--config=",
-            "-c",
-        ],
-        yolo_after: &["exec", "resume"],
-        yolo_skip: &[
-            "resume",
-            "config",
-            "export",
-            "trace",
-            "model-profile",
-            "skills",
-            "voice",
-            "plugins",
-            "sandbox",
-            "schema",
-            "serve",
-            "session-message",
-            "mcp",
-            "auth",
-            "login",
-            "logout",
-            "usage",
-            "init",
-        ],
+        yolo_flags: &[],
+        yolo_markers: &[],
         live_upgrade: true,
         revision_versions: true,
         floor: revision_floor(1, 4, 9, 6297, Some(1)),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        signin_gate: None,
     },
     VendorSpec {
         program: "codex-old",
@@ -733,66 +591,15 @@ pub const VENDORS: &[VendorSpec] = &[
         ],
         shim_env: &["GROK_DISABLE_AUTOUPDATER=1"],
         warm: None,
-        self_update_verbs: &["update"],
-        yolo_flags: &["--always-approve"],
-        yolo_markers: &[
-            "--always-approve",
-            "--dangerously-skip-permissions",
-            "--permission-mode",
-            "--permission-mode=",
-            "--sandbox",
-            "--sandbox=",
-            "--allow",
-            "--allow=",
-            "--allowedTools",
-            "--allowedTools=",
-            "--deny",
-            "--deny=",
-            "--disallowedTools",
-            "--disallowedTools=",
-            "--disallowed-tools",
-            "--disallowed-tools=",
-        ],
-        yolo_after: &["agent"],
-        // The 1.0.45 source's `Command` words, and 1.0.67's `worker`, `cursor-worker`,
-        // `clone`, `ssh` and `host-server` (its strings name each), and clap's `help`.
-        yolo_skip: &[
-            "inspect",
-            "doctor",
-            "leader",
-            "login",
-            "logout",
-            "mcp",
-            "plugin",
-            "memory",
-            "models",
-            "sessions",
-            "usage",
-            "setup",
-            "share",
-            "wrap",
-            "export",
-            "trace",
-            "version",
-            "v",
-            "completions",
-            "worktree",
-            "du",
-            "disk-usage",
-            "workspace",
-            "dashboard",
-            "worker",
-            "cursor-worker",
-            "clone",
-            "ssh",
-            "host-server",
-            "help",
-        ],
+        // grok-alab's `run` sets the yolo default, gates a signed-out launch and answers
+        // `grok update` (HX-10d).
+        self_update_verbs: &[],
+        yolo_flags: &[],
+        yolo_markers: &[],
         live_upgrade: false,
         revision_versions: false,
         floor: floor(1, 0, 67),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        signin_gate: Some(GROK_SIGNIN_GATE),
     },
     VendorSpec {
         program: "kimi",
@@ -824,47 +631,14 @@ pub const VENDORS: &[VendorSpec] = &[
         ],
         shim_env: &["KIMI_CODE_NO_AUTO_UPDATE=1"],
         warm: None,
-        self_update_verbs: &["upgrade", "update"],
-        yolo_flags: &["--auto"],
-        yolo_markers: &[
-            "--auto",
-            "-y",
-            "--yes",
-            "--auto-approve",
-            "--plan",
-            "-p",
-            "--prompt",
-            "--prompt=",
-            "-S",
-            "--session",
-            "--session=",
-            "-r",
-            "--resume",
-            "--resume=",
-            "-c",
-            "--continue",
-            "-C",
-        ],
-        yolo_after: &[],
-        yolo_skip: &[
-            "export",
-            "fork",
-            "provider",
-            "session",
-            "acp",
-            "web",
-            "login",
-            "doctor",
-            "vis",
-            "install-desktop",
-            "app",
-            "migrate",
-        ],
+        // kimi-alab's `run` sets the yolo default and answers `kimi upgrade`/`update` (HX-09b).
+        self_update_verbs: &[],
+        yolo_flags: &[],
+        yolo_markers: &[],
         live_upgrade: false,
         revision_versions: false,
         floor: floor(2, 3, 1),
         legacy_ceiling: NEVER_INDEX_PINNED,
-        signin_gate: None,
     },
 ];
 

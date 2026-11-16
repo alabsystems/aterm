@@ -2145,3 +2145,12 @@ fn identity_record_refuses_symlinked_state_and_converge_directories() {
         "ai = \"m112\"\nfleet = \"m112\"\n"
     );
 }
+
+/// The runner's readings of its own process, read around real port runs, on the targets whose
+/// `struct rusage` `aterm_machines::sync::cost` declares.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+#[path = "converge_spent_tests.rs"]
+mod spent;

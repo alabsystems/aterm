@@ -202,8 +202,12 @@ impl SessionLog {
             self.observed.carry_tokens()
         ));
         if let Some(t) = self.tab {
+            let by = self
+                .tab_opened_by()
+                .map(|by| format!(" by={}", by.word()))
+                .unwrap_or_default();
             out.push(format!(
-                "tab v=1 opened={} window={} parked={} parent={}",
+                "tab v=1 opened={} window={} parked={} parent={}{by}",
                 t.opened_wall,
                 t.window,
                 u8::from(t.parked),
@@ -391,7 +395,8 @@ impl SessionLog {
                         })
                     };
                     if let Some(place) = read() {
-                        self.carry_tab(place);
+                        let by = kv(line, "by").map(aterm_slog::Actor::from_word);
+                        self.carry_tab(place, by);
                     }
                 }
                 "spend" if kv(line, "v") == Some("1") => {

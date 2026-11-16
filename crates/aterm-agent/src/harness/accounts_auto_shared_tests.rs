@@ -2961,7 +2961,7 @@ impl super::super::cli::shared_provider::Provider for CheckedCandidate {
     ) -> super::super::cli::shared_provider::Execution {
         self.calls.fetch_add(1, Ordering::SeqCst);
         super::super::cli::shared_provider::Execution::BotCheck(
-            "Cloudflare's bot check did not clear in 90 s".into(),
+            "the sign-in page carries Cloudflare's bot check; aterm pressed nothing there".into(),
         )
     }
 

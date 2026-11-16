@@ -32,14 +32,14 @@
 
 use aterm_machines::init::{Base, BaseLock};
 use aterm_machines::sync::{
-    AccountsRead, AwakeRead, FabricRead, FleetDone, FleetRead, GithubRead, IdentityRead, NodeRead,
-    PeersDone, PeersRead, Ports, ReleaseRead, RequestsRead, SharedDone, SharedRead,
-    StewardLeaseRead, StewardRevokeRead, StewardStandbyServerRead, VaultRead,
+    AccountsRead, AwakeRead, ElsewhereRun, FabricRead, FleetDone, FleetRead, GithubRead,
+    IdentityRead, NodeRead, PeersDone, PeersRead, Ports, ReleaseRead, RequestsRead, SharedDone,
+    SharedRead, StarterWatch, StewardLeaseRead, StewardRevokeRead, StewardStandbyServerRead,
+    VaultRead,
 };
 use aterm_secrets::client::{Foundable, NotFounded};
 use aterm_types::machine_name::{GeneratedNames, Number};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 mod repository_tools;
 
@@ -239,6 +239,68 @@ fn repository_inputs(
         },
     )
     .map_err(|why| why.to_string())
+}
+
+/// The check each effect of one repository run makes first ([`repository_capture`]).
+type RepositoryCurrent = Box<dyn Fn() -> Result<bool, String> + Send + Sync>;
+
+/// The default stage's inputs for one repository run of this pass (`sync.clone`'s acquisition
+/// or `sync.refresh`), within its repository `execution`, and the check each of its effects
+/// makes first: a first clone may take a long time, so the person's Stop, repository switch or
+/// profile change, captured by `intent`, and a change of the selected vault's materialization
+/// hold every later effect, not just the next sync pass.
+fn repository_capture(
+    state: &std::path::Path,
+    sys: &aterm_machines::port::Live,
+    ctx: &aterm_machines::items::Ctx,
+    intent: aterm_machines::init::OwedCloneIntent,
+    execution: Option<aterm_machines::sync::repository_refresh::Execution>,
+) -> Result<
+    (
+        aterm_machines::init_github::InitialRepositoryInputs,
+        RepositoryCurrent,
+    ),
+    String,
+> {
+    let paths = vault_paths()?;
+    let current_state = state.to_path_buf();
+    let Some(config) = repository_vault(&paths, sys, ctx)? else {
+        let inputs = aterm_machines::init_github::InitialRepositoryInputs::capture_ready(sys, ctx)?
+            .with_repository_execution(execution);
+        let current_inputs = inputs.clone();
+        return Ok((
+            inputs,
+            Box::new(move || {
+                intent.current_inputs(
+                    &aterm_machines::port::Live::new(),
+                    &current_state,
+                    &setup_holds(),
+                    &current_inputs,
+                )
+            }),
+        ));
+    };
+    let captured = repository_inputs(&paths, &config, sys, ctx)?.ok_or(REPOSITORIES_SYNCING)?;
+    let current_inputs = captured.inputs.clone();
+    let snapshot = captured.snapshot;
+    let ctx = ctx.clone();
+    Ok((
+        captured.inputs.with_repository_execution(execution),
+        Box::new(move || {
+            if !intent.current_inputs(
+                &aterm_machines::port::Live::new(),
+                &current_state,
+                &setup_holds(),
+                &current_inputs,
+            )? || !aterm_machines::init_github::uses_vault_inventory(
+                &aterm_machines::port::Live::new(),
+                &ctx,
+            )? {
+                return Ok(false);
+            }
+            snapshot.is_current(&paths).map_err(|why| why.to_string())
+        }),
+    ))
 }
 
 /// What stands before `sync.peers`' join besides the vault: System State's plan (the Secrets
@@ -1923,6 +1985,12 @@ impl Ports for Live {
         }
     }
 
+    /// Every row of the pass reads through a [`aterm_machines::port::Live`] of its own, and
+    /// they all share this process's record, which this empties.
+    fn new_pass(&self) {
+        aterm_machines::port::CheckoutRecords::new_pass(&aterm_machines::port::Live::new());
+    }
+
     fn own_account(&self) -> bool {
         aterm_machines::sessions::is_live_account()
     }
@@ -1948,12 +2016,6 @@ impl Ports for Live {
 
     fn now_ms(&self) -> u64 {
         aterm_time::unix_millis().unwrap_or(0)
-    }
-
-    fn sleep(&self, duration: Duration) {
-        if !duration.is_zero() {
-            std::thread::sleep(duration);
-        }
     }
 
     fn installed_release(&self) -> bool {
@@ -2209,12 +2271,10 @@ impl Ports for Live {
     }
 
     fn sync_fleet(&self) -> Result<FleetDone, String> {
-        match aterm_agent::try_sync_from_cache() {
-            Ok(aterm_agent::FleetSync::Blocked(why)) => Ok(FleetDone::Blocked(why)),
-            Ok(synced) => Ok(FleetDone::Synced(synced.report())),
-            Err(err) if err.at_capacity => Ok(FleetDone::AtCapacity(err.why)),
-            Err(err) => Err(err.why),
-        }
+        Ok(match aterm_agent::sync_from_cache()? {
+            aterm_agent::FleetSync::Blocked(why) => FleetDone::Blocked(why),
+            synced => FleetDone::Synced(synced.report()),
+        })
     }
 
     fn node(&self) -> Result<NodeRead, String> {
@@ -2493,7 +2553,6 @@ impl Ports for Live {
 
     fn clone_owed(
         &self,
-        work: aterm_secrets::converge::RepositoryWork,
         execution: Option<aterm_machines::sync::repository_refresh::Execution>,
     ) -> Result<aterm_machines::init::CloneOwedOutcome, String> {
         let state = self
@@ -2501,12 +2560,11 @@ impl Ports for Live {
             .ok_or("no state directory holds the clone aterm init owes")?;
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
-        let paths = vault_paths()?;
         let intent = aterm_machines::init::OwedCloneIntent::capture(&sys, &state, &setup_holds())?;
-        let current_state = state.clone();
         if let Some(withdrawal) =
             aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(&sys, &ctx)?
         {
+            let current_state = state.clone();
             return aterm_machines::init::withdraw_repository_credential(
                 &sys,
                 &state,
@@ -2528,54 +2586,29 @@ impl Ports for Live {
                 readback: None,
             });
         }
-        let Some(config) = repository_vault(&paths, &sys, &ctx)? else {
-            let inputs =
-                aterm_machines::init_github::InitialRepositoryInputs::capture_ready(&sys, &ctx)?
-                    .with_repository_execution(execution);
-            let current_inputs = inputs.clone();
-            return aterm_machines::init::clone_owed_captured(
-                &sys,
-                &state,
-                work,
-                inputs,
-                move || {
-                    intent.current_inputs(
-                        &aterm_machines::port::Live::new(),
-                        &current_state,
-                        &setup_holds(),
-                        &current_inputs,
-                    )
-                },
-            );
-        };
-        let captured =
-            repository_inputs(&paths, &config, &sys, &ctx)?.ok_or(REPOSITORIES_SYNCING)?;
-        let current_inputs = captured.inputs.clone();
-        aterm_machines::init::clone_owed_captured(
-            &sys,
-            &state,
-            work,
-            captured.inputs.with_repository_execution(execution),
-            move || {
-                // A first clone may take a long time. The person's Stop, repository switch or
-                // profile change must hold every later effect, not just the next sync pass.
-                if !intent.current_inputs(
-                    &aterm_machines::port::Live::new(),
-                    &current_state,
-                    &setup_holds(),
-                    &current_inputs,
-                )? || !aterm_machines::init_github::uses_vault_inventory(
-                    &aterm_machines::port::Live::new(),
-                    &ctx,
-                )? {
-                    return Ok(false);
-                }
-                captured
-                    .snapshot
-                    .is_current(&paths)
-                    .map_err(|why| why.to_string())
-            },
-        )
+        let (inputs, current) = repository_capture(&state, &sys, &ctx, intent, execution)?;
+        aterm_machines::init::clone_owed_captured(&sys, &state, inputs, current)
+    }
+
+    fn refresh_repositories(
+        &self,
+        execution: Option<aterm_machines::sync::repository_refresh::Execution>,
+    ) -> Result<aterm_machines::init::RepositoryRefreshed, String> {
+        let state = self
+            .state_dir()
+            .ok_or("no state directory holds the repositories' converge state")?;
+        let sys = aterm_machines::port::Live::new();
+        let ctx = repository_context(&sys)?;
+        let intent = aterm_machines::init::OwedCloneIntent::capture(&sys, &state, &setup_holds())?;
+        if aterm_machines::init_github::RepositoryCredentialWithdrawal::capture(&sys, &ctx)?
+            .is_some()
+        {
+            return Ok(aterm_machines::init::RepositoryRefreshed::Ran(
+                "no checkout is refreshed: a repository credential withdrawal runs".into(),
+            ));
+        }
+        let (inputs, current) = repository_capture(&state, &sys, &ctx, intent, execution)?;
+        aterm_machines::init::refresh_repositories_captured(&sys, inputs, current)
     }
 
     fn forget_owed_clone(&self) -> Result<(), String> {
@@ -2585,22 +2618,34 @@ impl Ports for Live {
         aterm_machines::init::forget_owed_clone(&state)
     }
 
-    fn clone_tuning(&self) -> Result<aterm_machines::clone_tuning::Reading, String> {
+    fn clone_tuning(
+        &self,
+        keep: aterm_machines::clone_tuning::Keep,
+    ) -> Result<aterm_machines::clone_tuning::Reading, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clones' tuning record")?;
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
-        aterm_machines::clone_tuning::read(&sys, &ctx, &state, &setup_holds())
+        aterm_machines::clone_tuning::read(&sys, &ctx, &state, &setup_holds(), keep)
     }
 
-    fn tune_clones(&self) -> Result<aterm_machines::clone_tuning::Tuned, String> {
+    fn tune_clones(
+        &self,
+        execution: Option<aterm_machines::sync::repository_refresh::Execution>,
+    ) -> Result<aterm_machines::clone_tuning::Tuned, String> {
         let state = self
             .state_dir()
             .ok_or("no state directory holds the clones' tuning record")?;
         let sys = aterm_machines::port::Live::new();
         let ctx = repository_context(&sys)?;
-        aterm_machines::clone_tuning::apply(&sys, &ctx, &state, &setup_holds())
+        aterm_machines::clone_tuning::apply(
+            &sys,
+            &ctx,
+            &state,
+            &setup_holds(),
+            execution.map(|execution| execution.pass),
+        )
     }
 
     fn accounts(&self) -> Result<AccountsRead, String> {
@@ -2782,14 +2827,35 @@ impl Ports for Live {
             .and_then(|value| aterm_secrets::converge::note_word(&value))
     }
 
+    /// This runner's parent, the starter that started it (the subscriber, the mesh node, the
+    /// window, setup, or a held copy that handed its pass here, which ends as the subscriber that
+    /// started it does), watched in the kernel for its exit. A parent that is gone already, read
+    /// as this process's parent no longer being it (on macOS an orphan is launchd's, pid 1), is
+    /// [`StarterWatch::Ended`]: that read after the watch is made also catches a parent that
+    /// ended before it, whose number the watch may then have taken for another process.
+    fn watch_starter(&self, ended: Box<dyn FnOnce() + Send>) -> StarterWatch {
+        let starter = std::os::unix::process::parent_id();
+        if starter <= 1 {
+            return StarterWatch::Ended;
+        }
+        let watch = aterm_uds::exitwatch::ExitMoment::<()>::watch_then(starter, || (), ended);
+        if std::os::unix::process::parent_id() != starter {
+            return StarterWatch::Ended;
+        }
+        watch.map_or(StarterWatch::Unwatched, |watch| {
+            StarterWatch::Watching(Box::new(watch))
+        })
+    }
+
     /// This process's readings: the time since its first reading, the programs every
     /// [`aterm_machines::port::Live`] of this process started (the pass's rows each make their
-    /// own), and `getrusage`'s CPU for this process and for the children it has waited for. A
-    /// child a row starts without that port (`scutil` for this Mac's names is one) is in the
-    /// CPU once waited for, and not in the counts.
+    /// own), its gits by subcommand, and `getrusage`'s CPU for this process and for the children
+    /// it has waited for. A child a row starts without that port (`scutil` for this Mac's names
+    /// is one) is in the CPU once waited for, and not in the counts.
     fn spent(&self) -> aterm_machines::sync::Spent {
         static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-        let (spawns, gits) = aterm_machines::port::Live::new().runs();
+        let live = aterm_machines::port::Live::new();
+        let (spawns, gits) = live.runs();
         let (cpu_ms, child_cpu_ms) = aterm_machines::sync::cost::cpu_ms();
         aterm_machines::sync::Spent {
             mono_ms: u64::try_from(
@@ -2801,6 +2867,7 @@ impl Ports for Live {
             .unwrap_or(u64::MAX),
             spawns,
             gits,
+            git_by: live.git_by(),
             child_cpu_ms,
             cpu_ms,
         }
@@ -2818,12 +2885,16 @@ impl Ports for Live {
         release_elsewhere(own.as_deref(), &apps)
     }
 
-    fn run_elsewhere(&self, program: &Path, args: &[String]) -> Result<Option<i32>, String> {
+    /// The installed app's run, started as [`hand_off_command`] says; the wait it returns reaps
+    /// it, on whichever thread the hand-off waits for it.
+    fn start_elsewhere(&self, program: &Path, args: &[String]) -> Result<ElsewhereRun, String> {
         let mut child = hand_off_command(program, args)
             .spawn()
             .map_err(|why| why.to_string())?;
-        let status = child.wait().map_err(|why| why.to_string())?;
-        Ok(status.code())
+        Ok(Box::new(move || -> Result<Option<i32>, String> {
+            let status = child.wait().map_err(|why| why.to_string())?;
+            Ok(status.code())
+        }))
     }
 }
 

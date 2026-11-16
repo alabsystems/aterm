@@ -9336,14 +9336,14 @@ fn a_command_stub_reports_and_waits_for_its_program() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
-/// ONCE A PENDING grok LANDS, ITS LAUNCH IS HANDED TO ITS GATED bin/ SHIM, NEVER cmd_run:
-/// `gated_shim` names `bin/grok`, the shim the stub stood in for, whose sign-in block
-/// (`the_signin_block_gates_a_signed_out_interactive_grok_on_aterm`) stops a signed-out
-/// interactive launch under aterm. CONTROL: a row with no sign-in gate (claude) keeps
-/// `cmd_run`'s path.
+/// ONCE A PENDING grok LANDS, ITS LAUNCH IS HANDED TO ITS bin/ SHIM, NEVER cmd_run: `led_shim`
+/// names `bin/grok`, the shim the stub stood in for, whose harness hand-off runs the launch
+/// under grok-alab (`the_grok_twin_hands_its_session_to_grok_alab_once_installed`), which gates
+/// a signed-out launch since HX-10d; kimi, which kimi-alab leads, goes the same way. CONTROL: a
+/// word no harness leads (claude) keeps `cmd_run`'s path.
 #[cfg(unix)]
 #[test]
-fn a_landed_grok_runs_through_its_gated_shim_after_a_pending_wait() {
+fn a_landed_grok_runs_through_its_led_shim_after_a_pending_wait() {
     use std::os::unix::fs::PermissionsExt as _;
     let l = temp_layout("pend-gated");
     let exe = |path: &std::path::Path, body: &str| {
@@ -9377,14 +9377,20 @@ fn a_landed_grok_runs_through_its_gated_shim_after_a_pending_wait() {
         ),
     );
     assert!(!crate::stub::pending_stub_exists(&l, "grok"), "grok landed");
+    assert!(
+        prelude.contains("bin/grok-alab' run -- "),
+        "PRECONDITION: grok's shim hands its launch to grok-alab: {prelude}"
+    );
     assert_eq!(
-        gated_shim(&l, "grok"),
+        led_shim(&l, "grok"),
         Some(l.shim(&grok)),
         "the shim the stub stood in for"
     );
+    let kimi = crate::store::ToolName::new("kimi").unwrap();
+    assert_eq!(led_shim(&l, "kimi"), Some(l.shim(&kimi)));
     assert!(
-        gated_shim(&l, "claude").is_none(),
-        "CONTROL: a row with no sign-in gate keeps cmd_run's path"
+        led_shim(&l, "claude").is_none(),
+        "CONTROL: a word no harness leads keeps cmd_run's path"
     );
 }
 

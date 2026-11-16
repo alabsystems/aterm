@@ -464,7 +464,8 @@ const _: () = {
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
-    /// Sends a synchronous control code (`FSCTL_GET_REPARSE_POINT` / `FSCTL_SET_REPARSE_POINT`).
+    /// Sends a synchronous control code (`FSCTL_GET_REPARSE_POINT` / `FSCTL_SET_REPARSE_POINT`,
+    /// `FSCTL_QUERY_USN_JOURNAL` / `FSCTL_READ_FILE_USN_DATA`).
     pub(crate) fn DeviceIoControl(
         hDevice: HANDLE,
         dwIoControlCode: u32,
@@ -476,6 +477,89 @@ unsafe extern "system" {
         lpOverlapped: *mut c_void,
     ) -> i32;
 }
+
+/// `FSCTL_QUERY_USN_JOURNAL` (winioctl.h): the change journal of the volume a handle is on; any
+/// handle on the volume asks it, with no right.
+pub(crate) const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00F4;
+/// `FSCTL_READ_FILE_USN_DATA` (winioctl.h): the change-journal record of the file a handle is open
+/// on, with no right.
+pub(crate) const FSCTL_READ_FILE_USN_DATA: u32 = 0x0009_00EB;
+/// `ERROR_JOURNAL_DELETE_IN_PROGRESS`: the volume's change journal is being deleted.
+pub(crate) const ERROR_JOURNAL_DELETE_IN_PROGRESS: i32 = 1178;
+/// `ERROR_JOURNAL_NOT_ACTIVE`: the volume keeps no change journal.
+pub(crate) const ERROR_JOURNAL_NOT_ACTIVE: i32 = 1179;
+
+/// `USN_JOURNAL_DATA_V0`: a volume's change journal (its V1 and V2 extend it).
+#[repr(C)]
+pub(crate) struct USN_JOURNAL_DATA_V0 {
+    pub UsnJournalID: u64,
+    pub FirstUsn: i64,
+    pub NextUsn: i64,
+    pub LowestValidUsn: i64,
+    pub MaxUsn: i64,
+    pub MaximumSize: u64,
+    pub AllocationDelta: u64,
+}
+
+/// `READ_FILE_USN_DATA`: the record versions `FSCTL_READ_FILE_USN_DATA` may answer with.
+#[repr(C)]
+pub(crate) struct READ_FILE_USN_DATA {
+    pub MinMajorVersion: u16,
+    pub MaxMajorVersion: u16,
+}
+
+/// `USN_RECORD_V2`: a change-journal record with 64-bit file references (NTFS).
+#[repr(C)]
+pub(crate) struct USN_RECORD_V2 {
+    pub RecordLength: u32,
+    pub MajorVersion: u16,
+    pub MinorVersion: u16,
+    pub FileReferenceNumber: u64,
+    pub ParentFileReferenceNumber: u64,
+    pub Usn: i64,
+    pub TimeStamp: i64,
+    pub Reason: u32,
+    pub SourceInfo: u32,
+    pub SecurityId: u32,
+    pub FileAttributes: u32,
+    pub FileNameLength: u16,
+    pub FileNameOffset: u16,
+    pub FileName: [u16; 1],
+}
+
+/// `USN_RECORD_V3`: a change-journal record with 128-bit file references (`FILE_ID_128`; ReFS, and
+/// NTFS when asked for it).
+#[repr(C)]
+pub(crate) struct USN_RECORD_V3 {
+    pub RecordLength: u32,
+    pub MajorVersion: u16,
+    pub MinorVersion: u16,
+    pub FileReferenceNumber: [u8; 16],
+    pub ParentFileReferenceNumber: [u8; 16],
+    pub Usn: i64,
+    pub TimeStamp: i64,
+    pub Reason: u32,
+    pub SourceInfo: u32,
+    pub SecurityId: u32,
+    pub FileAttributes: u32,
+    pub FileNameLength: u16,
+    pub FileNameOffset: u16,
+    pub FileName: [u16; 1],
+}
+
+const _: () = {
+    assert!(size_of::<USN_JOURNAL_DATA_V0>() == 56);
+    assert!(offset_of!(USN_JOURNAL_DATA_V0, NextUsn) == 16);
+    assert!(size_of::<READ_FILE_USN_DATA>() == 4);
+    assert!(offset_of!(USN_RECORD_V2, MajorVersion) == 4);
+    assert!(offset_of!(USN_RECORD_V2, Usn) == 24);
+    assert!(offset_of!(USN_RECORD_V2, FileName) == 60);
+    assert!(size_of::<USN_RECORD_V2>() == 64);
+    assert!(offset_of!(USN_RECORD_V3, MajorVersion) == 4);
+    assert!(offset_of!(USN_RECORD_V3, Usn) == 40);
+    assert!(offset_of!(USN_RECORD_V3, FileName) == 76);
+    assert!(size_of::<USN_RECORD_V3>() == 80);
+};
 
 /// `FSCTL_SET_REPARSE_POINT` (winioctl.h).
 #[cfg(any(test, debug_assertions))]

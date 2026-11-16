@@ -441,20 +441,10 @@ impl Live {
     /// [`plans`] compares to say the live sessions changed.
     #[must_use]
     pub fn digest(&self) -> u64 {
-        let mut cwds: Vec<&Path> = self.cwds.iter().map(PathBuf::as_path).collect();
-        cwds.sort();
-        cwds.dedup();
-        let mut bytes = Vec::new();
-        for id in &self.sessions {
-            bytes.extend_from_slice(id.as_bytes());
-            bytes.push(0);
-        }
-        bytes.push(1);
-        for cwd in cwds {
-            bytes.extend_from_slice(cwd.as_os_str().as_encoded_bytes());
-            bytes.push(0);
-        }
-        aterm_hash::fnv1a_64(&bytes)
+        live_digest(
+            self.sessions.iter().map(String::as_str),
+            self.cwds.iter().map(PathBuf::as_path),
+        )
     }
 
     /// Whether what keeps a live session's builds could not be read whole: no pass starts.
@@ -625,8 +615,34 @@ pub fn ask(survey: &Survey, live: &Live, free_target: u64, table: Option<&Table>
     ask
 }
 
+/// A digest of live session ids and working directories, each set read sorted and once: what
+/// [`plans`] compares to say the live sessions changed ([`Live::digest`]), and what an
+/// emergency pass that could not meet its line waits on (`super::cadence::Unmet`).
+#[must_use]
+pub fn live_digest<'a>(
+    sessions: impl IntoIterator<Item = &'a str>,
+    cwds: impl IntoIterator<Item = &'a Path>,
+) -> u64 {
+    let sessions: BTreeSet<&str> = sessions.into_iter().collect();
+    let mut cwds: Vec<&Path> = cwds.into_iter().collect();
+    cwds.sort();
+    cwds.dedup();
+    let mut bytes = Vec::new();
+    for id in sessions {
+        bytes.extend_from_slice(id.as_bytes());
+        bytes.push(0);
+    }
+    bytes.push(1);
+    for cwd in cwds {
+        bytes.extend_from_slice(cwd.as_os_str().as_encoded_bytes());
+        bytes.push(0);
+    }
+    aterm_hash::fnv1a_64(&bytes)
+}
+
 /// The record that a budget pass could not meet its target, in the harness state directory
-/// ([`Unmet`]): read by [`plans`], written by [`unmet`], removed by [`met`].
+/// ([`Unmet`]): read by [`plans`], written by [`unmet`], removed by [`met`]. An emergency pass
+/// keeps its own (`super::EMERGENCY_UNMET_FILE`, through the `*_in` forms).
 pub const UNMET_FILE: &str = "disk-budget-unmet.json";
 
 /// The least time, in seconds, from an episode's last pass to the next one its memo plans with
@@ -738,7 +754,13 @@ impl Unmet {
 /// record (a corrupt one then costs one more row, after which it is whole again).
 #[must_use]
 pub fn load(dir: &Path) -> Option<Unmet> {
-    aterm_uds::atomic_file::read_regular_text(&dir.join(UNMET_FILE), FILE_MAX)
+    load_in(dir, UNMET_FILE)
+}
+
+/// [`load`] of the memo `file` in `dir`.
+#[must_use]
+pub fn load_in(dir: &Path, file: &str) -> Option<Unmet> {
+    aterm_uds::atomic_file::read_regular_text(&dir.join(file), FILE_MAX)
         .ok()
         .and_then(|text| Unmet::decode(&text))
 }
@@ -769,7 +791,16 @@ pub fn plans(memo: Option<&Unmet>, inputs: &Inputs, now: i64) -> bool {
 ///
 /// `dir` could not be made, or the memo could not be written.
 pub fn unmet(dir: &Path, inputs: &Inputs, now: i64) -> io::Result<bool> {
-    let (memo, row) = match load(dir) {
+    unmet_in(dir, UNMET_FILE, inputs, now)
+}
+
+/// [`unmet`] in the memo `file` in `dir`.
+///
+/// # Errors
+///
+/// `dir` could not be made, or the memo could not be written.
+pub fn unmet_in(dir: &Path, file: &str, inputs: &Inputs, now: i64) -> io::Result<bool> {
+    let (memo, row) = match load_in(dir, file) {
         Some(memo) if memo.volume == inputs.volume && memo.cap == inputs.cap => (
             Unmet {
                 seen_rebuildable: inputs.rebuildable,
@@ -796,7 +827,7 @@ pub fn unmet(dir: &Path, inputs: &Inputs, now: i64) -> io::Result<bool> {
     };
     std::fs::create_dir_all(dir)?;
     aterm_uds::atomic_file::write_checked(
-        &dir.join(UNMET_FILE),
+        &dir.join(file),
         memo.encode().as_bytes(),
         0o600,
         || Ok(()),
@@ -811,7 +842,16 @@ pub fn unmet(dir: &Path, inputs: &Inputs, now: i64) -> io::Result<bool> {
 ///
 /// The memo is there and could not be removed.
 pub fn met(dir: &Path) -> io::Result<()> {
-    match std::fs::remove_file(dir.join(UNMET_FILE)) {
+    met_in(dir, UNMET_FILE)
+}
+
+/// [`met`] of the memo `file` in `dir`.
+///
+/// # Errors
+///
+/// The memo is there and could not be removed.
+pub fn met_in(dir: &Path, file: &str) -> io::Result<()> {
+    match std::fs::remove_file(dir.join(file)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
         _ => Ok(()),
     }

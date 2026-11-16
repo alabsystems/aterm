@@ -70,6 +70,59 @@ fn bounded(collection: &Collection, value: &Value) -> bool {
         && aterm_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= collection.max_row)
 }
 
+/// `change` as a row of owned `collection` written by the machine `signer` (the record's writer,
+/// resolved through the roster it names): its machine, counter and body, or `None` where it is
+/// inert (a removal, a key that is not the signer's, a body without a counter or past the row
+/// bound), which no reader projects.
+fn owned_row<'c>(
+    collection: &Collection,
+    change: &'c Change,
+    signer: Option<[u8; 16]>,
+) -> Option<([u8; 16], u64, &'c Value)> {
+    let value = change.value.as_ref()?;
+    let machine = owner_of(collection, &change.key).filter(|m| Some(*m) == signer)?;
+    let n = value.get("n").and_then(Value::as_u64)?;
+    bounded(collection, value).then_some((machine, n, value))
+}
+
+/// `change` as an entry `<uuid32>.<n>` of log `collection` written by the machine `signer`: its
+/// machine, counter and body, or `None` where it is inert (a key that is not the signer's or not
+/// canonical, a removal, a body past the row bound). A later copy of one (machine, n) is a
+/// reader's judgement over every record, not this one's.
+fn log_entry<'c>(
+    collection: &Collection,
+    change: &'c Change,
+    signer: Option<[u8; 16]>,
+) -> Option<([u8; 16], u64, &'c Value)> {
+    let (uuid, text) = change.key.split_once('.')?;
+    if text.is_empty()
+        || (text.len() > 1 && text.starts_with('0'))
+        || !text.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let n = text.parse::<u64>().ok()?;
+    let machine = keys::parse_uuid32(uuid).filter(|m| Some(*m) == signer)?;
+    let value = change.value.as_ref().filter(|v| bounded(collection, v))?;
+    Some((machine, n, value))
+}
+
+/// Whether `change`, written by the machine `signer`, is one an owned or log reader of `table`
+/// keeps; a cell of an owner collection, and a change to a collection this build does not
+/// compile, always count as kept.
+#[cfg(unix)] // read by the unix-only history (`att::history`)
+pub(crate) fn kept(table: &Table, change: &Change, signer: Option<[u8; 16]>) -> bool {
+    match table.collection(&change.collection) {
+        Some(collection) if collection.kind == Kind::Owned => {
+            owned_row(collection, change, signer).is_some()
+        }
+        Some(collection) if collection.kind == Kind::Log => {
+            log_entry(collection, change, signer).is_some()
+        }
+        _ => true,
+    }
+}
+
 /// Each key's latest row of an owned collection, keeping only rows whose key names the
 /// machine `resolve` finds for the record's (roster, actor).
 #[cfg_attr(
@@ -112,21 +165,11 @@ pub fn read_owned(
             .iter()
             .filter(|c| c.collection == collection.name)
         {
-            let Some(value) = &change.value else {
-                read.inert += 1;
-                continue;
-            };
-            let named = owner_of(collection, &change.key);
             let signer = *signer.get_or_insert_with(|| resolve(&op.roster, &op.actor));
-            let n = value.get("n").and_then(Value::as_u64);
-            let (Some(machine), Some(n)) = (named.filter(|m| Some(*m) == signer), n) else {
+            let Some((machine, n, value)) = owned_row(collection, change, signer) else {
                 read.inert += 1;
                 continue;
             };
-            if !bounded(collection, value) {
-                read.inert += 1;
-                continue;
-            }
             let rank = (op.period, n, op.sequence);
             if read
                 .rows
@@ -189,21 +232,8 @@ pub fn read_log(
             .iter()
             .filter(|c| c.collection == collection.name)
         {
-            let parsed = change.key.split_once('.').and_then(|(uuid, text)| {
-                if text.is_empty()
-                    || (text.len() > 1 && text.starts_with('0'))
-                    || !text.bytes().all(|b| b.is_ascii_digit())
-                {
-                    return None;
-                }
-                let n = text.parse::<u64>().ok()?;
-                Some((keys::parse_uuid32(uuid)?, n))
-            });
             let signer = *signer.get_or_insert_with(|| resolve(&op.roster, &op.actor));
-            let (Some((machine, n)), Some(value)) = (
-                parsed.filter(|(machine, _)| Some(*machine) == signer),
-                change.value.as_ref().filter(|v| bounded(collection, v)),
-            ) else {
+            let Some((machine, n, value)) = log_entry(collection, change, signer) else {
                 read.inert += 1;
                 continue;
             };
@@ -302,8 +332,13 @@ pub fn may_publish_schema(state: &SchemaState, ours: u32) -> bool {
 /// the owner's verb even where it restores a value written automatically, so it never spends
 /// the reverting Mac's quota (or lands past it, inert while `revert` reports success).
 pub fn automatic(table: &Table, op: &Op) -> bool {
-    !op.revert
-        && op.changes.iter().any(|change| {
+    automatic_record(table, op.revert, &op.changes)
+}
+
+/// [`automatic`] for a record by its parts: whether it is a revert, and its changes.
+pub fn automatic_record(table: &Table, revert: bool, changes: &[Change]) -> bool {
+    !revert
+        && changes.iter().any(|change| {
             table
                 .collection(&change.collection)
                 .is_some_and(|collection| collection.kind != Kind::Cells)
@@ -364,20 +399,32 @@ pub struct Quota {
     )
 )]
 pub fn quota(table: &Table, ops: &[Op], merges: &[(Actor, u64)]) -> Quota {
+    quota_of(
+        table,
+        ops.iter()
+            .map(|op| (op.actor, op.sequence, op.id, automatic(table, op))),
+        merges,
+    )
+}
+
+/// [`quota`] over each business record as (writer, sequence, digest, whether it is
+/// [`automatic`]), so a reader that judged each record in place copies no change out of it.
+pub(crate) fn quota_of(
+    table: &Table,
+    records: impl Iterator<Item = (Actor, u64, Digest, bool)>,
+    merges: &[(Actor, u64)],
+) -> Quota {
     let mut business = BTreeMap::<Actor, BTreeSet<u64>>::new();
-    for op in ops {
-        business.entry(op.actor).or_default().insert(op.sequence);
+    let mut by_writer = BTreeMap::<Actor, Vec<(u64, Digest)>>::new();
+    for (actor, sequence, id, automatic) in records {
+        business.entry(actor).or_default().insert(sequence);
+        if automatic {
+            by_writer.entry(actor).or_default().push((sequence, id));
+        }
     }
     let mut joins = BTreeMap::<Actor, BTreeSet<u64>>::new();
     for (actor, sequence) in merges {
         joins.entry(*actor).or_default().insert(*sequence);
-    }
-    let mut by_writer = BTreeMap::<Actor, Vec<(u64, Digest)>>::new();
-    for op in ops.iter().filter(|op| automatic(table, op)) {
-        by_writer
-            .entry(op.actor)
-            .or_default()
-            .push((op.sequence, op.id));
     }
     let mut quota = Quota::default();
     for (actor, mut records) in by_writer {

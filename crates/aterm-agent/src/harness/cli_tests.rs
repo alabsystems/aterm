@@ -12286,6 +12286,7 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
             disk::Level::Short,
             Some(t.target),
             &off,
+            None,
             1
         ),
         ReserveMove::Kept,
@@ -12303,7 +12304,15 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     };
     let between = Some(t.emergency + disk::reserve::RESERVE_BYTES);
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(between, None), between, &t, 1),
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(between, None),
+            between,
+            &t,
+            None,
+            1,
+        ),
         ReserveMove::Kept
     );
     assert!(!reserve.exists());
@@ -12311,7 +12320,7 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
     assert!(plenty_free < t.floor, "partial recovery is sufficient");
     let plenty = Some(plenty_free);
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, 2),
+        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, None, 2),
         ReserveMove::Written
     );
     assert_eq!(
@@ -12319,30 +12328,38 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
         disk::reserve::RESERVE_BYTES
     );
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, 3),
+        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, None, 3),
         ReserveMove::Kept,
         "written once"
     );
     let full = Some(0);
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, 4),
+        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, None, 4),
         ReserveMove::Released(disk::reserve::RESERVE_BYTES)
     );
     assert!(!reserve.exists());
     assert_eq!(rows(), ["written", "released"]);
 
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(between, None), between, &t, 5),
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(between, None),
+            between,
+            &t,
+            None,
+            5
+        ),
         ReserveMove::Kept,
         "releasing the reserve alone cannot immediately rearm it"
     );
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, 6),
+        disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, None, 6),
         ReserveMove::Written,
         "partial recovery rearms the journal's reserve below the build-room floor"
     );
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, 7),
+        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, None, 7),
         ReserveMove::Released(disk::reserve::RESERVE_BYTES)
     );
     assert_eq!(rows(), ["written", "released", "written", "released"]);
@@ -12362,7 +12379,7 @@ fn the_reserve_is_released_first_at_an_emergency_and_rewritten_when_space_is_bac
         victim.join("keep")
     };
     assert!(matches!(
-        disk_reserve_look(&state, &reserve, disk::Level::Emergency, full, &t, 8),
+        disk_reserve_look(&state, &reserve, disk::Level::Emergency, full, &t, None, 8),
         ReserveMove::Refused(_)
     ));
     assert_eq!(std::fs::read(&kept).expect("victim"), b"keep");
@@ -12404,7 +12421,17 @@ fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
     };
     let t = disk::Config::default().thresholds(Some(460 << 30));
     let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
-    let look = |now| disk_reserve_look(&state, &reserve, t.level(plenty, None), plenty, &t, now);
+    let look = |now| {
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(plenty, None),
+            plenty,
+            &t,
+            None,
+            now,
+        )
+    };
     compact("/c");
     assert!(
         matches!(look(1), ReserveMove::Refused(ref why) if why.contains("compresses")),
@@ -12417,7 +12444,7 @@ fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
     assert_eq!(look(4), ReserveMove::Written);
     let full = Some(0);
     assert_eq!(
-        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, 5),
+        disk_reserve_look(&state, &reserve, t.level(full, None), full, &t, None, 5),
         ReserveMove::Released(disk::reserve::RESERVE_BYTES)
     );
     compact("/c");
@@ -12432,7 +12459,7 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     let tmp = tmp_dir("sweep-why");
     let state = tmp.path().join("state");
     let path = Path::new("/c/ws/.cargo-build");
-    let cases: [(Unused, &[&str]); 8] = [
+    let cases: [(Unused, &[&str]); 9] = [
         (
             Unused::Gone {
                 idle: std::time::Duration::from_secs(26 * 3_600),
@@ -12476,6 +12503,19 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
                 freed: 3 << 30,
             },
             &["3.0 GiB", "2 entries"],
+        ),
+        (
+            Unused::MergedWorktree {
+                idle: std::time::Duration::from_secs(31 * 86_400),
+                after: std::time::Duration::from_secs(30 * 86_400),
+            },
+            &[
+                "written for 7d",
+                "wrote this for 31d",
+                "unwritten 30d",
+                "merged into origin/main",
+                "the worktree stays",
+            ],
         ),
     ];
     for (why, _) in cases {
@@ -12790,7 +12830,7 @@ fn a_refused_reserve_is_journalled_once_per_reason() {
             })
             .collect()
     };
-    let look = |now| disk_reserve_look(&state, &reserve, level, plenty, &t, now);
+    let look = |now| disk_reserve_look(&state, &reserve, level, plenty, &t, None, now);
     std::fs::create_dir_all(&reserve).expect("a folder in the reserve's place");
     assert!(matches!(look(1), ReserveMove::Refused(_)));
     assert_eq!(look(2), ReserveMove::StillRefused);
@@ -12829,7 +12869,8 @@ fn a_failed_reserve_write_waits_before_it_is_tried_again() {
     let t = disk::Config::default().thresholds(Some(460 << 30));
     let plenty = Some(t.target + disk::reserve::RESERVE_BYTES);
     let level = t.level(plenty, None);
-    let look = |reserve: &Path, now| disk_reserve_look(&state, reserve, level, plenty, &t, now);
+    let look =
+        |reserve: &Path, now| disk_reserve_look(&state, reserve, level, plenty, &t, None, now);
     let mode = |p: &Path, m| {
         std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("its mode");
     };
@@ -14744,6 +14785,360 @@ fn ls_prints_each_row_where_it_came_from_and_the_strip_list() {
     assert_eq!(v["rows"][0]["tool"].as_str(), Some("claude-alab"));
     assert_eq!(v["env_strip"][0].as_str(), Some("MINE_"));
     assert_eq!(v["env_refused"][0]["entry"].as_str(), Some("PATH"));
+}
+
+/// EXIT TEST 3 (DC-06a): an emergency pass with nothing to remove writes one `cannot-meet` row
+/// (the free, kept and rebuildable figures, `by` emergency) and plans no other until something
+/// moves; the volume leaving its emergency, by more than it hovers, ends the episode, and the
+/// next one writes its own row. The clock is frozen at `NOW`.
+/// NEGATIVE CONTROLS: a pass that removed a row (even one that freed no byte), freed a byte, was
+/// no emergency's, followed a sweep that freed one, had a row refused or ended at the line writes
+/// none and waits on nothing; a page that does not close its cycle writes none either, and a
+/// close that waited on its own page alone fails the gathered ripening and lock; an end that wrote
+/// a row each pass fails `rows() == 1` after the second; a host that planned on the interval
+/// alone (`cadence::due`) plans the pass the wait refuses past [`disk::cadence::PASS_EVERY`];
+/// an episode that ended at the line's first crossing fails the hovering look's `rows() == 1`.
+#[test]
+fn an_emergency_pass_with_nothing_to_remove_writes_one_cannot_meet_row() {
+    use disk::cadence::{
+        EMERGENCY_DROP, Emergency, LOW_EVERY, Look, PASS_EVERY, Pass, UNMET_WAIT_MAX_S, Unmet, over,
+    };
+    const NOW: i64 = 1_792_195_200;
+    const GIB: u64 = 1 << 30;
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-emergency-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let state = dir.path();
+    let rows = || {
+        std::fs::read_to_string(state.join(DISK_LEDGER))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains("\"kind\":\"cannot-meet\""))
+            .count()
+    };
+    let lock = state.join("s-1-2.lock");
+    std::fs::write(&lock, b"").expect("lock");
+    let done = disk::Applied {
+        seen: disk::Rebuildable {
+            bytes: 3 * GIB,
+            partial: false,
+        },
+        waits: disk::Waits {
+            ripens: Some(NOW + 300),
+            held: vec![disk::Held::Session(lock.clone())],
+        },
+        ..disk::Applied::default()
+    };
+    let at = EmergencyAt {
+        state,
+        now: NOW,
+        level: disk::Level::Emergency,
+        volume: "/",
+        total: 100 * GIB,
+        line: 4 * GIB,
+        live: 7,
+    };
+    let unit = disk::Row {
+        class: disk::Class::CargoTargets,
+        path: PathBuf::from("/x"),
+        bytes: 0,
+        bytes_partial: false,
+        witness: disk::Witness::NotLinkTarget {
+            live: PathBuf::from("/x"),
+        },
+        removable: true,
+        blocked: None,
+    };
+    let end = |at: &EmergencyAt<'_>, done: &disk::Applied, swept, after| {
+        let mut emergency = Emergency::default();
+        disk_emergency_end(at, &mut emergency, Some(done), swept, after);
+        emergency
+    };
+
+    for (tag, at, not_unmet, swept, after) in [
+        (
+            "removed, no bytes",
+            at,
+            disk::Applied {
+                removed: vec![(unit.clone(), disk::Removed::default())],
+                ..done.clone()
+            },
+            0,
+            Some(GIB),
+        ),
+        (
+            "released",
+            at,
+            disk::Applied {
+                freed_bytes: 1,
+                ..done.clone()
+            },
+            0,
+            Some(GIB),
+        ),
+        (
+            "refused",
+            at,
+            disk::Applied {
+                denials: vec![disk::Refusal::NoClass],
+                ..done.clone()
+            },
+            0,
+            Some(GIB),
+        ),
+        (
+            "short",
+            EmergencyAt {
+                level: disk::Level::Short,
+                ..at
+            },
+            done.clone(),
+            0,
+            Some(GIB),
+        ),
+        ("swept", at, done.clone(), 1, Some(GIB)),
+        ("at the line", at, done.clone(), 0, Some(4 * GIB)),
+        ("unread", at, done.clone(), 0, None),
+    ] {
+        assert_eq!(
+            end(&at, &not_unmet, swept, after),
+            Emergency::default(),
+            "{tag}"
+        );
+    }
+    let mut emergency = Emergency::default();
+    disk_emergency_end(&at, &mut emergency, None, 0, Some(GIB));
+    assert_eq!(
+        emergency,
+        Emergency::default(),
+        "a pass that scanned nothing"
+    );
+    assert_eq!(rows(), 0);
+
+    // A page that does not close its cycle writes nothing and waits on nothing, and the page
+    // that closes it waits on both pages' ripening and locks.
+    let mut emergency = Emergency::default();
+    let first = disk::Applied {
+        unfinished: Some("a page is left".to_owned()),
+        ..done.clone()
+    };
+    disk_emergency_end(&at, &mut emergency, Some(&first), 0, Some(GIB));
+    assert_eq!(emergency.unmet, None, "mid-cycle");
+    assert_eq!(rows(), 0);
+    let closing = disk::Applied {
+        waits: disk::Waits::default(),
+        ..done.clone()
+    };
+    disk_emergency_end(&at, &mut emergency, Some(&closing), 0, Some(GIB));
+    let unmet = emergency.unmet.clone().expect("unmet");
+    assert_eq!(
+        unmet,
+        Unmet {
+            free: GIB,
+            ripens: NOW + 300,
+            held: vec![disk::Held::Session(lock.clone())],
+            live: 7,
+        },
+        "the closing page waits on the cycle's every page"
+    );
+    assert_eq!(
+        emergency.gathered,
+        disk::Waits::default(),
+        "and gathers anew"
+    );
+    assert_eq!(rows(), 1);
+    let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("ledger");
+    let row = ledger
+        .lines()
+        .find(|l| l.contains("\"kind\":\"cannot-meet\""))
+        .expect("the row");
+    for want in [
+        "\"by\":\"emergency\"",
+        &format!("\"free_bytes\":{GIB}"),
+        &format!("\"target_free_bytes\":{}", 4 * GIB),
+        &format!("\"kept_bytes\":{}", 96 * GIB),
+        &format!("\"rebuildable_bytes\":{}", 3 * GIB),
+        "\"held\":1",
+    ] {
+        assert!(row.contains(want), "{want}: {row}");
+    }
+    assert!(end(&at, &done, 0, Some(GIB)).unmet.is_some(), "still unmet");
+    assert_eq!(rows(), 1, "one row an episode");
+    let unripe = disk::Applied {
+        waits: disk::Waits {
+            ripens: Some(NOW + 2 * UNMET_WAIT_MAX_S),
+            held: Vec::new(),
+        },
+        ..done.clone()
+    };
+    for (tag, done) in [("no ripening", &closing), ("a late one", &unripe)] {
+        assert_eq!(
+            end(&at, done, 0, Some(GIB)).unmet.map(|u| u.ripens),
+            Some(NOW + UNMET_WAIT_MAX_S),
+            "{tag}: the clock's wait is bounded"
+        );
+    }
+
+    let emergency_level = disk::Level::Emergency;
+    let t0 = std::time::Instant::now();
+    let past = t0 + PASS_EVERY + std::time::Duration::from_secs(1);
+    let look = |level, free: Option<u64>, unix: i64, demand: bool| Look {
+        at: past,
+        unix,
+        level,
+        free,
+        room: 0,
+        poked: false,
+        demand,
+    };
+    let fruitless = || {
+        Some(Pass {
+            at: t0,
+            free: Some(GIB),
+            fruitless: true,
+            level: emergency_level,
+            low_every: LOW_EVERY,
+        })
+    };
+    // Whether `look` runs a pass with the wait standing, past the interval since a fruitless
+    // pass, and whether the wait still stands after it.
+    let due = |waiting: &Unmet, look: &Look, live: Option<u64>| {
+        let mut emergency = Emergency {
+            unmet: Some(waiting.clone()),
+            ..Emergency::default()
+        };
+        let due = emergency.due(&mut fruitless(), look, || live);
+        (due, emergency.unmet.is_some())
+    };
+    // The wait's lock is held while nothing moves: a lock let go is itself a move ("let go").
+    let build = crate::harness::disk::target::Build::holds(&lock);
+    let nothing = look(emergency_level, Some(GIB), NOW + 60, false);
+    assert_eq!(
+        due(&unmet, &nothing, Some(7)),
+        (false, true),
+        "nothing moved"
+    );
+    assert!(
+        disk::cadence::due(&mut fruitless(), past, emergency_level, Some(GIB), false, 0),
+        "the interval alone would plan one"
+    );
+    for (tag, look, live) in [
+        (
+            "free space up",
+            look(emergency_level, Some(GIB + EMERGENCY_DROP), NOW + 60, false),
+            Some(7),
+        ),
+        (
+            "free space down",
+            look(emergency_level, Some(GIB - EMERGENCY_DROP), NOW + 60, false),
+            Some(7),
+        ),
+        (
+            "free space unread",
+            look(emergency_level, None, NOW + 60, false),
+            Some(7),
+        ),
+        (
+            "ripe",
+            look(emergency_level, Some(GIB), NOW + 300, false),
+            Some(7),
+        ),
+        ("live", nothing, Some(8)),
+        (
+            "an agent asks",
+            look(emergency_level, Some(GIB), NOW + 60, true),
+            Some(7),
+        ),
+    ] {
+        assert_eq!(due(&unmet, &look, live), (true, false), "{tag}");
+    }
+    assert_eq!(
+        due(&unmet, &nothing, None),
+        (false, true),
+        "live sessions unread"
+    );
+    drop(build);
+    assert_eq!(due(&unmet, &nothing, Some(7)), (true, false), "let go");
+    let free_lock = Unmet {
+        held: Vec::new(),
+        ..unmet.clone()
+    };
+    // Off the emergency, what moved ends the wait and the level's own cadence decides: an `ok`
+    // volume is handed no pass.
+    let ok = look(
+        disk::Level::Ok,
+        Some(GIB + 2 * EMERGENCY_DROP),
+        NOW + 60,
+        false,
+    );
+    assert_eq!(
+        due(&free_lock, &ok, Some(7)),
+        (false, false),
+        "out of it: no pass at ok"
+    );
+    // Hovering at the line moves nothing: the wait stands at `short` too.
+    let at_line = Unmet {
+        free: 4 * GIB - (1 << 20),
+        ..free_lock.clone()
+    };
+    let hovering = look(
+        disk::Level::Short,
+        Some(4 * GIB + (1 << 20)),
+        NOW + 60,
+        false,
+    );
+    assert_eq!(due(&at_line, &hovering, Some(7)), (false, true), "hovering");
+    let asks = look(emergency_level, Some(GIB), NOW, true);
+    assert!(
+        Emergency::default().due(&mut fruitless(), &asks, || Some(7)),
+        "an agent's ask with no wait standing"
+    );
+
+    let line = 4 * GIB;
+    assert!(!over(
+        disk::Level::Short,
+        Some(line + EMERGENCY_DROP - 1),
+        line
+    ));
+    assert!(over(disk::Level::Short, Some(line + EMERGENCY_DROP), line));
+    assert!(
+        !over(emergency_level, Some(100 * GIB), line),
+        "an inode emergency"
+    );
+    assert!(!over(disk::Level::Unknown, None, line));
+    let mut emergency = Emergency {
+        unmet: Some(unmet.clone()),
+        ..Emergency::default()
+    };
+    disk_emergency_look(
+        state,
+        &mut emergency,
+        disk::Level::Short,
+        Some(line + 1),
+        line,
+    );
+    assert!(
+        emergency.unmet.is_some(),
+        "a look inside the band keeps the wait"
+    );
+    assert!(end(&at, &done, 0, Some(GIB)).unmet.is_some());
+    assert_eq!(
+        rows(),
+        1,
+        "and the memo: the line's crossing is one episode"
+    );
+    disk_emergency_look(
+        state,
+        &mut emergency,
+        disk::Level::Short,
+        Some(line + EMERGENCY_DROP),
+        line,
+    );
+    assert_eq!(emergency, Emergency::default(), "out of it, by the drop");
+    assert!(end(&at, &done, 0, Some(GIB)).unmet.is_some());
+    assert_eq!(rows(), 2, "the next episode writes its own row");
 }
 
 /// `upgrade` names a tab by its tab ID in either form: `t` and 10 Crockford base32 characters,

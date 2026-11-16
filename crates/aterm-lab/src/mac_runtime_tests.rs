@@ -4,6 +4,224 @@
 use super::*;
 
 #[test]
+fn sip_probe_retains_complete_facts_before_setup_and_preserves_the_gate() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let enabled = b"System Integrity Protection status: enabled.\n".as_slice();
+    for (name, status, stdout, expected) in [
+        ("enabled", 0, enabled, None),
+        (
+            "disabled",
+            0,
+            b"System Integrity Protection status: disabled.\n".as_slice(),
+            Some(crate::mac::NOT_RUN),
+        ),
+        ("empty", 0, b"".as_slice(), Some(crate::mac::NOT_RUN)),
+        (
+            "custom",
+            0,
+            b"System Integrity Protection status: unknown (Custom Configuration).\n".as_slice(),
+            Some(crate::mac::NOT_RUN),
+        ),
+        ("nonzero", 7 << 8, enabled, Some(1)),
+        ("signal", libc::SIGKILL, enabled, Some(1)),
+    ] {
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let probe = SipProbe {
+            tart: "/owned/tart",
+            requested_image: "registry/image@sha256:requested",
+            selected_base: "existing-prepared-base",
+            guest: "owned-runtime-guest",
+        };
+        // Stderr is evidence, not the SIP acceptance authority. Keep its binary bytes too.
+        let stderr = b"disabled in a diagnostic, not stdout\0\xff\n".to_vec();
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.to_vec(),
+            stderr: stderr.clone(),
+        };
+        let status = output.status;
+        let captures = Cell::new(0);
+        let setup = Cell::new(false);
+        let result = (|| {
+            require_sip_on(tmp.path(), &probe, || {
+                captures.set(captures.get() + 1);
+                Ok(output)
+            })?;
+            let receipt: Value =
+                aterm_json::from_slice(&std::fs::read(tmp.path().join("sip.json")).unwrap())
+                    .unwrap();
+            assert_eq!(receipt["output_complete"].as_bool(), Some(true));
+            assert_eq!(
+                std::fs::read(tmp.path().join("sip.stdout")).unwrap(),
+                stdout
+            );
+            assert_eq!(
+                std::fs::read(tmp.path().join("sip.stderr")).unwrap(),
+                stderr
+            );
+            setup.set(true);
+            Ok::<(), Fail>(())
+        })();
+        assert_eq!(captures.get(), 1, "{name}");
+        assert_eq!(setup.get(), expected.is_none(), "{name}");
+        match expected {
+            Some(code) => assert_eq!(result.unwrap_err().code, code, "{name}"),
+            None => result.unwrap(),
+        }
+        let receipt: Value =
+            aterm_json::from_slice(&std::fs::read(tmp.path().join("sip.json")).unwrap()).unwrap();
+        assert_eq!(receipt["output_complete"].as_bool(), Some(true), "{name}");
+        assert_eq!(
+            receipt["success"].as_bool(),
+            Some(status.success()),
+            "{name}"
+        );
+        assert_eq!(
+            receipt["exit"].as_i64(),
+            status.code().map(i64::from),
+            "{name}"
+        );
+        assert_eq!(
+            receipt["signal"].as_i64(),
+            status.signal().map(i64::from),
+            "{name}"
+        );
+        assert_eq!(
+            receipt["stdout_bytes"].as_u64(),
+            Some(stdout.len() as u64),
+            "{name}"
+        );
+        assert_eq!(
+            receipt["stderr_bytes"].as_u64(),
+            Some(stderr.len() as u64),
+            "{name}"
+        );
+        assert_eq!(
+            receipt["probe"]["tart_path_reference"].as_str(),
+            Some(probe.tart)
+        );
+        assert_eq!(
+            receipt["probe"]["requested_image_reference"].as_str(),
+            Some(probe.requested_image)
+        );
+        assert_eq!(
+            receipt["probe"]["selected_base_reference"].as_str(),
+            Some(probe.selected_base)
+        );
+        assert_eq!(
+            receipt["probe"]["vm_name_reference"].as_str(),
+            Some(probe.guest)
+        );
+        assert_eq!(
+            receipt["probe"]["argv"],
+            json!([
+                probe.tart,
+                "exec",
+                probe.guest,
+                "/bin/sh",
+                "-c",
+                SIP_STATUS_COMMAND
+            ])
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("sip.stdout")).unwrap(),
+            stdout,
+            "{name}"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("sip.stderr")).unwrap(),
+            stderr,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn sip_capture_failure_has_no_invented_status_or_complete_streams_and_never_sets_up() {
+    use std::cell::Cell;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let probe = SipProbe {
+        tart: "/owned/tart",
+        requested_image: "requested-image",
+        selected_base: "selected-base",
+        guest: "owned-guest",
+    };
+    let setup = Cell::new(false);
+    let result = (|| {
+        require_sip_on(tmp.path(), &probe, || {
+            Err("complete guest output: stdout exceeds its complete-output bound".into())
+        })?;
+        setup.set(true);
+        Ok::<(), Fail>(())
+    })();
+    assert_eq!(result.unwrap_err().code, 1);
+    assert!(!setup.get());
+    let receipt: Value =
+        aterm_json::from_slice(&std::fs::read(tmp.path().join("sip.json")).unwrap()).unwrap();
+    assert_eq!(receipt["output_complete"].as_bool(), Some(false));
+    for field in [
+        "success",
+        "exit",
+        "signal",
+        "stdout_file",
+        "stderr_file",
+        "stdout_bytes",
+        "stderr_bytes",
+    ] {
+        assert!(receipt[field].is_null(), "{field}");
+    }
+    assert!(receipt["error"].as_str().is_some());
+    assert!(!tmp.path().join("sip.stdout").exists());
+    assert!(!tmp.path().join("sip.stderr").exists());
+}
+
+#[test]
+fn sip_evidence_write_failure_cannot_admit_setup_or_publish_a_complete_record() {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let blocked = tmp.path().join("sip.stderr");
+    std::fs::create_dir(&blocked).unwrap();
+    std::fs::write(blocked.join("retained"), b"existing evidence").unwrap();
+    let probe = SipProbe {
+        tart: "/owned/tart",
+        requested_image: "requested-image",
+        selected_base: "selected-base",
+        guest: "owned-guest",
+    };
+    let stdout = b"System Integrity Protection status: enabled.\n";
+    let setup = Cell::new(false);
+    let result = (|| {
+        require_sip_on(tmp.path(), &probe, || {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: stdout.to_vec(),
+                stderr: b"new stderr".to_vec(),
+            })
+        })?;
+        setup.set(true);
+        Ok::<(), Fail>(())
+    })();
+    assert_eq!(result.unwrap_err().code, 1);
+    assert!(!setup.get());
+    assert_eq!(
+        std::fs::read(tmp.path().join("sip.stdout"))
+            .unwrap()
+            .as_slice(),
+        stdout
+    );
+    assert_eq!(
+        std::fs::read(blocked.join("retained")).unwrap(),
+        b"existing evidence"
+    );
+    assert!(!tmp.path().join("sip.json").exists());
+}
+
+#[test]
 fn collection_observes_retained_raw_streams_and_cannot_erase_a_red_execution() {
     use std::os::unix::process::ExitStatusExt as _;
 

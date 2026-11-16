@@ -22,6 +22,17 @@ fn rec(body: Body) -> Rec {
     }
 }
 
+/// The folder `path` names (a Unix absolute path) as this platform spells an absolute path, the
+/// one form a claimed folder's row holds ([`crate::claim::normal`]): itself on Unix, under `C:`
+/// with each `/` a `\` on Windows, whose cleanup records its folders so.
+fn absolute(path: &str) -> String {
+    if cfg!(windows) {
+        format!("C:{}", path.replace('/', "\\"))
+    } else {
+        path.to_owned()
+    }
+}
+
 fn open(host: &str, account: Option<&str>, program: Option<&str>, model: Option<&str>) -> Open {
     Open {
         via: Via::FleetWorker,
@@ -648,19 +659,19 @@ fn clean_archived_gone_uncleaned_cleaned_lines_round_trip() {
         rec(Body::Gone {
             bytes: Some(312_000_000),
             why: None,
-            path: "/Users//a/scratch".to_owned(),
+            path: absolute("/Users//a/scratch"),
             did: Did::Deleted,
         }),
         rec(Body::Gone {
             bytes: None,
             why: Some(Keep::Unpushed),
-            path: "/Users//a/repo".to_owned(),
+            path: absolute("/Users//a/repo"),
             did: Did::Kept,
         }),
         rec(Body::Gone {
             bytes: Some(1),
             why: None,
-            path: "/Users//a/half".to_owned(),
+            path: absolute("/Users//a/half"),
             did: Did::Failed,
         }),
         rec(Body::Uncleaned { why: Unclean::Busy }),
@@ -683,7 +694,7 @@ fn clean_archived_gone_uncleaned_cleaned_lines_round_trip() {
     let gone = rec(Body::Gone {
         bytes: Some(10),
         why: None,
-        path: "/Users//a/scratch".to_owned(),
+        path: absolute("/Users//a/scratch"),
         did: Did::Deleted,
     })
     .line();
@@ -730,7 +741,16 @@ fn clean_archived_gone_uncleaned_cleaned_lines_round_trip() {
 fn the_longest_gone_line_fits_the_record_cap() {
     use crate::claim::{CLAIM_PATH_BYTES, Keep};
     let longest_id = format!("r-20261109-1411-{}-{}", "a".repeat(8), u32::MAX);
-    let path = format!("/{}", "\u{7f}".repeat((CLAIM_PATH_BYTES - 1) / 3));
+    // The root as this platform spells it, then characters written as three bytes each, and
+    // one byte apiece for what is left: a path of all `CLAIM_PATH_BYTES` encoded bytes.
+    let root = absolute("/");
+    let fill = CLAIM_PATH_BYTES - root.len();
+    let path = format!(
+        "{root}{}{}",
+        "\u{7f}".repeat(fill / 3),
+        "a".repeat(fill % 3)
+    );
+    assert_eq!(aterm_codec::pct::encoded_len(&path), CLAIM_PATH_BYTES);
     let gone = Rec {
         t_ms: u64::MAX,
         id: longest_id,
@@ -748,7 +768,7 @@ fn the_longest_gone_line_fits_the_record_cap() {
 
 /// A record names a tab, and an actor token a requester, by its tab ID in either form: `t` and
 /// 10 Crockford base32 characters, or the `s-` and 20 hex digits a tab opened before that form
-/// keeps until it closes. NEGATIVE CONTROL: a malformed ID of each form is refused, whole and
+/// keeps until aterm restores or closes it. NEGATIVE CONTROL: a malformed ID of each form is refused, whole and
 /// inside a fleet drive's token.
 #[test]
 fn a_tab_and_a_token_name_a_tab_id_in_either_form() {
@@ -777,5 +797,62 @@ fn a_tab_and_a_token_name_a_tab_id_in_either_form() {
             Rec::parse(&format!("t=1 op=keep req={ID} tab={bad} by=human")).is_none(),
             "CONTROL: {bad}"
         );
+    }
+}
+
+/// A row an earlier build wrote for a tab opened before the `t` form, as its bytes are on disk:
+/// the tab by its `s-` ID, and its requester by that ID alone (a local agent's tab) or inside a
+/// fleet drive's token. Each reads back and writes the same line. NEGATIVE CONTROL: a loose or
+/// forged `s-` word in any of the three places is no record.
+#[test]
+fn a_stored_row_naming_a_legacy_tab_reads_back_as_it_was_written() {
+    for line in [
+        format!(
+            "t=1 op=open req={ID} via=ctl-spawn form=agent:claude node=- host=m72 \
+             by={LEGACY_SID} program=- model=- account=- why_src=none"
+        ),
+        format!(
+            "t=1 op=open req={ID} via=fleet-shell form=shell \
+             node=87be5228c0ffee0087be5228c0ffee00 host=m114 by={LEGACY_BY} program=claude \
+             model=opus-5.5 account=- why_src=none"
+        ),
+        format!("t=1 op=tab req={ID} tab={LEGACY_SID} by={LEGACY_SID}"),
+        format!("t=1 op=tab req={ID} tab={LEGACY_SID} by={LEGACY_BY}"),
+        format!("t=1 op=keep req={ID} tab={LEGACY_SID} by=human"),
+        format!("t=1 op=attach req={ID} tab={LEGACY_SID} verb=turn n=2 by={LEGACY_BY}"),
+    ] {
+        let rec = Rec::parse(&line).unwrap_or_else(|| panic!("no record: {line}"));
+        assert_eq!(rec.line(), line);
+    }
+    assert_eq!(
+        Rec::parse(&format!(
+            "t=1 op=tab req={ID} tab={LEGACY_SID} by={LEGACY_BY}"
+        )),
+        Some(Rec {
+            t_ms: 1,
+            id: ID.to_owned(),
+            body: Body::Tab {
+                tab: LEGACY_SID.to_owned(),
+                by: LEGACY_BY.to_owned(),
+            },
+        })
+    );
+    for bad in [
+        "s-1",
+        "s-0123456789abcdef01234",
+        "s-0123456789ABCDEF0123",
+        "S-0123456789abcdef0123",
+    ] {
+        for line in [
+            format!("t=1 op=tab req={ID} tab={bad} by=human"),
+            format!("t=1 op=tab req={ID} tab={SID} by={bad}"),
+            format!("t=1 op=tab req={ID} tab={SID} by=fleet:87be5228:{bad}"),
+            format!(
+                "t=1 op=open req={ID} via=ctl-spawn form=agent:claude node=- host=m72 by={bad} \
+                 program=- model=- account=- why_src=none"
+            ),
+        ] {
+            assert!(Rec::parse(&line).is_none(), "CONTROL: {line}");
+        }
     }
 }

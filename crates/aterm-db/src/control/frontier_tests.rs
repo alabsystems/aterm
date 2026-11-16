@@ -9,7 +9,7 @@ use crate::control::frontier::{
 use aterm_secrets::{
     client,
     crossing::RecordsBound,
-    membership_log::{Body, Draft, Entrant, Log, Record, RecordBudgets, encode_records},
+    membership_log::{Body, Draft, Entrant, Log, Record, RecordBudgets, read_records},
 };
 use std::net::TcpStream;
 
@@ -35,7 +35,7 @@ fn stated(endpoint: &Endpoint, wire: Wire) -> usize {
     let metadata = 4 + HELLO_FIXED + 6;
     match wire {
         Wire::Whole => metadata,
-        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
             metadata + 4 + 13 + 32 * View::of(endpoint).unwrap().have().len()
         }
     }
@@ -277,7 +277,7 @@ impl RecordsLab {
                 &format!("m{}", n + 1),
             )
             .unwrap();
-            client::save_records(&paths, genesis.bytes()).unwrap();
+            client::save_records(&paths, genesis.wire_bytes().unwrap().as_ref()).unwrap();
             paths
         });
         let endpoints: [Endpoint; 2] = std::array::from_fn(|n| {
@@ -321,7 +321,7 @@ impl RecordsLab {
 
 /// Make `log` the records `paths` holds: crossed, as custody past the legacy count is.
 fn keep(paths: &client::Paths, log: &Log) {
-    let wire = encode_records(log.records());
+    let wire = read_records(log.records()).unwrap();
     if log.held_count() > aterm_secrets::membership_log::LEGACY_RECORDS {
         // Construct future-budget custody without relaxing the public legacy wire decoder.
         aterm_secrets::fsx::write_atomic(
@@ -415,7 +415,7 @@ fn frontier_native_tls_repairs_marked_history_and_preserves_its_mark_in_either_d
                 .unwrap();
             log.insert(record).unwrap();
         }
-        client::save_records(&paths[source], &encode_records(log.records())).unwrap();
+        client::save_records(&paths[source], &read_records(log.records()).unwrap()).unwrap();
         std::fs::write(
             paths[source].records_file().with_extension("crossed"),
             b"crossed\n",
@@ -617,7 +617,7 @@ fn frontier_batches_visit_every_record_with_count_and_byte_bounds() {
         let batch = crate::control::frontier::select_batch(Wire::Delta, &records, &mut cursor);
         assert!(!batch.is_empty());
         assert!(batch.len() <= BATCH_RECORDS);
-        let bytes: usize = batch.iter().map(|record| record.bytes().len()).sum();
+        let bytes: usize = batch.iter().map(|record| record.wire_len()).sum();
         if batch.len() == 1 && bytes > BATCH_BYTES {
             alone = true;
         } else {
@@ -646,7 +646,7 @@ fn frontier_batches_visit_every_record_with_count_and_byte_bounds() {
     let (mut seen, mut cursor, mut count_limited) = (BTreeSet::new(), None, false);
     while seen != expected {
         let batch = crate::control::frontier::select_batch(Wire::Whole, &records, &mut cursor);
-        let bytes: usize = batch.iter().map(|record| record.bytes().len()).sum();
+        let bytes: usize = batch.iter().map(|record| record.wire_len()).sum();
         assert!(!batch.is_empty() && batch.len() <= WHOLE_BATCH_RECORDS);
         assert!(bytes <= WHOLE_BATCH_BYTES);
         count_limited |= batch.len() == WHOLE_BATCH_RECORDS;
@@ -1040,10 +1040,10 @@ fn frontier_rejects_a_different_real_genesis_even_when_root_metadata_matches() {
         }
         send_frame(
             &mut input,
-            &evidence_header(bound, true, 1, foreign.bytes().len() as u64),
+            &evidence_header(bound, true, 1, foreign.wire_len() as u64),
         )
         .unwrap();
-        send_frame(&mut input, foreign.bytes()).unwrap();
+        send_frame(&mut input, foreign.wire_bytes().unwrap().as_ref()).unwrap();
         let mut stream = Script {
             input: Cursor::new(input),
             output: Vec::new(),
@@ -1153,7 +1153,7 @@ fn frontier_native_tls_repairs_history_past_the_legacy_count() {
     let expected = fixture.names(0, LEGACY_RECORDS as u64 + 2);
     assert!(client::records_marked_crossed(&fixture.paths[0]).unwrap());
     assert_eq!(
-        aterm_secrets::membership_log::decode_records(&encode_records(expected.records()))
+        aterm_secrets::membership_log::decode_records(&read_records(expected.records()).unwrap())
             .unwrap()
             .len(),
         expected.held_count()
@@ -1236,7 +1236,7 @@ fn a_legacy_witness_past_the_legacy_count_is_refused() {
         let log = fixture.names(0, LEGACY_RECORDS as u64);
         let records: Vec<_> = log.records().cloned().collect();
         assert_eq!(records.len(), LEGACY_RECORDS + 1);
-        let witness = |n: usize| encode_records(&records[..n]);
+        let witness = |n: usize| read_records(&records[..n]).unwrap();
         let decoded = decode_log_witness(fixture.lab.trust, &witness(LEGACY_RECORDS))
             .expect("a legacy peer's whole witness");
         assert_eq!(decoded.held_count(), LEGACY_RECORDS);
@@ -1554,10 +1554,10 @@ fn push_one(lab: &Lab, receiver: &Endpoint, record: &Record) -> Repair {
     let mut input = opening(lab.trust, &lab.requests[1], bound, Wire::Delta);
     send_frame(
         &mut input,
-        &evidence_header(bound, true, 1, record.bytes().len() as u64),
+        &evidence_header(bound, true, 1, record.wire_len() as u64),
     )
     .unwrap();
-    send_frame(&mut input, record.bytes()).unwrap();
+    send_frame(&mut input, record.wire_bytes().unwrap().as_ref()).unwrap();
     let mut stream = Script {
         input: Cursor::new(input),
         output: Vec::new(),
@@ -1707,7 +1707,7 @@ fn two_peers_of_twelve_thousand_records_converge_with_session_bytes_pinned() {
         let moved: usize = lefts
             .iter()
             .chain(&rights)
-            .map(|record| 4 + record.bytes().len())
+            .map(|record| 4 + record.wire_len())
             .sum();
 
         let ([(dialed, dialing), (answered, answering)], written) =
@@ -1791,10 +1791,10 @@ fn a_released_atdb4_mac_and_this_build_meet_on_its_frames() {
     send_frame(&mut released, &metadata(1)).unwrap();
     send_frame(
         &mut released,
-        &evidence_header(bound, true, 1, genesis.bytes().len() as u64),
+        &evidence_header(bound, true, 1, genesis.wire_len() as u64),
     )
     .unwrap();
-    send_frame(&mut released, genesis.bytes()).unwrap();
+    send_frame(&mut released, genesis.wire_bytes().unwrap().as_ref()).unwrap();
     let answer = |wire| {
         let mut stream = Script {
             input: Cursor::new(released.clone()),
@@ -1823,11 +1823,11 @@ fn a_released_atdb4_mac_and_this_build_meet_on_its_frames() {
     let header = receive_frame(&mut answered, 22).unwrap();
     assert_eq!(
         header,
-        evidence_header(bound, true, 1, genesis.bytes().len() as u64)
+        evidence_header(bound, true, 1, genesis.wire_len() as u64)
     );
     assert_eq!(
-        receive_frame(&mut answered, genesis.bytes().len()).unwrap(),
-        genesis.bytes()
+        receive_frame(&mut answered, genesis.wire_len()).unwrap(),
+        genesis.wire_bytes().unwrap().as_ref()
     );
 
     let opened = |wire| {
@@ -2048,14 +2048,14 @@ fn a_full_mac_judges_a_peer_on_the_push_it_has_room_for() {
         let before = client::load_records(&paths).unwrap().inventory();
         let bound = RecordsBound::here(false);
         let mut input = opening(lab.trust, &lab.requests[1], bound, Wire::Delta);
-        let bytes: usize = pushed.iter().map(|record| record.bytes().len()).sum();
+        let bytes: usize = pushed.iter().map(|record| record.wire_len()).sum();
         send_frame(
             &mut input,
             &evidence_header(bound, true, pushed.len() as u32, bytes as u64),
         )
         .unwrap();
         for record in &pushed {
-            send_frame(&mut input, record.bytes()).unwrap();
+            send_frame(&mut input, record.wire_bytes().unwrap().as_ref()).unwrap();
         }
         let judge = || {
             let mut stream = Script {
@@ -2262,7 +2262,7 @@ fn a_remove_not_yet_acknowledged_refuses_its_mac_at_the_handshake() {
     let paths = responder.paths.clone().unwrap();
     aterm_secrets::fsx::write_atomic(
         &paths.records_file(),
-        &encode_records(removed.records()),
+        &read_records(removed.records()).unwrap(),
         0o600,
     )
     .unwrap();
@@ -2663,6 +2663,7 @@ const fn alpn(protocol: Protocol) -> &'static str {
         Protocol::Frontier(Wire::Delta) => "atdb/5",
         Protocol::Frontier(Wire::Duplex) => "atdb/6",
         Protocol::Frontier(Wire::Reconcile) => "atdb/7",
+        Protocol::Frontier(Wire::Ranges) => "atdb/8",
     }
 }
 
@@ -2810,7 +2811,7 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
     assert!(removed.membership().removal(&actor).is_some());
     aterm_secrets::fsx::write_atomic(
         &paths.records_file(),
-        &encode_records(removed.records()),
+        &read_records(removed.records()).unwrap(),
         0o600,
     )
     .unwrap();
@@ -2868,12 +2869,12 @@ fn a_pending_enrollment_is_judged_on_every_record_held() {
     // CONTROL: the same records acknowledged, as a writer that finishes leaves them.
     aterm_secrets::fsx::write_atomic(
         &paths.records_file(),
-        &encode_records(seated.records()),
+        &read_records(seated.records()).unwrap(),
         0o600,
     )
     .unwrap();
     assert_eq!(
-        client::save_records(&paths, &encode_records(removed.records())).unwrap(),
+        client::save_records(&paths, &read_records(removed.records()).unwrap()).unwrap(),
         1
     );
     assert_eq!(
@@ -2957,7 +2958,7 @@ fn a_remove_after_the_check_stops_every_later_grant_on_atdb_2_3() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let lab = Lab::new();
     let (founded, removed) = founded_then_removed(&lab);
-    let wire = encode_records(removed.records());
+    let wire = read_records(removed.records()).unwrap();
     let mut n = 0;
     // What the responder granted Mac 2 after its `Remove` became durable, `durable`, at its lease
     // under `protocol` with `mutant` on.
@@ -3105,4 +3106,270 @@ fn the_acknowledged_log_is_classified_for_judging_a_peer() {
     let judged =
         client::acknowledged_commons_log(&client::Paths::for_home(&home), lab.trust).unwrap();
     assert_eq!(kind(judged), "no log");
+}
+
+/// A [`RecordsLab`] whose control journals share the genesis and `shared` updates after it, Mac 0
+/// holding the next `control` updates, which Mac 1 lacks, and whose membership logs share the
+/// genesis, Mac 1 holding `records` `Name` records Mac 0 lacks; Mac 1 an `atdb/7` build when
+/// `atdb7`. The updates in the order Mac 0 took them, each after its parent.
+fn diverged(shared: usize, control: usize, records: u64, atdb7: bool) -> (RecordsLab, Vec<Node>) {
+    let mut fixture = RecordsLab::new();
+    let mut parent = fixture.lab.genesis.id();
+    let updates: Vec<Node> = (0..shared + control)
+        .map(|n| {
+            let node = fixture
+                .lab
+                .update(parent, format!("ranges-{n}").as_bytes(), &[]);
+            parent = node.id();
+            node
+        })
+        .collect();
+    for (mac, held) in [(0, shared + control), (1, shared)] {
+        let mut journal = fixture.lab.journal(mac);
+        journal.ingest(fixture.lab.genesis.bytes()).unwrap();
+        for node in &updates[..held] {
+            journal.ingest(node.bytes()).unwrap();
+        }
+    }
+    fixture.names(1, records);
+    if atdb7 {
+        let [mac0, mac1] = fixture.endpoints;
+        fixture.endpoints = [mac0, mac1.reconcile_tables_only()];
+    }
+    (fixture, updates)
+}
+
+/// One loopback dial over TLS from `initiator` to `responder`, each offering its database
+/// protocols, with `mutant` on in the responder's thread (and in the initiator's too when `both`):
+/// what each side returned, its repair and the bytes each of its range reconciliations wrote
+/// ([`RECONCILED`], in order), the initiator's first.
+fn reconciling_dial(
+    initiator: &Endpoint,
+    responder: &Endpoint,
+    mutant: Option<mutants::Mutant>,
+    both: bool,
+) -> [(Result<Report>, Repair, Vec<usize>); 2] {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::scope(|scope| {
+        let answered = scope.spawn(|| {
+            RECONCILED.take();
+            let connection = Connection::admit(
+                aterm_uds::accept(
+                    &listener,
+                    aterm_uds::AcceptWait::Forever,
+                    aterm_uds::AcceptedMode::Blocking,
+                )
+                .unwrap()
+                .0,
+                Scope::Loopback,
+            )
+            .unwrap();
+            let mut repair = Repair::default();
+            let answer = || responder.exchange(connection, Side::Responder, &mut repair);
+            let result = match mutant {
+                Some(mutant) => mutants::with(mutant, answer),
+                None => answer(),
+            };
+            (result, repair, RECONCILED.take())
+        });
+        RECONCILED.take();
+        let mut repair = Repair::default();
+        let mut dial = || {
+            initiator.exchange(
+                Connection::connect(address, Scope::Loopback, aterm_spec::wait::MUST_HAPPEN)
+                    .unwrap(),
+                Side::Initiator,
+                &mut repair,
+            )
+        };
+        let result = match mutant.filter(|_| both) {
+            Some(mutant) => mutants::with(mutant, dial),
+            None => dial(),
+        };
+        let dialed = (result, repair, RECONCILED.take());
+        [dialed, answered.join().unwrap()]
+    })
+}
+
+/// The control nodes Lab Mac `mac` holds.
+fn control_held(fixture: &RecordsLab, mac: usize) -> BTreeSet<Digest> {
+    fixture.lab.journal(mac).inventory().copied().collect()
+}
+
+/// LT-B5K: two Macs that both speak `atdb/8` meet on it over TLS, and one session converges
+/// control journals that share 801 nodes and differ by 200 and membership logs that differ by
+/// 100 records: every node and record moves, each node after its parent, where `atdb/7` moves 16
+/// nodes a session. Each inventory's range reconciliation writes under 8 KiB, both ways together:
+/// the shared update chain is agreed by its frontier, and each differing id is named once in a
+/// difference page (32 bytes), with a few hundred bytes beside them, where `atdb/7` sends both
+/// whole control lists. (The two together cannot be under 8 KiB: 300 differing ids are 9.6 KB.)
+///
+/// NEGATIVE CONTROLS (in the test): with the control journal reconciled by range alone
+/// (`Mutant::ControlRangesOnly`, no update chain agreed first) its inventory bytes pass 8 KiB; and
+/// the same two Macs with Mac 1 an `atdb/7` build meet on `atdb/7`: no range reconciliation runs,
+/// the session moves 16 of the 200 nodes (one batch), and the two whole control lists are past
+/// 8 KiB by themselves.
+#[test]
+fn atdb8_converges_two_hundred_control_nodes_and_a_hundred_records_in_one_session() {
+    const SHARED: usize = 800;
+    const CONTROL: usize = 200;
+    const RECORDS: u64 = 100;
+    let (fixture, updates) = diverged(SHARED, CONTROL, RECORDS, false);
+    let union: BTreeSet<Digest> = std::iter::once(fixture.lab.genesis.id())
+        .chain(updates.iter().map(Node::id))
+        .collect();
+    let records: BTreeSet<_> = client::load_records(&fixture.paths[1]).unwrap().inventory();
+    assert_eq!(records.len() as u64, RECORDS + 1);
+    assert_eq!(control_held(&fixture, 1).len(), SHARED + 1);
+
+    let [
+        (dialed, dialing, dialed_bytes),
+        (answered, answering, answered_bytes),
+    ] = reconciling_dial(&fixture.endpoints[0], &fixture.endpoints[1], None, false);
+    let (dialed, answered) = (dialed.unwrap(), answered.unwrap());
+    assert_eq!((dialed.sent, answered.received), (CONTROL, CONTROL));
+    assert_eq!((dialed.deferred, answered.deferred), (0, 0));
+    for repair in [&dialing, &answering] {
+        assert!(repair.membership_error().is_none(), "{repair:?}");
+        assert_eq!(
+            repair.membership().map(|report| report.deferred),
+            Some(0),
+            "{repair:?}"
+        );
+    }
+    assert_eq!(dialing.membership().unwrap().received, RECORDS as usize);
+    for mac in 0..2 {
+        assert_eq!(
+            control_held(&fixture, mac),
+            union,
+            "Mac {mac}'s control journal"
+        );
+        assert_eq!(
+            client::load_records(&fixture.paths[mac])
+                .unwrap()
+                .inventory(),
+            records,
+            "Mac {mac}'s membership records"
+        );
+    }
+    // Parents first: Mac 1 took each node after its parent.
+    let journal = fixture.lab.journal(1);
+    let offset = |id: &Digest| journal.receipt(id).unwrap().offset;
+    for node in &updates {
+        for parent in node.parents() {
+            assert!(
+                offset(parent) < offset(&node.id()),
+                "a node before its parent"
+            );
+        }
+    }
+    // The control journal's reconciliation, then the membership log's, on each side.
+    assert_eq!((dialed_bytes.len(), answered_bytes.len()), (2, 2));
+    let control = dialed_bytes[0] + answered_bytes[0];
+    let membership = dialed_bytes[1] + answered_bytes[1];
+    eprintln!(
+        "atdb/8: control inventories {control} bytes for {CONTROL} differing of {} nodes, \
+         membership {membership} bytes for {RECORDS} differing of {} records",
+        union.len(),
+        records.len()
+    );
+    assert!(control < 8 * 1024, "control inventory bytes {control}");
+    assert!(
+        membership < 8 * 1024,
+        "membership inventory bytes {membership}"
+    );
+
+    // Negative control: the control journal reconciled by range alone.
+    let (ranged, _) = diverged(SHARED, CONTROL, RECORDS, false);
+    let [(dialed, _, dialed_bytes), (answered, _, answered_bytes)] = reconciling_dial(
+        &ranged.endpoints[0],
+        &ranged.endpoints[1],
+        Some(mutants::Mutant::ControlRangesOnly),
+        true,
+    );
+    assert_eq!(dialed.unwrap().sent, CONTROL);
+    answered.unwrap();
+    assert_eq!(control_held(&ranged, 1), control_held(&ranged, 0));
+    let ranges_only = dialed_bytes[0] + answered_bytes[0];
+    eprintln!("ranges alone: control inventories {ranges_only} bytes");
+    assert!(ranges_only > 8 * 1024, "{ranges_only}");
+
+    // Negative control: Mac 1 an `atdb/7` build.
+    let (older, _) = diverged(SHARED, CONTROL, RECORDS, true);
+    let [(dialed, _, dialed_bytes), (answered, _, answered_bytes)] =
+        reconciling_dial(&older.endpoints[0], &older.endpoints[1], None, false);
+    assert_eq!(dialed.unwrap().sent, RECORDS_PER_ROUND);
+    answered.unwrap();
+    assert!(dialed_bytes.is_empty() && answered_bytes.is_empty());
+    assert_eq!(
+        control_held(&older, 1).len(),
+        SHARED + 1 + RECORDS_PER_ROUND,
+        "atdb/7 moves one batch a session"
+    );
+    let whole_lists = 2 * 4 + 32 * (union.len() + SHARED + 1);
+    assert!(whole_lists > 8 * 1024, "{whole_lists}");
+}
+
+/// An `atdb/7` build dials this one, and they meet on `atdb/7` and converge on its frames: control
+/// one batch of 16 nodes a session, so a 40-node difference takes three sessions, membership in
+/// its own rounds, and no range reconciliation runs on either side.
+///
+/// NEGATIVE CONTROL (in the test): with this build reading `atdb/7`'s ALPN as `atdb/8`
+/// (`Mutant::RangesOnReconcile`), it speaks `atdb/8`'s frames to the `atdb/7` peer, the session
+/// fails, and no node moves.
+#[test]
+fn an_atdb7_peer_converges_with_this_build_on_atdb7() {
+    const SHARED: usize = 4;
+    const CONTROL: usize = 40;
+    const RECORDS: u64 = 10;
+    let (fixture, updates) = diverged(SHARED, CONTROL, RECORDS, true);
+    let union: BTreeSet<Digest> = std::iter::once(fixture.lab.genesis.id())
+        .chain(updates.iter().map(Node::id))
+        .collect();
+    let records: BTreeSet<_> = client::load_records(&fixture.paths[1]).unwrap().inventory();
+    let (this, older) = (&fixture.endpoints[0], &fixture.endpoints[1]);
+
+    // Negative control: this build reads the `atdb/7` peer's protocol as `atdb/8`.
+    let [(dialed, ..), (answered, ..)] =
+        reconciling_dial(older, this, Some(mutants::Mutant::RangesOnReconcile), false);
+    assert!(
+        dialed.is_err() || answered.is_err(),
+        "{dialed:?} {answered:?}"
+    );
+    assert_eq!(control_held(&fixture, 1).len(), SHARED + 1);
+
+    let mut sessions = 0;
+    while control_held(&fixture, 1) != union {
+        sessions += 1;
+        assert!(
+            sessions <= CONTROL.div_ceil(RECORDS_PER_ROUND),
+            "no convergence"
+        );
+        let [
+            (dialed, dialing, dialed_bytes),
+            (answered, answering, answered_bytes),
+        ] = reconciling_dial(older, this, None, false);
+        let (dialed, answered) = (dialed.unwrap(), answered.unwrap());
+        assert!(dialed_bytes.is_empty() && answered_bytes.is_empty());
+        assert_eq!(
+            dialed.received,
+            RECORDS_PER_ROUND.min(CONTROL - (sessions - 1) * RECORDS_PER_ROUND)
+        );
+        assert_eq!(answered.sent, dialed.received);
+        for repair in [&dialing, &answering] {
+            assert!(repair.membership_error().is_none(), "{repair:?}");
+        }
+    }
+    assert_eq!(sessions, CONTROL.div_ceil(RECORDS_PER_ROUND));
+    assert_eq!(control_held(&fixture, 0), union);
+    for mac in 0..2 {
+        assert_eq!(
+            client::load_records(&fixture.paths[mac])
+                .unwrap()
+                .inventory(),
+            records,
+            "Mac {mac}'s membership records"
+        );
+    }
 }

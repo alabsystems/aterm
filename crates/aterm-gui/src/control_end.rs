@@ -347,9 +347,9 @@ fn fresh_context_with(
             .iter()
             .filter(|certificate| {
                 certificate.restored
-                    || current.closed_logs().exits_since(0).any(|exit| {
-                        exit.local_id == certificate.key && exit.sid.as_str() == certificate.sid
-                    })
+                    || current
+                        .closed_logs()
+                        .closed(certificate.key, &certificate.sid)
             })
             .cloned()
             .collect();

@@ -1143,7 +1143,7 @@ fn merged_meta<'a>(
     };
     metas
         .iter()
-        .min_by(|(a_id, a), (b_id, b)| merit(*b).cmp(&merit(*a)).then(a_id.cmp(b_id)))
+        .min_by(|(a_id, a), (b_id, b)| merit(b).cmp(&merit(a)).then(a_id.cmp(b_id)))
         .copied()
 }
 

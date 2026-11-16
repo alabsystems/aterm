@@ -14,7 +14,8 @@ const OTHER: usize = WAKE_SLOTS - 1;
 /// The process's wake ledger, read by `metrics` and zeroed by `metrics reset`.
 pub(crate) static WAKES: WakeTable = WakeTable::new();
 
-/// Lock-free per-slot wake counts and once-claimed variant names.
+/// Lock-free per-slot counts and once-claimed names: the wake ledger's variants, and the control
+/// listener's requests by peer and verb (`control_listener::note_request`).
 pub(crate) struct WakeTable {
     counts: [AtomicU64; WAKE_SLOTS],
     names: [OnceLock<&'static str>; WAKE_SLOTS],
@@ -38,7 +39,12 @@ impl WakeTable {
         OTHER
     }
 
-    /// Counted wakes since the last reset, sorted busiest first (ties by name), omitting zeroes.
+    /// Count one event under `name`; a name past the table's 255 counts under `other`.
+    pub(crate) fn note(&self, name: &str) {
+        self.counts[self.slot(name)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts since the last reset, sorted busiest first (ties by name), omitting zeroes.
     #[must_use]
     pub(crate) fn attribution(&self) -> Vec<(&'static str, u64)> {
         let mut out: Vec<(&'static str, u64)> = self

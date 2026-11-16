@@ -296,6 +296,57 @@ fn setup_field_names_what_is_left_and_done_once_the_plan_finished() {
     );
 }
 
+/// The word `rows=` says of `word`'s row in the background evidence `fields`.
+fn row_word<'a>(fields: &'a str, word: &str) -> Option<&'a str> {
+    fields
+        .split_ascii_whitespace()
+        .find_map(|field| field.strip_prefix("rows="))?
+        .split(',')
+        .find_map(|row| row.strip_prefix(word)?.strip_prefix(':'))
+}
+
+/// A row read again keeps the standing of the reading it holds (FL-160): while its new reading
+/// is queued or under way, `rows=` says it `in-place` and `setup=` names it as no step left,
+/// never `pending:` as a reading still to come. NEGATIVE CONTROL: the same read of a row with
+/// no reading behind it is a step still to come, `unknown` in `rows=` and `pending:` in
+/// `setup=`.
+#[test]
+fn a_row_read_again_keeps_its_standing_in_rows() {
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    let mut status = SetupStatus {
+        finished: true,
+        ..fully_observed_setup(selection, Vec::new())
+    };
+    let idle = background_setup_fields(&status, READ_AT, false);
+    assert_eq!(row_word(&idle, "fda"), Some("in-place"), "{idle}");
+    for queued in [true, false] {
+        status.observing = vec![(fda, None, queued)];
+        let fields = background_setup_fields(&status, READ_AT, false);
+        assert_eq!(
+            row_word(&fields, "fda"),
+            Some("in-place"),
+            "queued={queued}: the kept reading's standing: {fields}"
+        );
+        let setup = setup_field(&status, READ_AT);
+        assert!(
+            !setup.starts_with("pending:") && !setup.contains("fda"),
+            "queued={queued}: a row read again is no step left: {setup}"
+        );
+    }
+
+    // CONTROL: a row with no reading behind it, read the same way, is a step still to come.
+    status.observed.retain(|seen| seen.subject != fda);
+    status.observed.push(Observation::unknown(fda));
+    let fields = background_setup_fields(&status, READ_AT, false);
+    assert_eq!(row_word(&fields, "fda"), Some("unknown"), "{fields}");
+    assert!(
+        setup_field(&status, READ_AT).starts_with("pending:fda"),
+        "{fields}"
+    );
+}
+
 #[test]
 fn setup_field_requires_current_evidence_after_the_plan_finishes() {
     let fda = Subject::Access(Access::FullDiskAccess);

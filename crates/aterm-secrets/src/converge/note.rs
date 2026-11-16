@@ -3,17 +3,14 @@
 
 //! Why a converge runner was started, as its starter notes it and the runner's aterm.log line
 //! carries it. A starter (the vault subscriber's [`super::Due`], the window's lane) keeps the
-//! causes of the pass it owes and how often a runner it started for that pass found the lock
-//! held, and hands them to the runner in one environment variable ([`START_NOTE_ENV`]) that no
-//! other program reads. The note is words and numbers alone: no path, name or address. What
+//! causes of the pass it owes and hands them to the runner in one environment variable
+//! ([`START_NOTE_ENV`]) that no other program reads. The note is words and numbers alone: no
+//! path, name or address. What
 //! moved a starter's repository input mark is in it as classes ([`MarkMoved`]: which kind of
 //! Git metadata, or what else), never as the path that moved.
 
-use super::Last;
-use aterm_uds::spawnfd::Child;
 use std::cell::Cell;
 use std::ffi::OsStr;
-use std::time::Duration;
 
 /// The reasons a starter owes a pass: a set, each with one word in the note.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -46,21 +43,19 @@ impl Causes {
     pub const RETRY_FAILED: Self = Self(1 << 11);
     /// The retry after a runner that left work unfinished came due.
     pub const RETRY_UNFINISHED: Self = Self(1 << 12);
-    /// The retry after a runner that found the lock held came due.
-    pub const RETRY_HELD: Self = Self(1 << 13);
     /// Identity's own retry came due.
-    pub const RETRY_IDENTITY: Self = Self(1 << 14);
+    pub const RETRY_IDENTITY: Self = Self(1 << 13);
     /// The shared repository wave's retry came due.
-    pub const RETRY_WAVE: Self = Self(1 << 15);
+    pub const RETRY_WAVE: Self = Self(1 << 14);
     /// The window lane's first pass.
-    pub const FIRST: Self = Self(1 << 16);
+    pub const FIRST: Self = Self(1 << 15);
     /// The window lane's recheck timer, after a pass that ran.
-    pub const TIMER: Self = Self(1 << 17);
+    pub const TIMER: Self = Self(1 << 16);
     /// The window's network moved.
-    pub const NETWORK: Self = Self(1 << 18);
+    pub const NETWORK: Self = Self(1 << 17);
 
     /// Each cause's word, by bit.
-    const WORDS: [&'static str; 19] = [
+    const WORDS: [&'static str; 18] = [
         "start",
         "applied",
         "recovered",
@@ -74,7 +69,6 @@ impl Causes {
         "recheck",
         "retry-failed",
         "retry-unfinished",
-        "retry-held",
         "retry-identity",
         "retry-wave",
         "first",
@@ -222,22 +216,15 @@ impl MarkMoved {
     }
 }
 
-/// What a starter knows as it starts a runner: why the pass is owed, what the runners it
-/// started for this same pass that found the lock held cost, and what moved its inputs' mark.
+/// What a starter knows as it starts a runner: why the pass is owed and what moved its inputs'
+/// mark.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StartNote {
-    /// Why the pass is owed: every cause noted since the starter's last start, and, after a
-    /// runner that found the lock held, that runner's causes again.
+    /// Why the pass is owed: every cause noted since the starter's last start.
     pub causes: Causes,
-    /// How many runners in a row, before this one, ended finding the lock held.
-    pub held: u32,
-    /// The CPU those runners spent, in milliseconds, where their reap measured it.
-    pub held_cpu_ms: u64,
-    /// Milliseconds from the first of those runners' end to this start.
-    pub waited_ms: u64,
     /// What moved the starter's repository input mark in the looks that called for work since
-    /// its last start (and, after a runner that found the lock held, that runner's again): the
-    /// union over [`Self::moves`] looks, so one look's own set only where that is 1.
+    /// its last start: the union over [`Self::moves`] looks, so one look's own set only where
+    /// that is 1.
     pub moved: MarkMoved,
     /// How many looks [`Self::moved`] is the union of.
     pub moves: u32,
@@ -247,40 +234,25 @@ pub struct StartNote {
 pub const NOTE_MAX: usize = 240;
 
 impl StartNote {
-    /// The note as the runner's line carries it: `c=<cause>+<cause>,h=<held>,hc=<held CPU
-    /// ms>,w=<waited ms>,m=<class>+<class>,n=<looks>`, a field left out where it is empty or
-    /// 0, so a note with nothing to say is empty. Where the whole would pass [`NOTE_MAX`] bytes
-    /// the classes are cut first, to `m=many`, and then, where that is still too long, the
-    /// causes, to `c=many`; the numbers are never cut (with every number at its largest the
-    /// note cut twice is under 100 bytes).
+    /// The note as the runner's line carries it: `c=<cause>+<cause>,m=<class>+<class>,n=<looks>`,
+    /// a field left out where it is empty or 0, so a note with nothing to say is empty. Where the
+    /// whole would pass [`NOTE_MAX`] bytes its classes are cut, to `m=many`: every cause with the
+    /// number at its largest is then 195 bytes, so nothing else is ever cut.
     #[must_use]
     pub fn word(&self) -> String {
-        let (causes, moved) = (self.causes.words(), self.moved.words());
-        let cut = |words: &str| if words.is_empty() { "" } else { "many" };
-        let whole = self.rendered(&causes, &moved);
+        let causes = self.causes.words();
+        let whole = self.rendered(&causes, &self.moved.words());
         if whole.len() <= NOTE_MAX {
-            return whole;
+            whole
+        } else {
+            self.rendered(&causes, "many")
         }
-        let classes_cut = self.rendered(&causes, cut(&moved));
-        if classes_cut.len() <= NOTE_MAX {
-            return classes_cut;
-        }
-        self.rendered(cut(&causes), cut(&moved))
     }
 
     fn rendered(&self, causes: &str, moved: &str) -> String {
         let mut fields = Vec::new();
         if !causes.is_empty() {
             fields.push(format!("c={causes}"));
-        }
-        if self.held != 0 {
-            fields.push(format!("h={}", self.held));
-        }
-        if self.held_cpu_ms != 0 {
-            fields.push(format!("hc={}", self.held_cpu_ms));
-        }
-        if self.waited_ms != 0 {
-            fields.push(format!("w={}", self.waited_ms));
         }
         if !moved.is_empty() {
             fields.push(format!("m={moved}"));
@@ -333,20 +305,6 @@ pub fn note_word(value: &OsStr) -> Option<String> {
         b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'+' | b',' | b'=' | b'-')
     };
     (!word.is_empty() && word.len() <= NOTE_MAX && word.bytes().all(plain)).then(|| word.to_owned())
-}
-
-/// How `runner` stands now, as [`Last::of`] reads it (reaping and taking it once it ended, a
-/// failed wait leaving it in custody as running), and the CPU it spent where a measured wait
-/// reaped it. The measured wait is tried first and decides nothing: a runner it reaped keeps
-/// its status, which [`Last::of`] then reads, and where it reaped none (the runner still runs,
-/// the wait failed, or this target has no measured wait) [`Last::of`] waits as it always does
-/// and no CPU is given. So a runner stands here exactly as [`Last::of`] says, by its one mapping.
-pub fn reap(runner: &mut Option<Child>) -> (Last, Option<Duration>) {
-    let cpu = match runner.as_mut().map(Child::try_wait_with_rusage) {
-        Some(Ok(Some(usage))) => Some(usage.cpu),
-        _ => None,
-    };
-    (Last::of(runner), cpu)
 }
 
 #[cfg(test)]

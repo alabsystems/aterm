@@ -957,11 +957,14 @@ pub fn reconcile(layout: &Layout, depth: Depth) -> Report {
                         continue;
                     }
                 };
-            if !row
-                .body
-                .as_deref()
-                .is_some_and(|have| have.as_bytes() == want.body)
-            {
+            // The entry activation lays: a link where the shim would only exec the program.
+            #[cfg(unix)]
+            let want = crate::platform::path_entry(
+                want,
+                &row.target,
+                crate::platform::STARTS_AT_REAL_PATH,
+            );
+            if !want.is_laid() {
                 files.push(want);
             }
         }

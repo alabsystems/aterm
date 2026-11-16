@@ -327,7 +327,7 @@ impl Mac {
                 serve_offering_with_ask_within(
                     &listener,
                     (&listening, Arc::new(|| (FleetScope::Content, SERVES)), deny),
-                    None,
+                    (None, None),
                     &serve_stop,
                     HANG,
                     move |served, op| {

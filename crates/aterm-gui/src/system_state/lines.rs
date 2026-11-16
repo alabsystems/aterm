@@ -213,6 +213,9 @@ pub(crate) struct LineView {
     /// Its live status phrase: what is true now, and where that differs from what aterm sets
     /// up, `now → wanted`.
     pub(crate) phrase: String,
+    /// Equivalent observation-phase captions measured together, so checking the same facts
+    /// cannot change the header's footprint. They are never painted as current readings.
+    pub(crate) layout_phrases: Vec<String>,
     /// The phrase reads in the tertiary ink ("Left as is", a line's scope while it is read).
     pub(crate) quiet: bool,
     /// The rows it opens to: every row of the line that is not in the card.
@@ -230,6 +233,79 @@ impl LineView {
     pub(crate) fn expandable(&self) -> bool {
         !self.rows.is_empty() || self.other_vault
     }
+}
+
+pub(crate) fn phrase_with_state(word: &str, phrase: &str) -> String {
+    if phrase.to_lowercase().contains(word) {
+        return phrase.to_owned();
+    }
+    let mut word = word.to_owned();
+    if let Some(first) = word.get_mut(..1) {
+        first.make_ascii_uppercase();
+    }
+    format!("{word} · {phrase}")
+}
+
+fn history_summary(line: Line, not_joined: bool) -> &'static str {
+    if not_joined {
+        NO_VAULT_HERE
+    } else if line == Line::Permissions {
+        "Granted"
+    } else {
+        "In place"
+    }
+}
+
+fn blocks_history(row: &RowView) -> bool {
+    matches!(&row.value, RowValue::Muted(word)
+        if row.standing != Some(Standing::NotNeeded) || word == super::OFFERED_WORD)
+}
+
+fn line_layout_phrases(
+    line: Line,
+    members: &[&RowView],
+    state: &LineState,
+    partly: bool,
+) -> Vec<String> {
+    let mut phrases = vec![phrase_with_state(state.word, &state.phrase)];
+    if !matches!(state.word, "done" | "as last read" | "not joined") {
+        return phrases;
+    }
+    let managed: Vec<&RowView> = members.iter().copied().filter(|row| row.managed).collect();
+    if managed.is_empty() || managed.iter().any(|row| blocks_history(row)) {
+        return phrases;
+    }
+    let not_joined = line == Line::Secrets && managed.iter().any(|row| {
+        row.subject == Subject::Setting(Setting::Secrets)
+            && matches!(&row.value, RowValue::One(value) | RowValue::LastKnown(value) if value == "Not joined")
+    });
+    let full = not_joined
+        || managed
+            .iter()
+            .all(|row| row.settled() || row.chip == Some(super::Chip::LastKnown));
+    let lead = if partly { "Partly on · " } else { "" };
+    if full {
+        let current = if not_joined {
+            NO_VAULT_HERE.to_owned()
+        } else {
+            now_words(line, &managed, true)
+        };
+        phrases.push(phrase_with_state(
+            if not_joined { "not joined" } else { "done" },
+            &format!("{lead}{current}"),
+        ));
+        for phase in ["", " · checking", " · waiting to read"] {
+            phrases.push(format!(
+                "{lead}{} · as last read{phase}",
+                history_summary(line, not_joined)
+            ));
+        }
+    } else if state.word == "as last read" {
+        for phase in ["current reading unavailable", "checking", "waiting to read"] {
+            phrases.push(format!("{lead}Some results as last read · {phase}"));
+        }
+    }
+    phrases
 }
 
 /// `name: now → wanted` for a row that differs, else its name.
@@ -651,6 +727,7 @@ pub(crate) fn line_view(
     let plan = app.reviewed_plan();
     let steps = Steps::of(status, rows, Some(&plan));
     let state = line_state(app, line, &members, card, on, set < bits.len(), &steps);
+    let layout_phrases = line_layout_phrases(line, &members, &state, set < bits.len());
     // The state is said once: where the phrase says it already ("Waiting for the vault…"), the
     // label is the line's name and its phrase.
     let said = spoken(&state.phrase);
@@ -670,6 +747,7 @@ pub(crate) fn line_view(
         mark: state.mark,
         word: state.word,
         phrase: state.phrase,
+        layout_phrases,
         quiet: state.quiet,
         // An Off line shows no rows (§4.3); a newer aterm's rows read as they stand.
         rows: if on || status.newer() {
@@ -914,42 +992,57 @@ fn line_state(
         };
         return with_lead(LineState::new(Mark::Waiting, why));
     }
-    if has_history
-        && !managed
-            .iter()
-            .any(|row| matches!(row.value, RowValue::Muted(_)))
-    {
+    if has_history && !managed.iter().any(|row| blocks_history(row)) {
         let observing = managed
             .iter()
             .filter_map(|row| {
                 status.observation_progress(row.subject, Some(app.plan.vault_url.as_str()))
             })
             .reduce(|a, b| a && b);
+        let phase = match observing {
+            Some(true) => " · waiting to read",
+            Some(false) => " · checking",
+            None => "",
+        };
+        if line == Line::Secrets
+            && managed.iter().any(|row| {
+                row.subject == Subject::Setting(Setting::Secrets)
+                    && row.chip == Some(super::Chip::LastKnown)
+                    && matches!(&row.value, RowValue::LastKnown(value) if value == "Not joined")
+            })
+        {
+            return with_lead(
+                LineState::new(Mark::Off, format!("{NO_VAULT_HERE} · as last read{phase}"))
+                    .word("as last read")
+                    .quiet(),
+            );
+        }
         if managed
             .iter()
             .all(|row| row.settled() || row.chip == Some(super::Chip::LastKnown))
         {
-            let phase = match observing {
-                Some(true) => " · waiting to read",
-                Some(false) => " · checking",
-                None => "",
-            };
-            // The check is past presentation only; progress still counts current readings.
-            return with_lead(
-                LineState::new(Mark::Done, format!("In place as last read{phase}"))
-                    .word("as last read"),
-            );
-        }
-        if observing.is_none() {
+            // These values describe the previous reading, never current readiness.
             return with_lead(
                 LineState::new(
-                    Mark::Pending,
-                    "Some results as last read · current reading unavailable",
+                    Mark::Done,
+                    format!("{} · as last read{phase}", history_summary(line, false)),
                 )
-                .word("as last read")
-                .quiet(),
+                .word("as last read"),
             );
         }
+        let latest = match observing {
+            Some(true) => "waiting to read",
+            Some(false) => "checking",
+            None => "current reading unavailable",
+        };
+        return with_lead(
+            LineState::new(
+                Mark::Pending,
+                format!("Some results as last read · {latest}"),
+            )
+            .word("as last read")
+            .quiet(),
+        );
     }
     if managed.iter().any(|row| unread(row)) {
         return with_lead(LineState::checking(line));
@@ -992,7 +1085,7 @@ fn line_state(
         // Nothing of it applies on this Mac (every row not needed).
         return with_lead(LineState::new(Mark::Done, "Nothing to set up here"));
     }
-    with_lead(LineState::new(Mark::Done, now_words(line, &managed)))
+    with_lead(LineState::new(Mark::Done, now_words(line, &managed, false)))
 }
 
 /// A managed row nothing has read yet.
@@ -1040,12 +1133,15 @@ pub(crate) fn waiting_for(row: &RowView) -> String {
 
 /// What is true now of a line whose rows are all as wanted (§4.3): `Caps Lock is Control ·
 /// Dock 3 apps`, `Joined · local cache ready`.
-fn now_words(line: Line, managed: &[&RowView]) -> String {
+fn now_words(line: Line, managed: &[&RowView], history: bool) -> String {
     let value = |setting: Setting| {
         managed
             .iter()
             .find(|row| row.subject == Subject::Setting(setting))
-            .and_then(|row| row.value_now())
+            .and_then(|row| match &row.value {
+                RowValue::LastKnown(value) if history => Some(value.as_str()),
+                _ => row.value_now(),
+            })
             .map(|value| aterm_types::macos_setup::live_until_login(value).unwrap_or(value))
     };
     let parts: Vec<String> = match line {
@@ -1106,10 +1202,30 @@ pub(crate) struct Hero {
     /// Set up now shows in the footer: a quiet recovery while a hold stands (a Stop, an older
     /// aterm's Cancel), the only time changes to make wait for a press (revision 4).
     pub(crate) start: bool,
-    /// The lockup's progress: the managed rows done, of those read. Both 0 until something was
-    /// read, and then no progress is claimed.
+    /// The lockup's display progress, including useful confirmed history while rows are read.
+    /// Both 0 until a managed row has a current or retained reading.
     pub(crate) done: usize,
     pub(crate) total: usize,
+    /// The count includes retained results and must be qualified as historical.
+    pub(crate) as_last_read: bool,
+}
+
+impl Hero {
+    pub(crate) const fn progress_label(&self) -> &'static str {
+        if self.as_last_read {
+            "Setup progress as last read"
+        } else {
+            "Setup progress"
+        }
+    }
+
+    fn progress_caption(&self) -> String {
+        if self.as_last_read {
+            format!("{} of {} as last read", self.done, self.total)
+        } else {
+            progress_words(self.done, self.total)
+        }
+    }
 }
 
 /// `11 of 16 done`.
@@ -1136,10 +1252,9 @@ fn things(n: usize) -> String {
     }
 }
 
-/// THE PROGRESS RULE (§4.5, pure): how many managed rows are done, of those aterm manages, once
-/// a managed row has an answer beyond unknown. Done means done: a row in the card, a step
-/// that failed, waits for aterm's next try or could not be confirmed is not, nor is one changed
-/// since aterm set it, which setup leaves as it is, so full progress is every line done.
+/// The lockup's display progress: current settled readings and explicitly historical settled
+/// readings keep their count during a check. A current problem still takes precedence. History
+/// changes no row's standing, setup readiness or access approval; the hero qualifies its count.
 pub(crate) fn progress(
     app: &SystemStateApp,
     rows: &[RowView],
@@ -1154,7 +1269,8 @@ pub(crate) fn progress(
         super::manages(plan.selection, seen.subject)
             && seen.standing != Standing::Unknown
             && !status.unconfirmed_observations.contains(&seen.subject)
-    }) {
+    }) && !rows.iter().any(last_confirmed)
+    {
         return (0, 0);
     }
     let steps = Steps::of(status, rows, Some(&plan));
@@ -1163,16 +1279,20 @@ pub(crate) fn progress(
         .iter()
         .filter(|row| {
             row.managed
-                && row.settled()
+                && (row.settled() || last_confirmed(row))
                 && row.chip != Some(super::Chip::Waiting)
                 && !matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD)
                 && !card.iter().any(|item| item.subject == Some(row.subject))
                 && !steps.failed.contains(&row.subject)
                 && !steps.retried.contains(&row.subject)
-                && !steps.unconfirmed.contains(&row.subject)
+                && (!steps.unconfirmed.contains(&row.subject) || last_confirmed(row))
         })
         .count();
     (done, total)
+}
+
+fn last_confirmed(row: &RowView) -> bool {
+    row.managed && row.chip == Some(super::Chip::LastKnown)
 }
 
 /// THE HERO RULE (§4.3, pure): the phase headline, from the headline rule's own reading
@@ -1184,7 +1304,11 @@ pub(crate) fn hero(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) ->
         .iter()
         .any(|row| matches!(row.value, RowValue::LastKnown(_)))
     {
-        hero.sub = "Showing last useful results".into();
+        hero.sub = if hero.as_last_read && hero.total > 0 {
+            hero.progress_caption()
+        } else {
+            "Showing last useful results".into()
+        };
     }
     hero
 }
@@ -1262,6 +1386,7 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
         start: held,
         done,
         total,
+        as_last_read: rows.iter().any(last_confirmed),
     };
     if !app.plan_known {
         hero.sub = String::new();

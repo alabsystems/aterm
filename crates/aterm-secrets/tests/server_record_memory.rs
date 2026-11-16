@@ -12,7 +12,7 @@ use aterm_secrets::{
     envelope, fsx,
     membership_log::{
         Body, Entrant, EpochAudience, Inserted, Log, MAX_RECORD, MemberId, Record, Store,
-        encode_records,
+        read_records,
     },
     server,
     text::{Audience, Entry},
@@ -139,7 +139,10 @@ fn assert_same_records(actual: &Store, expected: &Store) {
         expected.log().unwrap().heads()
     );
     for id in expected.inventory() {
-        assert_eq!(actual.get_bytes(&id), expected.get_bytes(&id));
+        assert_eq!(
+            actual.record(&id).map(|r| r.wire_bytes().unwrap()),
+            expected.record(&id).map(|r| r.wire_bytes().unwrap())
+        );
     }
 }
 
@@ -148,7 +151,7 @@ fn a_cold_server_load_bounds_input_scratch_beside_retained_records() {
     let directory = aterm_tempfile::tempdir().unwrap();
     let path = directory.path().join("cold.records");
     let fixture = large_history();
-    let wire = encode_records(fixture.log.records());
+    let wire = read_records(fixture.log.records()).unwrap();
     let keys = [envelope::signer_public(&GENESIS_SIGNER).unwrap()];
     let expected = Store::for_vault(NAME)
         .unwrap()
@@ -156,7 +159,7 @@ fn a_cold_server_load_bounds_input_scratch_beside_retained_records() {
         .recovering(&wire);
     assert_eq!(expected.len(), VALUES + 2);
     assert_eq!(expected.complete_inventory().len(), expected.len());
-    assert_eq!(expected.encode(), wire);
+    assert_eq!(expected.read_encoded().unwrap(), wire);
     assert!(wire.len() > VALUES * VALUE_BYTES);
     fsx::write_atomic(&path, &wire, 0o600).unwrap();
 
@@ -200,7 +203,7 @@ fn a_cold_server_load_preserves_waiting_and_torn_tail_recovery() {
     let directory = aterm_tempfile::tempdir().unwrap();
     let path = directory.path().join("cold.records");
     let mut fixture = large_history();
-    let wire = encode_records(fixture.log.records());
+    let wire = read_records(fixture.log.records()).unwrap();
     let keys = [envelope::signer_public(&GENESIS_SIGNER).unwrap()];
     let parent = fixture
         .log
@@ -226,7 +229,7 @@ fn a_cold_server_load_preserves_waiting_and_torn_tail_recovery() {
         .sign(&WRITER, INCARNATION)
         .unwrap();
     let mut pending = wire.clone();
-    pending.extend_from_slice(child.bytes());
+    pending.extend_from_slice(child.wire_bytes().unwrap().as_ref());
     let mut torn = pending.clone();
     torn.extend_from_slice(b"ALM");
     for bytes in [&pending, &torn] {
@@ -237,11 +240,14 @@ fn a_cold_server_load_preserves_waiting_and_torn_tail_recovery() {
         assert_eq!(expected.complete_inventory().len(), VALUES + 2);
         assert_eq!(expected.len(), VALUES + 3);
         assert!(expected.contains(child.id()));
-        assert!(expected.complete_bytes(child.id()).is_none());
+        assert!(!expected.holds(child.id()));
         fsx::write_atomic(&path, bytes, 0o600).unwrap();
         let (observed, on_file) = server::test_cold_records(&path, NAME, &keys).unwrap();
         assert_same_records(&observed, &expected);
-        assert_eq!(observed.encode(), expected.encode());
+        assert_eq!(
+            observed.read_encoded().unwrap(),
+            expected.read_encoded().unwrap()
+        );
         assert_eq!(on_file, None, "the complete prefix does not cover the file");
     }
 }

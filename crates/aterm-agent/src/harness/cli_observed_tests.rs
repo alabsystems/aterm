@@ -354,3 +354,70 @@ fn grok_and_kimi_places_are_observed_too() {
     assert_eq!(kimi[0].observed, None);
     assert_eq!(kimi[0].src, "auth-file");
 }
+
+/// ATERM-KI-1115-1802: an account signed in only to one of aterm's own browser profiles is a
+/// place too, as the sweep hands it to the registry (source `browser`): the profile's
+/// directory, the address it is signed in to, and the row that owns it; a Claude Code profile
+/// no row owns is believed by none, and a profile still marked unproven is no place.
+/// NEGATIVE CONTROL: with `browser_profiles` giving every login `row: None`, the row's own
+/// profile is believed by none: `` left: [("claude", "~/state/accounts/browsers/brontosaurus…",
+/// Some("brontosaurus…"), None, "browser"), …] ``.
+#[test]
+fn a_browser_profile_is_a_place_beside_the_row_that_owns_it() {
+    use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, sanitize_profile_key};
+    const NOW: i64 = 1_790_000_000;
+    let home = home();
+    let state = home.path().join("state");
+    let browsers = state.join("accounts/browsers");
+    for email in [BRONTO, UNICORN, STEGO] {
+        std::fs::create_dir_all(browsers.join(sanitize_profile_key(email))).unwrap();
+    }
+    std::fs::write(
+        browsers
+            .join(sanitize_profile_key(STEGO))
+            .join(PROFILE_UNPROVEN_MARK),
+        "",
+    )
+    .unwrap();
+    let roster = Roster::parse_for(
+        Cli::Claude,
+        &format!(
+            "[[account]]\nlabel = \"m22\"\nclass = \"dedicated\"\nemail = \"{BRONTO}\"\n\n\
+             [[account]]\nlabel = \"m9\"\nclass = \"dedicated\"\nemail = \"{STEGO}\"\n\
+             dir = {}\n",
+            crate::harness::host_path::toml(&home.path().join("logins/m9"))
+        ),
+    )
+    .unwrap();
+    let rows = browser_places_seen(&state, &[(Cli::Claude, roster)], home.path(), NOW);
+    let got: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.cli,
+                row.place.clone(),
+                row.observed.as_deref(),
+                row.believed.as_deref(),
+                row.src,
+            )
+        })
+        .collect();
+    let place = |email: &str| format!("~/state/accounts/browsers/{}", sanitize_profile_key(email));
+    assert_eq!(
+        got,
+        vec![
+            (
+                "claude",
+                place(BRONTO),
+                Some(BRONTO),
+                Some("m22"),
+                "browser"
+            ),
+            ("claude", place(UNICORN), Some(UNICORN), None, "browser"),
+        ]
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.agrees.is_none() && row.tabs.is_empty())
+    );
+}

@@ -594,3 +594,521 @@ fn a_start_suspended_child_has_not_run_though_it_is_not_held() {
     assert_eq!(thread_ran(me), Some(true), "this process runs");
     drop(held);
 }
+
+/// A hop of pid `pid` with unique id `uniqueid`, whose parent is `parent` with unique id
+/// `parent_uniqueid`, on no terminal.
+fn a_hop(pid: u32, uniqueid: u64, parent: u32, parent_uniqueid: u64) -> Hop {
+    Hop {
+        identity: super::super::Identity {
+            pid: i32::try_from(pid).expect("a pid"),
+            birth: super::super::Birth(u64::from(pid)),
+            idversion: Some(1),
+        },
+        uniqueid,
+        parent_uniqueid,
+        parent,
+        tty: None,
+    }
+}
+
+/// A run and `parents` parents above it: hop `k` (the run is hop 0) is pid `100 + k` with
+/// unique id `10_000 - k`, older than its child, and names hop `k + 1` as its parent by both;
+/// the last names launchd.
+fn a_line(parents: u32) -> Vec<Hop> {
+    (0..=parents)
+        .map(|k| {
+            let (pid, uniqueid) = (100 + k, 10_000 - u64::from(k));
+            if k == parents {
+                a_hop(pid, uniqueid, 1, 1)
+            } else {
+                a_hop(pid, uniqueid, pid + 1, uniqueid - 1)
+            }
+        })
+        .collect()
+}
+
+/// A classifier that names the pids of `stops` and nothing else.
+fn by_pid(stops: &[(u32, Stop)]) -> impl FnMut(&Hop) -> Option<Stop> + '_ {
+    move |hop: &Hop| {
+        stops
+            .iter()
+            .find(|(pid, _)| *pid == hop.identity.pid.unsigned_abs())
+            .map(|(_, stop)| *stop)
+    }
+}
+
+/// [`walk`] from `line`'s first hop, each pid read off `line` (`None` for one it lacks) and
+/// judged by `stop`, with the pids it read and the pids it judged, in order.
+fn walked(line: &[Hop], mut stop: impl FnMut(&Hop) -> Option<Stop>) -> (Walk, Vec<u32>, Vec<u32>) {
+    let (mut read, mut judged) = (Vec::new(), Vec::new());
+    let end = walk(
+        line[0],
+        |pid| {
+            read.push(pid);
+            line.iter()
+                .find(|hop| hop.identity.pid.unsigned_abs() == pid)
+                .copied()
+        },
+        |hop| {
+            judged.push(hop.identity.pid.unsigned_abs());
+            stop(hop)
+        },
+    );
+    (end, read, judged)
+}
+
+/// Each parent must be the process its child names by unique id, from the run's own parent up:
+/// one at the named pid with another unique id ends the walk Broken there and is never judged,
+/// though the classifier would take it for the tab, whether it is older than the child or
+/// younger. That holds at the run's own parent (the link a launcher that exits at once leaves
+/// open to a reuse of its pid) and at one further up. With the unique id its child names, the
+/// same line reaches the tab. NEGATIVE CONTROLS: a walk that asked only for a parent older than
+/// its child (`parent.uniqueid < child.uniqueid`) takes the older process for the tab; one that
+/// skipped the check on its first step reaches the tab through the impostor at the run's parent.
+#[test]
+fn walk_requires_each_hop_to_name_its_parent() {
+    let line = a_line(4);
+    let tab = [(102, Stop::Tab)];
+    assert_eq!(
+        walked(&line, by_pid(&tab)),
+        (Walk::Tab, vec![101, 102], vec![100, 101, 102])
+    );
+    for (at, read, judged) in [
+        (1, vec![101], vec![100]),
+        (2, vec![101, 102], vec![100, 101]),
+    ] {
+        for (uniqueid, case) in [
+            (line[at - 1].parent_uniqueid - 1, "an older process"),
+            (line[0].uniqueid + 1, "a younger process"),
+        ] {
+            let mut reused = line.clone();
+            reused[at].uniqueid = uniqueid;
+            assert_eq!(
+                walked(&reused, by_pid(&tab)),
+                (Walk::Broken, read.clone(), judged.clone()),
+                "{case} at hop {at}'s pid"
+            );
+        }
+    }
+}
+
+/// The walk ends at the first process the classifier names: another owner at hop 2 wins over
+/// the tab's shell at hop 4, which is never read, a tab at hop 2 wins over an owner at hop 4,
+/// and with no owner on the way the line reaches the tab. NEGATIVE CONTROL: a walk that went on
+/// past another owner to look for the tab answers Tab.
+#[test]
+fn walk_stops_at_the_first_owned_process() {
+    let line = a_line(5);
+    assert_eq!(
+        walked(&line, by_pid(&[(102, Stop::Other), (104, Stop::Tab)])),
+        (Walk::Other(line[2]), vec![101, 102], vec![100, 101, 102])
+    );
+    assert_eq!(
+        walked(&line, by_pid(&[(102, Stop::Tab), (104, Stop::Other)])).0,
+        Walk::Tab
+    );
+    assert_eq!(
+        walked(&line, by_pid(&[(104, Stop::Tab)])),
+        (
+            Walk::Tab,
+            vec![101, 102, 103, 104],
+            vec![100, 101, 102, 103, 104]
+        )
+    );
+}
+
+/// A run three `setsid` launches below the tab's shell reaches it: each launcher leads a
+/// session with no terminal, and the walk follows parents across sessions, judging the run and
+/// then each parent once; this aterm, above the shell, is never read. A classifier that stops
+/// at a terminal other than the tab's ([`Hop::tty`]) ends the walk at a launcher in another
+/// terminal's session. NEGATIVE CONTROL: a walk that judged each child in place of its parent
+/// reads one step past the shell.
+#[test]
+fn walk_reaches_the_tab_through_three_setsid_hops() {
+    const TAB: u32 = 0x1000_0007;
+    let mut line = a_line(5);
+    line[4].tty = Some(TAB);
+    let (shell, aterm) = (line[4].identity, line[5].identity);
+    let classify = |hop: &Hop| {
+        if hop.identity == shell {
+            Some(Stop::Tab)
+        } else if hop.identity == aterm || hop.tty.is_some_and(|tty| tty != TAB) {
+            Some(Stop::Other)
+        } else {
+            None
+        }
+    };
+    assert_eq!(
+        walked(&line, classify),
+        (
+            Walk::Tab,
+            vec![101, 102, 103, 104],
+            vec![100, 101, 102, 103, 104]
+        )
+    );
+    line[2].tty = Some(TAB + 1);
+    assert_eq!(walked(&line, classify).0, Walk::Other(line[2]));
+}
+
+/// The classifier judges the run itself before any parent is read. `kitty codex exec …` typed
+/// in the tab leaves the run leading a session on kitty's terminal, under a kitty that is still
+/// the tab shell's child on the tab's terminal: the rule that stops at a process on another
+/// terminal ends the walk at the run, Other, with nothing read. The same run with no terminal
+/// (`setsid`) climbs through kitty to the shell, and a run the classifier names the tab is the
+/// tab. NEGATIVE CONTROL: a walk that judged parents only judges kitty and then the shell, and
+/// takes the run on kitty's terminal for the tab's.
+#[test]
+fn walk_judges_the_run_itself() {
+    const TAB: u32 = 0x1000_0007;
+    let mut line = a_line(3);
+    line[0].tty = Some(TAB + 1);
+    line[1].tty = Some(TAB);
+    line[2].tty = Some(TAB);
+    let shell = line[2].identity;
+    let classify = |hop: &Hop| {
+        if hop.identity == shell {
+            Some(Stop::Tab)
+        } else if hop.tty.is_some_and(|tty| tty != TAB) {
+            Some(Stop::Other)
+        } else {
+            None
+        }
+    };
+    assert_eq!(
+        walked(&line, classify),
+        (Walk::Other(line[0]), Vec::new(), vec![100])
+    );
+    line[0].tty = None;
+    assert_eq!(
+        walked(&line, classify),
+        (Walk::Tab, vec![101, 102], vec![100, 101, 102])
+    );
+    assert_eq!(
+        walked(&line, by_pid(&[(100, Stop::Tab)])),
+        (Walk::Tab, Vec::new(), vec![100])
+    );
+}
+
+/// A child whose parent is launchd (`1`) or none (`0`) ends the walk Orphaned at that child,
+/// and launchd is never read: at the top of a line that never met the tab, and at a run whose
+/// own parent is launchd, with nothing read and only the run judged. NEGATIVE CONTROL: a walk
+/// that ended only at parent `0` reads launchd, which a reader that does not refuse pid 1
+/// answers.
+#[test]
+fn walk_refuses_an_orphan() {
+    let mut line = a_line(3);
+    line.push(a_hop(1, 1, 0, 0));
+    assert_eq!(
+        walked(&line, by_pid(&[])),
+        (
+            Walk::Orphaned,
+            vec![101, 102, 103],
+            vec![100, 101, 102, 103]
+        )
+    );
+    for parent in [1, 0] {
+        assert_eq!(
+            walked(&[a_hop(100, 10_000, parent, 1), line[4]], by_pid(&[])),
+            (Walk::Orphaned, Vec::new(), vec![100]),
+            "parent {parent}"
+        );
+    }
+}
+
+/// A parent that does not read (gone, another user's, a zombie) ends the walk Unread there,
+/// though the tab's shell stands above it, and nothing past it is read or judged. NEGATIVE
+/// CONTROL: a walk that took an unread parent for the top of the line answers Orphaned.
+#[test]
+fn walk_refuses_an_unreadable_hop() {
+    let mut line = a_line(4);
+    line.remove(2);
+    assert_eq!(
+        walked(&line, by_pid(&[(104, Stop::Tab)])),
+        (Walk::Unread, vec![101, 102], vec![100, 101])
+    );
+}
+
+/// The walk reads at most [`MAX_HOPS`] (64) parents: the tab's shell as the 64th parent is
+/// reached, as the 65th it is never read and the walk ends TooDeep, with the run and 64
+/// parents judged, and a hop that names itself as its parent (a reader out of step with the
+/// kernel) ends TooDeep after 64 reads, never looping. NEGATIVE CONTROL: a bound of 65 reads
+/// reaches the 65th.
+#[test]
+fn walk_stops_at_64_hops() {
+    assert_eq!(MAX_HOPS, 64);
+    let line = a_line(66);
+    let (end, read, _) = walked(&line, by_pid(&[(164, Stop::Tab)]));
+    assert_eq!((end, read.len()), (Walk::Tab, 64));
+    let (end, read, judged) = walked(&line, by_pid(&[(165, Stop::Tab)]));
+    assert_eq!(
+        (end, read.len(), judged.len(), read.last()),
+        (Walk::TooDeep, 64, 65, Some(&164))
+    );
+    let (end, read, _) = walked(&[a_hop(100, 10_000, 100, 10_000)], by_pid(&[]));
+    assert_eq!((end, read.len()), (Walk::TooDeep, 64));
+}
+
+/// This process's hop names its parent (the test runner, this user's) by pid and by unique id,
+/// and reads what [`read_lineage`] reads of it. A child it spawns names it the same way and
+/// walks up to it through the live reader. launchd, an exited child its parent has not reaped
+/// (a zombie) and a reaped one read none; the kernel answers no flavor 18 record for a zombie,
+/// so the zombie's none is the kernel's and [`read_hop`]'s own `SZOMB` refusal, kept on
+/// [`read_lineage`]'s terms, is not reached here. Off Apple nothing reads. NEGATIVE CONTROL: a
+/// hop that read its own unique id for its parent's fails the first link.
+#[test]
+fn read_hop_links_this_process_to_its_parent() {
+    use super::super::{ProcessPresence, process_presence};
+    let me = i32::try_from(std::process::id()).expect("pid");
+    if !cfg!(target_vendor = "apple") {
+        assert_eq!(read_hop(me), None);
+        return;
+    }
+    let live = |pid: u32| i32::try_from(pid).ok().and_then(read_hop);
+    let mine = read_hop(me).expect("this process reads");
+    let parent = std::os::unix::process::parent_id();
+    assert_eq!(mine.parent, parent);
+    let theirs = live(parent).expect("its parent reads: the test runner, this user's");
+    assert_eq!(
+        mine.parent_uniqueid, theirs.uniqueid,
+        "this process names its parent by unique id"
+    );
+    let lineage = read_lineage(me).expect("this process's lineage");
+    assert_eq!(
+        (mine.identity, mine.uniqueid, mine.parent, mine.tty),
+        (
+            lineage.identity,
+            lineage.uniqueid,
+            lineage.parent,
+            lineage.tty
+        ),
+        "what read_lineage reads"
+    );
+    let mut child = crate::spawnfd::command("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn");
+    let pid = i32::try_from(child.id()).expect("pid");
+    let hop = read_hop(pid);
+    let walked = hop.map(|hop| {
+        walk(hop, live, |h| {
+            (h.identity == mine.identity).then_some(Stop::Tab)
+        })
+    });
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + HANG;
+    while process_presence(pid) != ProcessPresence::Exited {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the child (pid {pid}) did not exit within its hang detector"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let exited = read_hop(pid);
+    let _ = child.wait();
+    let hop = hop.expect("the child reads");
+    assert_eq!(
+        (hop.parent, hop.parent_uniqueid),
+        (me.unsigned_abs(), mine.uniqueid),
+        "the child names this process"
+    );
+    assert!(hop.uniqueid > mine.uniqueid, "{hop:?} {mine:?}");
+    assert_eq!(
+        walked,
+        Some(Walk::Tab),
+        "the child walks up to this process"
+    );
+    assert_eq!(exited, None, "an exited child its parent has not reaped");
+    assert_eq!(read_hop(pid), None, "a reaped child");
+    assert_eq!(read_hop(1), None, "launchd's");
+}
+
+/// The kernel sets a process's parent unique id at its fork and again at each exec, to the
+/// parent it has then, and launchd's adoption alone leaves it. A shell's background child, its
+/// own exec made while the shell lives, names the shell; once the shell exits and launchd
+/// adopts it, it still names the exited shell; once it execs again (`cat`, which proves it ran
+/// by echoing a line) it names launchd (`1`), with its own unique id kept under a new pid
+/// version. Each step waits on the one before it, so no order of the kernel's is a race here.
+/// NEGATIVE CONTROL: the model this replaced, under which the launcher's unique id is kept
+/// through the adoption and any exec after it, fails the read after the exec.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn an_adopted_process_names_launchd_once_it_execs() {
+    use crate::spawnfd::{Child, Stdio, command};
+    use std::io::{BufRead as _, Write as _};
+    /// The launcher, ended and reaped however the test ends; the run ends once its input does.
+    struct Ended(Child);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let (run_reads, mut to_run) = crate::pipe().expect("the run's pipe");
+    let (launcher_reads, to_launcher) = crate::pipe().expect("the launcher's pipe");
+    let mut launcher = command("/bin/sh");
+    launcher
+        .args([
+            "-c",
+            r#"/bin/sh -c 'echo up; read go; exec /bin/cat' <&3 3<&- & echo "$!"; read done"#,
+        ])
+        .stdin(Stdio::from(launcher_reads))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    launcher
+        .inherit_guards_at(vec![(run_reads.into(), 3)])
+        .expect("the run's input at fd 3");
+    let mut launcher = Ended(launcher.spawn().expect("spawn the launcher"));
+    let out = launcher
+        .0
+        .stdout
+        .take()
+        .expect("the launcher's piped stdout");
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || {
+        lines
+            .recv_timeout(HANG)
+            .expect("a line within the hang detector")
+    };
+    let (mut run, mut up) = (None, false);
+    while run.is_none() || !up {
+        match next().as_str() {
+            "up" => up = true,
+            pid => run = Some(pid.parse::<i32>().expect("the run's pid")),
+        }
+    }
+    let run = run.expect("the run's pid");
+    let shell = i32::try_from(launcher.0.id())
+        .ok()
+        .and_then(read_hop)
+        .expect("the launcher reads");
+    let forked = read_hop(run).expect("the run reads");
+    drop(to_launcher);
+    launcher.0.wait().expect("the launcher exits");
+    let adopted = read_hop(run).expect("the adopted run reads");
+    to_run.write_all(b"go\nran\n").expect("write to the run");
+    assert_eq!(next(), "ran", "the run, now cat, echoes");
+    let execd = read_hop(run).expect("the run reads after its exec");
+    drop(to_run);
+    let launchd = super::uniq_identifier(1)
+        .expect("launchd's identifiers")
+        .p_uniqueid;
+    assert_eq!(
+        (forked.parent, forked.parent_uniqueid),
+        (shell.identity.pid.unsigned_abs(), shell.uniqueid),
+        "forked and exec'd under the shell, the run names it"
+    );
+    assert_eq!(
+        (adopted.parent, adopted.parent_uniqueid, adopted.identity),
+        (1, shell.uniqueid, forked.identity),
+        "adopted, it still names the exited shell"
+    );
+    assert_eq!(
+        (execd.parent, execd.parent_uniqueid, execd.uniqueid),
+        (1, launchd, forked.uniqueid),
+        "exec'd after the adoption, it names launchd"
+    );
+    assert_ne!(
+        execd.identity.idversion, adopted.identity.idversion,
+        "an exec takes a new pid version"
+    );
+}
+
+/// Set in the session leader [`a_hop_reads_its_sessions_controlling_terminal`] spawns of this
+/// test binary.
+#[cfg(target_vendor = "apple")]
+const TERMINAL_LEADER_ENV: &str = "ATERM_UDS_TEST_TERMINAL_LEADER";
+
+/// A hop's terminal is its session's controlling terminal, numbered as the terminal's own
+/// `st_rdev`: a child that leads a session of its own on a pty's terminal end (it takes the
+/// terminal at its stdin, `TIOCSCTTY`) reads that terminal and still names this process as its
+/// parent by unique id, and one that leads a session with none (`setsid` alone) reads none, as
+/// [`read_lineage`] reads them both. The leader is this test binary staged by
+/// [`TERMINAL_LEADER_ENV`]. NEGATIVE CONTROLS: a hop that read no terminal fails the leader;
+/// one that read `e_tdev` without `NODEV`'s none reads the bare session's as `u32::MAX`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_hop_reads_its_sessions_controlling_terminal() {
+    use crate::spawnfd::{Child, Stdio, command};
+    use std::os::unix::fs::MetadataExt as _;
+    const NAME: &str = "process::kin::tests::a_hop_reads_its_sessions_controlling_terminal";
+    if std::env::var_os(TERMINAL_LEADER_ENV).is_some() {
+        // SAFETY: This child leads a session of its own with no controlling terminal
+        // (`setsid`), and fd 0 is the pty's terminal end its parent handed it.
+        let rc = unsafe { libc::ioctl(0, libc::c_ulong::from(libc::TIOCSCTTY), 0) };
+        assert_eq!(rc, 0, "TIOCSCTTY: {}", std::io::Error::last_os_error());
+        println!("ran");
+        std::thread::sleep(HANG);
+        return;
+    }
+    /// The children, each ended and reaped however the test ends.
+    struct Ended(Vec<Child>);
+    impl Drop for Ended {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let me = i32::try_from(std::process::id()).expect("pid");
+    let (_master, terminal) = crate::holders::listing_tests::a_terminal();
+    let number =
+        u32::try_from(terminal.metadata().expect("fstat the terminal").rdev() & 0xffff_ffff)
+            .expect("a terminal's number");
+    let mut children = Ended(Vec::new());
+    // `--quiet` keeps the leader's `ran` on its own line for [`crate::deadline::prints`].
+    let leader = command(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            NAME,
+            "--nocapture",
+            "--quiet",
+            "--test-threads=1",
+        ])
+        .env(TERMINAL_LEADER_ENV, "1")
+        .setsid(true)
+        .stdin(Stdio::from(terminal))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the session leader");
+    children.0.push(leader);
+    let leader = children.0.last_mut().expect("the leader just kept");
+    crate::deadline::prints(leader, "ran", HANG);
+    let leader = i32::try_from(leader.id()).expect("pid");
+    let bare = command("/bin/sleep")
+        .arg("60")
+        .setsid(true)
+        .spawn()
+        .expect("spawn a session with no terminal");
+    let bare_pid = i32::try_from(bare.id()).expect("pid");
+    children.0.push(bare);
+    let mine = read_hop(me).expect("this process reads");
+    let (led, unled) = (read_hop(leader), read_hop(bare_pid));
+    let lineages = (read_lineage(leader), read_lineage(bare_pid));
+    drop(children);
+    let (led, unled) = (
+        led.expect("the leader reads"),
+        unled.expect("the bare session reads"),
+    );
+    assert_eq!(led.tty, Some(number), "the leader's terminal is the pty's");
+    assert_eq!(
+        (led.parent, led.parent_uniqueid),
+        (me.unsigned_abs(), mine.uniqueid),
+        "a session of its own still names this process"
+    );
+    assert_eq!(unled.tty, None, "a session with no terminal");
+    assert_eq!(
+        (lineages.0.map(|l| l.tty), lineages.1.map(|l| l.tty)),
+        (Some(led.tty), Some(unled.tty)),
+        "as read_lineage reads them"
+    );
+}

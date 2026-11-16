@@ -98,7 +98,8 @@ pub use aterm_uds::host::COULD_NOT_RUN as COULD_NOT_RUN_SENTINEL;
 pub(crate) struct Marks {
     /// The block carries [`COULD_NOT_RUN_SENTINEL`]: the case refused its machine.
     pub(crate) refused: bool,
-    /// The block names [`crate::exec::ENOSPC_SENTENCE`]: the case hit a full disk.
+    /// The case's panic ([`panic_words`]) names [`crate::exec::ENOSPC_SENTENCE`]: the case hit a
+    /// full disk.
     pub(crate) disk: bool,
 }
 
@@ -112,8 +113,31 @@ pub(crate) fn marks(block: &str) -> Marks {
     };
     Marks {
         refused: plain.contains(COULD_NOT_RUN_SENTINEL),
-        disk: plain.contains(crate::exec::ENOSPC_SENTENCE),
+        disk: panic_words(&plain).contains(crate::exec::ENOSPC_SENTENCE),
     }
+}
+
+/// The words of the panic that failed a case: its block from the last `thread '…' panicked`
+/// line to libtest's backtrace hint (`note: run with …`) or the block's end; a block with
+/// no such line is read whole. What the case logged before its panic is not why it failed: a
+/// test that injects a full disk logs the code's ENOSPC handling at every step (aterm-link's
+/// fabric sim does), and a red of such a test is the tree's, not its machine's.
+fn panic_words(block: &str) -> &str {
+    let mut start = None;
+    let mut at = 0;
+    for line in block.split_inclusive('\n') {
+        if line.starts_with("thread '") && line.contains("' panicked") {
+            start = Some(at);
+        }
+        at += line.len();
+    }
+    let Some(start) = start else {
+        return block;
+    };
+    let words = &block[start..];
+    words
+        .find("\nnote: run with `RUST_BACKTRACE")
+        .map_or(words, |end| &words[..end])
 }
 
 /// Whether the failed cases `seen` so far, each by its block's [`Marks`], already make their

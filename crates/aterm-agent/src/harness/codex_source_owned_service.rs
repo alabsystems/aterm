@@ -133,6 +133,17 @@ pub struct OwnedService {
     active: Option<Active>,
 }
 impl OwnedService {
+    /// Observe the actual owned child before this service starts stopping it.
+    /// Other actors may already have requested a stop; this supplies no cause.
+    ///
+    /// # Errors
+    /// Original child custody or the non-reaping kernel observation is unavailable.
+    #[cfg(debug_assertions)]
+    pub fn observe_child_exit_status(
+        &mut self,
+    ) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.worker.observe_child_exit_status()
+    }
     /// Debug observation of this actual owner after a frontend has withdrawn.
     /// The returned process is DATA, not an attachment or provider grant.
     ///

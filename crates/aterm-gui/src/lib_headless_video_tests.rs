@@ -323,10 +323,16 @@ fn a_filmed_window_never_rests_while_another_does() {
     app.settle_rest(quiet);
     assert!(!app.windows[&filmed].rest.resting(), "the filmed window");
     assert!(app.windows[&other].rest.resting(), "the other window");
+    assert!(
+        app.windows[&filmed].rest.attended(),
+        "the film keeps its window attended"
+    );
+    assert!(!app.windows[&other].rest.attended(), "the other lapsed");
 
     let _ = app.video_rec.take();
     app.settle_rest(quiet);
     assert!(app.windows[&filmed].rest.resting(), "the take ended");
+    assert!(!app.windows[&filmed].rest.attended(), "and its attention");
     let _ = std::fs::remove_dir_all(root);
 }
 

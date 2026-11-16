@@ -469,3 +469,211 @@ fn one_clis_places_and_the_account_each_runs_on() {
         accounts::Reconciled::Unread(Some(row)) if row.label == "m22"
     ));
 }
+
+/// A Claude Code profile of `email` whose `organizationType` is `organization`.
+fn planned(email: &str, organization: &str) -> String {
+    format!(
+        r#"{{"oauthAccount":{{"emailAddress":"{email}","accountUuid":"11111111-2222-3333-4444-555555555555","organizationType":"{organization}"}}}}"#
+    )
+}
+
+/// `path`'s modification time set to `at`, Unix seconds.
+fn dated(path: &Path, at: i64) {
+    let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(at.unsigned_abs());
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(at)
+        .unwrap();
+}
+
+/// An account's plan is noted once per change of its word, as its newest file states it: two
+/// places of one account that state two words are read by the newer, so the word does not flap
+/// between them from one look to the next, and a newest file that states no plan word (another
+/// organization type) notes nothing, never the older file's stale word. A `plan-seen` the
+/// journal did not take is due again; what was noted is kept in the sweep's file, which a word
+/// outside the vocabulary does not enter.
+/// NEGATIVE CONTROLS: with `sweep` taking each place's word in turn (the last read, not the
+/// newest file), the row directory's older `max` is noted: `` left: [Some("max")] right:
+/// [Some("team")] ``; with `run_through` not taking back an untaken plan, the file keeps it
+/// as noted: `` left: {"claude unicorn…": "team"} right: {} ``.
+#[cfg(unix)]
+#[test]
+fn a_plan_is_noted_once_per_change_of_word_from_the_newest_file() {
+    let home = home("plan");
+    let state = home.path().join("state");
+    let own = home.path().join("logins/work");
+    let file = home.path().join(".claude.json");
+    let row_file = profile::profile_in_home(&own);
+    // The default home, read first, is the newer file; the row's directory is read last.
+    write(&file, &planned(UNICORN, "claude_team"));
+    write(&row_file, &planned(UNICORN, "claude_max"));
+    dated(&file, T0 - 60);
+    dated(&row_file, T0 - 7_200);
+    let rosters = vec![(Cli::Claude, claude_roster(&own))];
+    let look = |now: i64, takes: fn(&Note) -> bool| {
+        let places = places(&rosters, home.path(), &OnToken::none());
+        let mut plans = Vec::new();
+        run_through(
+            &state,
+            &places,
+            now,
+            &mut |note| {
+                if note.kind == "plan-seen" {
+                    plans.push(note.plan);
+                }
+                takes(note)
+            },
+            &mut |_| (),
+        );
+        plans
+    };
+    journal::with_keyer(keyer, || {
+        // The journal drops the plan: it stays due.
+        assert_eq!(look(T0, |note| note.kind != "plan-seen"), [Some("team")]);
+        assert_eq!(load(&state).plans, BTreeMap::new());
+        assert_eq!(look(T0 + 60, |_| true), [Some("team")]);
+        assert_eq!(look(T0 + 120, |_| true), [], "noted once");
+        // The newest file states no plan word: the older file's word is stale, not restated.
+        write(&row_file, &planned(UNICORN, "claude_zero"));
+        dated(&row_file, T0 + 100);
+        assert_eq!(look(T0 + 180, |_| true), [], "the newest file speaks");
+        write(&row_file, &planned(UNICORN, "claude_pro"));
+        dated(&row_file, T0 + 200);
+        assert_eq!(look(T0 + 240, |_| true), [Some("pro")]);
+        assert_eq!(look(T0 + 300, |_| true), []);
+        let kept = load(&state);
+        assert_eq!(Swept::parse(kept.render().as_bytes()), kept);
+        assert_eq!(
+            kept.plans.values().map(String::as_str).collect::<Vec<_>>(),
+            ["pro"]
+        );
+    });
+    // A word outside the vocabulary in the file is no memory of a plan.
+    let parsed =
+        Swept::parse(br#"{"plans":{"claude a@b.example":"zq7","claude c@d.example":"max"}}"#);
+    assert_eq!(parsed.places, BTreeMap::new());
+    assert_eq!(
+        parsed.plans.into_iter().collect::<Vec<_>>(),
+        [("claude c@d.example".to_owned(), "max".to_owned())]
+    );
+}
+
+/// Every account signed in to one of aterm's own browser profiles is handed as an idle login
+/// from `browser`: a row's own profile as the row's account, a Claude Code profile no row owns
+/// as the address its name spells. A profile marked unproven, a label's, one named with a
+/// digest, one whose name two addresses could spell and a vendor profile no row owns name
+/// nothing. Only directory names and aterm's own mark are read.
+/// NEGATIVE CONTROL: with `proven` taking any directory, the row whose sign-in never succeeded
+/// is handed too: `` left: [("claude", "claude", "brontosaurus…", "browser"), ("claude",
+/// "claude", "stegosaurus…", "browser"), …] ``.
+#[test]
+fn a_browser_profile_hands_the_account_aterm_made_it_for() {
+    use crate::harness::headless_oauth::{PROFILE_UNPROVEN_MARK, sanitize_profile_key};
+    let home = home("browser");
+    let state = home.path().join("state");
+    let roster = claude_roster(&home.path().join("logins/work"));
+    let browsers = state.join("accounts/browsers");
+    for dir in [
+        sanitize_profile_key(BRONTO),
+        sanitize_profile_key(STEGO),
+        sanitize_profile_key(UNICORN),
+        "m9".to_owned(),
+        "ann-tag-at-proton.example-1a2b3c4d".to_owned(),
+        "ann-at-b-at-proton.example".to_owned(),
+    ] {
+        fs::create_dir_all(browsers.join(dir)).unwrap();
+    }
+    write(
+        &browsers
+            .join(sanitize_profile_key(STEGO))
+            .join(PROFILE_UNPROVEN_MARK),
+        "",
+    );
+    fs::create_dir_all(state.join("accounts/vendor-browsers/raptor-at-proton.example")).unwrap();
+    let logins = browser_logins(&state, home.path(), &[(Cli::Claude, roster)], T0);
+    let got: Vec<(&str, &str, &str, &str)> = logins
+        .iter()
+        .map(|l| (l.cli.id(), l.realm.as_str(), l.email.as_str(), l.src.word()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("claude", "claude", BRONTO, "browser"),
+            ("claude", "claude", UNICORN, "browser"),
+        ]
+    );
+    assert!(
+        logins
+            .iter()
+            .all(|l| l.state == LoginState::Idle && l.tab.is_none() && l.at == T0 as u64)
+    );
+    assert_eq!(profile_email("ann-at-b-at-proton.example"), None);
+    assert_eq!(profile_email("m9"), None);
+    assert_eq!(
+        profile_email(&sanitize_profile_key(UNICORN)).as_deref(),
+        Some(UNICORN)
+    );
+}
+
+/// A vendor row whose profile is Claude Code's (`vendor_profile_dir` lends a vendor sign-in the
+/// Claude Code profile of its address while it has none of its own) is not signed in to that
+/// vendor by Claude Code's sign-in there: only a profile of its own under `vendor-browsers/`
+/// counts, and the Claude Code profile stays the Claude Code account's.
+/// NEGATIVE CONTROL: with a vendor row counting the profile it resolves to, `` left: [("codex",
+/// "codex", "unicorn…", "browser")] right: [("claude", "claude", "unicorn…", "browser")] ``.
+#[test]
+fn a_vendor_row_on_claude_codes_profile_is_not_signed_in_by_it() {
+    use crate::harness::headless_oauth::sanitize_profile_key;
+    let home = home("vendor-browser");
+    let state = home.path().join("state");
+    fs::create_dir_all(
+        state
+            .join("accounts/browsers")
+            .join(sanitize_profile_key(UNICORN)),
+    )
+    .unwrap();
+    let codex = Roster::parse_for(
+        Cli::Codex,
+        &format!("[[account]]\nlabel = \"cx\"\nclass = \"dedicated\"\nemail = \"{UNICORN}\"\n"),
+    )
+    .unwrap();
+    let rosters = [(Cli::Codex, codex)];
+    let said = |logins: Vec<ObservedLogin>| -> Vec<(String, String, String, String)> {
+        logins
+            .iter()
+            .map(|l| {
+                (
+                    l.cli.id().to_owned(),
+                    l.realm.clone(),
+                    l.email.clone(),
+                    l.src.word().to_owned(),
+                )
+            })
+            .collect()
+    };
+    let row = |cli: &str| {
+        (
+            cli.to_owned(),
+            cli.to_owned(),
+            UNICORN.to_owned(),
+            "browser".to_owned(),
+        )
+    };
+    assert_eq!(
+        said(browser_logins(&state, home.path(), &rosters, T0)),
+        vec![row("claude")]
+    );
+    // CONTROL: with a profile of its own, the vendor row is signed in there.
+    fs::create_dir_all(
+        state
+            .join("accounts/vendor-browsers")
+            .join(sanitize_profile_key(UNICORN)),
+    )
+    .unwrap();
+    assert_eq!(
+        said(browser_logins(&state, home.path(), &rosters, T0)),
+        vec![row("codex"), row("claude")]
+    );
+}

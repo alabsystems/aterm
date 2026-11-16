@@ -663,9 +663,7 @@ fn read<T>(
         }
     };
     mailbox
-        .run_until(deadline.end(), |p| {
-            p.with_verification(operation, |_| Err("Mail verification unavailable".into()))
-        })
+        .run_until(deadline.end(), |p| p.with_renewal(operation))
         .map_err(|_| {
             mailbox.last_failure().is_some_and(|failure| {
                 failure.recovery() == aterm_mail::proton_error::Recovery::RetryRead

@@ -2168,9 +2168,10 @@ mod hook {
     }
 }
 
+/// `holders`' listing tests; [`listing_tests::a_terminal`] is every test's in the crate.
 #[cfg(test)]
 #[path = "holders_listing_tests.rs"]
-mod listing_tests;
+pub(crate) mod listing_tests;
 
 #[cfg(all(test, target_vendor = "apple"))]
 #[path = "holders_tests.rs"]

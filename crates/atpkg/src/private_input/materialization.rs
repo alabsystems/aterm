@@ -45,6 +45,7 @@ pub struct MaterializedInput {
 }
 
 impl CompletedMaterialization {
+    #[cfg(any(target_os = "macos", test))] // read by the macOS-only host admission and tests
     pub(crate) fn from_native_return(attempt: MaterializationAttempt) -> Self {
         Self {
             original: ReturnedMaterialization::Attempt(Box::new(attempt)),

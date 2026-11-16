@@ -39,19 +39,29 @@ fn dir_screens(crate_dir: &Path, dir: &Path, into: &mut Vec<(String, Vec<String>
     }
 }
 
-/// Loads all fixture screens from `src/fixtures` and sibling policy fixtures when present.
+/// The policy fixture folders swept beside `src/fixtures` where the aterm workspace holds them:
+/// aterm-agent's captures, and alab-policy's tables and corpora, which the alab-harness copy
+/// aterm carries pinned in `vendor/alab-harness` holds.
+const POLICY_FIXTURES: [&str; 2] = [
+    "../aterm-agent/src/supervise/policy/fixtures",
+    "../../vendor/alab-harness/crates/alab-policy/fixtures",
+];
+
+/// Loads all fixture screens from `src/fixtures` and each of [`POLICY_FIXTURES`] when present.
 pub fn fixture_screens(sweep: &str) -> Vec<(String, Vec<String>)> {
     let crate_dir = aterm_tempfile::manifest_dir();
     let mut out = Vec::new();
     dir_screens(&crate_dir, &crate_dir.join("src/fixtures"), &mut out);
-    let agent = crate_dir.join("../aterm-agent/src/supervise/policy/fixtures");
-    if agent.is_dir() {
-        dir_screens(&crate_dir, &agent, &mut out);
-    } else {
-        eprintln!(
-            "{sweep}: {} absent (not in the aterm workspace): its captures are not swept",
-            agent.display()
-        );
+    for folder in POLICY_FIXTURES {
+        let dir = crate_dir.join(folder);
+        if dir.is_dir() {
+            dir_screens(&crate_dir, &dir, &mut out);
+        } else {
+            eprintln!(
+                "{sweep}: {} absent (not in the aterm workspace): its captures are not swept",
+                dir.display()
+            );
+        }
     }
     out
 }

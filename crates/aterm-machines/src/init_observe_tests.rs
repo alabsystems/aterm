@@ -30,6 +30,28 @@ fn planned(from: &str) -> ItemReport {
     row(Outcome::Planned, Some(from), Some("wanted"))
 }
 
+/// A repositories reading of `ready` of `total`, the rest still to clone.
+fn repositories(ready: usize, total: usize, signed_in: bool) -> Reading {
+    Reading::Repositories {
+        counts: RepositoryCounts {
+            ready,
+            missing: total - ready,
+            ..RepositoryCounts::default()
+        },
+        signed_in,
+    }
+}
+
+/// A partition with a repository in every class.
+const EVERY_CLASS: RepositoryCounts = RepositoryCounts {
+    ready: 41,
+    unborn: 4,
+    dependencies: 2,
+    missing: 9,
+    preserved: 1,
+    git_waits: 3,
+};
+
 /// A planned row whose item took `reading`, under the engine's own `from` line.
 fn read_as(reading: Reading) -> ItemReport {
     ItemReport {
@@ -69,14 +91,10 @@ fn every_reading_round_trips_through_its_rows_detail() {
             projects: 0,
             toolchain: true,
         },
+        repositories(2, 5, false),
+        repositories(5, 5, true),
         Reading::Repositories {
-            present: 2,
-            count: 5,
-            signed_in: false,
-        },
-        Reading::Repositories {
-            present: 5,
-            count: 5,
+            counts: EVERY_CLASS,
             signed_in: true,
         },
     ];
@@ -403,32 +421,17 @@ fn what_spotlight_still_indexes_is_a_note_never_a_step() {
 
 #[test]
 fn repositories_count_what_is_present_and_want_all_of_them() {
-    let partial = read_as(Reading::Repositories {
-        present: 3,
-        count: 7,
-        signed_in: false,
-    });
+    let partial = read_as(repositories(3, 7, false));
     let read = observation(Setting::Repositories, &[&partial]);
     assert_eq!(read.now.as_deref(), Some("3 of 7"));
     assert_eq!(read.wanted, "All 7");
-    let sign_in = read_as(Reading::Repositories {
-        present: 7,
-        count: 7,
-        signed_in: false,
-    });
+    let sign_in = read_as(repositories(7, 7, false));
     let read = observation(Setting::Repositories, &[&sign_in]);
     assert_eq!(read.now.as_deref(), Some("Needs sign-in"));
     assert_eq!(read.wanted, "All 7");
     let ok = ItemReport {
-        detail: Some(
-            Reading::Repositories {
-                present: 7,
-                count: 7,
-                signed_in: true,
-            }
-            .token(),
-        ),
-        ..row(Outcome::Ok, None, Some("7 matching worktrees present"))
+        detail: Some(repositories(7, 7, true).token()),
+        ..row(Outcome::Ok, None, Some("7 of 7 ready"))
     };
     let read = observation(Setting::Repositories, &[&ok]);
     assert_eq!(read.now.as_deref(), Some("All 7"));
@@ -438,6 +441,68 @@ fn repositories_count_what_is_present_and_want_all_of_them() {
     assert_eq!(read.standing, Standing::Waiting);
     assert_eq!((read.now, read.wanted.as_str()), (None, "All"));
     assert_eq!(read.detail.as_deref(), Some("offline"));
+}
+
+/// One rendering of the partition, every class in it: what is ready of the whole, then each
+/// class still owed, a class with none left unsaid. CONTROL: a partition that is all ready says
+/// only that.
+#[test]
+fn the_repository_summary_names_each_class_of_one_partition() {
+    assert_eq!(EVERY_CLASS.total(), 60);
+    assert_eq!(
+        EVERY_CLASS.summary(),
+        "41 of 60 ready; 4 without a commit; 2 needing required dependencies; 9 to clone; \
+         3 waiting for Git; 1 left as it is"
+    );
+    let owed = RepositoryCounts {
+        ready: 41,
+        unborn: 4,
+        missing: 9,
+        ..RepositoryCounts::default()
+    };
+    assert_eq!(
+        owed.summary(),
+        "41 of 54 ready; 4 without a commit; 9 to clone"
+    );
+    assert!(!owed.all_here());
+    let here = RepositoryCounts { missing: 0, ..owed };
+    assert!(here.all_here());
+    assert_eq!(
+        RepositoryCounts {
+            ready: 54,
+            ..RepositoryCounts::default()
+        }
+        .summary(),
+        "54 of 54 ready"
+    );
+}
+
+/// The GitHub repositories row stands as acquisition reads: the refresh of the checkouts
+/// already here keeps its own row, so neither its failure nor its wait moves this one.
+/// CONTROL: the same failed row under the acquisition's id fails the setting.
+#[test]
+fn a_refresh_row_never_moves_the_repositories_setting() {
+    let acquisition = ItemReport {
+        id: "init.github.native@alice".into(),
+        detail: Some(repositories(3, 3, true).token()),
+        ..row(Outcome::Ok, None, Some("3 of 3 ready"))
+    };
+    for outcome in [Outcome::Failed, Outcome::Blocked] {
+        let refresh = ItemReport {
+            id: "init.github.refresh@alice".into(),
+            why: Some("fetch failed".into()),
+            ..row(outcome, None, None)
+        };
+        let read = observation(Setting::Repositories, &[&acquisition, &refresh]);
+        assert_eq!(read.standing, Standing::InPlace, "{outcome:?}");
+        assert_eq!(read.now.as_deref(), Some("All 3"), "{outcome:?}");
+        let control = ItemReport {
+            id: "init.github.native@alice".into(),
+            ..refresh
+        };
+        let read = observation(Setting::Repositories, &[&acquisition, &control]);
+        assert_ne!(read.standing, Standing::InPlace, "{outcome:?}");
+    }
 }
 
 #[test]
@@ -451,14 +516,7 @@ fn successful_repository_operations_need_a_complete_signed_in_readback() {
             (0, 0, true, Standing::InPlace),
         ] {
             let report = ItemReport {
-                detail: Some(
-                    Reading::Repositories {
-                        present,
-                        count,
-                        signed_in,
-                    }
-                    .token(),
-                ),
+                detail: Some(repositories(present, count, signed_in).token()),
                 ..row(outcome, None, None)
             };
             let observed = observation(Setting::Repositories, &[&report]);
@@ -512,11 +570,7 @@ fn a_row_notes_the_reason_or_remedy_its_item_decided_and_never_the_engine_line()
     // The first waiting part that says why gives the note; a planned part beside it
     // and a waiting part that says nothing do not.
     let silent = blocked(None, "waits for init.github.auth@alice");
-    let planned = read_as(Reading::Repositories {
-        present: 1,
-        count: 2,
-        signed_in: true,
-    });
+    let planned = read_as(repositories(1, 2, true));
     let read = observation(
         Setting::Repositories,
         &[&planned, &silent, &blocked(Some(Wait::Unreached), line)],
@@ -603,4 +657,44 @@ fn a_row_that_differs_carries_no_engine_line_as_its_description() {
             .as_deref(),
         Some("applied, but it still reads absent")
     );
+}
+
+/// The waits a repository row takes on another pass's repository lease and on the shared
+/// refresh's retry ride in its detail under slugs of their own, end by themselves (no person's
+/// step), and read back as themselves: a row stood aside on the lock reads as waiting, with its
+/// note in the page's words, never the engine's line. NEGATIVE CONTROL: the slugs are no other
+/// wait's, and a detail naming neither reads as no reading.
+#[test]
+fn the_lease_and_shared_retry_waits_round_trip_under_their_own_slugs() {
+    for (wait, token) in [
+        (Wait::OtherPass, "reading:waits:other-pass"),
+        (Wait::SharedRetry, "reading:waits:shared-retry"),
+    ] {
+        assert_eq!(Reading::Waits(wait).token(), token);
+        assert_eq!(
+            Reading::of(&read_as(Reading::Waits(wait))),
+            Some(Reading::Waits(wait))
+        );
+        assert_eq!(
+            Wait::ALL
+                .into_iter()
+                .filter(|other| Reading::Waits(*other).token() == token)
+                .count(),
+            1,
+            "{wait:?}"
+        );
+        assert_eq!(wait.kind(), FailureKind::Transient, "{wait:?}");
+        let part = ItemReport {
+            why: Some("another aterm pass holds this account's repository lease".into()),
+            detail: Some(token.into()),
+            stood_aside: Some(StoodAside::Lock("held".into())),
+            ..row(Outcome::Blocked, None, None)
+        };
+        let read = observation(Setting::Repositories, &[&part]);
+        assert_eq!(read.standing, Standing::Waiting, "{wait:?}");
+        assert_eq!(read.note.as_deref(), Some(wait.note()), "{wait:?}");
+    }
+    let mut row = planned("x");
+    row.detail = Some("reading:waits:other-passes".into());
+    assert_eq!(Reading::of(&row), None);
 }

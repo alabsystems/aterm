@@ -12537,6 +12537,69 @@ fn keep_session(before: Option<&Snapshot>, snap: &mut Snapshot) {
 
 static PUBLISHED: Mutex<Option<HashMap<String, Snapshot>>> = Mutex::new(None);
 
+/// THE LAST LAUNCH EACH SESSION'S AGENT HAD, by session ID: what [`PUBLISHED`] last held for it,
+/// kept when that publication ends with the agent (a `None` publish), so the session's row in the
+/// machine's session table records the launch of an agent that exited before the session ended
+/// ([`take_last_launch`], tracker ST-15). Taken at the session's end; a session that never ran an
+/// agent has none.
+static LAST_LAUNCH: Mutex<Option<HashMap<String, crate::restore::AgentRestore>>> = Mutex::new(None);
+
+/// The launch of the last agent session `sid` ran ([`LAST_LAUNCH`]), taken: its end's row keeps
+/// it.
+pub(crate) fn take_last_launch(sid: &str) -> Option<crate::restore::AgentRestore> {
+    LAST_LAUNCH
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_mut()?
+        .remove(sid)
+}
+
+/// One row of a seamless update's last launches (`SessionHandoff::last_launches`): session
+/// `sid` on its first line, and `launch` after it as the layout writes an agent's.
+pub(crate) fn last_launch_row(sid: &str, launch: &crate::restore::AgentRestore) -> Option<String> {
+    let launch = aterm_toml::to_string(launch).ok()?;
+    Some(format!("{sid}\n{launch}"))
+}
+
+/// The session and launch a row of [`last_launch_row`] names; `None` for one this build cannot
+/// read.
+pub(crate) fn read_last_launch_row(row: &str) -> Option<(String, crate::restore::AgentRestore)> {
+    let (sid, launch) = row.split_once('\n')?;
+    if !crate::keeper_link::valid_sid(sid) {
+        return None;
+    }
+    Some((sid.to_owned(), aterm_toml::from_str(launch).ok()?))
+}
+
+/// The rows of [`LAST_LAUNCH`] of sessions `sids`, for a seamless update's manifest to carry
+/// ([`last_launch_row`]): the successor keeps them ([`adopt_last_launches`]), so a session that
+/// ends there keeps in its row the launch of an agent that exited here.
+pub(crate) fn last_launch_rows<'a>(sids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let last = LAST_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(last) = last.as_ref() else {
+        return Vec::new();
+    };
+    sids.into_iter()
+        .filter_map(|sid| last_launch_row(sid, last.get(sid)?))
+        .collect()
+}
+
+/// Keep the last launches a seamless update's predecessor carried (`rows`, [`last_launch_rows`])
+/// for their sessions, but where this process has its own already: how many it kept. A row this
+/// build cannot read keeps nothing.
+pub(crate) fn adopt_last_launches(rows: &[String]) -> usize {
+    let mut last = LAST_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+    let last = last.get_or_insert_with(HashMap::new);
+    let mut kept = 0;
+    for (sid, launch) in rows.iter().filter_map(|row| read_last_launch_row(row)) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = last.entry(sid) {
+            slot.insert(launch);
+            kept += 1;
+        }
+    }
+    kept
+}
+
 /// Publish `sid`'s kept snapshot (`None`: it has none).
 fn publish_snapshot(sid: &str, snap: Option<&Snapshot>) -> bool {
     publish_snapshot_from(sid, snap, false)
@@ -12555,6 +12618,13 @@ fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bo
         };
         before.as_ref().map(carried) != snap.as_ref().map(carried)
     };
+    if let Some(snap) = &snap {
+        let mut last = LAST_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
+        let last = last.get_or_insert_with(HashMap::new);
+        if moved || !last.contains_key(sid) {
+            last.insert(sid.to_string(), carried(snap));
+        }
+    }
     if moved && let Some(snap) = &snap {
         aterm_log::info!(
             "harness @{sid}: the relaunch snapshot kept names pid {}{}",
@@ -28382,11 +28452,34 @@ fn disk_reclaimed(looked: &mut disk_ask::Looked, bytes: u64) {
         });
 }
 
+/// The sessions `store` holds, as the worktree step reads them: each handle live while it is
+/// spawning or alive, and each closed log's session exited, read under one short read lock.
+#[cfg(target_os = "macos")]
+fn disk_worktree_roster(store: &Store) -> Vec<aterm_agent::harness::disk::worktree::SessionSeen> {
+    use aterm_agent::harness::disk::worktree::SessionSeen;
+    let held = store.read().unwrap_or_else(PoisonError::into_inner);
+    let mut roster: Vec<SessionSeen> = held
+        .live_handles()
+        .map(|h| SessionSeen {
+            sid: h.sid.as_str().to_owned(),
+            live: h.state != SessionState::Exited,
+        })
+        .collect();
+    roster.extend(held.closed_logs().exits().map(|exit| SessionSeen {
+        sid: exit.sid.as_str().to_owned(),
+        live: false,
+    }));
+    roster
+}
+
 /// The look's worktree step (`aterm_agent::harness::cli::disk_worktree_step`), hourly at most,
 /// under the pass lock (the one the look adopted from a budget page, else one taken now, which
 /// another host's pass may hold: then it runs at a later look): a merged, clean worktree no
-/// session uses goes, with its merged branch. What it freed is this look's; what went is one
-/// log line.
+/// session uses goes, with its merged branch, and so does one whose session is gone, its commits
+/// and edits pinned on refs first: after an hour of quiet where every build of it was a session
+/// `store` holds as exited, else after seven days. A merged, clean, quiet worktree outside an
+/// agent's shape stays and gives back its shared build directories. What it freed is this
+/// look's; the worktrees that went are one log line and the build directories that went another.
 #[cfg(target_os = "macos")]
 fn disk_worktree_look(
     home: &Path,
@@ -28395,6 +28488,7 @@ fn disk_worktree_look(
     config: aterm_agent::harness::disk::Config,
     table: &aterm_sysprobe::volumes::Table,
     looked: &mut disk_ask::Looked,
+    store: &Store,
 ) {
     use aterm_agent::harness::disk::{reserve, worktree};
     let mut schedule = DISK_WORKTREES
@@ -28434,6 +28528,12 @@ fn disk_worktree_look(
     );
     let open = worktree::open_sessions(home);
     let transcripts = home.join(".claude").join("projects");
+    let roster = disk_worktree_roster(store);
+    let record = atpkg::build_start::record();
+    let starts = record
+        .as_deref()
+        .map(atpkg::build_start::read)
+        .unwrap_or_default();
     let look = aterm_agent::harness::cli::WorktreeLook {
         state,
         home,
@@ -28443,6 +28543,9 @@ fn disk_worktree_look(
         session_cwd_unknown: unknown.as_deref(),
         open: &open,
         table: Some(table),
+        roster: Some(&roster),
+        starts: &starts,
+        record: record.as_deref(),
     };
     let done = aterm_agent::harness::cli::disk_worktree_step(&look, config, &mut schedule, &|| {
         lock.validate_for(&lock_path).is_ok()
@@ -28451,14 +28554,27 @@ fn disk_worktree_look(
     disk_reclaimed(looked, done.freed());
     if !done.removed.is_empty() {
         aterm_log::info!(
-            "harness disk watch: removed {} merged worktree(s) ({}), {} back",
+            "harness disk watch: removed {} worktree(s) ({}), {} back",
             done.removed.len(),
             done.removed
                 .iter()
                 .map(|r| r.path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", "),
-            atpkg::cost::human_bytes(done.freed())
+            atpkg::cost::human_bytes(done.removed_bytes())
+        );
+    }
+    if !done.given_back.is_empty() {
+        aterm_log::info!(
+            "harness disk watch: shared build directories of worktrees that stay: {} went ({}), \
+             {} back",
+            done.given_back.len(),
+            done.given_back
+                .iter()
+                .map(|g| g.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            atpkg::cost::human_bytes(done.given_back_bytes())
         );
     }
     if let Some(why) = &done.unfinished {
@@ -28570,13 +28686,17 @@ fn disk_look_pass(
         now,
     );
     let reserve = aterm_agent::harness::disk::reserve::path_for(&home);
-    if private.is_none() {
+    let reserve_look = |looked: &mut disk_ask::Looked| {
+        if private.is_some() {
+            return;
+        }
         match aterm_agent::harness::cli::disk_reserve_look(
             &state,
             &reserve,
             level,
             free,
             &thresholds,
+            room,
             now,
         ) {
             aterm_agent::harness::cli::ReserveMove::Kept
@@ -28600,8 +28720,17 @@ fn disk_look_pass(
                 );
             }
         }
+    };
+    // At an emergency the reserve goes FIRST, before anything this look writes. Its write, as
+    // large as the emergency line once the room is, waits until the look has read its sessions'
+    // screens, so a resume the recovered volume admits is not held behind it.
+    if level == Level::Emergency {
+        reserve_look(looked);
     }
     disk_sightings(board, seen, level, free, &state, now);
+    if level != Level::Emergency {
+        reserve_look(looked);
+    }
     if level == Level::Unknown {
         let _ = DISK_RUNS.admit(false, board);
         return;
@@ -28664,8 +28793,21 @@ fn disk_look_pass(
     {
         let pressed = config.below_warn(free) || projected.is_some();
         if private.is_none() && demand.is_none() && !pressed {
-            disk_worktree_look(&home, &state, now, config, &table, looked);
+            disk_worktree_look(&home, &state, now, config, &table, looked, store);
         }
+    }
+    // Every look of the owner's watch reads the episode's end, the looks that run no pass too, so
+    // a volume read back out of its emergency ends its wait and memo before the next one opens.
+    if private.is_none() {
+        aterm_agent::harness::cli::disk_emergency_look(
+            &state,
+            &mut DISK_EMERGENCY
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            level,
+            free,
+            thresholds.emergency,
+        );
     }
     if !DISK_RUNS.admit(
         (config.below_warn(free) || demand.is_some() || projected.is_some())
@@ -28784,20 +28926,36 @@ fn disk_look_pass(
     } else {
         level
     };
-    let due = demand.is_some()
-        || disk_pass_due(
+    let live = || {
+        aterm_agent::harness::disk::budget::live_digest(
+            sids.iter().map(String::as_str),
+            cwds.iter().map(std::path::PathBuf::as_path),
+        )
+    };
+    // An emergency pass that wrote `cannot-meet` waits for free space, an agent's ask, a lock,
+    // the clock or the live sessions to move, not for the interval.
+    let look = aterm_agent::harness::disk::cadence::Look {
+        at: started,
+        unix: now,
+        level: pass_level,
+        free,
+        room: room.unwrap_or(0),
+        poked,
+        demand: demand.is_some(),
+    };
+    let due = DISK_EMERGENCY
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(
             &mut DISK_LAST_PASS
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
-            started,
-            pass_level,
-            free,
-            poked,
-            room.unwrap_or(0),
+            &look,
+            || Some(live()),
         );
     if !due {
         #[cfg(target_os = "macos")]
-        disk_worktree_look(&home, &state, now, config, &table, looked);
+        disk_worktree_look(&home, &state, now, config, &table, looked, store);
         // Back above the floor with no pass due: the run of short passes
         // ends, and with it the owner's low-disk line.
         if reading.at_or_above_floor(free)
@@ -29118,14 +29276,17 @@ fn disk_look_pass(
         let went = done.went();
         aterm_log::info!(
             "harness disk watch: {} ({} GiB free against a {} GiB warning and a {} GiB floor), \
-             freed about {} — {} build director{} of ended owners, whole, {} in part; {} idle \
-             build director{} of live checkouts emptied (tier 3); and the incremental caches \
-             of {} cargo profile{}; each is listed in {}",
+             freed about {} — {} piece{} of what builds that died left (tier 0); {} build \
+             director{} of ended owners, whole, {} in part; {} idle build director{} of live \
+             checkouts emptied (tier 3); and the incremental caches of {} cargo profile{}; each \
+             is listed in {}",
             level.as_str(),
             free.map_or(0, |f| f >> 30),
             config.warn_free_gib,
             config.auto_free_gib,
             aterm_agent::harness::disk::human_bytes(done.freed_bytes),
+            went.died,
+            if went.died == 1 { "" } else { "s" },
             went.whole,
             if went.whole == 1 { "y" } else { "ies" },
             went.in_part,
@@ -29210,6 +29371,30 @@ fn disk_look_pass(
         note,
     );
     disk_episode_after(board, level_after, freed_bytes, &went);
+    {
+        let done = match &tick {
+            aterm_agent::harness::cli::DiskTick::Reclaimed(done, _) => Some(done),
+            aterm_agent::harness::cli::DiskTick::Plenty => None,
+        };
+        let mut emergency = DISK_EMERGENCY
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let (Some(key), Some(total)) = (home_key.as_ref(), total) {
+            let volume = key.spelled();
+            let at = aterm_agent::harness::cli::EmergencyAt {
+                state: &state,
+                now,
+                level: pass_level,
+                volume: &volume,
+                total,
+                line: thresholds.emergency,
+                live: live(),
+            };
+            aterm_agent::harness::cli::disk_emergency_end(&at, &mut emergency, done, swept, after);
+        } else {
+            emergency.reset();
+        }
+    }
     disk_pass_ran(
         started,
         free,
@@ -29785,12 +29970,18 @@ use aterm_agent::harness::disk::cadence::{
     LOW_EVERY_MAX as DISK_LOW_EVERY_MAX, PASS_EVERY as DISK_PASS_EVERY,
 };
 
-/// The last pass ([`disk_pass_due`]).
+/// The last pass ([`aterm_agent::harness::disk::cadence::due`]).
 type DiskPass = aterm_agent::harness::disk::cadence::Pass;
 
 static DISK_LAST_PASS: Mutex<Option<DiskPass>> = Mutex::new(None);
 
+/// An emergency pass that could not meet the line, and what it waits for
+/// ([`aterm_agent::harness::disk::cadence::Emergency`]).
+static DISK_EMERGENCY: Mutex<aterm_agent::harness::disk::cadence::Emergency> =
+    Mutex::new(aterm_agent::harness::disk::cadence::Emergency::NONE);
+
 /// Whether a look at `now` (the volume at `level`, `free` bytes free, `poked` since the last look, `room` bytes its room) runs a pass.
+#[cfg(test)]
 fn disk_pass_due(
     last: &mut Option<DiskPass>,
     now: Instant,

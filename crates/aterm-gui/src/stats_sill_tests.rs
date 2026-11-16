@@ -648,9 +648,10 @@ fn sill_frame_at(
     }
 }
 
-/// Where each panel and stroke of `prims` is placed, as `(index, [x0, y0, x1, y1])`: its
-/// rect cut to the clips around it. One its clips cut away whole is left out. A rounded
-/// stroke's line is centred on its rect's edge, so half of it falls outside the rect.
+/// Where each panel and stroke of `prims` is inked, as `(index, [x0, y0, x1, y1])`: a panel's
+/// rect, and the px a stroke's line is drawn in ([`crate::tray_raster::stroke_px`]: a rounded
+/// stroke's line is centred on its rect's edge, so half of it falls outside the rect), each
+/// cut to the clips around it. One its clips cut away whole is left out.
 fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
     let mut clips: Vec<[f32; 4]> = Vec::new();
     let mut out = Vec::new();
@@ -664,7 +665,17 @@ fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
                 clips.pop();
                 continue;
             }
-            DrawPrim::Panel { x, y, w, h, .. } | DrawPrim::Stroke { x, y, w, h, .. } => {
+            DrawPrim::Panel { x, y, w, h, .. } => [x, y, x + w, y + h],
+            DrawPrim::Stroke {
+                x,
+                y,
+                w,
+                h,
+                radius,
+                width,
+                ..
+            } => {
+                let (x, y, w, h) = crate::tray_raster::stroke_px((x, y, w, h), radius, width);
                 [x, y, x + w, y + h]
             }
             _ => continue,
@@ -691,14 +702,11 @@ fn inked(prims: &[DrawPrim]) -> Vec<(usize, [f32; 4])> {
 ///   [`sill_card_px`] are not 0); a frame that has this fault is judged no further.
 /// - `KIND`: the Sill draws panels, strokes and clips, which the `CARD` law places.
 /// - `CLIP`: each clip the Sill opens it closes.
-/// - `CARD`: no panel or stroke is placed outside the card ([`inked`]). Two things the Sill
-///   paints today pass it and are not in a window's picture. A rounded rim placed on the
-///   card's last row has half its line under the card, which the card's raster cuts (the
-///   GPU tank at 1×, on a 6 or 7 px card). And where the width law folds a column, its
-///   pressure cap and its ◢ are placed after the last column, a column gap past the Sill's
-///   right end, which is the frame's right edge where the side pad is that gap's 12 pt:
-///   those are let past the right edge here and nowhere else. `docs/KNOWN_ISSUES.md` has
-///   both, ATERM-KI-1114-182 and ATERM-KI-1114-181.
+/// - `CARD`: no panel or stroke is inked outside the card ([`inked`]), a rounded rim's line
+///   included, half of which falls outside its rect: the GPU tank's rim keeps its top line
+///   and its bottom line on the card's rows at 1× as at 2×. And no region that answers the
+///   pointer reaches past the frame's sides: a folded column's pressure cap and ◢, with
+///   their regions, are in the frame like everything else. Nothing is let past.
 /// - `TAB`: the Tab lane draws, and answers the pointer in each column the frame has, only
 ///   with two or more tabs and only where the card holds its row; elsewhere the columns
 ///   place nothing in that row.
@@ -755,26 +763,23 @@ fn sill_faults(snap: &Snapshot, f: &SillFrame) -> Vec<String> {
     };
     let pad = win.px(win.pad_pt) as f32;
     let fold = Fold::of(((w - pad).max(pad) - pad) / win.scale.max(0.5));
-    // Where a folded column's cap or ◢ starts: its region's left edge.
-    let folded_from = [
-        (Instrument::Memory, fold.memory),
-        (Instrument::Disk, fold.disk),
-    ]
-    .into_iter()
-    .filter(|(_, kept)| !kept)
-    .flat_map(|(i, _)| {
-        f.hits
-            .iter()
-            .filter(move |h| h.instrument() == i && h.bar() == Bar::Global)
-            .map(|h| h.rect.0)
-    })
-    .fold(f32::INFINITY, f32::min);
     for &(i, [x0, y0, x1, y1]) in &boxes {
-        if x0 < 0.0 || y0 < 0.0 || y1 > card_h || (x1 > w && x0 < folded_from) {
+        if x0 < 0.0 || y0 < 0.0 || y1 > card_h || x1 > w {
             faults.push(format!(
-                "CARD: prim {i} is placed at x {x0}..{x1}, y {y0}..{y1}, outside the {w} x \
+                "CARD: prim {i} is inked at x {x0}..{x1}, y {y0}..{y1}, outside the {w} x \
                  {card_h} px card: {:?}",
                 f.prims[i]
+            ));
+        }
+    }
+    for h in &f.hits {
+        let (x, _, hw, _) = h.rect;
+        if x < 0.0 || x + hw > w {
+            faults.push(format!(
+                "CARD: the {:?} {:?} region at x {x}..{} is outside the {w} px frame",
+                h.instrument(),
+                h.bar(),
+                x + hw
             ));
         }
     }
@@ -866,6 +871,16 @@ fn sill_faults(snap: &Snapshot, f: &SillFrame) -> Vec<String> {
         }
     }
     faults
+}
+
+/// The region of the folded disk's ◢ in `f`.
+fn wedge_region(f: &mut SillFrame) -> &mut (f32, f32, f32, f32) {
+    &mut f
+        .hits
+        .iter_mut()
+        .find(|h| h.instrument() == Instrument::Disk && h.bar() == Bar::Global)
+        .expect("the folded disk's ◢")
+        .rect
 }
 
 /// The laws each fault of `faults` names, in order, once each.
@@ -1166,4 +1181,71 @@ fn the_sill_gallery_keeps_every_scene_inside_its_card_at_both_scales() {
     folded.window.w_pt = OWNER_W as f32;
     let faults = sill_faults(&snap, &folded);
     assert_eq!(laws(&faults), ["FOLD"], "CONTROL: {faults:#?}");
+
+    // A folded disk's ◢ and its region one column gap past the Sill's right end, where the
+    // Sill placed them before their slot came off the columns' room: the frame's right edge,
+    // since the side pad is that gap's 12 pt. After the memory column (700 pt) and after
+    // the pressure cap's slot (450 pt), in the hot-hard scene, whose disk fills.
+    let wedge = rgba(
+        disk_wedge(&snap, &inks).expect("the hot-hard disk fills"),
+        0xFF,
+    );
+    for w_pt in [700.0, 450.0] {
+        let mut past = frame(SillWindow { w_pt, ..window });
+        assert_eq!(sill_faults(&snap, &past), Vec::<String>::new(), "{w_pt} pt");
+        let px = |pt: f32| past.window.px(pt) as f32;
+        let (w, gap) = (px(w_pt), px(COL_GAP_PT));
+        let right = w - px(PAD_PT);
+        assert_eq!(right + gap, w, "{w_pt} pt");
+
+        // The ◢'s region alone, reaching a px past the frame's right edge over its ◢.
+        let mut wide = frame(SillWindow { w_pt, ..window });
+        let region = wedge_region(&mut wide);
+        region.2 = w + 1.0 - region.0;
+        let faults = sill_faults(&snap, &wide);
+        assert_eq!(laws(&faults), ["CARD"], "CONTROL: {w_pt} pt: {faults:#?}");
+        assert_eq!(faults.len(), 1, "CONTROL: the region alone: {faults:#?}");
+
+        // The ◢ and its region where the Sill placed them.
+        let region = wedge_region(&mut past);
+        let (from, slot) = (region.0, region.2);
+        let dx = right + gap - from;
+        assert!(dx > 0.0, "{w_pt} pt: the ◢ is inside the Sill's right end");
+        region.0 += dx;
+        for p in &mut past.prims {
+            if let DrawPrim::Panel { x, fill, .. } = p
+                && *fill == wedge
+                && (from..from + slot).contains(&*x)
+            {
+                *x += dx;
+            }
+        }
+        let faults = sill_faults(&snap, &past);
+        assert_eq!(laws(&faults), ["CARD"], "CONTROL: {w_pt} pt: {faults:#?}");
+    }
+
+    // A 1× tank whose rect ends on the card's last row, as the Sill placed it on a 6 px card
+    // before its rim was held on the card: the rim's bottom line is under the card. And one
+    // whose rect starts on the card's first row: its top line is over the card.
+    let tight = at_1440(1.0, PAD_PT);
+    let card_h = tight.card() as f32;
+    for (y, h) in [(1.0, card_h - 1.0), (0.0, card_h - 1.0)] {
+        let mut tank = frame(tight);
+        let (gx, _, gw, _) = tank
+            .hits
+            .iter()
+            .find(|h| h.instrument() == Instrument::Gpu)
+            .expect("the GPU tank")
+            .rect;
+        let mut p = Painter::new(&inks, 1.0, tight.geom().font_px, false);
+        p.tank((gx + 1.0, y, gw - 2.0, h), Mark::still(0.5), None, 2.0);
+        tank.prims.extend(p.prims);
+        let faults = sill_faults(&snap, &tank);
+        assert_eq!(
+            laws(&faults),
+            ["CARD"],
+            "CONTROL: a tank at y {y}..{}: {faults:#?}",
+            y + h
+        );
+    }
 }

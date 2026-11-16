@@ -13,7 +13,8 @@ use crate::{
         signatures::{Facts, Identified},
     },
 };
-use astream_wire::Offset;
+use astream_wire::{Offset, sync::Digest};
+use aterm_digest::Sha256;
 use aterm_journal::Log;
 use std::borrow::Cow;
 
@@ -44,6 +45,50 @@ pub(super) fn read(
 ) -> Result<Replay> {
     let mut replay = Builder::new(acknowledged, pending);
     let mut offset = Offset::ZERO;
+    loop {
+        let batch = log.read_range(offset, 256)?;
+        if batch.is_empty() {
+            break;
+        }
+        for entry in batch {
+            offset = replay.push(std::sync::Arc::unwrap_or_clone(entry))?;
+        }
+    }
+    replay.finish()
+}
+
+/// [`read`] of the records after the prefix `held` witnesses, which a store kept across sessions
+/// already holds (`super::kept`): each record from `held.count` on is identified and its chain
+/// continued from `held`, and the claim judged as a whole replay judges it. The prefix itself is
+/// not read again; `last` judges the record that ends it, which the log must still hold: its
+/// identifier, receipt time and conflict flag as the kept store holds that offset.
+///
+/// # Errors
+/// As [`read`]; the claim acknowledges fewer records than `held` or another prefix; or the log
+/// no longer holds the prefix's last record as `last` judges it.
+pub(super) fn read_after(
+    log: &mut Log,
+    held: Witness,
+    acknowledged: impl Into<Boundary>,
+    last: impl FnOnce(&Digest, u64, bool) -> bool,
+) -> Result<Replay> {
+    let mut replay = Builder::after(held, acknowledged)?;
+    if let Some(before) = held.count.checked_sub(1) {
+        let record = log
+            .read_range(Offset(before), 1)?
+            .into_iter()
+            .next()
+            .filter(|record| record.seq.0 == before)
+            .ok_or_else(|| Error::new("table history lost acknowledged custody records"))?;
+        // The chain before it is the kept store's: only the record's own bytes are judged here.
+        let (wire, received_ms, conflict) = parts(std::sync::Arc::unwrap_or_clone(record))?;
+        if !last(&Sha256::digest(&wire), received_ms, conflict) {
+            return Err(Error::new(
+                "acknowledged table history differs from custody witness",
+            ));
+        }
+    }
+    let mut offset = Offset(held.count);
     loop {
         let batch = log.read_range(offset, 256)?;
         if batch.is_empty() {
@@ -95,11 +140,9 @@ fn identify(record: astream_broker::BrokerRecord, before: Witness) -> Result<Lin
     identify_with(record, before, None)
 }
 
-fn identify_with(
-    record: astream_broker::BrokerRecord,
-    before: Witness,
-    facts: Option<&Facts>,
-) -> Result<Linked> {
+/// A table journal record's wire, receipt time and conflict flag: a record of neither table
+/// subject, or one too short for its receipt time, is foreign.
+fn parts(record: astream_broker::BrokerRecord) -> Result<(Vec<u8>, u64, bool)> {
     if !matches!(record.subject.as_str(), SUBJECT | CONFLICT_SUBJECT) || record.body.len() < 8 {
         return Err(Error::new("foreign table journal record"));
     }
@@ -107,11 +150,21 @@ fn identify_with(
     let conflict = record.subject == CONFLICT_SUBJECT;
     let mut wire = record.body;
     wire.drain(..8);
+    Ok((wire, received_ms, conflict))
+}
+
+fn identify_with(
+    record: astream_broker::BrokerRecord,
+    before: Witness,
+    facts: Option<&Facts>,
+) -> Result<Linked> {
+    let seq = record.seq.0;
+    let (wire, received_ms, conflict) = parts(record)?;
     let wire = match facts {
         Some(facts) => Identified::new_with(wire, Some(facts)),
         None => Identified::new(wire),
     };
-    let through = before.advance(record.seq.0, wire.id(), received_ms)?;
+    let through = before.advance(seq, wire.id(), received_ms)?;
     Ok(Linked {
         wire,
         received_ms,
@@ -155,6 +208,27 @@ struct Claim {
     prefix_checked: bool,
 }
 impl Claim {
+    /// The claim's steps for a chain that continues from `held`, a prefix a kept store holds:
+    /// the claim must acknowledge at least that prefix, and exactly it where it acknowledges as
+    /// many records.
+    fn after(boundary: impl Into<Boundary>, held: Witness) -> Result<Self> {
+        let boundary = boundary.into();
+        let acknowledged = boundary.acknowledged();
+        if acknowledged.count < held.count
+            || (acknowledged.count == held.count && acknowledged != held)
+        {
+            return Err(Error::new(
+                "acknowledged table history differs from custody witness",
+            ));
+        }
+        Ok(Self {
+            acknowledged,
+            end: boundary.end(),
+            through: held,
+            prefix_checked: acknowledged == held,
+        })
+    }
+
     fn new(boundary: impl Into<Boundary>) -> Self {
         let boundary = boundary.into();
         let acknowledged = boundary.acknowledged();
@@ -239,6 +313,41 @@ pub(super) fn witnessed(
     })
 }
 
+/// [`witnessed`] of the records after the prefix `held` witnesses, which a store kept across
+/// sessions already holds (`super::kept`): the same judgments of the claim, and the chain through
+/// the prefix's last link must be `held`, so these links continue the kept records. `None` where
+/// it is not: the caller replays the journal in full.
+pub(super) fn witnessed_after(
+    links: &[Linked],
+    refused: Option<Error>,
+    acknowledged: impl Into<Boundary>,
+    held: Witness,
+) -> Result<Option<Replay>> {
+    let boundary = acknowledged.into();
+    let count = witnessed_count(links, refused, boundary)?;
+    let start = usize::try_from(held.count)
+        .map_err(|_| Error::new("table witness count exceeds this reader"))?;
+    if start > count {
+        return Ok(None);
+    }
+    let through = start
+        .checked_sub(1)
+        .map_or(Some(Witness::default()), |last| {
+            links.get(last).map(|link| link.through)
+        });
+    if through != Some(held) {
+        return Ok(None);
+    }
+    Ok(Some(Replay {
+        entries: links[start..count]
+            .iter()
+            .cloned()
+            .map(Linked::entry)
+            .collect(),
+        witness: boundary.acknowledged(),
+    }))
+}
+
 /// Custody-verified operation IDs for repair ordering alone. No envelope is authenticated or
 /// classified here; these IDs cannot establish an inventory or convergence evidence.
 pub(super) fn repair_ids(
@@ -312,6 +421,16 @@ impl Builder {
         }
     }
 
+    /// A writer's replay of the records after `held` ([`read_after`]).
+    fn after(held: Witness, boundary: impl Into<Boundary>) -> Result<Self> {
+        Ok(Self {
+            pending: false,
+            witness: held,
+            claim: Claim::after(boundary, held)?,
+            entries: Vec::new(),
+        })
+    }
+
     fn push(&mut self, entry: astream_broker::BrokerRecord) -> Result<Offset> {
         if self.pending {
             return Err(Error::new("unfinished table enrollment contains records"));
@@ -383,7 +502,7 @@ pub(super) fn restore(
     acknowledged: u64,
     catalog: bool,
     read_only: bool,
-) -> Result<Stored> {
+) -> Result<(Stored, crate::table::Class)> {
     let scope = batch.scope;
     // Store::open_claimed checks live authority around this held-source replay
     // and before finalization. Keep signed-envelope and historical validation
@@ -414,18 +533,22 @@ pub(super) fn restore(
             Err(error) => return Err(error),
         }
     };
+    let class = crate::table::Class::of(&envelope);
     let header = envelope.header;
     if header.id != receipt.id {
         return Err(Error::new("replayed receipt differs from ciphertext"));
     }
-    Ok(Stored {
-        wire: super::StoredWire::Shared(wire),
-        header,
-        receipt,
-        payload,
-        cut: control.cut,
-        checkpoint: control.checkpoint,
-    })
+    Ok((
+        Stored {
+            wire: super::StoredWire::Shared(wire),
+            header,
+            receipt,
+            payload,
+            cut: control.cut,
+            checkpoint: control.checkpoint,
+        },
+        class,
+    ))
 }
 
 #[cfg(test)]

@@ -64,18 +64,82 @@ pub enum Reading {
         /// The Trust toolchain aterm is using is still where Spotlight indexes it.
         toolchain: bool,
     },
-    /// `present` of the `count` repository checkouts and their selected required
-    /// dependencies are ready; `signed_in` is whether aterm's route returns the synced token.
+    /// How the repositories the plan names stand, one class each ([`RepositoryCounts`]);
+    /// `signed_in` is whether aterm's route returns the synced token.
     Repositories {
-        /// Repositories whose checkouts and selected required dependencies are ready.
-        present: usize,
-        /// Repositories the plan names.
-        count: usize,
+        /// The plan's repositories, by where each stands.
+        counts: RepositoryCounts,
         /// aterm's GitHub route hands back the synced token.
         signed_in: bool,
     },
     /// The probe could not go on (its row is blocked), for this reason.
     Waits(Wait),
+}
+
+/// Where each repository a plan names stands, one class each: the GitHub stage's partition
+/// of its inventory, which its acquisition row, `sync.clone` and System State all count and
+/// word alike ([`Self::summary`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryCounts {
+    /// Checkouts here, each with its selected required dependencies.
+    pub ready: usize,
+    /// Matching checkouts without a commit that no current empty-remote proof covers: only a
+    /// read of each remote, which acquires any commits it finds, can verify them.
+    pub unborn: usize,
+    /// Matching checkouts whose selected required dependencies need work.
+    pub dependencies: usize,
+    /// Repositories with nothing at their destination: each is cloned.
+    pub missing: usize,
+    /// Repositories left as they are: something else at the destination, another origin, a
+    /// standard home folder, or work there that setup preserves.
+    pub preserved: usize,
+    /// Checkouts whose required dependencies wait for a capable Git to be read.
+    pub git_waits: usize,
+}
+
+impl RepositoryCounts {
+    /// Every repository the plan names.
+    #[must_use]
+    pub const fn total(&self) -> usize {
+        self.ready
+            + self.unborn
+            + self.dependencies
+            + self.missing
+            + self.preserved
+            + self.git_waits
+    }
+
+    /// Every repository the plan names has a matching checkout here, ready or without a commit.
+    #[must_use]
+    pub const fn all_here(&self) -> bool {
+        self.ready + self.unborn == self.total()
+    }
+
+    /// The one line every reader gives these counts: how many are ready, then each class that
+    /// is not, as `41 of 54 ready; 4 without a commit; 9 to clone`.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        let mut line = format!("{} of {} ready", self.ready, self.total());
+        for (count, words) in [
+            (self.unborn, "without a commit"),
+            (self.dependencies, "needing required dependencies"),
+            (self.missing, "to clone"),
+            (self.git_waits, "waiting for Git"),
+            (
+                self.preserved,
+                if self.preserved == 1 {
+                    "left as it is"
+                } else {
+                    "left as they are"
+                },
+            ),
+        ] {
+            if count > 0 {
+                line.push_str(&format!("; {count} {words}"));
+            }
+        }
+        line
+    }
 }
 
 /// Why a blocked part cannot go on, as its item decided it in its probe: the reason a
@@ -106,11 +170,39 @@ pub enum Wait {
     /// The disk has no room for the repositories left: each clone would take free space below
     /// the line the window's disk watch keeps.
     DiskSpace,
+    /// Another aterm pass holds this account's repository lease (`align.lock`): its clones and
+    /// fetches are under way, and this row reads again once it lets the lease go. Decided before
+    /// any checkout or remote read, so the row waiting on it asks GitHub nothing.
+    OtherPass,
+    /// The shared refresh of the checkouts here failed, and its retry is not due yet: the run
+    /// whose turn it is makes it.
+    SharedRetry,
+}
+
+/// The local fact whose change ends a [`Wait`] ([`Wait::fact`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitFact {
+    /// Git's installation: managed Git or the developer tools' Git.
+    Git,
+    /// aterm's GitHub settings (`~/.config/aterm/init.toml`).
+    Settings,
+    /// The vault's copy on this Mac: the GitHub token and the repository inventory it delivers.
+    Vault,
+    /// This Mac's network, and GitHub answering on it.
+    Network,
+    /// The checkouts in the home folder, where something sits in a repository's way.
+    Checkouts,
+    /// The volume's free space.
+    Disk,
+    /// Another aterm pass's repository lease (`align.lock`), whose release ends the wait.
+    Lease,
+    /// The shared refresh's own retry, which falls due by itself.
+    Due,
 }
 
 impl Wait {
     /// Every reason, for the round trip.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::GitReadiness,
         Self::Settings,
         Self::Token,
@@ -122,6 +214,8 @@ impl Wait {
         Self::RepositoryInventory,
         Self::InTheWay,
         Self::DiskSpace,
+        Self::OtherPass,
+        Self::SharedRetry,
     ];
 
     fn slug(self) -> &'static str {
@@ -137,12 +231,15 @@ impl Wait {
             Self::RepositoryInventory => "repository-inventory",
             Self::InTheWay => "in-the-way",
             Self::DiskSpace => "disk-space",
+            Self::OtherPass => "other-pass",
+            Self::SharedRetry => "shared-retry",
         }
     }
 
     /// What ends this wait (design §3.6): Git becoming ready, GitHub answering again, room on
-    /// the disk (which the disk watch, a finished download or a person frees), or a GitHub token
-    /// the vault delivers (its need is filed in the ledger, never with a person), tried again
+    /// the disk (which the disk watch, a finished download or a person frees), another aterm
+    /// pass letting the repository lease go, the shared refresh's retry falling due, or a GitHub
+    /// token the vault delivers (its need is filed in the ledger, never with a person), tried again
     /// while the run has tries left ([`FailureKind::Transient`]). A credential never waits on a
     /// person. Only aterm's settings
     /// (an account other than the token's included) or an existing repository destination need
@@ -157,7 +254,9 @@ impl Wait {
             | Self::Unreached
             | Self::GitHub
             | Self::RepositoryInventory
-            | Self::DiskSpace => FailureKind::Transient,
+            | Self::DiskSpace
+            | Self::OtherPass
+            | Self::SharedRetry => FailureKind::Transient,
             Self::Settings | Self::OtherAccount | Self::InTheWay => FailureKind::NeedsPerson,
         }
     }
@@ -179,6 +278,28 @@ impl Wait {
             Self::RepositoryInventory => "Waits for repository metadata from the Secrets vault",
             Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
             Self::DiskSpace => "Not enough free disk space for the rest",
+            Self::OtherPass => "aterm's background pass is cloning these; this row follows it",
+            Self::SharedRetry => "Updating these waits for its next try after a failure",
+        }
+    }
+
+    /// The local fact whose change ends this wait: what a run parked on it watches, and the only
+    /// change of the repositories' inputs that ends its park early or starts its retry pace
+    /// afresh. A clone or fetch another pass makes moves the checkouts, which end only a wait on
+    /// a folder in a repository's way ([`WaitFact::Checkouts`]).
+    #[must_use]
+    pub const fn fact(self) -> WaitFact {
+        match self {
+            Self::GitReadiness => WaitFact::Git,
+            Self::Settings | Self::OtherAccount => WaitFact::Settings,
+            Self::Token | Self::TokenUnusable | Self::TokenRefused | Self::RepositoryInventory => {
+                WaitFact::Vault
+            }
+            Self::Unreached | Self::GitHub => WaitFact::Network,
+            Self::InTheWay => WaitFact::Checkouts,
+            Self::DiskSpace => WaitFact::Disk,
+            Self::OtherPass => WaitFact::Lease,
+            Self::SharedRetry => WaitFact::Due,
         }
     }
 
@@ -213,11 +334,16 @@ impl Reading {
                 projects,
                 toolchain,
             } => format!("kept-out:{projects}:{}", u8::from(toolchain)),
-            Self::Repositories {
-                present,
-                count,
-                signed_in,
-            } => format!("repositories:{present}:{count}:{}", u8::from(signed_in)),
+            Self::Repositories { counts, signed_in } => format!(
+                "repositories:{}:{}:{}:{}:{}:{}:{}",
+                counts.ready,
+                counts.unborn,
+                counts.dependencies,
+                counts.missing,
+                counts.preserved,
+                counts.git_waits,
+                u8::from(signed_in)
+            ),
             Self::Waits(wait) => format!("waits:{}", wait.slug()),
         };
         format!("{TOKEN}{body}")
@@ -252,8 +378,14 @@ impl Reading {
                 toolchain: number()? == 1,
             },
             "repositories" => Self::Repositories {
-                present: number()?,
-                count: number()?,
+                counts: RepositoryCounts {
+                    ready: number()?,
+                    unborn: number()?,
+                    dependencies: number()?,
+                    missing: number()?,
+                    preserved: number()?,
+                    git_waits: number()?,
+                },
                 signed_in: number()? == 1,
             },
             "waits" => {
@@ -300,8 +432,8 @@ impl Reading {
             Self::SignedIn => "Signed in".to_owned(),
             Self::DocsInstalled => "Docs indexed".to_owned(),
             Self::BuildsIndexed { .. } => "Builds indexed".to_owned(),
-            Self::Repositories { present, count, .. } if present < count => {
-                format!("{present} of {count}")
+            Self::Repositories { counts, .. } if counts.ready < counts.total() => {
+                format!("{} of {}", counts.ready, counts.total())
             }
             Self::Repositories {
                 signed_in: false, ..
@@ -350,12 +482,8 @@ pub fn standing(row: &ItemReport) -> Standing {
     // A successful operation is not evidence that every repository is present. Read-back's
     // typed inventory owns that fact, including when an older or partial pass reports success.
     if matches!(row.outcome, Outcome::Ok | Outcome::Changed)
-        && let Some(Reading::Repositories {
-            present,
-            count,
-            signed_in,
-        }) = Reading::of(row)
-        && (present != count || !signed_in)
+        && let Some(Reading::Repositories { counts, signed_in }) = Reading::of(row)
+        && (counts.ready != counts.total() || !signed_in)
     {
         return Standing::Differs;
     }
@@ -406,9 +534,22 @@ pub fn failure_note(rows: &[&ItemReport]) -> Option<&'static str> {
 /// description (`detail`) is its worst parts' reasons (`why`), and a row that differs has none
 /// (§3.3). A waiting row's note is the [`Reading::Waits`] reason of the first waiting part that
 /// gives one, and a row that needs a person the remedy of the first such part that gives one
-/// ([`Wait::note`]), never the engine's line.
+/// ([`Wait::note`]), never the engine's line. The GitHub repositories row stands as their
+/// acquisition reads: the refresh of checkouts already here ([`crate::init_github::refresh_row`])
+/// keeps its own row, and neither its fault nor its wait moves this one.
 #[must_use]
 pub fn observation(setting: Setting, rows: &[&ItemReport]) -> Observation {
+    let acquisition: Vec<&ItemReport>;
+    let rows = if setting == Setting::Repositories {
+        acquisition = rows
+            .iter()
+            .copied()
+            .filter(|row| !crate::init_github::refresh_row(row))
+            .collect();
+        acquisition.as_slice()
+    } else {
+        rows
+    };
     let subject = Subject::Setting(setting);
     let Some(standing) = rows
         .iter()
@@ -569,7 +710,7 @@ pub const TOOLCHAIN_NOTE: &str =
 fn wanted(setting: Setting, rows: &[&ItemReport]) -> String {
     if setting == Setting::Repositories
         && let Some(count) = rows.iter().find_map(|row| match Reading::of(row) {
-            Some(Reading::Repositories { count, .. }) => Some(count),
+            Some(Reading::Repositories { counts, .. }) => Some(counts.total()),
             _ => None,
         })
     {

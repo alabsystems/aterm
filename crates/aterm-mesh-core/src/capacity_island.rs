@@ -81,7 +81,7 @@ clean {
         Eq.trans (Nat.add_comm (t + m) S) (Eq.trans (Nat.add_assoc S t m).symm h)
       have h2 : t + m = r := Nat.add_right_cancel (t + m) S r h1
       have h3 : t ≤ r := kr_le_rw t (t + m) r (Nat.le_add_right t m) h2
-      Nat.lt_irrefl r (Nat.lt_of_lt_of_le r S r hr (Nat.le_trans S t r ht h3))
+      Nat.lt_irrefl r (@Nat.lt_of_lt_of_le r S r hr (@Nat.le_trans S t r ht h3))
 
     theorem kr_mod_unique (q m r S : Nat) (h : q * S + m = r + S) (hm : m < S) (hr : r < S) : m = r := by
       cases q with
@@ -89,7 +89,7 @@ clean {
         have h0 : m = r + S :=
           Eq.trans (Eq.trans (Nat.zero_add m).symm (congrArg (fun x => x + m) (Nat.zero_mul S)).symm) h
         have hSm : S ≤ m := kr_le_rw S (r + S) m (Nat.le_add_left S r) h0.symm
-        exact False.elim (Nat.lt_irrefl m (Nat.lt_of_lt_of_le m S m hm hSm))
+        exact False.elim (Nat.lt_irrefl m (@Nat.lt_of_lt_of_le m S m hm hSm))
       | succ q =>
         have h1 : S + q * S + m = r + S :=
           Eq.trans (congrArg (fun x => x + m) (Nat.succ_mul q S)).symm h
@@ -112,7 +112,7 @@ clean {
       rw [Nat.add_assoc a y b, Nat.add_comm y b]
 
     theorem kr_sub_mod (x y S : Nat) (hy : y ≤ x) (hx : x < S) : (x + (S - y)) % S = x - y :=
-      have hyS : y ≤ S := Nat.le_of_lt y S (Nat.lt_of_le_of_lt y x S hy hx)
+      have hyS : y ≤ S := @Nat.le_of_lt y S (Nat.lt_of_le_of_lt y x S hy hx)
       have e : x + (S - y) = (x - y) + S := kr_lin3 x (x - y) (S - y) y S (kr_sub_add_cancel y x hy) (kr_sub_add_cancel y S hyS)
       have hlt : x - y < S := Nat.lt_of_le_of_lt (x - y) x S (Nat.sub_le x y) hx
       Eq.trans (congrArg (fun z => z % S) e) (kr_add_mod_self (x - y) S hlt)
@@ -151,11 +151,11 @@ clean {
       kr_le_sub_of_add_le N C (L - H) (kr_room_split H C N L hr)
 
     theorem kr_room_c (H C N L : Nat) (hr : H + C + N ≤ L) : C ≤ L - H :=
-      Nat.le_trans C (N + C) (L - H) (Nat.le_add_left C N) (kr_room_split H C N L hr)
+      @Nat.le_trans C (N + C) (L - H) (Nat.le_add_left C N) (kr_room_split H C N L hr)
 
     theorem kr_room_h (H C N L : Nat) (hr : H + C + N ≤ L) : H ≤ L :=
-      Nat.le_trans H (H + C + N) L
-        (Nat.le_trans H (H + C) (H + C + N) (Nat.le_add_right H C) (Nat.le_add_right (H + C) N)) hr
+      @Nat.le_trans H (H + C + N) L
+        (@Nat.le_trans H (H + C) (H + C + N) (Nat.le_add_right H C) (Nat.le_add_right (H + C) N)) hr
 
     theorem kr_means_at (h c n l : UInt64) :
         spec_keeps_room h c n l = roomNat h.toNat c.toNat n.toNat l.toNat := by

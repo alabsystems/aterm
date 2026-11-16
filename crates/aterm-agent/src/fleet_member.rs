@@ -779,8 +779,6 @@ struct Opts {
     at: Option<(String, u16)>,
     /// `fleet sync`'s join ([`Synced`]).
     synced: Option<Synced>,
-    /// Set when `join`'s issuer dial failed at connection or per-address capacity.
-    saw_capacity: std::sync::atomic::AtomicBool,
     /// The `_alab._tcp` browse a join reads members' places from once none it knows answered
     /// ([`advertised_places`]); `None`: one of its own, started then.
     adverts: Option<std::sync::Arc<aterm_secrets::discover::Watch>>,
@@ -2124,10 +2122,6 @@ fn join_with_denial_deadline(
     ) {
         Ok(registered) => registered,
         Err(why) => {
-            if why.at_capacity() {
-                opts.saw_capacity
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             say(&out);
             return Err(failed(not_recorded(
                 &issuer_at,
@@ -2711,22 +2705,6 @@ enum JoinFailed {
     Registration(String),
     /// It was; no answer to the registration came.
     Unanswered(String),
-}
-
-impl JoinFailed {
-    /// Whether the failure matches an overloaded issuer listener at connection or per-address
-    /// capacity, so `sync.fleet` retries within minutes instead of waiting a full pass.
-    fn at_capacity(&self) -> bool {
-        match self {
-            Self::Dial(e) => e.at_capacity(),
-            Self::Unanswered(_) => true,
-            Self::PlaceHeld { .. }
-            | Self::OtherKey(_)
-            | Self::Unproved(_)
-            | Self::Denied(_)
-            | Self::Registration(_) => false,
-        }
-    }
 }
 
 impl std::fmt::Display for JoinFailed {
@@ -6526,15 +6504,6 @@ fn sync(places: &Places, args: &[String]) -> Result<String, Failure> {
     }
 }
 
-/// Why [`try_sync_from_cache`] did not finish, and whether the issuer listener was at capacity.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FleetSyncError {
-    /// Human-readable diagnostic.
-    pub why: String,
-    /// `true` when the issuer dial failed at connection or per-address capacity.
-    pub at_capacity: bool,
-}
-
 /// Converge this Mac on the default ALab fleet from the signed vault copy it already applied:
 /// `aterm fleet sync` without the vault sync it makes first, which stays the vault subscriber's
 /// (or the app's) to make, so two of them never materialize at once. It reads aterm's own state
@@ -6545,27 +6514,16 @@ pub struct FleetSyncError {
 /// code cannot be read; or the join or the default grant did not finish (the issuer not
 /// answering, say), for the next pass to try again.
 pub fn sync_from_cache() -> Result<FleetSync, String> {
-    try_sync_from_cache().map_err(|err| err.why)
-}
-
-/// [`sync_from_cache`], preserving whether an issuer refusal came from listener capacity so
-/// `sync.fleet` retries within minutes instead of waiting for the next 30-minute pass.
-///
-/// # Errors
-/// As [`sync_from_cache`], paired with `at_capacity` on [`FleetSyncError`].
-pub fn try_sync_from_cache() -> Result<FleetSync, FleetSyncError> {
-    let places = Places::here().map_err(|err| FleetSyncError {
-        why: err.into_text(),
-        at_capacity: false,
-    })?;
-    let opts = Opts::default();
+    let places = Places::here().map_err(Failure::into_text)?;
     announcing(&places, || {
-        sync_with(&places, false, || vault_code(Fetch::Cache), &opts)
+        sync_with(
+            &places,
+            false,
+            || vault_code(Fetch::Cache),
+            &Opts::default(),
+        )
     })
-    .map_err(|err| FleetSyncError {
-        why: err.into_text(),
-        at_capacity: opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed),
-    })
+    .map_err(Failure::into_text)
 }
 
 /// Sync an isolated machine from its applied, signed fixture vault, using the real join and
@@ -6982,10 +6940,6 @@ fn converge_under_elapsed(
     match join_with_denial_elapsed(places, &opts, code, denial_elapsed) {
         Ok(joined) => Ok(FleetSync::Joined(joined)),
         Err(failure) => {
-            if opts.saw_capacity.load(std::sync::atomic::Ordering::Relaxed) {
-                at.saw_capacity
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-            }
             // Another sync (a person's `aterm fleet sync` beside the pass) may have put this Mac
             // in the code's fleet while this one dialled, which this one's join then reads as a
             // move away from the fleet it began under: the Mac is where the sync brings it.

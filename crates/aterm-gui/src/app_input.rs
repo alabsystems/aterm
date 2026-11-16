@@ -6480,8 +6480,13 @@ impl App {
             ws.initial_frame_settle = None;
         }
         let held = self.held_window_size(target, asked);
+        // No caller asks for a person: the `resize` verb, an xtwinops resize, the hold that
+        // grows a window holding Settings to its least size. The event that reports the size
+        // touches nothing.
+        self.note_own_resize(target, held);
         match os_window {
             Some(w) => {
+                let before = w.inner_size();
                 // Best-effort: the WM may clamp or ignore it, so no local geometry is
                 // written on our own request, except when the backend answers `Some`
                 // (Wayland applies synchronously and sends no `Resized`): that answer is
@@ -6496,6 +6501,10 @@ impl App {
                     self.sync_surface_to_window(target);
                     self.on_resize(target, applied);
                     w.request_redraw();
+                }
+                let after = w.inner_size();
+                if after != before {
+                    self.note_own_resize(target, after);
                 }
             }
             // A headless window has no window manager to ask, so the size the rule holds is the
@@ -7441,6 +7450,12 @@ impl App {
                 .as_ref()
                 .and_then(|key| crate::native_tables::TablesApp::field_input(state, key.as_str()))
                 .is_some_and(|input| input.preedit().is_some()),
+            Some(crate::native_app::AppViewState::Navigator(state)) => state
+                .common
+                .last_focus
+                .as_ref()
+                .and_then(|key| crate::navigator::NavigatorApp::field_input(state, key.as_str()))
+                .is_some_and(|input| input.preedit().is_some()),
             Some(
                 crate::native_app::AppViewState::About(_)
                 | crate::native_app::AppViewState::Recovery(_)
@@ -7547,6 +7562,12 @@ impl App {
                         Some(read(&[cells.as_str()]))
                     }
                 }
+            }
+            Some(crate::native_app::AppViewState::Navigator(state)) => {
+                let key = state.common.last_focus.as_ref()?;
+                let text = crate::navigator::NavigatorApp::field_input(state, key.as_str())?
+                    .selected_text();
+                (!text.is_empty()).then(|| read(&[text]))
             }
             Some(
                 crate::native_app::AppViewState::About(_)
@@ -10064,6 +10085,16 @@ impl App {
                 }
             }
             MenuAction::Workers => self.open_workers_from_menu(),
+            MenuAction::Navigator => {
+                if let Err(error) = self.open_navigator(false) {
+                    self.pending_action_refusal = Some(error);
+                }
+            }
+            MenuAction::NavigatorSplit => {
+                if let Err(error) = self.open_navigator(true) {
+                    self.pending_action_refusal = Some(error);
+                }
+            }
             MenuAction::Mail => {
                 self.open_mail_tab();
             }

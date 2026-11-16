@@ -1,6 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //! Google-only account selection and password entry around the bounded OAuth reader.
+//!
+//! Before it touches anything the script reads the page for a check
+//! ([`crate::harness::headless_oauth::CHECK_PAGE_JS`]'s `checkMet()`), Google's own captcha and its
+//! "Verify it's you" page included, and answers it by its kind with nothing pressed or filled.
 
 pub(super) fn step_js(
     fallback: &str,
@@ -17,12 +21,21 @@ pub(super) fn step_js(
         if (url.startsWith('http://127.0.0.1:') || url.startsWith('chrome-error://')) return {fallback};
         return {{state:'google_refused',url}};
       }}
+{check}
+      const met = checkMet();
+      if (met) return {{state:met.kind,check:met.name,url}};
+      if (document.querySelector('input[name="ca"], #captchaimg')) return {{state:'human_check',check:'captcha',url}};
+      if (document.querySelector('input[name="idvPin"], #idvPin')) return {{state:'block_page',check:'Google',url}};
       const visible = e => e && !e.disabled && e.getClientRects().length > 0;
-      if (Array.from(document.querySelectorAll('iframe[src*="recaptcha"], input[name="ca"], #captchaimg')).some(visible)) return {{state:'google_refused',url}};
       const email = {email};
       const choices = Array.from(document.querySelectorAll('[data-identifier]'));
       const choice = choices.find(e => visible(e) && String(e.getAttribute('data-identifier')).toLowerCase() === email.toLowerCase());
-      if (choice) {{ choice.click(); return {{state:'clicked_consent',url}}; }}
+      if (choice) {{
+        if (choice.dataset.atermGoogleChoiceSent === 'true') return {{state:'consent_pressed',url}};
+        choice.dataset.atermGoogleChoiceSent = 'true';
+        choice.click();
+        return {{state:'clicked_consent',url,doc:String(window.performance && window.performance.timeOrigin || '')}};
+      }}
       const identities = Array.from(document.querySelectorAll('[data-email], [data-identifier], #profileIdentifier'));
       const matches = email.length > 0 && identities.some(e => visible(e) && String(e.getAttribute('data-email') || e.getAttribute('data-identifier') || e.textContent).trim().toLowerCase() === email.toLowerCase());
       const field = Array.from(document.querySelectorAll('input[type="password"]')).find(visible);
@@ -43,7 +56,7 @@ pub(super) fn step_js(
       const sms = Array.from(document.querySelectorAll('input[name="smsPin"], #smsPin')).some(visible) || /\/challenge\/(?:sms|ipp)(?:[/?#]|$)/.test(url);
       if (sms || (authenticator && !matches)) return {{state:'google_refused',url}};
       if (authenticator && !{code_is_authenticator}) return {{state:'google_needs_totp',url}};
-      const emailCode = Array.from(document.querySelectorAll('input[autocomplete="one-time-code" i], input[name*="code" i], input[name*="otp" i], input[inputmode="numeric" i], input[data-testid*="otp" i], input[maxlength="1"], input[name="idvPin"], #idvPin')).some(visible);
+      const emailCode = Array.from(document.querySelectorAll('input[autocomplete="one-time-code" i], input[name*="code" i], input[name*="otp" i], input[inputmode="numeric" i], input[data-testid*="otp" i], input[maxlength="1"]')).some(visible);
       if (emailCode && !matches) return {{state:'google_refused',url}};
       if (!authenticator && emailCode && {code_is_authenticator}) return {{state:'needs_mailbox',url}};
       const result = {fallback};
@@ -51,7 +64,8 @@ pub(super) fn step_js(
       return result;
     }})()"#,
         email = quoted(email.unwrap_or("")),
-        password = quoted(password.unwrap_or(""))
+        password = quoted(password.unwrap_or("")),
+        check = crate::harness::headless_oauth::CHECK_PAGE_JS,
     )
 }
 

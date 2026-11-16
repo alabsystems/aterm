@@ -422,6 +422,34 @@ fn assert_role_contract(what: &str, r: NativeRoles) {
             "{what}: success on the {on}"
         );
     }
+    // A status word in the danger ink stands on a list row's washes too (the navigator's `stuck`,
+    // a Workers row's `Failed`).
+    for (state, wash) in [
+        (
+            "selected",
+            mix_srgb(r.elevated, r.accent, ACCENT_WASH_SELECTED),
+        ),
+        (
+            "pressed",
+            mix_srgb(r.elevated, r.accent, ACCENT_WASH_PRESSED),
+        ),
+        (
+            "hovered",
+            mix_srgb(r.elevated, r.text_primary, ROW_HOVER_WASH),
+        ),
+        (
+            "selected, keys elsewhere",
+            mix_srgb(r.elevated, r.text_tertiary, ACCENT_WASH_SELECTED),
+        ),
+    ] {
+        // The accent ink's target, not the bare 4.5: a small painted word reads under its
+        // computed ratio.
+        let ratio = contrast_ratio(r.danger, wash);
+        assert!(
+            ratio >= ACCENT_TEXT_TARGET - 0.01,
+            "{what}: danger as a status word on a {state} row's wash is {ratio:.2}:1"
+        );
+    }
     assert!(
         contrast_ratio(r.accent, r.surface) >= ACCENT_INK_FLOOR,
         "{what}: accent as a rule on the page"
@@ -723,6 +751,63 @@ fn forced_chrome_themes_meet_the_roles_contract_for_any_carried_accent() {
     assert_eq!(light.bg, FORCED_LIGHT_CHROME_BG);
     assert_eq!(light.fg, FORCED_LIGHT_CHROME_FG);
     assert_eq!(light.selection, THEMES[1].selection);
+}
+
+/// The six grounds a status word in the danger ink stands on: the page, the card, and a list
+/// row's four washes.
+fn danger_grounds(r: &NativeRoles) -> [(&'static str, [u8; 3]); 6] {
+    [
+        ("page", r.surface),
+        ("card", r.elevated),
+        (
+            "selected row",
+            mix_srgb(r.elevated, r.accent, ACCENT_WASH_SELECTED),
+        ),
+        (
+            "pressed row",
+            mix_srgb(r.elevated, r.accent, ACCENT_WASH_PRESSED),
+        ),
+        (
+            "hovered row",
+            mix_srgb(r.elevated, r.text_primary, ROW_HOVER_WASH),
+        ),
+        (
+            "selected row, keys elsewhere",
+            mix_srgb(r.elevated, r.text_tertiary, ACCENT_WASH_SELECTED),
+        ),
+    ]
+}
+
+/// THE DANGER WORD KEEPS ITS FLOOR UNDER HIGH CONTRAST: on each of its six grounds, in every
+/// bundled theme and the hand-written ones, the danger ink meets the accent ink's headroom over
+/// 4.5 with High Contrast on as it does with it off. High Contrast's seed differs only in
+/// chroma, so nothing but the floor holds it there.
+#[test]
+fn danger_keeps_its_floor_on_every_row_ground_with_and_without_high_contrast() {
+    let themes = THEMES
+        .into_iter()
+        .map(|theme| ("hand-written", theme))
+        .chain(bundled_themes());
+    for (name, theme) in themes {
+        for high_contrast in [false, true] {
+            let r = roles(
+                theme,
+                AppearancePreferences {
+                    high_contrast,
+                    text_scale: 1.0,
+                    ..AppearancePreferences::default()
+                },
+            );
+            for (ground, rgb) in danger_grounds(&r) {
+                let ratio = contrast_ratio(r.danger, rgb);
+                assert!(
+                    ratio >= ACCENT_TEXT_TARGET - 0.01,
+                    "{name}, high contrast {high_contrast}: danger on the {ground} is \
+                     {ratio:.2}:1, under {ACCENT_TEXT_TARGET}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

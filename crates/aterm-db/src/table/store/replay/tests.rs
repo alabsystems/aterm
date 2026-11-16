@@ -726,7 +726,7 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     );
     // Negative control: lying about the verified-prefix boundary promotes the
     // exact same unwitnessed tail. The model must reject that unsafe composition.
-    let promoted = session
+    let (promoted, _) = session
         .with_read_batch(f.scope, |batch| {
             restore(batch, f.receipt, Identified::new(f.wire), 1, catalog, false)
         })

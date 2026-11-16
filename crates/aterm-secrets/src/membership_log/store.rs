@@ -5,7 +5,8 @@
 //! §4.1 F13).
 //!
 //! Each [`Record`] is self-delimiting on the wire (`ALM1`), so a stream or store file is the
-//! concatenation of signed record bytes: one record's [`Record::bytes`] is a one-record stream.
+//! concatenation of signed record bytes: one record's [`Record::wire_bytes`] is a one-record
+//! stream.
 
 use super::{
     Body, Kind, Log, MAX_HELD_RECORDS, MAX_RECORD, MAX_WAITING, Record, RecordBudgets, RecordId,
@@ -33,14 +34,26 @@ pub const MAX_RECORDS_STREAM: usize = 64 * 1024 * 1024;
 /// `transport::records_have_url`), which keeps as many as fit, in order.
 pub const HAVE_IDS: usize = 256;
 
-/// Concatenate the signed wire bytes of `records` into one self-delimiting stream.
-#[must_use]
-pub fn encode_records<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<u8> {
+#[cfg(test)]
+#[path = "store/whole_tests.rs"]
+mod whole;
+#[cfg(test)]
+pub(crate) use whole::encode_records;
+
+/// Concatenate the signed wire bytes of `records` into one self-delimiting stream, keeping no
+/// shelved record's bytes it reads ([`Record::wire_bytes`]): records a draft signed or a peer
+/// sent, which are in memory, and the records of a log read through the vault's head, whose
+/// replaced bodies are read back from the records file for this stream alone. Every encoder of
+/// records is fallible, so no stream comes out short where one does not read back.
+///
+/// # Errors
+/// A shelved record cannot be read back as it was.
+pub fn read_records<'a>(records: impl IntoIterator<Item = &'a Record>) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     for record in records {
-        out.extend_from_slice(record.bytes());
+        record.write_to(&mut out)?;
     }
-    out
+    Ok(out)
 }
 
 /// Decode and verify every [`Record`] in `bytes`, refusing the whole stream if any record is
@@ -461,12 +474,18 @@ fn alab_keys() -> Vec<[u8; 32]> {
 pub struct Store {
     compiled: Option<RecordId>,
     network: Option<RecordId>,
-    log: Option<Log>,
-    unrooted: BTreeMap<RecordId, Record>,
+    pub(super) log: Option<Log>,
+    pub(super) unrooted: BTreeMap<RecordId, Record>,
     lineage: Option<Vec<[u8; 32]>>,
     /// The budgets its log takes when its genesis arrives ([`RecordBudgets::current`] when the
     /// store was made).
     budgets: RecordBudgets,
+    /// Each record of the stream it was recovered from, in the stream's order, with its length,
+    /// where it took every frame of that stream ([`Store::recovering`]): where each record of a
+    /// records file read whole stands in it, which the vault's head names
+    /// ([`super::head::Origin`]) without reading the file again.
+    #[cfg(unix)]
+    pub(super) file_order: Option<std::sync::Arc<[(RecordId, usize)]>>,
 }
 
 /// Drop records waiting on a missing parent, highest id first, until `log` holds at most its
@@ -509,6 +528,8 @@ impl Store {
             unrooted: BTreeMap::new(),
             lineage: None,
             budgets: RecordBudgets::current(),
+            #[cfg(unix)]
+            file_order: None,
         }
     }
 
@@ -533,6 +554,8 @@ impl Store {
             unrooted: BTreeMap::new(),
             lineage: Some(lineage.to_vec()),
             budgets: RecordBudgets::current(),
+            #[cfg(unix)]
+            file_order: None,
         }
     }
 
@@ -658,6 +681,15 @@ impl Store {
     }
 
     fn recover_decoded(mut self, records: Vec<Record>, strict: bool) -> Self {
+        #[cfg(unix)]
+        {
+            self.file_order = strict.then(|| {
+                records
+                    .iter()
+                    .map(|record| (*record.id(), record.wire_len()))
+                    .collect()
+            });
+        }
         if !(strict && self.ingest_records(records.clone()).is_ok()) {
             for record in causal(records, |_| false) {
                 let _ = self.insert(record);
@@ -677,22 +709,59 @@ impl Store {
     }
 
     /// Encode every stored record in deterministic order: causally complete records from genesis
-    /// first, then records waiting on a missing parent by id.
-    #[must_use]
-    pub fn encode(&self) -> Vec<u8> {
-        self.encoded_records()
-            .flat_map(Record::bytes)
-            .copied()
-            .collect()
+    /// first, then records waiting on a missing parent by id ([`Store::write_encoded`]), keeping
+    /// no shelved record's bytes it reads ([`Record::wire_bytes`]).
+    ///
+    /// # Errors
+    /// A shelved record cannot be read back as it was.
+    pub fn read_encoded(&self) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_encoded(&mut out)?;
+        Ok(out)
     }
 
-    /// Write exactly [`Store::encode`]'s canonical signed stream without a whole-stream buffer.
+    /// The bytes of the log's records, each after its parents ([`Store::write_held_from`] from the
+    /// first), keeping no shelved record's bytes it reads ([`Record::wire_bytes`]).
+    ///
+    /// # Errors
+    /// A shelved record cannot be read back as it was.
+    pub fn read_held(&self) -> std::io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.write_held_from(0, &mut out)?;
+        Ok(out)
+    }
+
+    /// The length of the records files the records it shelved are read back from
+    /// ([`super::payload::Source`]), each once: what holding them open keeps on disk after a
+    /// writer replaced them, which the records cache charges ([`Store::footprint`] is what it
+    /// keeps in memory).
+    #[cfg(unix)]
+    pub(crate) fn shelf_len(&self) -> u64 {
+        let mut sources: Vec<&std::sync::Arc<super::payload::Source>> = Vec::new();
+        let records = self
+            .log
+            .iter()
+            .flat_map(|log| log.order.iter().chain(log.waiting.values()));
+        for record in records.chain(self.unrooted.values()) {
+            if let Some(source) = record.wire.source()
+                && !sources
+                    .iter()
+                    .any(|seen| std::sync::Arc::ptr_eq(seen, source))
+            {
+                sources.push(source);
+            }
+        }
+        sources.iter().map(|source| source.len()).sum()
+    }
+
+    /// Write exactly [`Store::read_encoded`]'s canonical signed stream without a whole-stream
+    /// buffer.
     ///
     /// # Errors
     /// The writer fails before the entire stream is written.
     pub fn write_encoded<W: std::io::Write + ?Sized>(&self, writer: &mut W) -> std::io::Result<()> {
         for record in self.encoded_records() {
-            writer.write_all(record.bytes())?;
+            record.write_to(writer)?;
         }
         Ok(())
     }
@@ -706,50 +775,36 @@ impl Store {
         self.held_from(0).iter().chain(pending)
     }
 
-    /// The bytes of the log's records, each after its parents ([`Store::encode`]'s first part):
-    /// what a vault server's records file holds (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23,
-    /// rule 1). Empty for a store with no genesis. A record waiting on a parent is held in memory
-    /// only: a server serves complete records alone ([`Store::missing`]), the complete part of a
-    /// log only grows, so the file changes only by an append of what the log holds past it, and
-    /// it stays within what every reader takes.
-    #[must_use]
-    pub fn encode_held(&self) -> Vec<u8> {
-        self.encode_held_from(0)
-    }
-
-    /// [`Store::encode_held`] past the log's first `from` records: what goes on the end of a
-    /// records file that holds those, already in causal order.
-    #[must_use]
-    pub fn encode_held_from(&self, from: usize) -> Vec<u8> {
-        self.held_from(from)
-            .iter()
-            .flat_map(Record::bytes)
-            .copied()
-            .collect()
-    }
-
-    /// Write exactly [`Store::encode_held_from`]'s complete-record suffix without collecting it.
+    /// Write the bytes of the log's records past its first `from`, each after its parents
+    /// ([`Store::read_encoded`]'s first part), without collecting them: what a vault server's
+    /// records file holds (`docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1 F23, rule 1), or what goes
+    /// on the end of one that holds the first `from`, already in causal order. Nothing for a
+    /// store with no genesis. A record waiting on a parent is held in memory only: a server
+    /// serves complete records alone ([`Store::missing`]), the complete part of a log only grows,
+    /// so the file changes only by an append of what the log holds past it, and it stays within
+    /// what every reader takes.
     ///
     /// # Errors
-    /// The writer fails before every byte is written.
+    /// The writer fails before every byte is written, or a shelved record cannot be read back as
+    /// it was.
     pub fn write_held_from<W: std::io::Write + ?Sized>(
         &self,
         from: usize,
         writer: &mut W,
     ) -> std::io::Result<()> {
         for record in self.held_from(from) {
-            writer.write_all(record.bytes())?;
+            record.write_to(writer)?;
         }
         Ok(())
     }
 
-    /// Exact byte length of [`Store::encode_held_from`]'s complete-record suffix.
+    /// Exact byte length of [`Store::write_held_from`]'s complete-record suffix.
     ///
     /// # Errors
     /// The sum cannot be represented as a byte length.
     pub fn held_len_from(&self, from: usize) -> std::io::Result<usize> {
         self.held_from(from).iter().try_fold(0usize, |sum, record| {
-            sum.checked_add(record.bytes().len()).ok_or_else(|| {
+            sum.checked_add(record.wire_len()).ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "held record length overflow",
@@ -812,12 +867,7 @@ impl Store {
     #[must_use]
     pub(crate) fn encoded_len(&self) -> usize {
         self.log.as_ref().map_or_else(
-            || {
-                self.unrooted
-                    .values()
-                    .map(|record| record.bytes().len())
-                    .sum()
-            },
+            || self.unrooted.values().map(|record| record.wire_len()).sum(),
             |log| log.total_bytes(),
         )
     }
@@ -853,8 +903,9 @@ impl Store {
         }
     }
 
-    /// Whether `id` is held with every parent (not waiting on one).
-    pub(crate) fn holds(&self, id: &RecordId) -> bool {
+    /// Whether `id` is held with every parent (not waiting on one), without reading its bytes.
+    #[must_use]
+    pub fn holds(&self, id: &RecordId) -> bool {
         self.log
             .as_ref()
             .is_some_and(|log| log.held.contains_key(id))
@@ -874,31 +925,24 @@ impl Store {
         }
     }
 
-    /// Exact signed wire bytes of `id` when held.
+    /// The record `id` when held, complete or waiting: its exact signed bytes are
+    /// [`Record::wire_bytes`].
     #[must_use]
-    pub fn get_bytes(&self, id: &RecordId) -> Option<&[u8]> {
+    pub fn record(&self, id: &RecordId) -> Option<&Record> {
         match &self.log {
-            Some(log) => log
-                .get(id)
-                .or_else(|| log.waiting.get(id))
-                .map(Record::bytes),
-            None => self.unrooted.get(id).map(Record::bytes),
+            Some(log) => log.get(id).or_else(|| log.waiting.get(id)),
+            None => self.unrooted.get(id),
         }
     }
 
-    /// Exact signed wire bytes of `id` when held as a causally complete record from genesis.
-    #[must_use]
-    pub fn complete_bytes(&self, id: &RecordId) -> Option<&[u8]> {
-        self.log.as_ref()?.get(id).map(Record::bytes)
-    }
-
-    /// What this store keeps in memory, as the records cache counts it: the wire bytes of every
-    /// record it holds, keeps waiting or keeps before a genesis, and its reachability index's
+    /// What this store keeps in memory, as the records cache counts it: the bytes it keeps of
+    /// every record it holds, keeps waiting or keeps before a genesis (a shelved record's frame
+    /// and whatever was read back of it: [`Record::resident_len`]), and its reachability index's
     /// bytes.
     #[cfg(any(unix, test))]
     pub(crate) fn footprint(&self) -> usize {
         self.log.as_ref().map_or_else(
-            || self.unrooted.values().map(|r| r.bytes().len()).sum(),
+            || self.unrooted.values().map(Record::resident_len).sum(),
             Log::footprint,
         )
     }
@@ -1047,7 +1091,7 @@ impl Store {
             let complete = record.parents().iter().all(|p| log.held.contains_key(p));
             if !complete
                 && (log.order.len() + log.waiting.len() >= log.budgets.held
-                    || log.total_bytes().saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM)
+                    || log.total_bytes().saturating_add(record.wire_len()) > MAX_RECORDS_STREAM)
             {
                 return Err(Error::of_kind(
                     crate::ErrorKind::MembershipCapacity,
@@ -1087,9 +1131,9 @@ impl Store {
         // store with no genesis yet always has room for it, however many records arrived first,
         // and once it lands the store holds no more than its held total and `MAX_RECORDS_STREAM`
         // (what `decode_records` reads back).
-        let unrooted_bytes: usize = self.unrooted.values().map(|r| r.bytes().len()).sum();
+        let unrooted_bytes: usize = self.unrooted.values().map(|r| r.wire_len()).sum();
         if self.unrooted.len() >= MAX_WAITING - 1
-            || unrooted_bytes.saturating_add(record.bytes().len()) > MAX_RECORDS_STREAM - MAX_RECORD
+            || unrooted_bytes.saturating_add(record.wire_len()) > MAX_RECORDS_STREAM - MAX_RECORD
         {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
@@ -1184,7 +1228,7 @@ impl Store {
         parents: &[RecordId],
         refused: Option<&Error>,
     ) -> MemberVerdict {
-        if self.complete_bytes(id).is_some() {
+        if self.holds(id) {
             return MemberVerdict::Applied;
         }
         if self.contains(id) {
@@ -1204,7 +1248,7 @@ impl Store {
             return MemberVerdict::Refused(why);
         }
         if refused.is_some_and(|e| e.kind() == crate::ErrorKind::MembershipCapacity)
-            || parents.iter().any(|p| self.complete_bytes(p).is_none())
+            || parents.iter().any(|p| !self.holds(p))
         {
             return MemberVerdict::Waiting(why);
         }

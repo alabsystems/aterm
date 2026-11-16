@@ -214,27 +214,30 @@ fn the_develop_layer_follows_the_record_and_never_guesses() {
     );
 }
 
-/// Scripts the local git reads [`checkout::kept_here`] performs on `~/aterm`.
+/// Scripts the local git reads [`checkout::kept_here`] performs on `~/aterm`: its record of
+/// facts ([`checkout::facts::tests::listing_of`]: the top of a worktree, not shallow, at `url`,
+/// `main` tracking origin's; on `main` where `branch` says so, else detached, at [`HEAD`];
+/// origin's default branch as last fetched `main`, also at [`HEAD`]), where git reaches origin,
+/// and its `status`.
 pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, status: &str) {
     let path = Path::new("/Users//alice/aterm");
+    let git = || checkout::git(sys, alice, Some(path));
     sys.on(
-        &checkout::Programs::listing(checkout::git(sys, alice, Some(path))).display(),
-        Ran::exit(1, ""),
+        &checkout::facts::rev_parse(sys, alice, path).display(),
+        Ran::ok(&format!(
+            "true\n\n{}\nfalse\n.git/index\n.git/objects/info/alternates\n",
+            path.display()
+        )),
+    );
+    sys.on(
+        &checkout::facts::config_listing(sys, alice, path).display(),
+        Ran::ok(&checkout::facts::tests::listing_of(&[
+            ("remote.origin.url", url),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+        ])),
     );
     for (args, ran) in [
-        (
-            vec!["rev-parse", "--is-inside-work-tree"],
-            Ran::ok("true\n"),
-        ),
-        (vec!["rev-parse", "--show-prefix"], Ran::ok("")),
-        (
-            vec!["config", "--get-all", "remote.origin.url"],
-            Ran::ok(&format!("{url}\n")),
-        ),
-        (
-            vec!["ls-remote", "--get-url", "origin"],
-            Ran::ok(&format!("{url}\n")),
-        ),
         (
             vec!["symbolic-ref", "--quiet", "HEAD"],
             if branch {
@@ -245,17 +248,37 @@ pub(crate) fn script_local(sys: &Fake, alice: &User, url: &str, branch: bool, st
         ),
         (
             vec!["rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
-            Ran::ok("1111111111111111111111111111111111111111\n"),
+            Ran::ok(&format!("{HEAD}\n")),
+        ),
+        (
+            vec!["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+            Ran::ok("refs/remotes/origin/main\n"),
+        ),
+        (
+            vec!["ls-remote", "--get-url", "origin"],
+            Ran::ok(&format!("{url}\n")),
         ),
     ] {
-        sys.on(
-            &checkout::git(sys, alice, Some(path)).args(args).display(),
-            ran,
-        );
+        sys.on(&git().args(args).display(), ran);
     }
+    // The refs the record reads: HEAD's branch where it is on one, and origin's.
+    let origin_main = "refs/remotes/origin/main".to_owned();
+    let wanted = if branch {
+        vec!["refs/heads/main".to_owned(), origin_main]
+    } else {
+        vec![origin_main]
+    };
+    let listed: String = wanted
+        .iter()
+        .map(|reference| format!("{HEAD} commit {reference}\n"))
+        .collect();
+    sys.on(
+        &checkout::facts::ref_listing(sys, alice, path, &wanted).display(),
+        Ran::ok(&listed),
+    );
     sys.on(
         &checkout::Programs::default()
-            .off(checkout::git(sys, alice, Some(path)))
+            .off(git())
             .args(checkout::NO_SIDE_RUNS)
             .args([
                 "status",
@@ -829,6 +852,158 @@ fn a_submodule_head_git_cannot_read_is_never_updated() {
     }
 }
 
+/// `~/aterm`'s submodule item, for alice, as init reads it.
+fn alice_submodules(alice: &User, path: &Path) -> Submodules {
+    Submodules {
+        user: alice.clone(),
+        path: path.to_path_buf(),
+        spelled: "~/aterm".into(),
+        stood: Aside::default(),
+        reader: Reader::Init,
+    }
+}
+
+/// The line of the `git submodule update` [`Submodules::update`] runs in `path`.
+fn submodule_update(sys: &Fake, alice: &User, path: &Path) -> String {
+    checkout::lazily(checkout::network(sys, alice, Some(path)))
+        .args(checkout::NO_SIDE_RUNS)
+        .args([
+            "submodule",
+            "update",
+            "--init",
+            "--checkout",
+            "--progress",
+            "--",
+            SUBMODULE,
+        ])
+        .display()
+}
+
+/// A STALLED VENDOR/ASTREAM UPDATE IS A NETWORK FAILURE, IN ITS OWN RECORD: `git submodule
+/// update` is a transfer ([`System::run_repository`]), so one that made no progress for its
+/// window fails the item saying so, stands nothing aside offline, and ends the submodule's own
+/// destination record (`aterm/vendor/astream`) failed as the network's, with nothing placed (the
+/// submodule was not checked out yet). NEGATIVE CONTROL: the same update with progress succeeds
+/// and ends its record ready, placed and usable.
+#[test]
+fn a_stalled_submodule_update_is_a_network_failure_in_its_own_record() {
+    use crate::repository_progress::{FailureKind, OutcomeReason, Phase};
+    for stalled in [true, false] {
+        let (sys, alice) = alice_with(None);
+        let path = Path::new("/Users//alice/aterm");
+        let update = submodule_update(&sys, &alice, path);
+        if stalled {
+            sys.stall(&update);
+        } else {
+            sys.on(&update, Ran::ok(""));
+        }
+        let item = alice_submodules(&alice, path);
+        let result = item.update(&sys, false);
+        let destination = path.join(SUBMODULE);
+        let observed = sys.repository_observations();
+        let record = observed
+            .iter()
+            .filter(|row| row.destination == destination)
+            .collect::<Vec<_>>();
+        assert!(
+            record.iter().all(|row| row.name == "aterm/vendor/astream"),
+            "stalled={stalled}: {record:?}"
+        );
+        let last = record.last().unwrap();
+        if stalled {
+            let why = result.unwrap_err();
+            assert!(why.contains("stopped: no progress for "), "{why}");
+            assert_eq!(last.phase, Phase::Failed);
+            assert!(!last.placed && !last.usable, "{last:?}");
+            assert_eq!(
+                last.outcome.as_ref().unwrap().reason,
+                OutcomeReason::Failed(FailureKind::Network)
+            );
+        } else {
+            result.unwrap();
+            assert_eq!(last.phase, Phase::Ready);
+            assert!(last.usable && last.placed);
+        }
+        assert!(item.stood.get().is_none(), "stalled={stalled}");
+    }
+}
+
+/// A CHECKED-OUT VENDOR/ASTREAM THAT LAGS IS FETCHED IN AN OBSERVED TRANSFER OF ITS OWN: where
+/// none of its refs reaches the commit the checkout records (the test `git submodule update`
+/// makes before its own fetch, which takes no `--progress` and so shows no meter), init runs
+/// `git fetch --progress` in it through [`System::run_repository`] first. A fetch that stalled
+/// fails the item as the network's, saying it was the fetch, runs no update, and ends the
+/// submodule's record failed at its fetch with the checkout still placed and usable. NEGATIVE
+/// CONTROLS: the same fetch with progress is followed by the update and the record ends ready;
+/// and where a ref already reaches the recorded commit nothing is fetched and the update alone
+/// runs.
+#[test]
+fn a_lagging_submodule_is_fetched_in_an_observed_transfer_before_its_update() {
+    use crate::repository_progress::{FailureKind, OutcomeReason, Phase};
+    const RECORDED: &str = "2222222222222222222222222222222222222222";
+    for (reached, stalled) in [(false, true), (false, false), (true, false)] {
+        let (sys, alice) = alice_with(None);
+        let path = Path::new("/Users//alice/aterm");
+        let inner = path.join(SUBMODULE);
+        sys.on(
+            &checkout::git(&sys, &alice, Some(path))
+                .args(["ls-files", "--stage", "-z", "--", SUBMODULE])
+                .display(),
+            Ran::ok(&format!("160000 {RECORDED} 0\t{SUBMODULE}\0")),
+        );
+        sys.on(
+            &checkout::git(&sys, &alice, Some(&inner))
+                .args(["rev-list", "-n", "1", RECORDED, "--not", "--all"])
+                .display(),
+            if reached {
+                Ran::ok("")
+            } else {
+                Ran::exit(128, &format!("fatal: bad object {RECORDED}\n"))
+            },
+        );
+        let fetch = checkout::network(&sys, &alice, Some(&inner))
+            .args(checkout::NO_SIDE_RUNS)
+            .args(["fetch", "--progress", "--no-recurse-submodules"])
+            .display();
+        if stalled {
+            sys.stall(&fetch);
+        } else {
+            sys.on(&fetch, Ran::ok(""));
+        }
+        let update = submodule_update(&sys, &alice, path);
+        sys.on(&update, Ran::ok(""));
+        let item = alice_submodules(&alice, path);
+        let result = item.update(&sys, true);
+        let calls = sys.calls();
+        let ran = |line: &str| calls.iter().any(|call| call == line);
+        let case = format!("reached={reached} stalled={stalled}");
+        assert_eq!(ran(&fetch), !reached, "{case}: {calls:?}");
+        let observed = sys.repository_observations();
+        let last = observed
+            .iter()
+            .rfind(|row| row.destination == inner)
+            .unwrap();
+        assert!(last.placed && last.usable, "{case}: {last:?}");
+        if stalled {
+            let why = result.unwrap_err();
+            assert!(
+                why.starts_with("git fetch in vendor/astream stopped: no progress for "),
+                "{why}"
+            );
+            assert!(!ran(&update), "{case}: {calls:?}");
+            assert_eq!(last.phase, Phase::Failed);
+            let outcome = last.outcome.as_ref().unwrap();
+            assert_eq!(outcome.stage, Phase::Fetching);
+            assert_eq!(outcome.reason, OutcomeReason::Failed(FailureKind::Network));
+        } else {
+            result.unwrap();
+            assert!(ran(&update), "{case}: {calls:?}");
+            assert_eq!(last.phase, Phase::Ready);
+        }
+        assert!(item.stood.get().is_none(), "{case}");
+    }
+}
+
 /// [`Submodules`] leaves a person's `astream` branch and uncommitted gitlink bump untouched.
 #[test]
 fn a_person_s_astream_branch_and_uncommitted_bump_are_left_as_they_are() {
@@ -1198,25 +1373,12 @@ fn reaches(calls: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Scripts what doctor reads of `~/aterm` past [`script_local`]: origin's default branch as
-/// last fetched (`main`, at `tip`), and a submodule at the commit the tree records with
-/// `submodule.recurse` true.
-fn script_fetched(sys: &Fake, alice: &User, tip: &str) {
+/// Scripts what doctor reads of `~/aterm` past [`script_local`] (whose record holds origin's
+/// default branch as last fetched, `main` at [`HEAD`]): a submodule at the commit the tree
+/// records with `submodule.recurse` true.
+fn script_fetched(sys: &Fake, alice: &User) {
     let path = Path::new("/Users//alice/aterm");
     for (args, ran) in [
-        (
-            vec!["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
-            Ran::ok("refs/remotes/origin/main\n"),
-        ),
-        (
-            vec![
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                "refs/remotes/origin/main^{commit}",
-            ],
-            Ran::ok(&format!("{tip}\n")),
-        ),
         (
             vec!["config", "--get", "submodule.recurse"],
             Ran::ok("true\n"),
@@ -1249,7 +1411,7 @@ fn doctor_reads_the_four_develop_rows_from_this_mac_alone() {
     let scripted = || {
         let (sys, alice) = alice_with(Some(recorded));
         script_local(&sys, &alice, ORIGIN, true, "");
-        script_fetched(&sys, &alice, HEAD);
+        script_fetched(&sys, &alice);
         sys.on(
             DOCTOR_CHECK,
             Ran::exit(0, "verify provision: PASS — 7 rows in place\n"),
@@ -1673,7 +1835,7 @@ fn every_doctor_develop_item_refuses_its_apply_and_runs_nothing() {
     for reader in [Reader::Doctor, Reader::Init] {
         let (sys, alice) = alice_with(None);
         script_local(&sys, &alice, ORIGIN, true, "");
-        script_fetched(&sys, &alice, HEAD);
+        script_fetched(&sys, &alice);
         let ctx = ctx(std::slice::from_ref(&alice));
         let placed = items(
             &alice,

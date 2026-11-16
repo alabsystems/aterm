@@ -161,16 +161,32 @@ pub(super) struct SpendCarry<'a> {
 
 /// What a close's totals read (§8), each `None` where aterm could not read it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct TabTotals {
+pub(crate) struct TabTotals {
+    /// Seconds from the tab's open to its close, of wall time.
+    pub(crate) wall_s: Option<u64>,
     /// CPU-seconds the tab's processes used over its life.
-    cpu_s: Option<u64>,
+    pub(crate) cpu_s: Option<u64>,
     /// The tab's peak memory footprint, MiB: the largest any of its processes alive at its
     /// close reached.
-    peak_mb: Option<u64>,
+    pub(crate) peak_mb: Option<u64>,
     /// Tokens its agents spent (input plus output), from usage reads that saw each run whole.
-    tokens: Option<u64>,
+    pub(crate) tokens: Option<u64>,
     /// The roster's label for the login its agent ran under.
-    account: Option<String>,
+    pub(crate) account: Option<String>,
+}
+
+/// What a tab's close wrote ([`SessionLog::close_tab`]): when and by whom the tab was opened, and
+/// its totals. The machine's session table keeps them in the session's row
+/// ([`crate::session_table`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TabClosed {
+    /// Wall ms of the open.
+    pub(crate) opened_wall: u64,
+    /// Who opened it (its open mark's `by=`); `None` for a place a seamless update carried from a
+    /// build that kept no opener.
+    pub(crate) opened_by: Option<Actor>,
+    /// The close's totals.
+    pub(crate) totals: TabTotals,
 }
 
 /// One `act=close` as the registry lets a placed session go.
@@ -219,6 +235,7 @@ impl SessionLog {
         at: Stamp,
     ) {
         self.tab = Some(place);
+        self.tab_opened_by = Some(by);
         let f = place.fields(TabAct::Open, Some(why));
         let f = match asked.why_text.as_deref() {
             Some(line) => f.clone().text(Key::WhyText, line).unwrap_or(f),
@@ -248,11 +265,11 @@ impl SessionLog {
 
     /// `mark - tab act=close` with the totals (§8): written before the session's own close, and
     /// only for a session an open placed (a session no tab held, a test's registry entry or a
-    /// headless one, has no tab to close).
-    pub(crate) fn close_tab(&mut self, close: TabClose<'_>, at: Stamp) {
-        let Some(place) = self.tab.take() else {
-            return;
-        };
+    /// headless one, has no tab to close). Returns what it wrote ([`TabClosed`]), `None` where no
+    /// open placed it.
+    pub(crate) fn close_tab(&mut self, close: TabClose<'_>, at: Stamp) -> Option<TabClosed> {
+        let place = self.tab.take()?;
+        let opened_by = self.tab_opened_by.take();
         let mut f = place.fields(TabAct::Close, close.why);
         let _ = f.set(
             Key::Out,
@@ -270,13 +287,14 @@ impl SessionLog {
         let spend = std::mem::take(&mut self.spend);
         let tree = spend.tree.unwrap_or_default();
         let totals = TabTotals {
+            wall_s,
             cpu_s: tree.cpu_ns.map(|ns| ns / 1_000_000_000),
             peak_mb: tree.peak_bytes.map(|bytes| bytes / (1024 * 1024)),
             tokens: spend.tokens(),
             account: spend.account,
         };
         let f = [
-            (Key::WallS, wall_s),
+            (Key::WallS, totals.wall_s),
             (Key::CpuS, totals.cpu_s),
             (Key::PeakMb, totals.peak_mb),
             (Key::Tokens, totals.tokens),
@@ -288,6 +306,11 @@ impl SessionLog {
         let account = totals.account.as_deref().unwrap_or(aterm_slog::UNAVAILABLE);
         let f = f.clone().text(Key::Account, account).unwrap_or(f);
         self.tab_mark(f, close.by, at);
+        Some(TabClosed {
+            opened_wall: place.opened_wall,
+            opened_by,
+            totals,
+        })
     }
 
     /// The placed tab now stands in `window`, parked under its Workers tab or not: a move to
@@ -350,9 +373,16 @@ impl SessionLog {
         self.tab
     }
 
-    /// Put back a carried place (`tab v=1`).
-    pub(super) fn carry_tab(&mut self, place: TabPlace) {
+    /// Put back a carried place (`tab v=1`) and who opened it (its `by=`, absent in a line an
+    /// older build wrote).
+    pub(super) fn carry_tab(&mut self, place: TabPlace, opened_by: Option<Actor>) {
         self.tab = Some(place);
+        self.tab_opened_by = opened_by;
+    }
+
+    /// Who opened the placed tab, to carry (`tab v=1 … by=`).
+    pub(super) const fn tab_opened_by(&self) -> Option<Actor> {
+        self.tab_opened_by
     }
 
     /// The agent spend a carry line names, as [`Self::spend_carry`] wrote it.

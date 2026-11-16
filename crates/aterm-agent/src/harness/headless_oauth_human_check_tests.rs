@@ -32,8 +32,6 @@ const CALLBACK: &str = "http://127.0.0.1:9123/callback?code=made-up&state=st_hum
 enum Answer {
     /// This value.
     Value(Value),
-    /// A protocol error, as Chrome answers a read whose page was replaced under it.
-    Replaced,
 }
 
 /// A stand-in browser over the CDP pipes whose page answers the `n`-th evaluation (from 1) of
@@ -76,10 +74,6 @@ fn browser(
                         match page(expression, n) {
                             Answer::Value(value) => json!({"id": id, "result": {
                                 "result": {"type": "object", "value": value}
-                            }}),
-                            Answer::Replaced => json!({"id": id, "error": {
-                                "code": -32000,
-                                "message": "Execution context was destroyed."
                             }}),
                         }
                     }
@@ -127,7 +121,6 @@ fn drive(page: impl FnMut(&str, usize) -> Answer + Send + 'static, reads: usize)
             AUTHORIZE,
             Some(EMAIL),
             (deadline, Duration::ZERO),
-            aterm_spec::wait::MUST_HAPPEN,
             |_, _| Err("no mailbox in a test"),
             |cb| {
                 delivered.push(cb.to_owned());
@@ -166,6 +159,19 @@ fn at(state: &str) -> Answer {
 #[test]
 fn the_sign_in_script_reads_every_check_before_it_acts_and_presses_consent_once() {
     let js = oauth_step_js(Some(EMAIL), Some("123456"), (false, false), None);
+    let widgets = HUMAN_CHECK_KINDS.map(|(_, selectors)| selectors).join(", ");
+    // THE ONE TABLE: every human check's selectors are in the joined list, in the page script's
+    // `humanCheckKinds`, and each is one the HTTP engine's HTML reader reads.
+    for (name, selectors) in HUMAN_CHECK_KINDS {
+        assert!(widgets.contains(selectors), "{name}");
+        assert!(
+            CHECK_PAGE_JS.contains(&format!("[\"{name}\", \"{selectors}\"]")),
+            "{name}"
+        );
+        for selector in selectors.split(',') {
+            assert!(html_selector_supported(selector), "{name}: {selector}");
+        }
+    }
     for widget in [
         "textarea[name='h-captcha-response']",
         "iframe[src*='hcaptcha.com']",
@@ -173,21 +179,17 @@ fn the_sign_in_script_reads_every_check_before_it_acts_and_presses_consent_once(
         "iframe[src*='recaptcha']",
         "input[name='cf-turnstile-response']",
         "iframe[src*='challenges.cloudflare.com']",
+        "iframe[src*='arkoselabs']",
+        "input[name='fc-token']",
     ] {
-        assert!(HUMAN_CHECK_WIDGETS.contains(widget), "{widget}");
+        assert!(widgets.contains(widget), "{widget}");
     }
     let find = |needle: &str| {
         js.find(needle)
             .unwrap_or_else(|| panic!("no {needle}: {js}"))
     };
-    let blocked = find(r#"return { state: "block_page""#);
-    let checked = find(r#"return { state: "bot_check""#);
-    let human = js
-        .find(&format!(
-            r#"if (document.querySelector("{HUMAN_CHECK_WIDGETS}")) return {{ state: "human_check", url: href }};"#
-        ))
-        .expect("the page script misses its human check");
-    assert!(blocked < checked && checked < human, "{js}");
+    assert!(js.contains(CHECK_PAGE_JS));
+    let human = find("if (met) return { state: met.kind, check: met.name, url: href };");
     for act in [
         ".click(",
         "requestSubmit(",
@@ -250,62 +252,46 @@ fn the_sign_in_script_reads_every_check_before_it_acts_and_presses_consent_once(
     );
 }
 
-/// A SIGN-IN PAGE WITH A HUMAN CHECK IS PRESSED NOTHING, AND ITS DEADLINE NAMES IT: the drive
-/// sends the page nothing but its read (no input, no navigation), counts none of its reads among
-/// its steps (more reads than its steps stand before the deadline), reads again where the check
-/// replaced its page under a read, and ends at the deadline naming the human check on its host,
-/// a stop that holds the row's step for a person. CONTROL: a check that goes away by itself,
-/// leaving its page at the callback, lets the drive deliver it.
-/// NEGATIVE CONTROL: with the drive taking `human_check` as any other answer, the read the
-/// check cut short ends it as a browser that could not be driven (`BrowserControl`): `` the
-/// human check was not named ``.
+/// A SIGN-IN PAGE WITH A HUMAN CHECK IS PRESSED NOTHING, AND ITS FIRST READ ENDS THE DRIVE
+/// NAMING IT: the drive sends the page nothing but its read (no input, no navigation past its
+/// start) and ends on that read naming the human check on its host, a stop that holds the row's
+/// step for a person. A check that would have gone away by itself is not waited for either: its
+/// callback is never delivered. NEGATIVE CONTROL: with the drive taking `human_check` as any
+/// other answer, the drive reads on: `` it ends on its first read ``.
 #[test]
 fn a_sign_in_page_with_a_human_check_is_pressed_nothing_and_ends_naming_it() {
-    let reads = MAX_OAUTH_STEPS + 10;
-    let (ended, met, delivered, log) = drive(
-        |_, n| {
-            if n == 3 {
-                Answer::Replaced
-            } else {
-                at("human_check")
-            }
-        },
-        reads,
-    );
-    assert_eq!(
-        met,
-        Some(Met::new(MetWord::HumanCheck, Some("claude.ai"))),
-        "the human check was not named"
-    );
-    assert_eq!(ended, Err(HUMAN_CHECK_MET));
-    let met = met.unwrap();
-    assert!(met.stopped() && met.takes_a_person() && met.word.holds_a_token_step());
-    assert!(delivered.is_empty());
-    assert!(
-        log.iter().filter(|m| *m == "read").count() >= reads,
-        "{log:?}"
-    );
-    assert_eq!(
-        log.iter().filter(|m| *m == "Page.navigate").count(),
-        1,
-        "the page was sent somewhere: {log:?}"
-    );
-    assert!(!log.iter().any(|m| m.starts_with("Input.")), "{log:?}");
-    assert!(log.ends_with(&["Target.closeTarget".to_owned(), "Browser.close".to_owned()]));
-
-    let (ended, met, delivered, _) = drive(
-        |_, n| {
-            if n <= 5 {
-                at("human_check")
-            } else {
-                Answer::Value(json!({"state": "callback", "url": CALLBACK}))
-            }
-        },
-        usize::MAX,
-    );
-    assert_eq!(ended, Ok(()));
-    assert_eq!(met, None);
-    assert_eq!(delivered, [CALLBACK]);
+    for clears_after in [usize::MAX, 2] {
+        let (ended, met, delivered, log) = drive(
+            move |_, n| {
+                if n <= clears_after {
+                    at("human_check")
+                } else {
+                    Answer::Value(json!({"state": "callback", "url": CALLBACK}))
+                }
+            },
+            usize::MAX,
+        );
+        assert_eq!(
+            met,
+            Some(Met::new(MetWord::HumanCheck, Some("claude.ai"))),
+            "the human check was not named"
+        );
+        assert_eq!(ended, Err(HUMAN_CHECK_MET));
+        let met = met.unwrap();
+        assert!(met.stopped() && met.word.is_bot_protection() && met.takes_a_person());
+        assert!(delivered.is_empty(), "{clears_after}");
+        assert_eq!(
+            log.iter().filter(|m| *m == "read").count(),
+            1,
+            "it ends on its first read: {log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|m| *m == "Page.navigate").count(),
+            1,
+            "the page was sent somewhere: {log:?}"
+        );
+        assert!(!log.iter().any(|m| m.starts_with("Input.")), "{log:?}");
+    }
 }
 
 /// A CONSENT CONTROL IS PRESSED ONCE PER PAGE LOAD: on a consent page that stays where it is
@@ -358,4 +344,147 @@ fn a_consent_control_is_pressed_once_per_page_load() {
     assert_eq!(met, None);
     assert_eq!(delivered, [CALLBACK]);
     assert_eq!(log.iter().filter(|m| *m == "read").count(), 2 * LOAD + 1);
+}
+
+/// PROTON'S OWN HUMAN VERIFICATION IS A CHECK OF THE ONE PREDICATE: its captcha frame (on its
+/// account API or its verification host), its captcha node and its `Human verification` modal
+/// are read by the shared predicate itself, the page script's and the HTTP engine's alike, so
+/// every act that reads it (a webmail sign-in's fill and submit included) stops on them. A
+/// Proton sign-in page with none of them is no check.
+/// NEGATIVE CONTROL: with the `Proton` row taken out of `HUMAN_CHECK_KINDS` and
+/// `humanCheckKinds` (the branch's first form, which read it only in the mail reader's own
+/// list), Proton's frame is no check: `` Proton's captcha frame: None ``.
+#[test]
+fn protons_human_verification_is_a_check_of_the_one_predicate() {
+    const LOGIN: &str = "https://account.proton.me/login";
+    for (what, html, check) in [
+        (
+            "Proton's captcha frame",
+            "<html><body><iframe src='https://account-api.proton.me/core/v4/captcha?Token=made-up'></iframe></body></html>",
+            Some(CheckMet::HumanCheck("Proton".into())),
+        ),
+        (
+            "Proton's verification host",
+            "<html><body><iframe src='https://verify.proton.me/?methods=captcha'></iframe></body></html>",
+            Some(CheckMet::HumanCheck("Proton".into())),
+        ),
+        (
+            "Proton's captcha node",
+            "<html><body><div data-testid='human-verification:captcha'></div></body></html>",
+            Some(CheckMet::HumanCheck("Proton".into())),
+        ),
+        (
+            "Proton's modal",
+            "<html><body><h1>Human verification</h1><p>To fight spam and abuse, please complete the verification.</p></body></html>",
+            Some(CheckMet::HumanCheck("captcha".into())),
+        ),
+        (
+            "a plain Proton sign-in",
+            "<html><head><title>Sign in | Proton</title></head><body><h1>Sign in</h1><input name='username'><input type='password' name='password'><button>Sign in</button></body></html>",
+            None,
+        ),
+    ] {
+        assert_eq!(check_in_html(LOGIN, html), check, "{what}: {html}");
+    }
+    assert!(
+        CHECK_PAGE_JS.contains(r#"["Proton", ""#),
+        "the page script's row"
+    );
+    assert!(CHECK_PAGE_JS.contains(r#"const humanCheckHeadings = ["human verification"];"#));
+    // A rendered page whose heading names the check is one too, read by the Rust predicate.
+    let modal = Page {
+        url: LOGIN.to_owned(),
+        heading: "Human verification".to_owned(),
+        ..Page::default()
+    };
+    assert_eq!(
+        check_met(&modal),
+        Some(CheckMet::HumanCheck("captcha".into()))
+    );
+    let plain = Page {
+        url: LOGIN.to_owned(),
+        heading: "Sign in".to_owned(),
+        ..Page::default()
+    };
+    assert_eq!(check_met(&plain), None);
+}
+
+/// THE WEBMAIL STEP READS THE CHECK BEFORE IT ACTS, AND A SIGNED-IN INBOX BY WHAT NO MAIL CAN
+/// PUT THERE: the webmail step's check answer comes before every fill, code fill, submit and
+/// press in the script, and again before it opens a message; on a sign-in page it reads the
+/// whole predicate (`checkMet()`), and once the inbox is up (its rows, no sign-in field) the
+/// mailbox's (`mailboxCheckMet()`), which reads the top document's title against Cloudflare's
+/// whole titles, Cloudflare's marks, Google's `/sorry` page and a widget in the top document,
+/// never the page's words, headings or controls, where a message's subject is, nor a frame,
+/// where its body is.
+/// NEGATIVE CONTROL: with `webmail_script` reading `checkMet()` on the inbox too (the branch's
+/// first form), the inbox scope is gone: `` the inbox is read by the mailbox's predicate ``.
+#[test]
+fn the_webmail_step_reads_the_check_before_it_acts() {
+    let creds = (
+        Some("ada@x.example"),
+        Some("fixture-only"),
+        Some("fixture-only"),
+        Some("123456"),
+    );
+    let mut scripts = vec![webmail_step_js(creds, (false, false, false, false), 0, &[])];
+    #[cfg(unix)]
+    scripts.push(webmail_login_js(creds, (false, false, false, false)));
+    for script in &scripts {
+        assert!(script.contains(CHECK_PAGE_JS));
+        let answer = script
+            .find("if (met) return { state: met.kind, check: met.name, url: href };")
+            .expect("the check's answer");
+        assert!(
+            script.contains("const checkHere = () => inboxUp ? mailboxCheckMet() : checkMet();"),
+            "the inbox is read by the mailbox's predicate"
+        );
+        assert!(script.find("const met = checkHere();").expect("the read") < answer);
+        for act in [
+            "setNativeValue(",
+            "fillCodeInputs(",
+            "submitInput(",
+            "clickSubmit(",
+            ".click(",
+        ] {
+            for (at, _) in script.match_indices(act) {
+                assert!(
+                    answer < at,
+                    "{act} at {at} before the check's answer at {answer}"
+                );
+            }
+        }
+        let open = script.find("chosen.click();").expect("the message's open");
+        assert!(script.find("!checkHere()").expect("the check before it") < open);
+    }
+    // The mailbox's predicate reads no words, headings, controls or frames.
+    let mailbox = CHECK_PAGE_JS
+        .split("const mailboxCheckMet = () => {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n  };").next())
+        .expect("the mailbox's predicate");
+    for read in [
+        "innerText",
+        "textContent",
+        "heads",
+        "humanCheckOf",
+        "checkRoots",
+        "botCheckWords",
+    ] {
+        assert!(
+            !mailbox.contains(read),
+            "the mailbox's predicate reads {read}: {mailbox}"
+        );
+    }
+    for read in [
+        "botCheckTitles.includes(title)",
+        "botCheckMarkers()",
+        "/sorry",
+        "humanCheckKinds",
+    ] {
+        assert!(
+            mailbox.contains(read),
+            "the mailbox's predicate misses {read}: {mailbox}"
+        );
+    }
 }

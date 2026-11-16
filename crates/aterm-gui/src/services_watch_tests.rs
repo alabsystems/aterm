@@ -125,3 +125,156 @@ fn the_status_fields_say_dash_until_read() {
     let b = Board::new(None);
     assert_eq!(b.judge.word(), "-");
 }
+
+/// THE WATCH RESTS FIVE MINUTES WHILE NOTHING NEEDS IT: a reading that follows no service and
+/// finds memory not pressed rests [`SERVICES_CALM`]; a service at the margin under the large bar,
+/// a told episode, the kernel's pressure past normal and no reading yet each read again in a
+/// [`DISK_TICK`]. NEGATIVE CONTROLS: a constant `DISK_TICK` fails the calm row; a constant
+/// `SERVICES_CALM` fails the followed row.
+#[test]
+fn the_watch_rests_long_only_while_nothing_is_followed() {
+    let after = |r: &Reading| {
+        let mut b = Board::new(Some(true));
+        let _ = step(&mut b, 0, Some(r));
+        next_read(&b)
+    };
+    assert_eq!(after(&reading(GIB)), SERVICES_CALM, "calm");
+    assert_eq!(
+        after(&reading(7 * GIB + (512 << 20))),
+        DISK_TICK,
+        "followed from the margin under the large bar"
+    );
+    assert_eq!(
+        next_read(&Board::new(Some(true))),
+        DISK_TICK,
+        "no reading yet"
+    );
+    let mut b = Board::new(Some(true));
+    let _ = step(&mut b, 0, Some(&reading(40 * GIB)));
+    let _ = step(&mut b, HOLD_MS, Some(&reading(40 * GIB)));
+    assert!(b.judge.over().next().is_some(), "told");
+    assert_eq!(next_read(&b), DISK_TICK, "a told episode");
+    let pressed = Reading {
+        pressure_warn: Some(true),
+        ..reading(GIB)
+    };
+    assert_eq!(after(&pressed), DISK_TICK, "pressure past normal");
+}
+
+/// A RING ENDS THE REST before its deadline, and the rest takes it: one heard before a five
+/// minutes' rest ends it at once, and the next rest, given no time, runs to its deadline unrung.
+/// A ring that reaches a parked rest is [`ParkBell`]'s own test
+/// (`park_bell::tests::a_ring_reaches_a_parked_waiter`). NEGATIVE CONTROL: a rest that reads the
+/// ring without taking it answers rung again.
+#[test]
+fn a_ring_ends_the_rest_once() {
+    let bell = ParkBell::new(false);
+    ring_on(&bell);
+    assert!(rest_on(&bell, SERVICES_CALM), "rung before the rest");
+    assert!(!rest_on(&bell, Duration::ZERO), "the ring was taken");
+}
+
+/// What the standby's loop did, in order.
+#[derive(Debug, PartialEq, Eq)]
+enum Did {
+    /// It asked for the lock while another held it, having read `reads` times.
+    Asked {
+        reads: usize,
+    },
+    Read,
+    Rested,
+}
+
+/// THE STANDBY WAITS ON THE LOCK, NOT ON A TIMER: while another process holds it, the watch asks
+/// once (its take blocks), reads nothing and never rests; once the lock is free, a read follows
+/// (a one-minute hang detector, not a budget). NEGATIVE CONTROL: a loop that rests before its
+/// first take (a poll's sleep) rests while the lock is held.
+#[test]
+fn the_standby_blocks_on_the_lock_until_it_is_free() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    let (did, saw) = mpsc::channel();
+    let (free, freed) = mpsc::channel::<()>();
+    let asks = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let watch = std::thread::spawn({
+        let (asks, reads) = (Arc::clone(&asks), Arc::clone(&reads));
+        let (asked, read, rested) = (did.clone(), did.clone(), did);
+        move || {
+            watch_loop(
+                || {
+                    asks.fetch_add(1, Ordering::SeqCst);
+                    let _ = asked.send(Did::Asked {
+                        reads: reads.load(Ordering::SeqCst),
+                    });
+                    freed.recv().ok()
+                },
+                || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let _ = read.send(Did::Read);
+                    (None, SERVICES_CALM)
+                },
+                |_| {},
+                |_| {
+                    let _ = rested.send(Did::Rested);
+                    false
+                },
+            );
+        }
+    });
+    let next = || {
+        saw.recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the loop moved")
+    };
+    assert_eq!(
+        next(),
+        Did::Asked { reads: 0 },
+        "asked once, blocked, before any read or rest"
+    );
+    assert_eq!(asks.load(Ordering::SeqCst), 1);
+    free.send(()).expect("free the lock");
+    assert_eq!(next(), Did::Read, "a read follows the release");
+    assert_eq!(next(), Did::Rested);
+    watch.join().expect("the watch ends");
+    assert_eq!(
+        asks.load(Ordering::SeqCst),
+        1,
+        "one ask for the whole stand-by"
+    );
+}
+
+/// A PRESS ANSWERS FROM THE WATCH'S READING, NEVER WITH A READ OF ITS OWN WHERE THE WATCH HAS
+/// READ: a board that tells the service answers yes and one at rest (following nothing) answers
+/// no, with no read on the press's thread, which would walk the process table on the window's;
+/// only a board nothing has read takes a reading now. NEGATIVE CONTROL: a board at rest that is
+/// read again at the press (as the freshness filter before this test read a board older than a
+/// [`DISK_TICK`]) reads on the press's thread, and the count is 1 before the unread board's.
+#[test]
+fn a_press_answers_from_the_watchs_reading_without_a_read_of_its_own() {
+    use std::cell::Cell;
+    let told = Mutex::new(Board::new(Some(true)));
+    let _ = step(
+        &mut told.lock().expect("board"),
+        0,
+        Some(&reading(40 * GIB)),
+    );
+    let _ = step(
+        &mut told.lock().expect("board"),
+        HOLD_MS,
+        Some(&reading(40 * GIB)),
+    );
+    let calm = Mutex::new(Board::new(Some(true)));
+    let _ = step(&mut calm.lock().expect("board"), 0, Some(&reading(GIB)));
+    assert_eq!(next_read(&calm.lock().expect("board")), SERVICES_CALM);
+    let reads = Cell::new(0);
+    let read = |footprint: u64| {
+        reads.set(reads.get() + 1);
+        Some(reading(footprint))
+    };
+    assert!(holds_in(&told, "fseventsd", || read(GIB)), "told");
+    assert!(!holds_in(&calm, "fseventsd", || read(40 * GIB)), "at rest");
+    assert_eq!(reads.get(), 0, "no read on the press's thread");
+    let unread = Mutex::new(Board::new(Some(true)));
+    assert!(holds_in(&unread, "fseventsd", || read(40 * GIB)), "unread");
+    assert_eq!(reads.get(), 1, "a board nothing has read reads now");
+}

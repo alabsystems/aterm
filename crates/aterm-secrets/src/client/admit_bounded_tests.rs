@@ -5,7 +5,7 @@ use super::*;
 use crate::age::Identity;
 use crate::commons::bootstrap::Device;
 use crate::crossing::{Faults, RecordsBound, inject};
-use crate::membership_log::{Body, Evidence, RecordBudgets};
+use crate::membership_log::{Body, Evidence, RecordBudgets, encode_records};
 
 const ROOT: [u8; 32] = [0x31; 32];
 const WRITER: [u8; 32] = [0x32; 32];

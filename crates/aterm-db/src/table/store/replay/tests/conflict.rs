@@ -1210,7 +1210,7 @@ fn log_enrolled_writer_fork_proof_survives_log_retirement_and_control_journal_fo
     client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
     save_records(
         &lab.paths[1],
-        &load_records(&lab.paths[0]).unwrap().encode(),
+        &load_records(&lab.paths[0]).unwrap().read_encoded().unwrap(),
     )
     .unwrap();
 
@@ -1243,7 +1243,7 @@ fn log_enrolled_writer_fork_proof_survives_log_retirement_and_control_journal_fo
         Evidence::Phrase,
     )
     .unwrap();
-    let log_wire = load_records(&lab.paths[1]).unwrap().encode();
+    let log_wire = load_records(&lab.paths[1]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[0], &log_wire).unwrap();
     save_records(&m3, &log_wire).unwrap();
     let b3 = Bootstrap::required(&m3).unwrap();
@@ -1317,7 +1317,7 @@ fn log_enrolled_writer_fork_proof_survives_log_retirement_and_control_journal_fo
 
     // Retire `m3` in the membership log; the `ACTF1` proof remains authentic and survives replay.
     remove_member_in_log(&lab.paths[0], actor_m3).unwrap();
-    let retired_wire = load_records(&lab.paths[0]).unwrap().encode();
+    let retired_wire = load_records(&lab.paths[0]).unwrap().read_encoded().unwrap();
     save_records(&lab.paths[1], &retired_wire).unwrap();
 
     let s1 = Session::open(&b1).unwrap();

@@ -426,10 +426,9 @@ fn read(
             };
             source
                 .run_until(end, |source| {
-                    source.with_verification(
-                        |source| source.observe_messages(&config.folder, 50, &config.baseline),
-                        |_| Err("Mail session verification unavailable".into()),
-                    )
+                    source.with_renewal(|source| {
+                        source.observe_messages(&config.folder, 50, &config.baseline)
+                    })
                 })
                 .map_err(|reason| Failure {
                     reason,

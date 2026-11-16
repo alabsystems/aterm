@@ -627,6 +627,7 @@ mod unix {
     use aterm_types::http_retry::{Cause, GitObservation};
 
     mod ancestry;
+    mod cache_ancestor;
     mod commit_config;
     mod object_view;
 
@@ -3271,7 +3272,7 @@ mod unix {
 
     /// Consume only fixed-size records from one proven-complete owned native
     /// stream. No whole-history vector/set, path names or partial tail is accepted.
-    fn source_object_batches(
+    fn spooled_object_batches(
         path: &Path,
         children: &Children<'_>,
         deadline: std::time::Duration,
@@ -3283,14 +3284,14 @@ mod unix {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|error| Error::local(format!("complete source inventory: {error}")))?;
+            .map_err(|error| Error::local(format!("complete object inventory: {error}")))?;
         let before = file.metadata().map_err(|e| Error::local(e.to_string()))?;
         if !before.is_file()
             || before.nlink() != 1
             || before.len() > crate::fx::child::MAX_RECORD_SPOOL_BYTES as u64
         {
             return Err(Error::refused(
-                "complete source inventory has unsupported type or size",
+                "complete object inventory has unsupported type or size",
             ));
         }
         let identity = |m: &std::fs::Metadata| {
@@ -3307,7 +3308,7 @@ mod unix {
         if identity(&before)
             != identity(&std::fs::symlink_metadata(path).map_err(|e| Error::local(e.to_string()))?)
         {
-            return Err(Error::refused("complete source inventory route changed"));
+            return Err(Error::refused("complete object inventory route changed"));
         }
         let mut reader = std::io::BufReader::new(file);
         let mut batch = Vec::with_capacity(16_384);
@@ -3324,7 +3325,7 @@ mod unix {
                 break;
             }
             if record.last() != Some(&b'\n') {
-                return Err(Error::protocol("incomplete source inventory record"));
+                return Err(Error::protocol("incomplete object inventory record"));
             }
             record.pop();
             let missing = record.first() == Some(&b'?');
@@ -3332,7 +3333,7 @@ mod unix {
             let oid = std::str::from_utf8(oid)
                 .ok()
                 .filter(|oid| crate::path::is_sha(oid))
-                .ok_or_else(|| Error::protocol("malformed source inventory record"))?;
+                .ok_or_else(|| Error::protocol("malformed object inventory record"))?;
             batch.push(oid.to_owned());
             if batch.len() == 16_384 {
                 consume(index, &batch)?;
@@ -3354,7 +3355,7 @@ mod unix {
                 )
         {
             return Err(Error::refused(
-                "complete source inventory changed during consumption",
+                "complete object inventory changed during consumption",
             ));
         }
         Ok(())
@@ -3756,7 +3757,7 @@ mod unix {
             // This per-operation coverage selects a transfer shape, not integrity or
             // resource authority. Inspect every native graph row even after a miss.
             let mut cache_covers_inventory = true;
-            source_object_batches(&inventory_path, &children, copy_deadline, |index, batch| {
+            spooled_object_batches(&inventory_path, &children, copy_deadline, |index, batch| {
                 let mut input = batch.join("\n");
                 input.push('\n');
                 let key = [
@@ -3815,8 +3816,8 @@ mod unix {
                 }
             } else {
                 // Keep filtered metadata out of the body worker's have set.
-                // An incomplete cache supplies no fetch haves or raw blob wants;
-                // the authenticated exact root supplies full history.
+                // Only a complete cached ancestor may supply fetch haves; the
+                // authenticated exact root still supplies every missing object.
                 let body = private.with_file_name("full-source-body.git");
                 step(
                     "source-body-init",
@@ -3829,34 +3830,36 @@ mod unix {
                     ],
                     None,
                 )?;
-                // This incomplete-cache plan requests the authenticated root
-                // once, never raw blob wants or a protocol-version retry. The
-                // cold worker advertises no borrowed/filtered commits and has
-                // neither a shallow boundary nor a body filter.
+                // A complete cached ancestor can supply actual object DATA
+                // without lending unrelated or partial objects as fetch haves.
+                let ancestor =
+                    cache_ancestor::find(&children, run, cache_common, private, oid, true)?;
+                if let Some(ancestor) = &ancestor {
+                    cache_ancestor::copy(&children, run, cache_common, &body, ancestor, true)?;
+                }
+                let mut args = Vec::new();
+                if ancestor.is_none() {
+                    args.extend([os("-c"), os("fetch.negotiationAlgorithm=noop")]);
+                }
+                args.extend([
+                    os("-c"),
+                    os("fetch.fsckObjects=true"),
+                    os("-c"),
+                    os("transfer.fsckObjects=true"),
+                    os("fetch"),
+                    os("--quiet"),
+                    os("--no-filter"),
+                    os("--no-tags"),
+                    os("--no-write-fetch-head"),
+                    os("--recurse-submodules=no"),
+                ]);
+                if let Some(ancestor) = ancestor {
+                    args.push(os(format!("--negotiation-tip={ancestor}")));
+                }
+                args.extend([os(remote.url()), os(format!("+{oid}:refs/agh/source"))]);
                 let key = [canonical.as_slice(), b"\nfull source exact root"].concat();
                 let fetched = children
-                    .remote_read(
-                        run,
-                        &[
-                            os("-c"),
-                            os("fetch.negotiationAlgorithm=noop"),
-                            os("-c"),
-                            os("fetch.fsckObjects=true"),
-                            os("-c"),
-                            os("transfer.fsckObjects=true"),
-                            os("fetch"),
-                            os("--quiet"),
-                            os("--no-filter"),
-                            os("--no-tags"),
-                            os("--no-write-fetch-head"),
-                            os("--recurse-submodules=no"),
-                            os(remote.url()),
-                            os(format!("+{oid}:refs/agh/source")),
-                        ],
-                        Some(&body),
-                        &key,
-                        None,
-                    )
+                    .remote_read(run, &args, Some(&body), &key, None)
                     .map_err(unsent)?;
                 if fetched.code != Some(0) {
                     return Err(failed(
@@ -4088,8 +4091,10 @@ mod unix {
         )?;
         check_current()?;
         let mut verified_packs = vec![hash.to_owned()];
+        let mut checkout_cache_store = None;
         if let Some((_, cache)) = checkout {
-            if let Some(cache) = cache {
+            let mut checkout_cache_ancestor = None;
+            let checkout_cache_common = if let Some(cache) = cache {
                 let cache = screened(&children, run, cache)?;
                 let view = step("checkout-cache", source_view_args(&cache), None)?;
                 let (common, shallow) = source_view(&view.stdout)?;
@@ -4098,8 +4103,26 @@ mod unix {
                         "checkout cache must have complete commit ancestry",
                     ));
                 }
+                let cache_store = hold_source_store(Path::new(common), None)?;
+                source_stores_disjoint(&pinned, &cache_store)?;
+                checkout_cache_store = Some(cache_store);
+                if let Some(metadata) = scratch {
+                    // Admit against the fresh remote graph before cache DATA
+                    // is borrowed into the metadata presence view.
+                    checkout_cache_ancestor = cache_ancestor::find(
+                        &children,
+                        run,
+                        Path::new(common),
+                        metadata,
+                        oid,
+                        false,
+                    )?;
+                }
                 lend_objects(&children, run, scratch, common, false)?;
-            }
+                Some(PathBuf::from(common))
+            } else {
+                None
+            };
             // Without a lent cache every blob is missing: the metadata fetch took none.
             let presence = match cache {
                 Some(_) => {
@@ -4124,7 +4147,7 @@ mod unix {
             let blobs: Vec<_> = blobs.into_iter().collect();
             // A provider may permit the exact commit but refuse arbitrary blob
             // wants beneath it. Keep the current checkout's complete bodies in
-            // a second, cold repository, never in the promisor metadata view.
+            // a second owned repository, never in the promisor metadata view.
             // Its shallow boundary and config remain private to this request.
             let body_scratch = scratch
                 .unwrap_or(Path::new("scratch.git"))
@@ -4166,28 +4189,40 @@ mod unix {
                         ],
                         None,
                     )?;
-                    // Request an authenticated commit root once, with no borrowed
-                    // refs, alternates, or filtered-history negotiation. Only its
-                    // selected blob IDs are packed into the receiving repository.
-                    let fetched = children
-                        .remote_read(
+                    let ancestor = checkout_cache_ancestor.as_deref();
+                    if let (Some(cache), Some(ancestor)) = (&checkout_cache_common, ancestor) {
+                        cache_ancestor::copy(
+                            &children,
                             run,
-                            &[
-                                os("-c"),
-                                os("fetch.negotiationAlgorithm=noop"),
-                                os("fetch"),
-                                os("--quiet"),
-                                os("--no-tags"),
-                                os("--no-write-fetch-head"),
-                                os("--recurse-submodules=no"),
-                                os("--depth=1"),
-                                os(remote.url()),
-                                os(format!("+{oid}:refs/agh/checkout-body")),
-                            ],
-                            Some(&body_scratch),
-                            &fetch_key,
-                            None,
-                        )
+                            cache,
+                            &body_scratch,
+                            ancestor,
+                            false,
+                        )?;
+                    }
+                    let mut args = Vec::new();
+                    if ancestor.is_none() {
+                        args.extend([os("-c"), os("fetch.negotiationAlgorithm=noop")]);
+                    }
+                    args.extend([
+                        os("fetch"),
+                        os("--quiet"),
+                        os("--no-tags"),
+                        os("--no-write-fetch-head"),
+                        os("--recurse-submodules=no"),
+                        os("--depth=1"),
+                    ]);
+                    if let Some(ancestor) = ancestor {
+                        args.push(os(format!("--negotiation-tip={ancestor}")));
+                    }
+                    args.extend([
+                        os(remote.url()),
+                        os(format!("+{oid}:refs/agh/checkout-body")),
+                    ]);
+                    // The private body worker holds only a checked ancestor's
+                    // complete DATA. Its shallow snapshot never enters the receiver.
+                    let fetched = children
+                        .remote_read(run, &args, Some(&body_scratch), &fetch_key, None)
                         .map_err(unsent)?;
                     if fetched.code != Some(0) {
                         return Err(failed(
@@ -4261,6 +4296,9 @@ mod unix {
         }
         cache_parents(Path::new(common), into)?;
         check_current()?;
+        if let Some(cache_store) = &checkout_cache_store {
+            source_stores_disjoint(&pinned, cache_store)?;
+        }
         let mut installed = Vec::new();
         if let Some(quarantine) = &quarantine {
             for hash in &verified_packs {
@@ -4305,6 +4343,9 @@ mod unix {
             }
         }
         check_current()?;
+        if let Some(cache_store) = &checkout_cache_store {
+            source_stores_disjoint(&pinned, cache_store)?;
+        }
         let updated = step(
             "update",
             vec![
@@ -4711,6 +4752,7 @@ mod unix {
     ) -> Result<ChildOut> {
         use std::collections::{BTreeMap, BTreeSet};
         const ZERO: &str = "0000000000000000000000000000000000000000";
+        const NEW_OBJECT_BATCH: usize = 16_384;
         let dir = screened(children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
         let step = |name: &str, args: Vec<OsString>, cwd: Option<&Path>| -> Result<ChildOut> {
@@ -5190,85 +5232,121 @@ mod unix {
             }
         }
         if incremental && !remote_owned && batch.updates().iter().any(|row| row.after != ZERO) {
-            let mut roots = String::new();
+            // A release snapshot can bring tens of thousands of new objects (a
+            // toolchain's first export after a long gap is ~35,000: 1.4 MB of
+            // IDs), past any single bounded capture. The inventory is therefore
+            // a record-spooled native listing, read back whole and checked in
+            // fixed batches, never truncated and never refused for its size
+            // below the spool's own finite bound.
+            let mut inventory_args = vec![
+                os("-c"),
+                os("core.commitGraph=false"),
+                os("-c"),
+                os("pack.useBitmaps=false"),
+                os("rev-list"),
+                os("--objects"),
+                os("--no-object-names"),
+            ];
             for u in batch.updates().iter().filter(|row| row.after != ZERO) {
-                roots.push_str(&u.after);
-                roots.push('\n');
+                inventory_args.push(os(&u.after));
             }
             for u in batch.updates().iter().filter(|u| u.before != ZERO) {
-                roots.push('^');
-                roots.push_str(&u.before);
-                roots.push('\n');
+                inventory_args.push(os(format!("^{}", u.before)));
             }
             if let Some(main) = remote_main {
-                roots.push('^');
-                roots.push_str(main);
-                roots.push('\n');
+                inventory_args.push(os(format!("^{main}")));
             }
-            let expected = checked_input(
-                "new-object-ids",
-                vec![
-                    os("-c"),
-                    os("core.commitGraph=false"),
-                    os("-c"),
-                    os("pack.useBitmaps=false"),
-                    os("rev-list"),
-                    os("--objects"),
-                    os("--no-object-names"),
-                    os("--stdin"),
-                ],
-                roots.as_bytes(),
-            )?;
-            if expected.stdout_may_be_truncated() {
-                return Err(Error::refused(
-                    "incremental object inventory reaches the 1 MiB admission limit",
+            // Every root above is a validated object ID; `--` keeps git from
+            // reading any of them as a path.
+            inventory_args.push(os("--"));
+            let private = scratch
+                .and_then(Path::parent)
+                .ok_or_else(|| Error::local("new-object inventory needs owned private storage"))?;
+            let inventory_path = private.join("new-object-ids");
+            let mut inventory_reader = children.clone();
+            inventory_reader.stdout_records = Some(inventory_path.clone());
+            let key = [canonical.as_slice(), b"\nstep new-object-ids"].concat();
+            let expected = inventory_reader
+                .git(&inventory_args, scratch, &key)
+                .map_err(unsent)?;
+            if expected.code != Some(0) {
+                return Err(failed(
+                    &run.op,
+                    &expected,
+                    children.gh.redactor(),
+                    &run.slug,
+                    false,
                 ));
             }
-            let ids = std::str::from_utf8(&expected.stdout)
-                .map_err(|_| Error::protocol("new object IDs are not UTF-8"))?;
-            if ids.lines().any(|s| !crate::path::is_sha(s)) {
-                return Err(Error::protocol("new object IDs are malformed"));
-            }
+            let inventory_deadline = children
+                .gh
+                .fx()
+                .mono()?
+                .checked_add(children.budget)
+                .ok_or_else(|| Error::refused("new-object inventory deadline overflow"))?;
+            let mut ids = String::new();
+            spooled_object_batches(&inventory_path, children, inventory_deadline, |_, batch| {
+                for oid in batch {
+                    ids.push_str(oid);
+                    ids.push('\n');
+                }
+                Ok(())
+            })?;
+            std::fs::remove_file(&inventory_path)
+                .map_err(|e| Error::local(format!("new-object inventory: {e}")))?;
             let prefix = scratch
                 .map_or_else(|| PathBuf::from("scratch.git"), Path::to_path_buf)
                 .join("objects/pack/pack");
-            // The complete bounded inventory above already walked these roots
-            // against the admitted BEFORE closure. Pack those exact IDs rather
-            // than repeating that historical walk. Strict verification and the
-            // source-independent membership check below still prove every ID.
-            let pack = checked_input(
-                "new-object-pack",
-                vec![
-                    os("-c"),
-                    os("core.commitGraph=false"),
-                    os("-c"),
-                    os("pack.useBitmaps=false"),
-                    os("pack-objects"),
-                    os("--quiet"),
-                    os("--no-revs"),
-                    os("--threads=8"),
-                    os("--no-use-bitmap-index"),
-                    prefix.as_os_str().to_owned(),
-                ],
-                ids.as_bytes(),
-            )?;
-            let hash = std::str::from_utf8(&pack.stdout)
-                .ok()
-                .and_then(|s| s.strip_suffix('\n'))
-                .filter(|s| crate::path::is_sha(s))
-                .ok_or_else(|| Error::protocol("new object pack ID is malformed"))?;
-            let path = prefix.with_file_name(format!("pack-{hash}.pack"));
-            checked(
-                "new-object-verify",
-                vec![
-                    os("index-pack"),
-                    os("--verify"),
-                    os("--strict"),
-                    os("--threads=8"),
-                    path.into_os_string(),
-                ],
-                scratch,
-            )?;
+            // Each record is one validated 40-hex ID and its newline, so the
+            // list splits on exact record boundaries into batches whose input
+            // (672 KB) and membership answer (~800 KB) each fit one bounded child.
+            let batches = ids
+                .as_bytes()
+                .chunks(41 * NEW_OBJECT_BATCH)
+                .map(|chunk| {
+                    std::str::from_utf8(chunk)
+                        .map_err(|_| Error::protocol("new object IDs are not UTF-8"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // The complete inventory above already walked these roots against
+            // the admitted BEFORE closure. Pack those exact IDs, a pack a batch,
+            // rather than repeating that historical walk. Strict verification and
+            // the source-independent membership check below still prove every ID.
+            for (index, batch_ids) in batches.iter().enumerate() {
+                let pack = checked_input(
+                    &format!("new-object-pack {index}"),
+                    vec![
+                        os("-c"),
+                        os("core.commitGraph=false"),
+                        os("-c"),
+                        os("pack.useBitmaps=false"),
+                        os("pack-objects"),
+                        os("--quiet"),
+                        os("--no-revs"),
+                        os("--threads=8"),
+                        os("--no-use-bitmap-index"),
+                        prefix.as_os_str().to_owned(),
+                    ],
+                    batch_ids.as_bytes(),
+                )?;
+                let hash = std::str::from_utf8(&pack.stdout)
+                    .ok()
+                    .and_then(|s| s.strip_suffix('\n'))
+                    .filter(|s| crate::path::is_sha(s))
+                    .ok_or_else(|| Error::protocol("new object pack ID is malformed"))?;
+                let path = prefix.with_file_name(format!("pack-{hash}.pack"));
+                checked(
+                    &format!("new-object-verify {index}"),
+                    vec![
+                        os("index-pack"),
+                        os("--verify"),
+                        os("--strict"),
+                        os("--threads=8"),
+                        path.into_os_string(),
+                    ],
+                    scratch,
+                )?;
+            }
             // Do not let the source alternate satisfy new-object membership:
             // every newly needed ID must reside in the strictly verified pack.
             let borrowed = if let Some(path) = &alternate {
@@ -5280,31 +5358,35 @@ mod unix {
             } else {
                 None
             };
-            let owned = checked_input(
-                "new-object-membership",
-                vec![
-                    os("cat-file"),
-                    os("--batch-check=%(objectname) %(objecttype)"),
-                ],
-                ids.as_bytes(),
-            )?;
-            if owned.stdout_may_be_truncated() {
-                return Err(Error::refused(
-                    "incremental object membership reaches the 1 MiB admission limit",
-                ));
-            }
-            let owned = std::str::from_utf8(&owned.stdout)
-                .map_err(|_| Error::protocol("owned object IDs are not UTF-8"))?;
-            if owned.lines().count() != ids.lines().count()
-                || !owned.lines().zip(ids.lines()).all(|(line, oid)| {
-                    line.split_once(' ').is_some_and(|(found, kind)| {
-                        found == oid && matches!(kind, "commit" | "tree" | "blob" | "tag")
+            // A batch's answer is at most ~49 bytes a row, inside one bounded
+            // capture, so a truncated answer is a protocol fault.
+            for (index, batch_ids) in batches.iter().enumerate() {
+                let owned = checked_input(
+                    &format!("new-object-membership {index}"),
+                    vec![
+                        os("cat-file"),
+                        os("--batch-check=%(objectname) %(objecttype)"),
+                    ],
+                    batch_ids.as_bytes(),
+                )?;
+                if owned.stdout_may_be_truncated() {
+                    return Err(Error::protocol(
+                        "new-object membership batch exceeds its bounded answer",
+                    ));
+                }
+                let owned = std::str::from_utf8(&owned.stdout)
+                    .map_err(|_| Error::protocol("owned object IDs are not UTF-8"))?;
+                if owned.lines().count() != batch_ids.lines().count()
+                    || !owned.lines().zip(batch_ids.lines()).all(|(line, oid)| {
+                        line.split_once(' ').is_some_and(|(found, kind)| {
+                            found == oid && matches!(kind, "commit" | "tree" | "blob" | "tag")
+                        })
                     })
-                })
-            {
-                return Err(Error::refused(
-                    "new objects are absent from the strictly verified owned pack",
-                ));
+                {
+                    return Err(Error::refused(
+                        "new objects are absent from the strictly verified owned pack",
+                    ));
+                }
             }
             if let (Some(path), Some(bytes)) = (&alternate, borrowed) {
                 std::fs::write(path, bytes)

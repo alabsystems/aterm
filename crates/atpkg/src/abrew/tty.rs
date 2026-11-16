@@ -96,6 +96,32 @@ pub(super) fn stderr_is_tty() -> bool {
     stderr_tty()
 }
 
+/// Stderr's terminal width: its window size, else
+/// `$COLUMNS`, else 80 (the progress bar's extent).
+pub(super) fn stderr_width() -> usize {
+    #[cfg(all(unix, not(test)))]
+    {
+        let mut ws = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `TIOCGWINSZ` writes one `winsize` into the
+        // struct handed to it and reads nothing else; fd 2
+        // is our stderr.
+        let rc = unsafe { libc::ioctl(2, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 {
+            return usize::from(ws.ws_col);
+        }
+    }
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|c| c.trim().parse().ok())
+        .filter(|c| *c > 0)
+        .unwrap_or(80)
+}
+
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";

@@ -4280,6 +4280,20 @@ impl WindowGpu {
         self.acquire_queue_sample_ns = Some(queued_ns);
     }
 
+    /// Record the timings of the drawable acquisition `surface` took since they were last read.
+    #[cfg(target_os = "macos")]
+    fn record_completed_acquire(
+        &mut self,
+        surface: &mut crate::metal::present::MetalWindowSurface,
+    ) {
+        if let Some(waited_ns) = surface.take_completed_acquire_wait_ns() {
+            self.record_surface_acquire(waited_ns);
+        }
+        if let Some(queued_ns) = surface.take_completed_acquire_queue_ns() {
+            self.record_surface_acquire_queue(queued_ns);
+        }
+    }
+
     /// Record the screen's raw EDR maximum for this window.
     #[inline]
     pub const fn set_edr_max(&mut self, v: f32) {
@@ -8217,12 +8231,7 @@ impl GpuRenderer {
             win.add_gpu_park(ring_parked_ns);
             let ms = surf.metal.as_mut().expect("checked above");
             let reconciled = ms.reconcile(live.mint.device(), &want);
-            if let Some(waited_ns) = ms.take_completed_acquire_wait_ns() {
-                win.record_surface_acquire(waited_ns);
-            }
-            if let Some(queued_ns) = ms.take_completed_acquire_queue_ns() {
-                win.record_surface_acquire_queue(queued_ns);
-            }
+            win.record_completed_acquire(ms);
             match reconciled {
                 Ok(_) => {}
                 Err(e) => {
@@ -8242,6 +8251,8 @@ impl GpuRenderer {
         let frame = match acquired {
             Ok(f) => f,
             Err(refusal) => {
+                // A refused frame may have taken a result of an earlier generation.
+                win.record_completed_acquire(ms);
                 return Err(crate::metal::present::surface_present_failure(
                     &refusal, hint,
                 ));
@@ -8331,6 +8342,8 @@ impl GpuRenderer {
             seq,
         });
         if let Some(ms) = surf.metal.as_mut() {
+            // This frame's own drawable, where the frame took it as it asked.
+            win.record_completed_acquire(ms);
             ms.prefetch_drawable();
         }
         self.metal_maybe_inject_loss();

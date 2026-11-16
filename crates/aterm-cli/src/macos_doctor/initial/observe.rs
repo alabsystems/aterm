@@ -41,11 +41,12 @@ impl ObservationRead {
     }
 }
 
-/// Read `subjects` for `plan` without changing anything. `network` adds the
-/// GitHub repositories row (the network and the token file); without it that row
-/// is left out. A row that cannot be read comes back Unknown with the reason in
-/// its detail; nothing is guessed. `admission` controls reads that can raise privacy dialogs.
-/// A private reader that was not admitted contributes a withheld row
+/// Read `subjects` for `plan` without changing anything, handing each batch to `keep` as it
+/// completes, so a slow batch holds up no row another batch read. `network` adds the
+/// GitHub repositories row (the network and the token file), read in a batch of its own,
+/// last; without it that row is left out. A row that cannot be read comes back Unknown with
+/// the reason in its detail; nothing is guessed. `admission` controls reads that can raise
+/// privacy dialogs. A private reader that was not admitted contributes a withheld row
 /// ([`Observation::withheld`]): no value and no failure, which retires no earlier evidence. An
 /// attempted read that fails contributes an Unknown row, so a caller can retire earlier evidence
 /// only for a read that actually ran.
@@ -54,19 +55,27 @@ pub fn observe_initial_setup(
     subjects: &[Subject],
     network: bool,
     admission: ObservationRead,
-) -> Vec<Observation> {
+    keep: &mut dyn FnMut(Vec<Observation>),
+) {
     let unread = |subject: Subject, why: &str| Observation {
         detail: Some(why.to_owned()),
         ..Observation::unknown(subject)
     };
     if let Err(why) = ensure_person_scope() {
-        return requested_subjects(subjects, network)
-            .map(|subject| unread(subject, &why))
-            .collect();
+        keep(
+            requested_subjects(subjects, network)
+                .map(|subject| unread(subject, &why))
+                .collect(),
+        );
+        return;
     }
-    read_batches(subjects, network, admission, |subjects, network| {
-        observe_subjects(plan, subjects, network)
-    })
+    read_batches(
+        subjects,
+        network,
+        admission,
+        |subjects, network| observe_subjects(plan, subjects, network),
+        keep,
+    );
 }
 
 fn requested_subjects(subjects: &[Subject], network: bool) -> impl Iterator<Item = Subject> + '_ {
@@ -76,13 +85,18 @@ fn requested_subjects(subjects: &[Subject], network: bool) -> impl Iterator<Item
         .filter(move |subject| network || *subject != Subject::Setting(Setting::Repositories))
 }
 
-/// Dispatch an observation's native reads under their own admission.
+/// Dispatch an observation's native reads under their own admission, handing each batch's
+/// readings to `keep` as it completes, in page order within it: the rows read in this process
+/// (the grants, the vault), then the other apps' data each private batch reads, then the GitHub
+/// repositories, whose read may wait on the network and so comes last, holding up none of the
+/// others.
 fn read_batches(
     subjects: &[Subject],
     network: bool,
     admission: ObservationRead,
     mut read: impl FnMut(&[Subject], bool) -> Vec<Observation>,
-) -> Vec<Observation> {
+    keep: &mut dyn FnMut(Vec<Observation>),
+) {
     // Each batch has independent admission and native state. An unwind retires only its
     // attempted readings; completed batches and skipped private readers keep their evidence.
     let mut read = |subjects: &[Subject], network| {
@@ -97,21 +111,29 @@ fn read_batches(
                     .collect()
             })
     };
+    let order = Subject::all();
+    let mut hand = |mut batch: Vec<Observation>| {
+        if !batch.is_empty() {
+            batch.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
+            keep(batch);
+        }
+    };
+    let repositories = Subject::Setting(Setting::Repositories);
     let mut safe = Vec::new();
     let mut workstation = Vec::new();
     let mut spotlight = Vec::new();
+    let mut github = Vec::new();
     for subject in requested_subjects(subjects, network) {
         match subject {
+            _ if subject == repositories => github.push(subject),
             _ if !subject.reads_privately() => safe.push(subject),
             Subject::Setting(Setting::Spotlight) => spotlight.push(subject),
             _ => workstation.push(subject),
         }
     }
-    let mut out = if safe.is_empty() {
-        Vec::new()
-    } else {
-        read(&safe, network)
-    };
+    if !safe.is_empty() {
+        hand(read(&safe, false));
+    }
     // A native batch may wait on another process or the network. Its entry needs the page's
     // current visibility, not the one a queue or an earlier batch saw. FDA and Plan mode
     // establish no permission to query another app's preferences or protected project paths.
@@ -120,16 +142,16 @@ fn read_batches(
             continue;
         }
         if admission.admits_private() {
-            out.extend(read(&private, false));
+            hand(read(&private, false));
         } else {
             // Withheld, not failed: no value and no failure is said of a row nothing read, and
             // an earlier reading of it stands (`Read::Withheld`).
-            out.extend(private.into_iter().map(Observation::withheld));
+            hand(private.into_iter().map(Observation::withheld).collect());
         }
     }
-    let order = Subject::all();
-    out.sort_by_key(|row| order.iter().position(|subject| *subject == row.subject));
-    out
+    if !github.is_empty() {
+        hand(read(&github, network));
+    }
 }
 
 /// [`observe_initial_setup`] past its scope check.

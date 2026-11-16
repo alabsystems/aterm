@@ -36,26 +36,12 @@ pub const SYNOPSIS: &str = "pack-bottle <program> (--archive <path> | --install-
      [--triple T] [--strip-components K] [--dep-bottle PATH]… [--donor-root DIR]… \
      [--merge-from PKG] [--key PATH] [--out DIR] [--unsigned | --upload]";
 
-/// Self-relocating `bin/git` wrapper written when `libexec/git-core/git` is staged. It locates
-/// itself with shell builtins alone (parameter expansion, `cd -P`, `pwd -P`), so it runs under
-/// any PATH its caller gives it, an empty or unset one included: Git's PATH is the caller's tool
-/// PATH, which need not hold `dirname` or any other system utility. It finds its root from the
-/// folder `$0` names, so it is run by its own path (atpkg's PATH shim execs it so) or through a
-/// symlinked directory, never through a symlink to the file itself, whose folder is not `bin/`.
-const GIT_WRAPPER: &str = "#!/bin/sh\n\
-case $0 in\n\
-  */*) __atpkg_bin_dir=${0%/*} ;;\n\
-  *) __atpkg_bin_dir=. ;;\n\
-esac\n\
-__atpkg_bin_dir=$(CDPATH='' cd -P -- \"${__atpkg_bin_dir:-/}\" && pwd -P) || exit 1\n\
-__atpkg_root=${__atpkg_bin_dir%/*}\n\
-__atpkg_root=${__atpkg_root:-/}\n\
-export ATERM_GIT_ROOT=\"$__atpkg_root\"\n\
-export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
-if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
-  export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\
-fi\n\
-exec \"$__atpkg_root/libexec/git-core/git\" \"$@\"\n";
+/// AppleDouble's magic number: the first four bytes of the `._<name>` file macOS writes beside a
+/// file when a copy's destination cannot hold that file's metadata.
+const APPLE_DOUBLE_MAGIC: [u8; 4] = [0x00, 0x05, 0x16, 0x07];
+
+/// The bound git's program is read under: the one [`check_stage_tree`] reads each object under.
+const MAX_GIT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Install inputs held to the archive packer's relocation and payload gates.
 #[derive(Clone, Debug)]
@@ -751,61 +737,175 @@ fn system_loader(triple: Triple) -> Option<&'static str> {
     }
 }
 
-/// Install the self-relocating `bin/git` wrapper when `program == "git"` and `libexec/git-core` is
-/// present, unlinking `bin/git` first so a hard-linked `libexec/git-core/git` binary inode is
-/// never truncated in place.
+/// Removes every AppleDouble file (a `._<name>` file that starts with [`APPLE_DOUBLE_MAGIC`]) from
+/// `stage`: macOS metadata a copy left beside the install's files, never part of the program, so
+/// no bottle ships one. A `._` file that is not AppleDouble is the install's own and stays.
 ///
 /// # Errors
-/// I/O failure or missing `git` binary when `libexec/git-core` exists.
-pub fn install_git_wrapper(program: &str, stage: &Path) -> Result<bool> {
-    if program != "git" {
-        return Ok(false);
+/// The stage cannot be walked, or an AppleDouble candidate cannot be opened or removed.
+fn drop_apple_double(stage: &Path) -> Result<()> {
+    use std::io::Read as _;
+    for rel in relocate::walk_files(stage).map_err(Error::refused)? {
+        if !rel
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("._"))
+        {
+            continue;
+        }
+        let path = stage.join(&rel);
+        let (mut file, _) = crate::identity::open_regular_nonblock(&path)
+            .map_err(|e| Error::io(format!("open {}", path.display()), &e))?;
+        let mut magic = [0u8; 4];
+        let apple_double = file.read_exact(&mut magic).is_ok() && magic == APPLE_DOUBLE_MAGIC;
+        drop(file);
+        if apple_double {
+            std::fs::remove_file(&path)
+                .map_err(|e| Error::io(format!("rm {}", path.display()), &e))?;
+        }
     }
-    let git_core = stage.join("libexec/git-core");
-    if !git_core.is_dir() {
-        return Ok(false);
+    Ok(())
+}
+
+/// Refuses a git whose `BUILD-ORIGIN.json`, its build's record of how it was built, does not say
+/// `"runtime_prefix": true`. The bottle's `bin/git` is git itself, with nothing in front of it to
+/// export `GIT_EXEC_PATH` or `GIT_TEMPLATE_DIR`, so git must find its exec path, templates and
+/// helpers from the path it runs from, which a git built with `RUNTIME_PREFIX` does (the GNU
+/// source build writes the record with it, `source::build`).
+///
+/// # Errors
+/// The record is missing, unreadable or not JSON, or does not say `runtime_prefix` is true.
+fn require_runtime_prefix(stage: &Path) -> Result<()> {
+    let path = stage.join("BUILD-ORIGIN.json");
+    let bytes = crate::identity::read_regular_bytes(&path, crate::identity::MAX_META_BYTES)
+        .map_err(|e| {
+            Error::refused(format!(
+                "git bottle: its BUILD-ORIGIN.json does not read ({e}); a git bottle ships only \
+                 a git whose build record says it was built with RUNTIME_PREFIX"
+            ))
+        })?;
+    let origin: aterm_json::Value = aterm_json::from_slice(&bytes).map_err(|e| {
+        Error::refused(format!(
+            "git bottle: its BUILD-ORIGIN.json is not JSON ({e})"
+        ))
+    })?;
+    if !matches!(
+        origin.get("runtime_prefix"),
+        Some(aterm_json::Value::Bool(true))
+    ) {
+        return Err(Error::refused(
+            "git bottle: its BUILD-ORIGIN.json does not say \"runtime_prefix\": true; bin/git is \
+             git itself, which finds its exec path, templates and helpers from its own path only \
+             when it is built with RUNTIME_PREFIX",
+        ));
     }
-    let bin_dir = stage.join("bin");
-    let bin_git = bin_dir.join("git");
-    let core_git = git_core.join("git");
-    if !core_git.is_file() {
-        if !bin_git.is_file() {
+    Ok(())
+}
+
+/// Whether `a` and `b` are one file (one device and inode). Never on a platform without inodes.
+fn one_file(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    inode_key(a).is_some_and(|key| inode_key(b) == Some(key))
+}
+
+/// Ships git itself as `bin/git`, the way git's own `make install` lays it out: `bin/git` and
+/// `libexec/git-core/git` are one file (a hard link), so git started by either name finds its exec
+/// path, templates and helpers from that name's folder ([`require_runtime_prefix`] holds the build
+/// to that). An install that carries only one of the names gets the other as a hard link, and two
+/// equal copies become one file. Two different files are refused, a `bin/git` that is a script in
+/// front of git above all, and so is a git that is itself a `#!` script ([`check_git_itself`]).
+///
+/// # Errors
+/// Neither name is a regular file beside an absent other, the two names hold different bytes,
+/// git is a `#!` script, or a link cannot be made.
+fn ship_git_itself(stage: &Path) -> Result<()> {
+    let bin_git = stage.join("bin/git");
+    let core_git = stage.join("libexec/git-core/git");
+    let regular = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+    };
+    let absent = |path: &Path| std::fs::symlink_metadata(path).is_err();
+    let link = |from: &Path, to: &Path| -> Result<()> {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::io(format!("mkdir {}", parent.display()), &e))?;
+        }
+        std::fs::hard_link(from, to).map_err(|e| {
+            Error::io(
+                format!("hard-link {} -> {}", to.display(), from.display()),
+                &e,
+            )
+        })
+    };
+    match (regular(&bin_git), regular(&core_git)) {
+        (Some(bin), Some(core)) => {
+            if !one_file(&bin, &core) {
+                let read = |path: &Path| {
+                    crate::identity::read_regular_bytes(path, MAX_GIT_BYTES)
+                        .map_err(|e| Error::io(format!("read {}", path.display()), &e))
+                };
+                if read(&bin_git)? != read(&core_git)? {
+                    return Err(Error::refused(
+                        "git bottle: bin/git is not libexec/git-core/git; a git bottle ships git \
+                         itself as bin/git, never a script or another program in front of it",
+                    ));
+                }
+                std::fs::remove_file(&bin_git)
+                    .map_err(|e| Error::io(format!("rm {}", bin_git.display()), &e))?;
+                link(&core_git, &bin_git)?;
+            }
+        }
+        (None, Some(_)) if absent(&bin_git) => link(&core_git, &bin_git)?,
+        (Some(_), None) if absent(&core_git) => link(&bin_git, &core_git)?,
+        _ => {
             return Err(Error::refused(
-                "git bottle has libexec/git-core/ without either libexec/git-core/git or bin/git",
+                "git bottle: git must be a regular file at bin/git or libexec/git-core/git, with \
+                 nothing else at the other name",
             ));
         }
-        std::fs::hard_link(&bin_git, &core_git)
-            .map_err(|e| Error::io(format!("link {}", core_git.display()), &e))?;
     }
-    std::fs::create_dir_all(&bin_dir)
-        .map_err(|e| Error::io(format!("mkdir {}", bin_dir.display()), &e))?;
-    if std::fs::symlink_metadata(&bin_git).is_ok() {
-        std::fs::remove_file(&bin_git)
-            .map_err(|e| Error::io(format!("rm {}", bin_git.display()), &e))?;
+    check_git_itself(stage)
+}
+
+/// Refuses a git stage whose `bin/git` and `libexec/git-core/git` are not one regular file, or
+/// whose git starts `#!`: the bottle ships git itself, never a script in front of it or in its
+/// place.
+///
+/// # Errors
+/// Either name is missing or not a regular file, the two are separate files, or git is a script.
+fn check_git_itself(stage: &Path) -> Result<()> {
+    use std::io::Read as _;
+    let bin_git = stage.join("bin/git");
+    let core_git = stage.join("libexec/git-core/git");
+    let regular = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .ok_or_else(|| {
+                Error::refused(format!(
+                    "git bottle: {} is not a regular file",
+                    path.display()
+                ))
+            })
+    };
+    if !one_file(&regular(&bin_git)?, &regular(&core_git)?) {
+        return Err(Error::refused(
+            "git bottle: bin/git and libexec/git-core/git are separate files; bin/git is git \
+             itself, one file with libexec/git-core/git",
+        ));
     }
-    {
-        use std::io::Write as _;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o755)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        let mut f = opts
-            .open(&bin_git)
-            .map_err(|e| Error::io(format!("open {}", bin_git.display()), &e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            f.set_permissions(std::fs::Permissions::from_mode(0o755))
-                .map_err(|e| Error::io(format!("chmod {}", bin_git.display()), &e))?;
-        }
-        f.write_all(GIT_WRAPPER.as_bytes())
-            .map_err(|e| Error::io(format!("write {}", bin_git.display()), &e))?;
+    let (mut file, _) = crate::identity::open_regular_nonblock(&core_git)
+        .map_err(|e| Error::io(format!("open {}", core_git.display()), &e))?;
+    let mut head = [0u8; 2];
+    file.read_exact(&mut head)
+        .map_err(|e| Error::io(format!("read {}", core_git.display()), &e))?;
+    if head == *b"#!" {
+        return Err(Error::refused(
+            "git bottle: git is a #! script; a git bottle ships git itself, never a script",
+        ));
     }
-    Ok(true)
+    Ok(())
 }
 
 /// Removes `git-credential-osxkeychain` from a staged git bottle. A bottle's binaries are signed
@@ -835,6 +935,9 @@ fn check_stage_tree(
     exposes: &[&str],
     backend: &dyn Backend,
 ) -> Result<usize> {
+    if program == "git" {
+        check_git_itself(stage)?;
+    }
     for tool in exposes {
         let entry = stage.join("bin").join(tool);
         if !atpkg::toolchain::is_executable_file(&entry) {
@@ -1018,6 +1121,10 @@ pub fn pack_bottle_with(
     }
 
     materialize_symlinks(&stage)?;
+    drop_apple_double(&stage)?;
+    if program == "git" {
+        require_runtime_prefix(&stage)?;
+    }
     if let programs::BottleOrigin::Reference(recipe) = bottle_def.origin {
         reference::prepare(recipe, request, &stage)?;
     }
@@ -1029,8 +1136,8 @@ pub fn pack_bottle_with(
     if program == "git" {
         drop_keychain_helper(&stage)?;
         git_text::rewrite(&stage, &version)?;
+        ship_git_itself(&stage)?;
     }
-    let _wrapped = install_git_wrapper(program, &stage)?;
     let mut all_vendored = rewrite_bottle_objects(&stage, &all_donors, request.triple, backend)?;
     let report =
         relocate::relocate_with(&stage, backend, None, &all_donors).map_err(Error::refused)?;

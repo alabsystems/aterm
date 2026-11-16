@@ -20,23 +20,16 @@ fn fixture(cmd: &mut Command, input: Option<&[u8]>) -> Result<String, String> {
         }
         None => aterm_uds::spawnfd::Stdio::null(),
     };
-    let out = aterm_uds::deadline::output_from_while_process_progressing(
+    let out = aterm_uds::deadline::output_from_while_process_progressing_complete_with_limit(
         cmd,
         stdin,
         aterm_uds::deadline::ECHO_HANG,
         "a judged fixture's git",
+        aterm_uds::deadline::OUTPUT_KEEP - 1,
     )
     .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
-    }
-    // The progress wait keeps only the last `OUTPUT_KEEP` bytes of each stream: refuse output
-    // that reaches it rather than answer with its tail.
-    if out.stdout.len() >= aterm_uds::deadline::OUTPUT_KEEP {
-        return Err(format!(
-            "a fixture's git wrote {} bytes or more, all the progress wait keeps; read less",
-            aterm_uds::deadline::OUTPUT_KEEP
-        ));
     }
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
@@ -151,6 +144,61 @@ fn renewal_interrupts_abort_only_scoped_journal_work() {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn raw_landing_interrupts_cancel_scoped_renewals_but_not_ordinary_journal_publication() {
+    const CHILD: &str = "ATERM_VERIFY_RAW_JOURNAL_INTERRUPT_CHILD";
+    const TEST: &str = "judged::tests::raw_landing_interrupts_cancel_scoped_renewals_but_not_ordinary_journal_publication";
+    if std::env::var_os(CHILD).is_some() {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "--quiet"]).unwrap();
+        git(root, &["config", "user.name", "Andrew Yates"]).unwrap();
+        git(root, &["config", "user.email", "test@example.invalid"]).unwrap();
+        git(root, &["init", "--bare", "--quiet", "remote"]).unwrap();
+        git(root, &["remote", "add", "origin", "remote"]).unwrap();
+        let record = lane_record("terminal", "attempt", "pass", 42);
+        crate::exec::group::kill_on_interrupt();
+        let _held = crate::exec::group::hold();
+        // SAFETY: this isolated child installed the real landing handler, and the live hold
+        // prevents its watchdog from ending the process before publication completes.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the isolated journal fixture must catch a real non-core SIGTERM to verify publication policy; it must not die by SIGKILL"
+        )]
+        let raised = unsafe { libc::raise(libc::SIGTERM) };
+        assert_eq!(raised, 0);
+        assert_eq!(crate::exec::group::taken(), Some(libc::SIGTERM));
+        let scoped = interruptible(|| append(root, "origin", None, &record, deadline()));
+        assert!(scoped.unwrap_err().contains("interrupted"));
+        assert!(head(root, "origin", deadline()).unwrap().is_none());
+        assert!(append(root, "origin", None, &record, deadline()).unwrap());
+        let published = head(root, "origin", deadline()).unwrap().unwrap();
+        assert_eq!(
+            records(root, Some(&published), deadline()).unwrap(),
+            [record]
+        );
+        assert_eq!(crate::exec::group::taken(), Some(libc::SIGTERM));
+        drop(dir);
+        return;
+    }
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1");
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        aterm_uds::deadline::ECHO_HANG,
+        "isolated raw-interrupt journal publication",
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -673,7 +721,7 @@ fn with_blobs(root: &Path, parent: &str, files: &[(String, Vec<u8>)]) -> String 
     let run = |args: &[&str], input: Option<&[u8]>| {
         let mut cmd = command(root, args);
         cmd.env("GIT_INDEX_FILE", &index);
-        output(&mut cmd, input).unwrap()
+        fixture(&mut cmd, input).unwrap()
     };
     run(&["read-tree", parent], None);
     let lines: String = files
@@ -819,7 +867,7 @@ fn a_fail_record_is_never_replaced() {
             NOW,
             deadline()
         ),
-        Ok(Appended::Raced),
+        Ok(Appended::Raced(Some(held.clone()))),
         "the second writer raced the first"
     );
     assert_eq!(
@@ -1260,6 +1308,191 @@ fn a_record_beside_a_slot_is_read_found_and_pruned_by_its_own_path() {
 }
 
 #[test]
+fn publication_matches_literal_paths_under_inherited_pathspec_modes() {
+    let (_tmp, one) = scratch(&["origin"]);
+    let base = lane_record("base", "held", "pass", 42);
+    assert!(append(&one, "origin", None, &base, deadline()).unwrap());
+    let parent = head(&one, "origin", deadline()).unwrap().unwrap();
+    let wanted = lane_record("t", "attempt*", "pass", 42);
+    let bytes = aterm_toml::to_string(&wanted).unwrap().into_bytes();
+    let elsewhere = with_blobs(
+        &one,
+        &parent,
+        &[("verdicts/t/attempt-other.toml".into(), bytes.clone())],
+    );
+    assert!(
+        !published(&one, Some(&elsewhere), &wanted, deadline()).unwrap(),
+        "a wildcard must not turn another path into publication evidence"
+    );
+    let exact = with_blobs(&one, &elsewhere, &[(Place::Beside.path(&wanted), bytes)]);
+    assert!(published(&one, Some(&exact), &wanted, deadline()).unwrap());
+
+    const CHILD: &str = "ATERM_VERIFY_LITERAL_JOURNAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let mut child = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "judged::tests::publication_matches_literal_paths_under_inherited_pathspec_modes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        for mode in [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+        ] {
+            child.env(mode, "1");
+        }
+        let out = aterm_uds::deadline::output_while_process_progressing_complete_with_limit(
+            &mut child,
+            aterm_uds::deadline::ECHO_HANG,
+            "literal journal pathspec child",
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn quoted_lane_paths_prune_the_stale_attempt_and_keep_the_fresh_slot() {
+    let (_tmp, one) = scratch(&["origin"]);
+    let day = 20_404 * 86_400;
+    let fresh = lane_record("t", "held", "pass", day);
+    assert!(append(&one, "origin", None, &fresh, deadline()).unwrap());
+    let parent = head(&one, "origin", deadline()).unwrap();
+    let stale = lane_record("t", "late\t雪\n", "red", day - RETENTION - 86_400);
+    assert!(
+        append_at(
+            &one,
+            "origin",
+            parent.as_deref(),
+            &stale,
+            Place::Beside,
+            deadline()
+        )
+        .unwrap()
+    );
+    let parent = head(&one, "origin", deadline()).unwrap();
+    let listed = filed(&one, parent.as_deref(), "verdicts/", deadline()).unwrap();
+    assert!(
+        listed.contains(&(Place::Beside.path(&stale), stale.clone())),
+        "{listed:?}"
+    );
+    let (blobs, unread) = blobs_under(
+        &one,
+        parent.as_deref().unwrap(),
+        &["verdicts/".into()],
+        deadline(),
+    )
+    .unwrap();
+    assert!(unread.is_empty());
+    assert!(blobs.contains(&(
+        Place::Beside.path(&stale),
+        aterm_toml::to_string(&stale).unwrap().into_bytes()
+    )));
+    let next = lane_record("u", "next", "judging", day + 86_400);
+    assert!(append(&one, "origin", parent.as_deref(), &next, deadline()).unwrap());
+    let after = head(&one, "origin", deadline()).unwrap();
+    assert_eq!(
+        record(&one, after.as_deref(), "t", deadline()).unwrap(),
+        Some(fresh.clone())
+    );
+    let remaining = records(&one, after.as_deref(), deadline()).unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining.contains(&fresh) && remaining.contains(&next),
+        "{remaining:?}"
+    );
+}
+
+#[test]
+fn journal_listings_preserve_paths_and_require_complete_utf8_records() {
+    assert_eq!(journal_listing(b"").unwrap().count(), 0);
+    let paths = [
+        " leading and trailing ",
+        "line\nbreak",
+        "tab\there",
+        "雪",
+        "�",
+    ];
+    let listing = paths
+        .iter()
+        .map(|path| format!("{path}\0"))
+        .collect::<String>();
+    assert_eq!(
+        journal_listing(listing.as_bytes())
+            .unwrap()
+            .collect::<Vec<_>>(),
+        paths
+    );
+    for invalid in [
+        &b"missing terminator"[..],
+        b"complete\0partial",
+        b"\0",
+        b"first\0\0last\0",
+        b"first\0\0",
+        b"invalid-\xff\0",
+    ] {
+        assert!(journal_listing(invalid).is_err(), "{invalid:?}");
+    }
+}
+
+#[test]
+fn journal_batch_requires_matching_objects_bounded_bodies_and_exact_framing() {
+    let first = "1111111111111111111111111111111111111111";
+    let second = "2222222222222222222222222222222222222222";
+    let requested = vec![
+        ("first".into(), first.into()),
+        ("second".into(), second.into()),
+    ];
+    let valid = format!("{first} blob 3\na\0b\n{second} missing\n");
+    let (read, unread) = parse_blobs(&requested, valid.as_bytes()).unwrap();
+    assert_eq!(read, vec![("first".into(), b"a\0b".to_vec())]);
+    assert_eq!(
+        unread,
+        vec![("second".into(), "its object is missing".into())]
+    );
+    let one = &requested[..1];
+    for invalid in [
+        format!("{second} blob 0\n\n"),
+        format!("{second} missing\n"),
+        format!("{first} blob 2\nx"),
+        format!("{first} blob 1\nx!"),
+        format!("{first} blob 0\n\nextra"),
+        format!("{first} missing\nextra"),
+        format!("{first} tree 0\n\n"),
+        format!("{first} blob 0"),
+    ] {
+        assert!(parse_blobs(one, invalid.as_bytes()).is_err(), "{invalid:?}");
+    }
+    assert!(parse_blobs(&requested, format!("{first} blob 0\n\n").as_bytes()).is_err());
+    let body = vec![b'x'; crate::land_record::MAX_BYTES as usize];
+    let mut response = format!("{first} blob {}\n", body.len()).into_bytes();
+    response.extend_from_slice(&body);
+    response.push(b'\n');
+    assert_eq!(
+        parse_blobs(one, &response).unwrap().0,
+        vec![("first".into(), body)]
+    );
+    let mut oversized =
+        format!("{first} blob {}\n", crate::land_record::MAX_BYTES + 1).into_bytes();
+    oversized.extend(std::iter::repeat_n(
+        b'x',
+        crate::land_record::MAX_BYTES as usize + 1,
+    ));
+    oversized.push(b'\n');
+    assert!(parse_blobs(one, &oversized).is_err());
+}
+
+#[test]
 fn journal_timeout_does_not_spawn_after_the_inherited_budget_expires() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let sentinel = "journal-argument-and-input-sentinel";
@@ -1283,6 +1516,21 @@ fn journal_timeout_does_not_spawn_after_the_inherited_budget_expires() {
         };
         assert!(why.contains("not-started"), "{why}");
     }
+}
+
+#[test]
+fn journal_mutation_admission_expires_but_an_admitted_writer_owns_its_full_window() {
+    let now = std::time::Instant::now();
+    let budget = ReadBudget(now + std::time::Duration::from_secs(60));
+    assert!(
+        budget
+            .admit(now + std::time::Duration::from_secs(60))
+            .is_err()
+    );
+    let admitted_at = now + std::time::Duration::from_secs(59);
+    let MutationBudget(until) = budget.admit(admitted_at).unwrap();
+    assert_eq!(until.duration_since(admitted_at), agh::git::GRANT_MAX);
+    assert!(until > budget.0);
 }
 
 #[test]
@@ -1381,7 +1629,14 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
                 }
             }
         };
-        let result = push_journal(dir.path(), "origin", Some(parent), sha, &run);
+        let result = push_journal(
+            dir.path(),
+            "origin",
+            Some(parent),
+            sha,
+            &run,
+            crate::remote::WriteRunner(&run),
+        );
         assert_eq!(pushes.get(), 1);
         if let Err(why) = &result {
             assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
@@ -1390,7 +1645,7 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
         }
         match code {
             0 => {
-                assert_eq!(result, Ok(Some(sha.to_owned())));
+                assert_eq!(result, Ok(Appended::Holds(sha.to_owned())));
                 assert_eq!(reads.get(), 0);
             }
             9 => {
@@ -1408,4 +1663,126 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
             _ => unreachable!(),
         }
     }
+}
+
+#[test]
+fn journal_append_reuses_each_races_imported_head_including_a_removed_ref() {
+    let mut reads = 0;
+    let mut parents = Vec::new();
+    let outcomes = [
+        Appended::Raced(Some("moved".to_owned())),
+        Appended::Raced(None),
+        Appended::Holds("landed".to_owned()),
+    ];
+    let mut outcomes = outcomes.into_iter();
+    let result = append_land_through(
+        false,
+        || {
+            reads += 1;
+            Ok(Some("initial".to_owned()))
+        },
+        |parent| {
+            parents.push(parent.map(str::to_owned));
+            Ok(outcomes.next().expect("only three attempts"))
+        },
+    );
+    assert_eq!(result, Ok(Some("landed".to_owned())));
+    assert_eq!(
+        parents,
+        [Some("initial".to_owned()), Some("moved".to_owned()), None]
+    );
+    assert_eq!(reads, 1, "a race already imported its observed head");
+}
+
+#[test]
+fn journal_append_stops_on_an_unknown_write_after_a_race() {
+    let mut reads = 0;
+    let mut parents = Vec::new();
+    let why = append_land_through(
+        false,
+        || {
+            reads += 1;
+            assert_eq!(reads, 1, "no fresh observation may authorize a retry");
+            Ok(Some("initial".to_owned()))
+        },
+        |parent| {
+            parents.push(parent.map(str::to_owned));
+            match parents.len() {
+                1 => Ok(Appended::Raced(Some("moved".to_owned()))),
+                2 => Err("controlled unknown write outcome".to_owned()),
+                _ => panic!("an unknown write must not be attempted again"),
+            }
+        },
+    )
+    .unwrap_err();
+    assert!(why.contains("controlled unknown write outcome"), "{why}");
+    assert_eq!(
+        parents,
+        [Some("initial".to_owned()), Some("moved".to_owned())]
+    );
+    assert_eq!(reads, 1);
+}
+
+#[test]
+fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, NOW, T, record, signer};
+    use std::cell::Cell;
+    let (_tmp, root) = scratch(&["origin"]);
+    let me = signer(7);
+    let rival = record(Check::Lint, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    let mine = record(Check::Fmt, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    append_land(
+        &root,
+        "origin",
+        std::slice::from_ref(&rival),
+        NOW,
+        deadline(),
+    )
+    .unwrap();
+    let until = deadline();
+    let writes = Cell::new(0);
+    let mut blob = cached_blobs(|bytes| {
+        writes.set(writes.get() + 1);
+        write_blob(&root, bytes, until)
+    });
+    let mut attempts = 0;
+    let head = append_land_through(
+        false,
+        || Ok(None),
+        |parent| {
+            attempts += 1;
+            land_append_with(
+                &root,
+                "origin",
+                parent,
+                std::slice::from_ref(&mine),
+                NOW,
+                until,
+                &mut blob,
+            )
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(attempts, 2);
+    assert_eq!(bytes_at(&root, &head, &rival.path), rival.bytes);
+    assert_eq!(bytes_at(&root, &head, &mine.path), mine.bytes);
+    assert_eq!(
+        writes.get(),
+        1,
+        "the rejected attempt already wrote this blob"
+    );
+    let changed = blob(b"different bytes").unwrap();
+    assert_ne!(changed, blob(&mine.bytes).unwrap());
+    assert_eq!(
+        writes.get(),
+        2,
+        "only different bytes require another write"
+    );
 }

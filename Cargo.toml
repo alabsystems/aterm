@@ -11,7 +11,7 @@ members = ["crates/*"]
 # they are publication tools or check runners.
 default-members = [
     "crates/aterm-repository-progress",
-    "crates/agh", "crates/alab-policy", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
+    "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-protocol", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-agent-names", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-aos-pane",
     "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-brotli", "crates/aterm-buffer",
     "crates/aterm-acaffeine", "crates/aterm-cap", "crates/aterm-capacity", "crates/aterm-resource-host",
@@ -56,11 +56,16 @@ default-members = [
 # vendor/astream is a submodule with its own workspace; its crates are path
 # dependencies of aterm-link and inherit package fields from its root manifest.
 #
+# vendor/alab-harness is a copy of one alab-harness tag, held to the git tree id
+# in vendor/alab-harness.pin (vendor/README-alab-harness.md). It has its own
+# `[workspace]` root, so it must be excluded: cargo would otherwise make its
+# alab-policy, a path dependency under this root, a member of this workspace.
+#
 # crates/aterm-windows-sys is excluded because it is the package `windows-sys`
 # 0.61.2 and crates/aterm-windows-sys-052 is `windows-sys` 0.52.0: cargo refuses
 # two members of one name. It is its own root (a `[workspace]` stub, as a
 # vendored fork has), and the `windows-sys` patch row reaches it by path.
-exclude = ["vendor/astream", "vendor/trust-build-cpu", "vendor/trust-sha2", "vendor/trust-jobserver-utils", "vendor/trust-resource-provenance", "vendor/trust-resource-controller", "vendor/trust-exec-policy", "crates/aterm-windows-sys"]
+exclude = ["vendor/astream", "vendor/alab-harness", "vendor/trust-build-cpu", "vendor/trust-sha2", "vendor/trust-jobserver-utils", "vendor/trust-resource-provenance", "vendor/trust-resource-controller", "vendor/trust-exec-policy", "crates/aterm-windows-sys"]
 resolver = "2"
 
 # The executable surface read by `atpkg-publish pack`: `expose` names commands
@@ -85,7 +90,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit.
 [workspace.package]
-version = "0.203.0"
+version = "0.204.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -93,7 +98,13 @@ authors = ["Andrew Yates"]
 
 [workspace.dependencies]
 # The turn-end readers, std only: aterm's engine and claude-code-alab read the same decisions.
-alab-policy = { path = "crates/alab-policy" }
+# The one copy lives in alab-harness; this is the tag vendor/alab-harness.pin names, copied by
+# alab-harness's tools/pin and never edited here. claude-code-alab gets its copy from this one
+# through `verify vendor-out`.
+alab-policy = { path = "vendor/alab-harness/crates/alab-policy" }
+# The harness wire (the `Record` type and the stream grammar) from the same pinned copy. Unix
+# only, so a crate takes it under `cfg(unix)`.
+alab-wire = { path = "vendor/alab-harness/crates/alab-wire" }
 aterm-mail = { path = "crates/aterm-mail" }
 aterm-mail-bigint = { path = "crates/aterm-mail-bigint" }
 # First-party serde (`crates/aterm-serde` + `crates/aterm-serde-derive`) exposed

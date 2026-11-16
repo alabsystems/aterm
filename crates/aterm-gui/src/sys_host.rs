@@ -1160,7 +1160,8 @@ impl HeldBy {
     }
 }
 
-/// What `sys disk held` reads beside the walker's board, each once per reply.
+/// What `sys disk held` reads beside the walker's board, each once per gather: a reply's, or
+/// the probe thread's for the Disk lens.
 pub(crate) struct HeldFacts<'a> {
     /// The build-start record's lines.
     pub(crate) starts: &'a [atpkg::build_start::Start],
@@ -1173,13 +1174,11 @@ pub(crate) struct HeldFacts<'a> {
     /// Whether a verify run kept its record of the units it used in a build mirror's build
     /// directory ([`run_kept`]).
     pub(crate) kept: &'a dyn Fn(&Path) -> bool,
-    /// When the reply reads them.
+    /// When the gather reads them.
     pub(crate) now: Instant,
 }
 
-/// `sys disk held`'s rows now: the walker's last board, the build-start record's lines, the
-/// sessions aterm's table holds, the passes aterm.toml leaves on, and, for a build mirror,
-/// whether a verify run kept its record there.
+/// `sys disk held`'s rows now, over the sessions aterm's table holds ([`held_for`]).
 fn held_now(store: &Store, home: Option<&Path>) -> disk_held::Holdings {
     let live: Vec<(u64, String)> = {
         let g = store.read().unwrap_or_else(PoisonError::into_inner);
@@ -1187,12 +1186,21 @@ fn held_now(store: &Store, home: Option<&Path>) -> disk_held::Holdings {
             .map(|h| (h.local_id, h.sid.as_str().to_owned()))
             .collect()
     };
+    held_for(&live, home)
+}
+
+/// `sys disk held`'s rows now: the walker's last board, the build-start record's lines, `live`
+/// (the sessions aterm's table holds, each one's local key and id), the passes aterm.toml
+/// leaves on, and, for a build mirror, whether a verify run kept its record there. The probe
+/// thread gathers the Disk lens's rows with it ([`crate::vitals_host::Request::live_ids`]), so
+/// the lens and the reply read one set of sessions at work; like the reply it demands no walk.
+pub(crate) fn held_for(live: &[(u64, String)], home: Option<&Path>) -> disk_held::Holdings {
     let starts = atpkg::build_start::record()
         .map(|r| atpkg::build_start::read(&r))
         .unwrap_or_default();
     let facts = HeldFacts {
         starts: &starts,
-        live: &live,
+        live,
         home,
         passes: Passes::now(),
         kept: &run_kept,

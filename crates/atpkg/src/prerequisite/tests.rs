@@ -717,7 +717,10 @@ fn fixture_version(want: Prerequisite) -> &'static str {
 
 impl Fixture {
     fn new(want: Prerequisite) -> Self {
-        let layout = crate::testdir::layout("signed-prerequisite");
+        Self::with_layout(want, crate::testdir::layout("signed-prerequisite"))
+    }
+
+    fn with_layout(want: Prerequisite, layout: crate::testdir::ScratchLayout) -> Self {
         let root = layout.build_dir(want.program(), 7);
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let executable = root.join("bin").join(want.executable());
@@ -1660,3 +1663,7 @@ fn private_namespace_is_fixed_to_held_commands_without_exposing_lean_or_global_s
         "reapplying an operation namespace is idempotent"
     );
 }
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "native_tests.rs"]
+mod native_inputs;

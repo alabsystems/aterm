@@ -1790,10 +1790,10 @@ fn result_full(rest: &str) -> Result<bool, String> {
     }
 }
 
-/// `result [full]` for a worker whose tab aterm closed, its task's end `record`
-/// ([`crate::retired_workers`]): its result file, kept while its row stands, read as a live
+/// `result [full]` for an ended session, its task's end `record` from its row
+/// ([`crate::session_table`]): its result file, kept while its row stands, read as a live
 /// worker's is, with no session left to read a missed result again from.
-pub(crate) fn retired_result(record: &TaskRecord, rest: &str) -> String {
+pub(crate) fn ended_result(record: &TaskRecord, rest: &str) -> String {
     match result_full(rest) {
         Ok(full) => answer_result(record, |path| {
             aterm_agent::harness::result::answer(path, full)
@@ -2127,10 +2127,9 @@ fn task_reply(ctx: &SessionCtx) -> String {
     )
 }
 
-/// The `task` reply for a worker whose tab aterm closed once its task concluded
-/// ([`crate::retired_workers`]): its final record, with no agent, program or attention, its session
-/// gone.
-pub(crate) fn retired_task_reply(record: &TaskRecord) -> String {
+/// The `task` reply for an ended session, from its row ([`crate::session_table`]): its final
+/// record, with no agent, program or attention, its session gone.
+pub(crate) fn ended_task_reply(record: &TaskRecord) -> String {
     format!(
         "OK task {} agent=- program_state=- attention=-\n",
         record.wire_fields()

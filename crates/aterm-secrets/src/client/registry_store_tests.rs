@@ -85,7 +85,7 @@ fn a_registry_put_waits_for_every_mac_reading_the_vault_to_write_no_secret_file(
     let error = floor(&judge(&older, &readers(&roster), Some(RELEASE)))
         .unwrap_err()
         .to_string();
-    assert!(error.contains("1 Mac run an older aterm"), "{error}");
+    assert!(error.contains("1 Mac runs an older aterm"), "{error}");
 
     let mut nothing = all.clone();
     nothing.record(b.actor(), NOW, Said::Nothing);
@@ -108,7 +108,7 @@ fn a_registry_put_waits_for_every_mac_reading_the_vault_to_write_no_secret_file(
     assert_eq!(outside.outside, 1);
     let error = floor(&outside).unwrap_err().to_string();
     assert!(
-        error.contains("1 Mac read the vault from outside the Commons roster"),
+        error.contains("1 Mac reads the vault from outside the Commons roster"),
         "{error}"
     );
     assert_eq!(

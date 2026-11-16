@@ -11,7 +11,29 @@ use std::sync::{
 };
 
 use crate::SessionPool;
-use crate::spawn::{HoldRelease, WAKE_LATCH_HELD, WAKE_LATCH_STAMP};
+use crate::spawn::{HoldRelease, WAKE_LATCH_DIRTY, WAKE_LATCH_HELD, WAKE_LATCH_STAMP};
+
+/// A read of the UI-owned index and, when selected, one session's current atomic latch.
+/// The reader may change that latch immediately after the sample; this is no global census.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Snapshot {
+    pub(crate) now_ns: u64,
+    pub(crate) sessions: usize,
+    pub(crate) ordered: usize,
+    pub(crate) indexed: usize,
+    pub(crate) selected: Option<Selected>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Selected {
+    pub(crate) session: u64,
+    pub(crate) pooled: bool,
+    pub(crate) enrolled: bool,
+    pub(crate) current: bool,
+    pub(crate) held: bool,
+    pub(crate) dirty: bool,
+    pub(crate) due_ns: u64,
+}
 
 #[derive(Default)]
 pub(crate) struct Frontier {
@@ -74,6 +96,37 @@ impl Frontier {
 }
 
 impl SessionPool {
+    /// Read aggregate index sizes and at most the selected session. This neither services a
+    /// hold nor walks the pool, and does not treat an indexed but reader-cleared word as held.
+    pub(crate) fn output_cadence_snapshot(&self, session: Option<u64>, now_ns: u64) -> Snapshot {
+        Snapshot {
+            now_ns,
+            sessions: self.sessions.len(),
+            ordered: self.output_holds.ordered.len(),
+            indexed: self.output_holds.deadlines.len(),
+            selected: session.map(|session| {
+                let live = self.sessions.get(&session);
+                let due = self.output_holds.deadlines.get(&session).copied();
+                let indexed = due.and_then(|due| self.output_holds.ordered.get(&(due, session)));
+                let current = live.zip(indexed).is_some_and(|(live, indexed)| {
+                    Arc::ptr_eq(&live.session.output_wake_pending, indexed)
+                });
+                let word = live.map_or(0, |live| {
+                    live.session.output_wake_pending.load(Ordering::Relaxed)
+                });
+                Selected {
+                    session,
+                    pooled: live.is_some(),
+                    enrolled: due.is_some(),
+                    current,
+                    held: word & WAKE_LATCH_HELD != 0,
+                    dirty: word & WAKE_LATCH_DIRTY != 0,
+                    due_ns: due.unwrap_or(0),
+                }
+            }),
+        }
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(

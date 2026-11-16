@@ -202,23 +202,45 @@ fn the_live_hosts_cores_are_the_machines_logical_cores() {
 #[test]
 fn a_command_can_remove_one_inherited_variable_without_clearing_the_rest() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
-    let removed = run(
-        &Cmd::new("/usr/bin/env").remove_env("PATH"),
-        env_in(dir.path()),
-    );
+    let (printenv, unrelated) = printenv();
+    let removed = run(&printenv.clone().remove_env("PATH"), env_in(dir.path()));
     assert!(removed.ok, "{}", removed.output);
-    assert!(!removed.output.lines().any(|line| line.starts_with("PATH=")));
+    // Windows names a variable in any case (`Path`), and one removal takes every spelling.
+    let named = |line: &str, name: &str| {
+        line.split_once('=').is_some_and(|(key, _)| {
+            if cfg!(windows) {
+                key.eq_ignore_ascii_case(name)
+            } else {
+                key == name
+            }
+        })
+    };
+    assert!(!removed.output.lines().any(|line| named(line, "PATH")));
     assert!(
-        removed.output.lines().any(|line| line.starts_with("HOME=")),
+        removed.output.lines().any(|line| named(line, unrelated)),
         "an unrelated inherited variable remains"
     );
     let restored = run(
-        &Cmd::new("/usr/bin/env")
-            .remove_env("PATH")
-            .env("PATH", "/restored"),
+        &printenv.remove_env("PATH").env("PATH", "/restored"),
         env_in(dir.path()),
     );
     assert!(restored.output.lines().any(|line| line == "PATH=/restored"));
+}
+
+/// A program, by a path that needs no `PATH`, that prints each variable of its environment as
+/// `NAME=value`; and a variable every run inherits that no test removes.
+#[cfg(not(windows))]
+fn printenv() -> (Cmd, &'static str) {
+    (Cmd::new("/usr/bin/env"), "HOME")
+}
+
+/// A program, by a path that needs no `PATH`, that prints each variable of its environment as
+/// `NAME=value`; and a variable every run inherits that no test removes.
+#[cfg(windows)]
+fn printenv() -> (Cmd, &'static str) {
+    let system = std::env::var_os("SystemRoot").expect("Windows names its own folder");
+    let cmd = Path::new(&system).join("System32").join("cmd.exe");
+    (Cmd::new(cmd).args(["/d", "/c", "set"]), "SystemRoot")
 }
 
 #[cfg(unix)]

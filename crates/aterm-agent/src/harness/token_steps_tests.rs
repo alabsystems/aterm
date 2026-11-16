@@ -16,14 +16,24 @@ fn stopped(word: MetWord) -> Stopped {
 /// Only an event ends a hold: a new Claude Code or aterm build where both versions are known,
 /// a window store or mailbox configuration written after the stop, a token made after it, and,
 /// for a code page that waited on a mailbox alone, the window reading the account's mailbox now.
-/// No time does, and nothing unknown does; a mailbox read now lets no other stop through.
+/// No time does, and nothing unknown does; a mailbox read now lets no other stop through. A
+/// check's record (in aterm's window or on the headless profile, a bot check, a block page or
+/// a human check) is held through every one of those, a token the vault holds that was made
+/// after it included (another Mac's says nothing of this Mac's browser or the page it met): a
+/// build, a store, a mailbox or a token is no person at the check, and a pass that went back to
+/// it would be a re-attempt at the check. Only this Mac's own token made, which clears the
+/// record, ends it ([`put`]).
 /// NEGATIVE CONTROL: with `moved` counting an unknown version as a change (`then != now` alone),
 /// a build nobody knew ends the hold: `` an unknown build ended the hold ``. With `holds`
-/// reading `mailbox_read` for every word, a mailbox released a human check: `` a mailbox the
-/// window reads ended a human check's hold ``.
+/// reading `mailbox_read` for every word, a mailbox released an unproven consent page's hold:
+/// `` a mailbox the window reads ended another stop's hold ``. With `holds` reading a
+/// check's word as any other's (the branch's first form), a new build ends a check's hold:
+/// `` a new Claude Code build ended WindowHumanCheck's hold ``. With `holds` ending any record
+/// at a token made after it (the merge's form), another Mac's token ends a check's:
+/// `` a token the vault holds ended WindowHumanCheck's hold ``.
 #[test]
 fn only_an_event_ends_a_hold() {
-    let step = stopped(MetWord::WindowHumanCheck);
+    let step = stopped(MetWord::ConsentUnproven);
     assert!(step.holds(&Since::default()), "nothing changed");
     let same = Since {
         cli: Some("2.1.318"),
@@ -38,7 +48,7 @@ fn only_an_event_ends_a_hold() {
             mailbox_read: Some(true),
             ..same
         }),
-        "a mailbox the window reads ended a human check's hold"
+        "a mailbox the window reads ended another stop's hold"
     );
     let no_mailbox = stopped(MetWord::WindowCodeNoMailbox);
     assert!(no_mailbox.waits_on_a_mailbox() && !step.waits_on_a_mailbox());
@@ -96,8 +106,65 @@ fn only_an_event_ends_a_hold() {
         ..Since::default()
     };
     assert!(step.holds(&unknown), "an unknown build ended the hold");
-    let unknown_then = Stopped::new(MetWord::WindowHumanCheck, AT, "", "").unwrap();
+    let unknown_then = Stopped::new(MetWord::ConsentUnproven, AT, "", "").unwrap();
     assert!(unknown_then.holds(&same), "an unknown build ended the hold");
+
+    // A check's record: nothing in `since` ends the hold.
+    for word in [
+        MetWord::WindowHumanCheck,
+        MetWord::WindowBotCheck,
+        MetWord::WindowBlockPage,
+        MetWord::HumanCheck,
+        MetWord::BotCheck,
+        MetWord::BlockPage,
+    ] {
+        let check = stopped(word);
+        assert!(word.is_bot_protection(), "{word:?}");
+        for (since, what) in [
+            (
+                Since {
+                    cli: Some("2.1.319"),
+                    ..same
+                },
+                "a new Claude Code build",
+            ),
+            (
+                Since {
+                    aterm: Some("0.200.0+g0123456789ab"),
+                    ..same
+                },
+                "a new aterm build",
+            ),
+            (
+                Since {
+                    route_at: Some(AT + 1),
+                    ..same
+                },
+                "a window store or mailbox written after the stop",
+            ),
+            (
+                Since {
+                    mailbox_read: Some(true),
+                    ..same
+                },
+                "a mailbox the window reads",
+            ),
+            (
+                Since {
+                    token_at: Some(AT + 1),
+                    ..same
+                },
+                "a token the vault holds",
+            ),
+        ] {
+            assert!(check.holds(&since), "{what} ended {word:?}'s hold");
+        }
+    }
+    // CONTROL: a stop that is no check is ended by a build.
+    assert!(!stopped(MetWord::WindowDeadline).holds(&Since {
+        cli: Some("2.1.319"),
+        ..same
+    }));
 }
 
 /// A record is made only of a word that holds a step, and of builds a record keeps: each stop
@@ -229,6 +296,53 @@ fn the_file_holds_each_accounts_record_and_nothing_else() {
             "a put wrote over a file that does not read"
         );
     }
+}
+
+/// A CHECK'S RECORD STANDS THROUGH A LATER STOP NO BOT PROTECTION MADE: a window a person closed
+/// in front of the check, a consent page of another account, or the window's deadline after it
+/// has not passed the check, so its record is kept as it was (word and second), as a sign-in's
+/// account check is (`accounts::keep_check`). Another check's record replaces it, and the token
+/// made clears it. CONTROL: a record that is no check's is replaced by any stop that holds.
+/// NEGATIVE CONTROL: with `put` writing every stop over the record (the merge's form), the closed
+/// window replaces the check: `` a closed window replaced WindowBotCheck's record ``.
+#[test]
+fn a_checks_record_stands_through_a_later_stop_no_bot_protection_made() {
+    let scratch = Scratch::new("steps-keep-check");
+    let store = scratch.store();
+    let check = stopped(MetWord::WindowBotCheck);
+    put(&store, KEY, Some(&check)).unwrap();
+    for word in [
+        MetWord::WindowClosed,
+        MetWord::WindowWrongAccount,
+        MetWord::WindowDeadline,
+        MetWord::WindowCodeNoMailbox,
+    ] {
+        let later = Stopped::new(word, AT + 60, "2.1.319", "0.199.0+g69ee51e2f4b5").unwrap();
+        put(&store, KEY, Some(&later)).unwrap();
+        assert_eq!(
+            read(&store).unwrap().get(KEY),
+            Some(&check),
+            "a closed window replaced WindowBotCheck's record ({word:?})"
+        );
+    }
+    let human = Stopped::new(
+        MetWord::HumanCheck,
+        AT + 120,
+        "2.1.319",
+        "0.199.0+g69ee51e2f4b5",
+    )
+    .unwrap();
+    put(&store, KEY, Some(&human)).unwrap();
+    assert_eq!(read(&store).unwrap().get(KEY), Some(&human));
+    put(&store, KEY, None).unwrap();
+    assert!(read(&store).unwrap().is_empty(), "the token made kept it");
+
+    // CONTROL: a record that is no check's is replaced.
+    let unproven = stopped(MetWord::ConsentUnproven);
+    put(&store, KEY, Some(&unproven)).unwrap();
+    let closed = stopped(MetWord::WindowClosed);
+    put(&store, KEY, Some(&closed)).unwrap();
+    assert_eq!(read(&store).unwrap().get(KEY), Some(&closed));
 }
 
 /// What lets a held step through without a person is dated by its own file: the account's

@@ -527,6 +527,10 @@ impl App {
     pub(crate) fn publish_need(&mut self, session: u64) -> bool {
         let started = Instant::now();
         let moved = self.publish_need_timed(session);
+        if moved {
+            // A need that came or went is the row's word (`stuck`, or what it read before).
+            self.navigator_mark_row(session);
+        }
         crate::metrics::note_need_publish(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
         );

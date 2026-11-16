@@ -54,6 +54,10 @@ pub struct Observed {
     /// a login that changed under a running process is known by its address changing between
     /// two reads ([`Sightings::due`]'s [`SeenWhy::Changed`]).
     pub mtime: Option<i64>,
+    /// The plan word the file states of the account ([`journal::plan_word`]), where it states
+    /// one: Claude Code's profile (`oauthAccount.organizationType`) and the plan claim of a Codex
+    /// login's tokens. Read in the same pass as the identity, and the only other field kept.
+    pub plan: Option<&'static str>,
 }
 
 /// What an observer saw of one process's login.
@@ -172,6 +176,8 @@ pub fn claude(
                 src: ObservedSrc::VaultToken,
                 path: PathBuf::from(entry.name()),
                 mtime: None,
+                // The profile in the row's directory may be another account's (§5.7).
+                plan: None,
             })
         }
         AuthRoute::Stored => {
@@ -184,6 +190,7 @@ pub fn claude(
                     src: ObservedSrc::Profile,
                     path,
                     mtime: unix_secs(mtime),
+                    plan: record.plan.and_then(|plan| journal::plan_word(plan.word())),
                 });
             }
             match profile::login_profile_of(env, user_home) {
@@ -307,8 +314,12 @@ pub fn codex(process: &Process<'_>, user_home: &Path, who: &ProcessLogin) -> Obs
         }
     };
     let path = super::codex_app_login::auth_path_in_home(&home);
-    let email = super::codex_app_login::read_account_in_home(&home).and_then(|a| a.email);
-    match email {
+    let account = super::codex_app_login::read_account_in_home(&home);
+    let plan = account
+        .as_ref()
+        .and_then(|account| account.plan.as_deref())
+        .and_then(journal::plan_word);
+    match account.and_then(|account| account.email) {
         Some(email) => Observation::Seen(Observed {
             cli: Cli::Codex.into(),
             email,
@@ -317,6 +328,7 @@ pub fn codex(process: &Process<'_>, user_home: &Path, who: &ProcessLogin) -> Obs
             src: ObservedSrc::AuthFile,
             mtime: mtime_of(&path),
             path,
+            plan,
         }),
         None if path.is_file() => Observation::SignedOut { path },
         None => Observation::Unread,
@@ -338,6 +350,7 @@ pub fn agy(process: &Process<'_>, user_home: &Path) -> Observation {
             src: ObservedSrc::CliLog,
             mtime: mtime_of(&path),
             path,
+            plan: None,
         }),
         profile::AgyLogin::Gateway => Observation::Routed {
             route: ObservedRoute::Gateway,
@@ -361,6 +374,7 @@ pub fn muse(process: &Process<'_>, user_home: &Path) -> Observation {
             src: ObservedSrc::AuthFile,
             mtime: mtime_of(&path),
             path,
+            plan: None,
         }),
         profile::MuseLogin::SignedOut { path } => Observation::SignedOut { path },
         profile::MuseLogin::Unread => Observation::Unread,
@@ -434,6 +448,7 @@ fn named_in(cli: Cli, region: Option<Region>, named: Option<Named>, path: PathBu
             src: ObservedSrc::AuthFile,
             mtime: mtime_of(&path),
             path,
+            plan: None,
         }),
         (None, Some(key)) => Observation::KeyOnly { key, path },
         (None, None) => Observation::Unread,

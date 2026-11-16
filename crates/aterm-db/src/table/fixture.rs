@@ -610,6 +610,11 @@ fn settle_copy(root: &std::path::Path, copied: &dyn Fn([u8; 16]) -> PathBuf, nee
         };
         let (old, new) = super::store::rebind_claim(&mut claim, &copied(claimed)).unwrap();
         std::fs::write(path, &claim).unwrap();
+        let group = path.with_file_name(format!("{name}.group"));
+        if let Ok(mut permit) = std::fs::read(&group) {
+            super::store::rebind_group(&mut permit, &claim).unwrap();
+            std::fs::write(&group, &permit).unwrap();
+        }
         needles.push(claimed.to_vec());
         for (old, new) in [
             (old.to_vec(), new.to_vec()),

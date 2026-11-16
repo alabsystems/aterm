@@ -1216,7 +1216,11 @@ pub(crate) enum Look {
     Poke,
 }
 
-/// Append a tick's `row` to `file` while `mode` observes (`observe` or `prompt`).
+/// Append a tick's `row` to `file` while `mode` observes (`observe` or `prompt`) and the row
+/// names a supervised session. A minute with none writes nothing: it counts no slot idle while
+/// ready ([`ring::idle_ready_ms`]) and a replay judges no look that does not name its session
+/// (`occupancy::replay::replay`), so a Mac with no agent tab makes no durable write a minute.
+/// The board's own rows ([`Judged::looked`]) keep it.
 ///
 /// # Errors
 /// The file's append failed ([`RingFile::append`]).
@@ -1227,7 +1231,9 @@ pub(crate) fn append_look(
     row: Option<&RingRow>,
 ) -> std::io::Result<bool> {
     match row {
-        Some(row) if look == Look::Tick && mode.observes() => file.append(row).map(|()| true),
+        Some(row) if look == Look::Tick && mode.observes() && !row.sessions.is_empty() => {
+            file.append(row).map(|()| true)
+        }
         _ => Ok(false),
     }
 }

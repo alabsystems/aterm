@@ -204,13 +204,15 @@ pub const FOCUSED: (&str, &str) = ("focused", "true");
 /// The deadline owner the stats deck's live edge (its glide, slide, beat and steam) fires as.
 pub const LIVE_LANE: &str = "stats_live";
 
-/// The loop wakes one needle frame takes: its deadline's timer wake and the `GpuSurfaceReady`
-/// wake its present brings. Three pet takes on 2026-10-28 counted 19, 34 and 46 needle fires
-/// beside 129, 160 and 184 wakes, as many `GpuSurfaceReady` wakes as frames: 91 or 92 wakes
-/// besides the needle's in each. Those takes predate the deck clock: a window on its display
-/// link fires [`NEEDLE_LANE`] only to resume the paused link, one timer wake, and draws its
-/// frames on the link's ticks, window events that [`SpinRow::max_wakes`] counts.
-pub const WAKES_PER_NEEDLE_FRAME: u64 = 2;
+/// The loop wakes one needle frame takes: its deadline's timer wake. Its present brings none: the
+/// drawable worker posts `GpuSurfaceReady` only for a frame that found no drawable and waits
+/// (`aterm-gpu`'s `metal/acquire_worker.rs`). Three pet takes on 2026-10-28, on a build whose
+/// worker posted that wake after every acquisition, counted 19, 34 and 46 needle fires beside
+/// 129, 160 and 184 wakes, as many `GpuSurfaceReady` wakes as frames: 91 or 92 wakes besides
+/// the needle's two a fire in each. Those takes also predate the deck clock: a window on its
+/// display link fires [`NEEDLE_LANE`] only to resume the paused link, one timer wake, and draws
+/// its frames on the link's ticks, window events that [`SpinRow::max_wakes`] counts.
+pub const WAKES_PER_NEEDLE_FRAME: u64 = 1;
 
 /// The pet rows' existing total deadline, including their readiness wait and observation.
 const PET_BUDGET_SECS: u64 = 130;

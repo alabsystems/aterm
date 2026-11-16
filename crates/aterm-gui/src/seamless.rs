@@ -3899,8 +3899,8 @@ pub(crate) struct IncomingHandoff {
     pub mirror_dropped: Vec<String>,
     /// Whether the outgoing process's node mirrored ([`crate::session_store::SessionHandoff::mirror_served`]).
     pub mirror_served: bool,
-    /// The outgoing process's retired workers ([`crate::session_store::SessionHandoff::retired_workers`]), the rows as written; adopted into this process's store before its first session ([`crate::retired_workers::RetiredWorkers::adopt`]).
-    pub retired_workers: Vec<String>,
+    /// The launch of the last agent each outgoing session ran ([`crate::session_store::SessionHandoff::last_launches`]), the rows as written; kept before this process's first session ([`crate::harness_host::adopt_last_launches`]).
+    pub last_launches: Vec<String>,
 }
 
 /// Whose content a whole-handoff refusal was about.
@@ -6344,7 +6344,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
         person_stamps: Some(person_stamps_path(std::path::Path::new(&path))),
         mirror_dropped: manifest.mirror_dropped,
         mirror_served: manifest.mirror_served,
-        retired_workers: manifest.retired_workers,
+        last_launches: manifest.last_launches,
     }
 }
 

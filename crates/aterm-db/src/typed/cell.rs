@@ -247,7 +247,7 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             if words.contains(&word) {
                 Ok(())
             } else {
-                Err("this word is not one the column knows")
+                Err("pick one of the column's own words")
             }
         }
         Ty::Label => keys::is_label(text()?)
@@ -424,7 +424,7 @@ fn check_elem(column: &Column, elem: &str) -> std::result::Result<(), &'static s
             .ok_or("a text set's element key is the digest of its text");
     }
     match inner {
-        Ty::Enum(words) if !words.contains(&elem) => Err("this word is not one the column knows"),
+        Ty::Enum(words) if !words.contains(&elem) => Err("pick one of the column's own words"),
         Ty::Label if !keys::is_label(elem) => Err("a machine label is m<N> or m<N>-xxxx"),
         _ if !pk_grammar(elem) => Err("a set element breaks the key grammar"),
         Ty::Enum(_) | Ty::Label | Ty::Key | Ty::Ref(_) => {

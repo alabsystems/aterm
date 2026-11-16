@@ -12,15 +12,18 @@
 //! a dead neighbour there.
 
 use aterm_mesh::{Waker, Woke};
+#[cfg(any(target_os = "macos", test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Which path readings are changes: every one after the first, which is the path in use when the
 /// monitor started (`PathMonitor::start`: "each later update is a change of that path").
+#[cfg(any(target_os = "macos", test))] // heard on macOS alone (Network.framework)
 #[derive(Debug, Default)]
 pub(super) struct PathChanges {
     started: AtomicBool,
 }
 
+#[cfg(any(target_os = "macos", test))]
 impl PathChanges {
     /// One reading heard: whether it is a change of the path.
     pub(super) fn read(&self) -> bool {

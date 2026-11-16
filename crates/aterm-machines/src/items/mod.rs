@@ -198,6 +198,11 @@ pub trait Item: Send + Sync {
     fn new_targets(&self, _held: &str, _from: &str) -> bool {
         false
     }
+
+    /// The engine is done with this row ([`aterm_converge::Item::row_ended`]): nothing follows
+    /// its last probe in this run. What the item kept from that probe for an apply that did not
+    /// come goes here. A wrapper that probes its inner item passes this on.
+    fn row_ended(&self) {}
 }
 
 /// Expands every item requested by `baseline` in execution order.

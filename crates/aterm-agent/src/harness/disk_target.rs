@@ -131,6 +131,277 @@ pub struct Profile {
     pub bytes: u64,
     /// `true` when that walk stopped at its bound: the figure is a floor.
     pub bytes_partial: bool,
+    /// What a build that died left in it ([`died_output`]), read only under pressure.
+    pub died: Died,
+}
+
+impl Profile {
+    /// The unix second this profile's `incremental/` may first go under pressure (tier 4), where
+    /// it is kept now only for its age: a build wrote into it within `min_idle_s`
+    /// ([`PRESSURE_MIN_IDLE_S`] at least). `None` where it may go now or by tier 2 (idle past
+    /// `threshold_days`), holds nothing to take, has no clock, or a build holds it.
+    #[must_use]
+    pub fn ripens_at(&self, now: i64, threshold_days: i64, min_idle_s: i64) -> Option<i64> {
+        let last = self.last_used?;
+        if !self.incremental || self.in_use.is_some() || idle(self.last_used, now, threshold_days) {
+            return None;
+        }
+        let at = last.saturating_add(min_idle_s.max(PRESSURE_MIN_IDLE_S));
+        (now < at).then_some(at)
+    }
+}
+
+/// A died build's unfinished incremental session folder younger than this, by its own
+/// modification time, is left. rustc's own collection of unfinished sessions waits ten seconds
+/// by the time in the session's name (`is_old_enough_to_be_collected`, rustc_incremental
+/// persist/fs.rs at Trust 0e47bc0b33); a folder's modification time is never earlier than its
+/// creation, so this is at least as strict. The session's lock is the real fence: rustc takes
+/// it before it makes the folder and holds it until the session ends.
+pub const DIED_SESSION_MIN_AGE_S: i64 = 10;
+
+/// A metadata temporary folder ([`metadata_temp`]) younger than this is left. No lock covers
+/// one, so its age and the process fence (no process with an executable, mapping, working
+/// directory or descriptor inside it) are what keep a live compile's.
+pub const DIED_METADATA_MIN_AGE_S: i64 = 60;
+
+/// The lock file's name of rustc's incremental session folder `name` while the session is
+/// unfinished: `s-{timestamp}-{random}-working`, each part base 36 (digits and lowercase
+/// letters), has its lock at `s-{timestamp}-{random}.lock` beside it. `None` for any other name,
+/// a finished session's (`s-{timestamp}-{random}-{svh}`) included. The names are the Trust
+/// compiler's own (rustc_incremental persist/fs.rs at Trust 0e47bc0b33): a change there has to
+/// reach this reader.
+#[must_use]
+pub fn unfinished_session_lock(name: &str) -> Option<String> {
+    let middle = name.strip_prefix("s-")?.strip_suffix("-working")?;
+    let (stamp, random) = middle.split_once('-')?;
+    let base36 = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+    };
+    (base36(stamp) && base36(random)).then(|| format!("s-{stamp}-{random}.lock"))
+}
+
+/// Whether `name` is a temporary folder rustc's metadata writer makes beside a crate's outputs
+/// while it writes them: `rmeta` and six random ASCII letters or digits (rustc_metadata fs.rs's
+/// `TempFileBuilder` prefix and the default random length, at Trust 0e47bc0b33). A compile that
+/// ends removes its own; one that died leaves it.
+#[must_use]
+pub fn metadata_temp(name: &str) -> bool {
+    name.len() == 11
+        && name
+            .strip_prefix("rmeta")
+            .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// One piece of a died build's partial output in a profile ([`died_output`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Partial {
+    /// Its path: an unfinished incremental session's folder, or a metadata temporary folder.
+    pub path: PathBuf,
+    /// A session's lock file ([`unfinished_session_lock`]); `None` for a metadata folder.
+    pub session_lock: Option<PathBuf>,
+    /// Its folder's modification time, unix seconds.
+    pub modified: i64,
+    /// What removing it would release ([`cache_bytes`]).
+    pub bytes: u64,
+    /// `true` when that walk stopped at its bound: the figure is a floor.
+    pub bytes_partial: bool,
+}
+
+/// A lock a build held over what a pass would take: the pass waits for it to be let go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Held {
+    /// A cargo profile whose build locks ([`CARGO_LOCKS`]) a build holds.
+    Profile(PathBuf),
+    /// An unfinished incremental session's lock file a rustc holds.
+    Session(PathBuf),
+}
+
+impl Held {
+    /// Whether the lock is let go now: a probe that takes each lock a moment and releases it,
+    /// creating none (a lock file that is gone is let go).
+    #[must_use]
+    pub fn released(&self) -> bool {
+        match self {
+            Held::Profile(profile) => locks_held(profile).is_none(),
+            Held::Session(lock) => lock_held(lock, &mut |_| {}).is_none(),
+        }
+    }
+}
+
+/// What a build that died left in one profile ([`died_output`]), and what keeps the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Died {
+    /// The pieces a pass may take.
+    pub partials: Vec<Partial>,
+    /// The earliest unix second a piece kept for its age may go.
+    pub ripens: Option<i64>,
+    /// The session locks a rustc holds over unfinished sessions (at most
+    /// [`super::cadence::HELD_PROBES`]).
+    pub held: Vec<Held>,
+    /// The listing stopped at [`MAX_WALK_ENTRIES`] names: more may be there.
+    pub cut: bool,
+}
+
+impl Died {
+    fn ripen(&mut self, at: i64) {
+        self.ripens = Some(self.ripens.map_or(at, |was| was.min(at)));
+    }
+
+    fn hold(&mut self, held: Held) {
+        if self.held.len() < super::cadence::HELD_PROBES {
+            self.held.push(held);
+        }
+    }
+}
+
+/// The names in one profile's folders [`died_output`] reads, counted against one bound.
+struct Listing {
+    left: usize,
+    cut: bool,
+}
+
+impl Listing {
+    /// The names in the folder at `dir` on device `dev` (none where it is no folder there, a
+    /// link included), each counted; past the bound the listing stops and is cut. Only a name
+    /// that matches a pattern is read further, so a large `deps/` costs its names alone.
+    fn names(&mut self, dir: &Path, dev: u64) -> Vec<std::ffi::OsString> {
+        if folder_modified(dir, dev).is_none() {
+            return Vec::new();
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            if self.left == 0 {
+                self.cut = true;
+                break;
+            }
+            self.left -= 1;
+            if let Ok(entry) = entry {
+                out.push(entry.file_name());
+            }
+        }
+        out
+    }
+}
+
+/// The modification time (unix seconds) of the folder at `path` on device `dev`, read without
+/// following a link; `None` where it is no folder there.
+fn folder_modified(path: &Path, dev: u64) -> Option<i64> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_dir() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.dev() != dev {
+            return None;
+        }
+    }
+    #[cfg(not(unix))]
+    if aterm_sysprobe::volumes::file_id(path, false).map(|id| id.dev) != Some(dev) {
+        return None;
+    }
+    let modified = meta.modified().ok()?;
+    Some(
+        modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .unwrap_or(0),
+    )
+}
+
+/// WHAT A BUILD THAT DIED LEFT in the profile at `profile` (on device `dev`), read at `now` by
+/// the Trust compiler's own names: each unfinished incremental session folder
+/// (`incremental/<crate>/s-…-working`, [`unfinished_session_lock`]) whose lock file is there and
+/// no process holds, [`DIED_SESSION_MIN_AGE_S`] old; and each metadata temporary folder
+/// ([`metadata_temp`]) in `deps/`, `examples/`, `build/<unit>/`, a build script's output folder
+/// (`build/<unit>/out/`, or `build/<unit>/<run>/out/` where the units are laid out by package),
+/// [`DIED_METADATA_MIN_AGE_S`] old. A younger piece sets [`Died::ripens`], a session whose lock
+/// a rustc holds is [`Died::held`]. A reading: it follows no link, leaves `dev`, takes a lock only
+/// a moment (and creates none), and lists at most [`MAX_WALK_ENTRIES`] names. The process fence
+/// of a metadata folder is the remover's, under the profile's locks ([`reclaim_died`]).
+pub(crate) fn died_output(profile: &Path, dev: u64, now: i64) -> Died {
+    let mut died = Died::default();
+    let mut listing = Listing {
+        left: MAX_WALK_ENTRIES,
+        cut: false,
+    };
+    let incremental = profile.join(INCREMENTAL);
+    for krate in listing.names(&incremental, dev) {
+        let krate = incremental.join(krate);
+        for name in listing.names(&krate, dev) {
+            let Some(lock) = name.to_str().and_then(unfinished_session_lock) else {
+                continue;
+            };
+            let path = krate.join(&name);
+            let Some(modified) = folder_modified(&path, dev) else {
+                continue;
+            };
+            // A session with no lock file beside it is no session rustc's rule judges: left.
+            let lock = krate.join(lock);
+            if !std::fs::symlink_metadata(&lock).is_ok_and(|m| m.is_file()) {
+                continue;
+            }
+            if now.saturating_sub(modified) < DIED_SESSION_MIN_AGE_S {
+                died.ripen(modified.saturating_add(DIED_SESSION_MIN_AGE_S));
+                continue;
+            }
+            if lock_held(&lock, &mut |_| {}).is_some() {
+                died.hold(Held::Session(lock));
+                continue;
+            }
+            let (bytes, bytes_partial) = cache_bytes(&path, Some(dev));
+            died.partials.push(Partial {
+                path,
+                session_lock: Some(lock),
+                modified,
+                bytes,
+                bytes_partial,
+            });
+        }
+    }
+    let mut outputs = vec![profile.join("deps"), profile.join("examples")];
+    let build = profile.join("build");
+    for unit in listing.names(&build, dev) {
+        let unit = build.join(unit);
+        for run in listing.names(&unit, dev) {
+            outputs.push(unit.join(run).join("out"));
+        }
+        outputs.push(unit.join("out"));
+        outputs.push(unit);
+    }
+    for folder in outputs {
+        for name in listing.names(&folder, dev) {
+            if !name.to_str().is_some_and(metadata_temp) {
+                continue;
+            }
+            let path = folder.join(&name);
+            let Some(modified) = folder_modified(&path, dev) else {
+                continue;
+            };
+            if now.saturating_sub(modified) < DIED_METADATA_MIN_AGE_S {
+                died.ripen(modified.saturating_add(DIED_METADATA_MIN_AGE_S));
+                continue;
+            }
+            let (bytes, bytes_partial) = cache_bytes(&path, Some(dev));
+            died.partials.push(Partial {
+                path,
+                session_lock: None,
+                modified,
+                bytes,
+                bytes_partial,
+            });
+        }
+    }
+    died.cut = listing.cut;
+    died
 }
 
 /// One build directory, with the facts that decide it.
@@ -685,6 +956,7 @@ fn facts(path: &Path, budget: WalkBudget) -> Option<TargetDir> {
             in_use: None,
             bytes: 0,
             bytes_partial: false,
+            died: Died::default(),
         })
         .collect();
     Some(TargetDir {
@@ -842,38 +1114,51 @@ fn locks_held(profile: &Path) -> Option<String> {
 
 fn locks_held_with(profile: &Path, hook: &mut dyn FnMut(&Path)) -> Option<String> {
     for lock in CARGO_LOCKS {
-        let path = profile.join(lock);
-        match std::fs::symlink_metadata(&path) {
-            Ok(m) if m.is_file() => {}
-            Ok(_) => return Some(format!("{} is not a plain file", path.display())),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
-        }
-        let mut open = std::fs::OpenOptions::new();
-        open.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        }
-        let file = match aterm_uds::kept_out(|| open.open(&path)) {
-            Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
-        };
-        if !file.metadata().is_ok_and(|m| m.is_file()) {
-            return Some(format!("{} is not a plain file", path.display()));
-        }
-        match HeldLock::try_take(file) {
-            Ok(Some(held)) => {
-                hook(&path);
-                drop(held);
-            }
-            Ok(None) => return Some(format!("a build holds {}", path.display())),
-            Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
+        if let Some(why) = lock_held(&profile.join(lock), hook) {
+            return Some(why);
         }
     }
     None
+}
+
+/// Whether a process holds the lock file at `path`: why, where one does or it could not be
+/// probed; `None` where it is free or not there. The probe opens it read-only (never creating
+/// it, never through a link) and takes its lock a moment (`flock`; `LockFileEx` on Windows),
+/// telling `hook` while it holds it. cargo's build locks are `flock`s, as rustc's session
+/// locks are on Linux; on macOS rustc takes a session's lock with `fcntl`, which the BSD
+/// kernel keeps on the same advisory list of the file as a `flock`, so the probe meets it
+/// there too (rustc_data_structures flock/unix.rs at Trust 0e47bc0b33).
+fn lock_held(path: &Path, hook: &mut dyn FnMut(&Path)) -> Option<String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => return Some(format!("{} is not a plain file", path.display())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
+    }
+    let mut open = std::fs::OpenOptions::new();
+    open.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        open.custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = match aterm_uds::kept_out(|| open.open(path)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(format!("{} could not be probed: {e}", path.display())),
+    };
+    if !file.metadata().is_ok_and(|m| m.is_file()) {
+        return Some(format!("{} is not a plain file", path.display()));
+    }
+    match HeldLock::try_take(file) {
+        Ok(Some(held)) => {
+            hook(path);
+            drop(held);
+            None
+        }
+        Ok(None) => Some(format!("a build holds {}", path.display())),
+        Err(e) => Some(format!("{} could not be probed: {e}", path.display())),
+    }
 }
 
 /// Bytes deleting the tree at `dir` would release.
@@ -1021,6 +1306,42 @@ pub fn reclaim_lru_with(
     fd::reclaim(path, judge, Select::Lru { profile, seen }, hook)
 }
 
+/// TIER 0's removal of one piece of what a died build left ([`died_output`],
+/// `super::Witness::DiedBuild`): the unfinished incremental session folder or metadata temporary
+/// folder `entry`, in the profile `profile` of the build directory `path`, last written at `seen`
+/// by the survey. Under the profile's build locks it takes the session's own lock (a rustc that
+/// holds it keeps its session), reads the entry's name again by the compiler's rules and its age
+/// again, has `check` judge it (a metadata folder's process fence), removes it on the measured
+/// device and puts its folder's access and modification times back, so the profile's clock
+/// ([`Profile::last_used`]) reads after the removal what it read before. The session's lock file
+/// stays: rustc's own collection removes a lock no session folder has.
+/// # Errors
+/// Nothing was reclaimed: the entry or its profile is no longer a candidate, a lock is held,
+/// `check` refused, or nothing could be removed.
+pub fn reclaim_died(
+    path: &Path,
+    profile: &Path,
+    entry: &Path,
+    judge: &Judge,
+    seen: i64,
+    check: &mut dyn FnMut() -> Result<(), String>,
+) -> io::Result<Removed> {
+    reclaim_died_with(path, profile, entry, judge, seen, check, &mut |_, _| {})
+}
+
+/// [`reclaim_died`] with a hook told each [`Stage`] (a test's probe; the path is the entry's).
+pub fn reclaim_died_with(
+    path: &Path,
+    profile: &Path,
+    entry: &Path,
+    judge: &Judge,
+    seen: i64,
+    check: &mut dyn FnMut() -> Result<(), String>,
+    hook: &mut dyn FnMut(Stage, &Path),
+) -> io::Result<Removed> {
+    fd::reclaim_died(path, (profile, entry), judge, seen, check, hook)
+}
+
 /// Below the floor, remove a build directory whose owner is gone, whole (`super::Witness::OwnerGone`).
 pub fn reclaim_whole(
     path: &Path,
@@ -1153,9 +1474,9 @@ impl Select<'_> {
 #[cfg(any(unix, windows))]
 mod fd {
     use super::{
-        CACHE_DIRS, CARGO_LOCKS, CLOCK_DIRS, HeldLock, INCREMENTAL, Judge, MAX_CUSTODY_DEPTH,
-        MAX_DELETE_DEPTH, Path, PathBuf, Removed, Select, Stage, TargetDir, WalkBudget, io,
-        root_facts,
+        CACHE_DIRS, CARGO_LOCKS, CLOCK_DIRS, DIED_METADATA_MIN_AGE_S, DIED_SESSION_MIN_AGE_S,
+        HeldLock, INCREMENTAL, Judge, MAX_CUSTODY_DEPTH, MAX_DELETE_DEPTH, Path, PathBuf, Removed,
+        Select, Stage, TargetDir, WalkBudget, io, root_facts,
     };
     use aterm_dirfd::{self as dirfd, AtFlags, Dir, Errno, Mode, OFlags, OwnedFd};
     #[cfg(windows)]
@@ -2641,6 +2962,259 @@ mod fd {
         })
     }
 
+    /// What `parts`, a path inside a profile, names by the compiler's rules: `Some(Some(lock))`
+    /// an unfinished incremental session (`incremental/<crate>/<session>`) and its lock file's
+    /// name; `Some(None)` a metadata temporary folder in `deps/`, `examples/`, `build/<unit>/`,
+    /// `build/<unit>/out/` or `build/<unit>/<run>/out/`; `None` anything else
+    /// ([`super::died_output`] reads the same).
+    fn died_kind(parts: &[&OsStr]) -> Option<Option<String>> {
+        let text: Vec<&str> = parts.iter().map(|p| p.to_str()).collect::<Option<_>>()?;
+        match text.as_slice() {
+            [inc, _, session] if *inc == INCREMENTAL => {
+                super::unfinished_session_lock(session).map(Some)
+            }
+            ["deps" | "examples", name]
+            | ["build", _, name]
+            | ["build", _, "out", name]
+            | ["build", _, _, "out", name]
+                if super::metadata_temp(name) =>
+            {
+                Some(None)
+            }
+            _ => None,
+        }
+    }
+
+    /// The modification time (unix seconds) of the folder `fd` holds open.
+    fn modified_at(fd: &OwnedFd) -> io::Result<i64> {
+        let file = std::fs::File::from(dirfd::openat(fd, ".", dir_flags(), Mode::empty())?);
+        let at = file.metadata()?.modified()?;
+        Ok(at
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| i64::try_from(d.as_secs()).ok())
+            .unwrap_or(0))
+    }
+
+    /// The folder `dir` (at `path`) opened to have its times put back, with the access and
+    /// modification times it has now.
+    #[cfg(unix)]
+    fn times_of(dir: &OwnedFd, _: &Path) -> io::Result<(std::fs::File, std::fs::FileTimes)> {
+        let file = std::fs::File::from(dirfd::openat(dir, ".", dir_flags(), Mode::empty())?);
+        let meta = file.metadata()?;
+        let times = std::fs::FileTimes::new()
+            .set_accessed(meta.accessed()?)
+            .set_modified(meta.modified()?);
+        Ok((file, times))
+    }
+
+    /// [`times_of`] on Windows: a folder's handle opened by a pinned descriptor may not write
+    /// attributes, so the folder is opened by `path` (as itself, never through a reparse point)
+    /// and held to `dir`'s identity.
+    #[cfg(windows)]
+    fn times_of(dir: &OwnedFd, path: &Path) -> io::Result<(std::fs::File, std::fs::FileTimes)> {
+        use crate::harness::disk::win::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES};
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::os::windows::io::AsHandle as _;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let mut open = std::fs::OpenOptions::new();
+        open.access_mode(FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        let file = aterm_uds::kept_out(|| open.open(path))?;
+        let want = dirfd::file_id(dir)?;
+        let opened = aterm_sysprobe::volumes::file_id_of_handle(file.as_handle());
+        if opened.map(|id| (id.dev, id.ino)) != Some((want.dev, want.ino)) {
+            return Err(io::Error::other("its name now names another folder"));
+        }
+        let meta = file.metadata()?;
+        let times = std::fs::FileTimes::new()
+            .set_accessed(meta.accessed()?)
+            .set_modified(meta.modified()?);
+        Ok((file, times))
+    }
+
+    /// Remove one piece of a died build's output ([`super::reclaim_died`]).
+    pub(super) fn reclaim_died(
+        path: &Path,
+        (profile, entry): (&Path, &Path),
+        judge: &Judge,
+        seen: i64,
+        check: &mut dyn FnMut() -> Result<(), String>,
+        hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        let refuse = |why: String| io::Error::other(format!("no longer a candidate: {why}"));
+        let mut parts = Vec::new();
+        for part in entry
+            .strip_prefix(profile)
+            .map_err(|_| refuse("it is not inside its profile".to_owned()))?
+            .components()
+        {
+            let std::path::Component::Normal(name) = part else {
+                return Err(refuse("not a plain path".to_owned()));
+            };
+            parts.push(name);
+        }
+        let Some(lock_name) = died_kind(&parts) else {
+            return Err(refuse("its name is not one a died build leaves".to_owned()));
+        };
+        let Some((name, folders)) = parts.split_last() else {
+            return Err(refuse("it is its profile".to_owned()));
+        };
+        fixed_volume(path)?;
+        let root = pin(path).map_err(gone_since)?;
+        let root_dev = on_measured_volume(&root, judge)?;
+        let (marker, holds_source) = root_facts(path);
+        let (profiles, cut) = find_at(&root, path, WalkBudget::SHIPPED);
+        TargetDir {
+            path: path.to_path_buf(),
+            marker,
+            holds_source,
+            walk_cut_short: cut,
+            profiles: Vec::new(),
+            device: Some(root_dev),
+            volume: None,
+            probed_recent: false,
+            origin: super::Origin::Named,
+            owned: super::Owned::NotOwned,
+            total: None,
+            foreign: None,
+            idle: None,
+        }
+        .fences()
+        .map_err(refuse)?;
+        if !profiles.iter().any(|p| same_path(p, profile)) {
+            return Err(refuse(
+                "not one of this build directory's cargo profiles".to_owned(),
+            ));
+        }
+        let profile_fd =
+            reopen(&root, path, profile, root_dev).map_err(|e| refuse(e.to_string()))?;
+        let held = take_all(&profile_fd, profile).map_err(refuse)?;
+        let listed =
+            names(&profile_fd).map_err(|e| refuse(format!("it could not be read: {e}")))?;
+        if !has_layout(&profile_fd, &listed) {
+            return Err(refuse("no longer a cargo profile".to_owned()));
+        }
+        let mut parent = dirfd::openat(&profile_fd, ".", dir_flags(), Mode::empty())?;
+        let mut parent_path = profile.to_path_buf();
+        for folder in folders {
+            parent_path.push(folder);
+            parent = match open_dir(&parent, folder)? {
+                Some(fd) if dev(&fd)? == root_dev => fd,
+                Some(_) => {
+                    return Err(refuse(format!(
+                        "{} is on another device",
+                        parent_path.display()
+                    )));
+                }
+                None => {
+                    return Err(refuse(format!(
+                        "{} is no longer a folder",
+                        parent_path.display()
+                    )));
+                }
+            };
+        }
+        let child = match open_dir(&parent, name)? {
+            Some(fd) if dev(&fd)? == root_dev => fd,
+            Some(_) => return Err(refuse("it is on another device".to_owned())),
+            None => return Err(gone_since(io::ErrorKind::NotFound.into())),
+        };
+        // A session's own lock: a rustc that still holds it is still writing the session.
+        let session = match &lock_name {
+            Some(lock) => match take_lock(&parent, lock, false) {
+                Ok(Some(taken)) => Some(taken),
+                Ok(None) => return Err(refuse(format!("a rustc holds its session lock {lock}"))),
+                Err(e) if e.raw_os_error() == Some(code::NOENT) => {
+                    return Err(refuse("its session lock is gone".to_owned()));
+                }
+                Err(e) => {
+                    return Err(refuse(format!("its session lock could not be taken: {e}")));
+                }
+            },
+            None => None,
+        };
+        hook(Stage::Locked, entry);
+        let modified =
+            modified_at(&child).map_err(|e| refuse(format!("its age could not be read: {e}")))?;
+        if modified > seen {
+            return Err(refuse("it was written into since the survey".to_owned()));
+        }
+        let min_age = if lock_name.is_some() {
+            DIED_SESSION_MIN_AGE_S
+        } else {
+            DIED_METADATA_MIN_AGE_S
+        };
+        let age = judge.now.saturating_sub(modified);
+        if age < min_age {
+            return Err(refuse(format!(
+                "it was written into {} ago",
+                super::human_age(age)
+            )));
+        }
+        check().map_err(refuse)?;
+        let child_entry = Child::of(&child, name).map_err(|e| refuse(e.to_string()))?;
+        let times = times_of(&parent, &parent_path);
+        hook(Stage::Deleting, entry);
+        if let Err(why) = ordinary_custody_at(&root, path) {
+            drop(session);
+            drop(held);
+            hook(Stage::Released, entry);
+            return Err(refuse(why));
+        }
+        let mut deleted = Deleted::default();
+        {
+            let mut pass = Removal {
+                on: root_dev,
+                custody: Some((&root, path)),
+                revoked: false,
+                _hook: hook,
+                permit: None,
+            };
+            remove_tree_at(
+                &parent,
+                &child_entry,
+                &parent_path,
+                0,
+                &mut deleted,
+                &mut pass,
+            );
+        }
+        let gone = matches!(open_dir(&parent, name), Ok(None));
+        match times.and_then(|(folder, times)| folder.set_times(times)) {
+            Ok(()) => {}
+            Err(e) => deleted.kept.push(format!(
+                "{}: its times could not be put back, so its profile reads as written now: {e}",
+                parent_path.display()
+            )),
+        }
+        drop(session);
+        drop(held);
+        hook(Stage::Released, entry);
+        if !gone && deleted.bytes == 0 {
+            let mut why = deleted.kept;
+            if why.is_empty() {
+                why.push("nothing could be removed".to_owned());
+            }
+            return Err(io::Error::other(format!(
+                "nothing reclaimed — {}",
+                why.join("; ")
+            )));
+        }
+        Ok(Removed {
+            bytes: deleted.bytes,
+            units: if gone {
+                vec![entry.to_path_buf()]
+            } else {
+                Vec::new()
+            },
+            skipped: Vec::new(),
+            trouble: deleted.kept,
+        })
+    }
+
     fn content_rank(name: &OsStr) -> u8 {
         match name.to_str() {
             Some(".fingerprint") => 0,
@@ -3410,6 +3984,18 @@ mod fd {
         _path: &Path,
         _judge: &Judge,
         _select: Select<'_>,
+        _hook: &mut dyn FnMut(Stage, &Path),
+    ) -> io::Result<Removed> {
+        Err(io::Error::other(
+            "reclaiming build caches needs unix or Windows",
+        ))
+    }
+    pub(super) fn reclaim_died(
+        _path: &Path,
+        _at: (&Path, &Path),
+        _judge: &Judge,
+        _seen: i64,
+        _check: &mut dyn FnMut() -> Result<(), String>,
         _hook: &mut dyn FnMut(Stage, &Path),
     ) -> io::Result<Removed> {
         Err(io::Error::other(

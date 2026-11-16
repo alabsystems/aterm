@@ -206,7 +206,9 @@ pub(crate) const PAGE: Page = Page {
                      claim that never wakes it; `task_news=1` marks a target that had news for \
                      this wait (it woke it, or under `all` had its share), `0` one whose row is \
                      only how it stands now. Wait again from each row's `rev=` \
-                     (`@<sid>:<rev>,…`).",
+                     (`@<sid>:<rev>,…`). A target that ended (`exits`), in this process or \
+                     before a quit, answers at once from its row in the machine's session \
+                     table: `state=closed`, its task's conclusion, `task_news=1`.",
                 ),
                 para(
                     "`aterm ctl [--host <h>] await task board …` waits on a `board`'s open rows \

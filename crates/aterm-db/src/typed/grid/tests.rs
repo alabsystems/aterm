@@ -792,6 +792,7 @@ const SETS: Table = Table {
     collections: &[&TEXT_SETS],
     self_quota: 0,
     ends: &[],
+    faces: &[],
 };
 
 /// A text set one of whose members holds a comma (`Studio, upstairs`) shows as a JSON list, and
@@ -1319,4 +1320,44 @@ fn a_raw_text_set_shows_a_member_with_a_comma_as_one() {
         "{}",
         exported.text
     );
+}
+
+/// A day shows as its date and reads back from it or from its number, on every surface that
+/// shows a cell; a date that names no day from 1970 through 9999 is refused by the date rule,
+/// and a day past 9999 shows as its number, never as a date made up past the calendar's end.
+/// NEGATIVE CONTROL: with `read` parsing a day as a whole number only (its `date_day` dropped),
+/// `2026-11-14` is refused: `` left: Err("this column holds a date, as 2026-11-14") right:
+/// Ok(Number(Number(Unsigned(20771)))) ``.
+#[test]
+fn a_day_shows_as_its_date_and_reads_back_from_it() {
+    let day = &Ty::Day;
+    assert_eq!(show(day, &json!(20_771)), "2026-11-14");
+    assert_eq!(show(day, &json!(0)), "1970-01-01");
+    assert_eq!(read(day, "2026-11-14"), Ok(json!(20_771)));
+    assert_eq!(read(day, " 20771 "), Ok(json!(20_771)));
+    let last = read(day, "9999-12-31").unwrap();
+    assert_eq!(show(day, &last), "9999-12-31");
+    let past = last.as_u64().unwrap() + 1;
+    assert_eq!(show(day, &json!(past)), past.to_string());
+    assert_eq!(show(day, &json!(u64::MAX)), u64::MAX.to_string());
+    assert_eq!(read(day, &past.to_string()), Ok(json!(past)));
+    for days in (0..=last.as_u64().unwrap()).step_by(997) {
+        assert_eq!(read(day, &show(day, &json!(days))), Ok(json!(days)));
+    }
+    for none in [
+        "2026-02-30",
+        "2026-13-01",
+        "11/14/2026",
+        "1969-12-31",
+        "10000-01-01",
+        "9000000000000000000-01-01",
+        "2026-1-14",
+        "+026-11-14",
+    ] {
+        assert_eq!(
+            read(day, none),
+            Err("this column holds a date, as 2026-11-14"),
+            "{none}"
+        );
+    }
 }

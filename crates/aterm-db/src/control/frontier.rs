@@ -4,7 +4,7 @@
 //! Fixed metadata, separately framed authority evidence and causal membership repair.
 //! Membership evidence never grants table or credential permissions by itself.
 //!
-//! Three wires share these frames ([`Wire`]). Under `atdb/5` and `atdb/6`, once metadata names
+//! Five wires share these frames ([`Wire`]). Under `atdb/5` and `atdb/6`, once metadata names
 //! each side's request, each states what it holds of the membership log ([`View`]). A peer then pushes only
 //! the records of its seat evidence outside the past of what the other stated, at most
 //! [`MAX_EVIDENCE`] bytes, and the other judges that push in a copy of its own records, writing
@@ -69,6 +69,11 @@ pub(super) enum Wire {
     /// operation inventory reconciled by range and its difference drained in one round, parents
     /// first ([`crate::replica`]).
     Reconcile,
+    /// `atdb/8` ([`fleet::ALPN_DATABASE_RANGES`]): [`Self::Reconcile`]'s, with the control
+    /// journal's inventory ([`super::exchange_ranges`]) and the membership log's
+    /// ([`drain_records`]) reconciled by range as well, each one's whole difference moved in one
+    /// session, parents first, in bounded batches.
+    Ranges,
 }
 
 impl Wire {
@@ -76,7 +81,7 @@ impl Wire {
     pub(super) const fn batch_records(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_RECORDS,
-            Self::Delta | Self::Duplex | Self::Reconcile => BATCH_RECORDS,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => BATCH_RECORDS,
         }
     }
 
@@ -84,7 +89,7 @@ impl Wire {
     pub(super) const fn batch_bytes(self) -> usize {
         match self {
             Self::Whole => WHOLE_BATCH_BYTES,
-            Self::Delta | Self::Duplex | Self::Reconcile => BATCH_BYTES,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => BATCH_BYTES,
         }
     }
 
@@ -92,7 +97,7 @@ impl Wire {
     pub(super) const fn evidence_bytes(self) -> usize {
         match self {
             Self::Whole => MAX_RECORDS_STREAM,
-            Self::Delta | Self::Duplex | Self::Reconcile => MAX_EVIDENCE,
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => MAX_EVIDENCE,
         }
     }
 
@@ -105,7 +110,7 @@ impl Wire {
     pub(super) const fn round_cap(self, capacity: usize) -> usize {
         match self {
             Self::Whole => capacity / (WHOLE_BATCH_BYTES / MAX_RECORD) + 2,
-            Self::Delta | Self::Duplex | Self::Reconcile => {
+            Self::Delta | Self::Duplex | Self::Reconcile | Self::Ranges => {
                 2 * (capacity.div_ceil(BATCH_RECORDS) + MAX_RECORDS_STREAM.div_ceil(BATCH_BYTES))
                     + 2
             }
@@ -427,23 +432,23 @@ pub(super) fn send_evidence(
     session: &Session,
 ) -> Result<()> {
     let wire = session.wire;
-    let wires: Vec<&[u8]> = match evidence {
+    let wires: Vec<Frame<'_>> = match evidence {
         Evidence::Log(log) => {
             // Bootstrap already selected the evidence needed for the seat,
             // restored node keys and audience access. Taking only the seat's
             // ancestors again can discard those later proofs.
             admit_by_log_witness(log, target.binding())?;
             match wire {
-                Wire::Whole => log.records().map(Record::bytes).collect(),
-                Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+                Wire::Whole => log.records().map(Frame::Record).collect(),
+                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
                     lacked(endpoint, Some(log), log.records(), session.have)
                         .into_iter()
-                        .map(Record::bytes)
+                        .map(Frame::Record)
                         .collect()
                 }
             }
         }
-        Evidence::Node(node) => vec![node],
+        Evidence::Node(node) => vec![Frame::Bytes(node)],
     };
     send_evidence_wires(
         endpoint,
@@ -459,13 +464,31 @@ pub(super) fn send_evidence(
 /// Frame evidence: a journal node alone, or records (under `atdb/5` none among them where the
 /// peer holds them all, under `atdb/4` at least one, as 0.153 requires), within the held bounds
 /// of both sides and `max_bytes`.
+/// One frame of evidence: a record of this Mac's log, whose bytes are read at its send
+/// ([`Record::wire_bytes`]: a replaced body of a log read through the vault's head is read back
+/// for that frame alone, and one that does not read back fails the send), or a journal node.
+#[derive(Clone, Copy)]
+enum Frame<'a> {
+    Record(&'a Record),
+    Bytes(&'a [u8]),
+}
+
+impl Frame<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Record(record) => record.wire_len(),
+            Self::Bytes(bytes) => bytes.len(),
+        }
+    }
+}
+
 fn send_evidence_wires(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
     remote: RecordsBound,
     wire: Wire,
     log: bool,
-    wires: &[&[u8]],
+    wires: &[Frame<'_>],
     max_bytes: usize,
 ) -> Result<()> {
     let bound = compatible(endpoint, remote)?;
@@ -495,7 +518,10 @@ fn send_evidence_wires(
     send_frame(stream, &header)?;
     for frame in wires {
         compatible(endpoint, remote)?;
-        send_frame(stream, frame)?;
+        match frame {
+            Frame::Record(record) => send_frame(stream, &record.wire_bytes()?)?,
+            Frame::Bytes(bytes) => send_frame(stream, bytes)?,
+        }
     }
     Ok(())
 }
@@ -565,7 +591,10 @@ fn receive_evidence(
     if mutants::on(mutants::Mutant::StoresPushFirst)
         && let Some(paths) = &endpoint.paths
     {
-        let wires: Vec<_> = records.iter().map(|r| r.bytes().to_vec()).collect();
+        let wires: Vec<_> = records
+            .iter()
+            .map(|r| r.wire_bytes().map(std::borrow::Cow::into_owned))
+            .collect::<std::io::Result<_>>()?;
         let _ = client::retain_bounded_records_for_commons(
             paths,
             endpoint.trust.network,
@@ -587,7 +616,7 @@ fn receive_evidence(
             admit_by_log_witness(&log, target.binding())?;
             Ok(Received::Witness(Box::new(log)))
         }
-        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
             let (overlay, pushed) = overlay(endpoint, session.view, records)?;
             admit_by_log_witness(&overlay, target.binding())?;
             Ok(Received::Push {
@@ -722,7 +751,7 @@ pub(super) fn connected(
     // Delta-frontier peers state what each side holds; an `atdb/4` peer sends its evidence next.
     let (view, have) = match wire {
         Wire::Whole => (View::NONE, Vec::new()),
-        Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+        Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
             let view = View::of(endpoint)?;
             let have = trade_haves(endpoint, stream, side, repair, &mut peer, &view)?;
             (view, have)
@@ -795,6 +824,7 @@ pub(super) fn connected(
         &Disk::new(&endpoint.dir, endpoint.trust),
         side,
         &mut lease,
+        (wire == Wire::Ranges).then_some(until),
     )?;
     if own.flags & peer.flags & RECORDS != 0 {
         lease.phase = Phase::MembershipRecords;
@@ -873,7 +903,7 @@ pub(super) fn connected(
                     pass,
                     actor,
                     side,
-                    matches!(wire, Wire::Duplex | Wire::Reconcile),
+                    matches!(wire, Wire::Duplex | Wire::Reconcile | Wire::Ranges),
                     stream,
                 );
             }
@@ -998,7 +1028,7 @@ fn send_batch(
     wire: Wire,
 ) -> Result<Report> {
     let bound = compatible(endpoint, peer)?;
-    let bytes: usize = records.iter().map(|record| record.bytes().len()).sum();
+    let bytes: usize = records.iter().map(Record::wire_len).sum();
     let mut header = [0u8; 21];
     header[..4].copy_from_slice(b"ABT4");
     header[4..8].copy_from_slice(&bound.held.to_be_bytes());
@@ -1008,7 +1038,7 @@ fn send_batch(
     send_frame(stream, &header)?;
     for record in records {
         compatible(endpoint, peer)?;
-        send_frame(stream, record.bytes())?;
+        send_frame(stream, &record.wire_bytes()?)?;
     }
     let ack = receive_frame(stream, 8 + wire.batch_records())?;
     if ack.len() != 8 + records.len()
@@ -1026,11 +1056,13 @@ fn send_batch(
     })
 }
 
+/// Take one batch of the peer's records, of at most `room` records.
 fn receive_batch(
     endpoint: &Endpoint,
     stream: &mut (impl Read + Write),
     peer: &mut Metadata,
     wire: Wire,
+    room: usize,
 ) -> Result<(Report, usize)> {
     let header = receive_frame(stream, 21)?;
     if header.len() != 21 || &header[..4] != b"ABT4" {
@@ -1047,6 +1079,7 @@ fn receive_batch(
         wire.batch_bytes()
     };
     if count > wire.batch_records()
+        || count > room
         || count > bound.held as usize
         || count > local.held as usize
         || bytes > most as u64
@@ -1135,7 +1168,7 @@ pub(super) fn select_batch(
         .take(missing.len().min(wire.batch_records()))
         .enumerate()
         .take_while(|(n, record)| {
-            bytes += record.bytes().len();
+            bytes += record.wire_len();
             *n == 0 || bytes <= wire.batch_bytes()
         })
         .map(|(_, record)| record.clone())
@@ -1179,6 +1212,9 @@ fn repair_records(
     wire: Wire,
 ) -> Result<(Report, Ending)> {
     pass.spend();
+    if wire == Wire::Ranges {
+        return drain_records(endpoint, stream, side, peer, hint, until);
+    }
     let mut total = Report::default();
     let capacity = own_bound(endpoint)?.held.max(peer.bound.held) as usize;
     for _ in 0..wire.round_cap(capacity) {
@@ -1206,10 +1242,13 @@ fn repair_records(
         let (sent, (received, incoming)) = match side {
             Side::Initiator => {
                 let sent = send_batch(endpoint, stream, peer.bound, &offered, wire)?;
-                (sent, receive_batch(endpoint, stream, peer, wire)?)
+                (
+                    sent,
+                    receive_batch(endpoint, stream, peer, wire, usize::MAX)?,
+                )
             }
             Side::Responder => {
-                let got = receive_batch(endpoint, stream, peer, wire)?;
+                let got = receive_batch(endpoint, stream, peer, wire, usize::MAX)?;
                 (
                     send_batch(endpoint, stream, peer.bound, &offered, wire)?,
                     got,
@@ -1248,6 +1287,127 @@ fn repair_records(
     }
     total.deferred = total.deferred.max(1);
     Ok((total, Ending::Exhausted))
+}
+
+/// `atdb/8`'s membership repair: the two sides' causally complete records reconcile by range once
+/// ([`super::reconcile`]; each signer's dense, unforked prefix agreed by its frontier, the rest by
+/// range, [`snapshot`]), and every record either side lacks then moves in this one session,
+/// parents first (the log's own order), in batches of at most [`BATCH_RECORDS`] records and
+/// [`BATCH_BYTES`] bytes (a larger record alone): batch after batch each way, until both sides offer
+/// an empty one in the same turn, which each side reads alike, or either side's `until` passes
+/// ([`super::proceed`]), both at the same frame boundary. A peer offers at most the records
+/// the reconciliation found it holds that this side lacks. Under the refusal hold
+/// ([`MembershipHint::offers`]) this side offers nothing and still takes what the peer offers.
+fn drain_records(
+    endpoint: &Endpoint,
+    stream: &mut (impl Read + Write),
+    side: Side,
+    peer: &mut Metadata,
+    hint: &mut MembershipHint,
+    until: Instant,
+) -> Result<(Report, Ending)> {
+    let wire = Wire::Ranges;
+    let (store, bound) = load_records(endpoint)?;
+    let records: Vec<Record> = store
+        .log()
+        .map_or_else(Vec::new, |log| log.records().cloned().collect());
+    drop(store);
+    let ours: BTreeSet<Digest> = records.iter().map(|record| *record.id()).collect();
+    // At most what both sides can hold: a peer's stated bound is its own claim.
+    let most = bound.held.min(peer.bound.held) as usize;
+    let theirs = super::reconcile(
+        stream,
+        side,
+        snapshot(&records, ours.clone()),
+        ours.len(),
+        most,
+    )?;
+    let mut lacked = theirs.difference(&ours).count();
+    let key = repair_key(bound, peer.bound, &ours, &theirs);
+    let now = Instant::now();
+    let owed: Vec<Record> = records
+        .into_iter()
+        .filter(|record| !theirs.contains(record.id()))
+        .collect();
+    // Under the hold the peer is offered nothing, and what it lacks stays deferred.
+    let (missing, withheld) = if hint.offers(&key, now) {
+        (owed, 0)
+    } else {
+        (Vec::new(), owed.len())
+    };
+    let mut total = Report::default();
+    let mut at = 0;
+    let ending = loop {
+        if !super::proceed(stream, side, until)? {
+            total.deferred = total.deferred.max(1);
+            break Ending::Interrupted;
+        }
+        let batch = next_batch(wire, &missing[at..]);
+        at += batch.len();
+        let (sent, (received, offered)) = match side {
+            Side::Initiator => {
+                let sent = send_batch(endpoint, stream, peer.bound, batch, wire)?;
+                (sent, receive_batch(endpoint, stream, peer, wire, lacked)?)
+            }
+            Side::Responder => {
+                let got = receive_batch(endpoint, stream, peer, wire, lacked)?;
+                (send_batch(endpoint, stream, peer.bound, batch, wire)?, got)
+            }
+        };
+        lacked -= offered;
+        total.sent += sent.sent;
+        total.received += received.received;
+        total.deferred += sent.deferred + received.deferred;
+        if batch.is_empty() && offered == 0 {
+            // What either side held back (the peer's `lacked` is its own `withheld`).
+            total.deferred += withheld + lacked;
+            break if total.deferred == 0 {
+                Ending::Complete
+            } else {
+                Ending::Deferred
+            };
+        }
+    };
+    // Every record the peer lacked was offered once this session, unless it was cut short.
+    hint.settle(
+        key,
+        &missing[..at]
+            .iter()
+            .map(|record| *record.id())
+            .collect::<Vec<_>>(),
+        total.sent,
+        at == missing.len(),
+        now,
+    );
+    Ok((total, ending))
+}
+
+/// The reconciliation snapshot of `ids`, the records `records` holds in causal order: each
+/// signer's dense, unforked prefix agreed by its frontier ([`Snapshot::from_inventory`]), as a
+/// table round's is, so two long logs that share most of their history trade their tails rather
+/// than ranges over the whole log. A header the index refuses leaves its record to the ranges.
+fn snapshot(records: &[Record], ids: BTreeSet<Digest>) -> astream_wire::sync::rbsr::Snapshot {
+    let mut index = astream_wire::sync::Index::new(records.len().max(1));
+    for record in records {
+        let _ = index.insert(record.sync_header());
+    }
+    astream_wire::sync::rbsr::Snapshot::from_inventory(ids, &index)
+}
+
+/// The next batch of `missing`: at most [`Wire::batch_records`] records and [`Wire::batch_bytes`]
+/// bytes, but for a first record larger than that, which goes alone.
+fn next_batch(wire: Wire, missing: &[Record]) -> &[Record] {
+    let mut bytes = 0;
+    let count = missing
+        .iter()
+        .take(wire.batch_records())
+        .enumerate()
+        .take_while(|(n, record)| {
+            bytes += record.wire_len();
+            *n == 0 || bytes <= wire.batch_bytes()
+        })
+        .count();
+    &missing[..count]
 }
 
 /// `ACE1` enrollment over a frontier wire: the member pushes its seat evidence and then the new
@@ -1383,11 +1543,11 @@ fn enroll(
             )
             .map_err(failure)?;
             let wires: Vec<_> = match session.wire {
-                Wire::Whole => chain.iter().map(Record::bytes).collect(),
-                Wire::Delta | Wire::Duplex | Wire::Reconcile => {
+                Wire::Whole => chain.iter().map(Frame::Record).collect(),
+                Wire::Delta | Wire::Duplex | Wire::Reconcile | Wire::Ranges => {
                     lacked(endpoint, None, &chain, session.have)
                         .into_iter()
-                        .map(Record::bytes)
+                        .map(Frame::Record)
                         .collect()
                 }
             };
@@ -1416,7 +1576,7 @@ fn enroll(
                 peer.bound,
                 session.wire,
                 false,
-                &[node.bytes()],
+                &[Frame::Bytes(node.bytes())],
                 MAX_NODE,
             )?;
             1
@@ -1440,8 +1600,8 @@ fn retain_grant<'a>(
 ) -> Result<usize> {
     let wires: Vec<_> = granted
         .into_iter()
-        .map(|record| record.bytes().to_vec())
-        .collect();
+        .map(|record| record.wire_bytes().map(std::borrow::Cow::into_owned))
+        .collect::<std::io::Result<_>>()?;
     let held = client::retain_bounded_records_for_commons(
         paths,
         endpoint.trust.network,

@@ -1548,6 +1548,100 @@ fn an_accepted_measure_passes_only_beside_every_other_ok() {
     assert!(judged.accepted.is_some());
 }
 
+/// A measure that could not run (a release bundle outside a virtual machine) is accepted like
+/// its FAIL and completes the tree beside every other ok. Negative control: a tree check that
+/// could not run is never accepted; it runs again.
+#[test]
+fn a_measure_that_could_not_run_is_accepted_and_a_tree_check_that_could_not_is_not() {
+    let f = Fixture::new();
+    let mut run = all_ok();
+    run.finished
+        .retain(|e| !matches!(e["check"].as_str(), Some("measure" | "test")));
+    run.finished.push(finished("measure", NOT_RUN));
+    run.finished.push(finished("test", NOT_RUN));
+    f.write("s1", &u(1), 3, &run);
+    let report = std::fs::canonicalize(&f.log).unwrap();
+    let accept = |check: Check, executable: Option<&str>| {
+        accept_in(
+            &f.root,
+            (COMMIT, TREE),
+            (check, executable),
+            "s1",
+            (&report, &u(9)),
+            "the owner shipped it",
+        )
+    };
+    assert!(
+        accept(Check::Test, None).is_err(),
+        "CONTROL: a tree check that could not run runs again"
+    );
+    accept(Check::Measure, Some(&u(1))).unwrap();
+    let judged = f.judge("s1", Some(&u(1)));
+    assert_eq!(judged.missing, ["test"]);
+    f.write(
+        "s1",
+        &u(1),
+        0,
+        &RunEvents {
+            finished: vec![finished("test", OK)],
+            ..RunEvents::default()
+        },
+    );
+    let judged = f.judge("s1", Some(&u(1)));
+    assert!(judged.complete(), "{}", judged.line());
+    assert!(judged.accepted.is_some());
+}
+
+/// The cutter hashes a step's log for the step's records, then appends its own lines (the
+/// records it wrote) to that log: an acceptance reads the log as it has grown, and is taken when
+/// the log still begins with the hashed lines. Negative control: a log whose hashed lines were
+/// rewritten is refused.
+#[test]
+fn an_acceptance_reads_the_log_the_cutter_appended_to_but_not_one_rewritten() {
+    let f = Fixture::new();
+    std::fs::write(&f.log, "verify: COULD NOT RUN\n").unwrap();
+    let hashed = crate::artifact::file_sha256(&f.log).unwrap();
+    let mut run = all_ok();
+    run.finished
+        .retain(|e| e["check"].as_str() != Some("measure"));
+    run.finished.push(finished("measure", NOT_RUN));
+    f.begin("s1", &u(1)).unwrap();
+    write_run(
+        &f.root,
+        &f.facts("s1", &u(1)),
+        RunEnd {
+            exit: 3,
+            log_sha256: &hashed,
+            events: Ok(&run),
+        },
+    )
+    .unwrap();
+    let report = std::fs::canonicalize(&f.log).unwrap();
+    let accept = || {
+        let now = crate::artifact::file_sha256(&report).unwrap();
+        accept_in(
+            &f.root,
+            (COMMIT, TREE),
+            (Check::Measure, Some(&u(1))),
+            "s1",
+            (&report, &now),
+            "the owner shipped it",
+        )
+    };
+    std::fs::write(
+        &f.log,
+        "verify: COULD NOT RUN, rewritten\nrecord: measure\n",
+    )
+    .unwrap();
+    assert!(
+        accept().is_err(),
+        "CONTROL: the hashed lines were rewritten"
+    );
+    std::fs::write(&f.log, "verify: COULD NOT RUN\nrecord: measure NOT RUN\n").unwrap();
+    accept().unwrap();
+    assert!(f.judge("s1", Some(&u(1))).complete());
+}
+
 /// An owner's acceptance of a tree check that runs the product's tests rewrites only that
 /// check's FAIL of this tree under this seal, one check per acceptance, and the tree passes once
 /// every other check has its own ok record, in words that name each accepted check and say it

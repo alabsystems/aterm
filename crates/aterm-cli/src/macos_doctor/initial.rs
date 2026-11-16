@@ -5044,6 +5044,19 @@ trait InitialHost {
     fn repositories_want_token(&mut self) -> bool {
         false
     }
+    /// What the Repositories stage, as [`Self::repositories`] last ran it, was left waiting on,
+    /// where its step typed it ([`repositories::left_wait`]): the park after the pass watches that
+    /// wait's fact alone ([`InitialSetupParkMark::checkouts_run`],
+    /// [`InitialSetupParkMark::lease_run`]).
+    fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+        None
+    }
+    /// What the Repositories stage this host ran last read of its row
+    /// ([`super::repositories_readback`], [`StageEvent::readback`]), taken once: none from a stage
+    /// that read none.
+    fn repositories_readback(&mut self) -> WorkstationReadback {
+        WorkstationReadback::EMPTY
+    }
     /// The Messages and FaceTime sign-outs, with the Accessibility they need. Each reads this
     /// login's session right before its own clicks, and one that cannot take them waits.
     fn accounts(&mut self, root: &Path) -> Result<Option<Report>, String>;
@@ -5165,8 +5178,8 @@ impl SetupNext {
 
     /// What one stage's rows leave: done when every row is ready ([`row_ready`]), a park when
     /// every row left waits on a person ([`WAITING`]), on a vault that did not answer
-    /// ([`UNREACHED`]) or answered that none is there ([`ABSENT`]), or on what an engine put off
-    /// ([`super::DEFERRED`]).
+    /// ([`UNREACHED`]) or answered that none is there ([`ABSENT`]), on another pass's repository
+    /// lease ([`HELD`]), or on what an engine put off ([`super::DEFERRED`]).
     fn of(rows: &[Row]) -> Self {
         if rows_ready(rows) {
             Self::Done
@@ -5175,7 +5188,7 @@ impl SetupNext {
                 row_ready(row)
                     || matches!(
                         row.status.as_str(),
-                        WAITING | UNREACHED | ABSENT | super::DEFERRED
+                        WAITING | UNREACHED | ABSENT | HELD | super::DEFERRED
                     )
             })
         {
@@ -5202,7 +5215,98 @@ pub(super) const ABSENT: &str = "absent";
 /// coming back moves it without a person.
 pub(super) const UNREACHED: &str = "unreached";
 
-/// Git availability and the admitted executable behind its selected command.
+/// A row's status when another aterm pass holds this account's repository lease
+/// (`align.lock`, [`aterm_machines::init_observe::Wait::OtherPass`]): the row stood aside before
+/// it read anything, which is no failure and journals none. The pass parks, and the lease's
+/// release wakes it ([`park_watch::Watches::lease`]).
+pub(super) const HELD: &str = "held";
+
+/// What the last Repositories stage of each state root's run left its acquisition waiting on,
+/// by that run's revision ([`record_repositories_left`]): the park after it watches that wait's
+/// fact alone ([`InitialSetupParkMark::lease_run`], [`InitialSetupParkMark::checkouts_run`]).
+/// The park reads it in the process whose pass set it; another process's park, or one after a
+/// relaunch, reads none, and the pass the relaunch starts records it again.
+static REPOSITORIES_LEFT: std::sync::Mutex<
+    std::collections::BTreeMap<PathBuf, (u64, aterm_machines::init_observe::Wait)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Record what the Repositories stage of `root`'s run `revision` was left waiting on: `None`
+/// where it waits on no typed fact (it finished, failed, or left only the refresh of the
+/// checkouts already here to retry).
+fn record_repositories_left(
+    root: &Path,
+    revision: u64,
+    wait: Option<aterm_machines::init_observe::Wait>,
+) {
+    let mut left = REPOSITORIES_LEFT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match wait {
+        Some(wait) => {
+            left.insert(root.to_path_buf(), (revision, wait));
+        }
+        None => {
+            if left.get(root).is_some_and(|(at, _)| *at <= revision) {
+                left.remove(root);
+            }
+        }
+    }
+}
+
+/// What the last Repositories stage of `root`'s run `revision` was left waiting on, as this
+/// process's pass recorded it ([`record_repositories_left`]).
+fn repositories_left(root: &Path, revision: u64) -> Option<aterm_machines::init_observe::Wait> {
+    REPOSITORIES_LEFT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(root)
+        .filter(|(at, _)| *at == revision)
+        .map(|(_, wait)| *wait)
+}
+
+/// The repository inputs a park compares ([`InitialSetupParkMark::facts_changed_since`]): the
+/// selected source, pinned helper and Git always, and the checkouts only while they are a fact of
+/// the run ([`InitialSetupParkMark::checkouts_run`]). A clone or fetch another pass, or the
+/// stage's own refresh, makes moves the checkouts, so it neither ends nor restarts a park whose
+/// stage waits on something else.
+#[derive(Clone)]
+struct RepositoryInputs {
+    mark: aterm_machines::init_github::RepositoryInputMark,
+    /// Whether the checkouts are a fact of this reading's run.
+    checkouts: bool,
+}
+
+impl RepositoryInputs {
+    /// Whether these inputs moved since `before`, by what this reading counts: the checkouts
+    /// only where both readings count them, so a stage that became complete, or came to wait on
+    /// a folder in a repository's way, during a pass is not woken by its own clones.
+    fn moved_since(&self, before: &Self) -> bool {
+        if self.checkouts && before.checkouts {
+            self.mark != before.mark
+        } else {
+            !self.mark.same_source(&before.mark)
+        }
+    }
+}
+
+/// Readings of one relevance are equal by what they count; a change of relevance (the stage
+/// completed, or came to wait on another fact) is a change in itself. Each relevance class is
+/// an equivalence of its own, so this one is too.
+impl PartialEq for RepositoryInputs {
+    fn eq(&self, other: &Self) -> bool {
+        self.checkouts == other.checkouts
+            && if self.checkouts {
+                self.mark == other.mark
+            } else {
+                self.mark.same_source(&other.mark)
+            }
+    }
+}
+
+impl Eq for RepositoryInputs {}
+
+/// Git availability and the admitted executable setup starts (a managed build's own git, whose
+/// path names its build).
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RepositoryGit {
     Missing,
@@ -5211,8 +5315,7 @@ enum RepositoryGit {
 
 impl RepositoryGit {
     fn read(sys: &dyn aterm_machines::port::System) -> Self {
-        aterm_machines::items::github::installed_git_identity(sys)
-            .map_or(Self::Missing, Self::Installed)
+        aterm_machines::items::github::installed_git(sys).map_or(Self::Missing, Self::Installed)
     }
 }
 /// Local facts that can wake a parked setup run. This is an observation, never
@@ -5236,8 +5339,24 @@ pub struct InitialSetupParkMark {
     git_run: Option<u64>,
     /// The selected Git's admitted build, read only for [`Self::git_run`].
     git: Option<RepositoryGit>,
-    /// The selected repository inputs and pinned helper, without running either Git or helper.
-    repository_inputs: Option<aterm_machines::init_github::RepositoryInputMark>,
+    /// The selected repository inputs and pinned helper, without running either Git or helper,
+    /// with the checkouts counted only for [`Self::checkouts_run`].
+    repository_inputs: Option<RepositoryInputs>,
+    /// The pending run whose checkouts are a fact of its Repositories stage: the stage is
+    /// complete, and a checkout that changed can invalidate its evidence, or its last run waits
+    /// on a folder in a repository's way ([`aterm_machines::init_observe::WaitFact::Checkouts`],
+    /// [`repositories_left`]), which only a change there moves. A stage waiting on anything else
+    /// (a retry of its own, the vault, the network, another pass's lease) is neither woken nor
+    /// restarted by a clone or fetch another pass makes.
+    checkouts_run: Option<u64>,
+    /// The pending run whose last Repositories stage waits on another pass's repository lease
+    /// ([`HELD`], [`aterm_machines::init_observe::WaitFact::Lease`], [`repositories_left`]): its
+    /// park waits on that lease's release, and reads neither Git nor the checkouts, which the
+    /// lease's holder is fetching into meanwhile.
+    lease_run: Option<u64>,
+    /// The repository lease releases this process heard ([`park_watch::lease_releases`]), read
+    /// only for [`Self::lease_run`].
+    lease: Option<u64>,
     /// An admitted pending Workstation stage whose local console can become available.
     workstation_run: Option<u64>,
     console: Option<bool>,
@@ -5293,6 +5412,13 @@ impl InitialSetupParkMark {
         {
             return true;
         }
+        // Another pass let the repository lease go that the Repositories stage waited on.
+        if self.lease_run.is_some()
+            && self.lease_run == before.lease_run
+            && changed(&self.lease, &before.lease)
+        {
+            return true;
+        }
         if self.network_run.is_none() || self.network_run != before.network_run {
             return false;
         }
@@ -5306,10 +5432,15 @@ impl InitialSetupParkMark {
                 && (changed(&self.subscriber, &before.subscriber)
                     || changed(&self.broker_unready, &before.broker_unready)))
             // Activation can replace Git behind the same stable shim; losing it also changes
-            // whether a completed repository stage can still be verified.
+            // whether a completed repository stage can still be verified. The checkouts count
+            // only where both readings count them ([`RepositoryInputs::moved_since`]).
             || (self.git_run.is_some()
                 && self.git_run == before.git_run
-                && (changed(&self.repository_inputs, &before.repository_inputs)
+                && (match (&self.repository_inputs, &before.repository_inputs) {
+                    (Some(now), Some(old)) => now.moved_since(old),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
                     || match (&self.git, &before.git) {
                         (Some(now), Some(old)) => now != old,
                         _ => false,
@@ -5322,9 +5453,13 @@ impl InitialSetupParkMark {
         self
     }
 
-    /// Read the selected Git while this pending run still selects Repositories.
+    /// Read the selected Git while this pending run still selects Repositories, unless its
+    /// stage waits on another pass's repository lease ([`Self::lease_run`]).
     fn with_git(mut self, read: impl FnOnce() -> Option<RepositoryGit>) -> Self {
-        self.git = self.git_run.and_then(|_| read());
+        self.git = self
+            .git_run
+            .filter(|_| self.lease_run.is_none())
+            .and_then(|_| read());
         self
     }
 
@@ -5332,7 +5467,12 @@ impl InitialSetupParkMark {
         mut self,
         read: impl FnOnce() -> Option<aterm_machines::init_github::RepositoryInputMark>,
     ) -> Self {
-        self.repository_inputs = self.git_run.and_then(|_| read());
+        let checkouts = self.checkouts_run.is_some();
+        self.repository_inputs = self
+            .git_run
+            .filter(|_| self.lease_run.is_none())
+            .and_then(|_| read())
+            .map(|mark| RepositoryInputs { mark, checkouts });
         self
     }
 
@@ -5398,14 +5538,29 @@ impl InitialSetupParkMark {
         {
             self.subscriber = previous.subscriber;
         }
-        if self.git_run.is_some() && self.git_run == previous.git_run && self.git.is_none() {
+        // A park on another pass's repository lease reads neither ([`Self::lease_run`]).
+        if self.git_run.is_some()
+            && self.git_run == previous.git_run
+            && self.lease_run.is_none()
+            && self.git.is_none()
+        {
             self.git = previous.git.clone();
         }
         if self.git_run.is_some()
             && self.git_run == previous.git_run
+            && self.lease_run.is_none()
             && self.repository_inputs.is_none()
         {
-            self.repository_inputs = previous.repository_inputs.clone();
+            // Counted as this reading counts the checkouts, so a failed read is no change.
+            let checkouts = self.checkouts_run.is_some();
+            self.repository_inputs =
+                previous
+                    .repository_inputs
+                    .clone()
+                    .map(|inputs| RepositoryInputs {
+                        checkouts,
+                        ..inputs
+                    });
         }
     }
 
@@ -5448,14 +5603,21 @@ impl InitialSetupParkMark {
     }
 
     /// The facts [`Self::facts_changed_since`] reads that can move while the run is parked: the
-    /// secrets folder and network while a pending run selects Secrets or Repositories, and Git
-    /// activation while it selects Repositories. The existing GUI input keeper observes a
-    /// pending Caps setting's native service set; it needs no additional watch or timer here.
+    /// secrets folder and network while a pending run selects Secrets or Repositories, Git
+    /// activation and the repository inputs while it selects Repositories, the checkouts only
+    /// while they are a fact of its stage ([`Self::checkouts_run`]), and, in place of Git, the
+    /// repository lease while its Repositories stage waits on another pass's
+    /// ([`Self::lease_run`]): that pass's fetches move the checkouts, and only its release moves
+    /// the stage. The existing GUI input keeper observes a pending Caps setting's native service
+    /// set; it needs no additional watch or timer here.
     pub fn watches(&self) -> Watches {
+        let git = self.network_run.is_some() && self.git_run.is_some() && self.lease_run.is_none();
         Watches {
             secrets: self.network_run.is_some(),
             network: self.network_run.is_some(),
-            git: self.network_run.is_some() && self.git_run.is_some(),
+            git,
+            checkouts: git && self.checkouts_run.is_some(),
+            lease: self.lease_run.is_some(),
         }
     }
 }
@@ -5469,8 +5631,9 @@ impl InitialSetupParkMark {
 /// permission prompt is made here.
 pub fn initial_setup_park_mark() -> InitialSetupParkMark {
     let sys = aterm_machines::port::Live::new();
+    let root = state_root().ok();
     initial_setup_park_mark_at(
-        state_root().ok().as_deref(),
+        root.as_deref(),
         aterm_secrets::client::Paths::live().ok().as_ref(),
         secrets_retry::Reads::now(&secrets_retry::Live),
         aterm_secrets::network::default_route,
@@ -5585,6 +5748,21 @@ fn initial_setup_park_mark_reading(
     let stage_dues = pending.map_or_else(Vec::new, |(root, progress, _, _, _, _)| {
         ledger::park_dues(root, progress, now)
     });
+    // The selected Repositories stage: its run, whether it is complete, and the fact of what its
+    // last run in this process left it waiting on ([`repositories_left`]).
+    let repositories = pending
+        .filter(|(_, _, _, repositories, _, _)| *repositories)
+        .map(|(root, progress, _, _, _, _)| {
+            (
+                progress.revision,
+                progress.done & Stage::Repositories.bit() != 0,
+                repositories_left(root, progress.revision)
+                    .map(aterm_machines::init_observe::Wait::fact),
+            )
+        });
+    let lease_run = repositories.and_then(|(run, done, fact)| {
+        (!done && fact == Some(aterm_machines::init_observe::WaitFact::Lease)).then_some(run)
+    });
     InitialSetupParkMark {
         vault,
         network_run: selected_network.map(|(_, progress, _, _, _, _)| progress.revision),
@@ -5594,11 +5772,14 @@ fn initial_setup_park_mark_reading(
         subscriber: selected_secrets.and_then(|_| subscriber()),
         join_run: unfinished_secrets.map(|(_, progress, _, _, _, _)| progress.revision),
         network: selected_network.and_then(|_| network()),
-        git_run: pending
-            .filter(|(_, _, _, repositories, _, _)| *repositories)
-            .map(|(_, progress, _, _, _, _)| progress.revision),
+        git_run: repositories.map(|(run, _, _)| run),
         git: None,
         repository_inputs: None,
+        checkouts_run: repositories.and_then(|(run, done, fact)| {
+            (done || fact == Some(aterm_machines::init_observe::WaitFact::Checkouts)).then_some(run)
+        }),
+        lease_run,
+        lease: lease_run.and_then(|_| park_watch::lease_releases()),
         workstation_run,
         console: None,
         keyboard_run,
@@ -5660,6 +5841,11 @@ struct LiveInitial<R> {
     token_wanted: bool,
     /// What the last Spotlight stage read of its row ([`InitialHost::spotlight_readback`]).
     spotlight_readback: WorkstationReadback,
+    /// What the last Repositories stage was left waiting on ([`InitialHost::repositories_wait`]).
+    repositories_wait: Option<aterm_machines::init_observe::Wait>,
+    /// What the last Repositories stage read of its row
+    /// ([`InitialHost::repositories_readback`]).
+    repositories_observed: WorkstationReadback,
     /// Actual native empty-origin observations live only through this setup pass's readback.
     repository_readback: Option<std::sync::Arc<aterm_machines::init_github::RepositoryReadback>>,
 }
@@ -5671,6 +5857,8 @@ impl LiveInitial<secrets_retry::Live> {
             repositories_failure: None,
             token_wanted: false,
             spotlight_readback: WorkstationReadback::EMPTY,
+            repositories_wait: None,
+            repositories_observed: WorkstationReadback::EMPTY,
             repository_readback: None,
         }
     }
@@ -5693,9 +5881,12 @@ fn secrets_rows(rows: Vec<aterm_machines::model::ItemReport>) -> Vec<Row> {
 }
 
 /// A setup row's status for one engine result. A row only a person moves (a
-/// switch in System Settings, a dialog) is [`WAITING`]: no pass retries it.
+/// switch in System Settings, a dialog) is [`WAITING`]: no pass retries it. A repository row
+/// that stood aside on another pass's repository lease is [`HELD`]: the pass parks until that
+/// lease is let go, and the row is no failure.
 pub(super) fn row_status(row: &aterm_machines::model::ItemReport) -> &'static str {
     use aterm_converge::StoodAside;
+    use aterm_machines::init_observe::{Reading, Wait};
     use aterm_machines::model::Outcome;
     if matches!(row.outcome, Outcome::Ok | Outcome::Changed)
         && aterm_machines::init_observe::standing(row)
@@ -5716,6 +5907,13 @@ pub(super) fn row_status(row: &aterm_machines::model::ItemReport) -> &'static st
             ) =>
         {
             WAITING
+        }
+        // Another pass holds the repository lease: a typed wait, decided before any read.
+        Outcome::Blocked
+            if matches!(row.stood_aside, Some(StoodAside::Lock(_)))
+                && Reading::of(row) == Some(Reading::Waits(Wait::OtherPass)) =>
+        {
+            HELD
         }
         Outcome::Blocked => "blocked",
         // Put off for the console, an idle Mac or the next launch: no pass a minute later moves it.
@@ -5817,8 +6015,13 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
 
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         let sys = aterm_machines::port::Live::new();
+        // Each run of the stage is a pass of its own: what a pass before it read of a checkout
+        // stands for nothing here, and its acquisition, refresh and read-back share one record.
+        aterm_machines::port::CheckoutRecords::new_pass(&sys);
         self.repositories_failure = None;
         self.token_wanted = false;
+        self.repositories_wait = None;
+        self.repositories_observed = WorkstationReadback::EMPTY;
         self.repository_readback = None;
         let start = initial_setup_holds();
         let ran = repositories::run_reading_guarded(
@@ -5837,6 +6040,8 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
         )?;
         self.repositories_failure = ran.failure;
         self.token_wanted = ran.token;
+        self.repositories_wait = ran.wait;
+        self.repositories_observed = ran.observed;
         self.repository_readback = ran.readback;
         Ok(ran.rows)
     }
@@ -5858,6 +6063,14 @@ impl<R: secrets_retry::Reads> InitialHost for LiveInitial<R> {
 
     fn repositories_failure(&mut self) -> Option<&'static str> {
         self.repositories_failure
+    }
+
+    fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+        self.repositories_wait
+    }
+
+    fn repositories_readback(&mut self) -> WorkstationReadback {
+        self.repositories_observed.take()
     }
 
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
@@ -6808,7 +7021,13 @@ fn execute_pass_target(
                         }]),
                     },
                 },
-                Stage::Repositories => host.repositories(repository_vault.as_ref()),
+                Stage::Repositories => {
+                    let rows = host.repositories(repository_vault.as_ref());
+                    // The run's own reading of the repositories row stands as its reading, in
+                    // place of another read of it (and of GitHub) after the stage.
+                    fence.readback = host.repositories_readback();
+                    rows
+                }
                 Stage::Accounts => match host.accounts(root) {
                     Ok(Some(result)) => {
                         if let Some(page) = result.page.as_ref() {
@@ -6850,6 +7069,9 @@ fn execute_pass_target(
                 if waits_for_vault {
                     rows = vec![vault_token_wait(vault)];
                     page = items_page(stage, &rows);
+                    // The run read this Mac's own credentials, which the row no longer stands
+                    // on: the row is read again after the stage.
+                    fence.readback = WorkstationReadback::EMPTY;
                 }
                 // A failed part's reason, where its step decided one, is the row's words on the page.
                 if !waits_for_vault
@@ -6858,6 +7080,18 @@ fn execute_pass_target(
                 {
                     page.failed_because(Setting::Repositories, reason);
                 }
+                // What the stage was left waiting on: the park after this pass watches that
+                // wait's fact alone ([`InitialSetupParkMark::lease_run`],
+                // [`InitialSetupParkMark::checkouts_run`]). Another pass's repository lease
+                // holding any of its rows ([`HELD`]) is a wait on that lease's release.
+                let wait = if waits_for_vault {
+                    Some(aterm_machines::init_observe::Wait::Token)
+                } else if rows.iter().any(|row| row.status == HELD) {
+                    Some(aterm_machines::init_observe::Wait::OtherPass)
+                } else {
+                    host.repositories_wait()
+                };
+                record_repositories_left(root, progress.revision, wait);
             }
             let left = SetupNext::of(&rows);
             if ready {

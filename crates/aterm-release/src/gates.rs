@@ -1257,11 +1257,16 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
     require_clean_cut_tree(&path)?;
     let moved = rev_parse(&tree, "HEAD")? != commit;
     if moved {
+        // The superproject alone: under the clone's `submodule.recurse` (AGENTS.md asks for it)
+        // a plain checkout also moves each submodule to the new commit's gitlink, and fails when
+        // the cut tree's own module repository never fetched that pin. `align_submodules`
+        // fetches and checks out every gitlink next.
         let checkout = [
             "checkout",
             "-q",
             "--detach",
             "--no-overwrite-ignore",
+            "--no-recurse-submodules",
             commit,
         ];
         git_ok(&tree, &[&BYTE_EXACT[..], &checkout].concat())?;

@@ -4,7 +4,7 @@
 use super::*;
 use crate::commons::binding::Request;
 use crate::crossing::fixture::LEGACY;
-use crate::membership_log::RecordBudgets;
+use crate::membership_log::{RecordBudgets, encode_records};
 
 fn member(tag: u8) -> ([u8; 32], [u8; 16], MemberId, Entrant) {
     let seed = [tag; 32];

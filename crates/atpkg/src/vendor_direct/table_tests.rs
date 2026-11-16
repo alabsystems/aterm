@@ -114,7 +114,7 @@ fn every_alias_is_a_clone_inside_its_own_rows_build() {
             (s.vendor, s.product, s.head_url, s.anchor, s.apple_team),
             (s.url_prefixes, s.url_query, s.digest_docs, s.shim_env),
             (s.self_update_verbs, s.yolo_flags, s.yolo_markers),
-            (s.yolo_after, s.yolo_skip, s.revision_versions),
+            s.revision_versions,
         )
     };
     assert_eq!(lane(old), lane(codex));
@@ -281,4 +281,92 @@ fn digest_documents_are_pinned_per_document() {
     assert!(Anchor::XaiNpmRegistry.reads_record_of(Anchor::XaiDeveloperId));
     assert!(!Anchor::XaiDeveloperId.reads_record_of(Anchor::XaiNpmRegistry));
     assert!(!Anchor::MetaDeveloperId.reads_record_of(Anchor::XaiDeveloperId));
+}
+
+/// What a row keeps of the launcher's blocks once its harness's `run` carries them: nothing.
+/// Read as production reads it ([`spec`], [`crate::selfupdate::verbs_of`],
+/// [`crate::yolo::policy_of`], [`crate::yolo::word_options`]): every launcher-block column is
+/// empty, the yolo word scan knows no option of its CLI and runs every launch as typed, and its
+/// twin carries no self-update, sign-in or yolo block. Its `shim_env` stays `shim_env`, since
+/// vendor-direct launches still read it.
+fn keeps_no_launcher_block(program: &str, shim_env: &[&str]) {
+    let none: &[&str] = &[];
+    let row = spec(program).unwrap_or_else(|| panic!("{program} has a row"));
+    assert_eq!(row.self_update_verbs, none, "{program}: self_update_verbs");
+    assert_eq!(row.yolo_flags, none, "{program}: yolo_flags");
+    assert_eq!(row.yolo_markers, none, "{program}: yolo_markers");
+    assert_eq!(row.shim_env, shim_env, "{program}: shim_env stays");
+    let raw: Vec<String> = shim_env.iter().map(|e| (*e).to_string()).collect();
+    assert_eq!(
+        Ok(row.shim_env()),
+        crate::shim_env::ShimEnv::admit(&raw),
+        "{program}: shim_env is admitted whole"
+    );
+    assert_eq!(crate::selfupdate::verbs_of(program), none, "{program}");
+    assert_eq!(
+        crate::yolo::policy_of(program),
+        crate::yolo::Policy::NONE,
+        "{program}"
+    );
+    assert_eq!(
+        crate::yolo::word_options(program),
+        crate::yolo::WordOptions::default(),
+        "{program}: the word scan knows no option of its CLI"
+    );
+    for typed in [
+        &[][..],
+        &["--yolo"],
+        &["update"],
+        &["upgrade"],
+        &["-m", "model", "fix it"],
+        &["exec", "x"],
+        &["agent", "-p", "hi"],
+    ] {
+        let args: Vec<String> = typed.iter().map(|w| (*w).to_string()).collect();
+        assert_eq!(
+            crate::yolo::decide(program, &args),
+            crate::yolo::Launch::AsTyped,
+            "{program} {typed:?}"
+        );
+    }
+    let prelude = crate::platform::twin_prelude(
+        program,
+        std::path::Path::new("/p"),
+        None,
+        crate::selfupdate::verbs_of(program),
+        &crate::yolo::policy_of(program),
+    );
+    for block in [
+        crate::selfupdate::HIDDEN_VERB,
+        "harness signin",
+        crate::yolo::ECHO_PREFIX,
+        crate::yolo::DEFAULT_ECHO_PREFIX,
+    ] {
+        assert!(
+            !prelude.contains(block),
+            "{program}: {block:?} in its twin: {prelude}"
+        );
+    }
+}
+
+/// HX-09b: kimi-alab's `run` sets the yolo default and answers `kimi upgrade` and `kimi
+/// update`, so kimi's row keeps no launcher block; its shim still turns Kimi Code's updater off.
+#[test]
+fn the_kimi_row_keeps_no_launcher_block() {
+    keeps_no_launcher_block("kimi", &["KIMI_CODE_NO_AUTO_UPDATE=1"]);
+}
+
+/// HX-10d: grok-alab's `run` sets the yolo default, gates a signed-out launch and answers `grok
+/// update`, so grok's row keeps no launcher block and its twin no sign-in block; its shim still
+/// turns Grok Build's updater off.
+#[test]
+fn the_grok_row_keeps_no_launcher_block() {
+    keeps_no_launcher_block("grok", &["GROK_DISABLE_AUTOUPDATER=1"]);
+}
+
+/// HX-13a: muse-alab's `run` sets the yolo default, so muse's row keeps no launcher block (Muse
+/// Code has no update verb and its shim exports nothing).
+#[test]
+fn the_muse_row_keeps_no_launcher_block() {
+    keeps_no_launcher_block("muse", &[]);
 }

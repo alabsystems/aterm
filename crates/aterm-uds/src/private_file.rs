@@ -1292,7 +1292,9 @@ impl PrivateLock {
     ///   (a `within` past what a clock can represent waits with no deadline);
     /// - `ErrorKind::InvalidData`, `<dir>/<name> is no regular file`;
     /// - [`check_private_dir`]'s refusal, which names `dir`;
-    /// - the open's own error.
+    /// - the open's own error, and the lock's;
+    /// - `ErrorKind::PermissionDenied` on a thread inside [`crate::file_lock::takes_nothing`],
+    ///   before the lock is tried.
     pub fn take(
         dir: &Path,
         name: &str,
@@ -1342,6 +1344,29 @@ impl PrivateLock {
         }
         crate::file_lock::lock_exclusive_blocking(&file)?;
         Ok(Self(file))
+    }
+
+    /// WAIT, TAKING NOTHING, UNTIL NO ONE HOLDS THE LOCK ON `<dir>/<name>`, opened as
+    /// [`take`](Self::take) opens it: a watcher's wait. [`wait_for`](Self::wait_for) takes the
+    /// lock, if only for a moment, and so stands ahead of the holder's own waiters while it
+    /// holds it; this never does, so a waiter at the release meets no one but other takers.
+    /// The kernel tells the thread of each release (an unlock, the close of a description that
+    /// held the lock, its holder's death) and the lock's holders are read after each, so no
+    /// clock wakes it meanwhile: a waiter that has taken the lock by that read keeps this wait
+    /// going until it lets go in turn, and one the kernel woke but that has not run yet finds
+    /// this wait ended with the lock free. The lock file leaving its name ends the wait too
+    /// (`file_lock`'s `wait_unlocked`). `held` runs once, where the lock was found held, before
+    /// the first wait.
+    ///
+    /// # Errors
+    ///
+    /// As [`take`](Self::take)'s open: `InvalidInput` for a `name` that is not one path
+    /// component, `InvalidData` for anything but a regular file, [`check_private_dir`]'s refusal
+    /// and the open's own error; and the kernel queue's or the lock read's own error.
+    #[cfg(target_os = "macos")]
+    pub fn wait_until_free(dir: &Path, name: &str, held: impl FnOnce()) -> io::Result<()> {
+        let file = Self::open(dir, name)?;
+        crate::file_lock::wait_unlocked(&file, held)
     }
 
     /// The lock file `<dir>/<name>`, admitted as [`take`](Self::take) says, not yet locked.

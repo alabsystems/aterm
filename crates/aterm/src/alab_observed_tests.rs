@@ -121,6 +121,7 @@ fn a_pass_ends_with_its_queue_and_take_up_is_inert_uninstalled() {
             marked: 0,
             findings: Vec::new(),
             records: 0,
+            waiting: Vec::new(),
         })
     }
     let queue = Mutex::new(Queue::default());
@@ -131,7 +132,7 @@ fn a_pass_ends_with_its_queue_and_take_up_is_inert_uninstalled() {
         5,
     ));
     assert!(queue.lock().unwrap().start());
-    run(&queue, quiet);
+    run(&queue, None, quiet);
     let mut held = queue.lock().unwrap();
     assert!(!held.running);
     assert!(held.last.is_some());
@@ -153,7 +154,8 @@ fn a_pass_that_panics_frees_the_queue() {
     let seen = login("a@proton.example", Some("s1"), LoginState::Running, 5);
     queue.lock().unwrap().gather(&seen);
     assert!(queue.lock().unwrap().start());
-    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&queue, broken)));
+    let ended =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&queue, None, broken)));
     assert!(ended.is_err());
     let mut held = queue
         .lock()
@@ -195,6 +197,7 @@ fn a_swept_login_is_passed_again_until_a_pass_takes_it() {
             marked: 0,
             findings: Vec::new(),
             records: 0,
+            waiting: Vec::new(),
         })
     }
     fn failed(_: &[Sighting]) -> Result<Observed, String> {
@@ -207,6 +210,7 @@ fn a_swept_login_is_passed_again_until_a_pass_takes_it() {
             marked: sightings.len(),
             findings: Vec::new(),
             records: 1,
+            waiting: Vec::new(),
         })
     }
     let day = IDLE_REFRESH_S.unsigned_abs();
@@ -218,7 +222,7 @@ fn a_swept_login_is_passed_again_until_a_pass_takes_it() {
         held.gather(&login(A, None, LoginState::Idle, now));
         assert!(held.start(), "not taken yet: gathered again");
         drop(held);
-        run(&queue, pass);
+        run(&queue, None, pass);
     }
     let mut held = queue.lock().unwrap();
     held.gather(&login(
@@ -255,4 +259,75 @@ fn a_sweep_reads_its_own_home_and_start_is_inert_uninstalled() {
     assert!(!state.exists());
     start_sweep();
     assert!(QUEUE.get().is_none());
+}
+
+/// On a Mac whose writer is fenced every pass refuses, and what it was handed, a tab's sighting
+/// included, waits in the kept file: the first pass after the fence lifts is handed it with
+/// whatever gathered since, and takes it.
+/// NEGATIVE CONTROL: with `run` passing what gathered alone (no kept file), the pass after the
+/// fence is handed one sighting: `` left: [1, 1] right: [1, 2] ``.
+#[test]
+fn a_fenced_pass_keeps_its_sightings_for_the_pass_after_it() {
+    thread_local! {
+        static HANDED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn fenced(sightings: &[Sighting]) -> Result<Observed, String> {
+        HANDED.with(|handed| handed.borrow_mut().push(sightings.len()));
+        Err("Commons writer succession is still preserving old records".to_owned())
+    }
+    fn authors(sightings: &[Sighting]) -> Result<Observed, String> {
+        HANDED.with(|handed| handed.borrow_mut().push(sightings.len()));
+        Ok(Observed {
+            quiet: None,
+            born: sightings.len(),
+            marked: sightings.len(),
+            findings: Vec::new(),
+            records: 1,
+            waiting: Vec::new(),
+        })
+    }
+    let state = aterm_tempfile::tempdir().unwrap();
+    let dir = aterm_db::alab::observe::kept::under(state.path());
+    let now = aterm_time::unix_millis().unwrap() / 1_000;
+    let queue = Mutex::new(Queue::default());
+    queue.lock().unwrap().gather(&login(
+        "tab@proton.example",
+        Some("s1"),
+        LoginState::Running,
+        now,
+    ));
+    run(&queue, Some(&dir), fenced);
+    let mut held = queue.lock().unwrap();
+    held.last = None;
+    held.gather(&login(
+        "swept@proton.example",
+        None,
+        LoginState::Idle,
+        now + 60,
+    ));
+    drop(held);
+    run(&queue, Some(&dir), authors);
+    assert_eq!(HANDED.with(|handed| handed.borrow().clone()), vec![1, 2]);
+    assert!(
+        aterm_db::alab::observe::kept::load(&dir)
+            .pending()
+            .is_empty()
+    );
+}
+
+/// A browser profile's sighting of a login a CLI's file also names leaves the CLI's word.
+/// NEGATIVE CONTROL: with `gather` taking every newer sighting's source,
+/// `` left: "browser" right: "profile" ``.
+#[test]
+fn a_browser_sighting_leaves_a_cli_login_its_source() {
+    const A: &str = "a@proton.example";
+    let mut queue = Queue::default();
+    queue.gather(&login(A, None, LoginState::Idle, 100));
+    queue.gather(&ObservedLogin {
+        src: ObservedSrc::Browser,
+        ..login(A, None, LoginState::Idle, 110)
+    });
+    let taken = queue.take(110);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].src.as_str(), "profile");
 }

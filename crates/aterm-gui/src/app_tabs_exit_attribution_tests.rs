@@ -6,15 +6,19 @@ use crate::CloseOutcome;
 use crate::app_window::CloseConfirm;
 use crate::session_store::{ExitReason, RosterChange};
 
-/// The newest close's reason and closer, from the closed index (6G-9).
+/// The newest close's reason and closer, from the row it left (6G-9, ST-15): the row a quit's
+/// close noted for the run's end to write, else the session table's newest.
 fn sole_exit(app: &App) -> (ExitReason, String) {
-    let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-    let rec = g
-        .closed_logs()
+    if let Some(row) = app.quit_closed_tasks.rows().last() {
+        return (row.out, row.by.clone());
+    }
+    let table = app.store.read().unwrap_or_else(|p| p.into_inner()).table();
+    let rec = table
         .exits_since(0)
-        .next_back()
+        .expect("a memory table is loaded")
+        .pop()
         .expect("one exit record after the close");
-    (rec.reason, rec.actor.as_wire().to_string())
+    (rec.out, rec.by)
 }
 
 fn exit_rows(app: &App) -> usize {
@@ -622,15 +626,21 @@ fn a_busy_tab_that_is_not_the_last_asks_before_it_closes() {
     assert_eq!(tabs(&app), 2, "an idle tab closes at once");
 }
 
+/// Session `session`'s close's reason and closer, from the row it left (ST-15): the row a quit's
+/// close noted for the run's end to write, else its row in the session table.
 #[cfg(not(target_os = "macos"))]
 fn exit_of(app: &App, session: u64) -> (ExitReason, String) {
-    let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-    let rec = g
-        .closed_logs()
-        .exits_since(0)
-        .rfind(|e| e.local_id == session)
-        .expect("an exit record for the session");
-    (rec.reason, rec.actor.as_wire().to_string())
+    if let Some(row) = app
+        .quit_closed_tasks
+        .rows()
+        .iter()
+        .rfind(|row| row.local == Some(session))
+    {
+        return (row.out, row.by.clone());
+    }
+    let table = app.store.read().unwrap_or_else(|p| p.into_inner()).table();
+    let row = table.by_local(session).expect("a row for the session");
+    (row.out, row.by)
 }
 
 #[cfg(not(target_os = "macos"))]

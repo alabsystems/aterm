@@ -107,6 +107,76 @@ pub(crate) fn note_busy_reply() {
     HEALTH.busy_replies.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Request lines taken since start, by who sent each and its verb: `<peer>/<verb>`.
+static REQUESTS: crate::metrics::wakes::WakeTable = crate::metrics::wakes::WakeTable::new();
+
+/// The ledger's word for a request line that names no verb of the table.
+const UNKNOWN_VERB: &str = "unknown";
+
+/// Count one request line from `peer` ([`peer_label`]). `verb` is the verb table's own name for
+/// the line's verb, so what a client types never names a counter.
+pub(crate) fn note_request(peer: &str, verb: Option<&'static str>) {
+    REQUESTS.note(&format!("{peer}/{}", verb.unwrap_or(UNKNOWN_VERB)));
+}
+
+/// The subcommand words the ledger keeps of an `aterm` peer's argv, at most.
+const PEER_WORDS: usize = 2;
+
+/// The ledger's name for the peer of one connection. `lane`: the name of a connection that is
+/// no local process's own (`fleet`, `bridge`), which wins. `pid`: the kernel's peer of a direct
+/// local connection; none is `indirect`, this process is `self`, and one whose name cannot be
+/// read is `unreadable`. Any other peer is its process name, and one named as this process is
+/// (an `aterm` command) is told apart by the subcommand words its argv starts with (`aterm
+/// harness tap`, `aterm ctl`): up to [`PEER_WORDS`] of them, ending at the first word that is
+/// not a lowercase letter followed by lowercase letters, digits and `-`.
+pub(crate) fn peer_label(
+    lane: Option<&'static str>,
+    pid: Option<u32>,
+    own_pid: u32,
+    comm_of: &dyn Fn(u32) -> Option<String>,
+    argv_of: &dyn Fn(u32) -> Option<Vec<Vec<u8>>>,
+) -> String {
+    if let Some(lane) = lane {
+        return lane.to_string();
+    }
+    let Some(pid) = pid else {
+        return "indirect".to_string();
+    };
+    if pid == own_pid {
+        return "self".to_string();
+    }
+    let Some(mut label) = comm_of(pid) else {
+        return "unreadable".to_string();
+    };
+    if comm_of(own_pid).as_deref() == Some(label.as_str()) {
+        let argv = argv_of(pid).unwrap_or_default();
+        let words = argv
+            .iter()
+            .skip(1)
+            .map_while(|word| {
+                std::str::from_utf8(word)
+                    .ok()
+                    .filter(|w| subcommand_word(w))
+            })
+            .take(PEER_WORDS);
+        for word in words {
+            label.push(' ');
+            label.push_str(word);
+        }
+    }
+    label
+}
+
+/// Whether `word` reads as a subcommand: at most 16 bytes, a lowercase letter, then lowercase
+/// letters, digits and `-`.
+fn subcommand_word(word: &str) -> bool {
+    word.len() <= 16
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
 /// Emit listener health metrics.
 pub(crate) fn emit_metrics(
     ctx: &crate::metrics::wire::ReadCtx,
@@ -114,6 +184,7 @@ pub(crate) fn emit_metrics(
 ) {
     let h = snapshot(ctx.now_ns / 1000);
     s.count("control_accepts", h.accepts);
+    s.count_pairs("control_requests", &REQUESTS.attribution(), "none");
     s.opt_count("control_last_accept_age_ms", h.last_accept_age_ms, "-");
     s.count("control_queue_pending", h.queue_pending);
     s.count("control_rebinds", h.rebinds);

@@ -22,10 +22,10 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     run_stage_prepared(ctx, spec, None)
 }
 
-pub(crate) fn run_stage_prepared(
-    ctx: &Ctx,
+pub(crate) fn run_stage_prepared<'ctx>(
+    ctx: &'ctx Ctx,
     spec: &StageSpec,
-    cells: Option<crate::cells::PreparedRun>,
+    cells: Option<crate::cells::PreparedRun<'ctx>>,
 ) -> Report {
     let mut r = Report::new(spec.title.clone());
     if let Err(why) = crate::test_workers::admitted_share(&ctx.env) {
@@ -1391,23 +1391,22 @@ fn test_doc_driver(ctx: &Ctx, bind: bool, cmd: Cmd) -> Cmd {
 }
 
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
-    let (k, v) = TRAIL_LAWS_FULL;
     let mut compile = test_compile_args(&ctx.scope);
     if crate::plan::folds_measuring(ctx) {
         compile.extend(measuring_bench_args());
     }
-    [
-        test_compile_cmd(ctx, bind, compile),
-        crate::test_env::command(
-            ctx,
-            with_checkers(
-                main_targo(ctx, test_run_args(&ctx.scope)),
-                ctx.checkers_in_tests,
-            ),
-        )
-        .env(k, v)
-        .counting_waits(),
-    ]
+    let mut run = crate::test_env::command(
+        ctx,
+        with_checkers(
+            main_targo(ctx, test_run_args(&ctx.scope)),
+            ctx.checkers_in_tests,
+        ),
+    );
+    if trail_laws_full(ctx) {
+        let (k, v) = TRAIL_LAWS_FULL;
+        run = run.env(k, v);
+    }
+    [test_compile_cmd(ctx, bind, compile), run.counting_waits()]
 }
 
 /// What every suite a failed build kept from running adds to its could-not-run row: the build's own failure is the finding, and what stood behind it decided nothing.
@@ -1456,6 +1455,17 @@ fn build_to_drive(
 
 /// Run the rainbow trail laws' full grid.
 pub const TRAIL_LAWS_FULL: (&str, &str) = ("TRAIL_LAWS_FULL", "1");
+
+/// Does this run's test child get [`TRAIL_LAWS_FULL`]? A release does, and so does a run whose
+/// change touched aterm-effects itself or whose selection names it ([`Scope::touches`]). A cone
+/// that holds aterm-effects only because something it depends on changed runs the laws' spines
+/// (`trail_host::sweep` in aterm-effects' tests). The off-spine cases, the second value of each
+/// axis and three light grounds read aterm-effects' own code, which that change did not edit,
+/// and the next release runs them. Measured on effects_suite, 577 tests on 18 cores: 149 CPU-s
+/// and 13 s on the spines, 306 CPU-s and 22 s on the full grid.
+fn trail_laws_full(ctx: &Ctx) -> bool {
+    ctx.release || ctx.scope.touches("aterm-effects")
+}
 
 fn test(ctx: &Ctx, r: &mut Report) {
     if !ctx.tools.have_targo() {
@@ -1534,8 +1544,9 @@ fn doctest_cmd(ctx: &Ctx, bind: bool) -> Cmd {
 
 /// Why a `measure` stage handed no bundle ran nothing, and the fix.
 pub const NO_APP: &str = "(no bundle to judge — fix: pass --app <path to aterm.app>; \
-                          for native debug validation use --app-profile debug with the bundle \
-                          `targo --unverified ship dev-app --profile test --no-install` builds)";
+                          `targo --unverified ship dev-app --no-install` assembles this \
+                          checkout's as dist/aterm (dev).app, and --app-profile debug judges \
+                          the one `--profile test` builds)";
 
 const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
 const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
@@ -3141,7 +3152,161 @@ fn objc_drive(ctx: &Ctx, r: &mut Report, drive: &ObjcDrive, command: &Cmd) {
 struct AppkitRuntime {
     cwd: std::path::PathBuf,
     commands: Vec<Cmd>,
-    _window_lock: aterm_uds::private_file::PrivateLock,
+    _window_lock: WindowLock,
+}
+
+/// The file whose lock serializes every AppKit verifier of this user.
+#[cfg(unix)]
+const WINDOWED_LOCK: &str = "windowed.lock";
+
+/// The record beside [`WINDOWED_LOCK`] naming its holder's pid, so a run waiting behind it can
+/// read the holder's process tree. A verifier that predates the record holds the lock unnamed.
+#[cfg(unix)]
+const WINDOWED_HOLDER: &str = "windowed.holder";
+
+/// How long the holder of [`WINDOWED_LOCK`] may make no progress before a run waiting behind it
+/// ends COULD NOT RUN: the project's one-minute hang detector for something that must happen,
+/// counted in the holder's work, not the wall's, so a holder that keeps working is waited for
+/// however long it holds.
+#[cfg(unix)]
+const WINDOWED_HOLDER_HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long each try at [`WINDOWED_LOCK`] lasts before the waiter reads its holder again.
+#[cfg(unix)]
+const WINDOWED_LOOK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// [`WINDOWED_LOCK`] held by this run, its pid in [`WINDOWED_HOLDER`]. The record is removed
+/// before the lock is let go (`Drop` runs before the fields drop), so a waiter never reads it
+/// naming a run that no longer holds the lock, save one that died holding it.
+#[cfg(unix)]
+struct WindowLock {
+    dir: std::path::PathBuf,
+    _lock: aterm_uds::private_file::PrivateLock,
+}
+
+#[cfg(unix)]
+impl Drop for WindowLock {
+    fn drop(&mut self) {
+        let _ = aterm_uds::private_file::remove_private(&self.dir, WINDOWED_HOLDER);
+    }
+}
+
+/// The pid [`WINDOWED_HOLDER`] in `dir` names; `None` where it names none or cannot be read.
+#[cfg(unix)]
+fn windowed_holder(dir: &std::path::Path) -> Option<u32> {
+    let bytes = aterm_uds::private_file::read_private(dir, WINDOWED_HOLDER, 32).ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+}
+
+/// Take [`WINDOWED_LOCK`] in `dir`, waiting for as long as its holder makes progress, and record
+/// this process as its holder. `progress` is asked, after each [`WINDOWED_LOOK_EVERY`] try that
+/// found the lock held, whether the holder [`WINDOWED_HOLDER`] names (if any) made progress since
+/// it was last asked; once it has said no for `hang` the wait ends. No count of tries and no
+/// wall-clock limit ends it while the holder works.
+///
+/// # Errors
+///
+/// [`aterm_uds::private_file::PrivateLock::take`]'s refusals other than `busy`, and a holder that
+/// made no progress for `hang`, named by its pid where its record names one.
+#[cfg(unix)]
+fn take_window_lock(
+    dir: &std::path::Path,
+    hang: std::time::Duration,
+    mut progress: impl FnMut(Option<u32>) -> bool,
+) -> Result<WindowLock, String> {
+    let look = WINDOWED_LOOK_EVERY.min(hang / 4);
+    let mut worked = std::time::Instant::now();
+    loop {
+        match aterm_uds::private_file::PrivateLock::take(
+            dir,
+            WINDOWED_LOCK,
+            look,
+            "another AppKit verifier holds the stable runtime",
+        ) {
+            Ok(lock) => {
+                // Advisory: a record that cannot be written leaves the lock held and its holder
+                // unnamed, which a waiter reads as a holder it cannot see work.
+                let _ = aterm_uds::private_file::write_private(
+                    dir,
+                    WINDOWED_HOLDER,
+                    std::process::id().to_string().as_bytes(),
+                );
+                return Ok(WindowLock {
+                    dir: dir.to_path_buf(),
+                    _lock: lock,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let holder = windowed_holder(dir);
+        if progress(holder) {
+            worked = std::time::Instant::now();
+            continue;
+        }
+        let idle = worked.elapsed();
+        if idle >= hang {
+            let who = holder.map_or_else(
+                || "another AppKit verifier, which recorded no pid,".to_string(),
+                |pid| format!("another AppKit verifier (pid {pid})"),
+            );
+            return Err(format!(
+                "{who} holds the stable runtime and has made no progress for {}s",
+                idle.as_secs()
+            ));
+        }
+    }
+}
+
+/// [`take_window_lock`]'s production reading of its holder: [`holder_progress_with`] over this
+/// process's view, each holder's tree read by a [`aterm_uds::deadline::ProcessProgressProbe`] of
+/// its own (its `read`, not `read_descendants`: the holder is no child of the waiter).
+#[cfg(unix)]
+fn holder_progress() -> impl FnMut(Option<u32>) -> bool {
+    let mut probe: Option<(u32, aterm_uds::deadline::ProcessProgressProbe)> = None;
+    holder_progress_with(
+        std::process::id(),
+        aterm_uds::process::pid_alive,
+        move |pid| {
+            if probe.as_ref().is_none_or(|(of, _)| *of != pid) {
+                probe = Some((pid, aterm_uds::deadline::ProcessProgressProbe::default()));
+            }
+            probe.as_mut().and_then(|(_, probe)| probe.read(pid))
+        },
+    )
+}
+
+/// Whether the holder a look names made progress since the last look: yes where a new holder took
+/// the lock, or where the named, live holder's tree read (`read`: a generation that grows with its
+/// CPU or I/O) grew, or did not compare with the last reading (its members changed, or one could
+/// not be read), which is no evidence of a stall, as [`aterm_uds::deadline`]'s progress waits
+/// count it. A holder's first reading is its baseline, not progress. No where the record names
+/// nobody, a process no longer alive, or `me` (a reused pid in a stale record never stands for the
+/// waiter's own work).
+#[cfg(unix)]
+fn holder_progress_with(
+    me: u32,
+    alive: impl Fn(u32) -> bool,
+    mut read: impl FnMut(u32) -> Option<u64>,
+) -> impl FnMut(Option<u32>) -> bool {
+    // The holder last read, and its last generation (`None`: its reading did not compare).
+    let mut seen: Option<(u32, Option<u64>)> = None;
+    move |holder| {
+        let Some(pid) = holder.filter(|&pid| pid != me && alive(pid)) else {
+            return false;
+        };
+        let generation = read(pid);
+        let Some((last, before)) = seen.replace((pid, generation)) else {
+            return false;
+        };
+        if last != pid {
+            return true;
+        }
+        match (before, generation) {
+            (Some(before), Some(now)) => before != now,
+            _ => true,
+        }
+    }
 }
 
 #[cfg(not(unix))]
@@ -3259,13 +3424,8 @@ fn appkit_group_runtime(
                 ctx.root.display()
             ));
         }
-        let window_lock = aterm_uds::private_file::PrivateLock::take(
-            &parent,
-            "windowed.lock",
-            std::time::Duration::from_secs(60),
-            "another AppKit verifier still owns the stable runtime",
-        )
-        .map_err(|error| format!("take the per-user AppKit runtime lock: {error}"))?;
+        let window_lock = take_window_lock(&parent, WINDOWED_HOLDER_HANG, holder_progress())
+            .map_err(|error| format!("take the per-user AppKit runtime lock: {error}"))?;
         let cwd = parent.join(group);
         match std::fs::symlink_metadata(&cwd) {
             Ok(_) => {
@@ -3767,11 +3927,15 @@ fn glue_row(
 /// The `cells` check ([`crate::cells`]): every forge cell but this machine's
 /// own (or each `--cell`), each linted for its own triple on the checkout's
 /// stock pin (a STOCK EXCEPTION), one row per cell.
-pub(crate) fn prepare_cells(ctx: &Ctx) -> Option<crate::cells::PreparedRun> {
+pub(crate) fn prepare_cells(ctx: &Ctx) -> Option<crate::cells::PreparedRun<'_>> {
     in_checkout(ctx, &mut Report::new("cells"), "cells").then(|| crate::cells::prepare(ctx))
 }
 
-fn foreign_cells(ctx: &Ctx, r: &mut Report, prepared: Option<crate::cells::PreparedRun>) {
+fn foreign_cells<'ctx>(
+    ctx: &'ctx Ctx,
+    r: &mut Report,
+    prepared: Option<crate::cells::PreparedRun<'ctx>>,
+) {
     if in_checkout(ctx, r, "cells") {
         crate::cells::run_prepared(ctx, r, prepared);
     }

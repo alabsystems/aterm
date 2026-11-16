@@ -236,7 +236,10 @@ impl Fixture {
             Some(envelope::signer_public(&SIGNER).unwrap())
         );
         assert!(!client::alab_vault(&config));
-        assert_eq!(client::save_records(&paths, genesis.bytes()).unwrap(), 1);
+        assert_eq!(
+            client::save_records(&paths, genesis.wire_bytes().unwrap().as_ref()).unwrap(),
+            1
+        );
         let fixture = Self {
             host,
             paths,
@@ -301,7 +304,10 @@ impl Fixture {
         assert_eq!(store.inventory(), ids);
         assert_eq!(store.complete_inventory(), ids);
         for record in records {
-            assert_eq!(store.get_bytes(record.id()), Some(record.bytes()));
+            assert_eq!(
+                store.record(record.id()).map(|r| r.wire_bytes().unwrap()),
+                Some(record.wire_bytes().unwrap())
+            );
         }
         store
     }
@@ -310,7 +316,7 @@ impl Fixture {
 fn wire(records: &[&Record]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for record in records {
-        bytes.extend_from_slice(record.bytes());
+        bytes.extend_from_slice(record.wire_bytes().unwrap().as_ref());
     }
     bytes
 }
@@ -401,7 +407,7 @@ fn valid_work() -> (usize, usize) {
 fn unreadable_descendants(unknown_kind: bool) {
     let fixture = Fixture::new();
     let hidden = fixture.root_name("unreadable", 10);
-    let mut bad = hidden.bytes().to_vec();
+    let mut bad = hidden.wire_bytes().unwrap().to_vec();
     if unknown_kind {
         // ALM1's kind follows its four-byte magic, version, and network digest.
         assert_eq!(&bad[..5], b"ALM1\x01");
@@ -460,12 +466,14 @@ fn unreadable_descendants(unknown_kind: bool) {
 fn malformed_tail_keeps_no_prefix() {
     let fixture = Fixture::new();
     let good = fixture.root_name("after-malformed", 10);
-    let mut malformed = good.bytes().to_vec();
+    let mut malformed = good.wire_bytes().unwrap().to_vec();
     malformed.extend_from_slice(b"ALM");
     fixture.host.answer(malformed, None);
     assert!(fixture.sync().is_err());
     fixture.assert_records(&[&fixture.genesis]);
-    fixture.host.answer(good.bytes().to_vec(), None);
+    fixture
+        .host
+        .answer(good.wire_bytes().unwrap().to_vec(), None);
     assert_eq!(fixture.sync().unwrap(), 1);
     assert_eq!(
         fixture.host.last_have().first(),
@@ -481,7 +489,7 @@ fn final_store_preserves_concurrent_addition() {
     let path = fixture.paths.records_file();
     let newer = wire(&[&fixture.genesis, &concurrent]);
     fixture.host.answer(
-        incoming.bytes().to_vec(),
+        incoming.wire_bytes().unwrap().to_vec(),
         Some(Box::new(move || {
             fsx::write_atomic(&path, &newer, 0o600).unwrap();
         })),
@@ -494,14 +502,14 @@ fn final_store_reconsiders_an_initially_known_record() {
     let fixture = Fixture::new();
     let known = fixture.root_name("known-before-fetch", 10);
     assert_eq!(
-        client::save_records(&fixture.paths, known.bytes()).unwrap(),
+        client::save_records(&fixture.paths, known.wire_bytes().unwrap().as_ref()).unwrap(),
         1
     );
     fixture.warm();
     let path = fixture.paths.records_file();
-    let older = fixture.genesis.bytes().to_vec();
+    let older = fixture.genesis.wire_bytes().unwrap().to_vec();
     fixture.host.answer(
-        known.bytes().to_vec(),
+        known.wire_bytes().unwrap().to_vec(),
         Some(Box::new(move || {
             fsx::write_atomic(&path, &older, 0o600).unwrap();
         })),

@@ -920,3 +920,44 @@ fn json_guarded_map_shapes() {
         None
     );
 }
+
+/// r405: `:extract_plist` strategy blocks reduce to one
+/// bundle-id property lookup; anything else stays
+/// block-only.
+#[test]
+fn plist_strategy_block_shapes() {
+    use super::super::formula::{PlistBlock, PlistProp};
+    let block = |body: &str| {
+        let text = format!("cask \"x\" do\n  livecheck do\n    url :url\n{body}\n  end\nend\n");
+        parse_livecheck_block(&text).and_then(|s| s.plist_block)
+    };
+    assert_eq!(
+        block(
+            "    strategy :extract_plist do |items|\n      items[\"com.example.app\"]&.short_version\n    end"
+        ),
+        Some(PlistBlock {
+            has_regex: false,
+            bundle_id: "com.example.app".into(),
+            prop: PlistProp::Short,
+            regex: false,
+        })
+    );
+    assert_eq!(
+        block(
+            "    strategy :extract_plist do |items, regex|\n      items[\"com.example.app\"]&.version&.[](regex, 1)\n    end"
+        ),
+        Some(PlistBlock {
+            has_regex: true,
+            bundle_id: "com.example.app".into(),
+            prop: PlistProp::Bundle,
+            regex: true,
+        })
+    );
+    // String interpolation does not reduce.
+    assert_eq!(
+        block(
+            "    strategy :extract_plist do |items|\n      item = items[\"com.example.app\"]\n      \"#{item.short_version},#{item.version}\"\n    end"
+        ),
+        None
+    );
+}

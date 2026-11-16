@@ -740,7 +740,7 @@ fn bare_manifest(sessions: Vec<SessionRecord>) -> SessionHandoff {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
-        retired_workers: Vec::new(),
+        last_launches: Vec::new(),
     }
 }
 
@@ -4667,19 +4667,8 @@ fn a_sessionless_handoff_with_a_lone_workers_list_is_taken_over() {
         .to_toml()
         .expect("the desk serializes")
     };
-    let left = vec!["what a worker the reaper closed left".to_owned()];
-    let stamp_left = |manifest: &mut SessionHandoff, _: &std::path::Path, _: &str| {
-        manifest.retired_workers.clone_from(&left);
-    };
-    let staged = stage_outgoing_handoff_full(
-        "lonelist",
-        0,
-        Some(&lone_desk),
-        None,
-        None,
-        &[],
-        Some(&stamp_left),
-    );
+    let staged =
+        stage_outgoing_handoff_full("lonelist", 0, Some(&lone_desk), None, None, &[], None);
     assert!(
         staged.fds_wire.is_empty(),
         "PRECONDITION: no session is handed"
@@ -4692,10 +4681,6 @@ fn a_sessionless_handoff_with_a_lone_workers_list_is_taken_over() {
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.refusal, None, "the list alone is a handoff");
     assert!(incoming.adopted.is_empty(), "no session is adopted");
-    assert_eq!(
-        incoming.retired_workers, left,
-        "a list's Finished rows keep answering here"
-    );
     let layout = incoming
         .layout
         .as_ref()

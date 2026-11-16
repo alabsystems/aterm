@@ -2549,6 +2549,7 @@ fn a_hog_says_when_it_was_last_built() {
         in_use: None,
         bytes: 0,
         bytes_partial: false,
+        died: crate::harness::disk::target::Died::default(),
     };
     let td =
         |path: &str, profiles: Vec<crate::harness::disk::target::Profile>, gib: u64| TargetDir {

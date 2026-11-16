@@ -182,6 +182,13 @@ impl<'a> Register<'a> {
         }
     }
 
+    /// Op `k`'s class: two ops of one class write the same thing. Classes are numbered by
+    /// their first op, in the register's order.
+    #[cfg(unix)] // read by the unix-only signing of a put's class (`entries.rs`)
+    pub(super) fn class_of(&self, k: usize) -> usize {
+        self.class[k]
+    }
+
     /// Classify the ops of each of `registers` (each register's ops in record order, no op in
     /// two) in one pass over `reach`, whose records' parents `parents` gives.
     pub(super) fn classify_all<P, I>(

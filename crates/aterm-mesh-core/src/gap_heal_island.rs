@@ -1476,10 +1476,8 @@ clean {
 
     -- Induction from n0.
     theorem gc_ind_from (P : Nat → Prop) (n0 : Nat) (h0 : P n0)
-        (hs : ∀ k, n0 ≤ k → P k → P (Nat.succ k)) (k : Nat) (hk : n0 ≤ k) : P k := by
-      induction hk with
-      | refl => exact h0
-      | step m hle ih => exact hs m hle ih
+        (hs : ∀ k, n0 ≤ k → P k → P (Nat.succ k)) (k : Nat) (hk : n0 ≤ k) : P k :=
+      Nat.le.rec (motive := fun k _ => P k) h0 (fun {m} hle ih => hs m hle ih) hk
 
     -- Finitely many eventualities, each kept once reached, hold together at one time.
     theorem gc_collect (P : Nat → Nat → Prop) (n : Nat)

@@ -33,15 +33,19 @@ fn wire_tab_close_by(
     state
 }
 
-/// The newest close's reason and closer, from the closed index.
+/// The newest close's reason and closer, from the row it left: the row a quit's close noted for
+/// the run's end to write, else the session table's newest.
 fn last_exit(app: &App) -> (ExitReason, String) {
-    let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-    let row = g
-        .closed_logs()
+    if let Some(row) = app.quit_closed_tasks.rows().last() {
+        return (row.out, row.by.clone());
+    }
+    let table = app.store.read().unwrap_or_else(|p| p.into_inner()).table();
+    let row = table
         .exits_since(0)
-        .next_back()
+        .expect("a memory table is loaded")
+        .pop()
         .expect("an exit row after the close");
-    (row.reason, row.actor.as_wire().to_string())
+    (row.out, row.by)
 }
 
 #[test]

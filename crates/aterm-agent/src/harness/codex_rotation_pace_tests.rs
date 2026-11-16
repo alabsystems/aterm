@@ -7,23 +7,33 @@
 
 use super::*;
 use crate::harness::codex_rotation_pace::{
-    ASKING_S, Climb, Minted, OwnRead, PACE_S, ReadPace, Run, Wait,
+    ASKING_S, Climb, KeptPace, Minted, OwnRead, PACE_S, Paces, ReadPace, Run, Wait,
 };
 use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
+use std::time::Instant;
 
 type Asked = Result<Option<codex_rotation::Proposal>, &'static str>;
 
-/// One ask at `at` of the process whose reads so far are `pace`.
+/// One ask at `at` of the process whose reads so far are `pace`, noted to it as its keeper notes
+/// each ask ([`KeptPace::asks`]).
 fn ask(world: &World, reader: &dyn UsageReader, pace: &mut ReadPace, at: i64) -> Asked {
+    pace.asks(at);
+    prepared(world, reader, pace, at)
+}
+
+/// The pass of an ask at `at` already noted to `pace`.
+fn prepared(world: &World, reader: &dyn UsageReader, pace: &mut ReadPace, at: i64) -> Asked {
     let seat = Seat {
         now: at,
         ..world.seat()
     };
     let mut session = asked_session(world);
     session.point = codex_rotation::wall_asked(at);
-    codex_rotation::prepare_paced(
+    codex_rotation::prepare(
         &seat,
         &session,
         &Identity::from_native("source", "user"),
@@ -424,7 +434,8 @@ fn a_row_named_and_never_reached_counts_as_asked() {
         };
         let mut session = session(Cli::Codex, Supervisor::Own, Mode::Early, exe);
         session.point = codex_rotation::wall_asked(NOW + at);
-        codex_rotation::prepare_paced(
+        pace.asks(NOW + at);
+        codex_rotation::prepare(
             &seat,
             &session,
             &Identity::from_native("source", "user"),
@@ -824,7 +835,8 @@ fn the_exec_path_is_paced_by_the_same_gate() {
             ..world.seat()
         };
         let before = reader.calls.borrow().len();
-        let proposal = codex_rotation::prepare_exec_paced(
+        pace.asks(NOW + at);
+        let proposal = codex_rotation::prepare_exec(
             &seat,
             &request,
             &world.exe,
@@ -1054,33 +1066,36 @@ fn asks_through_holds(
 
 /// A CONTROL THAT NOTES EVERY ASK IT ANSWERS KEEPS THE OWN LOGIN'S LADDER THROUGH ITS HOLDS: five
 /// rows each read usable on an account of its own, so each pass that reads one selects it, and
-/// none is ever taken. The control holds each selection for a minute (the TUI's observation),
-/// answering the asks of that minute with no pass, and the ask after it reads. Noted, those asks
-/// are one series with the passes, and an hour reads the session's login nine times: once with
-/// each row it had not read, and four times on its own ladder. CONTROL: unnoted, a minute and five
-/// seconds pass between two passes, each of them ends the ladder, and the hour reads that login
-/// twenty times.
+/// none is ever taken. The control holds each selection, answering the asks of that time with no
+/// pass, and the ask after it reads: for a minute (the TUI's observation), and for two (a receipt
+/// the TUI published, which its session asks the `status` of until it expires, or an exec
+/// operation, whose `reserve` its run retries until its deadline). Noted, those asks are one
+/// series with the passes, and an hour reads the session's login nine times either way: once with
+/// each row it had not read, and four times on its own ladder. CONTROL: unnoted, more than a
+/// minute passes between two passes, each of them ends the ladder, and the hour reads that login
+/// twenty times under the minute's holds and nineteen under the two minutes'.
 #[test]
 fn a_control_that_notes_every_ask_keeps_the_own_ladder_through_its_holds() {
     let labels = ["t1", "t2", "t3", "t4", "t5"];
-    let mut source_reads = Vec::new();
-    for fed in [true, false] {
-        let (world, mut reader, files) = pool("pace-held-selections", &labels);
-        for (file, label) in files.iter().zip(labels) {
-            reader.answers.insert(file.clone(), usage(label, false));
+    for (hold, passes, unfed) in [
+        (60, [0, 65, 130, 195, 260, 325, 390, 495, 2295], 20),
+        (120, [0, 125, 250, 375, 500, 625, 750, 875, 2550], 19),
+    ] {
+        let mut source_reads = Vec::new();
+        for fed in [true, false] {
+            let (world, mut reader, files) = pool("pace-held-selections", &labels);
+            for (file, label) in files.iter().zip(labels) {
+                reader.answers.insert(file.clone(), usage(label, false));
+            }
+            let mut pace = ReadPace::new();
+            let read = asks_through_holds(&world, &reader, &mut pace, (0, HOUR), hold, fed);
+            if fed {
+                assert_eq!(read, passes, "{hold}: {pace:?}");
+            }
+            source_reads.push(reads_of(&reader, &main_of(&world)));
         }
-        let mut pace = ReadPace::new();
-        let read = asks_through_holds(&world, &reader, &mut pace, (0, HOUR), 60, fed);
-        if fed {
-            assert_eq!(
-                read,
-                [0, 65, 130, 195, 260, 325, 390, 495, 2295],
-                "{pace:?}"
-            );
-        }
-        source_reads.push(reads_of(&reader, &main_of(&world)));
+        assert_eq!(source_reads, [9, unfed], "{hold}: fed, then CONTROL unfed");
     }
-    assert_eq!(source_reads, [9, 20], "fed, then CONTROL unfed");
 }
 
 /// A CLOCK SET BACK ENDS A SERIES OF ASKS: how long the process did not ask is unknown, so the
@@ -1138,7 +1153,8 @@ fn a_row_read_walled_on_another_limit_on_record_is_read_when_that_wall_ends() {
             };
             let mut session = asked_session(&world);
             session.point = codex_rotation::wall_asked(NOW + offset);
-            let _ = codex_rotation::prepare_paced(
+            pace.asks(NOW + offset);
+            let _ = codex_rotation::prepare(
                 &seat,
                 &session,
                 codex_rotation::Ask::of(&source, Some(OTHER)),
@@ -1174,4 +1190,233 @@ fn a_row_read_walled_on_another_limit_on_record_is_read_when_that_wall_ends() {
     let ends = 960 + accounts::RESET_GRACE_S;
     let read = asks(&reader, &mut pace, &mut every_5s(365, ends + 5));
     assert_eq!(read, [(ends, both)], "{pace:?}");
+}
+
+/// A PROCESS'S PACE IS KEPT FOR IT UNTIL ITS KEEPER FORGETS IT: each ask of one process gets the
+/// same pace, however long after, another process another, and a process forgotten a new one.
+#[test]
+fn paces_keep_one_pace_per_process_until_it_is_forgotten() {
+    let longest = Duration::from_secs(90);
+    let now = Instant::now();
+    let mut paces = Paces::default();
+    let first = paces.of(1_u32, now, longest);
+    assert!(Arc::ptr_eq(
+        &first,
+        &paces.of(1, now + longest * 10, longest)
+    ));
+    let second = paces.of(2, now, longest);
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(paces.processes().collect::<Vec<_>>(), [1, 2]);
+    paces.forget(&BTreeSet::from([1]));
+    assert_eq!(paces.processes().collect::<Vec<_>>(), [2]);
+    assert!(
+        !Arc::ptr_eq(&first, &paces.of(1, now, longest)),
+        "forgotten"
+    );
+    assert!(Arc::ptr_eq(&second, &paces.of(2, now, longest)));
+}
+
+/// A PACE HELD PAST THE LONGEST OBSERVATION IS REPLACED, AND ONLY THEN: while an observation holds
+/// a process's pace, an ask up to `longest` after the observation began gets that pace, and one
+/// later a new pace, which is the process's from then on. A pace whose observation ended,
+/// returning or unwinding, is never replaced, however long ago that was.
+#[test]
+fn a_pace_held_past_the_longest_observation_is_replaced() {
+    let longest = Duration::from_secs(90);
+    let start = Instant::now();
+    let mut paces = Paces::default();
+    let held = paces.of(7_u32, start, longest);
+    let replaced = held
+        .observe(start, |_| {
+            let within = paces.of(7, start + longest, longest);
+            assert!(
+                Arc::ptr_eq(&held, &within),
+                "within the longest observation"
+            );
+            let past = paces.of(7, start + longest + Duration::from_secs(1), longest);
+            assert!(!Arc::ptr_eq(&held, &past), "past it");
+            past
+        })
+        .expect("no other observation holds the pace");
+    let later = start + longest * 10;
+    assert!(Arc::ptr_eq(&replaced, &paces.of(7, later, longest)));
+    assert_eq!(replaced.observe(start, |_| "ran"), Some("ran"));
+    assert!(
+        Arc::ptr_eq(&replaced, &paces.of(7, later, longest)),
+        "returned"
+    );
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        replaced.observe(start, |_| panic!("the observation unwinds"));
+    }));
+    assert!(unwound.is_err(), "CONTROL");
+    assert!(
+        Arc::ptr_eq(&replaced, &paces.of(7, later, longest)),
+        "unwound"
+    );
+}
+
+/// A PACE IS REPLACED AGAIN ONLY ONCE THE ONE IT REPLACED IS HELD BY NONE: at most two
+/// observations of one process are out at once. While the observation that held the first pace
+/// past the longest observation still holds it, its replacement held as long is kept, not
+/// replaced. Once that first observation has ended, the replacement held too long is replaced in
+/// its turn.
+#[test]
+fn a_pace_is_replaced_again_only_once_the_one_it_replaced_is_held_by_none() {
+    let longest = Duration::from_secs(90);
+    let past = |held: Instant| held + longest + Duration::from_secs(1);
+    let start = Instant::now();
+    let mut paces = Paces::default();
+    let first = paces.of(7_u32, start, longest);
+    let second = first
+        .observe(start, |_| {
+            let second = paces.of(7, past(start), longest);
+            assert!(!Arc::ptr_eq(&first, &second), "CONTROL: replaced");
+            let kept = second
+                .observe(past(start), |_| paces.of(7, past(past(start)), longest))
+                .expect("no observation holds the new pace");
+            assert!(
+                Arc::ptr_eq(&kept, &second),
+                "the first observation is still out: {paces:?}"
+            );
+            second
+        })
+        .expect("no observation holds the first pace");
+    let third = second
+        .observe(past(start), |_| paces.of(7, past(past(start)), longest))
+        .expect("no observation holds the second pace");
+    assert!(
+        !Arc::ptr_eq(&third, &second),
+        "the first observation has ended: {paces:?}"
+    );
+}
+
+/// ONE OBSERVATION HOLDS A PROCESS'S PACE AT A TIME, AND ONE THAT UNWINDS LEAVES IT WHOLE: an
+/// observation that finds the pace held runs nothing; one after an observation that unwound
+/// holds the pace that one left, the own login's ladder it climbed standing.
+#[test]
+fn one_observation_holds_a_pace_at_a_time() {
+    let own = Path::new("/home/.codex/auth.json");
+    let kept = Paces::default().of((), Instant::now(), Duration::MAX);
+    let nested = kept.observe(Instant::now(), |_| kept.observe(Instant::now(), |_| "ran"));
+    assert_eq!(nested, Some(None));
+    kept.asks(NOW);
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        kept.observe(Instant::now(), |pace| {
+            let _ = pace.settle(own, OwnRead::Ended, None, Vec::new(), NOW);
+            panic!("the observation unwinds");
+        });
+    }));
+    assert!(unwound.is_err(), "CONTROL");
+    let held = kept.observe(Instant::now(), |pace| pace.holds(own, true, NOW + 30));
+    assert_eq!(held, Some(true), "{kept:?}");
+}
+
+/// AN ASK NOTED TO A PROCESS'S KEEPER IS ONE OF ITS PACE'S SERIES: the own login's ladder a pass
+/// climbed holds an ask of its series, and ends at an ask noted more than [`ASKING_S`] after the
+/// one before.
+#[test]
+fn an_ask_noted_to_the_keeper_is_of_its_paces_series() {
+    let own = Path::new("/home/.codex/auth.json");
+    let kept = Paces::default().of((), Instant::now(), Duration::MAX);
+    let holds = || kept.observe(Instant::now(), |pace| pace.holds(own, true, NOW + 59));
+    kept.asks(NOW);
+    let _ = kept.observe(Instant::now(), |pace| {
+        pace.settle(own, OwnRead::Ended, None, Vec::new(), NOW)
+    });
+    kept.asks(NOW + 30);
+    assert_eq!(holds(), Some(true), "CONTROL: {kept:?}");
+    assert_eq!(kept.asked_at(), Some(NOW + 30));
+    kept.asks(NOW + 30 + ASKING_S + 1);
+    assert_eq!(holds(), Some(false), "{kept:?}");
+}
+
+/// The offsets of `at`'s asks that read, each noted to `kept` and then observed through it, read
+/// by `asked`, which counts its reads in `reader`.
+fn kept_passes(
+    world: &World,
+    asked: &dyn UsageReader,
+    reader: &Reader,
+    kept: &KeptPace,
+    at: impl IntoIterator<Item = i64>,
+) -> Vec<i64> {
+    let mut read = Vec::new();
+    for at in at {
+        let before = reader.calls.borrow().len();
+        kept.asks(NOW + at);
+        let observed = kept.observe(Instant::now(), |pace| {
+            prepared(world, asked, pace, NOW + at)
+        });
+        assert!(
+            observed.is_some(),
+            "{at}: no other observation holds the pace"
+        );
+        if reader.calls.borrow().len() > before {
+            read.push(at);
+        }
+    }
+    read
+}
+
+/// EVERY ASK COUNTS WHILE A PASS HOLDS THE PACE: the session's own login answers as another
+/// identity, so each pass reads it alone and climbs its ladder. The pass at 0 takes 70 s, and the
+/// process asks every five seconds all the while, each ask noted to its keeper while the pass holds
+/// the pace (and answered with no read). The ask at 75 s is then one series with them: it reads on
+/// the ladder's first rung, which climbs to the 5 minute rung, so the next read is at 375 s.
+/// Unnoted, 75 s without an ask would end the ladder, and the ask at 75 s would climb a new one
+/// from its first rung, the next read coming at 135 s.
+#[test]
+fn every_ask_counts_while_a_pass_holds_the_pace() {
+    let (world, mut reader) = fixture("pace-asks-during-a-pass");
+    let main = main_of(&world);
+    reader.answers.insert(main, usage("another", true));
+    let kept = Paces::default().of((), Instant::now(), Duration::MAX);
+    let during = |seat: &Seat<'_>, _: &Path| {
+        if seat.now == NOW {
+            for at in every_5s(5, 75) {
+                kept.asks(NOW + at);
+                let answered = kept.observe(Instant::now(), |_| ());
+                assert!(answered.is_none(), "CONTROL: the pass holds the pace");
+            }
+        }
+    };
+    let hooked = Hooked {
+        reader: &reader,
+        during: &during,
+    };
+    let asks = [0].into_iter().chain(every_5s(75, 400));
+    let read = kept_passes(&world, &hooked, &reader, &kept, asks);
+    assert_eq!(read, [0, 75, 375], "{kept:?}");
+}
+
+/// AN ASK THAT ENDS THE SERIES WHILE A PASS RUNS ENDS THE LADDER THAT PASS CLIMBS: the session's
+/// own login answers as another identity, and its ladder climbs at 0, 60 and 360 s. While the pass
+/// at 360 s reads, the clock is set back an hour and the process asks, which ends its series of
+/// asks: that pass's climb is of the series that ended, so the next ask, five seconds later by
+/// the clock as it now is, reads, and the one a minute after that.
+#[test]
+fn an_ask_that_ends_the_series_during_a_pass_ends_the_ladder_it_climbs() {
+    let (world, mut reader) = fixture("pace-series-ends-during-a-pass");
+    let main = main_of(&world);
+    reader.answers.insert(main, usage("another", true));
+    let kept = Paces::default().of((), Instant::now(), Duration::MAX);
+    let back = 360 - HOUR;
+    let during = |seat: &Seat<'_>, _: &Path| {
+        if seat.now == NOW + 360 {
+            kept.asks(NOW + back);
+        }
+    };
+    let hooked = Hooked {
+        reader: &reader,
+        during: &during,
+    };
+    let read = kept_passes(&world, &hooked, &reader, &kept, every_5s(0, 365));
+    assert_eq!(read, [0, 60, 360], "CONTROL: {kept:?}");
+    let read = kept_passes(
+        &world,
+        &hooked,
+        &reader,
+        &kept,
+        every_5s(back + 5, back + 70),
+    );
+    assert_eq!(read, [back + 5, back + 65], "{kept:?}");
 }

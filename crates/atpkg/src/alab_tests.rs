@@ -741,7 +741,12 @@ fn link_ino(entry: &Path) -> u64 {
 }
 
 #[cfg(unix)]
-const LAUNCH_PROBE: &[u8] = b"#!/bin/sh\nprintf '%s|%s|%s|%s|%s|%s\\n' \"$0\" \"${DISABLE_AUTOUPDATER-unset}\" \"${ATPKG_MANAGED_LAUNCH_PID-unset}\" \"${ATPKG_MANAGED_LAUNCH_PATH-unset}\" \"${ATPKG_MANAGED_LAUNCH_TARGET-unset}\" \"$$\" >> \"$ATPKG_LAUNCH_LOG\"\n";
+fn launch_probe() -> Vec<u8> {
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let mut script = format!("#!{}\n", shell.display()).into_bytes();
+    script.extend_from_slice(b"printf '%s|%s|%s|%s|%s|%s\\n' \"$0\" \"${DISABLE_AUTOUPDATER-unset}\" \"${ATPKG_MANAGED_LAUNCH_PID-unset}\" \"${ATPKG_MANAGED_LAUNCH_PATH-unset}\" \"${ATPKG_MANAGED_LAUNCH_TARGET-unset}\" \"$$\" >> \"$ATPKG_LAUNCH_LOG\"\n");
+    script
+}
 
 #[cfg(unix)]
 fn observed_launch(shim: &Path, log: &Path, target: &Path, count: usize, env: &str) {
@@ -757,19 +762,18 @@ fn observed_launch_with_hint(
     env: &str,
     managed: Option<&Path>,
 ) {
-    let mut command = aterm_uds::spawnfd::command("/bin/sh");
+    let shell = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let mut command = aterm_uds::spawnfd::command(&shell);
     command
         .arg(shim)
         .arg("--version")
         .env_clear()
         .env("ATPKG_LAUNCH_LOG", log);
-    let result = aterm_uds::deadline::outputs_until(
-        &mut [&mut command],
-        std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    let result = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
         aterm_spec::wait::MUST_HAPPEN,
+        format!("shim launch {count} via {}", shim.display()),
     )
-    .pop()
-    .expect("one owned shell")
     .expect("owned shell completes");
     assert!(result.status.success(), "{result:?}");
     let written = std::fs::read_to_string(log).unwrap();
@@ -799,7 +803,8 @@ fn observed_launch_with_hint(
 #[test]
 fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     let l = scratch("twin");
-    let first = store_build_with(&l, BUILD, true, LAUNCH_PROBE);
+    let probe = launch_probe();
+    let first = store_build_with(&l, BUILD, true, &probe);
     let env = crate::shim_env::ShimEnv::admit(&[
         "DISABLE_AUTOUPDATER=1".to_string(),
         "ATPKG_MANAGED_LAUNCH_EXTRA=kept".to_string(),
@@ -839,7 +844,7 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     crate::activate::sweep_agents_dir(&l);
     assert!(twin(&l).exists(), "the sweep keeps an ALab twin");
     let (before, ino) = (std::fs::read(twin(&l)).unwrap(), link_ino(&entry));
-    let second = store_build_with(&l, BUILD + 1, true, LAUNCH_PROBE);
+    let second = store_build_with(&l, BUILD + 1, true, &probe);
     crate::activate::install_shims_env(
         &l,
         &second,
@@ -931,7 +936,7 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
         .unwrap()
         .build_id();
     let vendor = l.build_dir("codex", vendor_id);
-    package(&vendor, "0.165.0", LAUNCH_PROBE, false);
+    package(&vendor, "0.165.0", &probe, false);
     crate::store::mark_build_ready(&vendor).unwrap();
     crate::activate::activate_build(&l, &vendor).unwrap();
     crate::activate::install_shims(&l, &vendor, &["codex".to_string()], crate::Aliases::Off)
@@ -948,7 +953,7 @@ fn an_alab_twin_execs_an_entry_its_own_directory_re_points() {
     );
 
     let foreign = crate::testdir::dir("atpkg-alab-unmanaged-");
-    package(&foreign, "0.164.0-dev.9+gforeign", LAUNCH_PROBE, true);
+    package(&foreign, "0.164.0-dev.9+gforeign", &probe, true);
     crate::platform::install_shim_to(&primary, &foreign.join("bin/codex")).unwrap();
     let unmanaged = std::fs::read(&primary).unwrap();
     crate::activate::reconcile_agents(&l);
@@ -979,8 +984,9 @@ fn an_alab_dev_link_twin_execs_an_entry_a_relink_re_points() {
     let l = scratch("devlink");
     let d = crate::testdir::dir("atpkg-alab-devlink-pkgs-");
     let (a, b) = (d.join("a"), d.join("b"));
-    package(&a, "0.164.0-dev.1+ga", LAUNCH_PROBE, true);
-    package(&b, "0.164.0-dev.2+gb", LAUNCH_PROBE, true);
+    let probe = launch_probe();
+    package(&a, "0.164.0-dev.1+ga", &probe, true);
+    package(&b, "0.164.0-dev.2+gb", &probe, true);
     let a = std::path::absolute(&a).unwrap();
     let b = std::path::absolute(&b).unwrap();
     crate::link(&l, "codex", &a, &[PathBuf::from("bin/codex")]).unwrap();

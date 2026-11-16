@@ -620,7 +620,7 @@ fn git_identity_tracks_only_admitted_builds_without_starting_a_program() {
     let sys = Fake::root();
     sys.logged_in(&alice());
     sys.stat_of(CLT_GIT, GIT);
-    assert_eq!(installed_git_identity(&sys), Some(CLT_GIT.into()));
+    assert_eq!(installed_git(&sys), Some(CLT_GIT.into()));
     let prefix = Path::new("/Users//alice/Library/Application Support/aterm/pkg");
     let store = prefix.join("store/git");
     let shim = prefix.join("bin/git");
@@ -642,20 +642,19 @@ fn git_identity_tracks_only_admitted_builds_without_starting_a_program() {
             },
         );
         assert_eq!(
-            installed_git_identity(&sys),
+            installed_git(&sys),
             Some(CLT_GIT.into()),
             "an incomplete activation cannot supply a new build identity"
         );
         sys.stat_of(store.join(format!("{build}.ready")).to_str().unwrap(), FILE);
         sys.runtime_unready(&store.join(build), "the selected runtime is unavailable");
         assert_eq!(
-            installed_git_identity(&sys),
+            installed_git(&sys),
             Some(CLT_GIT.into()),
             "a ready record cannot bypass native runtime admission"
         );
         sys.runtime_ready(&store.join(build));
-        assert_eq!(installed_git(&sys), Some(shim.clone()));
-        assert_eq!(installed_git_identity(&sys), Some(payload));
+        assert_eq!(installed_git(&sys), Some(payload));
     }
     assert!(
         sys.calls().is_empty(),
@@ -684,16 +683,17 @@ fn installed_git_accepts_live_atpkg_git_without_clt_and_refuses_stub_or_without_
     sys.stat_of(&format!("{prefix}/store/git/12.ready"), FILE);
     sys.stat_of(&format!("{prefix}/store/git/12/bin/git"), exec);
 
-    // Positive: `installed_git` and `git_program` now select atpkg's `bin/git`, and
+    // Positive: `installed_git` and `git_program` now select the build's own `bin/git`, and
     // `GitItem::probe` runs without waiting on CLT.
-    assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
-    assert_eq!(git_program(&sys), PathBuf::from(&shim));
+    let payload = format!("{prefix}/store/git/12/bin/git");
+    assert_eq!(installed_git(&sys), Some(PathBuf::from(&payload)));
+    assert_eq!(git_program(&sys), PathBuf::from(&payload));
     // Negative control (C8): `installed_git_without_atpkg` returns `None` on the same machine.
     assert_eq!(installed_git_without_atpkg(&sys), None);
 
-    let quoted_shim = crate::port::shell_word(&shim);
+    let quoted_git = crate::port::shell_word(&payload);
     sys.on(
-        &format!("alice$ {quoted_shim} config --global --get user.name"),
+        &format!("alice$ {quoted_git} config --global --get user.name"),
         Ran::exit(1, ""),
     );
     let item = by_id("github.git-name@alice");
@@ -705,7 +705,7 @@ fn installed_git_accepts_live_atpkg_git_without_clt_and_refuses_stub_or_without_
     // CLT can lag the signed toolset's Git capabilities, so its arrival must not displace
     // the ready managed build that the repositories and their required dependencies use.
     sys.stat_of(CLT_GIT, exec);
-    assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
+    assert_eq!(installed_git(&sys), Some(PathBuf::from(&payload)));
 }
 
 #[test]
@@ -740,7 +740,10 @@ fn ready_managed_git_precedes_system_git_on_linux_without_lookup_processes() {
         "a stub or unfinished install cannot displace system Git"
     );
     sys.stat_of(&format!("{prefix}/store/git/12.ready"), FILE);
-    assert_eq!(installed_git(&sys), Some(PathBuf::from(&shim)));
+    assert_eq!(
+        installed_git(&sys),
+        Some(PathBuf::from(format!("{prefix}/store/git/12/bin/git")))
+    );
     assert_eq!(
         installed_git_without_atpkg(&sys),
         Some(PathBuf::from(SYSTEM_GIT))
@@ -757,9 +760,97 @@ fn ready_managed_git_precedes_system_git_on_linux_without_lookup_processes() {
     assert!(sys.run_complete_stdout(&command).unwrap().success());
     assert_eq!(sys.calls(), vec![command.display()]);
 
-    // A disabled or invalid managed shim immediately returns selection to the system Git.
+    // A disabled or invalid managed PATH entry immediately returns selection to the system Git.
     sys.stat_of(&shim, FILE);
     assert_eq!(installed_git(&sys), Some(PathBuf::from(SYSTEM_GIT)));
+}
+
+#[test]
+fn a_managed_git_linked_on_path_is_admitted_only_where_the_link_resolves_to_its_build() {
+    let who = User {
+        home: "/home/alice".into(),
+        ..alice()
+    };
+    let mut sys = Fake::root();
+    sys.linux = true;
+    sys.logged_in(&who);
+    let prefix = "/home/alice/.local/share/aterm/pkg";
+    let shim = format!("{prefix}/bin/git");
+    let exec = Stat {
+        mode: 0o755,
+        ..FILE
+    };
+    sys.file(
+        "/home/alice/.config/aterm/aterm.toml",
+        format!("[packages]\nprefix = \"{prefix}\"\n").as_bytes(),
+    );
+    sys.stat_of(SYSTEM_GIT, exec);
+    sys.link(&format!("{prefix}/store/git/current"), "12");
+    sys.stat_of(&format!("{prefix}/store/git/12/bin/git"), exec);
+    sys.stat_of(&format!("{prefix}/store/git/12.ready"), FILE);
+
+    // atpkg's PATH entry on Linux: a link to the build's git, which git itself is.
+    sys.link(&shim, "../store/git/12/bin/git");
+    assert_eq!(
+        installed_git(&sys),
+        Some(PathBuf::from(format!("{prefix}/store/git/12/bin/git")))
+    );
+
+    // Negative control: a link to another git (an older build, the system's) is not the
+    // selected build's entry, so selection stays with the system Git.
+    for elsewhere in ["../store/git/11/bin/git", SYSTEM_GIT] {
+        sys.link(&shim, elsewhere);
+        assert_eq!(
+            installed_git(&sys),
+            Some(PathBuf::from(SYSTEM_GIT)),
+            "a link to {elsewhere}"
+        );
+    }
+}
+
+/// A MANAGED GIT RUNS AS ITSELF (FL-165): with a ready managed build admitted, the git setup
+/// starts (a checkout's, the credential route's) is the build's own `bin/git`; the PATH entry
+/// atpkg laid for people to type (on macOS a `/bin/sh` script that execs it) only admits the
+/// build, so no git setup starts has a shell in front of it.
+/// NEGATIVE CONTROL: the entry no longer laid (not executable), the build is not admitted and
+/// native Git runs: the entry decides admission, and is the program in neither case.
+#[test]
+fn a_managed_git_runs_its_builds_own_git_never_its_path_entry() {
+    let sys = Fake::root();
+    sys.logged_in(&alice());
+    let exec = Stat {
+        mode: 0o755,
+        ..FILE
+    };
+    let prefix = atpkg_prefix_for(&sys, Path::new(&alice().home));
+    let store = prefix.join("store/git");
+    let program = store.join("12/bin/git");
+    let entry = prefix.join("bin/git");
+    sys.stat_of(CLT_GIT, exec);
+    sys.link(store.join("current").to_str().unwrap(), "12");
+    sys.stat_of(store.join("12.ready").to_str().unwrap(), FILE);
+    sys.stat_of(program.to_str().unwrap(), exec);
+    sys.stat_of(entry.to_str().unwrap(), exec);
+    assert_eq!(
+        installed_git_execution(&sys),
+        Some(GitExecution {
+            program: program.clone(),
+            entry: Some(entry.clone()),
+        })
+    );
+    assert_actor_git(&sys, &alice(), &program);
+
+    sys.stat_of(entry.to_str().unwrap(), FILE);
+    assert_eq!(
+        installed_git_execution(&sys),
+        Some(GitExecution {
+            program: CLT_GIT.into(),
+            entry: None,
+        }),
+        "control: an entry that is not laid admits no build"
+    );
+    assert_actor_git(&sys, &alice(), Path::new(CLT_GIT));
+    assert!(sys.calls().is_empty(), "selection starts no child");
 }
 
 #[test]
@@ -775,10 +866,10 @@ fn managed_git_uses_the_named_accounts_store_before_the_process_accounts_store()
         let store = prefix.join("store/git");
         sys.link(store.join("current").to_str().unwrap(), build);
         sys.stat_of(store.join(format!("{build}.ready")).to_str().unwrap(), FILE);
-        sys.stat_of(store.join(build).join("bin/git").to_str().unwrap(), exec);
-        let shim = prefix.join("bin/git");
-        sys.stat_of(shim.to_str().unwrap(), exec);
-        shim
+        let program = store.join(build).join("bin/git");
+        sys.stat_of(program.to_str().unwrap(), exec);
+        sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
+        program
     };
     let own = install(Path::new(&alice().home), "12");
     let named = install(Path::new("/Users//bob"), "13");
@@ -825,9 +916,9 @@ fn a_named_account_without_managed_git_never_borrows_the_process_accounts_build(
         let store = prefix.join("store/git");
         sys.link(store.join("current").to_str().unwrap(), "12");
         sys.stat_of(store.join("12.ready").to_str().unwrap(), FILE);
-        sys.stat_of(store.join("12/bin/git").to_str().unwrap(), exec);
-        let own = prefix.join("bin/git");
+        let own = store.join("12/bin/git");
         sys.stat_of(own.to_str().unwrap(), exec);
+        sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
         assert_eq!(installed_git(&sys), Some(own.clone()));
         let bob = User {
             name: "bob".into(),
@@ -878,7 +969,7 @@ fn an_unadmitted_managed_runtime_never_hides_a_usable_native_git() {
         sys.stat_of(prefix.join("bin/git").to_str().unwrap(), exec);
         assert_eq!(
             installed_git_for(&sys, Some(Path::new(&user.home))),
-            Some(prefix.join("bin/git"))
+            Some(build.join("bin/git"))
         );
         sys.runtime_unready(&build, "requires GNU libc 2.39; this host has 2.35");
         assert_eq!(
@@ -891,7 +982,7 @@ fn an_unadmitted_managed_runtime_never_hides_a_usable_native_git() {
         sys.runtime_ready(&build);
         assert_eq!(
             installed_git_for(&sys, Some(Path::new(&user.home))),
-            Some(prefix.join("bin/git"))
+            Some(build.join("bin/git"))
         );
     }
 }

@@ -2244,17 +2244,18 @@ HOW IT WORKS & GOTCHAS
     the vendor's own flag (`--dangerously-skip-permissions` for claude), unless the
     command line already names a permission mode; `--yolo` is an alias for that flag.
     Codex resume/fork, profiles and model config overrides also get that default.
-    kimi's flag is `--auto` (Never Ask), so aterm's `--yolo` takes over Kimi's own
-    `-y`/`--yolo` (Ask When Needed) and drops `-y`, `--yes` and `--auto-approve` beside it.
     The agent's own updater (`claude update`) runs `aterm pkg update <program>`.
+    kimi, grok and muse take all of this from their harnesses (kimi-alab, grok-alab,
+    muse-alab), which their twins hand each launch to as typed; without its harness a
+    launch runs the vendor CLI as typed.
   * Inside an aterm session, claude starts its fullscreen renderer from its first launch
     (`CLAUDE_CODE_NO_FLICKER=1`), unless the launch names a renderer: that variable or
     `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` set, a `"tui"` key in your own settings.json
     (`/tui default` saves one), or `--no-harness`.
   * Signed out, grok opens accounts.x.ai in the default browser on every launch. Inside a
-    session its twin first runs `aterm harness signin --cli grok --wait`: one sandboxed
+    session grok-alab first runs `aterm harness signin --cli grok --wait`: one sandboxed
     sign-in for the machine, one need with its code and page, no page opened; grok runs
-    only once that exits 0, else the twin exits 69. `login`, `logout`, `--help`, `-p`, the
+    only once that exits 0, else grok-alab exits 69. `login`, `logout`, `--help`, `-p`, the
     one-shot options and the local subcommands (`doctor`, `mcp`, `inspect`, …) skip it, and
     so does `--no-harness`; `dashboard` and every other subcommand are gated.
   * A toolchain build stages at once and goes live once no running build holds the old
@@ -3943,8 +3944,12 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
      now; `aterm ctl @self status`'s `program_check=` counts this tab's and the oldest).
   2. If it is not allowed, ask your operator to turn aterm on in System Settings ▸
      Privacy & Security ▸ Developer Tools (`aterm doctor` opens the pane).
-  3. A tab adopted across an in-place update (`attribution=adopted`) still gets scans;
-     open a fresh tab for heavy builds. When `syspolicyd` deadlocks with `tccd`
+  3. `attribution=adopted` records a session adoption, including a same-image handoff;
+     it does not diagnose a startup wait. Repeated macOS checks were observed after
+     cross-build updates, but this field alone cannot identify that case. Run builds
+     and tests with your own shell/background tools. A new tab needs an explicit
+     request or a concrete, observed need those tools cannot meet; state that reason
+     before spawning. When `syspolicyd` deadlocks with `tccd`
      (`syspolicyd=stuck` in `status`), only a restart of the Mac clears it. At rest
      that board is its last look's (`syspolicyd_age_ms=` says how old); an ask that
      finds it a minute old brings a fresh look, which the next ask reads.
@@ -3968,8 +3973,8 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
 
 GOTCHAS
   * `probe=pending` or a folder's `unknown` means unmeasured, not `denied`.
-  * `attribution=adopted`: the tab outlived an in-place update; open a new tab if its
-    access differs.
+  * `attribution=adopted` records a session adoption, including a same-image handoff.
+    It does not establish a startup failure or a lost permission.
   * An ad hoc signed dev build loses its grants on rebuild (`targo --unverified ship
     dev-app identity` creates a stable local identity).
   * macOS only; elsewhere EPERM is an ordinary permission error.

@@ -11,8 +11,7 @@ use aterm_secrets::{
     commons::binding::Request,
     envelope, fsx,
     membership_log::{
-        Body, Entrant, EpochAudience, Inserted, Kind, Log, MAX_RECORD, Record, Store,
-        encode_records,
+        Body, Entrant, EpochAudience, Inserted, Kind, Log, MAX_RECORD, Record, Store, read_records,
     },
     server,
     text::{Audience, Entry},
@@ -175,7 +174,10 @@ fn assert_same_records(actual: &Store, expected: &Store) {
         expected.log().unwrap().heads()
     );
     for id in expected.inventory() {
-        assert_eq!(actual.get_bytes(&id), expected.get_bytes(&id));
+        assert_eq!(
+            actual.record(&id).map(|r| r.wire_bytes().unwrap()),
+            expected.record(&id).map(|r| r.wire_bytes().unwrap())
+        );
     }
 }
 
@@ -184,7 +186,7 @@ fn a_cold_store_retains_one_payload_owner_per_signed_record() {
     let directory = aterm_tempfile::tempdir().unwrap();
     let path = directory.path().join("cold.records");
     let fixture = large_history();
-    let wire = encode_records(fixture.log.records());
+    let wire = read_records(fixture.log.records()).unwrap();
     let keys = [envelope::signer_public(&GENESIS_SIGNER).unwrap()];
     let expected = Store::for_vault(NAME)
         .unwrap()
@@ -192,7 +194,7 @@ fn a_cold_store_retains_one_payload_owner_per_signed_record() {
         .recovering(&wire);
     assert_eq!(expected.len(), VALUES + 5);
     assert_eq!(expected.complete_inventory().len(), expected.len());
-    assert_eq!(expected.encode(), wire);
+    assert_eq!(expected.read_encoded().unwrap(), wire);
     assert!(wire.len() > VALUES * VALUE_BYTES);
     fsx::write_atomic(&path, &wire, 0o600).unwrap();
 
@@ -222,7 +224,10 @@ fn a_cold_store_retains_one_payload_owner_per_signed_record() {
     drop(cloned_store);
     for (id, record, body) in escaped {
         let original = fixture.log.get(&id).unwrap();
-        assert_eq!(record.bytes(), original.bytes());
+        assert_eq!(
+            record.wire_bytes().unwrap().as_ref(),
+            original.wire_bytes().unwrap().as_ref()
+        );
         assert_eq!(payload(record.body()), payload(original.body()));
         drop(record);
         assert_eq!(payload(&body), payload(original.body()));
@@ -254,7 +259,7 @@ fn payload_clones_preserve_bytes_and_decrypt_after_owner_drops() {
     let directory = aterm_tempfile::tempdir().unwrap();
     let path = directory.path().join("cold.records");
     let fixture = large_history();
-    let wire = encode_records(fixture.log.records());
+    let wire = read_records(fixture.log.records()).unwrap();
     let keys = [envelope::signer_public(&GENESIS_SIGNER).unwrap()];
     fsx::write_atomic(&path, &wire, 0o600).unwrap();
     let (observed, on_file) = server::test_cold_records(&path, NAME, &keys).unwrap();
@@ -283,14 +288,17 @@ fn payload_clones_preserve_bytes_and_decrypt_after_owner_drops() {
             .records()
             .find(|record| record.kind() == kind)
             .unwrap();
-        let mut bytes = original.bytes().to_vec();
+        let mut bytes = original.wire_bytes().unwrap().to_vec();
         let decoded = Record::decode(&bytes).unwrap();
         let record = decoded.clone();
         let body = decoded.body().clone();
         bytes.fill(0);
         drop(bytes);
         drop(decoded);
-        assert_eq!(record.bytes(), original.bytes());
+        assert_eq!(
+            record.wire_bytes().unwrap().as_ref(),
+            original.wire_bytes().unwrap().as_ref()
+        );
         assert_eq!(payload(record.body()), payload(original.body()));
         drop(record);
         assert_eq!(payload(&body), payload(original.body()));

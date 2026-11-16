@@ -1161,7 +1161,16 @@ fn only_successful_unselected_git_manifest_diagnostics_are_nonfatal() {
     assert_eq!(read.checked, graph);
     assert!(red.status.is_none());
     assert_eq!(red.discovery.len(), 1);
-    assert!(red.discovery[0].contains("fixture/Cargo.toml"));
+    assert!(
+        red.discovery[0].contains(
+            &Path::new("fixture")
+                .join("Cargo.toml")
+                .display()
+                .to_string()
+        ),
+        "{}",
+        red.discovery[0]
+    );
     for (ok, path, tail) in [
         (false, &unused, finish),
         (true, &selected, finish),
@@ -1565,8 +1574,12 @@ fn a_windows_cell_brings_both_windows_sys_oracles_built_in_the_cells_lane() {
     );
     let cmd = win32_oracle_cmd(&ctx, "oracle-052", "1.97.1").expect("absolute paths");
     let argv = cmd.argv();
+    // The default target spelled with this host's separator, as the plan names the directory
+    // it captured (`DEFAULT_TARGET` is written with `/`).
     let oracle_bin = root
         .join(aterm_toolchain::build_cache::DEFAULT_TARGET)
+        .components()
+        .collect::<PathBuf>()
         .join("verify")
         .join(".ubd")
         .join("cells.noindex")
@@ -2030,7 +2043,7 @@ fn superseded(trimmed: &atpkg::build_cache::Trimmed) -> usize {
 /// [`cargo_call`] nothing is kept and the first run's assertions fail; a close in
 /// [`close_passed`] whatever the row fails the first control; a call read as passed by its exit
 /// alone fails the third, and one read by cargo's last message alone the second. That
-/// [`check_cell`] and `run_prepared` make these calls is held by
+/// [`run_cell`] and `run_prepared` make these calls is held by
 /// `prerequisite_tests::a_checked_cell_keeps_what_its_calls_used_and_a_failed_one_keeps_nothing`.
 #[cfg(unix)]
 #[test]

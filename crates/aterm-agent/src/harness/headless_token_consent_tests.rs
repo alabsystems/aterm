@@ -7,6 +7,7 @@
 //! [`serve_on_fixture`] is the opener's token branch on the stand-in browser, which the
 //! setup-token stand-in runs (`setup_token::tests::stand_in`).
 
+use super::super::BOT_CHECK_MET;
 use super::*;
 use crate::harness::open_url::Met;
 use std::io::{Read as _, Write as _};
@@ -48,12 +49,15 @@ pub(in crate::harness) enum Shows {
     Nobody,
     /// The consent page, naming another account as the one signed in.
     Another,
-    /// The consent page naming the account, its `Authorize` disabled beside an hCaptcha.
+    /// The consent page naming the account, its `Authorize` disabled beside an hCaptcha the
+    /// shared predicate read (`checkPageOf()`; in an open shadow root or a same-origin frame
+    /// alike).
     HumanCheck,
     /// The consent page naming the account, its `Authorize` disabled beside a Turnstile embedded
-    /// in it: Cloudflare's marker with none of its challenge words, so no bot check.
+    /// in it: Cloudflare's marker with none of its challenge words, a human check the Rust side
+    /// judges from the marker alone.
     Turnstile,
-    /// Cloudflare's check, which never clears.
+    /// Cloudflare's check.
     BotCheck,
     /// No consent page: the page is at its callback already, as for a grant the profile already
     /// holds ([`serve_on_fixture`]'s `callback`).
@@ -61,16 +65,11 @@ pub(in crate::harness) enum Shows {
 }
 
 impl Shows {
-    /// Whether the page stands on a human check, which only the drive's deadline ends.
+    /// Whether the page carries a check, which ends the drive on its first read.
     const fn checked(self) -> bool {
-        matches!(self, Self::HumanCheck | Self::Turnstile)
+        matches!(self, Self::HumanCheck | Self::Turnstile | Self::BotCheck)
     }
 }
-
-/// How many reads a test's drive of a page with a human check makes before the test ends its
-/// deadline, as a quit cancels one ([`Deadline::cancelled_by`]): only the deadline ends a human
-/// check, and this ends it on a count of reads rather than a clock.
-pub(in crate::harness) const HUMAN_READS: usize = 3;
 
 fn strings(list: &[&str]) -> Value {
     Value::Array(
@@ -90,8 +89,8 @@ pub(in crate::harness) fn consent_page(
 ) -> Value {
     let asks = "Claude Code would like to connect to your Claude account.\nIt will use Claude on \
                 your behalf.";
-    let consent = |text: String, buttons: &[&str], markers: &[&str], check: bool| {
-        json!({
+    let consent = |text: String, buttons: &[&str], markers: &[&str], check: Option<&str>| {
+        let mut page = json!({
             "url": url,
             "heading": "claude code would like to connect to your claude account",
             "text": text,
@@ -99,22 +98,25 @@ pub(in crate::harness) fn consent_page(
             "inputs": strings(&[]),
             "title": "authorize | claude",
             "markers": strings(markers),
-            "humanCheck": check,
-        })
+        });
+        if let (Some(check), Some(fields)) = (check, page.as_object_mut()) {
+            fields.insert("check".to_owned(), Value::String(check.to_owned()));
+        }
+        page
     };
     let enabled = ["authorize", "cancel"];
     let named = format!("{asks}\nLogged in as {email}\nAuthorize\nCancel");
     match shows {
-        Shows::Account => consent(named, &enabled, &[], false),
-        Shows::Nobody => consent(format!("{asks}\nAuthorize\nCancel"), &enabled, &[], false),
+        Shows::Account => consent(named, &enabled, &[], None),
+        Shows::Nobody => consent(format!("{asks}\nAuthorize\nCancel"), &enabled, &[], None),
         Shows::Another => consent(
             format!("{asks}\nLogged in as {OTHER}\nAuthorize\nCancel"),
             &enabled,
             &[],
-            false,
+            None,
         ),
-        Shows::HumanCheck => consent(named, &["cancel"], &[], true),
-        Shows::Turnstile => consent(named, &["cancel"], &["cf-turnstile"], true),
+        Shows::HumanCheck => consent(named, &["cancel"], &[], Some("human_check:hCaptcha")),
+        Shows::Turnstile => consent(named, &["cancel"], &["cf-turnstile"], None),
         Shows::BotCheck => json!({
             "url": url,
             "heading": "",
@@ -123,7 +125,6 @@ pub(in crate::harness) fn consent_page(
             "inputs": strings(&[]),
             "title": "just a moment...",
             "markers": strings(&["cf-turnstile", "challenge-platform"]),
-            "humanCheck": false,
         }),
         Shows::Callback => json!({"url": callback}),
     }
@@ -131,6 +132,9 @@ pub(in crate::harness) fn consent_page(
 
 /// What the stand-in browser's page answers ([`consent_browser`]).
 pub(in crate::harness) struct Stand {
+    /// The first read's answer, where it differs from `before`'s (a check that clears by
+    /// itself after it).
+    pub(in crate::harness) first: Option<Value>,
     /// Each read's answer before any act.
     pub(in crate::harness) before: Value,
     /// Each read's answer once an act came.
@@ -156,6 +160,7 @@ impl Stand {
             .unwrap_or_default()
             .to_owned();
         Self {
+            first: None,
             before,
             after,
             press: json!({"at": at, "did": "pressed"}),
@@ -230,8 +235,11 @@ pub(in crate::harness) fn consent_browser(
                             failed = stand.fails_from.is_some_and(|from| asked >= from);
                         }
                         acted |= !read;
+                        let asked = stand.asked.load(Ordering::SeqCst);
                         let value = if !read {
                             stand.press.clone()
+                        } else if let (1, Some(first)) = (asked, &stand.first) {
+                            first.clone()
                         } else if acted {
                             stand.after.clone()
                         } else {
@@ -263,8 +271,8 @@ pub(in crate::harness) fn consent_browser(
 /// admits it ([`TokenRequest::of`], for `email`'s profile in `store` or `label`'s), its page
 /// showing `shows`, and its callback (`callback`, the page an act leads to) handed to the
 /// waiting listener as the opener hands it (`deliver_claude_callback`): what the drive ended
-/// with, and the browser's log (empty where the request was not served). A page with a human
-/// check is read [`HUMAN_READS`] times, and its deadline then ends it.
+/// with, and the browser's log (empty where the request was not served). A page with a check
+/// ends the drive on its first read.
 pub(in crate::harness) fn serve_on_fixture(
     url: &str,
     (store, label, email): (Option<&Path>, Option<&str>, Option<&str>),
@@ -280,16 +288,15 @@ pub(in crate::harness) fn serve_on_fixture(
         consent_page(shows, url, &request.email, callback),
         json!({"url": callback}),
     );
-    let ends = stand.ends(shows.checked().then_some(HUMAN_READS));
     let (mut cdp, browser) = consent_browser(stand);
     let clock = Instant::now;
-    let deadline = Deadline::new(aterm_spec::wait::MUST_HAPPEN, &clock).cancelled_by(&ends);
+    let deadline = Deadline::new(aterm_spec::wait::MUST_HAPPEN, &clock);
     let served = super::super::finish_deadline(
         drive_until(
             &mut cdp,
             &request,
             (deadline, Duration::from_millis(5)),
-            (STALL, STALL),
+            STALL,
             |cb| super::super::deliver_claude_callback(cb, deadline),
         ),
         deadline,
@@ -334,7 +341,7 @@ fn drive_on(stand: Stand, ends_after: Option<usize>, proof_stall: Duration) -> D
         &mut cdp,
         &request,
         (deadline, Duration::from_millis(5)),
-        (STALL, proof_stall),
+        proof_stall,
         |cb| {
             delivered.push(cb.to_owned());
             Ok(200)
@@ -350,8 +357,7 @@ fn drive_on(stand: Stand, ends_after: Option<usize>, proof_stall: Duration) -> D
     )
 }
 
-/// One drive of a page that shows `shows`, whose act leads to its callback: a page with a human
-/// check for [`HUMAN_READS`] reads, then its deadline ends.
+/// One drive of a page that shows `shows`, whose act leads to its callback.
 fn drive(shows: Shows) -> Drove {
     let url = token_url(54545);
     let callback = token_callback(54545);
@@ -360,7 +366,7 @@ fn drive(shows: Shows) -> Drove {
             consent_page(shows, &url, EMAIL, &callback),
             json!({"url": callback}),
         ),
-        shows.checked().then_some(HUMAN_READS),
+        None,
         STALL,
     )
 }
@@ -369,11 +375,10 @@ fn drive(shows: Shows) -> Drove {
 /// account as the one signed in is pressed once and its callback delivered; one that names
 /// nobody is pressed nothing and ends naming that, on its host; one that names another account
 /// presses nothing and ends naming that, a stop that holds the step; one that carries a human
-/// check's widget (an hCaptcha, or a Turnstile embedded in it that is no bot check) is waited on
-/// until the drive's deadline, which names it, and Cloudflare's check is waited on for its
-/// stall, with nothing but the page's read ever evaluated there and no input sent. A page that
-/// asks for a sign-in is no consent of the account's, and a check after the press is still a
-/// check.
+/// check's widget (an hCaptcha the shared predicate read, or a Turnstile embedded in it that is
+/// no bot check) or Cloudflare's check ends the drive on its first read, naming it, with nothing
+/// but that one read evaluated there and no input sent. A page that asks for a sign-in is no
+/// consent of the account's, and a check after the press is still a check.
 /// NEGATIVE CONTROL: with `consent_step` pressing an enabled `Authorize` whatever `shows_email`
 /// says, the page that names nobody is pressed: `` Nobody: an act was sent ``.
 #[test]
@@ -394,7 +399,7 @@ fn authorize_is_pressed_only_where_the_page_shows_the_account() {
         (Shows::Another, WRONG_ACCOUNT, MetWord::ConsentWrongAccount),
         (Shows::HumanCheck, TOKEN_HUMAN_CHECK, MetWord::HumanCheck),
         (Shows::Turnstile, TOKEN_HUMAN_CHECK, MetWord::HumanCheck),
-        (Shows::BotCheck, BOT_CHECK_UNCLEARED, MetWord::BotCheck),
+        (Shows::BotCheck, BOT_CHECK_MET, MetWord::BotCheck),
     ] {
         let (ended, met, log, delivered) = drive(shows);
         assert!(
@@ -411,25 +416,48 @@ fn authorize_is_pressed_only_where_the_page_shows_the_account() {
             "{shows:?}: an input was sent: {log:?}"
         );
         assert!(log.iter().any(|m| m == "read"), "{shows:?}: {log:?}");
+        if shows.checked() {
+            assert_eq!(
+                log.iter().filter(|m| *m == "read").count(),
+                1,
+                "{shows:?}: a check was read again: {log:?}"
+            );
+        }
         assert!(delivered.is_empty(), "{shows:?}");
     }
 
+    // A check that would clear by itself after the first read is not waited out: the drive
+    // ended on that read, and the `Authorize` the page then shows is never pressed.
+    let url = token_url(54545);
+    let callback = token_callback(54545);
+    for shows in [Shows::HumanCheck, Shows::BotCheck] {
+        let mut stand = Stand::new(
+            consent_page(Shows::Account, &url, EMAIL, &callback),
+            json!({"url": callback}),
+        );
+        stand.first = Some(consent_page(shows, &url, EMAIL, &callback));
+        let (ended, _, log, delivered) = drive_on(stand, None, STALL);
+        assert!(ended.is_err(), "{shows:?}: the cleared page was approved");
+        assert!(
+            !log.iter().any(|m| m == "act") && delivered.is_empty(),
+            "{shows:?}: pressed once the check cleared: {log:?}"
+        );
+        assert_eq!(log.iter().filter(|m| *m == "read").count(), 1, "{log:?}");
+    }
+
     // A sign-in page on the profile is no consent: nothing is typed into it.
-    let sign_in = ConsentPage {
-        page: Page {
-            url: token_url(54545),
-            buttons: vec!["continue with email".to_owned()],
-            inputs: vec![Field::Email],
-            ..Page::default()
-        },
-        ..ConsentPage::default()
+    let sign_in = Page {
+        url: token_url(54545),
+        buttons: vec!["continue with email".to_owned()],
+        inputs: vec![Field::Email],
+        ..Page::default()
     };
     assert_eq!(
         consent_step(&sign_in, &consent_gate(EMAIL), false),
         Consent::Unproven
     );
     let page = |shows: Shows| {
-        consent_page_of(&consent_page(
+        page_of(&consent_page(
             shows,
             &token_url(54545),
             EMAIL,
@@ -437,7 +465,7 @@ fn authorize_is_pressed_only_where_the_page_shows_the_account() {
         ))
     };
     // Once pressed, nothing is pressed again; a human check that comes after the press is still
-    // waited on as one, and one beside an enabled `Authorize` is too.
+    // one, and one beside an enabled `Authorize` is too.
     let named = page(Shows::Account);
     assert_eq!(
         consent_step(&named, &consent_gate(EMAIL), false),
@@ -447,27 +475,31 @@ fn authorize_is_pressed_only_where_the_page_shows_the_account() {
         consent_step(&named, &consent_gate(EMAIL), true),
         Consent::Wait
     );
-    let checked = ConsentPage {
-        human_check: true,
+    let checked = Page {
+        check: Some(CheckMet::HumanCheck("hCaptcha".into())),
         ..named
     };
     for spent in [false, true] {
         assert_eq!(
             consent_step(&checked, &consent_gate(EMAIL), spent),
-            Consent::HumanCheck,
+            Consent::Check(CheckMet::HumanCheck("hCaptcha".into())),
             "{spent}"
         );
     }
     assert_eq!(
         consent_step(&page(Shows::Turnstile), &consent_gate(EMAIL), false),
-        Consent::HumanCheck
+        Consent::Check(CheckMet::HumanCheck("Turnstile".into()))
+    );
+    assert_eq!(
+        consent_step(&page(Shows::BotCheck), &consent_gate(EMAIL), false),
+        Consent::Check(CheckMet::BotCheck)
     );
 }
 
-/// THE READ AND THE PRESS: the read sets and presses nothing, and knows each human check's
-/// widget aterm's sign-in window knows (hCaptcha, reCAPTCHA, Turnstile). The press judges the
-/// page again before it presses, in this order: the document the read was made in, then
-/// Cloudflare's check or block page, then a human check's widget, then the account shown as
+/// THE READ AND THE PRESS: the read sets and presses nothing, and is the shared predicate's
+/// (each human check's widget aterm knows, in the page, its shadow roots and same-origin
+/// frames). The press judges the page again before it presses, in this order: the document the
+/// read was made in, then the check it carries (answered by name), then the account shown as
 /// the one signed in and no other address but the vendor's, then an enabled button whose
 /// whole label is `authorize`, and it presses at most that one button. What it is given is a
 /// string literal, never script text.
@@ -488,6 +520,7 @@ fn the_press_judges_the_page_again_before_its_one_click() {
     ] {
         assert!(TOKEN_PAGE_JS.contains(widget), "the read misses {widget}");
     }
+    assert!(TOKEN_PAGE_JS.contains(CHECK_PAGE_JS) && TOKEN_PAGE_JS.contains("checkPageOf()"));
     let at = "https://claude.com/cai/oauth/authorize?\"; x(); \"";
     let press = press_js(at, " Person@Example.com ").expect("a press");
     let find = |needle: &str| {
@@ -498,16 +531,13 @@ fn the_press_judges_the_page_again_before_its_one_click() {
     let moved = find(
         r#"if (here !== "https://claude.com/cai/oauth/authorize?\"; x(); \"") return answer("moved");"#,
     );
-    let bot = find(r#"blockPageOf(text)) return answer("unready");"#);
-    let widgets = find(&format!(
-        r#"if (document.querySelector("{}")) return answer("unready");"#,
-        human_check_widgets!()
-    ));
+    let check = find(r#"if (met) return { at: here, did: "check", check: met };"#);
+    assert!(find("const met = checkPageOf();") < check, "{press}");
     let shown = find(r#"return answer("unshown");"#);
     let absent = find(r#"if (!hit) return answer("absent");"#);
     let click = find("hit.click();");
     assert!(
-        moved < bot && bot < widgets && widgets < shown && shown < absent && absent < click,
+        moved < check && check < shown && shown < absent && absent < click,
         "{press}"
     );
     assert!(
@@ -522,17 +552,45 @@ fn the_press_judges_the_page_again_before_its_one_click() {
 }
 
 /// THE PRESS PRESSES ONLY THE PAGE THE READ JUDGED: where the page changed between the read and
-/// the press (it moved, a check came, it names the account no longer), the press answers that it
-/// pressed nothing, and the drive counts no press: the callback the page then reaches is handed
-/// over nowhere, and the drive ends naming a page that did not show the account. A press whose
-/// answer never came is not made again, and counts as none either.
+/// the press (it moved, it names the account no longer), the press answers that it pressed
+/// nothing, and the drive counts no press: the callback the page then reaches is handed over
+/// nowhere, and the drive ends naming a page that did not show the account. A press whose
+/// answer never came is not made again, and counts as none either. A check that came between
+/// the read and the press ends the drive on it, with that one act and no other.
 /// NEGATIVE CONTROL: with `press` taking every answer for a press, the callback is handed over:
-/// `` moved: a callback was delivered ``.
+/// `` moved: a callback was delivered ``; with a check at the press taken for no press (the
+/// branch's first form), the drive presses again into the check until its time runs out:
+/// `` human_check:Turnstile `` (`left: Err("timed out waiting for headless browser OAuth
+/// completion")`).
 #[test]
 fn a_press_on_a_page_that_changed_counts_as_none() {
     let url = token_url(54545);
     let callback = token_callback(54545);
-    for did in ["moved", "unready", "unshown", "absent"] {
+    for (word, end, met_word) in [
+        (
+            "human_check:Turnstile",
+            TOKEN_HUMAN_CHECK,
+            MetWord::HumanCheck,
+        ),
+        ("bot_check", BOT_CHECK_MET, MetWord::BotCheck),
+        ("made-up", TOKEN_HUMAN_CHECK, MetWord::HumanCheck),
+    ] {
+        let mut stand = Stand::new(
+            consent_page(Shows::Account, &url, EMAIL, &callback),
+            consent_page(Shows::Account, &url, EMAIL, &callback),
+        );
+        stand.press = json!({"at": url, "did": "check", "check": word});
+        let (ended, met, log, delivered) = drive_on(stand, None, STALL);
+        assert!(delivered.is_empty(), "{word}: a callback was delivered");
+        assert_eq!(ended, Err(end), "{word}");
+        assert_eq!(met.map(|met| met.word), Some(met_word), "{word}");
+        assert_eq!(
+            log.iter().filter(|m| *m == "act").count(),
+            1,
+            "{word}: an act at a check: {log:?}"
+        );
+    }
+    for did in ["moved", "unshown", "absent"] {
         let mut stand = Stand::new(
             consent_page(Shows::Account, &url, EMAIL, &callback),
             json!({"url": callback}),
@@ -612,13 +670,14 @@ fn a_callback_with_no_press_behind_it_is_handed_over_nowhere() {
     assert!(!log.iter().any(|m| m == "Fetch.continueRequest"), "{log:?}");
 }
 
-/// A READ THAT FAILS WHILE A CHECK STANDS IS READ AGAIN, AND THE DEADLINE STILL NAMES IT: where
-/// a human check or a page that does not show the account stood at the last read, a read that
-/// fails is made again, and one the deadline ended ends the drive as its deadline does, naming
-/// what stood, a stop that holds the step, never a browser that could not be driven. With
-/// nothing standing, a read that fails ends the drive as one.
-/// NEGATIVE CONTROL: with a failed read ending the drive unless a bot check stands, the human
-/// check ends at its second read as `browser-control`: `` left: Some(BrowserControl) ``.
+/// A READ THAT FAILS WHILE AN UNPROVEN PAGE STANDS IS READ AGAIN, AND THE DEADLINE STILL NAMES
+/// IT: where a page that does not show the account stood at the last read, a read that fails is
+/// made again, and one the deadline ended ends the drive as its deadline does, naming what
+/// stood, a stop that holds the step, never a browser that could not be driven. With nothing
+/// standing, a read that fails ends the drive as one. A check never stands: it ends the drive on
+/// the read that met it, before any read could fail.
+/// NEGATIVE CONTROL: with a failed read ending the drive whatever stood, the unproven page ends
+/// at its second read as `browser-control`: `` left: Some(BrowserControl) ``.
 #[test]
 fn a_read_that_fails_while_a_check_stands_still_names_it() {
     let url = token_url(54545);
@@ -626,14 +685,14 @@ fn a_read_that_fails_while_a_check_stands_still_names_it() {
     // The consent page, its `Authorize` not yet drawn and nothing standing.
     let mut drawing = consent_page(Shows::HumanCheck, &url, EMAIL, &callback);
     if let Some(page) = drawing.as_object_mut() {
-        page.insert("humanCheck".to_owned(), Value::Bool(false));
+        page.remove("check");
     }
     for (what, page, word, reads) in [
         (
             "HumanCheck",
             consent_page(Shows::HumanCheck, &url, EMAIL, &callback),
             MetWord::HumanCheck,
-            3,
+            1,
         ),
         (
             "Nobody",

@@ -432,8 +432,10 @@ pub(crate) fn read(pgid: i32, last: Option<&HolderImage>) -> HolderImage {
     HolderImage::of(pgid, start_us, Some(exe), build, read_ns)
 }
 
-/// `pgid`'s leader's start in microseconds, or `None` (gone, another user's).
-#[cfg(target_vendor = "apple")]
+/// `pgid`'s leader's start in microseconds on [`start_clock_us`]'s clock, or `None` (gone,
+/// another user's): the kernel's wall start record, macOS's birth record and Windows' creation
+/// `FILETIME` ([`aterm_uds::process::read_process_birth`]).
+#[cfg(any(target_vendor = "apple", windows))]
 pub(crate) fn start_us_of(pgid: i32) -> Option<u64> {
     let birth = aterm_uds::process::read_process_birth(pgid)?;
     birth
@@ -442,16 +444,79 @@ pub(crate) fn start_us_of(pgid: i32) -> Option<u64> {
         .checked_add(birth.microseconds)
 }
 
-/// `pgid`'s leader's start in microseconds, or `None` (gone, another user's).
+/// `pgid`'s leader's start in microseconds on [`start_clock_us`]'s clock, or `None` (gone,
+/// another user's).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn start_us_of(pgid: i32) -> Option<u64> {
     aterm_uds::process::read_process_start(pgid).map(|s| s.boot.0 / 1_000)
 }
 
 /// No start record wired here: every image is untracked.
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 pub(crate) fn start_us_of(_pgid: i32) -> Option<u64> {
     None
+}
+
+/// Now on the clock a leader's start is read on ([`start_us_of`]), in microseconds: Linux's boot
+/// clock (`CLOCK_BOOTTIME`, which `/proc/<pid>/stat`'s start time counts from), the wall clock
+/// on macOS (a process's birth record) and Windows (its creation `FILETIME`); `None` elsewhere.
+/// Read by the foreground sampler (`crate::fg_sample`, unix: a Windows session hears its
+/// programs from its job) and, on every platform, by tests.
+#[cfg(any(unix, test))]
+pub(crate) fn start_clock_us() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        aterm_uds::process::boot_clock_now().map(|c| c.0 / 1_000)
+    }
+    #[cfg(any(target_vendor = "apple", windows))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|d| u64::try_from(d.as_micros()).ok())
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    {
+        None
+    }
+}
+
+/// How far a leader's start as read ([`start_us_of`]) can precede its real start, in
+/// microseconds: one tick of Linux's `/proc/<pid>/stat` start time (10 ms at 100 a second,
+/// `aterm_uds::process::proc_start_tick_ns`); a microsecond of macOS's birth record, and of
+/// Windows' creation `FILETIME` read in whole microseconds (it counts 100 ns, stamped from the
+/// precise clock, not the clock tick: measured 2026-11-15 on Windows 11 26200, 30 children
+/// spawned in a row read 30 different sub-millisecond remainders, on no tick's grid); `None`
+/// elsewhere. Read where [`start_clock_us`] is.
+#[cfg(any(unix, test))]
+pub(crate) fn start_tick_us() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        aterm_uds::process::proc_start_tick_ns().map(|ns| ns.div_ceil(1_000))
+    }
+    #[cfg(any(target_vendor = "apple", windows))]
+    {
+        Some(1)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        windows
+    )))]
+    {
+        None
+    }
 }
 
 type Stamp = Option<(u64, u64, i128)>;

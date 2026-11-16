@@ -269,6 +269,26 @@ impl OwnedWorker {
         }
         Process::observe(spawned.child_mut().id()).ok_or(Error::Unavailable)
     }
+    /// Observe terminal exit through this actual child handle without reaping it.
+    /// This is diagnostic data at one instant, not SDK readiness or evidence of
+    /// which actor caused exit. Original cohort settlement remains unchanged.
+    ///
+    /// # Errors
+    /// Original child custody is unavailable or the kernel exit observation fails.
+    #[cfg(debug_assertions)]
+    pub fn observe_child_exit_status(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        let spawned = self
+            .spawned
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if !spawned.key().is_current()
+            || !spawned.is_original_child()
+            || !spawned.child_mut().owns_unreaped()
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        spawned.child_mut().observe_exit_status()
+    }
     /// Observe the physical control-channel binding by this exact unreaped child.
     /// This checks its original challenge and still-issued constructor member on
     /// the live SDK connection, independently of SDK construction readiness.

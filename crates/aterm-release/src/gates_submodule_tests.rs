@@ -259,3 +259,92 @@ fn an_unreadable_branch_refuses_and_an_undeclared_one_is_the_remotes_head() {
             .expect_err("no ancestry, no verdict");
     assert!(matches!(refused, PinRefusal::Unread(_)), "{refused}");
 }
+
+/// An existing cut tree moves to the next release while the clone keeps `submodule.recurse` on
+/// (AGENTS.md asks for it) and the new commit pins a submodule commit the cut tree's own module
+/// repository never fetched: the move checks out the superproject alone, and
+/// [`align_submodules`] fetches and checks out the pin. 0.203.0's cut stopped here on m86
+/// (`failed to unpack tree object`) because vendor/astream's pin had moved since 0.202.0.
+#[test]
+fn a_cut_tree_moves_to_a_submodule_pin_its_module_repository_never_fetched() {
+    use crate::ledger::testing::{self, Git};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ident = [
+        ("user.name", "Test"),
+        ("user.email", "test@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ];
+    let git = |at: &Path, args: &[&str]| {
+        let out = testing::git()
+            .arg("-C")
+            .arg(at)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let local = ["-c", "protocol.file.allow=always"];
+    let bus = dir.path().join("bus");
+    testing::init(&bus, &ident);
+    git(&bus, &["commit", "-q", "--allow-empty", "-m", "first pin"]);
+    let top = dir.path().join("top");
+    testing::init(&top, &ident);
+    git(
+        &top,
+        &[
+            &local[..],
+            &[
+                "submodule",
+                "add",
+                "-q",
+                bus.to_str().unwrap(),
+                "vendor/bus",
+            ],
+        ]
+        .concat(),
+    );
+    git(&top, &["commit", "-q", "-m", "pin the first"]);
+    let first = git(&top, &["rev-parse", "HEAD"]);
+    git(&top, &["config", "submodule.recurse", "true"]);
+
+    let cut = cut_tree_path(&top).unwrap();
+    git(
+        &top,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            cut.to_str().unwrap(),
+            &first,
+        ],
+    );
+    git(
+        &cut,
+        &[&local[..], &["submodule", "update", "-q", "--init"]].concat(),
+    );
+    git(
+        &cut.join("vendor/bus"),
+        &["config", "protocol.file.allow", "always"],
+    );
+
+    git(&bus, &["commit", "-q", "--allow-empty", "-m", "second pin"]);
+    let pin = git(&bus, &["rev-parse", "HEAD"]);
+    git(
+        &top.join("vendor/bus"),
+        &[&local[..], &["fetch", "-q", "origin"]].concat(),
+    );
+    git(&top.join("vendor/bus"), &["checkout", "-q", &pin]);
+    git(&top, &["commit", "-q", "-am", "pin the second"]);
+    let second = git(&top, &["rev-parse", "HEAD"]);
+
+    let moved = place_cut_tree(&Git::new(&top), &top, &second).expect("the cut tree moves");
+    assert!(moved.moved);
+    assert_eq!(git(&cut, &["rev-parse", "HEAD"]), second);
+    assert_eq!(git(&cut.join("vendor/bus"), &["rev-parse", "HEAD"]), pin);
+}

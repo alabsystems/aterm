@@ -10410,6 +10410,7 @@ fn a_workers_starter_is_the_account_its_login_file_names() {
                 src: crate::harness::journal::ObservedSrc::Profile,
                 path: "/home/someone/.claude.json".into(),
                 mtime: None,
+                plan: None,
             })
         }),
     };

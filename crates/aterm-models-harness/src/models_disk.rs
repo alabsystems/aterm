@@ -5,7 +5,14 @@
 
 use aterm_spec::derive::Model;
 
-/// THE PASS.
+/// THE PASS. Before any finished unit, tier 0 takes the pieces a build that died left
+/// (`partial`, those the pass has still to deal with, two at most here): admitted where a pass is
+/// short (a measured short or emergency, or a projection; `died` 1), each journalled (`died` 2),
+/// its writer's lock probed and taken (`held`), then removed; a lock a live writer holds over the
+/// piece (`writer`) keeps it, and the pass goes on to the next. `early` marks a finished unit's
+/// tier admitted at a short pass while a piece was still to be dealt with, whichever action
+/// admits it; `took_written`, a piece removed while its writer held it. The tier 0 mutants:
+/// `Admit1Early` admits tier 1 with pieces left, `RemoveWritten` removes past a held lock.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn disk_reclaim_pass_model() -> Model {
@@ -29,7 +36,13 @@ pub fn disk_reclaim_pass_model() -> Model {
             var past_target = 0;
             var whole_at_low = 0;
             var ten_on_projection = 0;
+            var partial = 0;
+            var writer = 0;
+            var died = 0;
+            var early = 0;
+            var took_written = 0;
 
+            action BuildDied when (looked == 0 && partial <= 1) { partial = partial + 1; }
             action MeasureOk when (looked == 0) { looked = 1; measured = 0; free = 3; }
             action MeasureLow when (looked == 0) { looked = 1; measured = 1; free = 2; }
             action MeasureShort when (looked == 0) { looked = 1; measured = 2; free = 1; }
@@ -40,16 +53,51 @@ pub fn disk_reclaim_pass_model() -> Model {
                 reserve = 0;
                 released_at = measured;
             }
+            action AdmitDied when (
+                looked == 1 && tier == 0 && died == 0 && partial > 0
+                    && (measured > 1 || projected == 1)
+            ) {
+                died = 1;
+            }
+            action JournalDied when (died == 1 && intent == 0 && partial > 0) {
+                died = 2;
+                intent = 1;
+            }
+            action WriterHolds when (died == 2 && intent == 1 && held == 0 && writer == 0) {
+                writer = 1;
+            }
+            action ProbeHeld when (died == 2 && intent == 1 && held == 0 && writer == 0) {
+                held = 1;
+            }
+            action ProbeRefused when (died == 2 && intent == 1) {
+                died = 1;
+                intent = 0;
+                held = 0;
+                writer = 0;
+                partial = partial - 1;
+            }
+            action RemoveDied when (died == 2 && intent == 1 && held == 1) {
+                took_written = if (writer == 1) { 1 } else { took_written };
+                died = 1;
+                intent = 0;
+                held = 0;
+                writer = 0;
+                partial = partial - 1;
+            }
             action Admit1 when (
                 looked == 1 && tier == 0 && (measured > 0 || demand == 1 || projected == 1)
+                    && (partial == 0 || (measured <= 1 && projected == 0))
             ) {
+                early = if (partial > 0 && (measured > 1 || projected == 1)) { 1 } else { early };
                 tier = 1;
                 stopped = 0;
             }
             action Admit2 when (
                 looked == 1 && tier <= 1 && intent == 0
                     && (measured > 0 || demand == 1 || projected == 1)
+                    && (partial == 0 || (measured <= 1 && projected == 0))
             ) {
+                early = if (partial > 0 && (measured > 1 || projected == 1)) { 1 } else { early };
                 tier = 2;
                 stopped = 0;
                 held = 0;
@@ -57,7 +105,9 @@ pub fn disk_reclaim_pass_model() -> Model {
             action Admit3 when (
                 looked == 1 && tier <= 2 && intent == 0
                     && (measured > 1 || demand == 1 || projected == 1)
+                    && (partial == 0 || (measured <= 1 && projected == 0))
             ) {
+                early = if (partial > 0 && (measured > 1 || projected == 1)) { 1 } else { early };
                 tier = 3;
                 stopped = 0;
                 held = 0;
@@ -69,7 +119,9 @@ pub fn disk_reclaim_pass_model() -> Model {
             }
             action Admit4 when (
                 looked == 1 && tier <= 3 && intent == 0 && (measured > 1 || projected == 1)
+                    && partial == 0
             ) {
+                early = if (partial > 0 && (measured > 1 || projected == 1)) { 1 } else { early };
                 tier = 4;
                 stopped = 0;
                 held = 0;
@@ -91,7 +143,7 @@ pub fn disk_reclaim_pass_model() -> Model {
             action LockRefused when (intent == 1 && held == 0 && (tier == 1 || tier == 3)) {
                 intent = 0;
             }
-            action Remove when (intent == 1 && (held == 1 || tier == 2 || tier == 4)) {
+            action Remove when (tier > 0 && intent == 1 && (held == 1 || tier == 2 || tier == 4)) {
                 past_target = if (tier > 1 && free == 3) { 1 } else { past_target };
                 intent = 0;
                 held = 0;
@@ -151,6 +203,22 @@ pub fn disk_reclaim_pass_model() -> Model {
                 recent_by = 3;
                 ten_on_projection = 1;
             }
+            action Admit1Early when (
+                Buggy == 9 && looked == 1 && tier == 0
+                    && (measured > 0 || demand == 1 || projected == 1)
+            ) {
+                early = if (partial > 0 && (measured > 1 || projected == 1)) { 1 } else { early };
+                tier = 1;
+                stopped = 0;
+            }
+            action RemoveWritten when (Buggy == 10 && died == 2 && intent == 1 && writer == 1) {
+                took_written = if (writer == 1) { 1 } else { took_written };
+                died = 1;
+                intent = 0;
+                held = 0;
+                writer = 0;
+                partial = partial - 1;
+            }
 
             invariant NothingWithoutIntent: unjournalled == 0;
             invariant WholeOnlyHeld: unheld == 0;
@@ -159,8 +227,96 @@ pub fn disk_reclaim_pass_model() -> Model {
             invariant StopsAtTarget: past_target == 0;
             invariant NoWholeAtLow: whole_at_low == 0;
             invariant TenMinutesOnlyShort: ten_on_projection == 0;
+            invariant DiedBuildFirst: early == 0;
+            invariant NoWriterRobbed: took_written == 0;
             bound TierBox: tier <= 4;
+            bound DiedBox: died <= 2;
+            bound PartialBox: partial <= 2;
             bound FreeBox: free <= 3;
+        }
+    }
+}
+
+/// THE EMERGENCY'S RECORD (DC-06a): at `disk=emergency` a pass that finds nothing it may take
+/// writes one `cannot-meet` row an episode (`rows`) and then waits (`waiting`): no pass is
+/// planned until something moves (`Move`: free space by the emergency drop either way or no
+/// longer read, an agent's wait for room, a held lock let go, the clock reaching what was kept
+/// for its age or the hour's bound, the live sessions), then the pass is due (`Wake`), in place
+/// of the ten-minute retry. A memo kept in a file (`memo`) keeps the row said across a restart
+/// (`Restart`), which loses the wait held in memory. The episode ends (`Leave`, with its memo)
+/// only once the volume reads out of the emergency by the drop, so free space hovering at the
+/// line is one episode. `PassUnmet` marks `blind` where it would run while a wait stood with
+/// nothing moved. The mutants: `RowAgain` writes the row again where the memo stands;
+/// `IntervalRetry` runs that pass, as a host that retried on the interval would;
+/// `RestartForgets` loses the memo at a restart, as one kept in memory would be;
+/// `LeaveKeepsMemo` ends the episode without its memo, so the next one is never said.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn disk_emergency_unmet_model() -> Model {
+    aterm_spec::ty_model! {
+        DiskEmergencyUnmet {
+            const Buggy = 0;
+            var emergency = 1;
+            var waiting = 0;
+            var memo = 0;
+            var rows = 0;
+            var moved = 0;
+            var blind = 0;
+
+            action PassUnmet when (emergency == 1 && waiting == 0) {
+                blind = if (waiting == 1 && moved == 0) { 1 } else { blind };
+                rows = if (memo == 0) { rows + 1 } else { rows };
+                memo = 1;
+                waiting = 1;
+                moved = 0;
+            }
+            action Move when (waiting == 1 && moved == 0) { moved = 1; }
+            action Wake when (waiting == 1 && moved == 1) { waiting = 0; }
+            action Restart when (emergency == 1) {
+                waiting = 0;
+                moved = 0;
+            }
+            action Leave when (emergency == 1) {
+                emergency = 0;
+                waiting = 0;
+                memo = 0;
+                rows = 0;
+                moved = 0;
+            }
+            action Enter when (emergency == 0) { emergency = 1; }
+
+            action RowAgain when (
+                Buggy == 1 && emergency == 1 && waiting == 0 && memo == 1 && rows <= 1
+            ) {
+                rows = rows + 1;
+                waiting = 1;
+                moved = 0;
+            }
+            action IntervalRetry when (
+                Buggy == 2 && emergency == 1 && waiting == 1 && moved == 0
+            ) {
+                blind = if (waiting == 1 && moved == 0) { 1 } else { blind };
+                rows = if (memo == 0) { rows + 1 } else { rows };
+                memo = 1;
+                waiting = 1;
+                moved = 0;
+            }
+            action RestartForgets when (Buggy == 3 && emergency == 1 && 2 > rows) {
+                waiting = 0;
+                moved = 0;
+                memo = 0;
+            }
+            action LeaveKeepsMemo when (Buggy == 4 && emergency == 1) {
+                emergency = 0;
+                waiting = 0;
+                rows = 0;
+                moved = 0;
+            }
+
+            invariant OneRowAnEpisode: rows <= 1;
+            invariant NoBlindRetry: blind == 0;
+            invariant EachEpisodeSaysIt: waiting == 0 || rows == 1;
+            bound RowsBox: rows <= 2;
         }
     }
 }

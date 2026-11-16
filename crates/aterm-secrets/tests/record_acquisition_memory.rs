@@ -503,11 +503,8 @@ impl Fixture {
             Some(envelope::signer_public(&SIGNER).unwrap())
         );
         assert!(!client::alab_vault(&config));
-        let initial = if whole {
-            &history.wire
-        } else {
-            history.records[0].bytes()
-        };
+        let first = history.records[0].wire_bytes().unwrap();
+        let initial = if whole { &history.wire[..] } else { &first[..] };
         assert_eq!(
             client::save_records(&paths, initial).unwrap(),
             if whole { values + 3 } else { 1 }
@@ -560,7 +557,10 @@ impl Fixture {
         assert_eq!(current.complete, ids);
         let store = client::load_records(&self.paths).unwrap();
         for record in records {
-            assert_eq!(store.get_bytes(record.id()), Some(record.bytes()));
+            assert_eq!(
+                store.record(record.id()).map(|r| r.wire_bytes().unwrap()),
+                Some(record.wire_bytes().unwrap())
+            );
         }
     }
 
@@ -598,7 +598,7 @@ impl Fixture {
 fn wire<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<u8> {
     let mut bytes = Vec::new();
     for record in records {
-        bytes.extend_from_slice(record.bytes());
+        bytes.extend_from_slice(record.wire_bytes().unwrap().as_ref());
     }
     bytes
 }
@@ -615,8 +615,17 @@ fn hex(id: &RecordId) -> String {
 fn measured(framing: Framing) -> (usize, usize, usize) {
     let fixture = Fixture::new(true, VALUES);
     let mut body = fixture.history.wire.clone();
-    body.extend_from_slice(fixture.history.records.last().unwrap().bytes());
-    body.extend_from_slice(fixture.history.records[0].bytes());
+    body.extend_from_slice(
+        fixture
+            .history
+            .records
+            .last()
+            .unwrap()
+            .wire_bytes()
+            .unwrap()
+            .as_ref(),
+    );
+    body.extend_from_slice(fixture.history.records[0].wire_bytes().unwrap().as_ref());
     let frames = fixture.history.records.len() + 2;
     let length = body.len();
     assert!(frames <= 32 && length > 6 * 1024 * 1024 && length < 8 * 1024 * 1024);
@@ -662,7 +671,14 @@ fn measured(framing: Framing) -> (usize, usize, usize) {
 
 fn unreadable_large_frame(bad_signature: bool) {
     let fixture = Fixture::new(false, 1);
-    let mut hidden = fixture.history.records.last().unwrap().bytes().to_vec();
+    let mut hidden = fixture
+        .history
+        .records
+        .last()
+        .unwrap()
+        .wire_bytes()
+        .unwrap()
+        .to_vec();
     // Use a complete large Put frame. Descendants refer to its exact received
     // digest, independent of its invalidity and unavailable original parents.
     if bad_signature {
@@ -689,7 +705,7 @@ fn unreadable_large_frame(bad_signature: bool) {
     let good = fixture.root_name("good");
     let mut bytes = wire([&leaf, &good]);
     bytes.extend_from_slice(&hidden);
-    bytes.extend_from_slice(child.bytes());
+    bytes.extend_from_slice(child.wire_bytes().unwrap().as_ref());
     fixture.host.answer(bytes, 200, Framing::Chunked);
     assert_eq!(fixture.sync().unwrap(), 1);
     fixture.assert_records(&[&fixture.history.records[0], &good]);
@@ -705,7 +721,7 @@ fn unreadable_large_frame(bad_signature: bool) {
 fn transport_failure_after_layout(framing: Framing, status: u16) {
     let fixture = Fixture::new(false, 1);
     let good = fixture.root_name("after-failure");
-    let mut bytes = good.bytes().to_vec();
+    let mut bytes = good.wire_bytes().unwrap().to_vec();
     bytes.extend_from_slice(b"invalid membership layout");
     fixture.host.answer(bytes.clone(), status, framing);
     // The retained collected API is an independent transport-category oracle.
@@ -744,7 +760,7 @@ fn transport_failure_after_layout(framing: Framing, status: u16) {
     assert_eq!(fixture.snapshot(), before);
     fixture
         .host
-        .answer(good.bytes().to_vec(), 200, Framing::Chunked);
+        .answer(good.wire_bytes().unwrap().to_vec(), 200, Framing::Chunked);
     assert_eq!(fixture.sync().unwrap(), 1);
     assert_eq!(
         fixture.host.have(),
@@ -768,14 +784,14 @@ fn clean_status_and_layout() {
     assert!(error.to_string().contains("answered 403"));
     assert_eq!(fixture.snapshot(), before);
     let good = fixture.root_name("after-layout");
-    let mut bytes = good.bytes().to_vec();
+    let mut bytes = good.wire_bytes().unwrap().to_vec();
     bytes.extend_from_slice(b"ALM");
     fixture.host.answer(bytes, 200, Framing::Chunked);
     assert!(fixture.sync().is_err());
     assert_eq!(fixture.snapshot(), before);
     fixture
         .host
-        .answer(good.bytes().to_vec(), 200, Framing::Length);
+        .answer(good.wire_bytes().unwrap().to_vec(), 200, Framing::Length);
     assert_eq!(fixture.sync().unwrap(), 1);
     assert_eq!(
         fixture.host.have(),
@@ -801,7 +817,7 @@ fn peer_retry(complete: bool) {
     let observed = Arc::new(AtomicBool::new(false));
     let observation = Arc::clone(&observed);
     let path = fixture.paths.records_file();
-    let initial = fixture.history.records[0].bytes().to_vec();
+    let initial = fixture.history.records[0].wire_bytes().unwrap().to_vec();
     {
         let mut state = peer.state.lock().unwrap();
         state.answer.allow_peek_close = true;

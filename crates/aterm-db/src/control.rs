@@ -48,6 +48,8 @@ pub(crate) mod faults;
 
 /// At most 4.5 MiB of sealed nodes are buffered per direction. The durable
 /// inventory, rather than an acknowledgement cursor, determines missing data.
+/// Before `atdb/8` it is also what one round moves; on `atdb/8` it bounds one batch alone, and a
+/// round moves batch after batch until the difference is empty ([`exchange_ranges`]).
 pub const RECORDS_PER_ROUND: usize = 16;
 const HELLO_FIXED: usize = 4 + 16 + 32 + 32 + REQUEST_LEN;
 const MAX_HELLO: usize = HELLO_FIXED + MAX_NODE;
@@ -87,6 +89,8 @@ pub enum Phase {
     ControlInventory,
     InventorySend,
     InventoryReceive,
+    /// Reconcile the two inventories by range (`atdb/8`).
+    InventoryReconcile,
     ControlBatch,
     /// Send this batch and wait for its durable receipts.
     BatchSend,
@@ -115,6 +119,7 @@ impl Phase {
             Self::ControlInventory => "control-local-inventory",
             Self::InventorySend => "control-inventory-send",
             Self::InventoryReceive => "control-inventory-receive",
+            Self::InventoryReconcile => "control-inventory-reconcile",
             Self::ControlBatch => "control-local-batch",
             Self::BatchSend => "control-batch-send-and-receipts",
             Self::BatchReceive => "control-batch-receive-and-retain",
@@ -784,6 +789,11 @@ pub struct Endpoint {
     /// whole-list table round, one batch a round, which `atdb/6` peers still run.
     #[cfg(test)]
     pub(crate) duplex: bool,
+    /// Offer `atdb/7` and earlier, dialling and listening, as the build before the control
+    /// journal and the membership log reconciled by range: a test that such a peer still
+    /// converges.
+    #[cfg(test)]
+    pub(crate) reconcile_tables_only: bool,
     /// MUTANT: a worker's redial keeps what its first exchange left, as before CS1, so a redial
     /// that fails is recorded as the first attempt's probe failure.
     #[cfg(test)]
@@ -803,13 +813,20 @@ enum Protocol {
     Legacy,
     Repair,
     Credentials,
-    /// `atdb/4` to `atdb/7`, as the wire names.
+    /// `atdb/4` to `atdb/8`, as the wire names.
     Frontier(frontier::Wire),
 }
 
 impl Protocol {
     fn from_alpn(alpn: Option<&[u8]>) -> Self {
+        #[cfg(test)]
+        if alpn == Some(fleet::ALPN_DATABASE_RECONCILE)
+            && mutants::on(mutants::Mutant::RangesOnReconcile)
+        {
+            return Self::Frontier(frontier::Wire::Ranges);
+        }
         match alpn {
+            Some(fleet::ALPN_DATABASE_RANGES) => Self::Frontier(frontier::Wire::Ranges),
             Some(fleet::ALPN_DATABASE_RECONCILE) => Self::Frontier(frontier::Wire::Reconcile),
             Some(fleet::ALPN_DATABASE_DUPLEX) => Self::Frontier(frontier::Wire::Duplex),
             Some(fleet::ALPN_DATABASE_DELTA) => Self::Frontier(frontier::Wire::Delta),
@@ -1327,6 +1344,8 @@ impl Endpoint {
                 #[cfg(test)]
                 duplex: false,
                 #[cfg(test)]
+                reconcile_tables_only: false,
+                #[cfg(test)]
                 redial_keeps_first_attempt: false,
             })
         })
@@ -1337,6 +1356,14 @@ impl Endpoint {
     #[must_use]
     pub(crate) fn duplex(mut self) -> Self {
         self.duplex = true;
+        self
+    }
+
+    /// This endpoint dials and listens as an `atdb/7` build ([`Self::reconcile_tables_only`]).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn reconcile_tables_only(mut self) -> Self {
+        self.reconcile_tables_only = true;
         self
     }
 
@@ -1403,7 +1430,7 @@ impl Endpoint {
                 "Commons writer differs from its persistent identity",
             ));
         }
-        let encoded_records = aterm_secrets::membership_log::encode_records(log.records());
+        let encoded_records = aterm_secrets::membership_log::read_records(log.records())?;
         let mut hello = Vec::with_capacity(HELLO_FIXED + encoded_records.len());
         hello.extend_from_slice(b"ACX2");
         hello.extend_from_slice(&trust.network);
@@ -1440,6 +1467,8 @@ impl Endpoint {
             legacy_credentials: false,
             #[cfg(test)]
             duplex: false,
+            #[cfg(test)]
+            reconcile_tables_only: false,
             #[cfg(test)]
             redial_keeps_first_attempt: false,
         })
@@ -1498,6 +1527,8 @@ impl Endpoint {
             #[cfg(test)]
             duplex: false,
             #[cfg(test)]
+            reconcile_tables_only: false,
+            #[cfg(test)]
             redial_keeps_first_attempt: false,
         })
     }
@@ -1540,6 +1571,8 @@ impl Endpoint {
                         fleet::test_client_handshake_database_v3_as
                     } else if self.duplex {
                         fleet::test_client_handshake_database_v6_as
+                    } else if self.reconcile_tables_only {
+                        fleet::test_client_handshake_database_v7_as
                     } else {
                         handshake
                     };
@@ -1588,6 +1621,8 @@ impl Endpoint {
                         fleet::test_server_handshake_database_v2_as
                     } else if self.legacy_credentials {
                         fleet::test_server_handshake_database_v3_as
+                    } else if self.reconcile_tables_only {
+                        fleet::test_server_handshake_database_v7_as
                     } else {
                         handshake
                     };
@@ -1990,6 +2025,7 @@ impl Endpoint {
             &Disk::new(&self.dir, self.trust),
             side,
             repair,
+            None,
         )
     }
 
@@ -2019,9 +2055,12 @@ impl Endpoint {
                 repair.application = result.ok();
                 return;
             }
-            // Only `atdb/7` reconciles table inventories by range; every earlier wire trades them
-            // whole, as its released builds do.
-            repair.data.reconcile = protocol == Protocol::Frontier(frontier::Wire::Reconcile);
+            // `atdb/7` and `atdb/8` reconcile table inventories by range; every earlier wire trades
+            // them whole, as its released builds do.
+            repair.data.reconcile = matches!(
+                protocol,
+                Protocol::Frontier(frontier::Wire::Reconcile | frontier::Wire::Ranges)
+            );
             let result = if matches!(protocol, Protocol::Credentials | Protocol::Frontier(_)) {
                 application.exchange(stream, actor, side, &mut repair.data)
             } else {
@@ -2668,6 +2707,18 @@ trait Store {
         }
         Ok(ids)
     }
+    /// The inventory and its range-reconciliation snapshot, read together. A store with no causal
+    /// chains reconciles by range alone.
+    fn snapshot(&self) -> Result<(BTreeSet<Digest>, astream_wire::sync::rbsr::Snapshot)> {
+        let ids = self.inventory()?;
+        Ok((ids.clone(), astream_wire::sync::rbsr::Snapshot::new(ids)))
+    }
+    /// `ids`, records this store holds, parents first: the order an `atdb/8` exchange sends them
+    /// in ([`exchange_ranges`]), so a peer is never sent a child before a parent it is also being
+    /// sent. A store whose records name no parents keeps the order given.
+    fn causal(&self, ids: Vec<Digest>) -> Result<Vec<Digest>> {
+        Ok(ids)
+    }
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>>;
     fn retain(&self, wires: &[Vec<u8>]) -> Result<Vec<bool>>;
 }
@@ -2698,6 +2749,52 @@ impl Store for Disk<'_> {
         let journal = Journal::read_existing(self.dir, self.trust)
             .map_err(|error| local_failure("inventory", error))?;
         Ok(journal.inventory().copied().collect())
+    }
+    /// The journal's nodes and their snapshot, in one read: the update chain from the genesis
+    /// ([`spine`]) is a dense prefix agreed by its frontier, so two journals that share most of
+    /// their history reconcile the tails alone, not ranges over the whole journal.
+    fn snapshot(&self) -> Result<(BTreeSet<Digest>, astream_wire::sync::rbsr::Snapshot)> {
+        let journal = Journal::read_existing(self.dir, self.trust)
+            .map_err(|error| local_failure("inventory", error))?;
+        let ids: BTreeSet<Digest> = journal.inventory().copied().collect();
+        #[cfg(test)]
+        if mutants::on(mutants::Mutant::ControlRangesOnly) {
+            return Ok((ids.clone(), astream_wire::sync::rbsr::Snapshot::new(ids)));
+        }
+        let index = spine(&journal, self.trust.genesis);
+        let snapshot = astream_wire::sync::rbsr::Snapshot::from_inventory(ids.clone(), &index);
+        Ok((ids, snapshot))
+    }
+    /// Each node after its parents among `ids` (`crate::table::store::causal_order`, as a table
+    /// round orders its records): a node is its own actor at sequence one, as the journal's causal
+    /// index keeps it, so ties go by digest.
+    fn causal(&self, ids: Vec<Digest>) -> Result<Vec<Digest>> {
+        if ids.len() < 2 {
+            return Ok(ids);
+        }
+        let journal = Journal::read_existing(self.dir, self.trust)
+            .map_err(|error| local_failure("causal order", error))?;
+        let headers: std::collections::BTreeMap<Digest, astream_wire::sync::Header> = ids
+            .iter()
+            .filter_map(|id| journal.node(id))
+            .map(|node| {
+                let mut actor = [0; 48];
+                actor[..32].copy_from_slice(&node.id());
+                (
+                    node.id(),
+                    astream_wire::sync::Header {
+                        id: node.id(),
+                        actor,
+                        sequence: 1,
+                        previous: None,
+                        parents: node.parents().to_vec(),
+                    },
+                )
+            })
+            .collect();
+        Ok(crate::table::store::causal_order(&ids, |id| {
+            headers.get(id)
+        }))
     }
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
         if ids.is_empty() {
@@ -2779,6 +2876,46 @@ impl Store for Disk<'_> {
             })
             .collect())
     }
+}
+
+/// The control journal's update chain as one writer's dense sequence, for a range
+/// reconciliation's frontier stage ([`astream_wire::sync::rbsr::Snapshot::from_inventory`]): the
+/// genesis at sequence one, and each node with a single parent on the chain at its parent's
+/// sequence and one, its parent as its previous record. Every header is a function of the node and
+/// its ancestors alone, so two journals give a shared node the same one, and a frontier names its
+/// node's whole chain, which the node's id commits. A node with several parents (a recovery) and
+/// what follows it stay out of the chain; a fork (two children of one node) puts two nodes at one
+/// sequence, and the snapshot then reconciles the whole journal by range. A fact for
+/// reconciliation only, never authority: the journal, not this index, judges a node.
+fn spine(journal: &Journal, genesis: Digest) -> astream_wire::sync::Index {
+    let mut children = std::collections::BTreeMap::<Digest, Vec<Digest>>::new();
+    for id in journal.inventory() {
+        if let Some(node) = journal.node(id)
+            && let [parent] = node.parents()
+        {
+            children.entry(*parent).or_default().push(*id);
+        }
+    }
+    let mut actor = [0; 48];
+    actor[..32].copy_from_slice(&genesis);
+    let mut index = astream_wire::sync::Index::new(journal.inventory().count().max(1));
+    if journal.node(&genesis).is_none() {
+        return index;
+    }
+    let mut next = vec![(genesis, 1u64, None)];
+    while let Some((id, sequence, previous)) = next.pop() {
+        let _ = index.insert(astream_wire::sync::Header {
+            id,
+            actor,
+            sequence,
+            previous,
+            parents: previous.into_iter().collect(),
+        });
+        for child in children.get(&id).into_iter().flatten() {
+            next.push((*child, sequence + 1, Some(id)));
+        }
+    }
+    index
 }
 
 /// Synchronize verified membership records (`ACX2`) in bounded passes; it signs nothing. A peer
@@ -2953,6 +3090,19 @@ impl Store for MembershipDisk<'_> {
         })
     }
 
+    /// `ids` in the log's own order, each record after its parents.
+    fn causal(&self, ids: Vec<Digest>) -> Result<Vec<Digest>> {
+        let ids: BTreeSet<Digest> = ids.into_iter().collect();
+        self.with_store("membership order", |store| {
+            Ok(store.log().map_or_else(Vec::new, |log| {
+                log.records()
+                    .map(|record| *record.id())
+                    .filter(|id| ids.contains(id))
+                    .collect()
+            }))
+        })
+    }
+
     fn batch(&self, ids: &[Digest]) -> Result<Vec<Vec<u8>>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -2963,10 +3113,11 @@ impl Store for MembershipDisk<'_> {
         self.with_store("membership batch", |store| {
             ids.iter()
                 .map(|id| {
-                    store
-                        .complete_bytes(id)
-                        .map(<[u8]>::to_vec)
-                        .ok_or_else(|| Error::new("membership record disappeared"))
+                    let record = store
+                        .log()
+                        .and_then(|log| log.get(id))
+                        .ok_or_else(|| Error::new("membership record disappeared"))?;
+                    Ok(record.wire_bytes()?.into_owned())
                 })
                 .collect()
         })
@@ -3033,7 +3184,12 @@ fn exchange_membership_round(
     } else {
         Vec::new()
     };
-    let (sent, received, deferred) = exchange_batches(stream, store, side, &ids, |_| {})?;
+    let Turn {
+        sent,
+        received,
+        deferred,
+        ..
+    } = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |_| {})?;
     hint.settle(
         key,
         &ids,
@@ -3054,14 +3210,20 @@ fn exchange_membership_round(
     ))
 }
 
-/// Repair the control journal over `stream`, the grant `pass` clears.
+/// Repair the control journal over `stream`, the grant `pass` clears: on `atdb/8` (`ranges`, the
+/// session's deadline) by range reconciliation and the whole difference ([`exchange_ranges`]), on
+/// every earlier wire by whole inventories and one batch each way, as their released builds do.
 fn exchange(
     pass: Pass,
     stream: &mut (impl Read + Write),
     store: &impl Store,
     side: Side,
     repair: &mut Repair,
+    ranges: Option<Instant>,
 ) -> Result<Report> {
+    if let Some(until) = ranges {
+        return exchange_ranges(pass, stream, store, side, repair, until);
+    }
     pass.spend();
     repair.phase = Phase::ControlInventory;
     let local = store.inventory()?;
@@ -3082,7 +3244,12 @@ fn exchange(
     };
     let ids = repair.next(&local, &remote);
     repair.phase = Phase::ControlBatch;
-    let (sent, received, deferred) = exchange_batches(stream, store, side, &ids, |phase| {
+    let Turn {
+        sent,
+        received,
+        deferred,
+        ..
+    } = exchange_batches(stream, store, side, &ids, RECORDS_PER_ROUND, |phase| {
         repair.phase = phase;
     })?;
     repair.phase = Phase::ControlComplete;
@@ -3093,35 +3260,193 @@ fn exchange(
     })
 }
 
+/// Repair the control journal over `stream` on `atdb/8`, the grant `pass` clears. The two
+/// inventories reconcile by range ([`reconcile`]), the journal's update chain from its genesis
+/// agreed first by its frontier ([`Store::snapshot`]). Every node either side lacks then moves in
+/// this one exchange, parents first ([`Store::causal`]), in batches of at most
+/// [`RECORDS_PER_ROUND`] nodes of at most [`Store::MAX_WIRE`] bytes each, a bound on what one batch
+/// holds in memory, never on what the exchange moves: batch after batch each way, until both sides
+/// offer an empty one in the same turn, which each side reads alike, or either side's `until`
+/// passes ([`proceed`]), which leaves the rest for the next session. A peer offers at most the
+/// nodes the reconciliation found it holds that this side lacks.
+fn exchange_ranges(
+    pass: Pass,
+    stream: &mut (impl Read + Write),
+    store: &impl Store,
+    side: Side,
+    repair: &mut Repair,
+    until: Instant,
+) -> Result<Report> {
+    pass.spend();
+    repair.phase = Phase::ControlInventory;
+    let (local, snapshot) = store.snapshot()?;
+    if local.len() > MAX_NODES {
+        return Err(Error::new("Commons inventory exceeds its bound"));
+    }
+    repair.phase = Phase::InventoryReconcile;
+    let remote = reconcile(stream, side, snapshot, local.len(), MAX_NODES)?;
+    let mut lacked = remote.difference(&local).count();
+    repair.phase = Phase::ControlBatch;
+    let missing = store.causal(local.difference(&remote).copied().collect())?;
+    let mut total = Report::default();
+    let mut batches = missing.chunks(RECORDS_PER_ROUND);
+    loop {
+        if !proceed(stream, side, until)? {
+            total.deferred += batches.len() + usize::from(lacked > 0);
+            break;
+        }
+        let batch = batches.next().unwrap_or_default();
+        let turn = exchange_batches(stream, store, side, batch, lacked, |phase| {
+            repair.phase = phase;
+        })?;
+        lacked -= turn.offered;
+        total.sent += turn.sent;
+        total.received += turn.received;
+        total.deferred += turn.deferred;
+        if batch.is_empty() && turn.offered == 0 {
+            break;
+        }
+    }
+    repair.phase = Phase::ControlComplete;
+    Ok(total)
+}
+
+/// Reconcile `local`, a snapshot of `held` identities, with the peer's inventory by range
+/// ([`crate::replica::reconcile_inventory_within`]), admitting at most `most` peer identities:
+/// the peer's whole set. The side that holds more leads the reconciliation ([`lead`]).
+///
+/// # Errors
+/// The stream fails, a frame is malformed or past its budget, or the two sides' sums disagree.
+pub(super) fn reconcile(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    local: astream_wire::sync::rbsr::Snapshot,
+    held: usize,
+    most: usize,
+) -> Result<BTreeSet<Digest>> {
+    #[cfg(test)]
+    let mut tally = tests::Tally {
+        inner: stream,
+        written: 0,
+    };
+    #[cfg(test)]
+    let stream = &mut tally;
+    let lead = lead(stream, side, held, most)?;
+    let remote =
+        crate::replica::reconcile_inventory_within(stream, lead, Some(local), most as u64, || {
+            Ok(())
+        })?
+        .ok_or_else(|| Error::new("Commons inventory reconciliation refused"))?;
+    #[cfg(test)]
+    tests::RECONCILED.with(|written| written.borrow_mut().push(tally.written));
+    Ok(remote)
+}
+
+/// Whether another turn of `atdb/8` batches follows: each side says whether its `until` is still
+/// ahead, in the session's fixed order, and both read the same two answers, so both stop at the
+/// same frame boundary once either deadline passes, rather than at a socket the deadline cut.
+pub(super) fn proceed(
+    stream: &mut (impl Read + Write),
+    side: Side,
+    until: Instant,
+) -> Result<bool> {
+    let own = [u8::from(Instant::now() < until)];
+    let mut peer = [0];
+    match side {
+        Side::Initiator => {
+            stream.write_all(&own)?;
+            stream.flush()?;
+            stream.read_exact(&mut peer)?;
+        }
+        Side::Responder => {
+            stream.read_exact(&mut peer)?;
+            stream.write_all(&own)?;
+            stream.flush()?;
+        }
+    }
+    if peer[0] > 1 {
+        return Err(Error::new("invalid Commons batch continuation"));
+    }
+    Ok(own[0] == 1 && peer[0] == 1)
+}
+
+/// Which side leads a range reconciliation: the one that states it holds more, ties to the
+/// session's initiator. What the leader holds alone crosses once, in its difference pages; what
+/// the other holds alone crosses twice, listed and then named back. A peer behind by a few
+/// hundred nodes has its difference named once whichever side dialled. Each side writes its count
+/// in the session's fixed order and reads the same two counts, so both agree.
+fn lead(stream: &mut (impl Read + Write), side: Side, held: usize, most: usize) -> Result<Side> {
+    let own = u32::try_from(held).map_err(|_| Error::new("Commons inventory exceeds its bound"))?;
+    let peer = match side {
+        Side::Initiator => {
+            stream.write_all(&own.to_le_bytes())?;
+            stream.flush()?;
+            read_u32(stream)?
+        }
+        Side::Responder => {
+            let peer = read_u32(stream)?;
+            stream.write_all(&own.to_le_bytes())?;
+            stream.flush()?;
+            peer
+        }
+    };
+    if peer as usize > most {
+        return Err(Error::new("Commons inventory exceeds its bound"));
+    }
+    Ok(match side {
+        Side::Initiator if own >= peer => Side::Initiator,
+        Side::Responder if own > peer => Side::Initiator,
+        _ => Side::Responder,
+    })
+}
+
+/// One turn of batches each way: what the peer durably took of this side's batch (`sent`), what
+/// this side durably took of the peer's (`received`), what either refused (`deferred`), and how
+/// many records the peer offered (`offered`).
+struct Turn {
+    sent: usize,
+    received: usize,
+    deferred: usize,
+    offered: usize,
+}
+
 /// Fetch outgoing wires in the send turn. Receiving may change which records the
 /// store can expose; only missing identities, never a payload decision, cross it.
+/// The peer's batch holds at most `most` records (and never more than [`RECORDS_PER_ROUND`]).
 fn exchange_batches(
     stream: &mut (impl Read + Write),
     store: &impl Store,
     side: Side,
     ids: &[Digest],
+    most: usize,
     mut phase: impl FnMut(Phase),
-) -> Result<(usize, usize, usize)> {
-    match side {
+) -> Result<Turn> {
+    let (sent, out, received, incoming) = match side {
         Side::Initiator => {
             phase(Phase::ControlBatch);
             let batch = store.batch(ids)?;
             phase(Phase::BatchSend);
             let (sent, out) = send_batch(stream, &batch)?;
             phase(Phase::BatchReceive);
-            let (received, incoming) = receive_batch(stream, store)?;
-            Ok((sent, received, out + incoming))
+            let (received, incoming) = receive_batch(stream, store, most)?;
+            (sent, out, received, incoming)
         }
         Side::Responder => {
             phase(Phase::BatchReceive);
-            let (received, incoming) = receive_batch(stream, store)?;
+            let (received, incoming) = receive_batch(stream, store, most)?;
             phase(Phase::ControlBatch);
             let batch = store.batch(ids)?;
             phase(Phase::BatchSend);
             let (sent, out) = send_batch(stream, &batch)?;
-            Ok((sent, received, out + incoming))
+            (sent, out, received, incoming)
         }
-    }
+    };
+    Ok(Turn {
+        sent,
+        received,
+        deferred: out + incoming,
+        offered: received + incoming,
+    })
 }
 
 fn select(
@@ -3191,12 +3516,16 @@ fn send_batch(stream: &mut (impl Read + Write), batch: &[Vec<u8>]) -> Result<(us
     }
     Ok((retained, batch.len() - retained))
 }
-fn receive_batch<S: Store>(stream: &mut (impl Read + Write), store: &S) -> Result<(usize, usize)> {
+fn receive_batch<S: Store>(
+    stream: &mut (impl Read + Write),
+    store: &S,
+    most: usize,
+) -> Result<(usize, usize)> {
     let n = read_u32(stream)? as usize;
     if n == 0 {
         return Ok((0, 0));
     }
-    if n > RECORDS_PER_ROUND {
+    if n > RECORDS_PER_ROUND || n > most {
         return Err(Error::new("Commons batch exceeds its bound"));
     }
     let mut wires = Vec::with_capacity(n);

@@ -7,12 +7,19 @@
 //! the lane looks when one changes. What no watch hears is read once a minute
 //! ([`CHECKOUT_LOOK`]): the checkout scope, the admission of the folders above the control paths,
 //! and a Git selection that moves no watched file.
+//!
+//! A converge pass's own Git writes to the checkouts (its fetches, fast-forwards, clones and
+//! their tuning) are recorded in the pass record under the account's state folder
+//! ([`checkout_writes`]), and a checkout move they account for exactly calls for no work
+//! ([`RepositoryInputMark::accounted`]): what anything else wrote, during the pass or after it,
+//! still does.
 
 use aterm_machines::init_github::{
     RepositoryCheckoutMetadata, RepositoryInputMark, RepositoryInputPathCache,
     RepositoryRefreshCursor, repository_input_mark,
 };
 use aterm_machines::port::{Live, System};
+use aterm_machines::sync::repository_refresh::{Accounted, checkout_writes};
 use aterm_secrets::client::Paths;
 use aterm_secrets::converge::{MarkMoved, RepositoryWork};
 use aterm_uds::file_watch::FileWatch;
@@ -130,6 +137,9 @@ impl Metadata {
 
 struct Inputs {
     paths: Paths,
+    /// The account's state folder, whose pass record holds the passes' own checkout writes
+    /// ([`checkout_writes`]): without one, every checkout move calls for work.
+    state: Option<PathBuf>,
     metadata: Option<Metadata>,
     seen: Option<RepositoryInputMark>,
     held: bool,
@@ -148,9 +158,16 @@ struct Inputs {
 }
 
 impl Inputs {
-    fn new(sys: &dyn System, paths: &Paths, allowed: bool, now: Instant) -> Self {
+    fn new(
+        sys: &dyn System,
+        paths: &Paths,
+        state: Option<PathBuf>,
+        allowed: bool,
+        now: Instant,
+    ) -> Self {
         let mut inputs = Self {
             paths: paths.clone(),
+            state,
             metadata: None,
             seen: None,
             held: !allowed,
@@ -250,10 +267,25 @@ impl Inputs {
             || admission
         {
             Some(RepositoryWork::Refresh)
-        } else if self.seen.as_ref() != Some(&mark) {
-            Some(RepositoryWork::Repair)
-        } else {
+        } else if self.seen.as_ref() == Some(&mark) {
             None
+        } else {
+            match self.own_writes(sys, &mark) {
+                // The passes' own writes moved the checkouts, exactly: nothing else did.
+                Accounted::Own { .. } => None,
+                // An effect of a pass that still runs moved them: judged once it ended, from
+                // the capture before it, which stays the one compared.
+                Accounted::Running => {
+                    metadata.checkouts = self
+                        .seen
+                        .as_ref()
+                        .map(RepositoryInputMark::captured_checkout_metadata);
+                    self.checkouts_read = Some(now);
+                    self.metadata = Some(metadata);
+                    return Ok(None);
+                }
+                Accounted::Not => Some(RepositoryWork::Repair),
+            }
         };
         if work.is_some() {
             // Why this look calls for work, as classes: the mark's own move, or `first` with no
@@ -280,6 +312,17 @@ impl Inputs {
         self.seen = Some(mark);
         self.held = false;
         Ok(work)
+    }
+
+    /// How the passes' own recorded checkout writes account for how `mark` differs from the
+    /// mark last seen ([`RepositoryInputMark::accounted`]); not at all without a state folder
+    /// or a mark before it.
+    fn own_writes(&self, sys: &dyn System, mark: &RepositoryInputMark) -> Accounted {
+        let (Some(state), Some(before)) = (self.state.as_deref(), self.seen.as_ref()) else {
+            return Accounted::Not;
+        };
+        let writes = checkout_writes(state);
+        mark.accounted(before, &writes, writes.running(sys))
     }
 
     /// What moved the mark in the looks that called for work since this was last asked, and
@@ -404,6 +447,8 @@ impl NamingInputs {
 
 struct Readiness {
     paths: Paths,
+    /// The account's state folder ([`Inputs::state`]).
+    state: Option<PathBuf>,
     ready: Option<(Inputs, RepositoryRefreshCursor)>,
 }
 
@@ -411,6 +456,7 @@ impl Readiness {
     fn new(
         sys: &dyn System,
         paths: &Paths,
+        state: Option<PathBuf>,
         allowed: impl Fn() -> bool,
         initial: impl FnOnce() -> aterm_secrets::converge::RefreshObservation,
         now: Instant,
@@ -426,12 +472,13 @@ impl Readiness {
                 // Establish the generation BEFORE the first source capture. Another owner
                 // may fulfill the next source before this actor gets its first callback.
                 let initial = initial();
-                let inputs = Inputs::new(sys, paths, allowed(), now);
+                let inputs = Inputs::new(sys, paths, state.clone(), allowed(), now);
                 let cursor = RepositoryRefreshCursor::new(initial, inputs.seen.as_ref());
                 (inputs, cursor)
             });
         Self {
             paths: paths.clone(),
+            state,
             ready,
         }
     }
@@ -446,7 +493,15 @@ impl Readiness {
         if self.ready.is_none() {
             // A temporary account lookup failure cannot retire this runtime's local-input
             // observer. The snapshot's receipt precedes this first actual source capture.
-            self.ready = Self::new(sys, &self.paths, &allowed, || observed, now).ready;
+            self.ready = Self::new(
+                sys,
+                &self.paths,
+                self.state.clone(),
+                &allowed,
+                || observed,
+                now,
+            )
+            .ready;
         }
         let (inputs, cursor) = self.ready.as_mut()?;
         inputs.request(sys, allowed(), observed, cursor, now)
@@ -608,6 +663,7 @@ fn observing(
     let readiness = Readiness::new(
         sys.as_ref(),
         paths,
+        state.clone(),
         || repositories(),
         || {
             state

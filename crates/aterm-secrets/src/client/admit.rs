@@ -44,7 +44,7 @@ use crate::members::desk::{Handing, Handout};
 use crate::members::{Allowed, Bundle};
 use crate::membership_log::{
     self, Entrant, EpochAudience, Log, OpenedAudienceEntries, Record, RecordId, SeatAudience,
-    Signer, admission_audiences, encode_records,
+    Signer, admission_audiences, read_records,
 };
 
 /// What the membership log says of an Allow ([`admit_by_phrase`]).
@@ -774,11 +774,8 @@ pub(super) fn log_path(
         )));
     }
     if !signed.is_empty() {
-        store.ingest(&encode_records(&signed))?;
-        if signed
-            .iter()
-            .any(|record| store.get_bytes(record.id()).is_none())
-        {
+        store.ingest(&read_records(&signed)?)?;
+        if signed.iter().any(|record| !store.contains(record.id())) {
             return Err(Error::new("the admission cannot be retained in full"));
         }
     }
@@ -794,7 +791,7 @@ pub(super) fn log_path(
         admit,
         label,
         signed,
-        records: store.encode_held(),
+        records: held_records(&store)?,
     }))
 }
 
@@ -1202,13 +1199,26 @@ pub fn post_records_to_servers(paths: &Paths) -> crate::Result<usize> {
 ///
 /// # Errors
 /// As [`post_records_to_servers`].
+/// The bytes of `store`'s complete records, each after its parents, for a peer's bundle
+/// ([`Store::read_held`]): a record an open through the vault's head shelved read back for it.
+///
+/// # Errors
+/// A shelved record does not read back as it was.
+pub(super) fn held_records(store: &crate::membership_log::Store) -> crate::Result<Vec<u8>> {
+    store
+        .read_held()
+        .map_err(|e| Error::new(format!("reading this Mac's membership records failed: {e}")))
+}
+
 pub(super) fn post_records_to_servers_by(paths: &Paths, by: Instant) -> crate::Result<usize> {
     let config = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     let store = load_records(paths)?;
     if store.is_empty() {
         return Ok(0);
     }
-    let wire = store.encode();
+    let wire = store
+        .read_encoded()
+        .map_err(|e| Error::new(format!("reading this Mac's membership records failed: {e}")))?;
     let mut urls = ledger_publish::candidate_server_urls(paths, &config, &[]);
     for url in policy_peer_urls(paths, &config) {
         if !urls.contains(&url) {

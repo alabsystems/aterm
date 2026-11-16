@@ -257,6 +257,26 @@ fn the_watch_hears_a_rename_by_replace_a_vault_made_later_and_a_fleet_key_writte
     reader.join().expect("the reader ends with its watch");
 }
 
+/// A pass that moves the lab's machines table (a nickname written to this Mac's registry row from
+/// any Mac arriving) is heard, so the read that follows the row runs (FL-169).
+#[test]
+fn the_watch_hears_the_lab_machines_table_move() {
+    let root = state();
+    let secrets = vault(root.path());
+    let status = aterm_db::file::root(&secrets).state(&aterm_db::file::MACHINES.file());
+    // The table's status is watched after the vault's standing files, keys from 3.
+    let key = 3 + u64::try_from(secrets.standing_files().len()).expect("a count");
+    let (watch, changes) = watch(root.path(), Some(&secrets)).expect("a watch");
+    // Each wait is a one-minute hang detector for a change that must be heard.
+    let hang = Duration::from_secs(60);
+    let hear = |what: &str| while changes.recv_timeout(hang).expect(what) != key {};
+    hear("the first look at the table's status");
+    std::fs::create_dir_all(status.parent().expect("a folder")).expect("the state folder");
+    aterm_uds::atomic_file::write(&status, b"{}", 0o600).expect("a status");
+    hear("the table's status moved");
+    drop(watch);
+}
+
 /// A take and a damaged custody record change membership without changing the fleet key.
 #[test]
 fn the_watch_hears_custody_pause_and_recovery() {

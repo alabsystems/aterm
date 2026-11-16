@@ -1549,7 +1549,7 @@ fn facts_push_stores_locally_or_over_fleet_and_rejects_forged_node() {
                 Arc::new(|| (FleetScope::Facts, SERVES)),
                 Arc::new(|| Arc::new(aterm_net::fleet::Denied::default())),
             ),
-            None,
+            (None, None),
             &server_stop,
             aterm_spec::wait::MUST_HAPPEN,
             move |served, op| {

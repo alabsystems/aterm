@@ -60,3 +60,144 @@ fn a_request_made_before_its_inputs_moved_is_admitted_for_the_inputs_there_are()
         "the same stale request is answered by the wave that ran for it"
     );
 }
+
+/// Every string a value holds, in order.
+fn strings(value: &aterm_json::Value, into: &mut Vec<String>) {
+    match value {
+        aterm_json::Value::String(text) => into.push(text.clone()),
+        aterm_json::Value::Array(items) => {
+            for item in items {
+                strings(item, into);
+            }
+        }
+        aterm_json::Value::Object(fields) => {
+            for field in fields.values() {
+                strings(field, into);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The record a pass keeps of its own checkout writes (`own`) holds digests alone: the folder a
+/// write names its checkout by and the checkout as the observer read it are 64 lowercase
+/// hexadecimal digits each, no path the pass wrote under appears anywhere in the record, and
+/// the record reads back as written. A run of finished writes takes a checkout from where the
+/// observer last read it to where it reads it now ([`CheckoutWrites::account`]), an open one
+/// only while its pass's process lives, and a write that begins where the last one did not end
+/// lets the earlier ones go.
+/// NEGATIVE CONTROL: a `CheckoutDigest` serialized as the folder's path puts the path in the
+/// record and fails the first assertion on the text.
+#[test]
+fn the_receipt_of_a_passs_own_checkout_writes_holds_digests_only() {
+    let memory = Arc::new(Memory::default());
+    let (_, lease) = pass(&memory, 1_000);
+    let folder = Path::new("/receipt-home/private-repository");
+    let checkout = CheckoutDigest::folder(folder);
+    let read = |byte: u8| CheckoutDigest::new([byte; 32]);
+    let holder = Holder {
+        pid: 4_242,
+        started_s: 1_700,
+    };
+
+    let open = lease
+        .begin_write(Some(holder), checkout, read(1))
+        .expect("begun");
+    let begun = lease.record().repositories.expect("recorded").own;
+    assert_eq!(
+        begun.account(checkout, read(1), read(2), true),
+        Accounted::Running,
+        "an effect under way while its pass runs"
+    );
+    assert_eq!(
+        begun.account(checkout, read(1), read(2), false),
+        Accounted::Not,
+        "an effect left open by a pass that no longer runs accounts for nothing"
+    );
+    lease
+        .end_write(open, Some((read(2), false)))
+        .expect("ended");
+    let open = lease
+        .begin_write(Some(holder), checkout, read(2))
+        .expect("begun");
+    lease.end_write(open, Some((read(3), true))).expect("ended");
+    let open = lease
+        .begin_write(Some(holder), checkout, read(3))
+        .expect("begun");
+    lease.end_write(open, None).expect("ended");
+
+    let record = lease.record();
+    let own = record.repositories.clone().expect("recorded").own;
+    assert_eq!(
+        own.account(checkout, read(1), read(3), false),
+        Accounted::Own { made: true }
+    );
+    assert_eq!(
+        own.account(checkout, read(1), read(2), false),
+        Accounted::Own { made: false }
+    );
+    assert_eq!(
+        own.account(checkout, read(2), read(3), false),
+        Accounted::Own { made: true }
+    );
+    assert_eq!(
+        own.account(checkout, read(3), read(4), false),
+        Accounted::Not,
+        "a move after the writes is no write of the pass's"
+    );
+    assert_eq!(
+        own.account(
+            CheckoutDigest::folder(Path::new("/receipt-home/another-repository")),
+            read(1),
+            read(2),
+            false
+        ),
+        Accounted::Not,
+        "another checkout's move is not this one's write"
+    );
+
+    let text = aterm_json::to_string(&record).expect("serialized");
+    assert!(
+        !text.contains("receipt-home") && !text.contains("private-repository"),
+        "{text}"
+    );
+    let mut digests = Vec::new();
+    strings(
+        &aterm_json::to_value(&own).expect("serialized"),
+        &mut digests,
+    );
+    assert_eq!(
+        digests.len(),
+        2 * 3,
+        "two kept writes, each a checkout, a before and an after; the one whose writes were \
+         not the pass's own is not kept: {digests:?}"
+    );
+    assert!(
+        digests.iter().all(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }),
+        "{digests:?}"
+    );
+    let back: Record = aterm_json::from_slice(text.as_bytes()).expect("read back");
+    assert_eq!(back.repositories.map(|state| state.own), Some(own));
+
+    let open = lease
+        .begin_write(Some(holder), checkout, read(7))
+        .expect("begun");
+    lease
+        .end_write(open, Some((read(8), false)))
+        .expect("ended");
+    let own = lease.record().repositories.expect("recorded").own;
+    assert_eq!(
+        own.account(checkout, read(1), read(3), false),
+        Accounted::Not,
+        "a write that begins elsewhere lets the earlier ones go"
+    );
+    assert_eq!(
+        own.account(checkout, read(7), read(8), false),
+        Accounted::Own { made: false }
+    );
+}

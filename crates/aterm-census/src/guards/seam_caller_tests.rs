@@ -176,7 +176,9 @@ fn a_release_build_compiles_its_roots_and_what_their_mods_load() {
         &corpus,
         crate::guards::tests::NO_ENGINE,
     );
-    let shipped: Vec<String> = released_files(&Sources::of(&tree)).into_iter().collect();
+    let shipped: Vec<String> = released_files(&Sources::of(&tree, &[]))
+        .into_iter()
+        .collect();
     assert_eq!(
         shipped,
         [
@@ -191,6 +193,100 @@ fn a_release_build_compiles_its_roots_and_what_their_mods_load() {
             "crates/a/src/lib.rs",
         ]
     );
+}
+
+/// A crate aterm vendors whole is read as `crates/` is: a public seam it declares, named by code
+/// a release build of aterm compiles (`use alab_policy::classify::…` in aterm-agent), is a
+/// finding, as is the crate's own release code naming its own private seam; the same name in a
+/// test file is not.
+/// NEGATIVE CONTROL: without the vendored declaration (as when the rule read only `crates/`),
+/// aterm-agent's mention is no finding.
+#[test]
+fn a_seam_of_a_vendored_crate_named_by_code_a_release_build_compiles_is_found() {
+    let policy_lib = "pub mod classify;\n";
+    let classify = "#[cfg(any(test, debug_assertions))]\n\
+                    #[doc(hidden)]\n\
+                    pub const MEASURED_SUBSTITUTION_BYPASSES: &[(&str, &str)] = &[];\n\
+                    #[cfg(any(test, debug_assertions))]\n\
+                    const UNREADABLE: &str = \"\";\n\
+                    pub fn shipped() -> &'static str { UNREADABLE }\n";
+    let agent = "mod approval;\n#[cfg(test)]\nmod approval_tests;\n";
+    let approval = "use alab_policy::classify::MEASURED_SUBSTITUTION_BYPASSES;\n\
+                    fn f() -> &'static str { alab_policy::classify::shipped() }\n";
+    let approval_tests = "use alab_policy::classify::MEASURED_SUBSTITUTION_BYPASSES;\n";
+    let aterm = [
+        ("crates/aterm-agent/src/lib.rs", agent),
+        ("crates/aterm-agent/src/approval.rs", approval),
+        ("crates/aterm-agent/src/approval_tests.rs", approval_tests),
+    ];
+    let vendored = [
+        (
+            "vendor/alab-harness/crates/alab-policy/src/lib.rs",
+            policy_lib,
+        ),
+        (
+            "vendor/alab-harness/crates/alab-policy/src/classify.rs",
+            classify,
+        ),
+    ];
+    let both: Vec<(&str, &str)> = aterm.iter().chain(&vendored).copied().collect();
+    let found = run(&SEAM_CALLER, &both);
+    assert_eq!(
+        spots(&found),
+        [
+            "crates/aterm-agent/src/approval.rs:1",
+            "vendor/alab-harness/crates/alab-policy/src/classify.rs:6",
+        ],
+        "{found:#?}"
+    );
+    assert!(found[0].detail.contains(
+        "names `MEASURED_SUBSTITUTION_BYPASSES` \
+         (vendor/alab-harness/crates/alab-policy/src/classify.rs:3)"
+    ));
+    assert!(run(&SEAM_CALLER, &aterm).is_empty());
+}
+
+/// A file of a vendored repository's crate is in that crate, by the crate's own folder; any other
+/// path is in its first two folders' crate.
+#[test]
+fn a_vendored_crates_files_are_in_that_crate() {
+    assert_eq!(
+        crate_of("vendor/alab-harness/crates/alab-policy/src/classify.rs"),
+        (
+            "vendor/alab-harness/crates/alab-policy/".to_owned(),
+            "alab_policy".to_owned()
+        )
+    );
+    assert!(crate_root(
+        "vendor/alab-harness/crates/alab-policy/src/lib.rs"
+    ));
+    assert!(!crate_root(
+        "vendor/alab-harness/crates/alab-policy/src/classify.rs"
+    ));
+    assert_eq!(
+        crate_of("crates/aterm-pty/src/unix.rs"),
+        ("crates/aterm-pty/".to_owned(), "aterm_pty".to_owned())
+    );
+    assert_eq!(
+        crate_of("vendor/astream/src/lib.rs"),
+        ("vendor/astream/".to_owned(), "astream".to_owned())
+    );
+}
+
+/// Each [`VENDORED`] folder holds Rust source in this checkout, so a move of the vendored copy
+/// cannot leave the rule reading nothing there unnoticed.
+#[test]
+fn every_vendored_folder_holds_rust_source_in_this_checkout() {
+    let root = aterm_tempfile::manifest_dir().join("../..");
+    for prefix in VENDORED {
+        let mut found = Vec::new();
+        crate::collect_rs_files(&root.join(prefix), &mut found).unwrap();
+        assert!(
+            !found.is_empty(),
+            "{prefix}: no Rust file lies here, so seam-caller reads no vendored seam (moved? \
+             name its new path in VENDORED)"
+        );
+    }
 }
 
 fn seam(name: &str, rel: &str, reach: Reach) -> Seam {

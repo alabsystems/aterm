@@ -2,12 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_machines::init_github::acquires_repository;
 
 mod deferred_mac_deadline_tests;
 mod embedded_restore_tests;
 mod ledger_conformance;
 mod pending_local_inputs_tests;
 mod pending_repository_inputs_tests;
+mod repository_park_facts_tests;
 mod resume_tests;
 pub(super) mod run_ledger_tests;
 mod upgrade_completion_tests;
@@ -56,6 +58,10 @@ pub(super) struct Fake {
     repositories_failure: Option<&'static str>,
     /// Whether it stopped for want of a GitHub token ([`repositories::want_token`]).
     token_wanted: bool,
+    /// What it was left waiting on ([`repositories::left_wait`]).
+    repositories_wait: Option<aterm_machines::init_observe::Wait>,
+    /// What it read of its row ([`crate::macos_doctor::repositories_readback`]).
+    repositories_observed: WorkstationReadback,
     /// What each Workstation stage was given to set ([`Progress::only`]).
     only: Vec<Option<Selection>>,
     /// A stage whose every run ends the process mid-stage (a panic the test catches), as a
@@ -281,9 +287,13 @@ impl InitialHost for Fake {
     }
     fn repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         self.repositories_vault.push(vault.is_some());
+        self.repositories_wait = None;
+        self.repositories_observed = WorkstationReadback::EMPTY;
         if let Some((sys, ctx)) = &self.native_repositories {
             self.calls.push(Stage::Repositories);
             self.native_repository_readback = None;
+            // Dated from before the run reads anything, as the live host dates it.
+            let at = aterm_machines::port::System::now(sys);
             let rows = aterm_machines::init_github::run_initial_repositories(
                 sys,
                 ctx,
@@ -291,6 +301,8 @@ impl InitialHost for Fake {
             )?;
             self.repositories_failure = repositories::failure_note(&rows);
             self.token_wanted = repositories::want_token(&rows);
+            self.repositories_wait = repositories::left_wait(&rows);
+            self.repositories_observed = crate::macos_doctor::repositories_readback(&rows.rows, at);
             self.native_repository_readback = rows.readback.map(std::sync::Arc::new);
             return Ok(item_rows(rows.rows));
         }
@@ -299,6 +311,14 @@ impl InitialHost for Fake {
 
     fn repositories_failure(&mut self) -> Option<&'static str> {
         self.repositories_failure
+    }
+
+    fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+        self.repositories_wait
+    }
+
+    fn repositories_readback(&mut self) -> WorkstationReadback {
+        self.repositories_observed.take()
     }
 
     fn current_repositories(&mut self, _vault: Option<&Plan>) -> Result<Vec<Row>, String> {
@@ -312,6 +332,7 @@ impl InitialHost for Fake {
                     ctx,
                     aterm_machines::model::Mode::Plan,
                     aterm_secrets::converge::RepositoryWork::Repair,
+                    aterm_machines::init_github::RepositorySteps::Both,
                     aterm_machines::init_github::InitialRepositoryInputs::capture_ready(sys, ctx)?
                         .with_repository_readback(self.native_repository_readback.clone()),
                     || Ok(true),
@@ -3182,6 +3203,86 @@ fn a_repository_git_readiness_wait_remains_owed_without_a_developer_tools_reques
     assert_eq!(host.calls, [Stage::Repositories, Stage::Repositories]);
 }
 
+/// A Repositories stage that meets another pass's repository lease parks without a failure:
+/// its acquisition and refresh rows are [`HELD`], decided before any read (the fixture fails on
+/// any repository command but a config read), the pass parks, the report needs attention but
+/// says no step failed, and the park after it watches the lease in place of Git and the
+/// checkouts the lease's holder is fetching into. CONTROL: with the lease let go, the next pass
+/// reads on, holds no row on the lease, and its park no longer watches it.
+#[test]
+fn a_repositories_stage_meeting_a_held_lease_parks_without_a_failure() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let revision = authorize_at(root.path(), &selected(&[Setting::Repositories]))
+        .unwrap()
+        .unwrap();
+    let mut host = native_repositories(true, true);
+    // Another pass's lease, as the converge pass holds align.lock across its rows.
+    let held = {
+        let (sys, _) = host.native_repositories.as_ref().unwrap();
+        aterm_machines::port::System::repository_pass(sys)
+            .unwrap()
+            .pass
+            .expect("the lease is free")
+    };
+    let (report, next) = execute_initial_for_revision(
+        &mut host,
+        root.path(),
+        revision,
+        &mut None,
+        SetupHooks::NONE,
+    )
+    .unwrap()
+    .unwrap();
+    let held_rows = report.rows.iter().filter(|row| row.status == HELD).count();
+    assert_eq!(
+        held_rows,
+        2,
+        "acquisition and refresh: {}",
+        report.to_text()
+    );
+    assert_eq!(next, SetupNext::Park, "{}", report.to_text());
+    assert!(report.needs_attention(), "{}", report.to_text());
+    assert!(!report.failed(), "{}", report.to_text());
+    assert!(
+        report.rows.iter().all(|row| row.status != "error"),
+        "{}",
+        report.to_text()
+    );
+    let saved = progress(root.path()).unwrap().unwrap();
+    assert_eq!(saved.done & Stage::Repositories.bit(), 0);
+    assert_eq!(
+        repositories_left(root.path(), saved.revision),
+        Some(aterm_machines::init_observe::Wait::OtherPass)
+    );
+    let watches = initial_setup_park_mark_with(Some(root.path()), None, 1_000, || None).watches();
+    assert!(
+        watches.lease && !watches.git && !watches.checkouts,
+        "{watches:?}"
+    );
+    drop(held);
+    let (report, _) = execute_initial_for_revision(
+        &mut host,
+        root.path(),
+        revision,
+        &mut None,
+        SetupHooks::NONE,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        report.rows.iter().all(|row| row.status != HELD),
+        "{}",
+        report.to_text()
+    );
+    assert_ne!(
+        repositories_left(root.path(), saved.revision),
+        Some(aterm_machines::init_observe::Wait::OtherPass)
+    );
+    let watches = initial_setup_park_mark_with(Some(root.path()), None, 1_000, || None).watches();
+    assert!(!watches.lease, "{watches:?}");
+    assert_eq!(host.calls, [Stage::Repositories, Stage::Repositories]);
+}
+
 #[test]
 fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
     use aterm_machines::port::{Ran, Stat, System as _};
@@ -3238,9 +3339,13 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
         let route = launcher.clone();
         let worktree = format!("{home}/before");
         sys.simulate(move |sys, command| {
-            let committed_head = command.args.windows(2).any(|pair| pair[0] == "-C" && pair[1] == worktree.as_str())
-                && command.args.windows(4).any(|args| args[0] == "rev-parse" && args[1] == "--verify" && args[2] == "--quiet" && args[3] == "HEAD^{commit}");
+            let here = command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == worktree.as_str());
             let command = command.display();
+            // The checkout's record of facts: its `rev-parse` batch, its config listing, HEAD on
+            // `main` at a commit, and no default branch of origin's recorded.
             Some(if command.ends_with(" credential fill") {
                 if sys.read_file(Path::new(&route)).is_ok_and(|bytes| bytes == b"launcher") {
                     Ran::ok("protocol=https\nhost=github.com\nusername=tester\npassword=inert_repository_tools_token\n")
@@ -3250,13 +3355,22 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
             } else if command.contains(" config --null --show-origin --get-regexp ") {
                 Ran::ok("")
             } else if command.ends_with(
-                " rev-parse --is-inside-work-tree --show-prefix --show-toplevel --git-path index",
+                " rev-parse --is-inside-work-tree --show-prefix --show-toplevel \
+                 --is-shallow-repository --git-path index --git-path objects/info/alternates",
             ) {
-                Ran::ok(&format!("true\n\n{worktree}\n.git/index\n"))
-            } else if command.ends_with(" config --get-all remote.origin.url") {
-                Ran::ok("https://github.com/tester/before.git\n")
-            } else if committed_head {
-                Ran::ok("1111111111111111111111111111111111111111\n")
+                Ran::ok(&format!(
+                    "true\n\n{worktree}\nfalse\n.git/index\n.git/objects/info/alternates\n"
+                ))
+            } else if command.contains(" config --null --show-scope --show-origin --get-regexp ") {
+                Ran::ok(
+                    "local\0file:.git/config\0remote.origin.url\nhttps://github.com/tester/before.git\0",
+                )
+            } else if here && command.ends_with(" symbolic-ref --quiet HEAD") {
+                Ran::ok("refs/heads/main\n")
+            } else if here && command.ends_with(" symbolic-ref --quiet refs/remotes/origin/HEAD") {
+                Ran::exit(1, "")
+            } else if here && command.ends_with(" refs/heads/main") && command.contains(" for-each-ref ") {
+                Ran::ok("1111111111111111111111111111111111111111 commit refs/heads/main\n")
             } else {
                 panic!("unexpected repository effect: {command}")
             })
@@ -3462,7 +3576,7 @@ fn completed_repositories_are_read_again_after_a_parked_accounts_stage() {
         }
         let (sys, _) = host.native_repositories.as_ref().unwrap();
         assert!(
-            sys.calls().iter().all(|call| !call.contains(" clone ")
+            sys.calls().iter().all(|call| !acquires_repository(call)
                 && !call.contains(" agh GET ")
                 && !call.contains("credential approve")),
             "{change}: readback and preservation must have no repository effects: {:?}",
@@ -3608,7 +3722,7 @@ fn repositories_recover_after_an_interface_change(with_secrets: bool) {
     let (sys, _) = host.native_repositories.as_ref().unwrap();
     assert!(sys.calls().iter().all(|call| !call.contains(" agh GET ")));
     assert!(sys.fed().is_empty());
-    assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
+    assert!(sys.calls().iter().all(|call| !acquires_repository(call)
         && !call.contains("credential approve")
         && !call.contains("--replace-all")));
 
@@ -3727,6 +3841,18 @@ impl InitialHost for WithholdingStages {
     }
     fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
         self.rest.current_repositories(vault)
+    }
+    fn repositories_failure(&mut self) -> Option<&'static str> {
+        self.rest.repositories_failure()
+    }
+    fn repositories_want_token(&mut self) -> bool {
+        self.rest.repositories_want_token()
+    }
+    fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+        self.rest.repositories_wait()
+    }
+    fn repositories_readback(&mut self) -> WorkstationReadback {
+        self.rest.repositories_readback()
     }
     fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
         self.doctor.follow_up(root)
@@ -4650,6 +4776,18 @@ fn a_workstation_stage_that_never_verifies_is_tried_again_less_often_across_work
         }
         fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
             self.rest.current_repositories(vault)
+        }
+        fn repositories_failure(&mut self) -> Option<&'static str> {
+            self.rest.repositories_failure()
+        }
+        fn repositories_want_token(&mut self) -> bool {
+            self.rest.repositories_want_token()
+        }
+        fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+            self.rest.repositories_wait()
+        }
+        fn repositories_readback(&mut self) -> WorkstationReadback {
+            self.rest.repositories_readback()
         }
         fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.rest.withheld(root)
@@ -7143,6 +7281,18 @@ mod vault {
         fn current_repositories(&mut self, vault: Option<&Plan>) -> Result<Vec<Row>, String> {
             self.rest.current_repositories(vault)
         }
+        fn repositories_failure(&mut self) -> Option<&'static str> {
+            self.rest.repositories_failure()
+        }
+        fn repositories_want_token(&mut self) -> bool {
+            self.rest.repositories_want_token()
+        }
+        fn repositories_wait(&mut self) -> Option<aterm_machines::init_observe::Wait> {
+            self.rest.repositories_wait()
+        }
+        fn repositories_readback(&mut self) -> WorkstationReadback {
+            self.rest.repositories_readback()
+        }
         fn withheld(&mut self, root: &Path) -> Result<Option<Report>, String> {
             self.rest.withheld(root)
         }
@@ -8093,6 +8243,8 @@ fn the_live_host_paces_each_secrets_try_by_the_network_and_the_vault_state() {
         repositories_failure: None,
         token_wanted: false,
         spotlight_readback: WorkstationReadback::EMPTY,
+        repositories_wait: None,
+        repositories_observed: WorkstationReadback::EMPTY,
         repository_readback: None,
     };
     let first = host.secrets_pace().expect("the live host paces every try");
@@ -8820,8 +8972,10 @@ fn partial_repository_readback_cannot_finish_its_setup_stage() {
             effect: Effect::Now,
             detail: Some(
                 Reading::Repositories {
-                    present: 0,
-                    count: 53,
+                    counts: aterm_machines::init_observe::RepositoryCounts {
+                        missing: 53,
+                        ..aterm_machines::init_observe::RepositoryCounts::default()
+                    },
                     signed_in: true,
                 }
                 .token(),

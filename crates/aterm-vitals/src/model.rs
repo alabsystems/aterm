@@ -1204,6 +1204,16 @@ pub struct DiskFacts {
     /// The journal's removals by hour: each hour's start (unix ms) and the bytes removed in it,
     /// oldest first, within the last 3 weeks.
     pub removals: Vec<(i64, u64)>,
+    /// Who holds home's volume, as the host last gathered `sys disk held`'s rows; `None` where it
+    /// gathered none.
+    pub held: Option<Arc<crate::sys::held::Holdings>>,
+    /// Whole seconds from that gather to this reading: the rows are that old, since the host
+    /// gathers them at its own pace and not while every window is hidden. `None` where it
+    /// gathered none.
+    pub held_age_s: Option<u64>,
+    /// The most used bytes DC-04's budget holds the volume to, where the watch sized one; a
+    /// reading, never a level.
+    pub cap: Option<u64>,
 }
 
 /// Whose a [`DiskDeed`] is: the subject of what it records. That is who did it, except where the
@@ -1307,6 +1317,9 @@ pub struct PlanFact {
 /// One sample of everything, from the host's probe thread.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Sample {
+    /// This process's bracketed thread CPU observations; a missing or failed read clears
+    /// continuity rather than carrying an earlier attribution.
+    pub self_cpu: Option<Result<crate::self_cpu::OwnCpuCut, &'static str>>,
     /// End of the frontend sweep on the two native, cross-process CPU clocks.
     pub native_cpu_cut: NativeCpuCut,
     /// Authenticated final process counters collected by their original native owning wait.
@@ -2752,6 +2765,8 @@ impl Unread {
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// This process's CPU bounds by observed thread name, separate from app and tab charges.
+    pub self_cpu: crate::self_cpu::OwnCpuView,
     /// Original native waits observed on this sample, including known aggregate CPU where a
     /// final own/child split was unavailable.
     pub native_terminals: Vec<NativeTerminal>,
@@ -3645,6 +3660,7 @@ impl ScopeRings {
 /// The model's running state. One per host instance.
 #[derive(Debug, Default)]
 pub struct Vitals {
+    self_cpu: crate::self_cpu::OwnCpuState,
     hardware_recorder: crate::hardware::Recorder,
     historical_cpu_report: Option<std::sync::Arc<crate::sys::json::Jv>>,
     authorized_cpu_policy: Option<std::sync::Arc<crate::sys::json::Jv>>,
@@ -4370,6 +4386,11 @@ impl Vitals {
 
     /// Absorb one sample and return the snapshot it makes.
     pub fn absorb(&mut self, s: &Sample) -> Snapshot {
+        let self_cpu = self.self_cpu.absorb(
+            s.self_cpu
+                .as_ref()
+                .map(|cut| cut.as_ref().map_err(|why| *why)),
+        );
         // A known PID with an unread start is neither a validated origin nor a disproved one.
         // Keep its proof dormant and mark every accounting consumer of this reading partial.
         let mut checked;
@@ -4784,6 +4805,7 @@ impl Vitals {
         };
 
         let mut snap = Snapshot {
+            self_cpu,
             native_terminals: s.native_terminals.clone(),
             cpu_counter_sample: s.cores.clone(),
             hardware: s.hardware.clone(),

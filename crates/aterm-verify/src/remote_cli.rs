@@ -4,8 +4,9 @@
 //! The linked agh transport, served by each executable hosting verifier remote reads.
 //!
 //! Both the verifier and release cutter dispatch this entry before their ordinary CLI.
-//! Remote children keep the caller's deadline and use the same linked agh protocol;
-//! an older installed application cannot select a different transport implementation.
+//! Reads retain their caller's deadline. Admitted native writes have a cancellation owner
+//! retained through settlement. Both use linked agh; an older installed application cannot
+//! select a different transport implementation.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -14,6 +15,7 @@ pub(crate) const FLAG: &str = "--remote-agh";
 
 enum Invocation<'a> {
     Transport(u32, &'a [OsString]),
+    Owned(u32, &'a [OsString]),
     Credential(&'a [OsString]),
 }
 
@@ -24,6 +26,20 @@ fn invocation(args: &[OsString]) -> Option<Invocation<'_>> {
         && helper == "git-credential"
     {
         return Some(Invocation::Credential(&args[1..]));
+    }
+    if let Some(args) = args.strip_prefix(&[OsString::from("owned")]) {
+        let (parent, tail) = args.split_first()?;
+        let parent = parent.to_str()?.parse::<u32>().ok()?;
+        if parent <= 1 || parent.to_string() != args[0].to_str()? {
+            return None;
+        }
+        // This private transport dedicates stdin to cancellation, never to an Agh body.
+        return (tail.len() == 6
+            && tail[0] == "repo"
+            && tail[1] == "push"
+            && tail[4] == "--input"
+            && tail[5] != "-")
+            .then_some(Invocation::Owned(parent, tail));
     }
     let (parent, args) = args.split_first()?;
     let text = parent.to_str()?;
@@ -53,10 +69,11 @@ pub unsafe fn entry(args: &[OsString]) -> Option<ExitCode> {
         );
         return Some(ExitCode::from(crate::exit::COULD_NOT_RUN as u8));
     };
-    let (parent, args) = match invocation {
+    let (parent, args, owned) = match invocation {
         // Git's group is owned by agh's Fx tether. A callback cannot choose another CLI verb.
-        Invocation::Credential(args) => (None, args),
-        Invocation::Transport(parent, args) => (Some(parent), args),
+        Invocation::Credential(args) => (None, args, false),
+        Invocation::Transport(parent, args) => (Some(parent), args, false),
+        Invocation::Owned(parent, args) => (Some(parent), args, true),
     };
     #[cfg(any(target_vendor = "apple", target_os = "linux"))]
     {
@@ -77,7 +94,84 @@ pub unsafe fn entry(args: &[OsString]) -> Option<ExitCode> {
     }
     #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
     let _ = parent;
+    #[cfg(unix)]
+    if owned {
+        // SAFETY: this exact private entry owns the inherited cancellation socket on stdin,
+        // before any thread or Rust stdin owner starts. Credential callbacks never take it.
+        let socket = unsafe { aterm_uds::spawnfd::adopt_inherited_socket(0) };
+        let result = socket.map_err(|why| why.to_string()).and_then(|socket| {
+            cancellation(aterm_uds::CtlStream::from(socket), |stop| {
+                agh::cli::main_entry_with_git_stop(args.to_vec(), stop)
+            })
+        });
+        return Some(result.unwrap_or_else(|why| {
+            eprintln!("verify remote: cannot own mutation cancellation: {why}");
+            ExitCode::from(crate::exit::COULD_NOT_RUN as u8)
+        }));
+    }
+    #[cfg(not(unix))]
+    if owned {
+        return Some(ExitCode::from(crate::exit::COULD_NOT_RUN as u8));
+    }
     Some(agh::cli::main_entry(args.to_vec()))
+}
+
+/// Arm before entering Agh and join the watcher on every return or unwind. A broken watcher
+/// requests stop; it never leaves a native mutation running without its cancellation owner.
+#[cfg(unix)]
+pub(super) fn cancellation<T>(
+    stream: aterm_uds::CtlStream,
+    work: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
+) -> Result<T, String> {
+    cancellation_with(aterm_uds::hangup::Bell::process(), stream, work)
+}
+
+#[cfg(unix)]
+fn cancellation_with<T>(
+    bell: &aterm_uds::hangup::Bell,
+    stream: aterm_uds::CtlStream,
+    work: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
+) -> Result<T, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    let (ring, heard) = mpsc::sync_channel(1);
+    let armed = bell
+        .arm(&stream, ring.clone())
+        .map_err(|why| why.to_string())?;
+    let finished = AtomicBool::new(false);
+    let stop = Arc::new(AtomicBool::new(false));
+    struct Finish<'a>(&'a AtomicBool, mpsc::SyncSender<()>);
+    impl Drop for Finish<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+            let _ = self.1.try_send(());
+        }
+    }
+    std::thread::scope(|scope| {
+        let requested = stop.clone();
+        let stream = &stream;
+        let armed = &armed;
+        let finished = &finished;
+        std::thread::Builder::new()
+            .name("verify-mutation-stop".into())
+            .spawn_scoped(scope, move || {
+                while heard.recv().is_ok() {
+                    if finished.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if !armed.ringing() || aterm_uds::hangup::peer_closed(stream) {
+                        requested.store(true, Ordering::Release);
+                        return;
+                    }
+                }
+                if !finished.load(Ordering::Acquire) {
+                    requested.store(true, Ordering::Release);
+                }
+            })
+            .map_err(|why| why.to_string())?;
+        let _finish = Finish(finished, ring);
+        Ok(work(stop))
+    })
 }
 
 #[cfg(test)]

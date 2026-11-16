@@ -1,21 +1,24 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Laying executables (the `bin/` shims, their `agents/` twins and `alab-` aliases, the pending
-//! stubs, the reroute stubs, the tombstones) through one writer: [`write_in_process`](crate::lay::write_in_process), and
+//! Laying executables (the `bin/` shims and links, their `agents/` twins and `alab-` aliases, the
+//! pending stubs, the reroute stubs, the tombstones) through one writer: [`write_in_process`](crate::lay::write_in_process), and
 //! [`write_regenerable`](crate::lay::write_regenerable) for a file every seed lays again.
 
 use std::ffi::OsStr;
 use std::io;
 use std::path::PathBuf;
 
-/// One executable to lay: where, and what bytes.
+/// One executable to lay: where, and what: a file's bytes, or a symbolic link to a program.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Executable {
     /// The destination path.
     pub path: PathBuf,
-    /// The file's bytes.
+    /// The file's bytes; empty for a link.
     pub body: Vec<u8>,
+    /// The program a symbolic link at `path` names, laid in place of a file (a PATH entry that
+    /// would only exec that program, `platform::path_entry`); `None` for a file.
+    pub link: Option<PathBuf>,
 }
 
 impl Executable {
@@ -24,6 +27,28 @@ impl Executable {
         Self {
             path: path.into(),
             body: body.into(),
+            link: None,
+        }
+    }
+
+    /// A symbolic link at `path` to the program `target`.
+    #[cfg(unix)]
+    pub fn link(path: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            body: Vec::new(),
+            link: Some(target.into()),
+        }
+    }
+
+    /// Whether `path` holds this executable now: a symbolic link naming the same target where
+    /// this is a link, else a regular file, never a link, with exactly these bytes.
+    #[must_use]
+    pub fn is_laid(&self) -> bool {
+        match &self.link {
+            Some(target) => std::fs::read_link(&self.path).is_ok_and(|have| have == *target),
+            None => crate::metadata_io::read_bounded_regular(&self.path, self.body.len())
+                .is_ok_and(|have| have == self.body),
         }
     }
 }
@@ -106,8 +131,9 @@ pub(crate) fn remove_in_process(path: &std::path::Path) -> io::Result<()> {
 }
 
 /// Write `file`'s bytes to a fresh sibling temp ([`staged_at`]), mode `0755`, flushed with
-/// `sync`; a temp this call creates is removed again on a later error. An occupied candidate
-/// is left untouched.
+/// `sync`; a temp this call creates is removed again on a later error. A link is staged as a
+/// symbolic link at the temp instead, which `symlink(2)` creates whole, so it has no bytes to
+/// flush. An occupied candidate is left untouched.
 fn stage(file: &Executable, sync: fn(&std::fs::File) -> io::Result<()>) -> io::Result<PathBuf> {
     stage_numbered(
         file,
@@ -129,6 +155,11 @@ fn stage_numbered(
             io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name")
         })?;
     let tmp = staged_at(&file.path, name, seq);
+    #[cfg(unix)]
+    if let Some(target) = &file.link {
+        std::os::unix::fs::symlink(target, &tmp)?;
+        return Ok(tmp);
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]

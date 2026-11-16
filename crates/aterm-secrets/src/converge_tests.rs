@@ -51,10 +51,9 @@ fn the_subscriber_starts_a_runner_at_start_per_applied_version_and_when_due() {
 }
 
 /// A start that comes due while the last runner runs waits for it to end rather than start a
-/// second that would find the lock held; one that found the lock held keeps its request
-/// until the existing five-second retry boundary.
+/// second beside it, and the owed start follows that end once.
 #[test]
-fn a_start_due_while_a_runner_runs_or_after_a_held_lock_is_owed_to_the_next_round() {
+fn a_start_due_while_a_runner_runs_is_owed_to_the_next_round() {
     let mut due = Due::default();
     assert!(due.at_start(0, HOME, Last::None));
     assert!(
@@ -70,18 +69,54 @@ fn a_start_due_while_a_runner_runs_or_after_a_held_lock_is_owed_to_the_next_roun
         "the owed start, once it ended"
     );
     assert!(!due.after_pass(&unchanged(), 4 * MINUTE, HOME, Last::Ended));
+}
+
+/// A RUNNER THAT WAITS FOR THE LOCK ANOTHER PASS HOLDS IS OWED ITS START AT ITS END, NOT AT A
+/// CLOCK: on m38 (2026-11-15) one pass held the lock for 40 minutes. A runner started for the
+/// subscriber waits for it, so for those 40 minutes, looked at every second while an input
+/// look asks for a repair each minute and the routes move once, it reads as running: nothing
+/// starts, the 5 s retry and the 30-minute recheck among them, and no time is owed but the
+/// recheck's. Its end starts exactly one runner, carrying the strongest work owed meanwhile (a
+/// refresh, for the moved routes); the next looks start nothing.
+/// NEGATIVE CONTROL: a starter that reads its waiting runner as gone (`Last::None` at each look,
+/// as it read a runner that ended held at once) starts one for the first minute's repair, at
+/// 60 s, where none is wanted.
+#[test]
+fn a_runner_waiting_for_the_lock_is_owed_its_start_at_its_end_not_at_a_clock() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    let mut starts = 0;
+    for second in 1..=40 * 60 {
+        let at = second * 1000;
+        if at % MINUTE == 0 {
+            due.because(Causes::INPUT_REPAIR);
+            due.request(RepositoryRequest::Repair);
+        }
+        let routes = if second < 10 * 60 { HOME } else { AWAY };
+        starts += usize::from(due.poll(at, routes, Last::Running));
+        assert_eq!(
+            due.next_at(),
+            Some(RECHECK_MS),
+            "no clock but the recheck's, at {second} s"
+        );
+    }
+    assert_eq!(starts, 0, "a waiting runner is still this starter's one");
     assert!(
-        !due.after_pass(&unchanged(), 5 * MINUTE, HOME, Last::Held),
-        "another pass held the lock: retain the request without a per-look loop"
+        due.poll(40 * MINUTE + 1, AWAY, Last::Ended),
+        "its end starts the start owed meanwhile"
     );
-    assert!(!due.after_pass(
-        &unchanged(),
-        5 * MINUTE + FIRST_RETRY_MS - 1,
-        HOME,
-        Last::None
-    ));
-    assert!(due.after_pass(&unchanged(), 5 * MINUTE + FIRST_RETRY_MS, HOME, Last::None));
-    assert!(!due.after_pass(&unchanged(), 6 * MINUTE, HOME, Last::Ended));
+    assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+    assert_eq!(
+        caused(&due),
+        causes([Causes::INPUT_REPAIR, Causes::ROUTES, Causes::RECHECK])
+    );
+    for at in [
+        40 * MINUTE + 2,
+        40 * MINUTE + FIRST_RETRY_MS + 2,
+        41 * MINUTE,
+    ] {
+        assert!(!due.poll(at, AWAY, Last::Ended), "once, at {at}");
+    }
 }
 
 /// The first healthy pass after failed ones starts a runner, on the routes and inside the
@@ -210,29 +245,58 @@ fn next_at_names_identitys_own_retry() {
     );
 }
 
+/// A HELD END IS RETRIED AS A FAILED ONE, NEVER ON A FLAT CLOCK: no runner's exit reads as held
+/// ([`Last::of`]), and a held end handed to [`Due::reaped`] all the same backs off as a failure
+/// does, its work kept and its cause `retry-failed`: the second in a row waits twice as long as
+/// the first.
+/// NEGATIVE CONTROL: a `Due` that hands the held end to [`RunnerRetry`] as it is retries the
+/// second after [`FIRST_RETRY_MS`] again, where twice that is wanted.
 #[test]
-fn held_and_running_runners_preserve_failed_retry_and_coalesced_work() {
+fn a_held_end_is_retried_as_a_failed_one_never_on_a_flat_clock() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    due.reaped(Last::Held, 1);
+    assert!(!due.poll(FIRST_RETRY_MS, HOME, Last::None));
+    assert!(due.poll(1 + FIRST_RETRY_MS, HOME, Last::None));
+    assert_eq!(caused(&due), Causes::RETRY_FAILED);
+    assert_eq!(
+        due.repository_work(),
+        RepositoryWork::Refresh,
+        "its work is kept"
+    );
+    due.reaped(Last::Held, 2 + FIRST_RETRY_MS);
+    let again = 2 + 3 * FIRST_RETRY_MS;
+    assert!(!due.poll(again - 1, HOME, Last::None));
+    assert!(due.poll(again, HOME, Last::None));
+}
+
+/// A retry that started a runner which then waits for the lock keeps the failure streak through
+/// the wait: nothing starts on the retry's clock while it runs, and a second failure after it
+/// backs off twice as long as the first.
+/// NEGATIVE CONTROL: a reap that resets the backoff on a long-running runner retries the second
+/// failure after [`FIRST_RETRY_MS`] where twice that is wanted.
+#[test]
+fn waiting_and_running_runners_preserve_failed_retry_and_coalesced_work() {
     let mut due = Due::default();
     assert!(due.at_start(0, HOME, Last::None));
     due.reaped(Last::Failed, 1);
     assert!(due.after_pass(&unchanged(), 5_001, HOME, Last::None));
-    due.reaped(Last::Held, 5_002);
+    for at in [5_002, 10_001, 10_002, 15_003, 600_000] {
+        assert!(
+            !due.after_pass(&unchanged(), at, HOME, Last::Running),
+            "a runner waiting for the lock starts nothing at {at}"
+        );
+    }
+    due.reaped(Last::Failed, 600_001);
+    assert!(!due.after_pass(&unchanged(), 610_000, HOME, Last::None));
     assert!(
-        !due.after_pass(&unchanged(), 5_002, HOME, Last::None),
-        "a held lock keeps its existing bounded retry"
+        due.after_pass(&unchanged(), 610_001, HOME, Last::None),
+        "the wait did not erase the failure streak"
     );
-    assert!(!due.after_pass(&unchanged(), 10_001, HOME, Last::None));
-    assert!(due.after_pass(&unchanged(), 10_002, HOME, Last::None));
-    due.reaped(Last::Failed, 10_003);
-    assert!(!due.after_pass(&unchanged(), 20_002, HOME, Last::None));
-    assert!(
-        due.after_pass(&unchanged(), 20_003, HOME, Last::None),
-        "a lock hold did not erase the failure streak"
-    );
-    assert!(!due.after_pass(&applied(), 20_004, HOME, Last::Running));
-    assert!(!due.after_pass(&unchanged(), 20_005, HOME, Last::Running));
-    assert!(due.after_pass(&unchanged(), 20_006, HOME, Last::Ended));
-    assert!(!due.after_pass(&unchanged(), 20_007, HOME, Last::Ended));
+    assert!(!due.after_pass(&applied(), 610_002, HOME, Last::Running));
+    assert!(!due.after_pass(&unchanged(), 610_003, HOME, Last::Running));
+    assert!(due.after_pass(&unchanged(), 610_004, HOME, Last::Ended));
+    assert!(!due.after_pass(&unchanged(), 610_005, HOME, Last::Ended));
 }
 
 #[test]
@@ -252,7 +316,7 @@ fn local_repairs_and_unrelated_versions_do_not_postpone_the_remote_recheck() {
 }
 
 #[test]
-fn pending_and_held_work_keeps_the_strongest_refresh_request() {
+fn pending_and_failed_work_keeps_the_strongest_refresh_request() {
     let mut due = Due::default();
     assert!(due.at_start(0, HOME, Last::None));
     assert!(due.after_local_progress(RepositoryWork::Repair, 1, HOME, Last::Ended));
@@ -263,7 +327,7 @@ fn pending_and_held_work_keeps_the_strongest_refresh_request() {
     assert!(due.poll(4, HOME, Last::Ended));
     assert_eq!(due.repository_work(), RepositoryWork::Refresh);
     assert!(!due.poll(5, HOME, Last::Ended));
-    due.reaped(Last::Held, 6);
+    due.reaped(Last::Failed, 6);
     assert!(due.after_local_progress(RepositoryWork::Repair, 7, HOME, Last::None));
     assert_eq!(due.repository_work(), RepositoryWork::Repair);
     assert!(!due.poll(5_005, HOME, Last::Ended));
@@ -355,7 +419,8 @@ fn producers_share_the_remote_wave_and_keep_their_generic_passes() {
         assert!(due.after_request(request, 2, HOME, Last::Ended));
         assert_eq!(due.repository_request(), request);
     }
-    subscriber.reaped(Last::Held, 3);
+    // The follower's runner waits for the lock while the node's runner refreshes.
+    assert!(!subscriber.poll(3, HOME, Last::Running));
     let finished = RefreshObservation {
         version: RefreshVersion {
             input: 2,
@@ -368,16 +433,15 @@ fn producers_share_the_remote_wave_and_keep_their_generic_passes() {
     };
     subscriber.observe(finished);
     assert!(
-        !subscriber.poll(100, HOME, Last::None),
-        "the held follower keeps its bounded retry after sharing the remote wave"
+        !subscriber.poll(100, HOME, Last::Ended),
+        "the follower's own pass, run once the lock was let go, shared the remote wave"
     );
-    assert!(
-        !subscriber.poll(FIRST_RETRY_MS + 2, HOME, Last::None),
-        "repository acknowledgment cannot accelerate the generic retry"
-    );
-    assert!(subscriber.poll(FIRST_RETRY_MS + 3, HOME, Last::None));
-    assert_eq!(subscriber.repository_work(), RepositoryWork::Repair);
-    assert!(!subscriber.poll(FIRST_RETRY_MS + 4, HOME, Last::Ended));
+    for at in [101, FIRST_RETRY_MS + 3, RECHECK_MS - 1] {
+        assert!(
+            !subscriber.poll(at, HOME, Last::None),
+            "nothing more is owed at {at}"
+        );
+    }
     subscriber.observe(RefreshObservation {
         recheck_ms: Some(0),
         ..finished
@@ -420,7 +484,7 @@ fn producers_share_the_remote_wave_and_keep_their_generic_passes() {
     startup.identity_changed();
     assert!(startup.after_pass(&unchanged(), 7, HOME, Last::None));
     assert_eq!(startup.repository_request(), RepositoryRequest::Repair);
-    assert!(!startup.after_pass(&unchanged(), 8, HOME, Last::Held));
+    assert!(!startup.after_pass(&unchanged(), 8, HOME, Last::Failed));
     assert!(!startup.poll(8 + FIRST_RETRY_MS - 1, HOME, Last::None));
     assert!(startup.poll(8 + FIRST_RETRY_MS, HOME, Last::None));
     assert_eq!(startup.repository_request(), RepositoryRequest::Repair);
@@ -477,8 +541,8 @@ fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request(
         ..failed
     });
     assert!(
-        !due.poll(2, HOME, Last::Held),
-        "a held repair is subsumed without spinning or moving the refresh deadline"
+        !due.poll(2, HOME, Last::Ended),
+        "a repair that ran beside it does not spin or move the refresh deadline"
     );
     due.observe(RefreshObservation {
         retry_ms: Some(0),
@@ -509,11 +573,13 @@ fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request(
         assert_eq!(owned.repository_work(), RepositoryWork::Repair);
         assert!(!owned.poll(FIRST_RETRY_MS + 2, HOME, Last::Ended));
 
-        // The successful owned generic job clears its captured debt. A later
-        // held-only trigger still owes its own generic pass, at the held deadline.
+        // The successful owned generic job clears its captured debt. A later forced
+        // refresh whose runner waited for the lock while another owner fulfilled it runs its
+        // own generic pass once the lock is let go, and is owed nothing after it.
         let forced =
             RepositoryRequest::Refresh(RefreshRequest::after(fulfilled.scope, fulfilled.version));
         assert!(owned.after_request(forced, FIRST_RETRY_MS + 1_000, HOME, Last::None));
+        assert!(!owned.poll(FIRST_RETRY_MS + 1_001, HOME, Last::Running));
         owned.observe(RefreshObservation {
             version: RefreshVersion {
                 attempt: 2,
@@ -522,16 +588,13 @@ fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request(
             },
             ..fulfilled
         });
-        assert!(!owned.poll(FIRST_RETRY_MS + 1_001, HOME, Last::Held));
-        assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_000, HOME, Last::None));
-        assert!(owned.poll(2 * FIRST_RETRY_MS + 1_001, HOME, Last::None));
-        assert_eq!(owned.repository_work(), RepositoryWork::Repair);
-        assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_002, HOME, Last::Ended));
+        assert!(!owned.poll(FIRST_RETRY_MS + 1_002, HOME, Last::Ended));
+        assert!(!owned.poll(2 * FIRST_RETRY_MS + 1_002, HOME, Last::None));
     }
 
     // Repair can run beside another owner's deferred Refresh without spending
     // that Refresh's failure streak. Its own non-repository failure still survives.
-    for outcome in [Last::Held, Last::Ended, Last::Failed, Last::Unfinished] {
+    for outcome in [Last::Ended, Last::Failed, Last::Unfinished] {
         let mut local = Due::default();
         local.observe(failed);
         assert!(!local.after_request(request, 0, HOME, Last::None));
@@ -634,7 +697,6 @@ fn shared_refresh_retry_allows_local_repair_without_losing_its_original_request(
         (Last::Failed, 0), // The starter refused the selected plan.
         (Last::Failed, 1),
         (Last::Unfinished, 1),
-        (Last::Held, 1),
     ] {
         let remote_at = 3 * FIRST_RETRY_MS;
         let retry_at = ended_at + FIRST_RETRY_MS;
@@ -775,7 +837,8 @@ fn the_runner_is_init_converge_the_subscribers_out_of_the_band_never_disclaiming
 /// A runner that does not end by itself leaves the start, and the reading of how it stands,
 /// returning at once: the subscriber's long-poll never waits on a pass. The child leads a
 /// process group of its own (the session `setsid` made), and one that ends with [`HELD`]
-/// reads as held.
+/// reads as failed: a runner a starter started waits for the lock rather than end so, and one
+/// that ends so all the same (an older installed app's pass) is retried on the failed backoff.
 #[cfg(unix)]
 #[test]
 fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
@@ -814,7 +877,7 @@ fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
     for (code, expected) in [
         (0, Last::Ended),
         (1, Last::Failed),
-        (HELD, Last::Held),
+        (HELD, Last::Failed),
         (UNFINISHED, Last::Unfinished),
     ] {
         let exe = script(&format!("exit-{code}"), format!("exit {code}"));
@@ -894,7 +957,6 @@ fn each_subscriber_start_notes_exactly_its_causes() {
     assert!(!due.poll(unfinished, AWAY, Last::Unfinished));
     assert!(due.poll(unfinished + 2 * FIRST_RETRY_MS, AWAY, Last::None));
     assert_eq!(caused(&due), Causes::RETRY_UNFINISHED);
-    assert_eq!(due.note().held, 0);
 
     // Identity's own retry and the runner's come due together after a failed pass that
     // carried identity debt.
@@ -929,73 +991,126 @@ fn each_subscriber_start_notes_exactly_its_causes() {
     assert_eq!(caused(&due), causes([Causes::RECHECK, Causes::RETRY_WAVE]));
 }
 
-/// A START THAT FOUND THE LOCK HELD IS COUNTED ON THE PASS THAT FOLLOWS IT, WHICH NAMES WHAT
-/// IT WAS FIRST OWED FOR: after the first start (`start`, `recheck`, the mark moved by the
-/// index in one look), a held runner, a config move and the 5 s retry give `{start, recheck,
-/// retry-held}` with `held == 1`, the CPU its reap measured, the 5 s waited and both classes
-/// in two looks; a second held runner gives `held == 2`, both runners' CPU and the time since
-/// the first, and keeps both classes; a runner that ran zeroes all of it. No start's pacing
-/// moves: the starts are at the times the retry gave before.
-/// NEGATIVE CONTROLS: a held reap that sets no retry cause gives `{start, recheck}` without
-/// `retry-held`; a held reap that does not put the held start's causes back gives
-/// `{retry-held}` alone; one that does not put its classes back gives `config` in one look.
-#[test]
-fn a_held_start_is_counted_and_keeps_its_causes_for_the_pass_that_follows() {
-    use std::time::Duration;
-    let owed = causes([Causes::START, Causes::RECHECK, Causes::RETRY_HELD]);
-    let both = MarkMoved::INDEX.with(MarkMoved::CONFIG);
+/// The subscriber's starter over a ten-minute hold of `align.lock`, looked at every second
+/// while an input look asks for a repair each minute: how many runners of `runner` it started,
+/// with the starter and the runner it keeps at the end. A runner that `ends_at_once` is let end
+/// before the next look, so its end is read there as the live starter reads it; one that waits
+/// for the lock still runs at every look.
+#[cfg(target_vendor = "apple")]
+fn ten_minutes_held(runner: &Path, ends_at_once: bool) -> (usize, Due, Option<Child>) {
     let mut due = Due::default();
-    due.because_moved(MarkMoved::INDEX, 1);
-    assert!(due.at_start(0, HOME, Last::None));
-    assert_eq!(
-        due.note(),
-        StartNote {
-            causes: causes([Causes::START, Causes::RECHECK]),
-            moved: MarkMoved::INDEX,
-            moves: 1,
-            ..StartNote::default()
+    let mut child: Option<Child> = None;
+    let mut ended = None;
+    let mut starts = 0;
+    for second in 0..=10 * 60 {
+        let at = second * 1000;
+        let last = ended.take().unwrap_or_else(|| Last::of(&mut child));
+        let starting = if second == 0 {
+            due.at_start(at, HOME, last)
+        } else {
+            if at % MINUTE == 0 {
+                due.request(RepositoryRequest::Repair);
+            }
+            due.poll(at, HOME, last)
+        };
+        if starting {
+            child = Some(start(runner, SUBSCRIBER, due.repository_work()).expect("start a runner"));
+            starts += 1;
+            if ends_at_once {
+                ended = Some(runner_ended(&mut child, "a runner that does not wait ends"));
+            }
         }
-    );
-    due.held_spent(Duration::from_millis(30));
-    assert!(!due.poll(1000, HOME, Last::Held));
-    due.because_moved(MarkMoved::CONFIG, 1);
-    assert!(!due.poll(1000 + FIRST_RETRY_MS - 1, HOME, Last::None));
-    assert!(due.poll(1000 + FIRST_RETRY_MS, HOME, Last::None));
+    }
+    (starts, due, child)
+}
+
+/// How `child` ended, once it has: a one-minute hang detector on its progress, not a budget.
+#[cfg(target_vendor = "apple")]
+fn runner_ended(child: &mut Option<Child>, what: &str) -> Last {
+    let pid = child.as_ref().expect("a runner").id();
+    aterm_spec::wait::until_while_working(pid, what, || match Last::of(child) {
+        Last::Running => None,
+        last => Some(last),
+    })
+}
+
+/// WHILE ANOTHER PROCESS HOLDS THE PASS'S LOCK, A STARTER STARTS NO FURTHER RUNNER: a runner
+/// that waits for `align.lock` in the kernel, as one a starter started does
+/// (`aterm_machines::sync::wait_lock`; here `lockf`, which takes the same BSD lock on the same
+/// file), reads as running for as long as another holds the lock. So the subscriber's starter,
+/// looked at every second over a ten-minute hold while an input look asks for a repair each
+/// minute, starts none after its first. Once the holder lets go, that runner takes the lock and
+/// ends, and the starter starts exactly one more for the repairs owed meanwhile, which finds the
+/// lock free and ends at once; nothing follows it.
+/// NEGATIVE CONTROL, run here: the same ten minutes with a runner that ends at once for the held
+/// lock (`lockf -t 0` exits [`HELD`], 75, as every runner did before started ones waited). The
+/// starter reads that end as a failure, so 17 runners start where the waiting one's 1 is wanted:
+/// the first at 0 s, its retries on the failed backoff (5 s doubling) at 6, 17, 38, 79, 160 and
+/// 321 s, and one for each minute's repair. Before, [`Last::of`] read exit 75 as
+/// [`Last::Held`], and the starter restarted the runner five seconds after each such end, with
+/// no backoff.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn while_another_process_holds_align_lock_a_starter_starts_no_further_runner() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let converge = scratch.path().join("converge");
+    aterm_uds::private_file::ensure_private_dir(&converge).expect("a private folder");
+    let holder = aterm_uds::private_file::PrivateLock::take(
+        &converge,
+        "align.lock",
+        std::time::Duration::ZERO,
+        "held by the test",
+    )
+    .expect("the lock is free");
+    let stand_in = |path: &str| aterm_uds::deadline::stand_in(Path::new(path));
+    let runner = |name: &str, lockf_flags: &str| {
+        let path = scratch.path().join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!{}\nexec {} {lockf_flags} {} {}\n",
+                stand_in("/bin/sh").display(),
+                stand_in("/usr/bin/lockf").display(),
+                converge.join("align.lock").display(),
+                stand_in("/usr/bin/true").display()
+            ),
+        )
+        .expect("the runner");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("executable");
+        path
+    };
+    let tries_once = runner("tries-once", "-k -t 0");
+    let waits = runner("waits", "-k");
+
+    let (starts, _, _) = ten_minutes_held(&tries_once, true);
     assert_eq!(
-        due.note(),
-        StartNote {
-            causes: owed,
-            held: 1,
-            held_cpu_ms: 30,
-            waited_ms: FIRST_RETRY_MS,
-            moved: both,
-            moves: 2,
-        }
+        starts, 17,
+        "a runner that ends at once for the held lock: 7 on the failed backoff, 10 for repairs"
     );
-    due.held_spent(Duration::from_millis(12));
-    assert!(!due.poll(7000, HOME, Last::Held));
-    assert!(due.poll(7000 + FIRST_RETRY_MS, HOME, Last::None));
+
+    let (starts, mut due, mut child) = ten_minutes_held(&waits, false);
     assert_eq!(
-        due.note(),
-        StartNote {
-            causes: owed,
-            held: 2,
-            held_cpu_ms: 42,
-            waited_ms: 11_000,
-            moved: both,
-            moves: 2,
-        }
+        starts, 1,
+        "a runner waiting for the lock is the starter's one"
     );
-    assert_eq!(
-        due.note().word(),
-        "c=start+recheck+retry-held,h=2,hc=42,w=11000,m=config+index,n=2"
+    drop(holder);
+    let last = runner_ended(
+        &mut child,
+        "the runner takes the lock once it is let go and ends",
     );
-    assert!(due.after_pass(&applied(), 20_000, HOME, Last::Ended));
-    assert_eq!(
-        due.note(),
-        StartNote {
-            causes: Causes::APPLIED,
-            ..StartNote::default()
-        }
+    assert_eq!(last, Last::Ended);
+    assert!(
+        due.poll(601_000, HOME, last),
+        "its end starts the repair owed meanwhile"
     );
+    assert_eq!(due.repository_work(), RepositoryWork::Repair);
+    let mut second = Some(start(&waits, SUBSCRIBER, due.repository_work()).expect("a runner"));
+    let mut last = runner_ended(&mut second, "a runner finding the lock free ends at once");
+    assert_eq!(last, Last::Ended);
+    for at in [601_001, 601_000 + FIRST_RETRY_MS, 20 * MINUTE] {
+        assert!(!due.poll(at, HOME, last), "nothing more is owed at {at}");
+        last = Last::of(&mut second);
+    }
 }

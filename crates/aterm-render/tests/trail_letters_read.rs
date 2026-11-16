@@ -1883,11 +1883,11 @@ pub fn worst(judged: &[Judged]) -> Option<(u64, Letter)> {
         .min_by(|a, b| a.1.judged().total_cmp(&b.1.judged()))
 }
 
-pub const STYLES: [&str; 17] = [
+/// Every trail style a setting selects, and one row for each ribbon body only a seam lays
+/// (`EffectsPipeline::set_ribbon_shape`): the underline and the flat body, each beside the cat.
+pub const STYLES: [&str; 15] = [
     "rainbow + cat",
     "underline rainbow + cat",
-    "underline rainbow + dog",
-    "underline rainbow",
     "rainbow + dog",
     "flat rainbow + cat",
     "rainbow",

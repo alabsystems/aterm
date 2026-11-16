@@ -300,6 +300,8 @@ pub(crate) enum Mutant {
     DeliverPastAStandingEntry,
     /// A fetch (`inbox get @<off>`) hands a session an own record whose in-flight entry stands (`Bridge::fetch_record`).
     FetchPastAStandingEntry,
+    /// A fetch hands an answer, or this node's `expired`, leaving the deadline it settles standing (`Bridge::fetch_record`).
+    FetchLeavesTheDeadline,
     /// An own record whose in-flight entry stands for aterm's drain drops the broker link, as
     /// every build before ATERM-KI-1111-3 did, where the bridge holds it alone
     /// (`Bridge::hold_record`).
@@ -415,7 +417,7 @@ pub(crate) enum Mutant {
     /// handed to the asker after the `expired`.
     SweepIgnoresQueuedAnswers,
     /// A refused post's later entries leave the in-flight journal lowest sequence first
-    /// (`Bridge::drop_behind_a_refused_post`), as every build before ATERM-KI-1114-56: a stop
+    /// (`Bridge::drop_behind_a_failed_post`), as every build before ATERM-KI-1114-56: a stop
     /// after the first drop leaves later entries the replay publishes ahead of the dropped
     /// post's send from the drain, out of its sender's order.
     DropBehindLowestFirst,
@@ -437,6 +439,21 @@ pub(crate) enum Mutant {
     /// none, with that one's answer unread (`Bridge::settle_unjournaled_ahead`): a kill leaves
     /// the entry, the attach's replay lands it, and that post's retry lands behind it.
     EntryAheadOfAPostWithNone,
+    /// A drain pass's group of fresh own-lane posts is sent ahead of the one append that
+    /// reserves them and journals their entries (ATERM-KI-1111-5, `Bridge::flush_post_group`):
+    /// a kill between leaves a publish on the bus that no reservation names, and the next drain
+    /// takes the post afresh at a new sequence and lands it again.
+    GroupSentAheadOfItsAppend,
+    /// The checks that read what is owed leave a drain pass's staged group out
+    /// (ATERM-KI-1111-5, `Bridge::owes_or_stages`): a post is pinned and grouped behind a staged
+    /// post of its sender's in the same words, or, against a broker that does not gap-fence,
+    /// behind a staged post of its sender's at all.
+    GroupedPostsUnowed,
+    /// A refusal read before a group's later burst drops no entry of its sender's posts the
+    /// group journaled and no burst has written yet (ATERM-KI-1111-5's review,
+    /// `Bridge::unwritten_behind`): a kill before the loop reaches them leaves their
+    /// entries, and the attach's replay lands them ahead of the refused post's retry.
+    UnwrittenGroupKeepsItsEntries,
     /// An attach takes its incarnation before it takes a stop's hand-off's files into the
     /// journal, as before item F4 (`StateDir::name_attach_in_posts`): one that stops between
     /// the two leaves the hand-off's heads stale for the next attach, whose replay publishes each
@@ -526,6 +543,14 @@ pub(crate) enum Mutant {
     /// a session was handed another record at that offset, on another lane or on a log since
     /// retired. A found seed pins the receipt law's reading.
     AnswerHandedByOffset,
+    /// NOT A BRIDGE RULE: THE DEADLINE LAW'S OWN, as it first read fetches (ATERM-KI-1115-9210):
+    /// an answer a session read by a fetch counts as handed below an `expired`
+    /// ([`World::judge_expiries`]) whatever log replaced the one it was read on, one that gave up
+    /// the ask it names included. A broker power loss ([`World::broker_stop`], `Stop::PowerLoss`)
+    /// that gave up the answer and the ask it named, and another ask landing at that offset, then
+    /// has the new ask's `expired` judged past an answer to the old one. A found seed pins the
+    /// law's reading.
+    FetchReadOnEveryLog,
     /// Every presence row reads its session's screen (`@<sid> text --json`) as it is published,
     /// as before critic item D03 (`Bridge::publish_session_presence`). Its control is a bridge
     /// unit test on the scripted verb lane
@@ -1058,7 +1083,7 @@ impl Opts {
 }
 
 /// What one run found.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Outcome {
     pub(crate) seed: u64,
     pub(crate) tier: Tier,
@@ -1162,6 +1187,10 @@ pub(crate) struct Stats {
     pub(crate) clean_stops: u64,
     /// Kills that met the bridge holding an inbox commit for its next write (critic item B08).
     pub(crate) kills_holding: u64,
+    /// Kills between a drain group's one append and its first write, and between a write of a
+    /// group's posts and their acks (ATERM-KI-1111-5, `Bridge::killed_inside_a_group`).
+    pub(crate) kills_group_appended: u64,
+    pub(crate) kills_group_unacked: u64,
     /// RETENTION (sim item B05): ticks the broker took, cuts that moved its base, records
     /// given up, fetches refused `retained-from=`, gap notices a tail was told and `link
     /// gap` lines aterm was, days passed at once, opens that set no rules, opens that set
@@ -1455,11 +1484,6 @@ struct World {
     /// `(asker, the answer's offset, the expiry's)`, honest once aterm was told a range of the
     /// asker's lane holding the answer ([`World::check_settled`]).
     expired_over_given_up: Vec<(String, u64, u64)>,
-    /// THE ORACLE'S: each `ack` or `expired` a session read by a fetch (`inbox get @<off>`):
-    /// `(its sid, the offset, the kind, the ask it names, what its `from=` names before any
-    /// `@`: the answer's sender, or the node for an `expired`)`. A fetch answer leaves no row,
-    /// so [`holds_answer`] reads these beside the rows.
-    read_by_fetch: BTreeSet<(String, u64, String, u64, String)>,
     /// `(asker, ask)` of every verdict on an asker's lane (an answer, an `expired`) a broker
     /// stop took with the acked records past what it kept ([`World::broker_stop`]).
     verdicts_lost: BTreeSet<(String, u64)>,
@@ -1514,17 +1538,15 @@ fn sender(src: &str, body: &Body) -> String {
     }
 }
 
-/// A subject of mail on this node's lanes, `/f/<F>/in/<node>/<sid>/<src>/<kind>`: `(sid, src,
-/// kind)`.
 /// WHETHER `asker` HOLDS THE COPY AT `off` OF AN ANSWER: a row of one of its sessions at that
 /// offset that is this answer, of `kind`, naming the ask at `re` and, where `from` names one,
-/// from that sender, or the same answer read by a fetch there (`read_by_fetch`). A row at the
-/// offset of another kind, another ask's or another sender's is another record. A row names no
-/// log, so the same answer to an ask at the same offset, at the same offset of a log since
-/// retired, still counts: the law errs toward a violation there, never past one.
+/// from that sender, or the same answer read by a fetch there
+/// ([`super::endpoint::Session::read_by_fetch`]). A row at the offset of another kind, another
+/// ask's or another sender's is another record. It counts a row or a read off the log the
+/// endpoint was last told too, so the same answer to an ask at the same offset of a log since
+/// retired still counts: the law errs toward a violation there, never past one.
 fn holds_answer(
     s: &EpState,
-    read_by_fetch: &BTreeSet<(String, u64, String, u64, String)>,
     asker: &str,
     off: u64,
     kind: &str,
@@ -1536,18 +1558,20 @@ fn holds_answer(
         .values()
         .chain(s.gone.iter())
         .filter(|session| session.sid == asker)
-        .flat_map(|session| session.rows.iter())
-        .any(|row| {
-            row.off == off
-                && row.kind == kind
-                && row.re == Some(re)
-                && sender(row.from.split('@').next().unwrap_or(""))
-        })
-        || read_by_fetch.iter().any(|(sid, at, k, r, by)| {
-            sid == asker && *at == off && k == kind && *r == re && sender(by)
+        .any(|session| {
+            session.rows.iter().any(|row| {
+                row.off == off
+                    && row.kind == kind
+                    && row.re == Some(re)
+                    && sender(row.from.split('@').next().unwrap_or(""))
+            }) || session.read_by_fetch.iter().any(|read| {
+                read.off == off && read.kind == kind && read.re == re && sender(&read.from)
+            })
         })
 }
 
+/// A subject of mail on this node's lanes, `/f/<F>/in/<node>/<sid>/<src>/<kind>`: `(sid, src,
+/// kind)`.
 fn in_lane(subject: &str) -> Option<(&str, &str, &str)> {
     let rest = subject
         .strip_prefix("/f/")?
@@ -1730,7 +1754,6 @@ impl World {
             asks: BTreeMap::new(),
             expiries_judged: BTreeSet::new(),
             expired_over_given_up: Vec::new(),
-            read_by_fetch: BTreeSet::new(),
             verdicts_lost: BTreeSet::new(),
             say_rng: Rng::new(seed ^ 0x05a7_7091_c5f4_0b0b),
             says: BTreeMap::new(),
@@ -2080,8 +2103,11 @@ impl World {
                 live.process.kill();
             }
             Err(payload) => {
-                if payload.is::<SimKill>() && live.bridge.holds_inbox_commit() {
-                    self.stats.kills_holding += 1;
+                if payload.is::<SimKill>() {
+                    if live.bridge.holds_inbox_commit() {
+                        self.stats.kills_holding += 1;
+                    }
+                    self.count_group_kill(&live.bridge);
                 }
                 let process = Arc::clone(&live.process);
                 drop(live);
@@ -2090,11 +2116,19 @@ impl World {
         }
     }
 
+    /// A kill that met `bridge` inside a drain group ([`Stats::kills_group_appended`]).
+    fn count_group_kill(&mut self, bridge: &Bridge) {
+        let (appended, unacked) = bridge.killed_inside_a_group();
+        self.stats.kills_group_appended += u64::from(appended);
+        self.stats.kills_group_unacked += u64::from(unacked);
+    }
+
     /// Kill the bridge now (a `kill -9` between two of its steps).
     fn kill(&mut self) {
         if let Some(live) = self.live.take() {
             self.note(format!("kill pid={} now", live.process.pid));
             self.stats.kills_holding += u64::from(live.bridge.holds_inbox_commit());
+            self.count_group_kill(&live.bridge);
             live.process.kill();
             drop(live);
             self.stats.kills += 1;
@@ -2325,19 +2359,6 @@ impl World {
                     continue; // one chunk of a body cut in lines: the world's are a marker each
                 }
                 self.stats.fetched += 1;
-                if let (Some(kind @ ("ack" | "expired")), Some(re), Some(from)) = (
-                    word("kind"),
-                    word("re").and_then(crate::parse_uint::<u64>),
-                    word("from").and_then(|f| f.split('@').next()),
-                ) {
-                    self.read_by_fetch.insert((
-                        sid.clone(),
-                        off,
-                        kind.to_string(),
-                        re,
-                        from.to_string(),
-                    ));
-                }
                 let text = word("text").map(crate::pct::decode);
                 match &at {
                     Some(held) if Some(Body::decode(&held.body).0.text) == text => {
@@ -2473,20 +2494,38 @@ impl World {
                     self.expired_over_given_up.push((asker.to_string(), a, e));
                 }
             }
+            let every_log = self.opts.mutants.contains(&Mutant::FetchReadOnEveryLog);
             let s = lock(&self.ep.state);
+            // A row of the log the endpoint was last told (an offset of a log since replaced
+            // names another record), or an answer the asker read by a fetch, which leaves none
+            // (ATERM-KI-1115-9210), while the ask it names stands: below the `expired`, or read
+            // before a fork took its own offset. A row keeps its own offset's reading: its
+            // `on_log` is the inbox floor's too.
             let handed = s
                 .sessions
                 .values()
                 .chain(s.gone.iter())
                 .filter(|x| x.sid == asker)
-                .flat_map(|x| x.rows.iter())
-                .find(|row| {
-                    row.on_log
-                        && row.off < e
-                        && row.re == Some(re)
-                        && ANSWER_KINDS.contains(&row.kind.as_str())
-                })
-                .map(|row| row.off);
+                .find_map(|x| {
+                    let answers = |kind: &str| ANSWER_KINDS.contains(&kind);
+                    x.rows
+                        .iter()
+                        .find(|row| {
+                            row.re == Some(re) && row.on_log && row.off < e && answers(&row.kind)
+                        })
+                        .map(|row| row.off)
+                        .or_else(|| {
+                            x.read_by_fetch
+                                .iter()
+                                .find(|read| {
+                                    read.re == re
+                                        && (read.ask_on_log || every_log)
+                                        && (read.off_replaced || read.off < e)
+                                        && answers(&read.kind)
+                                })
+                                .map(|read| read.off)
+                        })
+                });
             drop(s);
             if let Some(a) = handed {
                 bad.push(format!(
@@ -2529,7 +2568,7 @@ impl World {
                     .chain(s.gone.iter())
                     .any(|x| x.rows.iter().any(|r| r.on_log && r.off == off));
             }
-            holds_answer(&s, &self.read_by_fetch, asker, off, "expired", re, None)
+            holds_answer(&s, asker, off, "expired", re, None)
         };
         copies
             .into_iter()
@@ -4401,7 +4440,8 @@ impl World {
         // `ack` from its sender naming the same ask. Another session's row at the offset, of
         // another lane, is another record (seed 921 of `lossy_keyed` at 1200 steps: the answer
         // at @21 went unread with a cut and landed again at @41, and sessions long gone held
-        // notes at @21 of logs since retired).
+        // notes at @21 of logs since retired; found there, the sim's row pins seed 2984 since
+        // grouped sends moved the schedule).
         let gone = self.core.broker.gone();
         let by_offset = self.opts.mutants.contains(&Mutant::AnswerHandedByOffset);
         let handed = |off: u64, re: u64, from: &str| {
@@ -4415,9 +4455,7 @@ impl World {
             by_off
                 .get(&off)
                 .and_then(|subject| in_lane(subject))
-                .is_some_and(|(asker, _, _)| {
-                    holds_answer(&s, &self.read_by_fetch, asker, off, "ack", re, Some(from))
-                })
+                .is_some_and(|(asker, _, _)| holds_answer(&s, asker, off, "ack", re, Some(from)))
         };
         for ((re, from), offs) in answers {
             let once_given = offs.split_last().is_some_and(|(_, older)| {

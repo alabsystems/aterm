@@ -1050,13 +1050,19 @@ fn failed_append_is_deferred_and_a_later_exact_retry_is_acknowledged() {
     let wire = lab.genesis.bytes().to_vec();
     let locked = lab.journal(0);
     let mut script = offer(std::slice::from_ref(&wire));
-    assert_eq!(receive_batch(&mut script, &store).unwrap(), (0, 1));
+    assert_eq!(
+        receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
+        (0, 1)
+    );
     assert_eq!(script.output[32], 0);
     assert_eq!(locked.inventory().count(), 0);
     drop(locked);
     for _ in 0..2 {
         let mut script = offer(std::slice::from_ref(&wire));
-        assert_eq!(receive_batch(&mut script, &store).unwrap(), (1, 0));
+        assert_eq!(
+            receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
+            (1, 0)
+        );
         assert_eq!(
             script.output,
             [Sha256::digest(&wire).as_slice(), &[1]].concat()
@@ -1162,7 +1168,10 @@ fn network_reads_and_writes_never_own_the_journal_lock() {
         dir: &path,
         trust: lab.trust,
     };
-    assert_eq!(receive_batch(&mut stream, &store).unwrap(), (1, 0));
+    assert_eq!(
+        receive_batch(&mut stream, &store, RECORDS_PER_ROUND).unwrap(),
+        (1, 0)
+    );
     assert_eq!(lab.journal(0).inventory().count(), 1);
 }
 
@@ -1186,7 +1195,7 @@ fn missing_channel_proof_and_invalid_signatures_do_not_touch_storage() {
     *corrupt.last_mut().unwrap() ^= 1;
     let mut stream = offer(&[corrupt]);
     assert_eq!(
-        receive_batch(&mut stream, &Disk::new(&path, lab.trust)).unwrap(),
+        receive_batch(&mut stream, &Disk::new(&path, lab.trust), RECORDS_PER_ROUND).unwrap(),
         (0, 1)
     );
     assert!(
@@ -1327,7 +1336,10 @@ fn one_bad_record_does_not_block_other_signed_records_in_the_batch() {
     *bad.last_mut().unwrap() ^= 1;
     let node = lab.update(lab.genesis.id(), b"independent-valid-arrival", &[]);
     let mut script = offer(&[bad, node.bytes().to_vec(), lab.genesis.bytes().to_vec()]);
-    assert_eq!(receive_batch(&mut script, &store).unwrap(), (2, 1));
+    assert_eq!(
+        receive_batch(&mut script, &store, RECORDS_PER_ROUND).unwrap(),
+        (2, 1)
+    );
     assert_eq!(script.output[32], 0);
     assert_eq!(script.output[65], 1);
     assert_eq!(script.output[98], 1);
@@ -1379,15 +1391,15 @@ fn hostile_framing_is_bounded_and_receipts_require_exact_identity() {
     let store = Disk::new(&path, lab.trust);
     let wire = lab.genesis.bytes().to_vec();
     let mut duplicate = offer(&[wire.clone(), wire.clone()]);
-    assert!(receive_batch(&mut duplicate, &store).is_err());
+    assert!(receive_batch(&mut duplicate, &store, RECORDS_PER_ROUND).is_err());
     assert!(duplicate.output.is_empty());
     assert_eq!(lab.journal(0).inventory().count(), 0);
     let mut huge = offer(&[]);
     huge.input = Cursor::new(u32::MAX.to_le_bytes().to_vec());
-    assert!(receive_batch(&mut huge, &store).is_err());
+    assert!(receive_batch(&mut huge, &store, RECORDS_PER_ROUND).is_err());
     let mut short = offer(std::slice::from_ref(&wire));
     short.input.get_mut().pop();
-    assert!(receive_batch(&mut short, &store).is_err());
+    assert!(receive_batch(&mut short, &store, RECORDS_PER_ROUND).is_err());
     assert_eq!(lab.journal(0).inventory().count(), 0);
     for response in [
         vec![0; 33],
@@ -1651,7 +1663,7 @@ fn failed_pre_authentication_connected_round_clears_previous_round_state() {
 #[test]
 fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
     use aterm_secrets::client::{Paths, load_records, save_records};
-    use aterm_secrets::membership_log::{Body, Entrant, Evidence, Log, Record, encode_records};
+    use aterm_secrets::membership_log::{Body, Entrant, Evidence, Log, Record, read_records};
 
     let lab = Lab::new();
     {
@@ -1750,10 +1762,10 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
 
     save_records(
         &paths0,
-        &encode_records([&genesis, &admit_two, &name_two, &orphan_waiting]),
+        &read_records([&genesis, &admit_two, &name_two, &orphan_waiting]).unwrap(),
     )
     .unwrap();
-    save_records(&paths1, &encode_records([&genesis, &admit_three])).unwrap();
+    save_records(&paths1, &read_records([&genesis, &admit_three]).unwrap()).unwrap();
 
     // Negative control: a record founded for another Commons root is refused by `retain_records_for_commons`.
     let (_, _, _, foreign_e) = mk_entrant(9, "m9", [0xee; 16], lab.trust.authority);
@@ -1765,7 +1777,7 @@ fn commons_control_repairs_membership_records_and_tolerates_legacy_peers() {
             &paths_foreign,
             lab.trust.network,
             lab.trust.authority,
-            &[foreign_genesis.bytes().to_vec()],
+            &[foreign_genesis.wire_bytes().unwrap().to_vec()],
         )
         .unwrap(),
         vec![false]
@@ -2198,7 +2210,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
 
     let genesis_out = root.path().join("f18.genesis");
     test_sign_genesis(&m1, &genesis_out, &created.signer).expect("sign genesis");
-    let seeded_records = load_records(&m1).unwrap().encode();
+    let seeded_records = load_records(&m1).unwrap().read_encoded().unwrap();
     for p in [&m2, &m3, &m4] {
         save_records(p, &seeded_records).unwrap();
     }
@@ -2247,7 +2259,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
         label: "m5".to_owned(),
     };
     admit_member_in_log(&m2, entrant5, Evidence::Phrase).expect("non-admin m2 admits m5");
-    save_records(&m5, &load_records(&m2).unwrap().encode()).unwrap();
+    save_records(&m5, &load_records(&m2).unwrap().read_encoded().unwrap()).unwrap();
     pair_commons(&m2, &cfg2, &m5, &cfg5, 2);
     push(&m2, &cfg2, &m1, &cfg1);
 
@@ -2337,7 +2349,11 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
             Evidence::Phrase,
         )
         .expect("m3 signs Admit for m_sybil on its stale log");
-        save_records(&m_sybil, &load_records(&m3).unwrap().encode()).unwrap();
+        save_records(
+            &m_sybil,
+            &load_records(&m3).unwrap().read_encoded().unwrap(),
+        )
+        .unwrap();
         let b_sybil = Bootstrap::required(&m_sybil).unwrap();
         let cfg_sybil = root.path().join("c-sybil.toml");
         let e_sybil = Endpoint::from_bootstrap(&b_sybil)
@@ -2379,7 +2395,7 @@ fn two_islands_admit_and_remove_then_tables_continue_after_the_heal() {
     }
     // Once `m3` receives the log records, its local custody, `Session`, and table writes are
     // refused too.
-    save_records(&m3, &load_records(&m4).unwrap().encode()).unwrap();
+    save_records(&m3, &load_records(&m4).unwrap().read_encoded().unwrap()).unwrap();
     assert!(Bootstrap::cached(&m3).unwrap().is_none());
     assert!(Bootstrap::required(&m3).is_err());
     assert!(
@@ -2589,7 +2605,7 @@ fn multi_round_membership_sync_sends_seats_and_parents_before_children_regardles
         age::Identity,
         client::{Paths, load_records, retain_records_for_commons, save_records},
         commons::binding::Request as BindRequest,
-        membership_log::{Body, Entrant, Evidence, Founder, Log, Record, Root, encode_records},
+        membership_log::{Body, Entrant, Evidence, Founder, Log, Record, Root, read_records},
     };
     use std::os::unix::net::UnixStream;
 
@@ -2678,8 +2694,12 @@ fn multi_round_membership_sync_sends_seats_and_parents_before_children_regardles
     }
 
     let sender_records: Vec<Record> = log.records().cloned().collect();
-    save_records(&sender, &encode_records(&sender_records)).unwrap();
-    save_records(&receiver, &encode_records(std::slice::from_ref(&genesis))).unwrap();
+    save_records(&sender, &read_records(&sender_records).unwrap()).unwrap();
+    save_records(
+        &receiver,
+        &read_records(std::slice::from_ref(&genesis)).unwrap(),
+    )
+    .unwrap();
 
     let sender_disk = MembershipDisk::new(&sender, trust);
     let receiver_disk = MembershipDisk::new(&receiver, trust);
@@ -2697,7 +2717,11 @@ fn multi_round_membership_sync_sends_seats_and_parents_before_children_regardles
     );
     let digest_wires = sender_disk.batch(&digest_ids).unwrap();
     let neg_dir = Paths::for_home(&tmp.path().join("neg-receiver"));
-    save_records(&neg_dir, &encode_records(std::slice::from_ref(&genesis))).unwrap();
+    save_records(
+        &neg_dir,
+        &read_records(std::slice::from_ref(&genesis)).unwrap(),
+    )
+    .unwrap();
     let neg_acks = retain_records_for_commons(&neg_dir, network, authority, &digest_wires).unwrap();
     assert!(
         neg_acks.iter().all(|&ack| !ack),
@@ -2798,8 +2822,8 @@ fn a_converged_membership_exchange_reads_the_records_file_once_per_side() {
         authority,
         genesis: *genesis.id(),
     };
-    save_records(&a, genesis.bytes()).unwrap();
-    save_records(&b, genesis.bytes()).unwrap();
+    save_records(&a, genesis.wire_bytes().unwrap().as_ref()).unwrap();
+    save_records(&b, genesis.wire_bytes().unwrap().as_ref()).unwrap();
 
     let side = |stream: &mut UnixStream, paths: &Paths, side: Side| {
         let disk = MembershipDisk::new(paths, trust);
@@ -2854,7 +2878,7 @@ fn full_stores_at_legacy_bound(budgets: aterm_secrets::membership_log::RecordBud
         age::Identity,
         client::{Paths, load_records, save_records},
         commons::binding::Request as BindRequest,
-        membership_log::{Body, Founder, LEGACY_RECORDS, Log, Record, Root, encode_records},
+        membership_log::{Body, Founder, LEGACY_RECORDS, Log, Record, Root, read_records},
     };
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
@@ -2908,7 +2932,7 @@ fn full_stores_at_legacy_bound(budgets: aterm_secrets::membership_log::RecordBud
             log.insert(record).unwrap();
         }
         let records: Vec<Record> = log.records().cloned().collect();
-        save_records(paths, &encode_records(&records)).unwrap();
+        save_records(paths, &read_records(&records).unwrap()).unwrap();
         assert_eq!(
             load_records(paths).unwrap().complete_inventory().len(),
             LEGACY_RECORDS
@@ -2978,7 +3002,7 @@ fn a_peer_busy_for_one_round_takes_every_record_on_the_next_pass() {
     use aterm_secrets::{
         client::{Paths, load_records, save_records},
         commons::binding::Request as BindRequest,
-        membership_log::{Body, Founder, Log, Record, Root, encode_records},
+        membership_log::{Body, Founder, Log, Record, Root, read_records},
     };
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::Ordering;
@@ -3024,8 +3048,8 @@ fn a_peer_busy_for_one_round_takes_every_record_on_the_next_pass() {
         log.insert(record).unwrap();
     }
     let records: Vec<Record> = log.records().cloned().collect();
-    save_records(&a, &encode_records(&records)).unwrap();
-    save_records(&b, genesis.bytes()).unwrap();
+    save_records(&a, &read_records(&records).unwrap()).unwrap();
+    save_records(&b, genesis.wire_bytes().unwrap().as_ref()).unwrap();
     let held = load_records(&a).unwrap().complete_inventory();
 
     // One pass each way at `now`, with each side's hint kept across passes, while `b` takes
@@ -3331,11 +3355,9 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
             })
             .expect("restore m2 via Log::admit");
         store1
-            .ingest(&aterm_secrets::membership_log::encode_records(
-                &restored_recs,
-            ))
+            .ingest(&aterm_secrets::membership_log::read_records(&restored_recs).unwrap())
             .unwrap();
-        save_records(&m1, &store1.encode()).unwrap();
+        save_records(&m1, &store1.read_encoded().unwrap()).unwrap();
     }
 
     remove_member_in_log(&m1, actor_m4).expect("remove m4 so node key 0x77 is Removed");
@@ -3385,10 +3407,13 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
     );
 
     let mut store_all = store1.clone();
-    let _ = store_all.ingest(&aterm_secrets::membership_log::encode_records(
-        &log_with_node.records().cloned().collect::<Vec<_>>(),
-    ));
-    let encoded_all = store_all.encode();
+    let _ = store_all.ingest(
+        &aterm_secrets::membership_log::read_records(
+            &log_with_node.records().cloned().collect::<Vec<_>>(),
+        )
+        .unwrap(),
+    );
+    let encoded_all = store_all.read_encoded().unwrap();
     save_records(&m1, &encoded_all).unwrap();
     save_records(&m2, &encoded_all).unwrap();
 
@@ -3400,7 +3425,7 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
     let peer_log = check_log_witness(
         trust,
         &req2,
-        &aterm_secrets::membership_log::encode_records(witness2.records()),
+        &aterm_secrets::membership_log::read_records(witness2.records()).unwrap(),
     )
     .expect("restored + node-rotated member witness must pass check_log_witness");
     let ep2 = Endpoint::from_bootstrap(&b2)
@@ -3450,7 +3475,7 @@ fn log_witness_and_acx2_handle_restored_seats_rotated_node_keys_and_denied_write
 fn witness_prefixes(count: usize) -> (Trust, Request, Vec<Vec<u8>>) {
     use aterm_secrets::{
         age::Identity,
-        membership_log::{Body, Founder, Log, Record, Root, encode_records},
+        membership_log::{Body, Founder, Log, Record, Root, read_records},
     };
     let network = [0x41; 16];
     let authority = [0x42; 32];
@@ -3493,7 +3518,9 @@ fn witness_prefixes(count: usize) -> (Trust, Request, Vec<Vec<u8>>) {
         log.insert(name).unwrap();
     }
     let records: Vec<_> = log.records().cloned().collect();
-    let witnesses = (1..=count).map(|n| encode_records(&records[..n])).collect();
+    let witnesses = (1..=count)
+        .map(|n| read_records(&records[..n]).unwrap())
+        .collect();
     (trust, request, witnesses)
 }
 
@@ -3517,9 +3544,10 @@ fn witness_logs_decode_each_peer_once_round_robin_and_keep_the_hot_one() {
         for wire in &witnesses {
             let log = logs.check(trust, &request, wire).unwrap();
             assert_eq!(
-                aterm_secrets::membership_log::encode_records(
+                aterm_secrets::membership_log::read_records(
                     &log.records().cloned().collect::<Vec<_>>()
-                ),
+                )
+                .unwrap(),
                 *wire,
                 "a held log was handed out for other bytes"
             );
@@ -3802,3 +3830,33 @@ mod crossing_tests;
 
 #[path = "frontier_tests.rs"]
 mod frontier_tests;
+
+thread_local! {
+    /// The bytes each `atdb/8` range reconciliation on this thread wrote, in order
+    /// ([`super::reconcile`]): the control journal's, then the membership log's.
+    pub(crate) static RECONCILED: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Counts the bytes written through it ([`RECONCILED`]).
+pub(crate) struct Tally<'a, S> {
+    pub(crate) inner: &'a mut S,
+    pub(crate) written: usize,
+}
+
+impl<S: Read> Read for Tally<'_, S> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(out)
+    }
+}
+
+impl<S: Write> Write for Tally<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(bytes)?;
+        self.written += n;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}

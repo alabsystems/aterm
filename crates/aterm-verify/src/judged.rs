@@ -116,12 +116,44 @@ impl Place {
 
 pub fn command(root: &Path, args: &[&str]) -> Command {
     let mut cmd = crate::git_provider::command();
-    cmd.current_dir(root).args(args).env_remove("GITHUB_TOKEN");
+    // Journal selectors name exact stored paths, never caller-selected glob patterns.
+    cmd.current_dir(root)
+        .arg("--literal-pathspecs")
+        .args(args)
+        .env_remove("GITHUB_TOKEN");
+    for mode in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        cmd.env_remove(mode);
+    }
     cmd
 }
 
 pub fn deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60)
+}
+
+/// Reads, object assembly and compare-and-swap races share this admission deadline.
+/// An admitted mutation owns a separate work window and retains its owner through settlement.
+struct ReadBudget(std::time::Instant);
+
+struct MutationBudget(std::time::Instant);
+
+impl ReadBudget {
+    fn admit(&self, now: std::time::Instant) -> Result<MutationBudget, String> {
+        if now >= self.0 {
+            return Err("journal mutation not started: read and assembly budget expired".into());
+        }
+        if INTERRUPTIBLE.get() && crate::exec::group::taken().is_some() {
+            return Err("journal mutation not started: landing interrupted".into());
+        }
+        now.checked_add(agh::git::GRANT_MAX)
+            .map(MutationBudget)
+            .ok_or_else(|| "journal mutation work deadline overflow".into())
+    }
 }
 
 fn capture_until(
@@ -281,27 +313,29 @@ fn filed(
     under: &str,
     until: std::time::Instant,
 ) -> Result<Vec<(String, Record)>, String> {
-    let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
     let Some(head) = head else {
         return Ok(Vec::new());
     };
-    let listing = git(
-        root,
-        &[
-            "ls-tree",
-            "-r",
-            "--format=%(objectname) %(path)",
-            head,
-            under,
-        ],
+    let listing = output(
+        &mut command(
+            root,
+            &["ls-tree", "-r", "-z", "--full-tree", head, "--", under],
+        ),
+        None,
     )?;
     if listing.is_empty() {
         return Ok(Vec::new());
     }
-    let entries = listing
-        .lines()
-        .map(|line| line.split_once(' '))
+    let entries = journal_listing(listing.as_bytes())?
+        .map(|line| {
+            let (header, path) = line.split_once('\t')?;
+            let mut fields = header.split(' ');
+            match (fields.next(), fields.next(), fields.next(), fields.next()) {
+                (Some(_), Some(_), Some(object), None) => Some((object, path)),
+                _ => None,
+            }
+        })
         .collect::<Option<Vec<_>>>()
         .ok_or("invalid journal listing")?;
     let names: String = entries
@@ -682,7 +716,7 @@ fn node_of(edits: &[Edit]) -> Result<Node, String> {
 fn ls_tree(root: &Path, id: &str, until: std::time::Instant) -> Result<Entries, String> {
     let listing = output_until(&mut command(root, &["ls-tree", "-z", id]), None, until)?;
     let mut entries = Entries::new();
-    for record in listing.split('\0').filter(|record| !record.is_empty()) {
+    for record in journal_listing(listing.as_bytes())? {
         let invalid = || format!("invalid journal tree entry: {record:?}");
         let (head, name) = record.split_once('\t').ok_or_else(invalid)?;
         let mut fields = head.split(' ');
@@ -701,6 +735,18 @@ fn ls_tree(root: &Path, id: &str, until: std::time::Instant) -> Result<Entries, 
         );
     }
     Ok(entries)
+}
+
+/// Journal paths are UTF-8; preserve their bytes and require every Git record's terminator.
+fn journal_listing(bytes: &[u8]) -> Result<impl Iterator<Item = &str>, String> {
+    let listing = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
+    if !listing.is_empty() && !listing.ends_with('\0') {
+        return Err("unterminated journal tree listing".into());
+    }
+    if listing.split_terminator('\0').any(str::is_empty) {
+        return Err("empty record in journal tree listing".into());
+    }
+    Ok(listing.split_terminator('\0'))
 }
 
 /// Write the tree of `entries`: its id.
@@ -807,12 +853,13 @@ fn append_with(
     });
     let tree = edit_tree_with(parent, &edits, trees)?;
     let message = format!("verify watch: {} {}", record.state, record.commit);
-    publish(root, remote, parent, &tree, &message, until).map(|pushed| pushed.is_some())
+    publish(root, remote, parent, &tree, &message, until)
+        .map(|pushed| matches!(pushed, Appended::Holds(_)))
 }
 
 /// Commit `tree` over `parent` (none: the journal's first commit) and push it as the journal's
-/// head, a normal fast-forward that is the compare-and-swap: the commit, or `None` where a
-/// competing append moved the journal first.
+/// head, a normal fast-forward that is the compare-and-swap: the commit, or the imported head
+/// observed after a competing append moved the journal first.
 /// # Errors
 /// A local object or remote step failed, or the push was refused while the journal stayed at
 /// `parent`.
@@ -823,7 +870,7 @@ fn publish(
     tree: &str,
     message: &str,
     until: std::time::Instant,
-) -> Result<Option<String>, String> {
+) -> Result<Appended, String> {
     let started = std::time::Instant::now();
     let timed = |why| {
         format!(
@@ -848,7 +895,27 @@ fn publish(
         )
         .map_err(|why| format!("{tool:?} journal transport: {why}"))
     };
-    push_journal(root, remote, parent, &sha, &run).map_err(timed)
+    let admission = ReadBudget(until);
+    let write = |tool, args: &[std::ffi::OsString]| {
+        let MutationBudget(until) = admission.admit(std::time::Instant::now())?;
+        let scoped = INTERRUPTIBLE.get();
+        let watch = scoped.then(aterm_toolchain::interrupt::Watch::enter);
+        crate::remote::run_mutation(root, &git, tool, args, until, &mut || {
+            scoped
+                && (crate::exec::group::taken().is_some()
+                    || watch.as_ref().is_some_and(|watch| watch.caught().is_some()))
+        })
+        .map_err(|why| format!("{tool:?} journal mutation: {why}"))
+    };
+    push_journal(
+        root,
+        remote,
+        parent,
+        &sha,
+        &run,
+        crate::remote::WriteRunner(&write),
+    )
+    .map_err(timed)
 }
 
 fn push_journal(
@@ -857,7 +924,8 @@ fn push_journal(
     parent: Option<&str>,
     sha: &str,
     run: &crate::remote::Runner<'_>,
-) -> Result<Option<String>, String> {
+    write: crate::remote::WriteRunner<'_>,
+) -> Result<Appended, String> {
     let context = |why| {
         format!(
             "{why}; journal_ref={REF} journal_before={} journal_after={sha}",
@@ -865,8 +933,8 @@ fn push_journal(
         )
     };
     let remote = crate::remote::Remote::open(root, name, run).map_err(context)?;
-    let why = match remote.push(REF, parent, sha).map_err(context)? {
-        crate::remote::Pushed::Done => return Ok(Some(sha.to_owned())),
+    let why = match remote.push_with(write, REF, parent, sha).map_err(context)? {
+        crate::remote::Pushed::Done => return Ok(Appended::Holds(sha.to_owned())),
         crate::remote::Pushed::Rejected(why) => why,
         crate::remote::Pushed::Blocked { why, .. } | crate::remote::Pushed::Unsent(why) => {
             return Err(context(why));
@@ -881,7 +949,7 @@ fn push_journal(
         ))
     })?;
     if head.as_deref() != parent {
-        return Ok(None);
+        return Ok(Appended::Raced(head));
     }
     Err(context(why))
 }
@@ -1079,15 +1147,7 @@ fn blobs_under(
     dirs: &[String],
     until: std::time::Instant,
 ) -> Result<ReadBlobs, String> {
-    let mut args = vec![
-        "ls-tree",
-        "-r",
-        "-z",
-        "--full-tree",
-        "--format=%(objecttype) %(objectname) %(objectsize)%x09%(path)",
-        head,
-        "--",
-    ];
+    let mut args = vec!["ls-tree", "-r", "-z", "--full-tree", "--long", head, "--"];
     args.extend(dirs.iter().map(String::as_str));
     let listing = capture_until(&mut command(root, &args), None, until)?;
     if !listing.status.success() {
@@ -1095,14 +1155,18 @@ fn blobs_under(
     }
     let mut unread = Vec::new();
     let mut blobs = Vec::new();
-    for item in listing.stdout.split(|b| *b == 0).filter(|i| !i.is_empty()) {
-        let item = String::from_utf8_lossy(item);
+    for item in journal_listing(&listing.stdout)? {
         let invalid = || format!("invalid journal tree entry: {item:?}");
         let (fields, path) = item.split_once('\t').ok_or_else(invalid)?;
-        let mut fields = fields.split(' ');
-        let (Some(kind), Some(id), Some(size), None) =
-            (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
+        // The standard long format pads sizes; only the metadata is whitespace-separated.
+        let mut fields = fields.split_whitespace();
+        let (Some(_mode), Some(kind), Some(id), Some(size), None) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
             return Err(invalid());
         };
         if kind != "blob" {
@@ -1119,9 +1183,8 @@ fn blobs_under(
             ));
         }
     }
-    let mut read = Vec::new();
     if blobs.is_empty() {
-        return Ok((read, unread));
+        return Ok((Vec::new(), unread));
     }
     let input: String = blobs.iter().map(|(_, id)| format!("{id}\n")).collect();
     let objects = capture_until(
@@ -1132,8 +1195,16 @@ fn blobs_under(
     if !objects.status.success() {
         return Err(String::from_utf8_lossy(&objects.stderr).into_owned());
     }
-    let mut bytes = objects.stdout.as_slice();
-    for (path, _) in blobs {
+    let (read, missing) = parse_blobs(&blobs, &objects.stdout)?;
+    unread.extend(missing);
+    Ok((read, unread))
+}
+
+/// Bind every batch response to its requested object before accepting its body.
+fn parse_blobs(blobs: &[(String, String)], mut bytes: &[u8]) -> Result<ReadBlobs, String> {
+    let mut read = Vec::new();
+    let mut unread = Vec::new();
+    for (path, expected) in blobs {
         let end = bytes
             .iter()
             .position(|b| *b == b'\n')
@@ -1142,18 +1213,26 @@ fn blobs_under(
         bytes = &bytes[end + 1..];
         let fields: Vec<&str> = header.split(' ').collect();
         match fields[..] {
-            [_, "blob", size] => {
+            [id, "blob", size] if id == expected => {
                 let size = size.parse::<usize>().map_err(|e| e.to_string())?;
+                if size as u64 > crate::land_record::MAX_BYTES {
+                    return Err("journal blob exceeds the record size limit".into());
+                }
                 let body = bytes.get(..size).ok_or("truncated journal blob")?;
-                read.push((path, body.to_vec()));
+                read.push((path.clone(), body.to_vec()));
                 bytes = bytes
                     .get(size..)
                     .and_then(|b| b.strip_prefix(b"\n"))
                     .ok_or("missing object terminator")?;
             }
-            [_, "missing"] => unread.push((path, "its object is missing".to_owned())),
+            [id, "missing"] if id == expected => {
+                unread.push((path.clone(), "its object is missing".to_owned()));
+            }
             _ => return Err(format!("invalid journal object: {header}")),
         }
+    }
+    if !bytes.is_empty() {
+        return Err("unexpected bytes after journal objects".into());
     }
     Ok((read, unread))
 }
@@ -1166,8 +1245,9 @@ type ReadBlobs = (Vec<(String, Vec<u8>)>, Vec<(String, String)>);
 pub enum Appended {
     /// The journal's head, which holds a record at each path given, but those a prune drops.
     Holds(String),
-    /// A competing append moved the journal first: read its head again and retry.
-    Raced,
+    /// The imported head observed after a competing write, or `None` if it removed the ref.
+    /// Retry against this exact state; a subsequent change still fails the compare-and-swap.
+    Raced(Option<String>),
 }
 
 /// Append land `records` (verdict records and run records) over the journal's `parent` at Unix
@@ -1196,21 +1276,37 @@ pub fn land_append(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Appended, String> {
-    land_append_with(
-        root,
-        remote,
-        parent,
-        records,
-        now,
-        until,
-        &mut Trees {
-            list: &mut |id| ls_tree(root, id, until),
-            make: &mut |entries| mktree(root, entries, until),
-        },
-    )
+    land_append_with(root, remote, parent, records, now, until, &mut |bytes| {
+        write_blob(root, bytes, until)
+    })
 }
 
-/// [`land_append`], its tree objects read and written through `trees`.
+fn write_blob(root: &Path, bytes: &[u8], until: std::time::Instant) -> Result<String, String> {
+    output_until(
+        &mut command(root, &["hash-object", "-w", "--stdin"]),
+        Some(bytes),
+        until,
+    )
+    .map(|id| id.trim().to_owned())
+}
+
+/// Share only successful blob writes, by exact bytes, within one append to one repository.
+/// A race rebuilds trees against its new parent but does not need to write those blobs again.
+fn cached_blobs(
+    mut write: impl FnMut(&[u8]) -> Result<String, String>,
+) -> impl FnMut(&[u8]) -> Result<String, String> {
+    let mut written = std::collections::BTreeMap::<Vec<u8>, String>::new();
+    move |bytes| {
+        if let Some(id) = written.get(bytes) {
+            return Ok(id.clone());
+        }
+        let id = write(bytes)?;
+        written.insert(bytes.to_vec(), id.clone());
+        Ok(id)
+    }
+}
+
+/// [`land_append`], with blob publication shared across attempts by the caller.
 fn land_append_with(
     root: &Path,
     remote: &str,
@@ -1218,16 +1314,12 @@ fn land_append_with(
     records: &[crate::land_record::Signed],
     now: u64,
     until: std::time::Instant,
-    trees: &mut Trees<'_>,
+    blob: &mut dyn FnMut(&[u8]) -> Result<String, String>,
 ) -> Result<Appended, String> {
     let today = now / 86_400;
-    let blob = |bytes: &[u8]| {
-        output_until(
-            &mut command(root, &["hash-object", "-w", "--stdin"]),
-            Some(bytes),
-            until,
-        )
-        .map(|id| id.trim().to_owned())
+    let mut trees = Trees {
+        list: &mut |id| ls_tree(root, id, until),
+        make: &mut |entries| mktree(root, entries, until),
     };
     let mut edits = Vec::new();
     let day_at = |path: &str| {
@@ -1291,9 +1383,8 @@ fn land_append_with(
         Some(parent) if !fails.is_empty() => {
             let mut args = vec!["ls-tree", "-z", "--full-tree", "--name-only", parent, "--"];
             args.extend(fails.iter().copied());
-            output_until(&mut command(root, &args), None, until)?
-                .split('\0')
-                .filter(|path| !path.is_empty())
+            let listing = output_until(&mut command(root, &args), None, until)?;
+            journal_listing(listing.as_bytes())?
                 .map(str::to_owned)
                 .collect()
         }
@@ -1308,23 +1399,19 @@ fn land_append_with(
             blob: blob(&record.bytes)?,
         });
     }
-    let Some(tree) = edit_tree_if_changed(parent, &edits, trees)? else {
+    let Some(tree) = edit_tree_if_changed(parent, &edits, &mut trees)? else {
         return parent
             .map(|head| Appended::Holds(head.to_owned()))
             .ok_or_else(|| "an empty journal holds nothing".to_owned());
     };
     let message = format!("verify land: {} records", records.len());
-    Ok(
-        match publish(root, remote, parent, &tree, &message, until)? {
-            Some(head) => Appended::Holds(head),
-            None => Appended::Raced,
-        },
-    )
+    publish(root, remote, parent, &tree, &message, until)
 }
 
-/// Append `records` until an append holds them ([`land_append`]): each race reads the journal's
-/// head again and decides again over it, all within `until`. The head that holds them (`None`:
-/// no records, and no journal).
+/// Append `records` until an append holds them ([`land_append`]): each race carries the observed
+/// journal head into the next attempt. Reads, assembly and mutation admission share `until`;
+/// an admitted writer retains its own work window and settlement lifetime. The head that holds
+/// them (`None`: no records, and no journal).
 /// # Errors
 /// As [`land_append`], or the deadline passed.
 pub fn append_land(
@@ -1334,12 +1421,29 @@ pub fn append_land(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
+    let mut blob = cached_blobs(|bytes| write_blob(root, bytes, until));
+    append_land_through(
+        records.is_empty(),
+        || head_in(root, remote, until, ReadContext::AppendHead),
+        |parent| land_append_with(root, remote, parent, records, now, until, &mut blob),
+    )
+}
+
+fn append_land_through(
+    empty: bool,
+    mut read: impl FnMut() -> Result<Option<String>, String>,
+    mut append: impl FnMut(Option<&str>) -> Result<Appended, String>,
+) -> Result<Option<String>, String> {
     let started = std::time::Instant::now();
     let mut attempt = 0_u64;
+    let mut observed = None;
     loop {
         attempt = attempt.saturating_add(1);
         let attempt_started = std::time::Instant::now();
-        let parent = head_in(root, remote, until, ReadContext::AppendHead);
+        let parent = match observed.take() {
+            Some(head) => Ok(head),
+            None => read(),
+        };
         let head_ms = attempt_started.elapsed().as_millis();
         let timed = |why| {
             format!(
@@ -1351,12 +1455,12 @@ pub fn append_land(
             )
         };
         let parent = parent.map_err(timed)?;
-        if records.is_empty() {
+        if empty {
             return Ok(parent);
         }
-        match land_append(root, remote, parent.as_deref(), records, now, until).map_err(timed)? {
+        match append(parent.as_deref()).map_err(timed)? {
             Appended::Holds(head) => return Ok(Some(head)),
-            Appended::Raced => {}
+            Appended::Raced(head) => observed = Some(head),
         }
     }
 }

@@ -50,13 +50,13 @@ impl Drop for StandIn {
     }
 }
 
-/// The sessions a test window holds: those it hosts, the retired workers whose rows it keeps,
-/// and which of its sessions have task news; and whether its survey says its own look at the
+/// The sessions a test window holds: those it hosts, the ended sessions whose rows its session
+/// table keeps, and which of its sessions have task news; and whether its survey says its own look at the
 /// machine, as a window of an aterm that has the look does.
 #[derive(Clone, Default)]
 struct Holds {
     live: BTreeSet<String>,
-    retired: BTreeSet<String>,
+    rows: BTreeSet<String>,
     news: BTreeSet<String>,
     looks: bool,
 }
@@ -69,8 +69,8 @@ impl Holds {
         }
     }
 
-    fn with_retired(mut self, sids: &[&str]) -> Self {
-        self.retired = sids.iter().map(|sid| (*sid).to_owned()).collect();
+    fn with_rows(mut self, sids: &[&str]) -> Self {
+        self.rows = sids.iter().map(|sid| (*sid).to_owned()).collect();
         self
     }
 
@@ -85,7 +85,7 @@ impl Holds {
     }
 
     fn holds(&self, sid: &str) -> bool {
-        self.live.contains(sid) || self.retired.contains(sid)
+        self.live.contains(sid) || self.rows.contains(sid)
     }
 }
 
@@ -262,9 +262,9 @@ fn gate_answer(pid: u32, line: &str, holds: &Holds) -> Option<String> {
         let verb = words.next().unwrap_or_default();
         return Some(if holds.live.contains(sid) {
             format!("OK 1\nwindow={pid} {verb} {sid}\n")
-        } else if holds.retired.contains(sid) && verb == "result" {
-            format!("OK 1\nwindow={pid} retired result {sid}\n")
-        } else if holds.retired.contains(sid) {
+        } else if holds.rows.contains(sid) && verb == "result" {
+            format!("OK 1\nwindow={pid} row result {sid}\n")
+        } else if holds.rows.contains(sid) {
             "ERR denied: a worker whose tab the driven Mac closed once its task concluded answers \
              only @<sid> result and await task\n"
                 .to_owned()
@@ -293,7 +293,7 @@ fn gate_answer(pid: u32, line: &str, holds: &Holds) -> Option<String> {
         return Some(format!("ERR no such session @{gone}\n"));
     }
     let all = line.split_whitespace().any(|word| word == "all");
-    let news = |sid: &str| holds.news.contains(sid) || holds.retired.contains(sid);
+    let news = |sid: &str| holds.news.contains(sid) || holds.rows.contains(sid);
     let with_news = targets.iter().filter(|sid| news(sid)).count();
     let answered = if all {
         with_news == targets.len()
@@ -536,25 +536,25 @@ fn a_spawn_reaches_the_installed_apps_window_not_the_newest() {
     assert_eq!(new.served(), ["spawn cwd=/tmp"]);
 }
 
-/// A RETIRED WORKER'S RESULT STILL ANSWERS: the window that keeps a reaped worker's row takes
-/// `@<sid> result` and `await task @<sid>`, though another window is newer and the installed
-/// app's; any other verb gets that window's own refusal.
+/// AN ENDED SESSION'S RESULT STILL ANSWERS: the window whose session table keeps an ended
+/// worker's row takes `@<sid> result` and `await task @<sid>`, though another window is newer and
+/// the installed app's; any other verb gets that window's own refusal.
 #[test]
-fn a_retired_workers_result_answers_from_the_window_that_keeps_its_row() {
+fn an_ended_workers_result_answers_from_the_window_that_keeps_its_row() {
     let stand_in = StandIn::start();
     let (older, newer) = two_pids(&stand_in);
-    let relay = crate::test_scratch::short_dir("dr1-retired");
+    let relay = crate::test_scratch::short_dir("dr1-row");
     let old = TestWindow::open(
         relay.path(),
         older,
-        Holds::default().with_retired(&["t000000dead"]),
+        Holds::default().with_rows(&["t000000dead"]),
         false,
     );
     let new = TestWindow::open(relay.path(), newer, Holds::live(&["t00000000be"]), false);
     let answer = drive(relay.path(), Some(newer), "@t000000dead result");
     assert_eq!(
         answer,
-        format!("OK 1\nwindow={older} retired result t000000dead\n")
+        format!("OK 1\nwindow={older} row result t000000dead\n")
     );
     let answer = drive(
         relay.path(),

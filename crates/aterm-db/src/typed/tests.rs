@@ -148,6 +148,7 @@ pub(super) const TABLE: Table = Table {
     collections: &[&ACCOUNT, &ADDRESS, &FACTS, &OBS],
     self_quota: 2,
     ends: &[],
+    faces: &[],
 };
 
 /// A hand-built causal history: each write names the writes it observed.
@@ -1649,7 +1650,10 @@ mod commons {
     fn a_removed_macs_rows_stay_attributable() {
         let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
         client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
-        let records = client::load_records(&lab.paths[0]).unwrap().encode();
+        let records = client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         client::save_records(&lab.paths[1], &records).unwrap();
         let machines: Vec<[u8; 16]> = (0..2)
             .map(|n| *lab.bootstrap(n).request().unwrap().binding().machine())
@@ -1702,7 +1706,10 @@ mod commons {
         );
 
         client::remove_member_in_log(&lab.paths[0], actors[1]).unwrap();
-        let records = client::load_records(&lab.paths[0]).unwrap().encode();
+        let records = client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         client::save_records(&lab.paths[1], &records).unwrap();
         let (facts, _) = read(&lab, 0, false);
         assert_eq!(

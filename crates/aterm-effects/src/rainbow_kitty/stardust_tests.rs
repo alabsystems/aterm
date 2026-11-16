@@ -161,6 +161,8 @@ fn star(class: StarClass, lane: StarLane, born: Instant, tint: u32) -> Star {
         beside_caret: None,
         edge_cut: false,
         still: None,
+        shown: false,
+        caret_hid: false,
     }
 }
 
@@ -3064,8 +3066,14 @@ fn exhaust_run(
 }
 
 /// Every star a run of `keys` at `cps` and then twelve Backspaces bear on a blank page, each with
-/// its birth, and the sky they were born into. `flies` is the negative control: paper's stars fly.
-fn typed_and_erased(c: &Config, cps: f32, keys: u16, flies: bool) -> (Vec<Star>, Geom) {
+/// its birth, the sky they were born into, and the caret's path along row 5 (each key's instant
+/// and the caret's column after it). `flies` is the negative control: paper's stars fly.
+fn typed_and_erased(
+    c: &Config,
+    cps: f32,
+    keys: u16,
+    flies: bool,
+) -> (Vec<Star>, Geom, Vec<(Instant, u16)>) {
     if flies {
         return with_paper_stars_flying(|| typed_and_erased(c, cps, keys, false));
     }
@@ -3076,6 +3084,7 @@ fn typed_and_erased(c: &Config, cps: f32, keys: u16, flies: bool) -> (Vec<Star>,
     sky.probe_mut().probe_row(4, &[false; 120]);
     sky.probe_mut().probe_row(5, &[false; 120]);
     let mut born = Vec::new();
+    let mut path = Vec::new();
     for k in 0..keys + 12 {
         let at = t0 + Duration::from_secs_f32(f32::from(k) / cps);
         let (col, ev) = if k < keys {
@@ -3083,14 +3092,29 @@ fn typed_and_erased(c: &Config, cps: f32, keys: u16, flies: bool) -> (Vec<Star>,
         } else {
             (20 + keys - (k - keys) - 1, Event::Erase)
         };
+        path.push((at, col));
         let mut cx = ctx_in(g, at, c, (5, col));
         cx.disp = 0.9;
         cx.birth_disp = 0.9;
         sky.budget.refill(at);
         sky.on_event(&ev, at, &cx, &ribbon);
+        // Nothing draws this sky, so the caret's crossing may stand a star again elsewhere or let
+        // it go ([`Stardust::restand_crossed`]): each is read where it stands now.
+        born.retain_mut(|s: &mut Star| {
+            match sky
+                .live_iter()
+                .find(|l| l.born == s.born && l.seed == s.seed)
+            {
+                Some(live) => {
+                    *s = *live;
+                    true
+                }
+                None => s.dead(at),
+            }
+        });
         born.extend(sky.live_iter().filter(|s| s.born == at).copied());
     }
-    (born, g)
+    (born, g, path)
 }
 
 /// The pairs of `stars` born within [`PAPER_REST_S`] of each other whose reaches meet at some
@@ -3128,8 +3152,8 @@ fn pairs_crossing(stars: &[Star], g: Geom) -> usize {
 #[test]
 fn paper_s_stars_stand_still_on_rested_pixels() {
     let c = cfg(false);
-    let (stood, g) = typed_and_erased(&c, 16.0, 48, false);
-    let (flown, _) = typed_and_erased(&c, 16.0, 48, true);
+    let (stood, g, _) = typed_and_erased(&c, 16.0, 48, false);
+    let (flown, _, _) = typed_and_erased(&c, 16.0, 48, true);
     assert!(
         stood.len() >= 60,
         "the fixture bore only {} stars",
@@ -3183,8 +3207,114 @@ fn paper_s_stars_stand_still_on_rested_pixels() {
         pairs_crossing(&flown, g)
     );
     // A dark page's stars fly as before.
-    let (dark, _) = typed_and_erased(&cfg(true), 16.0, 48, false);
+    let (dark, _, _) = typed_and_erased(&cfg(true), 16.0, 48, false);
     assert!(dark.iter().all(|s| s.still.is_none()));
+}
+
+/// The stars of `stars` that reach a cell the caret crossed on `row` within [`PAPER_REST_S`]
+/// before their birth, or that are alive when it crosses one within [`PAPER_REST_S`] after it
+/// (`path`: each key's instant and the caret's column after it, the crossing every cell from the
+/// column before). Nothing draws the fixture's sky, so a star alive at a crossing is unseen.
+fn stood_on_the_caret_s_path(stars: &[Star], path: &[(Instant, u16)], g: Geom, row: u16) -> usize {
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let y0 = g.origin_y as i32 + i32::from(row) * ch;
+    stars
+        .iter()
+        .filter(|s| {
+            let (x, y) = s.pos(s.born, false);
+            let r = arm_peak_px(s.class, g.ch as f32) + 1;
+            let mut was = None;
+            path.iter().any(|&(at, col)| {
+                let from = was.replace(col).unwrap_or(col);
+                let x0 = g.origin_x as i32 + i32::from(from.min(col)) * cw;
+                let x1 = g.origin_x as i32 + (i32::from(from.max(col)) + 1) * cw - 1;
+                let near = if at >= s.born {
+                    !s.dead(at) && (at - s.born).as_secs_f32() < PAPER_REST_S
+                } else {
+                    (s.born - at).as_secs_f32() < PAPER_REST_S
+                };
+                near && x + r >= x0 && x - r <= x1 && y + r >= y0 && y - r < y0 + ch
+            })
+        })
+        .count()
+}
+
+/// Paper's stars keep off the cells the caret crossed, typing and under held Backspace, for a
+/// [`PAPER_REST_S`] before their birth, and one still unseen when the caret crosses its place
+/// within its rest stands elsewhere: the block darkens a cell's pixels and lets them go as a star
+/// does, and a star on its path added its turns to the caret's (ATERM-KI-1115-12548). The dust
+/// is not thinned for it. The control is the caret as it was ([`with_paper_caret_as_was`]):
+/// stars stand on its path.
+#[test]
+fn paper_s_stars_keep_off_the_caret_s_path_inside_their_rest() {
+    let c = cfg(false);
+    let (stood, g, path) = typed_and_erased(&c, 16.0, 48, false);
+    let (was, _, was_path) = with_paper_caret_as_was(|| typed_and_erased(&c, 16.0, 48, false));
+    let on = stood_on_the_caret_s_path(&stood, &path, g, 5);
+    let on_was = stood_on_the_caret_s_path(&was, &was_path, g, 5);
+    eprintln!(
+        "on the caret's path: {on} of {} stars; as it was {on_was} of {}",
+        stood.len(),
+        was.len()
+    );
+    assert_eq!(
+        on, 0,
+        "{on} stars stood on the caret's path inside their rest"
+    );
+    assert!(
+        stood.len() * 100 >= was.len() * 95,
+        "keeping off the caret thinned the dust: {} stars where {} were",
+        stood.len(),
+        was.len()
+    );
+    assert!(
+        on_was > 0,
+        "control: with the caret as it was no star stood on its path"
+    );
+}
+
+/// On paper a star the caret's block hid after it showed stays out for its life: read every
+/// frame, it came back once the caret had gone on, two more turns on pixels the caret had just
+/// turned. One the caret never comes near is drawn throughout. The control is the caret as it
+/// was ([`with_paper_caret_as_was`]): the star comes back.
+#[test]
+fn a_paper_star_the_caret_passed_does_not_come_back() {
+    let t0 = Instant::now();
+    let c = cfg(false);
+    // The star stands at (200, 100): column 22 of row 3.
+    let drawn = |carets: &[(u16, u16)]| -> Vec<bool> {
+        let mut sky = sky();
+        let mut s = star(StarClass::M1, StarLane::Strike, t0, TINT_WHITE_RGB);
+        s.still = Some((0, 0));
+        sky.sow(s);
+        let mut at = t0 + Duration::from_millis(40);
+        carets
+            .iter()
+            .map(|&caret| {
+                let mut sc = Scratch::default();
+                let mut f = sc.frame();
+                sky.emit(&ctx_in(geom(), at, &c, caret), &mut f);
+                at += Duration::from_millis(16);
+                sc.out.len() + sc.halos.len() > 0
+            })
+            .collect()
+    };
+    let passed = [(3, 40), (3, 22), (3, 40)];
+    assert_eq!(
+        drawn(&passed),
+        [true, false, false],
+        "the star the caret passed came back"
+    );
+    assert_eq!(
+        drawn(&[(3, 40); 3]),
+        [true; 3],
+        "a star the caret never came near is drawn throughout"
+    );
+    assert_eq!(
+        with_paper_caret_as_was(|| drawn(&passed)),
+        [true, false, true],
+        "control: with the caret as it was the star comes back"
+    );
 }
 
 /// A star on paper only cools: its core and reach hold at their birth values while its envelope

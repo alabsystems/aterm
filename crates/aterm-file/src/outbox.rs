@@ -262,9 +262,10 @@ impl From<io::Error> for Refused {
 ///
 /// Who reaches what is held by clippy.toml's `disallowed-methods` rows, a lint and not the type
 /// system: a call passes where its one statement carries `#[expect(clippy::disallowed_methods,
-/// reason = …)]` naming the explicit `aterm file` verb it is. [`OwnerAct::verb`] is called by
-/// aterm-db's `file::write::verb` (which `aterm file`'s own entry alone runs, under a row of
-/// its own) and by this crate's `outbox drop`; [`owner_act_for_test`] by each crate's one test
+/// reason = …)]` naming the explicit verb it is. [`OwnerAct::verb`] is called by aterm-db's
+/// `file::write::verb` (which only `aterm file`'s own entry and aterm-db's `file::rename_nick`,
+/// a rename of this Mac asked for by name, run, each under a row of its own) and by this crate's
+/// `outbox drop`; [`owner_act_for_test`] by each crate's one test
 /// helper; and the verbs that settle or remove a queued intent without one ([`File::claim`],
 /// [`File::mark_done`], [`File::dequeue`]) by aterm-db's publisher alone. It is not `Clone`,
 /// so each verb makes its own. The lab importer writes the registry itself and makes none.

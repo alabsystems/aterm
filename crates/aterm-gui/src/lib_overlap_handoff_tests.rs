@@ -757,13 +757,10 @@ fn a_deferred_pane_close_replays_behind_the_front_tab() {
     assert_eq!(app.structural_invariant_violation(), None);
 }
 
-/// The `(reason, by)` the session log journaled for `session`'s exit.
+/// The `(reason, by)` the row of `session`'s exit in the session table says.
 fn exit_of(app: &App, session: u64) -> Option<(crate::session_store::ExitReason, String)> {
-    let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-    g.closed_logs()
-        .exits_since(0)
-        .rfind(|e| e.local_id == session)
-        .map(|e| (e.reason, e.actor.as_wire().to_string()))
+    let table = app.store.read().unwrap_or_else(|p| p.into_inner()).table();
+    table.by_local(session).map(|e| (e.out, e.by))
 }
 
 #[test]
@@ -952,13 +949,7 @@ fn a_confirmed_busy_pane_close_replays_behind_the_tab_the_person_is_on() {
     );
     assert_eq!(app.focused_session_id(wid), Some(front));
     assert!(unseen(&app, heir), "the heir pane never came to the front");
-    let exit = {
-        let g = app.store.read().unwrap_or_else(|p| p.into_inner());
-        g.closed_logs()
-            .exits_since(0)
-            .rfind(|e| e.local_id == busy)
-            .map(|e| (e.reason, e.actor.as_wire().to_string()))
-    };
+    let exit = exit_of(&app, busy);
     assert_eq!(
         exit,
         Some((crate::session_store::ExitReason::UiClose, "human".into())),

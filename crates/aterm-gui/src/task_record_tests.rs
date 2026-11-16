@@ -3313,21 +3313,21 @@ fn a_record_never_names_a_result_file_that_is_gone() {
         "ERR result unavailable why=no-snapshot\n"
     );
 
-    // A seamless update's road, and a retired row's.
+    // A seamless update's road, and an ended session's row in the machine's session table.
     let carried = crate::session_store::test_handle(32);
     seed_carried(&carried.ctx, Some(&row(&gone)));
     names_nothing(&record_of(&carried.ctx), "a seamless update");
-    let adopt = |road: &str| {
-        let mut retired = crate::retired_workers::RetiredWorkers::default();
-        let line = format!("sid={} closed=7000 title=x {}", was.as_str(), row(&gone));
-        assert_eq!(
-            retired.adopt(&[line], Some(&tasks), Instant::now(), 9_000),
-            1,
-            "{road}"
+    let read_back = |road: &str| {
+        let text = format!(
+            "v = 1\nsid = {:?}\nid = 1\nended_ms = 7000\nout = \"reaper\"\nby = \"-\"\ntask = {:?}\n",
+            was.as_str(),
+            row(&gone)
         );
-        retired.by_sid(&was).expect("adopted").record.clone()
+        crate::session_table::Row::decode(&text, Some(&tasks))
+            .and_then(|row| row.task)
+            .expect(road)
     };
-    names_nothing(&adopt("gone"), "a retired row");
+    names_nothing(&read_back("gone"), "an ended session's row");
 
     // CONTROL: the result stands, so the record names it and `result` reads it.
     let scratch = aterm_tempfile::Builder::new()
@@ -3363,9 +3363,9 @@ fn a_record_never_names_a_result_file_that_is_gone() {
         "OK 1 source=transcript session=0b22 uuid=a-1 bytes=17\nFixed the parser.\n"
     );
     assert_eq!(
-        adopt("stands").result_path.as_deref(),
+        read_back("stands").result_path.as_deref(),
         Some(gone.as_path()),
-        "CONTROL: a retired row's too"
+        "CONTROL: an ended session's row's too"
     );
 
     // A link at the name is not the record's file.

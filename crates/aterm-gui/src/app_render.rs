@@ -3679,6 +3679,35 @@ pub(crate) fn divider_cell(p: impl Into<crate::chrome_band::ChromePalette>) -> R
     }
 }
 
+/// Close a sidebar page's side on the pane beside it with a hairline: each gap column beside
+/// `pane` (the page's `(row, col, rows, cols)`) takes the page's `ground` and a one-eighth rule
+/// in `ink` on its edge away from the page, in place of the divider's slab and the active
+/// pane's mark. The page reaches its neighbour and the rule is the one mark between them.
+pub(crate) fn stamp_page_edge(
+    dst: &mut RenderInput,
+    cols: usize,
+    pane: (usize, usize, usize, usize),
+    ground: [u8; 3],
+    ink: [u8; 3],
+) {
+    let (top, left, pane_rows, pane_cols) = pane;
+    let right = left.saturating_add(pane_cols);
+    let sides = [
+        (left.checked_sub(1), '\u{258f}'),
+        ((right < cols).then_some(right), '\u{2595}'),
+    ];
+    for (col, ch) in sides {
+        let Some(col) = col else {
+            continue;
+        };
+        for row in dst.cells.iter_mut().skip(top).take(pane_rows) {
+            if let Some(cell) = row.get_mut(col) {
+                *cell = chrome_band::cell(ch, ink, ground, false, false);
+            }
+        }
+    }
+}
+
 /// Which side of the active pane a divider run marks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActivePaneEdge {
@@ -7371,9 +7400,10 @@ impl App {
             icons.push_str("none");
         }
         Ok(format!(
-            "{line} word_icons={icons} {} resting={} sight={}",
+            "{line} word_icons={icons} {} resting={} attended={} sight={}",
             self.trail_target_fields()?,
             ws.rest.resting(),
+            ws.rest.attended(),
             ws.sight().name()
         ))
     }
@@ -8878,6 +8908,7 @@ impl App {
             .flatten();
         let holes_before = crate::tray_raster::chrome_text_holes();
         let compiled = if damage.is_some() {
+            self.navigator_note_viewport(view, viewport);
             match self.compiled_native_ui_for(id, instance, view, viewport) {
                 Ok(compiled) => Some(compiled),
                 Err(_) => return false,
@@ -9378,6 +9409,38 @@ impl App {
             });
         let grid = self.chrome_palette(ChromeSurface::Grid);
         let fluent_seam = self.fluent_seam(plan);
+        // A sidebar page's edge is a hairline in the separator's ink, not the pane divider: down
+        // the page on its own ground, and across its header's row on the header's.
+        let cells_of = |rect: &crate::tab_model::LogicalRect| {
+            (
+                rect.origin.y.round().max(0.0) as usize,
+                rect.origin.x.round().max(0.0) as usize,
+                (rect.size.height.round() as usize).max(1),
+                (rect.size.width.round() as usize).max(1),
+            )
+        };
+        let page_edge = (fluent_seam.is_none())
+            .then(|| {
+                plan.leaves
+                    .iter()
+                    .find(|leaf| self.view_is_sidebar_page(leaf.view))
+            })
+            .flatten()
+            .map(|leaf| {
+                let roles = crate::native_appearance::default_roles(
+                    self.chrome_palette(ChromeSurface::NativePage),
+                );
+                let header = leaf.header.as_ref().map(|rect| {
+                    (
+                        cells_of(rect),
+                        crate::pane_header::header_colors(
+                            self.chrome_palette(ChromeSurface::Header),
+                        )
+                        .bar_bg,
+                    )
+                });
+                (cells_of(&leaf.rect), roles, header)
+            });
         if let Some(mut route_guard_window) = self.windows.get_mut(&id) {
             let window = &mut **route_guard_window;
             fill_divider_grid(
@@ -9396,6 +9459,13 @@ impl App {
                     layout,
                     &[],
                 );
+            }
+            if let Some((pane, roles, header)) = page_edge {
+                let dst = &mut window.input_scratch;
+                stamp_page_edge(dst, cols, pane, roles.surface, roles.separator);
+                if let Some((header, ground)) = header {
+                    stamp_page_edge(dst, cols, header, ground, roles.separator);
+                }
             }
             window.input_scratch.snapshot_seq = window.input_scratch.snapshot_seq.wrapping_add(1);
             window.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
@@ -9687,9 +9757,12 @@ impl App {
                         abandoned = true;
                         break;
                     };
+                    let mut rasterized = false;
                     if let Some(damage) =
                         pending_native_leaf_damage(&cache, stamp, leaf_width, leaf_height)
                     {
+                        rasterized = true;
+                        self.navigator_note_viewport(leaf.view, viewport);
                         let holes_before = crate::tray_raster::chrome_text_holes();
                         let Ok(scene) = self.build_native_leaf_scene(
                             id,
@@ -9770,7 +9843,10 @@ impl App {
                         modal_native_prims.push(crate::widget::DrawPrim::ClipPop);
                     }
                     if leaf.focused {
-                        focused_compiled = Some((stamp, raster.compiled.clone()));
+                        // The compiled page is cloned for the window only where it is not the
+                        // one the window already holds, as the lone page's route does: a frame
+                        // of the terminal beside an unchanged page copies nothing of the page.
+                        focused_compiled = Some((stamp, leaf.view, rasterized));
                         if let Ok(presentation) =
                             self.native_runtime.presentation(native.instance, leaf.view)
                         {
@@ -9961,12 +10037,30 @@ impl App {
                     }
                 }
             }
-            window.native_ui_compiled =
-                focused_compiled.map(|(stamp, compiled)| crate::app_native::NativeCompiledFrame {
-                    stamp,
-                    phase: crate::app_native::NativeCompiledPhase::Staged,
-                    compiled,
-                });
+            match focused_compiled {
+                Some((stamp, _, false))
+                    if window
+                        .native_ui_compiled
+                        .as_ref()
+                        .is_some_and(|frame| frame.stamp == stamp) =>
+                {
+                    if let Some(frame) = window.native_ui_compiled.as_mut() {
+                        frame.phase = crate::app_native::NativeCompiledPhase::Staged;
+                    }
+                }
+                Some((stamp, view, _)) => {
+                    window.native_ui_compiled = window
+                        .leaf_render_cache
+                        .get(&view)
+                        .and_then(|cache| cache.native.as_ref())
+                        .map(|raster| crate::app_native::NativeCompiledFrame {
+                            stamp,
+                            phase: crate::app_native::NativeCompiledPhase::Staged,
+                            compiled: raster.compiled.clone(),
+                        });
+                }
+                None => window.native_ui_compiled = None,
+            }
             window.input_scratch.snapshot_seq = window.input_scratch.snapshot_seq.wrapping_add(1);
         }
         #[cfg(a11y_tree)]
@@ -18282,7 +18376,10 @@ impl App {
         if let Some(mut ws) = self.front_mut() {
             ws.initial_frame_settle = None;
         }
+        // A control client's resize, not a person's: the event that reports it touches nothing.
+        self.note_own_resize(wid, size);
         if let Some(w) = self.front().and_then(|ws| ws.os_window.clone()) {
+            let before = w.inner_size();
             // Best effort; the WM may clamp. `Some` means the backend applied
             // the size synchronously and no `Resized` follows (Wayland).
             if let Some(applied) = w.request_inner_size(size) {
@@ -18290,6 +18387,10 @@ impl App {
                     ws.win_px = Some(applied);
                 }
                 self.sync_surface_to_window(wid);
+            }
+            let after = w.inner_size();
+            if after != before {
+                self.note_own_resize(wid, after);
             }
             w.request_redraw();
         }

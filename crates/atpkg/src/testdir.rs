@@ -194,7 +194,12 @@ pub(crate) struct ScratchLayout {
 
 /// A fresh scratch store prefix under the temp dir, named `<prefix><unique>`.
 pub(crate) fn layout(prefix: &str) -> ScratchLayout {
-    let dir = dir(prefix);
+    layout_in(&std::env::temp_dir(), prefix)
+}
+
+/// Native input fixtures need checked ancestors, rather than world-writable /tmp.
+pub(crate) fn layout_in(parent: &Path, prefix: &str) -> ScratchLayout {
+    let dir = dir_in(parent, prefix);
     ScratchLayout {
         layout: Layout {
             prefix: dir.to_path_buf(),

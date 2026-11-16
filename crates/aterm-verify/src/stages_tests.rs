@@ -1192,7 +1192,8 @@ fn the_measuring_stage_does_not_run_behind_the_failed_compile_that_builds_its_be
     let outcome = |c: Ctx| {
         let mut c =
             c.with_measure_artifact(Some(crate::MeasureArtifact::unnamed("/release/aterm.app")));
-        c.tools.targo = PathBuf::from("/usr/bin/false");
+        // A targo present on every host (this test binary); the stage decides before it runs one.
+        c.tools.targo = std::env::current_exe().expect("this test binary");
         c.tools.refused = None;
         c.test_compile_failed
             .store(true, std::sync::atomic::Ordering::Release);
@@ -2133,8 +2134,10 @@ fn an_empty_change_selection_compiles_nothing_in_any_of_those_stages() {
         StageId::SpecCheckers,
     ] {
         let mut cc = ctx(c.scope.clone());
-        cc.tools.targo = PathBuf::from("/bin/sh");
-        cc.tools.tippy = Some(PathBuf::from("/bin/sh"));
+        // Tools present on every host (this test binary), so each stage reaches its selection.
+        let present = std::env::current_exe().expect("this test binary");
+        cc.tools.targo = present.clone();
+        cc.tools.tippy = Some(present);
         let r = run_stage(
             &cc,
             &StageSpec {
@@ -4503,6 +4506,46 @@ fn around_verb(argv: &[String]) -> (Vec<&str>, &str, Vec<&str>) {
     panic!("no subcommand: {argv:?}")
 }
 
+/// THE TRAIL LAWS' FULL GRID is the test child's under a release, and where the change touched
+/// aterm-effects or the selection names it; a cone that holds aterm-effects as a dependent
+/// alone runs the spines. The compile child never carries it. NEGATIVE CONTROL: the same cone
+/// with aterm-effects among its seeds carries it.
+#[test]
+fn the_test_child_runs_the_trail_laws_full_grid_for_a_release_or_an_effects_change() {
+    let full = |cmd: &Cmd| {
+        cmd.envs.iter().any(|(k, v)| {
+            (k.to_str(), v.to_str()) == (Some(TRAIL_LAWS_FULL.0), Some(TRAIL_LAWS_FULL.1))
+        })
+    };
+    let cone = |seed: &str| {
+        Scope::Changed(crate::scope::Changed {
+            base: "main".into(),
+            crates: vec!["aterm-core".into(), "aterm-effects".into()],
+            any_lib: true,
+            seeds: vec![seed.into()],
+            alone: vec![],
+        })
+    };
+    let dependent = ctx(cone("aterm-core"));
+    let [compile, run] = test_cmds(&dependent, false);
+    assert!(!full(&compile) && !full(&run), "{:?}", run.envs);
+    assert!(!full(
+        &test_cmds(&ctx(Scope::crate_only("aterm-core")), false)[1]
+    ));
+    let mut release = ctx(cone("aterm-core"));
+    release.release = true;
+    for context in [
+        ctx(cone("aterm-effects")),
+        ctx(Scope::crate_only("aterm-effects")),
+        ctx(Scope::workspace()),
+        release,
+    ] {
+        let [compile, run] = test_cmds(&context, false);
+        assert!(!full(&compile), "{:?}", compile.envs);
+        assert!(full(&run), "{:?}: {:?}", context.scope, run.envs);
+    }
+}
+
 /// Every `--config` of a main-lane child, and of the test run's recording pass, goes before
 /// its subcommand, the test graph's beside the build cache's and the recording runner's, and
 /// the test graph's flag right after it: Trust's `targo` reads a `--config` after the verb in
@@ -4922,5 +4965,150 @@ fn manifest_required_features_strips_comments_and_handles_single_quotes() {
             ("my-pkg".to_string(), "feat-a".to_string()),
             ("my-pkg".to_string(), "feat-b".to_string()),
         ]
+    );
+}
+
+/// A private directory for [`WINDOWED_LOCK`], kept by the tempdir it sits in.
+#[cfg(unix)]
+fn windowed_dir() -> (aterm_tempfile::TempDir, std::path::PathBuf) {
+    let temp = aterm_tempfile::tempdir().expect("scratch");
+    let dir = temp.path().join("runtime");
+    aterm_uds::private_file::create_private_dir(&dir).expect("private runtime dir");
+    (temp, dir)
+}
+
+/// LS-55: a run behind a holder of `windowed.lock` that keeps working waits however long it holds,
+/// well past the hang bound, takes the lock when the holder lets go, and names itself its holder
+/// until it lets go. CONTROL: the 60 s `PrivateLock::take` this replaced ended at its limit with
+/// the holder still working; here the holder lets go only after the waiter has looked at it for
+/// more than twice the bound.
+#[cfg(unix)]
+#[test]
+fn a_windowed_stage_waits_behind_a_holder_that_works_however_long_it_holds() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let (_temp, dir) = windowed_dir();
+    let hang = std::time::Duration::from_millis(200);
+    let held = aterm_uds::private_file::PrivateLock::take(
+        &dir,
+        WINDOWED_LOCK,
+        std::time::Duration::ZERO,
+        "test holder",
+    )
+    .expect("the test holds the lock first");
+    let looks = Arc::new(AtomicU32::new(0));
+    let waiter = {
+        let dir = dir.clone();
+        let looks = Arc::clone(&looks);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let taken = take_window_lock(&dir, hang, |_| {
+                looks.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            (taken.map(|lock| lock.dir.clone()), started.elapsed())
+        })
+    };
+    // Each look follows a try of `hang / 4`: twelve of them span three bounds. A waiter that
+    // ends first has given up on a working holder, which the assertions below report.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the waiter keeps looking at a working holder, or ends",
+        || (looks.load(Ordering::SeqCst) >= 12 || waiter.is_finished()).then_some(()),
+    );
+    drop(held);
+    let (taken, waited) = waiter.join().expect("waiter thread");
+    assert_eq!(taken.as_deref(), Ok(dir.as_path()), "it takes the lock");
+    assert!(waited > hang * 2, "it waited past the bound: {waited:?}");
+}
+
+/// LS-55: a run behind a holder of `windowed.lock` whose work shows no progress for the bound ends
+/// with an error that names the holder's pid from its record and says it made no progress, and
+/// the lock stays the holder's. CONTROL: a holder that works (the test above) is waited for.
+#[cfg(unix)]
+#[test]
+fn a_windowed_stage_behind_a_holder_with_no_progress_for_a_minute_could_not_run() {
+    let (_temp, dir) = windowed_dir();
+    let hang = std::time::Duration::from_millis(200);
+    let holder = take_window_lock(&dir, hang, |_| true).expect("the first run takes the lock");
+    assert_eq!(
+        windowed_holder(&dir),
+        Some(std::process::id()),
+        "the holder names itself"
+    );
+    let started = std::time::Instant::now();
+    let mut asked = Vec::new();
+    let refused = take_window_lock(&dir, hang, |pid| {
+        asked.push(pid);
+        false
+    });
+    let waited = started.elapsed();
+    let Err(error) = refused else {
+        panic!("a second run took a lock the first still holds");
+    };
+    assert!(waited >= hang, "it waited the whole bound: {waited:?}");
+    assert!(
+        error.contains(&format!("pid {}", std::process::id())) && error.contains("no progress"),
+        "{error}"
+    );
+    assert!(
+        asked.iter().all(|pid| *pid == Some(std::process::id())),
+        "{asked:?}"
+    );
+    drop(holder);
+    assert_eq!(
+        windowed_holder(&dir),
+        None,
+        "the record leaves before the lock does"
+    );
+}
+
+/// LS-55: what a waiter counts as its holder's progress, over scripted readings. A holder's first
+/// reading is its baseline; a grown generation, a reading that does not compare and a new holder
+/// are progress; the same generation, an unnamed holder, a dead one and the waiter's own pid (a
+/// stale record's reused pid) are not. CONTROL: each `assert!(!…)` line fails where the reading
+/// counted every look as progress, and each `assert!(…)` line where it counted none.
+#[cfg(unix)]
+#[test]
+fn a_windowed_waiter_counts_only_its_live_holders_work_as_progress() {
+    const ME: u32 = 7;
+    const DEAD: u32 = 9;
+    let mut script = VecDeque::from([Some(0), Some(0), Some(1), None, Some(4), Some(0), Some(0)]);
+    let mut read_pids = Vec::new();
+    let mut progress = holder_progress_with(
+        ME,
+        |pid| pid != DEAD,
+        |pid| {
+            read_pids.push(pid);
+            script.pop_front().expect("a scripted reading")
+        },
+    );
+    assert!(!progress(Some(100)), "a first reading is a baseline");
+    assert!(!progress(Some(100)), "the same generation is no work");
+    assert!(progress(Some(100)), "a grown generation is work");
+    assert!(
+        progress(Some(100)),
+        "a reading that does not compare is no evidence of a stall"
+    );
+    assert!(
+        progress(Some(100)),
+        "after it, the next reading is work too"
+    );
+    assert!(progress(Some(200)), "a new holder took the lock");
+    assert!(
+        !progress(Some(200)),
+        "the new holder's same generation is no work"
+    );
+    assert!(!progress(None), "an unnamed holder shows no work");
+    assert!(!progress(Some(DEAD)), "a dead holder shows no work");
+    assert!(
+        !progress(Some(ME)),
+        "the waiter's own pid never stands for its holder"
+    );
+    drop(progress);
+    assert_eq!(
+        read_pids,
+        [100, 100, 100, 100, 100, 200, 200],
+        "only live, other holders are read"
     );
 }

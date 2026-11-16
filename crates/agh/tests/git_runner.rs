@@ -26,6 +26,7 @@ use crate::common;
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod abrupt_stop_tests;
+mod cache_ancestor_tests;
 mod commit_ancestry_tests;
 mod inventory_retry_tests;
 mod object_view_tests;
@@ -1776,6 +1777,84 @@ fn native_push_incremental_borrows_only_authenticated_old_blob_authority() {
             .count(),
         2
     );
+}
+
+/// A release snapshot's first export can bring more new objects than one bounded
+/// capture holds. NEGATIVE CONTROL: the earlier heap inventory refused this push
+/// with "incremental object inventory reaches the 1 MiB admission limit".
+#[test]
+fn native_push_incremental_inventory_past_one_capture_is_admitted_whole() {
+    let world = World::canonical("incremental-wide");
+    let (remote, source, before, _) = incremental_source(&world);
+    // 30,000 new blobs and their two trees and commit: 1.23 MB of IDs, two
+    // membership batches.
+    let mut input = format!(
+        "commit refs/heads/wide\ncommitter fixture <fixture> 1700000000 +0000\ndata 4\nwide\nfrom {before}\n"
+    )
+    .into_bytes();
+    for n in 0..30_000 {
+        let body = format!("wide blob {n}\n");
+        input.extend_from_slice(
+            format!("M 100644 inline wide/{n}\ndata {}\n{body}\n", body.len()).as_bytes(),
+        );
+    }
+    input.extend_from_slice(b"done\n");
+    let mut cmd = aterm_uds::spawnfd::command(host_git_path());
+    cmd.args(["fast-import", "--quiet", "--done"])
+        .current_dir(&source);
+    let out = aterm_uds::deadline::output_with_input_until(
+        &mut cmd,
+        aterm_uds::secret::Secret::new(&input),
+        std::time::Instant::now() + common::HANG,
+        1 << 20,
+    )
+    .unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    let after = host_git(&source, &["rev-parse", "wide"]);
+    // The new-object listing itself would pass this helper's own bounded
+    // capture; the short names fit it (~170 KB).
+    assert_eq!(
+        host_git(
+            &source,
+            &["ls-tree", "--name-only", &format!("{after}:wide")]
+        )
+        .lines()
+        .count(),
+        30_000
+    );
+    assert_eq!(
+        host_git(
+            &source,
+            &["rev-list", "--count", &after, &format!("^{before}")]
+        ),
+        "1"
+    );
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &remote)
+        .build();
+    gh.run_git(&GitRun::push_refs(
+        &common::slug("fixture-dev/app"),
+        &source,
+        push_batch(&[("refs/heads/main", &before, &after)]),
+        false,
+    ))
+    .expect("a wide incremental push is admitted whole");
+    assert_eq!(host_git(&remote, &["rev-parse", "main"]), after);
+    assert_eq!(
+        host_git(&remote, &["show", "main:wide/29999"]),
+        "wide blob 29999"
+    );
+    let children = gh.fx().children_run();
+    let count = |arg: &str| {
+        children
+            .iter()
+            .filter(|s| s.args.iter().any(|a| a == arg))
+            .count()
+    };
+    // Two batches, each packed from its exact IDs and then proved present.
+    assert_eq!(count("--no-revs"), 2);
+    assert_eq!(count("--batch-check=%(objectname) %(objecttype)"), 2);
 }
 
 #[test]

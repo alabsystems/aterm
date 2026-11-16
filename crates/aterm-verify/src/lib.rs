@@ -1093,8 +1093,15 @@ impl MeasureArtifact {
         self.app.join("Contents/MacOS").join(name)
     }
 
-    /// Check profile, trusted VM observation and exact executable custody before a measurement
-    /// can spawn a process. A test's platform probe is inert unless explicitly injected.
+    /// Check profile and exact executable custody before a measurement can spawn a process.
+    ///
+    /// A release image runs on this Mac's own hardware, a release cut host included: no
+    /// platform fact is asked. The scratch world it starts in ([`aterm_types::world`]: the
+    /// marker in its environment, the lanes-off tables in its `aterm.toml`) keeps every lane
+    /// that acts for the login's account or reaches the LAN off, and a vault identity made under
+    /// that world's HOME is a lab identity (aterm-secrets' `LabMark::ForeignHome`), refused
+    /// before it asks the live ALab. An image without the compile facts this admission reads
+    /// is refused, and every build that has them makes that lab identity.
     pub(crate) fn admit(&self, ctx: &Ctx) -> Result<(), String> {
         let executable = self
             .executable
@@ -1105,9 +1112,6 @@ impl MeasureArtifact {
         }
         if self.profile == artifact::Profile::Debug && (ctx.release || ctx.checkers_in_tests) {
             return Err("debug bundle validation cannot qualify a release".into());
-        }
-        if self.profile == artifact::Profile::Release && (ctx.virtual_machine)() != Some(true) {
-            return Err("release bundle measurement uses a fresh HOME and requires a virtual machine; use an explicitly admitted debug bundle for native validation".into());
         }
         executable.validate(&self.bin("aterm"))?;
         for alias in ["aterm-gui", "aterm-ctl"] {
@@ -1228,9 +1232,6 @@ pub struct Ctx {
     pub no_windows: bool,
     /// Fresh console-lock reading for native-window stages. Inert in constructed test contexts.
     pub screen_locked: fn() -> bool,
-    /// Trusted platform observation for native release/scratch-world admission. Tests read no
-    /// live platform fact unless they explicitly inject one.
-    pub(crate) virtual_machine: fn() -> Option<bool>,
     /// A focused GUI pacing measurement, never release qualification.
     pub cursor_pacing: bool,
     /// Run only the test compilation stage, never a release qualification.
@@ -1485,16 +1486,6 @@ impl Ctx {
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             no_windows: false,
             screen_locked: || false,
-            virtual_machine: {
-                #[cfg(test)]
-                {
-                    || None
-                }
-                #[cfg(not(test))]
-                {
-                    aterm_sysprobe::hv_vmm_present
-                }
-            },
             cursor_pacing: false,
             compile_only: false,
             checkers_in_tests: false,
@@ -1970,13 +1961,16 @@ pub(crate) type Admitter = fn(
     aterm_capacity::Admit,
 ) -> Result<aterm_capacity::Claim, aterm_capacity::Error>;
 
+/// One invocation's captured cell inputs, bound to the context every resource consumer uses.
+pub(crate) type PrepareCells = for<'ctx> fn(&'ctx Ctx) -> Option<cells::PreparedRun<'ctx>>;
+
 /// What runs a stage, admits the run's quiet machine and admits each stage's memory: the live
 /// ones ([`LIVE`]), or a test's stand-ins.
 #[derive(Clone, Copy)]
 struct Seams {
     stage: fn(&Ctx, &plan::StageSpec) -> Report,
     prepare_build_dir: fn(&Ctx) -> std::io::Result<()>,
-    prepare_cells: Option<fn(&Ctx) -> Option<cells::PreparedRun>>,
+    prepare_cells: Option<PrepareCells>,
     admit_quiet: Admitter,
     admit_memory: Admitter,
 }
@@ -1993,6 +1987,96 @@ const LIVE: Seams = Seams {
     admit_quiet: admit_live,
     admit_memory: admit_live,
 };
+
+/// One invocation's resolved work, shared by disk, turn, CPU and memory admission.
+/// The context stays borrowed through execution; no other invocation can consume its cells.
+pub(crate) struct RunPlan<'ctx> {
+    ctx: &'ctx Ctx,
+    stages: Vec<plan::StageSpec>,
+    cells: Option<cells::PreparedRun<'ctx>>,
+    cells_compile: bool,
+}
+
+impl<'ctx> RunPlan<'ctx> {
+    fn capture(ctx: &'ctx Ctx, seams: Seams) -> Self {
+        let mut stages = plan::plan(ctx);
+        let wanted = stages.iter().any(|s| s.id == plan::StageId::ForeignCells);
+        let mut cells = if wanted && ended(ctx).is_none() {
+            seams.prepare_cells.and_then(|prepare| prepare(ctx))
+        } else {
+            None
+        };
+        if let Some(prepared) = cells.as_mut()
+            && prepared.for_context(ctx).is_ok()
+        {
+            prepared.resolve();
+        }
+        // A missing or mismatched preparation cannot lower any compiler admission.
+        let cells_compile = wanted
+            && cells.as_ref().map_or(true, |prepared| {
+                prepared.needs_compiler(ctx).unwrap_or(true)
+            });
+        if !cells_compile {
+            for spec in &mut stages {
+                if spec.id == plan::StageId::ForeignCells {
+                    spec.mem = 0;
+                }
+            }
+        }
+        Self {
+            ctx,
+            stages,
+            cells,
+            cells_compile,
+        }
+    }
+
+    pub(crate) fn context(&self) -> &Ctx {
+        self.ctx
+    }
+
+    pub(crate) fn compiles(&self, id: plan::StageId) -> bool {
+        !plan::named_skip(self.ctx, id)
+            && memory::compiles(id)
+            && (id != plan::StageId::ForeignCells || self.cells_compile)
+    }
+
+    pub(crate) fn has_compiler_stage(&self) -> bool {
+        self.stages.iter().any(|s| self.compiles(s.id))
+    }
+
+    pub(crate) fn builds(&self, check: Check) -> bool {
+        disk::builds(check) && (check != Check::Cells || self.cells_compile)
+    }
+}
+
+/// The stage's reservation and its invocation's actual compiler-work decision.
+/// Direct stage tests retain conservative admission without resolving unrelated inputs.
+enum StageAdmission<'run, 'ctx> {
+    Planned {
+        early: &'run EarlyClaims,
+        plan: &'run RunPlan<'ctx>,
+    },
+    #[cfg(test)]
+    Conservative(&'run EarlyClaims),
+}
+
+impl StageAdmission<'_, '_> {
+    fn inputs(&self, ctx: &Ctx, id: plan::StageId) -> Result<(&EarlyClaims, bool), String> {
+        match self {
+            Self::Planned { early, plan } => {
+                if !std::ptr::eq(plan.context(), ctx) {
+                    return Err(
+                        "the stage's prepared work belongs to another source context".into(),
+                    );
+                }
+                Ok((early, plan.compiles(id)))
+            }
+            #[cfg(test)]
+            Self::Conservative(early) => Ok((early, true)),
+        }
+    }
+}
 
 /// Admit `need` in this user's ledger on the live machine ([`admit_in`]), saying on stderr what
 /// it waits for.
@@ -3095,13 +3179,17 @@ fn staged(
     spec: &plan::StageSpec,
     held: Option<String>,
     seams: Seams,
-    early: &EarlyClaims,
+    admission: StageAdmission<'_, '_>,
     run_stage: impl Fn() -> Report,
 ) -> (Report, Instant, String, Option<memory::ObservedCpu>) {
     let could_not_run = |why: String, held: Option<String>| {
         let mut report = Report::new(spec.title.clone());
         report.cannot_run(format!("{} — {why}", spec.title));
         (report, Instant::now(), held.unwrap_or_default(), None)
+    };
+    let (early, compiler_work) = match admission.inputs(ctx, spec.id) {
+        Ok(inputs) => inputs,
+        Err(why) => return could_not_run(why, held),
     };
     // Every child can contribute CPU observations; only metered stages keep memory records. The
     // test compile's meter attributes each compiler to its unit to date compile-line spans. Its
@@ -3126,7 +3214,11 @@ fn staged(
         }
         let _metering = memory::metering(meter.clone());
         let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
-        let jobs = compile_width::jobs_for(ctx, spec.id);
+        let jobs = if spec.id == plan::StageId::ForeignCells && !compiler_work {
+            None
+        } else {
+            compile_width::jobs_for(ctx, spec.id)
+        };
         let units = claim.as_ref().and_then(|held| held.units.as_ref());
         let (report, begun, machine) =
             compile_width::run_stage(spec.id, ctx.pool.as_deref(), jobs, units, &stopping, || {
@@ -3157,7 +3249,11 @@ fn staged(
         machine.push_str(&said);
     }
     let units = claim.as_ref().and_then(|claim| claim.units.as_ref());
-    let measured = measured(ctx, spec, &report, meter.as_deref(), jobs, units);
+    let measured = if spec.id == plan::StageId::ForeignCells && !compiler_work {
+        None
+    } else {
+        measured(ctx, spec, &report, meter.as_deref(), jobs, units)
+    };
     let kept = measured.as_ref().map(|(_, kept)| *kept);
     if let Some((said, _)) = measured {
         machine.push_str("; ");
@@ -3326,20 +3422,32 @@ fn run_with(
     show: &Show<'_>,
     seams: Seams,
 ) -> std::io::Result<i32> {
+    run_with_plan(ctx, out, log, show, seams, None)
+}
+
+fn run_with_plan<'ctx>(
+    ctx: &'ctx Ctx,
+    out: &mut (dyn Write + Send),
+    log: &mut (dyn Write + Send),
+    show: &Show<'_>,
+    seams: Seams,
+    prepared: Option<RunPlan<'ctx>>,
+) -> std::io::Result<i32> {
     let started_ms = ctx.admission.begin();
-    let code = run_seamed(ctx, out, log, show, seams);
+    let code = run_seamed(ctx, out, log, show, seams, prepared);
     let ended = code.as_ref().map_or(exit::COULD_NOT_RUN, |code| *code);
     admission_rows::run(ctx, started_ms, ended);
     code
 }
 
 /// [`run_with`]'s run.
-fn run_seamed(
-    ctx: &Ctx,
+fn run_seamed<'ctx>(
+    ctx: &'ctx Ctx,
     out: &mut (dyn Write + Send),
     log: &mut (dyn Write + Send),
     show: &Show<'_>,
     seams: Seams,
+    prepared: Option<RunPlan<'ctx>>,
 ) -> std::io::Result<i32> {
     ctx.record_event(&format!(
         "verify-event: {}",
@@ -3378,7 +3486,15 @@ fn run_seamed(
     let _ = writeln!(log, "{head}");
     let _ = write!(log, "{}", toolchain_lines(ctx));
 
-    let stages = plan::plan(ctx);
+    let mut invocation = prepared.unwrap_or_else(|| RunPlan::capture(ctx, seams));
+    if !std::ptr::eq(invocation.ctx, ctx) {
+        writeln!(
+            out,
+            "verify: the prepared work belongs to another invocation; no check was run"
+        )?;
+        return Ok(exit::COULD_NOT_RUN);
+    }
+    let stages = invocation.stages.clone();
     // The run's plan, pulls and keys decided (by `run_cli`), said before the first stage
     // starts: `verify land` keys its records by it.
     if let Some(land) = &ctx.land {
@@ -3400,44 +3516,18 @@ fn run_seamed(
             return Ok(exit::COULD_NOT_RUN);
         }
     };
-    // Readiness is diagnostic, not a success dependency of any native stage. Keep the captured
-    // stock and terminal unready-cell results owned by this invocation, not by reusable Ctx.
-    let cell_stage = stages
-        .iter()
-        .find(|stage| stage.id == plan::StageId::ForeignCells);
-    let mut preparation = if cell_stage.is_some() && ended(ctx).is_none() {
-        seams.prepare_cells.and_then(|prepare| prepare(ctx))
-    } else {
-        None
-    };
-    let mut observed = true;
-    if let (Some(spec), Some(prepared)) = (cell_stage, preparation.as_mut())
-        && prepared.needs_resolution()
-    {
-        // A failed admission defers resolution to the ordinary cells stage; it cannot invent
-        // a missing-tool result or prevent the other checks from running.
-        observed = false;
-        if let Ok(claim) = claim_memory(ctx, spec, seams.admit_memory)
-            && ended(ctx).is_none()
-        {
-            let _reservation =
-                holding_resource_claim(claim.as_ref().map(|held| Arc::clone(&held.claim)));
-            let _covering = memory::covering(claim.as_ref().and_then(ResourceClaim::cover));
-            prepared.resolve_unready(ctx);
-            observed = true;
-        }
-    }
+    // Prerequisite observations use the same completed plans, never another graph walk.
+    let preparation = invocation.cells.take();
     if let Some(prepared) = &preparation
-        && observed
+        && prepared.for_context(ctx).is_ok()
     {
-        for (cell, triple, why) in prepared.unavailable(ctx) {
+        for (cell, triple, why) in prepared.unavailable() {
             let event = ctx.record_event(&format!(
                 "verify-event: {}",
                 crate::event_log::event_value(
                     crate::event_log::EventKind::CellPrerequisiteUnavailable,
                     aterm_json::json!({
-                          "complete":false,
-                        "cell":cell, "triple":triple, "detail":why
+                        "complete":false, "cell":cell, "triple":triple, "detail":why
                     })
                 )
             ));
@@ -3493,8 +3583,17 @@ fn run_seamed(
                 .filter_map(|c| ctx.checks.iter().position(|k| k == c))
                 .collect();
             let held = held_note(&stages, i, held, budget);
-            let (report, begun_at, machine, cpu) =
-                staged(ctx, &quiet, spec, held, seams, &early, || {
+            let (report, begun_at, machine, cpu) = staged(
+                ctx,
+                &quiet,
+                spec,
+                held,
+                seams,
+                StageAdmission::Planned {
+                    early: &early,
+                    plan: &invocation,
+                },
+                || {
                     let event = ctx.record_event(&report::stage_started(i, &spec.title));
                     if let Ok(mut o) = out.lock() {
                         let _ = o.write_all(event.as_bytes()).and_then(|()| o.flush());
@@ -3512,7 +3611,8 @@ fn run_seamed(
                     } else {
                         (seams.stage)(ctx, spec)
                     }
-                });
+                },
+            );
             let waiting = begun_at.saturating_duration_since(t0);
             let execution = begun_at.elapsed();
             // The ordered log and aggregate check result can wait for other stages;
@@ -4209,6 +4309,21 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             format!("verify: FAIL — [OB-1] {why}; no check was run"),
         );
     }
+    // Likewise a vendored copy pinned by tree id: the index holds the tree its pin names and the
+    // working copy changes nothing under it, before anything builds it. A hand edit or a build
+    // inside the copy changes no member, so the change cone alone would never pull `forge`.
+    match aterm_forge::tree_pins(&root) {
+        Ok(_) => {}
+        Err(aterm_forge::TreePinError::Fail(why)) => {
+            return stop(
+                exit::FAILED,
+                format!("verify: FAIL — [OB-1] {why}; no check was run"),
+            );
+        }
+        Err(aterm_forge::TreePinError::CouldNotRun(why)) => {
+            return could_not_run(format!("[OB-1] {why}; no check was run"));
+        }
+    }
     if parsed.builds_packages_here() {
         let path_env = tools.path_with_stage2_first(&env.path);
         let foreign = changed::foreign_specs(&root, &tools, &path_env, &parsed.packages);
@@ -4317,9 +4432,20 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     if parsed.queued_since.is_some() {
         ctx.admission.judged_by_land();
     }
+    turn::bind_events(&mut ctx);
+    let mut log = open_run_log(&mut ctx, parsed.log.as_deref(), cwd);
+    #[cfg(unix)]
+    if let Some(log) = &log
+        && let Err(why) = log.observe_signals(ctx.events.clone())
+    {
+        eprintln!("signal log unavailable: {why}");
+    }
+    ctx.hang_samples = log.as_ref().map(|log| run_log::sample_dir(&log.path));
+    let log_shown = log.as_ref().map(|log| log.path.display().to_string());
+    let invocation = RunPlan::capture(&ctx, LIVE);
     // A heavy run takes the judgment turn before it claims its disk, so a run that waits for the
     // turn holds nothing another run could use (`docs/DESIGN-landing-economy.md` §2.3).
-    let turn = match turn::take(&mut ctx, parsed.queued_since, parsed.admit) {
+    let turn = match turn::take(&invocation, parsed.queued_since, parsed.admit) {
         Ok(turn) => turn,
         Err(why) => {
             if let Some(record) = &ctx.runs {
@@ -4333,7 +4459,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         }
     };
     #[cfg(unix)]
-    let disk = match disk::admit(&ctx, parsed.admit) {
+    let disk = match disk::admit_planned(&invocation, parsed.admit) {
         Ok(held) => held,
         Err(why) => {
             if let Some(record) = &ctx.runs {
@@ -4345,15 +4471,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             return code;
         }
     };
-    let mut log = open_run_log(&mut ctx, parsed.log.as_deref(), cwd);
-    #[cfg(unix)]
-    if let Some(log) = &log
-        && let Err(why) = log.observe_signals(ctx.events.clone())
-    {
-        eprintln!("signal log unavailable: {why}");
-    }
-    ctx.hang_samples = log.as_ref().map(|log| run_log::sample_dir(&log.path));
-    let log_shown = log.as_ref().map(|log| log.path.display().to_string());
     let mut sink = std::io::sink();
     let log_writer: &mut (dyn Write + Send) = match log.as_mut() {
         Some(f) => f,
@@ -4370,7 +4487,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         cone: cone.as_deref(),
         log: log_shown.as_deref(),
     };
-    let code = match run(&ctx, &mut *out, log_writer, &show) {
+    let code = match run_with_plan(&ctx, &mut *out, log_writer, &show, LIVE, Some(invocation)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("verify: cannot write the result: {e}");

@@ -952,6 +952,55 @@ fn each_run_entry_raises_its_ports_count_by_exactly_one() {
     ));
     assert_eq!(live.runs(), (9, 2), "a refused run starts nothing");
     assert_eq!(beside.runs(), (1, 1));
+    assert_eq!(
+        live.git_by().counted(),
+        [("status", 1), ("other", 1)],
+        "each git is counted by its subcommand, one with none as `other`"
+    );
+    assert_eq!(beside.git_by().counted(), [("other", 1)]);
+}
+
+/// A GIT IS COUNTED BY THE FIRST WORD PAST ITS GLOBAL OPTIONS: `-C <dir>` and `-c <k=v>` are
+/// skipped with their word, every other `-…` alone, so `git -C x -c a=b --no-lazy-fetch
+/// rev-parse --git-dir` is a `rev-parse`; a word [`GIT_WORDS`] does not name, and a git with no
+/// word, is `other`; [`GitBy::since`] is the difference word by word, never below 0.
+/// NEGATIVE CONTROL: a `word_of` that took the first argument reads `-C` as `other`, and one that
+/// skipped only `-…` reads the directory `x` as the word.
+#[test]
+fn a_git_is_counted_by_the_first_word_past_its_global_options() {
+    let args = |words: &[&str]| -> Vec<OsString> { words.iter().map(OsString::from).collect() };
+    let word = |words: &[&str]| GIT_WORDS[GitBy::word_of(&args(words))];
+    assert_eq!(
+        word(&[
+            "-C",
+            "x",
+            "-c",
+            "a=b",
+            "--no-lazy-fetch",
+            "rev-parse",
+            "--git-dir"
+        ]),
+        "rev-parse"
+    );
+    assert_eq!(word(&["-C", "config", "for-each-ref"]), "for-each-ref");
+    assert_eq!(
+        word(&["-c", "status=x", "ls-remote", "--get-url"]),
+        "ls-remote"
+    );
+    assert_eq!(word(&["rev-list", "--left-right", "--count"]), "rev-list");
+    assert_eq!(word(&["gc"]), "other");
+    assert_eq!(word(&["--version"]), "other");
+    assert_eq!(word(&[]), "other");
+    assert_eq!(GIT_WORDS.last(), Some(&"other"));
+
+    let mut began = GitBy::default();
+    began.0[0] = 3;
+    began.0[1] = 5;
+    let mut now = began;
+    now.0[0] = 7;
+    now.0[2] = 1;
+    let spent = now.since(began);
+    assert_eq!(spent.counted(), [("rev-parse", 4), ("for-each-ref", 1)]);
 }
 
 /// EVERY `Live::new` OF A PROCESS COUNTS INTO ONE SUM, WHICH A CONVERGE PASS READS: the pass's

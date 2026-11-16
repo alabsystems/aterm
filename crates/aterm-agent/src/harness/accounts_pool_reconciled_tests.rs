@@ -33,6 +33,7 @@ fn seen(cli: Cli, email: &str) -> Observation {
         src: ObservedSrc::CliLog,
         path: "/logins/somewhere/cli.log".into(),
         mtime: Some(1),
+        plan: None,
     })
 }
 

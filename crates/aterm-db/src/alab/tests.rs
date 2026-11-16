@@ -458,7 +458,7 @@ fn seeds_fit_their_schemas_and_share_the_provider_words() {
         assert!(crate::typed::pk_grammar(plan.pk));
     }
     let rows = seeds::rows_for(&Cells::new()).unwrap();
-    assert_eq!(rows.len(), 6 + 7 + 7);
+    assert_eq!(rows.len(), 6 + 7 + 13);
     for change in rows.iter().flatten() {
         assert_eq!(change.value.as_ref().unwrap()["a"], Value::Bool(true));
     }

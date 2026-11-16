@@ -96,12 +96,16 @@ fn entries(planted: &[Planted]) -> Vec<Entry> {
 /// abort, or a stop at the push bound), the runs that ended without landing by exit, signal or a
 /// missing end, p50 and p95 minutes to main to a tenth (a landing of 1230 s is 20.5 minutes),
 /// landings by kind, re-judges and rounds by cause with their results, composes and aborts, the
-/// unreadable record, and the one movement of main no landing names. A run that started before
-/// the window is not counted, though its landing still names its movement. NEGATIVE CONTROL:
-/// the same store from a window that starts after every run counts none of them and no first
-/// judgment, while the movements their landings name stay recorded. Mutants run, each of which
-/// made this test fail: a stop at the push bound not counted as a lost race (2/9); r over every
-/// first judgment (1/6); minutes taken as whole minutes before the percentile (p50 20).
+/// unreadable record, the one movement of main that holds no receipt, and the one receipted
+/// landing no end record names. A run that started before the window is not counted, though its
+/// landing still names its movement, and its start is the earliest a record was read from: a
+/// receipted landing made before it is not asked for a record. NEGATIVE CONTROLS: the same
+/// store from a window that starts after every run counts none of them and no first judgment,
+/// while the movements their landings name stay recorded; and with no entry read no landing is
+/// counted as missing its record. Mutants run, each of which made this test fail: a stop at
+/// the push bound not counted as a lost race (2/9); r over every first judgment (1/6); minutes
+/// taken as whole minutes before the percentile (p50 20); a receipted landing asked for its
+/// record whenever it was made (2 of 6, the one from before the earliest record among them).
 #[test]
 fn the_census_prints_the_planted_values() {
     use Kind::{Abort, Compose, Judgment, Round};
@@ -216,7 +220,23 @@ fn the_census_prints_the_planted_values() {
         b"not a record",
         Origin::Journal,
     ));
-    let movements: Vec<String> = ['1', '2', '3', '4', '5'].into_iter().map(id).collect();
+    // Four landings the records name, one receipted landing no record names, a tip with no
+    // receipt, and a receipted landing from before the earliest record read (run H's start).
+    let moved = |commit: char, at: u64, landing: bool| Listed {
+        commit: id(commit),
+        parents: Vec::new(),
+        at,
+        landing,
+    };
+    let movements = [
+        moved('6', at(12), false),
+        moved('5', at(11), true),
+        moved('3', at(10), true),
+        moved('2', at(9), true),
+        moved('1', at(8), true),
+        moved('4', SINCE, true),
+        moved('0', SINCE - 61, true),
+    ];
     let lines = census(&store, &movements, SINCE);
     let expected = [
         format!(
@@ -234,16 +254,30 @@ fn the_census_prints_the_planted_values() {
         "  re-judges by cause: cut 1 (pass 1); doomed 1 (fail 1)".to_owned(),
         "  rounds by cause: kept-merge 1 (pass 1)".to_owned(),
         "  composes: 1; aborts: cut 1, doomed 1".to_owned(),
-        format!("  main movements with no record: 1 of 5 ({})", id('5')),
+        format!("  main tips with no receipt: 1 of 7 ({})", id('6')),
+        format!(
+            "  receipted landings with no run record: 1 of 5 since {} (the earliest run record \
+             read) ({})",
+            aterm_types::rfc3339::format_rfc3339(SINCE - 60),
+            id('5')
+        ),
     ];
     assert_eq!(lines, expected);
+    assert_eq!(
+        census(&[], &movements, SINCE)[expected.len() - 2..],
+        [
+            format!("  main tips with no receipt: 1 of 7 ({})", id('6')),
+            "  receipted landings with no run record: none counted (no run record was read)"
+                .to_owned(),
+        ]
+    );
 
     let later = census(&store, &movements, NOW + 86_400);
     assert!(later[0].contains(": 0 runs from 0 hosts;"), "{later:?}");
     assert_eq!(later[1], "  r (first judgments red): 0/0; 0 did not run");
     assert_eq!(
-        later.last(),
-        expected.last(),
+        later[later.len() - 2..],
+        expected[expected.len() - 2..],
         "every landing record names its movement, whatever window counts its run"
     );
 }
@@ -289,9 +323,21 @@ fn mains_movements_are_the_tip_its_landings_and_the_mains_they_were_pushed_onto(
     let commits = listed(&log);
     assert_eq!(commits.len(), 11);
     assert!(commits[0].landing && commits[4].landing && !commits[6].landing);
+    let moved = |listed: &[Listed]| -> Vec<(String, bool)> {
+        mainline(&id('3'), listed, SINCE)
+            .into_iter()
+            .map(|commit| (commit.commit, commit.landing))
+            .collect()
+    };
     assert_eq!(
-        mainline(&id('3'), &commits, SINCE),
-        [id('3'), id('m'), id('2'), id('r'), id('1')]
+        moved(&commits),
+        [
+            (id('3'), true),
+            (id('m'), false),
+            (id('2'), true),
+            (id('r'), false),
+            (id('1'), true)
+        ]
     );
     let unlanded: Vec<Listed> = commits
         .iter()
@@ -300,7 +346,7 @@ fn mains_movements_are_the_tip_its_landings_and_the_mains_they_were_pushed_onto(
             ..c.clone()
         })
         .collect();
-    assert_eq!(mainline(&id('3'), &unlanded, SINCE), [id('3')]);
+    assert_eq!(moved(&unlanded), [(id('3'), false)]);
 }
 
 /// THE CENSUS COUNTS A SPOOLED RUN RECORD THAT DOES NOT READ: a spool file named as a run record

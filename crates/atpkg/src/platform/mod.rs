@@ -247,13 +247,15 @@ pub(crate) fn install_shim(
     install_shim_to(shim, &build_bin_dir.join(tool.exe_file()))
 }
 
-/// `install_shim` whose wrapper also exports `env` ([`crate::shim_env`]) before it execs the
-/// target. When the target sits in a store build and the env is non-empty, the build's
-/// sidecar is recorded in the same step: a launcher that reaches the binary by its own
-/// path reads its environment from there ([`crate::shim_env::of_store_binary`]), never from
-/// this shim's text, so the two records must not be left to separate callers to keep in
-/// step. An empty env records nothing: the build's declaration stands over a shim laid
-/// plain ([`crate::ops::exec_env`]), and only a landing undeclares.
+/// Lay `tool`'s PATH entry at `shim` ([`shim_executable_env`]): a shim that exports `env`
+/// ([`crate::shim_env`]) before it execs the build's program or, where that shim would only
+/// exec it, on Unix a link to the program (`path_entry`). When the target sits in a store build
+/// and the env is non-empty, the build's sidecar is recorded in the same step: a launcher that
+/// reaches the binary by its own path reads its environment from there
+/// ([`crate::shim_env::of_store_binary`]), never from this shim's text, so the two records must
+/// not be left to separate callers to keep in step. An empty env records nothing: the build's
+/// declaration stands over a shim laid plain ([`crate::ops::exec_env`]), and only a landing
+/// undeclares.
 pub fn install_shim_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
@@ -261,6 +263,9 @@ pub fn install_shim_env(
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<()> {
     let target = build_bin_dir.join(tool.exe_file());
+    #[cfg(unix)]
+    crate::lay::write_in_process(&shim_executable_env(build_bin_dir, tool, shim, env)?)?;
+    #[cfg(not(unix))]
     install_shim_to_env(shim, &target, env)?;
     if !env.is_empty()
         && let Some(build_dir) = crate::shim_env::store_build_of(&target)
@@ -275,14 +280,20 @@ pub fn install_shim_to(shim: &Path, target: &Path) -> io::Result<()> {
     install_shim_to_env(shim, target, &crate::shim_env::ShimEnv::NONE)
 }
 
-/// The shim [`install_shim_env`] would lay.
+/// The PATH entry [`install_shim_env`] would lay: the shim [`shim_executable_to_env`] renders
+/// for the build's program or, on Unix, the link `path_entry` lays in its place where this
+/// kernel starts a program through a link at its real path (`STARTS_AT_REAL_PATH`).
 pub fn shim_executable_env(
     build_bin_dir: &Path,
     tool: &crate::store::ToolName,
     shim: &Path,
     env: &crate::shim_env::ShimEnv,
 ) -> io::Result<crate::lay::Executable> {
-    shim_executable_to_env(shim, &build_bin_dir.join(tool.exe_file()), env)
+    let target = build_bin_dir.join(tool.exe_file());
+    let file = shim_executable_to_env(shim, &target, env)?;
+    #[cfg(unix)]
+    let file = path_entry(file, &target, STARTS_AT_REAL_PATH);
+    Ok(file)
 }
 
 /// The tail of every `.cmd` forward line after the target's closing quote.
@@ -618,19 +629,7 @@ pub(crate) fn twin_prelude_with_launcher(
         return String::new();
     }
     let mut s = sh_selfupdate_prelude(program, prefix, crate::stub::named(atpkg), verbs);
-    // The sign-in block reads the launch as typed (it skips `--no-harness` itself), ahead of
-    // the yolo block, so a launch it stops never prints the yolo block's `running` line.
-    if let Some(row) = crate::vendor_direct::spec(program)
-        && let Some(gate) = &row.signin_gate
-    {
-        let skip: Vec<&str> = gate
-            .local
-            .iter()
-            .chain(row.self_update_verbs.iter())
-            .copied()
-            .collect();
-        s.push_str(&sh_signin_prelude(program, row.product, gate, &skip));
-    }
+    s.push_str(&sh_no_harness_prelude(program));
     s.push_str(&sh_yolo_prelude_with_launcher(
         program, yolo, verbs, launcher,
     ));
@@ -690,221 +689,22 @@ pub(crate) fn sh_harness_prelude(program: &str, prefix: &Path) -> String {
     )
 }
 
-/// Whether `name` may be embedded in the sign-in block as a variable name: `[A-Z_][A-Z0-9_]*`.
-fn is_shell_safe_env_name(name: &str) -> bool {
-    name.bytes()
-        .next()
-        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-}
-
-/// Whether `part` may be embedded in the sign-in block as one path component.
-fn is_shell_safe_component(part: &str) -> bool {
-    !part.is_empty()
-        && part != "."
-        && part != ".."
-        && part
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-}
-
-/// THE SIGN-IN BLOCK of a program's twin and `bin/` shim ([`crate::vendor_direct::SigninGate`]):
-/// under aterm (`ATERM_CHILD=1`, no `ATERM_NO_HARNESS` and no `--no-harness` or
-/// `--no-alab-harness` ahead of a literal `--`), an interactive launch (no one-shot option
-/// and no subcommand of `skip` before a literal `--`) that its environment and files say is
-/// signed out runs `aterm harness signin --cli <cli> --wait` first, and runs the program only
-/// once that exits 0; otherwise it exits 69 with one line. Outside aterm it does nothing.
-/// Renders empty where any word it would embed is not shell-safe (fail closed: no block,
-/// never a half-quoted one).
-#[must_use]
-pub(crate) fn sh_signin_prelude(
-    program: &str,
-    product: &str,
-    gate: &crate::vendor_direct::SigninGate,
-    skip: &[&str],
-) -> String {
-    let crate::vendor_direct::SigninGate {
-        cli,
-        credential_env,
-        login_file_env,
-        home_env,
-        home_default,
-        login_file,
-        one_shot,
-        local: _,
-    } = *gate;
-    if crate::store::ToolName::new(program).is_none()
-        || !crate::selfupdate::is_shell_safe_verb(program)
-        || !crate::selfupdate::is_shell_safe_verb(cli)
-        || !credential_env
-            .iter()
-            .chain([login_file_env, home_env].iter())
-            .all(|n| is_shell_safe_env_name(n))
-        || !is_shell_safe_component(home_default)
-        || !is_shell_safe_component(login_file)
-        || one_shot.is_empty()
-        || !one_shot
-            .iter()
-            .all(|f| crate::yolo::is_shell_safe_marker(f))
-        || !skip
-            .iter()
-            .all(|w| crate::selfupdate::is_shell_safe_verb(w))
-        || product.is_empty()
-        || !product
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b' ' | b'.' | b'-'))
-    {
-        return String::new();
-    }
-    let mut s = String::from("# atpkg: sign-in gate \u{2014} under aterm a signed-out ");
-    s.push_str(program);
-    s.push_str(" is signed in once for this machine by `aterm harness signin --cli ");
-    s.push_str(cli);
-    s.push_str(
-        "` (sandboxed: one sign-in and one need, no page opened) before an interactive launch, \
-         and runs only once that signs it in (aterm help pkg).\n",
-    );
-    let words = crate::yolo::word_options(program);
-    let alts = |list: &[&str]| -> Option<String> {
-        let mut seen: Vec<String> = Vec::new();
-        for f in list {
-            if !crate::yolo::is_shell_safe_marker(f) {
-                return None;
-            }
-            for spelled in std::iter::once(sh_quote_str(f)).chain(
-                f.starts_with("--")
-                    .then(|| format!("{}=*", sh_quote_str(f))),
-            ) {
-                if !seen.contains(&spelled) {
-                    seen.push(spelled);
-                }
-            }
-        }
-        Some(seen.join("|"))
-    };
-    let Some(once) = alts(one_shot) else {
-        return String::new();
-    };
-    let value_options: Vec<&str> = words
-        .values
-        .iter()
-        .copied()
-        .filter(|v| !one_shot.contains(v))
-        .collect();
-    let (Some(takes), Some(maybe)) = (alts(&value_options), alts(words.optional)) else {
-        return String::new();
-    };
-    s.push_str(
-        "if [ \"${ATERM_CHILD-}\" = 1 ] && [ -z \"${ATERM_NO_HARNESS-}\" ]; then\n  \
-         __atpkg_gate=1\n  \
-         __atpkg_v=0\n  \
-         __atpkg_first=1\n  \
-         for __atpkg_a in \"$@\"; do\n    \
-         if [ \"$__atpkg_v\" = 1 ]; then __atpkg_v=0; continue; fi\n    \
-         if [ \"$__atpkg_v\" = 2 ]; then\n      \
-         __atpkg_v=0\n      \
-         case \"$__atpkg_a\" in -*) ;; *) continue ;; esac\n    \
-         fi\n    \
-         case \"$__atpkg_a\" in\n      \
-         --) break ;;\n      \
-         '--no-harness'|'--no-alab-harness') __atpkg_gate=0; break ;;\n      ",
-    );
-    s.push_str(&once);
-    s.push_str(") __atpkg_gate=0; break ;;\n");
-    // A `--opt=value` spelling carries its own value, so only the bare one takes the next word.
-    let bare = |alt: &str| {
-        alt.split('|')
-            .filter(|a| !a.ends_with("=*"))
-            .collect::<Vec<_>>()
-            .join("|")
-    };
-    if !value_options.is_empty() {
-        s.push_str("      ");
-        s.push_str(&bare(&takes));
-        s.push_str(") __atpkg_v=1 ;;\n");
-    }
-    if !words.optional.is_empty() {
-        s.push_str("      ");
-        s.push_str(&bare(&maybe));
-        s.push_str(") __atpkg_v=2 ;;\n");
-    }
-    s.push_str("      -*) ;;\n      *)\n        if [ \"$__atpkg_first\" = 1 ]; then\n          __atpkg_first=0\n");
-    if !skip.is_empty() {
-        let mut uniq: Vec<&str> = Vec::new();
-        for w in skip {
-            if !uniq.contains(w) {
-                uniq.push(w);
-            }
-        }
-        s.push_str("          case \"$__atpkg_a\" in ");
-        s.push_str(
-            &uniq
-                .iter()
-                .map(|w| sh_quote_str(w))
-                .collect::<Vec<_>>()
-                .join("|"),
-        );
-        s.push_str(") __atpkg_gate=0; break ;; esac\n");
-    }
-    s.push_str("        fi\n        ;;\n");
-    s.push_str("    esac\n  done\n  if [ \"$__atpkg_gate\" = 1 ]; then\n    if ");
-    s.push_str(
-        &credential_env
-            .iter()
-            .map(|n| format!("[ -n \"${{{n}-}}\" ]"))
-            .collect::<Vec<_>>()
-            .join(" || "),
-    );
-    s.push_str("; then\n      __atpkg_gate=0\n");
-    // A login grok refused carries `<file>.refused` at least as new as itself (aterm's
-    // `harness::grok_signin::mark_refused`), and is signed out until a newer login replaces it.
-    let file_test = |path: &str| {
-        format!(
-            "[ -f \"{path}\" ] && [ -s \"{path}\" ] && {{ [ ! -e \"{path}.refused\" ] || [ \"{path}\" -nt \"{path}.refused\" ]; }}"
-        )
-    };
-    s.push_str(&format!(
-        "    elif [ -n \"${{{login_file_env}-}}\" ]; then\n      \
-         if {}; then __atpkg_gate=0; fi\n",
-        file_test(&format!("${login_file_env}"))
-    ));
-    s.push_str(&format!(
-        "    elif [ -n \"${{{home_env}-}}\" ]; then\n      \
-         if {}; then __atpkg_gate=0; fi\n",
-        file_test(&format!("${home_env}/{login_file}"))
-    ));
-    s.push_str(&format!(
-        "    elif [ -n \"${{HOME-}}\" ] && {}; then\n      __atpkg_gate=0\n    fi\n  fi\n",
-        file_test(&format!("$HOME/{home_default}/{login_file}"))
-    ));
-    let missing = format!(
-        "{program}: signed out of {product}, and aterm (which signs this machine in once) is \
-         not on PATH; nothing was started"
-    );
-    let refused = format!(
-        "{program}: not signed in to {product} (aterm harness signin --cli {cli} says why \
-         above); nothing was started"
-    );
-    s.push_str(
-        "  if [ \"$__atpkg_gate\" = 1 ]; then\n    \
-         __atpkg_aterm=$(command -v aterm 2>/dev/null) || __atpkg_aterm=\n    \
-         if [ -z \"$__atpkg_aterm\" ]; then\n      printf '%s\\n' ",
-    );
-    s.push_str(&sh_quote_str(&missing));
-    s.push_str(" 1>&2\n      exit 69\n    fi\n    if ! \"$__atpkg_aterm\" harness signin --cli ");
-    s.push_str(&sh_quote_str(cli));
-    s.push_str(" --wait; then\n      printf '%s\\n' ");
-    s.push_str(&sh_quote_str(&refused));
-    s.push_str(" 1>&2\n      exit 69\n    fi\n  fi\nfi\n");
-    s
-}
-
 /// The Unix `bin/` shim body: a `/bin/sh` stub that `exec`s the store binary.
 #[cfg(test)]
 pub(crate) fn sh_shim_content(target: &Path) -> String {
     sh_shim_content_env(target, &crate::shim_env::ShimEnv::NONE)
+}
+
+/// The first lines of every Unix shim: its interpreter, and why it execs.
+#[cfg(any(unix, test))]
+const SH_SHIM_HEAD: &str =
+    "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n";
+
+/// The Unix shim that only execs `target`: [`SH_SHIM_HEAD`] and one exec line, the body
+/// [`sh_shim_body`] renders with no environment, prelude, launch, route or build block.
+#[cfg(unix)]
+pub(crate) fn sh_exec_only(target: &Path) -> String {
+    format!("{SH_SHIM_HEAD}exec {} \"$@\"\n", sh_shim_quote(target))
 }
 
 /// The note ahead of an env-carrying shim's `export` lines.
@@ -1011,6 +811,40 @@ pub(crate) fn sh_selfupdate_prelude(
     s
 }
 
+/// The note line of the [`sh_no_harness_prelude`] block.
+const SH_NO_HARNESS_NOTE: &str = "# atpkg: `--no-harness` or `--no-alab-harness` ahead of a literal `--` is taken off, \
+     and this launch runs without its harness (ATERM_NO_HARNESS=1; aterm help pkg).\n";
+
+/// THE `--no-harness` BLOCK of an agent program's twin and `bin/` shim, whatever yolo policy its
+/// row has: `--no-harness` and `--no-alab-harness` ahead of a literal `--` are removed and
+/// `ATERM_NO_HARNESS=1` is exported, so the harness hand-off ([`sh_harness_prelude`]) and the
+/// usage tap stand aside and the vendor never sees either word ([`crate::yolo::strip_no_harness`]
+/// is the same rule for `aterm pkg run`). Empty for any other program.
+pub(crate) fn sh_no_harness_prelude(program: &str) -> String {
+    if !crate::stub::is_agent_program(program) {
+        return String::new();
+    }
+    let mut s = String::from(SH_NO_HARNESS_NOTE);
+    s.push_str(
+        "__atpkg_no_harness=0\n\
+         __atpkg_nh_stop=0\n\
+         __atpkg_n=$#\n\
+         while [ \"$__atpkg_n\" -gt 0 ]; do\n  \
+         __atpkg_n=$((__atpkg_n - 1))\n  \
+         if [ \"$__atpkg_nh_stop\" = 0 ] && { [ \"$1\" = \"--no-harness\" ] || [ \"$1\" = \"--no-alab-harness\" ]; }; then\n    \
+         __atpkg_no_harness=1\n    \
+         shift\n  \
+         else\n    \
+         if [ \"$1\" = \"--\" ]; then __atpkg_nh_stop=1; fi\n    \
+         set -- \"$@\" \"$1\"\n    \
+         shift\n  \
+         fi\n\
+         done\n\
+         if [ \"$__atpkg_no_harness\" = 1 ]; then ATERM_NO_HARNESS=1; export ATERM_NO_HARNESS; fi\n",
+    );
+    s
+}
+
 /// THE `--yolo` BLOCK of an agent program's twin and `bin/` shim ([`crate::yolo`]).
 #[cfg(test)]
 #[must_use]
@@ -1029,37 +863,24 @@ fn sh_yolo_prelude_with_launcher(
     launcher: Option<&crate::native_defaults::Launcher>,
 ) -> String {
     let launcher = launcher.filter(|_| program == "codex");
-    let crate::yolo::Policy {
-        flags,
-        markers,
-        after,
-        skip,
-    } = *policy;
+    let crate::yolo::Policy { flags, markers } = *policy;
     if flags.is_empty()
         || markers.is_empty()
         || !flags.iter().all(|f| crate::yolo::is_shell_safe_flag(f))
         || !markers.iter().all(|m| crate::yolo::is_shell_safe_marker(m))
-        || !after
+        || !skip_extra
             .iter()
-            .chain(skip.iter())
-            .chain(skip_extra.iter())
             .all(|w| crate::selfupdate::is_shell_safe_verb(w))
         || crate::store::ToolName::new(program).is_none()
         || !crate::selfupdate::is_shell_safe_verb(program)
     {
         return String::new();
     }
-    let skip_all: Vec<&str> = skip
-        .iter()
-        .copied()
-        .chain(skip_extra.iter().copied().filter(|w| !skip.contains(w)))
-        .collect();
     let spelled = flags
         .iter()
         .map(|f| sh_quote_str(f))
         .collect::<Vec<_>>()
         .join(" ");
-    let words = !after.is_empty() || !skip_all.is_empty();
     let fresh = |indent: &str| {
         let mut f = String::new();
         for (i, flag) in flags.iter().enumerate() {
@@ -1107,28 +928,8 @@ fn sh_yolo_prelude_with_launcher(
             );
         }
     };
-    s.push_str(
-        "__atpkg_no_harness=0\n\
-         __atpkg_nh_stop=0\n\
-         __atpkg_n=$#\n\
-         while [ \"$__atpkg_n\" -gt 0 ]; do\n  \
-         __atpkg_n=$((__atpkg_n - 1))\n  \
-         if [ \"$__atpkg_nh_stop\" = 0 ] && { [ \"$1\" = \"--no-harness\" ] || [ \"$1\" = \"--no-alab-harness\" ]; }; then\n    \
-         __atpkg_no_harness=1\n    \
-         shift\n  \
-         else\n    \
-         if [ \"$1\" = \"--\" ]; then __atpkg_nh_stop=1; fi\n    \
-         set -- \"$@\" \"$1\"\n    \
-         shift\n  \
-         fi\n\
-         done\n\
-         if [ \"$__atpkg_no_harness\" = 1 ]; then ATERM_NO_HARNESS=1; export ATERM_NO_HARNESS; fi\n",
-    );
     s.push_str("__atpkg_yolo=0\n__atpkg_posture=0\n");
     s.push_str("__atpkg_have_word=0\n__atpkg_word=\n__atpkg_word_at=0\n__atpkg_word_ok=1\n");
-    if !crate::yolo::word_options(program).optional.is_empty() {
-        s.push_str("__atpkg_maybe=0\n__atpkg_gap=0\n__atpkg_joins=0\n");
-    }
     for i in 0..flags.len() {
         s.push_str("__atpkg_p");
         s.push_str(&i.to_string());
@@ -1191,12 +992,7 @@ fn sh_yolo_prelude_with_launcher(
              ;;\n  esac\ndone\n",
         );
     }
-    let crate::yolo::WordOptions {
-        values,
-        optional,
-        switches,
-        own_yolo,
-    } = crate::yolo::word_options(program);
+    let crate::yolo::WordOptions { values, switches } = crate::yolo::word_options(program);
     let quoted = |words: &[&str]| {
         words
             .iter()
@@ -1205,12 +1001,8 @@ fn sh_yolo_prelude_with_launcher(
             .join("|")
     };
     let standalone: Vec<&str> = std::iter::once(crate::yolo::WORD)
-        .chain(own_yolo.iter().copied())
         .chain(flags.iter().copied())
         .chain(switches.iter().copied())
-        .collect();
-    let removable: Vec<&str> = std::iter::once(crate::yolo::WORD)
-        .chain(own_yolo.iter().copied())
         .collect();
     s.push_str(
         "__atpkg_at=0\n__atpkg_value=0\n\
@@ -1219,35 +1011,6 @@ fn sh_yolo_prelude_with_launcher(
          if [ \"$__atpkg_a\" = \"--\" ]; then break; fi\n  \
          if [ \"$__atpkg_value\" = 1 ]; then __atpkg_value=0; continue; fi\n",
     );
-    if !optional.is_empty() {
-        // An optional value takes a bare next token; a `--yolo` (or an own spelling) right
-        // after a bare one, then a bare word, is a removal that would join them (`yolo::Stop`).
-        s.push_str(
-            "  if [ \"$__atpkg_maybe\" = 1 ]; then\n    \
-             __atpkg_maybe=0\n    \
-             case \"$__atpkg_a\" in\n      \
-             -*) ;;\n      \
-             *) continue ;;\n    \
-             esac\n    \
-             case \"$__atpkg_a\" in\n      ",
-        );
-        s.push_str(&quoted(&removable));
-        s.push_str(
-            ") __atpkg_gap=1 ;;\n      \
-             *) __atpkg_gap=0 ;;\n    \
-             esac\n  \
-             elif [ \"$__atpkg_gap\" = 1 ]; then\n    \
-             case \"$__atpkg_a\" in\n      ",
-        );
-        s.push_str(&quoted(&removable));
-        s.push_str(
-            ") ;;\n      \
-             -*) __atpkg_gap=0 ;;\n      \
-             *) __atpkg_joins=1; __atpkg_word_ok=0; break ;;\n    \
-             esac\n  \
-             fi\n",
-        );
-    }
     s.push_str("  case \"$__atpkg_a\" in\n    ");
     s.push_str(&quoted(&standalone));
     s.push_str(") ;;\n");
@@ -1256,17 +1019,11 @@ fn sh_yolo_prelude_with_launcher(
         s.push_str(&quoted(values));
         s.push_str(") __atpkg_value=1 ;;\n");
     }
-    if !optional.is_empty() {
-        s.push_str("    ");
-        s.push_str(&quoted(optional));
-        s.push_str(") __atpkg_maybe=1 ;;\n");
-    }
-    if !values.is_empty() || !optional.is_empty() {
+    if !values.is_empty() {
         s.push_str("    ");
         s.push_str(
             &values
                 .iter()
-                .chain(optional.iter())
                 .map(|f| marker_pattern(f))
                 .collect::<Vec<_>>()
                 .join("|"),
@@ -1280,37 +1037,12 @@ fn sh_yolo_prelude_with_launcher(
          esac\ndone\n\
          if [ \"$__atpkg_value\" = 1 ]; then __atpkg_word_ok=0; fi\n",
     );
-    if !after.is_empty() {
-        s.push_str(
-            "__atpkg_after=0\n\
-             if [ \"$__atpkg_have_word\" = 1 ]; then\n  \
-             case \"$__atpkg_word\" in\n    ",
-        );
-        s.push_str(
-            &after
-                .iter()
-                .map(|w| sh_quote_str(w))
-                .collect::<Vec<_>>()
-                .join("|"),
-        );
-        s.push_str(") __atpkg_after=1 ;;\n  esac\nfi\n");
-    }
-    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]");
-    if !after.is_empty() {
-        s.push_str(" && [ \"$__atpkg_word_ok\" = 1 ]");
-    }
-    if !optional.is_empty() {
-        s.push_str(" && [ \"$__atpkg_joins\" = 0 ]");
-    }
-    s.push_str("; then\n  __atpkg_say=");
+    s.push_str("__atpkg_say=\nif [ \"$__atpkg_yolo\" = 1 ]; then\n  __atpkg_say=");
     s.push_str(&say(crate::yolo::ECHO_PREFIX));
     s.push_str(
         "\n  \
          __atpkg_stop=0\n  __atpkg_at=0\n",
     );
-    if !after.is_empty() {
-        s.push_str("  __atpkg_pending=0\n");
-    }
     s.push_str(
         "  __atpkg_n=$#\n  \
          while [ \"$__atpkg_n\" -gt 0 ]; do\n    \
@@ -1319,57 +1051,19 @@ fn sh_yolo_prelude_with_launcher(
          if [ \"$__atpkg_stop\" = 0 ] && [ \"$1\" = \"--yolo\" ]; then\n      \
          shift\n",
     );
-    if after.is_empty() {
-        s.push_str(&fresh("      "));
-    } else {
-        s.push_str(
-            "      if [ \"$__atpkg_after\" = 1 ] && [ \"$__atpkg_at\" -lt \"$__atpkg_word_at\" ]; then\n        \
-             __atpkg_pending=1\n      \
-             else\n",
-        );
-        s.push_str(&fresh("        "));
-        s.push_str("      fi\n");
-    }
-    if !own_yolo.is_empty() {
-        // `yolo::decide` drops the program's own spellings of the posture ahead of the first
-        // word, and none past an option the scan does not know.
-        s.push_str(
-            "    elif [ \"$__atpkg_stop\" = 0 ] && [ \"$__atpkg_word_ok\" = 1 ] && \
-             { [ \"$__atpkg_have_word\" = 0 ] || [ \"$__atpkg_at\" -lt \"$__atpkg_word_at\" ]; } && \
-             { ",
-        );
-        s.push_str(
-            &own_yolo
-                .iter()
-                .map(|w| format!("[ \"$1\" = {} ]", sh_quote_str(w)))
-                .collect::<Vec<_>>()
-                .join(" || "),
-        );
-        s.push_str("; }; then\n      shift\n");
-    }
+    s.push_str(&fresh("      "));
     s.push_str(
         "    else\n      \
          if [ \"$1\" = \"--\" ]; then __atpkg_stop=1; fi\n",
     );
-    if after.is_empty() {
-        s.push_str(
-            "      set -- \"$@\" \"$1\"\n      \
-             shift\n",
-        );
-    } else {
-        s.push_str(
-            "      set -- \"$@\" \"$1\"\n      \
-             shift\n      \
-             if [ \"$__atpkg_pending\" = 1 ] && [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
-             __atpkg_pending=0\n",
-        );
-        s.push_str(&fresh("          "));
-        s.push_str("      fi\n");
-    }
+    s.push_str(
+        "      set -- \"$@\" \"$1\"\n      \
+         shift\n",
+    );
     s.push_str(
         "    fi\n  done\nelif [ \"$__atpkg_posture\" = 0 ] && [ \"$__atpkg_word_ok\" = 1 ]; then\n",
     );
-    if !words {
+    if skip_extra.is_empty() {
         s.push_str("  __atpkg_say=");
         s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
         if launcher.is_some() {
@@ -1386,59 +1080,25 @@ fn sh_yolo_prelude_with_launcher(
             " \"$@\"\n"
         });
     } else {
-        if skip_all.is_empty() {
-            s.push_str("  __atpkg_say=");
-            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-            s.push('\n');
-        } else {
-            s.push_str(
-                "  if [ \"$__atpkg_have_word\" = 1 ]; then\n    case \"$__atpkg_word\" in\n      ",
-            );
-            s.push_str(
-                &skip_all
-                    .iter()
-                    .map(|w| sh_quote_str(w))
-                    .collect::<Vec<_>>()
-                    .join("|"),
-            );
-            s.push_str(") ;;\n      *) __atpkg_say=");
-            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-            s.push_str(" ;;\n    esac\n  else\n    __atpkg_say=");
-            s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
-            s.push_str("\n  fi\n");
-        }
+        s.push_str(
+            "  if [ \"$__atpkg_have_word\" = 1 ]; then\n    case \"$__atpkg_word\" in\n      ",
+        );
+        s.push_str(
+            &skip_extra
+                .iter()
+                .map(|w| sh_quote_str(w))
+                .collect::<Vec<_>>()
+                .join("|"),
+        );
+        s.push_str(") ;;\n      *) __atpkg_say=");
+        s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+        s.push_str(" ;;\n    esac\n  else\n    __atpkg_say=");
+        s.push_str(&say(crate::yolo::DEFAULT_ECHO_PREFIX));
+        s.push_str("\n  fi\n");
         delegate(&mut s);
-        if after.is_empty() {
-            s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
-            s.push_str(&spelled);
-            s.push_str(" \"$@\"\n  fi\n");
-        } else {
-            s.push_str(
-                "  if [ -n \"$__atpkg_say\" ] && [ \"$__atpkg_after\" = 0 ]; then\n    \
-                 set -- ",
-            );
-            s.push_str(&spelled);
-            s.push_str(
-                " \"$@\"\n  \
-                 elif [ -n \"$__atpkg_say\" ]; then\n    \
-                 __atpkg_n=$#\n    \
-                 __atpkg_at=0\n    \
-                 while [ \"$__atpkg_n\" -gt 0 ]; do\n      \
-                 __atpkg_n=$((__atpkg_n - 1))\n      \
-                 __atpkg_at=$((__atpkg_at + 1))\n      \
-                 set -- \"$@\" \"$1\"\n      \
-                 if [ \"$__atpkg_at\" = \"$__atpkg_word_at\" ]; then\n        \
-                 set -- \"$@\" ",
-            );
-            s.push_str(&spelled);
-            s.push_str(
-                "\n      \
-                 fi\n      \
-                 shift\n    \
-                 done\n  \
-                 fi\n",
-            );
-        }
+        s.push_str("  if [ -n \"$__atpkg_say\" ]; then\n    set -- ");
+        s.push_str(&spelled);
+        s.push_str(" \"$@\"\n  fi\n");
     }
     s.push_str(
         "fi\n\
@@ -1504,9 +1164,7 @@ fn sh_shim_body(
             )
         })
     };
-    let mut s = String::from(
-        "#!/bin/sh\n# atpkg shim — exec so the tool authenticates at its real path.\n",
-    );
+    let mut s = String::from(SH_SHIM_HEAD);
     s.push_str(prelude);
     if !env.is_empty() {
         s.push_str(SH_SHIM_ENV_NOTE);

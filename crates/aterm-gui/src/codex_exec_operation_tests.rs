@@ -244,3 +244,82 @@ fn a_gone_process_operation_is_forgotten_once_it_holds_nothing() {
     );
     assert_eq!(table.operations().len(), 2);
 }
+
+/// When a test's process asks (Unix seconds).
+const ASKED: i64 = 1_792_700_000;
+
+/// EVERY `arm` AND EVERY VERB OF THE OPERATION IT ARMED IS NOTED TO ITS PROCESS'S PACE, WHATEVER
+/// ANSWERS IT: an `arm` of a captured run with no selection to take is denied, and is noted all
+/// the same, at the time of its ask. A `reserve` of the process's own operation, the verb a run
+/// retries every 250 ms for as long as its pool commit is refused, is noted when it is served,
+/// though its capability is not the operation's and it is denied. CONTROL: an id/cap verb of a
+/// process that armed no operation asks nothing of its own here, and the tab keeps it no pace.
+#[test]
+fn every_arm_and_verb_of_its_operation_is_noted_to_its_processs_pace() {
+    let root = aterm_tempfile::tempdir().expect("a root");
+    let env = environment_in(root.path());
+    let tab = crate::session_store::test_handle_on(918_314, -1);
+    let ctx = &tab.ctx;
+    let me = std::process::id();
+    let mut mine = source(process(me, born(me)), root.path());
+    mine.exec_generation = Some(1);
+    let key = ProcessKey::of(&mine.process);
+    let paced = || {
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .rotation_paces
+            .processes()
+            .any(|kept| kept == key)
+    };
+    let asked_at = || {
+        ctx.fenced_writes
+            .native
+            .lock()
+            .unwrap()
+            .rotation_paces
+            .of(key, Instant::now(), Duration::MAX)
+            .asked_at()
+    };
+    let wrong = BTreeMap::from([("id", "wrong"), ("cap", "wrong")]);
+    assert_eq!(
+        serve_current(ctx, -1, ("reserve", &wrong), mine.clone()),
+        DENIED
+    );
+    assert!(!paced(), "CONTROL: a process with no operation");
+
+    let proof = crate::self_claim::Proven {
+        pid: me,
+        start: "fixture".into(),
+    };
+    let target = target();
+    let asking = Env {
+        now: ASKED,
+        ..env.clone()
+    };
+    assert_eq!(
+        arm_captured(
+            ctx,
+            (proof, mine.clone(), asking),
+            (intent(), "{}".into()),
+            (target.account.as_str(), target.user.as_str()),
+        ),
+        DENIED
+    );
+    assert_eq!(asked_at(), Some(ASKED), "the arm");
+
+    keep(ctx, armed(ctx, mine.clone(), &env));
+    let unix_now = || i64::try_from(now_ms() / 1000).unwrap();
+    let before = unix_now();
+    assert_eq!(
+        serve_current(ctx, -1, ("reserve", &wrong), mine.clone()),
+        DENIED
+    );
+    let after = unix_now();
+    assert!(
+        asked_at().is_some_and(|at| before <= at && at <= after),
+        "the reserve: {:?}",
+        asked_at()
+    );
+}

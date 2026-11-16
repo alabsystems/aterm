@@ -326,3 +326,48 @@ fn an_account_is_live_only_under_the_key_its_rows_derive() {
     passes(&mut [together]);
     passes(&mut [vec![put(&ACCOUNT, &stale, "status", json!("paused"))]]);
 }
+
+/// An account reads as its provider word and its login's address, one read of the view naming
+/// it; with no address it reads as the provider and its label; with no provider, as its address.
+/// NEGATIVE CONTROL: with `Names::of` naming an account by its address alone (its first arm
+/// `(Some(_), Some(address)) => address`), `` left: "ann@example.invalid" right: "openai ·
+/// ann@example.invalid" ``.
+#[test]
+fn an_account_is_named_by_its_provider_and_address() {
+    let mut book = Book::new();
+    let ann = pk("ann");
+    let both = keys::account_pk("codex", &at("ann")).unwrap();
+    let bare = keys::account_pk("claude", &at("bare")).unwrap();
+    let lone = keys::account_pk("claude", &at("lone")).unwrap();
+    let mut changes = row(&ann, &at("ann"));
+    changes.extend([
+        put(&ACCOUNT, &both, "provider", json!("openai")),
+        put(&ACCOUNT, &both, "realm", json!("codex")),
+        put(&ACCOUNT, &both, "login", json!(ann)),
+        put(&ACCOUNT, &bare, "provider", json!("anthropic")),
+        put(&ACCOUNT, &bare, "realm", json!("claude")),
+        put(&ACCOUNT, &bare, "label", json!("spare")),
+        put(&ACCOUNT, &lone, "login", json!(ann)),
+    ]);
+    book.write(1, &[], changes);
+    let view = View {
+        cells: book.cells(),
+        ..View::empty_for_test()
+    };
+    let names = Names::of(&REGISTRY, &view);
+    assert_eq!(
+        names.words("account", &both),
+        Some("openai \u{b7} ann@example.invalid")
+    );
+    assert_eq!(
+        names.words("account", &bare),
+        Some("anthropic \u{b7} spare")
+    );
+    assert_eq!(names.words("account", &lone), Some("ann@example.invalid"));
+    assert_eq!(names.words("account", "ac-none"), None);
+    assert_eq!(
+        names.words("phone", &both),
+        None,
+        "only machines and accounts"
+    );
+}

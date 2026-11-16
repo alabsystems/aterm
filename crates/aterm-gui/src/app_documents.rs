@@ -7924,7 +7924,8 @@ impl App {
             | AppKind::Recovery
             | AppKind::Allocation
             | AppKind::Workers
-            | AppKind::Tables => Err("requested app is not a document app".to_string()),
+            | AppKind::Tables
+            | AppKind::Navigator => Err("requested app is not a document app".to_string()),
         }
     }
 

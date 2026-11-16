@@ -1804,12 +1804,8 @@ fn only_a_group_proven_empty_is_recorded_closed() {
     }
     std::fs::write(&path, seed).expect("seed");
     let runs = Runs {
-        log: Mutex::new(
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .expect("open"),
-        ),
+        // Opened as `Runs::open` opens its record: to read as well, which a Windows lock needs.
+        log: Mutex::new(open_regular_write(&path, true).expect("open")),
         path: path.clone(),
         boot: "B".to_owned(),
         id: RunId {

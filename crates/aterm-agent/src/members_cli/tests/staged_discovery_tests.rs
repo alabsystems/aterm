@@ -120,7 +120,7 @@ impl CachedMember {
                         Arc::new(|| (FleetScope::Facts, &[FleetOp::VaultJoin])),
                         Arc::new(Arc::default),
                     ),
-                    ask,
+                    (ask, None),
                     &stop,
                     aterm_spec::wait::MUST_HAPPEN,
                     move |served, _| {

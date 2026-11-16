@@ -133,7 +133,7 @@ fn a_tally_line_reads_back_as_written_and_every_line_is_one_length() {
     let t = sample();
     let line = t.render();
     assert!(
-        line.starts_with("wait-tally v=8 rows=031 pid=0000004242 "),
+        line.starts_with("wait-tally v=9 rows=033 pid=0000004242 "),
         "{line}"
     );
     assert!(
@@ -232,10 +232,10 @@ fn a_line_of_another_row_count_or_flush_word_is_refused_by_its_head() {
         Ok(sample()),
         "the control: re-summed as it was, it reads"
     );
-    let fewer = body.replacen("rows=031", "rows=025", 1);
+    let fewer = body.replacen("rows=033", "rows=025", 1);
     let why = Tally::parse(&resummed(fewer)).expect_err("another row count");
     assert!(
-        why.contains("of 25 rows") && why.contains("reads 31"),
+        why.contains("of 25 rows") && why.contains("reads 33"),
         "{why}"
     );
     let other = if FLUSHES_COUNTED == "all" {
@@ -445,14 +445,14 @@ fn a_line_that_raced_its_write_or_lost_its_checksum_is_refused_never_read_as_a_c
     );
     for bad in [
         "",
-        "wait-tally v=8\n",
+        "wait-tally v=9\n",
         &old[..old.len() - 1],
-        &old.replace("wait-tally v=8", "wait-tally v=7"),
+        &old.replace("wait-tally v=9", "wait-tally v=8"),
         &old.replace(" sum=", " sum=0"),
     ] {
         assert!(Tally::parse(bad).is_err(), "{bad:?}");
     }
-    for body in ["wait-tally v=8 rows=031 pid=1 requests=1".to_string(), {
+    for body in ["wait-tally v=9 rows=033 pid=1 requests=1".to_string(), {
         let (body, _) = old.trim_end().rsplit_once(" sum=").expect("a sum");
         body.rsplit_once('.').expect("a band").0.to_string()
     }] {

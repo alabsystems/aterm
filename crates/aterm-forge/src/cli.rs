@@ -40,6 +40,9 @@ USAGE
         UNVERIFIED. vendor/astream must be a clean checkout
         of its gitlink, not behind the pin origin/main had at the merge-base
         unless a commit on the branch says `astream-pin-rollback: <reason>`.
+        A roster directory pinned by tree id must be, in the index, the tree
+        its vendor/<dir>.pin names, with nothing under it unstaged, untracked
+        or ignored; the repair is ~/alab-harness/tools/pin <checkout> <tag>.
 
   targo --unverified forge check [--cell NAME]...
         The `forge` check of `targo --unverified verify`, without compiling:

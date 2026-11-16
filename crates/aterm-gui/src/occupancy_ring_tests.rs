@@ -63,7 +63,8 @@ fn ready_at(at: i64) -> RingRow {
 }
 
 /// THE RING IS WRITTEN AT A MINUTE'S LOOK WHILE THE OWNER'S MODE OBSERVES (slice 1's F4, the
-/// facts ring's row a minute): `observe` and `prompt` append a tick's row. NEGATIVE CONTROLS:
+/// facts ring's row a minute while a session is supervised): `observe` and `prompt` append a
+/// tick's row that names a session. NEGATIVE CONTROLS:
 /// under `off` nothing is written — not even the file — and a poke between ticks has no row.
 #[test]
 fn the_ring_takes_a_ticks_row_while_the_mode_observes() {
@@ -94,10 +95,52 @@ fn the_ring_takes_a_ticks_row_while_the_mode_observes() {
     }
 }
 
+/// A MINUTE WITH NO SUPERVISED SESSION WRITES NO ROW: a Mac with no agent tab makes no durable
+/// write a minute, not even the file. NEGATIVE CONTROL: once the row names a session, the tick
+/// appends it, a session whose hold is not ready on no usable slot (a row that counts nothing idle
+/// while ready, kept for its guard and readings a replay reads) as well as a ready one.
+#[test]
+fn a_tick_with_no_session_writes_no_row() {
+    use crate::occupancy_host::{Look, append_look};
+    use aterm_agent::supervise::Occupancy;
+    let tmp = aterm_tempfile::tempdir().expect("tmp");
+    let path = ring::ring_path(tmp.path());
+    let mut file = RingFile::at(path.clone());
+    let empty = RingRow::of(&machine(T0, 1), Vec::new());
+    for mode in [Occupancy::Observe, Occupancy::Prompt] {
+        assert!(
+            !append_look(&mut file, mode, Look::Tick, Some(&empty)).expect("no session"),
+            "{mode:?}"
+        );
+    }
+    assert!(!path.exists(), "a minute with no session writes nothing");
+    let unready = RingRow::of(
+        &machine(T0 + MIN, 0),
+        vec![ring::RingSession {
+            sid: "a".to_string(),
+            held_ms: None,
+            ready: false,
+            guard: Some("person".to_string()),
+        }],
+    );
+    assert_eq!((unready.ready(), unready.idle_ready()), (0, 0));
+    for row in [unready, ready_at(T0 + 2 * MIN)] {
+        assert!(
+            append_look(&mut file, Occupancy::Observe, Look::Tick, Some(&row)).expect("a session"),
+            "{row:?}"
+        );
+    }
+    assert_eq!(
+        file.read().len(),
+        2,
+        "each row that names a session is kept"
+    );
+}
+
 /// THE HARNESS PAGE'S "IDLE WHILE READY" IS READ FROM THE RING'S FILE under the state
 /// directory: the slot-minutes of the last day's rows, a minute a ready look. NEGATIVE
-/// CONTROLS: no ring reads as none (the row is not drawn), and a row older than a day counts
-/// nothing.
+/// CONTROLS: no ring reads as none (the row is not drawn: no minute here has named a supervised
+/// session while the mode observed), and a row older than a day counts nothing.
 #[test]
 fn idle_while_ready_reads_the_last_day_of_the_ring() {
     use crate::harness_screen::idle_ready_min_under;

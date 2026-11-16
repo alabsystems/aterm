@@ -165,7 +165,7 @@ impl Carried {
 /// never projected, and a roll's own records, which restate rather than edit.
 ///
 /// # Errors
-/// The log's causal clocks are incomplete or exhausted (`Log::into_causal_history`).
+/// The log's causal clocks are incomplete or exhausted (`Log::causal_order`).
 pub(crate) fn of_log(
     session: &Session<'_>,
     table: &typed::Table,
@@ -175,10 +175,13 @@ pub(crate) fn of_log(
 ) -> Result<Vec<Entry>> {
     let resolve = owned::commons::historical(session);
     let mut out = Vec::new();
-    for (operation, command, hlc) in log.into_causal_history()? {
-        if over.contains(&operation.header.id) {
+    for (hlc, id) in log.causal_order()? {
+        if over.contains(&id) {
             continue;
         }
+        let Some((operation, command)) = log.eligible_record(&id) else {
+            continue;
+        };
         let Some(changes) = command_changes(command) else {
             continue;
         };
@@ -204,8 +207,11 @@ pub(crate) fn of_log(
     Ok(out)
 }
 
-fn command_changes(command: Command) -> Option<Vec<Change>> {
-    command.into_changes().filter(|changes| !changes.is_empty())
+fn command_changes(command: &Command) -> Option<Vec<Change>> {
+    command
+        .changes()
+        .filter(|changes| !changes.is_empty())
+        .map(<[Change]>::to_vec)
 }
 
 /// A roll's own record: every change restates (a carried register), archives, covers, carries
@@ -223,14 +229,31 @@ pub(crate) fn restates(changes: &[Change]) -> bool {
 
 /// `change` as carried: its value withheld where it is a secret's.
 fn written(table: &typed::Table, change: Change) -> Written {
-    let withheld = secret_column(table, &change.collection, &change.key)
-        || change.value.as_ref().is_some_and(holds_sealed);
+    let withheld = secret_change(
+        table,
+        &change.collection,
+        &change.key,
+        change.value.as_ref(),
+    );
     Written {
         collection: change.collection,
         key: change.key,
         value: if withheld { None } else { change.value },
         withheld,
     }
+}
+
+/// Whether a change to `key` of `collection` holding `value` is a secret's, which history lists
+/// with its key and no value: the column is a `Secret` or `SecretRef` of `table`, or the value
+/// holds a sealed token anywhere. The one rule of a roll's carried history and of a cell's listed
+/// values (`att::values`).
+pub(crate) fn secret_change(
+    table: &typed::Table,
+    collection: &str,
+    key: &str,
+    value: Option<&Value>,
+) -> bool {
+    secret_column(table, collection, key) || value.is_some_and(holds_sealed)
 }
 
 /// Whether `key` of `collection` is a `Secret` or `SecretRef` column of `table`.
@@ -248,8 +271,12 @@ fn secret_column(table: &typed::Table, collection: &str, key: &str) -> bool {
 fn withhold_again(table: &typed::Table, mut entry: Entry) -> Entry {
     for change in &mut entry.changes {
         if !change.withheld
-            && (secret_column(table, &change.collection, &change.key)
-                || change.value.as_ref().is_some_and(holds_sealed))
+            && secret_change(
+                table,
+                &change.collection,
+                &change.key,
+                change.value.as_ref(),
+            )
         {
             change.value = None;
             change.withheld = true;

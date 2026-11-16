@@ -3091,64 +3091,55 @@ impl LiveShell {
 
     /// Wait until `found` finds what it looks for in what `pipe` has read so far.
     fn wait_on<T>(&mut self, pipe: &Pumped, what: &str, found: impl Fn(&[u8]) -> Option<T>) -> T {
-        let started = std::time::Instant::now();
-        let mut out = pipe
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        loop {
-            if let Some(found) = found(&out) {
-                return found;
-            }
-            if let Ok(Some(status)) = self.child.try_wait() {
+        let result = aterm_spec::wait::within_while_working(
+            self.child.id(),
+            Self::TIMEOUT,
+            aterm_spec::wait::WORKING_GUARD,
+            std::time::Duration::from_millis(15),
+            || {
+                let out = pipe
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if let Some(found) = found(&out) {
+                    return Some(found);
+                }
                 drop(out);
-                panic!(
-                    "{}: shell exited ({status}) before {what} appeared\n{}",
-                    self.label,
-                    self.transcript()
-                );
-            }
-            if started.elapsed() >= Self::TIMEOUT {
-                drop(out);
-                panic!(
-                    "{}: timed out waiting for {what}\n{}",
-                    self.label,
-                    self.transcript()
-                );
-            }
-            out = pipe
-                .grew
-                .wait_timeout(out, std::time::Duration::from_millis(15))
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
+                if let Ok(Some(status)) = self.child.try_wait() {
+                    panic!(
+                        "{}: shell exited ({status}) before {what} appeared\n{}",
+                        self.label,
+                        self.transcript()
+                    );
+                }
+                None
+            },
+        );
+        result.unwrap_or_else(|why| {
+            panic!(
+                "{}: waiting for {what} ended: {why:?}\n{}",
+                self.label,
+                self.transcript()
+            )
+        })
     }
 
     /// Wait for the shell to exit and reap it.
     fn wait_exit_status(&mut self, what: &str) -> std::process::ExitStatus {
-        let started = std::time::Instant::now();
-        let pipe = std::sync::Arc::clone(&self.stdout);
-        loop {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                return status;
-            }
-            if started.elapsed() >= Self::TIMEOUT {
-                let _ = self.child.kill();
-                panic!("{}: {what}\n{}", self.label, self.transcript());
-            }
-            let out = pipe
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let tick = if pipe.ended.load(std::sync::atomic::Ordering::SeqCst) {
-                std::time::Duration::from_millis(1)
-            } else {
-                std::time::Duration::from_millis(15)
-            };
-            drop(
-                pipe.grew
-                    .wait_timeout(out, tick)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
+        let result = aterm_spec::wait::within_while_working(
+            self.child.id(),
+            Self::TIMEOUT,
+            aterm_spec::wait::WORKING_GUARD,
+            std::time::Duration::from_millis(15),
+            || {
+                self.child
+                    .try_wait()
+                    .unwrap_or_else(|error| panic!("{}: {what}: {error}", self.label))
+            },
+        );
+        result.unwrap_or_else(|why| {
+            let _ = self.child.kill();
+            panic!("{}: {what}: {why:?}\n{}", self.label, self.transcript());
+        })
     }
 
     /// The text after the last `key` before `end`.

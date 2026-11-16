@@ -179,10 +179,14 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
     let scratch = aterm_tempfile::tempdir().unwrap();
     let target = scratch.path().join("target with spaces [*]");
     let executable = target.join("debug/aterm");
+    let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
     std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
     std::fs::write(
         &executable,
-        "#!/bin/sh\nprintf '%s\\n' \"$ATERM_TEST_VERSION\"\nexit \"$ATERM_TEST_EXIT\"\n",
+        format!(
+            "#!{}\nprintf '%s\\n' \"$ATERM_TEST_VERSION\"\nexit \"$ATERM_TEST_EXIT\"\n",
+            shell.display()
+        ),
     )
     .unwrap();
     #[cfg(unix)]
@@ -191,17 +195,21 @@ fn the_public_clone_command_reads_as_one_line_and_admits_only_a_public_version()
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let run = |line: &str, exit: u8| {
-        let mut command = aterm_uds::spawnfd::command("sh");
+        let mut command = aterm_uds::spawnfd::command(&shell);
         command
             .args(["-c", clause])
             .current_dir(scratch.path())
             .env("CARGO_TARGET_DIR", &target)
             .env("ATERM_TEST_VERSION", line)
             .env("ATERM_TEST_EXIT", exit.to_string());
-        aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-            .unwrap_or_else(|why| {
-                panic!("public version clause for {line:?}, child exit {exit}: {why:?}")
-            })
+        aterm_uds::deadline::output_while_process_progressing(
+            &mut command,
+            aterm_spec::wait::MUST_HAPPEN,
+            format!("public version clause for {line:?}, child exit {exit}"),
+        )
+        .unwrap_or_else(|why| {
+            panic!("public version clause for {line:?}, child exit {exit}: {why:?}")
+        })
     };
     let toml = std::fs::read_to_string(repo().join("Cargo.toml")).unwrap();
     let workspace = toml

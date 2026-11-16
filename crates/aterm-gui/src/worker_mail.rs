@@ -107,6 +107,11 @@ impl Told {
         news
     }
 
+    /// Whether the conclusion entered at `entered` was told: a send finished with it.
+    pub(crate) fn told_end(&self, entered: u64) -> bool {
+        self.end == Some(entered)
+    }
+
     /// Whether the conclusion entered at `entered` was told, or a send has it in hand.
     fn took_end(&self, entered: u64) -> bool {
         self.end == Some(entered) || self.sending.contains(&Item::End(entered))
@@ -123,6 +128,12 @@ impl Told {
                 Item::End(entered) => self.end = Some(entered),
             }
         }
+    }
+
+    /// The conclusion entered at `entered` was told, by a close's mail, which takes no item in
+    /// hand.
+    const fn tell_end(&mut self, entered: u64) {
+        self.end = Some(entered);
     }
 
     /// No send took `item` after all: it is owed again.
@@ -247,6 +258,10 @@ pub(crate) struct Mail {
     pub(crate) text: String,
     /// What its send tells ([`Told::finish`]); none for a close, whose record leaves with it.
     item: Option<Item>,
+    /// A close's mail of a concluded task tells that conclusion, the one its record entered at
+    /// this rev: once its send finishes, the worker's row in the machine's session table says so
+    /// ([`Owed::told`]).
+    tells_end: Option<u64>,
 }
 
 /// What a worker owes its manager word of now, already taken in hand ([`owed`]).
@@ -258,6 +273,11 @@ pub(crate) struct Owed {
     lane: u64,
     /// Whether the worker is leaving this Mac's roster ([`report::post_leaving`]).
     leaving: bool,
+    /// The machine's session table, where a worker that left keeps its row.
+    table: Arc<crate::session_table::SessionTable>,
+    /// When the record these mails are of entered its state: with [`Self::task`], the
+    /// conclusion a mail that tells one told (`session_table::Told`).
+    since: u64,
     pub(crate) manager: Manager,
     pub(crate) mails: Vec<Mail>,
 }
@@ -319,11 +339,12 @@ fn owed_of(
     news: &[News],
     leaving: bool,
 ) -> Owed {
-    let handle = store
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .by_sid(&ctx.self_id)
-        .cloned();
+    let (handle, table) = {
+        let store = store
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (store.by_sid(&ctx.self_id).cloned(), store.table())
+    };
     let step = handle
         .as_ref()
         .and_then(|h| crate::survey::last_words(h, record.conclusion().is_some()));
@@ -333,6 +354,8 @@ fn owed_of(
         task: record.started_unix_ms,
         lane: crate::message_inbox::current_lane(),
         leaving,
+        table,
+        since: record.since_unix_ms,
         manager,
         mails: news
             .iter()
@@ -395,6 +418,8 @@ fn mail(sid: &str, news: &News, record: &TaskRecord, step: Option<&str>) -> Mail
         key: key(sid, what, hash),
         text,
         item,
+        tells_end: (matches!(news, News::Closed) && record.conclusion().is_some())
+            .then_some(record.entered),
     }
 }
 
@@ -545,10 +570,25 @@ impl Owed {
         Err(why)
     }
 
-    /// `mail`'s send finished: what it tells is told on the worker's record.
+    /// `mail`'s send finished: what it tells is told on the worker's record, where it is still
+    /// this task's. A conclusion it told, by its own mail or by a close's of a concluded task, is
+    /// told on the worker's row too, so a row its creator heard of is no longer kept past the
+    /// budget for it (`session_table::Live`): the row of a worker whose tab closed while that mail
+    /// was in hand, and the row a close is about to leave, which comes saying so.
     fn told(&self, mail: &Mail) {
+        let conclusion = crate::session_table::Told {
+            started_ms: self.task,
+            since_ms: self.since,
+        };
         if let Some(item) = mail.item {
             self.mark(|told| told.finish(item));
+            if matches!(item, Item::End(_)) {
+                self.table.told_end(&self.worker.self_id, conclusion);
+            }
+        }
+        if let Some(entered) = mail.tells_end {
+            self.mark(|told| told.tell_end(entered));
+            self.table.told_end(&self.worker.self_id, conclusion);
         }
     }
 

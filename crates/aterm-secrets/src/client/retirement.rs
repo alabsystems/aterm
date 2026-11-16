@@ -491,7 +491,7 @@ impl Admin {
         };
         if !plan.records.is_empty() {
             let mut store = load_records(bootstrap.paths())?;
-            let wire = crate::membership_log::encode_records(&plan.records);
+            let wire = crate::membership_log::read_records(&plan.records)?;
             log_entries::commit_authored_records(
                 bootstrap.paths(),
                 &mut store,

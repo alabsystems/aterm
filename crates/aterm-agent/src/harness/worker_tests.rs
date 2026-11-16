@@ -1548,14 +1548,18 @@ fn lent(agent: Program, argv: &[&str]) -> Vec<String> {
 
 /// The twin's reading of a worker's `flags`: it adds no yolo beside them (no [`Default`]), and
 /// where they type the twin's own `--yolo` it spells it once, beside no other posture of the CLI
-/// that contradicts it.
+/// that contradicts it. A twin that keeps no yolo of its own (Muse Code's, whose yolo is
+/// muse-alab's since HX-13a) runs every line as typed, its `--yolo` included.
 ///
 /// [`Default`]: atpkg::yolo::Launch::Default
 fn the_twin_adds_nothing(agent: Program, flags: &[String]) {
     use atpkg::yolo::{Launch, decide, flags_of};
     let cli = row(agent);
     match decide(cli.word, flags) {
-        Launch::AsTyped => assert!(!flags.iter().any(|f| f == "--yolo"), "{agent:?}: {flags:?}"),
+        Launch::AsTyped => assert!(
+            flags_of(cli.word).is_empty() || !flags.iter().any(|f| f == "--yolo"),
+            "{agent:?}: {flags:?}"
+        ),
         Launch::Flag(spelled) => {
             assert!(flags.iter().any(|f| f == "--yolo"), "{agent:?}: {flags:?}");
             for yolo in flags_of(cli.word) {
@@ -1883,7 +1887,8 @@ fn a_starter_at_or_above_its_clis_floor_lends_its_own() {
 /// ([`atpkg::yolo::decide`]) adds no yolo beside them, so the floor holds whichever program the
 /// line runs. CONTROL: the line of a starter that lends nothing names no posture, and is one the
 /// twin raises to its yolo, past the floor (codex-alab's bypass), or runs as typed in the CLI's
-/// own default, which asks (agy's and Muse Code's lines hold words the twin does not know); a
+/// own default, which asks (agy's line holds words the twin does not know, and Muse Code's twin
+/// keeps no yolo since HX-13a, handing every line to muse-alab's `run` as typed); a
 /// starter above the floor types its own posture and no floor; and the two unstarted lines that
 /// name none, Claude Code's and a bare `codex`'s, name none.
 #[cfg(unix)]
@@ -1945,8 +1950,13 @@ fn a_workers_typed_line_holds_its_floor_and_the_twin_runs_it_as_typed() {
         assert_eq!(words.pop().as_deref(), Some(""), "NUL-ended");
         words
     };
+    // The twin's markers, or for Muse Code, whose twin keeps none since HX-13a, the options its
+    // worker row reads as a posture.
     let names_posture = |cli: &WorkerCli, words: &[String]| {
-        let markers = policy_of(cli.word).markers;
+        let markers = match cli.agent {
+            Program::Muse => super::super::upgrade_muse::PERMISSION_FLAGS,
+            _ => policy_of(cli.word).markers,
+        };
         words.iter().any(|w| {
             markers.iter().any(|m| match m.strip_suffix('=') {
                 Some(long) => w.starts_with(&format!("{long}=")),

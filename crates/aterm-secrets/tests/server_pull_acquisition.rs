@@ -111,7 +111,7 @@ impl Frame {
         Self {
             id: *record.id(),
             parents: record.parents().to_vec(),
-            bytes: Arc::from(record.bytes()),
+            bytes: Arc::from(record.wire_bytes().unwrap().as_ref()),
         }
     }
     fn raw(bytes: Vec<u8>, parents: Vec<RecordId>) -> Self {
@@ -563,7 +563,10 @@ impl Fixture {
         let actual = fixture.server().stored_records(NAME);
         assert_eq!(actual.inventory(), expected.inventory());
         assert_eq!(actual.complete_inventory(), expected.complete_inventory());
-        assert_eq!(actual.encode(), expected.encode());
+        assert_eq!(
+            actual.read_encoded().unwrap(),
+            expected.read_encoded().unwrap()
+        );
         fixture
     }
 
@@ -599,7 +602,13 @@ impl Fixture {
         );
         let store = self.server().stored_records(NAME);
         for record in expected {
-            assert_eq!(store.complete_bytes(record.id()), Some(record.bytes()));
+            assert_eq!(
+                store
+                    .log()
+                    .and_then(|log| log.get(record.id()))
+                    .map(|r| r.wire_bytes().unwrap()),
+                Some(record.wire_bytes().unwrap())
+            );
         }
     }
 
@@ -619,7 +628,7 @@ impl Drop for Fixture {
 fn wire<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<u8> {
     let mut bytes = Vec::new();
     for record in records {
-        bytes.extend_from_slice(record.bytes());
+        bytes.extend_from_slice(record.wire_bytes().unwrap().as_ref());
     }
     bytes
 }
@@ -724,7 +733,7 @@ fn waiting_owner_promotes() -> usize {
     let fixture = Fixture::new(&[genesis, child.clone()]);
     let before = fixture.server().stored_records(NAME);
     assert_eq!(before.len(), 2);
-    assert!(before.complete_bytes(child.id()).is_none());
+    assert!(!before.holds(child.id()));
     fixture.peer.offer(
         vec![Frame::of(&child), Frame::of(&parent), Frame::of(&successor)],
         false,
@@ -748,7 +757,7 @@ fn unreadable_memo(bad_signature: bool) {
     let fixture = Fixture::new(&history.records);
     let good = history.mint("good");
     let hidden = history.mint("hidden");
-    let mut bytes = hidden.bytes().to_vec();
+    let mut bytes = hidden.wire_bytes().unwrap().to_vec();
     if bad_signature {
         *bytes.last_mut().unwrap() ^= 1;
     } else {
@@ -855,7 +864,7 @@ fn current_file_is_refreshed() {
     let known = history.records[1].clone();
     let incoming = history.mint("after-file-change");
     let path = fixture.path.clone();
-    let earlier = history.records[0].bytes().to_vec();
+    let earlier = history.records[0].wire_bytes().unwrap().to_vec();
     fixture.peer.offer(
         vec![Frame::of(&known), Frame::of(&incoming)],
         false,

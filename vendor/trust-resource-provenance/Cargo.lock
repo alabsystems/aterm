@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "astream-sys"
-version = "0.2.0"
+version = "0.2.2"
 
 [[package]]
 name = "aterm-dirfd"
@@ -91,7 +91,7 @@ checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "trust-exec-policy"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]

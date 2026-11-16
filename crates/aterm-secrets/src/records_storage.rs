@@ -475,6 +475,15 @@ pub(crate) fn intent_path(entry: &Path) -> Result<PathBuf> {
     side_path(entry, "preparing")
 }
 
+/// The vault's head beside `entry` (`records.head`): a cache of the data file's live state that
+/// an open reads in place of the file where it names the file as it is
+/// (`membership_log::head`). It is beside the entry, as the pin and the intent are, whatever
+/// layout the entry takes, and no transition reads, moves or needs it: a head that names another
+/// file than the one selected is not read.
+pub(crate) fn head_path(entry: &Path) -> Result<PathBuf> {
+    side_path(entry, "head")
+}
+
 fn side_path(entry: &Path, suffix: &str) -> Result<PathBuf> {
     let name = entry
         .file_name()

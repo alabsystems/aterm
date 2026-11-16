@@ -1216,6 +1216,16 @@ impl Child {
         self.observe_wait_result(result)
     }
 
+    /// Observe terminal status through this handle without consuming its exit.
+    /// A cached earlier reap supplies data only, not a new child identity pin.
+    ///
+    /// # Errors
+    /// Custody was lost, the kernel observation failed, or its status was invalid.
+    #[cfg(debug_assertions)]
+    pub fn observe_exit_status(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.exit_status_unreaped()
+    }
+
     /// Observe the terminal status without releasing this actual child's reservation.
     /// # Errors
     /// Custody was lost, the owning wait failed, or its terminal record was invalid.
@@ -1939,6 +1949,10 @@ impl Command {
             );
         }
         match self.forked() {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "spawnfd's own exec off Apple: the exec gate is macOS's, where an exec can wait on a process-table read"
+            )]
             Ok(mut command) => command.exec(),
             Err(error) => error,
         }

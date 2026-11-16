@@ -75,6 +75,12 @@ pub const ALPN_DATABASE_DUPLEX: &[u8] = b"atdb/6";
 /// round, parents first. Earlier peers negotiate [`ALPN_DATABASE_DUPLEX`] or an earlier protocol.
 pub const ALPN_DATABASE_RECONCILE: &[u8] = b"atdb/7";
 
+/// [`ALPN_DATABASE_RECONCILE`]'s frames, with the control journal's and the membership log's
+/// inventories reconciled by range as well, and each one's whole difference drained in one
+/// session in bounded batches, parents first. Earlier peers negotiate [`ALPN_DATABASE_RECONCILE`]
+/// or an earlier protocol.
+pub const ALPN_DATABASE_RANGES: &[u8] = b"atdb/8";
+
 const PROTOCOLS: [&[u8]; 2] = [ALPN_NODES, ALPN];
 
 /// The mesh's ALPN protocol (`atm/1`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.4): the
@@ -1163,6 +1169,9 @@ fn database_server_config() -> Arc<ServerConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_RECONCILE.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_RANGES.to_vec());
         Arc::new(config)
     }))
 }
@@ -1190,6 +1199,9 @@ fn database_client_config() -> Arc<ClientConfig> {
         config
             .alpn_protocols
             .insert(0, ALPN_DATABASE_RECONCILE.to_vec());
+        config
+            .alpn_protocols
+            .insert(0, ALPN_DATABASE_RANGES.to_vec());
         Arc::new(config)
     }))
 }
@@ -1420,7 +1432,7 @@ pub fn server_handshake_with_denied(
     )
 }
 
-/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_RECONCILE`]
+/// Authenticate a database-only listener, preferring [`ALPN_DATABASE_RANGES`]
 /// and retaining the earlier database and fleet protocols for older dialers. This serves
 /// only [`FleetOp::Database`], with no terminal survey or drive capability.
 ///
@@ -1502,6 +1514,21 @@ pub fn test_server_handshake_database_v5_as(
     test_server_handshake_database_version_as(tcp, secret, me, within, 5)
 }
 
+/// A released `atdb/7` listener (range-reconciled tables, whole-list control and membership
+/// inventories) for cross-version protocol tests.
+///
+/// # Errors
+/// As [`server_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_server_handshake_database_v7_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Accepted, FleetError> {
+    test_server_handshake_database_version_as(tcp, secret, me, within, 7)
+}
+
 /// The `atdb` version `alpn` names, or `None` for a protocol that is not a database one.
 #[cfg(any(test, debug_assertions))]
 fn database_version(alpn: &[u8]) -> Option<u8> {
@@ -1512,6 +1539,7 @@ fn database_version(alpn: &[u8]) -> Option<u8> {
         ALPN_DATABASE_DELTA,
         ALPN_DATABASE_DUPLEX,
         ALPN_DATABASE_RECONCILE,
+        ALPN_DATABASE_RANGES,
     ]
     .iter()
     .zip(2..)
@@ -1718,7 +1746,7 @@ pub fn client_handshake_as(
     client_handshake_by(tcp, secret, me, op, within).map_err(|undialed| undialed.error)
 }
 
-/// Authenticate a database dialer, preferring [`ALPN_DATABASE_RECONCILE`] and
+/// Authenticate a database dialer, preferring [`ALPN_DATABASE_RANGES`] and
 /// negotiating an earlier database or fleet protocol with an older listener. TLS pins,
 /// secret proofs and exporter-bound node proofs are unchanged.
 ///
@@ -1809,6 +1837,21 @@ pub fn test_client_handshake_database_v6_as(
     within: Duration,
 ) -> Result<Dialed, FleetError> {
     test_client_handshake_database_version_as(tcp, secret, me, within, 6)
+}
+
+/// A released `atdb/7` dialer (range-reconciled tables, whole-list control and membership
+/// inventories) for cross-version protocol tests.
+///
+/// # Errors
+/// As [`client_handshake_database_as`].
+#[cfg(any(test, debug_assertions))]
+pub fn test_client_handshake_database_v7_as(
+    tcp: TcpStream,
+    secret: &FleetSecret,
+    me: Option<&NodeIdentity>,
+    within: Duration,
+) -> Result<Dialed, FleetError> {
+    test_client_handshake_database_version_as(tcp, secret, me, within, 7)
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -2100,7 +2143,8 @@ pub const fn drive_per_source(slots: usize) -> usize {
 pub(crate) const PREAUTH_GRACE: Duration = Duration::from_secs(1);
 
 /// Return `true` if `ip` (after canonicalising IPv4-mapped IPv6) is loopback, private, or
-/// link-local.
+/// link-local: the one LAN an address heard from nothing that authenticated it may name
+/// ([`Provenance::Unproved`]).
 #[must_use]
 pub const fn is_fleet_source(ip: IpAddr) -> bool {
     match ip.to_canonical() {
@@ -2112,8 +2156,83 @@ pub const fn is_fleet_source(ip: IpAddr) -> bool {
     }
 }
 
-/// Refusal reason when a peer IP fails [`is_fleet_source`].
-pub const NOT_A_FLEET_SOURCE: &str = "not a loopback, private or link-local address";
+/// Where an address a fleet dial or a fleet listener meets was heard ([`is_fleet_dial`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Provenance {
+    /// From nothing that authenticated it: a Bonjour advert, a host name's lookup, an address
+    /// typed or booked, a connecting peer before its proofs. It names the one LAN alone
+    /// ([`is_fleet_source`]).
+    Unproved,
+    /// From an origin-signed presence row of a current seat, or from the node job's address
+    /// cache, which holds only an address a handshake to it proved. Its dial still proves the
+    /// node again (TLS and the fleet proofs, then the link's re-proof), so it may also name an
+    /// address beyond one LAN ([`is_overlay_address`]).
+    Proved,
+}
+
+/// Whether a fleet dial may go to `ip`, heard `via` one source: a fleet source
+/// ([`is_fleet_source`]) however it was heard, and an overlay address ([`is_overlay_address`])
+/// only when an authenticated source named it ([`Provenance::Proved`]). An unauthenticated
+/// source never makes this node dial past its LAN.
+#[must_use]
+pub const fn is_fleet_dial(ip: IpAddr, via: Provenance) -> bool {
+    is_fleet_source(ip) || (matches!(via, Provenance::Proved) && is_overlay_address(ip))
+}
+
+/// Whether `ip` (after canonicalising IPv4-mapped IPv6) is an address beyond one LAN that an
+/// authenticated source may name for a fleet dial: the shared address space 100.64.0.0/10
+/// (carrier-grade NAT, and the overlay a Tailscale-style VPN numbers its machines from), or a
+/// globally routed unicast address. Never loopback, private, link-local, multicast, broadcast,
+/// unspecified, "this network", documentation (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24,
+/// 2001:db8::/32, 3fff::/20), benchmarking (198.18.0.0/15), IETF protocol space (192.0.0.0/24,
+/// 2001::/23), reserved (240.0.0.0/4), 6to4 (2002::/16, which wraps an IPv4 address of any
+/// range), or any IPv6 address outside global unicast 2000::/3.
+#[must_use]
+pub const fn is_overlay_address(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            let shared = a == 100 && b & 0xc0 == 64;
+            shared
+                || !(a == 0
+                    || v4.is_private()
+                    || v4.is_loopback()
+                    || v4.is_link_local()
+                    || (a == 192 && b == 0 && c == 0)
+                    || v4.is_documentation()
+                    || (a == 198 && b & 0xfe == 18)
+                    || a >= 224)
+        }
+        IpAddr::V6(v6) => {
+            let [head, next, ..] = v6.segments();
+            head & 0xe000 == 0x2000
+                && !(head == 0x2001 && next < 0x0200)
+                && !(head == 0x2001 && next == 0x0db8)
+                && head != 0x2002
+                && !(head == 0x3fff && next < 0x1000)
+        }
+    }
+}
+
+/// The fleet listener's own judge of a peer's address before any proof: a fleet source
+/// ([`is_fleet_source`]), or an overlay address ([`is_overlay_address`]) that `proved` names,
+/// the addresses an authenticated source holds for a seat now ([`ProvedSources`]). With no
+/// `proved` a listener serves its LAN alone.
+#[must_use]
+pub fn admits_source(ip: IpAddr, proved: Option<&ProvedSources>) -> bool {
+    let ip = ip.to_canonical();
+    is_fleet_source(ip) || (is_overlay_address(ip) && proved.is_some_and(|named| named(ip)))
+}
+
+/// Whether an address beyond one LAN ([`is_overlay_address`]) is one a current seat's
+/// authenticated source names now: a presence row signed by the seat, or the node job's address
+/// cache. A fleet listener given one admits a connection from such an address to its proofs
+/// ([`admits_source`]); given none, it admits its LAN alone.
+pub type ProvedSources = Arc<dyn Fn(IpAddr) -> bool + Send + Sync>;
+
+/// Refusal reason when a peer IP fails [`admits_source`].
+pub const NOT_A_FLEET_SOURCE: &str =
+    "not a loopback, private or link-local address, nor one a seat's authenticated row names";
 
 /// Refusal reason when all listener slots are occupied by non-displaceable connections.
 pub const AT_CAPACITY: &str = "the fleet listener is at capacity";
@@ -2565,7 +2684,7 @@ pub fn serve<H, E>(
             Arc::new(move || offering),
             Arc::new(move || Arc::clone(&empty)),
         ),
-        None,
+        (None, None),
         stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
@@ -2593,7 +2712,7 @@ pub fn serve_offering<H, E>(
     serve_inner(
         ListenerSocket::Fleet(listener),
         (listening, offer, Arc::new(move || Arc::clone(&empty))),
-        None,
+        (None, None),
         stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
@@ -2623,7 +2742,7 @@ pub fn serve_offering_with_denied<H, E>(
     serve_inner(
         ListenerSocket::Fleet(listener),
         (listening, offer, deny),
-        None,
+        (None, None),
         stop,
         Locality::Fleet,
         HANDSHAKE_WITHIN,
@@ -2652,7 +2771,7 @@ pub fn serve_offering_with_ask<H, E>(
     serve_offering_with_ask_within(
         listener,
         (listening, offer, deny),
-        ask,
+        (ask, None),
         stop,
         HANDSHAKE_WITHIN,
         hand_over,
@@ -2666,7 +2785,7 @@ pub fn serve_offering_with_ask<H, E>(
 pub fn serve_offering_with_ask_within<H, E>(
     listener: &TcpListener,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
-    ask: Option<AskHandler>,
+    (ask, proved): (Option<AskHandler>, Option<ProvedSources>),
     stop: &Stop,
     handshake_within: Duration,
     hand_over: H,
@@ -2678,7 +2797,7 @@ pub fn serve_offering_with_ask_within<H, E>(
     serve_inner(
         ListenerSocket::Fleet(listener),
         (listening, offer, deny),
-        ask,
+        (ask, proved),
         stop,
         Locality::Fleet,
         handshake_within,
@@ -2738,7 +2857,7 @@ pub(crate) fn serve_with_handshake_on<H, E>(
             Arc::new(move || offering),
             Arc::new(move || Arc::clone(&empty)),
         ),
-        None,
+        (None, None),
         stop,
         Locality::Fleet,
         handshake_within,
@@ -2797,7 +2916,7 @@ pub fn serve_lan_within<H, E>(
             Arc::new(move || offering),
             Arc::new(move || Arc::clone(&empty)),
         ),
-        None,
+        (None, None),
         stop,
         locality,
         handshake_within,
@@ -2857,7 +2976,7 @@ impl Drop for ArmedHandshake {
 fn serve_inner<H, E>(
     listener: ListenerSocket<'_>,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
-    ask: Option<AskHandler>,
+    (ask, proved): (Option<AskHandler>, Option<ProvedSources>),
     stop: &Stop,
     locality: Locality,
     handshake_within: Duration,
@@ -2870,7 +2989,7 @@ fn serve_inner<H, E>(
     serve_seated(
         listener,
         (listening, offer, deny),
-        ask,
+        (ask, proved),
         stop,
         locality,
         handshake_within,
@@ -2888,7 +3007,7 @@ fn serve_inner<H, E>(
 fn serve_seated<H, E>(
     listener: ListenerSocket<'_>,
     (listening, offer, deny): (&Listening, OfferFn, DenyFn),
-    ask: Option<AskHandler>,
+    (ask, proved): (Option<AskHandler>, Option<ProvedSources>),
     stop: &Stop,
     locality: Locality,
     handshake_within: Duration,
@@ -2986,7 +3105,7 @@ fn serve_seated<H, E>(
             stopped = Some(format!("listener withdrawn: {error}"));
             break;
         }
-        if matches!(locality, Locality::Fleet) && !is_fleet_source(peer.ip()) {
+        if matches!(locality, Locality::Fleet) && !admits_source(peer.ip(), proved.as_ref()) {
             on_event(FleetEvent::Refused {
                 peer,
                 reason: NOT_A_FLEET_SOURCE.to_owned(),
@@ -3504,7 +3623,8 @@ const fn spoken(alpn: Option<&[u8]>) -> Option<Spoken> {
             | ALPN_DATABASE_FRONTIER
             | ALPN_DATABASE_DELTA
             | ALPN_DATABASE_DUPLEX
-            | ALPN_DATABASE_RECONCILE,
+            | ALPN_DATABASE_RECONCILE
+            | ALPN_DATABASE_RANGES,
         ) => Some(Spoken::Fleet { nodes: true }),
         Some(ALPN) => Some(Spoken::Fleet { nodes: false }),
         Some(ALPN_MESH) => Some(Spoken::Mesh),

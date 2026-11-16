@@ -2574,7 +2574,7 @@ fn wait_then_run(
         return ExitCode::from(127);
     }
     #[cfg(unix)]
-    if let Some(shim) = gated_shim(layout, tool) {
+    if let Some(shim) = led_shim(layout, tool) {
         #[expect(
             clippy::disallowed_types,
             reason = "a pending stub becomes the landed program's shim by exec: its caller's descriptors are the shim's"
@@ -2592,16 +2592,17 @@ fn wait_then_run(
     cmd_run(&rest)
 }
 
-/// THE SHIM A PENDING STUB HANDS A PROGRAM WITH A SIGN-IN GATE ONCE IT LANDS: its `bin/` shim,
-/// which carries the sign-in block ([`crate::platform::sh_signin_prelude`]) the twin does, so a
-/// signed-out interactive launch under aterm stops at `aterm harness signin` before the program
-/// can open a sign-in page in the person's browser. [`cmd_run`] would exec the store build past
-/// that block (`docs/DESIGN-harness-repos-2026-10-24.md` D44). `None` for a row with no gate,
-/// which keeps `cmd_run`'s path, and for a tool name atpkg refuses.
+/// THE SHIM A PENDING STUB HANDS A PROGRAM A HARNESS LEADS ONCE IT LANDS: its `bin/` shim,
+/// whose harness hand-off ([`crate::platform::sh_harness_prelude`]) runs the launch under the
+/// harness that leads its word ([`crate::harness::twin_harness`]). That harness's `run` does what
+/// the launcher's blocks once did for the word (the yolo default, and grok-alab's sign-in gate:
+/// HX-09b, HX-10d, HX-13a); [`cmd_run`] would exec the store build past the hand-off
+/// (`docs/DESIGN-harness-repos-2026-10-24.md` D44). `None` for a word no harness leads, which
+/// keeps `cmd_run`'s path, and for a tool name atpkg refuses.
 #[cfg(unix)]
-fn gated_shim(layout: &crate::store::Layout, tool: &str) -> Option<std::path::PathBuf> {
+fn led_shim(layout: &crate::store::Layout, tool: &str) -> Option<std::path::PathBuf> {
     let program = crate::stub::program_of_in(layout, tool);
-    crate::vendor_direct::spec(&program)?.signin_gate.as_ref()?;
+    crate::harness::twin_harness(layout, &program)?;
     Some(layout.shim(&crate::store::ToolName::new(tool)?))
 }
 
@@ -7008,6 +7009,12 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         Unused::Idle { idle } => format!(
             "candidate for the whole folder: nothing wrote it for {}, a month or more",
             days(idle)
+        ),
+        Unused::MergedWorktree { idle, after } => format!(
+            "candidate for the whole folder: its worktree is merged into origin/main, clean and \
+             quiet (nothing wrote it for {}, age threshold {}); the worktree stays",
+            days(idle),
+            days(after)
         ),
         Unused::Moved { idle, after } => format!(
             "candidate for the whole folder: it is in the root the cache moved from (builds now \

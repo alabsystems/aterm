@@ -3,8 +3,15 @@
 
 //! Control stream peer hangup detection ([`peer_state`](crate::hangup::peer_state), [`PeerState`](crate::hangup::PeerState), [`peer_closed`](crate::hangup::peer_closed)).
 //! Distinguishes [`PeerState::Gone`](crate::hangup::PeerState::Gone) and [`PeerState::Idle`](crate::hangup::PeerState::Idle), and shuts sockets via [`hang_up`](crate::hangup::hang_up).
+//! On Unix the hang-up [`Bell`](crate::hangup::Bell) rings an armed stream's channel when its peer goes [`PeerState::Gone`](crate::hangup::PeerState::Gone).
 
 use crate::CtlStream;
+
+#[cfg(unix)]
+#[path = "hangup_bell.rs"]
+mod bell;
+#[cfg(unix)]
+pub use bell::{Armed, Bell};
 
 /// What [`peer_state`] finds at the far end of a connected stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

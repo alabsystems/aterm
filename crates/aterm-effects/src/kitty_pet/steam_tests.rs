@@ -23,8 +23,14 @@ const FROM: u64 = 600;
 /// The cells (px) the scenes replay on: Linux's bundled JetBrains Mono (13 x 29), the trail
 /// gallery's 14 x 26, and Iosevka Term (11 x 28), the face every platform bundles.
 const CELLS: [(usize, usize); 3] = [(13, 29), (14, 26), (11, 28)];
-/// The pets judged (`cursor_pet`): the cat, and the dog, each beside the rainbow.
-const STYLES: [&str; 2] = ["cat", "dog"];
+/// The pets (`cursor_pet`): the cat, and the dog, each beside the rainbow.
+const SPECIES: [&str; 2] = ["cat", "dog"];
+/// The pet each law here is judged on. The dog is the cat in another coat: the species only
+/// skins the pose a frame carries, and no law here reads the pose, so a dog's replay is the
+/// cat's frame for frame. [`the_dog_s_frames_are_the_cat_s_on_every_face`] holds that, one scene
+/// of each kind on every face; while it holds, replaying each scene twice judges nothing more.
+/// A law that comes to read the species turns that test red, and takes [`SPECIES`] here.
+const STYLES: [&str; 1] = [SPECIES[0]];
 /// The prompt's row (0-based): the page's rows above and under it are lettered.
 const PROMPT_ROW: usize = 4;
 
@@ -57,7 +63,7 @@ const RIGHT: char = '\u{2192}';
 /// lettered cells (`row, col`) the box meets by a pixel or more, and how far (rows) the head law
 /// draws the body down its row and the share of its height it fits it to
 /// ([`EffectsPipeline::companion_head_sink_fit`]), and the caret's cell (`row, col`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Frame {
     ms: u64,
     alpha: u8,
@@ -267,7 +273,7 @@ fn past_the_row_under(frames: &[Frame], ch: usize) -> usize {
 
 /// A FULL-SCREEN PROGRAM'S ROWS UNDER ITS LINE ARE ITS OWN ([`OldPath::FullScreenKeepsItsRow`]),
 /// on every face's cells ([`CELLS`]): in the `steam` scene on the alternate screen the cat
-/// keeps its line's row. From 600 ms, the cat and the dog, between the gallery's own rows and
+/// keeps its line's row. From 600 ms, the cat ([`STYLES`]), between the gallery's own rows and
 /// between descenders and a sentence, keys typed at the window and as the gallery types them:
 /// no frame's foot lies past the row under the prompt, and no frame's box meets that row's
 /// letters. Negative control (the law reverted alone, the cat, the gallery's rows, both ways of
@@ -333,7 +339,7 @@ fn a_full_screen_program_s_rows_under_its_line_are_its_own_on_every_face() {
 /// row above's last letter (the gallery's row ends at its 52nd column, the cat seated at 52.4),
 /// and sets off back into the line, a walk at the window's Backspaces, a gathered leap as the
 /// gallery types. The head law reads the row above over that way while it is still at rest and
-/// draws the body down or fits it before it goes. From 600 ms, the cat and the dog, both pages,
+/// draws the body down or fits it before it goes. From 600 ms, the cat ([`STYLES`]), both pages,
 /// both ways of typing: no frame's box meets the row above's letters. Negative control (the law
 /// reverted alone, the cat, both pages, both ways of typing): on each face its box meets that
 /// row's last letters in two frames or more as it sets off (measured three to five, from the
@@ -393,7 +399,7 @@ type LeapRun = (
 /// before the caret's column after the Backspaces, the program moves the caret five rows down
 /// and back, three times down and twice up a second apart (vim's `5j` and `5k`), and the cat
 /// leaps straight down from the prompt's row, fitted the first time and drawn down after, and
-/// back up into it. From 600 ms, the cat and the dog, both ways of typing: no frame's box meets
+/// back up into it. From 600 ms, the cat ([`STYLES`]), both ways of typing: no frame's box meets
 /// the row above's letters, in the air or on the ground. Negative controls (the cat, typed at
 /// the window), on each face: with [`OldPath::HeldNoTaller`] the stretch takes the box into
 /// those letters in eight frames or more, over every leap and landing (measured 11 to 15); with
@@ -823,7 +829,7 @@ type WallRun = (
 /// cells ([`CELLS`]): the trail gallery's `last-row` on the main screen's last row, the row over it
 /// lettered in every cell and none under, the burst's line ending 4, 3, 2, 1 and 0 cells short of
 /// the grid's end, and one cell too long for its row, so that it wraps ([`LAST_ROW_ROOMS`]). The
-/// cat and the dog, keys typed at the window and as the gallery types them, from 300 ms past the
+/// cat ([`STYLES`]), keys typed at the window and as the gallery types them, from 300 ms past the
 /// first key. Where the line leaves the room the body fitted to its row takes (`art_cols` x
 /// [`ROW_FIT`] cells: 3.38 on 13 x 29, 2.82 on 14 x 26, 3.86 on 11 x 28), typed to its end at once,
 /// paused [`PAUSED_SHORT`] keys short of it ([`Then::Paused`]), its last letters after a run of
@@ -876,9 +882,10 @@ type WallRun = (
 /// pause at one blank cell and at none on 13 x 29 and 11 x 28, at none on 14 x 26; none in the
 /// others).
 ///
-/// Every run but the negative controls is replayed twice: on the gallery's grid, and with the
-/// prompt [`WALL_FLUSH_PATH`] cells longer, on 103 to 108 columns, where a box flush with the
-/// wall once read a column past the grid's end ([`PetBrain::rest_box_cols`]). There the law held
+/// The runs at rest and walked back ([`Then::Rests`], [`Then::Back`]) are replayed twice: on
+/// the gallery's grid, and with the prompt [`WALL_FLUSH_PATH`] cells longer, on 103 to 108
+/// columns, where a box flush with the wall once read a column past the grid's end
+/// ([`PetBrain::rest_box_cols`]): the two scenes that failed there. There the law held
 /// nothing on 14 x 26: the body stood on the line's last letters through the rest in 188 to 194
 /// frames, and from the first Left arrow at a seat followed the caret onto them in 213 and 215
 /// (Linux arm64, 2026-11-08).
@@ -924,6 +931,73 @@ type WallRun = (
 /// none; 24 on 14 x 26: 11 at two, 12 at one, 1 at none; 40 on 11 x 28: 30 at four, which seat
 /// the body, 8 at three, none at two, 1 at one and 1 at none), against 2, 1 and 2 with the law.
 /// Linux arm64, 2026-11-07.
+/// THE DOG'S FRAMES ARE THE CAT'S ([`STYLES`]): one scene of each kind this file replays, on
+/// every face, as the cat and as the dog. Every frame is the same: when, alpha, box, the
+/// lettered cells it meets, the head law's sink and fit, the caret's cell.
+#[test]
+fn the_dog_s_frames_are_the_cat_s_on_every_face() {
+    type Scene = fn((usize, usize), &str) -> Vec<Frame>;
+    let scenes: [(&str, Scene); 8] = [
+        ("steam", |cell, style| {
+            steamed(cell, style, STEAM_ROWS[0], &[], true, &[])
+        }),
+        ("a far leap between lettered rows", |cell, style| {
+            far_leap(cell, style, (FAR_LEAPS[0], Page::Between), &[], false)
+        }),
+        ("a bound under a lettered row", |cell, style| {
+            far_leap(cell, style, (ARC_LEAPS[0], Page::TwoOver), &[], false)
+        }),
+        ("the last row at rest", |cell, style| {
+            last_row(cell, (0, Then::Rests), style, &[], true).frames
+        }),
+        (
+            "the last row walked back, the prompt longer",
+            |cell, style| {
+                last_row_after(cell, WALL_FLUSH_PATH, (0, Then::Back), style, &[], false).frames
+            },
+        ),
+        ("a crossing re-aimed down", |cell, style| {
+            crossing_re_aimed_down(cell, style, &[])
+        }),
+        ("a gapped row over the body", |cell, style| {
+            under_a_gapped_row(cell, style, 300, &[])
+        }),
+        ("a walk through a gap in the line", |cell, style| {
+            walked_through_a_gap((cell, GAP_LINES[0]), 4, style, &[], true).0
+        }),
+    ];
+    let mut runs = Vec::new();
+    for cell in CELLS {
+        for scene in scenes {
+            for style in SPECIES {
+                runs.push((cell, scene, style));
+            }
+        }
+    }
+    let seen = aterm_spec::check::each(&runs, |&(cell, (_, scene), style)| scene(cell, style));
+    for (pair, frames) in runs.chunks(2).zip(seen.chunks(2)) {
+        let (cell, (name, _), _) = pair[0];
+        assert!(
+            frames[0].len() > 100,
+            "fixture: {name} on {cell:?} drew {}",
+            frames[0].len()
+        );
+        assert_eq!(
+            frames[0].len(),
+            frames[1].len(),
+            "{name} on {cell:?}: frames drawn"
+        );
+        let differs = frames[0]
+            .iter()
+            .zip(&frames[1])
+            .find(|(cat, dog)| cat != dog);
+        assert!(
+            differs.is_none(),
+            "{name} on {cell:?}: the dog's frame is not the cat's: {differs:?}"
+        );
+    }
+}
+
 #[test]
 fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
     let mut runs: Vec<WallRun> = Vec::new();
@@ -942,6 +1016,12 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
                 }
                 for ctl in [false, true] {
                     for path in [0, WALL_FLUSH_PATH] {
+                        // The longer prompt is replayed where it once failed: at rest and
+                        // walked back, where the rest box's width was rounded by a reciprocal
+                        // (13 and 14 px cells). The other scenes' judgments read no width.
+                        if path != 0 && !matches!(then, Then::Rests | Then::Back) {
+                            continue;
+                        }
                         for style in STYLES {
                             runs.push(((cell, path), (room, then), style, ctl, None));
                         }
@@ -1130,7 +1210,7 @@ fn a_wall_that_holds_no_seat_hides_the_body_on_every_face() {
 /// the last key the program clears the row over the line ([`Then::Opened`]). The margin's seat off
 /// the line stands the body on the cleared row in one tick, drawn where it stood, its feet in the
 /// line's row, and the head law draws it whole there, on that row (no sink). From the clearing to
-/// the Enter, the cat and the dog, keys typed at the window and as the gallery types them: it is
+/// the Enter, the cat ([`STYLES`]), keys typed at the window and as the gallery types them: it is
 /// on glass in every frame, and no frame's box meets a lettered cell. Negative control (the law
 /// reverted alone, the cat, each way of typing): it grows as it rises, the wall holding its right
 /// edge, and its box meets the line's last letters in 8 frames or more over each face's rooms,
@@ -1465,14 +1545,14 @@ fn far_leap(
 /// columns reaches (ATERM-KI-1107-3); 40 and 58 rows down from rest on the 85th row of a pane 160
 /// rows tall, where the window about the body reads rows far down the pane; and 88 rows up
 /// from rest at the foot of a pane [`TALL_ROWS`] tall. The body gathers to leap where it rests
-/// fitted to its row, far from the caret. From 600 ms, the cat and the dog, both ways of typing
+/// fitted to its row, far from the caret. From 600 ms, the cat ([`STYLES`]), both ways of typing
 /// (a scene from rest types no key, and runs once): no frame's box meets the letters the head
 /// law keeps it off ([`kept_off`]: the row's beside the prompt's that the leaps do not cross,
 /// both for a leap along the prompt's row, and for the leap up the row above's while the box
 /// stands on the prompt's row), and none moves more than [`STEP_ROWS`] rows from the frame
 /// before (measured at most 2.3). On a blank page the same leaps find no letters, and no frame
 /// draws the body down its row or fits it: the rows read about the body are read as they are,
-/// blank. Negative control (the law reverted alone, the cat and the dog, both ways of typing):
+/// blank. Negative control (the law reverted alone, the cat ([`STYLES`]), both ways of typing):
 /// the map reads about the caret alone and a read longer than a window reads nothing, the head
 /// law reads none of the body's rows and lets its fit go as it gathers to leap or sets off, and
 /// its box meets those letters in each scene's [`FarLeap::bites`] frames or more (measured on
@@ -1571,8 +1651,9 @@ fn a_body_far_from_the_caret_reads_its_own_rows_on_every_face() {
 /// from rest at the prompt's 15th column on a pane [`WIDE_COLS`] wide to the 290th column some
 /// rows down and back, under a row lettered two over the prompt's ([`Page::TwoOver`]). Each
 /// control's floor ([`FarLeap::bites`], the first) counts the frames over all of the scene's
-/// controls (the cat and the dog, 13 x 29, 14 x 26 and 11 x 28 px cells): two thirds of those
-/// measured on Linux arm64, 2026-11-08.
+/// controls (the cat ([`STYLES`]), 13 x 29, 14 x 26 and 11 x 28 px cells): two thirds of those
+/// measured (5 in each scene on macOS arm64, 2026-11-15; with the dog replayed beside the cat,
+/// 10, Linux arm64, 2026-11-08).
 const ARC_LEAPS: [FarLeap; 2] = [
     FarLeap {
         name: "5j to the 290th column from rest, a row two over the prompt lettered",
@@ -1580,7 +1661,7 @@ const ARC_LEAPS: [FarLeap; 2] = [
         typed: false,
         from: (5, 15),
         to: (10, 290),
-        bites: [6, 0],
+        bites: [3, 0],
     },
     FarLeap {
         name: "40j to the 290th column from rest, a row two over the prompt lettered",
@@ -1588,7 +1669,7 @@ const ARC_LEAPS: [FarLeap; 2] = [
         typed: false,
         from: (5, 15),
         to: (45, 290),
-        bites: [6, 0],
+        bites: [3, 0],
     },
 ];
 
@@ -1600,12 +1681,12 @@ const ARC_LEAPS: [FarLeap; 2] = [
 /// comes back to the prompt's row in a bound along a row whose arc's way, 275 columns, is longer
 /// than either window reads: the arc reads the row two over as far either way from the body as
 /// the window about it reaches, finds its letters and keeps its head under them. From 600 ms,
-/// the cat and the dog: no frame's box meets the letters two rows over the prompt's (the box's
+/// the cat ([`STYLES`]): no frame's box meets the letters two rows over the prompt's (the box's
 /// top measured at 88, 79 and 85 px on 13 x 29, 14 x 26 and 11 x 28 px cells, under that row's
 /// foot at 87, 78 and 84). Negative control (the law reverted alone): the arc reads nothing of a
 /// way that long and rises its whole arc, its box meets those letters in 1 or 2 frames of
-/// each run, the scene's [`FarLeap::bites`] or more over its six (measured 10 in each scene,
-/// its top at 79, 74 and 76 px, Linux arm64, 2026-11-08). In every run the body follows the
+/// each run, the scene's [`FarLeap::bites`] or more over its three (measured 5 in each scene,
+/// its top at 79, 74 and 76 px). In every run the body follows the
 /// caret off the prompt's rows in 60 frames or more (179 to 255).
 #[test]
 fn a_bound_along_the_row_keeps_its_head_under_the_row_two_over_on_every_face() {
@@ -1777,15 +1858,15 @@ fn crossing_re_aimed_down(cell: (usize, usize), style: &str, old: &[OldPath]) ->
 /// keeps a crossing down off its row under it (`PetBrain::left_top`), and a flight re-aimed in
 /// the air whose way goes up drops it (`PetBrain::rebase`). On the alternate screen at a pane's
 /// foot ([`TURNED_LEAPS`]) the program moves the caret far up and back while the body is in the
-/// air, twice, and the flight up is turned back down. From 600 ms, the cat and the dog: no
+/// air, twice, and the flight up is turned back down. From 600 ms, the cat ([`STYLES`]): no
 /// frame's box meets the row under's letters, and none moves more than [`STEP_ROWS`] rows from
 /// the frame before (measured at most 0.8, 1.5 and 1.9 rows). Negative control (the law reverted
-/// alone, the cat and the dog): the box, held at its take-off top as the body comes down from
+/// alone, the cat ([`STYLES`])): the box, held at its take-off top as the body comes down from
 /// high over it, moves 26, 29 or 47 rows in one frame and lies on the row under's letters in
 /// each scene's [`FarLeap::bites`] frames or more (measured 63, 73 and 179). A crossing down
 /// re-aimed further down keeps its top ([`crossing_re_aimed_down`]): no frame's box meets the
 /// row above's letters, and none moves more than [`STEP_ROWS`] rows; its control, the crossing
-/// drawn whole ([`OldPath::CrossingRisesIntoTheLine`] reverted, the cat and the dog), meets them
+/// drawn whole ([`OldPath::CrossingRisesIntoTheLine`] reverted, the cat ([`STYLES`])), meets them
 /// in ten frames or more (measured 15 or 16). In every scene the body follows the caret away
 /// from the prompt's rows in 60 frames or more.
 #[test]
@@ -1937,10 +2018,10 @@ const FAR_ALONG: [FarLeap; 7] = [
 /// column to the 290th on a pane [`WIDE_COLS`] wide, from the 30th to ten columns short of the
 /// end of panes 350, 513, 600 and [`WIDEST_COLS`] wide, and from the 15th to the 990th on the
 /// widest, where the body runs to the 602nd column and rests there while the caret is back. From
-/// 600 ms, the cat and the dog, between rows lettered to the margin and on a blank page: every
+/// 600 ms, the cat ([`STYLES`]), between rows lettered to the margin and on a blank page: every
 /// frame draws the body at full alpha, and it follows the caret away, from the caret's first
 /// leap drawn with its box's middle past halfway in 60 frames or more (measured 89 to 187).
-/// Negative control (the law reverted alone, the cat and the dog, both pages): the window about
+/// Negative control (the law reverted alone, the cat ([`STYLES`]), both pages): the window about
 /// the body reads glyphs alone, the hold reads nothing of a box outside the caret's window, goes
 /// blind, and takes the body off the glass, and a hidden body's flight keeps it off until the
 /// flight lands. It is off the glass in each scene's [`FarLeap::bites`] frames or more (measured
@@ -2048,10 +2129,10 @@ fn rose_in_a_gap(frames: &[Frame], row: usize, ch: usize, line_end: i32) -> usiz
 /// longer than one window reads ([`crate::pet_world::MAX_WORLD_COLS`]) is read that far, not
 /// refused. Three words 24 cells apart on the row over the prompt ([`under_a_gapped_row`]), the
 /// line typed under them, on panes 72, 256, 257, 300 and 1,000 columns wide. From 600 ms, the cat
-/// and the dog: once the law holds the body in the prompt's row, no frame's box rises past it
+/// ([`STYLES`]): once the law holds the body in the prompt's row, no frame's box rises past it
 /// under the words ([`rose_in_a_gap`]), and the box meets no letter of the row above; the law holds
 /// it, drawn down or fitted, in 150 frames or more (measured 211 on every pane). Negative control
-/// (the law reverted alone, the cat and the dog, the panes past 256 columns): a side read past
+/// (the law reverted alone, the cat ([`STYLES`]), the panes past 256 columns): a side read past
 /// one window reads nothing and counts as no ink, no gap, and the body rises whole in each gap,
 /// in 23 frames or more, two thirds of the fewest measured (35 on 11 x 28, 38 on 13 x 29, 43 on
 /// 14 x 26 on each of those panes, as with [`OldPath::HeadHeldAcrossGaps`] reverted on every
@@ -2188,7 +2269,7 @@ fn over_the_caret_and_letters(
 /// (`PetBrain::kept_off_the_line`), as every stand `PetBrain::ink_safe_col_for` offers clears it,
 /// so it never trades the line's letters for the caret's cell. On a full page's last row the
 /// caret walks back through a gap of the line and out again ([`walked_through_a_gap`], the line
-/// ending in 2, 4, 8 and 12 letters). From the first arrow to the Enter, the cat and the dog,
+/// ending in 2, 4, 8 and 12 letters). From the first arrow to the Enter, the cat ([`STYLES`]),
 /// typed at the window and as the gallery types: no run with the law draws the box over the
 /// caret's cell at full alpha, the caret short of the line's end, or on a lettered cell, in more
 /// frames than the same run with the law reverted, and on each face, over its runs, the law
@@ -2264,7 +2345,7 @@ const GAP_LINES: [usize; 3] = [GAP_LINE, 100, 296];
 /// through a gap of the line and out again, the line ending in 2, 4, 8 and 12 letters after it,
 /// four blank cells at the wall) a body at the wall keeps there while the stand by the caret lies
 /// in the gap, as it keeps there while that stand lies on the letters. From the first arrow to
-/// the Enter, the cat and the dog, typed at the window and as the gallery types: no frame's box
+/// the Enter, the cat ([`STYLES`]), typed at the window and as the gallery types: no frame's box
 /// reaches more than 2 px into a lettered cell, nor covers more than 2 px of the caret's cell at
 /// full alpha, the caret short of the line's end (the pose's swell at the wall on 11 x 28 reaches
 /// 1 px into the line's last letter, the caret's cell at the first arrow).

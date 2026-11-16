@@ -19,10 +19,6 @@ pub struct Policy {
     pub flags: &'static [&'static str],
     /// Tokens that already decide the posture: a launch holding one and no `--yolo` runs as typed.
     pub markers: &'static [&'static str],
-    /// First words the flags go behind.
-    pub after: &'static [&'static str],
-    /// First words that leave a launch without `--yolo` as typed.
-    pub skip: &'static [&'static str],
 }
 
 impl Policy {
@@ -30,8 +26,6 @@ impl Policy {
     pub const NONE: Self = Self {
         flags: &[],
         markers: &[],
-        after: &[],
-        skip: &[],
     };
 }
 
@@ -41,8 +35,6 @@ pub fn policy_of(program: &str) -> Policy {
     crate::vendor_direct::spec(program).map_or(Policy::NONE, |row| Policy {
         flags: row.yolo_flags,
         markers: row.yolo_markers,
-        after: row.yolo_after,
-        skip: row.yolo_skip,
     })
 }
 
@@ -100,17 +92,8 @@ fn marker_matches(marker: &str, token: &str) -> bool {
 pub(crate) struct WordOptions {
     /// Options that take the next token as their value.
     pub(crate) values: &'static [&'static str],
-    /// Options whose value is optional (clap's `num_args = 0..=1`, commander's `[value]`):
-    /// the next token is theirs unless it starts with `-`.
-    pub(crate) optional: &'static [&'static str],
     /// Options that take no value.
     pub(crate) switches: &'static [&'static str],
-    /// The program's own spellings of the posture a typed `--yolo` sets, each among the row's
-    /// markers: another name of the flag's option (grok's `--dangerously-skip-permissions`, an
-    /// alias of `--always-approve` its parser refuses twice), or a weaker posture its parser
-    /// refuses beside the flags (kimi's `-y`, `--yes` and `--auto-approve`). An explicit
-    /// `--yolo` drops each one ahead of the first word along with itself.
-    pub(crate) own_yolo: &'static [&'static str],
 }
 
 /// The CLI a managed name's vendor alias runs.
@@ -144,149 +127,44 @@ pub(crate) fn word_options(program: &str) -> WordOptions {
                 "--strict-config",
                 "--no-daemon",
             ],
-            ..WordOptions::default()
-        },
-        "muse" => WordOptions {
-            values: &["--model"],
-            ..WordOptions::default()
         },
         "claude" => WordOptions {
             switches: &["-p", "--print"],
             ..WordOptions::default()
         },
-        // grok's top-level `PagerArgs` (1.0.45 source, `xai-grok-pager/src/app/cli.rs`) plus
-        // 1.0.67's `--add-dir`. Hidden and feature-gated options, `-v`, `--version` and `-h`
-        // are left out, so a launch typing one runs as typed.
-        "grok" => WordOptions {
-            values: &[
-                "-m",
-                "--model",
-                "--cwd",
-                "-p",
-                "--single",
-                "--print",
-                "--prompt-file",
-                "--prompt-json",
-                "--load",
-                "--leader-socket",
-                "--debug-file",
-                "--output-format",
-                "--json-schema",
-                "--reasoning-effort",
-                "--effort",
-                "--rules",
-                "--append-system-prompt",
-                "--system-prompt-override",
-                "--system-prompt",
-                "-s",
-                "--session-id",
-                "--worktree-ref",
-                "--ref",
-                "--agent",
-                "--agents",
-                "--tools",
-                "--max-turns",
-                "--add-dir",
-            ],
-            optional: &["-r", "--resume", "-w", "--worktree"],
-            switches: &[
-                "-c",
-                "--continue",
-                "--no-auto-update",
-                "--debug",
-                "--verbatim",
-                "--include-partial-messages",
-                "--fork-session",
-                "--restore-code",
-                "--no-plan",
-                "--no-subagents",
-                "--disable-web-search",
-                "--no-alt-screen",
-                "--minimal",
-                "--fullscreen",
-                "--oauth",
-            ],
-            own_yolo: &["--dangerously-skip-permissions"],
-        },
-        // kimi 2.3.1's top-level options (`apps/kimi-code/src/cli/commands.ts`).
-        "kimi" => WordOptions {
-            values: &[
-                "-m",
-                "--model",
-                "-p",
-                "--prompt",
-                "--agent",
-                "--agent-file",
-                "--add-dir",
-                "--skills-dir",
-                "--output-format",
-            ],
-            optional: &["-S", "--session", "-r", "--resume"],
-            switches: &["-c", "--continue", "-C", "--plan"],
-            own_yolo: &["-y", "--yes", "--auto-approve"],
-        },
         _ => WordOptions::default(),
     }
 }
 
-/// Why the word scan stopped short of the first word ([`first_word`]).
+/// The word scan stopped short of the first word ([`first_word`]): an option it does not know,
+/// or a value missing at the end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stop {
-    /// An option the scan does not know, or a value missing at the end.
-    Unknown,
-    /// A typed `--yolo`, or one of [`WordOptions::own_yolo`], sits right after a bare
-    /// optional-value option and before a bare word: removing it would hand that word to the
-    /// option as its value.
-    Joins,
-}
+struct Unread;
 
 /// The actual argument position of the first word, past known leading values.
-fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, Stop> {
+fn first_word(program: &str, policy: &Policy, head: &[String]) -> Result<Option<usize>, Unread> {
     let opts = word_options(program);
-    let removable = |a: &str| a == WORD || opts.own_yolo.contains(&a);
     let mut value = false;
-    let mut maybe = false;
-    let mut gap = false;
     for (i, arg) in head.iter().enumerate() {
         let a = arg.as_str();
         if value {
             value = false;
             continue;
         }
-        if maybe {
-            maybe = false;
-            if !a.starts_with('-') {
-                // The optional value.
-                continue;
-            }
-            gap = removable(a);
-        } else if gap && !removable(a) {
-            if !a.starts_with('-') {
-                return Err(Stop::Joins);
-            }
-            gap = false;
-        }
-        if removable(a) || policy.flags.contains(&a) || opts.switches.contains(&a) {
+        if a == WORD || policy.flags.contains(&a) || opts.switches.contains(&a) {
             continue;
         } else if opts.values.contains(&a) {
             value = true;
-        } else if opts.optional.contains(&a) {
-            maybe = true;
-        } else if opts
-            .values
-            .iter()
-            .chain(opts.optional.iter())
-            .any(|flag| marker_matches(flag, a))
-        {
+        } else if opts.values.iter().any(|flag| marker_matches(flag, a)) {
             // A long `=value` or attached short value is already consumed.
             continue;
         } else if a.starts_with('-') {
-            return Err(Stop::Unknown);
+            return Err(Unread);
         } else {
             return Ok(Some(i));
         }
     }
-    if value { Err(Stop::Unknown) } else { Ok(None) }
+    if value { Err(Unread) } else { Ok(None) }
 }
 
 /// What a launch runs as ([`decide`]).
@@ -330,12 +208,10 @@ fn config_decides_posture(program: &str, head: &[String]) -> bool {
 }
 
 /// Decide `program args…`, reading the words ahead of a literal `--`. A program with no policy
-/// runs as typed, and so does an unknown leading option (with a typed `--yolo` too, when the
-/// policy has `after` words) or a removal that would join a bare word to an optional value
-/// ([`Stop::Joins`]). Else a typed `--yolo` becomes the policy's flags, dropping the program's
-/// own spellings of that posture ahead of the first word ([`Launch::Flag`]); else a marker, a
-/// Codex permission config assignment, `skip` word or self-update verb runs as typed; else the flags go in front, or behind an
-/// `after` word ([`Launch::Default`]).
+/// runs as typed. A typed `--yolo` becomes the policy's flags in place, each once
+/// ([`Launch::Flag`]). Else an option the word scan does not know, a marker, a Codex permission
+/// config assignment or a self-update verb as the first word runs as typed; else the flags go
+/// in front ([`Launch::Default`]).
 #[must_use]
 pub fn decide(program: &str, args: &[String]) -> Launch {
     let policy = policy_of(program);
@@ -344,55 +220,27 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     }
     let head_len = args.iter().take_while(|a| a.as_str() != "--").count();
     let head = &args[..head_len];
-    let word = first_word(program, &policy, head);
-    let explicit = head.iter().any(|a| a == WORD);
-    match word {
-        Err(Stop::Joins) => return Launch::AsTyped,
-        Err(Stop::Unknown) if !explicit || !policy.after.is_empty() => return Launch::AsTyped,
-        _ => {}
-    }
-    // The leading options an explicit `--yolo` may drop the program's own spellings from: none
-    // past an option the scan does not know.
-    let leading = match word {
-        Ok(Some(i)) => i,
-        Ok(None) => head_len,
-        Err(_) => 0,
-    };
-    let own_yolo = word_options(program).own_yolo;
-    let word = word.ok().flatten();
-    let after = word.is_some_and(|i| policy.after.contains(&head[i].as_str()));
-    if explicit {
+    if head.iter().any(|a| a == WORD) {
         let mut present: Vec<&str> = head.iter().map(String::as_str).collect();
-        let fresh = |out: &mut Vec<String>, present: &mut Vec<&str>| {
+        let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
+        for arg in head {
+            if arg != WORD {
+                out.push(arg.clone());
+                continue;
+            }
             for flag in policy.flags {
                 if !present.contains(flag) {
                     present.push(flag);
                     out.push((*flag).to_string());
                 }
             }
-        };
-        let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
-        let mut pending = false;
-        for (i, arg) in head.iter().enumerate() {
-            if arg == WORD {
-                if after && word.is_some_and(|w| i < w) {
-                    pending = true;
-                } else {
-                    fresh(&mut out, &mut present);
-                }
-            } else if i < leading && own_yolo.contains(&arg.as_str()) {
-                // The vendor's own spelling of the posture the flags set.
-            } else {
-                out.push(arg.clone());
-                if pending && word == Some(i) {
-                    pending = false;
-                    fresh(&mut out, &mut present);
-                }
-            }
         }
         out.extend(args[head_len..].iter().cloned());
         return Launch::Flag(out);
     }
+    let Ok(word) = first_word(program, &policy, head) else {
+        return Launch::AsTyped;
+    };
     if head
         .iter()
         .any(|a| policy.markers.iter().any(|m| marker_matches(m, a)))
@@ -400,22 +248,11 @@ pub fn decide(program: &str, args: &[String]) -> Launch {
     {
         return Launch::AsTyped;
     }
-    if let Some(i) = word {
-        // The self-update verbs skip too, on every lane: an update shape is
-        // decided by that intercept first (`claude update --help` forwards to
-        // the vendor), and the default must not land on the forward.
-        if policy.skip.contains(&head[i].as_str())
-            || crate::selfupdate::verbs_of(program).contains(&head[i].as_str())
-        {
-            return Launch::AsTyped;
-        }
-        if after {
-            let mut out: Vec<String> = Vec::with_capacity(args.len() + policy.flags.len());
-            out.extend(head[..=i].iter().cloned());
-            out.extend(policy.flags.iter().map(|f| (*f).to_string()));
-            out.extend(args[i + 1..].iter().cloned());
-            return Launch::Default(out);
-        }
+    // The self-update verbs skip, on every lane: an update shape is decided by that intercept
+    // first (`claude update --help` forwards to the vendor), and the default must not land on
+    // the forward.
+    if word.is_some_and(|i| crate::selfupdate::verbs_of(program).contains(&head[i].as_str())) {
+        return Launch::AsTyped;
     }
     let mut out: Vec<String> = policy.flags.iter().map(|f| (*f).to_string()).collect();
     out.extend(args.iter().cloned());

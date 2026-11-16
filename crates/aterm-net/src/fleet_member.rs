@@ -7156,38 +7156,6 @@ impl Unreached {
             )
     }
 
-    /// Whether the failure matches an overloaded listener at its connection or per-address slot
-    /// cap: `NO capacity` ([`FleetError::AddressBusy`]), an immediate mid-handshake drop when all
-    /// listener slots are occupied ([`Self::hung_up`]), a TCP reset/timeout while connecting, a
-    /// connect/handshake/reply deadline, or the local resolver permit cap.
-    #[must_use]
-    pub fn at_capacity(&self) -> bool {
-        if self.hung_up() {
-            return true;
-        }
-        match self {
-            Self::Handshake(_, FleetError::AddressBusy) | Self::Deadline(..) => true,
-            Self::Connect(_, e) => matches!(
-                e.kind(),
-                io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::TimedOut
-                    | io::ErrorKind::WouldBlock
-            ),
-            Self::Local(why) => why == "the fleet resolver is at capacity",
-            Self::Resolve(_)
-            | Self::Handshake(..)
-            | Self::Lookup(..)
-            | Self::Reply(..)
-            | Self::NotFleet(_)
-            | Self::OtherNode { .. }
-            | Self::Impostor { .. }
-            | Self::Misnamed { .. }
-            | Self::Unproved { .. }
-            | Self::Unbound { .. } => false,
-        }
-    }
-
     /// Whether the node's place said that node may drive this machine no more: it answered under
     /// another fleet's secret, refused this machine's, or proved that node under another key than
     /// this machine binds. Nothing else does: a node's drive is its own dial of this machine, so a

@@ -109,6 +109,13 @@ pub fn replay(rows: &[RingRow], spans: &[HoldSpan], sid: &str, from_ms: i64) -> 
             said = [None; RuleId::COUNT];
             continue;
         };
+        // A look that names no session `sid` is a minute the window judged nothing for it (it
+        // supervised `sid` not at all), so it says nothing of `sid`'s verdicts, however a hold
+        // span left open stands over it; and a ring that leaves such a look out (the window
+        // writes none that names no session) replays the same.
+        if row.session(sid).is_none() {
+            continue;
+        }
         if books.hold_since_ms() != Some(span.since_ms) {
             said = [None; RuleId::COUNT];
         }

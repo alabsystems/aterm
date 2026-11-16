@@ -325,13 +325,16 @@ fn sign_genesis_in_realm(
     if let Some(lock) = &held {
         revalidate_private_genesis(paths, &admin, &bootstrap, &access, lock)?;
     }
-    if !fsx::write_new(out, record.bytes(), 0o644)? {
+    if !fsx::write_new(out, &record.wire_bytes()?, 0o644)? {
         return Err(Error::new(format!(
             "{} exists: Genesis v2 is signed once, into a new file",
             out.display()
         )));
     }
-    let wire = seeded.as_ref().map(crate::membership_log::Store::encode);
+    let wire = seeded
+        .as_ref()
+        .map(crate::membership_log::Store::read_encoded)
+        .transpose()?;
     if let Some(wire) = &wire {
         if held.is_some() {
             let _ = super::save_records_unlocked(paths, wire)?;

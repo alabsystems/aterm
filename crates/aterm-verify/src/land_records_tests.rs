@@ -17,6 +17,57 @@ use crate::land_spool::Spool;
 use std::cell::Cell;
 use std::rc::Rc;
 
+#[test]
+fn a_spool_cleanup_failure_is_reported_without_losing_a_successful_append() {
+    struct RefusedCleanup {
+        dir: crate::land_spool::Dir,
+        path: String,
+    }
+    impl Spool for RefusedCleanup {
+        fn put(&self, record: &Signed) -> Result<(), String> {
+            self.dir.put(record)
+        }
+        fn pending(&self) -> Result<crate::land_spool::Pending, String> {
+            self.dir.pending()
+        }
+        fn done(&self, record: &Signed) -> Result<(), String> {
+            if record.path == self.path {
+                Err("controlled cleanup refusal".to_owned())
+            } else {
+                self.dir.done(record)
+            }
+        }
+    }
+    use crate::land_record::tests::{BASE, T, record};
+    let world = world_of();
+    let mac = Mac::new(&world, Some(7));
+    let me = signer(7);
+    let held = record(Check::Fmt, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    let removed = record(Check::Lint, Word::Ok, T, BASE, NOW)
+        .sign(Some(&me))
+        .unwrap();
+    mac.dir().put(&held).unwrap();
+    mac.dir().put(&removed).unwrap();
+    let mut records = mac.records();
+    records.spool = Box::new(RefusedCleanup {
+        dir: mac.dir(),
+        path: held.path.clone(),
+    });
+    let mut said = Vec::new();
+    records
+        .publish(&world.work, &mut |line| said.push(line.to_owned()))
+        .expect("cleanup cannot turn a successful append into an unwritten one");
+    assert_eq!(filed(&world.work, T), ["fmt.ok", "lint.ok"]);
+    assert_eq!(mac.dir().pending().unwrap().records, [held.clone()]);
+    assert!(
+        said.iter()
+            .any(|line| line.contains(&held.path) && line.contains("controlled cleanup refusal")),
+        "{said:?}"
+    );
+}
+
 /// A world whose clones can write the journal (its appends are commits).
 fn world_of() -> World {
     let world = world();
@@ -164,7 +215,7 @@ fn land_rounds(
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );

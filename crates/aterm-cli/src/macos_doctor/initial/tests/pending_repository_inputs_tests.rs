@@ -4,6 +4,7 @@
 //! A checkout completed elsewhere can settle an already admitted repository stage.
 
 use super::*;
+use aterm_machines::init_github::acquires_repository;
 use aterm_machines::port::{Ran, Stat, System};
 
 #[test]
@@ -39,28 +40,36 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         let read_checkout = checkout.clone();
         let read_git = git_dir.clone();
         sys.simulate(move |sys, command| {
-            let committed_head = command.args.windows(4).any(|args| {
-                args[0] == "rev-parse" && args[1] == "--verify"
-                    && args[2] == "--quiet" && args[3] == "HEAD^{commit}"
-            });
             let command = command.display();
+            // The checkout's record of facts, once it is one: its `rev-parse` batch, its config
+            // listing, HEAD on `main` at a commit, and no default branch of origin's recorded.
             Some(if command.ends_with(" credential fill") {
                 Ran::ok("protocol=https\nhost=github.com\nusername=tester\npassword=inert_repository_tools_token\n")
             } else if command.contains(" config --null --show-origin --get-regexp ") {
                 Ran::ok("")
             } else if command.ends_with(
-                " rev-parse --is-inside-work-tree --show-prefix --show-toplevel --git-path index",
+                " rev-parse --is-inside-work-tree --show-prefix --show-toplevel \
+                 --is-shallow-repository --git-path index --git-path objects/info/alternates",
             ) {
                 if sys.stat(&read_git).is_ok() {
-                    Ran::ok(&format!("true\n\n{}\n.git/index\n", read_checkout.display()))
+                    Ran::ok(&format!(
+                        "true\n\n{}\nfalse\n.git/index\n.git/objects/info/alternates\n",
+                        read_checkout.display()
+                    ))
                 } else {
                     Ran::exit(128, "not a Git repository")
                 }
-            } else if command.ends_with(" config --get-all remote.origin.url") {
-                Ran::ok("https://github.com/tester/arrived.git\n")
-            } else if committed_head {
+            } else if command.contains(" config --null --show-scope --show-origin --get-regexp ") {
+                Ran::ok(
+                    "local\0file:.git/config\0remote.origin.url\nhttps://github.com/tester/arrived.git\0",
+                )
+            } else if command.ends_with(" symbolic-ref --quiet HEAD") {
+                Ran::ok("refs/heads/main\n")
+            } else if command.ends_with(" symbolic-ref --quiet refs/remotes/origin/HEAD") {
+                Ran::exit(1, "")
+            } else if command.contains(" for-each-ref ") && command.ends_with(" refs/heads/main") {
                 assert!(sys.stat(&read_git).is_ok(), "only the completed checkout has a HEAD");
-                Ran::ok("1234567890abcdef1234567890abcdef12345678\n")
+                Ran::ok("1234567890abcdef1234567890abcdef12345678 commit refs/heads/main\n")
             } else {
                 panic!("unexpected repository effect: {command}")
             })
@@ -74,6 +83,12 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         let saved = progress(root).unwrap().unwrap();
         assert_eq!(saved.done & Stage::Repositories.bit(), 0);
         assert!(!saved.completed && !saved.stopped);
+        // Work at the destination holds the stage: only a change there moves it, so its park counts
+        // the checkouts ([`InitialSetupParkMark::checkouts_run`]).
+        assert_eq!(
+            repositories_left(root, revision),
+            Some(aterm_machines::init_observe::Wait::InTheWay)
+        );
         assert_eq!(
             pending_inputs::repositories_revision(root, &observation_at(root).unwrap().records),
             Some(revision)
@@ -105,7 +120,7 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         assert!(
             current
                 .iter()
-                .any(|row| row.detail.contains("1 matching worktrees present"))
+                .any(|row| row.detail.contains("1 of 1 ready"))
         );
         host.calls.clear();
         let resumed =
@@ -124,8 +139,14 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
                 pending_inputs::repositories_revision(root, &observation_at(root).unwrap().records),
                 None
             );
-            // Restore only the parked run's completion record to test its useful native fact.
+            // Restore only the parked run's completion record, and what its stage was left waiting
+            // on, to test its useful native fact.
             save_progress(root, saved).unwrap();
+            record_repositories_left(
+                root,
+                revision,
+                Some(aterm_machines::init_observe::Wait::InTheWay),
+            );
             assert!(
                 mark(&host).facts_changed_since(&parked),
                 "the parked repository must hear an externally completed matching checkout"
@@ -133,7 +154,7 @@ fn a_parked_repository_hears_a_matching_checkout_completed_elsewhere() {
         }
         let (sys, _) = host.native_repositories.as_ref().unwrap();
         assert_eq!(sys.read_file(&personal).unwrap(), b"preserved local work");
-        assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
+        assert!(sys.calls().iter().all(|call| !acquires_repository(call)
             && !call.contains(" agh GET ")
             && !call.contains("credential approve")));
     }

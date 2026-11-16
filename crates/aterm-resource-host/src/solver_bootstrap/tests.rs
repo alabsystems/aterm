@@ -92,13 +92,19 @@ pub(crate) fn entry() {
             return Err(invalid());
         }
         let args = [c"true".as_ptr(), std::ptr::null()];
+        let exec_gate = aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN)
+            .map_err(|_| invalid())?;
         // SAFETY: fixed complete argv. A broken restriction replaces only this
         // owned payload, which then fails to create the required work marker.
-        if unsafe { libc::execv(c"/usr/bin/true".as_ptr(), args.as_ptr()) } != -1
-            || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
-        {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the kernel restriction probe retains its closed process-read gate even if the sandbox is broken"
+        )]
+        let replaced = unsafe { libc::execv(c"/usr/bin/true".as_ptr(), args.as_ptr()) } != -1;
+        if replaced || io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
             return Err(invalid());
         }
+        drop(exec_gate);
         let journal = std::env::var_os("ATERM_TEST_SOLVER_JOURNAL").ok_or_else(invalid)?;
         let journal = std::fs::read(journal)?;
         if mode == "actor" {

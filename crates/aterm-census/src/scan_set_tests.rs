@@ -122,3 +122,96 @@ fn the_review_set_is_the_fork_ledger() {
     let root = synth_tree("aterm-scan-set", "ledger-absent", &[]);
     assert_eq!(reviewed_forks(&root), Ok(Vec::new()));
 }
+
+/// A manifest is TOML, and Cargo reads every TOML string kind: a qualify list's packed control
+/// is a multi-line literal string full of `#`, brackets and both quotes. Its targets read as
+/// they would without it, and each string reads as its text.
+#[test]
+fn a_manifest_with_literal_and_multi_line_strings_reads_its_targets() {
+    let text = r####"[package]
+name = "keys" # a comment
+autotests = false
+
+[package.metadata.atpkg]
+expose = ['keys']
+
+[[package.metadata.atpkg.qualify]]
+name = "control"
+stage = "packed"
+run = ["/bin/sh", "-c", '''
+# not a comment: [ { " ' ""
+cat > f <<'END'
+[[machine]]
+END
+''', 'x # y']
+within-secs = 120
+note = """
+a "basic" one, \""" escaped, and ""two"" before the end"""""
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+harness = false
+"####;
+    let targets = manifest_targets(text, "Cargo.toml").expect("valid TOML reads");
+    assert!(targets.package);
+    assert_eq!(targets.name.as_deref(), Some("keys"));
+    assert_eq!(targets.undiscovered, ["test"]);
+    assert_eq!(
+        targets.declared,
+        [(
+            "test",
+            Some("suite".to_string()),
+            Some("tests/suite.rs".to_string())
+        )]
+    );
+    assert_eq!(targets.runs_libtest, [false]);
+
+    let doc = parse_doc(text, "Cargo.toml").expect("valid TOML reads");
+    let entry = |key: &str| {
+        doc.sections
+            .iter()
+            .filter(|(header, _)| header == "package.metadata.atpkg.qualify")
+            .flat_map(|(_, entries)| entries)
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("no {key} in the qualify step"))
+    };
+    let Value::Array(run) = entry("run") else {
+        panic!("run is an array");
+    };
+    let words: Vec<&str> = run
+        .iter()
+        .map(|v| match v {
+            Value::Str(s) => s.as_str(),
+            other => panic!("{other:?} is not a string"),
+        })
+        .collect();
+    assert_eq!(
+        words,
+        [
+            "/bin/sh",
+            "-c",
+            "# not a comment: [ { \" ' \"\"\ncat > f <<'END'\n[[machine]]\nEND\n",
+            "x # y"
+        ]
+    );
+    let Value::Str(note) = entry("note") else {
+        panic!("note is a string");
+    };
+    assert_eq!(
+        note,
+        "a \"basic\" one, \\\"\"\" escaped, and \"\"two\"\" before the end\"\""
+    );
+
+    for broken in [
+        "a = '''\nnever closed\n",
+        "a = 'one line\nb = 1\n",
+        "a = [\n'''x'''\n",
+    ] {
+        assert!(
+            parse_doc(broken, "Cargo.toml").is_err(),
+            "{broken:?} must not read"
+        );
+    }
+}

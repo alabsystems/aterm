@@ -7,16 +7,16 @@ use super::*;
 fn failures_drive_recovery_without_parsing_messages() {
     for (status, code, kind, recovery) in [
         (422, 8002, Kind::Credentials, Recovery::Stop),
-        (422, 9001, Kind::Verification, Recovery::Verify),
+        (422, 9001, Kind::Verification, Recovery::Stop),
         (401, 10013, Kind::SessionExpired, Recovery::Reauthenticate),
-        (401, 9001, Kind::Verification, Recovery::Verify),
+        (401, 9001, Kind::Verification, Recovery::Stop),
         (429, 0, Kind::RateLimited, Recovery::RetryRead),
         (503, 0, Kind::Service, Recovery::RetryRead),
         (403, 0, Kind::Refused, Recovery::Stop),
         (422, 5003, Kind::ClientRejected, Recovery::Stop),
         (422, 2011, Kind::Refused, Recovery::Stop),
         (403, 9100, Kind::Scope, Recovery::Stop),
-        (422, 9002, Kind::DeviceVerification, Recovery::Verify),
+        (422, 9002, Kind::DeviceVerification, Recovery::Stop),
     ] {
         let error = Failure::response("/auth/v4", status, code, None);
         assert_eq!(error.kind, kind);

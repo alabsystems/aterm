@@ -402,6 +402,16 @@ fn no_session_and_mux_are_skipped() {
             "no-session",
         ),
         (
+            // an earlier tab's ID one hex digit over
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "s-0123456789abcdef01234"),
+            "no-session",
+        ),
+        (
+            // a loose `s-` word, which no build minted
+            MapEnv::new().with("ATERM_PARENT_SESSION_ID", "s-1"),
+            "no-session",
+        ),
+        (
             MapEnv::new()
                 .with("ATERM_PARENT_SESSION_ID", "t0000000001")
                 .with("ATERM_MUX", "1"),

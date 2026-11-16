@@ -1865,7 +1865,7 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
     );
 }
 
-/// A renewal whose page met Cloudflare's bot check, which did not clear, ends as a failure on
+/// A renewal whose page met Cloudflare's bot check ends as a failure on
 /// record naming Cloudflare, with the account's check, a durable human login task and no NEEDS
 /// YOU prompt. A later renewal with nobody at the terminal runs nothing and names the person's
 /// step; a person's renewal that fails for another reason replaces neither the task nor the
@@ -1881,8 +1881,8 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     let checked = SignInHost::new(
         Script::Ends(login_drive::Outcome::BotCheck(
-            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 \
-             s; aterm never tries to pass it"
+            "the sign-in page `www.kimi.ai/code/authorize_device` carries Cloudflare's bot check; \
+             aterm pressed nothing there and never tries to pass it"
                 .to_owned(),
         )),
         &home,
@@ -1891,8 +1891,9 @@ fn a_renewal_on_a_bot_check_records_a_quiet_human_login_task() {
     assert_eq!(code, exit(1), "{out}{err}");
     assert!(!out.contains("NEEDS YOU"), "{out}");
     assert!(
-        err.contains("Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear")
-            && !err.contains("person"),
+        err.contains(
+            "the sign-in page `www.kimi.ai/code/authorize_device` carries Cloudflare's bot check"
+        ) && !err.contains("person"),
         "{err}"
     );
     let ledger = read(&store.ledger_path());
@@ -1980,7 +1981,8 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
     let row = roster.row("kimi-one").expect("the row").clone();
     let bot_check = || {
         login_drive::Outcome::BotCheck(
-            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 s"
+            "the sign-in page `www.kimi.ai/code/authorize_device` carries Cloudflare's bot check; \
+             aterm pressed nothing there and never tries to pass it"
                 .to_owned(),
         )
     };
@@ -2245,6 +2247,41 @@ fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_sto
     assert!(read(&store.ledger_path()).contains("www.kimi.ai window done untidied"));
 }
 
+/// `ACCOUNTS BROWSER` on a profile it makes marks it unproven, as a headless sign-in's fresh
+/// profile is, until a sign-in there is kept: a window closed with nothing signed in leaves a
+/// profile the sweep counts as signed in to nothing (`observe::sweep::browser_logins`) and no
+/// renewal takes as proven. CONTROL: the session kept removes the mark.
+/// NEGATIVE CONTROL: with the verb making the profile unmarked, `` assertion failed: …
+/// is_file() ``.
+#[cfg(unix)]
+#[test]
+fn accounts_browser_leaves_a_profile_it_made_unproven_until_a_sign_in_is_kept() {
+    use crate::harness::{browser_window::WindowEnd, headless_oauth::PROFILE_UNPROVEN_MARK};
+    let (tmp, env) = kimi_env("browser-unproven");
+    let home = tmp.path().join("home");
+    let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
+    let profile = crate::harness::headless_oauth::row_browser_profile(
+        Cli::Kimi,
+        &store.dir,
+        &store.shared_dir(),
+        "kimi-one",
+        Some("kimi-one@example.com"),
+    );
+    assert!(!profile.exists());
+    let line = "accounts browser kimi-one --cli kimi";
+    let empty = SignInHost {
+        ends: (WindowEnd::Done, false),
+        ..SignInHost::desk(&home)
+    };
+    let (code, out, err) = renew(line, &env, &empty);
+    assert_eq!(code, exit(1), "{out}{err}");
+    assert!(profile.join(PROFILE_UNPROVEN_MARK).is_file());
+    let kept = SignInHost::desk(&home);
+    let (code, out, err) = renew(line, &env, &kept);
+    assert_eq!(code, exit(0), "CONTROL: {out}{err}");
+    assert!(!profile.join(PROFILE_UNPROVEN_MARK).exists());
+}
+
 /// `ACCOUNTS BROWSER` opens nothing on a profile another of aterm's launches holds (a headless
 /// renewal's shell writes no `SingletonLock`), naming it by its pid. CONTROL: released, it opens.
 #[cfg(unix)]
@@ -2330,8 +2367,8 @@ fn a_renewal_that_stopped_for_a_person_says_so() {
     }
     assert_eq!(
         renewal(login_drive::Outcome::BotCheck(
-            "Cloudflare's bot check on `www.kimi.ai/code/authorize_device` did not clear in 90 \
-             s; aterm never tries to pass it"
+            "the sign-in page `www.kimi.ai/code/authorize_device` carries Cloudflare's bot check; \
+             aterm pressed nothing there and never tries to pass it"
                 .to_owned()
         )),
         Renewal::BotCheck

@@ -6,8 +6,11 @@
 //! `state.toml`, the verified vault, a join's identity or source), this Mac's
 //! network changing (the kernel's network-change events, [`aterm_uds::network::RouteChanges`]),
 //! and a `git`
-//! arriving (atpkg's, the Command Line Tools' or Xcode's), and the selected repository inputs
-//! or pinned helper changing. A watch only
+//! arriving (atpkg's, the Command Line Tools' or Xcode's), the selected repository inputs
+//! or pinned helper changing, the checkouts changing while they are a fact of the Repositories
+//! stage (it is complete, or a folder sits in a repository's way), and this account's repository
+//! lease (`align.lock`) coming free after other aterm passes held it while a Repositories stage
+//! waits on it. A watch only
 //! says "look again": the park reads its mark again and runs a pass only when a fact changed.
 //! Each watch lets a burst settle before it says so, and the network watch says so at most once a
 //! minute, so an interface that keeps going up and down moves a park no more often than the
@@ -16,8 +19,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// The facts a park watches ([`super::InitialSetupParkMark::watches`]).
@@ -29,13 +32,21 @@ pub struct Watches {
     pub network: bool,
     /// Git activation and local repository inputs: the selected source and pinned helper.
     pub git: bool,
+    /// The checkouts the selected inventory names, beside [`Self::git`]: only while they are a
+    /// fact of the Repositories stage ([`super::InitialSetupParkMark::checkouts_run`]), as a
+    /// clone or fetch another pass makes moves them without moving a stage that waits on
+    /// anything else.
+    pub checkouts: bool,
+    /// This account's repository lease, which another aterm pass holds while the Repositories
+    /// stage waits on it ([`super::HELD`]): its coming free ([`lease_releases`]).
+    pub lease: bool,
 }
 
 impl Watches {
     /// Whether nothing is watched: the park waits on a person, or on its one timer.
     #[must_use]
     pub const fn none(self) -> bool {
-        !self.secrets && !self.network && !self.git
+        !self.secrets && !self.network && !self.git && !self.checkouts && !self.lease
     }
 }
 
@@ -105,6 +116,8 @@ impl ParkWatch {
                 .map_err(io::Error::other)?,
             );
             folders.extend(repository_input_folders(&input_files));
+        }
+        if watches.checkouts {
             let sys = aterm_machines::port::Live::new();
             let user = aterm_machines::port::System::identity(&sys)
                 .map_err(io::Error::other)?
@@ -135,6 +148,9 @@ impl ParkWatch {
                     changed,
                 )?
             });
+        }
+        if watches.lease {
+            watch_lease(Arc::clone(&stop), Arc::clone(&lost), changed)?;
         }
         if watches.network {
             watch.network = Some(watch_network(stop, lost, changed)?);
@@ -672,6 +688,133 @@ fn watch_network_over(
         #[cfg(test)]
         routes: watched,
     })
+}
+
+/// How many times a lease watch found the repository lease in each lock folder free after other
+/// passes held it ([`watch_lease_at`]), counted by folder as [`LEASE_WAITERS`] waits by folder.
+static LEASE_RELEASES: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+/// The releases of this account's repository lease this process heard ([`LEASE_RELEASES`]):
+/// what a park on that lease reads in its mark ([`super::InitialSetupParkMark`]), so a release
+/// moves the mark whichever park's watch heard it. `None` with no account state folder, where
+/// no lease watch starts ([`watch_lease`]).
+pub(super) fn lease_releases() -> Option<u64> {
+    lease_dir().ok().map(|dir| lease_releases_at(&dir))
+}
+
+/// The releases a lease watch heard of the lease in `dir` ([`LEASE_RELEASES`]).
+fn lease_releases_at(dir: &Path) -> u64 {
+    LEASE_RELEASES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A park a lease watch tells ([`watch_lease_at`]).
+struct Teller {
+    stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    changed: fn(),
+}
+
+/// The one thread per lock folder that waits on the repository lease, and the parks it tells:
+/// a park that ends leaves its thread waiting in the kernel, so the next park, while the lease
+/// stays held, joins that thread instead of starting another.
+static LEASE_WAITERS: Mutex<BTreeMap<PathBuf, Vec<Teller>>> = Mutex::new(BTreeMap::new());
+
+/// The folder of this account's repository lease, `<state>/converge`, which holds `align.lock`
+/// ([`aterm_machines::sync::LOCK`]).
+///
+/// # Errors
+/// `NotFound` with no account state folder.
+fn lease_dir() -> io::Result<PathBuf> {
+    let state = aterm_types::dirs::account_state_dir()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no account state folder"))?;
+    Ok(state.join(aterm_converge::FileJournal::DIR))
+}
+
+/// Watch this account's repository lease: `<state>/converge/align.lock`
+/// ([`aterm_machines::sync::LOCK`]), which the converge pass and every repository stage take.
+fn watch_lease(stop: Arc<AtomicBool>, lost: Arc<AtomicBool>, changed: fn()) -> io::Result<()> {
+    watch_lease_at(&lease_dir()?, stop, lost, changed, || {})
+}
+
+/// A thread that waits in the kernel, taking nothing, until no one holds `<dir>/align.lock`
+/// ([`aterm_uds::private_file::PrivateLock::wait_until_free`]), then counts the release in its
+/// folder ([`LEASE_RELEASES`]) and tells each park still watching; the stage the park runs
+/// next tries the lease itself. The thread never takes the lease, not even for a moment
+/// ([`aterm_uds::file_lock::takes_nothing`] refuses it a take), so a background runner waiting
+/// at the release ([`aterm_machines::sync::wait_lock`]) is never behind it. Such a runner,
+/// which works the same repositories, has usually taken the lease by the time the thread reads
+/// its holders, and the thread then waits on through its hold; one the kernel woke but that has
+/// not run yet when the thread reads the lease free takes it just after, or finds the stage
+/// ahead of it, and a stage that meets it parks on it once more. No clock wakes the thread
+/// meanwhile. `held` runs once where the lock was found held, before the wait (a test's hook
+/// to see the watch wait). A park that ends before the release is not told; the thread goes on
+/// waiting for the next park that joins it. A wait that fails is `lost` for each park it would
+/// have told ([`lose`]).
+///
+/// # Errors
+/// The thread could not start.
+fn watch_lease_at(
+    dir: &Path,
+    stop: Arc<AtomicBool>,
+    lost: Arc<AtomicBool>,
+    changed: fn(),
+    held: fn(),
+) -> io::Result<()> {
+    let teller = Teller {
+        stop,
+        lost,
+        changed,
+    };
+    let mut waiters = LEASE_WAITERS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(tellers) = waiters.get_mut(dir) {
+        // A thread already waits on this lease: it tells this park too.
+        tellers.retain(|teller| !teller.stop.load(Ordering::Acquire));
+        tellers.push(teller);
+        return Ok(());
+    }
+    waiters.insert(dir.to_path_buf(), vec![teller]);
+    let folder = dir.to_path_buf();
+    let spawned = std::thread::Builder::new()
+        .name("aterm-setup-park-lease".into())
+        .spawn(move || {
+            let released = aterm_uds::file_lock::takes_nothing(|| {
+                aterm_uds::private_file::PrivateLock::wait_until_free(
+                    &folder,
+                    aterm_machines::sync::LOCK,
+                    held,
+                )
+            })
+            .is_ok();
+            if released {
+                *LEASE_RELEASES
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entry(folder.clone())
+                    .or_insert(0) += 1;
+            }
+            let tellers = LEASE_WAITERS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&folder)
+                .unwrap_or_default();
+            for teller in tellers {
+                if !released {
+                    lose(&teller.stop, &teller.lost, teller.changed);
+                } else if !teller.stop.load(Ordering::Acquire) {
+                    (teller.changed)();
+                }
+            }
+        });
+    if let Err(why) = spawned {
+        waiters.remove(dir);
+        return Err(why);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

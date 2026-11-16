@@ -2163,19 +2163,56 @@ fn route_refusal(route: WriteRoute) -> Option<&'static str> {
 }
 
 /// Whether the Claude row `label`'s next sign-in is a person's at this Mac on its records
-/// ([`super::accounts_sync::left_to_a_person`]). Records this run cannot read hold nothing: what
-/// stands on them is unknown, and the run that reads them after a sign-in made one moments ago.
+/// ([`super::accounts_sync::left_to_a_person`]), for a run with nobody at this terminal (a run of
+/// a person's there asks nothing of this). Records this run cannot read hold the row, as a
+/// check's record that cannot be read holds its page: what stands on them is unknown, and a check
+/// may be among it (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3). A row its roster no
+/// longer has holds nothing.
 fn left_to_a_person_here(env: &Env, store: &accounts::Store, label: &str, now: i64) -> bool {
     let Some(path) = env.accounts_roster_for(Cli::Claude) else {
-        return false;
+        return true;
     };
     store
         .read_account_records(Some(&path), now)
-        .is_ok_and(|records| {
+        .map_or(true, |records| {
             records.raw_roster.row(label).is_some_and(|raw| {
                 super::accounts_sync::left_to_a_person(store, raw, &records.logins)
             })
         })
+}
+
+/// The refusal of a run with nobody at this terminal for the account whose token step a check's
+/// record holds ([`token_steps::Stopped::holds`]: the page a capture loaded carried Cloudflare's
+/// check or block page or a human check, and only a person's act at a terminal on this Mac runs
+/// the step over it), or whose steps file does not read, which holds every step; `None` where
+/// neither stands.
+fn check_record_refusal(store: &Store, account: &Account) -> Option<String> {
+    let steps = match token_steps::read(store) {
+        Ok(steps) => steps,
+        Err(why) => {
+            return Some(format!(
+                "{}: {why}; while it does not read, every token step stays held, and nothing is \
+                 made for {}",
+                token_steps::STEPS_FILE,
+                account.quietly()
+            ));
+        }
+    };
+    let stopped = steps
+        .get(account.key.as_str())
+        .filter(|stopped| stopped.word.is_bot_protection())?;
+    let step = account.label.as_ref().map(|label| {
+        Step::Token {
+            label: label.clone(),
+            replace: false,
+        }
+        .to_string()
+    });
+    Some(format!(
+        "the token step for {} {}; nothing was made",
+        account.quietly(),
+        stopped.words(step.as_deref())
+    ))
 }
 
 /// `aterm harness accounts token <name> [--replace | --remove]` (§4.6): the module's summary
@@ -2189,29 +2226,42 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    // A run nobody at a terminal of their own started (an agent's, a script's) is told so in
+    // aterm's window, which then ends at the read that finds any check instead of waiting on it.
+    let via = if super::cli::person_at_terminal(host) {
+        Via::Desk
+    } else {
+        Via::Unattended
+    };
     run_with_clock(
         env,
         host,
         name,
         mode,
-        (Via::Desk, None),
+        (via, None),
         out,
         err,
         Instant::now,
+        &mut |_| {},
     )
 }
 
 /// Where a run's token page opens ([`run_with_clock`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
-    /// The verb's own route: aterm's sign-in window at this Mac's own desk, and nowhere else.
+    /// The verb's own route for a person at a terminal of their own on this Mac
+    /// ([`super::cli::person_at_terminal`]): aterm's sign-in window at this Mac's own desk, and
+    /// nowhere else, which waits for the person on a page that carries a check.
     Desk,
     /// The account's own headless browser profile, one a headless sign-in proved (plan package
     /// FL-137): nobody is asked, and no window opens.
     Headless,
-    /// Aterm's sign-in window at this Mac's own desk, opened by this Mac's upkeep with nobody
-    /// there (plan package FL-138, [`backfill_run`]): a code page whose code no mailbox the
-    /// window reads gives ends the run at once ([`setup_token::OpenerRoute::unattended`]).
+    /// Aterm's sign-in window at this Mac's own desk, opened with nobody at a terminal of their
+    /// own: by this Mac's upkeep (plan package FL-138, [`backfill_run`]), the token step after a
+    /// sign-in nobody at a terminal started ([`after_sign_in`]), or an agent's or a script's
+    /// run of the verb. The window is told so ([`setup_token::OpenerRoute::unattended`]): it ends
+    /// at the read that finds any check, and a code page whose code no mailbox the window reads
+    /// gives ends the run at once.
     Unattended,
 }
 
@@ -2229,7 +2279,8 @@ const HEADLESS_ROUTE_WITHIN: Duration = Duration::from_secs(3 * 60);
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "the verb's inputs, its route, both streams and its clock, each one its own"
+    reason = "the verb's inputs, its route, both streams, its clock and its caller's hold, each \
+              one its own"
 )]
 fn run_with_clock(
     env: &Env,
@@ -2240,6 +2291,7 @@ fn run_with_clock(
     out: &mut dyn Write,
     err: &mut dyn Write,
     now: impl FnOnce() -> Instant,
+    unrecorded: &mut dyn FnMut(super::accounts_sync::PendingCheck),
 ) -> ExitCode {
     let refuse = |err: &mut dyn Write, why: &str| {
         let _ = writeln!(err, "aterm harness accounts token: {why}");
@@ -2295,6 +2347,17 @@ fn run_with_clock(
         && left_to_a_person_here(env, &store, label, host.now().max(env.now))
     {
         return refuse(err, &super::cli::left_words(Cli::Claude, label));
+    }
+    // Nor is the account's token page loaded again with nobody at this terminal where its token
+    // step's own record of a check stands: only a person's act at a terminal on this Mac runs
+    // the step over it. This Mac's upkeep judges the record with every other of its own
+    // ([`step_held`]).
+    if !matches!(mode, TokenMode::Remove)
+        && upkeep.is_none()
+        && !super::cli::person_at_terminal(host)
+        && let Some(why) = check_record_refusal(&store, &account)
+    {
+        return refuse(err, &why);
     }
     let tokens = store.shared_dir().join(TOKENS_DIR);
     if let Err(why) = store
@@ -2483,7 +2546,13 @@ fn run_with_clock(
         setup_token::OpenerPage::Headless { .. } => HEADLESS_ROUTE_WITHIN,
     };
     let sign_in = host.token_sign_in(&route);
-    mint(
+    let checked = CheckedRow::before(
+        env,
+        &store,
+        (account.label.as_deref(), account.key.as_str()),
+        now,
+    );
+    let code = mint(
         (&store, vault.as_ref(), sign_in.as_ref()),
         (&account, &program, cli_version, &env_vars, &route),
         (
@@ -2493,7 +2562,135 @@ fn run_with_clock(
             holds,
         ),
         (out, err),
-    )
+    );
+    if let Some(checked) = checked {
+        if code == ExitCode::SUCCESS {
+            checked.end_after(&store, account.key.as_str(), now);
+        } else if let Some(pending) = checked.hold_after(&store, account.key.as_str(), now, err) {
+            unrecorded(pending);
+        }
+    }
+    code
+}
+
+/// The Claude row a token's capture runs for, as it stood before the capture
+/// ([`CheckedRow::before`]): where the capture's page carried a bot protection, the row's
+/// account is held for a person as a sign-in a check stopped is ([`CheckedRow::hold_after`]),
+/// and where the capture made the token, the account's check its step's earlier check wrote
+/// ends with the step's record ([`CheckedRow::end_after`]): one check, one lifetime.
+struct CheckedRow {
+    roster_path: PathBuf,
+    row: accounts::Row,
+    generation: Option<u64>,
+    /// When the account's token step's own record of a check stood before the capture, where
+    /// one did ([`token_steps::Stopped`] of a bot protection).
+    step_check_at: Option<u64>,
+}
+
+impl CheckedRow {
+    /// The row `label` of Claude Code's roster, its renewal generation and its account `key`'s
+    /// token step's record of a check, before a capture runs: a login made for the row after
+    /// this ends any check the capture records. `None` where the account has no row or the
+    /// records do not read.
+    fn before(
+        env: &Env,
+        store: &Store,
+        (label, key): (Option<&str>, &str),
+        now: u64,
+    ) -> Option<Self> {
+        let roster_path = env.accounts_roster_for(Cli::Claude)?;
+        let records = store
+            .read_account_records(Some(&roster_path), i64::try_from(now).unwrap_or(i64::MAX))
+            .ok()?;
+        let row = records.raw_roster.row(label?)?.clone();
+        let generation = records
+            .logins
+            .get(&row.label)
+            .map(|binding| binding.renewal_generation);
+        let step_check_at = token_steps::read(store).ok().and_then(|steps| {
+            steps
+                .get(key)
+                .filter(|stopped| stopped.word.is_bot_protection())
+                .map(|stopped| stopped.at)
+        });
+        Some(Self {
+            roster_path,
+            row,
+            generation,
+            step_check_at,
+        })
+    }
+
+    /// Where the capture that started at `now` made the token over a check's record of its step
+    /// (a person's own run at a terminal on this Mac: no other run passes such a record), ends
+    /// the account's [`accounts::CheckStop`] that record wrote ([`Self::hold_after`]) too: the
+    /// person passed the very page that carried it, as the token's record says by clearing
+    /// ([`token_steps::put`]). Only that check ends: one whose second is not the record's (a
+    /// sign-in's check met since, which [`accounts::note_check_stop`] keeps as the later) stands,
+    /// and so does this one while the step's record of it does (its clearing did not land).
+    fn end_after(&self, store: &Store, key: &str, now: u64) {
+        let cleared = || {
+            token_steps::read(store)
+                .is_ok_and(|steps| steps.get(key).map(|stopped| stopped.at) != self.step_check_at)
+        };
+        if let Some(at) = self.step_check_at
+            && cleared()
+        {
+            super::accounts_sync::end_token_check(
+                store,
+                &self.roster_path,
+                &self.row,
+                (
+                    i64::try_from(at).unwrap_or(i64::MAX),
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                ),
+            );
+        }
+    }
+
+    /// Where the capture that started at `now` left a bot protection's record of the account
+    /// `key`'s step ([`token_steps::Stopped`]: Cloudflare's check or block page, a human check,
+    /// headless or in aterm's window), records it as the row's account's [`accounts::CheckStop`]
+    /// too (`accounts_sync::write_check_stop`), so every door with nobody at this Mac holds the
+    /// row and its token step for a person (`accounts_sync::left_to_a_person`) by the one rule a
+    /// check's hold ends by: a login made for the row, a signed-in `accounts browser` window, or,
+    /// for the step's own record, this Mac's token made after it. The run holds the account's
+    /// lock, so the record read is this capture's. Where the account's records stay busy, the
+    /// check is answered (and said on `err`) for the caller to hold in its process until it is on
+    /// record (the upkeep's `AutoRenewGuard::unrecorded_checks`), as a sign-in's door does.
+    fn hold_after(
+        &self,
+        store: &Store,
+        key: &str,
+        now: u64,
+        err: &mut dyn Write,
+    ) -> Option<super::accounts_sync::PendingCheck> {
+        let at = token_steps::read(store).ok().and_then(|steps| {
+            steps
+                .get(key)
+                .filter(|stopped| stopped.word.is_bot_protection() && stopped.at >= now)
+                .map(|stopped| stopped.at)
+        })?;
+        let check = super::accounts_sync::PendingCheck {
+            roster_path: self.roster_path.clone(),
+            row: self.row.clone(),
+            generation: self.generation,
+            at: i64::try_from(at).unwrap_or(i64::MAX),
+        };
+        if super::accounts_sync::write_check_stop(store, &check)
+            != super::accounts_sync::CheckWrite::Busy
+        {
+            return None;
+        }
+        let _ = writeln!(
+            err,
+            "aterm harness accounts token: {}: the check its page carried could not be recorded \
+             on the account (its records stayed busy); the token step's own record holds its \
+             token step",
+            self.row.label
+        );
+        Some(check)
+    }
 }
 
 /// Where the sign-in a run just made of a row was made, which says where its token is made
@@ -2529,28 +2726,56 @@ pub enum SignedIn {
 ///   another account's (Claude Code's success names none): the step is said once, on `out`,
 ///   where the bare verb would make one, and nothing is run or written.
 ///
-/// The sign-in is itself what a stopped step waits for, so a record a check left
-/// ([`token_steps`]) does not hold this run, and its capture replaces the record or clears it.
-pub fn after_sign_in(
+/// Who is there decides how the window's page runs, not where the sign-in ran: a sign-in a
+/// person at a terminal of their own on this Mac ran in aterm's window ([`super::cli::person_at_terminal`])
+/// makes the token there as the bare verb does ([`Via::Desk`]), and a record a stop left
+/// ([`token_steps`]) does not hold its run: the person may complete a check there, and aterm
+/// presses nothing on one. Any other run (this Mac's upkeep, an agent's or a script's renewal)
+/// makes it there with nobody there ([`Via::Unattended`]: the window ends at the read that finds
+/// any check), and a headless sign-in on the account's headless profile, where nobody is either:
+/// on both, a record of a check holds the run ([`check_holds`]) and the step is offered instead,
+/// since only a person's act at a terminal on this Mac goes back to a page that carried one
+/// (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3). A run's capture replaces the record
+/// or clears it. Where the capture's check could not be recorded on the account, `unrecorded`
+/// is handed it, for a caller that keeps such a check in its process.
+pub(super) fn after_sign_in(
     env: &Env,
     host: &dyn AccountsHost,
     label: &str,
     signed_in: SignedIn,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
+    (out, err): (&mut dyn Write, &mut dyn Write),
+    unrecorded: &mut dyn FnMut(super::accounts_sync::PendingCheck),
 ) -> Option<ExitCode> {
     let via = match signed_in {
-        SignedIn::Window => Via::Desk,
+        SignedIn::Window if super::cli::person_at_terminal(host) => Via::Desk,
+        SignedIn::Window => Via::Unattended,
         SignedIn::Headless => Via::Headless,
         SignedIn::Elsewhere => {
             offer_after_sign_in(env, host, label, out);
             return None;
         }
     };
-    if !step_due_after(env, host, label, via) {
+    let Some(due) = step_due_after(env, host, label, via) else {
         if via == Via::Headless {
             offer_after_sign_in(env, host, label, out);
         }
+        return None;
+    };
+    if via != Via::Desk && check_holds(&due) {
+        let where_ = if via == Via::Headless {
+            "on the headless browser profile"
+        } else {
+            "in aterm's sign-in window, and nobody at this Mac's terminal started this run"
+        };
+        let _ = writeln!(
+            out,
+            "{label}: its token's consent page carried a check the last time it was tried, so \
+             this run makes none {where_}; `{}` run by a person at this Mac makes one",
+            Step::Token {
+                label: label.to_owned(),
+                replace: false,
+            }
+        );
         return None;
     }
     let _ = match via {
@@ -2575,13 +2800,14 @@ pub fn after_sign_in(
         out,
         err,
         Instant::now,
+        unrecorded,
     ))
 }
 
 /// Says the step once, on `out`, where the bare verb would make `label`'s token and the run that
 /// signed it in makes none ([`after_sign_in`]); nothing is run or written.
 fn offer_after_sign_in(env: &Env, host: &dyn AccountsHost, label: &str, out: &mut dyn Write) {
-    if !step_due_after(env, host, label, Via::Desk) {
+    if step_due_after(env, host, label, Via::Desk).is_none() {
         return;
     }
     let _ = writeln!(
@@ -2762,7 +2988,8 @@ pub enum Backfill {
 /// for this gap of this token, whatever that capture ended in ([`token_steps::Tried::holds`]),
 /// is held until the Claude Code build a capture would run or this aterm's build differs from the
 /// one that ran it, the account's window store or a mailbox configuration file is written after
-/// it ([`token_steps::route_at`]), or a token for the account is made after it. A stop at a code
+/// it ([`token_steps::route_at`]), or a token for the account is made after it; a check's record
+/// by none of these, only by a person's act at a terminal on this Mac. A stop at a code
 /// page nobody typed a code on is also let through by aterm's window reading the account's
 /// mailbox now ([`token_steps::mailbox_read`]); the upkeep's record of the run is not. No time
 /// alone lets a step through, no restart of this process does, and a file of those records that
@@ -2960,17 +3187,18 @@ fn step_held(
 /// under its account's lock).
 #[allow(
     clippy::too_many_arguments,
-    reason = "the account, what the upkeep found of it and how, and both streams, each its own"
+    reason = "the account, what the upkeep found of it and how, both streams and the upkeep's \
+              hold, each its own"
 )]
-pub fn backfill_run(
+pub(super) fn backfill_run(
     env: &Env,
     host: &dyn AccountsHost,
     label: &str,
     finding: &Finding,
     home_mac: bool,
     routes: NobodyRoutes,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
+    (out, err): (&mut dyn Write, &mut dyn Write),
+    unrecorded: &mut dyn FnMut(super::accounts_sync::PendingCheck),
 ) -> Option<ExitCode> {
     match backfill_due(env, host, label, home_mac, routes) {
         Backfill::Due(now) if now == *finding => {}
@@ -2999,6 +3227,7 @@ pub fn backfill_run(
         out,
         err,
         Instant::now,
+        unrecorded,
     );
     let ran = (code != ExitCode::SUCCESS).then(|| {
         token_steps::Tried::new(
@@ -3018,6 +3247,25 @@ pub fn backfill_run(
     Some(code)
 }
 
+/// Whether a check holds `due`'s step for a run nobody at a terminal started, on the account's
+/// headless profile or in aterm's window: the record a capture left is a bot protection's
+/// ([`super::open_url::MetWord::is_bot_protection`]), which only a person's act at a terminal on
+/// this Mac passes, and this Mac's token made clears ([`token_steps::Stopped::holds`]). A steps
+/// file that does not read holds it.
+fn check_holds(due: &DueAfter) -> bool {
+    token_steps::read(&due.store).map_or(true, |steps| {
+        steps
+            .get(due.key.as_str())
+            .is_some_and(|stopped| stopped.word.is_bot_protection())
+    })
+}
+
+/// What [`step_due_after`] found of a step that is due: the accounts store and the account's key.
+struct DueAfter {
+    store: Store,
+    key: String,
+}
+
 /// When the token `found` names was made, where the vault holds one with its meta.
 fn made_at(found: &Lookup<Standing>) -> Option<u64> {
     match found {
@@ -3035,46 +3283,47 @@ fn made_at(found: &Lookup<Standing>) -> Option<u64> {
 /// (`rejected`, `unreadable here`, `mismatched`, or in use) may be every other Mac's: the run
 /// leaves it to this Mac's upkeep, which replaces the few it may ([`backfill_due`]), and to a
 /// person, whom the verb's own surface offers the step ([`TokenState::offer`]). A quick look
-/// ([`STANDING_LOOK`]) that reads and writes nothing else; anything it cannot read is not due.
-fn step_due_after(env: &Env, host: &dyn AccountsHost, label: &str, via: Via) -> bool {
+/// ([`STANDING_LOOK`]) that reads and writes nothing else; anything it cannot read is not due
+/// (`None`).
+fn step_due_after(env: &Env, host: &dyn AccountsHost, label: &str, via: Via) -> Option<DueAfter> {
     if (via.window() && !host.opens_sign_in_window())
         || !host.on_macos()
         || setup_token::route_in(&host.verb_env()).is_some()
     {
-        return false;
+        return None;
     }
-    let Ok(account) = account_of(env, label, &host.session_logins(env)) else {
-        return false;
-    };
+    let account = account_of(env, label, &host.session_logins(env)).ok()?;
     let (Some(store), Some(vault)) = (env.accounts_store_for(Cli::Claude), host.token_vault())
     else {
-        return false;
+        return None;
     };
     if via == Via::Headless
         && !super::headless_oauth::has_browser_profile(&store.dir, label, Some(&account.email))
     {
-        return false;
+        return None;
     }
     let by = || Instant::now() + STANDING_LOOK;
     if !vault
         .route(by())
         .is_ok_and(|route| route_refusal(route).is_none())
     {
-        return false;
+        return None;
     }
-    let Ok(found) = vault.standing(&account.key, by()) else {
-        return false;
-    };
+    let found = vault.standing(&account.key, by()).ok()?;
     let table = read_table(&store).ok();
     let row = table
         .as_ref()
         .and_then(|table| table.row_for(account.key.as_str(), &found));
     let now = u64::try_from(host.now().max(env.now)).unwrap_or(0);
-    !vault.waiting_here(&account.key).unwrap_or(true)
+    (!vault.waiting_here(&account.key).unwrap_or(true)
         && matches!(
             TokenState::of(&found, row, now),
             TokenState::None | TokenState::Ended
-        )
+        ))
+    .then(|| DueAfter {
+        key: account.key.as_str().to_owned(),
+        store,
+    })
 }
 
 /// What [`mint`] makes a token of: the account, the Claude Code build and its version, the
@@ -3173,8 +3422,8 @@ fn mint(
                 ),
                 _ => capture_words(&why),
             };
-            if stopped.is_some() {
-                line.push_str(&held_words(account));
+            if let Some(stopped) = &stopped {
+                line.push_str(&held_words(account, stopped));
             }
             return refuse(err, &line);
         }
@@ -3413,21 +3662,17 @@ fn hold(store: &Store, key: &Key, stopped: Option<&token_steps::Stopped>, err: &
     }
 }
 
-/// What a refusal adds where its stop holds the account's step: what tries it again.
-fn held_words(account: &Account) -> String {
-    let person = account.label.as_ref().map_or_else(String::new, |label| {
-        format!(
-            ", or by `{}`",
-            Step::Token {
-                label: label.clone(),
-                replace: false,
-            }
-        )
+/// What a refusal adds where its stop holds the account's step: what tries it again
+/// ([`token_steps::Stopped::again`]).
+fn held_words(account: &Account, stopped: &token_steps::Stopped) -> String {
+    let step = account.label.as_ref().map(|label| {
+        Step::Token {
+            label: label.clone(),
+            replace: false,
+        }
+        .to_string()
     });
-    format!(
-        "; it is tried again only at the account's next sign-in in aterm's sign-in window or on \
-         its headless browser profile, with a new Claude Code or aterm build{person}"
-    )
+    format!("; {}", stopped.again(step.as_deref()))
 }
 
 /// How long a token's meta says it lasts, as the capture's words would: printed days, else

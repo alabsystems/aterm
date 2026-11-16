@@ -42,6 +42,7 @@ mod session_reach;
 pub(crate) mod spawns;
 mod staged_child;
 mod stops;
+mod transfer;
 mod tree;
 mod tty_wait;
 
@@ -51,6 +52,7 @@ pub use scratch::Scratch;
 pub use secret::{SECRET_MAX, Secret, no_core_dumps};
 pub use staged_child::{START_BYTE, START_LIMIT, StagedChild};
 pub use stops::{name as stop_name, say_on_stop};
+pub use transfer::TRANSFER_STALL;
 
 /// How [`System::clone_tree`] made its copy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,7 +155,8 @@ pub struct Cmd {
     pub session: bool,
     /// A file to read standard input from; standard input is closed otherwise.
     pub stdin: Option<PathBuf>,
-    /// The deadline, counted from the start of the run.
+    /// The deadline, counted from the start of the run. [`System::run_repository`] reads none on
+    /// a port that observes progress: a transfer is bounded by its progress ([`TRANSFER_STALL`]).
     pub budget: Duration,
     /// Variables added to the fixed environment, in order.
     pub env: Vec<(String, String)>,
@@ -405,6 +408,10 @@ pub enum RunFailed {
     AfterStart(String),
     /// The deadline passed; the process group was killed.
     TimedOut(Duration),
+    /// Neither the run's output nor its process tree's work advanced for this long, so its
+    /// process group was killed ([`System::run_repository`]): a transfer whose link stopped
+    /// carrying it.
+    Stalled(Duration),
     /// The port refused the run before starting it (such as `as_user` without root).
     Refused(String),
 }
@@ -415,12 +422,19 @@ impl std::fmt::Display for RunFailed {
             Self::Spawn(why) => write!(f, "could not start: {why}"),
             Self::AfterStart(why) => write!(f, "failed after start: {why}"),
             Self::TimedOut(d) => write!(f, "no answer within {}s", d.as_secs()),
+            Self::Stalled(d) => write!(f, "no progress for {}s", d.as_secs()),
             Self::Refused(why) => write!(f, "refused: {why}"),
         }
     }
 }
 
 impl RunFailed {
+    /// Whether the run was ended for making no progress ([`RunFailed::Stalled`]).
+    #[must_use]
+    pub const fn is_stall(&self) -> bool {
+        matches!(self, Self::Stalled(_))
+    }
+
     /// Keep a collector's post-start failures distinct from a failure to spawn a child.
     #[must_use]
     pub fn from_child(error: aterm_uds::deadline::RunError, budget: Duration) -> Self {
@@ -917,7 +931,12 @@ pub trait System: Sync {
     /// Publish diagnostic acquisition state; inert on injected backends.
     fn repository_progress(&self, _progress: &crate::repository_progress::Progress) {}
 
-    /// Capture a repository acquisition while observing its Git progress.
+    /// Run a repository transfer (a clone, a fetch, a merge that may fetch what a partial clone
+    /// lacks) while observing its Git progress. A port that observes progress ([`Live`]) bounds
+    /// it by progress, never by `cmd.budget`: it runs while Git writes or its process tree works,
+    /// and ends with [`RunFailed::Stalled`] once neither happened for [`TRANSFER_STALL`]
+    /// (`port::transfer`). Its standard input is the file [`Cmd::stdin_file`] names (a fetch's
+    /// refspecs), else closed. The default runs it as [`System::run_complete_stdout`].
     fn run_repository(
         &self,
         cmd: &Cmd,
@@ -1551,6 +1570,20 @@ pub trait System: Sync {
         Err("this system keeps no repository convergence record".into())
     }
 
+    /// Whether another owner works this account's repositories now, read without taking or
+    /// trying the repository lease: what a plan reads in place of the lease it never takes
+    /// (`init.github.native`'s probe). The default, a system with no record: no.
+    fn repository_pass_running(&self) -> bool {
+        false
+    }
+
+    /// The record of checkout facts this port keeps for the converge pass it runs
+    /// ([`CheckoutRecords`]), or `None` where it keeps none and every read of a checkout's
+    /// facts is made afresh (this default).
+    fn checkout_records(&self) -> Option<std::sync::Arc<CheckoutRecords>> {
+        None
+    }
+
     /// Whether this process came in over a remote login: OpenSSH's `SSH_CONNECTION` or
     /// `SSH_TTY` is set ([`crate::console`]). The default: no.
     fn remote_login(&self) -> bool {
@@ -1613,24 +1646,207 @@ pub struct Identity {
     pub os_version: String,
 }
 
-/// How many programs [`Live`]s started ([`Live::runs`]): every one, and those among them named
-/// `git`.
+/// How many programs [`Live`]s started ([`Live::runs`]): every one, those among them named
+/// `git`, and those gits by their subcommand ([`GitBy`]).
 #[derive(Debug, Default)]
 struct RunCounts {
     all: std::sync::atomic::AtomicU64,
     git: std::sync::atomic::AtomicU64,
+    by: [std::sync::atomic::AtomicU64; GIT_WORDS.len()],
 }
 
 impl RunCounts {
-    /// Count one start of `program`, the program the caller asked for (not the `sudo` a run as
-    /// another user goes through).
-    fn note(&self, program: &Path) {
+    /// Count one start of `cmd`'s program, the program the caller asked for (not the `sudo` a
+    /// run as another user goes through), and of a git, its subcommand ([`GitBy::word_of`]).
+    fn note(&self, cmd: &Cmd) {
         use std::sync::atomic::Ordering;
         self.all.fetch_add(1, Ordering::Relaxed);
-        if program.file_name() == Some(std::ffi::OsStr::new("git")) {
+        if cmd.program.file_name() == Some(std::ffi::OsStr::new("git")) {
             self.git.fetch_add(1, Ordering::Relaxed);
+            self.by[GitBy::word_of(&cmd.args)].fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// How many gits of each subcommand were started ([`Live::git_by`]), by [`GIT_WORDS`]: a
+/// converge pass's cost line names them (`git_by=`), so a pass that starts thousands of gits
+/// says which reads they were.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GitBy(pub [u64; GIT_WORDS.len()]);
+
+/// The subcommands [`GitBy`] counts apart, then `other`: every git whose first word after its
+/// global options is none of them, one with none included (`git --version`).
+pub const GIT_WORDS: [&str; 24] = [
+    "rev-parse",
+    "config",
+    "for-each-ref",
+    "symbolic-ref",
+    "show-ref",
+    "ls-remote",
+    "status",
+    "fetch",
+    "merge",
+    "merge-base",
+    "rev-list",
+    "clone",
+    "checkout",
+    "ls-tree",
+    "ls-files",
+    "cat-file",
+    "diff",
+    "log",
+    "submodule",
+    "update-index",
+    "init",
+    "credential",
+    "remote",
+    "other",
+];
+
+impl GitBy {
+    /// The index in [`GIT_WORDS`] of the subcommand `args` (a git's arguments) runs: the first
+    /// argument that is no global option, past each `-C` and `-c` and the word after it, and past
+    /// every other argument that starts with `-` (`--no-lazy-fetch`); `other` where that is none
+    /// of [`GIT_WORDS`].
+    #[must_use]
+    pub fn word_of(args: &[OsString]) -> usize {
+        let other = GIT_WORDS.len() - 1;
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            if arg == "-C" || arg == "-c" {
+                args.next();
+                continue;
+            }
+            if arg.as_encoded_bytes().first() == Some(&b'-') {
+                continue;
+            }
+            return GIT_WORDS[..other]
+                .iter()
+                .position(|word| arg == word)
+                .unwrap_or(other);
+        }
+        other
+    }
+
+    /// What was counted from `began` to this later reading.
+    #[must_use]
+    pub const fn since(self, began: Self) -> Self {
+        let mut by = [0; GIT_WORDS.len()];
+        let mut at = 0;
+        while at < by.len() {
+            by[at] = self.0[at].saturating_sub(began.0[at]);
+            at += 1;
+        }
+        Self(by)
+    }
+
+    /// Each subcommand counted at least once with its count, the most first (the order of
+    /// [`GIT_WORDS`] between equals).
+    #[must_use]
+    pub fn counted(&self) -> Vec<(&'static str, u64)> {
+        let mut counted: Vec<(&'static str, u64)> = GIT_WORDS
+            .iter()
+            .zip(self.0)
+            .filter(|(_, count)| *count > 0)
+            .map(|(word, count)| (*word, count))
+            .collect();
+        // Stable: equal counts keep the order of the words.
+        counted.sort_by_key(|&(_, count)| std::cmp::Reverse(count));
+        counted
+    }
+}
+
+/// One converge pass's record of each checkout's facts (`crate::checkout::facts`), by the
+/// account that read them and the checkout's folder: what [`System::checkout_records`] keeps.
+/// Every [`Live`] of a process shares one, which a pass's owner empties once as the pass begins
+/// ([`CheckoutRecords::new_pass`]), so no fact read in one pass stands for another while every
+/// row of the pass (`sync.clone` and `sync.refresh` each build a stage of their own) reads what
+/// the rows before it read. A record is reused only while the files it came from stand as they
+/// were. Beside them it keeps the pass's record of aterm's credential route
+/// ([`CheckoutRecords::route`]), emptied with them.
+#[derive(Default)]
+pub struct CheckoutRecords {
+    by: std::sync::Mutex<
+        std::collections::BTreeMap<(u32, PathBuf), std::sync::Arc<crate::checkout::facts::Facts>>,
+    >,
+    route: crate::git_credential::Records,
+}
+
+impl std::fmt::Debug for CheckoutRecords {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CheckoutRecords")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CheckoutRecords {
+    fn held(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        std::collections::BTreeMap<(u32, PathBuf), std::sync::Arc<crate::checkout::facts::Facts>>,
+    > {
+        self.by
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The record `uid` keeps of the checkout at `path`, where there is one.
+    pub(crate) fn get(
+        &self,
+        uid: u32,
+        path: &Path,
+    ) -> Option<std::sync::Arc<crate::checkout::facts::Facts>> {
+        self.held().get(&(uid, path.to_owned())).cloned()
+    }
+
+    /// Keep `facts` as `uid`'s record of the checkout at `path`.
+    pub(crate) fn put(
+        &self,
+        uid: u32,
+        path: &Path,
+        facts: std::sync::Arc<crate::checkout::facts::Facts>,
+    ) {
+        self.held().insert((uid, path.to_owned()), facts);
+    }
+
+    /// Forget `uid`'s record of the checkout at `path`.
+    pub(crate) fn forget(&self, uid: u32, path: &Path) {
+        self.held().remove(&(uid, path.to_owned()));
+    }
+
+    /// The pass's record of aterm's credential route: git's credential settings and what
+    /// aterm's helper hands back ([`crate::git_credential::Records`]).
+    pub(crate) fn route(&self) -> &crate::git_credential::Records {
+        &self.route
+    }
+
+    /// Forget every record, the credential route's too.
+    pub fn clear(&self) {
+        self.held().clear();
+        self.route.clear();
+    }
+
+    /// Begin a pass's repository work on `sys`: forget every record of checkout facts and of the
+    /// credential route it keeps (a [`Live`]'s is the one every [`Live`] of this process
+    /// shares). Only a pass's owner calls this, once, as the pass begins: `crate::sync`'s pass
+    /// once it holds its lock (`crate::sync::Ports::new_pass`), System State's repositories
+    /// stage, and `aterm init`'s run. An item, a row or a stage's construction never does, so a
+    /// pass's rows share what each of them read, and a plan read beside a pass (System State's
+    /// own readings) empties nothing under it.
+    pub fn new_pass(sys: &dyn System) {
+        if let Some(records) = sys.checkout_records() {
+            records.clear();
+        }
+    }
+}
+
+/// The record every [`Live::new`] of this process shares ([`CheckoutRecords`]).
+fn process_records() -> std::sync::Arc<CheckoutRecords> {
+    static RECORDS: std::sync::OnceLock<std::sync::Arc<CheckoutRecords>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(RECORDS.get_or_init(Default::default))
 }
 
 /// The counts every [`Live::new`] of this process shares. A converge pass is one process whose
@@ -1650,9 +1866,15 @@ pub struct Live {
     /// The programs this port started ([`Live::runs`]), counted with every other [`Live::new`]
     /// of this process.
     runs: std::sync::Arc<RunCounts>,
+    /// The record of checkout facts every [`Live::new`] of this process keeps
+    /// ([`System::checkout_records`]).
+    records: std::sync::Arc<CheckoutRecords>,
     /// The loopback origins [`System::download`] reads from in a test, instead of github.com.
     #[cfg(test)]
     release_origins: Option<aterm_update_core::github_rest::Origins>,
+    /// A test's own window for [`System::run_repository`], in place of [`TRANSFER_STALL`].
+    #[cfg(test)]
+    transfer_stall: Option<Duration>,
 }
 
 impl Live {
@@ -1663,9 +1885,33 @@ impl Live {
             agent_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/nonexistent")),
             full_disk_access: None,
             runs: process_runs(),
+            records: process_records(),
             #[cfg(test)]
             release_origins: None,
+            #[cfg(test)]
+            transfer_stall: None,
         }
+    }
+
+    /// The live port, its repository transfers ([`System::run_repository`]) ended after `window`
+    /// without progress in place of [`TRANSFER_STALL`]: a test's own window.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn stalling_after(window: Duration) -> Self {
+        Self {
+            transfer_stall: Some(window),
+            ..Self::new()
+        }
+    }
+
+    /// How long a repository transfer may go without progress ([`TRANSFER_STALL`], or a test's
+    /// own window).
+    fn transfer_stall(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(window) = self.transfer_stall {
+            return window;
+        }
+        TRANSFER_STALL
     }
 
     /// How many programs this process's [`Live`]s have started, and how many of those were
@@ -1673,11 +1919,12 @@ impl Live {
     /// [`System::run_complete_output`], [`System::run_complete_stdout_input`],
     /// [`System::run_repository`], [`System::run_fed`] and [`System::run_tty`], counted as the
     /// run's child command is built, once its argv was admitted. So a run that fails or is
-    /// refused after that and before its child starts (its stdin file not opened, a pipe or a
-    /// staging file not made, a stop seen just before the spawn) is counted, as is one whose
-    /// spawn failed; one refused before it (its argv not admitted, a stop seen first) is not. A
-    /// child started detached ([`System::spawn_detached`], [`System::stage_detached`]), a
-    /// relay's runs and a child a caller starts without this port are not counted.
+    /// refused after that and before its child starts (its stdin file or a staging file not
+    /// opened, a pipe not made, a stop seen just before the spawn) is counted, as is one whose
+    /// spawn failed; one refused before it (its argv not admitted, the staging files of a
+    /// [`Cmd::keep_on_timeout`] run not made, a stop seen first) is not. A child started
+    /// detached ([`System::spawn_detached`], [`System::stage_detached`]), a relay's runs and a
+    /// child a caller starts without this port are not counted.
     #[must_use]
     pub fn runs(&self) -> (u64, u64) {
         use std::sync::atomic::Ordering;
@@ -1685,6 +1932,16 @@ impl Live {
             self.runs.all.load(Ordering::Relaxed),
             self.runs.git.load(Ordering::Relaxed),
         )
+    }
+
+    /// Of [`Self::runs`]' gits, how many ran each subcommand ([`GitBy::word_of`]): their sum is
+    /// the gits counted.
+    #[must_use]
+    pub fn git_by(&self) -> GitBy {
+        use std::sync::atomic::Ordering;
+        GitBy(std::array::from_fn(|at| {
+            self.runs.by[at].load(Ordering::Relaxed)
+        }))
     }
 
     /// This port counting its starts apart from every other `Live`'s, so a test reads its own.
@@ -1698,7 +1955,7 @@ impl Live {
     /// over `program` and `args`, which [`Self::argv`] made of it), counted once
     /// ([`Self::runs`]).
     fn command(&self, cmd: &Cmd, program: &Path, args: &[OsString]) -> aterm_uds::spawnfd::Command {
-        self.runs.note(&cmd.program);
+        self.runs.note(cmd);
         fixed_command(program, args, &self.child_env(cmd), cmd.cwd.as_deref())
     }
 
@@ -2190,22 +2447,40 @@ impl System for Live {
         progress: &mut crate::repository_progress::Progress,
     ) -> Result<Ran, RunFailed> {
         use aterm_uds::deadline::{ChildOutput, OUTPUT_KEEP};
-        if !cmd.program.is_absolute() || cmd.stdin.is_some() || cmd.keep_on_timeout {
-            return Err(RunFailed::Refused("repository progress requires an absolute program, closed stdin and a complete result".into()));
+        use std::cell::Cell;
+        use std::time::Instant;
+        if !cmd.program.is_absolute() || cmd.keep_on_timeout {
+            return Err(RunFailed::Refused(
+                "repository progress requires an absolute program and a complete result".into(),
+            ));
         }
         self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
         let mut child = self.command(cmd, &program, &args);
+        let stdin = open_stdin_file(cmd.stdin.as_deref())?;
+        let stall = self.transfer_stall();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         let mut parser = crate::repository_progress::GitProgress::default();
-        let mut published = std::time::Instant::now();
+        let mut published = Instant::now();
         let mut last_phase = progress.phase;
-        let status = aterm_uds::deadline::stream_until_stopped(
+        // The output callback counts what the transfer wrote; the stop callback judges the
+        // window over that count and the tree below the root ([`transfer::Window`]).
+        let root = Cell::new(None);
+        let written = Cell::new(0_u64);
+        let stalled = Cell::new(false);
+        let mut window = transfer::Window::new(stall, Instant::now());
+        let status = aterm_uds::deadline::stream_with_stdin_until_stopped(
             &mut child,
-            Some(deadline_after(cmd.budget)),
-            |_| {},
+            stdin,
+            None,
+            |pid| root.set(Some(pid)),
             |pipe, bytes| {
+                written.set(
+                    written
+                        .get()
+                        .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX)),
+                );
                 if pipe == ChildOutput::Stdout {
                     if stdout.len().saturating_add(bytes.len()) > OUTPUT_KEEP {
                         return Err(io::Error::other("repository stdout exceeds capture bound"));
@@ -2222,18 +2497,33 @@ impl System for Live {
                     {
                         self.repository_progress(progress);
                         last_phase = progress.phase;
-                        published = std::time::Instant::now();
+                        published = Instant::now();
                     }
                 }
                 Ok(())
             },
-            || self.stopped().is_some(),
+            || {
+                if self.stopped().is_some() {
+                    return true;
+                }
+                let ended = window.stalled(Instant::now(), written.get(), || {
+                    root.get().and_then(transfer::tree_work)
+                });
+                stalled.set(ended);
+                ended
+            },
+            None,
         )
         .map_err(|e| RunFailed::AfterStart(format!("repository acquisition: {e}")))?;
         parser.finish(progress);
         self.repository_progress(progress);
-        let status =
-            status.ok_or_else(|| RunFailed::AfterStart("repository acquisition stopped".into()))?;
+        let Some(status) = status else {
+            return Err(if stalled.get() {
+                RunFailed::Stalled(stall)
+            } else {
+                RunFailed::AfterStart("repository acquisition stopped".into())
+            });
+        };
         Ok(Ran {
             status: status.code(),
             stdout,
@@ -2423,7 +2713,7 @@ impl System for Live {
                 )));
             }
             let (program, args) = self.argv(&cmd)?;
-            self.runs.note(&cmd.program);
+            self.runs.note(&cmd);
             let mut child = aterm_uds::spawnfd::command(&program);
             for (key, value) in &cmd.env {
                 child.env(key, value);
@@ -3226,6 +3516,23 @@ impl System for Live {
         crate::sync::repository_refresh::RepositoryPass::open(&state, now)
     }
 
+    /// Another process's refresh claim in the shared record
+    /// ([`crate::sync::repository_refresh::running`]), or a repository another live process is
+    /// still cloning, filling or refreshing (its progress record, [`crate::repository_progress`]:
+    /// one whose owner died reads as interrupted, and so finished).
+    fn repository_pass_running(&self) -> bool {
+        let here = std::process::id();
+        crate::repository_progress::read()
+            .iter()
+            .any(|row| row.pid != here && !row.phase.is_finished())
+            || aterm_types::dirs::account_state_dir()
+                .is_some_and(|state| crate::sync::repository_refresh::running(&state))
+    }
+
+    fn checkout_records(&self) -> Option<std::sync::Arc<CheckoutRecords>> {
+        Some(std::sync::Arc::clone(&self.records))
+    }
+
     fn remote_login(&self) -> bool {
         console_session::remote_login()
     }
@@ -3410,6 +3717,9 @@ mod fake {
     /// Scripted [`System`] implementation for unit tests.
     #[derive(Default)]
     pub struct Fake {
+        /// The record of checkout facts [`System::checkout_records`] answers: none by default, so
+        /// every read of a checkout's facts runs its gits, as a test scripts them.
+        pub checkout_records: Option<Arc<super::CheckoutRecords>>,
         repository_observations: Mutex<Vec<crate::repository_progress::Progress>>,
         repository_record: Arc<crate::sync::repository_refresh::Memory>,
         exclusive_paths: Arc<Mutex<std::collections::BTreeSet<PathBuf>>>,
@@ -3437,6 +3747,8 @@ mod fake {
         /// The commands whose [`System::run`] gives no answer within its budget
         /// ([`Fake::time_out`]).
         timeouts: Mutex<std::collections::BTreeSet<String>>,
+        /// The commands whose [`System::run_repository`] makes no progress ([`Fake::stall`]).
+        stalls: Mutex<std::collections::BTreeSet<String>>,
         stage_commit_refused: Mutex<bool>,
         stage_abort_refused: Mutex<bool>,
         start_answers: Mutex<std::collections::VecDeque<Result<(), RunFailed>>>,
@@ -4142,6 +4454,14 @@ mod fake {
             self
         }
 
+        /// Make [`System::run_repository`] of the command whose display is `key` make no
+        /// progress: [`RunFailed::Stalled`] after [`super::TRANSFER_STALL`], as a transfer whose
+        /// link stopped carrying it ends.
+        pub fn stall(&self, key: &str) -> &Self {
+            self.stalls.lock().unwrap().insert(key.to_owned());
+            self
+        }
+
         /// Script what the Bonjour request `ask` hears; an unscripted one hears nothing.
         pub fn on_bonjour(
             &self,
@@ -4833,6 +5153,21 @@ mod fake {
                 )));
             }
             Ok(reply)
+        }
+
+        /// A transfer [`Fake::stall`] named makes no progress; any other is scripted as
+        /// [`System::run_complete_stdout`] is.
+        fn run_repository(
+            &self,
+            cmd: &Cmd,
+            _progress: &mut crate::repository_progress::Progress,
+        ) -> Result<Ran, RunFailed> {
+            let key = cmd.display();
+            if self.stalls.lock().unwrap().contains(&key) {
+                self.calls.lock().unwrap().push(key);
+                return Err(RunFailed::Stalled(super::TRANSFER_STALL));
+            }
+            self.run_complete_stdout(cmd)
         }
 
         fn run_complete_output(&self, cmd: &Cmd) -> Result<Ran, RunFailed> {
@@ -5676,6 +6011,14 @@ mod fake {
                 &self.repository_record,
                 self.now.saturating_mul(1000),
             ))
+        }
+
+        fn repository_pass_running(&self) -> bool {
+            self.repository_record.running()
+        }
+
+        fn checkout_records(&self) -> Option<Arc<super::CheckoutRecords>> {
+            self.checkout_records.clone()
         }
 
         fn create_new(&self, path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {

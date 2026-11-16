@@ -8,6 +8,7 @@
 use super::{Asked, Github, INPUT_MAX, asked, decode, inventory, profile, read_token};
 use crate::model::User;
 use crate::port::{OwnedFileMetadata, Stat, System};
+use crate::sync::repository_refresh::{Accounted, CheckoutWrites};
 use aterm_secrets::converge::{
     RefreshObservation, RefreshRequest, RefreshScope, RefreshVersion, RepositoryRequest,
     RepositoryWork,
@@ -333,6 +334,19 @@ impl RepositoryInputMark {
         }
     }
 
+    /// How a converge pass's own recorded Git writes (`writes`, `running` saying whether the
+    /// pass that recorded last still runs) account for how this later mark differs from
+    /// `before`: never where anything but the checkouts differs ([`Self::same_source`]), and for
+    /// the checkouts exactly as their capture says ([`Accounted`]).
+    #[must_use]
+    pub fn accounted(&self, before: &Self, writes: &CheckoutWrites, running: bool) -> Accounted {
+        if self.same_source(before) {
+            self.checkouts.accounted(&before.checkouts, writes, running)
+        } else {
+            Accounted::Not
+        }
+    }
+
     /// Opaque scheduling scope, never permission to use its inputs. It excludes
     /// every checkout field so a refresh cannot request itself through its own fetch.
     pub fn refresh_scope(&self) -> Option<aterm_secrets::converge::RefreshScope> {
@@ -510,9 +524,9 @@ fn git_paths(sys: &dyn System) -> Vec<PathBuf> {
     let Some(git) = crate::items::github::installed_git_execution(sys) else {
         return Vec::new();
     };
-    let mut paths = vec![git.program, git.payload];
-    paths.sort();
-    paths.dedup();
+    // The entry admits a managed build, so a change to it can change which git runs.
+    let mut paths = vec![git.program];
+    paths.extend(git.entry);
     paths
 }
 

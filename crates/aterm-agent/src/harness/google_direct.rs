@@ -3,7 +3,6 @@
 
 //! Browser approval of a native agy Google request. Native agy retains PKCE and token exchange.
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,7 +11,7 @@ use super::google_browser::{self, MemoryBrowser};
 use super::google_credentials::{self, Credentials};
 use super::google_federation::{self, Authenticator};
 use super::google_identity::Identity;
-use super::headless_oauth::{self as oauth, MailboxConfig};
+use super::headless_oauth as oauth;
 use super::wake_deadline::WakeDeadline;
 use aterm_secrets::SecretBytes;
 
@@ -28,7 +27,6 @@ pub enum Error {
     SecurityCheck,
     Verification,
     Rejected,
-    Mail(&'static str),
     /// Its automatic account work was cancelled (a quit, an update).
     Cancelled,
 }
@@ -38,16 +36,17 @@ impl std::fmt::Display for Error {
         f.write_str(match self {
             Self::Credentials(error) => return std::fmt::Display::fmt(error, f),
             Self::Browser(error) => return std::fmt::Display::fmt(error, f),
-            Self::Mail(why) => why,
             Self::Deadline => "Google approval exceeded its authorization deadline",
             Self::Configuration => "Google identity binding changed during authorization",
             Self::Redirect => "Google approval left its admitted native flow",
             Self::Callback => "Google callback did not match the native request",
-            Self::SecurityCheck => "Google sign-in requires a security check",
+            Self::SecurityCheck => {
+                "Google sign-in carries a check; aterm pressed nothing there and never tries to pass it"
+            }
             Self::Verification => {
                 "Google sign-in requires an unsupported or unconfigured verification step"
             }
-            Self::Rejected => "Google rejected the submitted credential or verification code",
+            Self::Rejected => "Google rejected the submitted credential or authenticator code",
             Self::Cancelled => "Google approval stopped for shutdown or update",
         })
     }
@@ -58,7 +57,6 @@ pub(super) struct Context<'a> {
     pub identity: &'a Identity,
     pub home: &'a Path,
     pub state: &'a Path,
-    pub mailbox: Option<&'a MailboxConfig>,
     pub current: &'a dyn Fn() -> bool,
 }
 
@@ -94,10 +92,6 @@ pub(super) fn approve(
     let mut identifier_sent = false;
     let mut password_sent = false;
     let mut totp_sent = false;
-    let mut mail_sent = false;
-    let mut mail_code: Option<SecretBytes> = None;
-    let mut seen = BTreeSet::new();
-    let started = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok());
     loop {
         if cancelled(ctx) {
             return Err(Error::Cancelled);
@@ -146,11 +140,12 @@ pub(super) fn approve(
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
+        // A check ends the approval at once, with nothing on the page touched.
+        if oauth::check_met(&view).is_some() {
+            return Err(Error::SecurityCheck);
+        }
         if !request.admits_google(&view.url) {
             return Err(Error::Redirect);
-        }
-        if oauth::bot_check(&view) {
-            return Err(Error::SecurityCheck);
         }
         let mut act = |password: Option<&str>, totp: Option<&str>| {
             let otp = totp.and_then(|secret| {
@@ -169,10 +164,6 @@ pub(super) fn approve(
                 authenticator,
                 identifier_sent,
                 password_sent,
-                ctx.identity
-                    .verification_email()
-                    .map(|target| (target, mail_code.as_ref().and_then(SecretBytes::as_str))),
-                mail_sent,
             ));
             browser.evaluate(&page, script.as_str().unwrap_or_default(), true)
         };
@@ -183,6 +174,13 @@ pub(super) fn approve(
             None => act(None, None),
         }
         .map_err(Error::Browser)?;
+        if result
+            .as_str()
+            .and_then(google_federation::action_check)
+            .is_some()
+        {
+            return Err(Error::SecurityCheck);
+        }
         match result.as_str() {
             Some("credentials") => {
                 credentials =
@@ -193,34 +191,8 @@ pub(super) fn approve(
             Some("totp") => totp_sent = true,
             // The callback captures the final cookies; canonical native verification commits them.
             Some("consent") => {}
-            Some("mailbox") => {
-                let code = google_federation::verification_mail_from(
-                    ctx.identity,
-                    Some(ctx.home),
-                    ctx.mailbox,
-                    started,
-                    super::login_drive::Deadline::waking(deadline, &std::time::Instant::now)
-                        .cancelled_by(&|| cancelled(ctx)),
-                    &mut seen,
-                )
-                // A poll the cancellation ended says its deadline passed; it was a quit.
-                .map_err(|why| {
-                    if cancelled(ctx) {
-                        Error::Cancelled
-                    } else {
-                        Error::Mail(why)
-                    }
-                })?;
-                mail_code = Some(SecretBytes::from(code));
-            }
-            Some("mailcode") => {
-                mail_sent = true;
-                mail_code = None;
-            }
-            Some("mailcode_rejected" | "totp_rejected" | "refused") => return Err(Error::Rejected),
-            Some("mailbox_unconfigured" | "mailbox_refused" | "challenge") => {
-                return Err(Error::Verification);
-            }
+            Some("totp_rejected" | "refused") => return Err(Error::Rejected),
+            Some("challenge") => return Err(Error::Verification),
             _ => {}
         }
         std::thread::sleep(Duration::from_millis(100));

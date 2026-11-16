@@ -116,7 +116,8 @@ USAGE
   targo --unverified ship accept-check-failure CHECK REPORT REASON
       Only on the owner's explicit instruction to ship a known failure of a check that
       runs the product's tests (test, spec, appkit or measure): accept the journaled
-      release's recorded FAIL of CHECK, read from REPORT (the log its record names).
+      release's recorded FAIL of CHECK, read from REPORT (the log its record names);
+      for measure also its NOT RUN (a release bundle is measured only in a VM).
       Keeps the failed report and its digest; never writes a passing verification.
       Every other check still needs its own ok record; a FAIL of a source-shape check
       (candidate-shim, fmt, lint, census, forge, libc) is never accepted.

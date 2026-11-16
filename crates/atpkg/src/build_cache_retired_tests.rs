@@ -2680,3 +2680,183 @@ fn a_write_while_the_history_check_reads_keeps_the_worktree() {
     assert!(g.has_worktree(&wt), "{}", g.worktrees());
     assert!(linked_receipts(&g).is_empty(), "the receipt is withdrawn");
 }
+
+/// A PINNED WORKTREE GOES ONLY WHILE ITS PINS HOLD ITS HEAD AND ITS TREE AND NOTHING WAS
+/// WRITTEN IN IT SINCE THEY BEGAN (DC-02b): a worktree with a commit `origin/main` lacks, an edit
+/// and an untracked file stays by the merged rule, and the pinned rule admits it before its
+/// pins. Its removal then keeps it while its pin names a commit that does not hold its HEAD,
+/// while its pin ref no longer names the commit the pins recorded, while its one pin is its
+/// HEAD's (whose tree holds neither the edit nor the untracked file), while a file in it was
+/// rewritten after the pins began (the same bytes, which git sees no change in, its time set
+/// back a month; unix, whose files keep a change time), and while an empty folder was made in
+/// it since, each withdrawing its receipt and moving its tree back from its quarantine. With a
+/// snapshot of its files (made as the disk watch's pins make one, through a private index) and
+/// nothing written since, it goes, its quarantine with it, and its branch and its pins stay.
+/// NEGATIVE CONTROLS: without `pins_hold` the first two go; without the last read against the
+/// pins' tree ([`super::holds`]) the third goes with the edit and the untracked file; without
+/// the change-time and folder dating of custody's last walk the fourth and fifth go (git lists
+/// no empty folder, and no file in it is new by its modification time).
+#[test]
+fn a_pinned_worktree_goes_only_while_its_pins_hold_its_head_and_tree() {
+    use aterm_uds::holders::PathScan;
+    let g = gate();
+    let wt = linked(&g, "pinned");
+    let quarantine = super::pending::quarantine(&wt).expect("its quarantine's name");
+    let rev = |dir: &Path, name: &str| {
+        let a = GitCli.run(dir, &["rev-parse", "--verify", "--quiet", name]);
+        assert_eq!(a.code, Some(0), "{name}: {}", a.err);
+        a.out.trim().to_owned()
+    };
+    std::fs::write(wt.join("work.rs"), "// work\n").expect("written");
+    git(&wt, &["add", "work.rs"]);
+    git(&wt, &["commit", "-qm", "work"]);
+    std::fs::write(wt.join("Cargo.toml"), "[workspace] # edited\n").expect("edited");
+    std::fs::write(wt.join("notes.txt"), "notes\n").expect("written");
+    let head = rev(&wt, "HEAD");
+    let head_tree = rev(&wt, "HEAD^{tree}");
+    let main = rev(&g.checkout(), "refs/remotes/origin/main");
+    let inert = |_: &[PathBuf], _: &[u32]| -> std::io::Result<PathScan> { Ok(PathScan::default()) };
+    assert!(super::judge_worktree(&GitCli, g.home(), &g.checkout(), &wt, g.now).is_err());
+    super::judge_pinned_worktree(
+        &GitCli,
+        g.home(),
+        &g.checkout(),
+        &wt,
+        g.now,
+        super::UNWRITTEN,
+    )
+    .expect("admitted before its pins");
+    let pins = |name: &str, oid: &str, tree: &str, since: SystemTime| super::Pinned {
+        roots: vec![(name.to_owned(), oid.to_owned())],
+        ignored: Vec::new(),
+        tree: tree.to_owned(),
+        since,
+        quiet: super::UNWRITTEN,
+    };
+    let remove = |pinned: &super::Pinned| {
+        super::remove_pinned_worktree_with_processes(
+            &GitCli,
+            g.home(),
+            &g.checkout(),
+            &wt,
+            g.now,
+            pinned,
+            &inert,
+        )
+    };
+    let kept = |why: &str| {
+        assert!(
+            wt.join("notes.txt").is_file() && g.has_worktree(&wt),
+            "{why}"
+        );
+        assert!(!quarantine.exists(), "its tree is back where it was: {why}");
+        assert!(
+            linked_receipts(&g).is_empty(),
+            "its receipt is withdrawn: {why}"
+        );
+    };
+    git(&g.checkout(), &["update-ref", "refs/orphans/t/main", &main]);
+    git(&g.checkout(), &["update-ref", "refs/orphans/t/head", &head]);
+    let since = super::file_clock_now();
+    let why = remove(&pins("refs/orphans/t/main", &main, &head_tree, since))
+        .expect_err("main lacks HEAD");
+    assert!(why.contains("no pin of it holds it"), "{why}");
+    kept(&why);
+    let why =
+        remove(&pins("refs/orphans/t/head", &main, &head_tree, since)).expect_err("the pin moved");
+    assert!(why.contains("no longer names"), "{why}");
+    kept(&why);
+    let why = remove(&pins("refs/orphans/t/head", &head, &head_tree, since))
+        .expect_err("HEAD's tree holds neither the edit nor the untracked file");
+    assert!(why.contains("holds what its pins do not"), "{why}");
+    kept(&why);
+
+    let scratch = aterm_tempfile::tempdir().expect("a folder for a private index");
+    let index = scratch.path().join("index");
+    for args in [&["read-tree", "HEAD"][..], &["add", "-A", "--", "."]] {
+        let a = GitCli.run_env(&wt, args, Some(&index), &[]);
+        assert_eq!(a.code, Some(0), "{args:?}: {}", a.err);
+    }
+    let tree = GitCli.run_env(&wt, &["write-tree"], Some(&index), &[]);
+    assert_eq!(tree.code, Some(0), "{}", tree.err);
+    let tree = tree.out.trim().to_owned();
+    let snapshot = GitCli.run(
+        &wt,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit-tree",
+            &tree,
+            "-p",
+            &head,
+            "-m",
+            "snapshot",
+        ],
+    );
+    assert_eq!(snapshot.code, Some(0), "{}", snapshot.err);
+    let snapshot = snapshot.out.trim().to_owned();
+    git(
+        &g.checkout(),
+        &["update-ref", "refs/snapshots/t/x", &snapshot],
+    );
+    let snapshot_pins = |since| pins("refs/snapshots/t/x", &snapshot, &tree, since);
+
+    #[cfg(unix)]
+    {
+        let since = super::file_clock_now();
+        std::fs::write(wt.join("Cargo.toml"), "[workspace] # edited\n").expect("the same bytes");
+        a_month_old(&wt.join("Cargo.toml"));
+        let why = remove(&snapshot_pins(since)).expect_err("a file rewritten since");
+        assert!(why.contains("Cargo.toml was written after"), "{why}");
+        kept(&why);
+    }
+    let since = super::file_clock_now();
+    std::fs::create_dir(wt.join("later")).expect("an empty folder");
+    let why = remove(&snapshot_pins(since)).expect_err("a folder made since");
+    assert!(why.contains("was written after its removal began"), "{why}");
+    kept(&why);
+    std::fs::remove_dir(wt.join("later")).expect("taken away");
+
+    remove(&snapshot_pins(super::file_clock_now())).expect("pinned, it goes");
+    assert!(!wt.exists() && !g.has_worktree(&wt), "{}", g.worktrees());
+    assert!(!quarantine.exists(), "its quarantine went with it");
+    assert_eq!(rev(&g.checkout(), "refs/heads/agent/pinned"), head);
+    assert_eq!(rev(&g.checkout(), "refs/orphans/t/head"), head);
+    assert_eq!(rev(&g.checkout(), "refs/snapshots/t/x"), snapshot);
+    assert!(linked_receipts(&g).is_empty());
+}
+
+/// NO GIT RUN ASKS A FILE SYSTEM MONITOR: with `core.fsmonitor` in the repository's config
+/// naming a command that leaves a marker (git runs what the setting names as its monitor's hook
+/// whenever it reads an index), a status run in the snapshot as the judge runs git leaves no
+/// marker, since every run is given `core.fsmonitor=false` ([`super::OWN_READS`]); the same
+/// status with the setting handed back on its own command line leaves one, so the hook is live
+/// in this fixture. NEGATIVE CONTROL: without `OWN_READS` on every run the first status leaves
+/// the marker, as a builtin monitor's daemon would be started and left in the worktree.
+#[cfg(unix)]
+#[test]
+fn no_git_run_of_the_judge_asks_a_file_system_monitor() {
+    let g = gate();
+    let marker = g.home().join("monitor-asked");
+    let hook = format!("touch '{}'; :", marker.display());
+    git(&g.checkout(), &["config", "core.fsmonitor", &hook]);
+
+    let status = GitCli.run(&g.snapshot(), &["status", "--porcelain"]);
+    assert_eq!(status.code, Some(0), "{}", status.err);
+    assert!(
+        std::fs::symlink_metadata(&marker).is_err(),
+        "the monitor was asked: {}",
+        status.err
+    );
+
+    let told = format!("core.fsmonitor={hook}");
+    let status = GitCli.run(&g.snapshot(), &["-c", &told, "status", "--porcelain"]);
+    assert_eq!(status.code, Some(0), "{}", status.err);
+    assert!(
+        marker.is_file(),
+        "the fixture's hook runs when git is told to: {}",
+        status.err
+    );
+}

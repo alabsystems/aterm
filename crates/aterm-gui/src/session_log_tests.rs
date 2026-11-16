@@ -1588,13 +1588,9 @@ fn the_loop_hands_a_harness_read_wait_to_the_rollout_ask() {
     }
     .into();
     let t0 = std::time::Instant::now();
-    let _ = crate::codex_rollout_tap::due(
-        &mut app.session_status.rollout_asked,
-        0,
-        Some(target),
-        None,
-        (t0, None),
-    );
+    let _ = app
+        .session_status
+        .rollout_action(0, Some(target), None, (t0, None));
     let wait = |read_ms: u64| {
         let mut g = timeline.lock().unwrap();
         let since = g.slog().now().wall_ms + 3_000;
@@ -1605,12 +1601,7 @@ fn the_loop_hands_a_harness_read_wait_to_the_rollout_ask() {
             .pairs
             .wait = Some(transcript::ReadWait { since, read_ms });
     };
-    let pair = |app: &crate::App| {
-        app.session_status
-            .rollout_asked
-            .get(&0)
-            .and_then(|a| a.pair)
-    };
+    let pair = |app: &crate::App| app.session_status.rollout_ask(0).and_then(|a| a.pair);
     let owed = |app: &crate::App| {
         pair(app).is_some_and(|at| {
             at >= t0 + std::time::Duration::from_millis(2_900)
@@ -6215,12 +6206,8 @@ fn link_closed(index: &mut ClosedLogs, log: &Log, n: u64, keep: ClosedKeep) -> u
     let sid = aterm_session::SessionId::new(format!("s-closed-{n}"));
     let linked = index.link(ClosedExit {
         seq: n + 1,
-        t_ms: n,
         sid: sid.clone(),
         local_id: n,
-        reason: ExitReason::UiClose,
-        exit_code: None,
-        actor: ExitActor::Human,
     });
     let kept = ClosedLog::kept_from(
         log,
@@ -7194,7 +7181,9 @@ fn a_told_epoch_at_the_top_saturates_nothing() {
 /// [`aterm_slog::MAX_RECORD_BYTES`]. With the longest `why_text=` a request admits it gives up the
 /// account and keeps the rest; with every field at its longest (a legacy tab's ID as the parent,
 /// the widest window) it gives up the model too. Each time the mark, its `why_text=` and its
-/// `by=` are kept. A fleet drive names its requester's session by the `t` form alone.
+/// `by=` are kept. The requesting sid is a legacy tab's, the longest a fleet drive's token names
+/// (`fleet:<head>:` and 22 bytes, 37 in all): the requester line takes it, and the actor names
+/// what that line admitted.
 #[test]
 fn open_mark_fits_at_max_sizes() {
     use aterm_types::control_verbs::{
@@ -7205,7 +7194,7 @@ fn open_mark_fits_at_max_sizes() {
         aterm_codec::pct::encoded_len(&longest_why),
         REQUEST_WHY_BYTES
     );
-    let sid = "tqn5r6e0148";
+    let sid = "s-0123456789abcdef0123";
     let requester = Arc::new(Requester::of(
         Some(sid),
         Some(&"p".repeat(REQUESTER_TOKEN_MAX)),
@@ -7273,7 +7262,7 @@ fn open_mark_fits_at_max_sizes() {
     assert_eq!(
         named(&opened(
             &longest_why,
-            aterm_slog::ShortId::new("s-0123456789abcdef0123"),
+            aterm_slog::ShortId::new(sid),
             u64::MAX
         )),
         ["agent"],
@@ -7306,7 +7295,9 @@ fn a_tabs_place_is_carried_and_its_close_counts_from_the_open() {
     );
     assert!(
         pred.host_lines(at(1_000)).iter().any(|l| *l
-            == format!("tab v=1 opened={opened} window=3 parked=1 parent=s-0123456789abcdef0123")),
+            == format!(
+                "tab v=1 opened={opened} window=3 parked=1 parent=s-0123456789abcdef0123 by=harness"
+            )),
         "{:?}",
         pred.host_lines(at(1_000))
     );

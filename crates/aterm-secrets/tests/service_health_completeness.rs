@@ -328,7 +328,7 @@ impl Fixture {
 fn wire<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<u8> {
     let mut bytes = Vec::new();
     for record in records {
-        bytes.extend_from_slice(record.bytes());
+        bytes.extend_from_slice(record.wire_bytes().unwrap().as_ref());
     }
     bytes
 }
@@ -358,11 +358,11 @@ fn server_health_requires_the_complete_authenticated_frontier() {
     let waiting_bytes = wire([g, b]);
     let waiting = read(&waiting_bytes);
     assert!(waiting.contains(b.id()));
-    assert!(waiting.complete_bytes(g.id()).is_some());
-    assert!(waiting.complete_bytes(b.id()).is_none());
+    assert!(waiting.holds(g.id()));
+    assert!(!waiting.holds(b.id()));
     assert_eq!(waiting.inventory().len(), 2);
     assert_eq!(waiting.complete_inventory().len(), 1);
-    let unrooted_bytes = b.bytes().to_vec();
+    let unrooted_bytes = b.wire_bytes().unwrap().to_vec();
     let unrooted = read(&unrooted_bytes);
     assert!(unrooted.contains(b.id()));
     assert!(unrooted.log().is_none());
@@ -374,7 +374,7 @@ fn server_health_requires_the_complete_authenticated_frontier() {
     let unrooted_result = fixture.probe("unrooted B", unrooted_bytes);
     let complete_result = fixture.probe("complete rotated-signer G+A+B", full.clone());
     let mut duplicated = full.clone();
-    duplicated.extend_from_slice(b.bytes());
+    duplicated.extend_from_slice(b.wire_bytes().unwrap().as_ref());
     let duplicate_result = fixture.probe("complete duplicate frames", duplicated);
 
     let mut refusals = Vec::new();
@@ -452,7 +452,7 @@ fn server_health_requires_the_complete_authenticated_frontier() {
         &[Endpoint::Envelope],
     ));
 
-    let mut bad_record = b.bytes().to_vec();
+    let mut bad_record = b.wire_bytes().unwrap().to_vec();
     *bad_record.last_mut().unwrap() ^= 1;
     assert!(Record::decode(&bad_record).is_err());
     let mut corrupt = wire([g, a]);

@@ -178,14 +178,26 @@ pub(crate) fn become_build<A: AsRef<OsStr>>(
         None => {
             // SAFETY: `words[0]` and `argv` are NUL-terminated and live across the call, `argv`
             // ending in a null pointer; `execv` returns only on failure.
-            unsafe { libc::execv(words[0].as_ptr(), argv.as_ptr()) };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
+            )]
+            unsafe {
+                libc::execv(words[0].as_ptr(), argv.as_ptr())
+            };
         }
         Some(env) => {
             let mut envp: Vec<*const libc::c_char> = env.iter().map(|e| e.as_ptr()).collect();
             envp.push(std::ptr::null());
             // SAFETY: as for `execv`, and `envp` likewise: NUL-terminated entries, live, ending
             // in a null pointer.
-            unsafe { libc::execve(words[0].as_ptr(), argv.as_ptr(), envp.as_ptr()) };
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the exec gate is closed above on macOS (`closed`), where an exec could wait on a process-table read"
+            )]
+            unsafe {
+                libc::execve(words[0].as_ptr(), argv.as_ptr(), envp.as_ptr())
+            };
         }
     }
     let err = std::io::Error::last_os_error();

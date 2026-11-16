@@ -22,7 +22,10 @@ fn table() -> Table {
     for n in 1..3 {
         client::save_records(
             &lab.paths[n],
-            &client::load_records(&lab.paths[0]).unwrap().encode(),
+            &client::load_records(&lab.paths[0])
+                .unwrap()
+                .read_encoded()
+                .unwrap(),
         )
         .unwrap();
     }
@@ -103,7 +106,8 @@ impl Table {
             &self.lab.paths[n],
             &client::load_records(&self.lab.paths[from])
                 .unwrap()
-                .encode(),
+                .read_encoded()
+                .unwrap(),
         )
         .unwrap();
     }

@@ -126,6 +126,8 @@ mod deck_motion;
 #[cfg(target_os = "macos")]
 mod disk_ask_lane;
 #[cfg(target_os = "macos")]
+mod disk_full_lane;
+#[cfg(target_os = "macos")]
 mod disk_lane;
 #[cfg(target_os = "macos")]
 mod door;
@@ -282,6 +284,8 @@ mod mac_nux_guest;
 #[cfg(target_os = "macos")]
 mod mac_runtime;
 #[cfg(target_os = "macos")]
+mod mac_self_cpu;
+#[cfg(target_os = "macos")]
 mod mac_slots;
 #[cfg(target_os = "macos")]
 mod measure;
@@ -357,6 +361,8 @@ mod scn;
 mod screen;
 #[cfg(target_os = "macos")]
 mod seamless;
+#[cfg(target_os = "macos")]
+mod self_cpu_qualification;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 mod installer_handoff {
     pub fn cold_cmd(_: &[String]) -> crate::Res {
@@ -911,9 +917,12 @@ Outside any lab (no jail, no stub):
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
                                  `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (each run's
                                  record goes to $LAB_STATE/results/)
-  tables-page [--out DIR] [ATERM]
+  tables-page [--out DIR] [--lines N] [--columns N] [ATERM]
                                  the Tables page on a private instance with a scratch registry: frames of
-                                 its read, a conflict, staged edits and their write (debug lab image)
+                                 its read, a conflict, staged edits (an agent's Write refused), a value
+                                 its Mac reports otherwise, a Mac's facts, the reference tables and
+                                 Check, in a window N lines tall (56 by default) and N columns wide
+                                 (200; under 110 the page stands in one column) (debug lab image)
   this-mac-page [--out DIR] [ATERM]
                                  Settings ▸ This Mac on a private instance: frames of its read and a typed
                                  nickname, act's refusal of Save with the scratch name unmoved, and this
@@ -953,6 +962,10 @@ Outside any lab (no jail, no stub):
                                  run's record goes to $LAB_STATE/results/, its name carrying --label's WORD)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
+  disk-full [--aterm PATH] [--keep]
+                                 fill two 8 GiB sparse APFS images under their emergency line: verify the reserve goes first, a
+                                 died build's partial output goes and its finished units and sources stay, and ballast alone
+                                 gets one cannot-meet row and no removal (~2 min)
   disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
                                  real Claude Code tabs in a lab whose HOME is a sparse APFS image (10-16 GiB) below
                                  its floor once aterm's own pass is spent: verify the disk-free@v1 ask types its line to
@@ -1042,6 +1055,8 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW, four in turn: typing latency to the glass with a recording holding each key for its echo, builds A B B A (~3 min plus each window's wait for a quiet Mac; `--help` for details)
   title-drift-memory <same frozen builds/workload> --calibration-memory-mib N --bound-growth-mib N --bound-reason TEXT --out DIR
                                  OPENS PRIVATE WINDOWS: functional memory sizing only; no timing qualification (`--help` for required bounds)
+  output-cadence --aterm PATH --aterm-source SHA --aterm-sha256 SHA --aterm-build-record JSONL --functional-memory-mib N --out DIR
+                                 OPENS PRIVATE WINDOWS: 200 quiet peers, natural held output, native input and hold retirement; no timing qualification
   title-drift --a PATH --a-source SHA --a-sha256 SHA --b PATH --b-source SHA --b-sha256 SHA --out DIR
       --cases windows1,windows2,windows8 selects actual OS-window scaling (30 idle tabs per extra window)
   restore-native --a PATH --a-source SHA --a-sha256 SHA --a-build-record JSONL --b PATH --b-source SHA --b-sha256 SHA --b-build-record JSONL --out DIR
@@ -1412,6 +1427,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "recording-cpu" => cpu_observation::cmd(args),
         "idle-cpu" => idle_cpu::cmd(args),
         "disk-lane" => disk_lane::cmd_disk_lane(args),
+        "disk-full" => disk_full_lane::cmd_disk_full(args),
         "disk-ask" => disk_ask_lane::cmd_disk_ask(args),
         "slot-capture" => slot_lane::cmd_slot_capture(args),
         "slot-lane" => slot_lane::cmd_slot_lane(args),
@@ -1441,6 +1457,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "aos-cadence" => aos_cadence::cmd_aos_cadence(args),
         "title-drift" => title_drift::cmd(args),
         "title-drift-memory" => title_drift::memory_cmd(args),
+        "output-cadence" => title_drift::cadence_native_cmd(args),
         "restore-native" => restore_native::run(args),
         "aos-search" => aos_search::cmd_aos_search(args),
         "aos-gpu-bench" => aos_gpu_bench::cmd_aos_gpu_bench(args),

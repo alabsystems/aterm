@@ -47,7 +47,8 @@ pub(crate) const RESCAN_KNOWN: Duration = Duration::from_secs(15);
 /// Rescan interval when the previous scan found no siblings.
 pub(crate) const RESCAN_NONE: Duration = Duration::from_secs(60);
 
-/// Starts or coalesces a background sibling scan sending [`Wake::SiblingScan`].
+/// Starts or coalesces a background sibling scan sending [`Wake::SiblingScan`] where its rows
+/// changed ([`Scans`]).
 pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
     if SCAN_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         return;
@@ -64,15 +65,16 @@ pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
     let spawned = std::thread::Builder::new()
         .name("aterm-sibling-scan".to_string())
         .spawn(move || {
+            let mut scans = Scans::new(scan_siblings, |rows| {
+                proxy.send_event(Wake::SiblingScan(rows)).is_ok()
+            });
             loop {
-                let known = {
+                let pass = {
                     let _clear = ClearInFlight;
-                    let rows = scan_siblings();
-                    let known = !rows.is_empty();
-                    if proxy.send_event(Wake::SiblingScan(rows)).is_err() {
-                        return;
-                    }
-                    known
+                    scans.pass()
+                };
+                let Some(known) = pass else {
+                    return;
                 };
                 std::thread::sleep(if known { RESCAN_KNOWN } else { RESCAN_NONE });
                 if CADENCE.load(Ordering::Acquire) != ticket
@@ -84,6 +86,44 @@ pub(crate) fn request_scan(proxy: EventLoopProxy<Wake>) {
         });
     if spawned.is_err() {
         SCAN_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
+
+/// One scan thread's passes: each scans, and sends its rows only where they differ from the ones
+/// it last sent. The window acts on a change alone (`Wake::SiblingScan`'s handler), so an equal
+/// scan costs its event loop no wake.
+struct Scans<S, T> {
+    scan: S,
+    send: T,
+    /// The rows last sent; `None` before the first send, so a thread's first scan is sent.
+    sent: Option<Vec<SiblingInstance>>,
+}
+
+impl<S, T> Scans<S, T>
+where
+    S: FnMut() -> Vec<SiblingInstance>,
+    T: FnMut(Vec<SiblingInstance>) -> bool,
+{
+    const fn new(scan: S, send: T) -> Self {
+        Self {
+            scan,
+            send,
+            sent: None,
+        }
+    }
+
+    /// Scan once and send the rows where they changed: whether a sibling was found, `None` once a
+    /// send failed (the event loop is gone).
+    fn pass(&mut self) -> Option<bool> {
+        let rows = (self.scan)();
+        let known = !rows.is_empty();
+        if self.sent.as_ref() != Some(&rows) {
+            if !(self.send)(rows.clone()) {
+                return None;
+            }
+            self.sent = Some(rows);
+        }
+        Some(known)
     }
 }
 

@@ -66,7 +66,10 @@ pub(super) fn client(
         ) {
             return Err(Error::new("pending device refused membership witness"));
         }
-        let wires: Vec<Vec<u8>> = witness_log.records().map(|r| r.bytes().to_vec()).collect();
+        let wires: Vec<Vec<u8>> = witness_log
+            .records()
+            .map(|r| r.wire_bytes().map(std::borrow::Cow::into_owned))
+            .collect::<std::io::Result<_>>()?;
         let acks = client::retain_records_for_commons(
             paths,
             endpoint.trust.network,
@@ -292,7 +295,7 @@ pub(super) fn serve(
         let chain =
             client::enroll_commons_member_in_log(paths, endpoint.trust, request, possession)
                 .map_err(failure)?;
-        let encoded_records = aterm_secrets::membership_log::encode_records(&chain);
+        let encoded_records = aterm_secrets::membership_log::read_records(&chain)?;
         let mut wire = Vec::with_capacity(4 + encoded_records.len());
         wire.extend_from_slice(b"ACW2");
         wire.extend_from_slice(&encoded_records);

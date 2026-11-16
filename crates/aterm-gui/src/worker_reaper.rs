@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use alab_policy::config::Autopilot;
 
 use crate::harness_host::credit_claim;
-use crate::retired_workers::{Retired, forget_results};
 use crate::task_record::{TaskRecord, TaskState};
 
 /// The former retirement delay, retained only as a regression-test age.
@@ -300,16 +299,6 @@ impl crate::App {
             .retain(|session, _| steps.iter().any(|(over, _)| over == session));
         self.worker_job_seen
             .retain(|session, _| concluded.contains(session));
-        let aged = self
-            .store
-            .write()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retired_workers_mut()
-            .drop_aged(aterm_time::unix_millis().unwrap_or(0));
-        if !aged.is_empty() {
-            forget_results(&self.store, &aged);
-            self.settle_retired_windows(&aged);
-        }
         steps
     }
 
@@ -450,19 +439,6 @@ impl crate::App {
             .autopilot_word();
         if autopilot != Some(Autopilot::Off) {
             self.worker_autopilot_off(handle.sid.as_str());
-        }
-    }
-
-    /// Settle the Workers tab of each window whose page listed one of the retired rows `dropped`.
-    pub(crate) fn settle_retired_windows(&mut self, dropped: &[Retired]) {
-        let mut windows: Vec<crate::WindowId> =
-            dropped.iter().filter_map(|row| row.window).collect();
-        windows.sort_unstable();
-        windows.dedup();
-        for wid in windows {
-            if self.windows.contains_key(&wid) {
-                self.settle_workers_tab(wid);
-            }
         }
     }
 }

@@ -525,7 +525,53 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
     let checking = row_view(spotlight, &pending, Selection::all());
     assert_eq!(checking.value, RowValue::LastKnown("Kept out".into()));
     assert!(checking.label.contains("as last read"));
-    assert_eq!(checking.standing, Some(Standing::Unknown));
+    assert_eq!(
+        checking.standing,
+        Some(Standing::InPlace),
+        "a row read again keeps its reading's standing"
+    );
+    assert_eq!(checking.chip, Some(Chip::LastKnown));
+}
+
+/// A row read again while a pass runs keeps the standing of the reading it holds (FL-160): the
+/// busy headline counts it settled while its new reading is under way, and its chip says it is
+/// as last read. NEGATIVE CONTROL: the same read of a row with no reading behind it is no
+/// settled row, so the count drops by one.
+#[test]
+fn busy_headline_counts_rows_read_again_as_settled() {
+    let dock = Subject::Setting(Setting::Dock);
+    let every = Subject::all()
+        .into_iter()
+        .map(|subject| {
+            reading(subject, Standing::InPlace, Some("As wanted")).stamped(1_700_000_000)
+        })
+        .collect();
+    let mut status = with_readings(Selection::all(), every);
+    status.busy = true;
+    status.observing = vec![(dock, None, false)];
+    let views = rows(&status, Selection::all());
+    let managed = views.iter().filter(|row| row.managed).count();
+    assert!(managed > 1, "a full plan manages more than the Dock");
+    let again = views.iter().find(|row| row.subject == dock).unwrap();
+    assert_eq!(again.standing, Some(Standing::InPlace));
+    assert_eq!(again.chip, Some(Chip::LastKnown));
+    assert!(again.settled());
+    assert_eq!(
+        headline(&status, &views, status.plan.as_ref()).text,
+        format!("Setting up this Mac… {managed} of {managed}"),
+        "the row read again counts as settled"
+    );
+
+    // CONTROL: a row with no reading behind it, read the same way, is still to come.
+    status.observed.retain(|seen| seen.subject != dock);
+    status.observed.push(Observation::unknown(dock));
+    let views = rows(&status, Selection::all());
+    let unread = views.iter().find(|row| row.subject == dock).unwrap();
+    assert!(!unread.settled());
+    assert_eq!(
+        headline(&status, &views, status.plan.as_ref()).text,
+        format!("Setting up this Mac… {} of {managed}", managed - 1)
+    );
 }
 
 /// A row changed since aterm set it (init design §6.6) reads as it is now, under "Changed since
@@ -4487,7 +4533,7 @@ fn a_focused_vault_field_stays_in_view_as_the_list_shrinks_and_shows_when_typed_
 
 /// The headline and the lockup reach a screen reader in words (§4.7): the headline is a Heading
 /// named by its words, in one line or wrapped, and the lockup a progress indicator with its
-/// count, named "Setup progress".
+/// count and whether its readings are historical.
 #[cfg(a11y_tree)]
 #[test]
 fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
@@ -4528,8 +4574,26 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
     cold.observing = vec![(spotlight, None, false), (dock, None, false)];
     let mut page = page_reading(&cold);
     let hero = hero_of(&page);
-    assert_eq!((hero.done, hero.total), (0, 0));
+    assert_eq!((hero.done, hero.total), (1, 15));
+    assert!(hero.as_last_read);
     assert!(!page.headline().set_up);
+    let compiled = compile(&page, &SystemStateViewState::default(), 999.0, 900.0);
+    let projection =
+        crate::native_accessibility::project_native_accessibility(&compiled, None).unwrap();
+    let id = projection
+        .id_for_key(&UiKey::new("system-state/progress"))
+        .unwrap();
+    let progress = projection
+        .update()
+        .nodes
+        .iter()
+        .find(|(candidate, _)| *candidate == id)
+        .unwrap()
+        .1
+        .clone();
+    assert_eq!(progress.label(), Some("Setup progress as last read"));
+    assert_eq!(progress.numeric_value(), Some(1.0));
+    assert_eq!(progress.max_numeric_value(), Some(15.0));
     cold.observed
         .push(reading(dock, Standing::InPlace, Some("Current Dock")).stamped(1_700_000_000));
     cold.observing.retain(|(subject, _, _)| *subject != dock);
@@ -4537,6 +4601,7 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
     let hero = hero_of(&page);
     assert_eq!(hero.done, 1);
     assert!(hero.total > hero.done);
+    assert!(!hero.as_last_read);
 }
 
 #[test]

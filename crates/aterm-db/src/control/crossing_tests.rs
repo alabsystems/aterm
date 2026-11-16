@@ -83,7 +83,7 @@ fn cached_membership_disk_stops_serving_after_the_durable_mark() {
         1,
     )
     .unwrap();
-    aterm_secrets::client::save_records(&paths, genesis.bytes()).unwrap();
+    aterm_secrets::client::save_records(&paths, genesis.wire_bytes().unwrap().as_ref()).unwrap();
     let disk = MembershipDisk::new(&paths, lab.trust);
     let before = disk.inventory().unwrap();
     assert!(before.contains(genesis.id()));
@@ -95,7 +95,10 @@ fn cached_membership_disk_stops_serving_after_the_durable_mark() {
         disk.select_missing(&before, &BTreeSet::new(), &mut None)
             .is_err()
     );
-    assert!(disk.retain(&[genesis.bytes().to_vec()]).is_err());
+    assert!(
+        disk.retain(&[genesis.wire_bytes().unwrap().to_vec()])
+            .is_err()
+    );
 }
 
 /// The log a Mac's records file holds in the legacy database fence's conformance, rooted in the
@@ -226,7 +229,7 @@ fn realize(
     for records in [base, &batch[..nr]] {
         aterm_secrets::client::save_records(
             &paths,
-            &aterm_secrets::membership_log::encode_records(records),
+            &aterm_secrets::membership_log::read_records(records).unwrap(),
         )
         .unwrap();
     }
@@ -316,8 +319,8 @@ fn legacy_exchange(
             .iter()
             .filter(|record| {
                 written
-                    .windows(record.bytes().len())
-                    .any(|window| window == record.bytes())
+                    .windows(record.wire_len())
+                    .any(|window| window == record.wire_bytes().unwrap().as_ref())
             })
             .count();
         (written.is_empty(), served)
@@ -411,7 +414,7 @@ fn the_legacy_database_fence_conforms_to_the_capacity_model() {
     let peer_base = custody(&lab, "peer-base", false);
     aterm_secrets::client::save_records(
         &peer_base,
-        &aterm_secrets::membership_log::encode_records(&base),
+        &aterm_secrets::membership_log::read_records(&base).unwrap(),
     )
     .unwrap();
     let mut judged = 0;

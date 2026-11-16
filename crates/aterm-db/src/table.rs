@@ -380,6 +380,13 @@ impl ReadBatch<'_, '_> {
         self.open_envelope(Envelope::parse(self.scope, wire)?)
     }
 
+    /// [`Self::authenticate`] of an identified wire: its signature is checked through the fact
+    /// the wire keeps ([`signatures::verify_identified`]), once for every store that shares it,
+    /// never through the process-wide cache alone, whose bound a large table passes.
+    fn authenticate_identified(&self, wire: &signatures::Identified) -> Result<Record> {
+        self.open_envelope(Envelope::parse_identified(self.scope, wire)?)
+    }
+
     fn open_envelope(&self, envelope: Envelope<'_>) -> Result<Record> {
         self.session
             .decode_envelope(self.scope, envelope, false, self.keys.as_ref())?
@@ -429,6 +436,99 @@ impl ReadBatch<'_, '_> {
             )?
             .ok_or_else(|| Error::new("table payload authentication failed"))?;
         Ok(cut)
+    }
+}
+
+/// The judgments a replay makes of a record that depend on its class alone (its roster, epoch
+/// and signer), never on its bytes: whether its source is discarded under the batch's control
+/// head, and whether a historical writer grant and key open its payload. A store kept across
+/// sessions (`store::kept`) holds the verdicts its records were classified under, and keeps
+/// their classification only while the same class asked again in a later batch answers alike.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct Class {
+    roster: Digest,
+    epoch: u64,
+    actor: Actor,
+}
+
+impl Class {
+    fn of(envelope: &Envelope<'_>) -> Self {
+        Self {
+            roster: envelope.roster,
+            epoch: envelope.epoch,
+            actor: envelope.header.actor,
+        }
+    }
+}
+
+/// A class's verdict in one read batch ([`ReadBatch::class_verdict`]).
+pub(crate) struct Verdict {
+    /// The source is discarded on the batch's control head: a witnessed record of it is
+    /// quarantined.
+    discarded: bool,
+    key: KeyVerdict,
+}
+
+/// Whether a historical writer grant and key open the class's payloads, and under which key.
+enum KeyVerdict {
+    /// Granted, under the key this comparison token names.
+    Granted(crypto::PayloadKeyIdentity),
+    /// No historical writer grant or key yet ([`Error::is_awaiting_membership`]).
+    Awaiting,
+    /// Any other refusal (busy included): a verdict that matches no other.
+    Failed,
+}
+
+impl Verdict {
+    /// Whether every record of a class judged `self` is classified as one judged `other` is:
+    /// the same discarded verdict and the same key verdict, a grant under the same key. A
+    /// refusal other than awaiting membership matches nothing.
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.discarded == other.discarded
+            && match (&self.key, &other.key) {
+                (KeyVerdict::Granted(a), KeyVerdict::Granted(b)) => a.matches(b),
+                (KeyVerdict::Awaiting, KeyVerdict::Awaiting) => true,
+                _ => false,
+            }
+    }
+
+    /// Whether a record of the class that is not quarantined waits for membership: a reading
+    /// open holds it pending, and a writing open refuses.
+    pub(crate) const fn awaiting(&self) -> bool {
+        !self.discarded && matches!(self.key, KeyVerdict::Awaiting)
+    }
+}
+
+impl ReadBatch<'_, '_> {
+    /// `class`'s verdict in this batch: the discarded-source judgment under the batch's control
+    /// head, as [`Self::discarded_source`] makes it, and the historical writer grant and key, as
+    /// [`Self::replay_metadata`] asks them, through the batch's keys. It opens no payload.
+    ///
+    /// # Errors
+    /// The batch's control head is uncertain (`snapshot_changed`), as a replay of any record
+    /// of the class refuses.
+    fn class_verdict(&self, class: &Class) -> Result<Verdict> {
+        let head = match &self.keys {
+            None => self.session.control_head(),
+            Some(_) => *self.head.get_or_init(|| self.session.control_head()),
+        };
+        let discarded = self.session.classify_discarded_class(class, head)?;
+        let key = match self.session.with_class_key(
+            self.scope,
+            class,
+            false,
+            self.keys.as_ref(),
+            |key, identity| {
+                Ok(Some(
+                    *identity.get_or_init(|| crypto::payload_key_identity(key)),
+                ))
+            },
+        ) {
+            Ok(Some(identity)) => KeyVerdict::Granted(identity),
+            Err(error) if error.is_awaiting_membership() => KeyVerdict::Awaiting,
+            Ok(None) | Err(_) => KeyVerdict::Failed,
+        };
+        Ok(Verdict { discarded, key })
     }
 }
 
@@ -2052,7 +2152,27 @@ impl<'a> Session<'a> {
             &std::cell::OnceCell<crypto::PayloadKeyIdentity>,
         ) -> Result<Option<T>>,
     ) -> Result<Option<T>> {
-        let (roster, epoch, actor) = (envelope.roster, envelope.epoch, envelope.header.actor);
+        self.with_class_key(scope, &Class::of(envelope), negative, keys, open)
+    }
+
+    /// [`Self::with_payload_key`] for every record of `class`: the historical writer grant and the
+    /// key are a function of the class alone, never of a record's bytes.
+    fn with_class_key<T>(
+        &self,
+        scope: Scope,
+        class: &Class,
+        negative: bool,
+        keys: Option<&ReadKeys>,
+        open: impl FnOnce(
+            &[u8; 32],
+            &std::cell::OnceCell<crypto::PayloadKeyIdentity>,
+        ) -> Result<Option<T>>,
+    ) -> Result<Option<T>> {
+        let Class {
+            roster,
+            epoch,
+            actor,
+        } = *class;
         if !self.history.borrow().contains_key(&roster) {
             // A roster this Mac has not seen, or holds no access to, waits for its view to
             // grow; local contention stays busy.
@@ -2141,27 +2261,33 @@ impl<'a> Session<'a> {
         envelope: &Envelope<'_>,
         head: ControlHead,
     ) -> Result<bool> {
+        self.classify_discarded_class(&Class::of(envelope), head)
+    }
+
+    /// [`Self::classify_discarded_source`] for every record of `class`: whether a source is
+    /// discarded is a function of its roster, epoch and signer alone.
+    fn classify_discarded_class(&self, class: &Class, head: ControlHead) -> Result<bool> {
         match head {
-            ControlHead::Selected(head) => Ok(self.discarded_source_at(envelope, head)),
+            ControlHead::Selected(head) => Ok(self.discarded_class_at(class, head)),
             ControlHead::Unselected => Ok(false),
             ControlHead::Uncertain => Err(Error::snapshot_changed()),
         }
     }
 
-    fn discarded_source_at(&self, envelope: &Envelope<'_>, head: Digest) -> bool {
+    fn discarded_class_at(&self, class: &Class, head: Digest) -> bool {
         use aterm_secrets::commons::constraints::Fact;
-        let Some(node) = self.journal.node(&envelope.roster) else {
+        let Some(node) = self.journal.node(&class.roster) else {
             return false;
         };
         node.has_payload()
-            && !self.journal.selected_ancestor(envelope.roster, head)
+            && !self.journal.selected_ancestor(class.roster, head)
             && node.facts().iter().any(|fact| {
                 matches!(fact,
-                Fact::Epoch { generation, .. } if *generation == envelope.epoch)
+                Fact::Epoch { generation, .. } if *generation == class.epoch)
             })
             && node.facts().iter().any(|fact| {
                 matches!(fact,
-                Fact::Bind { binding } if binding.actor() == envelope.header.actor)
+                Fact::Bind { binding } if binding.actor() == class.actor)
             })
     }
 

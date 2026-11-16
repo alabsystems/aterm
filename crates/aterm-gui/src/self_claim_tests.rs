@@ -224,14 +224,13 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
         tap_target_by(ctx, 4242, alive_as_proven),
         Some(watched.clone())
     );
-    let mut asked = std::collections::HashMap::new();
+    let mut asked = None;
     let t0 = std::time::Instant::now();
     // The tab wrote nothing, so its second read is its rest clock's.
     for at in [t0, t0 + REST_FAR] {
         assert_eq!(
             due(
                 &mut asked,
-                7594,
                 tap_target_by(ctx, 4242, alive_as_proven),
                 None,
                 (at, None)
@@ -258,7 +257,6 @@ fn a_passive_release_keeps_its_copy_to_read_and_no_act_path_sees_it() {
     assert_eq!(
         due(
             &mut asked,
-            7594,
             tap_target(ctx, 4242),
             None,
             (t0 + REST_FAR * 2, None)

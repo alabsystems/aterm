@@ -95,7 +95,7 @@ fn manifest(ids: &[u64]) -> SessionHandoff {
         mirror_dropped: Vec::new(),
         mirror_served: false,
         machine_names: Vec::new(),
-        retired_workers: Vec::new(),
+        last_launches: Vec::new(),
     }
 }
 

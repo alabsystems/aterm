@@ -14,6 +14,66 @@ fn reading(setting: Setting, standing: Standing, note: Option<&str>) -> Observat
     .stamped(1_700_000_000)
 }
 
+#[test]
+fn a_missing_journal_fence_is_not_an_explicit_empty_journal() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let journal = scratch.path().join("journal.jsonl");
+    let dock = reading(Setting::Dock, Standing::InPlace, None);
+    let saved = record(7, &[(dock.clone(), Fence(None))], &journal);
+    assert_eq!(parse(&saved, 7, &journal), [(dock, Fence(None))]);
+    let mut entry = saved["rows"][0].clone();
+    entry.as_object_mut().unwrap().remove("journal");
+    let saved = json!({"format": READ_BACK_FORMAT, "revision": 7, "rows": [entry]});
+    assert!(
+        parse(&saved, 7, &journal).is_empty(),
+        "a missing fence supplies no evidence of an empty journal"
+    );
+}
+
+#[test]
+fn unusable_read_backs_do_not_acquire_the_journal_lock() {
+    let journal = Journaled::new();
+    let path = journal.path();
+    let saved = record(7, &[(journal.dock.clone(), journal.fence())], &path);
+    let lock = path.with_file_name(aterm_converge::FileJournal::LOCK);
+    // The fixture's writer has finished; removing its lock file makes the next read observable.
+    std::fs::remove_file(&lock).unwrap();
+    assert_eq!(parse(&saved, 7, &path).len(), 1);
+    assert!(
+        lock.exists(),
+        "CONTROL: a valid reading checks real history"
+    );
+    std::fs::remove_file(&lock).unwrap();
+
+    for (field, value) in [
+        ("row", json!("not-a-row")),
+        (
+            "row",
+            json!(Subject::Setting(Setting::Secrets).setup_word()),
+        ),
+        ("standing", json!("not-a-standing")),
+        ("standing", json!(Standing::Differs.word())),
+        ("wanted", json!(7)),
+        ("read_at", Value::Null),
+    ] {
+        let mut entry = saved["rows"][0].clone();
+        entry
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        let invalid = json!({
+            "format": READ_BACK_FORMAT,
+            "revision": 7,
+            "rows": [entry],
+        });
+        assert!(parse(&invalid, 7, &path).is_empty(), "{field}: {invalid}");
+        assert!(
+            !lock.exists(),
+            "an unusable reading acquired the journal lock: {field}"
+        );
+    }
+}
+
 /// A launch keeps what it read back settled of the private rows, and the next launch reads
 /// it back exactly, its time included, under the same revision while the journal holds no
 /// change written since each row's read started. Anything else is no reading: a row that
@@ -456,6 +516,34 @@ fn a_saved_fence_advances_in_memory_only_after_publication() {
     );
     let value: Value = aterm_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     assert!(value["rows"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn duplicate_subjects_cannot_rebind_a_rejected_readings_fence() {
+    let mut journaled = Journaled::new();
+    let path = journaled.path().with_file_name("read-back.json");
+    let old = journaled.fence();
+    let stale = journaled.dock.clone();
+    journaled.change("init.dock@alice");
+    let fresh = journaled.fence();
+    let current = Observation {
+        now: Some("new reading".to_owned()),
+        ..journaled.dock.clone()
+    };
+    let mut valid = [(current.clone(), fresh)];
+    remember_in(&path, &journaled.path(), 7, &mut valid).unwrap();
+    let saved = std::fs::read(&path).unwrap();
+
+    let mut ambiguous = [(stale, old), (current, fresh)];
+    let before = ambiguous.clone();
+    let result = remember_in(&path, &journaled.path(), 7, &mut ambiguous);
+    assert_eq!(
+        ambiguous[0].1, old,
+        "the rejected stale reading must not inherit the current reading's fence"
+    );
+    assert!(result.is_err(), "duplicate subjects are not a snapshot");
+    assert_eq!(ambiguous, before);
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
 }
 
 /// No launch, save or fence check runs while the real writer rotates. The index retains

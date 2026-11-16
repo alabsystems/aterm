@@ -332,7 +332,11 @@ fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
     let root = world.0.clone();
     let label = job_label("default");
     let _job = Job::new(&label);
-    let (a, sock) = boot(&root, "a", &[(JOB_LABEL_SEAM, &label)]);
+    let (a, sock) = boot(
+        &root,
+        "a",
+        &[(JOB_LABEL_SEAM, &label), ("ATERM_LOG", "info")],
+    );
     let mut last = String::new();
     let answered = aterm_spec::wait::within(crate::keeper_world::FIRST_EXEC_HANG, GAP, || {
         last = keeper_status(&root);
@@ -342,7 +346,8 @@ fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
     });
     assert!(
         answered.is_some(),
-        "the keeper the launch started never answered; its status:\n{last}"
+        "the keeper the launch started never answered; its status:\n{last}\ninstance log:\n{}",
+        crate::headless_boot::log_tail(&root.join("a.log"))
     );
     assert!(
         matches!(

@@ -53,6 +53,32 @@ fn a_child_born_after_a_wall_reading_reads_later_and_none_once_exited() {
     drop(child);
 }
 
+/// Windows has no fork, so every live process reads as exec'd: this process and a spawned
+/// child read `Some(true)`, and a child that exited (its handle still held, so its pid is not
+/// reused yet) and pids 0 and 1 read `None`, as their creation records do. NEGATIVE CONTROL
+/// (run): the reader answering `Some(true)` for any pid fails "an exited process".
+#[test]
+fn every_live_process_reads_as_execd_and_an_exited_one_reads_none() {
+    use crate::spawnfd::Stdio;
+    let own = i32::try_from(std::process::id()).expect("a pid");
+    assert_eq!(super::read_process_execd(own), Some(true), "this process");
+    let mut child = crate::spawnfd::command("cmd")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cmd");
+    let pid = i32::try_from(child.id()).expect("a pid");
+    let live = super::read_process_execd(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(live, Some(true), "a spawned child");
+    assert_eq!(super::read_process_execd(pid), None, "an exited process");
+    assert_eq!(super::read_process_execd(1), None, "never pid 1");
+    assert_eq!(super::read_process_execd(0), None, "never pid 0");
+    drop(child);
+}
+
 #[test]
 fn the_raw_creation_filetime_is_the_untruncated_procstart() {
     const UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;

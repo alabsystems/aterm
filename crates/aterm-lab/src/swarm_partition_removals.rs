@@ -622,7 +622,7 @@ fn carry_among(macs: &[&Mac], ev: &mut Evidence) {
         .iter()
         .filter_map(|m| {
             let store = client::load_records(&m.paths).ok()?;
-            (!store.is_empty()).then(|| (m.name.clone(), store.encode()))
+            (!store.is_empty()).then(|| (m.name.clone(), store.read_encoded().unwrap()))
         })
         .collect();
     for (from, wire) in &wires {

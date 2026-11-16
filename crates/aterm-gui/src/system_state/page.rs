@@ -515,7 +515,11 @@ impl<'a, 'b> Page<'a, 'b> {
             PetGlyphId::PetSitLookup
         } else if self.card.iter().any(|item| item.mark == Mark::Failed) {
             PetGlyphId::PetSitEar
-        } else if hero.total > 0 && hero.done == hero.total && !self.app.status.busy {
+        } else if hero.total > 0
+            && hero.done == hero.total
+            && !hero.as_last_read
+            && !self.app.status.busy
+        {
             PetGlyphId::PetLoaf
         } else if self.app.status.running() {
             PetGlyphId::PetStand
@@ -555,7 +559,7 @@ impl<'a, 'b> Page<'a, 'b> {
             UiContent::Custom(AuditedCustomNode {
                 audit_id: crate::native_ui::SYSTEM_STATE_BRAND_AUDIT,
                 role: SemanticRole::ProgressIndicator,
-                label: "Setup progress".to_owned(),
+                label: self.hero.progress_label().to_owned(),
                 paint: Some(spec.value()),
                 action: None,
                 focusable: false,
@@ -1775,22 +1779,22 @@ impl<'a, 'b> Page<'a, 'b> {
         let title_style = StyleRef::Plain;
         // Every theme names the state before its detail; the switch only names automatic
         // setup. A key's name stays whole on one line where the phrase wraps.
-        let phrase = if !line.phrase.to_lowercase().contains(line.word) {
-            let mut word = line.word.to_owned();
-            if let Some(first) = word.get_mut(..1) {
-                first.make_ascii_uppercase();
-            }
-            format!("{word} · {}", line.phrase)
-        } else {
-            line.phrase.clone()
-        }
-        .replace("Caps Lock", "Caps\u{a0}Lock");
+        let phrase = lines::phrase_with_state(line.word, &line.phrase)
+            .replace("Caps Lock", "Caps\u{a0}Lock");
+        let layout_phrases: Vec<String> = line
+            .layout_phrases
+            .iter()
+            .map(|phrase| phrase.replace("Caps Lock", "Caps\u{a0}Lock"))
+            .collect();
         let phrase_style = if line.quiet {
             StyleRef::Quiet
         } else {
             StyleRef::Secondary
         };
-        let phrase_w = Metrics::words_w(SemanticRole::Text, phrase_style, &phrase);
+        let phrase_w = layout_phrases
+            .iter()
+            .map(|phrase| Metrics::words_w(SemanticRole::Text, phrase_style, phrase))
+            .fold(0.0, f32::max);
         // A fixed title column where it fits, so the phrases line up.
         let title_col = Line::ALL
             .iter()
@@ -1868,7 +1872,14 @@ impl<'a, 'b> Page<'a, 'b> {
                 title_line,
             );
             let pad = ((band - title_line - m.text_line) / 2.0).max(4.0);
-            head_h = (pad * 2.0 + title_h + phrase_h).max(band);
+            let reserved_h = layout_phrases
+                .iter()
+                .map(|phrase| {
+                    lines_in(phrase, SemanticRole::Text, phrase_style, words_room).len() as f32
+                        * m.text_line
+                })
+                .fold(phrase_h, f32::max);
+            head_h = (pad * 2.0 + title_h + reserved_h).max(band);
             info.push(
                 group(format!("{key}/words"))
                     .layout(

@@ -211,44 +211,143 @@ enum Value {
     Other(String),
 }
 
-fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_str => i += 1,
-            b'"' => in_str = !in_str,
-            b'#' if !in_str => return &line[..i],
-            _ => {}
-        }
-        i += 1;
-    }
-    line
+/// Where a scan of TOML text stands: outside any string, or inside one of TOML's four
+/// string kinds.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lexed {
+    Code,
+    Basic,
+    Literal,
+    MultiBasic,
+    MultiLiteral,
 }
 
-const fn depth_delta(line: &str) -> i32 {
-    let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut d = 0i32;
+/// The length of the run of `quote` bytes at the start of `bytes`.
+fn quote_run(bytes: &[u8], quote: u8) -> usize {
+    bytes.iter().take_while(|&&b| b == quote).count()
+}
+
+/// Where a multi-line string's body ends in `body` (the text after its opening delimiter),
+/// and where its closing delimiter ends: the first run of three or more `quote`s outside an
+/// escape closes it, its last three being the delimiter (TOML lets one or two quotes stand
+/// right before it).
+fn multi_line_end(body: &str, quote: u8, escapes: bool) -> Option<(usize, usize)> {
+    let bytes = body.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_str => i += 1,
-            b'"' => in_str = !in_str,
-            b'{' | b'[' if !in_str => d += 1,
-            b'}' | b']' if !in_str => d -= 1,
+        if escapes && bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == quote {
+            let run = quote_run(&bytes[i..], quote);
+            if run >= 3 {
+                return Some((i + run - 3, i + run));
+            }
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The document's entries, each a section header or a `key = value`, with the 1-based line
+/// it starts on: comments removed and the lines of a multi-line array or inline table joined
+/// by a space. Every TOML string kind is read as a string, so a `#`, a bracket or a quote of
+/// the other kind inside one is text, and a multi-line string keeps its newlines.
+fn entries(text: &str, file: &str) -> Result<Vec<(usize, String)>, String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut entry: Vec<u8> = Vec::new();
+    let (mut line, mut start, mut depth, mut lexed, mut i) = (1, 1, 0i32, Lexed::Code, 0);
+    let mut finish = |entry: &mut Vec<u8>, start: usize| -> Result<(), String> {
+        let text = String::from_utf8(std::mem::take(entry))
+            .map_err(|e| format!("{file}:{start}: not UTF-8: {e}"))?;
+        if !text.trim().is_empty() {
+            out.push((start, text.trim().to_string()));
+        }
+        Ok(())
+    };
+    while i < bytes.len() {
+        let b = bytes[i];
+        let mut step = 1;
+        match (lexed, b) {
+            (Lexed::Code, b'#') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            (Lexed::Code, b'\n') => {
+                line += 1;
+                if depth > 0 {
+                    entry.push(b' ');
+                } else {
+                    finish(&mut entry, start)?;
+                    (start, depth) = (line, 0);
+                }
+                i += 1;
+                continue;
+            }
+            (Lexed::Code, b'"' | b'\'') => {
+                let multi = quote_run(&bytes[i..], b) >= 3;
+                (lexed, step) = match (b, multi) {
+                    (b'"', false) => (Lexed::Basic, 1),
+                    (b'"', true) => (Lexed::MultiBasic, 3),
+                    (_, false) => (Lexed::Literal, 1),
+                    (_, true) => (Lexed::MultiLiteral, 3),
+                };
+            }
+            (Lexed::Code, b'[' | b'{') => depth += 1,
+            (Lexed::Code, b']' | b'}') => depth -= 1,
+            (Lexed::Basic | Lexed::MultiBasic, b'\\') => step = 2.min(bytes.len() - i),
+            (Lexed::Basic, b'"') | (Lexed::Literal, b'\'') => lexed = Lexed::Code,
+            (Lexed::Basic | Lexed::Literal, b'\n') => {
+                return Err(format!("{file}:{line}: unterminated string"));
+            }
+            (Lexed::MultiBasic, b'"') | (Lexed::MultiLiteral, b'\'') => {
+                step = quote_run(&bytes[i..], b);
+                if step >= 3 {
+                    lexed = Lexed::Code;
+                }
+            }
             _ => {}
         }
-        i += 1;
+        line += bytes[i..i + step].iter().filter(|&&b| b == b'\n').count();
+        entry.extend_from_slice(&bytes[i..i + step]);
+        i += step;
     }
-    d
+    if lexed != Lexed::Code {
+        return Err(format!("{file}:{start}: unterminated string"));
+    }
+    if depth > 0 {
+        return Err(format!("{file}:{start}: unbalanced brackets in entry"));
+    }
+    finish(&mut entry, start)?;
+    Ok(out)
 }
 
 fn parse_value(s: &str) -> Result<(Value, &str), String> {
     let s = s.trim_start();
     let bytes = s.as_bytes();
     match bytes.first() {
+        Some(&quote) if matches!(quote, b'"' | b'\'') && bytes.starts_with(&[quote; 3]) => {
+            let body = &s[3..];
+            let (end, close) = multi_line_end(body, quote, quote == b'"')
+                .ok_or_else(|| "unterminated string".to_string())?;
+            // A newline right after the opening delimiter is not part of the string.
+            let text = &body[..end];
+            let text = text
+                .strip_prefix("\r\n")
+                .or_else(|| text.strip_prefix('\n'))
+                .unwrap_or(text);
+            Ok((Value::Str(text.to_string()), &body[close..]))
+        }
+        Some(b'\'') => {
+            let end = s[1..]
+                .find('\'')
+                .ok_or_else(|| "unterminated string".to_string())?;
+            Ok((Value::Str(s[1..=end].to_string()), &s[end + 2..]))
+        }
         Some(b'"') => {
             let mut i = 1;
             while i < bytes.len() {
@@ -325,50 +424,26 @@ struct Doc {
 
 fn parse_doc(text: &str, file: &str) -> Result<Doc, String> {
     let mut sections: Vec<(String, Vec<(String, Value)>)> = vec![(String::new(), Vec::new())];
-    let mut lines = text.lines().enumerate().peekable();
-    while let Some((lineno, raw)) = lines.next() {
-        let line = strip_comment(raw).trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') {
-            if !line.ends_with(']') {
+    for (lineno, logical) in entries(text, file)? {
+        if logical.starts_with('[') {
+            if !logical.ends_with(']') {
                 return Err(format!(
-                    "{file}:{}: malformed section header `{line}`",
-                    lineno + 1
+                    "{file}:{lineno}: malformed section header `{logical}`"
                 ));
             }
-            let header = line.trim_matches(['[', ']']).trim().to_string();
+            let header = logical.trim_matches(['[', ']']).trim().to_string();
             sections.push((header, Vec::new()));
             continue;
         }
-        let mut logical = line.to_string();
-        let mut depth = depth_delta(line);
-        while depth > 0 {
-            let Some((_, next)) = lines.next() else {
-                return Err(format!(
-                    "{file}:{}: unbalanced brackets in entry",
-                    lineno + 1
-                ));
-            };
-            let next = strip_comment(next).trim();
-            depth += depth_delta(next);
-            logical.push(' ');
-            logical.push_str(next);
-        }
-        let eq = logical.find('=').ok_or_else(|| {
-            format!(
-                "{file}:{}: expected `key = value`, got `{logical}`",
-                lineno + 1
-            )
-        })?;
+        let eq = logical
+            .find('=')
+            .ok_or_else(|| format!("{file}:{lineno}: expected `key = value`, got `{logical}`"))?;
         let key = logical[..eq].trim().to_string();
         let (value, rest) =
-            parse_value(&logical[eq + 1..]).map_err(|e| format!("{file}:{}: {e}", lineno + 1))?;
+            parse_value(&logical[eq + 1..]).map_err(|e| format!("{file}:{lineno}: {e}"))?;
         if !rest.trim().is_empty() {
             return Err(format!(
-                "{file}:{}: trailing text `{}` after value",
-                lineno + 1,
+                "{file}:{lineno}: trailing text `{}` after value",
                 rest.trim()
             ));
         }

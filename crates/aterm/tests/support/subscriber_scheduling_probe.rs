@@ -476,7 +476,8 @@ mod native {
             // every retained record if one exists; an empty stream is no POST.
             let records = client::load_records(&admin_paths)
                 .map_err(io::Error::other)?
-                .encode_held();
+                .read_held()
+                .unwrap();
             if !records.is_empty() {
                 aterm_secrets::transport::post_records(&url, &records).map_err(io::Error::other)?;
             }

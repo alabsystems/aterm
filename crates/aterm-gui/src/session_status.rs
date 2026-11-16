@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 #[path = "session_program.rs"]
 pub(crate) mod program;
 
+#[path = "session_status_schedule.rs"]
+mod schedule;
+
+use schedule::ScheduledStatuses;
+
 /// Native claim fields shared by the full App record and the display-free
 /// host. They describe the currently admitted claim, never fixture assertions.
 pub(crate) fn native_supervisor_fields(
@@ -3821,8 +3826,6 @@ pub(crate) const NATIVE_SWEEP: Duration = Duration::from_secs(1);
 /// Per-session status classifier table enforcing observation intervals and scheduling wakes.
 #[derive(Debug)]
 pub(crate) struct StatusObserver {
-    policy: StatusPolicy,
-    min_interval: Duration,
     badge: bool,
     sessions: ScheduledStatuses,
     census_initialized: bool,
@@ -3830,13 +3833,11 @@ pub(crate) struct StatusObserver {
     /// The last native sweep's time and whether it left an operation open.
     native_swept: Option<(Instant, bool)>,
     unclassified: Vec<u64>,
-    agents: std::collections::HashMap<u64, AgentWatch>,
     agent_seq: u64,
     agent_cleared_at: u64,
     programs: program::ProgramResolver,
     pub(crate) inputs: crate::input_stall::InputWatches,
     footer_asked: std::collections::HashMap<u64, FooterAsk>,
-    pub(crate) rollout_asked: std::collections::HashMap<u64, crate::codex_rollout_tap::RolloutAsk>,
     pub(crate) slog_wakes: crate::session_log::Wakes,
     pub(crate) slog_memory: crate::session_log::MemorySweep,
     program_states: std::collections::HashMap<u64, crate::program_state::ProgramStateGate>,
@@ -3883,101 +3884,6 @@ impl SessionSlot {
     }
 }
 
-/// Owns both classifier membership and its observation deadlines. Mutable classifier access
-/// cannot change a deadline; insertion, rescheduling and removal maintain the ordered index here.
-#[derive(Debug, Default)]
-struct ScheduledStatuses {
-    slots: std::collections::HashMap<u64, ScheduledStatus>,
-    deadlines: std::collections::BTreeSet<(Instant, u64)>,
-}
-
-#[derive(Debug)]
-struct ScheduledStatus {
-    state: SessionSlot,
-    next_due: Instant,
-}
-
-impl std::ops::Deref for ScheduledStatus {
-    type Target = SessionSlot;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state
-    }
-}
-
-impl ScheduledStatuses {
-    fn ensure(&mut self, id: u64, policy: StatusPolicy, now: Instant) -> &mut SessionSlot {
-        let slot = self.slots.entry(id).or_insert_with(|| {
-            self.deadlines.insert((now, id));
-            ScheduledStatus {
-                state: SessionSlot::new(policy, now),
-                next_due: now,
-            }
-        });
-        &mut slot.state
-    }
-
-    fn get(&self, id: &u64) -> Option<&ScheduledStatus> {
-        self.slots.get(id)
-    }
-
-    fn get_mut(&mut self, id: &u64) -> Option<&mut SessionSlot> {
-        self.slots.get_mut(id).map(|slot| &mut slot.state)
-    }
-
-    fn contains_key(&self, id: &u64) -> bool {
-        self.slots.contains_key(id)
-    }
-
-    fn values(&self) -> impl Iterator<Item = &ScheduledStatus> {
-        self.slots.values()
-    }
-
-    fn reschedule(&mut self, id: u64, due: Instant) {
-        if let Some(slot) = self.slots.get_mut(&id) {
-            self.deadlines.remove(&(slot.next_due, id));
-            slot.next_due = due;
-            self.deadlines.insert((due, id));
-        }
-    }
-
-    fn any_due(&self, now: Instant) -> bool {
-        self.deadlines.first().is_some_and(|(due, _)| *due <= now)
-    }
-
-    fn due_ids(&self, now: Instant) -> Vec<u64> {
-        self.deadlines
-            .iter()
-            .take_while(|(due, _)| *due <= now)
-            .map(|(_, id)| *id)
-            .collect()
-    }
-
-    fn remove(&mut self, id: &u64) {
-        if let Some(slot) = self.slots.remove(id) {
-            self.deadlines.remove(&(slot.next_due, *id));
-        }
-    }
-
-    fn reconfigure(&mut self, policy: StatusPolicy, latest: Instant) {
-        self.deadlines.clear();
-        for (id, slot) in &mut self.slots {
-            slot.state.fsm.policy = policy;
-            slot.next_due = slot.next_due.min(latest);
-            self.deadlines.insert((slot.next_due, *id));
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.slots.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.slots.clear();
-        self.deadlines.clear();
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct FailureMark {
     failing: bool,
@@ -4017,21 +3923,17 @@ impl StatusObserver {
     /// Creates a [`StatusObserver`] with `policy` and minimum per-session observation interval.
     pub(crate) fn new(policy: StatusPolicy, min_interval: Duration) -> Self {
         Self {
-            policy,
-            min_interval,
             badge: true,
-            sessions: ScheduledStatuses::default(),
+            sessions: ScheduledStatuses::new(policy, min_interval),
             census_initialized: false,
             swept_pool_epoch: 0,
             native_swept: None,
             unclassified: Vec::new(),
-            agents: std::collections::HashMap::new(),
             agent_seq: 0,
             agent_cleared_at: 0,
             programs: program::ProgramResolver::default(),
             inputs: crate::input_stall::InputWatches::default(),
             footer_asked: std::collections::HashMap::new(),
-            rollout_asked: std::collections::HashMap::new(),
             slog_wakes: crate::session_log::Wakes::default(),
             slog_memory: crate::session_log::MemorySweep::default(),
             program_states: std::collections::HashMap::new(),
@@ -4160,7 +4062,7 @@ impl StatusObserver {
         at: (Instant, Option<Instant>),
         wake: &crate::claude_footer::LogWake,
     ) {
-        use crate::codex_rollout_tap::{Look, due, follow_ask};
+        use crate::codex_rollout_tap::{Look, follow_ask};
         let target = crate::self_claim::fronts_claimant(program)
             .then(|| crate::self_claim::tap_target(ctx, pgid))
             .flatten();
@@ -4172,21 +4074,38 @@ impl StatusObserver {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .codex_terminals()
                 .is_some();
-        follow_ask(
-            due(
-                &mut self.rollout_asked,
-                session,
-                target,
-                Some(Look {
-                    screen: generation,
-                    counted,
-                }),
-                at,
-            ),
+        let ask = self.rollout_action(
             session,
-            ctx,
-            wake,
+            target,
+            Some(Look {
+                screen: generation,
+                counted,
+            }),
+            at,
         );
+        follow_ask(ask, session, ctx, wake);
+    }
+
+    /// Advances one session's rollout cadence and its owned transition deadline together.
+    pub(crate) fn rollout_action(
+        &mut self,
+        session: u64,
+        target: Option<crate::self_claim::TapTarget>,
+        look: Option<crate::codex_rollout_tap::Look>,
+        at: (Instant, Option<Instant>),
+    ) -> crate::codex_rollout_tap::Ask {
+        self.sessions.edit(session, |record| {
+            crate::codex_rollout_tap::due(&mut record.rollout, target, look, at)
+        })
+    }
+
+    /// Returns the owned rollout cadence state for assertions in this crate's fixtures.
+    #[cfg(test)]
+    pub(crate) fn rollout_ask(
+        &self,
+        session: u64,
+    ) -> Option<&crate::codex_rollout_tap::RolloutAsk> {
+        self.sessions.rollout(&session)
     }
 
     /// Hands `session`'s harness pairing read wait (with the instant a read settles it from), or
@@ -4197,7 +4116,9 @@ impl StatusObserver {
         session: u64,
         wait: Option<(crate::session_log::transcript::ReadWait, Instant)>,
     ) {
-        crate::codex_rollout_tap::pair_wait(&mut self.rollout_asked, session, wait);
+        self.sessions.edit_existing(session, |record| {
+            crate::codex_rollout_tap::pair_wait(&mut record.rollout, wait);
+        });
     }
 
     /// Returns the published [`crate::input_stall::InputStallFact`] for `session`, if any.
@@ -4290,7 +4211,8 @@ impl StatusObserver {
         if !self.sessions.contains_key(&session) {
             return;
         }
-        self.sessions.reschedule(session, now + self.min_interval);
+        self.sessions
+            .reschedule(session, now + self.sessions.min_interval());
         self.note_output(session, now);
     }
 
@@ -4305,39 +4227,40 @@ impl StatusObserver {
         now: Instant,
         print: impl FnOnce() -> u64,
     ) -> u64 {
-        let policy = self.policy;
-        let slot = self.sessions.ensure(session, policy, now);
-        match slot.screen {
-            Some((at, screen)) if at == clock => screen,
-            _ => {
-                let screen = print();
-                slot.screen = Some((clock, screen));
-                screen
-            }
-        }
+        self.sessions
+            .with_classified(session, now, |slot| match slot.screen {
+                Some((at, screen)) if at == clock => screen,
+                _ => {
+                    let screen = print();
+                    slot.screen = Some((clock, screen));
+                    screen
+                }
+            })
     }
 
     /// Folds `evidence` into `session`'s [`StatusFsm`] at `now` and returns whether its status changed.
     pub(crate) fn observe(&mut self, session: u64, evidence: &Evidence, now: Instant) -> bool {
-        let policy = self.policy;
-        let slot = self.sessions.ensure(session, policy, now);
-        let changed = match slot.lifecycle {
-            Some(lifecycle) => {
-                let mut evidence = *evidence;
-                evidence.lifecycle = Some(lifecycle);
-                slot.fsm.observe(&evidence, now)
+        let interval = self.sessions.min_interval();
+        self.sessions.with_classified(session, now, |scheduled| {
+            let slot = &mut **scheduled;
+            let changed = match slot.lifecycle {
+                Some(lifecycle) => {
+                    let mut evidence = *evidence;
+                    evidence.lifecycle = Some(lifecycle);
+                    slot.fsm.observe(&evidence, now)
+                }
+                None => slot.fsm.observe(evidence, now),
+            };
+            if changed {
+                slot.revision = slot.revision.saturating_add(1);
             }
-            None => slot.fsm.observe(evidence, now),
-        };
-        if changed {
-            slot.revision = slot.revision.saturating_add(1);
-        }
-        slot.failure.note(
-            slot.fsm.status().last_outcome.is_failure(),
-            evidence.completed_block.map(|b| b.id),
-        );
-        self.sessions.reschedule(session, now + self.min_interval);
-        changed
+            slot.failure.note(
+                slot.fsm.status().last_outcome.is_failure(),
+                evidence.completed_block.map(|block| block.id),
+            );
+            scheduled.next_due = now + interval;
+            changed
+        })
     }
 
     /// Records that `session`'s PTY exited with `how` and immediately classifies it as `Exited`.
@@ -4348,8 +4271,9 @@ impl StatusObserver {
         evidence: &Evidence,
         now: Instant,
     ) -> bool {
-        let policy = self.policy;
-        self.sessions.ensure(session, policy, now).lifecycle = Some(lifecycle);
+        self.sessions.with_classified(session, now, |slot| {
+            slot.lifecycle = Some(lifecycle);
+        });
         self.observe(session, evidence, now)
     }
 
@@ -4360,83 +4284,18 @@ impl StatusObserver {
 
     /// Returns the earliest instant when any session requires a time-driven status transition.
     pub(crate) fn next_wake(&self) -> Option<Instant> {
-        let agent_wake = self
-            .agents
-            .iter()
-            .filter_map(|(id, w)| {
-                let slot = self.sessions.get(id)?;
-                let followup = w.followup.then(|| {
-                    w.output_at.map_or(slot.next_due, |at| {
-                        at.checked_add(self.min_interval)
-                            .unwrap_or(at)
-                            .max(slot.next_due)
-                    })
-                });
-                let unresolved = if w.pgid > 0 && w.program_seen == Some(None) {
-                    w.resolved_at.map(|at| {
-                        (at + unresolved_program_recheck(w.resolve_attempts)).max(slot.next_due)
-                    })
-                } else {
-                    None
-                };
-                let confirmation = w
-                    .deferred_name_recheck_at
-                    .filter(|_| w.pgid > 0)
-                    .map(|at| at.max(slot.next_due));
-                let build_wait = w
-                    .resolved_at
-                    .filter(|_| w.build_waiting && w.pgid > 0)
-                    .map(|at| (at + PROGRAM_RECHECK).max(slot.next_due));
-                let settle = w
-                    .rest_at
-                    .map(|at| (at + AGENT_MIN_INTERVAL).max(slot.next_due));
-                let kimi = w.kimi_again.then(|| {
-                    w.read_at.map_or(slot.next_due, |at| {
-                        (at + AGENT_MIN_INTERVAL).max(slot.next_due)
-                    })
-                });
-                let unread = (w.kimi && w.input.look.is_some_and(|look| look.known && !look.read))
-                    .then_some(slot.next_due);
-                [
-                    followup,
-                    unresolved,
-                    confirmation,
-                    build_wait,
-                    settle,
-                    kimi,
-                    unread,
-                ]
-                .into_iter()
-                .flatten()
-                .min()
-            })
-            .min();
-        let rollout_wake = self
-            .rollout_asked
-            .iter()
-            .filter_map(|(id, ask)| {
-                let slot = self.sessions.get(id)?;
-                ask.wake().map(|at| at.max(slot.next_due))
-            })
-            .min();
-        let owed = self
-            .sessions
-            .values()
-            .filter_map(|slot| {
-                // Clamp to `next_due`.
-                slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
-            })
-            .min();
-        [owed, agent_wake, rollout_wake].into_iter().flatten().min()
+        self.sessions.next_wake()
     }
 
     /// Schedules a follow-up observation for `session` after the off-thread program resolver completes.
     pub(crate) fn note_program_answered(&mut self, session: u64) {
-        if self.sessions.contains_key(&session)
-            && let Some(watch) = self.agents.get_mut(&session)
-        {
-            watch.followup = true;
-        }
+        self.sessions.edit_existing(session, |record| {
+            if record.classified.is_some()
+                && let Some(watch) = &mut record.agent
+            {
+                watch.followup = true;
+            }
+        });
     }
 
     /// Returns the published [`Status`] for `session`, if classified.
@@ -4455,8 +4314,8 @@ impl StatusObserver {
     /// Marks `session`'s current failure outcome as seen by the user and returns whether its badge cleared.
     pub(crate) fn note_seen(&mut self, session: u64) -> bool {
         self.sessions
-            .get_mut(&session)
-            .is_some_and(|slot| slot.failure.see())
+            .edit_classified(session, |slot| slot.failure.see())
+            .unwrap_or(false)
     }
 
     /// Returns whether `session`'s current failure outcome has already been seen by the user.
@@ -4479,14 +4338,18 @@ impl StatusObserver {
         &mut self,
         session: u64,
     ) -> Option<crate::session_log::observed::StatusFacts> {
-        let slot = self.sessions.get_mut(&session)?;
-        let status = slot.fsm.status();
-        let key = (status.phase, status.last_outcome);
-        if slot.evented == Some(key) {
-            return None;
-        }
-        slot.evented = Some(key);
-        Some(status_facts(status))
+        self.sessions
+            .edit_classified(session, |scheduled| {
+                let slot = &mut **scheduled;
+                let status = slot.fsm.status();
+                let key = (status.phase, status.last_outcome);
+                if slot.evented == Some(key) {
+                    return None;
+                }
+                slot.evented = Some(key);
+                Some(status_facts(status))
+            })
+            .flatten()
     }
 
     /// Returns `session`'s published agent reading and sequence number.
@@ -4494,7 +4357,7 @@ impl StatusObserver {
         &self,
         session: u64,
     ) -> (u64, Option<crate::presence::AgentReading>) {
-        match self.agents.get(&session) {
+        match self.sessions.agent(&session) {
             Some(w) if w.reading_seq > 0 => (w.reading_seq, w.reading.clone()),
             _ => (self.agent_cleared_at, None),
         }
@@ -4502,8 +4365,8 @@ impl StatusObserver {
 
     /// Returns the program name under which `session`'s standing agent reading was classified.
     pub(crate) fn agent_reading_program(&self, session: u64) -> Option<&str> {
-        self.agents
-            .get(&session)
+        self.sessions
+            .agent(&session)
             .filter(|w| w.reading_seq > 0)
             .and_then(|w| w.program_seen.as_ref())
             .and_then(Option::as_deref)
@@ -4512,14 +4375,16 @@ impl StatusObserver {
     /// Overrides the program name recorded for `session`'s standing agent reading in tests.
     #[cfg(test)]
     pub(crate) fn stand_in_reading_program(&mut self, session: u64, program: &str) {
-        if let Some(w) = self.agents.get_mut(&session) {
-            w.program_seen = Some(Some(program.to_owned()));
-        }
+        self.sessions.edit_existing(session, |record| {
+            if let Some(watch) = &mut record.agent {
+                watch.program_seen = Some(Some(program.to_owned()));
+            }
+        });
     }
 
     /// Returns the sequence number of `session`'s published agent reading.
     pub(crate) fn agent_reading_seq(&self, session: u64) -> u64 {
-        match self.agents.get(&session) {
+        match self.sessions.agent(&session) {
             Some(w) if w.reading_seq > 0 => w.reading_seq,
             _ => self.agent_cleared_at,
         }
@@ -4527,19 +4392,17 @@ impl StatusObserver {
 
     /// Marks `session` as owing an agent screen read after new PTY output arrives.
     pub(crate) fn note_output(&mut self, session: u64, now: Instant) {
-        if let Some(w) = self.agents.get_mut(&session) {
-            w.followup = true;
-            w.output_at = Some(now);
-        }
+        self.sessions.edit_existing(session, |record| {
+            if let Some(watch) = &mut record.agent {
+                watch.followup = true;
+                watch.output_at = Some(now);
+            }
+        });
     }
 
     /// Schedules one additional observation for `session` at its next ordinary interval.
     pub(crate) fn owe_look(&mut self, session: u64) {
-        if self.sessions.contains_key(&session)
-            && let Some(w) = self.agents.get_mut(&session)
-        {
-            w.followup = true;
-        }
+        self.note_program_answered(session);
     }
 
     /// Notes one `look` at `session`'s input ([`aterm_session::sink::SinkWriter::input_look`]),
@@ -4558,18 +4421,16 @@ impl StatusObserver {
         look: aterm_session::sink::InputLook,
         wall_ms: u64,
     ) {
-        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
-            pgid: -1,
-            ..AgentWatch::default()
-        });
-        let quiet = look.read
-            && w.input
-                .look
-                .is_some_and(|last| last.read && last.mark == look.mark);
-        if look.known && !quiet {
-            w.input.ms = w.input.ms.max(wall_ms);
-        }
-        w.input.look = Some(look);
+        self.sessions.with_agent(session, |w| {
+            let quiet = look.read
+                && w.input
+                    .look
+                    .is_some_and(|last| last.read && last.mark == look.mark);
+            if look.known && !quiet {
+                w.input.ms = w.input.ms.max(wall_ms);
+            }
+            w.input.look = Some(look);
+        })
     }
 
     /// Returns whether the current sweep should read `session`'s terminal screen rows for agent
@@ -4588,35 +4449,34 @@ impl StatusObserver {
         runs: bool,
         now: Instant,
     ) -> bool {
-        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
-            pgid: -1,
-            ..AgentWatch::default()
-        });
-        let program_moved = w.program_seen.as_ref() != Some(program);
-        let settle_due = w
-            .rest_at
-            .is_some_and(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
-        let moved = w.seq_seen != Some(generation)
-            || w.cursor_seen != Some(cursor)
-            || program_moved
-            || w.runs_seen != runs
-            || settle_due
-            || w.kimi_again
-            || w.kimi_box
-                .is_some_and(|seen| seen.input_ms() != w.input.moment());
-        if !moved {
-            return false;
-        }
-        let last = if program_moved {
-            w.classified_at
-        } else {
-            w.read_at
-        };
-        let floor = last.is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
-        if !floor {
-            w.followup = true;
-        }
-        floor
+        self.sessions.with_agent(session, |w| {
+            let program_moved = w.program_seen.as_ref() != Some(program);
+            let settle_due = w
+                .rest_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
+            let moved = w.seq_seen != Some(generation)
+                || w.cursor_seen != Some(cursor)
+                || program_moved
+                || w.runs_seen != runs
+                || settle_due
+                || w.kimi_again
+                || w.kimi_box
+                    .is_some_and(|seen| seen.input_ms() != w.input.moment());
+            if !moved {
+                return false;
+            }
+            let last = if program_moved {
+                w.classified_at
+            } else {
+                w.read_at
+            };
+            let floor =
+                last.is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
+            if !floor {
+                w.followup = true;
+            }
+            floor
+        })
     }
 
     #[allow(
@@ -4650,207 +4510,212 @@ impl StatusObserver {
         now: Instant,
     ) -> AgentStep {
         let signs = signs.into();
-        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
-            pgid: -1,
-            ..AgentWatch::default()
-        });
-        let group_moved = w.pgid != pgid;
-        let program = if w.pgid > 0 && group_moved {
-            None
-        } else {
-            program
-        };
-        if group_moved {
-            w.pgid = pgid;
-            w.deferred_name_recheck_at = None;
-            w.name_confirmed = false;
-            if w.frame.is_some_and(|(g, _)| g != pgid) {
-                w.frame = None;
-            }
-        }
-        let program_moved = w.program_seen.as_ref() != Some(&program);
-        let screen_moved = w.seq_seen != Some(generation) || w.cursor_seen != Some(cursor);
-        if let Some(name) = program.as_deref() {
-            w.resolve_attempts = 0;
-            let recognized_agent = aterm_phase::program_of(name).is_some();
-            // A frame arriving during a lookup still needs its own confirmation:
-            // that lookup may have read the shell before it launched the agent.
-            if pgid > 0
-                && !group_moved
-                && w.deferred_name_recheck_at.is_none()
-                && !recognized_agent
-                && (!w.name_confirmed || screen_moved || program_moved)
-            {
-                let floor = if w.name_confirmed {
-                    PROGRAM_NAMED_RECHECK_FLOOR
-                } else {
-                    PROGRAM_NAME_CONFIRM
-                };
-                let since_request = w.resolved_at.map_or(now, |at| at + floor);
-                w.deferred_name_recheck_at = Some((now + PROGRAM_NAME_CONFIRM).max(since_request));
-            }
-            if recognized_agent {
-                w.deferred_name_recheck_at = None;
-                if !group_moved && !resolving {
-                    w.name_confirmed = true;
-                }
-            }
-        } else {
-            w.deferred_name_recheck_at = None;
-            w.name_confirmed = false;
-        }
-        let Some(rows) = rows else {
-            let handback = group_moved && pgid > 0;
-            w.followup = resolving || program_moved || screen_moved || handback;
-            if group_moved {
-                w.program_seen = None;
-                if handback
-                    && w.classified_at
-                        .is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL)
-                    && self.sessions.contains_key(&session)
-                {
-                    w.output_at = None;
-                    self.sessions.reschedule(session, now);
-                }
-            }
-            return AgentStep::default();
-        };
-        w.read_at = Some(now);
-        let moved = screen_moved;
-        if moved || w.screen_at.is_none() {
-            w.screen_at = Some(now);
-        }
-        w.seq_seen = Some(generation);
-        w.cursor_seen = Some(cursor);
-        w.followup = moved || resolving;
-        let runs = crate::presence::runs_bit(signs);
-        if runs {
-            w.rest_at = None;
-        } else if w.runs_seen {
-            w.rest_at = Some(now);
-        }
-        w.runs_seen = runs;
-        let settling = w
-            .rest_at
-            .is_some_and(|at| now.saturating_duration_since(at) < AGENT_MIN_INTERVAL);
-        let hash = zone_hash(crate::presence::live_zone(&rows), cursor, runs);
-        if w.zone_hash == Some(hash) && !program_moved && w.rest_at.is_none() {
-            return AgentStep {
-                zone_unchanged: true,
-                ..AgentStep::default()
-            };
-        }
-        w.zone_hash = Some(hash);
-        w.program_seen = Some(program.clone());
-        w.classified_at = Some(now);
-        let known = w.frame.filter(|(g, _)| *g == pgid).map(|(_, p)| p);
-        let pending = program.is_none() && pgid > 0;
-        let mut verdict = crate::presence::agent_verdict_guarded(
-            session,
-            program.as_deref(),
-            pending,
-            known,
-            &rows,
-            cursor,
-            signs,
-            now,
-        );
-        // A Kimi Bash box the screen reads as read-only is judged against Kimi's own record too.
-        // That verdict rests on more than the live zone (the record, and the tab's input), so the
-        // next screen is classified whole, and a box not yet settled is read again though nothing
-        // moves (a request may land on disk after it).
-        let judged = crate::kimi_record::judge(
-            session,
-            pgid,
-            &mut verdict,
-            || crate::presence::prompt_drawn(aterm_phase::Program::Kimi, &rows),
-            (w.input.moment(), w.screen_at.unwrap_or(now)),
-            &mut w.kimi_box,
-            now,
-        );
-        w.kimi_again = judged == crate::kimi_record::Judged::Again;
-        // Only a Kimi box is judged against when its program read its input.
-        w.kimi = match verdict.program() {
-            Some(aterm_phase::Program::Kimi) => true,
-            Some(
-                aterm_phase::Program::Claude
-                | aterm_phase::Program::Codex
-                | aterm_phase::Program::Agy
-                | aterm_phase::Program::Muse
-                | aterm_phase::Program::Grok
-                | aterm_phase::Program::Generic,
-            )
-            | None => false,
-        };
-        if judged != crate::kimi_record::Judged::Untouched {
-            w.zone_hash = None;
-        }
-        if let crate::presence::AgentVerdict::Agent {
-            by_frame: true,
-            program,
-            ..
-        } = &verdict
-        {
-            w.frame = Some((pgid, *program));
-        }
-        if w.rest_at.is_some() {
-            let ended = verdict.reading().is_none_or(|r| {
-                matches!(r.phase, crate::presence::AgentPhase::Busy)
-                    || verdict
-                        .program()
-                        .is_some_and(|p| p.reader().end_drawn(&rows))
+        let agent_seq = &mut self.agent_seq;
+        self.sessions.edit(session, |record| {
+            let w = record.agent.get_or_insert_with(|| AgentWatch {
+                pgid: -1,
+                ..AgentWatch::default()
             });
-            if settling && !ended {
-                w.zone_hash = None;
-                w.followup = true;
-                return AgentStep::default();
-            }
-            w.rest_at = None;
-        }
-        let reading = verdict.reading().cloned();
-        let reading_changed = reading != w.reading;
-        if judged != crate::kimi_record::Judged::Untouched
-            && !moved
-            && !program_moved
-            && !reading_changed
-        {
-            // A box read again for its record alone, on a screen that did not move, that reads
-            // as it did: the published verdict stands for this screen, as an unchanged zone's.
-            return AgentStep {
-                zone_unchanged: true,
-                ..AgentStep::default()
+            let group_moved = w.pgid != pgid;
+            let program = if w.pgid > 0 && group_moved {
+                None
+            } else {
+                program
             };
-        }
-        if reading_changed {
-            self.agent_seq += 1;
-            w.reading = reading;
-            w.reading_seq = self.agent_seq;
-        }
-        let subject = verdict.subject().map(str::to_string);
-        let gauges = crate::session_timeline::AgentGauges {
-            ctx_pct: w.reading.as_ref().and_then(|r| r.context_pct),
-            shells: match verdict.program() {
-                Some(aterm_phase::Program::Claude) => aterm_phase::shells_running(&rows),
-                // codex-alab draws no count aterm reads: its record's claim joins at
-                // SessionTimeline::gauges.
+            if group_moved {
+                w.pgid = pgid;
+                w.deferred_name_recheck_at = None;
+                w.name_confirmed = false;
+                if w.frame.is_some_and(|(g, _)| g != pgid) {
+                    w.frame = None;
+                }
+            }
+            let program_moved = w.program_seen.as_ref() != Some(&program);
+            let screen_moved = w.seq_seen != Some(generation) || w.cursor_seen != Some(cursor);
+            if let Some(name) = program.as_deref() {
+                w.resolve_attempts = 0;
+                let recognized_agent = aterm_phase::program_of(name).is_some();
+                // A frame arriving during a lookup still needs its own confirmation:
+                // that lookup may have read the shell before it launched the agent.
+                if pgid > 0
+                    && !group_moved
+                    && w.deferred_name_recheck_at.is_none()
+                    && !recognized_agent
+                    && (!w.name_confirmed || screen_moved || program_moved)
+                {
+                    let floor = if w.name_confirmed {
+                        PROGRAM_NAMED_RECHECK_FLOOR
+                    } else {
+                        PROGRAM_NAME_CONFIRM
+                    };
+                    let since_request = w.resolved_at.map_or(now, |at| at + floor);
+                    w.deferred_name_recheck_at =
+                        Some((now + PROGRAM_NAME_CONFIRM).max(since_request));
+                }
+                if recognized_agent {
+                    w.deferred_name_recheck_at = None;
+                    if !group_moved && !resolving {
+                        w.name_confirmed = true;
+                    }
+                }
+            } else {
+                w.deferred_name_recheck_at = None;
+                w.name_confirmed = false;
+            }
+            let Some(rows) = rows else {
+                let handback = group_moved && pgid > 0;
+                w.followup = resolving || program_moved || screen_moved || handback;
+                if group_moved {
+                    w.program_seen = None;
+                    if handback
+                        && w.classified_at.is_none_or(|at| {
+                            now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL
+                        })
+                        && let Some(slot) = record.classified.as_mut()
+                    {
+                        w.output_at = None;
+                        slot.next_due = now;
+                    }
+                }
+                return AgentStep::default();
+            };
+            w.read_at = Some(now);
+            let moved = screen_moved;
+            if moved || w.screen_at.is_none() {
+                w.screen_at = Some(now);
+            }
+            w.seq_seen = Some(generation);
+            w.cursor_seen = Some(cursor);
+            w.followup = moved || resolving;
+            let runs = crate::presence::runs_bit(signs);
+            if runs {
+                w.rest_at = None;
+            } else if w.runs_seen {
+                w.rest_at = Some(now);
+            }
+            w.runs_seen = runs;
+            let settling = w
+                .rest_at
+                .is_some_and(|at| now.saturating_duration_since(at) < AGENT_MIN_INTERVAL);
+            let hash = zone_hash(crate::presence::live_zone(&rows), cursor, runs);
+            if w.zone_hash == Some(hash) && !program_moved && w.rest_at.is_none() {
+                return AgentStep {
+                    zone_unchanged: true,
+                    ..AgentStep::default()
+                };
+            }
+            w.zone_hash = Some(hash);
+            w.program_seen = Some(program.clone());
+            w.classified_at = Some(now);
+            let known = w.frame.filter(|(g, _)| *g == pgid).map(|(_, p)| p);
+            let pending = program.is_none() && pgid > 0;
+            let mut verdict = crate::presence::agent_verdict_guarded(
+                session,
+                program.as_deref(),
+                pending,
+                known,
+                &rows,
+                cursor,
+                signs,
+                now,
+            );
+            // A Kimi Bash box the screen reads as read-only is judged against Kimi's own record too.
+            // That verdict rests on more than the live zone (the record, and the tab's input), so the
+            // next screen is classified whole, and a box not yet settled is read again though nothing
+            // moves (a request may land on disk after it).
+            let judged = crate::kimi_record::judge(
+                session,
+                pgid,
+                &mut verdict,
+                || crate::presence::prompt_drawn(aterm_phase::Program::Kimi, &rows),
+                (w.input.moment(), w.screen_at.unwrap_or(now)),
+                &mut w.kimi_box,
+                now,
+            );
+            w.kimi_again = judged == crate::kimi_record::Judged::Again;
+            // Only a Kimi box is judged against when its program read its input.
+            w.kimi = match verdict.program() {
+                Some(aterm_phase::Program::Kimi) => true,
                 Some(
-                    aterm_phase::Program::Codex
-                    | aterm_phase::Program::Grok
-                    | aterm_phase::Program::Kimi
+                    aterm_phase::Program::Claude
+                    | aterm_phase::Program::Codex
                     | aterm_phase::Program::Agy
                     | aterm_phase::Program::Muse
+                    | aterm_phase::Program::Grok
                     | aterm_phase::Program::Generic,
                 )
-                | None => None,
-            },
-        };
-        AgentStep {
-            reading_changed,
-            turn: verdict.turn(),
-            publish: Some((verdict.word(), verdict.detail(), subject, verdict.program())),
-            gauges,
-            zone_unchanged: false,
-        }
+                | None => false,
+            };
+            if judged != crate::kimi_record::Judged::Untouched {
+                w.zone_hash = None;
+            }
+            if let crate::presence::AgentVerdict::Agent {
+                by_frame: true,
+                program,
+                ..
+            } = &verdict
+            {
+                w.frame = Some((pgid, *program));
+            }
+            if w.rest_at.is_some() {
+                let ended = verdict.reading().is_none_or(|r| {
+                    matches!(r.phase, crate::presence::AgentPhase::Busy)
+                        || verdict
+                            .program()
+                            .is_some_and(|p| p.reader().end_drawn(&rows))
+                });
+                if settling && !ended {
+                    w.zone_hash = None;
+                    w.followup = true;
+                    return AgentStep::default();
+                }
+                w.rest_at = None;
+            }
+            let reading = verdict.reading().cloned();
+            let reading_changed = reading != w.reading;
+            if judged != crate::kimi_record::Judged::Untouched
+                && !moved
+                && !program_moved
+                && !reading_changed
+            {
+                // A box read again for its record alone, on a screen that did not move, that reads
+                // as it did: the published verdict stands for this screen, as an unchanged zone's.
+                return AgentStep {
+                    zone_unchanged: true,
+                    ..AgentStep::default()
+                };
+            }
+            if reading_changed {
+                *agent_seq += 1;
+                w.reading = reading;
+                w.reading_seq = *agent_seq;
+            }
+            let subject = verdict.subject().map(str::to_string);
+            let gauges = crate::session_timeline::AgentGauges {
+                ctx_pct: w.reading.as_ref().and_then(|r| r.context_pct),
+                shells: match verdict.program() {
+                    Some(aterm_phase::Program::Claude) => aterm_phase::shells_running(&rows),
+                    // codex-alab draws no count aterm reads: its record's claim joins at
+                    // SessionTimeline::gauges.
+                    Some(
+                        aterm_phase::Program::Codex
+                        | aterm_phase::Program::Grok
+                        | aterm_phase::Program::Kimi
+                        | aterm_phase::Program::Agy
+                        | aterm_phase::Program::Muse
+                        | aterm_phase::Program::Generic,
+                    )
+                    | None => None,
+                },
+            };
+            AgentStep {
+                reading_changed,
+                turn: verdict.turn(),
+                publish: Some((verdict.word(), verdict.detail(), subject, verdict.program())),
+                gauges,
+                zone_unchanged: false,
+            }
+        })
     }
 
     /// Returns whether `session`'s foreground process group leader should be resolved now.
@@ -4865,7 +4730,7 @@ impl StatusObserver {
         if group_changed {
             return true;
         }
-        self.agents.get(&session).is_some_and(|w| {
+        self.sessions.agent(&session).is_some_and(|w| {
             let first_unnamed = program.is_none() && w.resolved_at.is_none();
             let confirmation_due = program.is_some_and(|p| aterm_phase::program_of(p).is_none())
                 && w.pgid > 0
@@ -4887,25 +4752,25 @@ impl StatusObserver {
     /// ([`AgentWatch::build_waiting`]), which [`Self::program_due`] and [`Self::next_wake`] read
     /// again on a timer, still screen or not.
     pub(crate) fn note_build_wait(&mut self, session: u64, waiting: bool) {
-        if let Some(w) = self.agents.get_mut(&session) {
-            w.build_waiting = waiting;
-        }
+        self.sessions.edit_existing(session, |record| {
+            if let Some(watch) = &mut record.agent {
+                watch.build_waiting = waiting;
+            }
+        });
     }
 
     fn note_program_request(&mut self, session: u64, pgid: i32, now: Instant) {
-        let w = self.agents.entry(session).or_insert_with(|| AgentWatch {
-            pgid: -1,
-            ..AgentWatch::default()
-        });
-        if w.pgid != pgid {
-            w.resolve_attempts = 0;
-            w.deferred_name_recheck_at = None;
-            w.name_confirmed = false;
-        } else if w.deferred_name_recheck_at.take().is_some() {
-            w.name_confirmed = true;
-        }
-        w.resolved_at = Some(now);
-        w.resolve_attempts = w.resolve_attempts.saturating_add(1).min(3);
+        self.sessions.with_agent(session, |w| {
+            if w.pgid != pgid {
+                w.resolve_attempts = 0;
+                w.deferred_name_recheck_at = None;
+                w.name_confirmed = false;
+            } else if w.deferred_name_recheck_at.take().is_some() {
+                w.name_confirmed = true;
+            }
+            w.resolved_at = Some(now);
+            w.resolve_attempts = w.resolve_attempts.saturating_add(1).min(3);
+        })
     }
 
     /// Requests an off-thread process-name lookup for `pgid` into `timeline`.
@@ -4934,15 +4799,16 @@ impl StatusObserver {
 
     /// Updates `session`'s running-command `detail` and returns whether it changed.
     pub(crate) fn set_detail(&mut self, session: u64, detail: Option<String>) -> bool {
-        let Some(slot) = self.sessions.get_mut(&session) else {
-            return false;
-        };
-        if slot.fsm.set_detail(detail) {
-            slot.revision = slot.revision.saturating_add(1);
-            true
-        } else {
-            false
-        }
+        self.sessions
+            .edit_classified(session, |slot| {
+                if slot.fsm.set_detail(detail) {
+                    slot.revision = slot.revision.saturating_add(1);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false)
     }
 
     /// Folds an OSC 7501 program-state reading for `session` and returns whether it changed.
@@ -5040,14 +4906,12 @@ impl StatusObserver {
 
     /// Removes all classifier and agent-watch state for a retired `session`.
     pub(crate) fn retire(&mut self, session: u64) {
-        self.agents.remove(&session);
         self.program_states.remove(&session);
         let _ = self.inputs.forget(session);
         self.programs.retire(session);
         crate::claude_footer::stop_session(session, None);
         self.footer_asked.remove(&session);
         crate::codex_rollout_tap::retire_session(session);
-        self.rollout_asked.remove(&session);
         crate::kimi_record::forget(session);
         self.sessions.remove(&session);
     }
@@ -5059,16 +4923,7 @@ impl StatusObserver {
         min_interval: Duration,
         now: Instant,
     ) -> bool {
-        let moved = self.policy.quiet_after != policy.quiet_after
-            || self.policy.dwell != policy.dwell
-            || self.min_interval != min_interval;
-        if !moved {
-            return false;
-        }
-        self.policy = policy;
-        self.min_interval = min_interval;
-        self.sessions.reconfigure(policy, now + min_interval);
-        true
+        self.sessions.reconfigure(policy, min_interval, now)
     }
 
     /// Clears all per-session classifier state when `tab_status` is disabled.
@@ -5077,8 +4932,6 @@ impl StatusObserver {
         self.sessions.clear();
         self.programs.clear_pending();
         self.footer_asked.clear();
-        self.rollout_asked.clear();
-        self.agents.clear();
         self.agent_seq += 1;
         self.agent_cleared_at = self.agent_seq;
         self.census_initialized = false;
@@ -5787,6 +5640,7 @@ impl crate::App {
 
     /// Reconfigures `status_observer` after `self.config` updates `tab_status*` settings.
     pub(crate) fn reconfigure_session_status(&mut self) {
+        self.navigator_note_tab_status();
         let now = std::time::Instant::now();
         let moved = if self.config.tab_status_or_default() {
             self.session_status.reconfigure(
@@ -6501,6 +6355,10 @@ mod tests;
 #[cfg(test)]
 #[path = "session_status_edge_inbox_tests.rs"]
 mod edge_inbox_tests;
+
+#[cfg(test)]
+#[path = "session_status_deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 #[path = "session_status_agent_verdict_tests.rs"]

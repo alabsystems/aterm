@@ -206,6 +206,10 @@ impl aterm_converge::Item for Bound<'_> {
     fn stands_aside(&self) -> Option<StoodAside> {
         self.item.stands_aside(self.sys, self.ctx)
     }
+
+    fn row_ended(&self) {
+        self.item.row_ended();
+    }
 }
 
 /// A machines [`Activation`] with the `System` and context it runs against.

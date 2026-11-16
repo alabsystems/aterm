@@ -563,7 +563,7 @@ fn setup_field_of(
         });
     // The stages the run's last pass parked to ask again by itself, in the rows' words: a
     // vault nobody answered (`unreached`) or that answered none is there (`absent`), a person's
-    // wait (`waiting`), a step put off.
+    // wait (`waiting`), another pass's repository lease (`held`), a step put off.
     let mut asking: Vec<&str> = Vec::new();
     for stage in status
         .rows
@@ -571,7 +571,7 @@ fn setup_field_of(
         .filter(|row| {
             matches!(
                 row.status.as_str(),
-                "waiting" | "unreached" | "absent" | "deferred"
+                "waiting" | "unreached" | "absent" | "held" | "deferred"
             )
         })
         .filter_map(|row| aterm_types::macos_setup::StageRow::named(&row.name))
@@ -674,8 +674,10 @@ fn setup_field_of(
 /// way ([`readings_hold`]). `observed_generation` counts the readings published, not time.
 /// `rows=` names each managed row with its standing word ([`Standing::word`], `unknown` before
 /// any reading), `unread` for one no usable reading stands behind and `offered` for a grant on
-/// offer ([`RowSaid::word`]), never a note or a value. A reader judges a reading's age at its
-/// own clock and says it, so evidence past its standing is said as last read, never as current.
+/// offer ([`RowSaid::word`]), never a note or a value. A row read again keeps its last reading's
+/// standing until the new reading lands, as the page's row does. A reader judges a reading's age
+/// at its own clock and says it, so evidence past its standing is said as last read, never as
+/// current.
 ///
 /// `caps_live` separately describes reported OS/HID mappings for service cohorts, not a physical
 /// key-press test or saved Caps readiness; it never contributes a verified bit. The lifecycle

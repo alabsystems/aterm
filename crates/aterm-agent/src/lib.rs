@@ -109,9 +109,9 @@ pub mod vault_join;
 /// driven over it.
 #[cfg(unix)]
 pub use fleet_member::{
-    FleetCheck, FleetName, FleetSync, FleetSyncError, check_from_cache, drive_fleet,
-    drive_fleet_from_shell, drive_fleet_proven, fleet_name_for, fleet_node, follow_fleet_name,
-    survey_fleet, sync_from_cache, try_sync_from_cache,
+    FleetCheck, FleetName, FleetSync, check_from_cache, drive_fleet, drive_fleet_from_shell,
+    drive_fleet_proven, fleet_name_for, fleet_node, follow_fleet_name, survey_fleet,
+    sync_from_cache,
 };
 /// The harness core.
 pub mod harness;

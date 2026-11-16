@@ -4,10 +4,12 @@
 //! The menu bar's machine title, `m8 Heron` right of the version
 //! (`docs/DESIGN-machine-names-2026-11-04.md` §5.1). A reader thread makes this machine's name
 //! where none is there yet ([`aterm_agent::machine_name::ensure_in_view`]), reads it again when
-//! `machine-name.toml`, the fleet key, its custody or one of the vault's standing files changes
-//! ([`aterm_secrets::client::Paths::standing_files`]), and posts [`Wake::MachineName`] when what
-//! it shows changed. It hears a change through [`FileWatch`] (kqueue on each file and its
-//! folder, so a replace by rename is heard), so it polls nothing. The standing files are the
+//! `machine-name.toml`, the fleet key, its custody, one of the vault's standing files
+//! ([`aterm_secrets::client::Paths::standing_files`]) or the status of the lab's machines table
+//! changes (a nickname written to this Mac's registry row, which the read follows), and posts
+//! [`Wake::MachineName`] when what it shows changed. It hears a change through [`FileWatch`]
+//! (kqueue on each file and its folder, so a replace by rename is heard), so it polls nothing.
+//! The standing files are the
 //! vault's source, saved state, identity and handed-over Allowed, and the trusted log's entry,
 //! pin, intent, header and data file. The vault's subscriber replaces its `state.toml` only
 //! when what it holds changed (when it last heard its vault is among that, and moves about once
@@ -161,27 +163,34 @@ enum Heard {
 }
 
 /// The watch on the files the title comes from, `machine-name.toml`, the fleet key, its custody and the
-/// standing files of `vault` where one is read: `changes` hears one `()` for each whose stamp
-/// (device, inode, length, modification and change times) moved, and one at the watch's first
-/// look at each. The state directory is made private first, as a reader makes it; the vault's
+/// standing files of `vault` where one is read, with the status of the lab's machines table
+/// there, which a pass moves when a nickname written to this Mac's row from any Mac arrives
+/// (the read follows it, FL-169): `changes` hears the key of each whose stamp
+/// (device, inode, length, modification and change times) moved, and each key once at the
+/// watch's first look at it. The state directory is made private first, as a reader makes it; the vault's
 /// folder is left as it is, and where it is not there yet the watch listens on the nearest
 /// folder above it, so a vault first made after launch is heard.
 ///
 /// # Errors
 /// The state directory cannot be made private, or the platform's file events cannot start.
-fn watch(state: &Path, vault: Option<&Paths>) -> io::Result<(FileWatch, mpsc::Receiver<()>)> {
+fn watch(state: &Path, vault: Option<&Paths>) -> io::Result<(FileWatch, mpsc::Receiver<u64>)> {
     aterm_uds::private_file::ensure_private_dir(state)?;
     let (tell, changes) = mpsc::channel();
     let watch = FileWatch::platform(
         "aterm-machine-name-watch",
-        Box::new(move |_| {
-            let _ = tell.send(());
+        Box::new(move |key| {
+            let _ = tell.send(key);
         }),
     )?;
     watch.watch(0, state.join(aterm_agent::machine_name::file::FILE));
     watch.watch(1, state.join(aterm_net::fleet::KEY_FILE));
     watch.watch(2, state.join(aterm_net::fleet_member::VAULT_FILE));
-    for (key, file) in (3..).zip(vault.into_iter().flat_map(Paths::standing_files)) {
+    let files = vault.into_iter().flat_map(|paths| {
+        let mut files = paths.standing_files();
+        files.push(aterm_db::file::root(paths).state(&aterm_db::file::MACHINES.file()));
+        files
+    });
+    for (key, file) in (3..).zip(files) {
         watch.watch(key, file);
     }
     Ok((watch, changes))
@@ -189,7 +198,7 @@ fn watch(state: &Path, vault: Option<&Paths>) -> io::Result<(FileWatch, mpsc::Re
 
 /// Wait for a change, at most `timeout` where one is given. Every change told by then goes with
 /// the first, since one read covers them all.
-fn heard(changes: &mpsc::Receiver<()>, timeout: Option<Duration>) -> Heard {
+fn heard(changes: &mpsc::Receiver<u64>, timeout: Option<Duration>) -> Heard {
     let first = match timeout {
         None => changes
             .recv()
@@ -197,7 +206,7 @@ fn heard(changes: &mpsc::Receiver<()>, timeout: Option<Duration>) -> Heard {
         Some(timeout) => changes.recv_timeout(timeout),
     };
     match first {
-        Ok(()) => {
+        Ok(_) => {
             while changes.try_recv().is_ok() {}
             Heard::Change
         }
@@ -219,16 +228,26 @@ fn unwatched(timeout: Option<Duration>) -> Heard {
 }
 
 /// The name as it stands, made where none is there yet (`roster` is read only then), in a state
-/// directory made private first, as `aterm name` makes it, and whether this machine is in a fleet
-/// ([`InFleet::read`] over `state` and the vault at `vault`, where one is read).
+/// directory made private first, as `aterm name` makes it, after it takes the nickname this Mac's
+/// own registry row was given from any Mac
+/// ([`aterm_agent::machine_name::follow_registry`]; a follow that fails is logged and leaves the
+/// name as it was), and whether this machine is in a fleet ([`InFleet::read`] over `state` and
+/// the vault at `vault`, where one is read).
 fn read(
     state: &Path,
     vault: Option<&Paths>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
 ) -> io::Result<MachineView> {
     aterm_uds::private_file::ensure_private_dir(state)?;
-    let (name, _) =
-        aterm_agent::machine_name::ensure_in_view(state, roster, aterm_netplace::unix_ms_now())?;
+    let now_ms = aterm_netplace::unix_ms_now();
+    let (name, _) = aterm_agent::machine_name::ensure_in_view(state, roster, now_ms)?;
+    let name = match aterm_agent::machine_name::follow_registry(state, now_ms) {
+        Ok(moved) => moved.unwrap_or(name),
+        Err(why) => {
+            aterm_log::info!("machine name: the lab registry's nickname was not taken ({why})");
+            name
+        }
+    };
     Ok(MachineView {
         rev: name.rev,
         name: name.name(),
@@ -603,6 +622,38 @@ struct NameEdit {
     publication: Option<aterm_agent::machine_name::publish::Pending>,
 }
 
+/// Refuse, before anything changes, a nickname this Mac's lab registry row would refuse
+/// ([`aterm_agent::machine_name::registry::refusal`]), so the file and the row never part over
+/// it.
+fn registry_takes(
+    state: &Path,
+    nick: Option<&aterm_types::machine_name::Nickname>,
+) -> Result<(), String> {
+    match nick.and_then(|nick| aterm_agent::machine_name::registry::refusal(state, nick)) {
+        Some(why) => Err(format!("the lab registry refuses that nickname ({why})")),
+        None => Ok(()),
+    }
+}
+
+/// Write the nickname `name` holds to this Mac's lab registry row (where `state` is this
+/// account's live naming state) as a person's act, queued for this process's shared-files
+/// thread to publish rather than waited on, logging what became of it. A window names no aterm
+/// session as the act's: the one in its environment is the tab it was opened from, not the
+/// person's press.
+fn register(state: &Path, name: &aterm_agent::machine_name::file::MachineName) {
+    use aterm_net::fleet_member::name_record::ByKind;
+    let written = aterm_agent::machine_name::registry::write_nick(
+        state,
+        &name.nick,
+        ByKind::Person,
+        None,
+        std::time::Duration::ZERO,
+    );
+    if let Some(note) = written.note() {
+        aterm_log::info!("machine name: {note}");
+    }
+}
+
 fn change_number(
     state: &Path,
     config: &Path,
@@ -616,9 +667,11 @@ fn change_number(
     use aterm_net::fleet_member::name_record::ByKind;
     // Refuse naming holds and invalid configuration before changing the canonical name.
     let policy = publish::Policy::read(config, to.num)?;
+    registry_takes(state, to.nick.as_ref())?;
     let set = set_name(state, to, lab, ByKind::Person, roster, stamp, false)
         .map_err(|why| why.to_string())?;
     let publication = publish::publish(state, config, &policy, Some(system)).err();
+    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,
@@ -660,6 +713,7 @@ fn change_undo(
     let publication = policy
         .as_ref()
         .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
+    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,
@@ -685,11 +739,15 @@ fn change_nickname(
         .and_then(chosen_number)
         .map(|number| publish::Policy::read(config, number))
         .transpose()?;
+    if let aterm_agent::machine_name::NickTo::Word(word) = to {
+        registry_takes(state, Some(word))?;
+    }
     let set =
         set_nick(state, to, ByKind::Person, roster, stamp, false).map_err(|why| why.to_string())?;
     let publication = policy
         .as_ref()
         .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
+    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,

@@ -492,12 +492,15 @@ fn reassert_witness(layout: &Layout, program: &str, build: u64) -> Result<(), Fl
 /// the signed one, its records kept beside it now
 /// ([`crate::harness_record::keep_beside`]), so its `[harness]` makes a row without waiting for
 /// its next build. Best-effort: a fetch or write that fails is tried again on the next pass.
+/// The signed tree is the one for `triple`, the triple the install selects its artifact for, as
+/// the build was staged for it.
 fn keep_live_harness_records(
     fetcher: &dyn Fetcher,
     layout: &Layout,
     (index, repo): (&TrustedIndex, &str),
     program: &str,
     build: u64,
+    triple: &str,
     prepared: Option<&crate::manifest::PkgManifest>,
 ) {
     let build_dir = layout.build_dir(program, build);
@@ -521,9 +524,7 @@ fn keep_live_harness_records(
             &fetched
         }
     };
-    let signed = pkg
-        .artifact_for(crate::cli::current_triple())
-        .map(|a| a.tree_root.as_str());
+    let signed = pkg.artifact_for(triple).map(|a| a.tree_root.as_str());
     if signed.is_some() && held_root(&build_dir).as_deref() == signed {
         let _ = crate::harness_record::keep_beside(&build_dir, pkg);
     }
@@ -853,6 +854,7 @@ fn install_inner(
                 (&index, repo.as_str()),
                 program,
                 pinned,
+                triple,
                 prepared.as_ref(),
             );
             let shimmed = lay_commands_off_path(

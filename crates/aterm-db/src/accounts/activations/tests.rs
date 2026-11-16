@@ -1281,7 +1281,10 @@ fn log_backed_account_preparation_survives_log_appends_and_epoch_rotations_until
     client::sync(&lab.paths[2], None).unwrap();
     let genesis_out = lab.paths[0].home.join("f18.genesis");
     client::test_sign_genesis(&lab.paths[0], &genesis_out, &lab.signer).unwrap();
-    let initial_wire = client::load_records(&lab.paths[0]).unwrap().encode();
+    let initial_wire = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     for p in [&lab.paths[1], &lab.paths[2]] {
         client::save_records(p, &initial_wire).unwrap();
     }
@@ -1329,7 +1332,10 @@ fn log_backed_account_preparation_survives_log_appends_and_epoch_rotations_until
     //    to a new epoch (`Access::basis()` changes). `b.prepare` must still succeed on `m2` via
     //    `Session::historical_writer_in`.
     client::remove_member_in_log(&lab.paths[0], actor_2).unwrap();
-    let wire_after_rem2 = client::load_records(&lab.paths[0]).unwrap().encode();
+    let wire_after_rem2 = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &wire_after_rem2).unwrap();
     assert_eq!(
         b.prepare(ACCOUNT, &bconfig)
@@ -1343,7 +1349,10 @@ fn log_backed_account_preparation_survives_log_appends_and_epoch_rotations_until
 
     // 3. Once `m2` itself (`actor_1`) is removed in the membership log, `b.prepare` is refused.
     client::remove_member_in_log(&lab.paths[0], actor_1).unwrap();
-    let wire_after_rem1 = client::load_records(&lab.paths[0]).unwrap().encode();
+    let wire_after_rem1 = client::load_records(&lab.paths[0])
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &wire_after_rem1).unwrap();
     assert!(b.prepare(ACCOUNT, &bconfig).is_err());
 }

@@ -3396,7 +3396,7 @@ fn split_steps(
         .filter(|&i| i != r && i < lab.macs.len() && lab.macs[i].server.is_some())
         .collect();
     let reached: Vec<usize> = a_servers.iter().copied().step_by(2).collect();
-    let wire = aterm_secrets::membership_log::encode_records(prefix.iter().copied());
+    let wire = aterm_secrets::membership_log::read_records(prefix.iter().copied()).unwrap();
     ev.partial.reached_ms = aterm_time::unix_millis().ok_or("the clock reads before 1970")?;
     for &i in &reached {
         aterm_secrets::transport::post_records(&lab.macs[i].url(), &wire)

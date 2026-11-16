@@ -25,6 +25,8 @@ const CENSUS_WAIT: Duration = Duration::from_secs(5);
 struct Watch {
     cursor: discover::Cursor,
     last: Option<cadence::Pass>,
+    /// An emergency pass that could not meet the line, and what it waits for.
+    emergency: cadence::Emergency,
     daily: Mutex<maintenance::Schedule>,
     rooms: super::room::Rooms,
     fill: Option<(String, fill::Fill)>,
@@ -38,6 +40,7 @@ impl Watch {
         Self {
             cursor: discover::Cursor::new(),
             last: None,
+            emergency: cadence::Emergency::default(),
             daily: Mutex::new(maintenance::Schedule::new()),
             rooms: super::room::Rooms::load(state),
             fill: None,
@@ -81,13 +84,48 @@ impl Watch {
             meter.observe(now, volume.free);
         }
         let room = self.rooms.room(&key, now, volume.total);
-        if self.rooms.save_due(now) {
-            self.rooms.save(&env.state)?;
-        }
         let config = reading.on_volume_with(Some(volume.total), Some(room));
         let thresholds = reading.thresholds_with(Some(volume.total), Some(room));
         let level = thresholds.level(Some(volume.free), volume.files_free);
-        if config.auto_free_gib == 0 || level == super::Level::Unknown {
+        let off = config.auto_free_gib == 0 || level == super::Level::Unknown;
+        let pass_path = reserve::pass_lock_for(home);
+        let started = Instant::now();
+        let mut freed = 0u64;
+        // The reserve's bytes are no sweep's or pass's: they never stand for the pass's progress.
+        let mut released = 0u64;
+        if !off {
+            // The reserve goes FIRST, before anything this look writes: its unlink needs no
+            // space, and at a real ENOSPC the room record's save below could not be written.
+            // The outer run retains the same real guard through off/standby/errors/sleep.
+            held.validate_for(&pass_path)?;
+            let reserve_path = reserve::path_for(home);
+            let moved = cli::disk_reserve_look(
+                &env.state,
+                &reserve_path,
+                level,
+                Some(volume.free),
+                &thresholds,
+                Some(room),
+                now,
+            );
+            if let cli::ReserveMove::Released(bytes) = moved {
+                released = bytes;
+                freed = freed.saturating_add(bytes);
+            }
+        }
+        // A save that fails is said and not fatal to the look (nor is saying it, on a full disk
+        // that holds this process's stderr): `save_due` stamped it, so it is tried again within
+        // the hour.
+        if self.rooms.save_due(now)
+            && let Err(e) = self.rooms.save(&env.state)
+        {
+            let _ = writeln!(
+                err,
+                "aterm harness disk watch: the room record was not saved ({e}); it is saved \
+                 again within the hour"
+            );
+        }
+        if off {
             self.cursor.reset_cycle();
             writeln!(
                 out,
@@ -99,8 +137,9 @@ impl Watch {
             .fill
             .get_or_insert_with(|| (key.clone(), fill::Fill::new()));
         if entry.0 != key {
-            *entry = (key, fill::Fill::new());
+            *entry = (key.clone(), fill::Fill::new());
             self.last = None;
+            self.emergency.reset();
         }
         let fill = &mut entry.1;
         let projected = fill.observe(
@@ -110,9 +149,6 @@ impl Watch {
             thresholds.short_below(),
         );
         let placing = discover::placing_of(home, &table);
-        let pass_path = reserve::pass_lock_for(home);
-        let started = Instant::now();
-        let mut freed = 0u64;
         // The shared daily stamp borrows the genuine lifetime pass.lock guard.
         let daily =
             maintenance::eligible(&config, level, true, placing.is_some(), projected.is_some());
@@ -149,29 +185,30 @@ impl Watch {
         } else {
             level
         };
-        let due = cadence::due(
-            &mut self.last,
-            started,
+        cli::disk_emergency_look(
+            &env.state,
+            &mut self.emergency,
             pass_level,
             Some(volume.free),
-            false,
+            thresholds.emergency,
+        );
+        // An emergency pass that wrote `cannot-meet` waits for free space, a lock, the clock or
+        // the live sessions to move, not for the interval.
+        let look = cadence::Look {
+            at: started,
+            unix: now,
+            level: pass_level,
+            free: Some(volume.free),
             room,
-        );
-        // The outer run retains the same real guard through off/standby/errors/sleep. A
-        // legacy GUI admission captured before config changed cannot slip between ticks.
+            poked: false,
+            demand: false,
+        };
+        let due = self.emergency.due(&mut self.last, &look, || {
+            let snap = Snapshot::read();
+            snap.sessions.unknown.is_none().then(|| snap.live())
+        });
+        // A legacy GUI admission captured before config changed cannot slip between ticks.
         held.validate_for(&pass_path)?;
-        let reserve_path = reserve::path_for(home);
-        let moved = cli::disk_reserve_look(
-            &env.state,
-            &reserve_path,
-            level,
-            Some(volume.free),
-            &thresholds,
-            now,
-        );
-        if let cli::ReserveMove::Released(bytes) = moved {
-            freed = freed.saturating_add(bytes);
-        }
         // The worktree step runs hourly on a look with no pressure pass due, never ahead of
         // one: under pressure it waits for a look between passes (a pass that freed nothing
         // stops being due), and it is bounded by its wall and its git's.
@@ -179,6 +216,15 @@ impl Watch {
             let snap = Snapshot::read();
             let open = worktree::open_sessions(home);
             let transcripts = home.join(".claude/projects");
+            // The watch holds no window's sessions, so a build-start line says nothing here of
+            // whose a worktree is: each waits seven days of quiet, beside the session, transcript
+            // and process checks. The step reads the record again before a worktree that stays
+            // gives back a build directory.
+            let record = atpkg::build_start::record();
+            let starts = record
+                .as_deref()
+                .map(atpkg::build_start::read)
+                .unwrap_or_default();
             let look = cli::WorktreeLook {
                 state: &env.state,
                 home,
@@ -188,6 +234,9 @@ impl Watch {
                 session_cwd_unknown: snap.sessions.unknown.as_deref(),
                 open: &open,
                 table: Some(&table),
+                roster: None,
+                starts: &starts,
+                record: record.as_deref(),
             };
             held.validate_for(&pass_path)?;
             let done = cli::disk_worktree_step(&look, config, &mut self.worktrees, &|| {
@@ -197,9 +246,17 @@ impl Watch {
             if !done.removed.is_empty() {
                 writeln!(
                     out,
-                    "disk watch: removed {} merged worktree(s), {} back",
+                    "disk watch: removed {} worktree(s), {} back",
                     done.removed.len(),
-                    super::human_bytes(done.freed())
+                    super::human_bytes(done.removed_bytes())
+                )?;
+            }
+            if !done.given_back.is_empty() {
+                writeln!(
+                    out,
+                    "disk watch: shared build directories of worktrees that stay: {} went, {} back",
+                    done.given_back.len(),
+                    super::human_bytes(done.given_back_bytes())
                 )?;
             }
         }
@@ -295,6 +352,22 @@ impl Watch {
         let after_reading = measure();
         let after = after_reading.as_ref().map(|r| r.free);
         let level_after = thresholds.level(after, after_reading.and_then(|r| r.files_free));
+        let at = cli::EmergencyAt {
+            state: &env.state,
+            now,
+            level: pass_level,
+            volume: &key,
+            total: volume.total,
+            line: thresholds.emergency,
+            live: snapshot.live(),
+        };
+        let done = match &tick {
+            DiskTick::Reclaimed(done, _) => Some(done),
+            DiskTick::Plenty => None,
+        };
+        // What this look's sweeps freed: all it freed but the pass's own and the reserve's.
+        let swept = freed.saturating_sub(reclaimed).saturating_sub(released);
+        cli::disk_emergency_end(&at, &mut self.emergency, done, swept, after);
         credit(fill, freed, volume.free, after, started);
         let progress = freed > 0;
         cadence::ran(
@@ -711,6 +784,14 @@ struct Snapshot {
 }
 
 impl Snapshot {
+    /// The live sessions' digest ([`super::budget::live_digest`]).
+    fn live(&self) -> u64 {
+        super::budget::live_digest(
+            self.sids.iter().map(String::as_str),
+            self.sessions.cwds.iter().map(PathBuf::as_path),
+        )
+    }
+
     fn read() -> Self {
         let deadline = Instant::now() + CENSUS_WAIT;
         match Self::read_until(deadline) {

@@ -141,12 +141,21 @@ pub struct Row {
 impl Row {
     /// Whether the setting or account is out of policy, blocked, waiting, unreached, absent
     /// (`initial::ABSENT`: a vault whose address answered that none is there, which the stage
-    /// parks on as on one nobody answered), unverified or failed ([`Report::needs_attention`]).
+    /// parks on as on one nobody answered), held (`initial::HELD`: another pass holds the
+    /// repository lease, which the stage parks on until it lets go), unverified or failed
+    /// ([`Report::needs_attention`]).
     #[must_use]
     pub fn needs_attention(&self) -> bool {
         matches!(
             self.status.as_str(),
-            "drift" | "error" | "blocked" | "waiting" | "unreached" | "absent" | "unverified"
+            "drift"
+                | "error"
+                | "blocked"
+                | "waiting"
+                | "unreached"
+                | "absent"
+                | "held"
+                | "unverified"
         )
     }
 
@@ -224,7 +233,8 @@ pub struct PassPage {
 /// An owned native readback, independent of journal outcomes or setup completion: each a
 /// complete item cohort's reading, dated from before its run read anything. Only the native
 /// producers construct nonempty values: the Mac settings and sign-out runs
-/// ([`run_workstation_readback`]) and the Spotlight stage's.
+/// ([`run_workstation_readback`]), the Spotlight stage's and the Repositories stage's
+/// ([`repositories_readback`]).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct WorkstationReadback(Vec<aterm_types::macos_setup::Observation>);
 
@@ -277,6 +287,25 @@ impl WorkstationReadback {
             }
         }
     }
+}
+
+/// What the Repositories stage's own run read of the GitHub repositories row: the reading its
+/// item rows `rows` give ([`aterm_machines::init_observe::observation`], which leaves out the
+/// refresh of the checkouts already here, a row of its own), dated `at`, from before that run
+/// read anything, so its age is never told as less than it is (design §3.5). The stage's end
+/// carries it ([`StageEvent::readback`]) in place of a read of the row after the stage.
+#[must_use]
+pub fn repositories_readback(
+    rows: &[aterm_machines::model::ItemReport],
+    at: u64,
+) -> WorkstationReadback {
+    WorkstationReadback(vec![
+        aterm_machines::init_observe::observation(
+            aterm_types::macos_setup::Setting::Repositories,
+            &rows.iter().collect::<Vec<_>>(),
+        )
+        .stamped(at),
+    ])
 }
 
 /// Run one already-prepared native pass and retain its complete post-apply facts

@@ -239,6 +239,64 @@ fn with_no_block_the_read_asks_atermss_route_alone() {
     assert!(!why.contains("fixture"), "{why}");
 }
 
+/// A PASS READS THE CREDENTIAL ROUTE ONCE (FL-164): with the record a pass's
+/// [`crate::port::Live`]s share ([`crate::port::CheckoutRecords`]), the vault's pass, the
+/// keychain item's probe and the vault's pass again make one read of git's credential settings
+/// and one `git credential fill` between them. A vault token that changed asks aterm's helper
+/// again, which hands back the new one; a global config file that changed reads both again.
+/// NEGATIVE CONTROL: with no record, as before, each reader reads afresh: four settings reads
+/// (the probe makes two) and two fills.
+#[test]
+fn a_pass_reads_the_credential_route_once() {
+    use crate::items::Item as _;
+    const NEW: &str = "fixture_new_token";
+    let count =
+        |sys: &Fake, run: &str| sys.calls().iter().filter(|call| call.contains(run)).count();
+    let reads = |sys: &Fake| {
+        (
+            count(sys, " config --null --show-origin --get-regexp "),
+            count(sys, " credential fill"),
+        )
+    };
+    let current =
+        |sys: &Fake| matches!(vault_git_credentials(sys).unwrap(), GithubRead::Current(_));
+    for kept in [true, false] {
+        let who = user("alice", 501);
+        let mut sys = fake(&who);
+        if kept {
+            sys.checkout_records = Some(Default::default());
+        }
+        script::alike(&sys, &who);
+        script::lookups_hold(&sys, &who, GITHUB, "alice", DEV);
+        if kept {
+            // The answer after the first, once the vault's token changes.
+            script::lookups_hold(&sys, &who, GITHUB, "alice", NEW);
+        }
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+        assert!(current(&sys), "{kept}: {:?}", sys.calls());
+        let probe = super::super::keychain::Keychain::new(who.clone()).probe(&sys, &ctx);
+        assert!(
+            matches!(probe, crate::model::Probe::NotApplicable { .. }),
+            "{kept}: {probe:?}"
+        );
+        assert!(current(&sys), "{kept}: {:?}", sys.calls());
+        if !kept {
+            assert_eq!(reads(&sys), (4, 2), "control: {:?}", sys.calls());
+            continue;
+        }
+        assert_eq!(reads(&sys), (1, 1), "{:?}", sys.calls());
+        sys.vault_set(&who.home, crate::init_github::TOKEN_ENTRY, NEW.as_bytes());
+        assert!(current(&sys), "the new token: {:?}", sys.calls());
+        assert_eq!(reads(&sys), (1, 2), "{:?}", sys.calls());
+        sys.file(
+            &format!("{}/.gitconfig", who.home),
+            b"[user]\n\tname = Alice\n",
+        );
+        assert!(current(&sys), "a new ~/.gitconfig: {:?}", sys.calls());
+        assert_eq!(reads(&sys), (2, 3), "{:?}", sys.calls());
+    }
+}
+
 /// The pass replaces the block whose revert the engine journaled, from the settings alone.
 /// Negative controls: a block that changed since, a stage turned off since and a block
 /// already gone write nothing.

@@ -21,6 +21,10 @@ pub use named::configured_build;
 pub use named::configured_tool;
 #[cfg(unix)]
 pub mod handoff;
+#[cfg(unix)]
+mod native;
+#[cfg(unix)]
+pub use native::HeldNativeTool;
 
 /// Stable native-runner admission capability; older clients refuse the query.
 pub const LEASE_CAPABILITY: &str = "aterm-signed-prerequisite-leases-v1";
@@ -598,6 +602,10 @@ impl<'a> Session<'a> {
             ));
         }
         let tool = HeldTool {
+            #[cfg(unix)]
+            creator: std::process::id(),
+            #[cfg(unix)]
+            native_attempt: None,
             executable: held
                 .executable
                 .ok_or("the prerequisite executable is absent")?,
@@ -786,6 +794,12 @@ fn same_selection(a: &Record, b: &Record) -> bool {
 /// A signed store executable and the lease keeping its immutable build alive.
 #[derive(Debug)]
 pub struct HeldTool {
+    #[cfg(unix)]
+    creator: u32,
+    // Restricts one actual native capture attempt; it supplies no runtime or
+    // resource authority. Refusal cannot renew this original endpoint.
+    #[cfg(unix)]
+    native_attempt: Option<std::time::Instant>,
     executable: PathBuf,
     physical: PathBuf,
     image: std::fs::File,

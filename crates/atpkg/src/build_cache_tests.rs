@@ -7403,3 +7403,298 @@ fn the_over_budget_sweep_takes_an_unkept_stale_part_of_the_shared_cache_alone() 
         "{removed:?}"
     );
 }
+
+/// A MERGED WORKTREE'S BUILD DIRECTORIES GO WHOLE, AND NOTHING BESIDE THEM (DC-21,
+/// [`reclaim_merged_worktree`]): of the build directories that mirror a worktree and the
+/// workspaces nested in it, each eight days old, the one nothing holds goes, its intent asked
+/// first, while one a build holds a cargo lock of stays with no intent asked, one whose folders
+/// are old and one file was rewritten yesterday stays, one with a folder written yesterday
+/// stays, and so does one whose only fresh entry is a folder inside a folder laid out as a git
+/// directory, which the files' walk passes over; before that, a call whose read of the files
+/// must end at an instant already past takes nothing and asks nothing. A link among the
+/// mirror's folders is not entered and a mirror reached through a link is not read, so what
+/// they point at stands; the mirror of a sibling whose name starts with the worktree's stays;
+/// the worktree named through a link gives back the mirror of what it resolves to, and one
+/// whose builds ran under the link's own name gives back the mirror of that name; a worktree
+/// that is the home (named as it is while the home is named through a link, too), the
+/// filesystem root or a relative path takes nothing; a cache root that is a link is not
+/// entered; a removal whose caller's leave ends once the directory is moved aside leaves it in
+/// its stage with its intent closed, which the cache's own pass finishes, and so does a later
+/// call for the same worktree. NEGATIVE CONTROLS: without the cargo locks taken the held one
+/// goes; without the files' own times read (`retired::written_since`) the rewritten one goes;
+/// without the folders' clock the one with the fresh folder in a git-shaped folder goes, and
+/// with neither clock the one with a fresh folder; with the files' read given no end the first
+/// call takes the top one; with a mirror entered through a link, or links among its folders
+/// followed, the planted directories go; with the mirror matched as a string prefix the
+/// sibling's goes; without the worktree's path as given the one built under the link's name
+/// stays; without the home check, or with the home read only as given, every build directory
+/// under the home goes; with the cache root not read as a real directory the one behind the
+/// linked root goes; with the leave not asked at the removal the staged directory goes in the
+/// same call; without the stage branch of the walk the second staged one stays.
+#[cfg(unix)]
+#[test]
+fn a_merged_worktrees_build_directories_go_whole_and_nothing_beside_them() {
+    let f = Fixture::new("build-cache-merged-worktree");
+    let root = cache_root(&f.home);
+    let quiet = 7 * DAY;
+    let now = SystemTime::now();
+    let processes = |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default());
+    let fence = fence::Fence::new(&processes);
+    let always = Leave {
+        quiet,
+        within: &|| true,
+        until: None,
+    };
+    let run = |worktree: &Path, asked: &mut Vec<PathBuf>| {
+        reclaim_merged_worktree_on(
+            &f.home,
+            worktree,
+            now,
+            &always,
+            &mut |path, _| {
+                asked.push(path.to_path_buf());
+                true
+            },
+            &fence,
+        )
+    };
+    let merged = |went: &[(PathBuf, Unused)]| -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = went
+            .iter()
+            .filter(|(_, why)| matches!(why, Unused::MergedWorktree { .. }))
+            .map(|(path, _)| path.clone())
+            .collect();
+        paths.sort();
+        paths
+    };
+
+    let wt = f.dir("home/wt");
+    let top = lay(&root, &wt, 8 * DAY);
+    let locked = lay(&root, &wt.join("crates/tool"), 8 * DAY);
+    std::fs::write(locked.join("debug/.cargo-lock"), b"").unwrap();
+    age_tree(&locked, 8 * DAY);
+    let lock = crate::metadata_io::open_regular(&locked.join("debug/.cargo-lock")).unwrap();
+    let held = crate::lock::Flock::try_lock(lock).unwrap();
+    let rewritten = lay(&root, &wt.join("crates/rewritten"), 8 * DAY);
+    age_by(&rewritten.join("debug/deps/x"), DAY);
+    let fresh = lay(&root, &wt.join("crates/fresh"), 8 * DAY);
+    age_by(&fresh.join("debug"), DAY);
+    // A build script's clone in its output: the files' walk passes over a folder laid out as a
+    // git directory, so only the folders' clock dates what is in it.
+    let cloned = lay(&root, &wt.join("crates/cloned"), 8 * DAY);
+    let clone = cloned.join("debug/build/out/clone");
+    std::fs::create_dir_all(clone.join("objects")).unwrap();
+    std::fs::create_dir_all(clone.join("refs")).unwrap();
+    std::fs::write(clone.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+    age_tree(&cloned, 8 * DAY);
+    age_by(&clone.join("objects"), DAY);
+    let sibling = lay(&root, &f.root.join("home/wt2"), 8 * DAY);
+    let beside = lay(&root, &f.root.join("home/other"), 8 * DAY);
+    // A link among the mirror's folders, and a mirror that is itself a link, each to a folder
+    // elsewhere that holds a build directory as old.
+    let elsewhere = f.dir("elsewhere");
+    let planted = lay(&elsewhere, Path::new("/x"), 8 * DAY);
+    let other_planted = lay(&elsewhere, Path::new("/y"), 8 * DAY);
+    let mirror = top.parent().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(elsewhere.join("x"), mirror.join("crates/via")).unwrap();
+    let linked = f.root.join("home/linked");
+    let linked_mirror = build_dir(&root, &linked).parent().unwrap().to_path_buf();
+    std::os::unix::fs::symlink(elsewhere.join("y"), &linked_mirror).unwrap();
+
+    // The read of a build directory's files must end at an instant already past: whether one
+    // was written is unknown, so nothing is asked for and nothing goes.
+    let mut asked = Vec::new();
+    let late_read = Leave {
+        until: Some(std::time::Instant::now()),
+        ..always
+    };
+    let went = reclaim_merged_worktree_on(
+        &f.home,
+        &wt,
+        now,
+        &late_read,
+        &mut |path, _| {
+            asked.push(path.to_path_buf());
+            true
+        },
+        &fence,
+    );
+    assert!(went.is_empty() && asked.is_empty(), "{went:?} {asked:?}");
+    assert!(
+        top.join("debug/deps/x").is_file(),
+        "its files were not read"
+    );
+
+    let went = run(&wt, &mut asked);
+    assert_eq!(
+        merged(&went),
+        [top.clone()],
+        "the one nothing holds: {went:?}"
+    );
+    assert_eq!(went.len(), 1, "{went:?}");
+    assert_eq!(asked, [top.clone()], "no other intent was asked");
+    assert!(!top.exists(), "it went whole");
+    assert!(
+        stages_in(&mirror, OsStr::new(DOOMED)).is_empty(),
+        "no stage is left"
+    );
+    for kept in [
+        &locked,
+        &rewritten,
+        &fresh,
+        &cloned,
+        &sibling,
+        &beside,
+        &planted,
+        &other_planted,
+    ] {
+        assert!(
+            kept.join("debug/deps/x").is_file(),
+            "{} stays",
+            kept.display()
+        );
+    }
+    assert!(run(&linked, &mut asked).is_empty(), "a linked mirror");
+    assert!(other_planted.join("debug/deps/x").is_file());
+    assert!(
+        std::fs::symlink_metadata(&linked_mirror)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+
+    // The lock let go and the rewritten file a week old: named through a link, the worktree
+    // gives back the mirror of what the link resolves to.
+    drop(held);
+    age_by(&rewritten.join("debug/deps/x"), 8 * DAY);
+    let alias = f.root.join("alias");
+    std::os::unix::fs::symlink(&wt, &alias).unwrap();
+    let went = run(&alias, &mut asked);
+    let mut both = vec![locked.clone(), rewritten.clone()];
+    both.sort();
+    assert_eq!(merged(&went), both, "{went:?}");
+    assert!(!locked.exists() && !rewritten.exists());
+    assert!(
+        fresh.join("debug/deps/x").is_file(),
+        "its folder was written yesterday"
+    );
+    assert!(
+        cloned.join("debug/deps/x").is_file(),
+        "a folder in its git-shaped folder was written yesterday"
+    );
+    assert!(planted.join("debug/deps/x").is_file());
+
+    // A worktree whose builds ran under a link's own name: the cache mirrors the name as given,
+    // and that mirror goes.
+    let spelled = f.root.join("spelled");
+    std::os::unix::fs::symlink(f.dir("home/real"), &spelled).unwrap();
+    let under_name = lay(&root, &spelled, 8 * DAY);
+    let went = run(&spelled, &mut asked);
+    assert_eq!(merged(&went), [under_name.clone()], "{went:?}");
+    assert!(!under_name.exists());
+
+    // The home, the filesystem root and a relative path mirror no worktree; nor does the home
+    // named as it is while the caller names the home through a link.
+    let before = asked.len();
+    for not_a_worktree in [f.home.as_path(), Path::new("/"), Path::new("home/wt")] {
+        let went = run(not_a_worktree, &mut asked);
+        assert!(went.is_empty(), "{}: {went:?}", not_a_worktree.display());
+    }
+    let home_link = f.root.join("home-link");
+    std::os::unix::fs::symlink(&f.home, &home_link).unwrap();
+    let went = reclaim_merged_worktree_on(
+        &home_link,
+        &f.home,
+        now,
+        &always,
+        &mut |path, _| {
+            asked.push(path.to_path_buf());
+            true
+        },
+        &fence,
+    );
+    assert!(went.is_empty(), "the home through a link: {went:?}");
+    assert_eq!(asked.len(), before, "nothing was asked for");
+    for kept in [&sibling, &beside, &fresh] {
+        assert!(
+            kept.join("debug/deps/x").is_file(),
+            "{} stays",
+            kept.display()
+        );
+    }
+
+    // A cache root that is a link to a folder laid out as a cache: it is not entered.
+    let other_home = f.dir("home2");
+    let behind = f.dir("behind");
+    let other_wt = f.dir("home2/wt");
+    let behind_leaf = lay(&behind, &other_wt, 8 * DAY);
+    let other_root = cache_root(&other_home);
+    std::fs::create_dir_all(other_root.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&behind, &other_root).unwrap();
+    let went = reclaim_merged_worktree_on(
+        &other_home,
+        &other_wt,
+        now,
+        &always,
+        &mut |path, _| {
+            asked.push(path.to_path_buf());
+            true
+        },
+        &fence,
+    );
+    assert!(went.is_empty(), "a linked cache root: {went:?}");
+    assert_eq!(asked.len(), before, "nothing was asked for");
+    assert!(behind_leaf.join("debug/deps/x").is_file());
+
+    // The caller's leave ends once the directory is moved aside: it stays in its stage, its
+    // intent closed with nothing gone, and a pass of the cache finishes it; a later call for
+    // the same worktree finishes such a stage too.
+    let staged = Unused::Refused {
+        by: Refusal::Staged,
+    };
+    let mut stages = Vec::new();
+    for name in ["home/late", "home/later"] {
+        let late = f.dir(name);
+        let late_leaf = lay(&root, &late, 8 * DAY);
+        let late_mirror = late_leaf.parent().unwrap().to_path_buf();
+        let until_moved = Leave {
+            within: &|| late_leaf.exists(),
+            ..always
+        };
+        let went =
+            reclaim_merged_worktree_on(&f.home, &late, now, &until_moved, &mut |_, _| true, &fence);
+        let found = stages_in(&late_mirror, OsStr::new(DOOMED));
+        assert_eq!(found.len(), 1, "moved aside and left there: {went:?}");
+        let stage = found[0].clone();
+        assert_eq!(
+            went,
+            [(stage.clone(), staged)],
+            "its stage, nothing of it gone"
+        );
+        assert!(!late_leaf.exists() && stage.join("debug/deps/x").is_file());
+        stages.push((late, stage));
+    }
+    let (later, later_stage) = stages.pop().unwrap();
+    let went = reclaim_merged_worktree_on(&f.home, &later, now, &always, &mut |_, _| true, &fence);
+    assert_eq!(
+        went,
+        [(later_stage.clone(), Unused::Unfinished)],
+        "a later call for the worktree finishes its stage"
+    );
+    assert!(!later_stage.exists());
+    let (_, stage) = stages.pop().unwrap();
+    let finished = reclaim_watched_on(
+        &root,
+        Some(&f.home),
+        SystemTime::now(),
+        ReclaimAfter::CALM,
+        None,
+        &mut |_, _| true,
+        &fence,
+    );
+    assert!(
+        finished.contains(&(stage.clone(), Unused::Unfinished)),
+        "the cache's own pass finishes it: {finished:?}"
+    );
+    assert!(!stage.exists());
+}

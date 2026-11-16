@@ -159,6 +159,16 @@ pub(crate) fn asks(ctx: &crate::Ctx) -> bool {
     !ctx.release && !ctx.compile_only && crate::checks::DEV.iter().all(|c| ctx.checks.contains(c))
 }
 
+/// Bind turn observations before the invocation freezes its source context.
+pub(crate) fn bind_events(ctx: &mut crate::Ctx) {
+    if asks(ctx) {
+        let context = event_log::Context::captured(ctx);
+        ctx.events
+            .get_or_insert_with(event_log::EventLog::unrecorded)
+            .bind(context);
+    }
+}
+
 /// The turn a heavy run holds ([`take`]) until it ends ([`Held::end`]).
 pub(crate) struct Held {
     _claim: aterm_capacity::Claim,
@@ -279,11 +289,12 @@ fn now_ms() -> u64 {
 /// # Errors
 /// The wait ended on an interrupt or the run's end, which ends the run.
 pub(crate) fn take(
-    ctx: &mut crate::Ctx,
+    plan: &crate::RunPlan<'_>,
     since_ms: Option<u64>,
     mode: aterm_capacity::Admit,
 ) -> Result<Option<Held>, String> {
-    if !asks(ctx) {
+    let ctx = plan.context();
+    if !plan.has_compiler_stage() || !asks(ctx) {
         return Ok(None);
     }
     let cores = aterm_capacity::cores();
@@ -300,11 +311,6 @@ pub(crate) fn take(
         since_ms: since_ms.unwrap_or_else(now_ms),
         predicted_ms: prediction.machine_ms,
     };
-    // The turn's events come before the run's log opens; bind them to the run as that would.
-    let context = event_log::Context::captured(ctx);
-    ctx.events
-        .get_or_insert_with(event_log::EventLog::unrecorded)
-        .bind(context);
     let events = ctx.events.as_ref();
     let need = aterm_capacity::Need::new(format!("verify judgment turn: {}", ctx.scope.label()))
         .heavy(heavy.since_ms, heavy.predicted_ms)

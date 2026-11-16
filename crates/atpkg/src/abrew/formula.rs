@@ -140,6 +140,10 @@ pub struct LivecheckSpec {
     /// A `:yaml` strategy block reduced to a data shape
     /// (see `YamlShape`); other blocks stay `None`.
     pub yaml_block: Option<YamlBlock>,
+    /// An `:extract_plist` strategy block reduced to a
+    /// data shape (see `PlistBlock`); other blocks stay
+    /// `None`.
+    pub plist_block: Option<PlistBlock>,
     /// `skip` was declared; the string is its optional message.
     pub skip: Option<String>,
     /// `throttle <versions>` / `throttle days: <days>`.
@@ -249,6 +253,26 @@ pub enum XmlShape {
 pub struct YamlBlock {
     pub has_regex: bool,
     pub shape: YamlShape,
+}
+
+/// An `:extract_plist` strategy block reduced to data:
+/// one bundle-identifier lookup of one version property,
+/// optionally with the regex's first capture applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlistBlock {
+    pub has_regex: bool,
+    pub bundle_id: String,
+    pub prop: PlistProp,
+    pub regex: bool,
+}
+
+/// Which plist version a block reads (`short_version`
+/// = `CFBundleShortVersionString`, `version` =
+/// `CFBundleVersion`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlistProp {
+    Short,
+    Bundle,
 }
 
 /// The data-only shapes a `:yaml` block body can take:

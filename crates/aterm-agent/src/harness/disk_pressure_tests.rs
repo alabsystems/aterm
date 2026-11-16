@@ -820,3 +820,118 @@ fn under_a_projection_above_the_floor_a_recent_profile_waits_an_hour() {
     });
     assert!(pressure_order(&rep).contains(&b.join("debug")), "{rep:?}");
 }
+
+/// The real remover at `now`, on any device, its process scan reading no process (the fence
+/// over a metadata folder is its own test's: a test host's other processes are not this one's).
+fn unfenced(now: i64) -> impl FnMut(&Row) -> std::io::Result<Removed> {
+    remover_among(
+        Judge {
+            now,
+            threshold_days: DEFAULT_TARGET_STALE_DAYS,
+            device: None,
+            volume: None,
+        },
+        None,
+        |_: &[PathBuf], _: &[u32]| Ok(aterm_uds::holders::PathScan::default()),
+        discover::running_claude_census,
+        idle::Sessions::default,
+        aterm_sysprobe::volumes::table,
+    )
+}
+
+/// EXIT TEST 2 (DC-06a): at an emergency, what a build that died left goes before any finished
+/// unit. A volume filled to zero holds three recent profiles; in the least recently used one a
+/// build died, leaving an unfinished incremental session (its lock free) and a metadata folder.
+/// The report plans both as tier 0 ahead of every tier 4 row; the real pass journals and removes
+/// them first, then takes the least recently used profile's `incremental/` as tier 4, which it
+/// could not do had the removals moved that profile's clock past the survey. The session's lock
+/// file stays for rustc's own collection (read as tier 4 begins, before it takes
+/// `incremental/`), and every finished unit (`deps/`'s rlib) stays.
+/// NEGATIVE CONTROL: a remover that does not put `deps/`'s times back moves the profile's clock,
+/// so tier 4 refuses `b/target/debug` ("written into since the survey") and the third removal
+/// fails; a planner that ranks tier 0 after tier 4 fails the first two; a remover that takes
+/// the session's lock file with it fails the lock's line.
+#[test]
+fn at_an_emergency_a_died_builds_partial_output_goes_before_any_finished_unit() {
+    let tmp = Tmp::new("died-first");
+    let (a, b, now) = three_recent(tmp.path());
+    let profile = b.join("debug");
+    let krate = profile.join("incremental/lay-1x2y3z");
+    let session = krate.join("s-old1-died1-working");
+    std::fs::create_dir_all(&session).expect("session");
+    std::fs::write(session.join("query-cache.bin"), vec![3u8; 8192]).expect("query cache");
+    std::fs::write(krate.join("s-old1-died1.lock"), b"").expect("lock");
+    let meta = profile.join("deps/rmetaAb12Cd");
+    std::fs::create_dir_all(&meta).expect("rmeta");
+    std::fs::write(meta.join("lib.rmeta"), vec![4u8; 8192]).expect("rmeta file");
+    set_mtime(&session, now - HOUR);
+    set_mtime(&meta, now - HOUR);
+    last_used(&profile, now - 5 * HOUR);
+    let config = Config::default();
+    let target = config.pressure_target_bytes();
+
+    let (survey, rep) = surveyed(&tmp, &[a, b.clone()], now, 0);
+    let tiers: Vec<Option<Tier>> = rep.rows.iter().map(Row::tier).collect();
+    assert_eq!(
+        tiers
+            .iter()
+            .filter(|t| **t == Some(Tier::DiedBuild))
+            .count(),
+        2,
+        "{rep:?}"
+    );
+    assert!(
+        tiers.windows(2).all(|w| w[0] <= w[1]),
+        "tier 0 first, then each tier in turn: {tiers:?}"
+    );
+    assert!(rep.waits.held.is_empty(), "{:?}", rep.waits);
+
+    let mut reads = 0;
+    let mut journal = Vec::new();
+    let lock = krate.join("s-old1-died1.lock");
+    let mut lock_at_tier_4 = None;
+    let done = apply_auto(
+        &rep,
+        survey.transcripts_root.as_deref(),
+        &mut unfenced(now),
+        &mut scripted(vec![0, target], &mut reads),
+        &mut |step| {
+            if matches!(step, Step::Removing(r) if r.tier() == Some(Tier::RecentIncremental)) {
+                lock_at_tier_4.get_or_insert(lock.exists());
+            }
+            journal.push(step_row(now, "", step));
+            true
+        },
+    )
+    .expect("an emergency");
+
+    let went: Vec<(&Path, Option<Tier>)> = done
+        .removed
+        .iter()
+        .map(|(row, _)| (row.path.as_path(), row.tier()))
+        .collect();
+    assert_eq!(
+        went,
+        [
+            (meta.as_path(), Some(Tier::DiedBuild)),
+            (session.as_path(), Some(Tier::DiedBuild)),
+            (profile.as_path(), Some(Tier::RecentIncremental)),
+        ],
+        "{done:?}"
+    );
+    assert!(done.denials.is_empty(), "{done:?}");
+    assert!(!meta.exists() && !session.exists());
+    assert_eq!(
+        lock_at_tier_4,
+        Some(true),
+        "the session went and its lock stayed for rustc's own collection"
+    );
+    assert!(!profile.join("incremental").exists(), "tier 4 took it");
+    assert!(profile.join("deps/liblay.rlib").exists(), "a finished unit");
+    let witnesses: Vec<bool> = journal
+        .iter()
+        .filter(|l| l.contains("\"kind\":\"removing\""))
+        .map(|l| l.contains("\"witness\":\"died-build\""))
+        .collect();
+    assert_eq!(witnesses, [true, true, false], "{journal:?}");
+}

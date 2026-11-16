@@ -622,6 +622,63 @@ fn split_tree_layout_and_neighbor_share_logical_rects() {
     );
 }
 
+/// A SIDEBAR'S SEAT IS FIRST, BESIDE THE WHOLE TREE: the new leaf is the root's first child at
+/// the share asked for, and everything the tree held is its second child, its own splits and
+/// ratios as they were. NEGATIVE CONTROL: `split_leaf` seats its new leaf second at half.
+#[test]
+fn a_first_seat_puts_the_new_leaf_left_of_the_whole_tree_at_its_share() {
+    let mut tree = SplitTree::leaf(1u64);
+    assert!(tree.split_leaf(1, SplitAxis::Vertical, 2));
+    let held = tree.clone();
+    assert!(tree.seat_first(SplitAxis::Horizontal, 9, 0.25));
+    assert_eq!(tree.leaves(), vec![9, 1, 2], "the new leaf is first");
+    let SplitTree::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = &tree
+    else {
+        panic!("a split at the root");
+    };
+    assert_eq!((*axis, *ratio), (SplitAxis::Horizontal, 0.25));
+    assert_eq!(**first, SplitTree::Leaf(9));
+    assert_eq!(**second, held, "what the tree held is whole on the right");
+    let bounds = LogicalRect::new(0.0, 0.0, 121.0, 24.0);
+    let leaves = tree.layout(bounds, 1.0, 1.0);
+    assert_eq!(leaves[0].rect.origin.x, 0.0);
+    assert_eq!(leaves[0].rect.size.width, 30.0, "a quarter of 120 cells");
+    assert!(
+        !tree.seat_first(SplitAxis::Horizontal, 9, 0.25),
+        "held once"
+    );
+    assert!(!tree.seat_first(SplitAxis::Horizontal, 7, f32::NAN));
+
+    let mut second_seat = SplitTree::leaf(1u64);
+    assert!(second_seat.split_leaf(1, SplitAxis::Horizontal, 9));
+    assert_eq!(second_seat.leaves(), vec![1, 9]);
+}
+
+#[test]
+fn a_tabs_first_seat_focuses_the_new_view_and_ends_a_zoom() {
+    let mut store = ViewStore::default();
+    let terminal = store.insert_terminal(11).expect("terminal view");
+    let native = store
+        .insert_native(AppInstanceId::from_stored(7))
+        .expect("native view");
+    let mut tab = Tab::new(
+        TabId::from_stored(3),
+        terminal,
+        TabPresentation::terminal("shell"),
+    );
+    assert!(tab.seat_first(SplitAxis::Horizontal, native, 0.25));
+    assert_eq!(tab.root.leaves(), vec![native, terminal]);
+    assert_eq!(tab.focus, native);
+    assert!(!tab.zoomed);
+    assert!(!tab.seat_first(SplitAxis::Horizontal, native, 0.25));
+    assert!(tab.invariant_holds(&store));
+}
+
 #[test]
 fn divider_hit_drives_the_same_split_and_stale_path_fails_closed() {
     let mut tree = SplitTree::leaf(1u64);

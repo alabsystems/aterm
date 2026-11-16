@@ -57,7 +57,7 @@ use crate::members::Allowed;
 use crate::members::bundle::Reader;
 use crate::membership_log::{
     Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, Record, RecordCounts,
-    Signer, encode_records,
+    Signer, read_records,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -457,11 +457,8 @@ pub fn admit_successor(
         ));
     };
     if !signed.is_empty() {
-        store.ingest(&encode_records(&signed))?;
-        if signed
-            .iter()
-            .any(|record| store.get_bytes(record.id()).is_none())
-        {
+        store.ingest(&read_records(&signed)?)?;
+        if signed.iter().any(|record| !store.contains(record.id())) {
             return Err(Error::new(
                 "the successor's admission cannot be retained in full",
             ));
@@ -483,7 +480,7 @@ pub fn admit_successor(
             admit: seated.entry,
             label: label.clone(),
             signed: signed.clone(),
-            records: store.encode_held(),
+            records: super::admit::held_records(&store)?,
         },
         policy,
         succeeding.reader,

@@ -101,7 +101,8 @@ pub mod watch;
 pub(crate) mod win;
 
 pub use target::{
-    CARGO_LOCKS, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, PROJECTED_MIN_IDLE_S, Profile, TargetDir,
+    CARGO_LOCKS, Held, INCREMENTAL, Judge, PRESSURE_MIN_IDLE_S, PROJECTED_MIN_IDLE_S, Profile,
+    TargetDir,
 };
 
 /// `disk.idle_build_dirs`.
@@ -246,9 +247,12 @@ pub struct Config {
     pub dead_build_dirs: bool,
     /// `disk.room_gib`: the room PINNED, read as written (`None`: the watch's measured room, [`room`]).
     pub room_gib: Option<u64>,
-    /// `disk.idle_build_dirs`.
+    /// `disk.idle_build_dirs`: may an idle build directory go whole (tier 3, and a merged,
+    /// quiet worktree's that stays, [`worktree::Facts::build_dirs`])?
     pub idle_build_dirs: bool,
-    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]).
+    /// `disk.idle_build_days`: tier 3's window ([`idle::DEFAULT_IDLE_BUILD_DAYS`]), and, where
+    /// it is longer than seven days, how long a merged worktree's build directory is unwritten
+    /// before it goes; below 1 turns both off.
     pub idle_build_days: i64,
     /// `disk.cap_used_gib`: the cap the rebuildable budget is counted against ([`Self::budget`]). No line or level reads it; over it the budget's pass takes only what no live session's builds use ([`budget`]), and the pressure pass's discovery cycle is scoped on [`Self::removal_view`], which leaves it out.
     pub cap_used_gib: Cap,
@@ -317,7 +321,8 @@ impl Config {
         })
     }
 
-    /// Whether tier 3 ([`Witness::IdleWhole`]) may remove.
+    /// Whether tier 3 ([`Witness::IdleWhole`]) may remove, and with it whether a merged, quiet
+    /// worktree that stays gives back its build directory ([`worktree::Facts::build_dirs`]).
     #[must_use]
     pub const fn idle_whole_on(&self) -> bool {
         self.idle_build_dirs && self.idle_build_days >= 1 && self.auto_free_gib > 0
@@ -664,9 +669,53 @@ pub struct Rebuildable {
     pub partial: bool,
 }
 
+/// What a pressure pass waits for before more may go ([`Report::waits`]): the earliest second
+/// something kept for its age may go, and the build locks that keep the rest.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Waits {
+    /// The earliest unix second something a pass would take, kept now for its age, may go.
+    pub ripens: Option<i64>,
+    /// The locks a build held over what a pass would take, at most [`cadence::HELD_PROBES`].
+    pub held: Vec<Held>,
+}
+
+impl Waits {
+    fn ripen(&mut self, at: i64) {
+        self.ripens = Some(self.ripens.map_or(at, |was| was.min(at)));
+    }
+
+    fn hold(&mut self, held: Held) {
+        if self.held.len() < cadence::HELD_PROBES && !self.held.contains(&held) {
+            self.held.push(held);
+        }
+    }
+
+    /// `other`'s waits added to these: the earlier ripening, and its locks up to the bound.
+    fn merge(&mut self, other: &Waits) {
+        if let Some(at) = other.ripens {
+            self.ripen(at);
+        }
+        for held in &other.held {
+            self.hold(held.clone());
+        }
+    }
+}
+
 /// Why a row is safe to remove.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Witness {
+    /// TIER 0: a piece of what a build that died left in a profile ([`target::died_output`]).
+    DiedBuild {
+        marker: String,
+        build_dir: PathBuf,
+        profile: PathBuf,
+        /// The unfinished session's lock file; `None`: a metadata temporary folder.
+        session_lock: Option<PathBuf>,
+        /// Its folder's modification time at the survey, unix seconds.
+        modified: i64,
+        age_s: i64,
+        device: u64,
+    },
     StaleBuildDir {
         marker: String,
         profiles: usize,
@@ -729,6 +778,20 @@ impl Witness {
     #[must_use]
     pub fn describe(&self) -> String {
         match self {
+            Witness::DiedBuild {
+                marker,
+                session_lock,
+                age_s,
+                ..
+            } => format!(
+                "{marker} present; {}, unwritten for {} — a build that died left it, so a pass takes it before any finished unit (costs nothing: no build reads it again)",
+                if session_lock.is_some() {
+                    "an unfinished incremental session whose lock no rustc holds"
+                } else {
+                    "a metadata folder a compile was writing, no process inside it"
+                },
+                target::human_age(*age_s)
+            ),
             Witness::StaleBuildDir {
                 marker,
                 profiles,
@@ -804,6 +867,7 @@ impl Witness {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
+            Witness::DiedBuild { .. } => "died-build",
             Witness::StaleBuildDir { .. } => "stale-build-dir",
             Witness::LeastRecentlyUsed { .. } => "least-recently-used",
             Witness::OwnerGone { .. } => "owner-gone",
@@ -819,6 +883,8 @@ impl Witness {
 /// THE TIERS of the automatic pass, cheapest to the owner first (design `docs/DESIGN-disk-awareness-2026-10-17.md` §4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
+    /// What a build that died left (`Witness::DiedBuild`): it serves no build.
+    DiedBuild = 0,
     EndedOwners = 1,
     IdleIncremental = 2,
     IdleWhole = 3,
@@ -860,6 +926,7 @@ impl Row {
             return None;
         }
         match self.witness {
+            Witness::DiedBuild { .. } => Some(Tier::DiedBuild),
             Witness::OwnerGone { .. } => Some(Tier::EndedOwners),
             Witness::StaleBuildDir { .. } => Some(Tier::IdleIncremental),
             Witness::IdleWhole { .. } => Some(Tier::IdleWhole),
@@ -954,6 +1021,10 @@ pub struct Report {
     /// What a budget pass may take ([`budget::ask`]), where one runs: [`pass_plan`] then plans
     /// its rows alone.
     pub budget: Option<budget::Ask>,
+    /// The rebuildable bytes the survey saw on the measured volume ([`seen_rebuildable`]).
+    pub seen: Rebuildable,
+    /// What a pressure pass waits for before more may go.
+    pub waits: Waits,
 }
 
 /// One build directory — or an x.py checkout's whole `build/` — holding bytes no row of the report would free.
@@ -1234,7 +1305,11 @@ fn row_value(r: &Row) -> Value {
     }
     if let Witness::LeastRecentlyUsed { last_used, .. }
     | Witness::OwnerGone { last_used, .. }
-    | Witness::IdleWhole { last_used, .. } = &r.witness
+    | Witness::IdleWhole { last_used, .. }
+    | Witness::DiedBuild {
+        modified: last_used,
+        ..
+    } = &r.witness
     {
         o.insert("last_used".to_owned(), Value::from(rfc3339_utc(*last_used)));
     }
@@ -1346,6 +1421,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         .map(|t| t.path.as_path())
         .collect();
     let mut whole: Vec<&Path> = Vec::new();
+    let mut waits = Waits::default();
     let mut next = 0;
     for t in targets {
         let at = t.fences().is_ok().then(|| {
@@ -1353,7 +1429,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             next - 1
         });
         let (own, leaves) = decided_by(t, at, &deciding);
-        match whole_verdict(t, survey, config, &leaves) {
+        match whole_verdict(t, survey, config, &leaves, &mut waits) {
             Some(Ok(witness)) => {
                 let (bytes, bytes_partial) = t.total.unwrap_or((0, true));
                 rows.push(Row {
@@ -1404,7 +1480,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
             )),
         }
     }
-    let pressure_cut = pressure_rows(survey, config, &whole, &mut rows, &mut notes);
+    let pressure_cut = pressure_rows(survey, config, &whole, (&mut rows, &mut waits), &mut notes);
     idle_whole_rows(survey, config, &mut rows, &mut notes);
     notes.extend(survey.notes.iter().cloned());
     for holder in &survey.registered_holders {
@@ -1450,6 +1526,7 @@ pub fn report(survey: &Survey, config: Config) -> Report {
 
     let warn = survey.free_bytes.is_some_and(|b| b < warn_free_bytes);
     let hogs = hogs(survey, config, &rows, &notes, &|_| true);
+    let seen = seen_rebuildable(survey, pressure_cut);
     Report {
         now: survey.now,
         trigger: survey.trigger,
@@ -1473,7 +1550,62 @@ pub fn report(survey: &Survey, config: Config) -> Report {
         demand: survey.demand,
         projected: survey.projected,
         budget: None,
+        seen,
+        waits,
     }
+}
+
+/// The rebuildable bytes the survey saw on the measured volume, without another walk: each
+/// build directory there that was sized and each registered holder there, a tree nested in
+/// another counted in the outer one ([`collapse_nested_holders`]). The figure is a floor
+/// (`partial`) where a size walk stopped at its bound, the survey's input was cut, the pressure
+/// plan was `cut`, or a died build's listing stopped at its bound ([`target::Died::cut`]).
+fn seen_rebuildable(survey: &Survey, cut: bool) -> Rebuildable {
+    let mut partial = cut || survey.target_input_cut || survey.targets.len() > MAX_TARGETS;
+    let Some(device) = survey.volume_device else {
+        return Rebuildable {
+            bytes: 0,
+            partial: true,
+        };
+    };
+    let mut by: BTreeMap<PathBuf, Hog> = BTreeMap::new();
+    for t in survey.targets.iter().take(MAX_TARGETS) {
+        if t.device != Some(device) {
+            continue;
+        }
+        let Some((bytes, walk_partial)) = t.total else {
+            partial = true;
+            continue;
+        };
+        partial |= t.profiles.iter().any(|p| p.died.cut);
+        by.entry(t.path.clone()).or_insert_with(|| Hog {
+            path: t.path.clone(),
+            bytes,
+            bytes_partial: walk_partial,
+            why: String::new(),
+            serves: None,
+            built_s_ago: None,
+        });
+    }
+    for holder in &survey.registered_holders {
+        if target::dev_of(&holder.path) != Some(device) {
+            continue;
+        }
+        by.entry(holder.path.clone())
+            .and_modify(|known| {
+                if holder.bytes > known.bytes {
+                    known.bytes = holder.bytes;
+                    known.bytes_partial |= holder.bytes_partial;
+                }
+            })
+            .or_insert_with(|| holder.clone());
+    }
+    let mut seen = Rebuildable { bytes: 0, partial };
+    for root in collapse_nested_holders(by) {
+        seen.bytes = seen.bytes.saturating_add(root.bytes);
+        seen.partial |= root.bytes_partial;
+    }
+    seen
 }
 
 fn idle_whole_rows(survey: &Survey, config: Config, rows: &mut Vec<Row>, notes: &mut Vec<String>) {
@@ -1544,6 +1676,7 @@ fn whole_verdict(
     survey: &Survey,
     config: Config,
     leaves: &[PathBuf],
+    waits: &mut Waits,
 ) -> Option<Result<Witness, String>> {
     let discover::Owned::Gone { evidence, owner } = &t.owned else {
         return None;
@@ -1587,6 +1720,9 @@ fn whole_verdict(
             return Err("it holds no cargo profile".to_owned());
         }
         if let Some(why) = t.profiles.iter().find_map(|p| p.in_use.clone()) {
+            for p in t.profiles.iter().filter(|p| p.in_use.is_some()) {
+                waits.hold(Held::Profile(p.path.clone()));
+            }
             return Err(why);
         }
         let mut newest = 0;
@@ -1610,6 +1746,7 @@ fn whole_verdict(
             quiet_s
         };
         if age_s < quiet_s {
+            waits.ripen(newest.saturating_add(quiet_s));
             return Err(format!(
                 "a profile was written into {} ago, inside the {} quiet window",
                 target::human_age(age_s),
@@ -1674,7 +1811,9 @@ fn row_dir(r: &Row) -> Option<&Path> {
         Witness::StaleBuildDir { .. } | Witness::OwnerGone { .. } | Witness::IdleWhole { .. } => {
             Some(&r.path)
         }
-        Witness::LeastRecentlyUsed { build_dir, .. } => Some(build_dir),
+        Witness::LeastRecentlyUsed { build_dir, .. } | Witness::DiedBuild { build_dir, .. } => {
+            Some(build_dir)
+        }
         _ => None,
     }
 }
@@ -1839,7 +1978,8 @@ pub fn hogs_left(
             .iter()
             .filter(|(row, removed)| match &row.witness {
                 Witness::OwnerGone { .. } => !removed.units.contains(&row.path),
-                Witness::StaleBuildDir { .. }
+                Witness::DiedBuild { .. }
+                | Witness::StaleBuildDir { .. }
                 | Witness::LeastRecentlyUsed { .. }
                 | Witness::IdleWhole { .. } => removed.bytes != row.bytes,
                 Witness::NotLinkTarget { .. }
@@ -1967,7 +2107,10 @@ fn hog_of(t: &TargetDir, config: Config, survey: &Survey, notes: &[String]) -> (
 }
 
 const fn is_pressure(r: &Row) -> bool {
-    matches!(r.witness, Witness::LeastRecentlyUsed { .. })
+    matches!(
+        r.witness,
+        Witness::LeastRecentlyUsed { .. } | Witness::DiedBuild { .. }
+    )
 }
 
 fn lru_rank(r: &Row) -> (u8, i64) {
@@ -1975,7 +2118,11 @@ fn lru_rank(r: &Row) -> (u8, i64) {
     match r.witness {
         Witness::OwnerGone { last_used, .. }
         | Witness::LeastRecentlyUsed { last_used, .. }
-        | Witness::IdleWhole { last_used, .. } => (tier, last_used),
+        | Witness::IdleWhole { last_used, .. }
+        | Witness::DiedBuild {
+            modified: last_used,
+            ..
+        } => (tier, last_used),
         Witness::StaleBuildDir { idle_days, .. } => (tier, -idle_days),
         _ => (tier, 0),
     }
@@ -1985,7 +2132,7 @@ fn pressure_rows(
     survey: &Survey,
     config: Config,
     whole: &[&Path],
-    rows: &mut Vec<Row>,
+    (rows, waits): (&mut Vec<Row>, &mut Waits),
     notes: &mut Vec<String>,
 ) -> bool {
     if survey.targets.is_empty() {
@@ -2055,12 +2202,45 @@ fn pressure_rows(
     }
     let dirs: Vec<&Path> = eligible.iter().map(|(t, ..)| t.path.as_path()).collect();
     let mut picks: Vec<Row> = Vec::new();
+    let mut died: Vec<Row> = Vec::new();
     for (i, (t, marker, device)) in eligible.iter().enumerate() {
         // A whole row takes every profile of its build directory.
         if whole.contains(&t.path.as_path()) {
             continue;
         }
         let speaks = |p: &Profile| speaker(&dirs, &p.path) == Some(i);
+        // TIER 0: what a build that died left goes before any finished unit.
+        for p in t.profiles.iter().filter(|p| speaks(p)) {
+            if p.in_use.is_some() {
+                waits.hold(Held::Profile(p.path.clone()));
+            }
+            if let Some(at) = p.ripens_at(survey.now, config.target_stale_days, min_idle_s) {
+                waits.ripen(at);
+            }
+            if let Some(at) = p.died.ripens {
+                waits.ripen(at);
+            }
+            for held in &p.died.held {
+                waits.hold(held.clone());
+            }
+            died.extend(p.died.partials.iter().map(|piece| Row {
+                class: Class::CargoTargets,
+                path: piece.path.clone(),
+                bytes: piece.bytes,
+                bytes_partial: piece.bytes_partial,
+                witness: Witness::DiedBuild {
+                    marker: marker.clone(),
+                    build_dir: t.path.clone(),
+                    profile: p.path.clone(),
+                    session_lock: piece.session_lock.clone(),
+                    modified: piece.modified,
+                    age_s: survey.now.saturating_sub(piece.modified),
+                    device: *device,
+                },
+                removable: true,
+                blocked: None,
+            }));
+        }
         let (candidates, kept) =
             t.pressure_candidates(survey.now, config.target_stale_days, min_idle_s);
         notes.extend(kept.into_iter().filter(|(p, _)| speaks(p)).map(|(p, why)| {
@@ -2098,18 +2278,29 @@ fn pressure_rows(
             picks.push(row);
         }
     }
-    picks.sort_by(|a, b| {
+    let by_rank = |a: &Row, b: &Row| {
         lru_rank(a)
             .cmp(&lru_rank(b))
             .then_with(|| a.path.cmp(&b.path))
-    });
+    };
+    died.sort_by(by_rank);
+    picks.sort_by(by_rank);
+    let died_cut = died.len() > MAX_ROWS_PER_CLASS;
+    if died_cut {
+        notes.push(format!(
+            "cargo-targets: the died-build plan selected {MAX_ROWS_PER_CLASS} rows; other \
+             unfinished output remains"
+        ));
+    }
     let cut = picks.len() > MAX_ROWS_PER_CLASS;
     if cut {
         notes.push(format!("cargo-targets: the recent-profile plan selected {MAX_ROWS_PER_CLASS} rows; other eligible profiles remain"));
     }
+    died.truncate(MAX_ROWS_PER_CLASS);
     picks.truncate(MAX_ROWS_PER_CLASS);
+    rows.extend(died);
     rows.extend(picks);
-    cut
+    cut || died_cut
 }
 
 /// Is `path` at or under `dir`, where a miss must never be read as "not under" (S1, the one path rule).
@@ -2753,6 +2944,15 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
              held its locks",
             span(idle)
         ),
+        Unused::MergedWorktree { idle, after } => format!(
+            "its worktree is merged into origin/main and clean, nothing in it or in git's files \
+             for it was written for {}, and nothing wrote this for {} (it goes once unwritten \
+             {}); the worktree stays, and its next build makes this again; no build held its \
+             locks",
+            span(atpkg::build_cache::retired::UNWRITTEN),
+            span(idle),
+            span(after)
+        ),
         Unused::Moved { idle, after } => format!(
             "it is in the root the cache moved from when it went under .ubd, out of fseventsd's \
              stream, which no build of this version writes, and nothing wrote it for {} (the \
@@ -2847,6 +3047,9 @@ pub fn sweep_reason(why: atpkg::build_cache::Unused) -> String {
         Unused::Requested => "explicit registered-cache retirement".to_owned(),
         Unused::Gone { .. } => "its workspace is gone".to_owned(),
         Unused::Idle { idle } => format!("unwritten {}", sweep_span(idle)),
+        Unused::MergedWorktree { idle, .. } => {
+            format!("its worktree is merged and quiet {}", sweep_span(idle))
+        }
         Unused::Moved { idle, .. } => format!("in the old root, unwritten {}", sweep_span(idle)),
         Unused::Unfinished => "left half-removed by an earlier sweep".to_owned(),
         Unused::PackageSuperseded => "another package compiler generation is waiting".to_owned(),
@@ -3112,10 +3315,18 @@ pub fn worktree_row(now: i64, action: SweepAction, row: &WorktreeRow<'_>) -> Str
 /// ([`cannot_meet_row`]).
 pub const CANNOT_MEET_ROW_KIND: &str = "cannot-meet";
 
+/// The `by` of the `cannot-meet` row an emergency pass writes ([`CannotMeetRow`]).
+pub const EMERGENCY_ROW_BY: &str = "emergency";
+
+/// The memo of an emergency pass that could not meet the line, in the harness state directory
+/// (a [`budget::Unmet`] record, through [`budget::unmet_in`]): one `cannot-meet` row an
+/// episode, kept across a restart, removed once a look reads the volume out of its emergency.
+pub const EMERGENCY_UNMET_FILE: &str = "disk-emergency-unmet.json";
+
 /// What one `cannot-meet` row of the disk ledger says ([`cannot_meet_row`]).
 #[derive(Debug, Clone, Copy)]
 pub struct CannotMeetRow<'a> {
-    /// Which pass could not meet it (`budget`).
+    /// Which pass could not meet it (`budget`, or [`EMERGENCY_ROW_BY`]).
     pub by: &'a str,
     /// The volume, by its spelled key.
     pub volume: &'a str,
@@ -3163,24 +3374,85 @@ pub fn cannot_meet_row(now: i64, row: &CannotMeetRow<'_>) -> String {
         "held".to_owned(),
         Value::from(u64::try_from(row.held).unwrap_or(u64::MAX)),
     );
-    let text = format!(
-        "{} free of the {} the cap leaves, with {}{} kept that aterm cannot rebuild and nothing \
-         more a pass may take ({} build director{} kept for live sessions); no further row \
-         until the cap or the volume changes or a pass meets the target; a pass is planned \
-         again when the rebuildable bytes grow or the live sessions change",
-        human_bytes(row.free),
-        human_bytes(row.free_target),
-        if row.partial { "at most " } else { "" },
-        human_bytes(row.budget.kept),
-        row.held,
-        if row.held == 1 { "y" } else { "ies" },
-    );
+    let text = if row.by == EMERGENCY_ROW_BY {
+        format!(
+            "{} free under the {} emergency line, with {}{} kept that aterm cannot rebuild and \
+             {}{} it could rebuild that no pass may take now ({} build lock{} held over it); no \
+             further row until the volume leaves its emergency by {}; a pass is planned again \
+             when free space moves by as much, an agent asks for room, a lock is let go, \
+             something kept for its age may go (an hour on at the latest) or the live sessions \
+             change",
+            human_bytes(row.free),
+            human_bytes(row.free_target),
+            if row.partial { "at most " } else { "" },
+            human_bytes(row.budget.kept),
+            if row.partial { "at least " } else { "" },
+            human_bytes(row.budget.rebuildable),
+            row.held,
+            if row.held == 1 { "" } else { "s" },
+            human_bytes(cadence::EMERGENCY_DROP),
+        )
+    } else {
+        format!(
+            "{} free of the {} the cap leaves, with {}{} kept that aterm cannot rebuild and \
+             nothing more a pass may take ({} build director{} kept for live sessions); no \
+             further row until the cap or the volume changes or a pass meets the target; a pass \
+             is planned again when the rebuildable bytes grow or the live sessions change",
+            human_bytes(row.free),
+            human_bytes(row.free_target),
+            if row.partial { "at most " } else { "" },
+            human_bytes(row.budget.kept),
+            row.held,
+            if row.held == 1 { "y" } else { "ies" },
+        )
+    };
     o.insert(
         "text".to_owned(),
         Value::from(truncate_bytes(&text, ROW_TEXT_CAP).to_owned()),
     );
     aterm_json::to_string(&Value::Object(o))
         .unwrap_or_else(|_| format!("{{\"kind\":\"{CANNOT_MEET_ROW_KIND}\"}}"))
+}
+
+/// The `kind` of the worktree step's push rows in the disk ledger ([`worktree_push_row`]).
+pub const WORKTREE_PUSH_ROW_KIND: &str = "worktree-push";
+
+/// One `worktree-push` row of the disk ledger ([`worktree::step`]), a record and never an
+/// alert, of the refs a gone worktree's pins owe its repository's origin (`owed`): `pushed`,
+/// each read back at origin; `owed`, why its try failed, once each time that changes; `parked`,
+/// a ref of one of their names at origin names another commit, so it is tried no more;
+/// `dropped`, the owed file had no room for it (its refs stand in its checkout); or
+/// `unrecorded`, the owed file could not be read or written (`owed` `None`), what in `text`.
+#[must_use]
+pub fn worktree_push_row(
+    now: i64,
+    action: &str,
+    owed: Option<&worktree::pins::Owed>,
+    text: &str,
+) -> String {
+    let mut o = Map::new();
+    o.insert("ts".to_owned(), Value::from(rfc3339_utc(now)));
+    o.insert("sid".to_owned(), Value::from(String::new()));
+    o.insert(
+        "kind".to_owned(),
+        Value::from(WORKTREE_PUSH_ROW_KIND.to_owned()),
+    );
+    o.insert("action".to_owned(), Value::from(action.to_owned()));
+    if let Some(owed) = owed {
+        o.insert("path".to_owned(), Value::from(path_text(&owed.worktree)));
+        o.insert("repo".to_owned(), Value::from(path_text(&owed.push.repo)));
+        o.insert(
+            "refs".to_owned(),
+            Value::Array(owed.push.words().into_iter().map(Value::from).collect()),
+        );
+        o.insert("tries".to_owned(), Value::from(u64::from(owed.tries)));
+    }
+    o.insert(
+        "text".to_owned(),
+        Value::from(truncate_bytes(text, ROW_TEXT_CAP).to_owned()),
+    );
+    aterm_json::to_string(&Value::Object(o))
+        .unwrap_or_else(|_| format!("{{\"kind\":\"{WORKTREE_PUSH_ROW_KIND}\"}}"))
 }
 
 /// One `poke` row of the disk ledger.
@@ -3261,6 +3533,11 @@ pub struct Applied {
     /// The checkouts' `target*` links whose target the pass's search found not there
     /// ([`discover::Dangling`]).
     pub dangling: Vec<discover::Dangling>,
+    /// The rebuildable bytes the pass's survey saw on the volume ([`Report::seen`]), partial
+    /// too where the search for build directories did not finish its cycle.
+    pub seen: Rebuildable,
+    /// What the pass waits for before more may go ([`Report::waits`]).
+    pub waits: Waits,
 }
 
 impl Applied {
@@ -3286,7 +3563,9 @@ impl Applied {
     pub fn went(&self) -> Went {
         let mut went = Went::default();
         for (row, removed) in &self.removed {
-            if matches!(row.witness, Witness::IdleWhole { .. }) {
+            if matches!(row.witness, Witness::DiedBuild { .. }) {
+                went.died += removed.units.len();
+            } else if matches!(row.witness, Witness::IdleWhole { .. }) {
                 went.idle_whole += 1;
             } else if !matches!(row.witness, Witness::OwnerGone { .. }) {
                 went.profiles += removed.units.len();
@@ -3309,6 +3588,8 @@ pub struct Went {
     pub in_part: usize,
     /// Live checkouts' whole idle build directories whose profiles were emptied (tier 3), in whole or in part.
     pub idle_whole: usize,
+    /// Pieces of what builds that died left (tier 0).
+    pub died: usize,
     /// Every other unit that went.
     pub profiles: usize,
 }
@@ -3356,6 +3637,7 @@ pub fn pass_plan(rep: &Report) -> Option<Vec<Planned>> {
             .filter(|r| r.class == Class::CargoTargets && r.removable)
             .filter_map(|r| {
                 let target = match r.tier()? {
+                    Tier::DiedBuild => short.then_some(None),
                     Tier::EndedOwners => (low || short || demand.is_some()).then_some(None),
                     Tier::IdleIncremental => {
                         (low || short || demand.is_some()).then(|| Some(idle(low || short)))
@@ -3456,7 +3738,7 @@ pub fn apply(
     let rows = rows
         .into_iter()
         .map(|row| Planned {
-            target: is_pressure(&row).then_some(target),
+            target: (is_pressure(&row) && row.tier() != Some(Tier::DiedBuild)).then_some(target),
             row,
         })
         .collect();
@@ -3595,6 +3877,45 @@ pub(crate) fn remover_among(
 ) -> impl FnMut(&Row) -> std::io::Result<Removed> {
     move |row: &Row| match row.class {
         Class::CargoTargets => match &row.witness {
+            Witness::DiedBuild {
+                build_dir,
+                profile,
+                session_lock,
+                modified,
+                device,
+                ..
+            } => {
+                let judge = Judge {
+                    device: Some(*device),
+                    ..judge
+                };
+                if session_lock.is_some() {
+                    // The session's own lock is its fence: the remover takes it.
+                    target::reclaim_died(
+                        build_dir,
+                        profile,
+                        &row.path,
+                        &judge,
+                        *modified,
+                        &mut || Ok(()),
+                    )
+                } else {
+                    // No lock covers a metadata folder: no process may be inside it, before
+                    // the profile's locks are taken and again under them.
+                    let inside = [row.path.clone()];
+                    discover::unused_under(&inside, &processes).map_err(|why| {
+                        std::io::Error::other(format!("no longer a candidate: {why}"))
+                    })?;
+                    target::reclaim_died(
+                        build_dir,
+                        profile,
+                        &row.path,
+                        &judge,
+                        *modified,
+                        &mut || discover::unused_under(&inside, &processes),
+                    )
+                }
+            }
             Witness::LeastRecentlyUsed {
                 build_dir,
                 last_used,
@@ -3918,6 +4239,18 @@ pub fn scan_with(
             td.origin = origin;
             let (total, foreign) = target::total_bytes_owned(&td.path);
             td.total = Some(total);
+            // What a died build left is read only where a pressure pass could take it: on the
+            // measured volume, a build directory whose fences hold and whose profiles were
+            // probed for a build's locks, and never in a profile a build holds.
+            if let Some(device) = td.device.filter(|d| Some(*d) == s.volume_device)
+                && td.probed_recent
+                && config.pressed(free_bytes, roots.projected.as_ref())
+                && td.fences().is_ok()
+            {
+                for p in td.profiles.iter_mut().filter(|p| p.in_use.is_none()) {
+                    p.died = target::died_output(&p.path, device, now);
+                }
+            }
             let whole = matches!(td.owned, discover::Owned::Gone { .. })
                 || (roots.idle_whole && idle::checkout_of(&td.origin, &td.path).is_some());
             td.foreign = foreign.or_else(|| {

@@ -4,6 +4,7 @@
 use super::*;
 use crate::git_credential::GITHUB;
 use crate::git_credential::script;
+use crate::init_github::acquires_repository;
 use crate::items::defaults::tests::user;
 use crate::port::{Fake, GithubResponse, Ran, Stat};
 
@@ -124,6 +125,7 @@ fn a_captured_local_blocker_is_not_reread_after_capture() {
         &ctx,
         Mode::Plan,
         RepositoryWork::Refresh,
+        RepositorySteps::Both,
         captured,
         Box::new(|| Ok(true)),
     )
@@ -241,7 +243,7 @@ fn required_dependencies_wait_for_managed_git_and_preserve_dirty_work() {
     );
     let untouched = |calls: &[String]| {
         calls.iter().all(|call| {
-            !call.contains(" clone ")
+            !acquires_repository(call)
                 && !call.contains(" fetch ")
                 && !call.contains(" checkout ")
                 && !call.contains(" submodule ")
@@ -280,14 +282,7 @@ fn required_dependencies_wait_for_managed_git_and_preserve_dirty_work() {
         crate::model::Outcome::Ok,
         "{ready:?}"
     );
-    assert_eq!(
-        Reading::of(stage(&ready)),
-        Some(Reading::Repositories {
-            present: 1,
-            count: 1,
-            signed_in: true
-        })
-    );
+    assert_eq!(Reading::of(stage(&ready)), Some(signed_in(all_ready(1))));
     assert!(untouched(&sys.calls()), "{:?}", sys.calls());
 
     sys.file(
@@ -345,10 +340,10 @@ fn native_bootstrap_counts_and_repairs_required_gitlinks_on_new_and_existing_par
         let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         assert_eq!(
             super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-            Some(super::InventoryCounts {
-                present: 0,
-                unborn: 0,
-                total: 1
+            Some(RepositoryCounts {
+                dependencies: usize::from(already_present),
+                missing: usize::from(!already_present),
+                ..RepositoryCounts::default()
             })
         );
         let rows = run(&sys, &ctx, Mode::Apply).unwrap();
@@ -357,26 +352,15 @@ fn native_bootstrap_counts_and_repairs_required_gitlinks_on_new_and_existing_par
             crate::model::Outcome::Changed,
             "{already_present}: {rows:?}"
         );
-        assert_eq!(
-            Reading::of(stage(&rows)),
-            Some(Reading::Repositories {
-                present: 1,
-                count: 1,
-                signed_in: true
-            })
-        );
+        assert_eq!(Reading::of(stage(&rows)), Some(signed_in(all_ready(1))));
         assert_eq!(
             super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-            Some(super::InventoryCounts {
-                present: 1,
-                unborn: 0,
-                total: 1
-            })
+            Some(all_ready(1))
         );
         assert_eq!(
             sys.calls()
                 .iter()
-                .filter(|call| call.contains(" clone "))
+                .filter(|call| acquires_repository(call))
                 .count(),
             if already_present { 1 } else { 2 }
         );
@@ -403,7 +387,7 @@ fn native_dependency_failure_stays_unfinished_and_the_next_pass_repairs_only_the
     }
     let once = AtomicBool::new(false);
     sys.simulate(move |_, command| {
-        (command.display().contains(" clone ") && !once.swap(true, Ordering::SeqCst))
+        (acquires_repository(&command.display()) && !once.swap(true, Ordering::SeqCst))
             .then(|| Ran::exit(128, "synthetic transport unavailable"))
     });
     let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
@@ -415,10 +399,9 @@ fn native_dependency_failure_stays_unfinished_and_the_next_pass_repairs_only_the
     );
     assert_eq!(
         super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-        Some(super::InventoryCounts {
-            present: 0,
-            unborn: 0,
-            total: 1
+        Some(RepositoryCounts {
+            dependencies: 1,
+            ..RepositoryCounts::default()
         })
     );
     assert!(sys.stat(&parent).is_ok());
@@ -431,16 +414,12 @@ fn native_dependency_failure_stays_unfinished_and_the_next_pass_repairs_only_the
     );
     assert_eq!(
         super::super::automatic_inventory_counts(&sys, &ctx).unwrap(),
-        Some(super::InventoryCounts {
-            present: 1,
-            unborn: 0,
-            total: 1
-        })
+        Some(all_ready(1))
     );
     assert_eq!(
         sys.calls()
             .iter()
-            .filter(|call| call.contains(" clone "))
+            .filter(|call| acquires_repository(call))
             .count(),
         2
     );
@@ -461,7 +440,7 @@ fn blocked_required_dependency_keeps_its_counts_and_names_preserved_work_not_sig
         Probe::Person { step, how } => {
             assert_eq!(step, REPOSITORIES_STEP);
             assert!(
-                how.contains("0 of 1 repositories ready") && how.contains("preserved work"),
+                how.contains("0 of 1 ready") && how.contains("preserved work"),
                 "{how}"
             );
             assert!(!how.contains("sign-in"));
@@ -469,15 +448,14 @@ fn blocked_required_dependency_keeps_its_counts_and_names_preserved_work_not_sig
         }
         other => panic!("{other:?}"),
     }
-    let reading = Reading::Repositories {
-        present: 0,
-        count: 1,
-        signed_in: true,
-    };
+    let reading = signed_in(RepositoryCounts {
+        preserved: 1,
+        ..RepositoryCounts::default()
+    });
     assert_eq!(item.detail(&sys, &ctx), Some(reading.token()));
     assert_eq!(reading.word().as_deref(), Some("0 of 1"));
     assert_eq!(sys.read_file(&path).unwrap(), b"preserved owner work");
-    assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
+    assert!(!sys.calls().iter().any(|call| acquires_repository(call)));
 }
 
 #[test]
@@ -503,7 +481,7 @@ fn cached_preserved_dependency_work_is_rechecked_without_a_source_change_or_manu
     let source = super::super::token_read(&sys, &ctx).unwrap().unwrap().mark;
     let state = aterm_tempfile::tempdir().unwrap();
     crate::init::owe_clone(state.path(), &Holds::NONE).unwrap();
-    assert!(crate::init::clone_owed(&sys, state.path(), RepositoryWork::Refresh).is_err());
+    assert!(crate::init::clone_owed(&sys, state.path()).is_err());
     // The persisted marker is the old untyped format, and must not be treated as an
     // eternal prohibition after the owner corrects only the local dependency path.
     let record = state
@@ -528,7 +506,7 @@ fn cached_preserved_dependency_work_is_rechecked_without_a_source_change_or_manu
     assert!(
         !sys.calls()
             .iter()
-            .any(|call| call.contains(" clone ") || call.contains("agh GET"))
+            .any(|call| acquires_repository(call) || call.contains("agh GET"))
     );
     assert_eq!(
         std::fs::read(&record).unwrap(),
@@ -557,7 +535,7 @@ fn cached_preserved_dependency_work_is_rechecked_without_a_source_change_or_manu
         sys.stat(&path).is_err(),
         "a due read still changes no worktree"
     );
-    crate::init::clone_owed(&sys, state.path(), RepositoryWork::Refresh).unwrap();
+    crate::init::clone_owed(&sys, state.path()).unwrap();
     assert_eq!(
         super::super::token_read(&sys, &ctx).unwrap().unwrap().mark,
         source
@@ -573,16 +551,16 @@ fn cached_preserved_dependency_work_is_rechecked_without_a_source_change_or_manu
             aterm_secrets::converge::RepositoryWork::Repair,
         )
         .unwrap(),
-        OwedClone::Verified {
-            present: 1,
-            total: 1
-        }
+        OwedClone::Verified(crate::init_observe::RepositoryCounts {
+            ready: 1,
+            ..crate::init_observe::RepositoryCounts::default()
+        })
     );
     assert!(!record.exists());
     assert_eq!(
         sys.calls()
             .iter()
-            .filter(|call| call.contains(" clone "))
+            .filter(|call| acquires_repository(call))
             .count(),
         1
     );
@@ -617,7 +595,7 @@ fn preseeded_checkouts_do_not_verify_an_unusable_preserved_credential_helper() {
     let owed = crate::init::owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap();
     assert_eq!(sys.read_file(&launcher).unwrap(), preserved);
     assert!(!sys.calls().iter().any(|call| {
-        call.contains(" clone ") || call.contains("agh GET") || call.contains("--unset")
+        acquires_repository(call) || call.contains("agh GET") || call.contains("--unset")
     }));
     assert!(
         matches!(owed, OwedClone::Waiting(_)),
@@ -626,10 +604,10 @@ fn preseeded_checkouts_do_not_verify_an_unusable_preserved_credential_helper() {
     missing.store(false, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         crate::init::owed_clone(&sys, state.path(), &Holds::NONE, None).unwrap(),
-        OwedClone::Verified {
-            present: 1,
-            total: 1
-        },
+        OwedClone::Verified(crate::init_observe::RepositoryCounts {
+            ready: 1,
+            ..crate::init_observe::RepositoryCounts::default()
+        }),
         "repair of only the preserved route can now verify the same checkouts"
     );
     assert_eq!(sys.read_file(&launcher).unwrap(), preserved);
@@ -921,7 +899,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
                 .sys
                 .calls()
                 .iter()
-                .any(|call| call.contains("credential fill") || call.contains(" clone "))
+                .any(|call| call.contains("credential fill") || acquires_repository(call))
         );
     }
 
@@ -958,6 +936,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Plan,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -972,6 +951,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -984,6 +964,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1208,7 +1189,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         assert!(
             !command.contains("ls-remote")
                 && !command.contains(" fetch ")
-                && !command.contains(" clone "),
+                && !acquires_repository(&command),
             "a local acknowledgment started {command}"
         );
         None
@@ -1225,6 +1206,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1240,6 +1222,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Plan,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1257,6 +1240,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1268,6 +1252,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1308,6 +1293,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Plan,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1361,6 +1347,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1394,6 +1381,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1408,13 +1396,23 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Plan,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
     assert_eq!(stage(&unknown_rows).outcome, crate::model::Outcome::Blocked);
     assert!(
-        super::super::items_for_execution(&cold.sys, &cold.ctx, None, RepositoryWork::Repair, None)
-            .is_ok(),
+        super::super::stage_items(
+            &cold.sys,
+            &cold.ctx,
+            None,
+            Mode::Plan,
+            RepositoryWork::Repair,
+            RepositorySteps::Both,
+            None,
+            None
+        )
+        .is_ok(),
         "unknown cleanup intent must not abort construction of other setup groups"
     );
     assert_eq!(std::fs::read(&ledger_file).unwrap(), reenabled_bytes);
@@ -1425,11 +1423,13 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     );
     let allow_withdrawal = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let allowed = Arc::clone(&allow_withdrawal);
-    let guarded_items = super::super::items_for_execution_with_withdrawal_guard(
+    let guarded_items = super::super::stage_items(
         &cold.sys,
         &cold.ctx,
         None,
+        Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Acquisition,
         None,
         Some(Box::new(move || {
             Ok(allowed.load(std::sync::atomic::Ordering::SeqCst))
@@ -1465,6 +1465,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &cold.ctx,
         Mode::Plan,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1576,11 +1577,14 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     aterm_uds::atomic_file::write(&config_file, b"not toml [", 0o600).unwrap();
     assert!(client::config(&cold.paths).is_err());
     assert!(
-        super::super::items_for_execution(
+        super::super::stage_items(
             sys.as_ref(),
             &cold.ctx,
             None,
+            Mode::Plan,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
+            None,
             None
         )
         .unwrap()
@@ -1612,6 +1616,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &forbidden.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1691,6 +1696,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             &fixture.ctx,
             mode,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
             captured.inputs.clone(),
             Box::new(move || snapshot.is_current(&paths).map_err(|why| why.to_string())),
         )
@@ -1819,6 +1825,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &rejected.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -1895,6 +1902,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             &rejected.ctx,
             Mode::Apply,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
             None,
         )
         .unwrap();
@@ -2068,6 +2076,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &rejected.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -2110,6 +2119,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         &rejected.ctx,
         Mode::Apply,
         RepositoryWork::Repair,
+        RepositorySteps::Both,
         None,
     )
     .unwrap();
@@ -2264,6 +2274,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             &legacy.ctx,
             Mode::Apply,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
             None,
         )
         .unwrap();
@@ -2420,6 +2431,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             &logged.ctx,
             Mode::Apply,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
             None,
         )
         .unwrap()
@@ -2638,7 +2650,10 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         )
         .unwrap();
         client::seed_vault_genesis(&admin_paths, &root.path().join("genesis.v2")).unwrap();
-        let genesis = client::load_records(&admin_paths).unwrap().encode();
+        let genesis = client::load_records(&admin_paths)
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         let admin = client::admin_open(&admin_paths).unwrap();
         let mut doc = admin.doc.clone();
         doc.set_entry(&audience, "gh_access_token", TOKEN.as_bytes())
@@ -2653,7 +2668,10 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         .unwrap() else {
             panic!("the source serves its actual published envelope");
         };
-        let complete = client::load_records(&admin_paths).unwrap().encode();
+        let complete = client::load_records(&admin_paths)
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         let (mirror_server, mirror) = start_server(&root.path().join("mirror"));
         aterm_secrets::transport::publish(
             &aterm_secrets::transport::Source::Url(mirror.clone()),
@@ -2760,6 +2778,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
                 &refined.ctx,
                 Mode::Apply,
                 RepositoryWork::Repair,
+                RepositorySteps::Both,
                 None,
             )
             .unwrap()
@@ -2890,7 +2909,7 @@ fn captured_repository_readback_at_the_console_reads_no_workstation_census() {
         aterm_secrets::converge::RepositoryWork::Repair,
     )
     .unwrap();
-    assert!(matches!(reading, crate::init::OwedClone::Verified { .. }));
+    assert!(matches!(reading, crate::init::OwedClone::Verified(_)));
     assert!(
         fixture
             .sys
@@ -3002,7 +3021,7 @@ fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vaul
         // vault still syncing (`Waiting`).
         let unchanged = matches!(changed, "none" | "unrelated" | "writer");
         assert_eq!(
-            matches!(owed, OwedClone::Verified { .. }),
+            matches!(owed, OwedClone::Verified(_)),
             unchanged,
             "{changed}: {owed:?}"
         );
@@ -3018,7 +3037,7 @@ fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vaul
         assert!(
             !sys.calls()
                 .iter()
-                .any(|call| call.contains(" clone ") || call.contains("agh GET"))
+                .any(|call| acquires_repository(call) || call.contains("agh GET"))
         );
     }
 }
@@ -3042,7 +3061,7 @@ fn native_dependency_batch_checks_stop_and_real_input_changes_after_each_downloa
         let pressed = Arc::clone(&stop);
         let who = item.user.clone();
         sys.simulate(move |sys, command| {
-            if command.display().contains(" clone ") {
+            if acquires_repository(&command.display()) {
                 match change {
                     "stop" => pressed.store(true, Ordering::SeqCst),
                     "token" => {
@@ -3081,7 +3100,7 @@ fn native_dependency_batch_checks_stop_and_real_input_changes_after_each_downloa
         assert_eq!(
             sys.calls()
                 .iter()
-                .filter(|call| call.contains(" clone "))
+                .filter(|call| acquires_repository(call))
                 .count(),
             if change == "none" { 2 } else { 1 },
             "{change}"
@@ -3200,6 +3219,7 @@ fn captured_private_inventory_clones_in_the_accounts_background_session() {
         &context,
         Mode::Apply,
         RepositoryWork::Refresh,
+        RepositorySteps::Both,
         captured,
         Box::new(|| Ok(true)),
     )
@@ -3209,15 +3229,8 @@ fn captured_private_inventory_clones_in_the_accounts_background_session() {
         crate::model::Outcome::Changed,
         "{rows:?}"
     );
-    assert_eq!(
-        Reading::of(stage(&rows)),
-        Some(Reading::Repositories {
-            present: 1,
-            count: 1,
-            signed_in: true
-        })
-    );
-    assert!(sys.calls().iter().any(|call| call.contains(" clone ")));
+    assert_eq!(Reading::of(stage(&rows)), Some(signed_in(all_ready(1))));
+    assert!(sys.calls().iter().any(|call| acquires_repository(call)));
     assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
 }
 
@@ -3233,7 +3246,7 @@ fn a_native_repository_batch_respects_late_stop_but_not_an_explicit_older_hold()
         let stop = Arc::new(AtomicBool::new(false));
         let pressed = Arc::clone(&stop);
         sys.simulate(move |_, command| {
-            if late_stop && command.display().contains(" clone ") {
+            if late_stop && acquires_repository(&command.display()) {
                 pressed.store(true, Ordering::SeqCst);
             }
             None
@@ -3264,7 +3277,7 @@ fn a_native_repository_batch_respects_late_stop_but_not_an_explicit_older_hold()
         let clones = sys
             .calls()
             .iter()
-            .filter(|call| call.contains(" clone "))
+            .filter(|call| acquires_repository(call))
             .count();
         if late_stop {
             assert!(
@@ -3349,7 +3362,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
             let syncing = paths.clone();
             let once = std::sync::atomic::AtomicBool::new(false);
             sys.simulate(move |_, command| {
-                if command.display().contains(" clone ")
+                if acquires_repository(&command.display())
                     && !once.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     let next = match changed {
@@ -3381,6 +3394,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
                     &ctx,
                     Mode::Apply,
                     RepositoryWork::Refresh,
+                    RepositorySteps::Both,
                     captured.inputs,
                     Box::new(move || {
                         captured
@@ -3401,7 +3415,7 @@ fn scoped_vault_inputs_publish_through_unrelated_sync_but_refuse_changed_inputs(
             assert_eq!(
                 sys.calls()
                     .iter()
-                    .filter(|call| call.contains(" clone "))
+                    .filter(|call| acquires_repository(call))
                     .count(),
                 1,
                 "{changed}"
@@ -3428,7 +3442,7 @@ fn ordinary_local_repository_batches_refuse_input_changes_and_allow_unrelated_se
         let once = AtomicBool::new(false);
         let boundary = Mutex::new(());
         sys.simulate(move |sys, command| {
-            if command.display().contains(" clone ") {
+            if acquires_repository(&command.display()) {
                 let _mutation = boundary.lock().unwrap();
                 if once.swap(true, Ordering::SeqCst) {
                     return None;
@@ -3544,7 +3558,7 @@ fn colliding_private_inventory_leaves_every_checkout_untouched_and_unfinished() 
         Reading::of(stage(&rows)),
         Some(Reading::Waits(Wait::RepositoryInventory))
     );
-    assert!(sys.calls().iter().all(|call| !call.contains(" clone ")
+    assert!(sys.calls().iter().all(|call| !acquires_repository(call)
         && !call.contains("--replace-all")
         && !call.contains("credential approve")));
 }
@@ -3580,7 +3594,7 @@ fn native_inventory_follows_agh_pagination_before_any_mutation() {
     assert!(
         sys.calls()
             .iter()
-            .all(|call| !call.contains("credential approve") && !call.contains(" clone "))
+            .all(|call| !call.contains("credential approve") && !acquires_repository(call))
     );
 }
 
@@ -3603,7 +3617,7 @@ fn failed_native_inventory_never_persists_credentials_or_clones() {
             .iter()
             .all(|call| !call.contains("credential approve")
                 && !call.contains("--replace-all")
-                && !call.contains(" clone "))
+                && !acquires_repository(call))
     );
 }
 
@@ -3853,9 +3867,51 @@ fn keychain_block_then_vault(sys: &Fake, user: &User) -> Vec<String> {
     script::replaces_keychain_block(sys, user)
 }
 
-/// The stage's own row: the keychain row comes before it ([`run_with`]).
+/// The stage's acquisition row (`init.github.native@<user>`): the keychain row comes before it
+/// and the refresh row after it ([`run_with`]).
 fn stage(rows: &[crate::model::ItemReport]) -> &crate::model::ItemReport {
-    rows.last().expect("the stage's row")
+    rows.iter()
+        .find(|row| row.id.starts_with("init.github.native@"))
+        .expect("the acquisition's row")
+}
+
+/// `aterm init --plan`'s acquisition item for `user` alone, `unasked` where init.toml has no
+/// `[github]`: its probe takes no repository lease.
+fn acquisition(user: &User, unasked: bool) -> Box<dyn Item> {
+    items(
+        user,
+        None,
+        unasked,
+        Mode::Plan,
+        RepositoryWork::Refresh,
+        RepositorySteps::Acquisition,
+        None,
+        None,
+    )
+    .remove(0)
+}
+
+/// The stage's refresh row (`init.github.refresh@<user>`), after acquisition.
+fn refreshed(rows: &[crate::model::ItemReport]) -> &crate::model::ItemReport {
+    rows.iter()
+        .find(|row| super::super::refresh_row(row))
+        .expect("the refresh's row")
+}
+
+/// The acquisition's reading of `counts`, signed in.
+fn signed_in(counts: RepositoryCounts) -> Reading {
+    Reading::Repositories {
+        counts,
+        signed_in: true,
+    }
+}
+
+/// `ready` repositories ready, and nothing else listed.
+fn all_ready(ready: usize) -> RepositoryCounts {
+    RepositoryCounts {
+        ready,
+        ..RepositoryCounts::default()
+    }
 }
 
 /// `[github] enabled = false` holds on this entry point too, which System State reaches with
@@ -3902,7 +3958,7 @@ fn the_off_switch_keeps_the_keychain_block_on_the_stages_own_run() {
             assert!(
                 !sys.calls()
                     .iter()
-                    .any(|call| call.contains(" clone ") || call.contains(" agh GET "))
+                    .any(|call| acquires_repository(call) || call.contains(" agh GET "))
             );
         }
     }
@@ -4210,7 +4266,7 @@ fn lookups_that_hand_back_another_token_stop_before_any_clone_and_withhold_outpu
     let why = item.apply(&sys, &context).unwrap_err();
     assert!(why.contains("does not hand back the synced token"), "{why}");
     assert!(!why.contains("unrelated_private_value") && !why.contains(TOKEN));
-    assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
+    assert!(!sys.calls().iter().any(|call| acquires_repository(call)));
 }
 
 #[test]
@@ -4280,7 +4336,7 @@ fn a_vault_version_changed_during_inventory_refuses_all_local_effects() {
             .iter()
             .all(|call| !call.contains("credential approve")
                 && !call.contains("--global")
-                && !call.contains(" clone "))
+                && !acquires_repository(call))
     );
 }
 
@@ -4331,7 +4387,7 @@ fn captured_clones_never_write_the_login_keychain() {
             && !call.contains("osxkeychain")
             && !call.contains(TOKEN)
             && !call.contains("--global")
-            && !call.contains(" clone ")),
+            && !acquires_repository(call)),
         "{calls:?}"
     );
 }
@@ -4342,6 +4398,17 @@ fn captured_clones_never_write_the_login_keychain() {
 /// synced token.
 fn listing(listed: &[String], present: &[String]) -> (Fake, NativeRepositories) {
     listing_with(listed, present, &[])
+}
+
+/// [`listing`] for another module's tests: alice, signed in at the console, whose private
+/// inventory lists `listed`, `present` of them already worktrees in `~`, the rest cloned as
+/// the fake scripts them.
+pub(crate) fn inventory(listed: &[&str], present: &[&str]) -> (Fake, User) {
+    let owned =
+        |names: &[&str]| -> Vec<String> { names.iter().map(|&name| name.to_owned()).collect() };
+    let (sys, item) = listing(&owned(listed), &owned(present));
+    sys.logged_in(&item.user);
+    (sys, item.user.clone())
 }
 
 /// [`listing`], with the worktrees named in `theirs` cloned from someone else's origin.
@@ -4377,11 +4444,15 @@ fn listing_with(
         let foreign: Vec<_> = theirs
             .iter()
             .map(|name| {
+                let origin = format!("https://github.com/someone/{name}.git");
                 (
-                    crate::checkout::git(&sys, &item.user, Some(&home.join(name)))
-                        .args(["config", "--get-all", "remote.origin.url"])
+                    crate::checkout::facts::config_listing(&sys, &item.user, &home.join(name))
                         .display(),
-                    format!("https://github.com/someone/{name}.git\n"),
+                    crate::checkout::facts::tests::listing_of(&[
+                        ("remote.origin.url", origin.as_str()),
+                        ("branch.main.remote", "origin"),
+                        ("branch.main.merge", "refs/heads/main"),
+                    ]),
                 )
             })
             .collect();
@@ -4547,7 +4618,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             }
             // The fake mirrors the index the real git leaves in the worktree, which a
             // checkout with a commit must have to read as finished
-            // (`repos::WORKTREE_READ`'s `--git-path index`).
+            // (the `--git-path index` of `checkout::facts::REV_PARSE`).
             let index = at.join(".git/index");
             if let Ok(written) = Live::new().stat(&index) {
                 sys.stat_of(index.to_str().unwrap(), written);
@@ -4560,6 +4631,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             &ctx,
             Mode::Apply,
             RepositoryWork::Refresh,
+            RepositorySteps::Both,
             InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
             Box::new(|| Ok(true)),
         )
@@ -4573,11 +4645,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
         );
         assert_eq!(
             Reading::of(stage(&empty_pass)),
-            Some(Reading::Repositories {
-                present: 1,
-                count: 1,
-                signed_in: true
-            })
+            Some(signed_in(all_ready(1)))
         );
         assert!(!head().success(), "empty readiness invents no local commit");
 
@@ -4621,6 +4689,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
                 &ctx,
                 Mode::Apply,
                 RepositoryWork::Refresh,
+                RepositorySteps::Both,
                 InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
                 Box::new(|| Ok(true)),
             )
@@ -4631,11 +4700,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             ));
             assert_eq!(
                 Reading::of(stage(&still_empty)),
-                Some(Reading::Repositories {
-                    present: 1,
-                    count: 1,
-                    signed_in: true
-                }),
+                Some(signed_in(all_ready(1))),
                 "{preserved}: an actually empty origin remains complete"
             );
             assert!(
@@ -4674,6 +4739,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             } else {
                 RepositoryWork::Refresh
             },
+            RepositorySteps::Both,
             InitialRepositoryInputs::capture(&sys, &ctx).unwrap(),
             Box::new(|| Ok(true)),
         )
@@ -4686,14 +4752,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             );
             assert_eq!(actual.out().trim(), expected);
             assert_eq!(std::fs::read(work.join("README")).unwrap(), b"one\n");
-            assert_eq!(
-                Reading::of(stage(&applied)),
-                Some(Reading::Repositories {
-                    present: 1,
-                    count: 1,
-                    signed_in: true
-                })
-            );
+            assert_eq!(Reading::of(stage(&applied)), Some(signed_in(all_ready(1))));
         } else {
             assert!(
                 !actual.success(),
@@ -4727,13 +4786,22 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
                     "{preserved}: no first checkout"
                 );
             }
+            // Owner work found before the first checkout is preserved; a collision only the
+            // checkout itself meets fails that checkout's line, still without a commit.
+            let counts = if preserved == "late ignored" {
+                RepositoryCounts {
+                    unborn: 1,
+                    ..RepositoryCounts::default()
+                }
+            } else {
+                RepositoryCounts {
+                    preserved: 1,
+                    ..RepositoryCounts::default()
+                }
+            };
             assert_eq!(
                 Reading::of(stage(&applied)),
-                Some(Reading::Repositories {
-                    present: 0,
-                    count: 1,
-                    signed_in: true
-                }),
+                Some(signed_in(counts)),
                 "{preserved}: an unborn preserved worktree is unfinished"
             );
         }
@@ -5051,6 +5119,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             &ctx,
             Mode::Plan,
             RepositoryWork::Refresh,
+            RepositorySteps::Both,
             inputs.clone(),
             Box::new(|| Ok(true)),
         )
@@ -5074,6 +5143,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             &ctx,
             Mode::Apply,
             RepositoryWork::Repair,
+            RepositorySteps::Both,
             inputs.clone(),
             Box::new(|| Ok(true)),
         )
@@ -5095,16 +5165,27 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             &ctx,
             Mode::Apply,
             RepositoryWork::Refresh,
+            RepositorySteps::Both,
             inputs,
             Box::new(|| Ok(true)),
         )
         .unwrap();
+        assert_eq!(
+            stage(&applied).outcome,
+            crate::model::Outcome::Ok,
+            "{case}: refresh faults leave the acquisition standing: {applied:?}"
+        );
         if matches!(
             case,
             "parallel stopped" | "parallel rebound" | "parallel offline"
         ) {
             assert_eq!(
                 stage(&applied).outcome,
+                crate::model::Outcome::Ok,
+                "{case}: {applied:?}"
+            );
+            assert_eq!(
+                refreshed(&applied).outcome,
                 crate::model::Outcome::Failed,
                 "{case}: {applied:?}"
             );
@@ -5133,8 +5214,13 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
         ) {
             assert_eq!(
                 stage(&applied).outcome,
+                crate::model::Outcome::Ok,
+                "{case}: {applied:?}"
+            );
+            assert_eq!(
+                refreshed(&applied).outcome,
                 crate::model::Outcome::Failed,
-                "{applied:?}"
+                "{case}: {applied:?}"
             );
             assert!(sys.calls().iter().any(|call| call.contains("--symref")));
             assert!(
@@ -5160,9 +5246,9 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             continue;
         }
         assert_eq!(
-            stage(&applied).outcome,
+            refreshed(&applied).outcome,
             crate::model::Outcome::Ok,
-            "{applied:?}"
+            "{case}: {applied:?}"
         );
         assert_eq!(
             repos.head(&repos.work),
@@ -5338,6 +5424,7 @@ fn node_and_subscriber_share_a_source_refresh_wave_using_the_alignment_record() 
             &ctx,
             Mode::Apply,
             RepositoryWork::Refresh,
+            RepositorySteps::Both,
             inputs.with_repository_execution(Some(Execution {
                 request: RepositoryRequest::Refresh(request),
                 pass: Arc::clone(&pass),
@@ -5686,14 +5773,7 @@ fn private_inventory_branch_history_does_not_strand_new_checkouts() {
             crate::model::Outcome::Changed,
             "{rows:?}"
         );
-        assert_eq!(
-            Reading::of(stage(&rows)),
-            Some(Reading::Repositories {
-                present: 1,
-                count: 1,
-                signed_in: true
-            })
-        );
+        assert_eq!(Reading::of(stage(&rows)), Some(signed_in(all_ready(1))));
         assert!(
             sys.stat(&Path::new(&item.user.home).join("new"))
                 .unwrap()
@@ -5702,7 +5782,7 @@ fn private_inventory_branch_history_does_not_strand_new_checkouts() {
         assert_eq!(
             sys.calls()
                 .iter()
-                .filter(|call| call.contains(" clone "))
+                .filter(|call| acquires_repository(call))
                 .count(),
             1
         );
@@ -5716,8 +5796,180 @@ fn ran_in(calls: &[String], path: &Path, args: &str) -> usize {
     calls.iter().filter(|call| call.ends_with(&at)).count()
 }
 
-const TOP_LEVEL: &str =
-    "rev-parse --is-inside-work-tree --show-prefix --show-toplevel --git-path index";
+/// The record of facts' `rev-parse` batch ([`crate::checkout::facts::REV_PARSE`]): one a read
+/// of a checkout's record.
+fn top_level() -> String {
+    crate::checkout::facts::REV_PARSE.join(" ")
+}
+
+/// alice's three clean checkouts at origin's tip, each with no required submodule: every git a
+/// record of their facts (`rev-parse`, `config`, `for-each-ref`) and a refresh's read of them
+/// (`ls-remote --get-url`, `status`, `ls-remote --symref`) runs is scripted, and HEAD and
+/// origin's HEAD stand in their files. The port keeps one record of checkout facts across its
+/// runs where `kept` says, as a pass's [`crate::port::Live`]s share their process's; else none.
+fn current_checkouts(kept: bool) -> (Fake, NativeRepositories, Vec<std::path::PathBuf>) {
+    const COMMIT: &str = "1111111111111111111111111111111111111111";
+    let present = names("current", 3);
+    let (mut sys, item) = listing(&present, &present);
+    if kept {
+        sys.checkout_records = Some(Default::default());
+    }
+    let home = Path::new(&item.user.home).to_owned();
+    let paths: Vec<std::path::PathBuf> = present.iter().map(|name| home.join(name)).collect();
+    for path in &paths {
+        for at in [path.join(".git"), path.join(".git/objects")] {
+            sys.stat_of(at.to_str().unwrap(), stat(true, 0o700));
+        }
+        for (file, bytes) in [
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            (
+                ".git/refs/remotes/origin/HEAD",
+                "ref: refs/remotes/origin/main\n",
+            ),
+            (".git/index", "DIRC"),
+        ] {
+            sys.file(path.join(file).to_str().unwrap(), bytes.as_bytes());
+        }
+    }
+    let modeled = paths.clone();
+    sys.simulate(move |_, command| {
+        let path = modeled.iter().find(|path| {
+            command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == path.as_os_str())
+        })?;
+        let has = |word: &str| command.args.iter().any(|arg| arg == word);
+        let name = path.file_name()?.to_str()?;
+        let url = format!("https://github.com/alice/{name}.git");
+        Some(if has("--is-inside-work-tree") {
+            Ran::ok(&format!(
+                "true\n\n{}\nfalse\n.git/index\n.git/objects/info/alternates\n",
+                path.display()
+            ))
+        } else if has("--show-scope") {
+            Ran::ok(&crate::checkout::facts::tests::listing_of(&[
+                ("remote.origin.url", url.as_str()),
+                ("branch.main.remote", "origin"),
+                ("branch.main.merge", "refs/heads/main"),
+            ]))
+        } else if has("for-each-ref") {
+            Ran::ok(&format!(
+                "{COMMIT} commit refs/heads/main\n{COMMIT} commit refs/remotes/origin/main\n"
+            ))
+        } else if has("--get-url") {
+            Ran::ok(&format!("{url}\n"))
+        } else if has("status") {
+            Ran::ok("")
+        } else if has("--symref") {
+            Ran::ok(&format!("ref: refs/heads/main\tHEAD\n{COMMIT}\tHEAD\n"))
+        } else {
+            return None;
+        })
+    });
+    (sys, item, paths)
+}
+
+/// The gits of `calls` that ran in the checkout at `path`.
+fn gits_in<'a>(calls: &'a [String], path: &Path) -> Vec<&'a String> {
+    let within = format!("-C {} ", path.display());
+    calls.iter().filter(|call| call.contains(&within)).collect()
+}
+
+/// A REFRESH PASS READS EACH CURRENT CHECKOUT IN AT MOST SIX GITS (FL-164): a whole apply pass
+/// (the acquisition's read and read-back, the refresh's probe, its storage and tracking checks
+/// and each of align's guards) over clean checkouts at origin's tip, each with no required
+/// submodule, fills one record of each checkout's facts with three gits (`rev-parse`, `config`,
+/// `for-each-ref`; HEAD and origin's HEAD read from their files) and reuses it for every later
+/// read while its files stand; beyond it a checkout costs one `ls-remote --get-url`, one
+/// `status` before the network read and one `ls-remote --symref`: six. Every checkout reaches
+/// that network read, so the six are a whole refresh's.
+/// NEGATIVE CONTROL: the same pass on a port that keeps no record reads each checkout's facts
+/// afresh for every reader, well over six (the reads before the record, one git per fact per
+/// reader, took about 50).
+#[test]
+fn a_refresh_pass_reads_each_current_checkout_in_at_most_six_gits() {
+    for kept in [true, false] {
+        let (sys, item, paths) = current_checkouts(kept);
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let rows = run(&sys, &context, Mode::Apply).unwrap();
+        let calls = sys.calls();
+        for path in &paths {
+            let ran = gits_in(&calls, path);
+            let symref = ran.iter().filter(|call| call.contains("--symref")).count();
+            assert_eq!(
+                symref, 1,
+                "{kept}: the refresh reads origin once: {ran:#?} {rows:?}"
+            );
+            if kept {
+                assert!(ran.len() <= 6, "{kept}: {} gits: {ran:#?}", ran.len());
+            } else {
+                assert!(
+                    ran.len() > 6,
+                    "control: {} gits with no record: {ran:#?}",
+                    ran.len()
+                );
+            }
+        }
+    }
+}
+
+/// A PASS'S `sync.clone` AND `sync.refresh` SHARE ONE RECORD (FL-164): the converge pass runs
+/// its acquisition (`sync.clone`, as a Repair run) and then its refresh (`sync.refresh`) as two
+/// runs, each building a stage of its own; with the record their pass's owner began
+/// ([`crate::port::CheckoutRecords::new_pass`]) and neither stage beginning another, the two
+/// rows together read each clean checkout at origin's tip in at most six gits, as one run of
+/// both does ([`a_refresh_pass_reads_each_current_checkout_in_at_most_six_gits`]).
+/// NEGATIVE CONTROL: a record begun again between the two rows, as each stage's construction
+/// began one before, reads each checkout's facts afresh in the refresh: more than six.
+#[test]
+fn a_pass_s_clone_then_refresh_rows_read_each_current_checkout_in_at_most_six_gits() {
+    for begun_between in [false, true] {
+        let (sys, item, paths) = current_checkouts(true);
+        let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        crate::port::CheckoutRecords::new_pass(&sys);
+        let cloned = run_with(
+            &sys,
+            &context,
+            Mode::Apply,
+            RepositoryWork::Repair,
+            RepositorySteps::Acquisition,
+            None,
+        )
+        .unwrap();
+        if begun_between {
+            crate::port::CheckoutRecords::new_pass(&sys);
+        }
+        let refreshed_rows = run_with(
+            &sys,
+            &context,
+            Mode::Apply,
+            RepositoryWork::Refresh,
+            RepositorySteps::Refresh,
+            None,
+        )
+        .unwrap();
+        let calls = sys.calls();
+        for path in &paths {
+            let ran = gits_in(&calls, path);
+            let symref = ran.iter().filter(|call| call.contains("--symref")).count();
+            assert_eq!(
+                symref, 1,
+                "{begun_between}: the refresh reads origin once: {ran:#?} {cloned:?} \
+                 {refreshed_rows:?}"
+            );
+            if begun_between {
+                assert!(
+                    ran.len() > 6,
+                    "control: {} gits with a record begun between the rows: {ran:#?}",
+                    ran.len()
+                );
+            } else {
+                assert!(ran.len() <= 6, "{} gits: {ran:#?}", ran.len());
+            }
+        }
+    }
+}
 
 /// One whole pass over 50 repositories already in `~` and 10 to clone: private metadata is
 /// captured once, and completion rechecks all worktrees locally after cloning. Each
@@ -5737,7 +5989,7 @@ fn a_whole_pass_reuses_private_inventory_but_rechecks_all_local_worktrees() {
     );
     assert_eq!(
         stage(&rows).to.as_deref(),
-        Some("60 matching worktrees present; aterm's GitHub route hands back the synced token")
+        Some("60 of 60 ready; aterm's GitHub route hands back the synced token")
     );
     let calls = sys.calls();
     let count = |what: &str| calls.iter().filter(|call| call.ends_with(what)).count();
@@ -5753,15 +6005,19 @@ fn a_whole_pass_reuses_private_inventory_but_rechecks_all_local_worktrees() {
     let home = Path::new(&item.user.home);
     for name in &present {
         let path = home.join(name);
-        assert_eq!(ran_in(&calls, &path, TOP_LEVEL), 2, "{name}");
+        assert_eq!(ran_in(&calls, &path, &top_level()), 2, "{name}");
         assert_eq!(
-            ran_in(&calls, &path, "config --get-all remote.origin.url"),
+            calls
+                .iter()
+                .filter(|call| **call
+                    == crate::checkout::facts::config_listing(&sys, &item.user, &path).display())
+                .count(),
             2,
             "{name}"
         );
     }
     for name in &missing {
-        assert_eq!(ran_in(&calls, &home.join(name), TOP_LEVEL), 1, "{name}");
+        assert_eq!(ran_in(&calls, &home.join(name), &top_level()), 1, "{name}");
     }
     assert_eq!(
         calls
@@ -5772,7 +6028,10 @@ fn a_whole_pass_reuses_private_inventory_but_rechecks_all_local_worktrees() {
         "{calls:#?}"
     );
     assert_eq!(
-        calls.iter().filter(|call| call.contains(" clone ")).count(),
+        calls
+            .iter()
+            .filter(|call| acquires_repository(call))
+            .count(),
         missing.len(),
         "{calls:#?}"
     );
@@ -5847,8 +6106,7 @@ fn a_guard_or_switch_after_the_clone_still_says_what_its_installer_did() {
 #[test]
 fn the_stage_row_says_what_a_new_clones_hook_installer_did() {
     const INSTALLED: &str = "Trust git hooks: installed (core.hooksPath = scripts/hooks)";
-    let present = "1 matching worktrees present; aterm's GitHub route hands back the synced \
-                   token";
+    let present = "1 of 1 ready; aterm's GitHub route hands back the synced token";
     for (carries, reply, says) in [
         (
             true,
@@ -5912,7 +6170,7 @@ fn four_clones_run_at_once() {
     let gate = Arc::new((Mutex::new((0_usize, 0_usize)), Condvar::new()));
     let seen = Arc::clone(&gate);
     sys.simulate(move |fake, cmd| {
-        if !cmd.display().contains(" clone --no-single-branch ") {
+        if !repos::fetches_advertised(&cmd.display()) {
             return None;
         }
         let calls = fake.calls();
@@ -5940,25 +6198,744 @@ fn four_clones_run_at_once() {
     for name in &missing {
         assert!(sys.stat(&home.join(name)).is_ok(), "{name}");
     }
+
+    // Checkouts without a commit share the clones' lanes: two clones and two reads of an
+    // unfinished checkout's remote run at once, each waiting inside its clone or read for
+    // the other three, which a pool that took the unfinished checkouts after the clones never
+    // lets happen. Each read fails here, and the clones beside it still finish.
+    let missing = names("new", 2);
+    let unfinished = names("unborn", 2);
+    let (sys, item) = listing(&missing, &[]);
+    let listed: Vec<aterm_json::Value> = missing
+        .iter()
+        .chain(&unfinished)
+        .zip(1..)
+        .map(|(name, id)| repository("alice", name, id))
+        .collect();
+    metadata(&sys, &item.user, aterm_json::Value::Array(listed));
+    for name in &unfinished {
+        unborn_checkout(&sys, &item.user, name);
+    }
+    // How many lanes run, the most that ran at once, and each kind seen while another ran.
+    let gate = Arc::new((Mutex::new((0_usize, 0_usize, false)), Condvar::new()));
+    let seen = Arc::clone(&gate);
+    sys.simulate(move |_, cmd| {
+        let display = cmd.display();
+        let clone = repos::fetches_advertised(&display);
+        let read = display.contains("ls-remote --symref") && display.contains("/unborn-");
+        if !clone && !read {
+            return None;
+        }
+        let (lock, turn) = &*seen;
+        let mut state = lock.lock().unwrap();
+        state.0 += 1;
+        state.1 = state.1.max(state.0);
+        turn.notify_all();
+        let (mut state, waited) = turn
+            .wait_timeout_while(state, std::time::Duration::from_secs(60), |state| {
+                state.1 < LANES_SEEN
+            })
+            .unwrap();
+        assert!(
+            !waited.timed_out(),
+            "the clones and reads never ran at once"
+        );
+        state.2 |= read;
+        state.0 -= 1;
+        read.then(|| Ran::exit(128, "fatal: synthetic: the remote cannot be reached\n"))
+    });
+    let why = item.apply(&sys, &context).unwrap_err();
+    for name in &unfinished {
+        assert!(why.contains(&format!("~/{name}: ")), "{why}");
+    }
+    let state = *gate.0.lock().unwrap();
+    assert_eq!((state.1, state.2), (LANES_SEEN, true), "{why}");
+    for name in &missing {
+        assert!(sys.stat(&home.join(name)).is_ok(), "{name}: {why}");
+    }
+}
+
+/// `name` in alice's `~`, a checkout of her repository without a commit, as a clone cut off
+/// before it fetched anything leaves one: its storage hers and whole, its branch `main` naming
+/// no commit, its origin's endpoint her repository's.
+fn unborn_checkout(sys: &Fake, who: &User, name: &str) {
+    let path = Path::new(&who.home).join(name);
+    let base = name.bytes().map(u64::from).sum::<u64>() * 10;
+    for (at, ino) in [
+        (path.clone(), base),
+        (path.join(".git"), base + 1),
+        (path.join(".git/objects"), base + 2),
+    ] {
+        sys.stat_of(at.to_str().unwrap(), stat(true, 0o700));
+        sys.file_id_of(
+            &at,
+            crate::port::FileId {
+                dev: 1,
+                ino,
+                born_ns: None,
+            },
+        );
+    }
+    repos::tests::script_worktree(sys, who, &path, name);
+    repos::tests::script_head(sys, who, &path, None);
+    let git = || crate::checkout::git(sys, who, Some(&path));
+    let url = format!("https://github.com/alice/{name}.git");
+    sys.on(
+        &git().args(["ls-remote", "--get-url", "--", &url]).display(),
+        Ran::ok(&url),
+    );
+}
+
+/// One checkout of alice's here, `work`, behind its origin (real git, in a private home), and
+/// `new`, listed but not here, whose clone the fake scripts. Every git run in `work` runs for
+/// real, its remote reads and fetches against `remote` in that home (the origin itself where
+/// none is named).
+struct BesideRefresh<'a> {
+    repos: crate::checkout::tests::Repos<'a>,
+    sys: Fake,
+    ctx: Ctx,
+    /// `work`'s commit, which its origin is ahead of.
+    behind: String,
+    /// The origin's commit.
+    ahead: String,
+}
+
+fn beside_refresh<'a>(
+    live: &'a crate::port::Live,
+    label: &str,
+    remote: Option<&str>,
+) -> BesideRefresh<'a> {
+    let git = crate::items::github::need_native_git();
+    let repos = crate::checkout::tests::Repos::new(live, label);
+    let who = User {
+        name: "alice".into(),
+        ..repos.who.clone()
+    };
+    let behind = repos.head(&repos.work);
+    repos.g(
+        &repos.work,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/alice/work.git",
+        ],
+    );
+    let ahead = repos.advance("second.txt", "source two\n");
+    let mut sys = Fake::root();
+    sys.euid = who.uid;
+    sys.linux = !live.macos();
+    let owned = Stat {
+        uid: who.uid,
+        gid: who.gid,
+        ..stat(true, 0o700)
+    };
+    // The home's ancestry stands as it does on a Mac, so the clone's publication into it
+    // invents none ([`bare`]).
+    for ancestor in Path::new(&who.home).ancestors().skip(1) {
+        sys.stat_of(
+            ancestor.to_str().unwrap(),
+            Stat {
+                uid: 0,
+                gid: 0,
+                ..stat(true, 0o755)
+            },
+        );
+    }
+    sys.logged_in(&who)
+        .stat_of(&who.home, owned)
+        .executable(git, b"selected fixture git")
+        .stat_of(repos.work.to_str().unwrap(), owned);
+    for path in [
+        repos.work.join(".git"),
+        repos.work.join(".git/objects"),
+        repos.work.join(".git/index"),
+    ] {
+        sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+    }
+    script::launcher(&sys, &who);
+    owned_source(&sys, &who);
+    metadata(
+        &sys,
+        &who,
+        aterm_json::json!([
+            repository("alice", "new", 1),
+            repository("alice", "work", 2)
+        ]),
+    );
+    script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
+    script::alike(&sys, &who);
+    let new = Path::new(&who.home).join("new");
+    repos::tests::script_clone_named(&sys, &who, "new", 0, false);
+    repos::tests::script_existing(&sys, &who, &new, "new");
+    let work = repos.work.clone();
+    let remote = remote.map_or_else(
+        || repos.origin.clone(),
+        |name| Path::new(&who.home).join(name),
+    );
+    sys.simulate(move |_, command| {
+        if !command.args.iter().any(|arg| arg == work.as_os_str()) {
+            return None;
+        }
+        let mut command = command.clone();
+        let fetching = command.args.iter().any(|arg| arg == "fetch");
+        if fetching || command.args.iter().any(|arg| arg == "--symref") {
+            for arg in &mut command.args {
+                if arg == "origin" {
+                    *arg = remote.as_os_str().to_owned();
+                }
+            }
+            if fetching {
+                command
+                    .args
+                    .push("+refs/heads/*:refs/remotes/origin/*".into());
+            }
+        }
+        Some(
+            crate::port::Live::new()
+                .run_complete_stdout(&command)
+                .unwrap(),
+        )
+    });
+    let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+    BesideRefresh {
+        repos,
+        sys,
+        ctx,
+        behind,
+        ahead,
+    }
+}
+
+/// Where the first clone and the first read of `work`'s remote (its advertisement or a fetch)
+/// fall among `calls`.
+fn clone_and_refresh_order(calls: &[String], work: &Path) -> (usize, usize) {
+    let at = format!("-C {} ", work.display());
+    let clone = calls
+        .iter()
+        .position(|call| acquires_repository(call))
+        .expect("the missing repository is cloned");
+    let read = calls
+        .iter()
+        .position(|call| {
+            call.contains(&at) && (call.contains("ls-remote --symref") || call.contains(" fetch "))
+        })
+        .expect("the checkout here reads its remote");
+    (clone, read)
+}
+
+/// Acquisition runs before the refresh, as rows of their own: the missing repository is
+/// cloned before the checkout already here reads its remote, and the refresh then
+/// fast-forwards that checkout in its own row (Refresh work). NEGATIVE CONTROL: the refresh
+/// run first, the order before acquisition had a row of its own (every checkout here
+/// refreshed, then the clones), reads `work`'s remote before the clone, which the same order
+/// check catches.
+#[test]
+fn missing_repositories_clone_before_existing_checkouts_refresh() {
+    let live = crate::port::Live::new();
+    let fixture = beside_refresh(&live, "native-clone-first", None);
+    let rows = run(&fixture.sys, &fixture.ctx, Mode::Apply).unwrap();
+    assert_eq!(
+        stage(&rows).outcome,
+        crate::model::Outcome::Changed,
+        "{rows:?}"
+    );
+    assert_eq!(
+        refreshed(&rows).outcome,
+        crate::model::Outcome::Ok,
+        "{rows:?}"
+    );
+    assert_eq!(fixture.repos.head(&fixture.repos.work), fixture.ahead);
+    let (clone, read) = clone_and_refresh_order(&fixture.sys.calls(), &fixture.repos.work);
+    assert!(
+        clone < read,
+        "the refresh read before the clone: {clone} > {read}"
+    );
+
+    let control = beside_refresh(&live, "native-refresh-first", None);
+    for steps in [RepositorySteps::Refresh, RepositorySteps::Acquisition] {
+        run_with(
+            &control.sys,
+            &control.ctx,
+            Mode::Apply,
+            RepositoryWork::Refresh,
+            steps,
+            None,
+        )
+        .unwrap();
+    }
+    assert_eq!(control.repos.head(&control.repos.work), control.ahead);
+    let (clone, read) = clone_and_refresh_order(&control.sys.calls(), &control.repos.work);
+    assert!(
+        read < clone,
+        "the control's refresh ran first: {read} > {clone}"
+    );
+}
+
+/// A refresh that fails fails its own row alone: the missing repository is cloned beside it,
+/// and the acquisition row, and System State's GitHub repositories row with it, read every
+/// repository ready. CONTROL: the same failed row under the acquisition's id fails that
+/// setting, and with its remote reachable the refresh row is Ok
+/// ([`missing_repositories_clone_before_existing_checkouts_refresh`]).
+#[test]
+fn a_refresh_fault_never_withholds_missing_clones() {
+    use aterm_types::macos_setup::{Setting, Standing};
+    let live = crate::port::Live::new();
+    let fixture = beside_refresh(&live, "native-refresh-fault", Some("unreachable.git"));
+    let rows = run(&fixture.sys, &fixture.ctx, Mode::Apply).unwrap();
+    assert_eq!(
+        stage(&rows).outcome,
+        crate::model::Outcome::Changed,
+        "{rows:?}"
+    );
+    assert_eq!(
+        Reading::of(stage(&rows)),
+        Some(signed_in(all_ready(2))),
+        "{rows:?}"
+    );
+    let home = Path::new(&fixture.ctx.users[0].home);
+    assert!(fixture.sys.stat(&home.join("new")).is_ok());
+    let refresh = refreshed(&rows);
+    assert_eq!(refresh.outcome, crate::model::Outcome::Failed, "{rows:?}");
+    assert!(
+        refresh
+            .why
+            .as_deref()
+            .is_some_and(|why| why.contains("~/work")),
+        "{refresh:?}"
+    );
+    assert_eq!(fixture.repos.head(&fixture.repos.work), fixture.behind);
+    let all: Vec<&crate::model::ItemReport> = rows.iter().collect();
+    let observed = crate::init_observe::observation(Setting::Repositories, &all);
+    assert_eq!(observed.standing, Standing::InPlace, "{observed:?}");
+    let as_acquisition = crate::model::ItemReport {
+        id: stage(&rows).id.clone(),
+        ..refresh.clone()
+    };
+    let observed =
+        crate::init_observe::observation(Setting::Repositories, &[stage(&rows), &as_acquisition]);
+    assert_eq!(observed.standing, Standing::Failed, "{observed:?}");
+}
+
+/// Acquisition leaves its repository lease to the refresh bound after it in the same run: no
+/// other pass takes the lock between the two rows, and the refresh ends it. CONTROL: an
+/// acquisition with no refresh after it (`sync.clone`'s) ends its lease at its read-back.
+#[test]
+fn acquisition_leaves_its_lease_to_the_refresh_after_it() {
+    for steps in [RepositorySteps::Both, RepositorySteps::Acquisition] {
+        let (sys, item) = listing(&["here".to_owned(), "new".to_owned()], &["here".to_owned()]);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let bound = items(
+            &item.user,
+            None,
+            true,
+            Mode::Apply,
+            RepositoryWork::Refresh,
+            steps,
+            None,
+            None,
+        );
+        let free = || sys.repository_pass().unwrap().pass.is_some();
+        let acquisition = &bound[0];
+        assert!(
+            matches!(acquisition.probe(&sys, &ctx), Probe::Change { .. }),
+            "{steps:?}"
+        );
+        acquisition.apply(&sys, &ctx).unwrap();
+        assert!(!free(), "{steps:?}: the clone holds the lease");
+        assert!(
+            matches!(acquisition.probe(&sys, &ctx), Probe::Ok { .. }),
+            "{steps:?}"
+        );
+        assert_eq!(free(), steps == RepositorySteps::Acquisition, "{steps:?}");
+        if let Some(refresh) = bound.get(1) {
+            assert!(matches!(refresh.probe(&sys, &ctx), Probe::Ok { .. }));
+            refresh
+                .refresh_guarded(&sys, &ctx, &|| Ok(()))
+                .expect("the refresh runs")
+                .unwrap();
+            assert!(free(), "the refresh ends the lease");
+        }
+    }
+}
+
+/// A change the engine does not make leaves no repository lease held: the end of its row lets go
+/// of the lease the probe kept for that apply ([`Item::row_ended`]), so no other pass reads the
+/// repositories as held while nothing works them. Here the change is held back
+/// ([`aterm_converge::held_back`]), as a hold, a stand-aside, a refused journal record or a stop
+/// leaves it, in a run with the refresh row after it and in one without; nothing is cloned.
+/// NEGATIVE CONTROL: the same probe with no row ended after it keeps the lease for its apply, and
+/// an acquisition's row end leaves the lease to the refresh row bound after it, whose own end
+/// lets it go.
+#[test]
+fn a_change_the_engine_does_not_make_leaves_no_repository_lease() {
+    let place = || Place {
+        layer: Layer::Workstation,
+        class: Class::Install,
+        requires: Requires::Account,
+        remedy: Remedy::Command("aterm init".into()),
+    };
+    for steps in [RepositorySteps::Both, RepositorySteps::Acquisition] {
+        let built = |user: &User| {
+            items(
+                user,
+                None,
+                true,
+                Mode::Apply,
+                RepositoryWork::Refresh,
+                steps,
+                None,
+                None,
+            )
+        };
+        // CONTROL: the probe keeps the lease until its row ends.
+        let (sys, item) = listing(&["here".to_owned(), "new".to_owned()], &["here".to_owned()]);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let free = || sys.repository_pass().unwrap().pass.is_some();
+        let control = built(&item.user);
+        assert!(
+            matches!(control[0].probe(&sys, &ctx), Probe::Change { .. }),
+            "{steps:?}"
+        );
+        assert!(
+            !free(),
+            "{steps:?}: the probe keeps the lease for its apply"
+        );
+        control[0].row_ended();
+        assert_eq!(free(), steps == RepositorySteps::Acquisition, "{steps:?}");
+        if let Some(refresh) = control.get(1) {
+            refresh.row_ended();
+            assert!(free(), "the refresh row's end lets the lease go");
+        }
+        // The engine holds the change back and ends both rows.
+        let (sys, item) = listing(&["here".to_owned(), "new".to_owned()], &["here".to_owned()]);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let free = || sys.repository_pass().unwrap().pass.is_some();
+        let repository_items = built(&item.user);
+        let bound = crate::engine::bind(
+            repository_items
+                .iter()
+                .map(|boxed| (boxed.as_ref(), place())),
+            &sys,
+            &ctx,
+        );
+        let held = aterm_converge::held_back(bound, "held for the test");
+        let mut journal = sys.journal().unwrap();
+        let rows = aterm_converge::run(&held, Mode::Apply, journal.as_mut()).unwrap();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Blocked,
+            "{steps:?}: {rows:?}"
+        );
+        assert!(free(), "{steps:?}: {rows:?}");
+        assert!(
+            sys.stat(&Path::new(&item.user.home).join("new")).is_err(),
+            "{steps:?}"
+        );
+    }
+}
+
+/// The repository lease is decided before anything is read. An apply that meets another pass's
+/// lease stands both rows aside on that lock (`StoodAside::Lock`, reading [`Wait::OtherPass`]):
+/// it reads no checkout, asks no remote anything, clones nothing and journals nothing. A plan
+/// never takes the lease: with another pass holding it and no refresh of that pass's under way,
+/// it reads the checkouts as ever, and with that pass's refresh claim on record it reads the same
+/// wait, reading no checkout. NEGATIVE CONTROL: with the lease free, the same apply reads every
+/// checkout, asks the remote, and clones the missing repository.
+#[test]
+fn a_held_lease_is_decided_before_the_checkout_read() {
+    use aterm_secrets::converge::RefreshRequest;
+    for held in [true, false] {
+        let (sys, item) = listing(&["here".to_owned(), "new".to_owned()], &["here".to_owned()]);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let home = Path::new(&item.user.home);
+        let here = home.join("here");
+        let reads = || ran_in(&sys.calls(), &here, &top_level());
+        let remote = || {
+            sys.calls()
+                .iter()
+                .filter(|call| {
+                    call.contains("ls-remote")
+                        || acquires_repository(call)
+                        || call.contains(" fetch ")
+                })
+                .count()
+        };
+        // Another pass's lease, as the converge pass holds align.lock across its rows.
+        let access = sys.repository_pass().unwrap();
+        let observed = access.observed.version;
+        let other = held.then(|| access.pass.expect("the lease is free"));
+        let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+        let waits_on_the_lease = |row: &crate::model::ItemReport| {
+            row.outcome == crate::model::Outcome::Blocked
+                && matches!(row.stood_aside, Some(StoodAside::Lock(_)))
+                && Reading::of(row) == Some(Reading::Waits(Wait::OtherPass))
+        };
+        let Some(other) = other else {
+            assert_eq!(
+                stage(&rows).outcome,
+                crate::model::Outcome::Changed,
+                "{rows:?}"
+            );
+            assert!(reads() > 0, "the free lease reads the checkout");
+            assert!(remote() > 0, "{:#?}", sys.calls());
+            assert!(sys.stat(&home.join("new")).is_ok());
+            continue;
+        };
+        for row in [stage(&rows), refreshed(&rows)] {
+            assert!(waits_on_the_lease(row), "{row:?}");
+        }
+        assert_eq!(reads(), 0, "{:#?}", sys.calls());
+        assert_eq!(remote(), 0, "{:#?}", sys.calls());
+        assert!(sys.stat(&home.join("new")).is_err());
+        let journal = sys
+            .written(Fake::JOURNAL)
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+            .unwrap_or_default();
+        assert!(
+            !journal.contains("init.github.native@") && !journal.contains("init.github.refresh@"),
+            "{journal}"
+        );
+        // A plan never tries the lease: the other pass's lease alone holds back no read.
+        let rows = run(&sys, &ctx, Mode::Plan).unwrap();
+        assert!(!waits_on_the_lease(stage(&rows)), "{rows:?}");
+        let planned = reads();
+        assert!(planned > 0, "{:#?}", sys.calls());
+        // That pass's refresh claim on record: the plan reads the wait, and no checkout.
+        let scope = InitialRepositoryInputs::capture(&sys, &ctx)
+            .unwrap()
+            .refresh_scope(&sys)
+            .unwrap();
+        let now = sys.now().saturating_mul(1000);
+        assert!(matches!(
+            other
+                .admit(RefreshRequest::after(Some(scope), observed), scope, now)
+                .unwrap(),
+            Admission::Refresh(_)
+        ));
+        let rows = run(&sys, &ctx, Mode::Plan).unwrap();
+        for row in [stage(&rows), refreshed(&rows)] {
+            assert!(waits_on_the_lease(row), "{row:?}");
+        }
+        assert_eq!(reads(), planned, "{:#?}", sys.calls());
+    }
+}
+
+/// A shared refresh that failed and waits for its retry stands the refresh row aside,
+/// waiting, and holds back no clone: the missing repository is cloned in the same run, and
+/// System State's GitHub repositories row reads every repository ready. The run carries the
+/// pass's request, captured once when the pass began, as the converge pass carries it, so the
+/// failed wave's retry covers it. CONTROL: with no failed wave on record, the refresh row
+/// refreshes.
+#[test]
+fn a_waiting_refresh_retry_still_clones_missing_repositories() {
+    use crate::sync::repository_refresh::Admission;
+    use aterm_secrets::converge::{RefreshRequest, RepositoryRequest};
+    use aterm_types::macos_setup::{Setting, Standing};
+    for failed_before in [true, false] {
+        let (sys, item) = listing(&["here".to_owned(), "new".to_owned()], &["here".to_owned()]);
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
+        let inputs = InitialRepositoryInputs::capture(&sys, &ctx).unwrap();
+        let scope = inputs.refresh_scope(&sys).unwrap();
+        let access = sys.repository_pass().unwrap();
+        let pass = access.pass.unwrap();
+        let request = RefreshRequest::after(Some(scope), access.observed.version);
+        if failed_before {
+            // An earlier wave over this same request failed: its retry waits its delay.
+            let now = sys.now().saturating_mul(1000);
+            let Admission::Refresh(ticket) = pass.admit(request, scope, now).unwrap() else {
+                panic!("the first wave is admitted");
+            };
+            pass.finish(ticket, false, now).unwrap();
+        }
+        let rows = run_captured(
+            &sys,
+            &ctx,
+            Mode::Apply,
+            RepositoryWork::Refresh,
+            RepositorySteps::Both,
+            inputs.with_repository_execution(Some(Execution {
+                request: RepositoryRequest::Refresh(request),
+                pass: Arc::clone(&pass),
+            })),
+            Box::new(|| Ok(true)),
+        )
+        .unwrap();
+        assert_eq!(
+            stage(&rows).outcome,
+            crate::model::Outcome::Changed,
+            "{failed_before}: {rows:?}"
+        );
+        let home = Path::new(&item.user.home);
+        assert!(sys.stat(&home.join("new")).is_ok(), "{failed_before}");
+        let refresh = refreshed(&rows);
+        if failed_before {
+            assert_eq!(refresh.outcome, crate::model::Outcome::Blocked, "{rows:?}");
+            assert!(
+                matches!(refresh.stood_aside, Some(StoodAside::Waiting(_))),
+                "{refresh:?}"
+            );
+        } else {
+            assert_eq!(refresh.outcome, crate::model::Outcome::Ok, "{rows:?}");
+        }
+        let all: Vec<&crate::model::ItemReport> = rows.iter().collect();
+        let observed = crate::init_observe::observation(Setting::Repositories, &all);
+        assert_eq!(
+            observed.standing,
+            Standing::InPlace,
+            "{failed_before}: {observed:?}"
+        );
+    }
+}
+
+/// One checkout without a commit whose remote read fails withholds no clone. On m38 on
+/// 2026-11-15 every pass failed reading `~/aterm-packages`, a checkout of an empty GitHub
+/// repository, during a DNS outage, and `~/all-comp` was never tried. Here the missing
+/// repository is cloned in the same run, and the row fails on that checkout's line alone,
+/// which ends with Git's own reason, its credential dropped. CONTROL: with the same empty
+/// origin reachable, its empty advertisement reads as an empty repository's, ready, never an
+/// error, and the run clones the missing one beside it.
+#[test]
+fn a_failed_unborn_read_withholds_no_clone() {
+    use crate::port::Live;
+    // A credential in the URL Git names, as a misconfigured helper or remote can leave one.
+    let secret = ["ghp", "fixturevalue"].join("_");
+    let unreached = format!(
+        "fatal: unable to access 'https://alice:{secret}@github.com/alice/aterm-packages.git/': \
+         Could not resolve host: github.com\n"
+    );
+    let git = crate::items::github::need_native_git();
+    for reachable in [false, true] {
+        let live = Live::new();
+        let repos = crate::checkout::tests::Repos::new(&live, "native-unborn-unread");
+        let who = User {
+            name: "alice".into(),
+            ..repos.who.clone()
+        };
+        let home = Path::new(&who.home);
+        let empty = home.join("empty.git");
+        repos.init(&empty, true);
+        let work = home.join("aterm-packages");
+        repos.clone_into(&empty, &work);
+        let origin = "https://github.com/alice/aterm-packages.git";
+        repos.g(&work, &["remote", "set-url", "origin", origin]);
+        let mut sys = Fake::root();
+        sys.euid = who.uid;
+        sys.linux = !live.macos();
+        // The home's ancestry stands as it does on a Mac, so the clone's publication into it
+        // invents none ([`bare`]).
+        for ancestor in home.ancestors().skip(1) {
+            sys.stat_of(
+                ancestor.to_str().unwrap(),
+                Stat {
+                    uid: 0,
+                    gid: 0,
+                    ..stat(true, 0o755)
+                },
+            );
+        }
+        sys.logged_in(&who)
+            .stat_of(&who.home, live.stat(home).unwrap())
+            .executable(git, b"selected fixture git");
+        for path in [work.clone(), work.join(".git"), work.join(".git/objects")] {
+            sys.stat_of(path.to_str().unwrap(), live.stat(&path).unwrap());
+            sys.file_id_of(&path, live.file_id(&path).unwrap());
+        }
+        script::launcher(&sys, &who);
+        owned_source(&sys, &who);
+        metadata(
+            &sys,
+            &who,
+            aterm_json::json!([
+                repository("alice", "all-comp", 1),
+                repository("alice", "aterm-packages", 2)
+            ]),
+        );
+        script::lookups_hold(&sys, &who, GITHUB, "alice", TOKEN);
+        script::alike(&sys, &who);
+        repos::tests::script_clone_named(&sys, &who, "all-comp", 0, false);
+        repos::tests::script_existing(&sys, &who, &home.join("all-comp"), "all-comp");
+        let (at, bare, unreached) = (work.clone(), empty.clone(), unreached.clone());
+        sys.simulate(move |_, command| {
+            if !command
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == at.as_os_str())
+            {
+                return None;
+            }
+            let read = command.args.iter().any(|arg| arg == "--symref");
+            if read && !reachable {
+                return Some(Ran::exit(128, &unreached));
+            }
+            let mut command = command.clone();
+            if read {
+                for arg in &mut command.args {
+                    if arg == origin {
+                        *arg = bare.as_os_str().to_owned();
+                    }
+                }
+            }
+            Some(Live::new().run_complete_stdout(&command).unwrap())
+        });
+        let ctx = crate::items::defaults::tests::ctx(std::slice::from_ref(&who));
+        let rows = run(&sys, &ctx, Mode::Apply).unwrap();
+        assert!(
+            sys.stat(&home.join("all-comp")).is_ok_and(|stat| stat.dir),
+            "{reachable}: the missing repository is cloned: {rows:?}"
+        );
+        let row = stage(&rows);
+        if reachable {
+            assert_eq!(row.outcome, crate::model::Outcome::Changed, "{rows:?}");
+            assert_eq!(Reading::of(row), Some(signed_in(all_ready(2))), "{rows:?}");
+            continue;
+        }
+        assert_eq!(row.outcome, crate::model::Outcome::Failed, "{rows:?}");
+        let why = row.why.as_deref().unwrap();
+        assert!(
+            why.contains(
+                "~/aterm-packages: cannot read the unfinished repository's complete remote \
+                 references: fatal: unable to access origin: Could not resolve host: github.com"
+            ),
+            "{why}"
+        );
+        assert!(!why.contains(&secret) && !why.contains("alice:"), "{why}");
+        assert!(!why.contains("~/all-comp"), "{why}");
+        assert_eq!(
+            Reading::of(row),
+            Some(signed_in(RepositoryCounts {
+                unborn: 1,
+                missing: 1,
+                ..RepositoryCounts::default()
+            })),
+            "the probe counts the unread checkout as still without a commit: {rows:?}"
+        );
+    }
 }
 
 /// The most clones a pass runs at once.
 const LANES_SEEN: usize = 4;
 
 /// A clone that no longer reads as the repository's own worktree there during read-back
-/// (another origin took its place once it was
-/// published) is still missing: the row fails instead of counting it present or dropping it.
+/// (another origin took its place once it was published) is no repository ready: the row
+/// fails, counting it left as it is, instead of counting it present or dropping it.
 #[test]
 fn a_clone_the_read_back_cannot_verify_is_still_missing() {
     let (sys, item) = listing(&["new".to_owned()], &[]);
-    let origin = format!(
-        "-C {}/new config --get-all remote.origin.url",
-        item.user.home
-    );
+    let origin = crate::checkout::facts::config_listing(
+        &sys,
+        &item.user,
+        &Path::new(&item.user.home).join("new"),
+    )
+    .display();
     sys.simulate(move |_, cmd| {
-        cmd.display()
-            .ends_with(&origin)
-            .then(|| Ran::ok("https://github.com/someone/new.git\n"))
+        (cmd.display() == origin).then(|| {
+            Ran::ok(&crate::checkout::facts::tests::listing_of(&[
+                ("remote.origin.url", "https://github.com/someone/new.git"),
+                ("branch.main.remote", "origin"),
+                ("branch.main.merge", "refs/heads/main"),
+            ]))
+        })
     });
     let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
     let rows = run(&sys, &context, Mode::Apply).unwrap();
@@ -5969,11 +6946,10 @@ fn a_clone_the_read_back_cannot_verify_is_still_missing() {
     );
     assert_eq!(
         Reading::of(stage(&rows)),
-        Some(Reading::Repositories {
-            present: 0,
-            count: 1,
-            signed_in: true,
-        })
+        Some(signed_in(RepositoryCounts {
+            preserved: 1,
+            ..RepositoryCounts::default()
+        }))
     );
     assert!(
         sys.calls()
@@ -6024,7 +7000,7 @@ fn readback_rechecks_preexisting_worktrees_and_dependencies_after_a_clone_batch(
         let changed = AtomicBool::new(false);
         let removed = if dependency { child } else { parent };
         sys.simulate(move |sys, command| {
-            if command.display().contains(" clone ") && !changed.swap(true, Ordering::SeqCst) {
+            if acquires_repository(&command.display()) && !changed.swap(true, Ordering::SeqCst) {
                 // Another local process removes an old checkout while a different
                 // repository downloads. The credential and inventory do not change.
                 if dependency {
@@ -6044,11 +7020,12 @@ fn readback_rechecks_preexisting_worktrees_and_dependencies_after_a_clone_batch(
         );
         assert_eq!(
             Reading::of(stage(&rows)),
-            Some(Reading::Repositories {
-                present: 1,
-                count: 2,
-                signed_in: true,
-            }),
+            Some(signed_in(RepositoryCounts {
+                ready: 1,
+                dependencies: usize::from(dependency),
+                missing: usize::from(!dependency),
+                ..RepositoryCounts::default()
+            })),
             "dependency={dependency}: {rows:?}"
         );
         assert_eq!(
@@ -6061,18 +7038,11 @@ fn readback_rechecks_preexisting_worktrees_and_dependencies_after_a_clone_batch(
             crate::model::Outcome::Changed,
             "dependency={dependency}: {resumed:?}"
         );
-        assert_eq!(
-            Reading::of(stage(&resumed)),
-            Some(Reading::Repositories {
-                present: 2,
-                count: 2,
-                signed_in: true,
-            })
-        );
+        assert_eq!(Reading::of(stage(&resumed)), Some(signed_in(all_ready(2))));
         assert_eq!(
             sys.calls()
                 .iter()
-                .filter(|call| call.contains(" clone "))
+                .filter(|call| acquires_repository(call))
                 .count(),
             2
         );
@@ -6099,7 +7069,8 @@ fn blocked_destinations_remain_unfinished_while_the_other_repositories_clone() {
             .as_ref()
             .map(|explain| explain.why.as_str()),
         Some(
-            "1 of 3 repositories ready; preserved work or dependency metadata blocks completion: \
+            "1 of 3 ready; 2 left as they are; preserved work or dependency metadata blocks \
+             completion: \
              ~/Documents is a standard home folder; left untouched; \
              ~/infra has a different or credential-bearing GitHub origin; left untouched"
         )
@@ -6131,15 +7102,14 @@ fn an_entirely_blocked_inventory_never_claims_zero_repositories_are_complete() {
     assert_eq!(
         item.detail(&sys, &context),
         Some(
-            Reading::Repositories {
-                present: 0,
-                count: 53,
-                signed_in: true
-            }
+            signed_in(RepositoryCounts {
+                preserved: 53,
+                ..RepositoryCounts::default()
+            })
             .token()
         )
     );
-    assert!(!sys.calls().iter().any(|call| call.contains(" clone ")));
+    assert!(!sys.calls().iter().any(|call| acquires_repository(call)));
 }
 
 /// `aterm init`'s default stage on a Mac the vault wrote no GitHub token to asks nobody
@@ -6150,7 +7120,7 @@ fn an_entirely_blocked_inventory_never_claims_zero_repositories_are_complete() {
 fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
     let (sys, bare) = bare();
     let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&bare.user));
-    match item(&bare.user, None, true, RepositoryWork::Refresh, None, None).probe(&sys, &context) {
+    match acquisition(&bare.user, true).probe(&sys, &context) {
         Probe::NotApplicable { why } => {
             assert!(why.contains("gh_access_token entry"), "{why}");
             assert!(why.contains("on this Mac yet"), "{why}");
@@ -6171,14 +7141,13 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         aterm_json::json!([repository("alice", "ready", 1)]),
     );
     assert!(matches!(
-        item(&bare.user, None, false, RepositoryWork::Refresh, None, None).probe(&sys, &context),
+        acquisition(&bare.user, false).probe(&sys, &context),
         Probe::Blocked { .. }
     ));
     // On Linux the row names the machine, not a Mac.
     let (mut linux, _) = self::bare();
     linux.linux = true;
-    match item(&bare.user, None, true, RepositoryWork::Refresh, None, None).probe(&linux, &context)
-    {
+    match acquisition(&bare.user, true).probe(&linux, &context) {
         Probe::NotApplicable { why } => assert!(why.contains("on this machine yet"), "{why}"),
         other => panic!("{other:?}"),
     }
@@ -6186,8 +7155,7 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
     // (with the distribution's git there, so the step reaches the token): a blocked
     // operation, never a person's step.
     linux.executable(crate::items::github::SYSTEM_GIT, b"synthetic git");
-    match item(&bare.user, None, false, RepositoryWork::Refresh, None, None).probe(&linux, &context)
-    {
+    match acquisition(&bare.user, false).probe(&linux, &context) {
         Probe::Blocked { why } => assert!(why.contains("vault copy yet"), "{why}"),
         other => panic!("{other:?}"),
     }
@@ -6344,7 +7312,7 @@ fn the_keychain_block_is_journaled_before_it_is_replaced_and_someone_elses_helpe
         );
         let clone = calls
             .iter()
-            .find(|call| call.contains(" clone "))
+            .find(|call| acquires_repository(call))
             .expect("the clone ran");
         assert!(
             clone.contains("secrets git-credential") && clone.contains(helper),

@@ -463,10 +463,33 @@ fn is_result_file_of(name: &str, sid: &SessionId) -> bool {
         .is_some_and(|rev| !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// Whether `name` is a session's brief in the tasks directory: its task file, or an older build's
+/// trust sidecar beside it ([`task_file_name`], [`trust_file_name`]). It is the session's own and
+/// goes with the session; a row keeps none (`session_table::ResultKeeps`).
+pub(crate) fn is_brief(name: &str) -> bool {
+    name.strip_suffix("-1.txt")
+        .or_else(|| name.strip_suffix("-1.trust.json"))
+        .is_some_and(crate::keeper_link::valid_sid)
+}
+
 /// Whether `name` is one of session `sid`'s files in the tasks directory: its task file, an older
 /// build's trust sidecar, or a result of its.
 fn is_file_of(name: &str, sid: &SessionId) -> bool {
     name == task_file_name(sid) || name == trust_file_name(sid) || is_result_file_of(name, sid)
+}
+
+/// The session ID a result file's name is written under, a snapshot's (`<sid>-<rev>.result.md`,
+/// [`snapshot_sid`]) or its sidecar's (`.result.src`); `None` for a name no done edge writes.
+pub(crate) fn result_owner(name: &str) -> Option<&str> {
+    let stem = name
+        .strip_suffix(".result.md")
+        .or_else(|| name.strip_suffix(".result.src"))?;
+    let (sid, rev) = stem.rsplit_once('-')?;
+    (!rev.is_empty()
+        && rev.len() <= 20
+        && rev.bytes().all(|b| b.is_ascii_digit())
+        && aterm_session::is_minted_sid(sid))
+    .then_some(sid)
 }
 
 /// The session ID a snapshot's name is written under (`<sid>-<rev>.result.md`), `None` for a
@@ -514,52 +537,37 @@ const TASKS_DIR_SCAN: usize = 65_536;
 
 /// Remove session `sid`'s task files once the session is gone from `store`: its task file, the
 /// results its tab's record named under other session IDs (`carried`,
-/// `SessionTimeline::carried_results`), and its own results unless `keep_results` (a worker aterm
-/// closed keeps them while its retired row stands, [`crate::retired_workers`], then
-/// [`retire_result_files`]). A file a record `store` still holds names stays ([`Kept`]): a row may
-/// name a file another tab's record names too (`task mark` takes any path in the tasks
-/// directory), and that record still answers from it; so does the one a retired row of `sid`
-/// names.
-pub(crate) fn retire_task_file(
-    store: &Store,
-    sid: &SessionId,
-    carried: &[PathBuf],
-    keep_results: bool,
-) {
+/// `SessionTimeline::carried_results`), and its own results, but a file a record `store` still
+/// holds names, or a row of the machine's session table ([`Kept`]): a row may name a file another
+/// tab's record names too (`task mark` takes any path in the tasks directory), and that record
+/// still answers from it; and the row the session's end left names its result, which lives as
+/// long as that row ([`crate::session_table`]).
+pub(crate) fn retire_task_file(store: &Store, sid: &SessionId, carried: &[PathBuf]) {
     if let Some(dir) = crate::task_record::tasks_dir() {
-        let kept = Kept::of(store);
+        let kept = Kept::of(store, &dir);
         remove_in(
             &dir,
             std::slice::from_ref(sid),
-            if keep_results {
-                Retire::TaskFile
-            } else {
-                Retire::All
-            },
+            Retire::All,
             carried,
             &|name| kept.holds(&dir, name),
         );
     }
 }
 
-/// Remove the results of session `sid`, whose retired row has gone, its task file gone with its
-/// session already: those its ID names, and the one its row's record named under an earlier ID of
-/// its tab (`named`, [`carried_result_of`]) unless a record `store` still holds names that file.
-pub(crate) fn retire_result_files(store: &Store, sid: &SessionId, named: Option<&Path>) {
-    if let Some(dir) = crate::task_record::tasks_dir() {
-        let carried: Vec<PathBuf> = named
-            .and_then(|path| carried_result_of(path, sid))
-            .into_iter()
-            .collect();
-        let kept = Kept::of(store);
-        remove_in(
-            &dir,
-            std::slice::from_ref(sid),
-            Retire::Results,
-            &carried,
-            &|name| kept.holds(&dir, name),
-        );
-    }
+/// Remove the results rows of the machine's session table named (`named`), and their sidecars,
+/// the rows gone ([`crate::session_table`]): each by its own path, which a close left alone of its
+/// session's files, but where a record `store` holds or another row still names it ([`Kept`]),
+/// or the session it was written under lives. One collection of what is kept and one pin of the
+/// tasks directory serve them all; nothing else of the directory is read.
+pub(crate) fn retire_row_results(store: Option<&Store>, named: &[PathBuf]) {
+    let Some(dir) = crate::task_record::tasks_dir().filter(|_| !named.is_empty()) else {
+        return;
+    };
+    let kept = store.map_or_else(Kept::default, |store| Kept::of(store, &dir));
+    remove_in(&dir, &[], Retire::Results, named, &|name| {
+        kept.holds(&dir, name)
+    });
 }
 
 /// Which of a session's files [`remove_in`] removes.
@@ -567,33 +575,31 @@ pub(crate) fn retire_result_files(store: &Store, sid: &SessionId, named: Option<
 enum Retire {
     /// Its task file (and an older build's trust sidecar beside it) and its result files.
     All,
-    /// Its task file and the results named by path, not those its ID names.
-    TaskFile,
     /// Its result files alone.
     Results,
 }
 
 /// What a set of records keeps in the tasks directory: every file of each live session by its
-/// ID, the results of each retired row by its ID (its task file went with its session), and the
-/// result each record names or came back with.
+/// ID, the result each record names or came back with, and the results the rows of the machine's
+/// session table name ([`crate::session_table::ResultKeeps`]).
 #[derive(Default)]
 struct Kept {
     live: Vec<SessionId>,
-    retired: Vec<SessionId>,
     named: Vec<PathBuf>,
+    rows: Option<crate::session_table::ResultKeeps>,
 }
 
 impl Kept {
-    /// What the records this process holds keep: its live sessions and its retired rows.
-    fn of(store: &Store) -> Self {
-        let mut kept = Self::default();
-        let live = {
+    /// What the records this process holds keep in the tasks directory `dir`: its live sessions
+    /// and its session table's rows.
+    fn of(store: &Store, dir: &Path) -> Self {
+        let (live, table) = {
             let store = store.read().unwrap_or_else(|p| p.into_inner());
-            for row in store.retired_workers().rows() {
-                kept.retired.push(row.sid.clone());
-                kept.named.extend(row.record.result_path.clone());
-            }
-            store.snapshot()
+            (store.snapshot(), store.table())
+        };
+        let mut kept = Self {
+            rows: Some(table.result_keeps(dir)),
+            ..Self::default()
         };
         for handle in live {
             kept.keep_live(&handle);
@@ -627,8 +633,8 @@ impl Kept {
 
     fn holds(&self, dir: &Path, name: &str) -> bool {
         self.live.iter().any(|sid| is_file_of(name, sid))
-            || self.retired.iter().any(|sid| is_result_file_of(name, sid))
             || self.named.iter().any(|path| is_named(dir, path, name))
+            || self.rows.as_ref().is_some_and(|rows| rows.holds(name))
     }
 }
 
@@ -639,10 +645,17 @@ impl Kept {
 /// the tasks directory; it notes the session here, and the run's end removes its files with
 /// those of the sessions it still holds, keeping what the written layout names
 /// ([`retire_task_files_at_quit`]).
+///
+/// It also holds the rows of the sessions the quit ends ([`Self::note_row`]): those its closes
+/// left before the layout was written, and those it ends at the run's end
+/// (`App::close_sessions_at_quit`). Only once the layout is written can the run's end tell which
+/// sessions it brings back; those keep no row, and the rest are written before the tasks
+/// directory is settled, so the result each names is kept (`App::retire_tasks_at_quit`).
 #[derive(Default)]
 pub(crate) struct QuitClosed {
     sids: Vec<SessionId>,
     carried: Vec<PathBuf>,
+    rows: Vec<crate::session_table::Row>,
 }
 
 impl QuitClosed {
@@ -651,6 +664,22 @@ impl QuitClosed {
     pub(crate) fn note(&mut self, sid: SessionId, carried: Vec<PathBuf>) {
         self.sids.push(sid);
         self.carried.extend(carried);
+    }
+
+    /// Note the row of a session the quit ends, to write once its layout is known.
+    pub(crate) fn note_row(&mut self, row: crate::session_table::Row) {
+        self.rows.push(row);
+    }
+
+    /// The rows noted so far ([`Self::note_row`]).
+    #[cfg(test)]
+    pub(crate) fn rows(&self) -> &[crate::session_table::Row] {
+        &self.rows
+    }
+
+    /// The rows noted ([`Self::note_row`]), taken.
+    pub(crate) fn take_rows(&mut self) -> Vec<crate::session_table::Row> {
+        std::mem::take(&mut self.rows)
     }
 }
 
@@ -682,10 +711,16 @@ fn retire_task_files_in(
     closed: &QuitClosed,
     restored: &[PathBuf],
 ) {
-    let live = store.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+    let (live, table) = {
+        let store = store.read().unwrap_or_else(|p| p.into_inner());
+        (store.snapshot(), store.table())
+    };
     let mut tasked = closed.sids.clone();
     let mut carried = closed.carried.clone();
-    let mut kept = Kept::default();
+    let mut kept = Kept {
+        rows: Some(table.result_keeps(dir)),
+        ..Kept::default()
+    };
     for handle in live {
         if parked.contains(&handle.sid) {
             kept.keep_live(&handle);
@@ -710,7 +745,7 @@ fn retire_task_files_in(
 
 /// The session IDs the terminal leaves of `layout` name, as a restore carries them
 /// (`restore::carried_sid`).
-fn layout_sids(layout: &crate::restore::RestoreManifest) -> Vec<SessionId> {
+pub(crate) fn layout_sids(layout: &crate::restore::RestoreManifest) -> Vec<SessionId> {
     let mut sids = Vec::new();
     for window in &layout.windows {
         for tab in &window.restored_tabs {
@@ -760,7 +795,7 @@ pub(crate) fn restored_results(manifest: &crate::restore::RestoreManifest) -> Ve
 /// clear. A result a row names is removed by its path only where its name is one a done edge
 /// writes (`<s-hex>-<rev>.result.md`, [`snapshot_sid`]): a row may name any file in the tasks
 /// directory, and one that is no snapshot is nothing a tab left.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RestoredTasks {
     sids: Vec<SessionId>,
     named: Vec<PathBuf>,
@@ -796,13 +831,18 @@ impl RestoredTasks {
         }
     }
 
-    /// Remove what the layout left, once the restore has seeded every record it brings back
-    /// (`App::close_restore_pass`), or at a quit before then that published no layout of its own,
+    /// Remove what the layout left, once the restore has seeded every record it brings back and
+    /// the session table's load has ended (`App::close_restore_pass`,
+    /// `session_table::SessionTable::when_loaded`), or at a quit before then that published no
+    /// layout of its own,
     /// after which nothing names those IDs again (`App::settle_quit_desk_and_tasks`): each file
-    /// but those a session or a retired row in `store` keeps ([`Kept`]), so a shell the keeper
-    /// handed back under its ID keeps its task file, and a restored record the result it names.
+    /// but those a session in `store` or a row of its session table keeps ([`Kept`]), so a shell
+    /// the keeper handed back under its ID keeps its task file, and a restored record the result
+    /// it names.
     pub(crate) fn sweep(&self, store: &Store) {
-        self.sweep_keeping(Kept::of(store));
+        if let Some(dir) = crate::task_record::tasks_dir() {
+            self.sweep_keeping(&dir, Kept::of(store, &dir));
+        }
     }
 
     /// [`Self::sweep`] at a quit that came before the restore finished, which wrote layout
@@ -812,20 +852,20 @@ impl RestoredTasks {
     /// tabs still owed are in it as this layout had them, under the IDs and rows a later restore
     /// reads, and a tab the quit closed before the write is in it by its row alone.
     pub(crate) fn sweep_at_quit(&self, store: &Store, written: &crate::restore::RestoreManifest) {
-        let mut kept = Kept::of(store);
-        kept.keep_layout(written);
-        self.sweep_keeping(kept);
+        if let Some(dir) = crate::task_record::tasks_dir() {
+            let mut kept = Kept::of(store, &dir);
+            kept.keep_layout(written);
+            self.sweep_keeping(&dir, kept);
+        }
     }
 
-    fn sweep_keeping(&self, kept: Kept) {
+    fn sweep_keeping(&self, dir: &Path, kept: Kept) {
         if self.sids.is_empty() && self.named.is_empty() {
             return;
         }
-        if let Some(dir) = crate::task_record::tasks_dir() {
-            remove_in(&dir, &self.sids, Retire::All, &self.named, &|name| {
-                kept.holds(&dir, name)
-            });
-        }
+        remove_in(dir, &self.sids, Retire::All, &self.named, &|name| {
+            kept.holds(dir, name)
+        });
     }
 }
 
@@ -877,7 +917,7 @@ fn remove_in(
             remove(aterm_agent::harness::result::sidecar_of(Path::new(name)).as_os_str());
         }
     }
-    if which == Retire::TaskFile || sids.is_empty() {
+    if sids.is_empty() {
         return;
     }
     let names = match pinned.names_up_to(TASKS_DIR_SCAN) {
@@ -3386,4 +3426,4 @@ fn fish_version_takes_dollar_paren(said: &str) -> Option<bool> {
 
 #[cfg(test)]
 #[path = "task_launch_tests.rs"]
-mod tests;
+pub(crate) mod tests;

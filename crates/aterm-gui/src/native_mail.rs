@@ -583,44 +583,17 @@ fn retry_interval(failures: u32) -> std::time::Duration {
     )
 }
 
-fn verify_proton(
-    challenge: &aterm_mail::human::Challenge,
-    notify: &mut impl FnMut(String),
-) -> Result<aterm_mail::human::Verified, String> {
-    let recovery = aterm_mail::human::Recovery::prepare(challenge)?;
-    if !recovery.is_email() {
-        return Err("No configured unattended SMS recovery route".into());
-    }
-    let config = aterm_agent::harness::mail_recovery::configured()?;
-    if aterm_agent::harness::mail_recovery::candidates(&config, &recovery.destination).is_empty() {
-        return Err("No stored mailbox route matches Proton's recovery address".into());
-    }
-    notify("Retrieving Proton verification from the configured recovery mailbox".into());
-    let since = aterm_time::unix_secs().ok_or("System clock is invalid")?;
-    recovery.request_code()?;
-    let code = aterm_agent::harness::mail_recovery::code(&config, &recovery.destination, since)?;
-    recovery.complete(&Secret::new(code))
-}
-
-fn read_with_verification<T>(
+/// Runs a read on `account`, renewing a Proton session's rejected access once. A human
+/// verification Proton asks for ends the read (`aterm_mail::proton::HUMAN_VERIFICATION_STOP`):
+/// aterm never answers one, from a mailbox or anywhere else.
+fn read_renewing<T>(
     account: &mut Account,
     mut operation: impl FnMut(&mut dyn Mailbox) -> Result<T, String>,
-    notify: &mut impl FnMut(String),
 ) -> Result<T, String> {
     match account {
         Account::Proton(proton) => {
             let mut proton = proton.lock().map_err(|_| "Mail reader lock failed")?;
-            let external = proton.externally_authenticated();
-            proton.with_verification(
-                |proton| operation(proton),
-                |challenge| {
-                    if external {
-                        Err("The authenticated mail session requires verification".into())
-                    } else {
-                        verify_proton(challenge, notify)
-                    }
-                },
-            )
+            proton.with_renewal(|proton| operation(proton))
         }
         Account::Standard(account) => {
             let mut account = account.lock().map_err(|_| "Mail account lock failed")?;
@@ -641,12 +614,13 @@ fn connect_browser(
         .map_err(|error| error.to_string())
 }
 
+/// Whether a failed API connection may go on in the headless browser: only where Proton turned
+/// down this API client or its scope. A verification Proton asked for, answered or not, never
+/// sends the sign-in to the browser, where a check on its page would meet software in a person's
+/// stead: that would go around the check, which nothing in aterm does.
 fn permits_browser_fallback(kind: aterm_mail::proton_error::Kind) -> bool {
     use aterm_mail::proton_error::Kind;
-    matches!(
-        kind,
-        Kind::Verification | Kind::DeviceVerification | Kind::Scope | Kind::ClientRejected
-    )
+    matches!(kind, Kind::Scope | Kind::ClientRejected)
 }
 
 fn failed_proton_connection(proton: &aterm_mail::proton::Proton, error: String) -> String {
@@ -703,7 +677,7 @@ fn perform(
                         generation: 0,
                     },
                 )));
-                return finish_connect(email, account, accounts, verify);
+                return finish_connect(email, account, accounts);
             }
             let config = aterm_agent::harness::mail_recovery::configured()?;
             let provider = stored_provider(&email).ok_or("Stored account needs server settings")?;
@@ -785,25 +759,13 @@ fn perform(
                         let lease = aterm_mail::session::acquire(&home, &email)?;
                         let saved = aterm_mail::session::load(&home, &email)?;
                         let resumed = match saved {
-                            Some(credentials) => {
-                                aterm_mail::proton::Proton::resume(credentials, |challenge| {
-                                    verify_proton(challenge, verify)
-                                        .inspect_err(|_| fallback_needed = true)
-                                })?
-                            }
+                            Some(credentials) => aterm_mail::proton::Proton::resume(credentials)?,
                             None => None,
                         };
                         let was_resumed = resumed.is_some();
                         let mut proton = match resumed {
                             Some(proton) => proton,
-                            None => aterm_mail::proton::Proton::sign_in_with_verifier(
-                                &login,
-                                &password,
-                                |challenge| {
-                                    verify_proton(challenge, verify)
-                                        .inspect_err(|_| fallback_needed = true)
-                                },
-                            )?,
+                            None => aterm_mail::proton::Proton::sign_in(&login, &password)?,
                         };
                         if was_resumed {
                             // Rotation must reach disk before slower mailbox setup begins.
@@ -833,9 +795,7 @@ fn perform(
                             proton.persist(&home, &email)?;
                             proton.unlock_mailbox(mailbox_password.as_ref().unwrap_or(&password))
                         };
-                        let mut setup = proton.with_verification(&mut prepare, |challenge| {
-                            verify_proton(challenge, verify).inspect_err(|_| fallback_needed = true)
-                        });
+                        let mut setup = proton.with_renewal(&mut prepare);
                         if setup.is_err()
                             && was_resumed
                             && proton
@@ -844,18 +804,8 @@ fn perform(
                         {
                             // Only explicit refresh-token rejection permits a password
                             // login. The account lease remains held across both attempts.
-                            proton = aterm_mail::proton::Proton::sign_in_with_verifier(
-                                &login,
-                                &password,
-                                |challenge| {
-                                    verify_proton(challenge, verify)
-                                        .inspect_err(|_| fallback_needed = true)
-                                },
-                            )?;
-                            setup = proton.with_verification(&mut prepare, |challenge| {
-                                verify_proton(challenge, verify)
-                                    .inspect_err(|_| fallback_needed = true)
-                            });
+                            proton = aterm_mail::proton::Proton::sign_in(&login, &password)?;
+                            setup = proton.with_renewal(&mut prepare);
                         }
                         proton.hold_session(lease);
                         if let Err(error) = setup {
@@ -912,7 +862,7 @@ fn perform(
                     },
                 )))
             };
-            finish_connect(email, account, accounts, verify)
+            finish_connect(email, account, accounts)
         }
 
         Work::List { account, folder } => {
@@ -921,11 +871,7 @@ fn perform(
                 .ok_or("Account is no longer connected")?;
             account.refresh()?;
             Ok(Reply::Listed {
-                messages: read_with_verification(
-                    account,
-                    |mailbox| mailbox.messages(&folder, 50),
-                    verify,
-                )?,
+                messages: read_renewing(account, |mailbox| mailbox.messages(&folder, 50))?,
                 folder,
             })
         }
@@ -938,11 +884,9 @@ fn perform(
                 .get_mut(account)
                 .ok_or("Account is no longer connected")?;
             account.refresh()?;
-            Ok(Reply::Read(read_with_verification(
-                account,
-                |mailbox| mailbox.read(&folder, &id),
-                verify,
-            )?))
+            Ok(Reply::Read(read_renewing(account, |mailbox| {
+                mailbox.read(&folder, &id)
+            })?))
         }
         Work::Send {
             account,
@@ -992,7 +936,6 @@ fn finish_connect(
     email: String,
     mut account: Account,
     accounts: &mut Vec<(String, Account)>,
-    verify: &mut impl FnMut(String),
 ) -> Result<Reply, String> {
     account.refresh()?;
     let folder: String = match &account {
@@ -1000,11 +943,9 @@ fn finish_connect(
         Account::Standard(_) => "INBOX",
     }
     .into();
-    let listing = read_with_verification(
-        &mut account,
-        |mailbox| Ok((mailbox.folders()?, mailbox.messages(&folder, 50)?)),
-        verify,
-    );
+    let listing = read_renewing(&mut account, |mailbox| {
+        Ok((mailbox.folders()?, mailbox.messages(&folder, 50)?))
+    });
     let (folders, messages) = match listing {
         Ok(listing) => listing,
         Err(error) => {

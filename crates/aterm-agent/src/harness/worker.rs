@@ -81,9 +81,10 @@ pub struct WorkerCli {
     /// ([`Self::unnamed_posture`]). Every CLI's floor is held here but Claude Code's, whose mode
     /// [`starter`] holds to it once it has read the starter's route ([`claude_starter_args`]),
     /// and codex-alab's, which [`starter_of`] judges beside its starter's own config
-    /// ([`codex_lent`]). Each floor's first word is a posture marker of atpkg's managed twin
-    /// ([`atpkg::yolo::decide`]), so a twin the line runs adds no yolo flag beside it: the floor
-    /// holds whether or not the line runs that twin.
+    /// ([`codex_lent`]). Each floor's first word is a posture marker of whatever sets the CLI's
+    /// yolo default, atpkg's managed twin ([`atpkg::yolo::decide`]) or, for Muse Code since
+    /// HX-13a, muse-alab's `run`, which that twin hands the line to as typed; so neither adds a
+    /// yolo flag beside it: the floor holds whether or not the line runs that twin.
     flags: fn(&[String]) -> Result<Vec<String>, String>,
 }
 

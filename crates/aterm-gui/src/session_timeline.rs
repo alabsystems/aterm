@@ -190,6 +190,11 @@ pub(crate) struct SessionMeta {
     /// publishes, so it cannot overwrite the copy that placement's own read took, as a renewal
     /// in place no longer moving the revision would otherwise let it.
     pub(crate) claim_placements: u64,
+    /// The claimant's record stream (`stream @<sid> v=1`), kept beside the claim and outside
+    /// [`SupervisorClaim`], which [`Self::set_supervisor`] rebuilds on every claim line: a renewal
+    /// must not forget what was acknowledged. Keyed on the claimant's proof
+    /// ([`Self::open_stream`]); never serialized.
+    pub(crate) stream: Option<StreamState>,
     /// The actual host runner carrying this session's task across a process replacement.
     /// A claim's release or a new claim does not end the runner's responsibility.
     pub(crate) task_exit_owner: crate::harness_host::task_exit::Slot,
@@ -260,6 +265,7 @@ impl PartialEq for SessionMeta {
             supervisor: _,
             supervisor_revision: _,
             claim_placements: _,
+            stream: _,
             task_exit_owner: _,
             builtin_relaunch_epoch: _,
             supervisor_builtin: _,
@@ -399,6 +405,7 @@ impl SessionMeta {
             supervisor: None,
             supervisor_revision: 0,
             claim_placements: 0,
+            stream: None,
             task_exit_owner: Default::default(),
             builtin_relaunch_epoch: RelaunchEpoch::default(),
             supervisor_builtin: false,
@@ -507,6 +514,30 @@ impl SessionMeta {
     #[must_use]
     pub(crate) fn live_supervisor(&self, now_us: u64) -> Option<&str> {
         self.live_claim(now_us).map(|claim| claim.holder.as_str())
+    }
+
+    /// Open the record stream of the claimant `proven` on the aterm instance `epoch`
+    /// ([`crate::control_auth::process_instance_id`]) and return its state. The same claimant
+    /// keeps what was acknowledged (`acked`), its applied kinds and its counters across
+    /// connections, so a reopened stream resends only what follows; another claimant starts
+    /// from nothing. `in` counts aterm's records within one epoch: a new epoch starts it at 0.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn open_stream(
+        &mut self,
+        proven: &crate::harness_claim::Proven,
+        epoch: &str,
+    ) -> &mut StreamState {
+        let state = match self.stream.take() {
+            Some(mut kept) if kept.proven == *proven => {
+                if kept.epoch != epoch {
+                    kept.epoch = epoch.to_string();
+                    kept.sent = 0;
+                }
+                kept
+            }
+            _ => StreamState::new(proven.clone(), epoch),
+        };
+        self.stream.insert(state)
     }
 
     /// The live claim itself at `now_us` (a lapsed `ttl=` claim reads as none).
@@ -1439,6 +1470,73 @@ impl AttentionOwners {
                 Ok(true)
             }
         }
+    }
+}
+
+/// A claimant's record stream (`stream @<sid> v=1`, `control_stream.rs`), kept on the session
+/// beside its claim and keyed on the claimant's proof. It names no wire type: every platform
+/// builds this file, and the wire library is Unix only.
+#[derive(Clone, Debug)]
+pub(crate) struct StreamState {
+    /// The claimant (pid and kernel start) whose stream this is.
+    pub(crate) proven: crate::harness_claim::Proven,
+    /// The aterm instance that answered the stream's `OK`.
+    pub(crate) epoch: String,
+    /// The last harness record acknowledged: every record up to it was applied or dropped.
+    pub(crate) acked: u64,
+    /// The last record aterm sent in this epoch (`in=`); an acknowledgement is not counted.
+    pub(crate) sent: u64,
+    /// The kinds, by their wire word, a record of which was applied. A kind acknowledged but
+    /// not applied yet is not here, so its built-in source keeps feeding it.
+    pub(crate) applied: std::collections::BTreeSet<&'static str>,
+    /// Records acknowledged with a `dropped=` reason (`stream_dropped=`).
+    pub(crate) dropped: u64,
+    /// Records of a kind this aterm does not know (`stream_unknown=`).
+    pub(crate) unknown: u64,
+    /// Records of a known kind this aterm does not apply yet (`stream_unapplied=`).
+    pub(crate) unapplied: u64,
+    /// `title` records, acknowledged and written by nothing yet (`stream_titles=`).
+    pub(crate) titles: u64,
+    /// When the last `beat` arrived, on the awake clock ([`aterm_uds::process::awake_ms`]);
+    /// HX-15e's watchdog reads it.
+    pub(crate) last_beat_ms: Option<u64>,
+}
+
+impl StreamState {
+    fn new(proven: crate::harness_claim::Proven, epoch: &str) -> Self {
+        Self {
+            proven,
+            epoch: epoch.to_string(),
+            acked: 0,
+            sent: 0,
+            applied: std::collections::BTreeSet::new(),
+            dropped: 0,
+            unknown: 0,
+            unapplied: 0,
+            titles: 0,
+            last_beat_ms: None,
+        }
+    }
+
+    /// The seven `stream_*` words `meta` prints for `stream` (`-` and zeros for none).
+    pub(crate) fn meta_words(stream: Option<&Self>) -> String {
+        let (epoch, acked, sent, dropped, unknown, unapplied, titles) =
+            stream.map_or(("-", 0, 0, 0, 0, 0, 0), |s| {
+                (
+                    s.epoch.as_str(),
+                    s.acked,
+                    s.sent,
+                    s.dropped,
+                    s.unknown,
+                    s.unapplied,
+                    s.titles,
+                )
+            });
+        format!(
+            "stream_epoch={epoch} stream_acked={acked} stream_in={sent} \
+             stream_dropped={dropped} stream_unknown={unknown} stream_unapplied={unapplied} \
+             stream_titles={titles}"
+        )
     }
 }
 

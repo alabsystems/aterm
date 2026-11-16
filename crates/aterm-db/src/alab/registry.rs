@@ -29,8 +29,8 @@ use crate::{
     Error, Result,
     database::Change,
     typed::{
-        ClaimRule, Collection, Column, Derive, Kind, Member, OnConflict, Refused, Table, Ty,
-        Writer, Writers,
+        ClaimRule, Collection, Column, Derive, Face, Faced, Kind, Member, OnConflict, ROW_KEY,
+        Refused, Table, Ty, View, Writer, Writers,
         cell::{self, CellKey, CellValue, Cells},
         keys,
     },
@@ -970,10 +970,11 @@ crate::att_collection!(
     /// Which account a Mac's tabs really run, as their CLIs' login files say, keyed
     /// `<account pk>.<signer uuid32>` (`docs/DESIGN-account-discovery-2026-11-09.md`): the
     /// account, the CLI, whether a tab runs it, how many, since when, when last written, and
-    /// where its login was read. Each Mac writes only its own rows.
+    /// where its login was read. Each Mac writes only its own rows. Version 2 adds the source
+    /// word `browser` (design §3.8: a new enum word is version n+1).
     pub ACCOUNT_OBS = Collection {
         name: "account-obs",
-        version: 1,
+        version: 2,
         kind: Kind::Owned,
         writers: Writers::SelfSuffix,
         prefix: "",
@@ -1494,6 +1495,164 @@ pub const COLLECTIONS: [&Collection; 16] = [
     &SOURCE,
 ];
 
+/// How a person is shown each collection of every registry generation, in the order the Tables
+/// page lists them within a face (docs/DESIGN-tables-app-2026-11-14.md §3.1): the owner's data,
+/// what each Mac states and the importer's runs, then the reference rows every build compiles
+/// (a Mac model is born by the first Mac that reports it). `archived` carries owned rows of an
+/// earlier generation, which the view reads as those rows; `history` carries an earlier
+/// generation's history entries, which history, as of and diff read as those entries.
+///
+/// Each names its columns' display order ([`Faced::order`]), the column that names a row first:
+/// a row is read by its name, then what it is and where it stands, then the rest.
+pub const FACES: &[Faced] = &[
+    face(
+        "machine",
+        ("Machines", "Machine"),
+        Face::Owner,
+        &[
+            "label", "nickname", "role", "status", "location", "model", "chip", "ram_gb",
+        ],
+    ),
+    face(
+        "account",
+        ("AI accounts", "AI account"),
+        Face::Owner,
+        &[
+            "label", "provider", "login", "status", "plan", "services", "renews",
+        ],
+    ),
+    face(
+        "preference",
+        ("Links", "Link"),
+        Face::Owner,
+        &["machine", "account", "rank", "why", "since"],
+    ),
+    face(
+        "address",
+        ("Emails", "Email"),
+        Face::Owner,
+        &["addr", "kind", "domain", "protected", "mailbox"],
+    ),
+    face(
+        "mailbox",
+        ("Mailboxes", "Mailbox"),
+        Face::Owner,
+        &["label", "service", "login", "webmail"],
+    ),
+    face(
+        "phone",
+        ("Phones", "Phone"),
+        Face::Owner,
+        &["label", "last4", "carrier", "line_type", "device"],
+    ),
+    face(
+        "auth-route",
+        ("Sign-in routes", "Sign-in route"),
+        Face::Owner,
+        &["account", "method", "rank", "address", "phone"],
+    ),
+    face(
+        "subaccount",
+        ("Sub-accounts", "Sub-account"),
+        Face::Owner,
+        &["label", "account", "key"],
+    ),
+    face(
+        "machine-facts",
+        ("Mac facts", "Mac's facts"),
+        Face::Mac,
+        &["label", "mac", "hosts", "hw_model", "chip", "ram_gb", "at"],
+    ),
+    face(
+        "account-obs",
+        ("Accounts in use", "Account in use"),
+        Face::Mac,
+        &["account", "cli", "state", "tabs", "at"],
+    ),
+    face(
+        "mailbox-obs",
+        ("Mailbox readings", "Mailbox reading"),
+        Face::Mac,
+        &["mailbox", "complete", "addresses", "at"],
+    ),
+    face(
+        "roll",
+        ("Rolls", "Roll"),
+        Face::Mac,
+        &["from", "covered", "ops", "at"],
+    ),
+    face(
+        "source",
+        ("Imports", "Import"),
+        Face::Tool,
+        &["name", "kind", "at", "rows", "by"],
+    ),
+    face(
+        "provider",
+        ("Providers", "Provider"),
+        Face::Seeded,
+        &[ROW_KEY, "name", "site", "status"],
+    ),
+    face("cli", ("CLIs", "CLI"), Face::Seeded, &[ROW_KEY, "provider"]),
+    face(
+        "plan",
+        ("Plans", "Plan"),
+        Face::Seeded,
+        &[ROW_KEY, "provider", "name", "tier", "status"],
+    ),
+    face(
+        "model",
+        ("Mac models", "Mac model"),
+        Face::Seeded,
+        &[ROW_KEY, "marketing", "form", "chip_family", "year"],
+    ),
+    face(
+        "archived",
+        ("Archived rows", "Archived row"),
+        Face::Carried,
+        &["generation"],
+    ),
+    face(
+        "history",
+        ("Carried history", "Carried history entry"),
+        Face::Carried,
+        &[],
+    ),
+];
+
+/// A collection's face: `(title, singular)` are its names for many rows and for one.
+const fn face(
+    collection: &'static str,
+    (title, singular): (&'static str, &'static str),
+    face: Face,
+    order: &'static [&'static str],
+) -> Faced {
+    Faced {
+        collection,
+        title,
+        singular,
+        face,
+        order,
+    }
+}
+
+// Every generation the build knows, read from the one list of them: a generation added there
+// whose collection has no face does not compile.
+const _: () = {
+    let mut n = 0;
+    while n < GENERATIONS.len() {
+        assert!(
+            GENERATIONS[n].faces_every_collection(),
+            "every registry collection says how a person is shown it, once"
+        );
+        assert!(
+            GENERATIONS[n].orders_name_columns(),
+            "every display order names its collection's columns, each once"
+        );
+        n += 1;
+    }
+};
+
 /// `alab/registry`.
 pub const REGISTRY: Table = Table {
     application: APPLICATION,
@@ -1501,6 +1660,7 @@ pub const REGISTRY: Table = Table {
     collections: &COLLECTIONS,
     self_quota: SELF_QUOTA,
     ends: &["preference"],
+    faces: FACES,
 };
 
 /// The second generation's role (design §3.8, §11 step 13).
@@ -1586,6 +1746,7 @@ pub const REGISTRY_2: Table = Table {
     collections: &COLLECTIONS_2,
     self_quota: SELF_QUOTA,
     ends: &["preference"],
+    faces: FACES,
 };
 
 /// The third generation's role: the first whose history holds no secret (docs/PLAN.md LT-04).
@@ -1600,6 +1761,7 @@ pub const REGISTRY_3: Table = Table {
     collections: &COLLECTIONS_3,
     self_quota: SELF_QUOTA,
     ends: &["preference"],
+    faces: FACES,
 };
 
 /// The fourth generation's role: the first whose free-text lists are text sets (LT-15B).
@@ -1616,6 +1778,7 @@ pub const REGISTRY_4: Table = Table {
     collections: &COLLECTIONS_4,
     self_quota: SELF_QUOTA,
     ends: &["preference"],
+    faces: FACES,
 };
 
 /// The registry's generations, oldest first: generation `n` is `GENERATIONS[n - 1]`.
@@ -1716,6 +1879,71 @@ pub fn account_label(pk: &str, row: &cell::Row) -> Option<String> {
             keys::default_account_label(realm, pk).ok()
         })
 }
+
+/// What a person reads for a reference to a row, as one read of a registry generation holds it:
+/// a machine by its label, an account by its provider word and its login's address (the owner,
+/// 2026-11-11, "An account's name and slug" in docs/OWNER_RULINGS.md). Every surface that
+/// names a referenced row in words asks this; a slug joins the account's words here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Names {
+    machines: BTreeMap<String, String>,
+    accounts: BTreeMap<String, String>,
+}
+
+impl Names {
+    /// The words for every machine and account row `view` of `table` holds, retired ones too: a
+    /// reference outlives the row's life.
+    pub fn of(table: &Table, view: &View) -> Self {
+        let text = |row: &cell::Row, column: &str| {
+            row.get(column)
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+        };
+        let mut names = Self::default();
+        if let Some(machine) = table.collection(MACHINE.name) {
+            for (pk, row) in view.project(machine).rows {
+                if let Some(label) = text(&row, "label") {
+                    names.machines.insert(pk, label);
+                }
+            }
+        }
+        let addresses = table
+            .collection(ACCOUNT_ADDRESS)
+            .map(|address| view.project(address))
+            .unwrap_or_default();
+        if let Some(account) = table.collection(ACCOUNT.name) {
+            for (pk, row) in view.project(account).rows {
+                let address = text(&row, "login")
+                    .and_then(|login| addresses.rows.get(&login).and_then(|a| text(a, "addr")));
+                let words = match (text(&row, "provider"), address) {
+                    (Some(provider), Some(address)) => format!("{provider} \u{b7} {address}"),
+                    (Some(provider), None) => match account_label(&pk, &row) {
+                        Some(label) => format!("{provider} \u{b7} {label}"),
+                        None => provider,
+                    },
+                    (None, Some(address)) => address,
+                    (None, None) => continue,
+                };
+                names.accounts.insert(pk, words);
+            }
+        }
+        names
+    }
+
+    /// The words for row `pk` of collection `target`, where this read names it.
+    pub fn words(&self, target: &str, pk: &str) -> Option<&str> {
+        match target {
+            "machine" => self.machines.get(pk),
+            "account" => self.accounts.get(pk),
+            _ => None,
+        }
+        .map(String::as_str)
+    }
+}
+
+/// The collection an account's login names.
+const ACCOUNT_ADDRESS: &str = "address";
 
 #[cfg(test)]
 mod tests;

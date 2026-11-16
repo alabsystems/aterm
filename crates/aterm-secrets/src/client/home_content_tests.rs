@@ -42,6 +42,8 @@ impl Content {
             .rev()
             .filter(|path| !to.dirs.contains_key(*path))
         {
+            // A directory goes with the vault's head it holds, which no content names.
+            let _ = std::fs::remove_file(home.join(path).join("records.head"));
             std::fs::remove_dir(home.join(path)).unwrap();
         }
         for (path, &mode) in &to.dirs {
@@ -177,6 +179,12 @@ impl Known {
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = at.join(entry.file_name());
+            if entry.file_name() == "records.head" {
+                // The vault's head, a cache of the records file beside it that any resolve by
+                // the home's identity writes and any open judges against that file
+                // (`membership_log::head`): not the home's state.
+                continue;
+            }
             let kind = entry.file_type().unwrap();
             let meta = entry.metadata().unwrap();
             let mode = meta.permissions().mode() & 0o7777;

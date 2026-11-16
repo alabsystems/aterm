@@ -369,3 +369,45 @@ fn later_attempt_wins_and_owner_loss_keeps_the_previous_failure() {
     assert!(!rows[0].usable);
     assert_eq!(rows[0].previous.last().unwrap().phase, Phase::Failed);
 }
+
+/// A NAME LONGER THAN A READER ADMITS IS BOUNDED, NEVER DROPPED: a dependency's record, named for
+/// its parent and a long path (295 bytes, a two-byte character astride the head's cut), keeps at
+/// most [`NAME_MAX`] bytes, its head and its tail with the middle elided, and a reader lists it;
+/// a name within the bound is kept as it is. NEGATIVE CONTROL: the same record with its name set
+/// back past the bound after it was made is one no reader lists.
+#[cfg(unix)]
+#[test]
+fn a_long_name_is_bounded_so_a_reader_still_lists_its_record() {
+    let name = format!(
+        "parent/{}\u{e9}{}/library",
+        "a".repeat(118),
+        "b".repeat(160)
+    );
+    assert!(name.len() > NAME_MAX);
+    let mut row = Progress::new(&name, "/home/person/parent/vendor/library".into());
+    assert!(row.name.len() <= NAME_MAX, "{}", row.name.len());
+    assert!(row.name.starts_with("parent/aaa"), "{}", row.name);
+    assert!(row.name.ends_with("bbb/library"), "{}", row.name);
+    assert!(row.name.contains('\u{2026}'), "{}", row.name);
+    assert_eq!(
+        Progress::new("parent/vendor/library", "/home/person/parent".into()).name,
+        "parent/vendor/library"
+    );
+    row.pid = u32::MAX;
+    row.birth = None;
+    row.enter(Phase::Ready);
+    for (within, listed) in [(true, 1), (false, 0)] {
+        let dir = aterm_tempfile::TempDir::new().unwrap();
+        let mut written = row.clone();
+        if !within {
+            written.name.clone_from(&name);
+        }
+        aterm_uds::atomic_file::write(
+            &dir.path().join(format!("{}.json", written.attempt)),
+            &aterm_json::to_vec(&written).unwrap(),
+            0o600,
+        )
+        .unwrap();
+        assert_eq!(read_from(dir.path()).len(), listed, "within={within}");
+    }
+}

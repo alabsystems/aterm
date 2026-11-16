@@ -217,3 +217,114 @@ fn the_pass_lock_lets_one_pass_run_at_a_time() {
     assert!(take_pass(&path).is_err(), "a link is not followed");
     assert_eq!(std::fs::read(&victim).expect("victim"), b"keep");
 }
+
+/// THE RESERVE IS SIZED TO TEN MINUTES OF THE MEASURED FALL: a twelfth of the room, never over
+/// the emergency line nor under [`RESERVE_BYTES`] (which wins where the line is under it), and
+/// the look writes it at that size once free space is twice that size over the emergency line,
+/// its `written` row carrying the bytes. NEGATIVE CONTROLS: free space over the emergency line
+/// by twice [`RESERVE_BYTES`] alone writes nothing (the gate is the size, so a look that still
+/// added the fixed [`RESERVE_BYTES`] fails it); with no room read the look writes
+/// [`RESERVE_BYTES`] (a size that ignored the room fails the first length, a constant one
+/// this); and a room a tenth larger keeps the file as it is, inode, length and time (a look that
+/// rewrote to the exact size each time fails it).
+#[test]
+fn the_reserve_is_sized_to_ten_minutes_of_the_measured_fall() {
+    use crate::harness::cli::{DISK_LEDGER, ReserveMove, disk_reserve_look};
+    use std::os::unix::fs::MetadataExt as _;
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    assert_eq!(sized(Some(16 * GIB), 8 * GIB), 16 * GIB / 12);
+    assert_eq!(sized(Some(200 * GIB), 8 * GIB), 8 * GIB);
+    assert_eq!(sized(Some(GIB), 8 * GIB), RESERVE_BYTES);
+    assert_eq!(sized(None, 8 * GIB), RESERVE_BYTES);
+    assert_eq!(sized(Some(200 * GIB), 128 * MIB), RESERVE_BYTES);
+
+    let tmp = Tmp::new("reserve-sized");
+    let state = tmp.path().join("state");
+    let t = crate::harness::disk::Config::default().thresholds(Some(460 << 30));
+    let room = 12 * (RESERVE_BYTES + MIB);
+    let want = sized(Some(room), t.emergency);
+    assert_eq!(want, RESERVE_BYTES + MIB, "a twelfth of the room");
+    let gate = t.emergency;
+    let last_row = || -> aterm_json::Value {
+        let text = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+        let line = text.lines().last().expect("a row");
+        aterm_json::from_str(line).expect("a row")
+    };
+
+    let short = Some(gate + 2 * RESERVE_BYTES);
+    let reserve = path_for(&tmp.path().join("short"));
+    assert_eq!(
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(short, None),
+            short,
+            &t,
+            Some(room),
+            1,
+        ),
+        ReserveMove::Kept,
+        "free space short of twice the size over the emergency line writes nothing"
+    );
+    assert!(!reserve.exists());
+
+    let plenty = Some(gate + 2 * want);
+    let reserve = path_for(&tmp.path().join("home"));
+    assert_eq!(
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(plenty, None),
+            plenty,
+            &t,
+            Some(room),
+            2,
+        ),
+        ReserveMove::Written
+    );
+    let written = std::fs::symlink_metadata(&reserve).expect("written");
+    assert_eq!(written.len(), want);
+    let row = last_row();
+    assert_eq!(row["kind"].as_str(), Some("reserve"));
+    assert_eq!(row["action"].as_str(), Some("written"));
+    assert_eq!(row["bytes"].as_u64(), Some(want), "{row:?}");
+
+    let grown = room + room / 10;
+    let plenty_grown = Some(gate + 2 * sized(Some(grown), t.emergency));
+    assert_eq!(
+        disk_reserve_look(
+            &state,
+            &reserve,
+            t.level(plenty_grown, None),
+            plenty_grown,
+            &t,
+            Some(grown),
+            3
+        ),
+        ReserveMove::Kept,
+        "a room a tenth larger rewrites nothing"
+    );
+    let kept = std::fs::symlink_metadata(&reserve).expect("kept");
+    assert_eq!(
+        (kept.ino(), kept.len(), kept.mtime(), kept.mtime_nsec()),
+        (
+            written.ino(),
+            written.len(),
+            written.mtime(),
+            written.mtime_nsec()
+        )
+    );
+
+    let unread = path_for(&tmp.path().join("unread"));
+    assert_eq!(
+        disk_reserve_look(&state, &unread, t.level(plenty, None), plenty, &t, None, 4),
+        ReserveMove::Written
+    );
+    assert_eq!(
+        std::fs::symlink_metadata(&unread).expect("written").len(),
+        RESERVE_BYTES,
+        "with no room read, the least"
+    );
+    assert_eq!(last_row()["bytes"].as_u64(), Some(RESERVE_BYTES));
+}

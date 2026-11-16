@@ -638,7 +638,56 @@ pub(crate) fn cmd_window_dims(proxy: &EventLoopProxy<Wake>, json: bool) -> Strin
     }
 }
 
-const METRICS_USAGE: &str = "ERR usage: metrics [reset|percentiles] [--json]\n";
+const METRICS_USAGE: &str = "ERR usage: metrics [reset|percentiles|cadence] [--json]\n";
+
+/// Observe the current output-cadence index on its UI owner, with no service or reset.
+pub(crate) fn cmd_metrics_cadence(
+    proxy: &EventLoopProxy<Wake>,
+    session: Option<u64>,
+    json: bool,
+) -> String {
+    match control_media::call_main(proxy, |reply| Wake::ReadOutputCadence { session, reply }) {
+        Ok(snapshot) if json => {
+            let mut sink = JsonSink::new();
+            emit_cadence(&snapshot, &mut sink);
+            json_ok(&sink.finish())
+        }
+        Ok(snapshot) => {
+            let mut sink = TextSink::new("OK", FlagWords::ZeroOne);
+            emit_cadence(&snapshot, &mut sink);
+            format!("{}\n", sink.finish())
+        }
+        Err(error) => format!("ERR {error}\n"),
+    }
+}
+
+fn emit_cadence(snapshot: &crate::output_cadence::Snapshot, sink: &mut dyn FieldSink) {
+    sink.count("cadence_schema", 1);
+    sink.count("now_ns", snapshot.now_ns);
+    sink.count(
+        "sessions",
+        u64::try_from(snapshot.sessions).unwrap_or(u64::MAX),
+    );
+    sink.count(
+        "ordered",
+        u64::try_from(snapshot.ordered).unwrap_or(u64::MAX),
+    );
+    sink.count(
+        "indexed",
+        u64::try_from(snapshot.indexed).unwrap_or(u64::MAX),
+    );
+    if let Some(selected) = snapshot.selected {
+        sink.count("session", selected.session);
+        sink.flag("pooled", selected.pooled);
+        sink.flag("enrolled", selected.enrolled);
+        sink.flag("current", selected.current);
+        sink.flag("held", selected.held);
+        sink.flag("dirty", selected.dirty);
+        sink.count("due_ns", selected.due_ns);
+    } else {
+        sink.label("session", "none");
+    }
+}
 
 /// `metrics [reset|percentiles] [--json]` -> one `OK k=v ...\n` line of live render/latency counters.
 pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> String {

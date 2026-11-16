@@ -2645,20 +2645,29 @@ clean {
       · exact f h
       · exact g h
 
+    -- The bounds lastN's laws step by, each its own omega over only its own
+    -- hypotheses (inside an induction step, omega would also case-split on the
+    -- induction hypothesis and the branch's negations).
+    theorem ww_le_of_lt_succ (i n : Nat) (h : i < Nat.succ n) : i ≤ n := by omega
+    theorem ww_lt_of_lt_succ_ne (i n : Nat) (h : i < Nat.succ n) (hne : ¬ (i = n)) : i < n := by omega
+    theorem ww_lt_succ_of_lt (a n : Nat) (h : a < n) : a < Nat.succ n := by omega
+    theorem ww_lt_succ_self (n : Nat) : n < Nat.succ n := by omega
+    theorem ww_not_lt_zero (i : Nat) : ¬ (i < 0) := by omega
+
     -- lastN: the largest index below n that p holds of, never one past it.
     theorem ww_lastN_ge (p : Nat → Bool) : ∀ (n i : Nat), i < n → p i = true → i ≤ lastN n p := by
       intro n
       induction n with
-      | zero => intro i hi _; exact absurd hi (by omega)
+      | zero => intro i hi _; exact absurd hi (ww_not_lt_zero i)
       | succ n ih =>
         intro i hi hp
         by_cases hpn : p n = true
         · have e : lastN (Nat.succ n) p = n := show (if p n = true then n else lastN n p) = n from if_pos hpn
-          rw [e]; omega
+          rw [e]; exact ww_le_of_lt_succ i n hi
         · have e : lastN (Nat.succ n) p = lastN n p :=
             show (if p n = true then n else lastN n p) = lastN n p from if_neg hpn
           have hin : ¬ (i = n) := fun h => hpn (Eq.mpr (congrArg (fun x => p x = true) h.symm) hp)
-          rw [e]; exact ih i (by omega) hp
+          rw [e]; exact ih i (ww_lt_of_lt_succ_ne i n hi hin) hp
 
     theorem ww_lastN_spec (p : Nat → Bool) : ∀ (n : Nat), lastN n p ≠ 0 → p (lastN n p) = true ∧ lastN n p < n := by
       intro n
@@ -2668,12 +2677,12 @@ clean {
         intro h
         by_cases hpn : p n = true
         · have e : lastN (Nat.succ n) p = n := show (if p n = true then n else lastN n p) = n from if_pos hpn
-          rw [e]; exact ⟨hpn, by omega⟩
+          rw [e]; exact ⟨hpn, ww_lt_succ_self n⟩
         · have e : lastN (Nat.succ n) p = lastN n p :=
             show (if p n = true then n else lastN n p) = lastN n p from if_neg hpn
           have r := ih (fun z => h (Eq.trans e z))
           rw [e]
-          exact ⟨r.1, by omega⟩
+          exact ⟨r.1, ww_lt_succ_of_lt (lastN n p) n r.2⟩
 
     -- The write of name n that lands with S is pending, of a version S holds, of name n, born.
     theorem ww_landing (w : WWorld) (S : Nat → Bool) (n : Nat) (h : landingOf w S n ≠ 0) :

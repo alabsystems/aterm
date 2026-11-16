@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use aterm_machines::init_github::acquires_repository;
 use aterm_machines::model::{HostFacts, User};
 use aterm_machines::port::{Fake, GithubResponse, Ran, Stat};
 use aterm_secrets::client::{self, JoinOptions, Paths};
@@ -171,7 +172,7 @@ fn leaving_the_secrets_group_as_is_still_checks_the_configured_default_vault() {
     assert!(
         !sys.calls()
             .iter()
-            .any(|call| call.contains(" clone ") || call.contains(" agh GET "))
+            .any(|call| acquires_repository(call) || call.contains(" agh GET "))
     );
 }
 
@@ -199,7 +200,8 @@ fn a_ready_selected_vault_allows_repository_observation() {
     assert!(
         result.iter().any(|row| matches!(
             aterm_machines::init_observe::Reading::of(row),
-            Some(aterm_machines::init_observe::Reading::Repositories { count: 1, .. })
+            Some(aterm_machines::init_observe::Reading::Repositories { counts, .. })
+                if counts.total() == 1
         )),
         "{result:?}"
     );
@@ -402,7 +404,7 @@ fn an_empty_selected_inventory_needs_no_git_or_repository_work() {
     assert!(
         !sys.calls().iter().any(|call| call.contains(" agh GET ")
             || call.contains("credential fill")
-            || call.contains(" clone ")),
+            || acquires_repository(call)),
         "{:?}",
         sys.calls()
     );
@@ -446,7 +448,7 @@ fn an_empty_selected_inventory_needs_no_git_or_repository_work() {
             .iter()
             .any(|call| call.contains("credential fill")
                 || call.contains("/user")
-                || call.contains(" clone "))
+                || acquires_repository(call))
     );
 }
 
@@ -583,4 +585,71 @@ fn a_context_naming_two_accounts_is_an_error_the_run_retries() {
         "{:?}",
         sys.calls()
     );
+}
+
+/// A refresh of the checkouts already here that failed parks System State's stage on it and
+/// leaves the GitHub repositories setting standing as their acquisition reads: the page notes
+/// no unfinished change of the setting, no failure reason is the setting's, and the refresh's
+/// reason stays its row's words. NEGATIVE CONTROL: the same failure through the plain item
+/// rows fails the setting, and on the acquisition's row it still does.
+#[test]
+fn a_failed_refresh_parks_the_stage_and_never_fails_the_repositories_setting() {
+    use aterm_machines::model::{Effect, ItemReport, Outcome};
+    use aterm_types::macos_setup::Unfinished;
+    let fault = "git fetch origin failed: fatal: early EOF";
+    let item = |id: &str, title: &str, outcome: Outcome| ItemReport {
+        id: id.into(),
+        family: "github".into(),
+        title: title.into(),
+        outcome,
+        from: None,
+        to: None,
+        why: (outcome == Outcome::Failed).then(|| fault.to_owned()),
+        revert: None,
+        effect: Effect::Now,
+        detail: None,
+        layer: None,
+        class: None,
+        explain: None,
+        stood_aside: None,
+        waits_on: None,
+        essential: false,
+        elapsed_ms: None,
+    };
+    let run = |acquired: Outcome, refreshed: Outcome| RepositoryRun {
+        rows: vec![
+            item(
+                "init.github.native@alice",
+                "GitHub repositories from synced development credentials",
+                acquired,
+            ),
+            item(
+                "init.github.refresh@alice",
+                "GitHub repositories already here, fast-forwarded where clean and behind",
+                refreshed,
+            ),
+        ],
+        readback: None,
+    };
+    let fails_setting = |rows: &[Row]| {
+        super::super::items_page(Stage::Repositories, rows)
+            .expect("the GitHub repositories stage has a page of its own")
+            .outcome
+            .unfinished
+            .contains(&(Setting::Repositories, Unfinished::Failed))
+    };
+
+    let ran = reading(Some(run(Outcome::Ok, Outcome::Failed)));
+    let statuses: Vec<&str> = ran.rows.iter().map(|row| row.status.as_str()).collect();
+    assert_eq!(statuses, ["ok", crate::macos_doctor::DEFERRED]);
+    assert_eq!(ran.rows[1].detail, fault);
+    assert!(!fails_setting(&ran.rows));
+    assert_eq!(ran.failure, None);
+
+    let plain = item_rows(run(Outcome::Ok, Outcome::Failed).rows);
+    assert_eq!(plain[1].status, "error");
+    assert!(fails_setting(&plain));
+    let acquisition = reading(Some(run(Outcome::Failed, Outcome::Ok)));
+    assert_eq!(acquisition.rows[0].status, "error");
+    assert!(fails_setting(&acquisition.rows));
 }

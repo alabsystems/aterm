@@ -216,6 +216,9 @@ impl Item for Aside<'_> {
     fn read_aside(&self) -> Option<StoodAside> {
         self.inner.read_aside()
     }
+    fn row_ended(&self) {
+        self.inner.row_ended();
+    }
 }
 
 /// Wrap `items` so pending changes report `Blocked` with `why` instead of applying.
@@ -355,6 +358,9 @@ impl Item for HeldBack<'_> {
     fn read_aside(&self) -> Option<StoodAside> {
         self.inner.read_aside()
     }
+    fn row_ended(&self) {
+        self.inner.row_ended();
+    }
 }
 
 struct Narrowed<'a> {
@@ -422,6 +428,9 @@ impl Item for Narrowed<'_> {
     }
     fn read_aside(&self) -> Option<StoodAside> {
         self.inner.read_aside()
+    }
+    fn row_ended(&self) {
+        self.inner.row_ended();
     }
 }
 

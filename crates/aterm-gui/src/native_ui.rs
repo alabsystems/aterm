@@ -6436,7 +6436,11 @@ fn paint_compiled_node_at(
                     crate::native_appearance::ACCENT_WASH_SELECTED,
                 )
             } else if control.state.hovered {
-                mix_rgb(roles.elevated, roles.text_primary, 0.09)
+                mix_rgb(
+                    roles.elevated,
+                    roles.text_primary,
+                    crate::native_appearance::ROW_HOVER_WASH,
+                )
             } else if navigation {
                 roles.elevated
             } else {
@@ -9663,7 +9667,11 @@ fn paint_control_surface(
                     crate::native_appearance::ACCENT_WASH_PRESSED,
                 )
             } else if state.hovered {
-                mix_rgb(roles.elevated, roles.text_primary, 0.09)
+                mix_rgb(
+                    roles.elevated,
+                    roles.text_primary,
+                    crate::native_appearance::ROW_HOVER_WASH,
+                )
             } else {
                 control_rest_fill(&roles)
             },

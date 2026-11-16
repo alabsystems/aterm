@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::age;
+use aterm_digest::Sha256;
 use std::sync::OnceLock;
 
 #[path = "payload_tests.rs"]

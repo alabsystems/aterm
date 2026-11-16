@@ -533,14 +533,16 @@ impl Log {
         })
     }
 
-    /// Business history ordered by a clock derived before filtering structural or refused
-    /// operations: those signed parents still constrain the clocks of edits that observed them.
+    /// Every eligible business record as (derived clock, operation digest), in that order: the
+    /// sort key of history (`att::history`). The clocks are folded over the whole authenticated
+    /// index, structural and refused records included, since their signed parents still
+    /// constrain the edits that observed them; causal-only merges are left out of the order.
+    /// Nothing is copied out of a record: a reader of one page looks up only the records it keeps
+    /// ([`Self::eligible_record`]).
     ///
     /// # Errors
     /// An authenticated causal parent has no derived clock, or its logical counter overflows.
-    pub(crate) fn into_causal_history(
-        mut self,
-    ) -> Result<impl Iterator<Item = (Operation, Command, Hlc)>> {
+    pub(crate) fn causal_order(&self) -> Result<Vec<(Hlc, Digest)>> {
         let withheld = self
             .records
             .iter()
@@ -564,25 +566,30 @@ impl Log {
             }
             clocks.insert(id, Hlc::after(operation.authored_ms, parent_clock)?);
         }
-        let mut ordered = self
-            .eligible
-            .iter()
-            .map(|id| {
-                clocks
-                    .get(id)
-                    .copied()
-                    .map(|clock| (clock, *id))
-                    .ok_or_else(|| Error::new("table history causal clock is incomplete"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ordered.sort_unstable();
-        Ok(ordered.into_iter().filter_map(move |(clock, id)| {
-            let (operation, command) = self.records.remove(&id)?;
-            match command {
-                Some(Command::Merge { .. }) | None => None,
-                Some(command) => Some((operation, command, clock)),
+        let mut ordered = Vec::with_capacity(self.eligible.len());
+        for id in &self.eligible {
+            let clock = clocks
+                .get(id)
+                .copied()
+                .ok_or_else(|| Error::new("table history causal clock is incomplete"))?;
+            if self.eligible_record(id).is_some() {
+                ordered.push((clock, *id));
             }
-        }))
+        }
+        ordered.sort_unstable();
+        Ok(ordered)
+    }
+
+    /// The eligible business record `id` and its decoded command; `None` for a causal-only
+    /// merge, an ineligible record or one this log does not hold.
+    pub(crate) fn eligible_record(&self, id: &Digest) -> Option<(&Operation, &Command)> {
+        if !self.eligible.contains(id) {
+            return None;
+        }
+        match self.records.get(id)? {
+            (_, Some(Command::Merge { .. }) | None) => None,
+            (operation, Some(command)) => Some((operation, command)),
+        }
     }
     /// [`Self::eligible`], and each eligible causal-only merge as its writer and sequence: the
     /// joins `application::append` writes before a record on a wide frontier, which a typed

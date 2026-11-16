@@ -499,6 +499,7 @@ fn the_config_walk_stops_where_targo_stops_it() {
     let outer = home.join(".cargo/config.toml");
     let manifest = root.join("Cargo.toml");
     let args = ["--unverified".into(), "build".into()];
+    #[cfg_attr(not(unix), expect(unused_mut, reason = "only unix pushes a row below"))]
     let mut rows = vec![
         (None, root.join("near")),
         (Some(cwd.clone().into_os_string()), home.join("outer")),

@@ -63,6 +63,7 @@ mod held;
 #[cfg(test)]
 mod hook_tests;
 mod journals;
+pub(crate) mod kept;
 #[cfg(unix)]
 mod pending;
 #[cfg(test)]
@@ -82,6 +83,24 @@ type ReplayObserver = Option<Box<dyn FnOnce()>>;
 #[cfg(test)]
 thread_local! {
     static REPLAY_OBSERVER: std::cell::RefCell<ReplayObserver> = const { std::cell::RefCell::new(None) };
+    /// Opens on this thread that replayed a store's whole journal, a reopen's tail aside.
+    static JOURNAL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// [`REPLAY_OBSERVER`]'s point in an open or a reopen ([`kept`]): its journal read, before it
+/// restores a record.
+#[cfg(test)]
+pub(crate) fn replay_observed() {
+    if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
+        observe();
+    }
+}
+
+/// How many opens on this thread replayed a store's whole journal: a reopen of a kept store
+/// ([`kept`]) replays only the records after the ones it kept, and is not one.
+#[cfg(test)]
+pub(crate) fn journal_replays() -> usize {
+    JOURNAL_REPLAYS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
@@ -528,6 +547,15 @@ enum StoredWire {
 }
 
 impl StoredWire {
+    /// The record this wire holds, authenticated in `batch`: a shared wire's signature through
+    /// the fact it keeps, so a read of a table of any size verifies each held signature once.
+    fn authenticate(&self, batch: &ReadBatch<'_, '_>) -> Result<Record> {
+        match self {
+            Self::Owned(wire) => batch.authenticate(wire),
+            Self::Shared(wire) => batch.authenticate_identified(wire),
+        }
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(wire) => wire,
@@ -892,18 +920,26 @@ impl Store {
             return Self::observe(session, dir, scope);
         }
         let mut store = Self::open_mode(session, dir, scope, false)?;
-        // A write a held `Remove` kept pending (M4) seals once its new epoch has arrived, when
-        // its table next opens for writing, not only at the table's next write. A seal refused
-        // before it appends (the pending set does not open, a merge is due) leaves the write
-        // pending and the open standing: the next write runs the same seal and returns its error
-        // to that write's caller. An append whose outcome is uncertain poisons the handle, so
-        // the open fails with that append's own error.
-        if let Err(error) = store.seal_pending(session)
-            && (store.poisoned || store.log.as_ref().is_some_and(Log::is_poisoned))
+        store.seal_held(session)?;
+        Ok(store)
+    }
+
+    /// A writing open's seal of held writes ([`Self::open`]). A write a held `Remove` kept
+    /// pending (M4) seals once its new epoch has arrived, when its table next opens for writing,
+    /// not only at the table's next write. A seal refused before it appends (the pending set does
+    /// not open, a merge is due) leaves the write pending and the open standing: the next write
+    /// runs the same seal and returns its error to that write's caller. An append whose outcome
+    /// is uncertain poisons the handle, so the open fails with that append's own error.
+    ///
+    /// # Errors
+    /// The seal's append is uncertain.
+    fn seal_held(&mut self, session: &Session<'_>) -> Result<()> {
+        if let Err(error) = self.seal_pending(session)
+            && (self.poisoned || self.log.as_ref().is_some_and(Log::is_poisoned))
         {
             return Err(error);
         }
-        Ok(store)
+        Ok(())
     }
 
     /// Read the independently witnessed committed prefix beside any live writer.
@@ -1433,6 +1469,23 @@ impl Store {
         initialize: bool,
         claimed: Claimed<'_, '_>,
     ) -> Result<Self> {
+        Self::open_claimed_classified(session, dir, scope, initialize, claimed, None)
+    }
+
+    /// [`Self::open_claimed`], recording into `classes`, where given, each replayed record's
+    /// class and its verdict ([`crate::table::Verdict`]) in the replay's own read batch: what a
+    /// store kept across sessions ([`kept`]) holds its records' classification under.
+    ///
+    /// # Errors
+    /// As [`Self::open_claimed`].
+    fn open_claimed_classified(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        initialize: bool,
+        claimed: Claimed<'_, '_>,
+        mut classes: Option<&mut kept::Classes>,
+    ) -> Result<Self> {
         // Keep each admitted vault source stable through local replay. Live
         // authority is checked before replay, before finalization and before
         // returning the store; in a table-repair read batch each check judges
@@ -1545,8 +1598,9 @@ impl Store {
             .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()))
             .collect();
         #[cfg(test)]
-        if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
-            observe();
+        {
+            JOURNAL_REPLAYS.with(|count| count.set(count.get() + 1));
+            replay_observed();
         }
         if !replay.entries.is_empty() {
             // Each header is admitted as the causal index would admit it, and the index is built
@@ -1585,7 +1639,7 @@ impl Store {
                             return Err(Error::new("duplicate physical table conflict"));
                         }
                     } else {
-                        let stored = replay::restore(
+                        let (stored, class) = replay::restore(
                             batch,
                             receipt,
                             wire,
@@ -1593,6 +1647,11 @@ impl Store {
                             catalog,
                             read_only,
                         )?;
+                        if let Some(classes) = classes.as_deref_mut()
+                            && !classes.contains_key(&class)
+                        {
+                            classes.insert(class, batch.class_verdict(&class)?);
+                        }
                         store.admit(&stored.header, stored.wire.len())?;
                         store.operation_bytes += stored.wire.len();
                         let slot = if stored.payload.awaiting_membership() {
@@ -1620,50 +1679,75 @@ impl Store {
                 Ok(())
             })?;
         }
-        // An observation finalizes nothing, and `check` below holds its context.
-        if !read_only {
-            session.context(scope)?;
-            session.mutation_guard()?;
-        }
-        if let Some(log) = &mut store.log {
-            log.finish_open()?;
-            if pending {
-                store.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(dir)?);
-            }
-            if pending || store.witness != acknowledged {
-                store.publish_witness(store.witness)?;
-                for (offset, conflict, wire) in &adopted {
-                    appended(&Appended {
-                        table: scope.digest(),
-                        recovery: store.is_recovery(),
-                        kind: if *conflict {
-                            AppendKind::Conflict
-                        } else {
-                            AppendKind::Operation
-                        },
-                        offset: *offset,
-                        length: store.witness.count,
-                        via: Via::Local,
-                        wire: wire.wire(),
-                    });
-                }
-            } else if permitted {
-                // Replay stopped at the acknowledged witness a pending group permit starts at:
-                // the writer stopped before any of that group reached the log (a group that
-                // did is adopted above, its permit then complete). Retire the permit before
-                // anything appends: the next append moves custody past its start without
-                // reaching its end, and a permit left behind would refuse every later open.
-                group::retire(&store.claim_dir, &store.claim_name)?;
-            }
-            // Complete a possible earlier rename whose directory barrier failed, and make a
-            // retirement above durable before any append moves the custody witness.
-            aterm_durable::durable_dir(&store.claim_dir)?;
-            directory::remember(dir, &store.claim_dir, &store.claim_name, &store.claim)?;
-        }
+        store.finish_open(session, pending, acknowledged, &adopted, permitted)?;
         #[cfg(test)]
         OPENS_AND_CHECKS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
         store.check(session)?;
         Ok(store)
+    }
+
+    /// An open's last steps once its records are held, before its check: an observation
+    /// finalizes nothing; a writing open holds the session's context and mutation guard, finishes
+    /// the journal's open, publishes the witness of the tail it `adopted` past `acknowledged`
+    /// (each record new here, which the append sink hears of as `Local`) or retires a group
+    /// permit no record of reached the log, and makes custody durable and remembered.
+    ///
+    /// # Errors
+    /// The session's context or mutation guard refuses, or the journal's finish, the witness
+    /// publication, the retirement, the directory flush or the folder's remembered identity
+    /// fails.
+    fn finish_open(
+        &mut self,
+        session: &Session<'_>,
+        pending: bool,
+        acknowledged: Witness,
+        adopted: &[(u64, bool, super::signatures::Identified)],
+        permitted: bool,
+    ) -> Result<()> {
+        let Some(log) = &mut self.log else {
+            return Ok(());
+        };
+        session.context(self.scope)?;
+        session.mutation_guard()?;
+        log.finish_open()?;
+        if pending {
+            self.claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(&self.data_dir)?);
+        }
+        if pending || self.witness != acknowledged {
+            self.publish_witness(self.witness)?;
+            for (offset, conflict, wire) in adopted {
+                appended(&Appended {
+                    table: self.scope.digest(),
+                    recovery: self.is_recovery(),
+                    kind: if *conflict {
+                        AppendKind::Conflict
+                    } else {
+                        AppendKind::Operation
+                    },
+                    offset: *offset,
+                    length: self.witness.count,
+                    via: Via::Local,
+                    wire: wire.wire(),
+                });
+            }
+        } else if permitted {
+            // Replay stopped at the acknowledged witness a pending group permit starts at:
+            // the writer stopped before any of that group reached the log (a group that
+            // did is adopted above, its permit then complete). Retire the permit before
+            // anything appends: the next append moves custody past its start without
+            // reaching its end, and a permit left behind would refuse every later open.
+            group::retire(&self.claim_dir, &self.claim_name)?;
+        }
+        // Complete a possible earlier rename whose directory barrier failed, and make a
+        // retirement above durable before any append moves the custody witness.
+        aterm_durable::durable_dir(&self.claim_dir)?;
+        directory::remember(
+            &self.data_dir,
+            &self.claim_dir,
+            &self.claim_name,
+            &self.claim,
+        )?;
+        Ok(())
     }
     pub const fn scope(&self) -> Scope {
         self.scope
@@ -3153,7 +3237,7 @@ impl Store {
                 .filter(|id| {
                     self.records[*id].cut.is_none() && self.records[*id].checkpoint.is_none()
                 })
-                .map(|id| batch.authenticate(&self.records[id].wire))
+                .map(|id| self.records[id].wire.authenticate(batch))
                 .collect::<Result<Vec<_>>>()?;
             self.check(session)?;
             Ok(records)
@@ -3166,6 +3250,48 @@ impl Store {
     pub fn metadata_evidence(&self, session: &Session<'_>) -> Result<Vec<MetadataEvidence>> {
         self.metadata_with_append_bound(session)
             .map(|(evidence, _)| evidence)
+    }
+
+    /// What this store holds here, as one digest that opens no payload: every retained record
+    /// (its digest, whether its payload opens, is quarantined or awaits membership, and whether
+    /// it is a removal cutoff), every fork or discarded-source proof (its key, whether it is
+    /// active and the source it discards), and the session's access head and basis, on which
+    /// each record's eligibility, its roster's bindings and every cutoff are judged. Two reads
+    /// under one revision see the same records judged the same way, so whatever a reader
+    /// derives from them alone (an application's eligible records, their causal clocks and
+    /// order) is the same; a record arriving, a payload opening or a membership change moves it.
+    ///
+    /// # Errors
+    /// The store's custody no longer holds ([`Self::check`]).
+    pub(crate) fn revision(&self, session: &Session<'_>) -> Result<Digest> {
+        self.check(session)?;
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(b"aterm/commons/table-revision/1\0");
+        hash.update(&self.scope.digest());
+        hash.update(&session.access_observation());
+        hash.update(&(self.records.len() as u64).to_le_bytes());
+        for (id, stored) in &self.records {
+            let payload: u8 = match stored.payload {
+                PayloadState::Ready => 0,
+                PayloadState::Quarantined(..) => 1,
+                PayloadState::AwaitingMembership => 2,
+            };
+            hash.update(id);
+            hash.update(&[payload, u8::from(stored.cut.is_some())]);
+        }
+        hash.update(&(self.conflicts.len() as u64).to_le_bytes());
+        for (key, stored) in &self.conflicts {
+            hash.update(key);
+            hash.update(&[u8::from(stored.conflict.active())]);
+            match stored.conflict.discarded() {
+                Some(source) => {
+                    hash.update(&[1]);
+                    hash.update(&source.header.id);
+                }
+                None => hash.update(&[0]),
+            }
+        }
+        Ok(hash.finalize())
     }
 
     /// Read application evidence and its next append's conservative record
@@ -3303,7 +3429,7 @@ impl Store {
             .values()
             .map(|stored| {
                 let record = if stored.payload.is_ready() {
-                    Some(batch.authenticate(&stored.wire)?)
+                    Some(stored.wire.authenticate(batch)?)
                 } else {
                     None
                 };
@@ -3891,6 +4017,13 @@ pub(crate) fn rebind_claim(claim: &mut [u8], dir: &Path) -> Result<(Digest, Dige
     let before = custody_of(claim);
     claim[ANCHOR_LEN..WITNESS_AT].copy_from_slice(&directory::legacy(dir)?);
     Ok((before, custody_of(claim)))
+}
+
+/// The group permission beside a claim (`<claim>.group`), bound to `claim` once [`rebind_claim`]
+/// rebound it: a permit outlives its completed group, so a copy's permit binds the copy's claim.
+#[cfg(test)]
+pub(crate) fn rebind_group(permit: &mut [u8], claim: &[u8]) -> Result<()> {
+    group::rebind(permit, claim)
 }
 
 /// `ids` in causal order under `header`: Kahn's algorithm over the parent links (`parents` and

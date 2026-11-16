@@ -3,6 +3,107 @@
 
 use super::*;
 
+/// r405: plist field extraction in both encodings, and
+/// the no-block item version assembly
+/// (`[short, bundle]` present parts, deduplicated).
+#[test]
+fn plist_fields_and_item_versions() {
+    let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+	<key>CFBundleShortVersionString</key>
+	<string>2.5.0</string>
+	<key>Nested</key>
+	<dict>
+		<key>CFBundleVersion</key>
+		<string>inner</string>
+	</dict>
+	<key>CFBundleVersion</key>
+	<string>250</string>
+	<key>Count</key>
+	<integer>7</integer>
+</dict>
+</plist>"#;
+    assert_eq!(
+        plist_string_fields(xml).unwrap(),
+        vec![
+            (
+                "CFBundleShortVersionString".to_string(),
+                "2.5.0".to_string()
+            ),
+            ("CFBundleVersion".to_string(), "250".to_string()),
+        ]
+    );
+    // Hand-built bplist00: {A: "1.2", B: "12", N: {x: "y"}}.
+    let bin: &[u8] = &[
+        98, 112, 108, 105, 115, 116, 48, 48, 211, 1, 2, 3, 4, 5, 6, 81, 65, 81, 66, 81, 78, 83, 49,
+        46, 50, 82, 49, 50, 209, 7, 8, 81, 120, 81, 121, 8, 15, 17, 19, 21, 25, 28, 31, 33, 0, 0,
+        0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 35,
+    ];
+    assert_eq!(
+        plist_string_fields(bin).unwrap(),
+        vec![
+            ("A".to_string(), "1.2".to_string()),
+            ("B".to_string(), "12".to_string()),
+        ]
+    );
+    assert_eq!(plist_string_fields(b"bplist00junk"), None);
+    // Mutations of a valid document never panic (the
+    // parser runs on downloaded bytes): every truncation
+    // and single-byte flip returns or parses cleanly.
+    for cut in 0..bin.len() {
+        let _ = plist_string_fields(&bin[..cut]);
+    }
+    for i in 0..bin.len() {
+        for delta in [1u8, 0x80, 0xff] {
+            let mut mutated = bin.to_vec();
+            mutated[i] = mutated[i].wrapping_add(delta);
+            let _ = plist_string_fields(&mutated);
+        }
+    }
+    for cut in 0..xml.len() {
+        let _ = plist_string_fields(&xml[..cut]);
+    }
+    let item = |short: Option<&str>, bundle: Option<&str>| {
+        PlistItem {
+            bundle_id: None,
+            short: short.map(str::to_string),
+            bundle: bundle.map(str::to_string),
+        }
+        .version()
+    };
+    assert_eq!(
+        item(Some("2.5.0"), Some("250")).as_deref(),
+        Some("2.5.0,250")
+    );
+    assert_eq!(item(Some("4.0"), Some("4.0")).as_deref(), Some("4.0"));
+    assert_eq!(item(Some("3.1"), None).as_deref(), Some("3.1"));
+    assert_eq!(item(None, Some("777")).as_deref(), Some("777"));
+    assert_eq!(item(None, None), None);
+}
+
+/// r402: GitHub API failures take brew's raised texts
+/// (bare exception class for 404s, prefixed HTTP
+/// explanation otherwise).
+#[test]
+fn github_api_error_texts() {
+    let not_found = agh::Error::new(agh::Kind::NotFound, "GitHub answered 404: Not Found");
+    assert_eq!(
+        github_api_error(&not_found),
+        "GitHub::API::HTTPNotFoundError"
+    );
+    let not_visible = agh::Error::new(agh::Kind::NotVisible, "as dev, answers 404");
+    assert_eq!(
+        github_api_error(&not_visible),
+        "GitHub::API::HTTPNotFoundError"
+    );
+    let limited = agh::Error::new(agh::Kind::RateLimited, "GitHub answered 403: slow down");
+    assert_eq!(
+        github_api_error(&limited),
+        "GitHub API Error: GitHub answered 403: slow down"
+    );
+}
+
 /// r399: the mini YAML parser walks block mappings
 /// (pnpm-lock shape) and sequences, and scalar
 /// typing follows YAML 1.1 resolution.
@@ -71,23 +172,50 @@ fn debug_matched_dedupes_in_discovery_order() {
     assert_eq!(debug_matched(&[]), "");
 }
 
-/// r384: file-name version tokens and PyPI project
-/// derivation, as shown by `brew livecheck -r
-/// --verbose` on python-shaped resources.
+/// r384/r407: PyPI project derivation, as shown by
+/// `brew livecheck -r --verbose` on python-shaped
+/// resources and pinned against the oracle strategy's
+/// own `FILENAME_REGEX` (run under Ruby): the name is
+/// greedy to the last `-` before a trailing
+/// `.<alnum>+` suffix, so a dotted-post version file
+/// (`python-dateutil-2.9.0.post0.tar.gz`, ansible's
+/// resource) derives `python-dateutil`, and a wheel
+/// keeps its tags in the name, as the oracle does.
 #[test]
 fn pypi_project_and_file_version_tokens() {
     let flit = "https://files.pythonhosted.org/packages/e7/91/flit_core-4.1.0.tar.gz";
     assert_eq!(pypi_project(flit).as_deref(), Some("flit-core"));
-    assert_eq!(file_version_token(flit), Some((2, "4.1.0".to_string())));
     let whl = "https://files.pythonhosted.org/packages/a/packaging-26.3-py3-none-any.whl";
-    assert_eq!(pypi_project(whl).as_deref(), Some("packaging"));
-    assert_eq!(file_version_token(whl), Some((1, "26.3".to_string())));
+    assert_eq!(
+        pypi_project(whl).as_deref(),
+        Some("packaging-26.3-py3-none")
+    );
     let zope = "https://files.pythonhosted.org/packages/b/zope_interface-7.0.3.tar.gz";
     assert_eq!(pypi_project(zope).as_deref(), Some("zope-interface"));
     assert_eq!(
-        pypi_project("https://example.com/packaging-26.3.tar.gz"),
-        None
+        pypi_project(
+            "https://files.pythonhosted.org/packages/66/c0/python-dateutil-2.9.0.post0.tar.gz"
+        )
+        .as_deref(),
+        Some("python-dateutil")
     );
+    assert_eq!(
+        pypi_project("https://files.pythonhosted.org/packages/66/c0/my%20pkg-1.0.zip").as_deref(),
+        Some("my-pkg")
+    );
+    assert_eq!(
+        pypi_project("https://files.pythonhosted.org/packages/66/c0/pkg-1.0.README").as_deref(),
+        Some("pkg")
+    );
+    for none in [
+        "https://example.com/packaging-26.3.tar.gz",
+        "https://files.pythonhosted.org/packages/a/nover.xz",
+        "https://files.pythonhosted.org/packages/a/-1.0.tar.gz",
+        "https://files.pythonhosted.org/packages/a/pkg.TAR.GZ",
+        "https://files.pythonhosted.org/packages/a/pkg-",
+    ] {
+        assert_eq!(pypi_project(none), None, "{none}");
+    }
     // Path-segment fallback (influxdb@2 ui-assets).
     assert_eq!(
         url_version_token(
@@ -96,16 +224,9 @@ fn pypi_project_and_file_version_tokens() {
         .as_deref(),
         Some("2.10.0")
     );
-    // Letter-suffixed tokens stay undetected (the run
-    // delegates rather than guess).
-    assert_eq!(
-        file_version_token("https://files.pythonhosted.org/x/foo-1.0rc1.tar.gz"),
-        None
-    );
-    // r389: resource-current detection across the
+    // r389/r403: resource-current detection across the
     // oracle-probed filename shapes (None = delegate;
-    // the oracle's own answers for the delegated rows
-    // are noted in the round's probes).
+    // every Some is the oracle's own reported version).
     let shapes: &[(&str, Option<&str>)] = &[
         ("foo-1.0rc1.tar.gz", Some("1.0rc1")),
         ("foo-2.0-beta.3.tar.gz", Some("2.0-beta.3")),
@@ -113,24 +234,46 @@ fn pypi_project_and_file_version_tokens() {
         ("foo1.2.tar.gz", Some("1.2")),
         ("foo_1.2.3_alpha.tar.gz", Some("1.2.3_alpha")),
         ("foo-2024.01.tar.gz", Some("2024.01")),
+        // r407: the oracle's `.post\d+` forms (probed
+        // via `brew ruby` Version.parse); `1.2.post`
+        // (no digits) stays None here, delegating rather
+        // than guessing (the oracle reports `1.2.post`).
+        ("python-dateutil-2.9.0.post0.tar.gz", Some("2.9.0.post0")),
+        ("foo-1.2.3.post12.tar.gz", Some("1.2.3.post12")),
+        ("foo-1.2-post3.tar.gz", Some("1.2-post3")),
+        ("foo-1.2_post3.tar.gz", Some("1.2_post3")),
+        ("foo-1.2.post3-linux.tar.gz", Some("1.2.post3")),
+        ("foo-1.2xpost3.tar.gz", Some("1.2xpost3")),
+        ("foo-1.2.POST3.tar.gz", Some("3")),
+        ("foo-1.2.dev3.tar.gz", Some("3")),
+        ("foo-1.2.post.tar.gz", None),
         ("foo-r16.tar.gz", Some("16")),
-        ("foo-1.0.0-linux.tar.gz", None),
+        ("foo-1.0.0-linux.tar.gz", Some("1.0.0")),
         ("foo-1.2.3.4.5.tar.gz", Some("1.2.3.4.5")),
         ("foo-3.0a.tar.gz", Some("3.0a")),
         ("foo-1.1.1j.tar.gz", Some("1.1.1j")),
         ("foo-2.4.60-1.tar.gz", Some("2.4.60-1")),
         ("foo2bar-1.0.tar.gz", Some("1.0")),
         ("lib2to3-4.5.tar.gz", Some("4.5")),
-        ("foo-1.2-3.4.tar.gz", None),
+        ("foo-1.2-3.4.tar.gz", Some("3.4")),
         ("foo128.tar.gz", Some("128")),
         ("foo-ver1.2.tar.gz", Some("1.2")),
-        ("foo-1.2.3-rc.1+build5.tar.gz", None),
-        ("foo-1.0_amd64.tar.gz", None),
-        ("foo-1.0-src.tar.gz", None),
+        ("foo-1.2.3-rc.1+build5.tar.gz", Some("1.2.3-rc.1")),
+        ("foo-1.2.3+build5.tar.gz", None),
+        ("foo-1.0_amd64.tar.gz", Some("64")),
+        ("foo-1.0-src.tar.gz", Some("1.0")),
         ("foo-1.0.RELEASE.tar.gz", Some("1.0.RELEASE")),
-        ("foo-1.0.0.Final.tar.gz", None),
+        ("foo-1.0.0.GA.tar.gz", Some("1.0.0.GA")),
+        ("foo-1.0.0.Final.tar.gz", Some("1.0.0")),
         ("foo-9.4p1.tar.gz", Some("1")),
-        ("foo-1.0.1-2.el8.tar.gz", None),
+        ("foo-1.0.1-2.el8.tar.gz", Some("8")),
+        ("boost_1_87_0.tar.gz", Some("1.87.0")),
+        ("foo-1.0.0-1-linux.tar.gz", Some("1.0.0")),
+        ("foo-1.0.0-rc1-linux.tar.gz", Some("1.0.0-rc1")),
+        ("foo-1.0.0-snapshot.tar.gz", Some("1.0.0")),
+        ("foo-1.0.0-x64.tar.gz", Some("1.0.0")),
+        ("foo-1.0.0-arm64.tar.gz", Some("64")),
+        ("foo-1.0_1.tar.gz", None),
         ("packaging-26.3-py3-none-any.whl", Some("26.3")),
         ("zope_interface-7.0.3-py3-none-any.whl", Some("7.0.3")),
     ];

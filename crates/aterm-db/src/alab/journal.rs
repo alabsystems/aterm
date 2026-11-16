@@ -358,6 +358,7 @@ pub const JOURNAL: Table = Table {
     collections: &[&EV, &USE, &SUM, &RELAY, &PLACE, &UPD, &LOGIN, &USAGE],
     self_quota: usize::MAX,
     ends: &[],
+    faces: &[],
 };
 
 /// What this Mac's journal is doing, as `aterm db alab check` reports it: `off` where
@@ -437,6 +438,65 @@ pub fn fold_signin_for_test(spool: &Spool, account: &Pk, now: u64) -> crate::Res
             .map(|(state, _)| state),
         peer_events: read(&[]),
         peer: read(&uses),
+    })
+}
+
+/// What this Mac would publish of one account's plan after what `spool` took in
+/// ([`fold_plan_for_test`]): each as `(word, when)`.
+#[cfg(any(test, debug_assertions))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FoldedPlan {
+    /// This Mac's book: the plan its metrics row states.
+    pub book: Option<(String, u64)>,
+    /// The `plan` (`{word, t}`) of the account's `use` row, as a peer reads it.
+    pub use_row: Option<(String, u64)>,
+    /// The account's `plan-seen` events in the `ev` batch this Mac would append, oldest first.
+    pub events: Vec<(String, u64)>,
+    /// What a peer that holds the `ev` batch and the `use` row reads as the plan this Mac saw
+    /// ([`seen::Seen::plan`]): the plan the fleet's accounts relation states as `plan_observed`
+    /// (`<provider>-<word>`) and `plan_at`.
+    pub peer: Option<(String, u64)>,
+}
+
+/// Test seam for the harness's side (`crates/aterm`): run the local half of two flusher passes
+/// over `spool` at `now`, as [`fold_signin_for_test`] does, and say what each record this Mac
+/// publishes states of `account`'s plan: its book, its `use` row and its `ev` batch, which are
+/// what a reader of the fleet's accounts takes the observed plan from.
+///
+/// # Errors
+/// The spool, outbox or book cannot be read or written, or a `use` row cannot be built.
+#[cfg(any(test, debug_assertions))]
+pub fn fold_plan_for_test(spool: &Spool, account: &Pk, now: u64) -> crate::Result<FoldedPlan> {
+    const PEER: &str = "00000000000000000000000000000001";
+    flush::take_in(spool, false, now)?;
+    let (book, outbox) = flush::take_in(spool, false, now)?;
+    let row = match book.accounts.get(account) {
+        Some(facts) => Some(facts.use_row(1, now / book::WEEK, now, caps::USE_ROW)?),
+        None => None,
+    };
+    let use_row = row.as_ref().and_then(|row| {
+        let plan = row.get("plan")?;
+        let word = plan.get("word")?.as_str()?.to_owned();
+        Some((word, plan.get("t")?.as_u64()?))
+    });
+    let uses: Vec<_> = row.into_iter().map(|row| (*account, row)).collect();
+    let peer = seen::Seen::of_published(PEER, &outbox, &uses, now)
+        .plan(account.as_str())
+        .map(|plan| (plan.word.clone(), plan.t));
+    let events = outbox
+        .iter()
+        .filter(|event| event.kind == Kind::PlanSeen && event.account.as_ref() == Some(account))
+        .filter_map(|event| Some((event.plan?.as_str().to_owned(), event.t)))
+        .collect();
+    Ok(FoldedPlan {
+        book: book
+            .facts(now)
+            .accounts
+            .get(account)
+            .and_then(|facts| facts.plan.clone()),
+        use_row,
+        events,
+        peer,
     })
 }
 

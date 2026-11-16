@@ -136,15 +136,12 @@ fn headless_account_connects_and_reads_through_native_worker() {
 #[test]
 fn browser_fallback_does_not_repeat_credentials_or_network_failures() {
     use aterm_mail::proton_error::Kind;
-    for kind in [
-        Kind::Verification,
-        Kind::DeviceVerification,
-        Kind::Scope,
-        Kind::ClientRejected,
-    ] {
+    for kind in [Kind::Scope, Kind::ClientRejected] {
         assert!(permits_browser_fallback(kind));
     }
     for kind in [
+        Kind::Verification,
+        Kind::DeviceVerification,
         Kind::Credentials,
         Kind::RateLimited,
         Kind::Network,

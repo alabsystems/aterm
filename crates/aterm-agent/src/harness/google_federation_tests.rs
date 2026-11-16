@@ -277,52 +277,6 @@ fn kimi_cookie_completion_requires_current_native_attempt_and_provider_proof() {
 }
 
 #[test]
-fn exact_saved_gmail_grant_supplies_verification_mail_without_a_config_file() {
-    let home = aterm_tempfile::tempdir().unwrap();
-    let identity = |target: &str| {
-        Registry::parse(&format!("[[identities]]\nid='google'\nemail='person@example.com'\nverification_email='{target}'\n[[bindings]]\nprovider='kimi-global'\naccount='one'\nidentity='google'\nexpected_email='person@example.com'\n")).unwrap().resolve("kimi-global","one").unwrap().0.clone()
-    };
-    let wanted = identity("rescue@gmail.com");
-    aterm_mail::oauth::session::register(
-        home.path(),
-        "rescue@gmail.com",
-        "fixture-client",
-        None,
-        aterm_mail::Secret::new("fixture-refresh".into()),
-    )
-    .unwrap();
-    let mut approver = VendorApprover::with_mailbox(
-        super::super::accounts::Cli::Kimi,
-        "one",
-        home.path(),
-        home.path(),
-        oauth::MailboxConfig::default(),
-    );
-    approver.mailbox = None;
-    approver.mailbox_source = None;
-    let native = verification_config(&wanted, &approver).unwrap();
-    assert_eq!(native.user.as_deref(), Some("rescue@gmail.com"));
-    assert!(native.has_native_google_route(Some("rescue@gmail.com")));
-    assert!(native.password.is_none());
-    assert!(verification_config(&identity("missing@gmail.com"), &approver).is_err());
-    let explicit=oauth::MailboxConfig::from_toml_str("[[mailboxes]]\nlogin='owner@proton.me'\npassword='fixture-only'\nwebmail_url='https://mail.proton.me/u/0/inbox'\nreceives=['rescue@gmail.com']\n",None).unwrap();
-    approver.mailbox_source = Some(explicit);
-    assert_eq!(
-        verification_config(&wanted, &approver)
-            .unwrap()
-            .route_for(Some("rescue@gmail.com"))
-            .unwrap()
-            .login,
-        "owner@proton.me"
-    );
-    approver.mailbox_source=Some(oauth::MailboxConfig::from_toml_str("[[mailboxes]]\nlogin='owner@proton.me'\nwebmail_url='https://mail.proton.me/u/0/inbox'\nreceives=['rescue@gmail.com']\n",None).unwrap());
-    assert!(
-        verification_config(&wanted, &approver).is_err(),
-        "an unavailable explicit route cannot silently change providers"
-    );
-}
-
-#[test]
 fn inner_google_flow_is_distinct_and_refuses_other_clients_callbacks_and_scopes() {
     let flow = InnerFlow::admit(GOOGLE, HOSTS).unwrap();
     assert!(flow.admits_google("https://accounts.google.com/v3/signin/identifier", HOSTS));
@@ -470,6 +424,13 @@ fn configured_binding_is_exact_and_an_expired_handoff_does_not_launch_a_browser(
     assert_eq!(provider_key("kimi", &["www.kimi.com", "www.kimi.ai"]), None);
 }
 
+/// THE GOOGLE SCRIPTS, RUN IN THE PINNED BROWSER ON FIXTURE PAGES (about:blank, no network):
+/// each acts only on its own origin and identity and submits once; a check (a widget shown or
+/// hidden, its button enabled or not; "Verify it's you") is answered as one with nothing ticked,
+/// filled or pressed; the vendor card with no check is ticked, then pressed once, in the
+/// evaluation that read it; a layer over the button takes the press point and nothing is pressed.
+/// NEGATIVE CONTROL: with `select_google`'s `elementFromPoint` test removed, the press goes
+/// through the layer: `` a press went through a layer over the button ``.
 #[test]
 #[ignore = "runs script behavior in the pinned full headless browser"]
 fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenges_alone() {
@@ -502,8 +463,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             Authenticator::Unavailable,
             true,
             false,
-            None,
-            false,
         );
         let script = format!(
             "((location)=>{action})({{origin:'https://accounts.google.com',pathname:{}}})",
@@ -531,8 +490,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
         Authenticator::Submitted,
         true,
         true,
-        None,
-        false,
     );
     let submitted = format!(
         "((location)=>{submitted})({{origin:'https://accounts.google.com',pathname:'/v3/signin/challenge/totp'}})"
@@ -583,8 +540,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             Authenticator::Unavailable,
             true,
             true,
-            None,
-            false,
         );
         let script = format!(
             "((location)=>{action})({{origin:{},pathname:'/signin/oauth/consent'}})",
@@ -645,8 +600,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             Authenticator::Unavailable,
             false,
             sent,
-            None,
-            false,
         );
         let scoped = format!(
             "((location)=>{script})({{origin:{},pathname:'/v3/signin/challenge/pwd'}})",
@@ -661,50 +614,18 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             json!(actions)
         );
     }
-    for (account, hint, code, submitted, expected, actions) in [
+    // Google's "Verify it's you" page, its mailed code's field with no such words around it
+    // included, is a check: it is answered as one, and nothing on it is filled or pressed.
+    for (account, text) in [
         (
             "person@example.com",
-            "r***@example.com",
-            None,
-            false,
-            "mailbox",
-            0,
+            "A verification code was sent by email to r***@example.com",
         ),
-        (
-            "person@example.com",
-            "r***@example.com.",
-            Some("246810"),
-            false,
-            "mailcode",
-            1,
-        ),
-        (
-            "person@example.com",
-            "r***@example.com",
-            Some("246810"),
-            true,
-            "wait",
-            0,
-        ),
-        (
-            "other@example.com",
-            "r***@example.com",
-            Some("246810"),
-            false,
-            "refused",
-            0,
-        ),
-        (
-            "person@example.com",
-            "other@example.com",
-            Some("246810"),
-            false,
-            "mailbox_refused",
-            0,
-        ),
+        ("other@example.com", "Email sent to rescue@example.com"),
+        ("person@example.com", "Verify it&#39;s you"),
     ] {
         let fixture = format!(
-            "document.body.innerHTML='<span id=profileIdentifier>{account}</span><form><p>A verification code was sent by email to {hint}</p><input id=idvPin><button type=button id=idvPreregisteredEmailNext>Next</button></form>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true"
+            "document.body.innerHTML='<span id=profileIdentifier>{account}</span><form><p>{text}</p><input id=idvPin><button type=button id=idvPreregisteredEmailNext>Next</button></form>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true"
         );
         browser.evaluate(&page, &fixture, false).unwrap();
         let script = google_action(
@@ -713,42 +634,28 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             Authenticator::Unavailable,
             true,
             true,
-            Some(("rescue@example.com", code)),
-            submitted,
         );
         let scoped = format!(
             "((location)=>{script})({{origin:'https://accounts.google.com',pathname:'/v3/signin/challenge/ipe'}})"
         );
         assert_eq!(
             browser.evaluate(&page, &scoped, true).unwrap(),
-            json!(expected)
+            json!("check:block_page:Google")
         );
         assert_eq!(
             browser.evaluate(&page, "window.actions", false).unwrap(),
-            json!(actions)
+            json!(0)
         );
     }
-    browser.evaluate(&page,"document.body.innerHTML='<span id=profileIdentifier>person@example.com</span><form><p>Email sent to rescue@example.com</p><input id=idvPin aria-invalid=true><button type=button id=idvPreregisteredEmailNext>Next</button></form>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true",false).unwrap();
-    let rejected = google_action(
-        "person@example.com",
-        Some("fixture-only"),
-        Authenticator::Unavailable,
-        true,
-        true,
-        Some(("rescue@example.com", None)),
-        true,
-    );
-    let rejected = format!(
-        "((location)=>{rejected})({{origin:'https://accounts.google.com',pathname:'/v3/signin/challenge/ipe'}})"
-    );
-    assert_eq!(
-        browser.evaluate(&page, &rejected, true).unwrap(),
-        json!("mailcode_rejected")
-    );
-    assert_eq!(
-        browser.evaluate(&page, "window.actions", false).unwrap(),
-        json!(0)
-    );
+    // The pages below carry no check: the last "Verify it's you" page is taken down first, or
+    // it, not the path, would answer.
+    browser
+        .evaluate(
+            &page,
+            "document.body.innerHTML='<span id=profileIdentifier>person@example.com</span>';window.actions=0;true",
+            false,
+        )
+        .unwrap();
     for path in [
         "/signin/recovery",
         "/signup",
@@ -761,8 +668,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
             Authenticator::Unavailable,
             true,
             true,
-            Some(("rescue@example.com", Some("246810"))),
-            false,
         );
         let scoped = format!(
             "((location)=>{script})({{origin:'https://accounts.google.com',pathname:{}}})",
@@ -784,8 +689,6 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
         Authenticator::Unavailable,
         false,
         false,
-        None,
-        false,
     );
     let scoped = format!(
         "((location)=>{script})({{origin:'https://accounts.google.com',pathname:'/signin'}})"
@@ -798,10 +701,71 @@ fn browser_actions_enforce_origin_identity_single_submission_and_leave_challenge
         browser.evaluate(&page, "window.actions", false).unwrap(),
         json!(0)
     );
-    browser.evaluate(&page, "document.body.innerHTML='<label><input type=checkbox id=terms>I agree to the terms and privacy policy</label><label><input type=checkbox id=captcha>I am human</label><button>Continue with Google</button>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true", false).unwrap();
-    assert!(!choose_google(&mut browser, &page, "about:blank").unwrap());
-    assert!(choose_google(&mut browser, &page, "about:blank").unwrap());
-    assert_eq!(browser.evaluate(&page, "({terms:document.querySelector('#terms').checked,captcha:document.querySelector('#captcha').checked,actions:window.actions})", false).unwrap(), json!({"terms":true,"captcha":false,"actions":1}));
+    // A vendor card with a human check, shown or not, its button enabled or not: nothing is
+    // ticked or pressed, and the check is named.
+    for widget in [
+        "<label><input type=checkbox id=captcha>I am human</label>",
+        "<iframe src=\\'https://newassets.hcaptcha.com/captcha/v1/x\\'></iframe>",
+        "<textarea name=g-recaptcha-response style=display:none></textarea>",
+        "<div class=cf-turnstile data-sitekey=fixture></div>",
+        "<div hidden><iframe src=\\'https://client-api.arkoselabs.com/fc/x\\'></iframe></div>",
+    ] {
+        for button in [
+            "<button>Continue with Google</button>",
+            "<button disabled>Continue with Google</button>",
+        ] {
+            browser.evaluate(&page, &format!("document.body.innerHTML='<label><input type=checkbox id=terms>I agree to the terms and privacy policy</label>{widget}{button}';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true"), false).unwrap();
+            assert!(
+                matches!(
+                    choose_google(&mut browser, &page, "about:blank").unwrap(),
+                    Chosen::Check(_)
+                ),
+                "{widget} {button}"
+            );
+            assert_eq!(
+                browser
+                    .evaluate(
+                        &page,
+                        "({terms:document.querySelector('#terms').checked,actions:window.actions})",
+                        false
+                    )
+                    .unwrap(),
+                json!({"terms":false,"actions":0}),
+                "{widget} {button}"
+            );
+        }
+    }
+    // CONTROL: the same card with no check is ticked, then pressed once.
+    browser.evaluate(&page, "document.body.innerHTML='<label><input type=checkbox id=terms>I agree to the terms and privacy policy</label><button>Continue with Google</button>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true", false).unwrap();
+    assert_eq!(
+        choose_google(&mut browser, &page, "about:blank").unwrap(),
+        Chosen::Waiting
+    );
+    assert_eq!(
+        choose_google(&mut browser, &page, "about:blank").unwrap(),
+        Chosen::Pressed
+    );
+    assert_eq!(
+        browser
+            .evaluate(
+                &page,
+                "({terms:document.querySelector('#terms').checked,actions:window.actions})",
+                false
+            )
+            .unwrap(),
+        json!({"terms":true,"actions":1})
+    );
+    // A layer over the button takes the press point: nothing is pressed under it.
+    browser.evaluate(&page, "document.body.innerHTML='<button>Continue with Google</button><div style=\"position:fixed;left:0;top:0;width:100vw;height:100vh;z-index:9\"></div>';window.actions=0;document.querySelector('button').onclick=()=>window.actions++;true", false).unwrap();
+    assert_eq!(
+        choose_google(&mut browser, &page, "about:blank").unwrap(),
+        Chosen::Waiting,
+        "a press went through a layer over the button"
+    );
+    assert_eq!(
+        browser.evaluate(&page, "window.actions", false).unwrap(),
+        json!(0)
+    );
 }
 
 #[test]
@@ -863,7 +827,7 @@ fn live_kimi_google_transition_preserves_context_and_vendor_callback() {
                 "anonymous vendor page requires a security check"
             );
             if login_drive::pinned(&view.url, HOSTS)
-                && choose_google(&mut browser, &page, &view.url).unwrap()
+                && choose_google(&mut browser, &page, &view.url).unwrap() == Chosen::Pressed
             {
                 clicks += 1;
             }
@@ -1039,7 +1003,7 @@ fn live_claude_google_transition_observes_vendor_callback() {
                 continue;
             }
             if super::super::open_url::CLAUDE_PIN.admits(&view.url)
-                && choose_google(&mut browser, &page, &view.url).unwrap()
+                && choose_google(&mut browser, &page, &view.url).unwrap() == Chosen::Pressed
             {
                 clicks += 1;
             }
@@ -1049,95 +1013,77 @@ fn live_claude_google_transition_observes_vendor_callback() {
     }
 }
 
+/// EVERY GOOGLE SCRIPT READS THE PAGE FOR A CHECK BEFORE IT TOUCHES ANYTHING: the account
+/// chooser, the identifier, password and authenticator fills, the consent press and the
+/// vendor's `Continue with Google` all follow the shared predicate in the same evaluation, and
+/// a check's answer names it. Google's own captcha and its "Verify it's you" field are checks.
+/// The vendor's button is pressed in that evaluation, after the point at its centre was found
+/// to be the button itself; an answer of where it is presses nothing later.
+/// NEGATIVE CONTROL: with `select_google` answering the button's centre for a press sent by a
+/// later command (the branch's first form), `` a press left the evaluation that read the
+/// check ``.
 #[test]
-fn verification_in_shared_inbox_selects_the_google_account_without_consuming_others() {
-    let root = aterm_tempfile::tempdir().unwrap();
-    let maildir = root.path().join("mail");
-    std::fs::create_dir(&maildir).unwrap();
-    let cfg = oauth::MailboxConfig {
-        dir: Some(maildir.clone()),
-        ..Default::default()
-    };
-    let approver = VendorApprover::with_mailbox(
-        super::super::accounts::Cli::Kimi,
-        "fixture",
-        root.path(),
-        root.path(),
-        cfg,
+fn every_google_script_reads_the_check_before_it_touches_anything() {
+    let action = google_action(
+        "ada@x.example",
+        Some("fixture-only"),
+        Authenticator::Ready("123456"),
+        false,
+        false,
     );
-    let identity = |email: &str| {
-        let source = format!(
-            "[[identities]]\nid='one'\nemail='{email}'\nverification_email='rescue@example.com'\n[[bindings]]\nprovider='kimi-global'\naccount='one'\nidentity='one'\nexpected_email='{email}'\n"
-        );
-        Registry::parse(&source)
-            .unwrap()
-            .resolve("kimi-global", "one")
-            .unwrap()
-            .0
-            .clone()
-    };
-    for (file, account, code, sender) in [
-        (
-            "a",
-            "other@example.com",
-            "111111",
-            "noreply@accounts.google.com",
-        ),
-        (
-            "b",
-            "person@example.com",
-            "222222",
-            "noreply@accounts.google.com",
-        ),
-        (
-            "c",
-            "person@example.com",
-            "333333",
-            "noreply@accounts.google.com.evil.test",
-        ),
+    let select = select_google("https://www.kimi.ai/login");
+    for (script, met) in [
+        (&action, "if(met) return 'check:'+met.kind+':'+met.name;"),
+        (&select, "if(met) return {check: met};"),
     ] {
-        let encoded = aterm_codec::base64::encode(
-            format!("Verification code: {code}\nGoogle account: {account}\n").as_bytes(),
-        )
-        .unwrap();
-        let raw = format!(
-            "From: {sender}\r\nTo: rescue@example.com\r\nDate: Thu, 01 Jan 1970 00:16:40 +0000\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n"
-        );
-        std::fs::write(maildir.join(file), raw).unwrap();
+        assert!(script.contains(oauth::CHECK_PAGE_JS));
+        let at = script.find(met).expect("the check's answer");
+        for (touch, _) in script.match_indices(".click(") {
+            assert!(at < touch, "a press before the check");
+        }
+        for (touch, _) in script.match_indices("fill(") {
+            assert!(at < touch, "a fill before the check");
+        }
     }
-    std::fs::write(maildir.join("stale"),"From: noreply@accounts.google.com\r\nTo: rescue@example.com\r\nDate: Thu, 01 Jan 1970 00:16:10 +0000\r\n\r\nGoogle account person@example.com\nVerification code: 444444\n").unwrap();
-    let mut seen = BTreeSet::new();
-    assert_eq!(
-        verification_mail(
-            &identity("person@example.com"),
-            &approver,
-            Some(1000),
-            login_drive::Deadline::after(Duration::from_secs(1)),
-            &mut seen
-        )
-        .unwrap(),
-        "222222"
-    );
-    assert_eq!(
-        verification_mail(
-            &identity("other@example.com"),
-            &approver,
-            Some(1000),
-            login_drive::Deadline::after(Duration::from_secs(1)),
-            &mut seen
-        )
-        .unwrap(),
-        "111111"
-    );
+    let press = select
+        .find("button.click();")
+        .expect("a press left the evaluation that read the check");
+    let hit = select
+        .find("document.elementFromPoint(x,y)")
+        .expect("the hit test");
+    assert!(hit < press, "the press comes before its hit test");
+    assert!(!select.contains("return {x,y}"), "{select}");
+    assert_eq!(chosen_of(&json!({"pressed": true})), Chosen::Pressed);
+    for answer in [
+        json!({"x": 10.0, "y": 20.0}),
+        json!(false),
+        json!({"pressed": false}),
+    ] {
+        assert_eq!(chosen_of(&answer), Chosen::Waiting, "{answer}");
+    }
+    let captcha = action
+        .find("return 'check:human_check:captcha';")
+        .expect("Google's captcha");
+    let verify = action
+        .find("return 'check:block_page:Google';")
+        .expect("Verify it's you");
+    let chooser = action.find("choice.click()").expect("the chooser's press");
+    assert!(captcha < chooser && verify < chooser);
     assert!(
-        verification_mail(
-            &identity("person@example.com"),
-            &approver,
-            Some(1000),
-            login_drive::Deadline::after(Duration::from_millis(50)),
-            &mut seen
-        )
-        .is_err(),
-        "neither a consumed code nor a code from before this login may be reused"
+        !action.contains("idvPinNext"),
+        "the mailed code is never typed"
     );
+    assert_eq!(
+        action_check("check:human_check:hCaptcha"),
+        Some(oauth::CheckMet::HumanCheck("hCaptcha".into()))
+    );
+    assert_eq!(
+        action_check("check:block_page:Google"),
+        Some(oauth::CheckMet::BlockPage)
+    );
+    assert_eq!(
+        action_check("check:made-up"),
+        Some(oauth::CheckMet::HumanCheck("captcha".into()))
+    );
+    assert_eq!(action_check("challenge"), None);
 }

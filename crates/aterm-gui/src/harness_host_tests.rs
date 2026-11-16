@@ -25591,6 +25591,10 @@ fn pty_job(end: JobEnd) -> (i32, std::process::Child, i32) {
                     if end == JobEnd::Member {
                         libc::fork();
                     }
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "a forked child's exec: it has one thread, so nothing in it can hold the exec"
+                    )]
                     libc::execv(argv[0], argv.as_ptr());
                     libc::_exit(127);
                 }

@@ -952,19 +952,14 @@ fn refers(ty: &Ty) -> Option<&'static str> {
     }
 }
 
+/// A ring collection's columns: each column's name and the type it shows, where it has one.
+type Columns = Vec<(&'static str, Option<&'static str>)>;
+
 /// Each Mac's rows of an owned collection of the ring, `read` already judged by their keys
 /// (`owned::read_owned`: a row at a key that does not name its signer's machine is inert and
 /// never here): one row per key, `<pk>.<uuid32>`, its columns the collection's. Returns the
 /// columns, the rows and the cells withheld.
-fn mine(
-    collection: &Collection,
-    read: &OwnedRead,
-) -> (
-    Vec<(&'static str, Option<&'static str>)>,
-    BTreeSet<String>,
-    Vec<Row>,
-    u64,
-) {
+fn mine(collection: &Collection, read: &OwnedRead) -> (Columns, BTreeSet<String>, Vec<Row>, u64) {
     let schema: Vec<(&'static str, Option<&'static str>)> = collection
         .columns
         .iter()
@@ -1037,14 +1032,7 @@ const EVENT_SECONDS: [&str; 3] = ["t", "r", "u"];
 /// event's place in it). An event this build's vocabulary does not read
 /// ([`Event::from_value`]) is no row and is counted with the inert records. Returns the
 /// columns, the rows, the cells withheld and the events not read.
-fn events(
-    read: &LogRead,
-) -> (
-    Vec<(&'static str, Option<&'static str>)>,
-    Vec<Row>,
-    u64,
-    u64,
-) {
+fn events(read: &LogRead) -> (Columns, Vec<Row>, u64, u64) {
     let schema = EVENT_COLUMNS
         .iter()
         .map(|(name, _, ty)| (*name, refers(ty)))
@@ -1066,7 +1054,7 @@ fn events(
                 ..Row::default()
             };
             for (name, key, ty) in &EVENT_COLUMNS {
-                let Some(x) = wire.get(*key) else {
+                let Some(x) = wire.get(key) else {
                     continue;
                 };
                 let x = match x.as_u64() {

@@ -9,6 +9,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use super::*;
+#[cfg(unix)]
 use crate::supervise::config::Approve;
 
 /// A test's wait for something that must happen: a hang detector, never a budget.
@@ -504,25 +505,35 @@ fn an_untrusted_folder_is_settled_by_one_start_and_booked() {
     assert_eq!(notes.recorded.len(), 1, "nothing booked twice");
 }
 
-/// NOTHING IS STARTED where there is nothing to settle or no leave to: a launch that prints and
-/// exits (`-p`, `--print`), a subcommand, a line that does not parse, a launch with no terminal
-/// on its output, the harness off for the launch, the home directory, a policy that trusts
-/// nothing here, a session a hold stands on or another supervisor claims, and a folder already
-/// recorded. None of them is journaled: each is the policy's or the launch's own. CONTROL: the
-/// same world with none of those starts the build
+/// [`settle`] in `w` under `gate`, asserting it started nothing, booked nothing and wrote no
+/// profile.
+fn settled_starting_nothing(
+    w: &World,
+    launch: &Launch<'_>,
+    gate: &dyn Fn(&Path) -> Gate,
+) -> Settled {
+    let vendor = Fake::recording(&w.profile());
+    let mut notes = Notes::default();
+    let settled = settle(launch, gate, &vendor, &mut notes, DEADLINE);
+    assert!(vendor.calls().is_empty(), "{settled:?} started the build");
+    assert!(notes.recorded.is_empty() && notes.refused.is_empty());
+    assert!(!w.profile().exists(), "{settled:?} wrote a profile");
+    settled
+}
+
+/// NOTHING IS STARTED where there is nothing to settle: a launch that prints and exits (`-p`,
+/// `--print`), a subcommand, a line that does not parse, a launch with no terminal on its output,
+/// the harness off for the launch, and the home directory, the account's or the one the launch's
+/// own home variable names (`HOME`; `USERPROFILE` on Windows, which Claude Code's `os.homedir()`
+/// reads there). None of them asks the gate or is journaled: each is the launch's own. CONTROL:
+/// the same world with none of those starts the build
 /// ([`an_untrusted_folder_is_settled_by_one_start_and_booked`]).
 #[test]
 fn nothing_is_started_where_there_is_nothing_to_settle() {
     let w = World::new("skips");
     let env = w.env();
     let run = |launch: &Launch<'_>, gate: &dyn Fn(&Path) -> Gate| {
-        let vendor = Fake::recording(&w.profile());
-        let mut notes = Notes::default();
-        let settled = settle(launch, gate, &vendor, &mut notes, DEADLINE);
-        assert!(vendor.calls().is_empty(), "{settled:?} started the build");
-        assert!(notes.recorded.is_empty() && notes.refused.is_empty());
-        assert!(!w.profile().exists(), "{settled:?} wrote a profile");
-        settled
+        settled_starting_nothing(&w, launch, gate)
     };
     for line in [
         &["claude", "-p", "hello there"][..],
@@ -567,7 +578,7 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
         ),
         Settled::NotInteractive
     );
-    // The home directory: the account's, and the one the launch's own `HOME` names.
+    // The home directory: the account's, and the one the launch's own home variable names.
     assert_eq!(
         run(
             &Launch {
@@ -579,13 +590,158 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
         Settled::Home
     );
     let mut at_home = env.clone();
-    at_home.push(("HOME".to_string(), w.folder.to_string_lossy().into_owned()));
+    at_home.push((
+        super::super::accounts::HOMEDIR_ENV.to_string(),
+        w.folder.to_string_lossy().into_owned(),
+    ));
     assert_eq!(
         run(&w.launch(&argv, &at_home), &|_| panic!("asked the gate")),
         Settled::Home
     );
-    // The policy: `approve = "none"`, Autopilot off (the table's, and the session's own word
-    // over a table that is on), the harness off, off for Claude Code.
+}
+
+/// NOR WHERE THE POLICY OR THE SESSION REFUSES BEFORE ANY FOLDER IS JUDGED: Autopilot off (the
+/// table's, and the session's own word over a table that is on), the harness off, off for Claude
+/// Code, and a session a hold stands on (under the window's own host too) or another supervisor
+/// claims. None of them is journaled: each is the policy's own, and each names its reason.
+/// CONTROL: the default policy, over a session with no word of its own, no hold and no
+/// supervisor but a window's own host, answers as the folder judgment does ([`gate`] over no
+/// session's facts), which names none of those reasons: it trusts the folder on unix
+/// ([`nothing_is_started_where_the_policy_gives_no_leave`]) and none on Windows
+/// (ATERM-KI-1115-31415).
+#[test]
+fn nothing_is_started_where_the_policy_or_the_session_refuses_before_any_folder() {
+    let w = World::new("refuses");
+    let env = w.env();
+    let run = |launch: &Launch<'_>, gate: &dyn Fn(&Path) -> Gate| {
+        settled_starting_nothing(&w, launch, gate)
+    };
+    let argv = words(&["claude"]);
+    let policy = |config: &SupervisorConfig, word: Option<Autopilot>| {
+        gate(
+            &Policy {
+                config,
+                autopilot: word,
+                trusted_cwd: None,
+                home: Some(&w.home),
+                uid: 502,
+            },
+            &w.folder,
+        )
+    };
+    let on = SupervisorConfig::default();
+    let judged = policy(&on, None);
+    let off = "the harness is off for Claude Code";
+    for (what, config, word, why) in [
+        (
+            "autopilot off",
+            SupervisorConfig {
+                turn_end: alab_policy::config::PolicyConfig {
+                    autopilot: Autopilot::Off,
+                    ..on.turn_end.clone()
+                },
+                ..on.clone()
+            },
+            None,
+            "Autopilot is off",
+        ),
+        (
+            "the session's word off",
+            on.clone(),
+            Some(Autopilot::Off),
+            "Autopilot is off",
+        ),
+        (
+            "harness off",
+            SupervisorConfig {
+                enabled: false,
+                ..on.clone()
+            },
+            None,
+            off,
+        ),
+        (
+            "off for Claude Code",
+            SupervisorConfig {
+                off: vec![aterm_phase::Program::Claude],
+                ..on.clone()
+            },
+            None,
+            off,
+        ),
+    ] {
+        assert_eq!(policy(&config, word), Gate::Refuses(why), "{what}");
+        assert_ne!(
+            judged,
+            Gate::Refuses(why),
+            "the control names no reason of {what}"
+        );
+        assert_eq!(
+            run(&w.launch(&argv, &env), &|_| policy(&config, word)),
+            Settled::Gated(why),
+            "{what}"
+        );
+    }
+    // The session, as its window says it stands: a hold on it (a person took the tab over, a
+    // local or fleet halt), and a supervisor that is no window's own host.
+    let seen = |hold: &str, supervisor: &str| Seen {
+        meta: "OK cwd=%2Fw trusted_cwd=- autopilot=-\n".to_string(),
+        status: format!("OK schema=1 hold={hold} supervisor={supervisor} autopilot=cruise\n"),
+    };
+    let session = |seen: &Seen| session_gate(&on, Some(seen), Some(&w.home), 502, &w.folder);
+    for (hold, supervisor) in [("0", "-"), ("0", "aterm-harness@4242")] {
+        assert_eq!(
+            session(&seen(hold, supervisor)),
+            judged,
+            "the control: hold={hold} supervisor={supervisor}"
+        );
+    }
+    for (what, at, why) in [
+        ("a hold", seen("1", "-"), "a hold stands on the session"),
+        (
+            "a hold under the window's own host",
+            seen("1", "aterm-harness@4242"),
+            "a hold stands on the session",
+        ),
+        (
+            "another supervisor",
+            seen("0", "codex-alab@77"),
+            "another supervisor claims the session",
+        ),
+    ] {
+        assert_eq!(session(&at), Gate::Refuses(why), "{what}");
+        assert_ne!(
+            judged,
+            Gate::Refuses(why),
+            "the control names no reason of {what}"
+        );
+        assert_eq!(
+            run(&w.launch(&argv, &env), &|_| session(&at)),
+            Settled::Gated(why),
+            "{what}"
+        );
+    }
+}
+
+/// NOR WHERE THE POLICY TRUSTS NO FOLDER HERE: `approve = "none"`, and `approve = "safe"` with
+/// no trust root over the folder; nor where the folder is already recorded. None of them is
+/// journaled: each is the policy's own. CONTROLS: the default policy trusts the folder, and so
+/// does a session whose own word is on over a table that is off. Unix's: the folder judgment
+/// ([`approval::trust_folder_rule`]) reads `/`-rooted folders alone, as the folder-trust
+/// dialog's own reading does, and the key a record is read under is spelled as Unix spells it,
+/// so on Windows no folder is trusted (ATERM-KI-1115-31415); the refusals made before any folder
+/// is judged run on every platform
+/// ([`nothing_is_started_where_the_policy_or_the_session_refuses_before_any_folder`]).
+#[cfg(unix)]
+#[test]
+fn nothing_is_started_where_the_policy_gives_no_leave() {
+    let w = World::new("leave");
+    let env = w.env();
+    let run = |launch: &Launch<'_>, gate: &dyn Fn(&Path) -> Gate| {
+        settled_starting_nothing(&w, launch, gate)
+    };
+    let argv = words(&["claude"]);
+    // The policy: `approve = "none"`, and `approve = "safe"` with no root over the folder.
     let policy = |config: &SupervisorConfig, word: Option<Autopilot>| {
         gate(
             &Policy {
@@ -621,34 +777,6 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
             },
             None,
         ),
-        (
-            "autopilot off",
-            SupervisorConfig {
-                turn_end: alab_policy::config::PolicyConfig {
-                    autopilot: Autopilot::Off,
-                    ..on.turn_end.clone()
-                },
-                ..on.clone()
-            },
-            None,
-        ),
-        ("the session's word off", on.clone(), Some(Autopilot::Off)),
-        (
-            "harness off",
-            SupervisorConfig {
-                enabled: false,
-                ..on.clone()
-            },
-            None,
-        ),
-        (
-            "off for Claude Code",
-            SupervisorConfig {
-                off: vec![aterm_phase::Program::Claude],
-                ..on.clone()
-            },
-            None,
-        ),
     ] {
         let said = policy(&config, word);
         let Gate::Refuses(why) = said else {
@@ -675,40 +803,6 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
         ),
         Gate::Trusts(approval::RULE_TRUST_ANY)
     );
-    // The session, as its window says it stands: a hold on it (a person took the tab over, a
-    // local or fleet halt), and a supervisor that is no window's own host.
-    let seen = |hold: &str, supervisor: &str| Seen {
-        meta: "OK cwd=%2Fw trusted_cwd=- autopilot=-\n".to_string(),
-        status: format!("OK schema=1 hold={hold} supervisor={supervisor} autopilot=cruise\n"),
-    };
-    let session = |seen: &Seen| session_gate(&on, Some(seen), Some(&w.home), 502, &w.folder);
-    for (hold, supervisor) in [("0", "-"), ("0", "aterm-harness@4242")] {
-        assert_eq!(
-            session(&seen(hold, supervisor)),
-            Gate::Trusts(approval::RULE_TRUST_ANY),
-            "the control: hold={hold} supervisor={supervisor}"
-        );
-    }
-    for (what, at, why) in [
-        ("a hold", seen("1", "-"), "a hold stands on the session"),
-        (
-            "a hold under the window's own host",
-            seen("1", "aterm-harness@4242"),
-            "a hold stands on the session",
-        ),
-        (
-            "another supervisor",
-            seen("0", "codex-alab@77"),
-            "another supervisor claims the session",
-        ),
-    ] {
-        assert_eq!(session(&at), Gate::Refuses(why), "{what}");
-        assert_eq!(
-            run(&w.launch(&argv, &env), &|_| session(&at)),
-            Settled::Gated(why),
-            "{what}"
-        );
-    }
     // A folder already recorded: no gate asked, nothing started.
     std::fs::write(w.profile(), profile_trusting(&[&w.folder])).expect("the profile");
     let vendor = Fake::recording(&w.profile());
@@ -730,7 +824,9 @@ fn nothing_is_started_where_there_is_nothing_to_settle() {
 /// one the session's starter trusted, is settled under the dialog's safe rule, and under
 /// `approve = "all"` any other folder under the full-power one, so the row booked names the rule
 /// that would have answered the dialog (the table itself is pinned against the dialog's
-/// decision in the policy's own tests).
+/// decision in the policy's own tests). Unix's: on Windows the folder judgment trusts no folder
+/// (ATERM-KI-1115-31415).
+#[cfg(unix)]
 #[test]
 fn the_gate_names_the_rule_the_dialog_would_be_answered_under() {
     let w = World::new("gate");
@@ -980,28 +1076,36 @@ fn launches_at_once_start_at_most_one_build_each_and_write_no_profile() {
     assert_eq!(left, [".claude.json"], "nothing beside the profile");
 }
 
+/// A window's `meta` reply naming the session's own Autopilot word and the folder its starter
+/// trusted, each as the reply encodes it.
+fn meta_reply(autopilot: &str, trusted: &str) -> String {
+    format!(
+        "OK title=x cwd=%2Fw state=idle agent_cwd=%2Fw trusted_cwd={trusted} worker=- \
+         autopilot={autopilot} land_at=-\n"
+    )
+}
+
+/// A window's `status` reply naming the hold on the session and its supervisor.
+fn status_reply(hold: &str, supervisor: &str) -> String {
+    format!(
+        "OK schema=1 sid=s-0123 enabled=true hold={hold} hold_advisory=- fabric=absent \
+         hold_by=- supervisor={supervisor} supervisor_act=- autopilot=cruise human_ms=12\n"
+    )
+}
+
 /// THE SESSION'S FACTS ARE WHAT ITS WINDOW SAYS OF IT: from `meta`, its own Autopilot word (`-`:
-/// none) and the folder its starter trusted; from `status`, the hold on it and whether a
-/// supervisor that is no window's own host claims it. A reply that is no `OK`, a word this build
-/// does not know, or a `status` that names no `hold=` is no reading, and the gate over no
-/// reading says so ([`Gate::Unread`]) and trusts nothing.
+/// none) and the folder its starter trusted, an absolute one as this platform spells it; from
+/// `status`, the hold on it and whether a supervisor that is no window's own host claims it. A
+/// reply that is no `OK`, a word this build does not know, or a `status` that names no `hold=`
+/// is no reading.
 #[test]
 fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
-    let meta = |autopilot: &str, trusted: &str| {
-        format!(
-            "OK title=x cwd=%2Fw state=idle agent_cwd=%2Fw trusted_cwd={trusted} worker=- \
-             autopilot={autopilot} land_at=-\n"
-        )
-    };
-    let status = |hold: &str, supervisor: &str| {
-        format!(
-            "OK schema=1 sid=s-0123 enabled=true hold={hold} hold_advisory=- fabric=absent \
-             hold_by=- supervisor={supervisor} supervisor_act=- autopilot=cruise human_ms=12\n"
-        )
-    };
     let seen = |meta: String, status: String| Seen { meta, status };
     let facts = |autopilot: &str, trusted: &str, hold: &str, supervisor: &str| {
-        session_facts(&seen(meta(autopilot, trusted), status(hold, supervisor)))
+        session_facts(&seen(
+            meta_reply(autopilot, trusted),
+            status_reply(hold, supervisor),
+        ))
     };
     let clear = Facts {
         autopilot: None,
@@ -1009,12 +1113,18 @@ fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
         held: false,
         claimed: false,
     };
+    // The starter's folder, and the reply's spelling of it.
+    let (trusted, encoded) = if cfg!(windows) {
+        (r"C:\w\a b", r"C:\w\a%20b")
+    } else {
+        ("/w/a b", "%2Fw%2Fa%20b")
+    };
     assert_eq!(facts("-", "-", "0", "-"), Some(clear.clone()));
     assert_eq!(
-        facts("off", "%2Fw%2Fa%20b", "0", "aterm-harness@19307"),
+        facts("off", encoded, "0", "aterm-harness@19307"),
         Some(Facts {
             autopilot: Some(Autopilot::Off),
-            trusted_cwd: Some(PathBuf::from("/w/a b")),
+            trusted_cwd: Some(PathBuf::from(trusted)),
             ..clear.clone()
         }),
         "a window's own host is no other supervisor"
@@ -1039,44 +1149,94 @@ fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
     for (what, unread) in [
         (
             "meta refused",
-            seen("ERR no such session\n".to_string(), status("0", "-")),
+            seen("ERR no such session\n".to_string(), status_reply("0", "-")),
         ),
-        ("no meta", seen(String::new(), status("0", "-"))),
+        ("no meta", seen(String::new(), status_reply("0", "-"))),
         (
             "status refused",
-            seen(meta("-", "-"), "ERR busy\n".to_string()),
+            seen(meta_reply("-", "-"), "ERR busy\n".to_string()),
         ),
         (
             "a status that names no hold",
             seen(
-                meta("-", "-"),
+                meta_reply("-", "-"),
                 "OK schema=1 supervisor=- autopilot=cruise\n".to_string(),
             ),
         ),
         (
             "a hold that says nothing",
-            seen(meta("-", "-"), status("-", "-")),
+            seen(meta_reply("-", "-"), status_reply("-", "-")),
         ),
     ] {
         assert_eq!(session_facts(&unread), None, "{what}");
     }
+}
 
+/// THE GATE OVER NO READING, OR OVER A SESSION WHOSE OWN WORD IS OFF, TRUSTS NOTHING
+/// ([`session_gate`]), before any folder is judged: no reply, and a `meta` that is no `OK`, are
+/// no reading ([`Gate::Unread`]), and a session whose own Autopilot word is off is refused.
+/// CONTROL: a session with no word of its own, no hold and no other supervisor answers as the
+/// folder judgment over its facts does ([`gate`]), which is neither: it trusts the folder on
+/// unix ([`the_gate_over_the_sessions_facts_trusts_by_them`]) and none on Windows
+/// (ATERM-KI-1115-31415).
+#[test]
+fn the_gate_over_no_reading_or_an_off_word_trusts_nothing() {
+    let seen = |meta: String, status: String| Seen { meta, status };
+    let w = World::new("off-word");
+    let on = SupervisorConfig::default();
+    let ask = |seen: Option<&Seen>| session_gate(&on, seen, Some(&w.home), 502, &w.folder);
+    let judged = gate(
+        &Policy {
+            config: &on,
+            autopilot: None,
+            trusted_cwd: None,
+            home: Some(&w.home),
+            uid: 502,
+        },
+        &w.folder,
+    );
+    assert!(
+        !matches!(judged, Gate::Unread(_) | Gate::Refuses("Autopilot is off")),
+        "{judged:?}"
+    );
+    assert_eq!(
+        ask(Some(&seen(meta_reply("-", "-"), status_reply("0", "-")))),
+        judged,
+        "the control"
+    );
+    assert_eq!(
+        ask(Some(&seen(meta_reply("off", "-"), status_reply("0", "-")))),
+        Gate::Refuses("Autopilot is off")
+    );
+    assert!(matches!(ask(None), Gate::Unread(_)), "no reply");
+    assert!(
+        matches!(
+            ask(Some(&seen(
+                "ERR busy\n".to_string(),
+                status_reply("0", "-")
+            ))),
+            Gate::Unread(_)
+        ),
+        "a meta refused"
+    );
+}
+
+/// THE GATE OVER THE SESSION'S FACTS TRUSTS BY THEM ([`session_gate`]): the default policy
+/// trusts the folder of a session with no word of its own, and under `approve = "safe"` the
+/// folder the session's starter trusted. Unix's: on Windows the folder judgment trusts no folder
+/// (ATERM-KI-1115-31415); what the gate refuses before any folder is judged runs on every
+/// platform ([`the_gate_over_no_reading_or_an_off_word_trusts_nothing`]).
+#[cfg(unix)]
+#[test]
+fn the_gate_over_the_sessions_facts_trusts_by_them() {
+    let seen = |meta: String, status: String| Seen { meta, status };
     let w = World::new("seen");
     let on = SupervisorConfig::default();
     let ask = |seen: Option<&Seen>| session_gate(&on, seen, Some(&w.home), 502, &w.folder);
     assert_eq!(
-        ask(Some(&seen(meta("-", "-"), status("0", "-")))),
+        ask(Some(&seen(meta_reply("-", "-"), status_reply("0", "-")))),
         Gate::Trusts(approval::RULE_TRUST_ANY)
     );
-    assert_eq!(
-        ask(Some(&seen(meta("off", "-"), status("0", "-")))),
-        Gate::Refuses("Autopilot is off")
-    );
-    assert!(matches!(ask(None), Gate::Unread(_)), "no reply");
-    assert!(matches!(
-        ask(Some(&seen("ERR busy\n".to_string(), status("0", "-")))),
-        Gate::Unread(_)
-    ));
     let safe = SupervisorConfig {
         approve: Approve::Safe,
         ..on.clone()
@@ -1085,7 +1245,7 @@ fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
     assert_eq!(
         session_gate(
             &safe,
-            Some(&seen(meta("-", &folder), status("0", "-"))),
+            Some(&seen(meta_reply("-", &folder), status_reply("0", "-"))),
             Some(&w.home),
             502,
             &w.folder
@@ -1098,7 +1258,9 @@ fn the_sessions_facts_are_read_from_its_meta_and_status_replies() {
 /// A RELAUNCH LINE IS SETTLED UNDER THE CLAUDE HOME IT NAMES: a line that moves a session to a
 /// second Claude home is settled against that home's profile, with the build started under the
 /// line's own variables and none of this process's AI variables. CONTROL: the same line under a
-/// home that already records the folder starts nothing.
+/// home that already records the folder starts nothing. Unix's: on Windows the folder judgment
+/// trusts no folder, so nothing is started (ATERM-KI-1115-31415).
+#[cfg(unix)]
 #[test]
 fn a_relaunch_line_is_settled_under_the_claude_home_it_names() {
     let w = World::new("relaunch");

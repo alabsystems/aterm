@@ -3,6 +3,9 @@
 
 //! `sys why` text and JSON rendering from the cause engine's [`Account`] ([`crate::explain`]).
 
+#[path = "why_self_cpu.rs"]
+mod self_cpu;
+
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
 use super::view::{
@@ -890,6 +893,7 @@ pub fn why_text(
             let w = Reading::new(ctx, s, WhySubject::Cpu);
             lines.push(w.calm_sentence());
             lines.push(w.you_line(WhySubject::Cpu));
+            lines.extend(self_cpu::text(&s.self_cpu));
             lines.extend(w.cannot_lines());
             return;
         }
@@ -907,6 +911,9 @@ pub fn why_text(
     };
     let ranked = w.ranked(subject);
     let mut head = head;
+    if subject == WhySubject::Cpu {
+        head.extend(self_cpu::text(&s.self_cpu));
+    }
     if subject == WhySubject::Mem && w.a.facts.as_ref().is_some_and(|f| f.lane.on()) {
         head.push(Reading::owners_line(&ranked));
     }
@@ -1429,6 +1436,9 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
             o.set("figure", w.figure_json(WhySubject::Cpu));
             o.set("you", w.you_json(WhySubject::Cpu));
             o.set("cannot", w.cannot_json());
+            if let Some(value) = self_cpu::json(&s.self_cpu) {
+                o.set("self_cpu", value);
+            }
             return;
         }
         Bare::Subject(subject) => subject,
@@ -1445,7 +1455,12 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
     o.set("figure", w.figure_json(subject));
     let ranked = w.ranked(subject);
     match subject {
-        WhySubject::Cpu => o.set("split_mc", w.split_json()),
+        WhySubject::Cpu => {
+            o.set("split_mc", w.split_json());
+            if let Some(value) = self_cpu::json(&s.self_cpu) {
+                o.set("self_cpu", value);
+            }
+        }
         WhySubject::Mem => {
             o.set(
                 "classes",

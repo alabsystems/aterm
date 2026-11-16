@@ -370,7 +370,7 @@ fn open_paired_at(path: &Path, generated: bool, invocation: Option<&str>) -> io:
         return Err(io::Error::other("run log pair changed during admission"));
     }
     // Both private roles remain visible throughout reuse, before new run records.
-    events.set_len(PRIVATE_EVENTS_HEADER.len() as u64)?;
+    cut_to_header(&events, &events_path(path))?;
     file.set_len(PRIVATE_HUMAN_HEADER.len() as u64)?;
     file.seek(io::SeekFrom::End(0))?;
     {
@@ -402,6 +402,28 @@ fn open_paired_at(path: &Path, generated: bool, invocation: Option<&str>) -> io:
         prune(parent, &directory);
     }
     Ok(log)
+}
+
+/// Cut the admitted companion back to its role header through the append handle it is held by.
+#[cfg(not(windows))]
+fn cut_to_header(events: &File, _path: &Path) -> io::Result<()> {
+    events.set_len(PRIVATE_EVENTS_HEADER.len() as u64)
+}
+
+/// Cut the admitted companion back to its role header. Its append handle holds
+/// `FILE_APPEND_DATA` without `FILE_WRITE_DATA`, and Windows refuses to move such a handle's end
+/// of file (`ERROR_ACCESS_DENIED`), so the cut goes through a handle opened to write the file at
+/// `path`, as itself, once its identity proves it the very file the append handle holds.
+#[cfg(windows)]
+fn cut_to_header(events: &File, path: &Path) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    crate::event_log::private_flags(&mut options);
+    let writer = options.open(path)?;
+    if file_key(&writer)? != file_key(events)? {
+        return Err(io::Error::other("run log pair changed during admission"));
+    }
+    writer.set_len(PRIVATE_EVENTS_HEADER.len() as u64)
 }
 
 fn is_run_log(name: &OsStr) -> bool {

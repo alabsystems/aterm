@@ -21,8 +21,13 @@
 //! - **landings** by kind, and how many resumed a judgment an earlier run kept;
 //! - **re-judges** (judgments not the run's first) and **rounds** by cause, with their results;
 //! - **aborts** by word;
-//! - **main movements with no record**: commits main is known to have moved to in the window
-//!   that no landing's end record names ([`mainline`]), the first few named.
+//! - **main tips with no receipt**: of the commits main is known to have moved to in the window
+//!   ([`mainline`]), those whose trailers hold no landing receipt, the first few named. The
+//!   trailers alone say so, whatever the journal holds;
+//! - **receipted landings with no run record**: of the movements that hold a receipt and were
+//!   made at or after the start of the earliest run record read, those no landing's end record
+//!   names. A landing made before that start has its record, if any, where this census did not
+//!   read, so it is not counted.
 
 use crate::exit;
 use crate::land_record::Origin;
@@ -38,7 +43,7 @@ pub const USAGE: &str = "usage: targo --unverified verify land --census [--since
 /// The window a census reads where `--since` names none: the run records' retention
 /// ([`crate::judged::RUN_RETENTION`]).
 pub const WINDOW: u64 = crate::judged::RUN_RETENTION;
-/// How many unrecorded movements a census names; the rest are counted.
+/// How many commits a census names on a line; the rest are counted.
 const NAMED: usize = 10;
 
 /// A commit as [`census_cli`]'s `git log` lists it for [`mainline`].
@@ -57,9 +62,10 @@ pub struct Listed {
 /// main its push saw ([`crate::land`]'s publish makes every landing so). Nothing else is known to
 /// have been main: a commit that is not a landing may have been pushed with a branch under it (a
 /// merge of a person's branch, pushed as it stands), so no parent of one is followed, and a run
-/// of direct pushes between two landings shows as its last.
+/// of direct pushes between two landings shows as its last. Each is given as listed, with its
+/// time and whether it holds a receipt.
 #[must_use]
-pub fn mainline(tip: &str, listed: &[Listed], since: u64) -> Vec<String> {
+pub fn mainline(tip: &str, listed: &[Listed], since: u64) -> Vec<Listed> {
     let made = |commit: &&Listed| commit.at >= since;
     let mut main: BTreeSet<&str> = BTreeSet::from([tip]);
     for commit in listed.iter().filter(made).filter(|commit| commit.landing) {
@@ -72,8 +78,21 @@ pub fn mainline(tip: &str, listed: &[Listed], since: u64) -> Vec<String> {
         .iter()
         .filter(made)
         .filter(|commit| main.contains(commit.commit.as_str()))
-        .map(|commit| commit.commit.clone())
+        .cloned()
         .collect()
+}
+
+/// ` (a, b, and n more)` for the commits a line names, at most [`NAMED`] of them; nothing for
+/// none.
+fn named(commits: &[&str]) -> String {
+    if commits.is_empty() {
+        return String::new();
+    }
+    let mut names = commits[..commits.len().min(NAMED)].join(", ");
+    if commits.len() > NAMED {
+        names.push_str(&format!(", and {} more", commits.len() - NAMED));
+    }
+    format!(" ({names})")
 }
 
 /// `git log`'s lines as [`census_cli`] asks for them (`%H %P`, `%ct` and the trailers, unit
@@ -177,11 +196,15 @@ fn by_cause(steps: &[&Record]) -> String {
 
 /// The census of the runs `entries` hold that started at `since` or later, and of `movements`,
 /// the commits main moved to in the window ([`mainline`]): the lines [`census_cli`] prints.
+/// A movement's receipt is read from its trailers; whether a receipted one has a run record is
+/// asked only of those made at or after the earliest run record among `entries`.
 /// An entry at a path two origins both hold is read once.
 #[must_use]
-pub fn census(entries: &[Entry], movements: &[String], since: u64) -> Vec<String> {
+pub fn census(entries: &[Entry], movements: &[Listed], since: u64) -> Vec<String> {
     let mut seen = BTreeSet::new();
     let mut unread = 0;
+    // The start of the earliest run record read, in the window or before it.
+    let mut earliest: Option<u64> = None;
     let mut runs: BTreeMap<&str, Told<'_>> = BTreeMap::new();
     let mut landed_commits = BTreeSet::new();
     for entry in entries {
@@ -196,6 +219,7 @@ pub fn census(entries: &[Entry], movements: &[String], since: u64) -> Vec<String
         if let Some(landing) = &record.landing {
             landed_commits.insert(landing.commit.as_str());
         }
+        earliest = Some(earliest.map_or(record.run.started, |at| at.min(record.run.started)));
         if record.run.started < since {
             continue;
         }
@@ -265,9 +289,20 @@ pub fn census(entries: &[Entry], movements: &[String], since: u64) -> Vec<String
     }
     seconds.sort_unstable();
     let hosts: BTreeSet<&str> = runs.values().map(|told| told.host).collect();
-    let unrecorded: Vec<&String> = movements
+    let unreceipted: Vec<&str> = movements
         .iter()
-        .filter(|commit| !landed_commits.contains(commit.as_str()))
+        .filter(|commit| !commit.landing)
+        .map(|commit| commit.commit.as_str())
+        .collect();
+    let receipted: Vec<&str> = movements
+        .iter()
+        .filter(|commit| commit.landing && earliest.is_some_and(|at| commit.at >= at))
+        .map(|commit| commit.commit.as_str())
+        .collect();
+    let unrecorded: Vec<&str> = receipted
+        .iter()
+        .copied()
+        .filter(|commit| !landed_commits.contains(commit))
         .collect();
     let counted = |counts: &BTreeMap<&str, usize>| {
         if counts.is_empty() {
@@ -330,24 +365,24 @@ pub fn census(entries: &[Entry], movements: &[String], since: u64) -> Vec<String
             counted(&aborted)
         ),
     ];
-    let mut movement = format!(
-        "  main movements with no record: {} of {}",
-        unrecorded.len(),
-        movements.len()
-    );
-    if !unrecorded.is_empty() {
-        let named: Vec<&str> = unrecorded
-            .iter()
-            .take(NAMED)
-            .map(|commit| commit.as_str())
-            .collect();
-        movement.push_str(&format!(" ({}", named.join(", ")));
-        if unrecorded.len() > NAMED {
-            movement.push_str(&format!(", and {} more", unrecorded.len() - NAMED));
-        }
-        movement.push(')');
-    }
-    lines.push(movement);
+    lines.push(format!(
+        "  main tips with no receipt: {} of {}{}",
+        unreceipted.len(),
+        movements.len(),
+        named(&unreceipted)
+    ));
+    lines.push(match earliest {
+        Some(at) => format!(
+            "  receipted landings with no run record: {} of {} since {} (the earliest run record \
+             read){}",
+            unrecorded.len(),
+            receipted.len(),
+            aterm_types::rfc3339::format_rfc3339(at),
+            named(&unrecorded)
+        ),
+        None => "  receipted landings with no run record: none counted (no run record was read)"
+            .to_owned(),
+    });
     lines
 }
 

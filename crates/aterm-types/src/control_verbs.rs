@@ -2074,7 +2074,8 @@ pub const VERBS: &[VerbSpec] = &[
             setup_state!(),
             ". `rows=` says each row the plan manages with its standing (`in-place`, `differs`, \
              `needs-you`, `waiting`, `at-login`, `failed`, `not-needed`, `unknown` before any \
-             reading), or `unread` or `offered` as `setup=` says it, never a note or a value. \
+             reading), or `unread` or `offered` as `setup=` says it, never a note or a value; \
+             a row read again keeps its last reading's standing until the new reading lands. \
              `verified` is the selection bitset of the private rows read back as wanted, \
              whatever the reading's age, while no change that could move one is under way, and \
              `verified_at` when the oldest of those readings started (`-` with none), whose age \
@@ -2756,8 +2757,14 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Status,
         App,
-        "render/latency counters [reset|percentiles]",
-        "— `percentiles` prints `n_<x>=` and `<x>_p50/_p95/_p99_ms=` for `input`, `present`, \
+        "render/latency counters [reset|percentiles|cadence]",
+        "— `cadence` reads output-hold index sizes and the selected session's live latch on \
+         the UI owner. It neither services holds nor resets counters. `ordered` and `indexed` \
+         count the two indexes; `pooled` says the selected session exists in the pool. \
+         `enrolled` differs from `held` when the reader cleared a \
+         pending entry. `current` says the indexed latch belongs to this session incarnation; \
+         `due_ns` and `now_ns` use the app's output clock. The atomic latch may move after \
+         its sample. `percentiles` prints `n_<x>=` and `<x>_p50/_p95/_p99_ms=` for `input`, `present`, \
          `render`, `key_write`, `key_queue`, `pre_present`, `acquire`, `acquire_queue`, `resize`, \
          `reflow`, `present_tainted`, `term_wait_redraw`/`term_wait_press`/`term_wait_mouse`, `echo`, \
          `present_glass`, `out_req`, `ime`, `status_glance` (`max_status_glance_ms=`), \
@@ -3500,13 +3507,16 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "open a tab app: `open app mail|about|settings|tables`",
+        "open a tab app: `open app mail|about|settings|tables|navigator`",
         concat!(
             "From a tab not in front of the person (another tab shows, or aterm is behind \
              another app) an open answers `ERR desk refused behind: …` and brings nothing up; \
              a close is answered as ever. \
              `open app settings [/route]` selects a Settings page; `open app system-state` \
-             opens setup; `open app markdown|editor <local-file-uri>` opens a document. \
+             opens setup; `open app markdown|editor <local-file-uri>` opens a document; \
+             `open app navigator [split]` lists every live session of every window, in a \
+             tab or as the active tab's left pane, and replies `app navigator split` where \
+             it split. \
              `open <target> [close]` opens or \
              closes a front-window surface (",
             open_targets!(),
@@ -3748,7 +3758,9 @@ pub const VERBS: &[VerbSpec] = &[
          `word_icons=` (the word icons on glass, window px `x0,x1,y0,y1` joined by `;`, or \
          `none`), `selection=front window= view= session=` for its actual current target, \
          `resting=true|false` (whether that window rests: untouched and showing no new output \
-         for `idle_rest_secs`, so it runs no blink and its deck draws still), and \
+         for `idle_rest_secs`, so it runs no blink and its deck draws still), \
+         `attended=true|false` (whether a person touched that window within the last 40 s; \
+         past that its deck draws still at each reading until the next touch), and \
          `sight=visible|covered|off-glass` (where that window's frames can be seen: `visible`, \
          some of it on screen; `covered`, fully covered, on another Space or on a sleeping \
          display, drawing at most a frame every 5 s; `off-glass`, minimised or its app hidden, \
@@ -3915,8 +3927,11 @@ pub const VERBS: &[VerbSpec] = &[
          or a rollout's retried on `no-reply`/`no-marker`, and a rollout the landing could not \
          find looked for again, updating `result_bytes=`). The header ends ` checked=<word>` \
          where the landing named what aterm checked (`task`'s `checked=`). \
+         An ended session (`exits`) answers `@<sid> result` and `@<sid> task` from its row in \
+         the machine's session table, after a quit too, as long as the row stands; the result \
+         file lives as long as its row (`why=no-task` for a row with no task). \
          Errors: `ERR no task`, `ERR result unavailable \
-         why=<working|stalled|exited|no-transcript|no-reply|no-marker|empty|no-check|no-report|no-snapshot|unreadable|no-prompt|no-words>`.",
+         why=<working|stalled|exited|no-transcript|no-reply|no-marker|empty|no-check|no-report|no-snapshot|unreadable|no-prompt|no-words|no-task>`.",
     ),
     v(
         "ready",
@@ -4044,6 +4059,24 @@ pub const VERBS: &[VerbSpec] = &[
          withdrawn|taken|none`).",
     )
     .input(Input::NONE),
+    va(
+        "stream",
+        Owner,
+        Status,
+        Session,
+        OwnerOnly,
+        "stream @<sid> v=1: a harness's record stream on its claim's connection",
+        "— Unix only, verb first (never `@<sid> stream`, and never forwarded). Opens only on the \
+         connection that holds `<sid>`'s live contract 4 claim (`ERR usage` otherwise, contract 2 \
+         or 3 included; `ERR busy streams` when every stream lane is taken, the connection and \
+         its claim kept). Replies `OK stream v=1 epoch=<instance> acked=<seq> in=<seq>`; from \
+         then on the connection carries one JSON record per line, at most 256 KiB each, and \
+         every harness record is answered `{\"k\":\"ack\",\"seq\":<n>[,\"dropped\":\"<why>\"]}` \
+         (`bound`, `rate`, `scope`, `applied`). A `seq` past `acked+1`, or the claim placed on \
+         another connection, closes it; reopen and resend from `acked`. `meta` prints its \
+         counters (`stream_*`). `docs/HARNESS-CONTRACT.md` has the grammar.",
+    )
+    .input(Input::NONE),
     v(
         "inbox",
         Read,
@@ -4095,8 +4128,9 @@ pub const VERBS: &[VerbSpec] = &[
          [demoted=<k>] [via=<p,...>] [verdict=<v>] [truncated=1 len=<n>]` + body; errors: `ERR \
          retained-from=<floor> off=<n>` below `oldest_on_bus=`/`bus_head=` retention, `ERR no such \
          record off=<n>`, `ERR timeout off=<n>` after 10 s, `ERR fabric <state> off=<n>`, `ERR \
-         fetch failed reason=<why> off=<n>` (a malformed, refused or log-replaced answer), or \
-         `ERR busy` past 8 parked reads).",
+         fetch failed reason=<why> off=<n>` (a malformed, refused or log-replaced answer, or \
+         `unsettled`: an own message the bridge may still send again, or an answer whose deadline \
+         is not yet off its disk, which a later fetch reads), or `ERR busy` past 8 parked reads).",
     )
     .forms(&[form(AtWord).lane(Wait)]),
     v(
@@ -4533,17 +4567,21 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "exits [<n>] [since=<id>]: the instance EXIT LEDGER (Owner-only)",
-        "— one `exit <id> t=<ms> sid=<sid> local=<n> \
-         reason=<shell-exit|ctl-close|ui-close|window-close|reaper|unknown> exit_code=<n|-> \
+        "exits [<n>] [since=<id>]: the machine's EXIT LEDGER of ended sessions (Owner-only)",
+        "— one `exit <id> t=<ms> sid=<sid> local=<n|-> \
+         reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|reaper|unknown> exit_code=<n|-> \
          by=<sid|human|ctl|bridge|harness|fleet:<node>:<sid>|-> left=<n|->` line per exited \
          session (`by=` the session that asked, an owner-token `aterm ctl` run from a tab \
          included; `ctl` a client in no tab; `fleet:<node>:<sid>` another Mac's drive, by the \
          head of its node and the session there that asked, `-` where none; the closed tab's \
          own `tab act=close` mark in its `log` names the same actor), read from \
-         the closed-session index (its last 512 closes, in the order they left the registry; also \
-         pushed live via `subscribe @<sid> events` `closing reason= by=` and `subscribe … \
-         sessions` `session-exited <sid> reason=`). `left=` counts the processes the tab left \
+         the machine's session table, one row on disk per ended session, which outlives a quit \
+         (oldest first; `<id>` is the end's unix µs, `t=` its wall ms, `local=` the local id it \
+         had where this process ended it and `-` where another did; a quit leaves an `app-quit` \
+         row for each session its layout does not bring back; `ERR session table loading` while \
+         the launch still reads it; also pushed live via `subscribe @<sid> events` `closing \
+         reason= by=` and `subscribe … sessions` `session-exited <sid> reason=`). `left=` counts \
+         the processes the tab left \
          running that `end` takes (`sys left scope=aterm` lists them), `-` where the leftover \
          view keeps no record of the close.",
     )

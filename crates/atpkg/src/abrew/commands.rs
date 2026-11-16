@@ -15428,9 +15428,10 @@ mod livecheck {
         let want_resources = has_flag(rest, "--resources", "-r");
         let debug = has_flag(rest, "--debug", "-d");
         // With both, the oracle dumps its args object first.
-        if has_flag(rest, "--extract-plist", "") || (debug && has_flag(rest, "--verbose", "-v")) {
+        if debug && has_flag(rest, "--verbose", "-v") {
             return super::super::unsupported("'livecheck' with these arguments is not native");
         }
+        let extract_plist_flag = has_flag(rest, "--extract-plist", "");
         // Brew's selection order: --tap, --installed, named,
         // watchlist file, else everything in every tap.
         #[derive(PartialEq)]
@@ -15695,7 +15696,14 @@ mod livecheck {
         // the whole run.
         let mut prepared: Vec<Prepared> = Vec::new();
         for pkg in &pkgs {
-            match prepare(prefix, api, pkg, pkgs.len(), want_resources) {
+            match prepare(
+                prefix,
+                api,
+                pkg,
+                pkgs.len(),
+                want_resources,
+                extract_plist_flag,
+            ) {
                 // The oracle crashes with a backtrace on a
                 // missing reference under --debug; delegate.
                 Ok(p) if debug && matches!(p, Prepared::RefMissing(_)) => {
@@ -15764,6 +15772,35 @@ mod livecheck {
         let mut any_printed = false;
         let mut failed_run = false;
         let mut json_entries: Vec<JVal> = Vec::new();
+        // Brew's JSON-mode progress bar (TTY stderr only):
+        // a "Running checks" headline and a per-package
+        // bar, cleared at the end when stdout shares the
+        // screen. Text mode and quiet runs never show it.
+        let progress = json && !quiet && super::super::tty::stderr_is_tty();
+        let progress_frame = |done: usize| {
+            use std::io::Write as _;
+            let total = pkgs.len();
+            let width = super::super::tty::stderr_width();
+            let inner = width.saturating_sub(15 + format!("{total}/{total}").len());
+            let filled = inner * done / total.max(1);
+            let mut err = std::io::stderr().lock();
+            let _ = write!(
+                err,
+                "\r Progress: [{}{}] {done}/{total} ",
+                "#".repeat(filled),
+                ".".repeat(inner - filled)
+            );
+            let _ = err.flush();
+        };
+        if progress {
+            use std::io::Write as _;
+            eprintln!("{}", super::super::tty::ohai_err("Running checks"));
+            let mut err = std::io::stderr().lock();
+            let _ = write!(err, "{}", " ".repeat(super::super::tty::stderr_width()));
+            let _ = err.flush();
+            drop(err);
+            progress_frame(0);
+        }
         for (i, pkg) in pkgs.iter().enumerate() {
             let use_full = full_name_flag || ambiguous_leaves.contains(&i);
             let display = if use_full {
@@ -15775,11 +15812,21 @@ mod livecheck {
                 println!("\n----------");
             }
             let outcome = check(pkg, &prepared[i], json, debug, &display);
+            if progress {
+                progress_frame(i + 1);
+            }
             match outcome {
                 Outcome::Skipped(status, messages) => {
                     if json {
                         if !newer_only {
-                            json_entries.push(status_json(pkg, &display, &status, &messages));
+                            json_entries.push(status_json(
+                                pkg,
+                                &display,
+                                &status,
+                                &messages,
+                                &[],
+                                verbose,
+                            ));
                         }
                     } else if !newer_only && !quiet {
                         print_skip(&display, &status, &messages);
@@ -15868,35 +15915,7 @@ mod livecheck {
                             println!();
                         }
                         puts_line(&format!("{name_s}: {cur_s} ==> {lat_s}"));
-                        for res in &resources {
-                            match res {
-                                ResOutcome::Checked {
-                                    name,
-                                    current: rcur,
-                                    latest: rlatest,
-                                    ..
-                                } => {
-                                    let r_out = lc_cmp(false, rcur, rlatest) == Ordering::Less;
-                                    let r_newer = lc_cmp(false, rcur, rlatest) == Ordering::Greater;
-                                    let rname = super::super::tty::blue_out(name);
-                                    let rcur_s = if r_newer {
-                                        super::super::tty::error(rcur)
-                                    } else {
-                                        rcur.clone()
-                                    };
-                                    let rlat_s = if r_out {
-                                        super::super::tty::success(rlatest)
-                                    } else {
-                                        rlatest.clone()
-                                    };
-                                    puts_line(&format!("  {rname}: {rcur_s} ==> {rlat_s}"));
-                                }
-                                ResOutcome::Errored { name, messages } => {
-                                    let rname = super::super::tty::error(name);
-                                    println!("  {rname}: {}", messages.join("; "));
-                                }
-                            }
-                        }
+                        print_resource_lines(&resources);
                     }
                 }
                 Outcome::RefErrored(msg) => {
@@ -15908,6 +15927,8 @@ mod livecheck {
                                 &display,
                                 "error",
                                 &Some(vec![msg]),
+                                &[],
+                                verbose,
                             ));
                         }
                     } else if !quiet {
@@ -15923,11 +15944,24 @@ mod livecheck {
                         super::super::tty::onoe!("Error: {name_s}: {msg}");
                     }
                 }
-                Outcome::RaisedErrored(messages, raise_text) => {
+                Outcome::RaisedErrored(messages, raise_text, resources) => {
                     failed_run = true;
+                    if resources
+                        .iter()
+                        .any(|r| matches!(r, ResOutcome::Errored { .. }))
+                    {
+                        failed_run = true;
+                    }
                     if json {
                         if !quiet {
-                            json_entries.push(status_json(pkg, &display, "error", &Some(messages)));
+                            json_entries.push(status_json(
+                                pkg,
+                                &display,
+                                "error",
+                                &Some(messages),
+                                &resources,
+                                verbose,
+                            ));
                         }
                     } else if !quiet {
                         let name_s = format!(
@@ -15940,12 +15974,26 @@ mod livecheck {
                             }
                         );
                         super::super::tty::onoe!("Error: {name_s}: {raise_text}");
+                        print_resource_lines(&resources);
                     }
                 }
-                Outcome::Errored(messages, raise_text) => {
+                Outcome::Errored(messages, raise_text, resources) => {
+                    if resources
+                        .iter()
+                        .any(|r| matches!(r, ResOutcome::Errored { .. }))
+                    {
+                        failed_run = true;
+                    }
                     if json {
                         if !quiet {
-                            json_entries.push(status_json(pkg, &display, "error", &Some(messages)));
+                            json_entries.push(status_json(
+                                pkg,
+                                &display,
+                                "error",
+                                &Some(messages),
+                                &resources,
+                                verbose,
+                            ));
                         }
                     } else {
                         failed_run = true;
@@ -15960,6 +16008,7 @@ mod livecheck {
                                 }
                             );
                             super::super::tty::onoe!("Error: {name_s}: {raise_text}");
+                            print_resource_lines(&resources);
                         }
                     }
                 }
@@ -15967,6 +16016,15 @@ mod livecheck {
         }
         if newer_only && !any_printed && !json && !quiet && !debug {
             println!("No newer upstream versions.");
+        }
+        if progress {
+            use std::io::Write as _;
+            let mut err = std::io::stderr().lock();
+            let _ = writeln!(err);
+            if super::super::tty::stdout_tty() {
+                let _ = write!(err, "\x1b[?2026h\x1b[1A\x1b[K\x1b[1A\x1b[K\x1b[?2026l");
+            }
+            let _ = err.flush();
         }
         if json {
             println!("{}", jpretty(&JVal::Arr(json_entries)));
@@ -15988,7 +16046,14 @@ mod livecheck {
 
     /// Brew's `status_hash` as JSON (meta always present on
     /// this path; brew only strips it from version infos).
-    fn status_json(pkg: &Pkg, display: &str, status: &str, messages: &Option<Vec<String>>) -> JVal {
+    fn status_json(
+        pkg: &Pkg,
+        display: &str,
+        status: &str,
+        messages: &Option<Vec<String>>,
+        resources: &[ResOutcome],
+        verbose: bool,
+    ) -> JVal {
         let mut fields = vec![
             (
                 if pkg.is_cask { "cask" } else { "formula" }.to_string(),
@@ -16007,7 +16072,51 @@ mod livecheck {
             meta.push(("head_only".to_string(), jbool(true)));
         }
         fields.push(("meta".to_string(), JVal::Obj(meta)));
+        if !resources.is_empty() {
+            fields.push((
+                "resources".to_string(),
+                JVal::Arr(
+                    resources
+                        .iter()
+                        .map(|r| resource_json(r, verbose))
+                        .collect(),
+                ),
+            ));
+        }
         JVal::Obj(fields)
+    }
+
+    /// The indented per-resource status lines (text mode).
+    fn print_resource_lines(resources: &[ResOutcome]) {
+        for res in resources {
+            match res {
+                ResOutcome::Checked {
+                    name,
+                    current: rcur,
+                    latest: rlatest,
+                    ..
+                } => {
+                    let r_out = lc_cmp(false, rcur, rlatest) == Ordering::Less;
+                    let r_newer = lc_cmp(false, rcur, rlatest) == Ordering::Greater;
+                    let rname = super::super::tty::blue_out(name);
+                    let rcur_s = if r_newer {
+                        super::super::tty::error(rcur)
+                    } else {
+                        rcur.clone()
+                    };
+                    let rlat_s = if r_out {
+                        super::super::tty::success(rlatest)
+                    } else {
+                        rlatest.clone()
+                    };
+                    puts_line(&format!("  {rname}: {rcur_s} ==> {rlat_s}"));
+                }
+                ResOutcome::Errored { name, messages } => {
+                    let rname = super::super::tty::error(name);
+                    println!("  {rname}: {}", messages.join("; "));
+                }
+            }
+        }
     }
 
     /// One resource's JSON entry: a version info when
@@ -16186,6 +16295,9 @@ mod livecheck {
         spec_defined: bool,
         outside: bool,
         import_error: Option<Box<ImportError>>,
+        /// Declared `app` artifact sources (casks), for
+        /// `:extract_plist` item selection.
+        apps: Vec<String>,
     }
 
     impl Pkg {
@@ -16220,15 +16332,17 @@ mod livecheck {
             meta: Box<LcMeta>,
             resources: Vec<ResOutcome>,
         },
-        /// (JSON messages, text-mode raised message)
-        Errored(Vec<String>, String),
+        /// (JSON messages, text-mode raised message,
+        /// resource outcomes — resources check even when
+        /// the main formula errors)
+        Errored(Vec<String>, String, Vec<ResOutcome>),
         /// A livecheck reference names a missing package:
         /// an error entry that also fails the run in JSON.
         RefErrored(String),
         /// A strategy exception: like `Errored`, but also
         /// fails the run in JSON (an ordinary
         /// unable-to-get-versions does not).
-        RaisedErrored(Vec<String>, String),
+        RaisedErrored(Vec<String>, String, Vec<ResOutcome>),
     }
 
     /// Brew's `load_formula_or_cask` for one named arg,
@@ -16473,7 +16587,8 @@ mod livecheck {
             (s.strategy_block
                 && s.json_block.is_none()
                 && s.xml_block.is_none()
-                && s.yaml_block.is_none())
+                && s.yaml_block.is_none()
+                && s.plist_block.is_none())
                 || s.url_options
         })
     }
@@ -16723,6 +16838,7 @@ mod livecheck {
             spec_defined,
             outside,
             import_error: facts.import_error,
+            apps: Vec::new(),
         }
     }
 
@@ -16821,12 +16937,24 @@ mod livecheck {
             spec_defined,
             outside,
             import_error: facts.import_error,
+            apps: c
+                .artifacts
+                .iter()
+                .filter_map(|a| match a {
+                    super::super::formula::Artifact::App(src, _) => Some(src.clone()),
+                    _ => None,
+                })
+                .collect(),
         }
     }
 
     /// Brew's `SkipConditions.skip_information` for a package,
     /// in brew's check order.
-    fn skip_info(pkg: &Pkg, total: usize) -> Option<(String, Option<Vec<String>>)> {
+    fn skip_info(
+        pkg: &Pkg,
+        total: usize,
+        extract_plist_flag: bool,
+    ) -> Option<(String, Option<Vec<String>>)> {
         let defined = pkg.spec_defined;
         let spec_skip = pkg.spec.as_ref().and_then(|s| s.skip.as_ref());
         let mut message: Option<String> = None;
@@ -16879,19 +17007,34 @@ mod livecheck {
                 return Some(("deprecated".to_string(), None));
             }
             if pkg.spec.as_ref().and_then(|s| s.strategy.as_deref()) == Some("extract_plist") {
-                // Brew enables ExtractPlist for a lone cask (or
-                // with the flag, delegated): not native.
-                if total == 1 {
+                // Brew enables ExtractPlist for a lone cask or
+                // with the flag; multiple casks without it
+                // skip. Enabled-but-not-native (non-zip
+                // container, unreduced block) delegates.
+                let enabled = total == 1 || extract_plist_flag;
+                let native = pkg.spec.as_ref().is_some_and(|s| {
+                    let url = match &s.url {
+                        Some(super::super::formula::LivecheckUrl::Literal(u)) => u.as_str(),
+                        _ => pkg.stable_url.as_str(),
+                    };
+                    let path = url.split(['?', '#']).next().unwrap_or(url);
+                    path.to_ascii_lowercase().ends_with(".zip")
+                        && (!s.strategy_block || s.plist_block.is_some())
+                });
+                if enabled && native {
+                    // Falls through to the remaining skips.
+                } else if enabled {
                     return Some(("__outside__".to_string(), None));
+                } else {
+                    return Some((
+                        "skipped".to_string(),
+                        Some(vec![
+                            "Use `--extract-plist` to enable checking multiple casks with \
+                             ExtractPlist strategy"
+                                .to_string(),
+                        ]),
+                    ));
                 }
-                return Some((
-                    "skipped".to_string(),
-                    Some(vec![
-                        "Use `--extract-plist` to enable checking multiple casks with \
-                         ExtractPlist strategy"
-                            .to_string(),
-                    ]),
-                ));
             }
             if pkg.version_latest && !defined {
                 return Some(("latest".to_string(), None));
@@ -17221,6 +17364,7 @@ mod livecheck {
         Json,
         Xml,
         Yaml,
+        ExtractPlist,
     }
 
     const KNOWN_STRATEGIES: &[&str] = &[
@@ -17402,41 +17546,36 @@ mod livecheck {
         name
     }
 
-    /// The version token of a distribution file name: the
-    /// first `-`/`_`-separated token that is exactly
-    /// `v?<digits>(.<digits>)*`, as (token index, version) —
-    /// the lenient finder PyPI project derivation indexes
-    /// by (resource currents use the strict
-    /// `detect_stem_version` below).
-    fn file_version_token(url: &str) -> Option<(usize, String)> {
-        let stem = file_stem(url);
-        for (i, tok) in stem.split(['-', '_']).enumerate() {
-            let t = tok.strip_prefix('v').unwrap_or(tok);
-            let shaped = !t.is_empty()
-                && t.split('.')
-                    .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
-            if shaped {
-                return Some((i, t.to_string()));
-            }
+    /// The strict subset of the oracle's version detection
+    /// pinned by probing its reported currents (r389, r403):
+    /// an underscore-joined digit group (`boost_1_87_0`)
+    /// when no dotted core exists; else the LAST dotted core
+    /// `v?<digits>(.<digits>)+`, possibly letter-prefixed
+    /// inside its token (`foo1.2`, `ver1.2`), with an
+    /// attached suffix (`1.0rc1`, `3.0a`, but not `9.4p1`),
+    /// `.RELEASE`/`.GA` kept, `.Final` cut, then prerelease
+    /// chunks (`-beta.3`, `_alpha`), then one numeric chunk
+    /// and/or a run of flavor chunks (`-linux`, `-src`, any
+    /// all-alphabetic chunk, `x64`/`win64`/`i386`) — a flavor
+    /// tail (with any numeric chunk before it) is excluded
+    /// from the version. `+metadata` survives only on a
+    /// prerelease-bearing detection. A core whose tail does
+    /// not fit falls through to the plainer rules, as the
+    /// oracle's cascade does (`_amd64` -> `64`). Stems mixing
+    /// an underscore digit group with a dotted core delegate
+    /// (their interaction is unpinned). Without a dotted
+    /// core: a plain `v?<digits>` token, else the last
+    /// token's trailing digits (`r16`, `foo128`, and — as
+    /// the oracle also reports — `9.4p1`).
+    fn detect_stem_version(stem: &str) -> Option<(usize, String)> {
+        if let Some((head, _)) = stem.split_once('+') {
+            let (idx, ver, had_prerelease) = detect_stem_inner(head)?;
+            return had_prerelease.then_some((idx, ver));
         }
-        None
+        detect_stem_inner(stem).map(|(idx, ver, _)| (idx, ver))
     }
 
-    /// The strict subset of the oracle's version detection
-    /// pinned by probing its reported currents (r389): a
-    /// dotted core `v?<digits>(.<digits>)+`, possibly
-    /// letter-prefixed inside its token (`foo1.2`, `ver1.2`),
-    /// with an attached suffix (`1.0rc1`, `3.0a`, but not
-    /// `9.4p1`), `.RELEASE`, then prerelease chunks
-    /// (`-beta.3`, `_alpha`) and one trailing numeric chunk
-    /// (`-1`). The whole tail from the core to the stem's
-    /// end must fit that grammar; anything else (`-linux`,
-    /// `_amd64`, a second dotted core, `+build`) is
-    /// undetected and the run delegates rather than guess.
-    /// Without a dotted core: a plain `v?<digits>` token,
-    /// else the last token's trailing digits (`r16`,
-    /// `foo128`, and — as the oracle also reports — `9.4p1`).
-    fn detect_stem_version(stem: &str) -> Option<(usize, String)> {
+    fn detect_stem_inner(stem: &str) -> Option<(usize, String, bool)> {
         // Tokens with byte spans: (start, text).
         let mut toks: Vec<(usize, &str)> = Vec::new();
         let mut start = 0usize;
@@ -17451,10 +17590,12 @@ mod livecheck {
         // Parse a dotted core inside one token: optional
         // letter prefix (a leading `v` included), then
         // digits(.digits)+, then an attached suffix —
-        // letters+digits (not a lone `p` run) or `.RELEASE`
-        // — consuming the token to its end. Returns the
-        // core's byte offset within the token.
-        let parse_core = |tok: &str| -> Option<usize> {
+        // letters+digits (not a lone `p` run), `.RELEASE`/
+        // `.GA` (kept), or `.Final` (cut) — consuming the
+        // token to its end. Returns the core's byte offset
+        // within the token and where the version ends
+        // inside it (before a cut `.Final`).
+        let parse_core = |tok: &str| -> Option<(usize, usize)> {
             let bytes = tok.as_bytes();
             // Candidate starts: every digit position whose
             // preceding bytes are all ASCII letters.
@@ -17486,8 +17627,21 @@ mod livecheck {
                     continue;
                 }
                 let rest = &tok[i..];
-                let ok = if rest.is_empty() || rest == ".RELEASE" {
+                // The oracle's post-release parser
+                // (`-(NUMERIC_WITH_OPTIONAL_DOTS(?:.post\d+)?)$`):
+                // a `.post<digits>` tail (lowercase `post`,
+                // digits to the token end) is part of the
+                // version (`2.9.0.post0`), as read from its
+                // version.rb and probed (r407).
+                let post_ok = rest
+                    .strip_prefix(".post")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()));
+                let ok = if post_ok {
                     true
+                } else if rest.is_empty() || rest == ".RELEASE" || rest == ".GA" {
+                    true
+                } else if rest.eq_ignore_ascii_case(".final") {
+                    return Some((at, i));
                 } else {
                     // Attached suffix: [a-zA-Z]+<digits>* to
                     // the token end, letter run not just `p`.
@@ -17497,7 +17651,7 @@ mod livecheck {
                         && rest[run_len..].bytes().all(|b| b.is_ascii_digit())
                 };
                 if ok {
-                    return Some(at);
+                    return Some((at, tok.len()));
                 }
             }
             None
@@ -17505,9 +17659,7 @@ mod livecheck {
 
         // Extension chunks after the core token.
         let prerelease_chunk = |tok: &str| -> bool {
-            const WORDS: &[&str] = &[
-                "alpha", "beta", "rc", "pre", "preview", "dev", "a", "b", "m", "ea", "snapshot",
-            ];
+            const WORDS: &[&str] = &["alpha", "beta", "rc", "pre", "preview", "a", "b", "m", "ea"];
             let (head, tail) = match tok.split_once('.') {
                 Some((h, t)) => (h, Some(t)),
                 None => (tok, None),
@@ -17525,30 +17677,118 @@ mod livecheck {
             WORDS.contains(&word.as_str()) && head[word.len()..].bytes().all(|b| b.is_ascii_digit())
         };
 
-        for (idx, &(tok_start, tok)) in toks.iter().enumerate() {
-            let Some(at) = parse_core(tok) else {
+        // A flavor chunk: any all-alphabetic chunk, plus
+        // the probed digit-bearing arch words.
+        let flavor_chunk = |tok: &str| -> bool {
+            !tok.is_empty()
+                && (tok.bytes().all(|b| b.is_ascii_alphabetic())
+                    || matches!(tok, "x64" | "win64" | "i386"))
+        };
+
+        // The last underscore-joined digit group
+        // (`\d+(_\d+)+`) in the stem, as (byte start,
+        // dotted text).
+        let bytes = stem.as_bytes();
+        let mut digit_group: Option<(usize, String)> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let mut end = i;
+                let mut joined = false;
+                while end < bytes.len()
+                    && bytes[end] == b'_'
+                    && end + 1 < bytes.len()
+                    && bytes[end + 1].is_ascii_digit()
+                {
+                    joined = true;
+                    end += 1;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                }
+                if joined {
+                    digit_group = Some((start, stem[start..end].replace('_', ".")));
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        let has_dotted = toks.iter().any(|&(_, tok)| parse_core(tok).is_some());
+        if let Some((start, ver)) = &digit_group {
+            if has_dotted {
+                // Their interaction is unpinned; delegate.
+                return None;
+            }
+            let idx = toks
+                .iter()
+                .position(|&(s, t)| *start >= s && *start < s + t.len())
+                .unwrap_or(0);
+            return Some((idx, ver.clone(), false));
+        }
+
+        // Dotted cores, last first; a core whose tail does
+        // not fit falls through to earlier cores and then
+        // the plain rules below.
+        for (idx, &(tok_start, tok)) in toks.iter().enumerate().rev() {
+            let Some((at, tok_end)) = parse_core(tok) else {
                 continue;
             };
-            // A dotted core was found: the whole remaining
-            // tail must fit, else undetected.
-            let mut ok = true;
-            let mut numeric_used = false;
-            for (j, &(_, chunk)) in toks.iter().enumerate().skip(idx + 1) {
-                let last = j == toks.len() - 1;
-                if !chunk.is_empty() && chunk.bytes().all(|b| b.is_ascii_digit()) {
-                    if last && !numeric_used {
-                        numeric_used = true;
-                    } else {
-                        ok = false;
-                    }
-                } else if numeric_used || !prerelease_chunk(chunk) {
-                    ok = false;
-                }
-                if !ok {
-                    break;
-                }
+            // A cut `.Final` ends the version inside the
+            // token; chunks after it cannot be represented.
+            if tok_end < tok.len() && idx + 1 < toks.len() {
+                continue;
             }
-            return ok.then(|| (idx, stem[tok_start + at..].to_string()));
+            let core_abs = tok_start + at;
+            let mut version_end = tok_start + tok_end;
+            let mut had_prerelease = false;
+            let mut j = idx + 1;
+            while j < toks.len() && prerelease_chunk(toks[j].1) {
+                version_end = toks[j].0 + toks[j].1.len();
+                had_prerelease = true;
+                j += 1;
+            }
+            // One `post<digits>` chunk after the core (and
+            // any prerelease chunks) extends the version
+            // (`1.2-post3`, `1.2_post3`; the oracle's
+            // any-char separator before `post`, r407). It
+            // is not a prerelease.
+            if j < toks.len()
+                && toks[j]
+                    .1
+                    .strip_prefix("post")
+                    .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+            {
+                version_end = toks[j].0 + toks[j].1.len();
+                j += 1;
+            }
+            let mut numeric = false;
+            if j < toks.len()
+                && !toks[j].1.is_empty()
+                && toks[j].1.bytes().all(|b| b.is_ascii_digit())
+            {
+                numeric = true;
+                j += 1;
+            }
+            let flavor_start = j;
+            while j < toks.len() && flavor_chunk(toks[j].1) {
+                j += 1;
+            }
+            if j != toks.len() {
+                continue;
+            }
+            let end = if j > flavor_start {
+                version_end
+            } else if numeric {
+                stem.len()
+            } else {
+                version_end
+            };
+            return Some((idx, stem[core_abs..end].to_string(), had_prerelease));
         }
 
         // No dotted core: a plain version-shaped token,
@@ -17556,7 +17796,7 @@ mod livecheck {
         for (i, &(_, tok)) in toks.iter().enumerate() {
             let t = tok.strip_prefix('v').unwrap_or(tok);
             if !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()) {
-                return Some((i, t.to_string()));
+                return Some((i, t.to_string(), false));
             }
         }
         let (last_idx, &(_, last)) = toks.iter().enumerate().next_back()?;
@@ -17569,7 +17809,7 @@ mod livecheck {
             .rev()
             .collect();
         if !digits.is_empty() && digits.len() < last.len() {
-            return Some((last_idx, digits));
+            return Some((last_idx, digits, false));
         }
         None
     }
@@ -17615,20 +17855,39 @@ mod livecheck {
     }
 
     /// The PyPI project a `files.pythonhosted.org` URL
-    /// belongs to: the file-name tokens before the version
-    /// token, PEP 503-normalized (`flit_core-4.1.0.tar.gz`
-    /// is `flit-core`, as `brew livecheck --verbose` shows).
+    /// belongs to, as the oracle's Pypi strategy derives
+    /// it: basename matched by its `FILENAME_REGEX`
+    /// (`<name>-<anything><suffix>`, name greedy to the
+    /// last `-` that lets a `.tar.<alnum>+`/`.<alnum>+`
+    /// suffix end the file, case-insensitive), then
+    /// `%20`/`_` become `-` (`flit_core-4.1.0.tar.gz` is
+    /// `flit-core`, as `brew livecheck --verbose` shows;
+    /// `python-dateutil-2.9.0.post0.tar.gz` is
+    /// `python-dateutil` — r407; a wheel's greedy name
+    /// keeps its tags, as the oracle's does).
     fn pypi_project(url: &str) -> Option<String> {
         if url_host(url) != "files.pythonhosted.org" {
             return None;
         }
-        let (idx, _) = file_version_token(url)?;
-        if idx == 0 {
+        let base = url.split(['?', '#']).next().unwrap_or_default();
+        let file = base.rsplit('/').next().unwrap_or_default();
+        let bytes = file.as_bytes();
+        // The suffix: final `.<alnum>+` run at the end.
+        let mut dot = bytes.len();
+        while dot > 0 && bytes[dot - 1].is_ascii_alphanumeric() {
+            dot -= 1;
+        }
+        if dot == 0 || dot == bytes.len() || bytes[dot - 1] != b'.' {
             return None;
         }
-        let stem = file_stem(url);
-        let name: Vec<&str> = stem.split(['-', '_']).take(idx).collect();
-        Some(name.join("-").to_lowercase())
+        // Greedy name: the last `-` before the suffix such
+        // that the name is nonempty.
+        let hyphen = file[..dot].rfind('-')?;
+        let name = &file[..hyphen];
+        if name.is_empty() {
+            return None;
+        }
+        Some(name.replace("%20", "-").replace('_', "-"))
     }
 
     /// Hosts of the priority-5 URL-pinned strategies abrew
@@ -17701,6 +17960,12 @@ mod livecheck {
         /// The checked unit's `version.major_minor`, for
         /// guarded `:json` map conditions.
         major_minor: String,
+        /// The `:extract_plist` block shape (a block-less
+        /// strategy keeps `None` with the strat set).
+        plist: Option<super::super::formula::PlistBlock>,
+        /// The cask's declared `app` artifact sources, for
+        /// `Strat::ExtractPlist` item selection.
+        apps: Vec<String>,
     }
 
     enum UrlPlan {
@@ -17722,6 +17987,7 @@ mod livecheck {
             Strat::Json => "Json",
             Strat::Xml => "Xml",
             Strat::Yaml => "Yaml",
+            Strat::ExtractPlist => "ExtractPlist",
         }
     }
 
@@ -17756,6 +18022,8 @@ mod livecheck {
             xml: None,
             yaml: None,
             major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
         })))
     }
 
@@ -17792,6 +18060,8 @@ mod livecheck {
             xml: None,
             yaml: None,
             major_minor: String::new(),
+            plist: None,
+            apps: Vec::new(),
         })))
     }
 
@@ -17825,6 +18095,7 @@ mod livecheck {
             ("header_match", "HeaderMatch", http),
             ("sparkle", "Sparkle", http),
             ("json", "Json", http),
+            ("extract_plist", "ExtractPlist", http),
         ];
         for (sym, name, applies) in zero {
             if explicit == Some(sym) && *applies {
@@ -17833,6 +18104,7 @@ mod livecheck {
         }
         if spec.is_some_and(|s| s.regex.is_some())
             || matches!(explicit, Some("json" | "xml" | "yaml"))
+            || (explicit == Some("extract_plist") && spec.is_some_and(|s| s.strategy_block))
         {
             out.push("PageMatch");
         }
@@ -17880,6 +18152,8 @@ mod livecheck {
                 xml: None,
                 yaml: None,
                 major_minor: major_minor.to_string(),
+                plist: None,
+                apps: Vec::new(),
             }))
         };
         if let Some(sym) = explicit {
@@ -17935,6 +18209,25 @@ mod livecheck {
                     let mut plan = run(Strat::Json, url.to_string(), re, None);
                     if let UrlPlan::Run(rp) = &mut plan {
                         rp.json = Some(block);
+                    }
+                    return Ok(plan);
+                }
+                "extract_plist" => {
+                    // Only zip containers are native (the
+                    // URL's extension is the plan-time
+                    // evidence; dmg/pkg delegate).
+                    let path = url.split(['?', '#']).next().unwrap_or(url);
+                    if !path.to_ascii_lowercase().ends_with(".zip") {
+                        return Err(Outside);
+                    }
+                    let sp = spec.and_then(|sp| sp.plist_block.clone());
+                    if spec.is_some_and(|sp| sp.strategy_block) && sp.is_none() {
+                        return Err(Outside);
+                    }
+                    let re = spec_regex()?;
+                    let mut plan = run(Strat::ExtractPlist, url.to_string(), re, None);
+                    if let UrlPlan::Run(rp) = &mut plan {
+                        rp.plist = sp;
                     }
                     return Ok(plan);
                 }
@@ -18156,6 +18449,7 @@ mod livecheck {
         pkg: &Pkg,
         total: usize,
         want_resources: bool,
+        extract_plist_flag: bool,
     ) -> Result<Prepared, Outside> {
         // References first: the skipped/deprecated state of
         // the *referencing* package does not gate the check
@@ -18170,7 +18464,7 @@ mod livecheck {
         // the referring package's.
         let own_version = eff.current.clone();
         eff.current.clone_from(&pkg.current);
-        if let Some((status, messages)) = skip_info(&eff, total) {
+        if let Some((status, messages)) = skip_info(&eff, total, extract_plist_flag) {
             if status == "__outside__" {
                 return Err(Outside);
             }
@@ -18197,7 +18491,7 @@ mod livecheck {
                 ));
             }
         };
-        let plans = plan_urls(eff_box.spec.as_ref(), urls, &own_version)?;
+        let plans = plan_urls(eff_box.spec.as_ref(), urls, &own_version, &eff_box.apps)?;
         let resources = if want_resources && !pkg.is_cask {
             resource_plans(pkg)?
         } else {
@@ -18253,6 +18547,7 @@ mod livecheck {
         spec: Option<&LivecheckSpec>,
         urls: Vec<String>,
         own_version: &str,
+        apps: &[String],
     ) -> Result<Vec<(String, UrlPlan)>, Outside> {
         let mut plans = Vec::new();
         let mut seen: Vec<String> = Vec::new();
@@ -18267,10 +18562,13 @@ mod livecheck {
                 continue;
             }
             seen.push(original.clone());
-            plans.push((
-                original,
-                plan_url(spec, &fetch, &major_minor_of(own_version))?,
-            ));
+            let mut plan = plan_url(spec, &fetch, &major_minor_of(own_version))?;
+            if let UrlPlan::Run(rp) = &mut plan
+                && rp.strat == Strat::ExtractPlist
+            {
+                rp.apps = apps.to_vec();
+            }
+            plans.push((original, plan));
         }
         Ok(plans)
     }
@@ -18331,7 +18629,7 @@ mod livecheck {
     ) -> Result<ResourcePlans, Outside> {
         let Some(spec) = spec else {
             return Ok(ResourcePlans::Urls(
-                plan_urls(None, vec![res_url.to_string()], &pkg.current)?,
+                plan_urls(None, vec![res_url.to_string()], &pkg.current, &[])?,
                 Vec::new(),
             ));
         };
@@ -18376,7 +18674,7 @@ mod livecheck {
             None => vec![res_url.to_string()],
         };
         Ok(ResourcePlans::Urls(
-            plan_urls(Some(&eff_spec), urls, &pkg.current)?,
+            plan_urls(Some(&eff_spec), urls, &pkg.current, &[])?,
             Vec::new(),
         ))
     }
@@ -18529,13 +18827,28 @@ mod livecheck {
                 if debug {
                     debug_header(pkg, eff, display, hops);
                 }
-                Outcome::Errored(vec![msg.clone()], msg.clone())
+                Outcome::Errored(vec![msg.clone()], msg.clone(), Vec::new())
             }
             Prepared::Ready(Ok(plans), last_updated, res_plans, eff, hops) => {
                 if debug {
                     debug_header(pkg, eff, display, hops);
                 }
                 let mut outcome = check_plans(eff, plans, *last_updated, json, debug);
+                // Resources check even when the main formula
+                // errors (a :parent resource then has no main
+                // latest to reuse and checks its own plans,
+                // which are empty — an error entry).
+                match &mut outcome {
+                    Outcome::Errored(_, _, resources) | Outcome::RaisedErrored(_, _, resources)
+                        if !res_plans.is_empty() =>
+                    {
+                        *resources = res_plans
+                            .iter()
+                            .map(|r| check_resource(r, json, debug))
+                            .collect();
+                    }
+                    _ => {}
+                }
                 if let Outcome::Checked {
                     latest,
                     resources,
@@ -18615,6 +18928,7 @@ mod livecheck {
             Strat::Json => json_versions(rp),
             Strat::Xml => xml_versions(rp),
             Strat::Yaml => yaml_versions(rp),
+            Strat::ExtractPlist => plist_versions(rp),
             Strat::Pypi => pypi_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref(),
@@ -18662,7 +18976,10 @@ mod livecheck {
                     continue;
                 }
                 Found::Raised(msg) => {
-                    if debug {
+                    // Closing debug lines follow a completed
+                    // fetch; GitHub API raises happen while
+                    // opening the API, before any content.
+                    if debug && !matches!(rp.strat, Strat::GithubLatest | Strat::GithubReleases) {
                         let raised_meta = LcMeta {
                             head_only: false,
                             cached: false,
@@ -18747,7 +19064,11 @@ mod livecheck {
         debug: bool,
     ) -> Outcome {
         if pkg.current.is_empty() {
-            return Outcome::Errored(vec![NO_CURRENT_MSG.to_string()], NO_CURRENT_MSG.to_string());
+            return Outcome::Errored(
+                vec![NO_CURRENT_MSG.to_string()],
+                NO_CURRENT_MSG.to_string(),
+                Vec::new(),
+            );
         }
         let mut last_messages: Option<Vec<String>> = None;
         let mut first_run = true;
@@ -18755,7 +19076,7 @@ mod livecheck {
             let rp = match plan {
                 UrlPlan::SkipUrl => continue,
                 UrlPlan::Raised(msg) => {
-                    return Outcome::RaisedErrored(vec![msg.clone()], msg.clone());
+                    return Outcome::RaisedErrored(vec![msg.clone()], msg.clone(), Vec::new());
                 }
                 UrlPlan::Run(rp) => rp,
             };
@@ -18784,7 +19105,10 @@ mod livecheck {
                     continue;
                 }
                 Found::Raised(msg) => {
-                    if debug {
+                    // Closing debug lines follow a completed
+                    // fetch; GitHub API raises happen while
+                    // opening the API, before any content.
+                    if debug && !matches!(rp.strat, Strat::GithubLatest | Strat::GithubReleases) {
                         let raised_meta = LcMeta {
                             head_only: pkg.head_only,
                             cached: false,
@@ -18812,7 +19136,7 @@ mod livecheck {
                             pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()),
                         );
                     }
-                    return Outcome::RaisedErrored(vec![msg.clone()], msg);
+                    return Outcome::RaisedErrored(vec![msg.clone()], msg, Vec::new());
                 }
             };
             versions.retain(|v| !v.is_empty());
@@ -18956,10 +19280,11 @@ mod livecheck {
             };
         }
         match last_messages {
-            Some(msgs) => Outcome::Errored(msgs, NO_VERSIONS_MSG.to_string()),
+            Some(msgs) => Outcome::Errored(msgs, NO_VERSIONS_MSG.to_string(), Vec::new()),
             None => Outcome::Errored(
                 vec![NO_VERSIONS_MSG.to_string()],
                 NO_VERSIONS_MSG.to_string(),
+                Vec::new(),
             ),
         }
     }
@@ -19980,6 +20305,374 @@ mod livecheck {
         }
     }
 
+    /// One extracted app's version facts.
+    struct PlistItem {
+        bundle_id: Option<String>,
+        short: Option<String>,
+        bundle: Option<String>,
+    }
+
+    impl PlistItem {
+        /// The no-block version: `[short, bundle]` present
+        /// parts, deduplicated, comma-joined.
+        fn version(&self) -> Option<String> {
+            let mut parts: Vec<&str> = Vec::new();
+            for part in [self.short.as_deref(), self.bundle.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if !parts.contains(&part) {
+                    parts.push(part);
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join(","))
+        }
+    }
+
+    /// A scratch directory removed on drop.
+    struct ScratchDir(std::path::PathBuf);
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The `:extract_plist` strategy for zip containers:
+    /// download, extract, and read the declared apps'
+    /// `Info.plist` versions (XML or binary plists).
+    fn plist_versions(rp: &RunPlan) -> Found {
+        use super::super::formula::PlistProp;
+        if let Some(block) = &rp.plist
+            && block.has_regex
+            && rp.re.is_none()
+        {
+            return Found::Raised(
+                "Two arguments found in `strategy` block but no regex provided.".to_string(),
+            );
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "abrew-livecheck-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if std::fs::create_dir_all(&dir).is_err() {
+            return Found::Versions(Vec::new(), None);
+        }
+        let scratch = ScratchDir(dir.clone());
+        let archive = dir.join("download.zip");
+        if let Err(e) = fetch::curl_to_file(&rp.url, &archive, &[]) {
+            let msg = e.trim().to_string();
+            return Found::Messages(vec![if msg.is_empty() {
+                "curl: download failed".to_string()
+            } else {
+                msg
+            }]);
+        }
+        let root = dir.join("extracted");
+        if crate::extract::extract_zip_tree(
+            &archive,
+            &root,
+            crate::install::UNSIGNED_SIZE_CAP,
+            crate::install::MAX_ENTRIES,
+            crate::extract::ExtractOptions::default(),
+        )
+        .is_err()
+        {
+            return Found::Versions(Vec::new(), None);
+        }
+        let mut items: Vec<PlistItem> = Vec::new();
+        for app in &rp.apps {
+            let Some(name) = std::path::Path::new(app)
+                .file_name()
+                .and_then(|n| n.to_str())
+            else {
+                continue;
+            };
+            let Some(plist) = find_app_plist(&root, name) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&plist) else {
+                continue;
+            };
+            let Some(fields) = plist_string_fields(&bytes) else {
+                continue;
+            };
+            let get = |key: &str| {
+                fields
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| !v.is_empty())
+            };
+            items.push(PlistItem {
+                bundle_id: get("CFBundleIdentifier"),
+                short: get("CFBundleShortVersionString"),
+                bundle: get("CFBundleVersion"),
+            });
+        }
+        drop(scratch);
+        let mut out: Vec<String> = Vec::new();
+        match &rp.plist {
+            Some(block) => {
+                let Some(item) = items
+                    .iter()
+                    .find(|it| it.bundle_id.as_deref() == Some(block.bundle_id.as_str()))
+                else {
+                    return Found::Versions(out, None);
+                };
+                let value = match block.prop {
+                    PlistProp::Short => &item.short,
+                    PlistProp::Bundle => &item.bundle,
+                };
+                if let Some(value) = value {
+                    if block.regex {
+                        match &rp.re {
+                            Some(re) => out.extend(search_group1(re, value)),
+                            None => {
+                                return Found::Raised(
+                                    "no implicit conversion from nil to integer".to_string(),
+                                );
+                            }
+                        }
+                    } else {
+                        out.push(value.clone());
+                    }
+                }
+            }
+            None => {
+                for item in &items {
+                    if let Some(v) = item.version() {
+                        out.push(v);
+                    }
+                }
+            }
+        }
+        Found::Versions(out, None)
+    }
+
+    /// The first `<name>/Contents/Info.plist` under
+    /// `root` (directories walked in name order).
+    fn find_app_plist(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let mut entries: Vec<_> = std::fs::read_dir(&dir)
+                .ok()?
+                .filter_map(Result::ok)
+                .collect();
+            entries.sort_by_key(|e| e.file_name());
+            for entry in entries {
+                let path = entry.path();
+                if !entry.file_type().ok()?.is_dir() {
+                    continue;
+                }
+                if entry.file_name().to_str() == Some(name) {
+                    let plist = path.join("Contents").join("Info.plist");
+                    if plist.is_file() {
+                        return Some(plist);
+                    }
+                }
+                pending.push(path);
+            }
+        }
+        None
+    }
+
+    /// A plist document's top-level string fields, from
+    /// either encoding. `None` when unparsable.
+    fn plist_string_fields(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+        if bytes.starts_with(b"bplist00") {
+            bplist_string_fields(bytes)
+        } else {
+            xml_plist_string_fields(&String::from_utf8_lossy(bytes))
+        }
+    }
+
+    /// Top-level `<dict>` string entries of an XML plist
+    /// (nested containers are skipped structurally).
+    fn xml_plist_string_fields(text: &str) -> Option<Vec<(String, String)>> {
+        let start = text.find("<dict>")?;
+        let mut rest = &text[start + "<dict>".len()..];
+        let mut out: Vec<(String, String)> = Vec::new();
+        loop {
+            let key_open = rest.find("<key>")?;
+            let after_open = &rest[key_open + "<key>".len()..];
+            // The closing </dict> at depth zero ends the walk;
+            // a <key> found only inside a nested container is
+            // past a value element and handled by skipping.
+            let key_close = after_open.find("</key>")?;
+            let key = xml_text_unescape(after_open[..key_close].trim());
+            let mut value_at = &after_open[key_close + "</key>".len()..];
+            value_at = value_at.trim_start();
+            if let Some(s) = value_at.strip_prefix("<string>") {
+                let end = s.find("</string>")?;
+                out.push((key, xml_text_unescape(&s[..end])));
+                rest = &s[end + "</string>".len()..];
+            } else if let Some(s) = value_at.strip_prefix("<string/>") {
+                out.push((key, String::new()));
+                rest = s;
+            } else {
+                // Skip this value element (container or
+                // scalar) by tag-depth from its opening tag.
+                let tag_end = value_at.find('>')?;
+                let tag = &value_at[1..tag_end];
+                let tag_name = tag.split([' ', '/']).next().unwrap_or(tag);
+                if tag.ends_with('/') {
+                    rest = &value_at[tag_end + 1..];
+                    continue;
+                }
+                let close = format!("</{tag_name}>");
+                let mut depth = 1usize;
+                let mut scan = &value_at[tag_end + 1..];
+                loop {
+                    let open_at = scan.find(&format!("<{tag_name}"));
+                    let close_at = scan.find(&close)?;
+                    if open_at.is_some_and(|o| o < close_at) {
+                        depth += 1;
+                        scan = &scan[open_at.unwrap() + tag_name.len() + 1..];
+                    } else {
+                        depth -= 1;
+                        scan = &scan[close_at + close.len()..];
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                }
+                rest = scan;
+            }
+            if rest.trim_start().starts_with("</dict>") {
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    /// A decoded binary-plist value (only what the field
+    /// walk needs).
+    enum BVal {
+        Str(String),
+        Dict(Vec<(String, BVal)>),
+        Other,
+    }
+
+    /// Top-level string fields of a `bplist00` document.
+    /// All offsets are bounds-checked (downloaded data).
+    fn bplist_string_fields(bytes: &[u8]) -> Option<Vec<(String, String)>> {
+        fn be_uint(bytes: &[u8], at: usize, len: usize) -> Option<u64> {
+            let mut v: u64 = 0;
+            for i in 0..len {
+                v = v
+                    .checked_mul(256)?
+                    .checked_add(u64::from(*bytes.get(at.checked_add(i)?)?))?;
+            }
+            Some(v)
+        }
+        fn parse(
+            bytes: &[u8],
+            offsets: &[u64],
+            idx: usize,
+            ref_size: usize,
+            depth: usize,
+        ) -> Option<BVal> {
+            if depth > 64 {
+                return None;
+            }
+            let at = usize::try_from(*offsets.get(idx)?).ok()?;
+            let marker = *bytes.get(at)?;
+            let kind = marker >> 4;
+            let info = usize::from(marker & 0x0f);
+            let (len, mut pos) = if info == 0x0f {
+                let int_marker = *bytes.get(at + 1)?;
+                if int_marker >> 4 != 0x1 {
+                    return None;
+                }
+                let n = 1usize << (int_marker & 0x0f);
+                let v = be_uint(bytes, at + 2, n)?;
+                (usize::try_from(v).ok()?, at.checked_add(2 + n)?)
+            } else {
+                (info, at + 1)
+            };
+            match kind {
+                0x5 => {
+                    let raw = bytes.get(pos..pos.checked_add(len)?)?;
+                    Some(BVal::Str(
+                        raw.iter().map(|&b| b as char).collect::<String>(),
+                    ))
+                }
+                0x6 => {
+                    let raw = bytes.get(pos..pos.checked_add(len.checked_mul(2)?)?)?;
+                    let units: Vec<u16> = raw
+                        .chunks_exact(2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect();
+                    Some(BVal::Str(String::from_utf16_lossy(&units)))
+                }
+                0xA => {
+                    for _ in 0..len {
+                        let r = usize::try_from(be_uint(bytes, pos, ref_size)?).ok()?;
+                        pos += ref_size;
+                        parse(bytes, offsets, r, ref_size, depth + 1)?;
+                    }
+                    Some(BVal::Other)
+                }
+                0xD => {
+                    let mut keys = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        keys.push(usize::try_from(be_uint(bytes, pos, ref_size)?).ok()?);
+                        pos += ref_size;
+                    }
+                    let mut vals = Vec::with_capacity(len);
+                    for _ in 0..len {
+                        vals.push(usize::try_from(be_uint(bytes, pos, ref_size)?).ok()?);
+                        pos += ref_size;
+                    }
+                    let mut pairs = Vec::new();
+                    for (k, v) in keys.into_iter().zip(vals) {
+                        let BVal::Str(key) = parse(bytes, offsets, k, ref_size, depth + 1)? else {
+                            return None;
+                        };
+                        let val = parse(bytes, offsets, v, ref_size, depth + 1)?;
+                        pairs.push((key, val));
+                    }
+                    Some(BVal::Dict(pairs))
+                }
+                _ => Some(BVal::Other),
+            }
+        }
+        if bytes.len() < 32 {
+            return None;
+        }
+        let trailer = &bytes[bytes.len() - 32..];
+        let offset_size = usize::from(trailer[6]);
+        let ref_size = usize::from(trailer[7]);
+        let num_objects = usize::try_from(be_uint(trailer, 8, 8)?).ok()?;
+        let top = usize::try_from(be_uint(trailer, 16, 8)?).ok()?;
+        let table_at = usize::try_from(be_uint(trailer, 24, 8)?).ok()?;
+        if offset_size == 0 || ref_size == 0 || num_objects > 1_000_000 {
+            return None;
+        }
+        let mut offsets = Vec::with_capacity(num_objects);
+        for i in 0..num_objects {
+            offsets.push(be_uint(
+                bytes,
+                table_at.checked_add(i.checked_mul(offset_size)?)?,
+                offset_size,
+            )?);
+        }
+        let BVal::Dict(pairs) = parse(bytes, &offsets, top, ref_size, 0)? else {
+            return None;
+        };
+        Some(
+            pairs
+                .into_iter()
+                .filter_map(|(k, v)| match v {
+                    BVal::Str(s) => Some((k, s)),
+                    _ => None,
+                })
+                .collect(),
+        )
+    }
+
     /// `git ls-remote --tags` with brew's 20s timeout (the
     /// worker thread is detached on timeout; process exit
     /// does not wait for it).
@@ -20032,6 +20725,20 @@ mod livecheck {
         Found::Versions(versions, None)
     }
 
+    /// The raised text brew reports for a GitHub API
+    /// failure: a 404 is the bare exception class name
+    /// (its message is empty); other failures carry
+    /// brew's `GitHub API Error:` prefix over the
+    /// HTTP-level explanation.
+    fn github_api_error(error: &agh::Error) -> String {
+        match error.kind {
+            agh::Kind::NotFound | agh::Kind::NotVisible => {
+                "GitHub::API::HTTPNotFoundError".to_string()
+            }
+            _ => format!("GitHub API Error: {}", error.why),
+        }
+    }
+
     fn github_latest_versions(url: &str, re: &LcRegex) -> Found {
         github_latest_versions_with(url, re, |slug| github_client()?.releases(slug).latest())
     }
@@ -20056,7 +20763,7 @@ mod livecheck {
         };
         let slug = match agh::Slug::parse(&format!("{user}/{repo}")) {
             Ok(slug) => slug,
-            Err(error) => return Found::Raised(format!("GitHub API Error: {error}")),
+            Err(error) => return Found::Raised(github_api_error(&error)),
         };
         match read(&slug) {
             Ok(release) => {
@@ -20069,7 +20776,7 @@ mod livecheck {
                 }
                 Found::Versions(versions, None)
             }
-            Err(error) => Found::Raised(format!("GitHub API Error: {error}")),
+            Err(error) => Found::Raised(github_api_error(&error)),
         }
     }
 
@@ -20097,7 +20804,7 @@ mod livecheck {
         };
         let slug = match agh::Slug::parse(&format!("{user}/{repo}")) {
             Ok(slug) => slug,
-            Err(error) => return Found::Raised(format!("GitHub API Error: {error}")),
+            Err(error) => return Found::Raised(github_api_error(&error)),
         };
         match read(&slug) {
             Ok(releases) => {
@@ -20114,7 +20821,7 @@ mod livecheck {
                 }
                 Found::Versions(versions, None)
             }
-            Err(error) => Found::Raised(format!("GitHub API Error: {error}")),
+            Err(error) => Found::Raised(github_api_error(&error)),
         }
     }
 

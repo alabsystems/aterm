@@ -1227,7 +1227,7 @@ impl Then {
     }
 
     fn posted_by(&self, sid: &str) -> bool {
-        self.post().is_some_and(|post| post.sid == sid)
+        matches!(self, Then::Post(sent) if sent.posted_by(sid))
     }
 
     fn post(&self) -> Option<&QueuedPost> {
@@ -1240,8 +1240,7 @@ impl Then {
     /// Whether this is a post of `sid`'s in `identity`'s words (one pinned before identities,
     /// whatever its words).
     fn posted_in(&self, sid: &str, identity: &PublishIdentity) -> bool {
-        matches!(self, Then::Post(sent) if sent.post.sid == sid
-            && sent.pin.identity.as_ref().is_none_or(|words| words == identity))
+        matches!(self, Then::Post(sent) if sent.posted_in(sid, identity))
     }
 
     fn own_lane_post(&self) -> bool {
@@ -1250,7 +1249,7 @@ impl Then {
 
     /// Whether this is a post of `sid`'s no in-flight entry stands for.
     fn unjournaled_post_of(&self, sid: &str) -> bool {
-        matches!(self, Then::Post(sent) if !sent.journaled && sent.post.sid == sid)
+        matches!(self, Then::Post(sent) if sent.unjournaled_post_of(sid))
     }
 
     fn waiting_post(&self) -> bool {
@@ -1264,6 +1263,38 @@ struct SentPost {
     subject: String,
     pin: PublishPin,
     journaled: bool,
+}
+
+impl SentPost {
+    fn posted_by(&self, sid: &str) -> bool {
+        self.post.sid == sid
+    }
+
+    /// Whether this is a post of `sid`'s in `identity`'s words (one pinned before identities,
+    /// whatever its words).
+    fn posted_in(&self, sid: &str, identity: &PublishIdentity) -> bool {
+        self.post.sid == sid
+            && self
+                .pin
+                .identity
+                .as_ref()
+                .is_none_or(|words| words == identity)
+    }
+
+    /// Whether this is a post of `sid`'s no in-flight entry stands for.
+    fn unjournaled_post_of(&self, sid: &str) -> bool {
+        !self.journaled && self.post.sid == sid
+    }
+}
+
+/// A FRESH POST OF A DRAIN PASS'S GROUP (ATERM-KI-1111-5, [`Bridge::post_group`]): its pin made,
+/// neither its reservation nor its in-flight `entry` written yet, nothing sent. The group's
+/// flush ([`Bridge::flush_post_group`]) writes every reservation and then every entry in one
+/// append, and then sends the group's publishes in bursts, one write each.
+#[derive(Debug)]
+struct StagedPost {
+    sent: SentPost,
+    entry: InFlight,
 }
 
 /// A POST OR AN OWED RECEIPT THE BROKER LANDED at `off`, its bookkeeping owed (critic items E07
@@ -1563,6 +1594,25 @@ pub struct Bridge {
     /// The landed posts a pass has read and not yet settled, in the order their acks were read
     /// ([`Bridge::flush_landings`]).
     landings: Vec<Landing>,
+    /// THE FRESH OWN-LANE POSTS A DRAIN PASS HAS STAGED AND NOT YET SENT, in the drain's order
+    /// (ATERM-KI-1111-5, [`Bridge::stage_post`]): flushed ([`Bridge::flush_post_group`]) before
+    /// any blocking call, any hold and any send outside the group, and at the drain's end, so
+    /// the wire keeps the drain's order. Every check that reads what is owed counts them owed
+    /// ([`Bridge::owes_or_stages`]).
+    post_group: Vec<StagedPost>,
+    /// THE POSTS OF A GROUP BEING SENT THAT NO BURST HAS WRITTEN YET, in the drain's order
+    /// ([`Bridge::send_post_group`]): journaled, each with its in-flight entry, and neither owed
+    /// on the link nor staged. A refusal read before their burst drops the entries of its
+    /// sender's posts here ([`Bridge::unwritten_behind`]).
+    group_rest: std::collections::VecDeque<(SentPost, Vec<u8>)>,
+    /// Where a flush of a group of two posts or more stands, for the sim's count of the kills
+    /// that land inside one ([`Bridge::killed_inside_a_group`]): appended and nothing written yet.
+    #[cfg(test)]
+    group_appended: bool,
+    /// The sequences such groups wrote to the broker, for the same count: a kill while one is
+    /// owed its answer lands between the group's write and its acks.
+    #[cfg(test)]
+    grouped_seqs: BTreeSet<u64>,
     locals: BTreeMap<u64, String>,
     per_sid: PerSession,
     roster_due: Instant,
@@ -2170,6 +2220,12 @@ impl Bridge {
             rows_sent: Vec::new(),
             grouping: false,
             landings: Vec::new(),
+            post_group: Vec::new(),
+            group_rest: std::collections::VecDeque::new(),
+            #[cfg(test)]
+            group_appended: false,
+            #[cfg(test)]
+            grouped_seqs: BTreeSet::new(),
             locals: BTreeMap::new(),
             per_sid: PerSession::default(),
             roster_due: now + roster_refresh(),
@@ -2282,6 +2338,7 @@ impl Bridge {
     /// One request on the verb lane, every `deliver` line an inbox run queued sent ahead of it
     /// ([`Bridge::send_rows`]), so aterm reads the lane in the order the bridge decided it.
     fn ctl_request(&mut self, line: &str) -> io::Result<Reply> {
+        self.flush_post_group();
         self.send_rows();
         let started = self.waits.starts();
         let ctl = &mut self.ctl;
@@ -2663,6 +2720,7 @@ impl Bridge {
     }
 
     fn conn_now(&mut self) -> Option<&mut Conn> {
+        self.flush_post_group();
         self.settle_acks();
         self.lift_gap_fences();
         self.conn.as_mut().and_then(Link::ready)
@@ -2803,11 +2861,15 @@ impl Bridge {
     }
 
     fn settle_acks(&mut self) {
+        self.flush_post_group();
         let waiting = self.fx.now();
         self.grouped(|bridge| while bridge.settle_one(waiting) {});
     }
 
+    /// Read the oldest owed answer, waiting for it; a drain pass's staged group is sent first
+    /// ([`Bridge::flush_post_group`]), so a wait for what is owed waits for the group's posts too.
     fn settle_one(&mut self, waiting: Instant) -> bool {
+        self.flush_post_group();
         let reading = self.waits.ack_starts();
         let Some(settled) = self.conn.as_mut().and_then(Link::recv) else {
             return false;
@@ -3019,6 +3081,7 @@ impl Bridge {
     }
 
     fn send_pipelined(&mut self, seq: u64, subject: &str, body: &[u8], then: Then) {
+        self.flush_post_group();
         // HELD BEHIND THE BROKER'S RATE LIMIT: concluded unsent, as the broker would refuse it,
         // each kind kept for its retry (a post at its pin, an `ev` sent again, a presence row
         // republished), and nothing on the wire while the bucket is empty.
@@ -3066,9 +3129,13 @@ impl Bridge {
             body,
             tag: then,
         };
+        let post = matches!(publish.tag, Then::Post(_));
         let sent = link.send_burst(commit, vec![publish], started);
         if first && self.unsent == Some(seq) {
             self.unsent = None;
+        }
+        if post {
+            self.waits.count(crate::wait_tally::Row::PostsPerWrite, 1);
         }
         if let Err(unsent) = sent {
             let e = self.burst_unsent(started, unsent.error, unsent.commit);
@@ -6439,10 +6506,10 @@ impl Bridge {
         // tries to end again as a delivery's does) may yet be landed again by the replay, a cut
         // having given this copy up; a session that read this copy would then read its post or
         // answer twice. Until the entry ends, the fetch fails `unsettled`, and a later one reads
-        // the record. The sim's fetching world, seed 5434: a decision whose entry a full disk would
-        // not clear, fetched at @156, given up by a cut, landed again at @179 and handed to the
-        // asker. A fetched answer's deadline is not waited for as a delivery's is
-        // (ATERM-KI-1115-9210). NEGATIVE CONTROL: `Mutant::FetchPastAStandingEntry`.
+        // the record. The sim's fetching world, seed 5434 (found there; the control pins 94 since
+        // grouped sends moved the schedule): a decision whose entry a full disk would not clear,
+        // fetched at @156, given up by a cut, landed again at @179 and handed to the asker.
+        // NEGATIVE CONTROL: `Mutant::FetchPastAStandingEntry`.
         #[cfg(test)]
         let held = !self
             .fx
@@ -6461,7 +6528,32 @@ impl Bridge {
             Ok(Some(src)) => subject::InAddr { src, ..addr },
             Err(why) => return Err(why.into()),
         };
-        let (kind, demoted, _) = self.classify_delivery(&addr, &body);
+        let (kind, demoted, stray) = self.classify_delivery(&addr, &body);
+        // AN ANSWER, OR THIS NODE'S `expired`, IS FETCHED ONLY ONCE THE DEADLINE IT SETTLES IS
+        // OFF THE DISK (item F4, ATERM-KI-1115-9210), as a delivery hands one: a session that read
+        // the answer by its offset holds it, and a deadline left standing is expired by the
+        // sweep once retention gave the answer up, an `expired` after the answer the asker read.
+        // A refused write fails the fetch `unsettled`, and a later one reads the record.
+        // NEGATIVE CONTROL: `Mutant::FetchLeavesTheDeadline`.
+        #[cfg(test)]
+        let settles = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::FetchLeavesTheDeadline);
+        #[cfg(not(test))]
+        let settles = true;
+        let answers = body
+            .re
+            .filter(|_| !stray && ANSWER_KINDS.contains(&kind.as_str()));
+        let expiry = body
+            .re
+            .filter(|_| kind == WakeClass::Expired && addr.src == self.node);
+        if settles
+            && !answers
+                .or(expiry)
+                .is_none_or(|re| self.settle_deadline_for(&addr.sid, re))
+        {
+            return Err("unsettled".into());
+        }
         let trust = trust_of(&addr.src, body.via.is_some());
         let from = self.render_from(&addr, &body);
         let mut fields = format!("from={from} kind={kind} trust={trust}");
@@ -6774,7 +6866,7 @@ impl Bridge {
     ///    flight, the later ones' entries are dropped with an earlier one's refusal, ahead of it:
     ///    by 2 none of them lands, and their posts stay queued at their pins for the drain, which
     ///    sends them after the earlier one's retry, each read back first
-    ///    ([`Bridge::drop_behind_a_refused_post`]; C12s1's review). A stop between their drops
+    ///    ([`Bridge::drop_behind_a_failed_post`]; C12s1's review). A stop between their drops
     ///    and its own leaves the refused one's entry, which the replay publishes again before the
     ///    drain sends them.
     /// 4. A post to another lane is never journaled ([`Bridge::publish_journaled`]): no entry
@@ -7978,8 +8070,9 @@ impl Bridge {
     /// same. Dropped, it costs nothing an asker can miss: one that read the first copy has its
     /// verdict, and one that did not has the answer. The sim's asking world, seed 3752: `expired`
     /// at @26, the answer at @44, cuts to 45 and 59, the relaunch's read back refused below 27,
-    /// and the copy at @100. NEGATIVE CONTROL (`Mutant::ReplayRepostsAMootExpiry`): every such
-    /// verdict is published again at its pin.
+    /// and the copy at @100 (found there; the sim's row pins seed 974 since grouped sends moved
+    /// the schedule). NEGATIVE CONTROL (`Mutant::ReplayRepostsAMootExpiry`): every such verdict
+    /// is published again at its pin.
     fn expiry_moot(&mut self, subject: &str, re: Option<u64>) -> io::Result<bool> {
         #[cfg(test)]
         if self
@@ -8653,6 +8746,7 @@ impl Bridge {
             return;
         }
         let group = subject::inbox_group(&self.cfg.fleet, &self.node);
+        self.flush_post_group();
         let waiting = self.fx.now();
         while self
             .conn
@@ -11157,7 +11251,23 @@ impl Bridge {
     /// the same blocking calls can conclude an earlier post whose `outbox sent` meets aterm
     /// gone, so each send looks again after the last of them ([`Bridge::unsendable`]; a retry
     /// or a keyed post after the settle before its read back, in [`Bridge::drain_post`]).
+    ///
+    /// THE FRESH OWN-LANE POSTS A PASS REACHES GO OUT AS ONE GROUP (ATERM-KI-1111-5): each is
+    /// staged where its checks let it go ([`Bridge::stage_post`]), and the group is flushed
+    /// ([`Bridge::flush_post_group`]) before any blocking call, any hold and any send outside
+    /// it, and at the pass's end.
     fn drain_posts(
+        &mut self,
+        posts: Vec<QueuedPost>,
+        owed_at_peek: Option<&BTreeSet<(String, u64)>>,
+    ) -> bool {
+        let drained = self.drain_posts_staged(posts, owed_at_peek);
+        self.flush_post_group();
+        drained
+    }
+
+    /// [`Bridge::drain_posts`], its group left staged at its end.
+    fn drain_posts_staged(
         &mut self,
         posts: Vec<QueuedPost>,
         owed_at_peek: Option<&BTreeSet<(String, u64)>>,
@@ -11179,7 +11289,7 @@ impl Bridge {
                     .unverified
                     .holds(&post.sid, crate::unverified_hold::Domain::Posts, now)
             {
-                self.held_senders.insert(post.sid.clone());
+                self.hold_in_the_drain(&post.sid);
                 if rate_held || !self.post_landed_behind_an_unverifiable_hold(&post) {
                     continue;
                 }
@@ -11313,7 +11423,7 @@ impl Bridge {
                 if self.conn.is_none() {
                     return false;
                 }
-                self.held_senders.insert(post.sid.clone());
+                self.hold_in_the_drain(&post.sid);
                 return true;
             }
         };
@@ -11347,7 +11457,7 @@ impl Bridge {
                             "aterm-link: post {} reservation unreadable, left queued: {e}",
                             post.id
                         );
-                        self.held_senders.insert(post.sid.clone());
+                        self.hold_in_the_drain(&post.sid);
                         return true;
                     }
                 };
@@ -11374,6 +11484,11 @@ impl Bridge {
                 self.mirror_drained_post(&subject);
                 let fresh = existing_pin.is_none() && post.key.is_none();
                 let retry = existing_pin.is_some();
+                let staged = self.staged_refusal(&post.sid);
+                // A fresh post to one of this node's own lanes joins the pass's group: its pin is
+                // made here, and its reservation is written with the group's
+                // ([`Bridge::flush_post_group`]).
+                let groups = fresh && staged.is_none() && self.on_own_lane(&subject);
                 let reserved = (|| -> io::Result<PublishPin> {
                     if let Some(mut pin) = existing_pin {
                         if pin.via_key {
@@ -11459,7 +11574,12 @@ impl Bridge {
                             pin
                         }
                     };
-                    self.state.set_post_pin(&post.sid, post.id, &pin)?;
+                    if !groups {
+                        self.state.set_post_pin(&post.sid, post.id, &pin)?;
+                        if fresh {
+                            self.waits.count(crate::wait_tally::Row::PostsPerAppend, 1);
+                        }
+                    }
                     Ok(pin)
                 })();
                 let pin = match reserved {
@@ -11469,11 +11589,13 @@ impl Bridge {
                             "aterm-link: post {} reservation refused, left queued: {e}",
                             post.id
                         );
-                        self.held_senders.insert(post.sid.clone());
+                        self.hold_in_the_drain(&post.sid);
                         return true;
                     }
                 };
-                let staged = self.staged_refusal(&post.sid);
+                if groups {
+                    return self.stage_post(post, pin, subject, encoded);
+                }
                 if fresh && staged.is_none() {
                     return self.send_post(post, pin, subject, encoded);
                 }
@@ -11624,11 +11746,10 @@ impl Bridge {
             return self.conn.is_some();
         }
         let waiting = self.fx.now();
-        while self
-            .conn
-            .as_ref()
-            .is_some_and(|link| link.owed().any(|then| then.posted_in(sid, identity)))
-            && self.settle_one(waiting)
+        while self.owes_or_stages(
+            |then| then.posted_in(sid, identity),
+            |staged| staged.posted_in(sid, identity),
+        ) && self.settle_one(waiting)
         {}
         self.conn.is_some()
     }
@@ -11651,10 +11772,9 @@ impl Bridge {
         }
         if self.on_own_lane(subject) {
             let waiting = self.fx.now();
-            while self
-                .conn
-                .as_ref()
-                .is_some_and(|link| link.owed().any(|then| then.unjournaled_post_of(sid)))
+            // Only what the link owes: a staged post's entry is in its group's append
+            // ([`Bridge::flush_post_group`]), so none is a post no entry stands for.
+            while self.owes_or_stages(|then| then.unjournaled_post_of(sid), |_| false)
                 && self.settle_one(waiting)
             {}
         }
@@ -11684,15 +11804,59 @@ impl Bridge {
             .then(|| io::Error::other(format!("held behind a refused post of {sid}'s")))
     }
 
+    /// Before a post of `sid`'s, against a broker that does not gap-fence, read the answer to
+    /// every post of `sid`'s owed or staged in the pass's group: a sender has one post in flight
+    /// ([`Bridge::pipelines_posts`]). `false` once the connection is lost.
     fn settle_sender(&mut self, sid: &str) -> bool {
         let waiting = self.fx.now();
-        while self
-            .conn
-            .as_ref()
-            .is_some_and(|link| link.owed().any(|then| then.posted_by(sid)))
+        while self.owes_or_stages(|then| then.posted_by(sid), |staged| staged.posted_by(sid))
             && self.settle_one(waiting)
         {}
         self.conn.is_some()
+    }
+
+    /// Whether the link owes an answer to a write `owed` names, or the pass's group stages a
+    /// post `staged` names ([`Bridge::post_group`]): a staged post is not yet owed on the link,
+    /// but it is owed all the same, and a wait for it sends the group first
+    /// ([`Bridge::settle_one`]). With the link gone, nothing is: the group is never sent.
+    /// NEGATIVE CONTROL (`Mutant::GroupedPostsUnowed`): the group's posts are not counted.
+    fn owes_or_stages(
+        &self,
+        owed: impl Fn(&Then) -> bool,
+        staged: impl Fn(&SentPost) -> bool,
+    ) -> bool {
+        let Some(link) = self.conn.as_ref() else {
+            return false;
+        };
+        #[cfg(test)]
+        let counted = !self
+            .fx
+            .mutant(crate::sim::world::Mutant::GroupedPostsUnowed);
+        #[cfg(not(test))]
+        let counted = true;
+        link.owed().any(owed) || (counted && self.post_group.iter().any(|s| staged(&s.sent)))
+    }
+
+    /// Whether the one-post-in-flight assertion stands down: only under
+    /// `Mutant::GroupedPostsUnowed`, so the sim's order and duplicate oracles, not the
+    /// assertion, judge what the mutant sends.
+    fn one_in_flight_unchecked(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.fx
+                .mutant(crate::sim::world::Mutant::GroupedPostsUnowed)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// A hold the drain sets on `sid`, the pass's group sent first ([`Bridge::flush_post_group`]):
+    /// a post of `sid`'s staged ahead of it goes out as it would have, alone, before the hold.
+    fn hold_in_the_drain(&mut self, sid: &str) {
+        self.flush_post_group();
+        self.held_senders.insert(sid.to_string());
     }
 
     fn send_post(
@@ -11702,8 +11866,10 @@ impl Bridge {
         subject: String,
         encoded: Vec<u8>,
     ) -> bool {
+        self.flush_post_group();
         debug_assert!(
             self.pipelines_posts()
+                || self.one_in_flight_unchecked()
                 || !self
                     .conn
                     .as_ref()
@@ -11743,6 +11909,267 @@ impl Bridge {
                 .note(crate::wait_tally::Row::PostPublish, self.post_event);
         }
         true
+    }
+
+    /// STAGE A FRESH POST TO ONE OF THIS NODE'S OWN LANES in the pass's group
+    /// (ATERM-KI-1111-5, [`Bridge::post_group`]), its pin made and nothing written: its
+    /// reservation and its in-flight entry are written with the group's, and its publish sent
+    /// in the group's bursts ([`Bridge::flush_post_group`]). It counts as opening its subject
+    /// now, so the next post's budget reads it ([`Bridge::count_opening`]). `false` once the
+    /// link is lost: nothing was reserved, and the post stays queued for a later drain.
+    fn stage_post(
+        &mut self,
+        post: QueuedPost,
+        pin: PublishPin,
+        subject: String,
+        encoded: Vec<u8>,
+    ) -> bool {
+        debug_assert!(
+            self.pipelines_posts()
+                || self.one_in_flight_unchecked()
+                || !self.owes_or_stages(
+                    |then| then.posted_by(&post.sid),
+                    |staged| { staged.posted_by(&post.sid) }
+                ),
+            "one pipelined post in flight per sender against a broker that does not gap-fence \
+             ({})",
+            post.sid
+        );
+        let Some(log) = self.conn.as_ref().map(|conn| conn.seen_log_identity()) else {
+            self.hold_in_the_drain(&post.sid);
+            return false;
+        };
+        let entry = InFlight {
+            pin: pin.clone(),
+            subject: subject.clone(),
+            body: encoded,
+            log,
+            at: Some(self.bus_high),
+        };
+        self.note_remote_lane(&subject);
+        self.count_opening(&subject);
+        self.post_group.push(StagedPost {
+            sent: SentPost {
+                post,
+                subject,
+                pin,
+                journaled: true,
+            },
+            entry,
+        });
+        true
+    }
+
+    /// SEND THE PASS'S GROUP (ATERM-KI-1111-5, [`Bridge::post_group`]), staged in the drain's
+    /// order: every post's reservation, then every post's in-flight entry, in one append of the
+    /// post journal ([`StateDir::stage_posts`]), and only then its publishes, in bursts of one
+    /// write each ([`Link::send_burst`]), each as many as the room left under
+    /// [`PIPELINE_WINDOW`] holds, the held inbox commit ahead of the first, as the mirror's
+    /// bursts go ([`Bridge::mirror_send`]). So a post's reservation and entry are on the
+    /// journal, in order, before its publish can reach the broker, as they were for a post
+    /// sent alone, and a kill anywhere leaves what a kill between one post's writes left: no
+    /// reservation (the post is drained afresh), reservations and no entry (retried at its pin,
+    /// read back first), or entries the attach's replay publishes at their pins, a prefix of the
+    /// group in its order, less the entries of the posts no burst had written behind an earlier
+    /// post of their sender's whose failure was concluded ([`Bridge::unwritten_behind`]).
+    /// Before each burst the answers above its lowest sequence are read on
+    /// a broker that gap-fences, the window waited on, the fences lifted and the rate limit
+    /// read, as for a post sent alone ([`Bridge::send_pipelined`]); a post whose sender an
+    /// answer read there held, or every post once aterm is gone, is concluded unsent, its entry
+    /// dropped. With the link gone or aterm gone before the append, nothing is written: the
+    /// group's posts stay queued, their senders held for the pass. An append the disk refuses
+    /// leaves them so too, as a refused reservation leaves a post. NEGATIVE CONTROL
+    /// (`Mutant::GroupSentAheadOfItsAppend`): the publishes go out first.
+    fn flush_post_group(&mut self) {
+        if self.post_group.is_empty() {
+            return;
+        }
+        let group = std::mem::take(&mut self.post_group);
+        if self
+            .unsent
+            .is_some_and(|seq| group.iter().any(|staged| staged.sent.pin.seq == seq))
+        {
+            self.unsent = None;
+        }
+        if self.conn.is_none() || self.aterm_gone() {
+            for staged in &group {
+                self.held_senders.insert(staged.sent.post.sid.clone());
+            }
+            return;
+        }
+        let reserves: Vec<(String, u64, PublishPin)> = group
+            .iter()
+            .map(|staged| {
+                let post = &staged.sent.post;
+                (post.sid.clone(), post.id, staged.sent.pin.clone())
+            })
+            .collect();
+        let entries: Vec<InFlight> = group.iter().map(|staged| staged.entry.clone()).collect();
+        let n = group.len() as u64;
+        let append = |bridge: &mut Self| {
+            let reserves: Vec<(&str, u64, &PublishPin)> = reserves
+                .iter()
+                .map(|(sid, id, pin)| (sid.as_str(), *id, pin))
+                .collect();
+            let appended = bridge.state.stage_posts(&reserves, &entries);
+            if appended.is_ok() {
+                bridge
+                    .waits
+                    .count(crate::wait_tally::Row::PostsPerAppend, n);
+            }
+            appended
+        };
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::GroupSentAheadOfItsAppend)
+        {
+            self.send_post_group(group);
+            let _ = append(self);
+            return;
+        }
+        let appended = append(self);
+        if let Err(e) = appended {
+            for staged in &group {
+                stderr_line!(
+                    "aterm-link: post {} reservation refused, left queued: {e}",
+                    staged.sent.post.id
+                );
+                self.held_senders.insert(staged.sent.post.sid.clone());
+            }
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.group_appended = group.len() > 1;
+        }
+        self.send_post_group(group);
+        // However the send ended (a write, a rate hold, the link lost, every post concluded
+        // unsent), no kill after it is inside this group.
+        #[cfg(test)]
+        {
+            self.group_appended = false;
+        }
+    }
+
+    /// The group's publishes, journaled, in bursts ([`Bridge::flush_post_group`]). The posts no
+    /// burst has written yet wait in [`Bridge::group_rest`], where a refusal an answer read
+    /// before their burst concludes finds them ([`Bridge::unwritten_behind`]).
+    fn send_post_group(&mut self, group: Vec<StagedPost>) {
+        debug_assert!(self.group_rest.is_empty(), "one group sent at a time");
+        self.group_rest = group
+            .into_iter()
+            .map(|staged| (staged.sent, staged.entry.body))
+            .collect();
+        while let Some(lowest) = self.group_rest.iter().map(|(sent, _)| sent.pin.seq).min() {
+            // HELD BEHIND THE BROKER'S RATE LIMIT, as a post sent alone is
+            // ([`Bridge::send_pipelined`]).
+            if let Some(left) = self.rate_held() {
+                return self.conclude_group_rest(&|| crate::rate_hold::held(left));
+            }
+            self.settle_above(lowest);
+            let waiting = self.fx.now();
+            while self
+                .conn
+                .as_ref()
+                .is_some_and(|link| link.unacked() >= PIPELINE_WINDOW)
+                && self.settle_one(waiting)
+            {}
+            self.lift_gap_fences();
+            if let Some(left) = self.rate_held() {
+                return self.conclude_group_rest(&|| crate::rate_hold::held(left));
+            }
+            let Some(room) = self
+                .conn
+                .as_ref()
+                .map(|link| PIPELINE_WINDOW.saturating_sub(link.unacked()).max(1))
+            else {
+                return self.conclude_group_rest(&|| unsent(broker_unreachable()));
+            };
+            let mut burst = Vec::new();
+            while burst.len() < room {
+                let Some((sent, body)) = self.group_rest.pop_front() else {
+                    break;
+                };
+                match self.unsendable(&sent.post.sid) {
+                    Some(e) => self.conclude(Then::Post(Box::new(sent)), Err(unsent(e))),
+                    None => burst.push((sent, body)),
+                }
+            }
+            if burst.is_empty() {
+                continue;
+            }
+            let held = self
+                .take_held_commit()
+                .map(|upto| (upto, subject::inbox_group(&self.cfg.fleet, &self.node)));
+            if held.is_some() && burst.len() > 1 && burst.len() + 1 > room {
+                if let Some(last) = burst.pop() {
+                    self.group_rest.push_front(last);
+                }
+            }
+            let (retry, producer_id) = (self.commit_refused, self.producer_id);
+            let started = self.fx.now();
+            let Some(link) = self.conn.as_mut() else {
+                for sent in burst.into_iter().rev() {
+                    self.group_rest.push_front(sent);
+                }
+                return self.conclude_group_rest(&|| unsent(broker_unreachable()));
+            };
+            let commit = held.as_ref().map(|(upto, group)| HeldCommit {
+                group,
+                upto: *upto,
+                tag: Then::Commit { upto: *upto, retry },
+            });
+            let n = burst.len() as u64;
+            #[cfg(test)]
+            if n > 1 {
+                self.grouped_seqs
+                    .extend(burst.iter().map(|(sent, _)| sent.pin.seq));
+            }
+            let (sents, bodies): (Vec<SentPost>, Vec<Vec<u8>>) = burst.into_iter().unzip();
+            let faces: Vec<String> = sents.iter().map(|sent| sent.subject.clone()).collect();
+            let publishes = sents
+                .into_iter()
+                .zip(faces.iter().zip(&bodies))
+                .map(|(sent, (face, body))| Publish {
+                    producer_id,
+                    seq: sent.pin.seq,
+                    first: true,
+                    subject: face,
+                    body,
+                    tag: Then::Post(Box::new(sent)),
+                })
+                .collect();
+            let written = link.send_burst(commit, publishes, started);
+            #[cfg(test)]
+            {
+                self.group_appended = false;
+            }
+            self.waits.count(crate::wait_tally::Row::PostsPerWrite, n);
+            if let Err(unsent) = written {
+                let e = self.burst_unsent(started, unsent.error, unsent.commit);
+                for then in unsent.tags {
+                    self.conclude(then, Err(io::Error::new(e.kind(), e.to_string())));
+                }
+                continue;
+            }
+            if self.post_event.is_some() {
+                for _ in 0..n {
+                    self.waits
+                        .note(crate::wait_tally::Row::PostPublish, self.post_event);
+                }
+            }
+        }
+        if !self.in_round && self.ack_batch == 0 {
+            self.settle_acks();
+        }
+    }
+
+    /// Every post of the group no burst wrote, concluded `e` ([`Bridge::send_post_group`]).
+    fn conclude_group_rest(&mut self, e: &dyn Fn() -> io::Error) {
+        while let Some((sent, _)) = self.group_rest.pop_front() {
+            self.conclude(Then::Post(Box::new(sent)), Err(e()));
+        }
     }
 
     fn follow(&mut self, sid: &str, next: PostNext) -> bool {
@@ -11786,7 +12213,7 @@ impl Bridge {
         let unsent = self.unsent.take();
         let record = self.group_record.take();
         if journaled && !self.fate_unknown(&e) {
-            self.drop_behind_a_refused_post(&post.sid, pin.seq, &e);
+            self.drop_behind_a_failed_post(&post.sid, pin.seq, &e);
             self.drop_in_flight(pin.seq);
         }
         let next = self.post_refused(&post, &subject, pin.seq, e);
@@ -11797,41 +12224,25 @@ impl Bridge {
         self.group_record = record;
     }
 
-    /// THE LATER POSTS OF A REFUSED POST'S SENDER LEAVE THE IN-FLIGHT JOURNAL WITH IT, ahead of
-    /// its own entry, on a link that gap-fences ([`Link::gap_fences`]): the broker refused the
-    /// post at `seq`, so its fence refuses every write of this producer above `seq` that the link
-    /// sent after it (`gap-fenced=`), and the fence is lifted only once their answers are read
-    /// ([`Bridge::lift_gap_fences`]): none of them lands. Their answers, still owed, conclude
-    /// them as ever. Left in the journal, an entry whose answer a kill or a lost link leaves
-    /// unread would be published by the attach's replay ([`Bridge::settle_in_flight`]) ahead of
-    /// the refused post's retry, which the drain sends first (C12s1's review). Against any other
-    /// broker a sender has one post in flight, and none is owed after it.
-    ///
-    /// HIGHEST SEQUENCE FIRST: each drop is its own write, so a stop between two leaves the
-    /// lower entries standing and the higher ones dropped, never the other way round. The
-    /// replay publishes what stands ahead of the drain's sends of what was dropped, so the
-    /// sender's order holds either way. Lowest first, a kill after the first drop left the later
-    /// entries for the replay to publish ahead of the dropped post's send from the drain (the
-    /// sim's windowed world, seed 56 at 1200 steps: #7's entry dropped, #8 to #11 replayed at
-    /// @553 to @556, #7 sent at @560; ATERM-KI-1114-56).
-    fn drop_behind_a_refused_post(&mut self, sid: &str, seq: u64, e: &io::Error) {
-        if astream_broker::broker_refusal(e).is_none() {
-            return;
-        }
-        let Some(link) = self.conn.as_ref().filter(|link| link.gap_fences()) else {
-            return;
-        };
-        let mut behind: Vec<u64> = link
-            .owed()
-            .filter_map(|then| match then {
-                Then::Post(sent)
-                    if sent.journaled && sent.post.sid == sid && sent.pin.seq > seq =>
-                {
-                    Some(sent.pin.seq)
-                }
-                _ => None,
-            })
-            .collect();
+    /// THE LATER ENTRIES OF A FAILED POST'S SENDER LEAVE THE IN-FLIGHT JOURNAL AHEAD OF ITS OWN,
+    /// HIGHEST SEQUENCE FIRST: those of its group no burst wrote yet
+    /// ([`Bridge::unwritten_behind`]) and, on a link that gap-fences, those the broker's fence
+    /// refuses behind a refusal ([`Bridge::fenced_behind_a_refused_post`]), in one descending
+    /// order. Each drop is its own write, so a stop between two leaves the lower entries standing
+    /// and the higher ones dropped, never the other way round. The replay publishes what stands
+    /// ahead of the drain's sends of what was dropped, so the sender's order holds either way.
+    /// Lowest first, a kill after the first drop left the later entries for the replay to publish
+    /// ahead of the dropped post's send from the drain (ATERM-KI-1114-56: the sim's windowed
+    /// world, seed 56 at 1200 steps, where #7's entry was dropped, #8 to #11 replayed at @553 to
+    /// @556 and #7 sent at @560; seed 8988 since the grouped post send). An unwritten post's
+    /// sequence lies above every written one of its sender's in its group, so the group's are
+    /// dropped first. NEGATIVE CONTROL (`Mutant::DropBehindLowestFirst`, which reverses the whole
+    /// order): that found seed, and for the group's part
+    /// `a_failures_unwritten_group_entries_are_dropped_highest_first`, whose every cut of the
+    /// journal leaves a sender's lowest entries standing.
+    fn drop_behind_a_failed_post(&mut self, sid: &str, seq: u64, e: &io::Error) {
+        let mut behind = self.unwritten_behind(sid, seq);
+        behind.extend(self.fenced_behind_a_refused_post(sid, seq, e));
         behind.sort_unstable_by(|a, b| b.cmp(a));
         #[cfg(test)]
         if self
@@ -11843,6 +12254,64 @@ impl Bridge {
         for later in behind {
             self.drop_in_flight(later);
         }
+    }
+
+    /// THE LATER POSTS OF A FAILED POST'S SENDER THAT NO BURST OF ITS GROUP HAS WRITTEN YET
+    /// LEAVE THE IN-FLIGHT JOURNAL WITH IT, ahead of its own entry ([`Bridge::group_rest`]): the
+    /// group's append journaled their entries, and an answer read before their burst (a settle
+    /// above its lowest sequence, a full window's, a lifted fence's) concluded the post at `seq`
+    /// with its entry dropped and its pin kept. Left standing until the burst loop reached them,
+    /// their entries would outlive a kill in between (the failure's ctl request, the fences'
+    /// lift), and the attach's replay would land them ahead of that post's retry (KI-1111-5's
+    /// review). Each is marked unjournaled here and its sequence returned for
+    /// [`Bridge::drop_behind_a_failed_post`] to drop; each is sent, if its sender is not held, as
+    /// a post with no entry: a kill after its write leaves its reservation, retried at its pin and
+    /// read back first. NEGATIVE CONTROL (`Mutant::UnwrittenGroupKeepsItsEntries`).
+    fn unwritten_behind(&mut self, sid: &str, seq: u64) -> Vec<u64> {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::UnwrittenGroupKeepsItsEntries)
+        {
+            return Vec::new();
+        }
+        self.group_rest
+            .iter_mut()
+            .filter(|(sent, _)| sent.journaled && sent.post.sid == sid && sent.pin.seq > seq)
+            .map(|(sent, _)| {
+                sent.journaled = false;
+                sent.pin.seq
+            })
+            .collect()
+    }
+
+    /// THE LATER POSTS OF A REFUSED POST'S SENDER THAT THE LINK OWES, on a link that gap-fences
+    /// ([`Link::gap_fences`]), for [`Bridge::drop_behind_a_failed_post`] to drop ahead of its own
+    /// entry: the broker refused the post at `seq`, so its fence refuses every write of this
+    /// producer above `seq` that the link sent after it (`gap-fenced=`), and the fence is lifted
+    /// only once their answers are read ([`Bridge::lift_gap_fences`]): none of them lands. Their
+    /// answers, still owed, conclude them as ever. Left in the journal, an entry whose answer a
+    /// kill or a lost link leaves unread would be published by the attach's replay
+    /// ([`Bridge::settle_in_flight`]) ahead of the refused post's retry, which the drain sends
+    /// first (C12s1's review). Against any other broker a sender has one post in flight, and none
+    /// is owed after it.
+    fn fenced_behind_a_refused_post(&self, sid: &str, seq: u64, e: &io::Error) -> Vec<u64> {
+        if astream_broker::broker_refusal(e).is_none() {
+            return Vec::new();
+        }
+        let Some(link) = self.conn.as_ref().filter(|link| link.gap_fences()) else {
+            return Vec::new();
+        };
+        link.owed()
+            .filter_map(|then| match then {
+                Then::Post(sent)
+                    if sent.journaled && sent.post.sid == sid && sent.pin.seq > seq =>
+                {
+                    Some(sent.pin.seq)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// A held post's retry landed at `off`: where this bridge already delivered that ask's answer
@@ -15051,6 +15520,19 @@ impl Bridge {
     /// ([`Bridge::hold_inbox_commit`]).
     pub(crate) fn holds_inbox_commit(&self) -> bool {
         self.commit_held.is_some()
+    }
+
+    /// Where a kill now lands in a drain's group of two posts or more (ATERM-KI-1111-5,
+    /// [`Bridge::flush_post_group`]): `(true, _)` between the group's append and its first
+    /// write, `(_, true)` between a write of its posts and their acks.
+    #[cfg(test)]
+    pub(crate) fn killed_inside_a_group(&self) -> (bool, bool) {
+        let unacked = self.conn.as_ref().is_some_and(|link| {
+            link.owed().any(|then| {
+                matches!(then, Then::Post(sent) if self.grouped_seqs.contains(&sent.pin.seq))
+            })
+        });
+        (self.group_appended, unacked)
     }
 
     /// Disables broker log-lineage verification on attach for negative-control testing.

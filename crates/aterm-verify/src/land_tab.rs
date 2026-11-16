@@ -90,6 +90,9 @@ pub fn task(root: &Path, words: &[String], head: &str) -> String {
     )
 }
 
+/// What [`start`] runs `aterm ctl` with: its words and standard input in, its stdout and stderr out.
+pub type Ctl<'a> = dyn FnMut(&[String], &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)> + 'a;
+
 /// Ask for the worker that lands `head`, the checkout's HEAD. `env` reads this process's
 /// environment, whose `ATERM_PARENT_SESSION_ID` names the aterm session this shell runs in, the
 /// one `aterm ctl @self` addresses. `ctl` runs `aterm ctl` with its words and its standard input
@@ -100,7 +103,7 @@ pub fn start(
     words: &[String],
     head: &str,
     env: &dyn Fn(&str) -> Option<String>,
-    ctl: &mut dyn FnMut(&[String], &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)>,
+    ctl: &mut Ctl<'_>,
 ) -> Start {
     if env(aterm_types::domain::ENV_PARENT_SESSION_ID).is_none_or(|sid| sid.is_empty()) {
         return Start::Here("this shell runs in no aterm session".to_owned());

@@ -1086,10 +1086,15 @@ fn each_session_names_the_account_its_login_record_names() {
 }
 
 /// A STOPPED TOKEN STEP IS SHOWN ON DEMAND WHILE ITS RECORD HOLDS (FL-136): the report's line
-/// says when, what stopped it and what tries it again, its JSON carries the word and when, and
-/// neither names a host; a record a later token released is not shown.
+/// says when, what stopped it and what tries it again (for a check, only a person's act), its
+/// JSON carries the word and when, and neither names a host; a check's record stands through a
+/// new Claude Code build and through a token made after it (another Mac's: it says nothing of
+/// the page this Mac met), and a record of any other stop a later token released is not shown.
 /// NEGATIVE CONTROL: with `held_steps` keeping every record, the account whose token was made
-/// after its stop still shows it: `` a released record was shown ``.
+/// after its stop still shows it: `` a released record was shown ``; with `Stopped::holds`
+/// reading a check's word as any other's, `` a new build released a check's record ``; with it
+/// letting a later token end a check's hold (the merge's form), `` a later token released a
+/// check's record ``.
 #[test]
 fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     use crate::harness::open_url::MetWord;
@@ -1121,9 +1126,9 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     assert!(
         text.contains(
             "\n    token step: stopped 2027-01-15: the consent page held Authorize behind a \
-             human check; it is tried again only at the account's next sign-in in aterm's \
-             sign-in window or on its headless browser profile, with a new Claude Code or aterm \
-             build, or by `aterm harness accounts token work`"
+             human check; it is tried again only by a person at a terminal on this Mac, who \
+             meets the check in aterm's sign-in window: at their own sign-in of the account \
+             there, or by `aterm harness accounts token work`"
         ),
         "{text}"
     );
@@ -1134,15 +1139,19 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
         Value::from("window-human-check")
     );
     assert_eq!(json["accounts"][0]["step"]["at"], Value::from(NOW));
-    // A new Claude Code build releases it, and so does a token made after the stop.
-    assert!(
+    // A new Claude Code build does not release a check's record; a token made after the stop
+    // does.
+    assert_eq!(
         held_steps(
             &store,
             std::slice::from_ref(&none),
             (None, &|_| None),
             || { Some("2.1.319".to_owned()) }
         )
-        .is_empty()
+        .stopped
+        .get(KEY),
+        Some(&step),
+        "a new build released a check's record"
     );
     let made = account(
         covered(LoginHalf::Ok),
@@ -1154,6 +1163,24 @@ fn a_stopped_token_step_is_shown_on_demand_while_its_record_holds() {
     let mut later = step.clone();
     later.at = NOW - 2 * DAY;
     token_steps::put(&store, KEY, Some(&later)).unwrap();
+    assert_eq!(
+        held_steps(
+            &store,
+            std::slice::from_ref(&made),
+            (None, &|_| None),
+            || None
+        )
+        .stopped
+        .get(KEY),
+        Some(&later),
+        "a later token released a check's record"
+    );
+    // The same token releases the record of a stop no check made.
+    token_steps::put(&store, KEY, None).unwrap();
+    let mut other =
+        Stopped::new(MetWord::WindowWrongAccount, NOW, "2.1.318", "").expect("a record");
+    other.at = NOW - 2 * DAY;
+    token_steps::put(&store, KEY, Some(&other)).unwrap();
     assert!(
         held_steps(
             &store,

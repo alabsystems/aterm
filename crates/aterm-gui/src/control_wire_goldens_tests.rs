@@ -8,8 +8,7 @@ use std::time::Instant;
 
 use super::control_session::{cmd_exits, cmd_timeline};
 use crate::session_store::{
-    ExitActor, ExitReason, SessionHandle, SessionHandoff, SessionState, SessionStore, new_store,
-    test_handle,
+    ExitActor, ExitReason, SessionHandle, SessionHandoff, SessionState, new_store, test_handle,
 };
 use crate::task_record::{TaskMark, TaskState};
 
@@ -261,60 +260,107 @@ fn mask_sids(text: &str, sids: &[String]) -> String {
     out
 }
 
+/// The ids of the rows of `store`'s session table, oldest first.
+fn exit_ids(store: &crate::session_store::Store) -> Vec<u64> {
+    let table = store.read().unwrap_or_else(|p| p.into_inner()).table();
+    assert!(table.loaded_within(std::time::Duration::from_secs(60)));
+    table
+        .exits_since(0)
+        .expect("loaded")
+        .iter()
+        .map(|head| head.id)
+        .collect()
+}
+
+/// `exit <id> ` as `exit <idK> `, `ids` naming each row's id in order: an id is its end's unix µs.
+fn mask_ids(text: &str, ids: &[u64]) -> String {
+    let mut out = text.to_string();
+    for (k, id) in ids.iter().enumerate() {
+        out = out.replace(&format!("exit {id} "), &format!("exit <id{k}> "));
+    }
+    out
+}
+
+/// Close session `local` of `store` as a tab's close does, leaving its row (ST-15).
+fn close(store: &crate::session_store::Store, local: u64, reason: ExitReason, actor: ExitActor) {
+    crate::session_table::close_leaving_row(store, local, reason, actor).expect("a close");
+}
+
 fn exits_text(plant: bool) -> String {
     let store = new_store();
     let mut sids = Vec::new();
-    {
-        let mut g = store.write().unwrap_or_else(|p| p.into_inner());
-        for (i, reason) in ExitReason::ALL.iter().enumerate() {
-            let local = i as u64 + 10;
-            let h = test_handle(local);
-            sids.push(h.sid.as_str().to_string());
+    for (i, reason) in ExitReason::ALL.iter().enumerate() {
+        let local = i as u64 + 10;
+        let h = test_handle(local);
+        sids.push(h.sid.as_str().to_string());
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
             g.register(h);
-            let driver = if plant { "s-drivex" } else { "s-driver" };
-            let actor = match i % 5 {
-                0 => ExitActor::Sid(format!("{driver}{i}")),
-                1 => ExitActor::Human,
-                2 => ExitActor::Ctl,
-                3 => ExitActor::Bridge,
-                _ => ExitActor::Unknown,
-            };
             if i % 2 == 0 {
                 g.note_exit_code(local, Some(i32::try_from(i).unwrap_or(0)));
             }
-            g.deregister_local_as(local, *reason, actor);
         }
+        let driver = if plant { "s-drivex" } else { "s-driver" };
+        let actor = match i % 5 {
+            0 => ExitActor::Sid(format!("{driver}{i}")),
+            1 => ExitActor::Human,
+            2 => ExitActor::Ctl,
+            3 => ExitActor::Bridge,
+            _ => ExitActor::Unknown,
+        };
+        close(&store, local, *reason, actor);
     }
+    let ids = exit_ids(&store);
     let mut out = String::new();
-    for rest in ["", "2", "since=4", "since=x"] {
-        out.push_str(&format!("> exits {rest}\n"));
-        out.push_str(&cmd_exits(&store, rest, &[]));
+    for (shown, rest) in [
+        ("", String::new()),
+        ("2", "2".to_owned()),
+        ("since=<id1>", format!("since={}", ids[1])),
+        ("since=x", "since=x".to_owned()),
+    ] {
+        out.push_str(&format!("> exits {shown}\n"));
+        out.push_str(&mask_ids(&cmd_exits(&store, &rest, &[]), &ids));
     }
-    let mut producer = SessionStore::default();
+    // A handoff: the successor's table reads the rows the producer's left in the same folder.
+    let rows = aterm_tempfile::tempdir().expect("the table's folder");
+    let producer = new_store();
+    crate::session_table::SessionTable::at(rows.path().to_path_buf()).serve(&producer);
     for local in 1..=3 {
         let h = test_handle(local);
         sids.push(h.sid.as_str().to_string());
-        producer.register(h);
+        producer
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(h);
     }
-    producer.deregister_local_as(3, ExitReason::ShellExit, ExitActor::Human);
-    let manifest = SessionHandoff::from_store(&producer);
+    close(&producer, 3, ExitReason::ShellExit, ExitActor::Human);
+    let producer_table = producer.read().unwrap_or_else(|p| p.into_inner()).table();
+    assert!(producer_table.flush());
+    drop(producer_table);
+    let manifest = SessionHandoff::from_store(&producer.read().unwrap_or_else(|p| p.into_inner()));
+    drop(producer);
     let read =
         SessionHandoff::from_toml(&manifest.to_toml().expect("a manifest")).expect("it reads");
     let successor = new_store();
-    {
-        let mut g = successor.write().unwrap_or_else(|p| p.into_inner());
-        g.continue_roster_seq(read.roster_seq.expect("the producer's count"));
-        for rec in &read.sessions {
-            let h = test_handle(rec.local_id);
-            sids.push(h.sid.as_str().to_string());
-            g.register(h);
-        }
-        g.deregister_local_as(1, ExitReason::UiClose, ExitActor::Human);
-        g.deregister_local_as(2, ExitReason::WindowClose, ExitActor::Ctl);
+    crate::session_table::SessionTable::at(rows.path().to_path_buf()).serve(&successor);
+    for rec in &read.sessions {
+        let h = test_handle(rec.local_id);
+        sids.push(h.sid.as_str().to_string());
+        successor
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .register(h);
     }
-    for rest in ["", "since=4", "1"] {
-        out.push_str(&format!("> successor exits {rest}\n"));
-        out.push_str(&cmd_exits(&successor, rest, &[]));
+    close(&successor, 1, ExitReason::UiClose, ExitActor::Human);
+    close(&successor, 2, ExitReason::WindowClose, ExitActor::Ctl);
+    let ids = exit_ids(&successor);
+    for (shown, rest) in [
+        ("", String::new()),
+        ("since=<id0>", format!("since={}", ids[0])),
+        ("1", "1".to_owned()),
+    ] {
+        out.push_str(&format!("> successor exits {shown}\n"));
+        out.push_str(&mask_ids(&cmd_exits(&successor, &rest, &[]), &ids));
     }
     mask_sids(&mask_t(&out), &sids)
 }
@@ -322,37 +368,38 @@ fn exits_text(plant: bool) -> String {
 const EXITS_GOLDEN: &str = concat!(
     "> exits \n",
     "OK 7\n",
-    "exit 2 t=* sid=<sid0> local=10 reason=shell-exit exit_code=0 by=s-driver0 left=-\n",
-    "exit 4 t=* sid=<sid1> local=11 reason=ctl-close exit_code=- by=human left=-\n",
-    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
-    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
-    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
-    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
+    "exit <id0> t=* sid=<sid0> local=10 reason=shell-exit exit_code=0 by=s-driver0 left=-\n",
+    "exit <id1> t=* sid=<sid1> local=11 reason=ctl-close exit_code=- by=human left=-\n",
+    "exit <id2> t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
+    "exit <id3> t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
+    "exit <id4> t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
+    "exit <id5> t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit <id6> t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
     "> exits 2\n",
     "OK 2\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
-    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
-    "> exits since=4\n",
+    "exit <id5> t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit <id6> t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
+    "> exits since=<id1>\n",
     "OK 5\n",
-    "exit 6 t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
-    "exit 8 t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
-    "exit 10 t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
-    "exit 12 t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
-    "exit 14 t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
+    "exit <id2> t=* sid=<sid2> local=12 reason=ui-close exit_code=2 by=ctl left=-\n",
+    "exit <id3> t=* sid=<sid3> local=13 reason=window-close exit_code=- by=bridge left=-\n",
+    "exit <id4> t=* sid=<sid4> local=14 reason=app-quit exit_code=4 by=- left=-\n",
+    "exit <id5> t=* sid=<sid5> local=15 reason=reaper exit_code=- by=s-driver5 left=-\n",
+    "exit <id6> t=* sid=<sid6> local=16 reason=unknown exit_code=6 by=human left=-\n",
     "> exits since=x\n",
     "ERR usage: exits [<n>] [since=<id>]\n",
     "> successor exits \n",
+    "OK 3\n",
+    "exit <id0> t=* sid=<sid9> local=- reason=shell-exit exit_code=- by=human left=-\n",
+    "exit <id1> t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
+    "exit <id2> t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
+    "> successor exits since=<id0>\n",
     "OK 2\n",
-    "exit 7 t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
-    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
-    "> successor exits since=4\n",
-    "OK 2\n",
-    "exit 7 t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
-    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
+    "exit <id1> t=* sid=<sid10> local=1 reason=ui-close exit_code=- by=human left=-\n",
+    "exit <id2> t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
     "> successor exits 1\n",
     "OK 1\n",
-    "exit 8 t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
+    "exit <id2> t=* sid=<sid11> local=2 reason=window-close exit_code=- by=ctl left=-\n",
 );
 
 #[test]

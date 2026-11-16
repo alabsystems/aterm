@@ -6,7 +6,7 @@
 use agh::Github;
 use aterm_json::json;
 use std::error::Error;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) fn recorded_git(client: &Github) -> Result<(aterm_json::Value, bool), Box<dyn Error>> {
     let children = client.fx().children_run();
@@ -17,9 +17,10 @@ pub(crate) fn recorded_git(client: &Github) -> Result<(aterm_json::Value, bool),
         .env_clear()
         .envs(first.env.iter().cloned())
         .arg("--version");
-    let version = aterm_uds::deadline::output_until_complete_stdout(
+    let version = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
         &mut command,
-        Instant::now() + Duration::from_secs(60),
+        Duration::from_secs(60),
+        "benchmark recorded Git version",
     )?;
     let version_text = String::from_utf8(version.stdout)?;
     let version_text = version_text.trim();

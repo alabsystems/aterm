@@ -575,11 +575,15 @@ fn renewal_ready_opener_runs_the_selected_headless_route() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].1, WORK);
     // On macOS a row with a mailbox signs in in aterm's own window, with or without a
-    // terminal; elsewhere its headless route runs.
+    // terminal; elsewhere its headless route runs. Nobody at a terminal of their own started
+    // this one, so the window is told so and ends at the read of any check.
     assert_eq!(
         calls[0].2,
         if host.macos {
-            RenewBrowser::Window { opener }
+            RenewBrowser::Window {
+                opener,
+                unattended: true,
+            }
         } else {
             RenewBrowser::Remote {
                 opener: Some(opener),
@@ -826,6 +830,7 @@ fn a_renewal_signs_in_to_a_staging_home_checks_it_there_and_repoints_the_binding
     let browser = if host.macos {
         RenewBrowser::Window {
             opener: opener.clone(),
+            unattended: false,
         }
     } else if cfg!(unix) {
         RenewBrowser::Profile {
@@ -2136,7 +2141,14 @@ fn only_a_sign_in_in_aterms_own_window_makes_its_rows_token_in_the_same_run() {
             opener: opener(),
             profile: profile(),
         },
-        RenewBrowser::Window { opener: opener() },
+        RenewBrowser::Window {
+            opener: opener(),
+            unattended: false,
+        },
+        RenewBrowser::Window {
+            opener: opener(),
+            unattended: true,
+        },
         RenewBrowser::Remote {
             opener: Some(opener()),
         },
@@ -2655,6 +2667,7 @@ fn the_sign_in_and_the_check_are_built_exactly() {
             set(accounts::HOME_ENV, "/s/logins/main+1"),
             gone(crate::harness::open_url::NO_HEADLESS_ENV),
             gone(crate::harness::open_url::WINDOW_ENV),
+            gone(crate::harness::open_url::UNATTENDED_ENV),
             set("BROWSER", "/s/bin/aterm-open-url"),
             set(crate::harness::open_url::PROFILE_ENV, "Claude main"),
         ])
@@ -2665,6 +2678,7 @@ fn the_sign_in_and_the_check_are_built_exactly() {
         OWNER,
         &RenewBrowser::Window {
             opener: PathBuf::from("/s/bin/aterm-open-url"),
+            unattended: false,
         },
     );
     assert_eq!(
@@ -2675,11 +2689,37 @@ fn the_sign_in_and_the_check_are_built_exactly() {
             set(accounts::HOME_ENV, "/h"),
             gone(crate::harness::open_url::NO_HEADLESS_ENV),
             gone(crate::harness::open_url::PROFILE_ENV),
+            gone(crate::harness::open_url::UNATTENDED_ENV),
             set("BROWSER", "/s/bin/aterm-open-url"),
             set(crate::harness::open_url::WINDOW_ENV, "1"),
         ]),
         "a sign-in in aterm's window runs aterm's opener with no browser profile and no \
          headless try"
+    );
+    // A window sign-in nobody at a terminal started (the upkeep's, an agent's) tells the window
+    // so: it ends at the read of any check instead of waiting on it for nobody.
+    let nobody = renew_command(
+        program,
+        "/h",
+        OWNER,
+        &RenewBrowser::Window {
+            opener: PathBuf::from("/s/bin/aterm-open-url"),
+            unattended: true,
+        },
+    );
+    assert_eq!(
+        envs(&nobody),
+        BTreeSet::from([
+            gone(accounts::LOGIN_ENV),
+            gone(crate::harness::open_url::INPUT_ENV),
+            set(accounts::HOME_ENV, "/h"),
+            gone(crate::harness::open_url::NO_HEADLESS_ENV),
+            gone(crate::harness::open_url::PROFILE_ENV),
+            set("BROWSER", "/s/bin/aterm-open-url"),
+            set(crate::harness::open_url::WINDOW_ENV, "1"),
+            set(crate::harness::open_url::UNATTENDED_ENV, "1"),
+        ]),
+        "a window sign-in nobody started was not told so"
     );
     let own = renew_command(
         program,
@@ -2718,6 +2758,10 @@ fn the_sign_in_and_the_check_are_built_exactly() {
         assert!(
             envs(command).contains(&gone(crate::harness::open_url::WINDOW_ENV)),
             "only a sign-in chosen for aterm's window names it; an inherited grant is dropped"
+        );
+        assert!(
+            envs(command).contains(&gone(crate::harness::open_url::UNATTENDED_ENV)),
+            "an inherited mark of nobody there is dropped"
         );
     }
 }
@@ -3041,6 +3085,7 @@ fn a_renewals_provider_inherits_no_grant_to_open_the_sign_in_window() {
             run(
                 &RenewBrowser::Window {
                     opener: PathBuf::from("/nonexistent/opener"),
+                    unattended: within.is_some(),
                 },
                 within
             ),
@@ -3346,11 +3391,19 @@ fn an_unattended_renewal_that_runs_out_leaves_no_provider_running() {
     );
 }
 
+/// AN UNATTENDED RENEWAL THAT MET A CHECK IS HELD AS ONE, A BLOCK PAGE INCLUDED: Cloudflare's
+/// check and its block page each end the renewal as `BotCheck`, which records a task and is
+/// never retried as a failed authentication; a cancellation records nothing, and a browser that
+/// could not be driven may be retried.
+/// NEGATIVE CONTROL: with the renewal classing only a check that takes a person
+/// (`Met::takes_a_person`, the branch's first form), the block page is a failed
+/// authentication: `` left: AuthFailed ``.
 #[cfg(unix)]
 #[test]
 fn an_unattended_browser_challenge_records_a_task_but_cancellation_does_not() {
     for (code, met, expected) in [
         (1, "bot-check claude.ai", Renewal::BotCheck),
+        (1, "block-page claude.ai", Renewal::BotCheck),
         (130, "bot-check claude.ai", Renewal::Failed),
         (1, "browser-control", Renewal::AuthFailed),
     ] {

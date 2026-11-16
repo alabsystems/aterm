@@ -167,6 +167,82 @@ pub(crate) fn snapshot_after_read(
     std::sync::Arc::new(snapshot)
 }
 
+/// The first wall millisecond at which [`fresh_snapshot`] would change `snapshot`, which it
+/// left as it is at `now_ms`: the moment the network's observation, a Reachable peer's lease
+/// or a service's sample stops being current. `None` when nothing in it is a current claim.
+pub(crate) fn next_expiry(snapshot: &NetworkStateSnapshot, now_ms: u64) -> Option<u64> {
+    let past = |observed: u64, age: u64| {
+        Some(observed.saturating_add(age).saturating_add(1)).filter(|edge| *edge > now_ms)
+    };
+    let network = &snapshot.network;
+    let current_network_claim = match network.visibility {
+        Visibility::Active | Visibility::Offline | Visibility::Disabled | Visibility::Waiting => {
+            true
+        }
+        Visibility::Checking => network.observed_at_ms != 0,
+        Visibility::Unavailable => false,
+    };
+    let network_edge = current_network_claim
+        .then(|| past(network.observed_at_ms, REACHABLE_MS))
+        .flatten();
+    let peers: &[_] = if network.visibility == Visibility::Active {
+        &network.peers
+    } else {
+        &[]
+    };
+    let peer_edges = peers
+        .iter()
+        .filter(|peer| peer.reachability == Reachability::Reachable)
+        .filter_map(|peer| {
+            let oldest = peer.last_seen_ms.min(peer.last_checked_ms?);
+            past(oldest, peer.reachable_for_ms())
+        });
+    let service_edges = [&snapshot.services.accounts, &snapshot.services.secrets]
+        .into_iter()
+        .filter(|service| service.availability != ServiceAvailability::Unknown)
+        .filter_map(|service| past(service.observed_at_ms, 60_000));
+    network_edge
+        .into_iter()
+        .chain(peer_edges)
+        .chain(service_edges)
+        .min()
+}
+
+/// What the band's poll keeps while it rides the reading's turns
+/// ([`crate::App::network_rides_reading`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Ride {
+    /// The reading's ask the last poll saw ([`crate::App::timed_reading_asked`]).
+    asked: Option<std::time::Instant>,
+    /// When the loop is owed a poll no reading's turn brings: the adopted snapshot's next
+    /// expiry ([`next_expiry`]), the fleet field's next freshness edge, or a busy read's one
+    /// retry, whichever is first.
+    edge: Option<std::time::Instant>,
+    /// A change adopted and not yet asked onto the glass, and how many of the reading's asks
+    /// polled since it was adopted. The reading's frame draws it; the second ask it waits
+    /// through asks for its frame itself.
+    owed: Option<u8>,
+}
+
+impl Ride {
+    /// A frame was asked of every window that draws the deck: nothing is owed.
+    pub(crate) const fn drawn(&mut self) {
+        self.owed = None;
+    }
+
+    /// The deadline the ride keeps ([`Self::edge`]).
+    #[cfg(all(test, unix))]
+    pub(crate) const fn edge(&self) -> Option<std::time::Instant> {
+        self.edge
+    }
+
+    /// Whether an adopted change waits for the reading's frame.
+    #[cfg(all(test, unix))]
+    pub(crate) const fn owes(&self) -> bool {
+        self.owed.is_some()
+    }
+}
+
 impl crate::App {
     /// The width (device px) and scale of the Network State band window `wid` draws, as its
     /// deck and lens frames lay it out: what its keys and meters lay the Fleet Field out on.
@@ -206,10 +282,35 @@ impl crate::App {
                 && self.network_band_drawn())
             .then(due);
         }
-        (self.lab_page_shown()
-            || self.network_band_drawn()
-            || self.network_inspected_at(std::time::Instant::now()))
-        .then(due)
+        let now = std::time::Instant::now();
+        if self.network_rides_reading(now) {
+            // The reading's own timer brings the turns the poll rides; a poll owed at once (the
+            // first, a fleet read's) and the ride's edge are the only deadlines of its own.
+            return match self.network_next_poll {
+                None => Some(now),
+                Some(_) => self.network_ride.edge,
+            };
+        }
+        (self.lab_page_shown() || self.network_band_drawn() || self.network_inspected_at(now))
+            .then(due)
+    }
+
+    /// Whether the band's poll rides the reading's turns instead of a tick of its own: a
+    /// network source is read, the deck alone draws its rows (no Network State lens on a
+    /// visible window, no Lab page, no inspection within its minute), and the loop asks for a
+    /// reading on a timer ([`Self::timed_reading_asked`]), whose frame draws the band.
+    pub(crate) fn network_rides_reading(&self, now: std::time::Instant) -> bool {
+        self.network_source.is_some()
+            && self.timed_reading_asked().is_some()
+            && self.network_band_drawn()
+            && !self.windows.values().any(|window| {
+                !window.occluded
+                    && window.stats_lens.open.is_some_and(|lens| {
+                        lens.focus == crate::stats_paint::Instrument::NetworkState
+                    })
+            })
+            && !self.lab_page_shown()
+            && !self.network_inspected_at(now)
     }
 
     /// Project the Fleet Field again where what it stands on moved: the glance's generation,
@@ -252,10 +353,28 @@ impl crate::App {
         moved
     }
 
+    /// Adopt the source's snapshot, at most once a second on whatever turn the loop runs, and
+    /// ask for a frame where the band's rows moved.
+    ///
+    /// While the poll rides the reading ([`Self::network_rides_reading`]) it has no tick of its
+    /// own: the turn that asks for a reading polls whatever the second's gate says, and a
+    /// change it or another turn adopts waits for the reading's frame
+    /// ([`Ride::drawn`]), so the band and the reading share one. A poll owed at once, one at
+    /// the ride's edge (an expiry, the fleet field's freshness, a busy read's retry) and the
+    /// second ask a change waits through ask for the frame themselves.
     pub(crate) fn service_network_state(&mut self, now: std::time::Instant) {
-        if self.network_next_poll.is_some_and(|due| now < due) {
+        let rides = self.network_rides_reading(now);
+        let asked = self.timed_reading_asked().flatten();
+        let reading_asked = rides && asked != self.network_ride.asked;
+        let at_edge = rides && self.network_ride.edge.is_some_and(|edge| now >= edge);
+        let at_once = self.network_next_poll.is_none();
+        if !rides {
+            self.network_ride.edge = None;
+        }
+        if !reading_asked && !at_edge && self.network_next_poll.is_some_and(|due| now < due) {
             return;
         }
+        self.network_ride.asked = asked;
         let band = self.network_band_drawn();
         // The lab's account rows, as the feed's own thread last projected them: never waited
         // on, and asked only while drawn, since the ask is what starts and keeps the feed.
@@ -275,14 +394,22 @@ impl crate::App {
         } else {
             crate::NetworkRead::Network
         };
+        let mut retry = None;
         let snapshot = if let Some(read) = self.network_source.as_ref() {
             self.network_next_poll = Some(now + std::time::Duration::from_secs(1));
-            snapshot_after_read(
+            let was_busy = self.network_source_busy;
+            let snapshot = snapshot_after_read(
                 read(services),
                 &self.network_snapshot,
                 &mut self.network_source_busy,
                 aterm_time::unix_millis(),
-            )
+            );
+            // The read that first finds the reader busy withholds every current claim: one
+            // retry a second on replaces it, as the next second's poll does off the ride.
+            if self.network_source_busy && !was_busy {
+                retry = self.network_next_poll;
+            }
+            snapshot
         } else if drawn || fleet {
             // The lab feed's first look comes back soon, since its thread starts on it; then
             // once a projection. The fleet's field needs no tick of its own: a new read clears
@@ -315,26 +442,46 @@ impl crate::App {
             let edge = now + std::time::Duration::from_millis(due.saturating_sub(now_ms));
             self.network_next_poll = Some(self.network_next_poll.map_or(edge, |p| p.min(edge)));
         }
-        if !changed && !field_moved {
+        if rides {
+            let ahead = |edge_ms: u64| {
+                now_ms
+                    .filter(|now_ms| edge_ms > *now_ms)
+                    .map(|now_ms| now + std::time::Duration::from_millis(edge_ms - now_ms))
+            };
+            let expiry = now_ms
+                .and_then(|now_ms| next_expiry(&self.network_snapshot, now_ms))
+                .and_then(ahead);
+            let field = self.fleet_field_due.and_then(ahead);
+            self.network_ride.edge = [retry, expiry, field].into_iter().flatten().min();
+        }
+        let moved = changed || field_moved;
+        // A change that waited through one ask of the reading asks for its frame at the next:
+        // a reading that does not land holds the band back one reading period, not for good.
+        let overdue = reading_asked && self.network_ride.owed.is_some_and(|asks| asks > 0);
+        if rides && !at_once && !at_edge && !overdue {
+            if moved || self.network_ride.owed.is_some() {
+                let asks = self.network_ride.owed.unwrap_or(0);
+                self.network_ride.owed = Some(asks.saturating_add(u8::from(reading_asked)));
+            }
             return;
         }
+        if !moved && self.network_ride.owed.is_none() {
+            return;
+        }
+        self.network_ride.owed = None;
         if changed && self.lab_page_shown() {
             self.publish_native_lab_state();
         }
-        let windows: Vec<_> = self
-            .windows
-            .iter()
-            .filter_map(|(id, window)| {
-                ((self.window_bars(*id) == crate::stats_deck::StatsBars::Deck
-                    && crate::stats_deck::stats_drawn_on(window))
-                    || window.stats_lens.open.is_some_and(|lens| {
-                        lens.focus == crate::stats_paint::Instrument::NetworkState
-                    }))
-                .then_some(*id)
-            })
-            .collect();
-        for window in windows {
-            self.request_window_redraw(window);
+        for (id, window) in &self.windows {
+            if (self.window_bars(*id) == crate::stats_deck::StatsBars::Deck
+                && crate::stats_deck::stats_drawn_on(window))
+                || window
+                    .stats_lens
+                    .open
+                    .is_some_and(|lens| lens.focus == crate::stats_paint::Instrument::NetworkState)
+            {
+                window.request_redraw();
+            }
         }
     }
 }
@@ -1255,3 +1402,7 @@ fn paint_lab_accounts(
 #[cfg(test)]
 #[path = "network_deck_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "network_deck_ride_tests.rs"]
+mod ride_tests;

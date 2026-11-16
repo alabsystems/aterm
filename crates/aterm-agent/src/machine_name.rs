@@ -4,10 +4,13 @@
 //! This machine's name (`docs/DESIGN-machine-names-2026-11-04.md`): its NAME (`m8`, or `unnumbered`
 //! while unnumbered), nickname and earlier numbers, kept in `machine-name.toml` whether or not it
 //! is in a fleet ([`file`]), made at first run by [`ensure`], and, once a number is chosen,
-//! published to its other readers ([`publish`]).
+//! published to its other readers ([`publish`]). A rename's nickname is written to this Mac's
+//! lab registry row too ([`registry`]), and a nickname written to that row from any Mac becomes
+//! this Mac's at its next read that shows it ([`follow_registry`]).
 
 pub mod file;
 pub mod publish;
+pub mod registry;
 
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
@@ -242,16 +245,86 @@ fn ensure_from(
     Ok((name, if created { origin } else { Origin::Kept }))
 }
 
+/// Take the nickname a person or a program wrote to this Mac's own `lab/machines` row from any
+/// Mac (the Tables page, `aterm file set lab/machines <row> nickname <word>`) into the name kept
+/// in `state` (tracker package FL-169), as a read that shows the name makes it (the menu bar's
+/// title, `aterm name`): the file is replaced only where [`followed`] moves it, judged again
+/// with the row read afresh under the name lock, so every process decides on the same files.
+/// The registry keeps who wrote the row and when; History records the change as
+/// [`Why::Registry`], with no author. An automatic write and an empty or conflicted cell are not
+/// followed, and a name whose row is none of this Mac's ([`registry::row_nick`]) is left as it
+/// is. Answers the name where the file changed.
+///
+/// # Errors
+/// The file cannot be read, or the name lock taken or the file replaced ([`file::replace`]).
+pub fn follow_registry(state: &Path, now_ms: u64) -> io::Result<Option<MachineName>> {
+    let Some(kept) = file::read(state)? else {
+        return Ok(None);
+    };
+    if row_followed(state, &kept, now_ms).is_none() {
+        return Ok(None);
+    }
+    let mut moved = None;
+    file::replace(state, |held| {
+        if let Some(next) = row_followed(state, held, now_ms) {
+            *held = next.clone();
+            moved = Some(next);
+        }
+        Ok(())
+    })?;
+    Ok(moved)
+}
+
+/// `held` once it has seen this Mac's row as `state`'s name reads it now ([`followed`]), or
+/// `None` where nothing moves.
+fn row_followed(state: &Path, held: &MachineName, now_ms: u64) -> Option<MachineName> {
+    registry::row_nick(state).and_then(|row| followed(held, row.as_ref(), now_ms))
+}
+
+/// `held` once it has seen its registry row's chosen nickname `row` (`None`: none chosen), or
+/// `None` where it saw that already ([`file::MachineName::row`]). A chosen nickname other than
+/// `held`'s renames it ([`renicked`], with no author, recorded as [`Why::Registry`]) where the
+/// file saw the row before, and where it never did and its own nickname is a drawn noun, which
+/// nobody chose. A first look at a row from a file whose nickname a person or a program chose
+/// (one an earlier build wrote, or one made while no row was this Mac's) only marks it seen, so
+/// a row value older than that choice does not replace it; so does a row holding `held`'s own
+/// nickname (a rename's own write).
+fn followed(held: &MachineName, row: Option<&Nickname>, now_ms: u64) -> Option<MachineName> {
+    let seen = file::RowSeen::Saw(row.cloned());
+    if held.row == seen {
+        return None;
+    }
+    let looked = held.row != file::RowSeen::Never || held.nick_class == NickClass::Auto;
+    let mut next = match row {
+        Some(row) if looked && held.nick != *row => renicked(held, row.clone(), None).map_or_else(
+            || held.clone(),
+            |mut next| {
+                let change = Change::between(held, &next, now_ms, Why::Registry);
+                next.record(change);
+                next
+            },
+        ),
+        _ => held.clone(),
+    };
+    next.row = seen;
+    Some(next)
+}
+
 fn first_registry(
     candidate: RegistryName,
     in_use: impl Fn(&str) -> bool,
     now_ms: u64,
 ) -> io::Result<(MachineName, Origin)> {
+    let row = match &candidate.nick {
+        Some((nick, NickClass::Chosen)) => Some(nick.clone()),
+        _ => None,
+    };
     let (nick, nick_class) = match candidate.nick {
         Some(nick) => nick,
         None => (file::draw_nick(in_use)?, NickClass::Auto),
     };
     let mut name = MachineName::unnumbered(nick, now_ms);
+    name.row = file::RowSeen::Saw(row);
     name.num = Some(candidate.num);
     name.class = Class::Seeded;
     name.since = IMPLIED_SINCE;
@@ -422,8 +495,8 @@ struct Locked {
 
 /// Edit this machine's name under the book lock and then the name lock, so no signed claim
 /// arrives between an edit's checks and its write: `edit` answers the name the stored one
-/// becomes, from what the books show ([`Locked`]), and the file is replaced with it unless
-/// `dry_run`. `by` names this node; a keyless dry run's `None` stands for a node absent from the
+/// becomes, from what the books show ([`Locked`]), once the stored one has followed this Mac's
+/// registry row ([`followed`]), and the file is replaced with it unless `dry_run`. `by` names this node; a keyless dry run's `None` stands for a node absent from the
 /// books ([`absent_node`]).
 fn edit_name(
     state: &Path,
@@ -448,8 +521,15 @@ fn edit_name(
         let mut changed = false;
         let mut preview = None;
         let name = file::replace(state, |stored| {
-            let next = edit(stored, &mut locked)?;
-            changed = next != *stored;
+            // The edit starts from the name as this Mac's registry row leaves it now
+            // ([`row_followed`]), so it never writes over a nickname the row was given and no
+            // read followed yet, and the row value it replaces counts as seen: the row still
+            // holding it until this edit's own write arrives undoes nothing.
+            let base = row_followed(state, stored, now_ms);
+            let base = base.as_ref().unwrap_or(stored);
+            let next = edit(base, &mut locked)?;
+            // What the request changed, not what the follow did.
+            changed = next != *base;
             if dry_run {
                 preview = Some(next);
             } else {
@@ -1138,7 +1218,9 @@ pub fn undo_publishes(name: &MachineName) -> Option<Number> {
 /// never one another Mac now holds, by any claim, or the vault gives another Mac), with the
 /// nickname it replaced, or a nickname change back alone ([`change_nick`], which leaves the claim
 /// as it is). The change is marked undone and the undo recorded as [`Why::Undone`]. `seen` is the
-/// newest change the caller read and showed: under the locks the undo takes back only that one,
+/// newest change the caller read and showed, from a read that followed this Mac's registry row
+/// ([`follow_registry`]) as the undo's own base does ([`edit_name`]): under the locks the undo
+/// takes back only that one,
 /// refusing ([`Cause::Unseen`]) where History's newest is another, so a name changed after the
 /// caller read it is never taken somewhere the caller did not show; `None` (a caller that read no
 /// name) takes back whatever History's newest is. `lab` is

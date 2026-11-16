@@ -438,14 +438,14 @@ fn with_the_harness_off_the_deck_reads_no_board_facts() {
     });
     let now = clock(UTC_MIDNIGHT + 60);
     assert!(shelf.watched());
-    let on = shelf.deck_facts(&home, &now);
+    let on = shelf.board_lock().deck_facts(&home, &now);
     assert!(on.watch);
     assert_eq!(on.level, Some(Level::Low));
     assert_eq!(on.stuck, 1);
     assert!(on.freed_today.is_some());
     shelf.publish(|b| b.watched = false);
     assert!(!shelf.watched());
-    let off = shelf.deck_facts(&home, &now);
+    let off = shelf.board_lock().deck_facts(&home, &now);
     assert_eq!(off, DiskFactsRaw::default());
     assert!(!off.watch);
     assert_eq!(off.level, None);

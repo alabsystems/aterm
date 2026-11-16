@@ -422,6 +422,23 @@ impl<T: Copy + Eq> SplitTree<T> {
         }
     }
 
+    /// Seat `new` first (left, or above) beside the whole tree, which becomes the second child:
+    /// a sidebar's place. `ratio` is the new leaf's share, clamped as a divider's is. False where
+    /// the tree already holds `new`.
+    pub fn seat_first(&mut self, axis: SplitAxis, new: T, ratio: f32) -> bool {
+        if ratio.is_nan() || self.contains(new) {
+            return false;
+        }
+        let rest = std::mem::replace(self, Self::Leaf(new));
+        *self = Self::Split {
+            axis,
+            ratio: ratio.clamp(0.05, 0.95),
+            first: Box::new(Self::Leaf(new)),
+            second: Box::new(rest),
+        };
+        true
+    }
+
     /// Describe the parent split that collapses when `target` is removed.
     #[must_use]
     pub fn leaf_placement(&self, target: T) -> Option<(SplitPath, SplitBranch, SplitAxis, f32)> {
@@ -1764,6 +1781,17 @@ impl Tab {
     /// Insert `new_view` as the second sibling of the focused leaf and focus it.
     pub fn split_focused(&mut self, axis: SplitAxis, new_view: ViewId) -> bool {
         if self.root.contains(new_view) || !self.root.split_leaf(self.focus, axis, new_view) {
+            return false;
+        }
+        self.focus = new_view;
+        self.zoomed = false;
+        true
+    }
+
+    /// Seat `new_view` first beside everything the tab holds ([`SplitTree::seat_first`]) and
+    /// focus it.
+    pub fn seat_first(&mut self, axis: SplitAxis, new_view: ViewId, ratio: f32) -> bool {
+        if !self.root.seat_first(axis, new_view, ratio) {
             return false;
         }
         self.focus = new_view;

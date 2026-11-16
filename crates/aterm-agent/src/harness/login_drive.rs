@@ -558,8 +558,8 @@ pub enum Approval {
     NeedsSignIn(String),
     /// It refused the page (another code, another account): why.
     Refused(String),
-    /// A bot protection answered: it waited on Cloudflare's bot check, which did not clear
-    /// ([`super::headless_oauth::bot_check`]), or the page was a bot protection's block page
+    /// A bot protection answered: it met Cloudflare's bot check, on its first read and with
+    /// nothing pressed ([`super::headless_oauth::bot_check`]), or a bot protection's block page
     /// ([`super::headless_oauth::block_page`]): why, naming the page's host and path, never its
     /// text. Software never tries to pass one, and no other Mac is asked to: the sign-in ends as
     /// the account's check on record ([`super::accounts::CheckStop`]), which nothing with nobody
@@ -691,8 +691,8 @@ pub enum Outcome {
     /// The approver stopped on the vendor's sign-in page, which the row's browser profile is
     /// signed out of, and it was ended.
     NeedsSignIn(String),
-    /// A bot protection answered the approver (Cloudflare's bot check, which did not clear, or a
-    /// block page), and it was ended ([`Approval::BotCheck`]).
+    /// A bot protection answered the approver (Cloudflare's bot check, a human check or a block
+    /// page, met on its first read), and it was ended ([`Approval::BotCheck`]).
     BotCheck(String),
     /// Sign-in completed without succeeding (provider OAuth error, missing authorization code, or CLI failure).
     Failed,

@@ -2,7 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
-use std::os::unix::process::CommandExt as _;
 
 fn stand_in(cloexec: bool) -> OwnedFd {
     let null = std::fs::File::open("/dev/null").expect("open /dev/null");
@@ -190,10 +189,11 @@ fn the_fork_lane_successor_transfers_the_proof_and_commit_ends_and_restores_thei
 fn the_cold_lane_exec_hands_over_nothing_this_process_holds() {
     const STAGE: &str = "ATERM_TEST_COLD_EXEC_HAND_OVER";
     if let Ok(stage) = std::env::var(STAGE) {
+        let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
         let stray = stand_in(false);
         let fd = stray.as_raw_fd();
         let _lifeline = (stage == "hand-over").then(super::cold_exec_hand_over);
-        let error = std::process::Command::new("/bin/sh")
+        let error = aterm_uds::spawnfd::transparent(&shell)
             .args(["-c", &aterm_spec::host::held_probe(fd)])
             .exec();
         panic!("the probe did not replace this helper: {error}");

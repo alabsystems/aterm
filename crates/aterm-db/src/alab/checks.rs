@@ -30,6 +30,65 @@ pub struct Finding {
     pub pks: Vec<String>,
 }
 
+/// What a lab finding of `kind` means, in a person's words, for each word this file's rules and
+/// `aterm db alab check` report (`duplicate-number` among them); `None` for any other word, whose
+/// sentence is the table layer's or none ([`check::said`] asks both). A sentence names no value,
+/// as a finding names none.
+pub fn sentence(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "facts-machine-unknown" => "A Mac's own facts bind a machine the registry does not have",
+        "facts-differ" => {
+            "A Mac's own facts say another chip, memory or disk than its machine row states"
+        }
+        "facts-bind-one-machine" => "Two live enrollments bind one machine",
+        "hw-hint-clone" => {
+            "Two live enrollments state one hardware hint: a copied Mac, or an identifier virtual \
+             machines share"
+        }
+        "mailbox-obs-key-mismatch" => {
+            "A mailbox observation's key does not name the mailbox it states"
+        }
+        "mailbox-obs-mailbox-unknown" => {
+            "A mailbox observation names a mailbox the registry does not have"
+        }
+        "mailbox-obs-on-retired-mailbox" => "A mailbox observation names a retired mailbox",
+        "mailbox-obs-ambiguous" => "Two mailboxes list this address in their latest observations",
+        "mailbox-discovery-differs" => {
+            "The mailbox set for this address is not the one discovery found it in"
+        }
+        "account-obs-key-mismatch" => {
+            "An account observation's key does not name the account it states"
+        }
+        "account-seen-unregistered" => "This Mac saw or used an account no registry row names yet",
+        "account-seen-unmarked" => {
+            "This Mac saw or used an account its own Accounts in use rows do not list yet"
+        }
+        "account-ambiguous" => {
+            "Two or more live accounts at one realm say this address, so a login of it matches \
+             none"
+        }
+        "preference-key-mismatch" => {
+            "A link's key names another machine and account than its cells say"
+        }
+        "preference-on-retired-machine" => "A live link names a retired machine",
+        "preference-for-retired-account" => "A live link names a retired account",
+        "account-login-retired" => "A live account's login is a retired address",
+        "account-identity-retired" => "A live account's identity is a retired address",
+        "label-ambiguous" => {
+            "A machine's label is another live machine's alias, so it names two Macs"
+        }
+        "address-key-elsewhere" => "An address row says an address another row is keyed by",
+        "alias-of-retired" => "An address is an alias of a retired address",
+        "alias-cycle" => "An address's alias links lead back to itself",
+        "address-mailbox-retired" => "An address names a retired mailbox",
+        "address-mailbox-hint-retired" => "An address's guessed mailbox is retired",
+        "mailbox-guess-differs" => "An address's mailbox is not the one guessed for it",
+        "protected-address-has-mailbox" => "A protected address names a mailbox",
+        "duplicate-number" => "Two live phone rows hold one number",
+        _ => return None,
+    })
+}
+
 /// The rules over the Macs' own rows (design §4.7): each is a finding and nothing merges. Two live
 /// enrollments bind one machine; two live enrollments state one hardware hint, a clone or a
 /// machine identifier VMs share; a row binds a machine the registry does not have; and a Mac's
@@ -280,6 +339,87 @@ pub fn account_obs(read: &OwnedRead, accounts: &Projection) -> Vec<Finding> {
     found.sort_unstable();
     found.dedup();
     found
+}
+
+/// A finding of what this Mac observed ([`observed`]), with the line that says which login it
+/// means: each sighting's CLI, how it was seen ([`super::observe::how`]), how long ago, and
+/// whether it waits for a pass. Never an address: the account the finding keys has no row to
+/// show it by.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Seen {
+    pub finding: Finding,
+    pub line: String,
+}
+
+/// One sighting as a [`Seen`] line says it: `codex · used by a tab · seen today · waiting for a
+/// pass`.
+fn seen_line(s: &super::observe::Sighting, pending: bool, now_ms: u64) -> String {
+    let days = now_ms.saturating_sub(s.at_ms) / 86_400_000;
+    let when = match days {
+        0 => "seen today".to_owned(),
+        1 => "seen 1 day ago".to_owned(),
+        n => format!("seen {n} days ago"),
+    };
+    let how = super::observe::how(&s.state, &s.src);
+    if pending {
+        format!("{} · {how} · {when} · waiting for a pass", s.cli)
+    } else {
+        format!("{} · {how} · {when}", s.cli)
+    }
+}
+
+/// The rule over what this Mac observes (`docs/DESIGN-account-discovery-2026-11-09.md`): every
+/// account it saw or used (`seen`, its kept sightings with whether each still waits for a pass,
+/// [`super::observe::kept`]) is a registry row, and this Mac's own `account-obs` row (keyed
+/// `<account>.<uuid>`) says so. A login no row names gives `account-seen-unregistered`, keyed by
+/// the account a pass would give birth to; an account a row names that this Mac's rows do not
+/// list gives `account-seen-unmarked`, keyed by that account's row, where this Mac's `uuid` is
+/// known. Each says which logins it means, at `now_ms` ([`Seen`]). A sighting that matches no one
+/// row is `account-ambiguous` or `account-address-taken` on the pass's own report, not here. On a
+/// Mac whose writer is fenced, or whose quota is spent, each finding stands until a pass
+/// registers it.
+pub fn observed(
+    seen: &[(super::observe::Sighting, bool)],
+    uuid: Option<&str>,
+    cells: &Cells,
+    obs: &OwnedRead,
+    now_ms: u64,
+) -> Vec<Seen> {
+    use super::observe::{Holds, holds};
+    let addresses = cell::project(&ADDRESS, cells);
+    let index = super::registry::AddressIndex::of(&addresses);
+    let accounts = cell::project(&ACCOUNT, cells);
+    let mut found: BTreeMap<Finding, Vec<String>> = BTreeMap::new();
+    for (s, pending) in seen {
+        let finding = match holds(s, &index, &accounts) {
+            Holds::Unborn(pk) => Finding {
+                kind: "account-seen-unregistered",
+                collection: ACCOUNT.name,
+                pks: vec![pk],
+            },
+            Holds::Row(pk) => match uuid {
+                Some(uuid) if !obs.rows.contains_key(&format!("{pk}.{uuid}")) => Finding {
+                    kind: "account-seen-unmarked",
+                    collection: ACCOUNT.name,
+                    pks: vec![pk],
+                },
+                _ => continue,
+            },
+            Holds::Unmatched => continue,
+        };
+        let line = seen_line(s, *pending, now_ms);
+        let lines = found.entry(finding).or_default();
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    found
+        .into_iter()
+        .map(|(finding, lines)| Seen {
+            finding,
+            line: lines.join("; "),
+        })
+        .collect()
 }
 
 /// The lab rules over `cells` of the registry generation `table`, then every generic finding,

@@ -1628,6 +1628,17 @@ impl JobFeed {
         }
     }
 
+    /// Whether the shell says a command is running: the block held is open (its OSC 133 C with
+    /// no D yet), as the reader's last feed left it. Read without the term lock.
+    pub(crate) fn runs(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .block
+            .as_ref()
+            .is_some_and(|block| block.open)
+    }
+
     /// The feed now: [`Self::at_pass`] with no pass's clock.
     #[cfg(test)]
     pub(crate) fn at(&self, epoch: Instant) -> TabFeed {

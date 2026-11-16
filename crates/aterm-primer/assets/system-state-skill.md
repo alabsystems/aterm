@@ -2,7 +2,7 @@
 name: system-state
 description: Read what this machine, every aterm process and this tab are doing now (CPU per core, GPU, memory and swap, disk space, which processes use them, and which commands stopped making progress). Use for "slow", "hung", "stuck", "frozen", "out of memory", "swap", "disk full", "which process", "load", "is my command still working", "wait for a quiet machine", or "benchmark".
 ---
-<!-- aterm skill v10 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
+<!-- aterm skill v11 — MANAGED FILE, rewritten by `aterm agents` on every install/update; remove this marker line and aterm will leave the file alone (reported as `foreign`) -->
 
 # System state in aterm
 
@@ -153,8 +153,11 @@ such a program ever starts is unmeasured, and nothing ends it for you. Do not re
 it, and do not rebuild or delete its file to unstick it (removing a file macOS is checking can
 crash `syspolicyd`): stop what started it and run it again.
 
-A tab kept across an aterm update (`attribution=adopted` in `status`) makes macOS check aterm's
-earlier copy at every program it starts: run builds and tests from a new tab.
+`attribution=adopted` records a session adoption, including a same-image handoff; it does not
+diagnose a startup wait. Repeated macOS checks were observed after cross-build updates, but
+this field alone cannot identify that case. Run builds and tests with your own
+shell/background tools. A new tab needs an explicit request or a concrete, observed need those
+tools cannot meet; state that reason before spawning.
 
 ## When one of macOS's services holds the memory
 

@@ -23,7 +23,7 @@ mod native {
     use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     const SLUG: &str = "fixture-dev/app";
     const SHA: &str = "1234567890123456789012345678901234567890";
@@ -228,17 +228,13 @@ read = ["anonymous"]
             let identity_ok = requests.iter().all(|s| {
                 (!s.had_authorization && s.as_login.is_none())
                     || (s.had_authorization
-                        && s.as_login.as_deref()
-                            == if expired {
-                                Some("fixture-reader")
-                            } else {
-                                op.login()
-                            }
-                        && (expired || op.login().is_some()))
+                        && !expired
+                        && s.as_login.as_deref() == op.login()
+                        && op.login().is_some())
             });
-            // Rule 5 routes an expired dev grant through the read chain. Its reader
-            // cannot authorize receive-pack; the expired writer must never answer.
-            let expected_authenticated = expired || op.login().is_some();
+            // An explicit invalid operation grant quits; it must not fall back to
+            // the read chain or send either the reader's or writer's credentials.
+            let expected_authenticated = !expired && op.login().is_some();
             let authenticated = requests.iter().any(|s| s.had_authorization);
             let receive_post = requests.iter().any(|s| {
                 s.method == "POST"
@@ -272,6 +268,7 @@ read = ["anonymous"]
                 && receive_post == (!expired && op.deletes());
             Ok((
                 json!({"requests":rows,"first_request_anonymous":first_anonymous,"actual_git":actual_git,
+                "identity_matches_expected":identity_ok,"authenticated":authenticated,"expected_authenticated":expected_authenticated,
                 "grant_files_after":grant_files,"main_stable":main_stable,"tag_present":tag_present,
                 "result_matches_expected":result_ok,"valid":valid}),
                 valid,
@@ -291,7 +288,11 @@ read = ["anonymous"]
             return Err("usage: git_helper_auth AGH_HELPER".into());
         }
         let helper: PathBuf = std::fs::canonicalize(&args[0])?;
-        let version = aterm_uds::fixture_git::git().arg("--version").output()?;
+        let version = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+            aterm_uds::fixture_git::git().arg("--version"),
+            Duration::from_secs(60),
+            "authentication benchmark fixture Git version",
+        )?;
         if !version.status.success() {
             return Err("fixture git --version failed".into());
         }

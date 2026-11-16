@@ -200,7 +200,7 @@ fn codex_rotation_failing_publication_is_retried_without_a_read_and_lapses_in_ti
                 published.set(published.get() + 1);
                 Err("writer-busy")
             },
-            || read.set(read.get() + 1),
+            |_| read.set(read.get() + 1),
         )
     };
     for attempt in 0..10 {
@@ -227,7 +227,10 @@ fn codex_rotation_failing_publication_is_retried_without_a_read_and_lapses_in_ti
     ));
     assert_eq!(ask_at(Duration::from_secs(55)), WAITING);
     assert_eq!((published.get(), read.get()), (10, 1));
-    assert!(matches!(*progress.lock().unwrap(), Progress::Reading));
+    assert!(matches!(
+        *progress.lock().unwrap(),
+        Progress::Reading(since) if since == observed + Duration::from_secs(55)
+    ));
 }
 
 /// A PUBLICATION THAT FAILED ONCE IS PUBLISHED AT THE NEXT ASK: the receipt writer is busy at
@@ -245,7 +248,7 @@ fn codex_rotation_publication_that_fails_once_is_published_at_the_next_ask() {
             &progress,
             observed,
             |_| Err("writer-busy"),
-            || read.set(read.get() + 1)
+            |_| read.set(read.get() + 1)
         ),
         WAITING
     );
@@ -253,7 +256,7 @@ fn codex_rotation_publication_that_fails_once_is_published_at_the_next_ask() {
         &progress,
         observed + Duration::from_secs(5),
         |_| Ok(receipt.clone()),
-        || read.set(read.get() + 1),
+        |_| read.set(read.get() + 1),
     );
     assert_eq!(reply, receipt.reply());
     assert!(
@@ -299,7 +302,7 @@ fn codex_rotation_selection_too_old_to_commit_is_not_published() {
 }
 
 /// The read of an ask that must start none.
-fn unread() {
+fn unread(_: Instant) {
     panic!("this ask starts no read")
 }
 
@@ -310,11 +313,11 @@ fn unpublished(_: &Selection) -> Result<Receipt, &'static str> {
 
 /// ONLY A RETRY THAT IS DUE STARTS A READ, AND IT STARTS ONE: an ask a millisecond before its
 /// job's retry is due reads nothing and leaves the retry when it was. The ask at that time runs
-/// the read once, with the progress already `Reading` and its lock free for the read to write
-/// its result or its failure to start, and is answered `waiting`. No ask while that read is out
-/// starts another, five seconds or an hour later. A job whose answer is `not-needed` is
-/// answered that at any age, stays so and reads nothing: no ask turns it into a retry. None of
-/// these asks publishes.
+/// the read once, with the progress already `Reading` from that time and its lock free for the
+/// read to write its result or its failure to start, and is answered `waiting`. No ask while
+/// that read is out starts another, five seconds or [`READ_LAPSES`] later. A job whose answer is
+/// `not-needed` is answered that at any age, stays so and reads nothing: no ask turns it into a
+/// retry. None of these asks publishes.
 #[test]
 fn codex_rotation_ask_starts_a_read_only_from_a_retry_that_is_due() {
     let due = Instant::now() + Duration::from_millis(RETRY_MS);
@@ -330,20 +333,19 @@ fn codex_rotation_ask_starts_a_read_only_from_a_retry_that_is_due() {
     );
     assert!(matches!(*progress.lock().unwrap(), Progress::Retry(at) if at == due));
     let reads = std::cell::Cell::new(0_u32);
-    let read = || {
+    let read = |since: Instant| {
         reads.set(reads.get() + 1);
         assert!(
-            matches!(progress.try_lock().as_deref(), Ok(Progress::Reading)),
-            "the read runs with the progress unlocked and already reading"
+            matches!(progress.try_lock().as_deref(), Ok(Progress::Reading(at)) if *at == since),
+            "the read runs with the progress unlocked and already reading from its time"
         );
     };
     assert_eq!(ask(&progress, due, unpublished, read), WAITING);
     assert_eq!(reads.get(), 1, "the ask that is due runs the read");
-    for later in [RETRY_MS, 3_600_000] {
-        let now = due + Duration::from_millis(later);
-        assert_eq!(ask(&progress, now, unpublished, read), WAITING);
-        assert_eq!(reads.get(), 1, "one read at a time, {later} ms on");
-        assert!(matches!(*progress.lock().unwrap(), Progress::Reading));
+    for later in [Duration::from_millis(RETRY_MS), READ_LAPSES] {
+        assert_eq!(ask(&progress, due + later, unpublished, read), WAITING);
+        assert_eq!(reads.get(), 1, "one read at a time, {later:?} on");
+        assert!(matches!(*progress.lock().unwrap(), Progress::Reading(at) if at == due));
     }
 
     let ended = Mutex::new(Progress::NotNeeded);
@@ -356,6 +358,51 @@ fn codex_rotation_ask_starts_a_read_only_from_a_retry_that_is_due() {
         );
         assert!(matches!(*ended.lock().unwrap(), Progress::NotNeeded));
     }
+}
+
+/// A READ OUT FOR LONGER THAN ONE CAN TAKE IS TAKEN FOR ONE THAT WILL NOT END, AND THE NEXT ASK
+/// STARTS ANOTHER: an ask [`READ_LAPSES`] after a read began starts none, and the first ask past
+/// it starts one, out from that ask's time, and is answered `waiting`. What the read taken never
+/// to end answers, should it end, changes nothing; what the new one answers is the job's. CONTROL:
+/// a read's own answer is written.
+#[test]
+fn codex_rotation_a_read_out_too_long_is_read_again_and_its_late_answer_dropped() {
+    let began = Instant::now();
+    let progress = Mutex::new(Progress::Reading(began));
+    assert_eq!(
+        ask(&progress, began + READ_LAPSES, unpublished, unread),
+        WAITING
+    );
+    let past = began + READ_LAPSES + Duration::from_millis(1);
+    let started = std::cell::Cell::new(None);
+    let read = |since| started.set(Some(since));
+    assert_eq!(ask(&progress, past, unpublished, read), WAITING);
+    assert_eq!(started.get(), Some(past), "the ask started another read");
+    let mut progress = progress.into_inner().unwrap();
+    assert!(matches!(progress, Progress::Reading(at) if at == past));
+    let later = past + Duration::from_secs(1);
+    observed(
+        &mut progress,
+        began,
+        Ok(Some(selection(began).proposal)),
+        true,
+        later,
+    );
+    assert!(
+        matches!(progress, Progress::Reading(at) if at == past),
+        "the late answer of the read taken never to end changes nothing: {progress:?}"
+    );
+    observed(
+        &mut progress,
+        past,
+        Ok(Some(selection(past).proposal)),
+        true,
+        later,
+    );
+    assert!(
+        matches!(&progress, Progress::Selected(kept) if kept.observed == later),
+        "CONTROL: the new read's answer is the job's: {progress:?}"
+    );
 }
 
 /// How long a test waits for a job's worker: far longer than a read that ends at its first
@@ -423,7 +470,7 @@ fn codex_rotation_prepare_asks_its_job_now_with_the_lanes_read_and_publication()
     assert_eq!(ask_the_lane(), WAITING);
     let job = job_of_the_session().expect("the first ask makes the job");
     let since = Instant::now();
-    while matches!(*job.progress.lock().unwrap(), Progress::Reading) {
+    while matches!(*job.progress.lock().unwrap(), Progress::Reading(_)) {
         assert!(
             since.elapsed() < PATIENCE,
             "hang: the read the first ask starts never wrote its result"
@@ -466,5 +513,293 @@ fn codex_rotation_prepare_asks_its_job_now_with_the_lanes_read_and_publication()
     assert!(
         job_of_the_session().is_some_and(|last| Arc::ptr_eq(&last, &job)),
         "every ask was the same job's"
+    );
+}
+
+/// The address of the read pace an observation of `process` holds, through [`observe_paced`], and
+/// what that observation answered: `None` where it never answered.
+fn paced_at(
+    ctx: &crate::SessionCtx,
+    process: ProcessKey,
+) -> Option<Result<Option<usize>, &'static str>> {
+    let (answered, answer) = std::sync::mpsc::channel();
+    let worker = observe_paced(
+        ctx,
+        "codex-quota-probe-test",
+        process,
+        |pace| Ok(Some(std::ptr::from_mut(pace).addr())),
+        move |result| answered.send(result).unwrap(),
+    )
+    .expect("the observation's thread");
+    let _ = worker.join();
+    answer.recv().ok()
+}
+
+/// The address of the read pace `ctx`'s tab keeps for `process`, held by this thread.
+fn kept_at(ctx: &crate::SessionCtx, process: ProcessKey) -> usize {
+    read_pace(ctx, process, Instant::now())
+        .observe(Instant::now(), |pace| std::ptr::from_mut(pace).addr())
+        .expect("no observation holds the pace")
+}
+
+/// A process as the tab keys it, at this test's pid and the birth `birth`.
+fn key(birth: u64) -> ProcessKey {
+    ProcessKey {
+        pid: std::process::id(),
+        birth,
+    }
+}
+
+/// A TAB KEEPS ONE READ PACE FOR EACH ASKING PROCESS, AND EVERY OBSERVATION OF IT HOLDS THAT ONE:
+/// the pace the tab keeps for a process is the same an hour later, a process at the same pid of
+/// another birth has another, and each observation of the process, one after another, holds the
+/// process's kept pace.
+#[test]
+fn a_tab_keeps_one_read_pace_per_process_and_each_observation_holds_it() {
+    let handle = crate::session_store::test_handle_on(9132, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let now = Instant::now();
+    let kept = read_pace(&ctx, key(10), now);
+    assert!(Arc::ptr_eq(
+        &kept,
+        &read_pace(&ctx, key(10), now + Duration::from_secs(3600))
+    ));
+    assert!(
+        !Arc::ptr_eq(&kept, &read_pace(&ctx, key(11), now)),
+        "another birth at the pid is another process"
+    );
+    let at = kept_at(&ctx, key(10));
+    for observation in 0..3 {
+        assert_eq!(
+            paced_at(&ctx, key(10)),
+            Some(Ok(Some(at))),
+            "observation {observation}"
+        );
+    }
+    assert_ne!(paced_at(&ctx, key(11)), Some(Ok(Some(at))));
+}
+
+/// AN OBSERVATION OF A PROCESS WHOSE PACE ANOTHER HOLDS READS NOTHING, AND ONE THAT PANICS LEAVES
+/// THE PACE TO THE NEXT: while one observation holds the pace, another of the same process runs
+/// nothing and answers `Ok(None)`, so its job asks again. One that panics answers
+/// `probe-panicked`, and the next observation holds the same pace.
+#[test]
+fn an_observation_of_a_held_pace_reads_nothing_and_one_that_panics_leaves_the_pace() {
+    let handle = crate::session_store::test_handle_on(9133, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let at = kept_at(&ctx, key(10));
+    let busy = read_pace(&ctx, key(10), Instant::now())
+        .observe(Instant::now(), |_| {
+            let (answered, answer) = std::sync::mpsc::channel();
+            let worker = observe_paced(
+                &ctx,
+                "codex-quota-probe-test",
+                key(10),
+                |_| -> Result<Option<()>, &'static str> { panic!("a held pace is read") },
+                move |result| answered.send(result).unwrap(),
+            )
+            .expect("the observation's thread");
+            let _ = worker.join();
+            answer.recv().ok()
+        })
+        .expect("no observation holds the pace");
+    assert_eq!(busy, Some(Ok(None)));
+
+    let (answered, answer) = std::sync::mpsc::channel();
+    let worker = observe_paced(
+        &ctx,
+        "codex-quota-probe-test",
+        key(10),
+        |_| -> Result<Option<()>, &'static str> { panic!("the observation unwinds") },
+        move |result| answered.send(result).unwrap(),
+    )
+    .expect("the observation's thread");
+    let _ = worker.join();
+    assert_eq!(answer.recv().ok(), Some(Err("probe-panicked")));
+    assert_eq!(paced_at(&ctx, key(10)), Some(Ok(Some(at))));
+}
+
+/// A PACE HELD PAST THE LONGEST OBSERVATION IS REPLACED: while an observation holds a process's
+/// pace, the tab hands out that pace until [`READ_LAPSES`] after the observation began, and a
+/// new one after; an observation of the process then runs, on the new pace.
+#[test]
+fn a_pace_an_observation_holds_too_long_is_replaced_and_the_process_is_read_again() {
+    let handle = crate::session_store::test_handle_on(9134, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let start = Instant::now();
+    let held = read_pace(&ctx, key(10), start);
+    let longest = READ_LAPSES;
+    let (replaced, observed) = held
+        .observe(start, |_| {
+            let within = read_pace(&ctx, key(10), start + longest);
+            assert!(
+                Arc::ptr_eq(&within, &held),
+                "within the longest observation"
+            );
+            let past = read_pace(&ctx, key(10), start + longest + Duration::from_millis(1));
+            assert!(!Arc::ptr_eq(&past, &held), "past it");
+            (past, paced_at(&ctx, key(10)))
+        })
+        .expect("no observation holds the pace");
+    let at = replaced
+        .observe(Instant::now(), |pace| std::ptr::from_mut(pace).addr())
+        .expect("no observation holds the new pace");
+    assert_eq!(observed, Some(Ok(Some(at))));
+}
+
+/// A FAILED PUBLICATION STARTS NO OBSERVATION, NOT EVEN ONE THE PACE WOULD ANSWER WITH NOTHING:
+/// asks every five seconds of a selection whose publication keeps failing, each wired to start
+/// its read as `start` does ([`observe_paced`]), with an observation that answers as a pace
+/// holding the selected row does (`Ok(None)`, no read). None starts: the selection is kept as it
+/// was read, for its publication to be tried again. Had a failed publication started a read, that
+/// observation's `Ok(None)` would have left the job without its selection, to wait for the row's
+/// next rung.
+#[test]
+fn codex_rotation_failed_publication_starts_no_paced_observation() {
+    let handle = crate::session_store::test_handle_on(9135, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    let observed = Instant::now();
+    let progress = Arc::new(Mutex::new(Progress::Selected(Box::new(selection(
+        observed,
+    )))));
+    let observations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mut workers = Vec::new();
+    for attempt in 0..4 {
+        let now = observed + Duration::from_secs(5 * attempt);
+        let reply = ask(
+            &progress,
+            now,
+            |_| Err("writer-busy"),
+            |_| {
+                let (counted, written) = (Arc::clone(&observations), Arc::clone(&progress));
+                workers.push(
+                    observe_paced(
+                        &ctx,
+                        "codex-quota-probe-test",
+                        key(10),
+                        move |_| {
+                            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Ok(None)
+                        },
+                        move |result| {
+                            *written.lock().unwrap() =
+                                progress_after_observation(result, true, Instant::now());
+                        },
+                    )
+                    .expect("the observation's thread"),
+                );
+            },
+        );
+        assert_eq!(reply, WAITING, "{attempt}");
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
+    assert_eq!(
+        observations.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no ask started an observation"
+    );
+    assert!(
+        matches!(
+            &*progress.lock().unwrap(),
+            Progress::Selected(kept) if kept.observed == observed && kept.receipt.is_none()
+        ),
+        "the selection is kept as it was read: {:?}",
+        progress.lock().unwrap()
+    );
+}
+
+/// When a test's process asks (Unix seconds).
+const ASKED: i64 = 1_792_700_000;
+
+/// EVERY ASK OF A USAGE-LIMIT MOVE IS NOTED TO ITS PROCESS'S PACE, WHATEVER ANSWERS IT: under a
+/// hold, each `prepare` the lane serves for the claimed process is answered `waiting` before any
+/// job is asked, and is noted all the same, at the time of its ask. So is each `status` and
+/// `commit` of a receipt, which a session given one asks instead of `prepare` for as long as
+/// that receipt is ready, and each `consume` and `complete`: here of a receipt the lane does not
+/// know, answered before any receipt is read. A lost login's `prepare` is not a usage-limit
+/// move's, and is noted to no pace.
+#[test]
+fn codex_rotation_every_ask_is_noted_to_its_processs_pace_whatever_answers_it() {
+    let handle = crate::session_store::test_handle_on(9136, -1);
+    let ctx = Arc::clone(&handle.ctx);
+    ctx.fabric
+        .seed_holds(crate::fabric::parse_holds(["local mine"]), &ctx.timeline);
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut env = Env::from_process().unwrap();
+    env.home = Some(root.join("home"));
+    env.state = root.join("state");
+    env.config = None;
+    let pid = std::process::id();
+    let proof = crate::self_claim::Proven {
+        pid,
+        start: aterm_agent::harness::restart_stamp::kernel_start(pid)
+            .expect("this process's kernel start"),
+    };
+    let intent = receipt().intent;
+    let copy = self_claimed::Copy {
+        lifetime: None,
+        pid,
+        start: proof.start.clone(),
+        home: root.join("home/.codex"),
+        seen: self_claimed::Seen::Removed,
+        resume: Ok(self_claimed::Resume {
+            argv: vec!["/codex".into(), "resume".into(), intent.thread.clone()],
+            session: intent.thread.clone(),
+            codex_home: None,
+            codex_auth_path: None,
+            cwd: None,
+        }),
+    };
+    let host: Arc<dyn super::super::login_rotation::Host> =
+        Arc::new(super::super::login_rotation::System);
+    let me = ProcessKey::of(&Process::observe(pid).expect("this process"));
+    let serve = |now: i64, request: renewal::Request, purpose: renewal::Purpose| {
+        let env = Env { now, ..env.clone() };
+        super::super::serve_claimed(
+            &ctx,
+            (env, proof.clone(), copy.clone()),
+            request,
+            purpose,
+            &host,
+        )
+    };
+    let prepare = || renewal::Request::Prepare(intent.clone());
+    let unknown = || "rotation-test-unknown".to_owned();
+    let turn = || intent.wall.clone();
+    let asks = [
+        prepare(),
+        prepare(),
+        renewal::Request::Status(unknown()),
+        renewal::Request::Commit(unknown()),
+        renewal::Request::Status(unknown()),
+        renewal::Request::Consume {
+            id: unknown(),
+            turn: turn(),
+        },
+        renewal::Request::Complete {
+            id: unknown(),
+            turn: turn(),
+        },
+    ];
+    let mut at = ASKED;
+    for request in asks {
+        let verb = format!("{request:?}");
+        let reply = serve(at, request, renewal::Purpose::WeeklyQuota);
+        assert!(reply.contains("state=waiting"), "{at} {verb}: {reply}");
+        assert_eq!(
+            read_pace(&ctx, me, Instant::now()).asked_at(),
+            Some(at),
+            "{at} {verb}"
+        );
+        at += 5;
+    }
+    let _ = serve(at, prepare(), renewal::Purpose::LoginRotation);
+    assert_eq!(
+        read_pace(&ctx, me, Instant::now()).asked_at(),
+        Some(at - 5),
+        "a lost login's ask"
     );
 }

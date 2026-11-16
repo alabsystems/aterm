@@ -43,9 +43,9 @@ mod inventory;
 pub mod retirement;
 
 /// THE TESTS' CALL INTO A PASS between an entry's intent on record and its rename aside (the
-/// leaf's in [`Sweep::walk`], a tooling entry's in [`tooling::reclaim`]), with the entry's path:
-/// where a test sets what refuses that rename after the check. Unix test builds alone: only this
-/// crate's Unix tests call it.
+/// leaf's in [`Sweep::take_whole`], a tooling entry's in [`tooling::reclaim`]), with the entry's
+/// path: where a test sets what refuses that rename after the check. Unix test builds alone:
+/// only this crate's Unix tests call it.
 #[cfg(all(test, unix))]
 #[path = "build_cache_seams_tests.rs"]
 pub(crate) mod seams;
@@ -833,6 +833,8 @@ pub enum Unused {
     Gone { idle: Duration },
     /// Nothing wrote it for `idle`, [`RECLAIM_IDLE`] or more: it goes whatever its workspace's state, which was not looked at — it may still be there.
     Idle { idle: Duration },
+    /// Its workspace lies in a linked worktree its caller judged merged into origin/main, clean and quiet outside an agent's shape, which stays (DC-21, [`reclaim_merged_worktree`]); nothing wrote it, a file or a folder, for `idle`, at least `after`.
+    MergedWorktree { idle: Duration, after: Duration },
     /// It is under the root the cache moved from ([`moved_from`]), which no build of this version writes, and nothing wrote it for `idle`, at least `after` ([`MOVED_AFTER`]): it goes whatever its workspace's state.
     Moved { idle: Duration, after: Duration },
     /// What an earlier pass renamed aside and did not finish removing. A dry plan forecasts what
@@ -1196,6 +1198,159 @@ fn reclaim_moved_on(
     intents.finish()
 }
 
+/// A MERGED WORKTREE THAT STAYS GIVES BACK ITS SHARED BUILD DIRECTORIES (DC-21): every build
+/// directory of the shared cache of `home` ([`cache_root`]) that mirrors `worktree` or a
+/// workspace inside it, under `worktree` as given and as resolved, goes whole once nothing wrote
+/// it, a file or a folder, for `leave.quiet` and no build holds its cargo locks
+/// ([`Unused::MergedWorktree`]), through every fence a cache pass has ([`Sweep::take_whole`]:
+/// custody, the process check before and after its intent, a stage of its own, the removal no
+/// one entry stops). The caller judged the worktree (merged into origin/main, clean, quiet,
+/// used by no session or process: `retired::judge_worktree_anywhere` and the disk look's
+/// worktree step); of the worktree itself this resolves its path and reads nothing more, and
+/// nothing of it is written. `record` is asked before each removal (`false` keeps it) and every
+/// intent it put on record closes with an outcome, as [`reclaim_watched`] returns them; a stage
+/// an earlier pass left under the mirror is finished too ([`Unused::Unfinished`]). `leave` is
+/// the caller's leave to go on ([`Leave`]): `leave.within` (its time, its pass lock) is asked
+/// before each folder and at each boundary of a removal's walk, and once it says `false`
+/// nothing more is moved or removed, and what was moved aside stays in its stage, which a pass
+/// of the cache finishes; the read of a build directory's files ends at `leave.until`, and one
+/// not read through by then stays. Nothing where `worktree` is relative, is `home` or a folder
+/// above it under either spelling, or where a folder from the cache root down to its mirror is
+/// a link ([`real_below`]): a mirror is entered only through real directories, so no other
+/// workspace's build directory is reached. The root the cache moved from is not read:
+/// [`reclaim_moved`] empties it within the hour. A process in a build directory keeps it, with a
+/// debug line and no warning: the worktree stands, and a language server or a build left
+/// running in it is no fault of the pass ([`fence::Fence::expected`]).
+pub fn reclaim_merged_worktree(
+    home: &Path,
+    worktree: &Path,
+    now: SystemTime,
+    leave: &Leave<'_>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_merged_worktree_on(
+        home,
+        worktree,
+        now,
+        leave,
+        record,
+        &fence::Fence::default().expected(),
+    )
+}
+
+/// [`reclaim_merged_worktree`] with an ownership probe supplied by a headless fixture.
+#[cfg(any(test, debug_assertions))]
+pub fn reclaim_merged_worktree_with_processes(
+    home: &Path,
+    worktree: &Path,
+    now: SystemTime,
+    leave: &Leave<'_>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    processes: fence::Processes<'_>,
+) -> Vec<(PathBuf, Unused)> {
+    reclaim_merged_worktree_on(
+        home,
+        worktree,
+        now,
+        leave,
+        record,
+        &fence::Fence::new(processes).expected(),
+    )
+}
+
+/// The leave a caller gives [`reclaim_merged_worktree`]: how quiet a build directory must be,
+/// and how long the caller may go on.
+#[derive(Clone, Copy)]
+pub struct Leave<'a> {
+    /// How long nothing, a file or a folder, must have written a build directory before it goes.
+    pub quiet: Duration,
+    /// Whether the caller may still go on (its time, its pass lock), asked before each folder
+    /// and at each boundary of a removal's walk.
+    pub within: &'a dyn Fn() -> bool,
+    /// When the read of a build directory's files ends: one not read through by then stays.
+    /// `None`: the read runs to its end.
+    pub until: Option<std::time::Instant>,
+}
+
+fn reclaim_merged_worktree_on(
+    home: &Path,
+    worktree: &Path,
+    now: SystemTime,
+    leave: &Leave<'_>,
+    record: &mut dyn FnMut(&Path, Unused) -> bool,
+    fence: &fence::Fence<'_>,
+) -> Vec<(PathBuf, Unused)> {
+    // A worktree that is the home, or a folder above it, mirrors every workspace of the cache.
+    let homes = [Some(home.to_path_buf()), std::fs::canonicalize(home).ok()];
+    let above_home = |spelled: &Path| homes.iter().flatten().any(|h| h.starts_with(spelled));
+    let root = cache_root(home);
+    let spellings = [
+        Some(worktree.to_path_buf()),
+        std::fs::canonicalize(worktree).ok(),
+    ];
+    let mut mirrors: Vec<PathBuf> = spellings
+        .into_iter()
+        .flatten()
+        .filter(|spelled| spelled.is_absolute() && !above_home(spelled))
+        .filter_map(|spelled| build_dir(&root, &spelled).parent().map(Path::to_path_buf))
+        .collect();
+    mirrors.sort();
+    mirrors.dedup();
+    let mut intents = Intents::new(record);
+    {
+        let mut sweep = Sweep {
+            root: &root,
+            home: Some(home),
+            now,
+            after: ReclaimAfter::CALM.into(),
+            placing: None,
+            moved: false,
+            compiler_store: None,
+            intents: &mut intents,
+            fence,
+            permitted: leave.within,
+            pruning: Vec::new(),
+            declined: false,
+        };
+        for mirror in &mirrors {
+            if real_below(&root, mirror) {
+                sweep.merged_walk(mirror, leave, 0);
+            }
+        }
+    }
+    intents.finish()
+}
+
+/// Whether `path` lies strictly below `root` and every folder from `root` down to it is a real
+/// directory, read without following a link: the rest of `path` after `root` is one or more
+/// plain names (no `..`, no root), and `root` and each folder on the way answer as a directory
+/// that is no link or reparse point. `root` itself is not below `root`.
+fn real_below(root: &Path, path: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let real = |dir: &Path| {
+        std::fs::symlink_metadata(dir)
+            .is_ok_and(|meta| meta.is_dir() && !crate::platform::is_reparse(&meta))
+    };
+    if !real(root) {
+        return false;
+    }
+    let mut at = root.to_path_buf();
+    let mut below = false;
+    for part in rest.components() {
+        let std::path::Component::Normal(name) = part else {
+            return false;
+        };
+        at.push(name);
+        if !real(&at) {
+            return false;
+        }
+        below = true;
+    }
+    below
+}
+
 /// One [`reclaim`] pass: where, when, and what went.
 struct Sweep<'a, 'r> {
     root: &'a Path,
@@ -1213,7 +1368,8 @@ struct Sweep<'a, 'r> {
     /// outcome that closes each intent it put on record.
     intents: &'a mut Intents<'r>,
     fence: &'a fence::Fence<'a>,
-    /// Additional authority checked at every deletion boundary for registered roots.
+    /// Additional authority checked at every deletion boundary: a registered root's, and the
+    /// leave of the caller of [`reclaim_merged_worktree`] (its time, its pass lock).
     permitted: &'a dyn Fn() -> bool,
     /// Live build directories, with a complete first inventory where the whole-cache judge
     /// kept one. Pruned once the walk took what costs nothing ([`Self::finish_prunes`]).
@@ -1545,56 +1701,7 @@ impl Sweep<'_, '_> {
                     }
                     continue;
                 };
-                if !self
-                    .fence
-                    .admit(&child, KeepReason::PermissionChanged, (self.permitted)())
-                    || !self.fence.admit(
-                        &child,
-                        KeepReason::Custody,
-                        registered::retention::allows_tree(&child),
-                    )
-                    || !self.fence.admit(
-                        &child,
-                        KeepReason::CannotStage,
-                        stage_for(&child, dir, OsStr::new(DOOMED)).is_some(),
-                    )
-                    || !self.fence.clear(&child, &child)
-                    || !self.fence.admit(
-                        &child,
-                        KeepReason::IntentDeclined,
-                        self.intents.ask(&child, why),
-                    )
-                {
-                    drop(held);
-                    continue;
-                }
-                if !self
-                    .fence
-                    .admit(&child, KeepReason::PermissionChanged, (self.permitted)())
-                    || !self.fence.admit(
-                        &child,
-                        KeepReason::Custody,
-                        registered::retention::allows_tree(&child),
-                    )
-                    || !self.fence.clear(&child, &child)
-                {
-                    drop(held);
-                    self.intents.stop();
-                    continue;
-                }
-                seams::staging(&child);
-                let staged = stage_unkept(&child, dir, OsStr::new(DOOMED));
-                drop(held);
-                match staged {
-                    Ok(Some(stage)) => {
-                        any = true;
-                        self.intents.moved(&stage);
-                        self.take(&stage, child.clone(), why, &child);
-                    }
-                    // Put back where it stood: a keep was published at it as it moved.
-                    Ok(None) => self.intents.stop(),
-                    Err(e) => self.intents.refused(Refusal::Rename(e.kind())),
-                }
+                any |= self.take_whole(dir, &child, held, why);
             } else if is_stage(name, OsStr::new(DOOMED)) {
                 let original = dir.join(LEAF);
                 if self.stage_recorded(&child, &original) {
@@ -1605,6 +1712,142 @@ impl Sweep<'_, '_> {
             }
         }
         if dir != root && (quiet || any) {
+            let _ = std::fs::remove_dir(dir);
+        }
+        any
+    }
+
+    /// TAKE THE BUILD DIRECTORY `child` OF THE MIRROR FOLDER `dir` WHOLE for `why`, its cargo
+    /// locks `held` ([`unused`]): while the pass's authority, custody read by its path, a stage
+    /// name it can be renamed to ([`stage_for`]) and the process fence allow, its intent is
+    /// asked; with that on record the authority, custody and the fence are read again, and it is
+    /// renamed aside in `dir` under a stage of its own ([`stage_unkept`]), its locks let go, and
+    /// removed ([`Self::take`]). `true` once it was moved aside, whatever its removal then left;
+    /// `false` where it stands where it stood: kept before its intent with nothing on record, or
+    /// its intent closed with nothing gone (a check made again refused it, a keep published as
+    /// it moved put it back, or its rename was refused: [`Refusal`]).
+    fn take_whole(
+        &mut self,
+        dir: &Path,
+        child: &Path,
+        held: Vec<crate::lock::Flock>,
+        why: Unused,
+    ) -> bool {
+        if !self
+            .fence
+            .admit(child, KeepReason::PermissionChanged, (self.permitted)())
+            || !self.fence.admit(
+                child,
+                KeepReason::Custody,
+                registered::retention::allows_tree(child),
+            )
+            || !self.fence.admit(
+                child,
+                KeepReason::CannotStage,
+                stage_for(child, dir, OsStr::new(DOOMED)).is_some(),
+            )
+            || !self.fence.clear(child, child)
+            || !self.fence.admit(
+                child,
+                KeepReason::IntentDeclined,
+                self.intents.ask(child, why),
+            )
+        {
+            drop(held);
+            return false;
+        }
+        if !self
+            .fence
+            .admit(child, KeepReason::PermissionChanged, (self.permitted)())
+            || !self.fence.admit(
+                child,
+                KeepReason::Custody,
+                registered::retention::allows_tree(child),
+            )
+            || !self.fence.clear(child, child)
+        {
+            drop(held);
+            self.intents.stop();
+            return false;
+        }
+        seams::staging(child);
+        let staged = stage_unkept(child, dir, OsStr::new(DOOMED));
+        drop(held);
+        match staged {
+            Ok(Some(stage)) => {
+                self.intents.moved(&stage);
+                self.take(&stage, child.to_path_buf(), why, child);
+                true
+            }
+            // Put back where it stood: a keep was published at it as it moved.
+            Ok(None) => {
+                self.intents.stop();
+                false
+            }
+            Err(e) => {
+                self.intents.refused(Refusal::Rename(e.kind()));
+                false
+            }
+        }
+    }
+
+    /// ONE MIRROR FOLDER `dir` OF A MERGED WORKTREE THAT STAYS ([`reclaim_merged_worktree`]),
+    /// its children as one listing read them: its [`LEAF`] goes whole ([`Self::take_whole`])
+    /// once nothing wrote it for `leave.quiet`, a folder of it ([`look`]) or a file
+    /// ([`retired::written_since`], which reads every file's own time; read before the leaf's
+    /// locks are taken, so no lock is held for that walk, and ended at `leave.until`, where one
+    /// not read through stays), and no build holds its locks ([`Unused::MergedWorktree`]). Both
+    /// clocks are read: the files' walk passes over a folder laid out as a git directory, which
+    /// a build script may make in its output, and only the inventory dates the folders in one.
+    /// Each stage an earlier pass left is finished once; every other folder is walked, since a
+    /// workspace nested in the worktree builds into a leaf of its own below. Nothing is pruned
+    /// in part. No folder is entered once the caller's leave is withdrawn, and `dir` itself goes
+    /// once this walk emptied it.
+    fn merged_walk(&mut self, dir: &Path, leave: &Leave<'_>, depth: usize) -> bool {
+        let (now, quiet) = (self.now, leave.quiet);
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        let children: Vec<PathBuf> = entries
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|e| e.path())
+            .collect();
+        let mut any = false;
+        for child in children {
+            aterm_uds::progress::tick();
+            if !(self.permitted)() {
+                break;
+            }
+            let name = child.file_name().unwrap_or_default();
+            if name == LEAF {
+                let since = now.checked_sub(quiet);
+                let judged = unused(
+                    &child,
+                    &|seen| {
+                        let idle = age(now, seen.newest);
+                        if idle < quiet {
+                            return None;
+                        }
+                        let read = retired::written_since(&child, since?, leave.until);
+                        matches!(read, Ok(None))
+                            .then_some(Unused::MergedWorktree { idle, after: quiet })
+                    },
+                    self.fence,
+                );
+                if let Some((held, why)) = judged {
+                    any |= self.take_whole(dir, &child, held, why);
+                }
+            } else if is_stage(name, OsStr::new(DOOMED)) {
+                let original = dir.join(LEAF);
+                if self.stage_recorded(&child, &original) {
+                    any |= self.finish_stage(&child, &original);
+                }
+            } else if depth < MAX_DEPTH {
+                any |= self.merged_walk(&child, leave, depth + 1);
+            }
+        }
+        if any {
             let _ = std::fs::remove_dir(dir);
         }
         any

@@ -2608,6 +2608,36 @@ impl StateDir {
         )
     }
 
+    /// STAGE A DRAIN PASS'S GROUP OF FRESH OWN-LANE POSTS (ATERM-KI-1111-5): every post's
+    /// reservation (`reserves`, as [`StateDir::set_post_pin`] writes one), then every post's
+    /// in-flight entry (`entries`, as [`StateDir::set_in_flight`] writes one), in one write
+    /// ([`StateDir::append_post_frames`]), before any of them is published. A write cut short
+    /// keeps a complete prefix: some reservations, or every reservation and the entries of the
+    /// group's first posts, so an entry stands only where every reservation of the group does,
+    /// and the entries that stand are of a prefix of the group in its order. On a failure none
+    /// is applied.
+    ///
+    /// # Errors
+    /// The journal unreadable or damaged, or the write: nothing was reserved.
+    pub(crate) fn stage_posts(
+        &self,
+        reserves: &[(&str, u64, &PublishPin)],
+        entries: &[InFlight],
+    ) -> io::Result<()> {
+        let _timed = self.timed(crate::wait_tally::Row::SetPostPin);
+        let mut posts = self.posts()?;
+        let frames = reserves
+            .iter()
+            .map(|&(sid, id, pin)| journal::Frame::Reserve {
+                sid: sid.to_string(),
+                id,
+                pin: pin.clone(),
+            })
+            .chain(entries.iter().cloned().map(journal::Frame::InFlight))
+            .collect();
+        self.append_post_frames(&mut posts, frames)
+    }
+
     /// The post journal, read and judged if this open has not read it yet
     /// ([`StateDir::judge_posts`]); where this open may write, a journal an attach it does not
     /// name went past has its records in flight retired ([`StateDir::retire_journal_in_flight`]) and

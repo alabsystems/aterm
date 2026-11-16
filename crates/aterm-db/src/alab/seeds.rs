@@ -154,8 +154,11 @@ pub struct PlanSeed {
     pub windows: &'static [&'static str],
 }
 
-/// The plan words the CLIs report: Claude Code's organization types and Codex's `plan_type`.
-pub const PLANS: [PlanSeed; 7] = [
+/// The plan words the CLIs report: Claude Code's organization types (`max`, `pro`, `team`,
+/// `enterprise`) and every ChatGPT `plan_type` a Codex login's claims name and the harness keeps
+/// (`aterm-agent` `harness::journal::PLANS`), so a plan a Mac observed names a row
+/// (`fleet::fold`, `<provider>-<word>`).
+pub const PLANS: [PlanSeed; 13] = [
     PlanSeed {
         pk: "anthropic-max",
         provider: keys::ANTHROPIC,
@@ -204,6 +207,48 @@ pub const PLANS: [PlanSeed; 7] = [
         name: "ChatGPT Pro Lite",
         period: Some("month"),
         windows: &["5h", "7d"],
+    },
+    PlanSeed {
+        pk: "openai-free",
+        provider: keys::OPENAI,
+        name: "ChatGPT Free",
+        period: None,
+        windows: &[],
+    },
+    PlanSeed {
+        pk: "openai-go",
+        provider: keys::OPENAI,
+        name: "ChatGPT Go",
+        period: Some("month"),
+        windows: &[],
+    },
+    PlanSeed {
+        pk: "openai-team",
+        provider: keys::OPENAI,
+        name: "ChatGPT Team",
+        period: None,
+        windows: &[],
+    },
+    PlanSeed {
+        pk: "openai-business",
+        provider: keys::OPENAI,
+        name: "ChatGPT Business",
+        period: None,
+        windows: &[],
+    },
+    PlanSeed {
+        pk: "openai-enterprise",
+        provider: keys::OPENAI,
+        name: "ChatGPT Enterprise",
+        period: None,
+        windows: &[],
+    },
+    PlanSeed {
+        pk: "openai-edu",
+        provider: keys::OPENAI,
+        name: "ChatGPT Edu",
+        period: None,
+        windows: &[],
     },
 ];
 

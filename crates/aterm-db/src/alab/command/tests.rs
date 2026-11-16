@@ -1519,26 +1519,23 @@ fn retired_keys_cannot_gain_new_preferences_and_strict_flags_or_open_keys_refuse
     ] {
         assert!(verb(bad).is_err(), "{bad:?}");
     }
-    // Retire m3 in the registry: `prefer` by key refuses, while `unprefer` by key or label ends
-    // the existing preference.
-    Handle::at(paths.clone(), &att::REGISTRY)
-        .commit_derived(false, |_| {
-            Ok((
-                (),
-                vec![vec![
-                    cell::change(
-                        &MACHINE,
-                        CellKey {
-                            pk: &m3_pk,
-                            col: "row",
-                            elem: None,
-                        },
-                        &CellValue::owner(MACHINE.version, json!("retired")),
-                    )
-                    .unwrap(),
-                ]],
-            ))
-        })
+    // m3 retired while its preference is live, as a concurrent write can leave it (this Mac's
+    // own retire of a machine a live preference names is refused; a write that makes such a
+    // preference live again is not yet, ATERM-KI-1115-3801): `prefer` by key refuses, while
+    // `unprefer` by key or label ends the lingering preference.
+    Registry::at(paths.clone())
+        .write(vec![vec![
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk: &m3_pk,
+                    col: "row",
+                    elem: None,
+                },
+                &CellValue::owner(MACHINE.version, json!("retired")),
+            )
+            .unwrap(),
+        ]])
         .unwrap();
     assert!(verb(&["prefer", &m3_pk, &claude]).is_err());
     let ended = verb(&["unprefer", "m3", &claude]).unwrap();
@@ -2823,6 +2820,62 @@ fn merge_dry_runs_then_folds_the_duplicate() {
     let again = verb(paths, &["merge", "--apply"]).unwrap();
     assert_eq!(again["written"], json!(0), "{again}");
     assert_eq!(again["merges"], json!([]), "{again}");
+}
+
+/// `check --tsv` says each finding in words, a line each, through the one function the Tables
+/// page says it by (`check::said`): a label that is another machine's alias reads as the sentence
+/// written beside its rule, with its table and its rows by key, and the lines are the JSON
+/// report's findings, one for one. A kind no sentence is written for prints its own word.
+/// NEGATIVE CONTROL: with `label-ambiguous`'s sentence taken out of `checks::sentence`, the line
+/// says the bare word: `` the rule's sentence: label-ambiguous\tmachine\t… ``.
+#[test]
+fn check_tsv_says_each_finding_in_words() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
+    let keep = verb(paths, &["add", "machine", "m36"]).unwrap()["mc"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let gone = verb(paths, &["add", "machine", "m104"]).unwrap()["mc"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    Handle::at(paths.clone(), &att::REGISTRY)
+        .commit_owner(|_| Ok(((), vec![vec![elem(&MACHINE, &keep, "aliases", "m104")]])))
+        .unwrap();
+    let report = verb(paths, &["check"]).unwrap();
+    let Value::String(tsv) = verb(paths, &["check", "--tsv"]).unwrap() else {
+        panic!("check --tsv prints lines");
+    };
+    let lines: Vec<&str> = tsv.lines().collect();
+    assert_eq!(lines[0], "finding\ttable\trows\tcolumns\tmeans\tdetail");
+    let found =
+        report["lab"].as_array().unwrap().len() + report["findings"].as_array().unwrap().len();
+    assert_eq!(lines.len(), 1 + found, "a line for each finding: {tsv}");
+    let ambiguous = lines
+        .iter()
+        .find(|line| line.starts_with("label-ambiguous\t"))
+        .expect("the label is another machine's alias");
+    let sentence = crate::typed::check::said("label-ambiguous");
+    assert_ne!(
+        sentence, "label-ambiguous",
+        "the rule's sentence: {ambiguous}"
+    );
+    assert_eq!(
+        *ambiguous,
+        format!("label-ambiguous\tmachine\t{gone}, {keep}\t\t{sentence}\t"),
+    );
+    // A kind no sentence is written for is said by its word.
+    let unknown = att::command::line(&json!({
+        "finding": "a-rule-of-a-later-build",
+        "collection": "machine",
+        "pks": [keep],
+    }));
+    assert_eq!(unknown.said, "a-rule-of-a-later-build");
+    assert_eq!(unknown.pks, [keep]);
 }
 
 /// A replica password shaped like a flag is covered only where it is a flag word that agrees

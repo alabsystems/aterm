@@ -10,11 +10,13 @@
 //! (`scripts/install-git-hooks.sh`, [`crate::init_github`]): one found in place never ran it, and
 //! running it again would repeat a 6 s self-test, may reach the network and runs the clone's own
 //! code. This runs none of a clone's code. It reads the declaration as data, from origin's
-//! default branch as the clone last fetched it ([`crate::checkout::fetched_head_by`]: `git config
-//! --blob <blob> --no-includes`, after a size check, never the worktree's copy), and applies
-//! only aterm's allowlist: `core.untrackedCache` and `feature.manyFiles`, set to `true`, in the
-//! clone's own config; `core.untrackedCache` alone in each populated submodule's; and index
-//! format 4 for the superproject's index. Every other declared key is named, never applied.
+//! default branch as the clone last fetched it (the pass's record of the clone's facts,
+//! [`checkout::Facts::fetched_head`]; `git config --blob <blob> --no-includes`, after a size
+//! check, never the worktree's copy), and only where origin's tip moved since it was last read
+//! there ([`DECLARATIONS`]). It applies only aterm's allowlist: `core.untrackedCache` and
+//! `feature.manyFiles`, set to `true`, in the clone's own config; `core.untrackedCache` alone in
+//! each populated submodule's; and index format 4 for the superproject's index. Every other
+//! declared key is named, never applied.
 //!
 //! The clones are the inventory's present ones ([`crate::init_github::vault_clones`], whose
 //! dependency reads turn off every hook and filter driver a repository names, as the writes
@@ -22,13 +24,16 @@
 //! hold of GitHub repositories none is in scope, and a folder the inventory does not name is
 //! never touched.
 //!
-//! Every git run here stays on this machine: none fetches an object a partial clone lacks
-//! (`GIT_NO_LAZY_FETCH`, and `--no-lazy-fetch` where git takes it: [`Git`], so a git that
-//! neither takes the option nor was seen to obey the variable tunes nothing). A write runs
-//! nothing else: no hook, whether a hooks folder's or one a config names, no filter driver, and
-//! no fsmonitor daemon ([`quiet`], [`checkout::Programs`]); a clone whose config names a hook or
-//! filter aterm cannot name to turn off is left as it is, and so is one whose config is a link,
-//! which git would write through.
+//! Every git run here stays on this machine: none fetches an object a partial clone lacks. Each
+//! carries `GIT_NO_LAZY_FETCH`. Clone tuning's own reads and writes add `--no-lazy-fetch` where
+//! git takes it ([`Git`]); the reads of the pass's record of a clone's facts
+//! ([`checkout::Facts::of`]) carry the variable alone, which every git that takes the option
+//! also obeys. A git that neither takes the option nor was seen to obey the variable tunes
+//! nothing. A write runs nothing else: no hook, whether a hooks folder's or one a config names,
+//! no filter driver, and no fsmonitor daemon ([`quiet`], [`checkout::Programs`], each named in
+//! the pass's record of the repository's facts); a clone whose config names a hook or filter
+//! aterm cannot name to turn off is left as it is, and so is one whose config is a link, which
+//! git would write through.
 //!
 //! The rules are the hook installers' (`scripts/hooks/_git_client_tuning.sh`):
 //! * A key set in any scope (`git config --show-scope`, read with no `-c`) is kept, and so is an
@@ -50,20 +55,28 @@
 //! made again at the same path starts afresh. A key removed after aterm set it is the
 //! person's opt-out and is not set again; a key the declaration drops is unset only while the
 //! repository's own config still holds aterm's value.
+//!
+//! What each clone's declaration held at origin's tip is kept in `<state>/converge/`
+//! [`DECLARATIONS`]: a commit's tree is what its name says (replacement refs are not read for
+//! it), so a pass whose clone still names that tip reads nothing of its declaration again. Only
+//! what applies writes it, under [`LOCK`]: an applying sync pass's read ([`Keep::Declarations`])
+//! and an [`apply`]. A plan (`aterm init --converge --check`), System State's reading and the
+//! doctor's probe keep nothing ([`Keep::Nothing`]) and write nothing.
 
 use crate::checkout::{self, NO_SIDE_RUNS, NoLazyFetch, NotFetched};
 use crate::engine::Place;
 use crate::init::Holds;
-use crate::init_github::{self, VaultClones};
+use crate::init_github::{self, PassWrites, VaultClones, Wrote as PassWrote};
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, User};
 use crate::port::{Cmd, FileId, Ran, Scratch, System};
+use crate::sync::repository_refresh::RepositoryPass;
 use aterm_converge::{Class, Layer, Remedy, Requires, StoodAside};
 use aterm_types::macos_setup::Setting;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 /// Where a repository declares its tuning, in git config syntax: the fleet's one path.
@@ -81,6 +94,13 @@ pub const RECORD: &str = "clone-tuning.json";
 
 /// The largest record read.
 const RECORD_MAX: usize = 4 * 1024 * 1024;
+
+/// What each clone's declaration held at origin's tip it was last read at, under
+/// `<state>/converge` (0600): [`Declarations`].
+const DECLARATIONS: &str = "clone-tuning-declarations.json";
+
+/// [`DECLARATIONS`]' shape. A record of another shape is read as none: it only spares reads.
+const DECLARATIONS_SCHEMA: u32 = 1;
 
 /// Taken across an apply, so a doctor and a sync pass never write the record at once.
 const LOCK: &str = "clone-tuning.lock";
@@ -158,12 +178,32 @@ const TO: &str = "tuned as each declares in its scripts/git-clone.gitconfig";
 /// What an apply that tuned no clone says.
 const NOTHING: &str = "nothing tuned";
 
-/// Read every clone in scope and say how it differs from its declaration. Writes nothing and
-/// takes no lock.
+/// Whether a [`read`] keeps what it read of each clone's declaration ([`DECLARATIONS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Keep {
+    /// Nothing: a plan's read (`--check`), System State's reading and the doctor's probe, none
+    /// of which writes anything.
+    Nothing,
+    /// What it read of a declaration, where `<state>/converge` is there and no [`apply`] holds
+    /// [`LOCK`] (one that does keeps what it read itself): an applying sync pass's read, so the
+    /// next pass reads no declaration whose tip stands.
+    Declarations,
+}
+
+/// Read every clone in scope and say how it differs from its declaration. Changes no clone. It
+/// writes only what `keep` asks for: under [`Keep::Declarations`], what it read of a
+/// declaration ([`DECLARATIONS`]), under [`LOCK`], taken without waiting; under
+/// [`Keep::Nothing`], nothing, and it takes no lock.
 ///
 /// # Errors
 /// The context, init profile, inventory or [`RECORD`] cannot be read.
-pub fn read(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result<Reading, String> {
+pub fn read(
+    sys: &dyn System,
+    ctx: &Ctx,
+    state: &Path,
+    holds: &Holds,
+    keep: Keep,
+) -> Result<Reading, String> {
     let (git, tops) = match scope(sys, ctx, holds)? {
         Scope::Out(why) => return Ok(Reading::NotApplicable(why)),
         Scope::Clones { git, tops } => (git, tops),
@@ -172,19 +212,39 @@ pub fn read(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result<
     let Some(record) = Record::read(&dir)? else {
         return Ok(Reading::NotApplicable(newer(&dir)));
     };
-    let clones = plan_all(sys, git, &tops, &record, test_volume(sys, &dir));
+    let mut known = Declarations::read(&dir);
+    let clones = plan_all(sys, git, &tops, &record, test_volume(sys, &dir), &mut known);
+    if keep == Keep::Declarations && known.changed() {
+        // An apply that holds the lock keeps what it read itself: this read waits for none.
+        if let Ok(locked) = aterm_uds::private_file::PrivateLock::take(
+            &dir,
+            LOCK,
+            Duration::ZERO,
+            "another aterm tunes the vault's clones now",
+        ) {
+            known.write(&dir, &locked);
+        }
+    }
     Ok(summary(&clones, sys.machine()))
 }
 
 /// Tune every clone in scope as [`read`] plans it: run the self-test first where one is owed,
 /// then write each key, record it, and convert the superproject's index. Stands aside
 /// ([`Tuned::aside`]) where nothing is in scope as it begins, and for each clone another git
-/// holds.
+/// holds. Run by a converge pass (`pass`, the repository lease it holds), each clone's writes
+/// are recorded as that pass's own ([`PassWrites::around`]), so the repository input observer
+/// takes none of them for new work.
 ///
 /// # Errors
 /// The lock, the record or the self-test cannot be had, or a write failed (each one named; the
 /// rest still ran).
-pub fn apply(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result<Tuned, String> {
+pub fn apply(
+    sys: &dyn System,
+    ctx: &Ctx,
+    state: &Path,
+    holds: &Holds,
+    pass: Option<Arc<RepositoryPass>>,
+) -> Result<Tuned, String> {
     apply_with(
         sys,
         ctx,
@@ -195,6 +255,7 @@ pub fn apply(sys: &dyn System, ctx: &Ctx, state: &Path, holds: &Holds) -> Result
             planned: &|| {},
             lock_wait: LOCK_WAIT,
         },
+        pass,
     )
 }
 
@@ -219,6 +280,7 @@ fn apply_with(
     state: &Path,
     holds: &Holds,
     seams: &Seams<'_>,
+    pass: Option<Arc<RepositoryPass>>,
 ) -> Result<Tuned, String> {
     let (git, tops) = match scope(sys, ctx, holds)? {
         Scope::Out(why) => return Ok(aside(why)),
@@ -227,13 +289,13 @@ fn apply_with(
     let dir = converge_dir(state);
     aterm_uds::private_file::ensure_private_dir(&dir)
         .map_err(|why| format!("{}: {why}", dir.display()))?;
-    let _held = match aterm_uds::private_file::PrivateLock::take(
+    let locked = match aterm_uds::private_file::PrivateLock::take(
         &dir,
         LOCK,
         seams.lock_wait,
         "another aterm tunes the vault's clones now",
     ) {
-        Ok(held) => held,
+        Ok(locked) => locked,
         Err(why) if why.kind() == std::io::ErrorKind::WouldBlock => {
             return Ok(aside(
                 "another aterm tunes the vault's clones now; the next pass tunes them".into(),
@@ -245,7 +307,8 @@ fn apply_with(
         return Ok(aside(newer(&dir)));
     };
     let test = test_volume(sys, &dir);
-    let mut clones = plan_all(sys, git, &tops, &record, test);
+    let mut known = Declarations::read(&dir);
+    let mut clones = plan_all(sys, git, &tops, &record, test, &mut known);
     if let Some(dev) = clones.iter().find_map(|clone| clone.pending) {
         let passed = (seams.self_test)(sys, git, &dir)?;
         record.volumes.insert(
@@ -256,13 +319,20 @@ fn apply_with(
             },
         );
         record.write(&dir)?;
-        clones = plan_all(sys, git, &tops, &record, test);
+        clones = plan_all(sys, git, &tops, &record, test, &mut known);
+    }
+    if known.changed() {
+        known.write(&dir, &locked);
     }
     (seams.planned)();
+    let writes = pass
+        .zip(ctx.users.first())
+        .and_then(|(pass, user)| PassWrites::new(sys, user, pass));
     let mut done = Vec::new();
     let mut failed = Vec::new();
     let mut held = Vec::new();
-    for clone in &clones {
+    // `plan_all` plans each of `tops` in turn: each plan is its clone's.
+    for (top, clone) in tops.iter().zip(&clones) {
         if let Some(why) = &clone.held {
             held.push(why.clone());
             continue;
@@ -270,7 +340,16 @@ fn apply_with(
         if !clone.differs() {
             continue;
         }
-        let tuning = tune(sys, git, clone, &mut record, &dir, &mut failed)?;
+        let mut tuned = || {
+            (
+                tune(sys, git, clone, &mut record, &dir, &mut failed),
+                PassWrote::Own,
+            )
+        };
+        let tuning = match &writes {
+            Some(writes) => writes.around(sys, top, tuned),
+            None => tuned().0,
+        }?;
         done.extend(tuning.done);
         held.extend(tuning.held);
     }
@@ -348,11 +427,11 @@ fn tune(
                     }
                     changed = true;
                 }
-                Err(Wrote::Locked) => {
+                Err(Unwritten::Locked) => {
                     locked = true;
                     break;
                 }
-                Err(Wrote::Failed(why)) => failed.push(format!(
+                Err(Unwritten::Failed(why)) => failed.push(format!(
                     "{}: {}{key}: {why}",
                     repo.label,
                     if set { "" } else { "unset " }
@@ -386,11 +465,11 @@ fn tune(
             held: None,
         },
         Ok(None) => Tuning { done, held: None },
-        Err(Wrote::Locked) => Tuning {
+        Err(Unwritten::Locked) => Tuning {
             done,
             held: Some(lock_held(&clone.label, "index.lock")),
         },
-        Err(Wrote::Failed(why)) => {
+        Err(Unwritten::Failed(why)) => {
             failed.push(format!(
                 "{}: index format not converted: {why}; the next pass tries again",
                 clone.label
@@ -473,7 +552,8 @@ impl Item for CloneTuning {
     }
 
     fn probe(&self, sys: &dyn System, ctx: &Ctx) -> Probe {
-        match read(sys, ctx, &self.state, &(self.holds)()) {
+        // A probe writes nothing: the doctor's apply keeps what it reads.
+        match read(sys, ctx, &self.state, &(self.holds)(), Keep::Nothing) {
             Ok(reading) => reading.probe(),
             Err(why) => Probe::Unusable { why },
         }
@@ -481,7 +561,7 @@ impl Item for CloneTuning {
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        let tuned = apply(sys, ctx, &self.state, &(self.holds)())?;
+        let tuned = apply(sys, ctx, &self.state, &(self.holds)(), None)?;
         *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
             tuned.aside.map(StoodAside::Waiting);
         *self.said.lock().unwrap_or_else(PoisonError::into_inner) = Some(tuned.said);
@@ -715,6 +795,91 @@ impl Record {
     }
 }
 
+/// What each clone's declaration held at origin's tip it was last read at ([`DECLARATIONS`]),
+/// by the clone's top. A declaration is a blob in a commit's tree, read with replacement refs
+/// off ([`at_commit`]), so it is what that commit's name says: while a clone's tip is the one
+/// kept, its declaration is what was kept. Only a declaration that was read whole is kept; one
+/// that could not be read (not fetched to a partial clone, too large, not config) is read again
+/// by every pass.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Declarations {
+    schema: u32,
+    #[serde(default)]
+    clones: BTreeMap<String, DeclaredAt>,
+    /// The clones this run looked up: what it writes back.
+    #[serde(skip)]
+    looked: BTreeSet<String>,
+    /// Whether this run read a declaration it keeps.
+    #[serde(skip)]
+    fresh: bool,
+}
+
+/// One clone's declaration at one tip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclaredAt {
+    /// Origin's tip it was read at.
+    tip: String,
+    /// Its `git config --null --list` ([`parse`]), empty where that tip declares nothing.
+    listing: String,
+}
+
+impl Declarations {
+    /// The record under `dir`, or none where there is none or it is not this aterm's shape: it
+    /// only spares reads, so each declaration it does not hold is read again.
+    fn read(dir: &Path) -> Self {
+        let read: Option<Self> =
+            aterm_uds::private_file::read_private(dir, DECLARATIONS, RECORD_MAX)
+                .ok()
+                .and_then(|bytes| aterm_json::from_slice(&bytes).ok());
+        read.filter(|known| known.schema == DECLARATIONS_SCHEMA)
+            .unwrap_or_default()
+    }
+
+    /// What `top`'s declaration held at `tip`, where it was read at that tip.
+    fn at(&mut self, top: &Path, tip: &str) -> Option<&str> {
+        let key = top.to_string_lossy().into_owned();
+        self.looked.insert(key.clone());
+        self.clones
+            .get(&key)
+            .filter(|kept| kept.tip == tip)
+            .map(|kept| kept.listing.as_str())
+    }
+
+    /// Keep `listing`, `top`'s declaration as read at `tip`.
+    fn keep(&mut self, top: &Path, tip: &str, listing: String) {
+        let key = top.to_string_lossy().into_owned();
+        self.looked.insert(key.clone());
+        self.clones.insert(
+            key,
+            DeclaredAt {
+                tip: tip.to_owned(),
+                listing,
+            },
+        );
+        self.fresh = true;
+    }
+
+    /// Whether this run changed the record: it read a declaration it keeps, or holds a clone it
+    /// did not look up, which [`Self::write`] drops.
+    fn changed(&self) -> bool {
+        self.fresh || self.clones.keys().any(|top| !self.looked.contains(top))
+    }
+
+    /// Write what this run read, of the clones it looked up alone, under [`LOCK`] (`_locked`),
+    /// so no two runs write it at once. A record that cannot be written is no failure: the next
+    /// pass reads the declarations again.
+    fn write(mut self, dir: &Path, _locked: &aterm_uds::private_file::PrivateLock) {
+        let looked = std::mem::take(&mut self.looked);
+        self.clones.retain(|top, _| looked.contains(top));
+        self.schema = DECLARATIONS_SCHEMA;
+        if let Ok(bytes) = aterm_json::to_vec(&self) {
+            let _ = aterm_uds::private_file::write_private(dir, DECLARATIONS, &bytes);
+        }
+    }
+}
+
 /// What a clone declares that aterm applies.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Declared {
@@ -862,15 +1027,18 @@ fn summary(clones: &[Plan], machine: &str) -> Reading {
     Reading::Current(now)
 }
 
+/// Plan each of `tops` in turn, each clone's declaration read where `known` does not hold it at
+/// its tip ([`declaration`]).
 fn plan_all(
     sys: &dyn System,
     git: Git<'_>,
     tops: &[PathBuf],
     record: &Record,
     test: Option<u64>,
+    known: &mut Declarations,
 ) -> Vec<Plan> {
     tops.iter()
-        .map(|top| plan(sys, git, top, record, test))
+        .map(|top| plan(sys, git, top, record, test, known))
         .collect()
 }
 
@@ -885,12 +1053,19 @@ fn label(user: &User, path: &Path) -> String {
 /// Plan one clone: its declaration, then each of its repositories. A clone with no declaration
 /// still has each key aterm set and its declaration no longer holds unset. A clone that differs
 /// where another git holds a lock it would take is left for the next pass, as a whole.
-fn plan(sys: &dyn System, git: Git<'_>, top: &Path, record: &Record, test: Option<u64>) -> Plan {
+fn plan(
+    sys: &dyn System,
+    git: Git<'_>,
+    top: &Path,
+    record: &Record,
+    test: Option<u64>,
+    known: &mut Declarations,
+) -> Plan {
     let mut plan = Plan {
         label: label(git.user, top),
         ..Plan::default()
     };
-    let declared = match declaration(sys, git, top) {
+    let declared = match declaration(sys, git, top, known) {
         Ok(declared) => declared,
         Err(why) => {
             plan.notes
@@ -965,7 +1140,7 @@ fn plan(sys: &dyn System, git: Git<'_>, top: &Path, record: &Record, test: Optio
 }
 
 /// Why a write in one of `plan`'s repositories could run something aterm cannot turn off by
-/// name ([`checkout::Programs::named`]).
+/// name ([`programs`]).
 fn unnamed(sys: &dyn System, git: Git<'_>, plan: &Plan) -> Option<String> {
     plan.repos
         .iter()
@@ -974,10 +1149,19 @@ fn unnamed(sys: &dyn System, git: Git<'_>, plan: &Plan) -> Option<String> {
             !repo.set.is_empty() || !repo.unset.is_empty() || (*at == 0 && plan.index.is_some())
         })
         .find_map(|(_, repo)| {
-            checkout::Programs::named(sys, git.local(sys, Some(&repo.path)))
+            programs(sys, git, &repo.path)
                 .err()
                 .map(|why| format!("{}: {why}", repo.label))
         })
+}
+
+/// Each hook and filter driver the config of the repository at `path` names, from the pass's
+/// record of its facts ([`checkout::Facts::programs`]).
+///
+/// # Errors
+/// Its facts cannot be read, or it names one in bytes that are not UTF-8.
+fn programs(sys: &dyn System, git: Git<'_>, path: &Path) -> Result<checkout::Programs, String> {
+    checkout::Facts::of(sys, git.user, path)?.programs()
 }
 
 /// The first lock that is there that `plan`'s writes would take: never waited on, never removed.
@@ -994,10 +1178,18 @@ fn held(sys: &dyn System, plan: &Plan) -> Option<String> {
     None
 }
 
-/// The clone's declaration on origin's default branch as last fetched: absent is an empty one.
-fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, String> {
-    let (branch, tip) =
-        checkout::fetched_head_by(sys, &|| git.local(sys, Some(top))).map_err(|why| match why {
+/// The clone's declaration on origin's default branch as last fetched, from the pass's record of
+/// the clone's facts ([`checkout::Facts::fetched_head`]): absent is an empty one. Read only
+/// where `known` does not hold it at that tip, and kept there once read ([`Declarations`]).
+fn declaration(
+    sys: &dyn System,
+    git: Git<'_>,
+    top: &Path,
+    known: &mut Declarations,
+) -> Result<Declared, String> {
+    let (branch, tip) = checkout::Facts::of(sys, git.user, top)?
+        .fetched_head()
+        .map_err(|why| match why {
             NotFetched::Unread(unread) => unread.why,
             NotFetched::Unrecorded { .. } => {
                 "records no default branch of origin's as last fetched (refs/remotes/origin/HEAD), \
@@ -1005,10 +1197,39 @@ fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, S
                     .to_owned()
             }
         })?;
-    let listed = git_text(sys, git, top, &["ls-tree", "-z", &tip, "--", DECLARATION])?;
+    if let Some(listing) = known.at(top, &tip) {
+        return Ok(parse(listing.as_bytes()));
+    }
+    let listing = declaration_at(sys, git, top, &branch, &tip)?;
+    let declared = parse(listing.as_bytes());
+    known.keep(top, &tip, listing);
+    Ok(declared)
+}
+
+/// [`Git::local`] in `top` for a read of what a commit holds: replacement refs off
+/// (`GIT_NO_REPLACE_OBJECTS`), so what it reads is what the commit's name says, which
+/// [`Declarations`] keeps by that name.
+fn at_commit(sys: &dyn System, git: Git<'_>, top: &Path) -> Cmd {
+    git.local(sys, Some(top)).env("GIT_NO_REPLACE_OBJECTS", "1")
+}
+
+/// The `git config --null --list` of [`DECLARATION`] in commit `tip` of `top`, origin's
+/// `branch` as last fetched ([`parse`] reads it): empty where the commit holds none.
+fn declaration_at(
+    sys: &dyn System,
+    git: Git<'_>,
+    top: &Path,
+    branch: &str,
+    tip: &str,
+) -> Result<String, String> {
+    let listed = text(
+        sys,
+        at_commit(sys, git, top),
+        &["ls-tree", "-z", tip, "--", DECLARATION],
+    )?;
     let listed = listed.trim_end_matches('\0');
     if listed.is_empty() {
-        return Ok(Declared::default());
+        return Ok(String::new());
     }
     let what = format!("its {DECLARATION} on {branch}");
     let (meta, _) = listed
@@ -1027,7 +1248,7 @@ fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, S
     // every failure reads as absent, comes before any read of its size or contents.
     if !run(
         sys,
-        &git.local(sys, Some(top)).args(["cat-file", "-e", blob]),
+        &at_commit(sys, git, top).args(["cat-file", "-e", blob]),
     )?
     .success()
     {
@@ -1036,7 +1257,7 @@ fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, S
             sys.machine()
         ));
     }
-    let size: u64 = git_text(sys, git, top, &["cat-file", "-s", blob])?
+    let size: u64 = text(sys, at_commit(sys, git, top), &["cat-file", "-s", blob])?
         .trim()
         .parse()
         .map_err(|_| format!("cannot read the size of {what}"))?;
@@ -1047,7 +1268,7 @@ fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, S
     }
     let ran = run(
         sys,
-        &git.local(sys, Some(top)).args([
+        &at_commit(sys, git, top).args([
             "config",
             "--blob",
             blob,
@@ -1059,7 +1280,9 @@ fn declaration(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Declared, S
     if !ran.success() {
         return Err(format!("{what} is not git config syntax"));
     }
-    Ok(parse(&ran.stdout))
+    // `parse` reads each NUL-ended record with any bytes that are not UTF-8 replaced. Replacing
+    // them in the whole listing first reads the same: a NUL is never part of what is replaced.
+    Ok(String::from_utf8_lossy(&ran.stdout).into_owned())
 }
 
 /// A declaration's `git config --null --list`: `name\nvalue` records, each ended by NUL.
@@ -1480,14 +1703,16 @@ fn index_due(sys: &dyn System, git: Git<'_>, top: &Path) -> Result<Option<u32>, 
 
 /// Move the superproject's index to [`INDEX_VERSION`] where it is still due after the writes,
 /// running nothing else ([`quiet`]); `Some(from)` once moved.
-fn convert_index(sys: &dyn System, git: Git<'_>, top: &Repo) -> Result<Option<u32>, Wrote> {
-    if top.unset.contains(&MANY_FILES) || !many_files(sys, git, &top.path).map_err(Wrote::Failed)? {
+fn convert_index(sys: &dyn System, git: Git<'_>, top: &Repo) -> Result<Option<u32>, Unwritten> {
+    if top.unset.contains(&MANY_FILES)
+        || !many_files(sys, git, &top.path).map_err(Unwritten::Failed)?
+    {
         return Ok(None);
     }
-    let Some(from) = index_due(sys, git, &top.path).map_err(Wrote::Failed)? else {
+    let Some(from) = index_due(sys, git, &top.path).map_err(Unwritten::Failed)? else {
         return Ok(None);
     };
-    let quiet = quiet(sys, git, &top.path).map_err(Wrote::Failed)?;
+    let quiet = quiet(sys, git, &top.path).map_err(Unwritten::Failed)?;
     write(sys, &quiet, &["update-index", "--index-version", "4"])?;
     Ok(Some(from))
 }
@@ -1588,11 +1813,11 @@ fn verdict(tested: &Ran) -> Result<bool, String> {
 
 /// [`Git::local`] for a write in `path` that runs nothing else: no hook from a hooks folder and no
 /// fsmonitor daemon ([`NO_SIDE_RUNS`]), no hook or filter driver its config names
-/// ([`checkout::Programs::off`]), and no wait on a `config.lock` another
+/// ([`programs`], [`checkout::Programs::off`]), and no wait on a `config.lock` another
 /// git took after [`held`] looked (`core.configLockTimeout=0`); with git's messages in English
 /// (`LC_ALL=C`), which [`write`] reads.
 fn quiet(sys: &dyn System, git: Git<'_>, path: &Path) -> Result<Cmd, String> {
-    let programs = checkout::Programs::named(sys, git.local(sys, Some(path)))?;
+    let programs = programs(sys, git, path)?;
     Ok(programs.off(
         git.local(sys, Some(path))
             .args(NO_SIDE_RUNS)
@@ -1603,20 +1828,20 @@ fn quiet(sys: &dyn System, git: Git<'_>, path: &Path) -> Result<Cmd, String> {
 
 /// Why a write did not land.
 #[derive(Debug)]
-enum Wrote {
+enum Unwritten {
     /// Another git holds a lock the write takes (git's "File exists").
     Locked,
     Failed(String),
 }
 
-fn write(sys: &dyn System, quiet: &Cmd, args: &[&str]) -> Result<(), Wrote> {
-    let ran = run(sys, &quiet.clone().args(args.iter().copied())).map_err(Wrote::Failed)?;
+fn write(sys: &dyn System, quiet: &Cmd, args: &[&str]) -> Result<(), Unwritten> {
+    let ran = run(sys, &quiet.clone().args(args.iter().copied())).map_err(Unwritten::Failed)?;
     if ran.success() {
         Ok(())
     } else if String::from_utf8_lossy(&ran.stderr).contains("File exists") {
-        Err(Wrote::Locked)
+        Err(Unwritten::Locked)
     } else {
-        Err(Wrote::Failed(ran.describe()))
+        Err(Unwritten::Failed(ran.describe()))
     }
 }
 
@@ -1629,9 +1854,14 @@ fn stdout(ran: &Ran) -> String {
     String::from_utf8_lossy(&ran.stdout).trim().to_owned()
 }
 
-/// One git read that must succeed, its standard output.
+/// One git read in `path` that must succeed, its standard output.
 fn git_text(sys: &dyn System, git: Git<'_>, path: &Path, args: &[&str]) -> Result<String, String> {
-    let ran = run(sys, &git.local(sys, Some(path)).args(args.iter().copied()))?;
+    text(sys, git.local(sys, Some(path)), args)
+}
+
+/// One read by `git` (a command with no subcommand yet) that must succeed, its standard output.
+fn text(sys: &dyn System, git: Cmd, args: &[&str]) -> Result<String, String> {
+    let ran = run(sys, &git.args(args.iter().copied()))?;
     if !ran.success() {
         return Err(format!(
             "git {} failed: {}",

@@ -107,6 +107,7 @@ fn tier_3_on_a_windows_checkout_holds_every_spelling_and_an_unknown_cwd() {
             in_use: None,
             bytes: 8192,
             bytes_partial: false,
+            died: super::super::target::Died::default(),
         });
     }
     let table = aterm_sysprobe::volumes::table();

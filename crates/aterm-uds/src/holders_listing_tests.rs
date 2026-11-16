@@ -122,7 +122,7 @@ fn pids_of_uid_lists_the_uid_it_is_given() {
 /// the master that keeps it open. XNU's lost allocation race (`EREDRIVEOPEN`) is opened
 /// again, within the one-minute hang detector.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-fn a_terminal() -> (std::os::fd::OwnedFd, std::fs::File) {
+pub(crate) fn a_terminal() -> (std::os::fd::OwnedFd, std::fs::File) {
     use std::os::fd::FromRawFd as _;
     use std::os::unix::fs::OpenOptionsExt as _;
     const EREDRIVEOPEN: i32 = -6;

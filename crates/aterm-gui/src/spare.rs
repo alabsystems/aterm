@@ -2953,6 +2953,7 @@ impl Wake {
             | Wake::MacosAccessCardDecided { .. }
             | Wake::ReadDims { .. }
             | Wake::ReadAppStatus { .. }
+            | Wake::ReadOutputCadence { .. }
             | Wake::ReadMessages { .. }
             | Wake::ReadUpdateControl { .. }
             | Wake::UpdateCheckCompleted

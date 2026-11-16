@@ -75,6 +75,122 @@ fn account_image_constructor_rejects_changed_image_and_linked_auth() {
     assert!(validate(&wrong).is_err());
 }
 
+const TAB: &str = "t000acc0vnt";
+
+/// A legacy tab's sid, the longest a mover key takes.
+const LONGEST_TAB: &str = "s-1a2b3c4d5e6f70819203";
+
+/// The longest key: the longest tab, and every number at its largest.
+fn longest_key() -> String {
+    mover_key(LONGEST_TAB, u32::MAX, u64::MAX, u64::MAX).unwrap()
+}
+
+/// The digests are SHA-256 as `shasum -a 256` computes it over the same bytes.
+#[test]
+fn mover_key_has_its_fixed_form() {
+    let key = mover_key(TAB, 4242, 1_763_200_000_123_456, 987_654);
+    assert_eq!(key.as_deref(), Some("t000acc0vnt/4242-4a1366308fd6"));
+    assert_eq!(key, mover_key(TAB, 4242, 1_763_200_000_123_456, 987_654));
+    let longest = longest_key();
+    assert_eq!(longest, "s-1a2b3c4d5e6f70819203/4294967295-c09292da8ea1");
+    assert_eq!(longest.len(), 46);
+    assert!(longest.bytes().all(|c| c.is_ascii_graphic()));
+}
+
+/// Every tab's sid has a key, in either form the tab-id grammar gives it: a minted one, and a
+/// legacy one as long as that grammar makes it.
+#[test]
+fn mover_key_takes_a_tab_sid_of_either_form() {
+    use aterm_types::tab_id::{LEGACY_LEN, TabId, is_legacy, is_tab_id};
+    assert!(is_tab_id(TAB) && is_legacy(LONGEST_TAB));
+    let legacy = format!("s-{}", "f".repeat(LEGACY_LEN - 2));
+    assert!(is_legacy(&legacy));
+    let minted = [0, u64::MAX].map(|bits| TabId::mint(|| bits, |_| false));
+    let tabs = [
+        TAB,
+        LONGEST_TAB,
+        legacy.as_str(),
+        minted[0].as_str(),
+        minted[1].as_str(),
+    ];
+    for tab in tabs {
+        let key = mover_key(tab, 4242, 100, 200).unwrap_or_else(|| panic!("{tab}"));
+        assert_eq!(key.split_once('/').map(|(tab, _)| tab), Some(tab));
+    }
+}
+
+#[test]
+fn mover_key_refuses_a_tab_that_is_not_a_plain_sid() {
+    assert!(mover_key(LONGEST_TAB, 1, 2, 3).is_some());
+    assert!(mover_key("t-0", 1, 2, 3).is_some());
+    let too_long = format!("{LONGEST_TAB}w");
+    for tab in [
+        "",
+        too_long.as_str(),
+        "t_0",
+        "t/0",
+        "t 0",
+        "t.0",
+        "t\n0",
+        "t\u{e9}",
+    ] {
+        assert_eq!(mover_key(tab, 1, 2, 3), None, "{tab:?}");
+    }
+    // A key is no plain sid itself, so it never names a tab.
+    let key = mover_key(TAB, 1, 2, 3).unwrap();
+    assert_eq!(mover_key(&key, 1, 2, 3), None);
+}
+
+#[test]
+fn two_births_or_uniqueids_give_two_keys() {
+    let key = mover_key(TAB, 4242, 100, 200).unwrap();
+    for other in [
+        mover_key(TAB, 4242, 101, 200),
+        mover_key(TAB, 4242, 100, 201),
+        mover_key(TAB, 4243, 100, 200),
+        mover_key("t000acc0vnu", 4242, 100, 200),
+    ] {
+        assert_ne!(other.as_deref(), Some(key.as_str()));
+    }
+    // The fields hash apart: a birth's last digit never becomes the unique id's first.
+    assert_ne!(mover_key(TAB, 1, 23, 4), mover_key(TAB, 1, 2, 34));
+}
+
+#[test]
+fn record_key_refuses_a_mover_key() {
+    let key = mover_key(TAB, 4242, 100, 200).unwrap();
+    assert_ne!(key, TAB);
+    for agent in super::super::upgrade::Agent::others() {
+        assert!(agent.record_key(TAB).is_some(), "{agent:?}");
+        assert_eq!(agent.record_key(&key), None, "{agent:?}");
+    }
+}
+
+/// The pool's ledger and canary read a session as one word of at most `WORD_MAX` bytes: the
+/// longest key comes back from both as it went in. An exec move's canary is its native receipt's
+/// (`accounts_pool::finish_move` sets the owner), and reading a state judges such a canary's sid
+/// before it takes the state: the key passes that judgment too.
+#[test]
+fn one_line_and_canary_of_keep_it_whole() {
+    use super::super::accounts::{Canary, State, WORD_MAX};
+    let key = longest_key();
+    assert_eq!(super::super::one_line(&key, WORD_MAX), key);
+    let now = 1_763_200_000;
+    let canary = Canary {
+        sid: key,
+        at: now,
+        took: false,
+        native_receipt: Some("0123456789abcdef".repeat(2)),
+    };
+    let state = State {
+        machine: "0a0b".into(),
+        canary: Some(canary.clone()),
+        ..State::default()
+    };
+    let read = State::from_json(&state.to_json(), now).unwrap();
+    assert_eq!(read.canary, Some(canary));
+}
+
 #[test]
 fn account_image_command_preserves_argv_without_shell_or_environment_fields() {
     let root = aterm_tempfile::tempdir().unwrap();

@@ -314,7 +314,9 @@ fn transferred_control_history_keeps_a_follow_up_then_yields_when_caught_up() {
         client
     };
 
-    for received in [crate::control::RECORDS_PER_ROUND, 2, 0] {
+    // `atdb/8` moves the whole backlog in one session, past one batch of 16; the follow-up then
+    // finds nothing and yields.
+    for received in [crate::control::RECORDS_PER_ROUND + 2, 0] {
         let (chosen, repair) = transport.hints.next(now).unwrap();
         assert_eq!(chosen, address, "control progress lost its follow-up");
         transport.finish(exchange(repair), now);

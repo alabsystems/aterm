@@ -1200,15 +1200,25 @@ fn a_last_window_s_close_keeps_the_results_its_layout_names() {
         crate::CloseOutcome::Exit
     ));
     next.settle_quit_desk_and_tasks(|_| QuitDesk::default(), |_, _| {});
+    let table = next.store.read().unwrap().table();
+    assert!(
+        results.iter().all(|file| file.exists()),
+        "CONTROL: no layout names them, so each stays with the row the quit left (ST-15)"
+    );
+    for head in table.exits_since(0).expect("a memory table is loaded") {
+        assert!(table.remove(&head.sid));
+    }
     assert!(
         results.iter().all(|file| !file.exists()),
-        "CONTROL: no layout names them, so they go with the quit"
+        "CONTROL: and goes when its row does"
     );
 }
 
 /// THE QUIT KEEPS WHAT A PUBLISHED LAYOUT NAMES, however its write ended: a write that failed
-/// before it published leaves no layout, so nothing is kept; one that published the layout and
-/// failed at its directory's sync left a layout the next launch reads, so its results stay.
+/// before it published leaves no layout, so every session it ended leaves a row and the results
+/// stay with their rows (ST-15); one that published the layout and failed at its directory's sync
+/// left a layout the next launch reads, which brings the sessions back with no row, and its
+/// results stay for it.
 #[test]
 fn a_quit_keeps_results_for_a_layout_published_though_its_write_failed() {
     let scratch = aterm_tempfile::Builder::new()
@@ -1241,8 +1251,17 @@ fn a_quit_keeps_results_for_a_layout_published_though_its_write_failed() {
         );
         assert_eq!(
             results.iter().filter(|file| file.exists()).count(),
-            if published { results.len() } else { 0 },
+            results.len(),
             "published = {published}"
+        );
+        let table = desk.app.store.read().unwrap().table();
+        assert_eq!(
+            table
+                .exits_since(0)
+                .expect("a memory table is loaded")
+                .is_empty(),
+            published,
+            "published = {published}: a row only for a session no layout brings back"
         );
         assert!(!desk.own_task.exists(), "published = {published}");
         for file in results.iter().filter(|file| file.exists()) {
@@ -1253,8 +1272,9 @@ fn a_quit_keeps_results_for_a_layout_published_though_its_write_failed() {
 
 /// A SEAMLESS UPDATE'S CANDIDATE REMOVES NO FILE OF A SESSION IT CLOSES BEFORE ITS COMMIT: the
 /// session is one it adopted, the handoff is withheld, and the predecessor resumes with a record
-/// that names those files. CONTROL: a process that is no candidate, at a quit that publishes no
-/// layout, takes them.
+/// that names those files, and it leaves no row. CONTROL: a process that is no candidate, at a
+/// quit that publishes no layout, takes the task file and keeps each result with the row it
+/// leaves (ST-15).
 #[test]
 fn a_candidate_before_its_commit_removes_no_file_of_a_session_it_closes() {
     let scratch = aterm_tempfile::Builder::new()
@@ -1271,7 +1291,21 @@ fn a_candidate_before_its_commit_removes_no_file_of_a_session_it_closes() {
             .settle_quit_desk_and_tasks(|_| QuitDesk::default(), |_, _| {});
         assert_eq!(
             files.iter().filter(|file| file.exists()).count(),
-            if candidate { files.len() } else { 0 },
+            if candidate {
+                files.len()
+            } else {
+                files.len() - 1
+            },
+            "candidate = {candidate}"
+        );
+        assert_eq!(desk.own_task.exists(), candidate, "candidate = {candidate}");
+        let table = desk.app.store.read().unwrap().table();
+        assert_eq!(
+            table
+                .exits_since(0)
+                .expect("a memory table is loaded")
+                .is_empty(),
+            candidate,
             "candidate = {candidate}"
         );
         for file in files.iter().filter(|file| file.exists()) {
@@ -1280,8 +1314,10 @@ fn a_candidate_before_its_commit_removes_no_file_of_a_session_it_closes() {
     }
 }
 
-/// A RESTORED WORKER'S CLOSE TAKES THE RESULT ITS TAB CAME BACK WITH, which its session's ID does
-/// not name, and leaves another worker's files.
+/// A RESTORED WORKER'S CLOSE KEEPS THE RESULT ITS TAB CAME BACK WITH, which its session's ID does
+/// not name, with the row it leaves (ST-15), and the row's removal takes it; another worker's
+/// files stay. CONTROL: the other worker's close takes its task file and keeps its result with
+/// its row, which takes it when it goes.
 #[test]
 fn a_restored_worker_s_close_takes_the_result_its_tab_came_back_with() {
     let scratch = aterm_tempfile::Builder::new()
@@ -1290,15 +1326,21 @@ fn a_restored_worker_s_close_takes_the_result_its_tab_came_back_with() {
         .expect("scratch dir");
     let wid = WindowId(0);
     let mut desk = two_done_workers(scratch.path());
-    let (w1, _) = worker(&desk.app, wid, "W1").expect("W1");
-    let (w2, _) = worker(&desk.app, wid, "W2").expect("W2");
+    let (w1, w1_ctx) = worker(&desk.app, wid, "W1").expect("W1");
+    let (w2, w2_ctx) = worker(&desk.app, wid, "W2").expect("W2");
+    let table = desk.app.store.read().unwrap().table();
     assert!(matches!(
         desk.app.close_session_by_id(w1),
         Ok(crate::app_tabs::CloseProgress::Retired)
     ));
     assert!(
+        pair(&desk.carried).iter().all(|file| file.exists()),
+        "W1's close kept the result under its earlier ID with its row"
+    );
+    assert!(table.remove(&w1_ctx.self_id));
+    assert!(
         pair(&desk.carried).iter().all(|file| !file.exists()),
-        "W1's close took the result under its earlier ID"
+        "W1's row took it"
     );
     assert!(
         pair(&desk.own).iter().all(|file| file.exists()) && desk.own_task.exists(),
@@ -1309,8 +1351,13 @@ fn a_restored_worker_s_close_takes_the_result_its_tab_came_back_with() {
         Ok(crate::app_tabs::CloseProgress::Retired)
     ));
     assert!(
-        pair(&desk.own).iter().all(|file| !file.exists()) && !desk.own_task.exists(),
-        "CONTROL: W2's close takes its own"
+        pair(&desk.own).iter().all(|file| file.exists()) && !desk.own_task.exists(),
+        "CONTROL: W2's close takes its task file and keeps its result with its row"
+    );
+    assert!(table.remove(&w2_ctx.self_id));
+    assert!(
+        pair(&desk.own).iter().all(|file| !file.exists()),
+        "CONTROL: W2's row takes its result"
     );
 }
 
@@ -1419,7 +1466,6 @@ fn a_quit_inside_the_drain_clears_what_the_tabs_it_placed_left() {
                 &emptied,
                 sid,
                 std::slice::from_ref(&left.snap.path),
-                false,
             );
         }
     }

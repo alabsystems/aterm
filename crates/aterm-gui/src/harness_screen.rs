@@ -35,7 +35,10 @@ pub(crate) struct HarnessStatsReport {
     /// LAN broker's own words), where it did not.
     pub(crate) lan_waits: Option<String>,
     /// The build-slot minutes idle while a session's hold was ready, over the day the facts
-    /// ring (`<state>/occupancy/facts.ring`) holds; `None` with no ring.
+    /// ring (`<state>/occupancy/facts.ring`) holds; `None` with no ring, and so no row on the
+    /// page, until a minute names a supervised session while the mode observes (the window writes
+    /// no row for a minute that names none, `occupancy_host::append_look`): a Mac that never
+    /// supervised a session there shows no "idle while ready", where it would read 0.
     pub(crate) idle_ready_min: Option<u64>,
     /// This Mac's label as the reading read it ([`local_computer_label`]): Tab Control shows it,
     /// and the event loop reads no file for it.
@@ -140,7 +143,8 @@ pub(crate) fn collect_harness_stats(
 }
 
 /// The slot-minutes idle while ready over the day before `now_ms`, from the facts ring under
-/// `state_dir` ([`aterm_agent::supervise::occupancy::ring`]); `None` where there is no ring.
+/// `state_dir` ([`aterm_agent::supervise::occupancy::ring`]); `None` where there is no ring
+/// ([`HarnessStatsReport::idle_ready_min`]).
 pub(crate) fn idle_ready_min_under(state_dir: &Path, now_ms: i64) -> Option<u64> {
     use aterm_agent::supervise::occupancy::ring;
     let path = ring::ring_path(state_dir);

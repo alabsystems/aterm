@@ -2543,7 +2543,10 @@ fn a_vault_writer_during_a_check_is_busy_not_a_changed_generation() {
     let mut lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
     let original = lab.paths[0].clone();
     client::seed_vault_genesis(&original, &lab._home.path().join("genesis.v2")).unwrap();
-    let records = client::load_records(&original).unwrap().encode();
+    let records = client::load_records(&original)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     client::save_records(&lab.paths[1], &records).unwrap();
     data(&lab);
     let mut selection = reserved(&lab);
@@ -4431,7 +4434,11 @@ fn admits_of(viewer: &Paths, binding: &Binding) -> Vec<aterm_secrets::membership
 
 /// `to` takes every membership record `from` holds, as the vault's exchange carries them.
 fn carry(from: &Paths, to: &Paths) {
-    client::save_records(to, &client::load_records(from).unwrap().encode()).unwrap();
+    client::save_records(
+        to,
+        &client::load_records(from).unwrap().read_encoded().unwrap(),
+    )
+    .unwrap();
 }
 
 /// The device request the home `paths` holds asks with, under `trust`.
@@ -4674,7 +4681,10 @@ fn a_pass_that_died_after_the_admission_resumes_on_the_kept_statement_without_a_
     let binding = request_of(&next, &trust).binding().clone();
     assert!(seats(&original, &binding));
     assert!(client::config(&next).unwrap().is_none());
-    let held = client::load_records(&original).unwrap().encode();
+    let held = client::load_records(&original)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
 
     assert_eq!(advance(&original, &config).unwrap(), next);
     assert!(completes(&original));
@@ -4683,7 +4693,10 @@ fn a_pass_that_died_after_the_admission_resumes_on_the_kept_statement_without_a_
         vec![aterm_secrets::membership_log::Evidence::Manual]
     );
     assert_eq!(
-        client::load_records(&original).unwrap().encode(),
+        client::load_records(&original)
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
         held,
         "the resumed pass signs nothing more"
     );
@@ -4794,7 +4807,10 @@ fn an_emptied_candidate_home_gets_no_key_and_asks_nothing() {
         "CONTROL: the reserved home links to its selection"
     );
     std::fs::remove_dir_all(&next.home).unwrap();
-    let held = client::load_records(&original).unwrap().encode();
+    let held = client::load_records(&original)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     for pass in 0..2 {
         let advanced = advance(&original, &config);
         assert!(
@@ -4809,7 +4825,10 @@ fn an_emptied_candidate_home_gets_no_key_and_asks_nothing() {
         assert!(!root(&original).join(STATEMENT).exists(), "pass {pass}");
     }
     assert_eq!(
-        client::load_records(&original).unwrap().encode(),
+        client::load_records(&original)
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
         held,
         "nothing is signed"
     );
@@ -4842,7 +4861,10 @@ fn a_member_with_no_clock_or_no_read_of_the_newest_records_signs_no_successor_se
     let statement = statement_by(&original, &next, &trust);
     let device = Device::open(&next).unwrap().unwrap();
     let request = device.request(trust.network, trust.authority).unwrap();
-    let held = client::load_records(&original).unwrap().encode();
+    let held = client::load_records(&original)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     let unset = client::admit_successor(
         &original,
         &client::Succeeding {
@@ -4870,7 +4892,13 @@ fn a_member_with_no_clock_or_no_read_of_the_newest_records_signs_no_successor_se
     assert_eq!(advance(&original, &config).unwrap(), next);
     assert!(!completes(&original));
     assert!(!seats(&original, request.binding()));
-    assert_eq!(client::load_records(&original).unwrap().encode(), held);
+    assert_eq!(
+        client::load_records(&original)
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
+        held
+    );
     assert!(guard(&original, true).is_err());
     // The pass kept why, and the status a person reads names it beside the pending source.
     let why = statement_refused(&original).unwrap();
@@ -4914,7 +4942,10 @@ fn a_statement_whose_pass_has_ended_waits_for_nothing_and_signs_nothing() {
     let statement = statement_by(&original, &next, &trust);
     let device = Device::open(&next).unwrap().unwrap();
     let request = device.request(trust.network, trust.authority).unwrap();
-    let held = client::load_records(&original).unwrap().encode();
+    let held = client::load_records(&original)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     let ended = Instant::now();
     let late = client::admit_successor(
         &original,
@@ -4933,7 +4964,13 @@ fn a_statement_whose_pass_has_ended_waits_for_nothing_and_signs_nothing() {
         !matches!(late, Ok(client::Succession::Let { .. })),
         "{late:?}"
     );
-    assert_eq!(client::load_records(&original).unwrap().encode(), held);
+    assert_eq!(
+        client::load_records(&original)
+            .unwrap()
+            .read_encoded()
+            .unwrap(),
+        held
+    );
     assert!(!seats(&original, request.binding()));
 
     // The bundle of a real admission, offered to the successor home after the pass ended.

@@ -82,9 +82,7 @@ impl Sent {
 
     /// Whether `store` does not hold every frame of what the server sent complete.
     pub(crate) fn left_in(&self, store: &Store) -> bool {
-        self.0
-            .iter()
-            .any(|frame| store.complete_bytes(&frame.id).is_none())
+        self.0.iter().any(|frame| !store.holds(&frame.id))
     }
 }
 
@@ -280,10 +278,7 @@ impl Gap {
     /// was made, and to a store that still holds every id of its floor complete.
     fn holds(&self, store: &Store, now: Instant) -> bool {
         now.saturating_duration_since(self.since) < UNTAKEN_AGAIN
-            && self
-                .floor
-                .iter()
-                .all(|id| store.complete_bytes(id).is_some())
+            && self.floor.iter().all(|id| store.holds(id))
     }
 }
 
@@ -372,7 +367,7 @@ impl<G: Ord + Clone> Untaken<G> {
                 self.used(group, url, now);
                 gap.heads
                     .into_iter()
-                    .filter(|id| store.complete_bytes(id).is_none())
+                    .filter(|id| !store.holds(id))
                     .collect()
             }
             Some(_) => {

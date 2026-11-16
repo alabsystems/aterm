@@ -9,9 +9,14 @@
 //! `<checkout>/.git/aterm-retiring/<the first 32 hex digits of the SHA-256 of its location>`:
 //! one slot per worktree, keyed by its path (git reuses an entry's id), so a stopped removal of
 //! one never blocks another's or the snapshot's, and none lies in the person's folders.
+//!
+//! A linked worktree's tree is moved aside before its first entry goes, to its quarantine
+//! beside it (`.<its name>.retiring.noindex`, [`quarantine`]): a write by its path then finds no
+//! folder, and what was written before the move is dated in the quarantine. Its receipt names
+//! the tree wherever it stands ([`standing`]); a tree that stands in both places is neither's.
 
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use super::super::registered::volume;
 
@@ -44,6 +49,20 @@ pub(super) struct Pending {
     /// the one kind of untracked entry a removal that stopped part way may leave.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) ignored: Vec<String>,
+    /// The refs that pinned a linked worktree's commits and edits before its removal began, each
+    /// `[its full name, the commit it names]` (the disk watch's worktree step, DC-02b): while
+    /// each names its commit, a HEAD one of them holds need not be in `origin/main`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) pins: Vec<[String; 2]>,
+    /// The tree the pins say a pinned worktree held ([`super::Pinned::tree`]): what a removal of
+    /// it that stopped part way may leave is what of that tree it did not take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tree: Option<String>,
+    /// Each submodule checked out in a linked worktree whose `.git` is a file, `[its path in the
+    /// worktree, that file's text]`: a removal that took the file and stopped still reads that
+    /// submodule through the git directory it names, and writes it back.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) modules: Vec<[String; 2]>,
 }
 
 impl Pending {
@@ -60,6 +79,38 @@ impl Pending {
             volume: self.entry_volume,
         }
     }
+
+    /// When its removal began, as the file clock dated it.
+    pub(super) fn started(&self) -> Result<SystemTime, String> {
+        let [seconds, nanos] = self.started;
+        let nanos = u32::try_from(nanos)
+            .ok()
+            .filter(|n| *n < 1_000_000_000)
+            .ok_or("snapshot removal receipt has an invalid start time")?;
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::new(seconds, nanos))
+            .ok_or_else(|| "snapshot removal receipt start time is out of range".to_owned())
+    }
+
+    /// What of the tree standing at `at` its custody walks pass over: its `.git` and each
+    /// recorded submodule's, the files its removal writes back.
+    pub(super) fn written_back(&self, at: &Path) -> Vec<PathBuf> {
+        let mut out = vec![at.join(".git")];
+        for [rel, _] in &self.modules {
+            if normal(rel) {
+                out.push(at.join(rel).join(".git"));
+            }
+        }
+        out
+    }
+}
+
+/// Whether `rel` is a path in a tree git writes: plain names only.
+pub(super) fn normal(rel: &str) -> bool {
+    !rel.is_empty()
+        && Path::new(rel)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +135,38 @@ impl Identity {
 pub(super) fn location(path: &Path) -> Option<PathBuf> {
     let folder = path.parent()?.canonicalize().ok()?;
     Some(super::git_path(&folder).join(path.file_name()?))
+}
+
+/// Where the tree of the linked worktree `wt` is moved before its first entry goes: beside it,
+/// `.<its name>.retiring.noindex`, on its volume, kept from Spotlight as its own name is.
+pub(super) fn quarantine(wt: &Path) -> Option<PathBuf> {
+    let name = wt.file_name()?.to_str()?;
+    Some(wt.with_file_name(format!(".{name}.retiring.noindex")))
+}
+
+/// Where the tree of `wt` stands, with its identity: at `wt`, or in its quarantine
+/// ([`quarantine`]) once a removal moved it there. `None` when it stands in neither; an `Err`
+/// when it stands in both (which one is its tree is then unknown) or one cannot be read.
+fn standing_identity(wt: &Path) -> Result<Option<(PathBuf, Identity)>, String> {
+    let here = identity(wt)?;
+    let aside = match quarantine(wt) {
+        Some(q) => identity(&q)?.map(|id| (q, id)),
+        None => None,
+    };
+    match (here, aside) {
+        (Some(id), None) => Ok(Some((wt.to_path_buf(), id))),
+        (None, aside) => Ok(aside),
+        (Some(_), Some((q, _))) => Err(format!(
+            "{} and its quarantine {} both stand, so which one is its tree is unknown: both stay",
+            wt.display(),
+            q.display()
+        )),
+    }
+}
+
+/// [`standing_identity`]'s place alone.
+pub(super) fn standing(wt: &Path) -> Result<Option<PathBuf>, String> {
+    Ok(standing_identity(wt)?.map(|(at, _)| at))
 }
 
 /// The folder of `checkout`'s linked worktrees' receipts.
@@ -241,22 +324,88 @@ pub(super) fn file_clock_now() -> SystemTime {
     SystemTime::now()
 }
 
+/// How [`unchanged_since`] dates what it walks.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Dating {
+    /// A folder's own time counts too (before the remover has begun): an old file moved or
+    /// copied in with its time kept, or a file moved out, writes the folder that holds it.
+    pub(super) folders: bool,
+    /// An entry's change time counts beside its modification time (unix, before the remover
+    /// has begun): a file moved, linked or copied in with its modification time kept or set
+    /// back still has a change time of when that was done. The walked folder's own change time
+    /// never counts, for its move into quarantine sets it.
+    pub(super) changed: bool,
+    /// When the walk stops, its tree kept.
+    pub(super) until: Option<Instant>,
+}
+
+impl Dating {
+    /// Files' modification times alone, to the walk's end: what a removal that stopped part way
+    /// left, whose folders it rewrote.
+    pub(super) const FILES: Self = Self {
+        folders: false,
+        changed: false,
+        until: None,
+    };
+}
+
+/// When `meta`'s entry was last written: its modification time, or with `changed` (unix) the
+/// later of it and its change time.
+fn dated(meta: &std::fs::Metadata, changed: bool) -> std::io::Result<SystemTime> {
+    let modified = meta.modified()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if changed {
+            let change = u64::try_from(meta.ctime())
+                .ok()
+                .zip(u32::try_from(meta.ctime_nsec()).ok())
+                .filter(|(_, nanos)| *nanos < 1_000_000_000)
+                .and_then(|(secs, nanos)| {
+                    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs, nanos))
+                })
+                .ok_or_else(|| std::io::Error::other("its change time is out of range"))?;
+            return Ok(modified.max(change));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = changed;
+    Ok(modified)
+}
+
 /// Unlike ordinary cache age discovery, custody revalidation includes nested Git
 /// bookkeeping and fails closed on unreadable entries. The remover only unlinks files;
-/// folder times and the root .git it restores are the two writes it can cause itself.
+/// folder times and the `.git` files it restores (`skip`) are the writes it can cause itself.
+/// `dating` says whose times count, and when the walk stops.
 pub(super) fn unchanged_since(
     root: &Path,
     since: SystemTime,
-    skip_gitfile: bool,
+    skip: &[PathBuf],
+    dating: Dating,
 ) -> Result<(), String> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(at) = stack.pop() {
-        if skip_gitfile && at == root.join(".git") {
+        if dating.until.is_some_and(|until| Instant::now() >= until) {
+            return Err(format!(
+                "snapshot custody's walk of {} ran out of time, so whether it was written is \
+                 unknown",
+                root.display()
+            ));
+        }
+        if skip.contains(&at) {
             continue;
         }
         let meta = std::fs::symlink_metadata(&at)
             .map_err(|error| format!("snapshot custody cannot read {}: {error}", at.display()))?;
+        let written = dated(&meta, dating.changed && at != root)
+            .map_err(|error| format!("snapshot custody cannot date {}: {error}", at.display()))?;
         if meta.is_dir() {
+            if dating.folders && written >= since {
+                return Err(format!(
+                    "{} was written after its removal began; its new work stays",
+                    at.display()
+                ));
+            }
             let entries = std::fs::read_dir(&at).map_err(|error| {
                 format!("snapshot custody cannot list {}: {error}", at.display())
             })?;
@@ -267,16 +416,11 @@ pub(super) fn unchanged_since(
                         .path(),
                 );
             }
-        } else {
-            let modified = meta.modified().map_err(|error| {
-                format!("snapshot custody cannot date {}: {error}", at.display())
-            })?;
-            if modified >= since {
-                return Err(format!(
-                    "{} was written after snapshot removal began; its new work stays",
-                    at.display()
-                ));
-            }
+        } else if written >= since {
+            return Err(format!(
+                "{} was written after snapshot removal began; its new work stays",
+                at.display()
+            ));
         }
     }
     Ok(())
@@ -319,13 +463,7 @@ fn read_bound(
     };
     let pending: Pending = aterm_json::from_slice(&bytes)
         .map_err(|error| format!("snapshot removal receipt is invalid: {error}"))?;
-    let [seconds, nanos] = pending.started;
-    if nanos >= 1_000_000_000 {
-        return Err("snapshot removal receipt has an invalid start time".to_owned());
-    }
-    let started = SystemTime::UNIX_EPOCH
-        .checked_add(Duration::new(seconds, nanos as u32))
-        .ok_or("snapshot removal receipt start time is out of range")?;
+    let started = pending.started()?;
     if started > now {
         return Err(
             "snapshot removal receipt starts after the current clock; its data stays".to_owned(),
@@ -337,11 +475,11 @@ fn read_bound(
     {
         return Err("snapshot removal receipt no longer names this snapshot".to_owned());
     }
-    if let Some(now) = identity(wt)? {
+    if let Some((at, now)) = standing_identity(wt)? {
         if pending.tree_gone || !pending.snapshot_identity().names(&now) {
             return Err("snapshot was replaced after removal began".to_owned());
         }
-        let gitfile = wt.join(".git");
+        let gitfile = at.join(".git");
         match crate::metadata_io::read_bounded_regular(&gitfile, 4096) {
             Ok(bytes) if bytes == pending.gitfile => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -351,7 +489,7 @@ fn read_bound(
                 );
             }
         }
-        unchanged_since(wt, started, true)?;
+        unchanged_since(&at, started, &pending.written_back(&at), Dating::FILES)?;
     } else if !pending.tree_gone && !proving_gone {
         return Err(
             "snapshot disappeared before its removal was proved; it may have moved".to_owned(),
@@ -371,7 +509,7 @@ fn read_bound(
                 );
             }
         }
-        unchanged_since(&pending.entry, started, false)?;
+        unchanged_since(&pending.entry, started, &[], Dating::FILES)?;
     }
     Ok(Some(pending))
 }
@@ -405,6 +543,9 @@ pub(super) fn prepare(
         tree_gone: false,
         started: [started.as_secs(), u64::from(started.subsec_nanos())],
         ignored,
+        pins: Vec::new(),
+        tree: None,
+        modules: Vec::new(),
     };
     Ok(pending)
 }
@@ -474,7 +615,7 @@ fn write(checkout: &Path, pending: &Pending, replace: bool) -> Result<(), String
 /// Prepared root on a later pass could have been moved, so it cannot authorize metadata.
 pub(super) fn tree_gone(checkout: &Path, wt: &Path, pending: &mut Pending) -> Result<(), String> {
     if read_bound(checkout, wt, SystemTime::now(), true)?.as_ref() != Some(pending)
-        || identity(wt)?.is_some()
+        || standing(wt)?.is_some()
     {
         return Err("snapshot changed while proving its removal".to_owned());
     }
@@ -505,7 +646,7 @@ pub(super) fn retract(checkout: &Path, wt: &Path, pending: &Pending) -> Result<(
 /// Only the same receipt goes, once both of its admitted directories are absent.
 pub(super) fn finish(checkout: &Path, wt: &Path, pending: &Pending) -> Result<(), String> {
     if read(checkout, wt)?.as_ref() != Some(pending)
-        || identity(wt)?.is_some()
+        || standing(wt)?.is_some()
         || identity(&pending.entry)?.is_some()
     {
         return Err("snapshot removal receipt still has data or changed custody".to_owned());

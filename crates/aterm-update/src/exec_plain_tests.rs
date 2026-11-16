@@ -106,7 +106,16 @@ fn zz_helper_entry_if_asked() -> bool {
     println!();
     println!("PRECONDITION sigpipe_ignored={}", sigpipe_is_ignored());
     let mut raw = exec_command("/nonexistent/exec-plain-probe");
-    let error = raw.exec();
+    let error = {
+        let _closed = aterm_sysprobe::exec_gate::close(aterm_sysprobe::exec_gate::SETTLES_WITHIN)
+            .expect("the raw signal oracle closes its process-read gate");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the standard-library signal oracle is isolated and its process-read gate is closed"
+        )]
+        let error = raw.exec();
+        error
+    };
     println!(
         "raw Command::exec errno={:?} sigpipe_ignored={}",
         error.raw_os_error(),

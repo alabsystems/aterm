@@ -73,14 +73,37 @@ pub fn composed_witness_generation_model() -> Model {
 }
 
 /// Demand-driven native drawable acquisition state machine.
+///
+/// The worker publishes a result (`Publish`) and then takes the `wanted` flag (`Swap`), posting
+/// the wake only where the flag was set. A frame that finds no drawable in hand sets the flag
+/// (`Want`), takes what the worker has published (`Recollect`: a result of the current epoch ends
+/// the step with nothing to wait for), and otherwise waits for the request in flight or for one
+/// it queues itself (`Settle`). `step` is where that frame stands: the main thread's other
+/// actions run only between frames, and the worker's two interleave with every one of them.
+/// `waiting` is the wait the window records, `posted` the wakes on their way to it.
+///
+/// `shaped` is whether the layer has the wanted configuration. A change of the wanted
+/// configuration starts a new epoch and leaves the layer behind (`Reshape`), or brings the want
+/// back to what the layer has (`Revert`); the layer is reshaped only with nothing outstanding
+/// (`Reconfigure`). A request is queued only against a shaped layer: a frame that finds nothing
+/// in flight on an unshaped one queues nothing and records no wait (`Settle`), and its caller
+/// retries after the reshape.
+///
+/// Mutants: 1 a second request, an accepted stale result, a blocked caller and an early
+/// retirement; 2 a take that keeps the request outstanding; 3 a result counted twice; 4 a take
+/// counted as a publication; 5 a close that wakes; 6 a close that keeps its ready result; 7 the
+/// flag taken before the result is published; 8 a frame that sets the flag and does not look
+/// again; 9 a frame that takes a stale result and queues nothing; 10 a wake nobody asked for;
+/// 11 a frame that queues its request on a layer that still owes its reshape.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn metal_drawable_acquire_model() -> Model {
     aterm_spec::ty_model! {
         MetalDrawableAcquire {
             const Buggy = 0;
-            const MaxRequests = 2;
+            const MaxRequests = 3;
             const MaxEpoch = 2;
+            const MaxWants = 3;
             var closed = 0;
             var pending = 0;
             var active = 0;
@@ -95,30 +118,64 @@ pub fn metal_drawable_acquire_model() -> Model {
             var wakes = 0;
             var invalid_accept = 0;
             var main_wait = 0;
+            var wanted = 0;
+            var wants = 0;
+            var swap_due = 0;
+            var swapped_early = 0;
+            var step = 0;
+            var waiting = 0;
+            var posted = 0;
+            var shaped = 1;
+            var request_shaped = 1;
             action Request when (
-                closed == 0 && requests <= MaxRequests - 1 &&
+                closed == 0 && step == 0 && shaped == 1 && requests <= MaxRequests - 1 &&
                 (pending == 0 || Buggy == 1)
             ) {
                 pending = pending + 1;
                 active = active + 1;
                 request_epoch = epoch;
+                request_shaped = shaped;
                 requests = requests + 1;
             }
-            action Complete when (active > 0) {
+            action Publish when (
+                active > 0 && swap_due == 0 &&
+                swapped_early == if Buggy == 7 { 1 } else { 0 }
+            ) {
                 active = active - 1;
                 completed = if Buggy == 3 { completed + 2 } else { completed + 1 };
                 ready = if closed == 0 { ready + 1 } else { ready };
                 pending = if closed == 0 { pending } else { pending - 1 };
                 published = if closed == 0 { published + 1 } else { published };
-                wakes = if closed == 0 { wakes + 1 } else { wakes };
+                swap_due = if Buggy == 7 { 0 } else { if closed == 0 { 1 } else { 0 } };
+                swapped_early = 0;
             }
-            action Take when (closed == 0 && ready > 0) {
+            action Swap when (
+                swap_due == 1 || (Buggy == 7 && active > 0 && swapped_early == 0)
+            ) {
+                swap_due = 0;
+                swapped_early = if Buggy == 7 { 1 } else { 0 };
+                wakes = if wanted == 1 || Buggy == 10 { wakes + 1 } else { wakes };
+                posted = if wanted == 1 || Buggy == 10 { posted + 1 } else { posted };
+                wanted = 0;
+            }
+            action Take when (closed == 0 && step == 0 && ready > 0) {
                 ready = ready - 1;
                 pending = if Buggy == 2 { pending } else { pending - 1 };
                 published = if Buggy == 4 { published + 1 } else { published };
             }
-            action Invalidate when (epoch <= MaxEpoch - 1) {
+            action Invalidate when (step == 0 && epoch <= MaxEpoch - 1) {
                 epoch = epoch + 1;
+            }
+            action Reshape when (step == 0 && epoch <= MaxEpoch - 1) {
+                epoch = epoch + 1;
+                shaped = 0;
+            }
+            action Revert when (step == 0 && shaped == 0 && epoch <= MaxEpoch - 1) {
+                epoch = epoch + 1;
+                shaped = 1;
+            }
+            action Reconfigure when (closed == 0 && step == 0 && pending == 0 && shaped == 0) {
+                shaped = 1;
             }
             action AcceptResult when (
                 Buggy == 1 || (closed == 0 && request_epoch == epoch)
@@ -130,12 +187,72 @@ pub fn metal_drawable_acquire_model() -> Model {
             action MainProgress {
                 main_wait = if Buggy == 1 && pending > 0 { 1 } else { main_wait };
             }
-            action Close when (closed == 0) {
+            action Want when (closed == 0 && step == 0 && wants <= MaxWants - 1) {
+                wanted = 1;
+                wants = wants + 1;
+                step = 1;
+            }
+            action Recollect when (step == 1) {
+                ready = if Buggy == 8 { ready } else { if ready > 0 { ready - 1 } else { ready } };
+                pending = if Buggy == 8 { pending } else {
+                    if ready > 0 { pending - 1 } else { pending }
+                };
+                wanted = if Buggy == 8 { wanted } else {
+                    if ready > 0 && request_epoch == epoch { 0 } else { wanted }
+                };
+                waiting = if Buggy == 8 { waiting } else {
+                    if ready > 0 && request_epoch == epoch { 0 } else { waiting }
+                };
+                step = if Buggy == 8 { 2 } else {
+                    if ready > 0 && request_epoch == epoch { 0 } else { 2 }
+                };
+            }
+            action Settle when (
+                step == 2 && (
+                    pending > 0 || Buggy == 9 || requests <= MaxRequests - 1 ||
+                    (shaped == 0 && 1 == if Buggy == 11 { 0 } else { 1 })
+                )
+            ) {
+                pending = if Buggy == 9 { pending } else {
+                    if pending == 0 { if shaped == 1 || Buggy == 11 { 1 } else { 0 } } else { 1 }
+                };
+                active = if Buggy == 9 { active } else {
+                    if pending == 0 && (shaped == 1 || Buggy == 11) { active + 1 } else { active }
+                };
+                request_epoch = if Buggy == 9 { request_epoch } else {
+                    if pending == 0 && (shaped == 1 || Buggy == 11) { epoch } else { request_epoch }
+                };
+                request_shaped = if Buggy == 9 { request_shaped } else {
+                    if pending == 0 && (shaped == 1 || Buggy == 11) { shaped } else {
+                        request_shaped
+                    }
+                };
+                requests = if Buggy == 9 { requests } else {
+                    if pending == 0 && (shaped == 1 || Buggy == 11) { requests + 1 } else {
+                        requests
+                    }
+                };
+                wanted = if Buggy == 9 { wanted } else {
+                    if pending == 0 { if shaped == 1 || Buggy == 11 { wanted } else { 0 } } else {
+                        wanted
+                    }
+                };
+                waiting = if Buggy == 9 { 1 } else {
+                    if pending == 0 { if shaped == 1 || Buggy == 11 { 1 } else { 0 } } else { 1 }
+                };
+                step = 0;
+            }
+            action HandleWake when (step == 0 && posted > 0) {
+                posted = posted - 1;
+                waiting = 0;
+            }
+            action Close when (closed == 0 && step == 0) {
                 closed = 1;
                 retiring = 1;
                 pending = if Buggy == 6 { active + ready } else { active };
                 ready = if Buggy == 6 { ready } else { 0 };
                 wakes = if Buggy == 5 { wakes + 1 } else { wakes };
+                waiting = 0;
             }
             action Retire when (
                 retiring == 1 && (active == 0 || Buggy == 1)
@@ -147,7 +264,12 @@ pub fn metal_drawable_acquire_model() -> Model {
             invariant OutstandingAccounted: pending == active + ready;
             invariant CallsBounded: requests <= MaxRequests && completed <= requests;
             invariant PublicationsBounded: published <= completed;
-            invariant OnlyPublicationWakes: wakes == published;
+            invariant WakeOnlyWhenWanted: wakes <= wants;
+            invariant NoStrandedWait:
+                waiting == 0 || posted > 0 ||
+                (wanted == 1 && (active > 0 || swap_due == 1));
+            invariant ShapedBeforeRequested:
+                pending == 0 || epoch > request_epoch || request_shaped == 1;
             invariant ClosedHasNoReadyResult: closed == 0 || ready == 0;
             invariant RetirementFollowsAcquisition: retired == 0 || active == 0;
             invariant NoInvalidAcceptance: invalid_accept == 0;

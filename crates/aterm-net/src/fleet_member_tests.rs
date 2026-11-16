@@ -5665,7 +5665,6 @@ fn a_connect_deadline_keeps_a_tried_address_failure() {
         );
         assert_eq!(tried, vec![first, next]);
         let why = walked.unwrap_err();
-        assert_eq!(why.at_capacity(), busy);
         if busy {
             assert!(
                 matches!(&why, Unreached::Handshake(at, FleetError::AddressBusy) if *at == first),
@@ -7501,7 +7500,7 @@ fn an_unavailable_broker_is_not_evidence_of_a_peer_dial() {
         assert!(!copied.dialled(), "{copied:?}");
         assert_eq!(copied.reason(), "lan-broker");
         assert_eq!(copied.to_string(), why.to_string());
-        assert!(!why.no_route() && !why.no_network() && !why.at_capacity());
+        assert!(!why.no_route() && !why.no_network());
         // An earlier address's retryable result cannot lend a peer attempt to this local failure.
         assert!(!super::PassFailure::exhausted(why, true).retryable);
     }
@@ -8231,7 +8230,7 @@ fn a_listener_that_has_not_read_its_deny_list_refuses_every_proven_peer_until_it
                         })
                     }),
                 ),
-                None,
+                (None, None),
                 &stop,
                 HANG,
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
@@ -8324,7 +8323,7 @@ fn c19_denied_node_and_unproved_peer_refused_with_valid_fleet_secret() {
                     Arc::new(|| (FleetScope::Content, EVERY_OP)),
                     Arc::new(move || Arc::clone(&deny)),
                 ),
-                None,
+                (None, None),
                 &stop,
                 HANG,
                 |served, _| served.answer(|s| s.write_all(b"OK 0\n")),
@@ -10678,47 +10677,6 @@ fn a_generic_fleet_refusal_is_not_diagnosed_as_a_different_secret() {
         different_secret.guidance(),
         "a generic NO verdict carries no proof that the fleet secrets differ"
     );
-}
-
-#[test]
-fn unreached_at_capacity_classifies_slot_drops_and_busy_without_retrying_refused_or_wrong_secret() {
-    let addr = SocketAddr::from(([10, 0, 0, 1], 7100));
-
-    // Positive: 16-slot drop (ConnectionReset / UnexpectedEof), NO capacity (AddressBusy),
-    // handshake deadline, TCP connect timeout, and resolver pool saturation.
-    for cap in [
-        Unreached::Handshake(
-            addr,
-            FleetError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
-        ),
-        Unreached::Handshake(
-            addr,
-            FleetError::Tls(io::Error::from(io::ErrorKind::UnexpectedEof)),
-        ),
-        Unreached::Handshake(addr, FleetError::AddressBusy),
-        Unreached::Deadline(Stage::Handshake, Duration::from_secs(5)),
-        Unreached::Connect(addr, io::Error::from(io::ErrorKind::TimedOut)),
-        Unreached::Local("the fleet resolver is at capacity".to_owned()),
-    ] {
-        assert!(cap.at_capacity(), "expected at_capacity for {cap:?}");
-    }
-
-    // Negative controls: listener down (ConnectionRefused), wrong secret, wrong node, NXDOMAIN.
-    for non_cap in [
-        Unreached::Connect(addr, io::Error::from(io::ErrorKind::ConnectionRefused)),
-        Unreached::Handshake(addr, FleetError::ListenerWrongSecret),
-        Unreached::OtherNode {
-            at: addr,
-            said: "aa".repeat(16),
-            want: "bb".repeat(16),
-        },
-        Unreached::Resolve("missing.local".to_owned()),
-    ] {
-        assert!(
-            !non_cap.at_capacity(),
-            "must not classify {non_cap:?} as capacity"
-        );
-    }
 }
 
 /// A heartbeat round keeps no copy of the issuer's book over one another read kept while the round

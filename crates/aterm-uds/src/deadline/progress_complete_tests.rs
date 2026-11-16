@@ -6,6 +6,61 @@ use super::*;
 const HANG: Duration = Duration::from_secs(60);
 
 #[test]
+fn owned_stdin_keeps_exact_binary_output_and_refuses_either_overflow() {
+    use std::io::{Seek as _, Write as _};
+
+    let sh = stand_in(std::path::Path::new("/bin/sh"));
+    let cat = stand_in(std::path::Path::new("/bin/cat"));
+    let limit = 64 * 1024;
+    for stderr in [false, true] {
+        for len in [0, limit, limit + 1] {
+            let bytes: Vec<_> = (0..len).map(|i| (i % 256) as u8).collect();
+            let mut stdin = aterm_tempfile::tempfile().unwrap();
+            stdin.write_all(&bytes).unwrap();
+            stdin.rewind().unwrap();
+            let mut command = crate::spawnfd::command(&sh);
+            command
+                .args([
+                    "-c",
+                    if stderr {
+                        "\"$1\" >&2; exit 7"
+                    } else {
+                        "\"$1\"; exit 7"
+                    },
+                    "sh",
+                ])
+                .arg(&cat);
+            let output = output_from_while_process_progressing_complete_with_limit(
+                &mut command,
+                stdin.into(),
+                HANG,
+                "complete owned stdin",
+                limit,
+            );
+            if len <= limit {
+                let output = output.unwrap();
+                assert_eq!(output.status.code(), Some(7));
+                let (actual, other) = if stderr {
+                    (output.stderr, output.stdout)
+                } else {
+                    (output.stdout, output.stderr)
+                };
+                assert_eq!(actual, bytes);
+                assert!(other.is_empty());
+            } else if stderr {
+                assert!(
+                    matches!(output, Err(CompleteProgressError::Complete(CompleteOutputError::Run(RunError::Capture(error)))) if error.kind() == io::ErrorKind::InvalidData)
+                );
+            } else {
+                assert!(
+                    matches!(output, Err(CompleteProgressError::Complete(CompleteOutputError::StdoutTooLarge { limit: found })) if found == limit)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_binary_streams_keep_failed_status_and_each_overflow_is_a_refusal() {
     let world = aterm_tempfile::tempdir().unwrap();
     let stdout = world.path().join("stdout");
@@ -94,6 +149,7 @@ fn collector(
 ) -> Result<Vec<u8>, String> {
     progress_complete_with(
         command,
+        Stdio::null(),
         HANG,
         "complete streaming fixture".into(),
         OUTPUT_KEEP,

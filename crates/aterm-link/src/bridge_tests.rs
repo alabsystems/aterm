@@ -10226,8 +10226,10 @@ fn own_lane_post_costs(per_drain: u64, drains: u64) -> crate::state::FileOps {
 
 /// WHAT A LOCAL POST COSTS THE STATE DIR (B19): four records of the post journal (its
 /// reservation, its record in flight, that record landed, the reservation retired) and the
-/// landed offset appended to `acked`, and nothing renamed, unlinked or read: four appends,
-/// the landing and the retirement one write (critic item E07, `Bridge::land_group`). Each
+/// landed offset appended to `acked`, and nothing renamed, unlinked or read: three appends,
+/// the reservation and the entry one write (the drain's group, ATERM-KI-1111-5,
+/// `Bridge::flush_post_group`; two appends before it), the landing and the retirement one write
+/// (critic item E07, `Bridge::land_group`). Each
 /// post's ack is read alone here (a broker that does not gap-fence: a sender's post waits
 /// for its last one's answer), so a landing group holds one post. Nothing is opened either:
 /// the first post opened the journal and `acked`, and each is held open for the posts after
@@ -10247,7 +10249,7 @@ fn a_local_post_costs_the_state_dir_a_counted_set_of_operations() {
                 fsyncs: 0,
                 barriers: 0,
                 unlinks: 0,
-                appends: 4 * posts,
+                appends: 3 * posts,
                 opens: 0,
             },
             "{drains} drain(s) of {per_drain} post(s)"
@@ -10283,7 +10285,7 @@ fn the_tallys_state_dir_rows_count_what_the_dir_did_and_an_off_tally_counts_none
         let spent = bridge.state.ops() - before;
         assert_eq!(
             (spent.unlinks, spent.appends),
-            (0, 4 * posts),
+            (0, 3 * posts),
             "on={on}: what a local post costs the dir"
         );
         bridge.tally_idle();
@@ -10303,14 +10305,19 @@ fn the_tallys_state_dir_rows_count_what_the_dir_did_and_an_off_tally_counts_none
             "each kind row is the dir's own count"
         );
         // Each post's ack read alone, each landing a group of one (critic item E07): its
-        // entry's end is its group's settle, counted with the retirement.
-        for row in [
-            Row::SetPostPin,
-            Row::SetInFlight,
-            Row::ClearPostSeq,
-            Row::AppendSelfAcked,
-        ] {
+        // entry's end is its group's settle, counted with the retirement. A sender's post waits
+        // for its last one's answer, so each drain group holds one post (ATERM-KI-1111-5): its
+        // reservation and its entry are one append, timed as the reservation.
+        for row in [Row::SetPostPin, Row::ClearPostSeq, Row::AppendSelfAcked] {
             assert_eq!(n(row), posts, "{row:?}: one a post");
+        }
+        assert_eq!(n(Row::SetInFlight), 0, "no entry journaled alone");
+        for row in [Row::PostsPerAppend, Row::PostsPerWrite] {
+            assert_eq!(
+                (n(row), t.row(row).total),
+                (posts, posts),
+                "{row:?}: one post an append and a write, a sender's posts in turn"
+            );
         }
         assert_eq!(n(Row::ClearInFlight), 0, "no entry ends alone");
         assert_eq!(n(Row::LaneOutbox), drains, "a peek a drain");
@@ -16102,6 +16109,133 @@ fn a_burst_from_many_senders_is_on_the_wire_at_once_and_each_lands_in_its_order(
     );
 }
 
+/// **A BURST'S FRESH OWN-LANE POSTS ARE JOURNALED IN ONE APPEND AND SENT IN ONE WRITE**
+/// (ATERM-KI-1111-5, [`Bridge::flush_post_group`]): behind the gap fence, a drain of four
+/// senders' posts, three each, stages all twelve, writes their reservations and then their
+/// in-flight entries in one append of the post journal, and sends them in one write, in the
+/// drain's order, where each post was an append for its reservation, another for its entry, and
+/// a write of its own before. Each lands once, every sender's in its order. A drain wider than
+/// the window sends what the room left under [`PIPELINE_WINDOW`] holds in each write, and never
+/// owes more than the window. The tally's `posts_per_append` and `posts_per_write` rows count it.
+#[cfg(unix)]
+#[test]
+fn a_bursts_fresh_posts_are_journaled_in_one_append_and_sent_in_one_write() {
+    use crate::wait_tally::{Row, Tally, FILE};
+    const SENDERS: [&str; 4] = ["ta000000000", "tb000000000", "tc000000000", "td000000000"];
+    let window = u64::try_from(PIPELINE_WINDOW).unwrap();
+    for per_sender in [3u64, window / 2 + 4] {
+        let posts = per_sender * SENDERS.len() as u64;
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[
+            (1, "ta000000000"),
+            (2, "tb000000000"),
+            (3, "tc000000000"),
+            (4, "td000000000"),
+            (5, "tr000000000"),
+        ]);
+        assert!(bridge.refresh_sessions().is_ok());
+        let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+        let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
+        bridge.indexed_subjects.insert(lane_of.clone());
+        let path = bridge.state.root().join(FILE);
+        bridge.tally_to(&path);
+        let writes = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let tapped = Arc::clone(&writes);
+        bridge
+            .conn
+            .as_mut()
+            .expect("the link stands")
+            .tap_writes(move |frames| {
+                tapped.lock().unwrap().push(
+                    frames
+                        .iter()
+                        .filter_map(|(then, _)| {
+                            then.post().map(|post| format!("{}-{}", post.sid, post.id))
+                        })
+                        .collect(),
+                );
+            });
+        let mut frame = String::new();
+        let mut order = Vec::new();
+        for n in 1..=per_sender {
+            for sid in SENDERS {
+                frame.push_str(&queued_note(sid, n, "@tr000000000", &format!("{sid}-{n}")));
+                order.push(format!("{sid}-{n}"));
+            }
+        }
+        *lane.outbox.lock().unwrap() = Some(frame);
+        // As the loop runs it: an answer is read when the window waits on one, not after the
+        // drain.
+        bridge.in_round = true;
+        let before = bridge.state.ops();
+        bridge.drain_outbox();
+        let staged_appends = bridge.state.ops().appends - before.appends;
+        bridge.in_round = false;
+        bridge.settle_acks();
+        let link = bridge.conn.as_ref().expect("still connected");
+        assert!(
+            link.peak() <= PIPELINE_WINDOW,
+            "{posts} posts: never more owed than the window ({})",
+            link.peak()
+        );
+        let writes = writes.lock().unwrap().clone();
+        let sent: Vec<String> = writes.iter().flatten().cloned().collect();
+        assert_eq!(
+            sent, order,
+            "{posts} posts: on the wire once each, in the drain's order"
+        );
+        bridge.tally_idle();
+        let t = Tally::parse(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let (appends, writes_n) = (t.row(Row::PostsPerAppend), t.row(Row::PostsPerWrite));
+        assert_eq!(
+            (appends.count, appends.total),
+            (1, posts),
+            "{posts} posts: one append reserves and journals the group"
+        );
+        assert_eq!(
+            (writes_n.count, writes_n.total),
+            (writes.len() as u64, posts),
+            "{posts} posts: the tally counts each write's posts"
+        );
+        if posts < window {
+            assert_eq!(writes.len(), 1, "{posts} posts: one write: {writes:?}");
+            assert_eq!(
+                staged_appends, 1,
+                "{posts} posts: the drain's only append is the group's, its acks unread"
+            );
+        } else {
+            assert_eq!(
+                writes[0].len(),
+                PIPELINE_WINDOW,
+                "{posts} posts: the first write fills the window"
+            );
+            assert!(writes.len() > 1, "{posts} posts: the rest waits for room");
+        }
+        let retired = retirements(&lane);
+        assert_eq!(retired.len() as u64, posts, "every post retired once");
+        let (mut reader, _) = bridge.connect().unwrap();
+        let notes = notes_on(&mut reader, &lane_of);
+        assert_eq!(notes.len() as u64, posts, "each note exactly once");
+        for sid in SENDERS {
+            let mine: Vec<String> = notes
+                .iter()
+                .map(|(_, text)| text.clone())
+                .filter(|text| text.starts_with(sid))
+                .collect();
+            let posted: Vec<String> = (1..=per_sender).map(|n| format!("{sid}-{n}")).collect();
+            assert_eq!(mine, posted, "{sid}'s notes in the order it posted them");
+        }
+        assert!(
+            bridge.state.in_flight().unwrap().is_empty(),
+            "every own-lane entry went with its answer"
+        );
+        for sid in SENDERS {
+            for n in 1..=per_sender {
+                assert_eq!(bridge.state.post_pin(sid, n).unwrap(), None);
+            }
+        }
+    }
+}
+
 /// `ta000000000`'s post 1 under a pin from a build before publication identities (no identity), and
 /// another writer's record at its sequence on `face`: astream's dedup answers the retry
 /// there, and the read back cannot tell that record from the post's first copy, so the
@@ -17296,9 +17430,23 @@ fn a_post_its_send_concludes_unsent_has_no_in_flight_entry_whatever_became_of_th
             .posts
             .remove(0);
         bridge.drain_post(a1);
-        assert!(
+        assert_eq!(
+            bridge.post_group.len(),
+            1,
+            "aterm_goes={aterm_goes}: a1 is staged in the pass's group, nothing written"
+        );
+        bridge.flush_post_group();
+        // With aterm gone the group's flush writes nothing and sends nothing; with aterm there
+        // its burst's wait for room in the window reads the cut.
+        assert_eq!(
             bridge.conn.is_none(),
-            "aterm_goes={aterm_goes}: a1's wait read the cut"
+            !aterm_goes,
+            "aterm_goes={aterm_goes}: a1's wait read the cut only where aterm stayed"
+        );
+        assert_eq!(
+            bridge.state.post_pin("ta000000000", 1).unwrap().is_some(),
+            !aterm_goes,
+            "aterm_goes={aterm_goes}: a1 is reserved only where its group was written"
         );
         let journaled: Vec<String> = bridge
             .state
@@ -17542,6 +17690,24 @@ fn a_senders_second_post_in_the_same_words_lands_after_the_first() {
             "NEGATIVE CONTROL: ta000000000 {id} retired at the first's @{first}: {retired:#?}"
         );
     }
+
+    // NEGATIVE CONTROL of the drain's group (ATERM-KI-1111-5, `Bridge::owes_or_stages`): the
+    // first `ok` staged in the pass's group, not yet owed on the link, and the second pinned
+    // beside it as though nothing of its sender's in its words were owed. Behind the gap fence
+    // only `Bridge::settle_same_words` reads the group here, so this arm is its control.
+    let SameWordsOutcome { notes, retired } = two_posts_in_the_same_words_behind_a_refusal(
+        crate::fx::Fx::os_without(crate::sim::world::Mutant::GroupedPostsUnowed),
+    );
+    let [(first, text)] = notes.as_slice() else {
+        panic!("NEGATIVE CONTROL (group): one `ok` on the bus, the second lost: {notes:?}");
+    };
+    assert_eq!(text, "ok");
+    for id in [1, 2] {
+        assert!(
+            retired.contains(&("ta000000000".to_string(), id, Some(*first))),
+            "NEGATIVE CONTROL (group): ta000000000 {id} retired at the first's @{first}: {retired:#?}"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -17613,6 +17779,213 @@ fn two_posts_in_the_same_words_behind_a_refusal(fx: crate::fx::Fx) -> SameWordsO
         notes: notes_on(&mut reader, &lane_of),
         retired: retirements(&lane),
     }
+}
+
+/// **A FAILURE READ BEFORE A GROUP'S LATER BURST TAKES THE ENTRIES OF ITS SENDER'S UNWRITTEN
+/// POSTS WITH IT** (ATERM-KI-1111-5's review, `Bridge::unwritten_behind`): `ta000000000`'s `a1`
+/// and `a2` are staged in one drain group and journaled in its one append; `a1` goes in the
+/// group's first burst, and the broker's refusal of it, transient so its sender is held and
+/// it is retried at its pin, is read before `a2`'s burst. `a2`'s entry goes with `a1`'s, so a
+/// kill before the burst loop reaches `a2` leaves no entry: the attach's replay publishes
+/// nothing, and the drain sends `a1`, then `a2`, in `ta000000000`'s order.
+///
+/// NEGATIVE CONTROL (`Mutant::UnwrittenGroupKeepsItsEntries`): `a2`'s entry outlives the kill,
+/// the replay lands it, and `a1`'s retry lands behind it.
+#[cfg(unix)]
+#[test]
+fn a_failure_read_before_a_later_burst_takes_its_senders_unwritten_entries() {
+    let (entries, replayed, drained) = refused_ahead_of_an_unwritten_post(crate::fx::Fx::os());
+    assert_eq!(entries, 0, "no entry outlives a1's refusal");
+    assert!(replayed.is_empty(), "nothing to replay: {replayed:?}");
+    assert_eq!(
+        drained,
+        ["a1", "a2"],
+        "ta000000000's posts once each, in its order"
+    );
+
+    let (entries, replayed, drained) = refused_ahead_of_an_unwritten_post(
+        crate::fx::Fx::os_without(crate::sim::world::Mutant::UnwrittenGroupKeepsItsEntries),
+    );
+    assert_eq!(entries, 1, "NEGATIVE CONTROL: a2's entry stands");
+    assert_eq!(replayed, ["a2"], "NEGATIVE CONTROL: the replay landed a2");
+    assert_eq!(
+        drained,
+        ["a2", "a1"],
+        "NEGATIVE CONTROL: a1's retry landed behind a2"
+    );
+}
+
+/// What [`a_failure_read_before_a_later_burst_takes_its_senders_unwritten_entries`] reads under
+/// `fx`: the in-flight entries standing once `a1`'s refusal is concluded, then `ta000000000`'s notes
+/// after the attach's replay, and after the drain that follows it.
+#[cfg(unix)]
+fn refused_ahead_of_an_unwritten_post(fx: crate::fx::Fx) -> (usize, Vec<String>, Vec<String>) {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
+    bridge.fx = fx;
+    assert!(bridge.refresh_sessions().is_ok());
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    let lane_of = format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node);
+    bridge.indexed_subjects.insert(lane_of.clone());
+    let posts: String = [1, 2]
+        .map(|id| queued_note("ta000000000", id, "@tr000000000", &format!("a{id}")))
+        .concat();
+    bridge.in_round = true;
+    for post in parse_drain(posts.as_bytes()).posts {
+        bridge.drain_post(post);
+    }
+    assert_eq!(
+        bridge.post_group.len(),
+        2,
+        "PRECONDITION: a1 and a2 staged in one group"
+    );
+    // The group's append, as its flush writes it; `a2` waits for a later burst, and `a1`'s
+    // refusal is concluded as an answer read before that burst concludes it.
+    let mut group = std::mem::take(&mut bridge.post_group);
+    let entries: Vec<InFlight> = group.iter().map(|staged| staged.entry.clone()).collect();
+    let reserves: Vec<(&str, u64, &PublishPin)> = group
+        .iter()
+        .map(|staged| {
+            let post = &staged.sent.post;
+            (post.sid.as_str(), post.id, &staged.sent.pin)
+        })
+        .collect();
+    bridge.state.stage_posts(&reserves, &entries).unwrap();
+    let (a2, a1) = (group.pop().unwrap(), group.pop().unwrap());
+    bridge.group_rest.push_back((a2.sent, a2.entry.body));
+    let refusal: io::Error = astream_broker::BrokerRefusal {
+        code: astream_broker::proto::ERR_TOO_MANY_CONNS,
+        msg: "busy".to_string(),
+    }
+    .into();
+    bridge.conclude(Then::Post(Box::new(a1.sent)), Err(refusal));
+    let entries = bridge.state.in_flight().unwrap().len();
+
+    // A kill now: the unwritten group and the link go with the process.
+    bridge.group_rest.clear();
+    bridge.held_senders.clear();
+    bridge.in_round = false;
+    bridge.conn = Some(bridge.connect().unwrap().0.into());
+    bridge
+        .conn
+        .as_mut()
+        .unwrap()
+        .ready()
+        .unwrap()
+        .hello()
+        .unwrap();
+    assert!(bridge.ask_gap_fences());
+    assert!(bridge.settle_in_flight());
+    let (mut reader, _) = bridge.connect().unwrap();
+    let posted = |reader: &mut Conn| -> Vec<String> {
+        notes_on(reader, &lane_of)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect()
+    };
+    let replayed = posted(&mut reader);
+    *lane.outbox.lock().unwrap() = Some(posts);
+    bridge.drain_outbox();
+    bridge.settle_acks();
+    (entries, replayed, posted(&mut reader))
+}
+
+/// **A FAILED POST'S SENDER'S UNWRITTEN ENTRIES LEAVE THE JOURNAL HIGHEST SEQUENCE FIRST**
+/// (ATERM-KI-1114-56 on the group's part, `Bridge::drop_behind_a_failed_post`): `ta000000000`'s
+/// `a1`, `a2` and `a3` are journaled in one drain group's append; `a1` goes in the first burst,
+/// and the broker's refusal of it is read before the burst of `a2` and `a3`. Each drop is its
+/// own record, so a kill can stop the journal between any two: at every cut of the journal the
+/// conclusion wrote, the sender's entries still standing are its lowest ones, and none stands
+/// above one dropped, which the attach's replay would publish ahead of the drain's sends of the
+/// dropped ones.
+///
+/// NEGATIVE CONTROL (`Mutant::DropBehindLowestFirst`): `a2`'s entry is dropped first, and the
+/// cut after that drop leaves `a3`'s standing above it.
+#[cfg(unix)]
+#[test]
+fn a_failures_unwritten_group_entries_are_dropped_highest_first() {
+    assert_eq!(
+        cuts_with_an_entry_above_a_dropped_one(crate::fx::Fx::os()),
+        0,
+        "no cut of the journal leaves an entry of ta000000000 above one dropped"
+    );
+    assert!(
+        cuts_with_an_entry_above_a_dropped_one(crate::fx::Fx::os_without(
+            crate::sim::world::Mutant::DropBehindLowestFirst
+        )) > 0,
+        "NEGATIVE CONTROL: a cut after a2's drop leaves a3's entry standing above it"
+    );
+}
+
+/// The cuts of the post journal, from before `a1`'s refusal is concluded to its end, at which
+/// `ta000000000`'s standing entries are not its lowest ones
+/// ([`a_failures_unwritten_group_entries_are_dropped_highest_first`]).
+#[cfg(unix)]
+fn cuts_with_an_entry_above_a_dropped_one(fx: crate::fx::Fx) -> usize {
+    let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "ta000000000"), (2, "tr000000000")]);
+    bridge.fx = fx;
+    assert!(bridge.refresh_sessions().is_ok());
+    let (_broker, _server) = on_a_broker(&lane, &mut bridge, true);
+    bridge
+        .indexed_subjects
+        .insert(format!("/f/f/in/{0}/tr000000000/{0}/note", bridge.node));
+    let posts: String = [1, 2, 3]
+        .map(|id| queued_note("ta000000000", id, "@tr000000000", &format!("a{id}")))
+        .concat();
+    bridge.in_round = true;
+    for post in parse_drain(posts.as_bytes()).posts {
+        bridge.drain_post(post);
+    }
+    assert_eq!(
+        bridge.post_group.len(),
+        3,
+        "PRECONDITION: a1, a2 and a3 staged in one group"
+    );
+    let mut group = std::mem::take(&mut bridge.post_group);
+    let entries: Vec<InFlight> = group.iter().map(|staged| staged.entry.clone()).collect();
+    let seqs: Vec<u64> = entries.iter().map(|entry| entry.pin.seq).collect();
+    let reserves: Vec<(&str, u64, &PublishPin)> = group
+        .iter()
+        .map(|staged| {
+            let post = &staged.sent.post;
+            (post.sid.as_str(), post.id, &staged.sent.pin)
+        })
+        .collect();
+    bridge.state.stage_posts(&reserves, &entries).unwrap();
+    let journal = bridge.state.root().join(crate::state::journal::FILE);
+    let before = std::fs::read(&journal).unwrap().len();
+    let a1 = group.remove(0);
+    for rest in group {
+        bridge.group_rest.push_back((rest.sent, rest.entry.body));
+    }
+    let refusal: io::Error = astream_broker::BrokerRefusal {
+        code: astream_broker::proto::ERR_TOO_MANY_CONNS,
+        msg: "busy".to_string(),
+    }
+    .into();
+    bridge.conclude(Then::Post(Box::new(a1.sent)), Err(refusal));
+    let bytes = std::fs::read(&journal).unwrap();
+    let standing_at = |cut: usize| -> Vec<bool> {
+        let held = crate::state::journal::read(&bytes[..cut]).index;
+        seqs.iter()
+            .map(|seq| held.in_flight.contains_key(seq))
+            .collect()
+    };
+    assert_eq!(
+        standing_at(before),
+        [true, true, true],
+        "PRECONDITION: the group's append journaled all three"
+    );
+    assert_eq!(
+        standing_at(bytes.len()),
+        [false, false, false],
+        "PRECONDITION: a1's refusal took every entry of ta000000000"
+    );
+    (before..=bytes.len())
+        .filter(|&cut| {
+            let standing = standing_at(cut);
+            standing.windows(2).any(|pair| !pair[0] && pair[1])
+        })
+        .count()
 }
 
 /// **THE ATTACH'S REPLAY HOLDS THE FENCES A REFUSED ENTRY SET** (C12s1's review,

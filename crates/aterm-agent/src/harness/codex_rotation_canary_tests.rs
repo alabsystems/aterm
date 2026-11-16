@@ -59,7 +59,7 @@ fn reserved(
     let proposal = {
         let mut session = weekly_session(&world);
         session.sid = "s-one";
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             &session,
             &source,
@@ -105,7 +105,7 @@ fn delayed_no_go_cannot_clear_a_newer_native_canary_in_the_same_session() {
         window: "seven_day".into(),
         at: Some(later),
     };
-    let next = codex_rotation::prepare(
+    let next = codex_rotation::prepare_once(
         &seat,
         &session,
         &source,

@@ -38,7 +38,7 @@ enum Holder {
 fn seed_log_with(lab: &Lab, history: u64, holder: Holder) -> aterm_secrets::membership_log::Log {
     use aterm_secrets::{
         client::{save_records, test_found},
-        membership_log::{Entrant, EpochAudience, Log, encode_records},
+        membership_log::{Entrant, EpochAudience, Log, read_records},
     };
     let founders = (0..lab.paths.len())
         .map(|n| Entrant {
@@ -135,7 +135,7 @@ fn seed_log_with(lab: &Lab, history: u64, holder: Holder) -> aterm_secrets::memb
         log.insert(sign(draft)).unwrap();
     }
     for paths in &lab.paths {
-        save_records(paths, &encode_records(log.records())).unwrap();
+        save_records(paths, &read_records(log.records()).unwrap()).unwrap();
     }
     log
 }
@@ -414,7 +414,7 @@ fn equal_legacy_history_never_allows_a_denied_third_member() {
 fn legacy_probe_alias_does_not_replace_the_local_change_fence() {
     use aterm_secrets::{
         client::{load_records, save_records},
-        membership_log::{Body, encode_records},
+        membership_log::{Body, read_records},
     };
     let pair = log_pair();
     let a = pair.replica(0);
@@ -437,7 +437,7 @@ fn legacy_probe_alias_does_not_replace_the_local_change_fence() {
         .with_seed(|seed| removed.sign(seed, *request.binding().incarnation()))
         .unwrap();
     log.insert(record).unwrap();
-    save_records(&pair.lab.paths[0], &encode_records(log.records())).unwrap();
+    save_records(&pair.lab.paths[0], &read_records(log.records()).unwrap()).unwrap();
     assert!(
         captured
             .local(b.actor, |_| -> Result<()> {
@@ -1524,7 +1524,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
             "tables": workload.tables(),
             "history_rotations": workload.history(),
             "log_records": records.len(),
-            "log_bytes": records.encode().len(),
+            "log_bytes": records.read_encoded().unwrap().len(),
             "warmup_rounds": warmed,
             "rounds": measured,
             "process_cpu_ns": u64::try_from(spent.as_nanos()).unwrap(),
@@ -1547,7 +1547,7 @@ fn quiet_rounds_observed(measured: u32, workload: Workload, history_reads: bool)
     let peer = pair.lab.bootstrap(1);
     let request = peer.request().unwrap();
     let witness = peer.log_witness().unwrap().expect("a log-backed peer");
-    let witness = aterm_secrets::membership_log::encode_records(witness.records());
+    let witness = aterm_secrets::membership_log::read_records(witness.records()).unwrap();
     let check = |logs: &crate::control::WitnessLogs| {
         logs.check(peer.trust(), &request, &witness).unwrap();
     };

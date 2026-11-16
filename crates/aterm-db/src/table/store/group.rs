@@ -191,6 +191,17 @@ pub(super) fn prepare(
     Ok(())
 }
 
+/// `permit`, a group permission, bound to `claim` instead: the permit a test's copy of a lab
+/// keeps beside its rebound claim ([`super::rebind_claim`]).
+#[cfg(test)]
+pub(super) fn rebind(permit: &mut [u8], claim: &[u8]) -> Result<()> {
+    if permit.len() != LEN || &permit[..5] != MAGIC {
+        return Err(Error::new("not a table group permission"));
+    }
+    permit[5..37].copy_from_slice(&binding(claim)?);
+    Ok(())
+}
+
 /// Retire the permit of a group none of whose records reached the journal: a writing
 /// open's replay, under the exclusive writer lock, stopped at the custody witness the
 /// permit starts at. It runs before any append: that append moves custody past the

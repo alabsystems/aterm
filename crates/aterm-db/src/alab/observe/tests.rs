@@ -747,3 +747,608 @@ fn observation_spends_at_most_its_share_and_a_reopened_tab_nothing() {
         "spent {spent}: discovery keeps half of what registration leaves"
     );
 }
+
+/// An observed login is born where a live account already holds its default label (the owner
+/// gave another account that name, or two keys share their first 24 bits): the birth leaves its
+/// label empty, which reads as the default, so the pass is written, `check` finds no shared
+/// label, and the next pass is not refused either. Two births of one pass that would share a
+/// default label are handled alike: the second is born without one.
+/// NEGATIVE CONTROL: with `account_birth` writing the default label whatever `taken` holds, the
+/// rules every write passes refuse the whole pass (`Registry::observe_accounts`, `authored`):
+/// `` account.label: row ac-…: live row ac-… holds the same label; only one live row may ``.
+#[test]
+fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
+    use crate::{alab::Registry, table::tests::Lab, typed::check};
+    use aterm_secrets::commons::roster::Role;
+    let born = account_pk(UNICORN);
+    let label = keys::default_account_label("claude", &born).unwrap();
+    let mut held = bronto_registry();
+    held.push(put(&ACCOUNT, &account_pk(BRONTO), "label", json!(label)));
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry.write(vec![held]).unwrap();
+    let config = lab.paths[0].home.join("config.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let observed = registry
+        .observe_accounts(&config, &[sighting(UNICORN, "running", 1, NOW)], NOW)
+        .expect("a birth whose default label is taken is written");
+    assert_eq!((observed.records, observed.born), (1, 1));
+    let view = registry.view().unwrap();
+    let accounts = cell::project(&ACCOUNT, &view.cells);
+    assert!(accounts.rows[&born].live());
+    assert_eq!(
+        accounts.rows[&born].get("label"),
+        None,
+        "born without the label"
+    );
+    let found = check::findings(
+        &[&ACCOUNT],
+        &std::collections::BTreeMap::from([(ACCOUNT.name, &accounts)]),
+    );
+    assert!(
+        !found.iter().any(|f| f.kind() == "unique"),
+        "no shared label: {found:?}"
+    );
+    let again = registry
+        .observe_accounts(
+            &config,
+            &[sighting(UNICORN, "idle", 0, NOW + DAY)],
+            NOW + DAY,
+        )
+        .expect("the next pass is not refused");
+    assert_eq!(again.born, 0);
+
+    // Two logins of one pass whose keys share their first 24 bits.
+    let mut by_label = std::collections::BTreeMap::new();
+    let (first, second) = (0..)
+        .find_map(|n: u32| {
+            let email = format!("u{n}@proton.example");
+            let label = keys::default_account_label("claude", &account_pk(&email)).unwrap();
+            by_label
+                .insert(label, email.clone())
+                .map(|earlier| (earlier, email))
+        })
+        .unwrap();
+    let plan = run(
+        ME,
+        &[
+            sighting(&first, "running", 1, NOW),
+            sighting(&second, "running", 1, NOW),
+        ],
+        &cells(bronto_registry()),
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!(plan.born, 2);
+    let labels = plan
+        .changes
+        .iter()
+        .filter(|c| c.collection == ACCOUNT.name && c.key.ends_with(".label"))
+        .count();
+    assert_eq!(labels, 1, "only the first birth takes the shared label");
+}
+
+fn seen_by(cli: &str, realm: &str, email: &str, state: &str, src: &str, at: u64) -> Sighting {
+    Sighting {
+        cli: cli.into(),
+        realm: realm.into(),
+        email: email.into(),
+        state: state.into(),
+        tabs: u64::from(state == "running"),
+        src: src.into(),
+        at_ms: at,
+    }
+}
+
+/// SF-18's exit test: every account a Mac saw or used is a registry row, with nobody listing it.
+///
+/// One Mac sees four accounts: a CLI login place (`signed in`), a Codex tab running another
+/// (`used by a tab`), one signed in only to one of aterm's own browser profiles (`browser only`),
+/// and bronto, which a row names and the owner assigned to another Mac, running in a tab. Its
+/// writer is fenced (a succession still preserving old records, as on m22): each pass refuses,
+/// and what it saw waits in this Mac's kept file, across a process's end, for the pass after the
+/// succession completes. That pass gives birth to each account no row named, writes this Mac's
+/// row of each saying how it was seen, and changes no assignment. `check` names each account
+/// seen and not held before, and nothing after.
+///
+/// NEGATIVE CONTROLS, each run: with `kept::through` handing `taken` alone (no kept file), the
+/// second fenced pass hands nothing: `` left: 0 right: 4 ``; with `browser` not a source word,
+/// the browser-only account is skipped: `` left: (None, 2, 3) right: (None, 3, 4) ``; with
+/// `checks::observed` reading no sighting, the check before the pass is `` left: [] ``.
+#[test]
+fn every_account_a_mac_saw_or_used_is_a_registry_row() {
+    use crate::{
+        alab::{
+            Registry, checks,
+            registry::{MACHINE, PREFERENCE},
+        },
+        generation::file_seams,
+        table::tests::Lab,
+    };
+    use aterm_secrets::commons::roster::Role;
+    const SIGNED: &str = "signed.m22@proton.example";
+    const USED: &str = "used.m22@proton.example";
+    const BROWSED: &str = "browsed.m22@proton.example";
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = lab.paths[0].clone();
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    // Bronto, assigned by the owner to m65.
+    let m65 = keys::machine_pk("m65");
+    let bronto = account_pk(BRONTO);
+    let link = keys::preference_pk(&m65, &bronto).unwrap();
+    let mut owner = bronto_registry();
+    owner.extend([
+        put(&MACHINE, &m65, "label", json!("m65")),
+        put(&MACHINE, &m65, "status", json!("active")),
+        put(&PREFERENCE, &link, "machine", json!(m65)),
+        put(&PREFERENCE, &link, "account", json!(bronto)),
+        put(&PREFERENCE, &link, "why", json!("owner")),
+    ]);
+    registry.write(vec![owner]).unwrap();
+    let config = paths.home.join("config.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let state = aterm_tempfile::tempdir().unwrap();
+    let dir = kept::under(state.path());
+    let seen = [
+        seen_by("claude", "claude", SIGNED, "idle", "profile", NOW),
+        seen_by("codex", "codex", USED, "running", "auth-file", NOW),
+        seen_by("claude", "claude", BROWSED, "idle", BROWSER, NOW),
+        seen_by("claude", "claude", BRONTO, "running", "profile", NOW),
+    ];
+    let codex_pk = |addr: &str| {
+        keys::account_pk("codex", &keys::claims_email(None, Some(addr)).unwrap()).unwrap()
+    };
+    let unborn = vec![account_pk(BROWSED), account_pk(SIGNED), codex_pk(USED)];
+
+    // Before any pass, `check` names what this Mac saw that the registry does not hold.
+    {
+        let mut kept = kept::Kept::default();
+        kept.hold(&seen);
+        let view = registry.view().unwrap();
+        let uuid = registry.own_uuid().unwrap();
+        let found = checks::observed(
+            &kept.observed(NOW),
+            Some(&uuid),
+            &view.cells,
+            view.owned
+                .get(ACCOUNT_OBS.name)
+                .unwrap_or(&OwnedRead::default()),
+            NOW,
+        );
+        let mut want: Vec<(&str, Vec<String>)> = unborn
+            .iter()
+            .map(|pk| ("account-seen-unregistered", vec![pk.clone()]))
+            .collect();
+        want.push(("account-seen-unmarked", vec![bronto.clone()]));
+        want.sort();
+        let mut got: Vec<(&str, Vec<String>)> = found
+            .iter()
+            .map(|f| (f.finding.kind, f.finding.pks.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(got, want);
+        assert!(
+            found
+                .iter()
+                .all(|f| checks::sentence(f.finding.kind).is_some())
+        );
+    }
+
+    // Fenced: a succession whose completion no home is known to hold, as on m22. The pass
+    // refuses, and its sightings wait in the file.
+    file_seams::fence_pending(&paths, &lab.bootstrap(0));
+    file_seams::seat(&paths, &lab.paths[1]);
+    file_seams::complete(&paths);
+    file_seams::invalidate_completion(&paths);
+    let (handed, done) = kept::through(&dir, &seen, NOW, |pending| {
+        registry.observe_accounts(&config, pending, NOW)
+    });
+    assert_eq!(handed.len(), 4);
+    let refused = done.expect_err("a fenced writer authors nothing");
+    assert!(
+        refused
+            .to_string()
+            .contains("succession is still preserving"),
+        "{refused}"
+    );
+    // Another pass while fenced, with nothing new gathered: still all four, still refused.
+    let (handed, done) = kept::through(&dir, &[], NOW + 60_000, |pending| {
+        registry.observe_accounts(&config, pending, NOW + 60_000)
+    });
+    assert_eq!(handed.len(), 4);
+    assert!(done.is_err());
+    // A process that ends loses nothing: a fresh read of the file holds every sighting.
+    assert_eq!(kept::load(&dir).pending().len(), 4);
+
+    // The succession completes again; the next pass, with nothing new gathered, registers
+    // them all.
+    file_seams::complete(&paths);
+    let later = NOW + 3_600_000;
+    let (handed, done) = kept::through(&dir, &[], later, |pending| {
+        registry.observe_accounts(&config, pending, later)
+    });
+    let done = done.unwrap();
+    assert_eq!(handed.len(), 4);
+    assert_eq!((done.quiet, done.born, done.marked), (None, 3, 4));
+    assert!(kept::load(&dir).pending().is_empty(), "the pass took them");
+
+    let view = registry.view().unwrap();
+    let uuid = registry.own_uuid().unwrap();
+    let accounts = view.project(&ACCOUNT);
+    for pk in &unborn {
+        let row = accounts.rows.get(pk).expect("born");
+        assert!(row.live());
+        assert!(row.get("login").and_then(Value::as_str).is_some());
+    }
+    let obs = view.owned.get(ACCOUNT_OBS.name).unwrap();
+    let how_of = |pk: &str| {
+        let row = &obs.rows[&format!("{pk}.{uuid}")].value;
+        how(row["state"].as_str().unwrap(), row["src"].as_str().unwrap())
+    };
+    assert_eq!(how_of(&account_pk(SIGNED)), "signed in");
+    assert_eq!(how_of(&codex_pk(USED)), "used by a tab");
+    assert_eq!(how_of(&account_pk(BROWSED)), "browser only");
+    assert_eq!(how_of(&bronto), "used by a tab");
+    // No assignment changed: the owner's one link still names m65 and bronto.
+    let links = view.project(&PREFERENCE);
+    assert_eq!(links.rows.len(), 1);
+    assert_eq!(
+        links.rows[&link].get("machine").and_then(Value::as_str),
+        Some(m65.as_str())
+    );
+    // And `check` finds nothing this Mac saw that the registry does not hold.
+    let found = checks::observed(
+        &kept::load(&dir).observed(later),
+        Some(&uuid),
+        &view.cells,
+        obs,
+        later,
+    );
+    assert_eq!(found, Vec::new());
+}
+
+/// The kept file: a newer sighting replaces an older one of its login; a browser's does not
+/// replace a CLI's within [`kept::HOLD_MS`], and does after it; a pass settles only what it
+/// was handed, never a newer sighting gathered since; and the file reads back what it wrote.
+/// NEGATIVE CONTROL: with `hold` taking every newer sighting, the browser's replaces the
+/// profile's: `` left: "browser" right: "profile" ``.
+#[test]
+fn the_kept_file_holds_the_strongest_newest_sighting_until_a_pass_takes_it() {
+    let mut kept = kept::Kept::default();
+    let cli = seen_by("claude", "claude", BRONTO, "idle", "profile", NOW);
+    kept.hold(std::slice::from_ref(&cli));
+    kept.hold(&[seen_by(
+        "claude",
+        "claude",
+        BRONTO,
+        "idle",
+        BROWSER,
+        NOW + DAY,
+    )]);
+    assert_eq!(kept.pending()[0].src, "profile");
+    kept.hold(&[seen_by(
+        "claude",
+        "claude",
+        BRONTO,
+        "idle",
+        BROWSER,
+        NOW + 3 * DAY,
+    )]);
+    assert_eq!(kept.pending()[0].src, BROWSER);
+    let passed = kept.pending();
+    kept.hold(&[seen_by(
+        "claude",
+        "claude",
+        BRONTO,
+        "running",
+        "profile",
+        NOW + 4 * DAY,
+    )]);
+    kept.settle(&passed);
+    assert_eq!(kept.pending().len(), 1, "a newer sighting still waits");
+    let read = kept::Kept::parse(kept.render().as_bytes());
+    assert!(read == kept);
+    kept.settle(&kept.pending());
+    assert!(kept.pending().is_empty());
+    kept.prune(NOW + 4 * DAY + kept::KEEP_MS + 1);
+    assert!(kept.observed(NOW + 4 * DAY).is_empty());
+}
+
+/// Of one account's sightings a CLI's speaks before a browser's, whatever their order.
+/// NEGATIVE CONTROL: without the planner's ordering, the row says the browser's:
+/// `` left: String("browser") right: String("profile") ``.
+#[test]
+fn a_browser_sighting_speaks_last_for_its_account() {
+    let plan = run(
+        ME,
+        &[
+            seen_by("claude", "claude", BRONTO, "idle", BROWSER, NOW),
+            seen_by("claude", "claude", BRONTO, "idle", "profile", NOW),
+        ],
+        &cells(bronto_registry()),
+        &OwnedRead::default(),
+        NOW,
+    );
+    let row = plan.changes[0].value.as_ref().unwrap();
+    assert_eq!(row["src"], json!("profile"));
+}
+
+/// A sighting whose address does not read (a domain with no dot, which a CLI's file may say) is
+/// skipped, and the pass goes on with the rest: kept on disk, it would otherwise refuse every
+/// later pass on this Mac, in every process.
+/// NEGATIVE CONTROL: with `plan` refusing the pass on `matched`'s error, `run`'s unwrap panics
+/// on the whole pass's `Err`.
+#[test]
+fn a_sighting_whose_address_does_not_read_is_skipped_and_the_pass_goes_on() {
+    const DOTLESS: &str = "someone@localhost";
+    assert!(keys::address(DOTLESS).is_err(), "the fixture does not read");
+    let plan = run(
+        ME,
+        &[
+            sighting(DOTLESS, "running", 1, NOW),
+            sighting(BRONTO, "running", 1, NOW),
+        ],
+        &cells(bronto_registry()),
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!((plan.born, plan.marked), (0, 1));
+    assert_eq!(plan.changes[0].key, format!("{}.{ME}", account_pk(BRONTO)));
+    assert!(plan.waiting.is_empty());
+}
+
+/// A sighting whose birth or first row the quota refused stays pending in the kept file, for a
+/// pass with room (after a roll) to register; one the registry already holds as this Mac's row
+/// says is taken.
+/// NEGATIVE CONTROLS, each run: with `through` settling every sighting handed, `` left: 0
+/// right: 1 ``; with `plan` naming no sighting in `waiting`, `` left: [] right: [0] ``.
+#[test]
+fn a_sighting_the_quota_refused_waits_for_a_pass_with_room() {
+    use crate::{alab::Registry, table::tests::Lab};
+    use aterm_secrets::commons::roster::Role;
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry.write(vec![bronto_registry()]).unwrap();
+    let config = lab.paths[0].home.join("config.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let state = aterm_tempfile::tempdir().unwrap();
+    let dir = kept::under(state.path());
+    let mut spent = 0;
+    for n in 0..OBSERVE_RESERVE as u64 {
+        let now = NOW + n;
+        let seen = [sighting(&format!("u{n}@proton.example"), "running", 1, now)];
+        let (_, done) = kept::through(&dir, &seen, now, |pending| {
+            registry.observe_accounts(&config, pending, now)
+        });
+        spent += done.unwrap().records;
+    }
+    assert_eq!(spent, OBSERVE_RESERVE);
+    assert!(kept::load(&dir).pending().is_empty());
+    let later = NOW + DAY;
+    let seen = [
+        sighting("late@proton.example", "running", 1, later),
+        sighting("u0@proton.example", "running", 1, later),
+    ];
+    let (handed, done) = kept::through(&dir, &seen, later, |pending| {
+        registry.observe_accounts(&config, pending, later)
+    });
+    let done = done.unwrap();
+    assert_eq!((done.quiet, done.records), (None, 0));
+    assert!(done.findings.iter().any(|f| f.kind == "quota-spent"));
+    let late = handed
+        .iter()
+        .position(|s| s.email == "late@proton.example")
+        .unwrap();
+    assert_eq!(done.waiting, vec![late]);
+    let pending = kept::load(&dir).pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].email, "late@proton.example");
+}
+
+/// A codex account in the registry, its login bronto's address.
+fn codex_registry() -> (String, Vec<Change>) {
+    let pk = keys::account_pk("codex", &keys::claims_email(None, Some(BRONTO)).unwrap()).unwrap();
+    let mut out = bronto_registry();
+    out.extend([
+        put(&ACCOUNT, &pk, "provider", json!(keys::OPENAI)),
+        put(&ACCOUNT, &pk, "realm", json!("codex")),
+        put(&ACCOUNT, &pk, "login", json!(addr_pk(BRONTO))),
+        put(&ACCOUNT, &pk, "status", json!("active")),
+    ]);
+    (pk, out)
+}
+
+/// A kept sighting older than this Mac's row of its account says nothing newer of it, and
+/// leaves the account to a newer sighting through another login in the same pass.
+/// NEGATIVE CONTROL: with the age test after the account is taken as seen, the codex-alab tab
+/// writes nothing: `` panicked … running ``.
+#[test]
+fn a_stale_sighting_leaves_its_account_to_a_newer_one() {
+    let (codex, registry) = codex_registry();
+    let held = cells(registry);
+    let idle = seen_by("codex", "codex", BRONTO, "idle", "auth-file", NOW);
+    let first = run(
+        ME,
+        std::slice::from_ref(&idle),
+        &held,
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!(first.marked, 1);
+    let obs = obs_after(OwnedRead::default(), &first.changes);
+    let later = NOW + 60_000;
+    let plan = run(
+        ME,
+        &[
+            seen_by("codex", "codex", BRONTO, "idle", "auth-file", NOW - DAY),
+            seen_by("codex-alab", "codex", BRONTO, "running", "auth-file", later),
+            seen_by("claude", "claude", UNICORN, "idle", "profile", later),
+        ],
+        &held,
+        &obs,
+        later,
+    );
+    let row = plan
+        .changes
+        .iter()
+        .find(|c| c.key == format!("{codex}.{ME}"))
+        .and_then(|c| c.value.as_ref());
+    assert!(
+        row.is_some_and(|row| row["state"] == json!("running") && row["cli"] == json!("codex-alab")),
+        "running"
+    );
+}
+
+/// The kept file: a CLI's sighting a little older than a kept browser one of its login (another
+/// process gathered it just before this one's browser look) replaces it, as a newer one does.
+/// NEGATIVE CONTROL: with `hold` dropping every older sighting, `` left: "browser" right:
+/// "profile" ``.
+#[test]
+fn a_cli_sighting_a_little_older_than_a_kept_browser_one_replaces_it() {
+    let mut kept = kept::Kept::default();
+    kept.hold(&[seen_by("claude", "claude", BRONTO, "idle", BROWSER, NOW)]);
+    kept.hold(&[seen_by(
+        "claude",
+        "claude",
+        BRONTO,
+        "idle",
+        "profile",
+        NOW - 60_000,
+    )]);
+    assert_eq!(kept.pending()[0].src, "profile");
+    // One older than the hold gives way: the browser's is the news.
+    let mut kept = kept::Kept::default();
+    kept.hold(&[seen_by("claude", "claude", BRONTO, "idle", BROWSER, NOW)]);
+    kept.hold(&[seen_by(
+        "claude",
+        "claude",
+        BRONTO,
+        "idle",
+        "profile",
+        NOW - kept::HOLD_MS - 1,
+    )]);
+    assert_eq!(kept.pending()[0].src, BROWSER);
+}
+
+/// `check` keeps a sighting that still waits for a pass however old it is (a Mac fenced for
+/// longer than [`kept::KEEP_MS`]); a taken one it compares for [`kept::KEEP_MS`].
+/// NEGATIVE CONTROL: with `observed` filtering by age alone, `` left: 0 right: 1 ``.
+#[test]
+fn check_keeps_a_pending_sighting_however_old() {
+    let mut kept = kept::Kept::default();
+    let old = seen_by("claude", "claude", BRONTO, "idle", "profile", NOW);
+    kept.hold(std::slice::from_ref(&old));
+    let late = NOW + kept::KEEP_MS + DAY;
+    kept.prune(late);
+    assert_eq!(kept.observed(late).len(), 1);
+    assert!(kept.observed(late)[0].1, "pending");
+    kept.settle(&[old]);
+    assert!(kept.observed(late).is_empty());
+}
+
+/// Each finding of what this Mac saw says which login it means, never its address: the CLI, how
+/// it was seen ([`how`]), how long ago, and whether it waits for a pass; and the GUI's Check
+/// view reads that line as the finding's detail. An account a row names that this Mac's rows do
+/// not list names the account's own row, which the view can show.
+/// NEGATIVE CONTROLS, each run: with `lab_json` leaving out the line, `` left: "" right:
+/// "claude · used by a tab · seen today" ``; with the unmarked finding naming `account-obs`,
+/// `` left: ("account-obs", …) right: ("account", …) ``.
+#[test]
+fn check_says_which_login_each_finding_means_never_its_address() {
+    use crate::alab::{checks, command::lab_json};
+    const BROWSED: &str = "browsed.m22@proton.example";
+    let seen = vec![
+        (
+            seen_by("claude", "claude", BROWSED, "idle", BROWSER, NOW - 2 * DAY),
+            true,
+        ),
+        (
+            seen_by("claude", "claude", BRONTO, "running", "profile", NOW),
+            false,
+        ),
+    ];
+    let found = checks::observed(
+        &seen,
+        Some(ME),
+        &cells(bronto_registry()),
+        &OwnedRead::default(),
+        NOW,
+    );
+    assert_eq!(found.len(), 2);
+    let of = |kind: &str| found.iter().find(|f| f.finding.kind == kind).unwrap();
+    let unborn = of("account-seen-unregistered");
+    assert_eq!(unborn.finding.pks, [account_pk(BROWSED)]);
+    assert!(unborn.line.starts_with("claude"));
+    assert!(unborn.line.contains(how("idle", BROWSER)));
+    assert!(unborn.line.contains("2 days"));
+    let unmarked = of("account-seen-unmarked");
+    assert_eq!(
+        (unmarked.finding.collection, unmarked.finding.pks.clone()),
+        (ACCOUNT.name, vec![account_pk(BRONTO)])
+    );
+    assert!(unmarked.line.contains(how("running", "profile")));
+    assert_ne!(unborn.line, unmarked.line, "waiting is said");
+    let json = lab_json(&[], &found, &[]);
+    for (finding, seen) in json.iter().zip(&found) {
+        assert!(!finding.to_string().contains('@'), "{finding}");
+        assert_eq!(crate::att::command::line(finding).detail, seen.line);
+    }
+}
+
+/// The source word `browser` moves `account-obs` to a new version (design §3.8): an older
+/// build's version-1 row, which lists no `browser`, gives way to this build's when it publishes,
+/// so the stored schema admits what this build writes, and two builds publishing into a fresh
+/// generation never split one version.
+/// NEGATIVE CONTROL: with `ACCOUNT_OBS` at version 1, the older row stands: `` left: One {
+/// version: 1, … } ``.
+#[test]
+fn the_browser_word_moves_account_obs_to_a_new_version() {
+    use crate::{
+        alab::Registry,
+        table::tests::Lab,
+        typed::{SCHEMA, owned::SchemaState},
+    };
+    use aterm_secrets::commons::roster::Role;
+    let mut older = ACCOUNT_OBS.schema_row();
+    let object = older.as_object_mut().unwrap();
+    object.insert("r".into(), json!(1));
+    let schema = object.get_mut("x").unwrap().as_object_mut().unwrap();
+    schema.insert("version".into(), json!(1));
+    for column in schema
+        .get_mut("columns")
+        .and_then(Value::as_array_mut)
+        .unwrap()
+    {
+        if let Some(words) = column
+            .as_object_mut()
+            .and_then(|column| column.get_mut("type"))
+            .and_then(Value::as_object_mut)
+            .and_then(|ty| ty.get_mut("enum"))
+            .and_then(Value::as_array_mut)
+        {
+            words.retain(|word| word.as_str() != Some(BROWSER));
+        }
+    }
+    assert_ne!(older, ACCOUNT_OBS.schema_row());
+    let lab = Lab::new(&[Role::Writer]);
+    let registry = Registry::at(lab.paths[0].clone());
+    registry.open().unwrap();
+    registry
+        .write(vec![vec![Change {
+            collection: SCHEMA.into(),
+            key: ACCOUNT_OBS.name.into(),
+            value: Some(older),
+        }]])
+        .unwrap();
+    registry.publish_schema().unwrap();
+    assert_eq!(
+        registry.view().unwrap().schema(ACCOUNT_OBS.name),
+        SchemaState::One {
+            version: ACCOUNT_OBS.version,
+            row: ACCOUNT_OBS.schema_row()
+        }
+    );
+}

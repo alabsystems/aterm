@@ -819,7 +819,8 @@ impl App {
             crate::native_app::AppKind::Markdown
             | crate::native_app::AppKind::Recovery
             | crate::native_app::AppKind::Workers
-            | crate::native_app::AppKind::Tables => None,
+            | crate::native_app::AppKind::Tables
+            | crate::native_app::AppKind::Navigator => None,
         }
     }
 
@@ -1015,10 +1016,13 @@ impl App {
     }
 
     /// Whether a tab's capture leaves `view` out, its sibling taking its place: a view no capture
-    /// describes ([`App::view_has_no_capture`]), a Mac Setup tab's terminal unless `carry_drafts`,
-    /// and a failed open's Recovery tab no plain open can try again ([`failed_open_leaf`]).
+    /// describes ([`App::view_has_no_capture`]), the navigator ([`App::view_is_unrestored_page`]),
+    /// which lists the machine's sessions and holds nothing of its own to bring back, a Mac Setup
+    /// tab's terminal unless `carry_drafts`, and a failed open's Recovery tab no plain open can
+    /// try again ([`failed_open_leaf`]).
     fn view_is_left_out(&self, view: crate::tab_model::ViewId, carry_drafts: bool) -> bool {
         self.view_has_no_capture(view)
+            || self.view_is_unrestored_page(view)
             || (!carry_drafts && self.view_is_developer_tools_session(view))
             || self.view_is_spent_failed_open(view)
     }
@@ -1231,6 +1235,7 @@ impl App {
                     | crate::native_app::AppViewState::Allocation(_)
                     | crate::native_app::AppViewState::Workers(_)
                     | crate::native_app::AppViewState::Tables(_)
+                    | crate::native_app::AppViewState::Navigator(_)
                     | crate::native_app::AppViewState::SystemState(_) => {}
                     crate::native_app::AppViewState::Settings(settings) => {
                         if carry_drafts {
@@ -1328,6 +1333,7 @@ impl App {
                 | crate::native_app::AppViewState::Allocation(_)
                 | crate::native_app::AppViewState::Workers(_)
                 | crate::native_app::AppViewState::Tables(_)
+                | crate::native_app::AppViewState::Navigator(_)
                 | crate::native_app::AppViewState::SystemState(_) => true,
                 crate::native_app::AppViewState::Editor(editor) => {
                     let (Some(text), Some(buffer)) =
@@ -1731,13 +1737,20 @@ impl App {
         // seamless update's successor sweeps nothing: its sessions keep their IDs, so the files
         // under the IDs its layout names are its own live sessions', which go at their close or
         // at its quit as any session's do. The predecessor ends at the Commit and removes none.
+        // The sweep is one-shot for those IDs, so it waits for the session table's load: before
+        // it every result is held, and would be kept for good.
+        let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
         if !self.handoff_successor {
-            tasks.sweep(&self.store);
+            let (tasks, store) = (tasks.clone(), self.store.clone());
+            table.when_loaded(move || tasks.sweep(&store));
         }
         self.seamless_held.clear();
         self.seamless_held_shown.clear();
         self.hand_restored_agents();
         self.settle_carried_settings_drafts();
+        // Every session the launch brings back is registered: the table's budget may judge which
+        // rows live sessions protect (tracker ST-15).
+        table.sessions_settled();
     }
 
     /// Re-grid every window's panes to its layout once the restore has placed all of its tabs. A
@@ -4540,11 +4553,13 @@ impl App {
         );
     }
 
-    /// A WORKER'S MANAGER STAYS ITS MANAGER ACROSS A COLD RESTART, which gives every session a new
-    /// sid: the leaf that held sid `was` came back as `ctx`, so every record whose `from=` names `was`
-    /// names `ctx`'s sid now, and `ctx`'s own record names its manager's new sid where that manager
-    /// came back before it. A manager that did not come back keeps the sid it had, which no session
-    /// here holds.
+    /// A WORKER'S MANAGER STAYS ITS MANAGER ACROSS A COLD RESTART, which keeps a leaf's tab ID
+    /// ([`Self::kept_leaf_identity`]) and gives its session a new sid only where it cannot (a sid
+    /// that is no tab ID, an ID a tab of this process holds or a live instance on this Mac serves,
+    /// a reopened closed tab): the leaf that held sid `was` came back as `ctx`, so where the two
+    /// differ every record whose `from=` names `was` names `ctx`'s sid now, and `ctx`'s own record
+    /// names its manager's new sid where that manager came back before it under a new one. A
+    /// manager that did not come back keeps the sid it had, which no session here holds.
     fn carry_restored_managers(&mut self, was: Option<&str>, ctx: &crate::SessionCtx) {
         let now = ctx.self_id.as_str();
         if let Some(was) = was.filter(|was| *was != now) {

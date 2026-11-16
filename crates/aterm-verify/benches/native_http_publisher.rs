@@ -247,7 +247,7 @@ read = ["anonymous"]
             &self,
             case: &Case,
             expected_after: bool,
-            unknown: bool,
+            lost_ack: bool,
         ) -> Result<(aterm_json::Value, bool), Box<dyn Error>> {
             let (actual_git, git_valid) = crate::git_provenance::recorded_git(&self.client)?;
             let refs = git(self.backend.repository(), &["show-ref"])?;
@@ -295,19 +295,20 @@ read = ["anonymous"]
             let dropped = requests.iter().filter(|r| r.response_dropped).count();
             let rows = request_rows(&requests);
             let api = self.fake.seen();
-            let api_writer = !api.is_empty()
-                && api
-                    .iter()
-                    .all(|r| r.as_login.as_deref() == Some("fixture-dev-bot"));
+            // Native Git publication need not issue a REST request. The receive POST above
+            // proves writer authentication; any REST requests must use that writer too.
+            let api_writer = api
+                .iter()
+                .all(|r| r.as_login.as_deref() == Some("fixture-dev-bot"));
             let valid = git_valid
                 && exact_refs
                 && object_exact != Some(false)
                 && grants == 0
-                && intents == usize::from(unknown)
+                && intents == 0
                 && writer_only
                 && challenge
                 && posts == 1
-                && dropped == usize::from(unknown)
+                && dropped == usize::from(lost_ack)
                 && api_writer;
             Ok((
                 json!({"actual_git":actual_git,"backend_git_version":self.backend.git_version(),"exact_final_refs":exact_refs,
@@ -453,46 +454,46 @@ read = ["anonymous"]
             "scope":"synthetic private HTTP loopback/CGI publisher, not app watchdog/TLS/WAN/GitHub latency"}),
         )?;
 
-        for control in ["known", "refused", "unknown"] {
+        for control in ["known", "refused", "lost_ack"] {
             let fixture = Fixture::new(&helper, &source, &seed, &cases[0], observe_children)?;
             if control == "refused" {
-                std::fs::write(
-                    fixture.backend.repository().join("refs/heads/main.lock"),
-                    b"owned fixture lock\n",
+                // A held ref lock is a retryable conflict, not a policy refusal.
+                // Deny updating the checked-out branch to reject the atomic push.
+                let repository = fixture.backend.repository();
+                git(repository, &["symbolic-ref", "HEAD", "refs/heads/main"])?;
+                git(repository, &["config", "core.bare", "false"])?;
+                git(
+                    repository,
+                    &["config", "receive.denyCurrentBranch", "refuse"],
                 )?;
             }
-            if control == "unknown" {
+            if control == "lost_ack" {
                 fixture.backend.lose_next_receive_response();
             }
             let result = fixture.publish();
-            let evidence = fixture.evidence(&cases[0], control != "refused", control == "unknown");
+            let evidence = fixture.evidence(&cases[0], control != "refused", control == "lost_ack");
             let expected = match control {
                 "known" => result.is_ok(),
                 "refused" => result.as_ref().is_err_and(|e| e.kind == Kind::Refused),
-                _ => result
-                    .as_ref()
-                    .is_err_and(|e| e.kind == Kind::OutcomeUnknown),
+                _ => result.is_ok(),
             };
             emit(
                 "control",
-                json!({"control":control,"result_expected":expected,"evidence":evidence.as_ref().ok().map(|(v,_)|v)}),
+                json!({"control":control,"result_expected":expected,"error":result.as_ref().err().map(ToString::to_string),"evidence":evidence.as_ref().ok().map(|(v,_)|v)}),
             )?;
             if !expected || !evidence?.1 {
                 return Err("untimed publisher control failed; attempt retained".into());
             }
-            if control == "unknown" {
+            if control == "lost_ack" {
+                // The publisher reconciles a lost acknowledgement by observing AFTER.
+                // Independently confirm every ref without replaying the receive.
                 let journal = fixture.client.journal(&agh::Slug::parse(SLUG)?)?;
-                let intent = fixture.open_intents()?[0].id.clone();
                 let posts = fixture
                     .backend
                     .seen()
                     .iter()
                     .filter(|r| r.post && r.service == Some(Service::Receive))
                     .count();
-                let retry = fixture.publish();
-                let retry_blocked = retry
-                    .as_ref()
-                    .is_err_and(|e| e.kind == Kind::OutcomeUnknown);
                 let discovered = fixture
                     .client
                     .run_git(&GitRun::ls_remote(&agh::Slug::parse(SLUG)?, None))?;
@@ -518,17 +519,13 @@ read = ["anonymous"]
                             && r.identity == Identity::Reader
                             && r.backend_attempted
                     });
-                if all_after && no_replay && retry_blocked && reader {
-                    journal.observe(&intent, Some(0))?;
-                }
-                let valid =
-                    all_after && no_replay && retry_blocked && reader && journal.open()?.is_empty();
+                let valid = all_after && no_replay && reader && journal.open()?.is_empty();
                 emit(
                     "reconciliation",
-                    json!({"all_after":all_after,"no_receive_replay":no_replay,"open_intents_after":journal.open()?.len(),"reader":reader,"retry_blocked":retry_blocked,"requests":request_rows(&fixture.backend.seen()),"valid":valid}),
+                    json!({"all_after":all_after,"no_receive_replay":no_replay,"open_intents_after":journal.open()?.len(),"reader":reader,"requests":request_rows(&fixture.backend.seen()),"valid":valid}),
                 )?;
                 if !valid {
-                    return Err("unknown reconciliation failed".into());
+                    return Err("lost acknowledgement reconciliation failed".into());
                 }
             }
         }

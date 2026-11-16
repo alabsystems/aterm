@@ -11,7 +11,7 @@ use aterm_secrets::{
     commons::binding::Request,
     envelope, fsx,
     membership_log::{
-        Entrant, EpochAudience, Inserted, Log, MAX_RECORD, Record, RecordId, encode_records,
+        Entrant, EpochAudience, Inserted, Log, MAX_RECORD, Record, RecordId, read_records,
     },
     server::{self, Options, Running},
     text::{Audience, Entry},
@@ -138,7 +138,7 @@ impl Fixture {
                 .unwrap();
             assert_eq!(log.insert(record).unwrap(), Inserted::Held);
         }
-        let wire = encode_records(log.records());
+        let wire = read_records(log.records()).unwrap();
         assert!(wire.len() > VALUES * VALUE_BYTES);
         fsx::write_atomic(
             &directory.path().join(format!("{NAME}.records")),
@@ -164,7 +164,7 @@ impl Fixture {
         let loaded = fixture.running().stored_records(NAME);
         assert_eq!(loaded.len(), VALUES + 2);
         assert_eq!(loaded.complete_inventory().len(), loaded.len());
-        assert_eq!(loaded.encode(), *fixture.wire);
+        assert_eq!(loaded.read_encoded().unwrap(), *fixture.wire);
         assert_eq!(
             fixture.running().test_records_on_file(NAME),
             Some(VALUES + 2)

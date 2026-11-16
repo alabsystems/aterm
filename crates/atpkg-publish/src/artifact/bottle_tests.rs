@@ -7,65 +7,9 @@ use super::*;
 use crate::artifact::relocate::ObjectRefs;
 use crate::artifact::tarwrite::RawFrames;
 
+/// A git build record that says the build is `RUNTIME_PREFIX`, as the GNU source build writes it.
 #[cfg(unix)]
-#[test]
-fn git_wrapper_relocates_without_path_utilities() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let work = aterm_tempfile::tempdir().unwrap();
-    let stage = work.path().join("original install");
-    let core = stage.join("libexec/git-core");
-    std::fs::create_dir_all(&core).unwrap();
-    std::fs::create_dir_all(stage.join("share/git-core/templates")).unwrap();
-    let backend = core.join("git");
-    std::fs::write(
-        &backend,
-        b"#!/bin/sh\nprintf '%s\\n' \"$ATERM_GIT_ROOT\" \"$GIT_EXEC_PATH\" \"$GIT_TEMPLATE_DIR\" \"$#\" \"$@\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(install_git_wrapper("git", &stage).unwrap());
-    let moved = work.path().join("moved git's install");
-    std::fs::rename(&stage, &moved).unwrap();
-    let moved = moved.canonicalize().unwrap();
-    let poison = work.path().join("poison");
-    std::fs::create_dir(&poison).unwrap();
-    let marker = work.path().join("dirname-called");
-    let dirname = poison.join("dirname");
-    std::fs::write(
-        &dirname,
-        b"#!/bin/sh\nprintf called > \"$ATPKG_POISON_MARKER\"\nexit 97\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&dirname, std::fs::Permissions::from_mode(0o755)).unwrap();
-    for path in [std::ffi::OsStr::new(""), poison.as_os_str()] {
-        let mut command = aterm_uds::spawnfd::command(moved.join("bin/git"));
-        command
-            .args(["argument with spaces", "--version"])
-            .env("PATH", path)
-            .env("ATPKG_POISON_MARKER", &marker)
-            .env_remove("GIT_EXEC_PATH")
-            .env_remove("GIT_TEMPLATE_DIR");
-        let output =
-            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            format!(
-                "{}\n{}\n{}\n2\nargument with spaces\n--version\n",
-                moved.display(),
-                moved.join("libexec/git-core").display(),
-                moved.join("share/git-core/templates").display()
-            )
-        );
-        assert!(!marker.exists());
-    }
-}
+const RUNTIME_PREFIX_ORIGIN: &[u8] = br#"{"git_version":"2.56.0","runtime_prefix":true}"#;
 
 #[test]
 fn cli_accepts_one_archive_or_install_tree_and_refuses_ambiguous_inputs() {
@@ -392,6 +336,7 @@ fn gnu_git_archives_merge_stage_elf_payloads_and_refuse_mislabeled_objects() {
                 TarEntry::Dir("git/2.56.0/bin/"),
                 TarEntry::Dir("git/2.56.0/libexec/git-core/"),
                 TarEntry::File("git/2.56.0/libexec/git-core/git", &elf, 0o755),
+                TarEntry::File("git/2.56.0/BUILD-ORIGIN.json", RUNTIME_PREFIX_ORIGIN, 0o644),
             ],
         );
         let donor = tmp.path().join(format!("pcre2-{triple}.tar"));
@@ -444,8 +389,10 @@ fn gnu_git_archives_merge_stage_elf_payloads_and_refuse_mislabeled_objects() {
                 .lock()
                 .expect("lock")
                 .iter()
-                .any(|(path, loader)| path.ends_with("libexec/git-core/git")
-                    && Some(loader.as_str()) == system_loader(triple))
+                .any(|(path, loader)| (path.ends_with("bin/git")
+                    || path.ends_with("libexec/git-core/git"))
+                    && Some(loader.as_str()) == system_loader(triple)),
+            "the one file git ships under both names gets the system loader"
         );
         assert!(result.signature.as_ref().is_some_and(|p| p.is_file()));
         let parsed: atpkg::PkgManifest = aterm_toml::from_str(
@@ -483,11 +430,12 @@ fn gnu_git_archives_merge_stage_elf_payloads_and_refuse_mislabeled_objects() {
                 .expect("donor license"),
             b"PCRE2 license\n"
         );
-        assert!(
-            std::fs::read_to_string(stage.join("bin/git"))
-                .expect("wrapper")
-                .contains("GIT_EXEC_PATH=")
+        assert_eq!(
+            std::fs::read(stage.join("bin/git")).expect("bin/git"),
+            elf,
+            "bin/git is git itself"
         );
+        check_git_itself(&stage).expect("bin/git and libexec/git-core/git are one file");
         // The actual retained-archive route keeps the payload bytes and still performs
         // client hash/tree/ELF admission. Native execution is injected here because these
         // deliberately minimal ELF fixtures are never executable programs.
@@ -658,6 +606,7 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
             TarEntry::Dir("git/2.51.0/share/git-core/templates/"),
             TarEntry::File("git/2.51.0/bin/git", &arm64, 0o755),
             TarEntry::Symlink("git/2.51.0/libexec/git-core/git", "../../bin/git"),
+            TarEntry::File("git/2.51.0/BUILD-ORIGIN.json", RUNTIME_PREFIX_ORIGIN, 0o644),
             TarEntry::File(
                 "git/2.51.0/libexec/git-core/git-credential-osxkeychain",
                 &arm64,
@@ -719,8 +668,8 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
         "missing @@HOMEBREW_PREFIX@@ dep must fail closed"
     );
 
-    // Positive: with `--dep-bottle`, `git` vendors `libpcre2-8.0.dylib`, writes the `bin/git`
-    // wrapper without clobbering `libexec/git-core/git`, and stages cleanly via atpkg.
+    // Positive: with `--dep-bottle`, `git` vendors `libpcre2-8.0.dylib`, keeps `bin/git` and
+    // `libexec/git-core/git` one file, and stages cleanly via atpkg.
     let mut arm_req = missing_dep_req;
     arm_req.dep_bottles = vec![dep_tar];
     let arm_out = pack_bottle_with(&ctx, &arm_req, &backend, &RawFrames::WHOLE)
@@ -736,6 +685,7 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
             TarEntry::Dir("git/2.51.0/bin/"),
             TarEntry::Dir("git/2.51.0/libexec/git-core/"),
             TarEntry::File("git/2.51.0/libexec/git-core/git", &x64, 0o755),
+            TarEntry::File("git/2.51.0/BUILD-ORIGIN.json", RUNTIME_PREFIX_ORIGIN, 0o644),
         ],
     );
     let x64_backend = FakeBackend::default();
@@ -764,7 +714,7 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
     assert_eq!(parsed.artifacts.len(), 2);
     assert!(parsed.artifacts.iter().all(|a| a.provenance.is_none()));
 
-    // Verify staged arm64 tree keeps Mach-O `libexec/git-core/git` and wrapper `bin/git`.
+    // Verify the staged arm64 tree ships the Mach-O git itself under both names.
     let staged = tmp.path().join("staged-git");
     let arm_row = parsed
         .artifacts
@@ -778,14 +728,14 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
         &atpkg::install::StageHooks::NONE,
     )
     .expect("publication verification");
-    let wrapper = std::fs::read_to_string(staged.join("bin/git")).expect("read wrapper");
-    assert!(wrapper.starts_with("#!/bin/sh\n"));
-    assert!(wrapper.contains("GIT_EXEC_PATH="));
-    assert_eq!(
-        std::fs::read(staged.join("libexec/git-core/git")).expect("read core git"),
-        arm64,
-        "wrapper write must not clobber hard-linked libexec/git-core/git binary"
-    );
+    for name in ["bin/git", "libexec/git-core/git"] {
+        assert_eq!(
+            std::fs::read(staged.join(name)).expect("read git"),
+            arm64,
+            "{name} is git itself"
+        );
+    }
+    check_git_itself(&staged).expect("bin/git and libexec/git-core/git are one file");
     assert!(
         !staged
             .join("libexec/git-core/git-credential-osxkeychain")
@@ -803,114 +753,8 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
 }
 
 #[cfg(unix)]
-fn staged_git_wrapper() -> (aterm_tempfile::TempDir, PathBuf) {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let temp = aterm_tempfile::tempdir().expect("tempdir");
-    let original = temp.path().join("original stage");
-    let core = original.join("libexec/git-core/git");
-    std::fs::create_dir_all(core.parent().unwrap()).expect("core directory");
-    std::fs::create_dir_all(original.join("share/git-core/templates")).expect("templates");
-    std::fs::write(
-        &core,
-        b"#!/bin/sh\nprintf '%s\\n' \"$ATERM_GIT_ROOT\" \"$GIT_EXEC_PATH\" \
-          \"$GIT_TEMPLATE_DIR\" \"$@\"\nexit 37\n",
-    )
-    .expect("payload");
-    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o755))
-        .expect("executable payload");
-    assert!(install_git_wrapper("git", &original).expect("install real producer wrapper"));
-    let relocated = temp.path().join("relocated stage with spaces");
-    std::fs::rename(&original, &relocated).expect("relocate staged wrapper and payload");
-    let relocated = relocated.canonicalize().expect("physical stage root");
-    (temp, relocated)
-}
-
-#[cfg(unix)]
-fn assert_staged_git_wrapper_runs(stage: &Path, path: &std::ffi::OsStr) {
-    for (program, script, directory) in [
-        (stage.join("bin/git"), None, stage.to_path_buf()),
-        (PathBuf::from("./bin/git"), None, stage.to_path_buf()),
-        (PathBuf::from("/bin/sh"), Some("git"), stage.join("bin")),
-    ] {
-        for overrides in [false, true] {
-            let mut command = aterm_uds::spawnfd::command(&program);
-            command.current_dir(&directory);
-            if let Some(script) = script {
-                command.arg(script);
-            }
-            command
-                .env_clear()
-                .env("PATH", path)
-                .args(["argument with spaces", "--literal"]);
-            let exec = if overrides {
-                command.env("GIT_EXEC_PATH", "caller exec directory");
-                "caller exec directory".to_owned()
-            } else {
-                stage.join("libexec/git-core").display().to_string()
-            };
-            let templates = if overrides {
-                command.env("GIT_TEMPLATE_DIR", "caller templates directory");
-                "caller templates directory".to_owned()
-            } else {
-                stage.join("share/git-core/templates").display().to_string()
-            };
-            let output =
-                aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
-                    .expect("staged wrapper starts");
-            assert_eq!(
-                output.status.code(),
-                Some(37),
-                "{program:?} {script:?} from {directory:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(
-                output.stderr.is_empty(),
-                "{program:?} {script:?} from {directory:?}: {output:?}"
-            );
-            assert_eq!(
-                output.stdout,
-                format!(
-                    "{}\n{exec}\n{templates}\nargument with spaces\n--literal\n",
-                    stage.display()
-                )
-                .as_bytes()
-            );
-        }
-    }
-}
-
-#[cfg(unix)]
 #[test]
-fn git_wrapper_works_without_a_caller_tool_path() {
-    let (_temp, stage) = staged_git_wrapper();
-    assert_staged_git_wrapper_runs(&stage, std::ffi::OsStr::new(""));
-}
-
-#[cfg(unix)]
-#[test]
-fn git_wrapper_works_with_poisoned_path_tools() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let (temp, stage) = staged_git_wrapper();
-    let poisoned = temp.path().join("poisoned caller tools");
-    std::fs::create_dir(&poisoned).expect("poison directory");
-    for name in ["dirname", "pwd"] {
-        let tool = poisoned.join(name);
-        std::fs::write(
-            &tool,
-            b"#!/bin/sh\nprintf 'caller tool ran\\n' >&2\nexit 89\n",
-        )
-        .expect("poison tool");
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
-            .expect("executable poison");
-    }
-    assert_staged_git_wrapper_runs(&stage, poisoned.as_os_str());
-}
-
-#[cfg(unix)]
-#[test]
-fn git_wrapper_runs_before_relocation_and_in_stage_libs_receive_rpath() {
+fn git_shipped_under_both_names_and_in_stage_libs_receive_rpaths_for_each() {
     use std::sync::Arc;
 
     use crate::host::fake::FakeHost;
@@ -942,6 +786,7 @@ fn git_wrapper_runs_before_relocation_and_in_stage_libs_receive_rpath() {
             TarEntry::Dir("git/2.51.0/libexec/git-core/"),
             TarEntry::File("git/2.51.0/bin/git", &arm64, 0o755),
             TarEntry::File("git/2.51.0/lib/libgit_helper.dylib", &arm64, 0o755),
+            TarEntry::File("git/2.51.0/BUILD-ORIGIN.json", RUNTIME_PREFIX_ORIGIN, 0o644),
         ],
     );
 
@@ -992,41 +837,33 @@ fn git_wrapper_runs_before_relocation_and_in_stage_libs_receive_rpath() {
     let _out = pack_bottle_with(&ctx, &req, &backend, &RawFrames::WHOLE)
         .expect("git bottle with bin/git + in-stage lib packs");
 
-    // Verify `libexec/git-core/git` was relocated at depth 2 (`../../lib/atpkg-vendored` and
-    // `../../lib`), not depth 1 (`../lib/atpkg-vendored`).
+    // `bin/git` and `libexec/git-core/git` are one file, relocated once (under the name the
+    // walk meets first, `bin/git`) with rpaths for both folders: depth 1 for `bin/git`, depth 2
+    // for `libexec/git-core/git`.
     let map = backend.refs.lock().expect("lock");
-    let core_git_refs = map
+    let git_refs = map
         .iter()
-        .find_map(|(k, v)| k.ends_with("libexec/git-core/git").then_some(v))
-        .expect("libexec/git-core/git refs recorded");
+        .find_map(|(k, v)| k.ends_with("bin/git").then_some(v))
+        .expect("git refs recorded");
     assert_eq!(
-        core_git_refs.needed,
+        git_refs.needed,
         vec![
             "@rpath/libintl.8.dylib".to_string(),
             "@rpath/libgit_helper.dylib".to_string(),
         ]
     );
-    assert!(
-        core_git_refs
-            .rpaths
-            .contains(&"@loader_path/../../lib/atpkg-vendored".to_string()),
-        "libexec/git-core/git must have depth-2 vendored rpath: {:?}",
-        core_git_refs.rpaths
-    );
-    assert!(
-        core_git_refs
-            .rpaths
-            .contains(&"@loader_path/../../lib".to_string()),
-        "libexec/git-core/git must have depth-2 in-stage lib/ rpath: {:?}",
-        core_git_refs.rpaths
-    );
-    assert!(
-        !core_git_refs
-            .rpaths
-            .contains(&"@loader_path/../lib/atpkg-vendored".to_string()),
-        "bin/git must be wrapped before relocation so depth-1 rpath is not written to core git: {:?}",
-        core_git_refs.rpaths
-    );
+    for rpath in [
+        "@loader_path/../lib/atpkg-vendored",
+        "@loader_path/../lib",
+        "@loader_path/../../lib/atpkg-vendored",
+        "@loader_path/../../lib",
+    ] {
+        assert!(
+            git_refs.rpaths.iter().any(|have| have == rpath),
+            "git run by either name finds its libraries: {rpath} missing from {:?}",
+            git_refs.rpaths
+        );
+    }
     drop(map);
 
     // Negative control: `check_stage_tree` refuses a Mach-O object that still carries an
@@ -1088,118 +925,175 @@ fn relinking_preserves_an_unrelated_occupied_legacy_name() {
     );
 }
 
-/// The wrapper `install_git_wrapper` wrote before it located itself with builtins alone, byte for
-/// byte: it ran `dirname` through the caller's PATH. Kept as the negative control for the test
-/// below.
+/// Writes a git install tree under `root` as a copy onto a volume that cannot hold extended
+/// attributes leaves one: `bin/git` and `libexec/git-core/git` as given (two files, or absent),
+/// the build record, AppleDouble files beside them, and a `._` file that is the install's own.
 #[cfg(unix)]
-const DIRNAME_GIT_WRAPPER: &str = "#!/bin/sh\n\
-__atpkg_bin_dir=$(CDPATH='' cd -- \"$(dirname -- \"$0\")\" && pwd -P) || exit 1\n\
-__atpkg_root=$(dirname -- \"$__atpkg_bin_dir\")\n\
-export ATERM_GIT_ROOT=\"$__atpkg_root\"\n\
-export GIT_EXEC_PATH=\"${GIT_EXEC_PATH:-$__atpkg_root/libexec/git-core}\"\n\
-if [ -d \"$__atpkg_root/share/git-core/templates\" ]; then\n\
-  export GIT_TEMPLATE_DIR=\"${GIT_TEMPLATE_DIR:-$__atpkg_root/share/git-core/templates}\"\n\
-fi\n\
-exec \"$__atpkg_root/libexec/git-core/git\" \"$@\"\n";
+fn git_install_tree(
+    root: &Path,
+    bin_git: Option<&[u8]>,
+    core_git: Option<&[u8]>,
+    origin: &[u8],
+) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let apple_double = [
+        &APPLE_DOUBLE_MAGIC[..],
+        &b"\x00\x02\x00\x00Mac OS X        "[..],
+    ]
+    .concat();
+    let files: [(&str, Option<&[u8]>, u32); 7] = [
+        ("bin/git", bin_git, 0o755),
+        ("libexec/git-core/git", core_git, 0o755),
+        ("BUILD-ORIGIN.json", Some(origin), 0o644),
+        ("._BUILD-ORIGIN.json", Some(&apple_double[..]), 0o644),
+        ("._bin", Some(&apple_double[..]), 0o755),
+        ("bin/._git", Some(&apple_double[..]), 0o644),
+        (
+            "share/git-core/._own",
+            Some(&b"the install's own file\n"[..]),
+            0o644,
+        ),
+    ];
+    for (rel, bytes, mode) in files {
+        let Some(bytes) = bytes else {
+            continue;
+        };
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&path, bytes).expect("write");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+    root.to_path_buf()
+}
 
+/// A git bottle ships git itself as `bin/git`: one file with `libexec/git-core/git`, never a
+/// script in front of it, and no AppleDouble file. A `bin/git` script in front of git, a git that
+/// is itself a script, and a build record that does not say `runtime_prefix` are refused.
 #[cfg(unix)]
 #[test]
-fn git_wrapper_locates_itself_under_an_empty_or_unset_path() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn a_git_bottle_ships_git_itself_as_bin_git() {
+    use std::sync::Arc;
 
-    let dir = aterm_tempfile::tempdir().expect("tempdir");
-    // A space in the root, and a symlinked directory in front of `bin/`, as a store link has.
-    let root = dir.path().join("git store").join("2026110303");
-    let core = root.join("libexec/git-core");
-    std::fs::create_dir_all(&core).expect("mkdir");
-    let stand_in = core.join("git");
-    std::fs::write(
-        &stand_in,
-        "#!/bin/sh\nprintf 'exec=%s root=%s args=%s\\n' \"${GIT_EXEC_PATH:-}\" \"${ATERM_GIT_ROOT:-}\" \"$*\"\n",
-    )
-    .expect("write stand-in");
-    std::fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    assert!(install_git_wrapper("git", &root).expect("wrapper"));
-    let link = dir.path().join("linked bin");
-    std::os::unix::fs::symlink(root.join("bin"), &link).expect("symlink");
+    use crate::host::fake::FakeHost;
+    use crate::testkit::Keys;
 
-    let real = std::fs::canonicalize(&root).expect("canonical root");
-    let expected = |args: &str| {
-        format!(
-            "exec={}/libexec/git-core root={} args={args}\n",
-            real.display(),
-            real.display()
-        )
-    };
-    // How each run is started: by the wrapper's path, through a symlinked bin/, by `sh bin/git`
-    // or `sh ./bin/git` from the root so `$0` is relative, or by `sh git` in bin/ so `$0` holds
-    // no slash; each with PATH empty and with PATH unset.
-    const LAUNCHES: [&str; 5] = ["absolute", "symlinked bin", "bin/git", "./bin/git", "git"];
-    let run = |launch: &str, unset: bool| {
-        let mut command = match launch {
-            "absolute" => aterm_uds::spawnfd::command(root.join("bin/git")),
-            "symlinked bin" => aterm_uds::spawnfd::command(link.join("git")),
-            relative => {
-                let mut c = aterm_uds::spawnfd::command("/bin/sh");
-                let cwd = if relative.contains('/') {
-                    root.clone()
-                } else {
-                    root.join("bin")
-                };
-                c.arg(relative).current_dir(cwd);
-                c
-            }
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let ctx = Keys::mint("m3", &[]).ctx(tmp.path(), Arc::new(FakeHost::new()));
+    let git = thin_macho_bytes(0x0100_000c);
+    let script: &[u8] =
+        b"#!/bin/sh\nexport GIT_EXEC_PATH=\"${0%/*}/../libexec/git-core\"\nexec \"$GIT_EXEC_PATH/git\" \"$@\"\n";
+    let pack = |input: PathBuf, out: &str| {
+        let request = BottleRequest {
+            program: "git".to_string(),
+            input: BottleInput::InstallTree(input),
+            version: "2.56.0".to_string(),
+            build: 1,
+            triple: AARCH64_APPLE_DARWIN,
+            strip_components: 0,
+            dep_bottles: Vec::new(),
+            donor_roots: Vec::new(),
+            merge_from: None,
+            key: None,
+            out: tmp.path().join(out),
+            signing: Signing::Unsigned,
+            upload: false,
         };
-        command
-            .args(["status", "two words"])
-            .env_remove("GIT_EXEC_PATH");
-        if unset {
-            command.env_remove("PATH");
-        } else {
-            command.env("PATH", "");
-        }
-        aterm_spec::wait::past_text_busy(|| {
-            aterm_uds::deadline::output_while_process_progressing(
-                &mut command,
-                aterm_spec::wait::MUST_HAPPEN,
-                format!("git wrapper {launch}, PATH unset={unset}"),
-            )
-            .map_err(|e| match e {
-                aterm_uds::deadline::ProgressError::Run(aterm_uds::deadline::RunError::Spawn(
-                    e,
-                )) => e,
-                other => std::io::Error::other(other),
-            })
-        })
-        .expect("run wrapper")
+        pack_bottle_with(&ctx, &request, &FakeBackend::default(), &RawFrames::WHOLE)
     };
-    for name in LAUNCHES {
-        for unset in [false, true] {
-            let out = run(name, unset);
-            assert!(
-                out.status.success(),
-                "{name} unset={unset}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(
-                String::from_utf8_lossy(&out.stdout),
-                expected("status two words"),
-                "{name} unset={unset}"
-            );
-        }
-    }
 
-    // Negative control: the dirname wrapper, run each of the same ways, cannot find itself under
-    // an empty PATH.
-    let wrapper = root.join("bin/git");
-    std::fs::remove_file(&wrapper).expect("rm wrapper");
-    std::fs::write(&wrapper, DIRNAME_GIT_WRAPPER).expect("write old wrapper");
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    for name in LAUNCHES {
-        let out = run(name, false);
+    // Git under both names as two equal files, as a copy that does not keep hard links leaves
+    // it: the bottle ships them as one file, git itself, and drops every AppleDouble file.
+    let packed = pack(
+        git_install_tree(
+            &tmp.path().join("copied install"),
+            Some(&git[..]),
+            Some(&git[..]),
+            RUNTIME_PREFIX_ORIGIN,
+        ),
+        "out",
+    )
+    .expect("a RUNTIME_PREFIX git packs");
+    let manifest: atpkg::PkgManifest =
+        aterm_toml::from_str(&std::fs::read_to_string(&packed.manifest).expect("read manifest"))
+            .expect("parse manifest");
+    let staged = tmp.path().join("staged");
+    atpkg::verify_for_publication(
+        &manifest.artifacts[0],
+        &packed.asset,
+        &staged,
+        &atpkg::install::StageHooks::NONE,
+    )
+    .expect("publication verification");
+    assert_eq!(
+        std::fs::read(staged.join("bin/git")).expect("read bin/git"),
+        git,
+        "bin/git is git itself"
+    );
+    check_git_itself(&staged).expect("bin/git and libexec/git-core/git are one file");
+    for apple_double in ["._BUILD-ORIGIN.json", "._bin", "bin/._git"] {
         assert!(
-            !out.status.success() && out.stdout.is_empty(),
-            "{name}: the dirname wrapper must fail under an empty PATH: {out:?}"
+            std::fs::symlink_metadata(staged.join(apple_double)).is_err(),
+            "the bottle ships the AppleDouble file {apple_double}"
         );
     }
+    assert_eq!(
+        std::fs::read(staged.join("share/git-core/._own")).expect("the install's own file"),
+        b"the install's own file\n",
+        "a `._` file that is not AppleDouble is the install's own"
+    );
+
+    // Negative control: the wrapper this replaces, a `bin/git` script in front of git.
+    let error = pack(
+        git_install_tree(
+            &tmp.path().join("wrapped install"),
+            Some(script),
+            Some(&git[..]),
+            RUNTIME_PREFIX_ORIGIN,
+        ),
+        "out-wrapped",
+    )
+    .expect_err("a script in front of git is refused");
+    assert!(
+        error
+            .to_string()
+            .contains("bin/git is not libexec/git-core/git"),
+        "{error}"
+    );
+
+    // Negative control: a git that is itself a script, under one name or both.
+    let error = pack(
+        git_install_tree(
+            &tmp.path().join("script install"),
+            Some(script),
+            None,
+            RUNTIME_PREFIX_ORIGIN,
+        ),
+        "out-script",
+    )
+    .expect_err("a git that is a script is refused");
+    assert!(error.to_string().contains("#! script"), "{error}");
+
+    // Negative control: a git not built RUNTIME_PREFIX, which nothing in front of it may fix.
+    let error = pack(
+        git_install_tree(
+            &tmp.path().join("fixed-prefix install"),
+            Some(&git[..]),
+            Some(&git[..]),
+            br#"{"git_version":"2.56.0","runtime_prefix":false}"#,
+        ),
+        "out-fixed-prefix",
+    )
+    .expect_err("a git not built RUNTIME_PREFIX is refused");
+    assert!(error.to_string().contains("runtime_prefix"), "{error}");
+
+    // The stage gate holds the packed tree to it too: two separate files are refused.
+    let separate = tmp.path().join("separate");
+    git_install_tree(
+        &separate,
+        Some(&git[..]),
+        Some(&git[..]),
+        RUNTIME_PREFIX_ORIGIN,
+    );
+    let error = check_git_itself(&separate).expect_err("two separate files are refused");
+    assert!(error.to_string().contains("separate files"), "{error}");
 }

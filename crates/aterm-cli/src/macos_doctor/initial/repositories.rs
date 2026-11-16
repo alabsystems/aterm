@@ -29,6 +29,12 @@ pub(super) struct Ran {
     pub failure: Option<&'static str>,
     /// It stopped for want of a GitHub token to sign in with ([`want_token`]).
     pub token: bool,
+    /// What its acquisition was left waiting on, where the step that stopped typed it
+    /// ([`left_wait`]).
+    pub wait: Option<aterm_machines::init_observe::Wait>,
+    /// What the run read of the GitHub repositories row, dated from before it read anything
+    /// ([`crate::macos_doctor::repositories_readback`]): none from a run that read none.
+    pub observed: crate::macos_doctor::WorkstationReadback,
     /// Actual native empty-origin evidence owned only by this setup host/pass.
     pub readback: Option<Arc<RepositoryReadback>>,
 }
@@ -42,6 +48,8 @@ pub(super) fn run_reading_guarded(
     mode: Mode,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<Ran, String> {
+    // Dated from before the run reads anything (design §3.5).
+    let at = sys.now();
     let current: Current = Arc::new(current);
     let result = items_current(
         sys,
@@ -66,10 +74,22 @@ pub(super) fn run_reading_guarded(
             }],
             failure: None,
             token: false,
+            wait: None,
+            observed: crate::macos_doctor::WorkstationReadback::EMPTY,
             readback: None,
         });
     }
-    result.map(reading)
+    result.map(|run| {
+        let observed = run
+            .as_ref()
+            .map_or(crate::macos_doctor::WorkstationReadback::EMPTY, |run| {
+                crate::macos_doctor::repositories_readback(&run.rows, at)
+            });
+        Ran {
+            observed,
+            ..reading(run)
+        }
+    })
 }
 
 fn reading(rows: Option<RepositoryRun>) -> Ran {
@@ -77,7 +97,9 @@ fn reading(rows: Option<RepositoryRun>) -> Ran {
         Some(run) => Ran {
             failure: failure_note(&run.rows),
             token: want_token(&run.rows),
-            rows: item_rows(run.rows),
+            wait: left_wait(&run.rows),
+            observed: crate::macos_doctor::WorkstationReadback::EMPTY,
+            rows: item_rows(run.rows.into_iter().map(refresh_left_for_later).collect()),
             readback: run.readback.map(Arc::new),
         },
         None => Ran {
@@ -88,24 +110,82 @@ fn reading(rows: Option<RepositoryRun>) -> Ran {
             )],
             failure: None,
             token: false,
+            wait: None,
+            observed: crate::macos_doctor::WorkstationReadback::EMPTY,
             readback: None,
         },
     }
 }
 
-/// Why the repositories' item `rows` failed, where the step that stopped decided it: the
-/// reading their item took, in System State's words (`GitHub can't be reached`), never the
-/// engine's English, which `aterm doctor` and the log keep (System State design §3.6).
-pub(super) fn failure_note(rows: &[aterm_machines::model::ItemReport]) -> Option<&'static str> {
-    aterm_machines::init_observe::failure_note(&rows.iter().collect::<Vec<_>>())
+/// The refresh of the checkouts already here (`init.github.refresh@<user>`) as System State's
+/// stage counts it: a fault of it, or a read-back that could not confirm it, is work left for a
+/// later pass (the subscriber's `sync.refresh` runs it again), so the stage parks on it and
+/// never fails or retries the GitHub repositories setting for it; that setting stands as their
+/// acquisition reads ([`aterm_machines::init_observe::observation`]). The refresh's reason stays
+/// its row's words, which `aterm doctor` and the log keep. Every other row is as its item
+/// reported it.
+fn refresh_left_for_later(
+    mut row: aterm_machines::model::ItemReport,
+) -> aterm_machines::model::ItemReport {
+    if aterm_machines::init_github::refresh_row(&row)
+        && matches!(super::row_status(&row), "error" | "blocked" | "unverified")
+    {
+        row.outcome = aterm_machines::model::Outcome::Deferred;
+    }
+    row
 }
 
-/// Whether the repositories' item `rows` stopped because this Mac has no GitHub token to sign in
-/// with: the file the vault's sync writes, or the one init.toml's `[github]` names, is not there
-/// ([`aterm_machines::init_observe::Wait::Token`]).
+/// The rows of `rows` the GitHub repositories setting stands on: all but the refresh of the
+/// checkouts already here ([`aterm_machines::init_github::refresh_row`]), whose fault or wait
+/// is its own row's alone.
+fn acquisition(
+    rows: &[aterm_machines::model::ItemReport],
+) -> Vec<&aterm_machines::model::ItemReport> {
+    rows.iter()
+        .filter(|row| !aterm_machines::init_github::refresh_row(row))
+        .collect()
+}
+
+/// Why the repositories' acquisition `rows` failed, where the step that stopped decided it: the
+/// reading their item took, in System State's words (`GitHub can't be reached`), never the
+/// engine's English, which `aterm doctor` and the log keep (System State design §3.6). A
+/// refresh of the checkouts already here gives none ([`acquisition`]).
+pub(super) fn failure_note(rows: &[aterm_machines::model::ItemReport]) -> Option<&'static str> {
+    aterm_machines::init_observe::failure_note(&acquisition(rows))
+}
+
+/// What the repositories' acquisition `rows` were left waiting on: the first part's wait, whose
+/// fact ([`aterm_machines::init_observe::Wait::fact`]) is what the park after the stage watches.
+/// It is the wait the step that stopped typed ([`aterm_machines::init_observe::Reading::Waits`]),
+/// or [`Wait::InTheWay`](aterm_machines::init_observe::Wait::InTheWay) where the part needs a
+/// person because work setup preserves, another origin or something else sits at a
+/// repository's destination (its counts' `preserved`): only a change there moves it. A refresh
+/// of the checkouts already here gives none ([`acquisition`]), nor does a part that failed.
+pub(super) fn left_wait(
+    rows: &[aterm_machines::model::ItemReport],
+) -> Option<aterm_machines::init_observe::Wait> {
+    use aterm_machines::init_observe::{Reading, Wait};
+    use aterm_machines::model::Outcome;
+    acquisition(rows)
+        .into_iter()
+        .find_map(|row| match Reading::of(row)? {
+            Reading::Waits(wait) => Some(wait),
+            Reading::Repositories { counts, .. }
+                if counts.preserved > 0 && row.outcome == Outcome::Person =>
+            {
+                Some(Wait::InTheWay)
+            }
+            _ => None,
+        })
+}
+
+/// Whether the repositories' acquisition `rows` stopped because this Mac has no GitHub token to
+/// sign in with: the file the vault's sync writes, or the one init.toml's `[github]` names, is
+/// not there ([`aterm_machines::init_observe::Wait::Token`]).
 pub(super) fn want_token(rows: &[aterm_machines::model::ItemReport]) -> bool {
     use aterm_machines::init_observe::{Reading, Wait};
-    rows.iter()
+    acquisition(rows)
+        .into_iter()
         .any(|row| Reading::of(row) == Some(Reading::Waits(Wait::Token)))
 }
 
@@ -174,6 +254,7 @@ fn local_items(
         ctx,
         mode,
         work,
+        aterm_machines::init_github::RepositorySteps::Both,
         inputs,
         move || current.as_ref().map_or(Ok(true), |current| current()),
     )
@@ -284,6 +365,7 @@ fn items_current(
         ctx,
         mode,
         work,
+        aterm_machines::init_github::RepositorySteps::Both,
         captured.inputs.with_repository_readback(readback),
         move || {
             if let Some(current) = &current

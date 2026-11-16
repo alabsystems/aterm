@@ -52,6 +52,7 @@ pub(crate) enum AppKind {
     Recovery,
     Workers,
     Tables,
+    Navigator,
 }
 
 impl AppKind {
@@ -67,6 +68,7 @@ impl AppKind {
             Self::Recovery => "recovery",
             Self::Workers => "workers",
             Self::Tables => "tables",
+            Self::Navigator => "navigator",
         }
     }
 
@@ -83,6 +85,7 @@ impl AppKind {
             Self::Recovery => "Recovery",
             Self::Workers => "Workers",
             Self::Tables => "Tables",
+            Self::Navigator => "Navigator",
         }
     }
 
@@ -99,6 +102,7 @@ impl AppKind {
             Self::Recovery => AppIcon::Recovery,
             Self::Workers => AppIcon::Workers,
             Self::Tables => AppIcon::Tables,
+            Self::Navigator => AppIcon::Workers,
         }
     }
 }
@@ -189,6 +193,7 @@ pub(crate) enum AppViewState {
     Recovery(RecoveryViewState),
     Workers(Box<crate::native_workers::WorkersViewState>),
     Tables(Box<crate::native_tables::TablesViewState>),
+    Navigator(Box<crate::navigator::NavigatorViewState>),
 }
 
 impl AppViewState {
@@ -203,6 +208,7 @@ impl AppViewState {
             Self::Recovery(_) => AppKind::Recovery,
             Self::Workers(_) => AppKind::Workers,
             Self::Tables(_) => AppKind::Tables,
+            Self::Navigator(_) => AppKind::Navigator,
         }
     }
 
@@ -223,6 +229,7 @@ impl AppViewState {
             Self::Recovery(view) => &view.common,
             Self::Workers(view) => &view.common,
             Self::Tables(view) => &view.common,
+            Self::Navigator(view) => &view.common,
         }
     }
 
@@ -244,6 +251,7 @@ impl AppViewState {
             Self::Recovery(view) => &mut view.common,
             Self::Workers(view) => &mut view.common,
             Self::Tables(view) => &mut view.common,
+            Self::Navigator(view) => &mut view.common,
         }
     }
 }
@@ -606,6 +614,7 @@ pub(crate) enum NativeApp {
     Recovery(RecoveryApp),
     Workers(Box<crate::native_workers::WorkersApp>),
     Tables(Box<crate::native_tables::TablesApp>),
+    Navigator(Box<crate::navigator::NavigatorApp>),
 }
 
 type UpdateCallback = for<'a> fn(
@@ -645,6 +654,7 @@ impl NativeApp {
             Self::Recovery(_) => &recovery_vtable::VTABLE,
             Self::Workers(_) => &workers_vtable::VTABLE,
             Self::Tables(_) => &tables_vtable::VTABLE,
+            Self::Navigator(_) => &navigator_vtable::VTABLE,
         }
     }
 
@@ -656,7 +666,11 @@ impl NativeApp {
         match self {
             Self::Mail(_) | Self::About(_) | Self::Settings(_) | Self::SystemState(_) => None,
             Self::Editor(app) => Some(app.document),
-            Self::Recovery(_) | Self::Workers(_) | Self::Tables(_) | Self::Allocation(_) => None,
+            Self::Recovery(_)
+            | Self::Workers(_)
+            | Self::Tables(_)
+            | Self::Navigator(_)
+            | Self::Allocation(_) => None,
         }
     }
 
@@ -853,6 +867,13 @@ define_app_vtable!(
     "workers"
 );
 define_app_vtable!(tables_vtable, Tables, Tables, AppKind::Tables, "tables");
+define_app_vtable!(
+    navigator_vtable,
+    Navigator,
+    Navigator,
+    AppKind::Navigator,
+    "navigator"
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecoveryLineStyle {
@@ -2340,6 +2361,9 @@ pub(crate) enum AppEffect {
     },
     InvalidateOwnPresentation,
     RepaintSelf(DamageRegion),
+    /// The event was handled and moved nothing its view draws: the host repaints nothing. A
+    /// handled event that names no repaint at all repaints its whole view.
+    Unchanged,
     /// The shared model changed; every attached view needs a fresh presentation.
     RepaintInstance(DamageRegion),
     /// Consume this shared review before any subsequently queued action runs.
@@ -2635,6 +2659,11 @@ impl UpdateCx<'_> {
         self.effects.push(AppEffect::RepaintSelf(damage));
     }
 
+    /// The event was handled and moved nothing this view draws ([`AppEffect::Unchanged`]).
+    pub(crate) fn unchanged(&mut self) {
+        self.effects.push(AppEffect::Unchanged);
+    }
+
     pub(crate) fn repaint_instance(&mut self, damage: DamageRegion) {
         self.effects.push(AppEffect::RepaintInstance(damage));
     }
@@ -2808,14 +2837,19 @@ impl NativeRuntime {
             | AppViewState::Recovery(_)
             | AppViewState::Allocation(_)
             | AppViewState::Workers(_)
-            | AppViewState::Tables(_) => {}
+            | AppViewState::Tables(_)
+            | AppViewState::Navigator(_) => {}
         }
+        let tables = matches!(state, AppViewState::Tables(_));
         self.views.insert(view, state);
         self.view_generations.insert(view, 1);
         let mut lifecycle = crate::front_content::ViewLifecycle::Created;
         let mounted = lifecycle.transition(crate::front_content::ViewLifecycle::Mounted);
         debug_assert!(mounted);
         self.view_lifecycles.insert(view, lifecycle);
+        if tables {
+            self.sync_tables_shown();
+        }
         Ok(())
     }
 
@@ -2834,6 +2868,9 @@ impl NativeRuntime {
         }
         let generation = self.view_generations.entry(view).or_insert(1);
         *generation = generation.saturating_add(1);
+        if matches!(state, AppViewState::Tables(_)) {
+            self.sync_tables_shown();
+        }
         Some(state)
     }
 
@@ -3148,6 +3185,66 @@ impl NativeRuntime {
         }
     }
 
+    /// Give the navigator the list as it stands ([`crate::app_navigator`]) and carry each of its
+    /// views to it: a selection whose session is gone moves to the row in its place.
+    pub(crate) fn publish_navigator(
+        &mut self,
+        instance: AppInstanceId,
+        tree: Arc<crate::navigator::NavTree>,
+    ) {
+        let Some(NativeApp::Navigator(app)) = self.instances.get_mut(&instance) else {
+            return;
+        };
+        let old = Arc::clone(app.tree());
+        app.publish(Arc::clone(&tree));
+        for mut state in self.views.values_mut() {
+            if let AppViewState::Navigator(view) = &mut *state {
+                view.rebase(&old, &tree);
+                state.touch();
+            }
+        }
+    }
+
+    /// The time the navigator words its rows' ages against.
+    pub(crate) fn set_navigator_clock(&mut self, instance: AppInstanceId, now_ms: u64) {
+        if let Some(NativeApp::Navigator(app)) = self.instances.get_mut(&instance) {
+            app.set_clock(now_ms);
+        }
+    }
+
+    /// What a press on the navigator asked for ([`crate::app_navigator`]).
+    pub(crate) fn take_navigator_action(
+        &mut self,
+        instance: AppInstanceId,
+    ) -> Option<crate::navigator::NavAction> {
+        match self.instances.get_mut(&instance) {
+            Some(NativeApp::Navigator(app)) => app.take_action(),
+            _ => None,
+        }
+    }
+
+    /// The inspector's reveal of a row the navigator's `view` lists off its screen
+    /// ([`crate::app_control`]). Whether the list moved.
+    pub(crate) fn reveal_navigator_control(&mut self, view: ViewId, key: &UiKey) -> bool {
+        let Some(tree) = self.instances.values().find_map(|app| match app {
+            NativeApp::Navigator(app) => Some(Arc::clone(app.tree())),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let Some(mut state) = self.views.get_mut(&view) else {
+            return false;
+        };
+        let moved = match &mut *state {
+            AppViewState::Navigator(navigator) => navigator.reveal_listed_control(key, &tree),
+            _ => false,
+        };
+        if moved {
+            state.touch();
+        }
+        moved
+    }
+
     /// Removing an already-dispatched action changes no visible controls.
     pub(crate) fn take_system_state_action(
         &mut self,
@@ -3194,7 +3291,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }) else {
             return false;
         };
@@ -3228,7 +3326,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }) else {
             return false;
         };
@@ -3252,7 +3351,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }) else {
             return false;
         };
@@ -3276,7 +3376,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }) else {
             return false;
         };
@@ -3540,7 +3641,8 @@ impl NativeRuntime {
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
                 | AppViewState::Workers(_)
-                | AppViewState::Tables(_) => {
+                | AppViewState::Tables(_)
+                | AppViewState::Navigator(_) => {
                     continue;
                 }
             };
@@ -3564,7 +3666,8 @@ impl NativeRuntime {
                 | AppViewState::Recovery(_)
                 | AppViewState::Allocation(_)
                 | AppViewState::Workers(_)
-                | AppViewState::Tables(_) => {}
+                | AppViewState::Tables(_)
+                | AppViewState::Navigator(_) => {}
             }
         }
     }
@@ -3668,7 +3771,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }
     }
 
@@ -3691,7 +3795,8 @@ impl NativeRuntime {
             | NativeApp::Recovery(_)
             | NativeApp::Allocation(_)
             | NativeApp::Workers(_)
-            | NativeApp::Tables(_) => None,
+            | NativeApp::Tables(_)
+            | NativeApp::Navigator(_) => None,
         }
     }
 
@@ -3828,7 +3933,8 @@ impl NativeRuntime {
                 | NativeApp::Recovery(_)
                 | NativeApp::Allocation(_)
                 | NativeApp::Workers(_)
-                | NativeApp::Tables(_) => None,
+                | NativeApp::Tables(_)
+                | NativeApp::Navigator(_) => None,
             })
             .collect()
     }
@@ -3849,7 +3955,8 @@ impl NativeRuntime {
                 | NativeApp::Recovery(_)
                 | NativeApp::Allocation(_)
                 | NativeApp::Workers(_)
-                | NativeApp::Tables(_) => None,
+                | NativeApp::Tables(_)
+                | NativeApp::Navigator(_) => None,
             })
             .collect::<Vec<_>>();
         let mut by_basename = BTreeMap::<String, Vec<(AppInstanceId, String)>>::new();
@@ -4008,7 +4115,26 @@ impl NativeRuntime {
         lifecycle
             .transition(next)
             .then_some(())
-            .ok_or(RuntimeError::UnknownView(view))
+            .ok_or(RuntimeError::UnknownView(view))?;
+        if matches!(self.views.get(&view), Some(AppViewState::Tables(_))) {
+            self.sync_tables_shown();
+        }
+        Ok(())
+    }
+
+    /// Tell the Tables page's reader whether any view of the page is shown (mounted, not
+    /// suspended): a hidden page reads nothing.
+    fn sync_tables_shown(&mut self) {
+        let shown = self.views.iter().any(|(view, state)| {
+            matches!(state, AppViewState::Tables(_))
+                && self.view_lifecycles.get(view)
+                    == Some(&crate::front_content::ViewLifecycle::Mounted)
+        });
+        for app in self.instances.values_mut() {
+            if let NativeApp::Tables(tables) = app {
+                tables.set_shown(shown);
+            }
+        }
     }
 
     #[cfg(test)]

@@ -57,6 +57,7 @@ pub mod rapl;
 pub mod room;
 pub mod runq;
 pub mod rusage;
+pub mod self_cpu;
 pub mod situation;
 #[cfg(target_os = "macos")]
 mod situation_macos;

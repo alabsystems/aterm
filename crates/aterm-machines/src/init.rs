@@ -1224,6 +1224,9 @@ fn entry_with_system(
         )
     };
     let sys = system();
+    // The run is a pass of its own: its repository rows share one record of each checkout's
+    // facts, and nothing read before it stands for it.
+    crate::port::CheckoutRecords::new_pass(sys.as_ref());
     let cwd = std::env::current_dir().ok();
     let printer = Printer::new(options.verbose, options.json);
     let result = sys
@@ -1562,11 +1565,14 @@ fn tab(
 /// QoS. `--check` probes and writes nothing. Its rows print as init's do, then a tally (or the
 /// JSON report). Exit 0 once admitted work settled (or a check ran without failure),
 /// [`aterm_secrets::converge::UNFINISHED`] while an apply pass has work left, and
-/// [`aterm_secrets::converge::HELD`] while another pass holds the lock; 1 for a failed row,
-/// an unwritten record, a pass that cannot
-/// run here or a tally standard output could not take ([`answer_to`]). A subscriber's pass
-/// from a program that is not the installed release app (a held copy) is the installed app's
-/// to run ([`hand_off`]).
+/// [`aterm_secrets::converge::HELD`] for a pass that did not run for the lock: a person's
+/// (`--trigger init`, the default) that found another pass holding it, or a started one (any
+/// other trigger), which waits for it, whose starter ended while it waited, or a held copy's
+/// hand-off whose starter ended before the installed app's pass ended or started; 1 for a
+/// failed row, an unwritten record, a pass that cannot run here, a hand-off whose started pass
+/// could not be waited for or a tally standard output could not take ([`answer_to`]). A
+/// subscriber's pass from a program that is not the installed release app (a held copy) is the
+/// installed app's to run ([`hand_off`]).
 fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode {
     let trigger = options.trigger.unwrap_or(crate::sync::Trigger::Init);
     ports.background(trigger);
@@ -1606,6 +1612,15 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
         Err(crate::sync::Stop::Held) => {
             say_after_run(format_args!(
                 "aterm init: another converge pass holds {}/{}; this one did not run",
+                aterm_converge::FileJournal::DIR,
+                crate::sync::LOCK
+            ));
+            return ExitCode::from(aterm_secrets::converge::HELD);
+        }
+        Err(crate::sync::Stop::Abandoned) => {
+            say_after_run(format_args!(
+                "aterm init: the program that started this converge pass ended while it waited \
+                 for {}/{}; this one did not run",
                 aterm_converge::FileJournal::DIR,
                 crate::sync::LOCK
             ));
@@ -1660,9 +1675,13 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
 /// keeps, a program `agent on --program` named) then applies the installed app's rows, as the
 /// window's pass does, so two builds never take turns undoing each other's writes and a fix in
 /// a later app reaches the subscriber's side. The installed app's run lowers its own QoS and
-/// writes its own ledger line. `None` where it could not be started or waited for, or ended
-/// with a usage error (an installed app older than this copy, with no such pass; each said in
-/// aterm.log): this copy runs the pass itself, as before.
+/// writes its own ledger line. Where this copy's own starter (the subscriber) ends first, this
+/// copy ends at once ([`aterm_secrets::converge::HELD`], [`run_handed_off`]): the installed
+/// app's runner watches this copy as the starter that started it, so a wait it still makes for
+/// the lock ends with it. A run that started but cannot be waited for ends this copy
+/// unsuccessfully, with no pass of its own beside the one it started. `None` where it could not
+/// be started, or ended with a usage error (an installed app older than this copy, with no such
+/// pass; each said in aterm.log): this copy runs the pass itself, as before.
 fn hand_off(
     options: &Options,
     ports: &dyn crate::sync::Ports,
@@ -1687,8 +1706,8 @@ fn hand_off(
     if options.verbose {
         args.push("--verbose".to_owned());
     }
-    match ports.run_elsewhere(program, &args) {
-        Ok(Some(2)) => {
+    match run_handed_off(ports, program, &args) {
+        Ok(HandedOff::Ended(Some(2))) => {
             ports.log(&format!(
                 "converge trigger=subscriber: the installed app ({}) does not take the pass \
                  (an app older than this copy); this copy runs it",
@@ -1696,11 +1715,51 @@ fn hand_off(
             ));
             None
         }
-        Ok(Some(code)) => Some(ExitCode::from(u8::try_from(code).unwrap_or(1))),
-        Ok(None) => {
+        Ok(HandedOff::Ended(Some(code))) => Some(ExitCode::from(u8::try_from(code).unwrap_or(1))),
+        Ok(HandedOff::Ended(None)) => {
             ports.log(&format!(
                 "converge trigger=subscriber: the installed app's pass ({}) ended by a signal",
                 program.display()
+            ));
+            Some(ExitCode::FAILURE)
+        }
+        Ok(HandedOff::StarterGone) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the program that started this copy had ended \
+                 before the installed app's pass ({}) started; nothing was started, and this \
+                 copy ends",
+                program.display()
+            ));
+            say_after_run(format_args!(
+                "aterm init: the program that started this converge pass had ended before it \
+                 handed off to the installed app's pass; nothing was started"
+            ));
+            Some(ExitCode::from(aterm_secrets::converge::HELD))
+        }
+        Ok(HandedOff::StarterEnded) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the program that started this copy ended; this \
+                 copy ends, and the installed app's pass ({}) with it if it still waits for \
+                 {}/{}",
+                program.display(),
+                aterm_converge::FileJournal::DIR,
+                crate::sync::LOCK
+            ));
+            say_after_run(format_args!(
+                "aterm init: the program that started this converge pass ended before the \
+                 installed app's pass it handed off to did; this copy ends"
+            ));
+            Some(ExitCode::from(aterm_secrets::converge::HELD))
+        }
+        Ok(HandedOff::Unwaited(why)) => {
+            ports.log(&format!(
+                "converge trigger=subscriber: the installed app's pass ({}) started but could \
+                 not be waited for ({why}); this copy ends without a pass of its own",
+                program.display()
+            ));
+            say_after_run(format_args!(
+                "aterm init: the installed app's pass this converge pass handed off to started \
+                 but could not be waited for: {why}"
             ));
             Some(ExitCode::FAILURE)
         }
@@ -1713,6 +1772,82 @@ fn hand_off(
             None
         }
     }
+}
+
+/// What became of the installed app's run of this copy's pass ([`run_handed_off`]).
+#[derive(Debug)]
+enum HandedOff {
+    /// It ended: its exit status, `None` where a signal ended it.
+    Ended(Option<i32>),
+    /// The program that started this copy was seen gone before the run started, so it never
+    /// started: nothing was owed.
+    StarterGone,
+    /// The program that started this copy ended once the run had started and before it ended:
+    /// nothing owes the run any more.
+    StarterEnded,
+    /// The run started, but its end could not be waited for: why.
+    Unwaited(String),
+}
+
+/// Run `program args`, the installed app's pass ([`crate::sync::Ports::start_elsewhere`]), and
+/// wait for it while this copy's own starter lives ([`crate::sync::Ports::watch_starter`]).
+/// That run's runner watches this copy as the starter that started it, not the subscriber that
+/// started this copy; so where the subscriber ends first (a restart, an upgrade), this copy stops
+/// waiting and returns at once, and the run, if it still waits for the lock another pass holds,
+/// ends its wait as this copy ends (`converge abandoned`). A run that already holds the lock goes
+/// on to its record, as the pass of a starter that ended once it held the lock does. A starter
+/// the watch saw end before the run was started leaves it unstarted
+/// ([`HandedOff::StarterGone`]); one that ends while it starts is seen once it started, and
+/// ends this copy's wait as above. Where nothing can watch the starter this copy waits for the
+/// run alone. A run that started but could not be waited for is [`HandedOff::Unwaited`], never
+/// an error: it goes on, and this copy must not run a pass beside it.
+///
+/// # Errors
+/// The run could not be started.
+fn run_handed_off(
+    ports: &dyn crate::sync::Ports,
+    program: &Path,
+    args: &[String],
+) -> Result<HandedOff, String> {
+    enum Woke {
+        Ended(Result<Option<i32>, String>),
+        StarterEnded,
+    }
+    let (woke, wakes) = std::sync::mpsc::channel();
+    let ended = woke.clone();
+    let watching = match ports.watch_starter(Box::new(move || {
+        let _ = ended.send(Woke::StarterEnded);
+    })) {
+        crate::sync::StarterWatch::Ended => return Ok(HandedOff::StarterGone),
+        crate::sync::StarterWatch::Watching(kept) => Some(kept),
+        crate::sync::StarterWatch::Unwatched => None,
+    };
+    // Nothing else sends before the run starts, so a message now is the starter's end, seen
+    // between the watch's start and here.
+    if wakes.try_recv().is_ok() {
+        return Ok(HandedOff::StarterGone);
+    }
+    let run = ports.start_elsewhere(program, args)?;
+    // A wait left blocked once the starter ended dies with this process, which then ends; the
+    // run it waited for goes on as the orphan it becomes, or ends its own wait with this copy.
+    if let Err(why) = std::thread::Builder::new()
+        .name("aterm-hand-off".to_owned())
+        .spawn(move || {
+            let _ = woke.send(Woke::Ended(run()));
+        })
+    {
+        return Ok(HandedOff::Unwaited(format!(
+            "the wait for it could not be made: {why}"
+        )));
+    }
+    let first = wakes.recv();
+    drop(watching);
+    Ok(match first {
+        Ok(Woke::Ended(Ok(code))) => HandedOff::Ended(code),
+        Ok(Woke::Ended(Err(why))) => HandedOff::Unwaited(why),
+        Ok(Woke::StarterEnded) => HandedOff::StarterEnded,
+        Err(_) => HandedOff::Unwaited("the wait for it ended without an answer".into()),
+    })
 }
 
 /// Whether this login owns this Mac's console, as `aterm init`'s context reads it
@@ -1947,15 +2082,12 @@ pub enum OwedClone {
     /// No clone was requested, no inventory can be verified here, or its selection is empty.
     Nothing(String),
     /// The private vault inventory was read and every repository verified locally.
-    Verified { present: usize, total: usize },
-    /// Every repository of the private vault inventory has a matching checkout here, but
-    /// `unborn` of them have no commit and no current proof that their remote is empty: only a
-    /// read of each remote, which acquires any commits it finds, can verify them.
-    Unobserved {
-        present: usize,
-        unborn: usize,
-        total: usize,
-    },
+    Verified(crate::init_observe::RepositoryCounts),
+    /// Every repository of the private vault inventory has a matching checkout here, but some
+    /// have no commit and no current proof that their remote is empty
+    /// ([`crate::init_observe::RepositoryCounts::unborn`]): only acquisition's read of each
+    /// remote, which takes any commits it finds, can verify them.
+    Unobserved(crate::init_observe::RepositoryCounts),
     /// One is owed, but init.toml turned the GitHub step off since: why.
     Off(String),
     /// One is owed, and the token it waits for, or the git every clone runs, is not on this Mac
@@ -2387,7 +2519,7 @@ pub fn owed_clone_captured(
         // a later local observation through this blocked capture.
         if matches!(
             &value,
-            OwedClone::Due(_) | OwedClone::Verified { .. } | OwedClone::Unobserved { .. }
+            OwedClone::Due(_) | OwedClone::Verified(_) | OwedClone::Unobserved(_)
         ) {
             return Ok(OwedClone::Waiting(why.into()));
         }
@@ -2507,46 +2639,38 @@ fn owed_clone_with(
             // the default inventory without applying or enumerating GitHub, so a
             // corrected worktree can resume even with an untyped pre-upgrade Person mark.
             // Explicit profiles keep their auth cache and never repeat its network probe.
-            let rows = match inputs {
-                Some(inputs) => crate::init_github::run_initial_repositories_captured(
-                    sys,
-                    &ctx,
-                    Mode::Plan,
-                    work,
-                    inputs.clone(),
-                    || Ok(true),
-                )?,
-                None => crate::init_github::run_initial_repositories_captured(
-                    sys,
-                    &ctx,
-                    Mode::Plan,
-                    work,
-                    crate::init_github::InitialRepositoryInputs::capture_ready(sys, &ctx)?,
-                    || Ok(true),
-                )?,
+            let inputs = match inputs {
+                Some(inputs) => inputs.clone(),
+                None => crate::init_github::InitialRepositoryInputs::capture_ready(sys, &ctx)?,
             };
+            let rows = crate::init_github::run_initial_repositories_captured(
+                sys,
+                &ctx,
+                Mode::Plan,
+                work,
+                crate::init_github::RepositorySteps::Acquisition,
+                inputs,
+                || Ok(true),
+            )?;
             for row in rows
                 .iter()
                 .filter(|row| !crate::init_github::keychain_row(row))
             {
                 let Some(crate::init_observe::Reading::Repositories {
-                    present,
-                    count,
+                    counts,
                     signed_in: true,
                 }) = crate::init_observe::Reading::of(row)
                 else {
                     continue;
                 };
                 match row.outcome {
-                    Outcome::Ok if present == count => {
-                        return Ok(OwedClone::Verified {
-                            present,
-                            total: count,
-                        });
+                    Outcome::Ok if counts.ready == counts.total() => {
+                        return Ok(OwedClone::Verified(counts));
                     }
                     Outcome::Planned => {
                         return Ok(OwedClone::Due(format!(
-                            "local checkout work now allows repository setup to finish ({present}/{count} ready)"
+                            "local checkout work now allows repository setup to finish ({})",
+                            counts.summary()
                         )));
                     }
                     _ => {}
@@ -2672,7 +2796,7 @@ fn automatic_clone(
         None => crate::init_github::automatic_inventory_counts(sys, &ctx),
     };
     match counted {
-        Ok(Some(counts)) if counts.total == 0 => Ok(OwedClone::Nothing(
+        Ok(Some(counts)) if counts.total() == 0 => Ok(OwedClone::Nothing(
             "the private inventory selects no repositories".into(),
         )),
         Ok(Some(counts)) if counts.all_here() => {
@@ -2681,22 +2805,14 @@ fn automatic_clone(
                     "confirm the delivered repository credential locally".into(),
                 ))
             } else if counts.unborn == 0 {
-                Ok(OwedClone::Verified {
-                    present: counts.present,
-                    total: counts.total,
-                })
+                Ok(OwedClone::Verified(counts))
             } else {
-                Ok(OwedClone::Unobserved {
-                    present: counts.present,
-                    unborn: counts.unborn,
-                    total: counts.total,
-                })
+                Ok(OwedClone::Unobserved(counts))
             }
         }
         Ok(Some(counts)) => Ok(OwedClone::Due(format!(
-            "{}/{} repositories from the private vault are present; fleet setup clones the rest",
-            counts.present + counts.unborn,
-            counts.total
+            "vault repositories: {}",
+            counts.summary()
         ))),
         Ok(None) => Ok(nothing()),
         Err(why) => Ok(OwedClone::Waiting(why)),
@@ -2717,21 +2833,18 @@ pub fn forget_owed_clone(state: &Path) -> Result<(), String> {
 }
 
 /// `sync.clone`'s apply: the GitHub step an `aterm init` owes, run once as init runs it, in any
-/// shell of the account; its record under `state` goes once every repository row is in place,
-/// and stays for the next pass otherwise. The keychain row runs with them but is no repository
-/// row: its retry is `sync.github`'s. A repository row only a person can finish marks the record
+/// shell of the account, its acquisition alone (`sync.refresh` refreshes what was here,
+/// [`refresh_repositories_captured`]); its record under `state` goes once every repository row
+/// is in place, and stays for the next pass otherwise. The keychain row runs with them but is
+/// no repository row: its retry is `sync.github`'s. A repository row only a person can finish marks the record
 /// with the step's mark now ([`OwedClone::Person`]), so no pass runs the step again until the
 /// token, init.toml or git's presence changes, or the person's own `aterm init` owes it afresh
 /// ([`note_owed`]).
 ///
 /// # Errors
 /// A repository row of the step did not end in place (its words), or the step could not run.
-pub fn clone_owed(
-    sys: &dyn System,
-    state: &Path,
-    work: aterm_secrets::converge::RepositoryWork,
-) -> Result<CloneOwedOutcome, String> {
-    clone_owed_in_pass(sys, state, work, None)
+pub fn clone_owed(sys: &dyn System, state: &Path) -> Result<CloneOwedOutcome, String> {
+    clone_owed_in_pass(sys, state, None)
 }
 
 /// Reuse the enclosing converge pass's alignment lease; standalone callers own
@@ -2741,10 +2854,9 @@ pub fn clone_owed(
 pub fn clone_owed_in_pass(
     sys: &dyn System,
     state: &Path,
-    work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
 ) -> Result<CloneOwedOutcome, String> {
-    clone_owed_in_pass_with_withdrawal_guard(sys, state, work, execution, None)
+    clone_owed_in_pass_with_withdrawal_guard(sys, state, execution, None)
 }
 
 /// As [`clone_owed_in_pass`], retaining a caller's independent current-holds check for
@@ -2754,7 +2866,6 @@ pub fn clone_owed_in_pass(
 pub fn clone_owed_in_pass_with_withdrawal_guard(
     sys: &dyn System,
     state: &Path,
-    work: aterm_secrets::converge::RepositoryWork,
     execution: Option<crate::sync::repository_refresh::Execution>,
     withdrawal_current: Option<Box<dyn Fn() -> Result<bool, String> + Send + Sync>>,
 ) -> Result<CloneOwedOutcome, String> {
@@ -2762,17 +2873,20 @@ pub fn clone_owed_in_pass_with_withdrawal_guard(
     if crate::init_github::uses_vault_inventory(sys, &ctx)? {
         let inputs = crate::init_github::InitialRepositoryInputs::capture_ready(sys, &ctx)?
             .with_repository_execution(execution);
-        return clone_owed_captured(sys, state, work, inputs, move || {
+        return clone_owed_captured(sys, state, inputs, move || {
             withdrawal_current
                 .as_ref()
                 .map_or(Ok(true), |current| current())
         });
     }
-    let items = crate::init_github::items_for_execution_with_withdrawal_guard(
+    // Acquisition reads no refresh work: it runs as a Repair run does.
+    let items = crate::init_github::stage_items(
         sys,
         &ctx,
         None,
-        work,
+        Mode::Apply,
+        aterm_secrets::converge::RepositoryWork::Repair,
+        crate::init_github::RepositorySteps::Acquisition,
         execution,
         withdrawal_current,
     )?;
@@ -2800,16 +2914,17 @@ pub fn clone_owed_in_pass_with_withdrawal_guard(
 pub fn clone_owed_captured(
     sys: &dyn System,
     state: &Path,
-    work: aterm_secrets::converge::RepositoryWork,
     inputs: crate::init_github::InitialRepositoryInputs,
     current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
 ) -> Result<CloneOwedOutcome, String> {
     let ctx = repository_context(sys)?;
+    // Acquisition reads no refresh work: it runs as a Repair run does.
     let rows = crate::init_github::run_initial_repositories_captured(
         sys,
         &ctx,
         Mode::Apply,
-        work,
+        aterm_secrets::converge::RepositoryWork::Repair,
+        crate::init_github::RepositorySteps::Acquisition,
         inputs,
         current,
     )?;
@@ -2818,6 +2933,62 @@ pub fn clone_owed_captured(
         said,
         readback: rows.readback,
     })
+}
+
+/// What `sync.refresh`'s apply did ([`refresh_repositories_captured`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryRefreshed {
+    /// The refresh ran, or had no checkout to take: what its row says.
+    Ran(String),
+    /// The shared refresh failed and waits for its retry, which a later pass makes: why.
+    Waiting(String),
+}
+
+/// `sync.refresh`'s apply: the refresh of the default source's checkouts already here
+/// (`init.github.refresh@<user>`), from inputs captured as [`clone_owed_captured`]'s are, after
+/// `sync.clone` acquired what was missing. It owns the shared refresh's admission and finish
+/// within the pass's repository execution; it writes no record of the clone `aterm init` owes.
+///
+/// # Errors
+/// The refresh row failed (its words), or the stage could not run.
+pub fn refresh_repositories_captured(
+    sys: &dyn System,
+    inputs: crate::init_github::InitialRepositoryInputs,
+    current: impl Fn() -> Result<bool, String> + Send + Sync + 'static,
+) -> Result<RepositoryRefreshed, String> {
+    let ctx = repository_context(sys)?;
+    let rows = crate::init_github::run_initial_repositories_captured(
+        sys,
+        &ctx,
+        Mode::Apply,
+        aterm_secrets::converge::RepositoryWork::Refresh,
+        crate::init_github::RepositorySteps::Refresh,
+        inputs,
+        current,
+    )?;
+    let Some(row) = rows.iter().find(|row| crate::init_github::refresh_row(row)) else {
+        return Ok(RepositoryRefreshed::Ran(
+            "no checkout is refreshed: a repository credential withdrawal runs".into(),
+        ));
+    };
+    match (row.outcome, &row.stood_aside) {
+        (Outcome::Ok | Outcome::Changed, _) => Ok(RepositoryRefreshed::Ran(format!(
+            "refreshed: {}",
+            row.to.as_deref().unwrap_or("every checkout here")
+        ))),
+        (Outcome::NotApplicable, _) => Ok(RepositoryRefreshed::Ran(format!(
+            "nothing refreshed: {}",
+            row.why.as_deref().unwrap_or(word(row.outcome))
+        ))),
+        (Outcome::Blocked, Some(aterm_converge::StoodAside::Waiting(why))) => {
+            Ok(RepositoryRefreshed::Waiting(why.clone()))
+        }
+        _ => Err(format!(
+            "{}: {}",
+            row.title,
+            row.why.as_deref().unwrap_or(word(row.outcome))
+        )),
+    }
 }
 
 /// One completed native repository attempt and its pass-owned empty-origin readback.
@@ -2835,11 +3006,13 @@ fn settle_owed_clone(
     rows: &[ItemReport],
 ) -> Result<String, String> {
     let dir = converge_state(state);
-    // The repositories' rows alone: the keychain row's own retry is `sync.github`'s, and its
-    // failing must not leave the mark unwritten and rerun this whole step every pass.
+    // The repositories' acquisition rows alone: the keychain row's own retry is
+    // `sync.github`'s, and its failing must not leave the mark unwritten and rerun this whole
+    // step every pass; a refresh's fault is `sync.refresh`'s and settles no clone.
     let repository_rows = || {
-        rows.iter()
-            .filter(|row| !crate::init_github::keychain_row(row))
+        rows.iter().filter(|row| {
+            !crate::init_github::keychain_row(row) && !crate::init_github::refresh_row(row)
+        })
     };
     if let Some(row) = repository_rows().find(|row| {
         !matches!(
@@ -4698,6 +4871,9 @@ impl Item for Guard {
     fn new_targets(&self, held: &str, from: &str) -> bool {
         self.inner.new_targets(held, from)
     }
+    fn row_ended(&self) {
+        self.inner.row_ended();
+    }
 }
 
 fn same_snapshot_read(a: &Read<PValue>, b: &Read<PValue>) -> bool {
@@ -5224,6 +5400,8 @@ fn prepare_groups_with(
                 sys,
                 ctx,
                 secrets.waited_on.as_deref(),
+                mode,
+                reading.only,
             ))
         } else {
             Vec::new()
@@ -5383,6 +5561,8 @@ fn elsewhere(
         sys,
         ctx,
         secrets.waited_on.as_deref(),
+        mode,
+        reading.only,
     ));
     let mac_only: Vec<Box<dyn Item>> = [
         ("init.preferences", "init", "Workstation preferences"),
@@ -5518,7 +5698,9 @@ fn context_selection(sys: &dyn System, ctx: &Ctx, only: &[String], picks: Picks)
     // Reading the local profile builds the real default or custom repository identities,
     // without probing their token, vault, checkout, helper or a preference. The group itself
     // still identifies a disabled or unread source without borrowing unrelated local facts.
-    let github = GITHUB.build(crate::init_github::items(sys, ctx, None));
+    // Built only for its rows' ids, every one of them: a plan's items, which never take the
+    // repository lease.
+    let github = GITHUB.build(crate::init_github::items(sys, ctx, None, Mode::Plan, &[]));
     rows.extend(github.iter().map(|item| (item.id(), GITHUB.setting)));
     groups.push((github, workstation_place(Class::Install)));
     let mut projected = selection_of_groups(&groups, &rows, runs, only);
@@ -6549,6 +6731,9 @@ impl Item for Unchanged<'_> {
             Instead::Kept(_) => None,
         }
     }
+    fn row_ended(&self) {
+        self.inner.row_ended();
+    }
 }
 
 /// A Network-lane item of a group the person's choices can hold after the run began (a GitHub
@@ -6696,6 +6881,9 @@ impl Item for HeldLate<'_> {
             return None;
         }
         self.inner.stands_aside(sys, ctx)
+    }
+    fn row_ended(&self) {
+        self.inner.row_ended();
     }
 }
 

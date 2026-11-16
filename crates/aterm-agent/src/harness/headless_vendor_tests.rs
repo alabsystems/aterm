@@ -1780,9 +1780,9 @@ fn nothing_labelled_agree_is_ever_pressed() {
     assert_eq!(vendor_step(&allow, &typed), Step::Press(0));
 }
 
-/// A bot-protection block page on a pinned host stops the drive at once, its text (this
-/// machine's address, the ray id) kept out of the reason. CONTROL: the same host without the
-/// block words waits.
+/// A bot-protection block page on a pinned host stops the drive at once as a check, its text
+/// (this machine's address, the ray id) kept out of the reason. CONTROL: the same host without
+/// the block words waits.
 #[test]
 fn a_bot_protection_block_page_stops_at_once_and_keeps_its_text_out_of_the_reason() {
     let gate = Gate {
@@ -1797,16 +1797,16 @@ fn a_bot_protection_block_page_stops_at_once_and_keeps_its_text_out_of_the_reaso
         &[],
         &[],
     );
-    match vendor_step(&blocked, &gate) {
-        Step::Blocked(why) => {
-            assert!(why.contains("bot-protection block page"), "{why}");
-            assert!(
-                !why.contains("192.0.2.1") && !why.to_ascii_lowercase().contains("ray id"),
-                "{why}"
-            );
-        }
-        step => panic!("{step:?}"),
-    }
+    assert_eq!(
+        vendor_step(&blocked, &gate),
+        Step::Check(CheckMet::BlockPage)
+    );
+    let why = check_reason(&CheckMet::BlockPage, &blocked.url);
+    assert!(why.contains("block page"), "{why}");
+    assert!(
+        !why.contains("192.0.2.1") && !why.to_ascii_lowercase().contains("ray id"),
+        "{why}"
+    );
     let plain = page(
         "https://accounts.x.ai/sign-in",
         "sign in",
@@ -3330,9 +3330,13 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
     assert!(wm_js.contains("if (userEl && !passEl && !totpInputs.length && !mpwEl && emailVal)"));
 
     assert!(VENDOR_PAGE_JS.contains("!i.readOnly"));
-    let act_code = vendor_act_js(&Step::FillOtp, Some("123456"));
+    let act_code = vendor_act_js(&Step::FillOtp, Some("123456"), &Page::default());
     assert!(act_code.contains("input[name*='code' i]"));
-    let act_email = vendor_act_js(&Step::FillEmail, Some("owner@example.com"));
+    let act_email = vendor_act_js(
+        &Step::FillEmail,
+        Some("owner@example.com"),
+        &Page::default(),
+    );
     assert!(act_email.contains("!el.readOnly"));
 
     // 3. `drive_cdp_vendor_within` retries mailbox polling when the first OTP is rejected and
@@ -3714,7 +3718,7 @@ fn parameter_pollution_userinfo_loopback_json_plus_siblings_and_input_guards() {
         pw_idx < em_idx,
         "password inputs must be classified before name*='email' checks"
     );
-    let act_code = vendor_act_js(&Step::FillOtp, Some("123456"));
+    let act_code = vendor_act_js(&Step::FillOtp, Some("123456"), &Page::default());
     assert!(act_code.contains("\"submit\"") && act_code.contains(".filter(textInput)"));
 }
 
@@ -3925,7 +3929,11 @@ fn cjk_otp_extraction_webmail_plus_siblings_and_spa_submit_guards() {
         code_idx < name_email_idx,
         "code attributes (name*='code', name*='otp', one-time-code, numeric) must be checked before name.includes('email')"
     );
-    let act_email = vendor_act_js(&Step::FillEmail, Some("owner@example.com"));
+    let act_email = vendor_act_js(
+        &Step::FillEmail,
+        Some("owner@example.com"),
+        &Page::default(),
+    );
     assert!(
         act_email.contains("isCodeField") && act_email.contains("disallowedSubmitLabel"),
         "vendor_act_js must exclude code fields when filling email and guard submitInput against third-party/cancel buttons"
@@ -3978,18 +3986,22 @@ fn challenge_json() -> Value {
     })
 }
 
-/// Cloudflare's managed challenge (its title or words AND one of its markers) is waited on, and
-/// nothing on it is pressed, even a `verify` or `continue` button. CONTROLS: the same words and
-/// button with no marker are a page like any other (its `continue` is pressed); a help page
-/// quoting "Just a moment..." is none; a sign-in form carrying a Turnstile widget without the
-/// words is none (its email is filled); and the block page still stops at once.
+/// Cloudflare's managed challenge (its title or words AND one of its markers) is a check, and
+/// nothing on it is pressed, even a `verify` or `continue` button. The acting rule fails
+/// closed: its words with no marker, or a Turnstile widget with no words, stop the drive too,
+/// though only the strict pair names Cloudflare's interstitial. CONTROLS: a help page quoting
+/// "Just a moment..." in its text is none (its form is filled); the block page stops at once.
 #[test]
-fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
+fn a_cloudflare_challenge_is_a_check_and_nothing_on_it_is_pressed() {
     let gate = loopback_gate();
     for buttons in [&["verify you are human"][..], &["continue"], &[]] {
         let challenge = challenge_page(buttons);
         assert!(bot_check(&challenge), "{buttons:?}");
-        assert_eq!(vendor_step(&challenge, &gate), Step::Wait, "{buttons:?}");
+        assert_eq!(
+            vendor_step(&challenge, &gate),
+            Step::Check(CheckMet::BotCheck),
+            "{buttons:?}"
+        );
     }
     let by_title = Page {
         text: "auth.openai.com".to_owned(),
@@ -4008,8 +4020,15 @@ fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
         markers: vec![],
         ..challenge_page(&["continue"])
     };
-    assert!(!bot_check(&unmarked), "words without a marker never count");
-    assert_eq!(vendor_step(&unmarked, &gate), Step::Press(0));
+    assert!(
+        !bot_check(&unmarked),
+        "words without a marker never name the interstitial"
+    );
+    assert_eq!(
+        vendor_step(&unmarked, &gate),
+        Step::Check(CheckMet::BotCheck),
+        "but its words alone still stop every act"
+    );
     let docs = Page {
         title: "troubleshooting sign-in".to_owned(),
         ..page(
@@ -4021,6 +4040,7 @@ fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
         )
     };
     assert!(!bot_check(&docs));
+    assert_eq!(check_met(&docs), None, "a quote of its title is no check");
     let form = Page {
         title: "log in".to_owned(),
         markers: vec![Marker::Turnstile],
@@ -4034,9 +4054,18 @@ fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
     };
     assert!(
         !bot_check(&form),
-        "a widget without the words is no challenge"
+        "a widget without the words is no interstitial"
     );
-    assert_eq!(vendor_step(&form, &gate), Step::FillEmail);
+    assert_eq!(
+        vendor_step(&form, &gate),
+        Step::Check(CheckMet::HumanCheck("Turnstile".into())),
+        "its email is not filled: Turnstile runs on the press of Continue"
+    );
+    let plain = Page {
+        markers: vec![],
+        ..form.clone()
+    };
+    assert_eq!(vendor_step(&plain, &gate), Step::FillEmail, "CONTROL");
     let blocked = Page {
         title: "attention required! | cloudflare".to_owned(),
         markers: vec![Marker::ChallengePlatform],
@@ -4049,7 +4078,10 @@ fn a_cloudflare_challenge_is_waited_on_and_nothing_on_it_is_pressed() {
             &[],
         )
     };
-    assert!(matches!(vendor_step(&blocked, &gate), Step::Blocked(_)));
+    assert_eq!(
+        vendor_step(&blocked, &gate),
+        Step::Check(CheckMet::BlockPage)
+    );
 }
 
 /// A reason the drive ends with on Cloudflare's bot check names Cloudflare and the page's host
@@ -4067,66 +4099,32 @@ fn names_the_bot_check(why: &str) {
     );
 }
 
-/// A bot check that has not cleared within the stall ends the drive naming Cloudflare and the
-/// page's host and path, however often it reloads itself, and never as a page waiting on a
-/// person. A reload read between its documents (its title and words, no marker yet) is a gap
-/// in the same wait. CONTROLS: a page between two reads with something to act on, a page on
-/// another host, or an idle gap of [`BOT_CHECK_GAP`] restarts its clock.
+/// Cloudflare's bot check is a step of its own on its first read, however it reloads itself (a
+/// reload read between its documents, its title and words with no marker yet, included), and
+/// is never a page waiting on a person. CONTROL: the same host's sign-in form with no check is
+/// filled.
 #[test]
-fn a_bot_check_that_does_not_clear_ends_naming_cloudflare_never_a_person() {
+fn a_bot_check_is_met_on_its_first_read_never_waited_on() {
     let gate = loopback_gate();
     let challenge = challenge_page(&["verify you are human"]);
-    let reloaded = Page {
-        url: "https://auth.openai.com/log-in?__cf_chl_rt_tk=another-made-up-token".to_owned(),
-        ..challenge.clone()
-    };
     let half_parsed = Page {
         markers: vec![],
         buttons: vec![],
-        ..reloaded.clone()
+        url: "https://auth.openai.com/log-in?__cf_chl_rt_tk=another-made-up-token".to_owned(),
+        ..challenge.clone()
     };
-    assert!(!bot_check(&half_parsed));
-    assert_eq!(vendor_step(&half_parsed, &gate), Step::Wait);
-    let t0 = Instant::now();
-    let at = |secs: u64| t0 + Duration::from_secs(secs);
-    let mut stall = PageStall::default();
-    assert_eq!(stall.note_bot_check(&challenge, &Step::Wait, t0), None);
-    assert_eq!(stall.note(&challenge, &Step::Wait, &gate, t0), None);
-    let mut t = 0;
-    while t + 5 < VENDOR_STALL.as_secs() {
-        assert_eq!(
-            stall.note_bot_check(&half_parsed, &Step::Wait, at(t + 2)),
-            None
-        );
-        assert_eq!(
-            stall.note_bot_check(&reloaded, &Step::Wait, at(t + 5)),
-            None
-        );
-        t += 5;
+    for read in [&challenge, &half_parsed] {
+        assert_eq!(check_met(read), Some(CheckMet::BotCheck), "{read:?}");
+        assert_eq!(vendor_step(read, &gate), Step::Check(CheckMet::BotCheck));
+        names_the_bot_check(&check_reason(&CheckMet::BotCheck, &read.url));
     }
+    let mut stall = PageStall::default();
+    let t0 = Instant::now();
     assert_eq!(
-        stall.note(&reloaded, &Step::Wait, &gate, t0 + 10 * VENDOR_STALL),
+        stall.note(&challenge, &Step::Wait, &gate, t0 + 10 * VENDOR_STALL),
         None,
         "a bot check is never a page waiting on a person"
     );
-    let why = stall
-        .note_bot_check(&reloaded, &Step::Wait, t0 + VENDOR_STALL)
-        .expect("a bot check that did not clear ends the drive");
-    names_the_bot_check(&why);
-    assert_eq!(
-        stall.bot_check_held(t0 + VENDOR_STALL).as_deref(),
-        Some(why.as_str())
-    );
-    // The deadline in a gap, too, ends as the bot check.
-    let mut stall = PageStall::default();
-    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
-    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1));
-    names_the_bot_check(
-        &stall
-            .bot_check_held(at(1) + BOT_CHECK_GAP / 2)
-            .expect("held through the gap"),
-    );
-
     let form = page(
         "https://auth.openai.com/log-in",
         "welcome back",
@@ -4134,129 +4132,26 @@ fn a_bot_check_that_does_not_clear_ends_naming_cloudflare_never_a_person() {
         &["continue"],
         &[Field::Email],
     );
-    let elsewhere = page("https://example.com/", "", "", &[], &[]);
-    for (other, step) in [
-        (&form, vendor_step(&form, &gate)),
-        (&form, Step::Wait),
-        (&elsewhere, Step::Wait),
-    ] {
-        let mut stall = PageStall::default();
-        let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
-        assert_eq!(stall.note_bot_check(other, &step, at(1)), None);
-        assert_eq!(stall.bot_check_held(at(1)), None, "{other:?} {step:?}");
-        assert_eq!(
-            stall.note_bot_check(&challenge, &Step::Wait, t0 + VENDOR_STALL),
-            None,
-            "its clock restarted: {other:?} {step:?}"
-        );
-    }
-    let mut stall = PageStall::default();
-    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
-    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1));
-    assert_eq!(
-        stall.bot_check_held(at(1) + BOT_CHECK_GAP),
-        None,
-        "a gap that outlasts BOT_CHECK_GAP ends the wait"
-    );
-    let _ = stall.note_bot_check(&half_parsed, &Step::Wait, at(1) + BOT_CHECK_GAP);
-    assert_eq!(
-        stall.note_bot_check(&challenge, &Step::Wait, t0 + VENDOR_STALL),
-        None,
-        "its clock restarted after the gap"
-    );
+    assert_eq!(check_met(&form), None);
+    assert_eq!(vendor_step(&form, &gate), Step::FillEmail);
 }
 
-/// A bot check read again after its idle or unread gap expired starts a fresh wait even when
-/// no intervening read cleared the clock. CONTROL: a gap shorter than the limit stays in the
-/// original wait.
+/// A drive whose deadline comes on any page, or none, was not approved in time: a check never
+/// reaches the deadline, since the drive ended on its first read.
 #[test]
-fn a_bot_check_reappearing_after_its_gap_starts_a_new_wait() {
-    const URL: &str = "https://auth.openai.com/log-in";
-    let start = Instant::now();
-    let gap = start + Duration::from_secs(1);
-    for unread in [false, true] {
-        for elapsed in [BOT_CHECK_GAP, BOT_CHECK_GAP + Duration::from_secs(1)] {
-            let mut bot = BotCheckClock::default();
-            assert_eq!(bot.check(URL, start), Duration::ZERO);
-            if unread {
-                bot.unread(gap);
-            } else {
-                bot.other(URL, true, gap);
-            }
-            let again = gap + elapsed;
-            assert_eq!(bot.held(again), None, "the gap expired");
-            assert_eq!(bot.check(URL, again), Duration::ZERO, "unread={unread}");
-            assert_eq!(bot.held(again), Some((URL, Duration::ZERO)));
-        }
-    }
-
-    let mut bot = BotCheckClock::default();
-    let _ = bot.check(URL, start);
-    bot.other(URL, true, gap);
-    let again = gap + BOT_CHECK_GAP / 2;
-    assert_eq!(bot.check(URL, again), again.duration_since(start));
-}
-
-/// A bot check on another host starts a new wait, whether read directly or after a short gap.
-/// CONTROL: another path or spelling of the same HTTPS host keeps the original wait.
-#[test]
-fn a_bot_check_on_another_host_starts_a_new_wait() {
-    const URL: &str = "https://auth.openai.com/log-in";
-    const OTHER: &str = "https://claude.ai/login";
-    let start = Instant::now();
-    for gap in [false, true] {
-        let mut bot = BotCheckClock::default();
-        let _ = bot.check(URL, start);
-        if gap {
-            bot.other(URL, true, start + Duration::from_secs(1));
-        }
-        let again = start + Duration::from_secs(2);
-        assert_eq!(bot.check(OTHER, again), Duration::ZERO, "gap={gap}");
-        assert_eq!(bot.held(again), Some((OTHER, Duration::ZERO)));
-    }
-
-    let mut bot = BotCheckClock::default();
-    let _ = bot.check(URL, start);
-    bot.other(URL, true, start + Duration::from_secs(1));
-    let again = start + Duration::from_secs(2);
-    let reloaded = "https://AUTH.OPENAI.COM:443/another-path?__cf_chl_rt_tk=made-up";
-    assert_eq!(bot.check(reloaded, again), again.duration_since(start));
-}
-
-/// A drive whose deadline comes while a bot check stands (or in a gap of its reloads) ends
-/// `BotCheck` naming it; one whose deadline comes on any other page, or none, was not approved
-/// in time.
-#[test]
-fn a_deadline_during_a_bot_check_ends_as_it() {
+fn a_deadline_names_the_last_place_only() {
     use super::super::login_drive::Approval;
-    let challenge = challenge_page(&[]);
-    let t0 = Instant::now();
-    let mut stall = PageStall::default();
-    let _ = stall.note_bot_check(&challenge, &Step::Wait, t0);
-    match vendor_out_of_time(&stall, Some("`auth.openai.com/log-in`"), t0) {
-        Approval::BotCheck(why) => names_the_bot_check(&why),
-        other => panic!("{other:?}"),
-    }
-    let mut ended = PageStall::default();
-    let _ = ended.note_bot_check(&challenge, &Step::Wait, t0);
-    let _ = ended.note_bot_check(
-        &page("https://example.com/", "", "", &[], &[]),
-        &Step::Wait,
-        t0,
-    );
-    for stall in [&PageStall::default(), &ended] {
+    for place in [Some("`auth.openai.com/log-in`"), None] {
         assert!(
             matches!(
-                vendor_out_of_time(stall, Some("`auth.openai.com/log-in`"), t0),
-                Approval::NeedsYou(why) if why.contains("auth.openai.com/log-in")
+                vendor_out_of_time(place),
+                Approval::NeedsYou(why) if place.is_none_or(|p| why.contains(p))
             ),
-            "{stall:?}"
+            "{place:?}"
         );
     }
-
-    let mut bot = BotCheckClock::default();
     let _ = take_met();
-    assert!(oauth_out_of_time(&bot, Some("claude.ai"), t0).contains("timed out"));
+    assert!(sign_in_out_of_time(Some("claude.ai")).contains("timed out"));
     assert_eq!(
         take_met(),
         Some(super::super::open_url::Met::new(
@@ -4264,31 +4159,18 @@ fn a_deadline_during_a_bot_check_ends_as_it() {
             Some("claude.ai")
         ))
     );
-    let _ = bot.check("https://claude.ai/login", t0);
-    bot.unread(t0 + Duration::from_secs(1));
-    assert_eq!(
-        oauth_out_of_time(&bot, Some("claude.ai"), t0 + Duration::from_secs(2)),
-        BOT_CHECK_UNCLEARED
-    );
-    assert_eq!(
-        take_met(),
-        Some(super::super::open_url::Met::new(
-            MetWord::BotCheck,
-            Some("claude.ai")
-        ))
-    );
 }
 
-/// A drive that meets Cloudflare's bot check ends `BotCheck` once it has stood for the stall,
-/// however it reloads (a half-parsed read between two), naming Cloudflare and never a person.
-/// CONTROL: a check that clears after three reads goes on to the page behind it, here the
-/// sign-in's callback.
+/// A drive that meets Cloudflare's bot check ends `BotCheck` on its first read, however it
+/// reloads, naming Cloudflare and never a person, and presses nothing: no act is evaluated.
+/// A check that would have cleared after three reads is not waited for either. CONTROL: a
+/// drive whose first page is the callback is approved.
 #[test]
-fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
+fn a_drive_on_a_bot_check_ends_on_its_first_read() {
     use super::super::login_drive::Approval;
     let gate = loopback_gate();
     let no_mail = |_: &mut CdpClient, _: Option<&str>| Err("no mailbox in a test");
-    let run = |cdp: (CdpClient, std::thread::JoinHandle<()>), stall: Duration| {
+    let run = |cdp: (CdpClient, std::thread::JoinHandle<()>)| {
         let (mut cdp, browser) = cdp;
         let got = drive_cdp_vendor_within(
             &mut cdp,
@@ -4298,7 +4180,7 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
                 &|| false,
                 super::super::login_drive::Deadline::after(aterm_spec::wait::MUST_HAPPEN),
             ),
-            PageStall::within(stall),
+            PageStall::within(aterm_spec::wait::MUST_HAPPEN),
             no_mail,
         );
         drop(cdp);
@@ -4309,29 +4191,39 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
         Approval::BotCheck(why) => names_the_bot_check(&why),
         other => panic!("{other:?}"),
     };
-    let short = Duration::from_millis(500);
-    named(run(fake_cdp_pages(vec![challenge_json()]), short));
+    let acts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = acts.clone();
     let mut reads = 0usize;
     let reloading = fake_cdp_serving(false, move |expression| {
         if expression != VENDOR_PAGE_JS {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return json!({"ok": true});
         }
         reads += 1;
-        if reads.is_multiple_of(2) {
-            // Its next document, read before its markers were parsed.
+        if reads > 3 {
             return json!({
-                "url": CHALLENGE_URL,
-                "heading": "auth.openai.com",
-                "title": "Just a moment...",
-                "text": "auth.openai.com",
-                "buttons": [],
-                "inputs": [],
-                "markers": []
+                "url": "http://localhost:1455/auth/callback?code=made-up&state=made-up",
+                "heading": "", "title": "", "text": "",
+                "buttons": [], "inputs": [], "markers": []
             });
         }
         challenge_json()
     });
-    named(run(reloading, short));
+    named(run(reloading));
+    assert_eq!(
+        acts.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing pressed"
+    );
+    named(run(fake_cdp_pages(vec![json!({
+        "url": CHALLENGE_URL,
+        "heading": "auth.openai.com",
+        "title": "Just a moment...",
+        "text": "auth.openai.com",
+        "buttons": [],
+        "inputs": [],
+        "markers": []
+    })])));
 
     let back = json!({
         "url": "http://localhost:1455/auth/callback?code=made-up&state=made-up",
@@ -4343,15 +4235,7 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
         "markers": []
     });
     assert_eq!(
-        run(
-            fake_cdp_pages(vec![
-                challenge_json(),
-                challenge_json(),
-                challenge_json(),
-                back
-            ]),
-            aterm_spec::wait::MUST_HAPPEN,
-        ),
+        run(fake_cdp_pages(vec![back])),
         Approval::Approved { page: false }
     );
 
@@ -4368,9 +4252,9 @@ fn a_drive_on_a_bot_check_ends_bot_check_and_one_that_clears_goes_on() {
         "inputs": [],
         "markers": []
     });
-    match run(fake_cdp_pages(vec![blocked]), aterm_spec::wait::MUST_HAPPEN) {
+    match run(fake_cdp_pages(vec![blocked])) {
         Approval::BotCheck(why) => assert!(
-            why.contains("bot-protection block page")
+            why.contains("a block page")
                 && !why.contains("192.0.2.1")
                 && !why.to_ascii_lowercase().contains("ray id"),
             "{why}"
@@ -4422,23 +4306,24 @@ fn the_headless_launch_hides_nothing_from_a_bot_check() {
     }
 }
 
-/// Both page readers judge Cloudflare's pages by one helper whose lists are the Rust ones, read
-/// the closed marker list only, and the OAuth step reads a block page or bot check before it
-/// presses or fills anything.
+/// Both page readers judge a page by the one check predicate whose lists are the Rust ones, read
+/// the closed marker list only, and the OAuth step reads the check before it presses or fills
+/// anything.
 #[test]
-fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
+fn the_page_readers_share_one_check_read_before_anything_is_pressed() {
     for word in CHALLENGE_TITLES.iter().chain(CHALLENGE_WORDS) {
-        assert!(BOT_CHECK_JS.contains(&format!("\"{word}\"")), "{word}");
+        assert!(CHECK_PAGE_JS.contains(&format!("\"{word}\"")), "{word}");
     }
     for marker in Marker::ALL {
         assert!(
-            BOT_CHECK_JS.contains(&format!("found.push(\"{}\")", marker.word())),
+            CHECK_PAGE_JS.contains(&format!("found.push(\"{}\")", marker.word())),
             "{marker:?}"
         );
         assert_eq!(Marker::of(marker.word()), Some(marker));
     }
-    assert!(VENDOR_PAGE_JS.contains(BOT_CHECK_JS));
+    assert!(VENDOR_PAGE_JS.contains(CHECK_PAGE_JS));
     assert!(VENDOR_PAGE_JS.contains("markers: botCheckMarkers()"));
+    assert!(VENDOR_PAGE_JS.contains("check: checkPageOf()"));
     let read = page_of(&json!({
         "url": CHALLENGE_URL,
         "title": "just a moment...",
@@ -4454,11 +4339,10 @@ fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
         (false, false),
         None,
     );
-    assert!(step.contains(BOT_CHECK_JS));
-    let blocked = step
-        .find("state: \"block_page\"")
-        .expect("block page state");
-    let checked = step.find("state: \"bot_check\"").expect("bot check state");
+    assert!(step.contains(CHECK_PAGE_JS));
+    let met = step
+        .find("if (met) return { state: met.kind, check: met.name, url: href };")
+        .expect("the check's answer");
     for act in [
         "switchBtn.click()",
         "control.click()",
@@ -4467,6 +4351,59 @@ fn the_page_readers_share_one_bot_check_read_before_anything_is_pressed() {
         "pressConsent(approve",
     ] {
         let at = step.find(act).expect(act);
-        assert!(blocked < at && checked < at, "{act} before the bot check");
+        assert!(met < at, "{act} before the check");
+    }
+}
+
+/// A VENDOR PAGE WHOSE READ NAMES A HUMAN CHECK IS ACTED ON NOT AT ALL: its Continue enabled or
+/// not, the widget shown or not (the reader names it either way), the drive's step is the
+/// check. Every act's script reads the page for a check, in the same evaluation, before it
+/// touches anything. NEGATIVE CONTROL: the same page read with no check is pressed.
+#[test]
+fn a_vendor_page_with_a_human_check_is_acted_on_not_at_all() {
+    let gate = loopback_gate();
+    for buttons in [&["continue"][..], &[]] {
+        let read = |check: Value| {
+            json!({
+                "url": "https://auth.openai.com/log-in",
+                "heading": "welcome back",
+                "title": "log in",
+                "text": "Email address",
+                "buttons": buttons,
+                "inputs": ["email"],
+                "markers": [],
+                "check": check,
+                "doc": "1700000000000.5"
+            })
+        };
+        let page = page_of(&read(json!("human_check:hCaptcha")));
+        assert_eq!(page.check, Some(CheckMet::HumanCheck("hCaptcha".into())));
+        assert_eq!(page.doc, "1700000000000.5");
+        assert_eq!(
+            vendor_step(&page, &gate),
+            Step::Check(CheckMet::HumanCheck("hCaptcha".into()))
+        );
+        let plain = page_of(&read(Value::Null));
+        assert_ne!(vendor_step(&plain, &gate), Step::Check(CheckMet::BotCheck));
+        assert!(
+            !matches!(vendor_step(&plain, &gate), Step::Check(_)),
+            "CONTROL"
+        );
+    }
+    for step in [Step::Press(0), Step::FillEmail, Step::FillCode] {
+        let act = vendor_act_js(&step, Some("ada@x.example"), &Page::default());
+        let met = act
+            .find("if (met) return { ok: false, check: met };")
+            .expect("the act's check");
+        for touch in [
+            "b.click()",
+            "setNativeValue(input",
+            "fillCodeInputs(codeInputsFor",
+        ] {
+            if let Some(at) = act.rfind(touch) {
+                assert!(met < at, "{touch} before the check");
+            }
+        }
+        assert!(act.find(CHECK_PAGE_JS).is_some_and(|at| at < met));
     }
 }

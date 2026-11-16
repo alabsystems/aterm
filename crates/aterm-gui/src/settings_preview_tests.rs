@@ -6403,38 +6403,88 @@ fn the_flying_cat_is_the_preview_s_companion_beside_the_rainbow_alone() {
     );
 }
 
+/// The flier rides ahead of the caret on its row, at the glide's seat: the caret's column
+/// rounded up to [`aterm_effects::word_decorations::GLIDE_STRIDE`]. The glide moves two cells
+/// every other key, so it passes over a pixel of the page half as often as a cell a key would
+/// (`the_flier_never_flashes`), and it keeps one distance from that stride column, within two
+/// cells of it: as far from the caret as that on a column the stride lands on, a cell further on
+/// a column between. The moments are keys both scenes type, each at the same time after its
+/// key, short of the card's right edge; the `sh` scene's prompt is a cell wider than
+/// PowerShell's and its Tab two keys sooner, so each scene's caret stands on a stride column and
+/// between across them. Control: a glide that moves a cell a key (`GLIDE_STRIDE_OFF`) keeps its
+/// distance from the caret instead, two distances from the stride column.
 #[test]
 fn the_flying_cat_rides_beside_the_caret_on_its_row() {
+    use aterm_effects::word_decorations::{GLIDE_STRIDE, GLIDE_STRIDE_OFF};
+
     let (cell_w, cell_h) = (8_i32, 17_i32);
     let raw = "the flying cat";
-    for &phase in &[1_500, 2_300] {
-        let input = played(
-            &SettingsPreviewSpec::cursor(flying_cat()).with_phase(phase),
-            Theme::default(),
-        );
-        let row = input.cursor_row as i32;
-        assert_eq!(
-            input.cursor_row,
-            prompt_row(&input),
-            "the caret types on the prompt"
-        );
-        let caret_x = input.cursor_col as i32 * cell_w;
-        let sprite = sprites(&input)
-            .into_iter()
-            .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
-            .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
+    let stride = usize::try_from(GLIDE_STRIDE).expect("a positive stride");
+    let moments: Vec<u64> = [9_u64, 13, 14, 15]
+        .iter()
+        .map(|&key| key * KEY_MS + 2 * MOTION_STEP_MS)
+        .collect();
+    // (the caret's column, how far past the caret's stride column the flier starts) at each
+    // moment.
+    let seats = || -> Vec<(usize, i32)> {
+        moments
+            .iter()
+            .map(|&phase| {
+                let input = played(
+                    &SettingsPreviewSpec::cursor(flying_cat()).with_phase(phase),
+                    Theme::default(),
+                );
+                let row = input.cursor_row as i32;
+                assert_eq!(
+                    input.cursor_row,
+                    prompt_row(&input),
+                    "the caret types on the prompt"
+                );
+                let col = input.cursor_col;
+                let stride_x = col.next_multiple_of(stride) as i32 * cell_w;
+                let sprite = sprites(&input)
+                    .into_iter()
+                    .max_by_key(|sprite| u32::from(sprite.w) * u32::from(sprite.h))
+                    .unwrap_or_else(|| panic!("{raw} at {phase} ms draws its companion"));
+                assert!(
+                    sprite.y >= (row - 1) * cell_h
+                        && sprite.y + i32::from(sprite.h) <= (row + 2) * cell_h,
+                    "{raw} at {phase} ms stays on the caret's row: y {}..{}",
+                    sprite.y,
+                    sprite.y + i32::from(sprite.h)
+                );
+                (col, sprite.x - stride_x)
+            })
+            .collect()
+    };
+    let seen = seats();
+    assert!(
+        seen.iter().any(|&(col, _)| col % stride == 0)
+            && seen.iter().any(|&(col, _)| col % stride != 0),
+        "the moments put the caret on a stride column and between: {seen:?}"
+    );
+    for (&phase, &(col, past)) in moments.iter().zip(&seen) {
         assert!(
-            sprite.x >= caret_x && sprite.x <= caret_x + 2 * cell_w,
-            "{raw} at {phase} ms starts {} px from the caret",
-            sprite.x - caret_x
-        );
-        assert!(
-            sprite.y >= (row - 1) * cell_h && sprite.y + i32::from(sprite.h) <= (row + 2) * cell_h,
-            "{raw} at {phase} ms stays on the caret's row: y {}..{}",
-            sprite.y,
-            sprite.y + i32::from(sprite.h)
+            (0..=2 * cell_w).contains(&past),
+            "{raw} at {phase} ms, the caret on column {col}, starts {past} px past the caret's \
+             stride column"
         );
     }
+    assert!(
+        seen.iter().all(|&(_, past)| past == seen[0].1),
+        "{raw} keeps one distance from the caret's stride column on either side of it: \
+         (caret column, px past its stride column) {seen:?}"
+    );
+    GLIDE_STRIDE_OFF.with(|off| off.set(true));
+    let a_cell_a_key = seats();
+    GLIDE_STRIDE_OFF.with(|off| off.set(false));
+    assert!(
+        a_cell_a_key
+            .iter()
+            .any(|&(_, past)| past != a_cell_a_key[0].1),
+        "negative control: a glide that moves a cell a key keeps two distances from the caret's \
+         stride column: {a_cell_a_key:?}"
+    );
 }
 
 /// THE PREVIEW'S FLIER FLIES THE TAB COMPLETION, AS THE TERMINAL'S DOES. The scene's Tab

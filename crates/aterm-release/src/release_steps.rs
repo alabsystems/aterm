@@ -11560,7 +11560,7 @@ fn prefreeze(repo: &Path, opts: &crate::release::ReleaseOptions) -> Result<(), S
                 return Err("the main observer cannot also be a pre-freeze worker".into());
             }
             let target = crate::github_remote::Remote::origin(repo)?.refresh_main()?;
-            println!("{target}");
+            println!("{}", observed_main_line(&target));
             return Ok(());
         }
         if let Ok(line) = std::env::var(AUTO_PREFREEZE) {
@@ -11655,6 +11655,33 @@ const PREFREEZE_WORKER: &str = "ATERM_RELEASE_PREFREEZE_WORKER";
 
 #[cfg(unix)]
 const PREFREEZE_OBSERVER: &str = "ATERM_RELEASE_PREFREEZE_OBSERVER";
+
+/// The observer's answer line. Its stdout also carries the refresh's own gate timing and
+/// `release-event:` lines (`cut_timing::Timer` prints them as each gate ends), so the
+/// supervisor reads the one line that carries this mark, never the whole output.
+#[cfg(unix)]
+const OBSERVED_MAIN: &str = "prefreeze-observed-main: ";
+
+#[cfg(unix)]
+fn observed_main_line(target: &str) -> String {
+    format!("{OBSERVED_MAIN}{target}")
+}
+
+/// The commit an observer's stdout names: exactly one marked line holding one full
+/// lowercase commit.
+#[cfg(unix)]
+fn observed_main(stdout: &[u8]) -> Result<String, String> {
+    let stdout = std::str::from_utf8(stdout)
+        .map_err(|_| "authenticated main observer wrote non-UTF8 output")?;
+    let mut answers = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(OBSERVED_MAIN));
+    match (answers.next(), answers.next()) {
+        (Some(_), Some(_)) => Err("authenticated main observer answered more than once".into()),
+        (Some(target), None) if aterm_codec::hex::is_lower(target, 40) => Ok(target.to_owned()),
+        _ => Err("authenticated main observer returned no full lowercase commit".into()),
+    }
+}
 
 #[cfg(unix)]
 fn prepare_cached_cutter(
@@ -12139,13 +12166,7 @@ impl PrefreezeSupervisorRuntime for LivePrefreezeSupervisor<'_> {
                 String::from_utf8_lossy(&stderr).trim()
             ));
         }
-        let target = String::from_utf8(stdout)
-            .map_err(|_| "authenticated main observer wrote non-UTF8 output")?;
-        let target = target.trim();
-        if !aterm_codec::hex::is_lower(target, 40) {
-            return Err("authenticated main observer returned no full lowercase commit".into());
-        }
-        Ok(Some(target.to_owned()))
+        observed_main(&stdout).map(Some)
     }
 
     fn settle_observation(&mut self, observation: &mut Self::Observation) {

@@ -736,6 +736,102 @@ fn waits_past_their_lanes_are_told_busy_and_hung_up_waits_give_their_places_back
     }
 }
 
+/// The `control_requests` ledger of a `metrics` reply: each `<peer>/<verb>` and its count.
+fn request_ledger(metrics: &str) -> std::collections::BTreeMap<String, u64> {
+    let field = metrics
+        .split(' ')
+        .find_map(|word| word.strip_prefix("control_requests="))
+        .unwrap_or_else(|| panic!("metrics lacks control_requests=: {metrics}"));
+    field
+        .split(',')
+        .filter(|pair| *pair != "none")
+        .map(|pair| {
+            let (name, count) = pair
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("no count in {pair:?}"));
+            (
+                name.to_string(),
+                count
+                    .parse()
+                    .unwrap_or_else(|e| panic!("the count of {pair:?}: {e}")),
+            )
+        })
+        .collect()
+}
+
+/// `metrics` names who asks what: every request line counts once under its peer's program and its
+/// verb's own name, an `aterm` command's under the subcommand words of its argv, and a line that
+/// names no verb under `unknown`.
+#[test]
+fn the_request_ledger_counts_each_request_under_its_peer_and_verb() {
+    const ASKED: u64 = 7;
+
+    roomy_test_process();
+    let world = world("r");
+    let sock = world.0.join("run/aterm/lanes.sock");
+    let _instance = boot(&world.0, &sock, LAUNCHD_SOFT_LIMIT);
+    let token = token(&sock);
+    let mut driver = Driver::established(&sock, &token)
+        .unwrap_or_else(|reply| panic!("the driver was not served within {HANG:?}: {reply:?}"));
+
+    let before = request_ledger(&driver.request("metrics"));
+    for _ in 0..ASKED {
+        assert!(driver.request("version").starts_with("OK"));
+    }
+    assert!(driver.request("zq-no-such-verb").starts_with("ERR"));
+    let out = aterm_ctl(&world.0, &sock, &["version"]);
+    assert!(
+        out.status.success(),
+        "aterm ctl version failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = request_ledger(&driver.request("metrics"));
+
+    let rose: std::collections::BTreeMap<&str, u64> = after
+        .iter()
+        .filter_map(|(name, count)| {
+            let rose = count - before.get(name).copied().unwrap_or(0);
+            (rose != 0).then_some((name.as_str(), rose))
+        })
+        .collect();
+    let unknown: Vec<&str> = rose
+        .keys()
+        .filter_map(|name| name.strip_suffix("/unknown"))
+        .collect();
+    let [me] = unknown[..] else {
+        panic!("one peer sent the line that names no verb: {rose:?}");
+    };
+    let exe = std::env::current_exe().expect("this test's executable");
+    let exe = exe.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    assert!(
+        !me.is_empty() && exe.starts_with(me),
+        "this driver is named by its program, {exe:?}: {me:?}"
+    );
+    let (mine, others): (Vec<_>, Vec<_>) = rose
+        .iter()
+        .partition(|(name, _)| name.starts_with(&format!("{me}/")));
+    assert_eq!(
+        mine,
+        [
+            (&format!("{me}/metrics").as_str(), &1),
+            (&format!("{me}/unknown").as_str(), &1),
+            (&format!("{me}/version").as_str(), &ASKED),
+        ],
+        "each of this driver's lines counted once, under its verb"
+    );
+    // How many lines one `aterm ctl version` sends is the command's own; who sent them is not.
+    assert!(
+        others
+            .iter()
+            .any(|(name, _)| **name == "aterm%20ctl/version")
+            && others
+                .iter()
+                .all(|(name, _)| name.starts_with("aterm%20ctl/")),
+        "the command's lines are named by its argv's words, and nobody else asked: {others:?}"
+    );
+}
+
 fn pipelined_wait(
     sock: &Path,
     token: &str,

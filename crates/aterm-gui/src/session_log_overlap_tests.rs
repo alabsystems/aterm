@@ -2415,28 +2415,58 @@ fn exited(app: &App) -> Vec<crate::session_store::RosterRecord> {
         .collect()
 }
 
-/// The closed index's exits, oldest first.
-fn closed_exits(app: &App) -> Vec<crate::session_log::ClosedExit> {
-    app.store
-        .read()
-        .unwrap()
-        .closed_logs()
-        .exits_since(0)
-        .cloned()
+/// One close as the closed index links it (its seq, sid and local id) and its row in the session
+/// table says it (its reason, code and closer's wire word, tracker ST-15).
+#[derive(Clone, Debug)]
+struct Exit {
+    seq: u64,
+    sid: aterm_session::SessionId,
+    local_id: u64,
+    reason: ExitReason,
+    exit_code: Option<i32>,
+    by: String,
+}
+
+/// The closed index's exits, oldest first, each read with its row.
+fn closed_exits(app: &App) -> Vec<Exit> {
+    let g = app.store.read().unwrap();
+    let table = g.table();
+    g.closed_logs()
+        .exits()
+        .map(|e| {
+            let row = table.row(&e.sid).expect("each close left a row");
+            Exit {
+                seq: e.seq,
+                sid: e.sid.clone(),
+                local_id: e.local_id,
+                reason: row.out,
+                exit_code: row.exit_code,
+                by: row.by,
+            }
+        })
         .collect()
 }
 
-/// Whether `exits` (the closed index's) answer every roster `Exited` row of
-/// `rows`: one slot each, in the rows' order, saying every field the row
-/// does (its seq, instant, sid, local id and reason: since 6G-9 the roster
-/// names no code and no closer, which the index alone holds), and each
+/// [`by_r1`] of a closer's wire word (`ExitActor::as_wire`).
+fn by_r1_of_wire(by: &str) -> String {
+    match by {
+        "human" | "ctl" | "harness" | "bridge" => by.to_owned(),
+        sid if aterm_session::is_minted_sid(sid) => sid.to_owned(),
+        _ => "-".to_owned(),
+    }
+}
+
+/// Whether `exits` (the closed index's, with their rows) answer every roster
+/// `Exited` row of `rows`: one slot each, in the rows' order, saying every
+/// field the row does (its seq, sid, local id and reason: since 6G-9 the
+/// roster names no code and no closer, which the row alone holds), and each
 /// exit's log's session close the same `out=` (`out_of` naming each
 /// reason's), `code=` and `by=` as the exit, and, from a skeleton, the
 /// row's instant. Returns how many agreed.
 fn exits_agree(
     app: &App,
     rows: &[crate::session_store::RosterRecord],
-    exits: &[crate::session_log::ClosedExit],
+    exits: &[Exit],
     out_of: fn(ExitReason) -> &'static str,
 ) -> Result<usize, String> {
     let (held, said): (Vec<u64>, Vec<u64>) = (
@@ -2449,8 +2479,8 @@ fn exits_agree(
         ));
     }
     for (row, exit) in rows.iter().zip(exits) {
-        let says = (row.t_ms, row.sid.as_str(), row.local_id, row.reason);
-        let holds = (exit.t_ms, exit.sid.as_str(), exit.local_id, exit.reason);
+        let says = (row.sid.as_str(), row.local_id, row.reason);
+        let holds = (exit.sid.as_str(), exit.local_id, exit.reason);
         if says != holds {
             return Err(format!(
                 "seq {}: the roster says {says:?}, the index {holds:?}",
@@ -2460,7 +2490,7 @@ fn exits_agree(
         let want = (
             out_of(exit.reason).to_string(),
             exit.exit_code.map(i64::from),
-            by_r1(&exit.actor),
+            by_r1_of_wire(&exit.by),
         );
         let Some((out, code, by, mono)) = index_close(app, row.local_id) else {
             return Err(format!("local {}: no log attached", row.local_id));
@@ -2470,7 +2500,7 @@ fn exits_agree(
                 "local {} ({:?} by {:?}): the index says {want:?}, the log {:?}",
                 row.local_id,
                 exit.reason,
-                exit.actor,
+                exit.by,
                 (out, code, by)
             ));
         }
@@ -2485,8 +2515,8 @@ fn exits_agree(
 }
 
 /// THE ROSTER AND THE CLOSED INDEX AGREE on every reason, the last close,
-/// interleaved; the index holds each closer raw and each code, as the log's
-/// close says them.
+/// interleaved; each close's row holds its closer raw and its code, as the
+/// log's close says them.
 #[test]
 fn the_roster_and_the_closed_index_agree_on_every_exit() {
     use crate::session_log::{ClosedKeep, ClosedSource};
@@ -2570,16 +2600,16 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
         Ok(ExitReason::ALL.len() * actors.len() + 3),
         "every reason by every actor, then the last close and the two interleaved: {shipped:?}"
     );
-    let closers = |exits: &[crate::session_log::ClosedExit]| -> Vec<ExitActor> {
+    let closers = |exits: &[Exit]| -> Vec<String> {
         exits
             .iter()
             .take(ExitReason::ALL.len() * actors.len())
-            .map(|e| e.actor.clone())
+            .map(|e| e.by.clone())
             .collect()
     };
-    let want: Vec<ExitActor> = ExitReason::ALL
+    let want: Vec<String> = ExitReason::ALL
         .iter()
-        .flat_map(|_| actors.iter().cloned())
+        .flat_map(|_| actors.iter().map(|actor| actor.as_wire().to_owned()))
         .collect();
     assert_eq!(closers(&exits), want, "each closer raw, in order");
     assert!(
@@ -2597,18 +2627,21 @@ fn the_roster_and_the_closed_index_agree_on_every_exit() {
         other => other.as_str(),
     };
     assert!(exits_agree(&app, &rows, &exits, swapped).is_err());
-    let mut later = rows.clone();
-    later[0].t_ms += 1;
-    assert!(exits_agree(&app, &later, &exits, ExitReason::as_str).is_err());
+    let mut other_session = rows.clone();
+    other_session[0].local_id += 1_000;
+    assert!(exits_agree(&app, &other_session, &exits, ExitReason::as_str).is_err());
     // An unminted closer reads `by=-` in the log, as an unknown one does:
     // only the index tells them apart.
     let unminted = exits
         .iter()
-        .position(|e| e.actor == ExitActor::Sid("s-driver".into()))
+        .position(|e| e.by == "s-driver")
         .expect("an unminted closer");
     let mut other_closer = exits.clone();
-    other_closer[unminted].actor = ExitActor::Unknown;
-    assert_eq!(by_r1(&ExitActor::Unknown), by_r1(&exits[unminted].actor));
+    other_closer[unminted].by = ExitActor::Unknown.as_wire().to_owned();
+    assert_eq!(
+        by_r1(&ExitActor::Unknown),
+        by_r1_of_wire(&exits[unminted].by)
+    );
     assert_ne!(
         closers(&other_closer),
         want,

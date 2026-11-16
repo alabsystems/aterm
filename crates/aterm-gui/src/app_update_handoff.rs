@@ -5002,6 +5002,7 @@ impl App {
                 }
             }
             self.flush_messages_log_within(crate::messages_host::MESSAGES_FLUSH_EXIT_WAIT);
+            self.flush_session_table_at_exit();
             let spawn = || {
                 let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
                 let mut cmd = aterm_uds::spawnfd::command(exe);
@@ -7612,6 +7613,19 @@ impl App {
             })
     }
 
+    /// Bring the session table's rows to disk before an update ends this process: the Commit's
+    /// `seamless::commit_and_exit` and the Windows replacement's exit run no run end, and a row or
+    /// a told conclusion still queued on the table's worker would go with the process
+    /// (`session_table::SessionTable::flush`). An idle table answers at once.
+    fn flush_session_table_at_exit(&self) {
+        let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
+        if !table.flush() {
+            aterm_log::warn!(
+                "update apply: the session table's rows did not all reach disk before the exit"
+            );
+        }
+    }
+
     #[cfg(unix)]
     fn commit_flush_refences(&mut self) -> bool {
         if self
@@ -8253,6 +8267,7 @@ impl App {
             {
                 self.flush_messages_log_within(HANDOFF_INPUT_DRAIN_YIELD);
             }
+            self.flush_session_table_at_exit();
             let carried: Vec<aterm_session::SessionId> = self
                 .store
                 .read()

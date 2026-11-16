@@ -527,6 +527,118 @@ pub fn fstat<Fd: AsHandle>(fd: Fd) -> Result<Stat> {
     })
 }
 
+/// A file's counter in its volume's change journal (NTFS, ReFS): which journal, and how far into it
+/// the file's last change is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Usn {
+    /// `USN_JOURNAL_DATA.UsnJournalID`: a journal deleted and made again has another id.
+    pub journal: u64,
+    /// The update sequence number of the file's last record in that journal, whatever the clock
+    /// reads: while the file stays open the file system writes a record, at a greater number, for
+    /// the first change of each kind (its data, names, attributes or times) made through any
+    /// handle on it, and another as its last handle closes. A second change of a kind already
+    /// recorded writes none until then (measured on NTFS: a second write through a handle still
+    /// open, or through another handle while the first stays open, leaves the number as it was).
+    pub usn: i64,
+}
+
+/// The change-journal counter of what `fd` is open on (open with any access, or none; a directory
+/// or a reparse point opened as itself too), `None` where its volume keeps no change journal: none
+/// is active or one is being deleted (`ERROR_JOURNAL_NOT_ACTIVE`,
+/// `ERROR_JOURNAL_DELETE_IN_PROGRESS`), or its file system has none at all (FAT, exFAT, a network
+/// share: `ERROR_INVALID_FUNCTION`, `ERROR_NOT_SUPPORTED`).
+/// # Errors
+/// `FSCTL_QUERY_USN_JOURNAL`'s other codes; `FSCTL_READ_FILE_USN_DATA`'s; `ERROR_INVALID_DATA`
+/// for an answer too short to hold what it says, or a record of a version this does not read.
+pub fn usn<Fd: AsHandle>(fd: Fd) -> Result<Option<Usn>> {
+    let raw = fd.as_handle().as_raw_handle();
+    let mut journal = ffi::USN_JOURNAL_DATA_V0 {
+        UsnJournalID: 0,
+        FirstUsn: 0,
+        NextUsn: 0,
+        LowestValidUsn: 0,
+        MaxUsn: 0,
+        MaximumSize: 0,
+        AllocationDelta: 0,
+    };
+    let mut returned = 0u32;
+    // SAFETY: `fd` is live for the call; no input buffer; `journal` is writable for the length
+    // passed, every bit pattern a valid one, and outlives the call; `returned` is a writable u32;
+    // synchronous (no OVERLAPPED).
+    let ok = unsafe {
+        ffi::DeviceIoControl(
+            raw,
+            ffi::FSCTL_QUERY_USN_JOURNAL,
+            std::ptr::null(),
+            0,
+            (&raw mut journal).cast::<c_void>(),
+            size_of::<ffi::USN_JOURNAL_DATA_V0>() as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return match Errno::last() {
+            Errno(
+                ffi::ERROR_JOURNAL_NOT_ACTIVE
+                | ffi::ERROR_JOURNAL_DELETE_IN_PROGRESS
+                | ffi::ERROR_INVALID_FUNCTION
+                | ffi::ERROR_NOT_SUPPORTED,
+            ) => Ok(None),
+            other => Err(other),
+        };
+    }
+    if (returned as usize) < size_of::<u64>() {
+        return Err(Errno(ffi::ERROR_INVALID_DATA));
+    }
+    let versions = ffi::READ_FILE_USN_DATA {
+        MinMajorVersion: 2,
+        MaxMajorVersion: 3,
+    };
+    // A record holds one of the file's names (at most 255 UTF-16 units) after its fixed fields.
+    let mut record = [0u64; 128];
+    // SAFETY: `fd` is live for the call; `versions` is readable for the length passed; `record`
+    // is writable for the length passed and outlives the call; `returned` is a writable u32;
+    // synchronous (no OVERLAPPED).
+    let ok = unsafe {
+        ffi::DeviceIoControl(
+            raw,
+            ffi::FSCTL_READ_FILE_USN_DATA,
+            (&raw const versions).cast::<c_void>(),
+            size_of::<ffi::READ_FILE_USN_DATA>() as u32,
+            record.as_mut_ptr().cast::<c_void>(),
+            size_of_val(&record) as u32,
+            &raw mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(Errno::last());
+    }
+    let bytes: Vec<u8> = record.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    let answered = bytes
+        .get(..returned as usize)
+        .ok_or(Errno(ffi::ERROR_INVALID_DATA))?;
+    let field = |at: usize, len: usize| {
+        answered
+            .get(at..at + len)
+            .ok_or(Errno(ffi::ERROR_INVALID_DATA))
+    };
+    let major_at = offset_of!(ffi::USN_RECORD_V2, MajorVersion);
+    let major = field(major_at, 2)?;
+    let usn_at = match u16::from_ne_bytes([major[0], major[1]]) {
+        2 => offset_of!(ffi::USN_RECORD_V2, Usn),
+        3 => offset_of!(ffi::USN_RECORD_V3, Usn),
+        _ => return Err(Errno(ffi::ERROR_INVALID_DATA)),
+    };
+    let mut usn = [0u8; 8];
+    usn.copy_from_slice(field(usn_at, 8)?);
+    Ok(Some(Usn {
+        journal: journal.UsnJournalID,
+        usn: i64::from_ne_bytes(usn),
+    }))
+}
+
 /// The GUID of the volume the file `fd` is open on, as the mount manager names the volume.
 /// # Errors
 /// The query's code (a volume the mount manager does not name answers one); `ERROR_INVALID_DATA`

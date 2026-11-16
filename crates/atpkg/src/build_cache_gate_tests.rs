@@ -776,3 +776,26 @@ fn the_record_lives_in_the_gate_and_each_holder_takes_its_own_back() {
         "the record adds no entry to the gates folder"
     );
 }
+
+/// A Linux holder's work is its `stat` line's `utime + stime + cutime + cstime`, read after the
+/// command name's last `)`: a name holding `) S` and digits does not shift the fields, and a
+/// line cut short or with a field that is not a count reads as nothing.
+#[test]
+fn a_linux_stat_line_gives_its_four_cpu_fields_after_the_names_last_paren() {
+    // pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt majflt cmajflt
+    // utime stime cutime cstime priority nice ...
+    let plain = "4242 (trustc) R 1 4242 4242 0 -1 4194304 900 10 2 0 700 300 20 10 20 0 1 0 5555 0";
+    assert_eq!(stat_work(plain), Some(1030));
+    let tricky = "77 (a) S 9 9 9 b) R 1 77 77 0 -1 0 0 0 0 0 7 3 2 1 20 0 1 0 1 0";
+    assert_eq!(
+        stat_work(tricky),
+        Some(13),
+        "the fields follow the name's last `)`"
+    );
+    assert_eq!(stat_work("77 (short) R 1 77 77 0 -1 0 0 0 0 0 7 3"), None);
+    assert_eq!(
+        stat_work("77 (x) R 1 77 77 0 -1 0 0 0 0 0 7 3 two 1 20"),
+        None
+    );
+    assert_eq!(stat_work("no name here"), None);
+}

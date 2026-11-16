@@ -263,9 +263,10 @@ fn asks_or_warns(line: &str) -> bool {
 /// and program), bytes, class and the pass that reaches it first, then the used bytes no row
 /// holds; the header and the JSON name the form and no scope; the held line says where the
 /// walks are, and the summary says so of each that is not complete; and no statement of any
-/// pass, nor anything else, warns or asks. NEGATIVE CONTROLS: plain `disk` over the same
-/// context prints no holding, names no form and keeps its own lines; the detector finds a
-/// forged statement that names a command.
+/// pass, long, brief or short (the Disk lens's forms, DC-09b), nor any walk's brief, nor anything
+/// else, warns or asks. NEGATIVE CONTROLS: plain `disk` over the same context prints no holding,
+/// names no form and keeps its own lines; the detector finds a forged statement that names a
+/// command.
 #[test]
 fn sys_disk_held_prints_each_holding_with_its_session_mark_and_next_pass() {
     let mirror = Holding {
@@ -379,7 +380,14 @@ fn sys_disk_held_prints_each_holding_with_its_session_mark_and_next_pass() {
         for l in &held.lines {
             assert!(!asks_or_warns(&l.text), "{}", l.text);
         }
+        let brief = walk
+            .brief()
+            .unwrap_or_else(|| panic!("{walk:?} has no brief"));
+        assert!(brief.len() <= 28, "{walk:?}: {brief}");
+        assert!(!asks_or_warns(brief), "{walk:?}: {brief}");
     }
+    assert_eq!(Walk::Complete.brief(), None);
+    assert_eq!(Walk::Complete.clause(), None);
     let every = [
         Next::Nothing,
         Next::NotAterms,
@@ -410,6 +418,13 @@ fn sys_disk_held_prints_each_holding_with_its_session_mark_and_next_pass() {
         }
         let statement = format!("holding n=1 pass={} next: {}", next.pass(), next.says());
         assert!(!asks_or_warns(&statement), "{statement}");
+        let brief = format!("holding n=1 pass={} next: {}", next.pass(), next.brief());
+        assert!(!asks_or_warns(&brief), "{brief}");
+        assert!(next.brief().len() <= 40, "{next:?}: {}", next.brief());
+        let short = format!("holding n=1 pass={} next: {}", next.pass(), next.short());
+        assert!(!asks_or_warns(&short), "{short}");
+        assert!(next.short().len() <= 16, "{next:?}: {}", next.short());
+        assert!(next.short().len() <= next.brief().len(), "{next:?}");
     }
     let json = render_json(&SysQuery::parse("disk held --json").unwrap(), &c);
     let violations = contract_violations(&json);

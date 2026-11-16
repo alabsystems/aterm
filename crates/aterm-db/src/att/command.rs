@@ -7,11 +7,13 @@
 //! secret-store entry's name, and no refusal quotes a value. JSON output is for scripts and
 //! agents; there is no MCP server.
 
-use super::{Capacity, Diff, Entry, Handle, Point, Roll, Saved, TABLES, Usage, View, edit, find};
+use super::{
+    Ask, CAPS, Capacity, Cursor, Diff, EntryKind, Filter, Handle, Inert, Page, Point, Revision,
+    Roll, Saved, TABLES, Usage, View, Writer, edit, find,
+};
 use crate::{
     Error, Result,
     database::decode_hex,
-    table::store::{MAX_BYTES, MAX_RECORDS, WRITER_BYTES, WRITER_RECORDS},
     typed::{
         Collection, Kind, SCHEMA, Table, Ty,
         cell::{CellKey, CellValue, Field},
@@ -36,12 +38,18 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
   get <app>/<role> <collection> <pk> [--at <operation>]\n\
                                         one row\n\
   scan <app>/<role> <collection> [--where col=val]... [--tsv|--json] [--at <operation>]\n\
-  history <app>/<role> [<collection> [<pk>]]\n\
-                                        who changed what, in causal order\n\
+  history <app>/<role> [<collection> [<pk>]] [--column <name>] [--writer <actor|machine>]\n\
+          [--kind aterm|import|explicit] [--limit <n>] [--after <cursor> --revision <rev>]\n\
+                                        who changed what, in causal order, a page at a time\n\
+                                        (100 entries unless --limit says): `next` is the\n\
+                                        --after of the next page and `revision` its\n\
+                                        --revision; a page that says `moved` starts again\n\
+                                        from the top, since the table moved under the cursor\n\
   diff <app>/<role> [<collection>] <from> [<to>|head]\n\
                                         the cells added, retired, changed and conflict-changed\n\
                                         from one point to a later one, and who made each\n\
-  check <app>/<role>                    conflicts, dangling references, unique clashes\n\
+  check <app>/<role> [--tsv]            conflicts, dangling references, unique clashes;\n\
+                                        --tsv says each in words, a line each\n\
   revert <app>/<role> <operation> [--request <hex>]\n\
   export <app>/<role> <collection> --tsv <file> [--where col=val]... [--at <operation>]\n\
   apply <file>                          write an exported file's changed cells\n\
@@ -51,6 +59,9 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
   secret-store entry. A header starting with = is read-only; a conflicted cell shows ⚠ a ‖ b; a new row leaves its pk empty; a deleted row is\n\
   retired. A cell that changed since the export is never overwritten. A point is an\n\
   operation as history prints it: --at reads the table as that operation's causal past holds it.\n";
+
+/// How many entries a page of `history` holds unless `--limit` says.
+const HISTORY_PAGE: usize = 100;
 
 /// What a verb prints.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +115,10 @@ struct Args {
     filters: Vec<Where>,
     /// `--at <operation>`: read as of that operation's causal cut.
     at: Option<Point>,
+    /// `history`'s page: its filters, cursor, revision and length.
+    page: Option<Ask>,
+    /// `history --limit` was given.
+    limited: bool,
 }
 
 fn parse(verb: &str, words: &[String]) -> Result<Args> {
@@ -125,7 +140,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
                 args.file = Some(value("--tsv")?);
             }
-            "--tsv" if verb == "scan" => args.tsv = true,
+            "--tsv" if matches!(verb, "scan" | "check") => args.tsv = true,
             "--request" if verb == "revert" => {
                 if args.request.is_some() {
                     return Err(Error::new("revert takes one --request <hex>"));
@@ -141,6 +156,45 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
             "--where" if matches!(verb, "scan" | "export" | "edit") => {
                 args.filters.push(Where::parse(&value("--where")?)?);
             }
+            "--column" | "--writer" | "--kind" | "--after" | "--revision" | "--limit"
+                if verb == "history" =>
+            {
+                let page = args
+                    .page
+                    .get_or_insert_with(|| Ask::first(Filter::default(), HISTORY_PAGE));
+                let given = value(word)?;
+                let twice = || Error::new(&format!("history takes one {word}"));
+                match word.as_str() {
+                    "--column" if page.filter.column.is_none() => {
+                        page.filter.column = Some(given);
+                    }
+                    "--writer" if page.filter.writer.is_none() => {
+                        page.filter.writer = Some(match given.len() {
+                            32 => Writer::Machine(decode_hex::<16>(&given)?),
+                            _ => Writer::Actor(decode_hex::<48>(&given)?),
+                        });
+                    }
+                    "--kind" if page.filter.kind.is_none() => {
+                        page.filter.kind =
+                            Some(EntryKind::parse(&given).ok_or_else(|| {
+                                Error::new("--kind is aterm, import or explicit")
+                            })?);
+                    }
+                    "--after" if page.after.is_none() => page.after = Some(Cursor::parse(&given)?),
+                    "--revision" if page.revision.is_none() => {
+                        page.revision = Some(Revision::parse(&given)?);
+                    }
+                    "--limit" if !args.limited => {
+                        page.limit = given
+                            .parse()
+                            .ok()
+                            .filter(|limit| *limit > 0)
+                            .ok_or_else(|| Error::new("--limit is a count of 1 or more"))?;
+                        args.limited = true;
+                    }
+                    _ => return Err(twice()),
+                }
+            }
             flag if flag.starts_with("--") => {
                 return Err(Error::new(&format!(
                     "{verb}: unknown option (see `aterm db table --help`)"
@@ -150,7 +204,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
         }
     }
     if args.tsv && args.json {
-        return Err(Error::new("scan takes either --tsv or --json"));
+        return Err(Error::new(&format!("{verb} takes either --tsv or --json")));
     }
     Ok(args)
 }
@@ -263,17 +317,22 @@ pub fn run(
         "history" => {
             args.at_most(3)?;
             let handle = handle(args.operand(0, "<app>/<role>")?)?;
-            let collection = args.operands.get(1).map(String::as_str);
-            if let Some(collection) = collection {
-                handle.compiled().collection(collection)?;
+            let mut ask = args
+                .page
+                .clone()
+                .unwrap_or_else(|| Ask::first(Filter::default(), HISTORY_PAGE));
+            if ask.revision.is_some() != ask.after.is_some() {
+                return Err(Error::new(
+                    "history takes --after and --revision together, as a page's `next` and `revision`",
+                ));
             }
-            let pk = args.operands.get(2).map(String::as_str);
-            Ok(Output::Json(history(
-                &handle,
-                &handle.history()?,
-                collection,
-                pk,
-            )))
+            if let Some(collection) = args.operands.get(1) {
+                handle.compiled().collection(collection)?;
+                ask.filter.collection = Some(collection.clone());
+            }
+            ask.filter.row = args.operands.get(2).cloned();
+            let page = handle.history_page(&ask)?;
+            Ok(Output::Json(history(&handle, &page, &ask.filter)))
         }
         "diff" => {
             args.at_most(4)?;
@@ -317,7 +376,14 @@ pub fn run(
             args.at_most(1)?;
             let handle = handle(args.operand(0, "<app>/<role>")?)?;
             let (view, usage) = handle.usage()?;
-            Ok(Output::Json(check(&handle, &view, &usage)))
+            let checked = check(&handle, &view, &usage);
+            if args.tsv {
+                let findings = checked["findings"]
+                    .as_array()
+                    .map_or(&[][..], Vec::as_slice);
+                return Ok(Output::Text(tsv(findings)));
+            }
+            Ok(Output::Json(checked))
         }
         "revert" => {
             args.at_most(2)?;
@@ -619,8 +685,8 @@ fn ls(handle: &Handle) -> Value {
         "complete": view.complete,
         "records": usage.records, "bytes": usage.bytes,
         "mine": {"records": usage.mine_records, "bytes": usage.mine_bytes},
-        "caps": {"records": MAX_RECORDS, "bytes": MAX_BYTES,
-            "writer_records": WRITER_RECORDS, "writer_bytes": WRITER_BYTES},
+        "caps": {"records": CAPS.records, "bytes": CAPS.bytes,
+            "writer_records": CAPS.writer_records, "writer_bytes": CAPS.writer_bytes},
         "quota": {"spent": mine, "of": compiled.table.self_quota},
         "inert": view.quota.over.len() + owned_inert,
         "refused": view.refused.len(),
@@ -628,14 +694,136 @@ fn ls(handle: &Handle) -> Value {
     })
 }
 
+/// One finding as a person reads it, from the JSON a `check` reports: its word, what it means
+/// ([`check::said`]), the table and rows it names, its columns, and what else it says. The
+/// `--tsv` form of `aterm db table check` and `aterm db alab check` prints these ([`tsv`]), and
+/// the Tables page's Check view lists them, so both say a finding alike.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Line {
+    /// The finding's word (`conflict`, `facts-differ`).
+    pub kind: String,
+    /// What it means ([`check::said`]): the word itself where no sentence is written for it.
+    pub said: String,
+    /// The table it names; empty where it names none (a spent quota, a roll).
+    pub collection: String,
+    /// The rows it names, by key, in its order.
+    pub pks: Vec<String>,
+    /// The columns it names.
+    pub columns: Vec<String>,
+    /// What else it says, in words: the table a dangling reference names, a quota's count, a
+    /// roll's reason and verb, a schema's version.
+    pub detail: String,
+}
+
+/// [`Line`] of one finding as `check` reports it in JSON. A field it does not know is said by
+/// its name and value, so nothing a finding carries is dropped.
+pub fn line(finding: &Value) -> Line {
+    let text = |value: &Value| match value {
+        Value::String(text) => text.clone(),
+        other => aterm_json::to_string(other).unwrap_or_default(),
+    };
+    let texts = |value: Option<&Value>| -> Vec<String> {
+        match value {
+            Some(Value::Array(items)) => items.iter().map(text).collect(),
+            Some(Value::Null) | None => Vec::new(),
+            Some(one) => vec![text(one)],
+        }
+    };
+    let kind = finding.get("finding").map(text).unwrap_or_default();
+    let mut pks = texts(finding.get("pk"));
+    pks.extend(texts(finding.get("pks")));
+    let mut columns = texts(finding.get("column"));
+    columns.extend(texts(finding.get("columns")));
+    let mut detail = Vec::new();
+    if let Some(target) = finding.get("target") {
+        detail.push(format!("names a {} row", text(target)));
+    }
+    if let (Some(spent), Some(of)) = (finding.get("spent"), finding.get("of")) {
+        let whose = if finding.get("mine") == Some(&Value::Bool(true)) {
+            "this Mac".to_owned()
+        } else {
+            let writer = finding.get("writer").map(text).unwrap_or_default();
+            format!("writer {}", writer.get(..8).unwrap_or(&writer))
+        };
+        detail.push(format!("{whose}: {} of {}", text(spent), text(of)));
+    }
+    if let Some(reason) = finding.get("reason") {
+        detail.push(format!("at its {} limit", text(reason)));
+    }
+    if let Some(verb) = finding.get("verb") {
+        detail.push(format!("run {}", text(verb)));
+    }
+    if let Some(version) = finding.get("version") {
+        detail.push(format!("version {}", text(version)));
+    }
+    if let Some(said) = finding.get("line") {
+        detail.push(text(said));
+    }
+    const READ: [&str; 15] = [
+        "finding",
+        "collection",
+        "pk",
+        "pks",
+        "column",
+        "columns",
+        "target",
+        "spent",
+        "of",
+        "mine",
+        "writer",
+        "reason",
+        "verb",
+        "version",
+        "line",
+    ];
+    if let Some(object) = finding.as_object() {
+        for (key, value) in object {
+            if !READ.contains(&key.as_str()) {
+                detail.push(format!("{key} {}", text(value)));
+            }
+        }
+    }
+    Line {
+        said: check::said(&kind).to_owned(),
+        kind,
+        collection: finding.get("collection").map(text).unwrap_or_default(),
+        pks,
+        columns,
+        detail: detail.join("; "),
+    }
+}
+
+/// `findings` as tab-separated lines a person or a spreadsheet reads: a header, then one line
+/// for each finding ([`line`]): its word, its table, its rows and its columns (each list a
+/// comma apart), what it means, and what else it says. A tab or a line end inside a field reads
+/// as a space.
+pub fn tsv(findings: &[Value]) -> String {
+    let field = |text: &str| text.replace(['\t', '\n', '\r'], " ");
+    let mut out = String::from("finding\ttable\trows\tcolumns\tmeans\tdetail\n");
+    for found in findings.iter().map(line) {
+        let fields = [
+            field(&found.kind),
+            field(&found.collection),
+            field(&found.pks.join(", ")),
+            field(&found.columns.join(", ")),
+            field(&found.said),
+            field(&found.detail),
+        ];
+        out.push_str(&fields.join("\t"));
+        out.push('\n');
+    }
+    out
+}
+
 pub(crate) fn finding_json(finding: &Finding) -> Value {
+    let kind = finding.kind();
     match finding {
         Finding::Conflict {
             collection,
             pk,
             column,
         } => json!({
-            "finding": "conflict",
+            "finding": kind,
             "collection": safe_key(collection),
             "pk": safe_key(pk),
             "column": safe_key(column),
@@ -646,7 +834,7 @@ pub(crate) fn finding_json(finding: &Finding) -> Value {
             column,
             target,
         } => json!({
-            "finding": "dangling",
+            "finding": kind,
             "collection": safe_key(collection),
             "pk": safe_key(pk),
             "column": safe_key(column),
@@ -657,7 +845,7 @@ pub(crate) fn finding_json(finding: &Finding) -> Value {
             columns,
             pks,
         } => json!({
-            "finding": "unique",
+            "finding": kind,
             "collection": safe_key(collection),
             "columns": columns.iter().map(|c| safe_key(c)).collect::<Vec<_>>(),
             "pks": pks.iter().map(|pk| safe_key(pk)).collect::<Vec<_>>(),
@@ -667,7 +855,7 @@ pub(crate) fn finding_json(finding: &Finding) -> Value {
             pk,
             column,
         } => json!({
-            "finding": "raw",
+            "finding": kind,
             "collection": safe_key(collection),
             "pk": safe_key(pk),
             "column": safe_key(column),
@@ -677,7 +865,7 @@ pub(crate) fn finding_json(finding: &Finding) -> Value {
             pk,
             column,
         } => json!({
-            "finding": "protected-secret",
+            "finding": kind,
             "collection": safe_key(collection),
             "pk": safe_key(pk),
             "column": safe_key(column),
@@ -714,6 +902,21 @@ pub(crate) fn capacity_json(table: &Table, found: &Capacity, me: &Actor) -> Valu
     }
 }
 
+/// `check`'s finding for each collection of `table` whose Macs state different versions of its
+/// columns in `view` (`schema-split`): `aterm db table check` and `aterm db alab check` each
+/// report these.
+pub fn schema_findings(table: &Table, view: &View) -> Vec<Value> {
+    table
+        .collections
+        .iter()
+        .filter_map(|collection| match view.schema(collection.name) {
+            SchemaState::Split { version } => Some(json!({"finding": "schema-split",
+                "collection": collection.name, "version": version})),
+            _ => None,
+        })
+        .collect()
+}
+
 fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
     let compiled = handle.compiled();
     let cells: Vec<&Collection> = compiled
@@ -731,14 +934,7 @@ fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
         .iter()
         .map(finding_json)
         .collect();
-    for collection in compiled.table.collections {
-        if let SchemaState::Split { version } = view.schema(collection.name) {
-            findings.push(
-                json!({"finding": "schema-split", "collection": collection.name,
-                "version": version}),
-            );
-        }
-    }
+    findings.extend(schema_findings(compiled.table, view));
     findings.extend(
         super::capacity(compiled.table, view, usage)
             .iter()
@@ -832,25 +1028,13 @@ fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>) -> Value {
         "to": point(&diff.to), "cells": cells})
 }
 
-fn history(
-    handle: &Handle,
-    entries: &[Entry],
-    collection: Option<&str>,
-    pk: Option<&str>,
-) -> Value {
-    let wanted = |change: &crate::database::Change| {
-        collection.is_none_or(|name| change.collection == name)
-            && pk.is_none_or(|pk| {
-                change.key == pk
-                    || change
-                        .key
-                        .strip_prefix(pk)
-                        .is_some_and(|rest| rest.starts_with('.'))
-            })
-    };
-    let operations: Vec<Value> = entries
+/// `history`'s page: each entry with the changes of it `filter` names, its kind and, where it
+/// projects nothing, why; the revision it was read at, whether that moved under the cursor
+/// asked, and the cursor of the next page.
+fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
+    let operations: Vec<Value> = page
+        .entries
         .iter()
-        .filter(|entry| entry.changes.iter().any(wanted))
         .map(|entry| {
             json!({
                 "operation": hex::encode_lower(&entry.operation),
@@ -859,12 +1043,16 @@ fn history(
                 "hlc": {"ms": entry.hlc.ms, "counter": entry.hlc.counter},
                 "request": entry.request.as_ref().map(|r| hex::encode_lower(r)),
                 "reverts": entry.reverts.as_ref().map(|r| hex::encode_lower(r)),
-                "changes": entry.changes.iter().filter(|c| wanted(c))
+                "kind": entry.kind.word(),
+                "inert": entry.inert.map(Inert::word),
+                "changes": entry.changes.iter().filter(|c| filter.wants(c))
                     .map(|c| change_json(handle, c)).collect::<Vec<_>>(),
             })
         })
         .collect();
-    json!({"table": handle.compiled().name(), "operations": operations})
+    json!({"table": handle.compiled().name(), "revision": page.revision.text(),
+        "moved": page.moved, "next": page.next.as_ref().map(Cursor::text),
+        "operations": operations})
 }
 
 /// The baseline file an export writes beside its TSV.

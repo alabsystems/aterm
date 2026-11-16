@@ -8,7 +8,7 @@
 use aterm_secrets::{
     SecretBytes, client,
     commons::bootstrap::Bootstrap,
-    membership_log::{Draft, EpochAudience, Inserted, Log, encode_records},
+    membership_log::{Draft, EpochAudience, Inserted, Log, read_records},
     text::{Audience, Entry, MAX_VALUE},
 };
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -159,7 +159,7 @@ fn fixture(paths: &client::Paths, vault: &std::path::Path, denied: &str) -> Log 
             .unwrap();
         assert_eq!(log.insert(sign(put)).unwrap(), Inserted::Held);
     }
-    let wire = encode_records(log.records());
+    let wire = read_records(log.records()).unwrap();
     assert!(wire.len() > VALUES * VALUE_BYTES);
     client::save_records(paths, &wire).unwrap();
     assert_eq!(
@@ -278,7 +278,7 @@ fn public_local_roster_read_bounds_unrelated_plaintext_retention() {
         .draft_put(&actor, authored + 2, epoch_id, &key, &host_roster)
         .unwrap();
     assert_eq!(original.insert(sign(put)).unwrap(), Inserted::Held);
-    client::save_records(&paths, &encode_records(original.records())).unwrap();
+    client::save_records(&paths, &read_records(original.records()).unwrap()).unwrap();
     let membership = original.membership();
     assert_eq!(membership.members().len(), 1);
     assert!(membership.unproved().is_empty());

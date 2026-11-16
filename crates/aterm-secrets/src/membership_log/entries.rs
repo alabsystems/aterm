@@ -933,6 +933,20 @@ impl EntryOpening<'_> {
         Ok(self.inner(entry))
     }
 
+    /// The meta of the text `Put` at `index`, opened: a shelved winner of an entry the head
+    /// classed, read back.
+    #[cfg(unix)]
+    fn text_put_meta(&self, index: usize) -> Result<EntryMeta> {
+        let entry = self.text_put(index)?;
+        Ok(EntryMeta {
+            index,
+            name: entry.name,
+            if_absent: entry.if_absent,
+            anchor: entry.anchor,
+            value_class: index,
+        })
+    }
+
     /// `entry` as a reader holds it: a Claude Code token entry's value opened from its inner
     /// seal where this Mac holds the epoch it names ([`inner::load`]); any other entry as it is.
     fn inner(&self, entry: Entry) -> Entry {
@@ -956,6 +970,180 @@ impl EntryOpening<'_> {
             .ok_or_else(|| Error::new("entry reference has no readable epoch"))?;
         let plain = open_aead(key, record, audience, epoch, salt, ciphertext)?;
         decode_commons_put_plaintext(&plain)
+    }
+}
+
+/// One counted `Put` the resolve opened: an entry's op, under its audience and name, or a Commons
+/// control op.
+enum OpenedPut {
+    Text((Audience, String), CandidateOp),
+    Commons(ControlRef),
+}
+
+/// What the resolve of a log read through the vault's head takes of it ([`super::head`]): the
+/// head's reading of each op it names, for the identity that resolves, and the entries the ops
+/// opened here name.
+#[cfg(unix)]
+struct Shelf<'a> {
+    log: &'a Log,
+    recipient: &'a crate::age::Recipient,
+    /// The shelved text `Put`s taken unopened, by the entry the head numbers: each one's index
+    /// and its write ([`super::head::Op::class`]).
+    shelved: BTreeMap<u32, Vec<(usize, u32)>>,
+    /// Each entry the head numbers that an op opened here names, as that op names it: `None`
+    /// where two such ops name different entries.
+    named: BTreeMap<u32, Option<(Audience, String)>>,
+    /// The writes of the ops opened here that the head names, by index.
+    classes: BTreeMap<usize, u32>,
+    /// The entries an op opened here writes that the head does not name, or names by two
+    /// numbers.
+    touched: BTreeSet<(Audience, String)>,
+    /// The number the head gives each entry an op opened here names.
+    numbers: BTreeMap<(Audience, String), u32>,
+}
+
+/// The shelved ops a [`Shelf`] placed ([`Shelf::place`]).
+#[cfg(unix)]
+struct Placed {
+    /// The entries classed as the head says.
+    served: BTreeSet<(Audience, String)>,
+    /// The meta each op of such an entry opened here read, by index: what its winner reads as.
+    real: BTreeMap<usize, EntryMeta>,
+    /// The shelved ops of the entries that are not: to open as a full resolve does.
+    unplaced: Vec<(usize, u32)>,
+}
+
+#[cfg(unix)]
+impl<'a> Shelf<'a> {
+    fn of(log: &'a Log, recipient: &'a crate::age::Recipient) -> Self {
+        Self {
+            log,
+            recipient,
+            shelved: BTreeMap::new(),
+            named: BTreeMap::new(),
+            classes: BTreeMap::new(),
+            touched: BTreeSet::new(),
+            numbers: BTreeMap::new(),
+        }
+    }
+
+    fn op(&self, id: &RecordId) -> Option<super::head::Op> {
+        self.log.head.as_deref()?.op(&self.recipient.0, id)
+    }
+
+    /// Whether the counted, openable `Put` at `index` is shelved and the head names it, so it is
+    /// taken unopened: a Commons control op among `commons`, an entry's op kept aside until every
+    /// op opened here is known ([`Shelf::place`]). One read back since (a peer was sent it) is
+    /// taken as one that was not: what the head says of it stands either way.
+    fn takes(
+        &mut self,
+        index: usize,
+        record: &Record,
+        audience: &EpochAudience,
+        commons: &mut Vec<ControlRef>,
+    ) -> bool {
+        if !record.on_shelf() {
+            return false;
+        }
+        let (Some(op), Body::Put { epoch, .. }) = (self.op(record.id()), record.body()) else {
+            return false;
+        };
+        match (audience, op.register) {
+            (EpochAudience::Commons, super::head::COMMONS) => commons.push(ControlRef {
+                index,
+                record_id: *record.id(),
+                epoch: *epoch,
+            }),
+            (EpochAudience::Commons, _) | (_, super::head::COMMONS) => return false,
+            _ if op.class == super::head::DELETE => return false,
+            _ => self
+                .shelved
+                .entry(op.register)
+                .or_default()
+                .push((index, op.class)),
+        }
+        true
+    }
+
+    /// The op `id`, opened here, writes the entry `key`.
+    fn opened(&mut self, id: &RecordId, key: &(Audience, String)) {
+        let Some(op) = self.op(id) else {
+            self.touched.insert(key.clone());
+            return;
+        };
+        let named = self
+            .named
+            .entry(op.register)
+            .or_insert_with(|| Some(key.clone()));
+        if named.as_ref() != Some(key) {
+            *named = None;
+        }
+        if *self.numbers.entry(key.clone()).or_insert(op.register) != op.register {
+            self.touched.insert(key.clone());
+        }
+        if let Some(index) = self.log.held.get(id) {
+            self.classes.insert(*index, op.class);
+        }
+    }
+
+    /// Put the shelved ops into `registers`: those of an entry an op opened here names, that no
+    /// op the head does not name writes, classed as the head says, every op of that entry
+    /// with them; the rest left to open.
+    fn place(self, registers: &mut BTreeMap<(Audience, String), Vec<CandidateOp>>) -> Placed {
+        let mut placed = Placed {
+            served: BTreeSet::new(),
+            real: BTreeMap::new(),
+            unplaced: Vec::new(),
+        };
+        for (number, shelved) in self.shelved {
+            let key = self.named.get(&number).cloned().flatten();
+            let Some(key) = key.filter(|key| !self.touched.contains(key)) else {
+                placed.unplaced.extend(shelved);
+                continue;
+            };
+            let ops = registers.entry(key.clone()).or_default();
+            if ops.iter().any(|op| match op.op {
+                DecodedOp::Put(_) => !self.classes.contains_key(&op.index),
+                DecodedOp::Delete => false,
+            }) {
+                placed.unplaced.extend(shelved);
+                continue;
+            }
+            for op in ops.iter_mut() {
+                if let DecodedOp::Put(entry) = &mut op.op {
+                    let class = self.classes.get(&op.index).copied().unwrap_or_default();
+                    let real = std::mem::replace(entry, head_meta(op.index, &key.1, class));
+                    placed.real.insert(op.index, real);
+                }
+            }
+            for (index, class) in shelved {
+                let record = &self.log.order[index];
+                let Body::Put { epoch, .. } = record.body() else {
+                    continue;
+                };
+                ops.push(CandidateOp {
+                    index,
+                    record_id: *record.id(),
+                    epoch: *epoch,
+                    op: DecodedOp::Put(head_meta(index, &key.1, class)),
+                });
+            }
+            placed.served.insert(key);
+        }
+        placed
+    }
+}
+
+/// An op of an entry classed by the head, as its register reads it: its write is the head's
+/// number for it, the same for two ops exactly where they write the same thing.
+#[cfg(unix)]
+fn head_meta(index: usize, name: &str, class: u32) -> EntryMeta {
+    EntryMeta {
+        index,
+        name: name.to_owned(),
+        if_absent: false,
+        anchor: None,
+        value_class: class as usize,
     }
 }
 
@@ -2359,52 +2547,83 @@ impl Log {
             keyed: &keyed_keys,
             effective,
         };
+        // A log read through the vault's head: its shelved `Put`s are taken as the head says the
+        // resolve that wrote it read them, unopened, where that holds ([`Shelf`]).
+        #[cfg(unix)]
+        let mut shelf = Shelf::of(self, &my_recipient);
+        let mut open_put = |i: usize, record: &Record| -> Result<Option<OpenedPut>> {
+            let Body::Put {
+                audience,
+                epoch,
+                salt,
+                ciphertext,
+            } = record.body()
+            else {
+                return Ok(None);
+            };
+            if excluded_audiences.contains(audience) {
+                return Ok(None);
+            }
+            let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed_keys, effective) else {
+                return Ok(None);
+            };
+            let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
+            if let Some(text_aud) = audience.as_text_audience() {
+                let entry = opening.inner(decode_put_plaintext(&text_aud, &plain)?);
+                let value_class =
+                    value_classes.intern(&opening, i, entry.value.as_slice(), digest)?;
+                let entry = EntryMeta {
+                    index: i,
+                    name: entry.name,
+                    if_absent: entry.if_absent,
+                    anchor: entry.anchor,
+                    value_class,
+                };
+                Ok(Some(OpenedPut::Text(
+                    (text_aud, entry.name.clone()),
+                    CandidateOp {
+                        index: i,
+                        record_id: *record.id(),
+                        epoch: *epoch,
+                        op: DecodedOp::Put(entry),
+                    },
+                )))
+            } else {
+                let _ = decode_commons_put_plaintext(&plain)?;
+                Ok(Some(OpenedPut::Commons(ControlRef {
+                    index: i,
+                    record_id: *record.id(),
+                    epoch: *epoch,
+                })))
+            }
+        };
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
                 continue;
             }
             match record.body() {
                 Body::Put {
-                    audience,
-                    epoch,
-                    salt,
-                    ciphertext,
+                    audience, epoch, ..
                 } => {
-                    if excluded_audiences.contains(audience) {
+                    #[cfg(unix)]
+                    if !excluded_audiences.contains(audience)
+                        && self
+                            .op_key(i, epoch, &unwrapped, &keyed_keys, effective)
+                            .is_some()
+                        && shelf.takes(i, record, audience, &mut commons_candidates)
+                    {
                         continue;
                     }
-                    let Some(epoch_key) = self.op_key(i, epoch, &unwrapped, &keyed_keys, effective)
-                    else {
-                        continue;
-                    };
-                    let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
-                    if let Some(text_aud) = audience.as_text_audience() {
-                        let entry = opening.inner(decode_put_plaintext(&text_aud, &plain)?);
-                        let value_class =
-                            value_classes.intern(&opening, i, entry.value.as_slice(), digest)?;
-                        let entry = EntryMeta {
-                            index: i,
-                            name: entry.name,
-                            if_absent: entry.if_absent,
-                            anchor: entry.anchor,
-                            value_class,
-                        };
-                        registers
-                            .entry((text_aud, entry.name.clone()))
-                            .or_default()
-                            .push(CandidateOp {
-                                index: i,
-                                record_id: *record.id(),
-                                epoch: *epoch,
-                                op: DecodedOp::Put(entry),
-                            });
-                    } else {
-                        let _ = decode_commons_put_plaintext(&plain)?;
-                        commons_candidates.push(ControlRef {
-                            index: i,
-                            record_id: *record.id(),
-                            epoch: *epoch,
-                        });
+                    #[cfg(not(unix))]
+                    let _ = (audience, epoch);
+                    match open_put(i, record)? {
+                        Some(OpenedPut::Text(key, op)) => {
+                            #[cfg(unix)]
+                            shelf.opened(record.id(), &key);
+                            registers.entry(key).or_default().push(op);
+                        }
+                        Some(OpenedPut::Commons(control)) => commons_candidates.push(control),
+                        None => {}
                     }
                 }
                 Body::Delete {
@@ -2427,19 +2646,39 @@ impl Log {
                     };
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
                     let name = decode_delete_plaintext(&plain)?;
-                    registers
-                        .entry((text_aud, name))
-                        .or_default()
-                        .push(CandidateOp {
-                            index: i,
-                            record_id: *record.id(),
-                            epoch: *epoch,
-                            op: DecodedOp::Delete,
-                        });
+                    let key = (text_aud, name);
+                    #[cfg(unix)]
+                    shelf.opened(record.id(), &key);
+                    registers.entry(key).or_default().push(CandidateOp {
+                        index: i,
+                        record_id: *record.id(),
+                        epoch: *epoch,
+                        op: DecodedOp::Delete,
+                    });
                 }
                 _ => {}
             }
         }
+        // The shelved ops of each entry the head names: classed as the head says, where every
+        // other counted op of the entry is one the head names too; opened as a full resolve opens
+        // them where an op the head does not name writes the entry, or none it names here says
+        // which entry it is.
+        #[cfg(unix)]
+        let (served, mut real) = {
+            let placed = shelf.place(&mut registers);
+            for (i, _) in placed.unplaced {
+                if let Some(OpenedPut::Text(key, op)) = open_put(i, &self.order[i])? {
+                    registers.entry(key).or_default().push(op);
+                }
+            }
+            for ops in registers.values_mut() {
+                ops.sort_by_key(|op| op.index);
+            }
+            (placed.served, placed.real)
+        };
+        #[cfg(unix)]
+        commons_candidates.sort_by_key(|control| control.index);
+        drop(open_put);
 
         let mut conflicts = BTreeSet::new();
         let mut concurrent: BTreeMap<(Audience, String), Vec<RecordId>> = BTreeMap::new();
@@ -2489,6 +2728,16 @@ impl Log {
                 conflicts.insert((audience.clone(), name.clone()));
             }
             if let DecodedOp::Put(entry) = &winner.op {
+                // An entry classed by the head reads its winner as the winner says it.
+                #[cfg(unix)]
+                let entry = &if served.contains(&(audience.clone(), name.clone())) {
+                    match real.remove(&winner.index) {
+                        Some(entry) => entry,
+                        None => opening.text_put_meta(winner.index)?,
+                    }
+                } else {
+                    entry.clone()
+                };
                 let semantic = &candidates[register.reps[w]];
                 if matches!(audience, Audience::Hosts(_)) {
                     let precedence = semantic;
@@ -2559,6 +2808,55 @@ impl Log {
             if let Some((aud, _, _)) = maximal.into_iter().min_by_key(|c| c.2) {
                 winning_host_audience.insert(name, aud.clone());
             }
+        }
+        #[cfg(unix)]
+        if super::head::wants(self, &my_recipient.0) {
+            let mut resolved = super::head::Resolved::default();
+            for (number, (((_, name), candidates), register)) in
+                registers.iter().zip(&classified).enumerate()
+            {
+                let Ok(number) = u32::try_from(number) else {
+                    break;
+                };
+                if inner_sealed(name) {
+                    // Which writes of an inner-sealed entry read the same depends on the epoch
+                    // keys the reading log holds, which a log made from this one changes: the
+                    // head says nothing of it, and every resolve opens its ops.
+                    continue;
+                }
+                for (k, op) in candidates.iter().enumerate() {
+                    let class = match op.op {
+                        DecodedOp::Delete => super::head::DELETE,
+                        DecodedOp::Put(_) => match u32::try_from(register.class_of(k)) {
+                            Ok(class) if class != super::head::DELETE => class,
+                            _ => continue,
+                        },
+                    };
+                    resolved.ops.insert(
+                        op.record_id,
+                        super::head::Op {
+                            register: number,
+                            class,
+                        },
+                    );
+                }
+            }
+            for control in &commons_candidates {
+                resolved.ops.insert(
+                    control.record_id,
+                    super::head::Op {
+                        register: super::head::COMMONS,
+                        class: 0,
+                    },
+                );
+            }
+            resolved.keep.extend(winning_puts.values().copied());
+            resolved.keep.extend(winning_ops.values().copied());
+            resolved.keep.extend(concurrent.values().flatten().copied());
+            resolved
+                .keep
+                .extend(commons_control.map(|index| *self.order[index].id()));
+            super::head::write(self, identity, &resolved);
         }
         drop_dangling_anchors(&mut by_audience, &mut winning_host_audience);
         let live = |(audience, name): &(Audience, String)| {
@@ -2750,6 +3048,7 @@ impl Log {
         let keyed = self.unwrap_keyed_epochs(identity, effective, |_| true)?;
         let mut lineage = Lineage::default();
         let mut unopened = false;
+        let sealed_name = inner_sealed(name);
         for (i, record) in self.order.iter().enumerate().skip(1) {
             if !effective.counts(i) {
                 continue;
@@ -2767,6 +3066,12 @@ impl Log {
                 unopened = true;
                 continue;
             };
+            if sealed_name && self.head_names(record.id()) {
+                // The vault's head names only ops of entries with no inner seal ([`super::head`]):
+                // this one writes another entry, and its body (a replaced one stays in the
+                // records file) is not read.
+                continue;
+            }
             let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
             let stored = decode_put_plaintext(&Audience::Everyone, &plain)?;
             if stored.name != name {
@@ -2895,6 +3200,11 @@ impl Log {
         let Some(epoch_key) = self.op_key(index, epoch, unwrapped, keyed, self.effective()) else {
             return Ok(Opened::Unopened);
         };
+        if inner_sealed(name) && self.head_names(record.id()) {
+            // The vault's head names only ops of entries with no inner seal ([`super::head`]):
+            // this one writes another name, and its body is not read.
+            return Ok(Opened::Other);
+        }
         let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
         let stored = decode_put_plaintext(&Audience::Everyone, &plain)?;
         if stored.name != name {

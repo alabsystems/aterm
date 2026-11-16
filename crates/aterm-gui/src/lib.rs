@@ -89,6 +89,7 @@ mod app_native;
 #[cfg(a11y_tree)]
 mod app_native_accessibility;
 mod app_native_motion;
+mod app_navigator;
 mod app_nudge;
 mod app_overview;
 mod app_palette;
@@ -155,8 +156,11 @@ mod native_mail_host;
 mod native_observe;
 mod native_session_policy;
 mod native_tables;
+mod native_tables_check;
+mod native_tables_choices;
 mod native_usage_retention;
 mod native_workers;
+mod navigator;
 #[cfg(all(test, target_os = "macos"))]
 mod nudge_conformance;
 mod option_routing;
@@ -172,7 +176,7 @@ mod resource_admission_attach;
 mod resource_admission_host;
 #[cfg(all(test, unix))]
 mod restore_pass_conformance;
-mod retired_workers;
+mod session_table;
 mod session_theme;
 #[cfg(all(test, unix))]
 mod settings_draft_carry_conformance;
@@ -901,6 +905,7 @@ mod pane;
 mod pane_chrome;
 mod pane_header;
 mod park;
+mod park_bell;
 #[cfg(all(test, unix))]
 mod parked_fork;
 #[cfg(unix)]
@@ -1093,9 +1098,11 @@ mod vitals_left;
 mod vitals_left_closed;
 mod vitals_situation;
 mod vitals_startup;
+mod wake_rings;
 mod wallpaper_present;
 mod watchdog;
 mod widget;
+mod window_presence;
 mod window_rest;
 mod window_show;
 
@@ -3352,6 +3359,10 @@ enum Wake {
     },
     ReadAppStatus {
         reply: std::sync::mpsc::Sender<Vec<String>>,
+    },
+    ReadOutputCadence {
+        session: Option<u64>,
+        reply: std::sync::mpsc::Sender<output_cadence::Snapshot>,
     },
     ReadMessages {
         query: aterm_messages::wire::ReadQuery,
@@ -9562,10 +9573,19 @@ const fn handoff_deferrable_input(event: &WindowEvent) -> bool {
 impl Wake {
     /// Whether this wake's handler only refreshes an observation of the world that no restore
     /// image reads: a surface ready to draw, a vitals reading, the disk board and its looks,
-    /// a sibling scan, a fleet read, the fleet traffic, this machine's name. Such a wake is not activity for the
-    /// crash journal ([`crash_journal::Lane::note_activity`]): it owes no capture and no
-    /// settle, so a window at rest does not build a restore image after each reading. Every
+    /// a sibling scan, a fleet read, the fleet traffic, this machine's name; or only answers a
+    /// control client's read (`status`, `sessions`, `harness policy`, the setup status, a `dims`
+    /// and a `resize`'s look at a pane's grid). Such a wake is not activity for the crash journal
+    /// ([`crash_journal::Lane::note_activity`]): it owes no capture and no settle, so a window
+    /// at rest does not build a restore image after each reading or each client's read. Every
     /// other wake is activity, the safe side: a capture equal to the last one writes nothing.
+    ///
+    /// A read's handler takes `&App`. What it writes, it writes behind a session's own locks
+    /// and in process-wide boards, none of which a restore image reads: `status` judges the
+    /// session's resize ledger (and may write a `render` mark to its session log), names who
+    /// typed last once, publishes the screen text it built to the frame slot, asks the
+    /// program-check watch for a look when its last one is stale, and wakes the input hook of
+    /// a session whose input sits unread with no stall watch armed.
     #[must_use]
     const fn only_observes(&self) -> bool {
         match self {
@@ -9575,7 +9595,13 @@ impl Wake {
             | Wake::HostNote(harness_host::HostNote::DiskLooked)
             | Wake::SiblingScan(_)
             | Wake::AgentsDiscoveryReady
-            | Wake::FleetRead => true,
+            | Wake::FleetRead
+            | Wake::ReadSessionStatus { .. }
+            | Wake::ReadSessionStatuses { .. }
+            | Wake::ReadHarnessPolicy { .. }
+            | Wake::ReadSetupStatus { .. }
+            | Wake::ReadWindowDims { .. }
+            | Wake::ReadPaneGrid { .. } => true,
             #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
             Wake::RestoreMeasurementReady => true,
             #[cfg(unix)]
@@ -10452,6 +10478,8 @@ struct App {
     network_source: Option<NetworkSnapshotSource>,
     network_source_busy: bool,
     network_next_poll: Option<Instant>,
+    /// What the band's poll keeps while it rides the reading's turns ([`network_deck::Ride`]).
+    network_ride: network_deck::Ride,
     /// When the network projection was last inspected ([`app_control::InspectRequest::Network`]),
     /// whose reader reads the services' states as the band does.
     network_inspected: Option<Instant>,
@@ -10656,6 +10684,9 @@ struct App {
     nudge_wake_ms: Option<u64>,
     /// When a Workers list on screen last read its workers ([`App::tick_workers`]).
     workers_read_at: Option<Instant>,
+    /// What the navigator's list was published from, and what may have moved since
+    /// ([`crate::app_navigator`]); `None` while no navigator is open.
+    nav: Option<Box<crate::app_navigator::NavWatch>>,
     /// `ATERM_DEV_WORKERS_FIXTURE` has been read ([`crate::app_workers`]).
     #[cfg(any(test, debug_assertions))]
     workers_fixture_landed: bool,
@@ -15103,6 +15134,7 @@ impl App {
 
     fn sync_window(&mut self, wid: WindowId) {
         self.settle_workers_tab(wid);
+        self.navigator_mark_structure();
         self.settle_tab_places(wid);
         // A tab that came or went may move the least the window keeps.
         self.push_least_window_size(wid);
@@ -15688,6 +15720,7 @@ impl App {
             network_source: None,
             network_source_busy: false,
             network_next_poll: None,
+            network_ride: network_deck::Ride::default(),
             network_inspected: None,
             lab_screen: lab_screen::LabScreen::default(),
             machine_page: machine_page::MachinePageHost::default(),
@@ -15825,6 +15858,7 @@ impl App {
             nudges: app_nudge::NudgeHost::new(aterm_core::terminal::repaint_nudge::Mode::Off),
             nudge_wake_ms: None,
             workers_read_at: None,
+            nav: None,
             #[cfg(any(test, debug_assertions))]
             workers_fixture_landed: false,
             nudge_gen_seen: 0,
@@ -16543,25 +16577,83 @@ impl App {
     /// surface, so a lab run of its dev-seam deck keeps the live one however long it is quiet.
     /// Run at the top of each loop turn, before the vitals and the deck are served, so a window
     /// that came to rest draws its still deck once in that turn.
+    ///
+    /// The same turn settles whether each window is attended
+    /// ([`window_rest::Rest::settle_attended`], [`window_rest::ATTENTION`]). The same two
+    /// windows are always attended, and so is every window under `motion = "full"`, a person's
+    /// own word that motion plays. A window whose attention lapsed here is asked for one frame,
+    /// which draws its deck still; no deadline is armed for the lapse, as none is for the rest.
     pub(crate) fn settle_rest(&mut self, now: Instant) {
         let after = self
             .config
             .idle_rest_or_default()
             .filter(|_| !self.headless);
+        let attention = (!self.headless
+            && self.config.motion_mode() != crate::motion::MotionMode::Full)
+            .then_some(window_rest::ATTENTION);
         let filmed = self.video_rec.as_ref().map(|rec| rec.window);
         for (wid, mut route_guard_ws) in &mut self.windows {
             let ws = &mut **route_guard_ws;
-            let after = after.filter(|_| filmed != Some(*wid));
-            ws.rest.settle(now, after);
+            let off_film = |quiet: Option<Duration>| quiet.filter(|_| filmed != Some(*wid));
+            ws.rest.settle(now, off_film(after));
+            if ws.rest.settle_attended(now, off_film(attention)) {
+                ws.request_redraw();
+            }
         }
     }
 
     /// A person's `event` in window `wid` at `now`, as it arrives and before it is handled: one
     /// that [`window_rest::stirs`] stirs the window ([`Self::stir_rest`]). `Focused(true)` counts
     /// the window as focused already, since its focus is stored only when the event is handled.
+    ///
+    /// The same event is a touch ([`Self::touch_rest`]) unless aterm made it itself for a
+    /// control client or a program: a key it posted ([`InputOrigin::Posted`], an `hwkey`
+    /// burst), or the `Resized` that reports a size it asked the window for
+    /// ([`Self::note_own_resize`]). A key another process posted may be a person's on-screen
+    /// keyboard or Screen Sharing, and counts; so does the focus coming to the window, whoever
+    /// brought it.
     pub(crate) fn note_rest_event(&mut self, wid: WindowId, event: &WindowEvent, now: Instant) {
         if window_rest::stirs(event) {
-            self.stir_rest(wid, now, matches!(event, WindowEvent::Focused(true)));
+            let focusing = matches!(event, WindowEvent::Focused(true));
+            self.stir_rest(wid, now, focusing);
+            let own = self
+                .windows
+                .get_mut(&wid)
+                .is_some_and(|mut ws| ws.rest.own(event));
+            if self.input_origin != InputOrigin::Posted && !own {
+                self.touch_rest(wid, now, focusing);
+            }
+        }
+    }
+
+    /// aterm asks window `wid` for the inner `size` on behalf of a control client or a program
+    /// (the `resize` verb's two forms, an xtwinops resize, the hold that grows a window holding
+    /// Settings to its least size): the `Resized` that reports that size is no person's touch
+    /// ([`window_rest::Rest::own`]). Where the platform applies the ask inside the call (macOS),
+    /// the caller notes the size the window then has, which is the size that event reports;
+    /// where a window manager answers later (X11) and gives another size, its event counts as a
+    /// touch.
+    pub(crate) fn note_own_resize(
+        &mut self,
+        wid: WindowId,
+        size: aterm_window::dpi::PhysicalSize<u32>,
+    ) {
+        if let Some(mut ws) = self.windows.get_mut(&wid) {
+            ws.rest.own_resize((size.width, size.height));
+        }
+    }
+
+    /// A person touched window `wid` at `now`: it is attended, and its attention starts over.
+    /// Where its attention had lapsed and it is focused, or `focusing` focuses it, a reading is
+    /// asked at once, as a wake asks one ([`Self::stir_rest`]): the deck moves again from that
+    /// reading, not in the touch's own frame.
+    pub(crate) fn touch_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
+        if self
+            .windows
+            .get_mut(&wid)
+            .is_some_and(|mut ws| ws.rest.touch(now) && (focusing || ws.focused))
+        {
+            self.vitals_ask_now(now);
         }
     }
 
@@ -16615,6 +16707,7 @@ impl App {
         self.mail_worker_news(session);
         self.rebuild_teams();
         self.refresh_presence_session(session);
+        self.navigator_mark_row(session);
         self.refresh_team_chrome(session);
         self.publish_workers_all();
         self.mark_status_dirty();
@@ -16629,6 +16722,7 @@ impl App {
         self.rebuild_teams();
         self.publish_workers_all();
         self.refresh_presence_session(session);
+        self.navigator_mark_row(session);
         self.mark_status_dirty();
         self.redraw_claude_footer(session);
         self.note_harness_arm(session);
@@ -16649,6 +16743,7 @@ impl App {
         let now_ns = u64::try_from(now.saturating_duration_since(self.lat_epoch).as_nanos())
             .unwrap_or(u64::MAX);
         self.pool.output_pass(session, now_ns);
+        self.navigator_note_output(session);
         self.vitals_output_edge(session, now);
         self.session_status.note_output(session, now);
         let session_visible = self.admit_output_redraws(session, now);
@@ -16658,6 +16753,7 @@ impl App {
         for changed in self.observe_session_statuses(now) {
             self.refresh_session_status_chrome(changed);
             self.refresh_presence_session(changed);
+            self.navigator_mark_row(changed);
         }
         if self.session_status.input_armed(session) {
             let _ = self.observe_input_stalls(now, Some(session));
@@ -16788,9 +16884,13 @@ impl App {
         if !occluded {
             ws.last_visible_views.clear();
             ws.rearm_present(true);
-            drop(route_guard_ws);
+        }
+        drop(route_guard_ws);
+        if !occluded {
             self.note_done_seen(wid);
         }
+        // A covered window's navigator reads no words and words no ages; uncovered it does.
+        self.navigator_mark_structure();
     }
 
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
@@ -16879,6 +16979,8 @@ impl App {
             }
         }
         let reorders_pre_commit_queue = !focused && self.pre_commit_focus_loss_reorders_queue(wid);
+        // A navigator's selection is the keyboard's only in the key window.
+        self.navigator_mark_structure();
         if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
             let ws = &mut **route_guard_ws;
             ws.focused = focused;
@@ -18568,6 +18670,7 @@ impl App {
         if targets.is_none() {
             self.title_drift.pending.remove(&session);
             self.title_drift.seen.insert(session, live_epoch);
+            self.navigator_mark_row(session);
             self.title_drift.last_flush.insert(session, now);
             let pool = &self.pool;
             let completed = &mut self.title_drift.completed;
@@ -19818,6 +19921,7 @@ impl ApplicationHandler<Wake> for App {
                 for changed in self.observe_session_statuses(Instant::now()) {
                     self.refresh_session_status_chrome(changed);
                     self.refresh_presence_session(changed);
+                    self.navigator_mark_row(changed);
                 }
             }
         }
@@ -19852,7 +19956,10 @@ impl ApplicationHandler<Wake> for App {
         if status_rebuilt {
             self.refresh_status_item();
             self.overview_refresh_all();
+            self.navigator_mark_structure();
         }
+        // Once a turn, and one branch while nothing is marked (`app_navigator`).
+        self.publish_navigators(Instant::now());
         #[cfg(target_os = "macos")]
         if !self.headless {
             self.publish_menu_live();
@@ -19949,6 +20056,14 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 workers_wake,
                 metrics::DeadlineOwner::Presence,
+            );
+        }
+        if let Some(navigator_wake) = self.navigator_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                navigator_wake,
+                metrics::DeadlineOwner::Navigator,
             );
         }
         if let Some(wake) = self.restored_worker_wake() {
@@ -20394,6 +20509,7 @@ impl App {
             }
             Wake::ClaudeFooter { session } => {
                 self.on_claude_footer_changed(session);
+                self.navigator_mark_words(session);
             }
             Wake::AccountMenuRead(completion) => self.on_account_menu_read(completion),
             Wake::AgentsDiscoveryReady => self.on_agents_discovery_ready(),
@@ -20414,6 +20530,7 @@ impl App {
             Wake::AllocationMonitorChanged => self.publish_allocation(),
             Wake::SessionLogMoved { session } => {
                 self.on_session_log_moved(session);
+                self.navigator_mark_words(session);
             }
             Wake::ProtectedRead { session, path } => {
                 self.note_protected_read(session, &path);
@@ -20425,7 +20542,13 @@ impl App {
             Wake::TaskChanged { session } => self.on_task_changed(session),
             Wake::CrashJournalOwed | Wake::HostMaintenance => {}
             Wake::LeaseChanged { session } => self.on_presence_wake(&session),
-            Wake::FabricChanged { session } => self.on_fabric_changed(&session),
+            Wake::FabricChanged { session } => {
+                // A topic post is a session's latest words where it is newer than its screen's.
+                if let Some(local) = self.local_session_of(&session) {
+                    self.navigator_mark_words(local);
+                }
+                self.on_fabric_changed(&session);
+            }
             Wake::Typed { session } => self.on_typed(&session),
             Wake::Driven { session, host, act } => self.on_driven(&session, &host, &act),
             Wake::Ready { session, window } => {
@@ -20745,6 +20868,10 @@ impl App {
                     Instant::now(),
                     &crate::control::pct_encode,
                 ));
+            }
+            Wake::ReadOutputCadence { session, reply } => {
+                let now_ns = u64::try_from(self.lat_epoch.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                let _ = reply.send(self.pool.output_cadence_snapshot(session, now_ns));
             }
             Wake::ReadMessages { query, reply } => {
                 let _ = reply.send(self.read_messages(&query));
@@ -27364,8 +27491,15 @@ pub fn main_entry_with_network(
     let seamless_conn_carry = incoming_handoff.connections;
     let seamless_mirror_dropped = incoming_handoff.mirror_dropped;
     let seamless_mirror_served = incoming_handoff.mirror_served;
-    let seamless_retired_workers = incoming_handoff.retired_workers;
     let seamless_roster_seq = incoming_handoff.roster_seq;
+    // The launch of the last agent each carried session ran, for the row it leaves when it ends
+    // here (tracker ST-15).
+    let kept_launches = crate::harness_host::adopt_last_launches(&incoming_handoff.last_launches);
+    if kept_launches > 0 {
+        aterm_log::info!(
+            "handoff: kept the last agent launch of {kept_launches} carried sessions for their rows"
+        );
+    }
     #[cfg(unix)]
     crate::fabric_launch::carry_attached(incoming_handoff.fabric_attached);
     #[cfg(unix)]
@@ -28336,21 +28470,11 @@ pub fn main_entry_with_network(
         }
         g.mirror().set_adopting(slog_mirror_adopting);
     }
-    if !seamless_retired_workers.is_empty() {
-        let kept = store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers_mut()
-            .adopt(
-                &seamless_retired_workers,
-                task_record::tasks_dir().as_deref(),
-                std::time::Instant::now(),
-                aterm_time::unix_millis().unwrap_or(0),
-            );
-        aterm_log::info!(
-            "workers: {kept} of the {} closed workers the outgoing process kept answer here",
-            seamless_retired_workers.len()
-        );
+    // The machine's session table: every ended session's row, read back from disk on a worker
+    // thread while the launch goes on (tracker ST-15). With no state folder the store keeps its
+    // memory table.
+    if let Some(dir) = crate::session_table::SessionTable::dir() {
+        crate::session_table::SessionTable::at(dir).serve(&store);
     }
     App::register_session(&store, &session0, None);
     let sock_bound = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -28909,6 +29033,7 @@ pub fn main_entry_with_network(
         network_source,
         network_source_busy,
         network_next_poll: None,
+        network_ride: network_deck::Ride::default(),
         network_inspected: None,
         lab_screen: lab_screen::LabScreen::default(),
         machine_page: machine_page::MachinePageHost::default(),
@@ -29053,6 +29178,7 @@ pub fn main_entry_with_network(
         nudges: app_nudge::NudgeHost::new(config.repaint_nudge_mode()),
         nudge_wake_ms: None,
         workers_read_at: None,
+        nav: None,
         #[cfg(any(test, debug_assertions))]
         workers_fixture_landed: false,
         nudge_gen_seen: 0,
@@ -29520,9 +29646,11 @@ pub fn main_entry_with_network(
     {
         let mp_proxy = event_loop.create_proxy();
         crate::memory_pressure::install(move |level| {
-            let _ = mp_proxy.send_event(Wake::MemoryPressure {
-                level,
-                applied: None,
+            crate::wake_rings::memory_pressure_moved(|| {
+                let _ = mp_proxy.send_event(Wake::MemoryPressure {
+                    level,
+                    applied: None,
+                });
             });
         });
         if !headless {
@@ -29548,7 +29676,9 @@ pub fn main_entry_with_network(
     }
     let wall_proxy = proxy.clone();
     watchdog::start(move || {
-        let _ = wall_proxy.send_event(Wake::WallMoved);
+        crate::wake_rings::wall_moved(|| {
+            let _ = wall_proxy.send_event(Wake::WallMoved);
+        });
     });
     heap_relief::start();
     #[cfg(unix)]
@@ -29579,12 +29709,15 @@ pub fn main_entry_with_network(
 }
 
 /// What a terminating signal does before it ends a windowed instance
-/// (`harness_host::arm_claims_off_as_the_window_dies`): the setup stages running now are noted as
-/// cut off by no crash, as a quit notes them (`system_state_host::note_setup_cut_off_as_the_window_dies`),
-/// so a logout that ends aterm by its SIGTERM (`launchctl bootout`) counts no begin toward a
-/// stage's park; then the window's account claims are given up.
+/// (`harness_host::arm_claims_off_as_the_window_dies`): its presence is written first, as a quit
+/// writes it (`window_presence::quit`, one write with no wait, so the bounded steps after it
+/// cannot leave it unwritten); then the setup stages running now are noted as cut off by no
+/// crash, as a quit notes them (`system_state_host::note_setup_cut_off_as_the_window_dies`), so a
+/// logout that ends aterm by its SIGTERM (`launchctl bootout`) counts no begin toward a stage's
+/// park; then the window's account claims are given up.
 #[cfg(unix)]
 fn the_window_dies() {
+    crate::window_presence::quit();
     #[cfg(target_os = "macos")]
     crate::system_state_host::note_setup_cut_off_as_the_window_dies();
     crate::harness_host::claims_off_as_the_window_dies();

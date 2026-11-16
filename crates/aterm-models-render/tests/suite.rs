@@ -4,3 +4,4 @@
 //! Combined Tier-0 model test binary for `aterm-models-render`.
 
 mod derived_gpu;
+mod metal_drawable_acquire;

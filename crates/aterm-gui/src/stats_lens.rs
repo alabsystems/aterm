@@ -17,6 +17,7 @@ use aterm_vitals::model::{
     Resource, ResourceView, Snapshot, StripEventKind,
 };
 use aterm_vitals::ring::{Agg, Cell, GapKind};
+use aterm_vitals::sys::{exe_word, held};
 use aterm_vitals::words::{self, InkKind, Ladder, Locale, Platform};
 
 use crate::deck_face::{ASCENT_EM, DESCENT_EM, FaceMetrics, deck_metrics};
@@ -346,6 +347,22 @@ const HEAD_BASE: f64 = 10.0;
 const ROW0_BASE: f64 = 24.0;
 /// A tolerance for measured widths.
 const EPS: f64 = 0.01;
+/// The most lines Held by lists, and the fewest a list of it holds before it is one line.
+const HELD_MOST: usize = 8;
+const HELD_LEAST: usize = 3;
+/// The most lines of Held by a reader hears as elements of their own.
+const HELD_SAID: usize = 6;
+/// How far apart a hatch's strokes start, pt.
+const HATCH_PITCH: f64 = 4.0;
+/// The least width a hatched span of a bar is drawn at, pt: a period of the hatch and a stroke,
+/// so however few its bytes it holds a whole stroke and never reads as its ground.
+const HATCH_LEAST: f64 = HATCH_PITCH + 2.0;
+/// The age, s, past which Held by says how old its rows are: three of the gathers an open Disk
+/// lens keeps up ([`crate::vitals_host::HELD_EVERY`]), so a lens that is open and read says
+/// nothing, and the frame a lens opens on, or one drawn after every window was hidden, does.
+const HELD_STALE_S: u64 = 3 * crate::vitals_host::HELD_EVERY.as_secs();
+/// The age, s, of the oldest walk past which Held by says how old its sizes may be.
+const HELD_OLD_WALK_S: u64 = 600;
 
 /// Where a section is laid.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -683,6 +700,67 @@ impl<'a> Pen<'a> {
         }
     }
 
+    /// 45° strokes in `stroke` over the rect at `(x, y)`, `w` by `h` pt, whose ground the caller
+    /// drew: one from each multiple of [`HATCH_PITCH`] along the shell, so a rect that moves or
+    /// grows does not slide its stripes, each cut to the rect less half a stroke's width (a
+    /// [`DrawPrim::Line`] has round caps and no clip). A rect too narrow for a stroke takes
+    /// none and reads as its ground, so a caller whose ground alone means something else gives
+    /// a hatched rect [`HATCH_LEAST`] at least (Space now's bar).
+    fn hatch(&mut self, x: f64, y: f64, w: f64, h: f64, stroke: Rgb) {
+        if !self.draw {
+            return;
+        }
+        let (x0, x1) = (x + 0.5, x + w - 0.5);
+        let (y0, y1) = (y + 0.5, y + h - 0.5);
+        let rise = y1 - y0;
+        if x1 <= x0 || rise <= 0.0 {
+            return;
+        }
+        let ink = rgba(stroke, 0xFF);
+        let mut bx = ((x0 - rise) / HATCH_PITCH).ceil() * HATCH_PITCH;
+        while bx < x1 {
+            // The stroke runs from (bx, y1) up to (bx + rise, y0); these are its ends in the rect.
+            let (ax, cx) = (bx.max(x0), (bx + rise).min(x1));
+            if (cx - ax) * std::f64::consts::SQRT_2 >= 0.5 {
+                self.line(ax, y1 - (ax - bx), cx, y1 - (cx - bx), ink);
+            }
+            bx += HATCH_PITCH;
+        }
+    }
+
+    /// A session's mark `r` pt in radius centred at `(cx, cy)`: a disc where `filled`, else a
+    /// ring one line wide. It is no [`WellMark`]: those mark what wants attention.
+    fn dot(&mut self, cx: f64, cy: f64, r: f64, filled: bool, ink: Rgb) {
+        if !self.draw {
+            return;
+        }
+        let s = self.s;
+        let (cx, cy) = (self.ox + (cx * s) as f32, self.oy + (cy * s) as f32);
+        let r = (r * s) as f32;
+        let color = rgba(ink, 0xFF);
+        self.p.prims.push(if filled {
+            DrawPrim::Dot { cx, cy, r, color }
+        } else {
+            DrawPrim::Ring {
+                cx,
+                cy,
+                r_outer: r,
+                thickness: s.round().max(1.0) as f32,
+                track: color,
+                start: 0.0,
+                frac: 0.0,
+                fill: color,
+            }
+        });
+    }
+
+    /// A caret under `(x, y)`, its apex there, 6 pt wide and 3.5 pt tall, one line wide: the
+    /// cap's mark under Space now's bar.
+    fn caret(&mut self, x: f64, y: f64, ink: Rgba) {
+        self.line(x - 3.0, y + 3.5, x, y, ink);
+        self.line(x, y, x + 3.0, y + 3.5, ink);
+    }
+
     /// A strip box [`skyline::skyline_box_in`] laid in device px, square-cornered.
     fn skyline(&mut self, sky: &Skyline) {
         if self.draw {
@@ -859,6 +937,18 @@ fn heading(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String]) {
         let ink = pen.inks.words2;
         pen.text(p.x + nw + 8.0, base, &sub, NOTE_PT, false, ink);
     }
+}
+
+/// A section heading whose words beside it always show: the first of `subs` that fits, else
+/// the last cut with "…" (what Held by's rows stand on, which no width sheds).
+fn heading_kept(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String]) {
+    let base = p.y + HEAD_BASE;
+    let name = pen.cut(name, p.w, HEAD_PT, true);
+    let ink = pen.inks.words;
+    let nw = pen.text(p.x, base, &name, HEAD_PT, true, ink);
+    let sub = fit_cut(pen.m, subs, (p.w - nw - 8.0).max(0.0), NOTE_PT, false);
+    let ink = pen.inks.words2;
+    pen.text(p.x + nw + 8.0, base, &sub, NOTE_PT, false, ink);
 }
 
 /// Where a one-line section's words start after its label.
@@ -2190,15 +2280,18 @@ fn disk_doc(c: Ctx<'_>) -> LensDoc<'_> {
         };
         ("Wrong?", t, ink)
     });
-    // What the software did comes after Filling and tops the right column; with no deed it is
-    // left out and the lens is as it was.
+    // Held by, then What the software did, come after Filling and top the right column in that
+    // order, over Writing now and Where the space is; with no held rows or no deed that section
+    // is left out, and with neither the lens is as it was.
+    let held = held_section(c);
     let did = did_section(c);
-    let two_order = if did.is_some() {
-        vec![0, 1, 2, 4, 3]
-    } else {
-        vec![0, 1, 3, 2]
+    let two_order = match (held.is_some(), did.is_some()) {
+        (false, false) => vec![0, 1, 3, 2],
+        (true, false) | (false, true) => vec![0, 1, 2, 4, 3],
+        (true, true) => vec![0, 1, 2, 3, 5, 4],
     };
     let mut sections = vec![space_section(c), filling_section(c)];
+    sections.extend(held);
     sections.extend(did);
     sections.extend([where_section(c), writing_section(c)]);
     LensDoc {
@@ -2266,8 +2359,22 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
             format!("{g} today"),
         ]
     });
+    // What the used space is, from the rows Held by lists over the same volume, and the cap
+    // the budget holds it to: both are readings, and neither moves the level or its lines.
+    let held = snap.facts.disk.as_ref().and_then(|d| d.held.as_deref());
+    let walk = held.map_or(held::Walk::Complete, |h| h.walk);
+    let spans = held.and_then(|h| class_spans(&held_lines(h, Some(v.used()), c.panes), h.walk));
+    let cap = d.and_then(|d| d.cap);
+    let key = space_key(spans, walk, cap);
     let mut words = vec![space.clone()];
     words.extend(legend.first().cloned());
+    if let Some(spans) = &spans {
+        words.push(spans.said());
+        words.extend(walk.clause().map(str::to_owned));
+    }
+    if let Some(cap) = cap {
+        words.push(format!("cap {} used", gb(cap as f64)));
+    }
     let parts: Vec<(String, String)> = freed
         .as_ref()
         .and_then(|f| f.first())
@@ -2292,6 +2399,13 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     let h = if freed.is_some() { 56.0 } else { 42.0 };
     let full = form(h, move |pen, p| {
         heading(pen, p, "Space now", &[]);
+        let name_w = pen.width(&pen.cut("Space now", p.w, HEAD_PT, true), HEAD_PT, true);
+        let beside = Place {
+            x: p.x + name_w + 12.0,
+            w: p.w - name_w - 12.0,
+            ..p
+        };
+        draw_space_key(pen, beside, &key);
         let inks = pen.inks;
         let (by, bh) = (p.y + 16.0, 10.0);
         let total = v.total.max(1) as f64;
@@ -2299,10 +2413,39 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
         let used = p.w * (v.used() as f64 / total).clamp(0.0, 1.0);
         let machine = pen.machine();
         pen.rect(p.x, by, used, bh, 1.5, rgba(machine, 0xFF));
+        if let Some(spans) = spans {
+            // From the fill's end leftward: what a build makes again, solid; then what is costly
+            // to have again, the same hue hatched (`hatch_ink`). What is left of the fill is
+            // kept or not classified, in the machine's ink as before.
+            // A span with bytes is never narrower than `least`: two device px solid, and
+            // hatched a whole period, so a few costly bytes do not read as rebuildable.
+            let share = |bytes: u64, least: f64| {
+                if bytes == 0 {
+                    0.0
+                } else {
+                    (p.w * bytes as f64 / total).max(least)
+                }
+            };
+            let e2 = p.x + used;
+            let e1 = (e2 - share(spans.rebuildable, 2.0 / pen.s)).max(p.x);
+            let e0 = (e1 - share(spans.costly, HATCH_LEAST)).max(p.x);
+            let hue = class_hue(pen);
+            pen.rect(e0, by, e2 - e0, bh, 0.0, rgba(hue, 0xFF));
+            let stroke = hatch_ink(pen);
+            pen.hatch(e0, by, e1 - e0, bh, stroke);
+        }
         for (_, b, critical) in &lines {
             let lx = p.x + p.w * (1.0 - (*b as f64 / total).clamp(0.0, 1.0));
             let ink = if *critical { inks.critical } else { inks.warn };
             pen.tick(lx, by - 2.0, by + bh + 2.0, rgba(ink, 0xFF));
+        }
+        if let Some(cap) = cap {
+            // The cap counts used bytes, so it is measured from the bar's start. It is a reading,
+            // never a level, and no ink alone says so: where a level's line is a tick across the
+            // bar in its own ink, the cap is a caret under the bar in the secondary words' ink,
+            // on the shell's ground whatever fill the bar has above it.
+            let cx = p.x + p.w * (cap as f64 / total).clamp(0.0, 1.0);
+            pen.caret(cx, by + bh + 0.75, rgba(inks.words2, 0xFF));
         }
         let base = p.y + 39.0;
         let s = pen.cut(&space, p.w, NOTE_PT, false);
@@ -2715,6 +2858,845 @@ fn ask_words(said: &str, session: bool) -> String {
         (other, _) => return format!("free-ask {other}"),
     };
     words.to_owned()
+}
+
+/// A size as Held by and Space now's key word it: the walker's last figure, never shown without
+/// what it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Size {
+    bytes: u64,
+    /// The bytes are a lower bound.
+    floor: bool,
+    /// Why it was not measured, where it was not.
+    unread: Option<&'static str>,
+    /// The bytes were cut to what the larger holdings left of the used space
+    /// ([`held::Shown::clamped`]), so they are less than the walker measured.
+    cut: bool,
+}
+
+impl Size {
+    /// `lines` together: a lower bound where any of them is one or was not measured, cut where
+    /// any of them was, and not measured where none of them was.
+    fn of<'l>(lines: impl IntoIterator<Item = &'l HeldLine>) -> Self {
+        let mut sum = Self {
+            bytes: 0,
+            floor: false,
+            unread: None,
+            cut: false,
+        };
+        let mut measured = false;
+        for line in lines {
+            sum.bytes = sum.bytes.saturating_add(line.bytes);
+            sum.floor |= line.floor || line.unread.is_some();
+            sum.cut |= line.cut;
+            measured |= line.unread.is_none();
+            if sum.unread.is_none() {
+                sum.unread = line.unread;
+            }
+        }
+        if measured {
+            sum.unread = None;
+        }
+        sum
+    }
+
+    /// As drawn: `12 GB`, `≥ 12 GB` for a lower bound, `12 GB cut` where it was cut to the used
+    /// space (the bound no longer holds of what is shown), `–` where it was not measured.
+    fn drawn(self) -> String {
+        match (self.unread, self.cut, self.floor) {
+            (Some(_), ..) => "\u{2013}".to_owned(),
+            (None, true, _) => format!("{} cut", gb(self.bytes as f64)),
+            (None, false, true) => format!("\u{2265} {}", gb(self.bytes as f64)),
+            (None, false, false) => gb(self.bytes as f64),
+        }
+    }
+
+    /// As said: the figure, `at least` it for a lower bound, that it was cut to fit the used
+    /// space, or that it was not measured and why.
+    fn said(self) -> String {
+        match (self.unread, self.cut, self.floor) {
+            (Some(why), ..) => format!("not measured ({why})"),
+            (None, true, _) => format!("{}, cut to fit the used space", gb(self.bytes as f64)),
+            (None, false, true) => format!("at least {}", gb(self.bytes as f64)),
+            (None, false, false) => gb(self.bytes as f64),
+        }
+    }
+}
+
+/// One line of Held by: a holding as `sys disk held` prints it, or, last, the used bytes no
+/// holding names. It carries no path: the lens draws none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HeldLine {
+    project: String,
+    worktree: held::Worktree,
+    mark: held::Mark,
+    /// The tab of the session at work in it, 1-based, and that session's program.
+    tab: Option<usize>,
+    exe: Option<String>,
+    /// The session those words name is the front tab's: every session at work that claims it
+    /// is, so the nearest of them, whose tab and program the row holds, is too.
+    mine: bool,
+    /// Its bytes after the clamp to the used bytes, whether they are a lower bound, why they
+    /// were not measured where they were not, and whether the clamp cut them.
+    bytes: u64,
+    floor: bool,
+    unread: Option<&'static str>,
+    cut: bool,
+    class: held::Class,
+    next: held::Next,
+}
+
+impl HeldLine {
+    /// Whether it is the last line: the used bytes no holding names.
+    fn is_other(&self) -> bool {
+        self.worktree == held::Worktree::Other
+    }
+
+    fn size(&self) -> Size {
+        Size {
+            bytes: self.bytes,
+            floor: self.floor,
+            unread: self.unread,
+            cut: self.cut,
+        }
+    }
+
+    /// Its session in words: the program and tab of the one at work in it, as far as the row
+    /// holds them, or that it is gone, or that there is none.
+    fn session_words(&self) -> String {
+        match (self.mark, self.exe.as_deref(), self.tab) {
+            (held::Mark::AtWork, Some(exe), Some(tab)) => format!("{exe} tab {tab}"),
+            (held::Mark::AtWork, None, Some(tab)) => format!("tab {tab}"),
+            (held::Mark::AtWork, Some(exe), None) => exe.to_owned(),
+            (held::Mark::AtWork, None, None) => "at work".to_owned(),
+            (held::Mark::Gone, ..) => "session gone".to_owned(),
+            (held::Mark::NoSession, ..) => "no session".to_owned(),
+        }
+    }
+}
+
+/// Held by's lines from the rows `h` the host gathered, as `sys disk held` prints them: one per
+/// holding in [`held::balance`]'s order (largest first, the unmeasured last), its bytes cut to
+/// what the rows above it leave of `used` (and marked cut where that took any of them, as the
+/// reply's `clamped=` does), and where `used` is known a last line for the bytes no holding
+/// names, so the lines add up to `used`. `panes` are the front tab's sessions. Every row the
+/// lens draws or says, and each span of Space now's bar, comes from this list.
+fn held_lines(h: &held::Holdings, used: Option<u64>, panes: &[u64]) -> Vec<HeldLine> {
+    let balanced = held::balance(&h.rows, used);
+    let mut lines: Vec<HeldLine> = balanced
+        .rows
+        .iter()
+        .map(|shown| {
+            let row = &h.rows[shown.i];
+            let exe = row.exe.as_deref().map(exe_word).filter(|w| *w != "-");
+            HeldLine {
+                project: row.project.clone(),
+                worktree: row.worktree,
+                mark: row.mark,
+                tab: row.tab,
+                exe: exe.map(str::to_owned),
+                mine: !row.keys.is_empty() && row.keys.iter().all(|k| panes.contains(k)),
+                bytes: shown.bytes,
+                floor: matches!(row.bytes, held::Bytes::AtLeast(_)),
+                unread: match row.bytes {
+                    held::Bytes::Unmeasured(why) => Some(why),
+                    held::Bytes::Measured(_) | held::Bytes::AtLeast(_) => None,
+                },
+                cut: shown.clamped,
+                class: row.class,
+                next: row.next,
+            }
+        })
+        .collect();
+    if let Some(other) = balanced.other {
+        lines.push(HeldLine {
+            project: "other".to_owned(),
+            worktree: held::Worktree::Other,
+            mark: held::Mark::NoSession,
+            tab: None,
+            exe: None,
+            mine: false,
+            bytes: other,
+            floor: false,
+            unread: None,
+            cut: false,
+            class: held::Class::Unclassified,
+            next: held::Next::Unknown,
+        });
+    }
+    lines
+}
+
+/// The used bytes by class, for Space now's bar and its key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClassSpans {
+    kept: u64,
+    /// What no holding names: the grey span holds it with the kept bytes, and it is never
+    /// called kept.
+    unclassified: u64,
+    costly: u64,
+    rebuildable: u64,
+    /// The classed figures are lower bounds, and so the unclassified one an upper bound: a
+    /// holding's size is a lower bound or was not measured, or a walk is still running.
+    floor: bool,
+    /// A holding's size was cut to what the larger ones left of the used space: the holdings
+    /// measure more than is used, so nothing is left unclassified and no figure bounds the
+    /// rest from above.
+    cut: bool,
+}
+
+/// What Space now's key and Held by say where a holding's size was cut to the used space.
+const CUT_BRIEF: &str = "sizes cut to fit";
+const CUT_CLAUSE: &str =
+    "the holdings measure more than the used space, so the smallest are cut to fit";
+
+impl ClassSpans {
+    /// The four figures, each apart, and that sizes were cut where they were.
+    fn said(&self) -> String {
+        let least = if self.floor { "at least " } else { "" };
+        let most = if self.floor && !self.cut {
+            "at most "
+        } else {
+            ""
+        };
+        let cut = if self.cut {
+            format!(" \u{b7} {CUT_CLAUSE}")
+        } else {
+            String::new()
+        };
+        format!(
+            "classes: kept {least}{} \u{b7} unclassified {most}{} \u{b7} costly {least}{} \u{b7} \
+             rebuildable {least}{}{cut}",
+            gb(self.kept as f64),
+            gb(self.unclassified as f64),
+            gb(self.costly as f64),
+            gb(self.rebuildable as f64)
+        )
+    }
+}
+
+/// `lines`' bytes by class while the walks stand at `walk`; `None` with no line.
+fn class_spans(lines: &[HeldLine], walk: held::Walk) -> Option<ClassSpans> {
+    if lines.is_empty() {
+        return None;
+    }
+    let sum = |class: held::Class| {
+        lines
+            .iter()
+            .filter(|l| l.class == class)
+            .fold(0_u64, |sum, l| sum.saturating_add(l.bytes))
+    };
+    Some(ClassSpans {
+        kept: sum(held::Class::Kept),
+        unclassified: sum(held::Class::Unclassified),
+        costly: sum(held::Class::Costly),
+        rebuildable: sum(held::Class::Rebuildable),
+        floor: walk == held::Walk::Walking || lines.iter().any(|l| l.floor || l.unread.is_some()),
+        cut: lines.iter().any(|l| l.cut),
+    })
+}
+
+/// The one hue of the bytes aterm can have again: aterm's ink (§11.3), `aterm_ic` under
+/// Increase Contrast. It is no heat, warn or critical ink: the lens keeps those for how full the
+/// disk is.
+fn class_hue(pen: &Pen<'_>) -> Rgb {
+    chip_ink(pen, ProcScope::Aterm, &[])
+}
+
+/// The ink of a hatch's strokes over [`class_hue`]: the track's, so the strokes read as gaps in
+/// the fill, where the hue stands off the track by 2:1 (3:1 under Increase Contrast, the floor
+/// of a mark); else the secondary words', or the words' where those stand off the hue further
+/// and the secondary ones do not reach that floor. On a black ground the track is nearly as
+/// dark as the hue is dim, and a hatch nobody can see would draw costly bytes as rebuildable.
+fn hatch_ink(pen: &Pen<'_>) -> Rgb {
+    let hue = class_hue(pen);
+    let floor = if pen.ic { ink::NON_TEXT } else { 2.0 };
+    let stands = |c: Rgb| ink::contrast(hue, c);
+    let (track, words2, words) = (pen.inks.track, pen.inks.words2, pen.inks.words);
+    if stands(track) >= floor {
+        track
+    } else if stands(words2) >= floor || stands(words2) >= stands(words) {
+        words2
+    } else {
+        words
+    }
+}
+
+/// A class's swatch, 6 by 7 pt on the baseline `base`: the machine's ink for what is kept or not
+/// classified, [`class_hue`] for what a build makes again, and that hue hatched
+/// ([`hatch_ink`]) for what is costly to have again. No swatch is drawn without its word.
+fn class_swatch(pen: &mut Pen<'_>, x: f64, base: f64, class: held::Class) {
+    let (y, w, h) = (base - 7.0, 6.0, 7.0);
+    match class {
+        held::Class::Kept | held::Class::Unclassified => {
+            let ink = pen.machine();
+            pen.rect(x, y, w, h, 1.0, rgba(ink, 0xFF));
+        }
+        held::Class::Costly | held::Class::Rebuildable => {
+            let hue = class_hue(pen);
+            pen.rect(x, y, w, h, 1.0, rgba(hue, 0xFF));
+            if class == held::Class::Costly {
+                let stroke = hatch_ink(pen);
+                pen.hatch(x, y, w, h, stroke);
+            }
+        }
+    }
+}
+
+/// Space now's key, on its heading's line: what each fill of the bar is, and the cap's figure.
+#[derive(Clone, Debug, Default)]
+struct SpaceKey {
+    /// Each class with bytes, left to right as the bar lays them: its swatch's class, its word
+    /// and its figure. Empty where nothing is costly or rebuildable: the bar is then one fill.
+    entries: Vec<(held::Class, &'static str, String)>,
+    /// The walk in a few words while it is not complete, else that sizes were cut where they
+    /// were: no figure is drawn without it, and it stays beside the words alone.
+    brief: Option<&'static str>,
+    /// `cap 1.4 TB`, where the budget has one.
+    cap: Option<String>,
+}
+
+/// Space now's key for `spans` while the walks stand at `walk`, with the budget's `cap`. The
+/// grey fill holds the kept bytes and what no holding names, so its word says both; where the
+/// figures are bounds, the classed ones read `≥` and the grey one, the rest of the used bytes,
+/// `≤`, which it loses where sizes were cut (the rest is then nothing, and the kept bytes are
+/// cut like the others).
+fn space_key(spans: Option<ClassSpans>, walk: held::Walk, cap: Option<u64>) -> SpaceKey {
+    let cut = spans.is_some_and(|s| s.cut);
+    let mut key = SpaceKey {
+        entries: Vec::new(),
+        brief: walk.brief().or(cut.then_some(CUT_BRIEF)),
+        cap: cap.map(|cap| format!("cap {}", gb(cap as f64))),
+    };
+    let Some(s) = spans.filter(|s| s.costly > 0 || s.rebuildable > 0) else {
+        return key;
+    };
+    let least = if s.floor { "\u{2265} " } else { "" };
+    let most = if s.floor && !s.cut { "\u{2264} " } else { "" };
+    let grey = s.kept.saturating_add(s.unclassified);
+    for (class, word, bytes, sign) in [
+        (held::Class::Kept, "kept and unclassified", grey, most),
+        (held::Class::Costly, "costly", s.costly, least),
+        (
+            held::Class::Rebuildable,
+            "rebuildable",
+            s.rebuildable,
+            least,
+        ),
+    ] {
+        if bytes > 0 {
+            key.entries
+                .push((class, word, format!("{sign}{}", gb(bytes as f64))));
+        }
+    }
+    key
+}
+
+/// `key` on the heading's baseline of `p`, which starts after the heading's name: the first
+/// that fits of each class's swatch, word and figure and of each swatch and word alone, either
+/// with the brief after it (the walk's while a walk is not complete) and the cap's figure ending
+/// at the right edge; then the words and the brief without the cap's figure, then the words
+/// alone. A fill is told by its hue, so its word outlasts the cap's figure, which shows alone
+/// only where no word fits; and the bar's spans are sizes, so the brief outlasts it too.
+fn draw_space_key(pen: &mut Pen<'_>, p: Place, key: &SpaceKey) {
+    /// A swatch and the gap after it, the gap between two entries, and the gap before the cap.
+    const SWATCH: f64 = 9.0;
+    const BETWEEN: f64 = 10.0;
+    const BEFORE_CAP: f64 = 12.0;
+    let base = p.y + HEAD_BASE;
+    let ink = pen.inks.words2;
+    let cap_w = key
+        .cap
+        .as_deref()
+        .map_or(0.0, |cap| pen.width(cap, NOTE_PT, false));
+    let cap_room = if key.cap.is_some() {
+        cap_w + BEFORE_CAP
+    } else {
+        0.0
+    };
+    let tail = key
+        .brief
+        .map_or_else(String::new, |brief| format!("\u{b7} {brief}"));
+    let figures: Vec<String> = key
+        .entries
+        .iter()
+        .map(|(_, word, figure)| format!("{word} {figure}"))
+        .collect();
+    let words: Vec<String> = key
+        .entries
+        .iter()
+        .map(|(_, word, _)| (*word).to_owned())
+        .collect();
+    let span = |texts: &[String], tail: &str| {
+        let entries: f64 = texts
+            .iter()
+            .map(|t| SWATCH + pen.width(t, NOTE_PT, false))
+            .sum();
+        let after = if tail.is_empty() {
+            0.0
+        } else {
+            4.0 + pen.width(tail, NOTE_PT, false)
+        };
+        entries + BETWEEN * texts.len().saturating_sub(1) as f64 + after
+    };
+    let chosen = [
+        (&figures, tail.as_str(), true),
+        (&words, tail.as_str(), true),
+        (&words, tail.as_str(), false),
+        (&words, "", false),
+    ]
+    .into_iter()
+    .find(|&(texts, tail, capped)| {
+        let room = if capped { cap_room } else { 0.0 };
+        !texts.is_empty() && span(texts, tail) + room <= p.w + EPS
+    });
+    if let Some((texts, tail, _)) = chosen {
+        let mut x = p.x;
+        for ((class, ..), text) in key.entries.iter().zip(texts) {
+            class_swatch(pen, x, base, *class);
+            x += SWATCH;
+            x += pen.text(x, base, text, NOTE_PT, false, ink) + BETWEEN;
+        }
+        pen.text(x - BETWEEN + 4.0, base, tail, NOTE_PT, false, ink);
+    }
+    if chosen.is_none_or(|(.., capped)| capped)
+        && let Some(cap) = key.cap.as_deref()
+        && cap_w <= p.w + EPS
+    {
+        pen.text_end(p.x + p.w, base, cap, NOTE_PT, false, ink);
+    }
+}
+
+/// What one drawn line of Held by is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HeldShown {
+    Line(HeldLine),
+    /// The lines a list too short for them all folds into one: how many, and their size.
+    Fold(usize, Size),
+}
+
+/// The `n` lines a list of `lines` shows: all of them where they fit, else the first, one line
+/// for those folded, and the last where it is the bytes no holding names, which every list
+/// keeps so that its lines still add up.
+fn held_shown(lines: &[HeldLine], n: usize) -> Vec<HeldShown> {
+    if lines.len() <= n {
+        return lines.iter().cloned().map(HeldShown::Line).collect();
+    }
+    let other = lines.last().filter(|l| l.is_other());
+    let tail = usize::from(other.is_some());
+    let head = n.saturating_sub(1 + tail);
+    let folded = &lines[head..lines.len() - tail];
+    let mut out: Vec<HeldShown> = lines[..head].iter().cloned().map(HeldShown::Line).collect();
+    out.push(HeldShown::Fold(folded.len(), Size::of(folded)));
+    out.extend(other.cloned().map(HeldShown::Line));
+    out
+}
+
+/// Held by's lines regrouped by who holds them, each group with its size: each program at work,
+/// largest first; the sessions that are gone; aterm's own folders that no session claims; the
+/// other folders no session claims; and, always an entry of its own, what no holding names. The
+/// second figure is how many of the groups, from the first, are programs.
+fn by_program(lines: &[HeldLine]) -> (Vec<(String, Size)>, usize) {
+    let mut programs: Vec<(String, Vec<&HeldLine>)> = Vec::new();
+    let (mut gone, mut own, mut none, mut other) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    for line in lines {
+        match (line.mark, line.worktree) {
+            (_, held::Worktree::Other) => other.push(line),
+            (held::Mark::AtWork, _) => {
+                let name = line.exe.as_deref().unwrap_or("at work");
+                match programs.iter_mut().find(|(n, _)| n == name) {
+                    Some((_, of)) => of.push(line),
+                    None => programs.push((name.to_owned(), vec![line])),
+                }
+            }
+            (held::Mark::Gone, _) => gone.push(line),
+            (
+                held::Mark::NoSession,
+                held::Worktree::Aterm | held::Worktree::Cache | held::Worktree::Tooling,
+            ) => own.push(line),
+            (held::Mark::NoSession, _) => none.push(line),
+        }
+    }
+    let mut groups: Vec<(String, Size)> = programs
+        .into_iter()
+        .map(|(name, of)| (name, Size::of(of)))
+        .collect();
+    groups.sort_by_key(|(_, size)| std::cmp::Reverse(size.bytes));
+    let n = groups.len();
+    for (name, of) in [
+        ("gone", gone),
+        ("aterm's own", own),
+        ("no session", none),
+        ("unclassified", other),
+    ] {
+        if !of.is_empty() {
+            groups.push((name.to_owned(), Size::of(of)));
+        }
+    }
+    (groups, n)
+}
+
+/// `clause` as a sentence: its first letter a capital, and a period after it.
+fn sentence(clause: &str) -> String {
+    let mut chars = clause.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!("{}{}.", first.to_uppercase(), chars.as_str())
+}
+
+/// Held by (`docs/DESIGN-disk-custody-2026-11-12.md` §4): who holds home's volume, from the rows
+/// the host last gathered for `sys disk held` ([`held_lines`]): each holding's project and kind
+/// of folder, a filled mark with the program and tab of the session at work in it or a hollow
+/// one where that session is gone, its class in a swatch and a word, its size, and last what
+/// aterm's next pass does with it by itself, in words: nothing here is a button, and nothing
+/// acts. The lines add up to the used space, the last being what no holding names; a list too
+/// short for them all folds the smallest into one line. The heading regroups them by program
+/// ([`by_program`]). The sizes are the disk walker's last and the rows the host's last gather:
+/// the lens starts no walk and no gather and waits on neither, so it says what it draws from.
+/// While a walk is not complete its words stay beside every size, in the heading and at the
+/// head of the one-line form; before them go how old the rows are, once they are older than an
+/// open lens keeps them ([`HELD_STALE_S`]: the frame a lens opens on, or one after every window
+/// was hidden), and how old the sizes may be, once the oldest walk behind them is
+/// ([`HELD_OLD_WALK_S`]). A size the clamp to the used space cut reads `cut`. The volume is the
+/// machine's, so the list ignores ↑/↓'s scope. `None` with no line, which leaves the lens as it
+/// was.
+fn held_section(c: Ctx<'_>) -> Option<Section<'_>> {
+    let snap = c.snap;
+    let disk = snap.facts.disk.as_ref()?;
+    let h = disk.held.as_deref()?;
+    let used = snap.volume.as_ref().map(|v| v.used());
+    let lines = held_lines(h, used, c.panes);
+    if lines.is_empty() {
+        return None;
+    }
+    let walk = h.walk;
+    let (groups, programs) = by_program(&lines);
+    let drawn_key = |groups: &[(String, Size)]| {
+        let entries: Vec<String> = groups
+            .iter()
+            .map(|(name, size)| format!("{name} {}", size.drawn()))
+            .collect();
+        entries.join(" \u{b7} ")
+    };
+    let key = drawn_key(&groups);
+    // What the rows and their sizes stand on, where that is not a fresh gather over complete,
+    // recent walks: how old the rows are, how old the sizes may be, and where the walks are.
+    let ago = |secs: u64| {
+        if secs < 60 {
+            format!("{secs} s")
+        } else {
+            words::duration_approx(secs as f64)
+        }
+    };
+    let as_of = disk
+        .held_age_s
+        .filter(|&age| age > HELD_STALE_S)
+        .map(|age| format!("as of {} ago", ago(age)));
+    let old = h
+        .oldest_walk_s
+        .filter(|&age| age >= HELD_OLD_WALK_S)
+        .map(|age| format!("sizes up to {} old", ago(age)));
+    let lead_with = |walk: Option<&str>| -> Option<String> {
+        let parts: Vec<&str> = as_of
+            .as_deref()
+            .into_iter()
+            .chain(old.as_deref())
+            .chain(walk)
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+    };
+    let (long, brief) = (lead_with(walk.clause()), lead_with(walk.brief()));
+    // With nothing to say of them the heading says the key, or its programs alone; else those
+    // words lead and are cut before they are dropped.
+    let subs: Vec<String> = match (&long, &brief) {
+        (Some(long), Some(brief)) => {
+            vec![format!("{long} \u{b7} {key}"), long.clone(), brief.clone()]
+        }
+        _ => {
+            let mut subs = vec![key];
+            if programs > 0 && programs < groups.len() {
+                subs.push(drawn_key(&groups[..programs]));
+            }
+            subs
+        }
+    };
+    let led = brief.is_some();
+
+    let said_key: Vec<String> = groups
+        .iter()
+        .map(|(name, size)| format!("{name} {}", size.said()))
+        .collect();
+    let mut words = vec![match used {
+        Some(used) => format!(
+            "Largest first; the rows add up to {} used.",
+            gb(used as f64)
+        ),
+        None => "Largest first.".to_owned(),
+    }];
+    words.push(format!("By program: {}.", said_key.join(", ")));
+    if lines.iter().any(|l| l.cut) {
+        words.push(sentence(CUT_CLAUSE));
+    }
+    words.extend(as_of.as_deref().map(sentence));
+    words.extend(old.as_deref().map(sentence));
+    words.extend(walk.clause().map(sentence));
+    let parts: Vec<(String, String)> = held_shown(&lines, HELD_SAID)
+        .iter()
+        .map(|shown| match shown {
+            HeldShown::Line(l) => (
+                format!("{} {}", l.project, l.worktree.word()),
+                format!(
+                    "{}, {}, {}; next: {}",
+                    l.session_words(),
+                    l.size().said(),
+                    l.class.word(),
+                    l.next.says()
+                ),
+            ),
+            HeldShown::Fold(k, size) => (format!("{k} more"), size.said()),
+        })
+        .collect();
+
+    // The one-line form: the largest holding, how many more there are and what no holding
+    // names, each form led by the brief words on what they stand on so that a cut keeps them.
+    let lead = brief
+        .as_ref()
+        .map_or_else(String::new, |brief| format!("{brief} \u{b7} "));
+    let holdings: Vec<&HeldLine> = lines.iter().filter(|l| !l.is_other()).collect();
+    let other = lines
+        .iter()
+        .find(|l| l.is_other())
+        .map(|l| format!("{} unclassified", l.size().drawn()));
+    let line: Vec<String> = match holdings.first() {
+        Some(first) => {
+            let tail = other.map_or_else(String::new, |other| format!(" \u{b7} {other}"));
+            let more = match holdings.len() - 1 {
+                0 => String::new(),
+                more => format!(" \u{b7} {more} more"),
+            };
+            let size = first.size().drawn();
+            let count = match holdings.len() {
+                1 => "1 holding".to_owned(),
+                n => format!("{n} holdings"),
+            };
+            vec![
+                format!(
+                    "{lead}{} {}, {}, {size}{more}{tail}",
+                    first.project,
+                    first.worktree.word(),
+                    first.session_words()
+                ),
+                format!("{lead}{}, {size}{more}{tail}", first.project),
+                format!(
+                    "{lead}{count} {}{tail}",
+                    Size::of(holdings.iter().copied()).drawn()
+                ),
+            ]
+        }
+        None => vec![format!("{lead}{}", other.unwrap_or_default())],
+    };
+
+    let panes = c.panes;
+    let most = lines.len().min(HELD_MOST);
+    let least = lines.len().min(HELD_LEAST);
+    let mut forms = Vec::new();
+    for n in (least..=most).rev() {
+        let (shown, subs) = (held_shown(&lines, n), subs.clone());
+        forms.push(form(rows_h(n, false), move |pen, p| {
+            if led {
+                heading_kept(pen, p, "Held by", &subs);
+            } else {
+                heading(pen, p, "Held by", &subs);
+            }
+            draw_held(pen, p, &shown, panes);
+        }));
+    }
+    forms.push(line_form("Held", line));
+    Some(Section {
+        name: "Held by".into(),
+        words,
+        right: true,
+        parts,
+        forms,
+    })
+}
+
+/// One drawn line of Held by, in the words of each of its columns.
+struct HeldCells {
+    /// Its class, for its swatch; none on the fold.
+    class: Option<held::Class>,
+    project: String,
+    kind: &'static str,
+    /// Its session's mark, where it has one: filled at work and hollow gone, and whether the
+    /// session its words name is the front tab's ([`HeldLine::mine`]).
+    mark: Option<(bool, bool)>,
+    session: String,
+    class_word: &'static str,
+    size: String,
+    next: Option<held::Next>,
+}
+
+impl HeldCells {
+    fn of(shown: &HeldShown) -> Self {
+        match shown {
+            HeldShown::Line(l) => Self {
+                class: Some(l.class),
+                project: l.project.clone(),
+                kind: l.worktree.word(),
+                mark: match l.mark {
+                    held::Mark::AtWork => Some((true, l.mine)),
+                    held::Mark::Gone => Some((false, false)),
+                    held::Mark::NoSession => None,
+                },
+                session: l.session_words(),
+                class_word: l.class.word(),
+                size: l.size().drawn(),
+                next: Some(l.next),
+            },
+            HeldShown::Fold(k, size) => Self {
+                class: None,
+                project: format!("{k} more"),
+                kind: "",
+                mark: None,
+                session: String::new(),
+                class_word: "",
+                size: size.drawn(),
+                next: None,
+            },
+        }
+    }
+}
+
+/// The widest of `texts` at the body size.
+fn widest<'t>(pen: &Pen<'_>, texts: impl Iterator<Item = &'t str>) -> f64 {
+    texts
+        .map(|t| pen.width(t, BODY_PT, false))
+        .fold(0.0, f64::max)
+}
+
+/// Held by's `shown` lines under its heading at `p`'s top, one a pitch, in columns: the class's
+/// swatch, the project, the kind of folder, the session's mark and words, the class's word, the
+/// size ending its column, and last what the next pass does. That column is as wide as its
+/// widest statement, so none is cut: every line's brief words ([`held::Next::brief`], the long
+/// ones on a line where they fit), else every line's short ones ([`held::Next::short`]), else
+/// no column, and the said form has the whole statement. Every other text is cut to its own
+/// column. A section too narrow for them all sheds, in this order, the next pass, the kind, the
+/// session's words (its mark stays) and last the class's word with its swatch: a class is told
+/// by its swatch's hue, and no hue is drawn without its word. The project and the size never
+/// go, and with no next pass the sizes end at the section's edge as every list's figures do.
+fn draw_held(pen: &mut Pen<'_>, p: Place, shown: &[HeldShown], panes: &[u64]) {
+    /// The swatch and the gap after it, the gap between two columns, and the mark's room.
+    const LEAD: f64 = 10.0;
+    const BETWEEN: f64 = 8.0;
+    const MARK: f64 = 10.0;
+    let inks = pen.inks;
+    let cells: Vec<HeldCells> = shown.iter().map(HeldCells::of).collect();
+    let size_w = widest(pen, cells.iter().map(|c| c.size.as_str()));
+    let kind_w = widest(pen, cells.iter().map(|c| c.kind));
+    let session_w = widest(pen, cells.iter().map(|c| c.session.as_str()));
+    let class_w = widest(pen, cells.iter().map(|c| c.class_word));
+    let briefs: Vec<String> = cells
+        .iter()
+        .filter_map(|c| c.next.map(held::Next::brief))
+        .collect();
+    let brief_w = widest(pen, briefs.iter().map(String::as_str));
+    let short_w = widest(
+        pen,
+        cells.iter().filter_map(|c| c.next.map(held::Next::short)),
+    );
+    let project_w =
+        widest(pen, cells.iter().map(|c| c.project.as_str())).min((p.w * 0.28).max(40.0));
+    // `next` is the next pass's column's width, 0 with no column.
+    let need = |next: f64, class: bool, kind: bool, words: bool| {
+        let column = |on: bool, w: f64| if on { BETWEEN + w } else { 0.0 };
+        LEAD + project_w
+            + column(kind, kind_w)
+            + BETWEEN
+            + MARK
+            + if words { session_w } else { 0.0 }
+            + column(class, class_w)
+            + BETWEEN
+            + size_w
+            + column(next > 0.0, next)
+    };
+    let (next_col, class, kind, words) = [
+        (brief_w, true, true, true),
+        (short_w, true, true, true),
+        (0.0, true, true, true),
+        (0.0, true, false, true),
+        (0.0, true, false, false),
+        (0.0, false, false, false),
+    ]
+    .into_iter()
+    .find(|&(next, class, kind, words)| need(next, class, kind, words) <= p.w + EPS)
+    .unwrap_or((0.0, false, false, false));
+    let next = next_col > 0.0;
+    // Where even the mark and the size leave too little, the project gives its room up.
+    let over = (need(next_col, class, kind, words) - p.w).max(0.0);
+    let project_w = (project_w - over).max(0.0);
+    let kind_x = p.x + LEAD + project_w + BETWEEN;
+    let mark_x = if kind {
+        kind_x + kind_w + BETWEEN
+    } else {
+        kind_x
+    };
+    let class_x = mark_x + MARK + if words { session_w } else { 0.0 } + BETWEEN;
+    let size_x = if class {
+        class_x + class_w + BETWEEN
+    } else {
+        class_x
+    };
+    let size_right = if next { size_x + size_w } else { p.x + p.w };
+    let next_x = size_right + BETWEEN;
+    let next_w = p.x + p.w - next_x;
+    for (i, cell) in cells.iter().enumerate() {
+        let base = p.y + ROW0_BASE + PITCH * i as f64;
+        if class && let Some(of) = cell.class {
+            class_swatch(pen, p.x, base, of);
+        }
+        let project = pen.cut(&cell.project, project_w, BODY_PT, false);
+        let ink = if cell.class.is_some() {
+            inks.words
+        } else {
+            inks.words2
+        };
+        pen.text(p.x + LEAD, base, &project, BODY_PT, false, ink);
+        if kind {
+            let s = pen.cut(cell.kind, kind_w, BODY_PT, false);
+            pen.text(kind_x, base, &s, BODY_PT, false, inks.words2);
+        }
+        let at_work = matches!(cell.mark, Some((true, _)));
+        if let Some((filled, mine)) = cell.mark {
+            // The front tab's session takes the tab's ink, as its chips do.
+            let tab = panes
+                .first()
+                .map(|&pane| chip_ink(pen, ProcScope::Tab(pane), panes));
+            let ink = match (filled, mine) {
+                (true, true) => tab.unwrap_or(inks.words),
+                (true, false) => inks.words,
+                (false, _) => inks.words2,
+            };
+            pen.dot(mark_x + 3.5, base - 3.4, 2.75, filled, ink);
+        }
+        if words {
+            let s = pen.cut(&cell.session, session_w, BODY_PT, false);
+            let ink = if at_work { inks.words } else { inks.words2 };
+            pen.text(mark_x + MARK, base, &s, BODY_PT, false, ink);
+        }
+        if class {
+            let s = pen.cut(cell.class_word, class_w, BODY_PT, false);
+            pen.text(class_x, base, &s, BODY_PT, false, inks.words2);
+        }
+        let size = pen.cut(&cell.size, p.w - LEAD, BODY_PT, false);
+        pen.text_end(size_right, base, &size, BODY_PT, false, inks.words);
+        if next && let Some(pass) = cell.next {
+            // The column holds the widest of the form it was sized by, so the last of these fits.
+            let forms = [pass.says(), pass.brief(), pass.short().to_owned()];
+            let s = fit_cut(pen.m, &forms, next_w.max(next_col), BODY_PT, false);
+            pen.text(next_x, base, &s, BODY_PT, false, inks.words2);
+        }
+    }
 }
 
 /// Where the space is (§7.4, §7.7).

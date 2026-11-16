@@ -1092,12 +1092,12 @@ pub(crate) struct TaskTarget<'a> {
     pub(crate) fact_since: Option<u64>,
 }
 
-/// One target of an `await task` ([`await_tasks`]): a live session's task ([`TaskTarget`]), or the
-/// row of a worker whose tab aterm closed once its task concluded ([`crate::retired_workers`]),
-/// which has its news at once: its end, `state=closed`, as a wait armed before the close reads it.
+/// One target of an `await task` ([`await_tasks`]): a live session's task ([`TaskTarget`]), or an
+/// ended session's row in the machine's session table ([`crate::session_table`]), which has its
+/// news at once: its end, `state=closed`, as a wait armed before the end reads it.
 pub(crate) enum Awaited<'a> {
     Live(TaskTarget<'a>),
-    Retired(String),
+    Ended(String),
 }
 
 /// `await task` on live sessions alone ([`await_tasks`]).
@@ -1111,7 +1111,7 @@ pub(crate) fn await_task(
     await_tasks(store, &awaited, combine, timeout_ms)
 }
 
-/// `await task`: park until the task records of `awaited` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner (one beside a standing ask too), never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), whose session closed, or a retired worker's row ([`Awaited::Retired`]), news from the start — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one. Rows answer in `awaited`'s order.
+/// `await task`: park until the task records of `awaited` have news — a target whose record's rev is past its `since` with a state to read (`done`, `exited`, `stalled`) or an ask raised under a task owner (one beside a standing ask too), never a `kind=wait` entry ([`crate::task_record::TaskRecord::has_news`]), a `facts=1` target whose fact word was noted past its fact edge (a clear is none), whose session closed, or an ended session's row ([`Awaited::Ended`]), news from the start — at the first such target (`any`) or once every target is one (`all`). A fact edit never moves `rev`, so a wait without `facts=1` never wakes on one. Rows answer in `awaited`'s order.
 pub(crate) fn await_tasks(
     store: &Store,
     awaited: &[Awaited<'_>],
@@ -1127,10 +1127,10 @@ pub(crate) fn await_tasks(
         .iter()
         .filter_map(|target| match target {
             Awaited::Live(target) => Some(*target),
-            Awaited::Retired(_) => None,
+            Awaited::Ended(_) => None,
         })
         .collect();
-    let retired = awaited.len() - targets.len();
+    let ended = awaited.len() - targets.len();
     let mut sub = crate::session_watch::Subscription::new();
     for target in &targets {
         let _ = sub.watch(&target.ctx.watchers);
@@ -1158,7 +1158,7 @@ pub(crate) fn await_tasks(
     let park = Park::new(&sub, &in_the_look, OnHangup::Abort, Stretch::None);
     let look = |_: Instant, _: bool, _: bool| {
         latch_task_news(store, &targets, &edges, &exits, &mut latched);
-        let with_news = retired + latched.iter().filter(|latch| latch.is_some()).count();
+        let with_news = ended + latched.iter().filter(|latch| latch.is_some()).count();
         let answered = match combine {
             Combine::Any => with_news > 0,
             Combine::All => with_news == awaited.len(),
@@ -1189,7 +1189,7 @@ pub(crate) fn await_tasks(
         // `live` holds one row per `Awaited::Live`, in order.
         let row = match target {
             Awaited::Live(_) => live.next().unwrap_or_default(),
-            Awaited::Retired(row) => row.clone(),
+            Awaited::Ended(row) => row.clone(),
         };
         out.push_str(&row);
         out.push('\n');
@@ -2182,7 +2182,22 @@ struct Park<'a> {
     exited: &'a dyn Fn() -> bool,
     on_hangup: OnHangup,
     stretch: Stretch<'a>,
+    /// How the park asks after its caller while it holds no arm of the hang-up bell.
     lane: crate::park::Lane,
+    /// How it asks while its own arm of [`Self::bell`] stands and the bell still serves it: the
+    /// bell rings `sub` when the caller hangs up, so one wait runs to the park's wake
+    /// ([`unsliced`]) and the woken loop asks [`super::caller_hung_up`] at its head.
+    #[cfg(unix)]
+    belled: crate::park::Lane,
+    /// The bell an aborting park arms on the connection its thread serves, for the park alone.
+    #[cfg(unix)]
+    bell: &'a aterm_uds::hangup::Bell,
+}
+
+/// One wait for the whole of what is left: a belled park's slice ([`Park::belled`]).
+#[cfg(unix)]
+const fn unsliced(left: std::time::Duration) -> std::time::Duration {
+    left
 }
 
 impl<'a> Park<'a> {
@@ -2198,6 +2213,13 @@ impl<'a> Park<'a> {
             on_hangup,
             stretch,
             lane: crate::park::Lane::SERVED,
+            #[cfg(unix)]
+            belled: crate::park::Lane {
+                slice: unsliced,
+                hung_up: super::caller_hung_up,
+            },
+            #[cfg(unix)]
+            bell: aterm_uds::hangup::Bell::process(),
         }
     }
 
@@ -2212,6 +2234,25 @@ impl<'a> Park<'a> {
             OnHangup::Abort => self.lane,
             OnHangup::Finish => self.lane.ignoring_hangup(),
         };
+        // An aborting park on a serving lane arms the bell on the connection the lane serves,
+        // for the park alone: a lane serves one connection after another, so nothing of the
+        // arm may outlive the park. It arms at its first wait, so a park its entry look answers
+        // never arms; a caller gone between the loop head's ask and the arm rings at the arm. A
+        // park the bell cannot arm keeps its lane's slices.
+        #[cfg(unix)]
+        let served = match self.on_hangup {
+            OnHangup::Abort => aterm_control::hangup::serving_fd(),
+            OnHangup::Finish => None,
+        }
+        .map(|fd| {
+            // SAFETY: ServingFd names the live connection this lane thread serves, whose stream
+            // a frame up this thread's stack owns until the scope that entered it ends; this
+            // park runs inside that scope, and the borrow, with the arm that holds it, ends
+            // with the park.
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+        });
+        #[cfg(unix)]
+        let mut armed: Option<Option<aterm_uds::hangup::Armed<'_>>> = None;
         let mut until = until;
         let mut parked_since: Option<Instant> = None;
         loop {
@@ -2256,6 +2297,22 @@ impl<'a> Park<'a> {
                 wake = wake.min(now + PARKED_POLL);
             }
             let flipped = || self.stretch.parked() != parked;
+            // A bell whose thread ended rang this arm as it ended: from the next wait on the
+            // park asks for itself again.
+            #[cfg(unix)]
+            let lane = if armed
+                .get_or_insert_with(|| {
+                    served
+                        .as_ref()
+                        .and_then(|fd| self.bell.arm(fd, self.sub.bell()).ok())
+                })
+                .as_ref()
+                .is_some_and(aterm_uds::hangup::Armed::ringing)
+            {
+                self.belled
+            } else {
+                lane
+            };
             let _ = crate::park::park(|bound| self.sub.wait(bound), wake, lane, &flipped);
         }
     }
@@ -5479,7 +5536,7 @@ fn meta_status(
     format!(
         "OK title={} user_title={} description={} icon={} role={} attention={} cwd={} state={state} \
          attention_owner={} attention_owners={} attention_kinds={} supervisor={} supervisor_proven={} \
-         questions={} agent_cwd={} trusted_cwd={} worker={} autopilot={} land_at={} \
+         {} questions={} agent_cwd={} trusted_cwd={} worker={} autopilot={} land_at={} \
          autopilot_by={} autopilot_since={}\n",
         pct_encode(&title),
         meta_value(meta.user_title.as_deref()),
@@ -5493,6 +5550,7 @@ fn meta_status(
         attention_kinds(&meta),
         meta_value(meta.live_supervisor(crate::metrics::now_us())),
         u8::from(meta.claim_proven(crate::metrics::now_us())),
+        crate::session_timeline::StreamState::meta_words(meta.stream.as_ref()),
         meta_value(meta.questions.as_deref()),
         meta_value(agent_cwd.as_deref()),
         meta_value(trusted_cwd.as_deref()),
@@ -6353,7 +6411,7 @@ pub(crate) fn cmd_raise(
     }
 }
 
-/// `exits [<n>] [since=<id>]` -> the instance's exit ledger, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|-> left=<n|->` line per session that left the registry — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater) over the closed-session index, whose slots are linked in the write that records the roster's `Exited` row, in its seq order (the row id); bounded by the index's last 512 closes. `left=` is what the leftover view's record of that close (`closed`, [`exits_closed`]) says the tab left running that `end` takes, and `-` where the view keeps no record of it.
+/// `exits [<n>] [since=<id>]` -> the machine's ended sessions, oldest-first, framed `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n|-> reason=<…> exit_code=<n|-> by=<sid|human|ctl|bridge|harness|fleet:…|-> left=<n|->` line per row of the machine's session table ([`crate::session_table`]), which outlives a quit — the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps rows with id strictly greater). `<id>` is the row's id (its end's unix µs), `t=` its end's wall ms, `local=` the local id it had where this process wrote the row and `-` where another did. `left=` is what the leftover view's record of that close (`closed`, [`exits_closed`]) says the tab left running that `end` takes, and `-` where the view keeps no record of it. `ERR session table loading` past the launch's load's wait.
 pub(crate) fn cmd_exits(
     store: &Store,
     rest: &str,
@@ -6363,10 +6421,18 @@ pub(crate) fn cmd_exits(
         Ok(page) => page,
         Err(usage) => return usage,
     };
-    let rows = {
-        let g = store.read().unwrap_or_else(|p| p.into_inner());
-        page.copy(g.closed_logs().exits_since(page.since.unwrap_or(0)))
+    let table = store.read().unwrap_or_else(|p| p.into_inner()).table();
+    let Ok(heads) = table.exits_since(page.since.unwrap_or(0)) else {
+        return "ERR session table loading\n".to_string();
     };
+    let rows: Vec<(crate::session_table::RowHead, Option<u64>)> = page
+        .copy(heads.iter())
+        .into_iter()
+        .map(|head| {
+            let local = table.local_here(&head);
+            (head, local)
+        })
+        .collect();
     exits_reply(&rows, closed)
 }
 
@@ -6381,19 +6447,20 @@ pub(crate) fn exits_closed() -> Vec<aterm_vitals::left::ClosedTab> {
 }
 
 fn exits_reply(
-    rows: &[crate::session_log::ClosedExit],
+    rows: &[(crate::session_table::RowHead, Option<u64>)],
     closed: &[aterm_vitals::left::ClosedTab],
 ) -> String {
     use std::fmt::Write as _;
     #[cfg(test)]
     crate::session_log::encode_probe();
     let mut out = format!("OK {}\n", rows.len());
-    for r in rows {
+    for (r, local) in rows {
         #[cfg(test)]
         crate::work_counts::ring_row_formatted();
         let exit_code = r
             .exit_code
             .map_or_else(|| "-".to_string(), |c| c.to_string());
+        let local = local.map_or_else(|| "-".to_string(), |l| l.to_string());
         let left = closed
             .iter()
             .rev()
@@ -6401,13 +6468,12 @@ fn exits_reply(
             .map_or_else(|| "-".to_string(), |t| t.left.to_string());
         let _ = writeln!(
             out,
-            "exit {} t={} sid={} local={} reason={} exit_code={exit_code} by={} left={left}",
-            r.seq,
-            r.t_ms,
+            "exit {} t={} sid={} local={local} reason={} exit_code={exit_code} by={} left={left}",
+            r.id,
+            r.ended_ms,
             r.sid.as_str(),
-            r.local_id,
-            r.reason.as_str(),
-            pct_encode(r.actor.as_wire()),
+            r.out.as_str(),
+            pct_encode(&r.by),
         );
     }
     out

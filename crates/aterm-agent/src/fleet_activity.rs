@@ -152,13 +152,8 @@ impl Watch {
 /// The book's files in `state` as they stand ([`BookSeen`]).
 fn book_seen(state: &Path) -> BookSeen {
     use aterm_net::fleet_member::{ISSUER_BOOK_FILE, PEERS_FILE};
-    [PEERS_FILE, ISSUER_BOOK_FILE].map(|file| {
-        let meta = std::fs::symlink_metadata(state.join(file)).ok()?;
-        Some((
-            aterm_uds::line_log::identity_of(&meta),
-            meta.modified().ok(),
-        ))
-    })
+    [PEERS_FILE, ISSUER_BOOK_FILE]
+        .map(|file| aterm_uds::line_log::identity_and_modified_at(&state.join(file)).ok())
 }
 
 /// The record of `state` read once at `now_ms`: its rows oldest first, named by the book, and

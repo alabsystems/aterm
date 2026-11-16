@@ -16,48 +16,66 @@ pub const MARK_ACTORS: usize = 16;
 /// The overflowed authors whose short counts are kept apart: past them, the shared pool.
 pub const MARK_OWED_AUTHORS: usize = 32;
 
-/// A bucket's full level, in thousandths of a token.
-const FULL: u32 = MARK_BURST * 1000;
-
-/// One author's tokens, in thousandths, as of a monotonic instant, and the
-/// marks it was short of since one last said so.
+/// A token bucket: tokens in thousandths as of a monotonic instant, with the burst it fills to and
+/// how long one token takes to come back, and the spends it was short of since one last said so.
+/// The mark limiter's are [`Bucket::full`]; a stream's budget is [`Bucket::new`] with its own two
+/// numbers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Bucket {
+pub struct Bucket {
     milli: u32,
     at_mono_ms: u64,
     short: u64,
+    /// The full level, in thousandths of a token.
+    full: u32,
+    /// How long one token takes to come back, at least 1 ms.
+    refill_ms: u64,
 }
 
 impl Bucket {
-    const fn full(now: u64) -> Bucket {
+    /// A full bucket of `burst` tokens at `now`, one of which comes back every `refill_ms`
+    /// (read as 1 when 0).
+    #[must_use]
+    pub const fn new(burst: u32, refill_ms: u64, now: u64) -> Bucket {
+        let full = burst.saturating_mul(1000);
         Bucket {
-            milli: FULL,
+            milli: full,
             at_mono_ms: now,
             short: 0,
+            full,
+            refill_ms: if refill_ms == 0 { 1 } else { refill_ms },
         }
+    }
+
+    /// The mark limiter's bucket: [`MARK_BURST`] tokens, one back every [`MARK_REFILL_MS`].
+    const fn full(now: u64) -> Bucket {
+        Bucket::new(MARK_BURST, MARK_REFILL_MS, now)
     }
 
     /// Refill to `now` (a clock that went back refills nothing).
     fn refill(&mut self, now: u64) {
         let elapsed = now.saturating_sub(self.at_mono_ms);
-        let gained = elapsed.saturating_mul(1000) / MARK_REFILL_MS;
+        let gained = elapsed.saturating_mul(1000) / self.refill_ms;
         let level = u64::from(self.milli).saturating_add(gained);
-        self.milli = u32::try_from(level.min(u64::from(FULL))).unwrap_or(FULL);
+        self.milli = u32::try_from(level.min(u64::from(self.full))).unwrap_or(self.full);
         self.at_mono_ms = self.at_mono_ms.max(now);
     }
 
     /// `Err(retry_ms)` while short of one token.
-    fn peek(&mut self, now: u64) -> Result<(), u64> {
+    ///
+    /// # Errors
+    /// The milliseconds until one token is back, at least 1.
+    pub fn peek(&mut self, now: u64) -> Result<(), u64> {
         self.refill(now);
         if self.milli >= 1000 {
             Ok(())
         } else {
             let short = u64::from(1000 - self.milli);
-            Err((short * MARK_REFILL_MS).div_ceil(1000).max(1))
+            Err((short * self.refill_ms).div_ceil(1000).max(1))
         }
     }
 
-    fn spend(&mut self, now: u64) {
+    /// Take one token (none is left below zero).
+    pub fn spend(&mut self, now: u64) {
         self.refill(now);
         self.milli = self.milli.saturating_sub(1000);
     }
@@ -65,7 +83,7 @@ impl Bucket {
     /// Full and so free to give to another session.
     fn idle(&mut self, now: u64) -> bool {
         self.refill(now);
-        self.milli >= FULL
+        self.milli >= self.full
     }
 }
 

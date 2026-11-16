@@ -14,8 +14,13 @@ pub struct FirstPartyVendored {
     pub dir: &'static str,
     /// The upstream repository this tree comes from. Names the repository,
     /// never a commit; any pin is read from the tree (`[OB-1]` prints a
-    /// submodule's gitlink).
+    /// submodule's gitlink, or the tag and tree a [`Self::pin`] names).
     pub upstream: &'static str,
+    /// The repo-relative pin file, `<dir>.pin`, when the directory is a copy of one upstream
+    /// tag held to its git tree id: the `tag=`/`tree=` lines the upstream's `tools/pin` writes.
+    /// `[OB-1]` and every `aterm-verify` run hold the index's copy to that tree
+    /// ([`crate::tree_pins`]). `None` for a directory pinned some other way or not at all.
+    pub pin: Option<&'static str>,
     /// Why it is aterm's own code rather than a redistribution, and why it is under `vendor/` at
     /// all.
     pub why: &'static str,
@@ -26,6 +31,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
     FirstPartyVendored {
         dir: "vendor/astream",
         upstream: "github.com/alabsystems/astream, a git submodule pinned by this tree's gitlink",
+        pin: None,
         why: "Same owner as github.com/alabsystems/aterm — the same account, not a similar \
           name — so this is aterm's own code, not a redistribution. It is under vendor/ for a \
           BUILD reason: crates/aterm-link path-depended on a sibling checkout most clones do \
@@ -42,8 +48,33 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
           the ratchet.",
     },
     FirstPartyVendored {
+        dir: "vendor/alab-harness",
+        upstream: "github.com/alabsystems/alab-harness, a copy of one release tag",
+        pin: Some("vendor/alab-harness.pin"),
+        why: "Same owner as github.com/alabsystems/aterm — Andrew Yates's own repository, not \
+          a similar name — so this is aterm's own code, not a redistribution. alab-harness holds \
+          the one copy of alab-policy, the turn-end deciders aterm's supervisor and every ALab \
+          harness share: aterm, aterm-agent, aterm-gui, aterm-lab, aterm-phase, aterm-slog and \
+          aterm-types link it by path, and claude-code-alab receives this copy through `verify \
+          vendor-out`. The directory is the whole tree of one alab-harness release tag, copied \
+          by alab-harness's tools/pin and held to that tag's git tree id in \
+          vendor/alab-harness.pin, which [OB-1], aterm-verify before any check runs and verify \
+          vendor-out before it reads the copy check; alab-harness's \
+          tools/check-pin also asks whether the tag is that tree upstream. It changes only \
+          there: edit alab-harness, tag a release, repin (vendor/README-alab-harness.md); \
+          nothing is edited or built inside it. Not a git submodule, unlike vendor/astream: \
+          alab-harness is private and has no remote every clone of aterm reaches, and a plain \
+          copy keeps public clones and hermetic releases complete. It is its own workspace, \
+          excluded in the root manifest, so its lints and clippy.toml (the purity check: no \
+          file, process, environment, network or clock access) govern it rather than aterm's \
+          census. alab-policy has no dependencies, so it adds no third-party package; alab-wire, \
+          the harness wire aterm-gui links under cfg(unix) for the record stream, depends only \
+          on libc.",
+    },
+    FirstPartyVendored {
         dir: "vendor/trust-build-cpu",
         upstream: "Trust crates/trust-build-cpu; the manifest records its exact source commit",
+        pin: None,
         why: "Original Andrew Yates code shared with the Trust compiler. Its Rust sources and \
           README are byte-identical to the recorded Trust commit; vendor/README-trust-build-cpu.md \
           records their hashes and the retained licences. The standalone manifest materializes \
@@ -55,6 +86,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
         dir: "vendor/trust-jobserver-utils",
         upstream: "Trust src/jobserver_utils at 263e40c542b1; the manifest's \
           [package.metadata.aterm-origin] records the commit and path",
+        pin: None,
         why: "Original Andrew Yates code: Trust's own scheduling descriptor handoff, added to \
           Trust on 2026-10-24, which depends on the registry `jobserver` crate rather than \
           copying it. Runtime and test sources are unchanged from the recorded commit \
@@ -67,6 +99,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
         dir: "vendor/trust-exec-policy",
         upstream: "Trust crates/trust-exec-policy at cae6f4b58466; the manifest's \
           [package.metadata.aterm-vendor] records the full commit and path",
+        pin: None,
         why: "Original Andrew Yates code: the maintained native final-exec policy leaf. \
           Its Rust sources, README, lockfile and retained licences are exact upstream \
           (vendor/trust-exec-policy/README.aterm.md); the standalone manifest only adds \
@@ -77,6 +110,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
         dir: "vendor/trust-resource-controller",
         upstream: "Trust crates/trust-resource-controller at 5db4b0acbd29; the manifest's \
           [package.metadata.aterm-vendor] records the repository and commit",
+        pin: None,
         why: "Original Andrew Yates code shared with the Trust compiler: the private native \
           resource member proxy codec. Its Rust source is exact upstream; the manifest only \
           redirects libc to aterm-libc (vendor/trust-resource-controller/README.aterm.md). A \
@@ -87,6 +121,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
         dir: "vendor/trust-resource-provenance",
         upstream: "Trust crates/trust-resource-provenance at 1f4f39cd0f69; the manifest's \
           [package.metadata.aterm-vendor] records the repository and commit",
+        pin: None,
         why: "Original Andrew Yates code shared with the Trust compiler: read-only native \
           provenance for retained resource custodians. Its Rust sources, README and licences \
           are exact upstream bytes, whose SHA-256 values \
@@ -99,6 +134,7 @@ pub const FIRST_PARTY_VENDORED: &[FirstPartyVendored] = &[
         dir: "vendor/trust-sha2",
         upstream: "Trust crates/trust-sha2 at 21a4afd96990; the manifest's \
           [package.metadata.aterm-origin] records the commit and path",
+        pin: None,
         why: "Original Andrew Yates code: Trust's own SHA-2 family, transcribed from FIPS PUB \
           180-4, with no dependencies. vendor/trust-build-cpu's manifest points its hash \
           dependency here (vendor/README-trust-build-cpu.md). A path dependency keeps hermetic \

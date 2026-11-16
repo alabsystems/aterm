@@ -107,7 +107,10 @@ fn template(log_backed: bool) -> Template {
     };
     if log_backed {
         client::seed_vault_genesis(&lab.paths[0], &lab._home.path().join("genesis.v2")).unwrap();
-        let records = client::load_records(&lab.paths[0]).unwrap().encode();
+        let records = client::load_records(&lab.paths[0])
+            .unwrap()
+            .read_encoded()
+            .unwrap();
         client::save_records(&lab.paths[1], &records).unwrap();
     }
     for n in 0..2 {
@@ -165,7 +168,10 @@ fn fixture(template: &Template, mode: i64) -> Fixture {
         1 => lab.rotate(&[Role::Writer, Role::Reader]),
         2 => {
             client::remove_member_in_log(&lab.paths[0], actors[1]).unwrap();
-            let records = client::load_records(&lab.paths[0]).unwrap().encode();
+            let records = client::load_records(&lab.paths[0])
+                .unwrap()
+                .read_encoded()
+                .unwrap();
             client::save_records(&lab.paths[1], &records).unwrap();
         }
         3..=6 => cutoff(

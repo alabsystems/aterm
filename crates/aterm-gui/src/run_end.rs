@@ -148,7 +148,44 @@ impl App {
     /// none, it is all of it but what this process's records keep
     /// (`task_launch::RestoredTasks::sweep`): the run's end has settled the take, which removes
     /// the taken layout, and retired this run's crash journal, so no file names those IDs again.
+    ///
+    /// First, EVERY SESSION THE QUIT ENDS FOR GOOD LEAVES A ROW (tracker ST-15): of the rows its
+    /// closes noted ([`crate::task_launch::QuitClosed::note_row`]), each of a session `published`
+    /// does not name, that no live predecessor still holds, goes to the machine's session table,
+    /// which then brings its rows to disk, waiting at most `session_table::FLUSH_WAIT`
+    /// (`session_table::SessionTable::flush`); a row still unwritten then is lost with the
+    /// process, and stderr says so. A session the layout brings back goes on, and keeps none. A
+    /// candidate before its Commit writes none: its predecessor holds every session. The sweeps
+    /// wait at most `session_table::LOAD_WAIT` for the table's load: before it every result is
+    /// held, and these sweeps are the last of those IDs.
     fn retire_tasks_at_quit(&mut self, published: Option<&crate::restore::RestoreManifest>) {
+        let parked = self.pool.predecessors_sessions();
+        let rows = self.quit_closed_tasks.take_rows();
+        let table = self.store.read().unwrap_or_else(|p| p.into_inner()).table();
+        if !self.incoming_handoff_pending {
+            let brought_back = published
+                .map(crate::task_launch::layout_sids)
+                .unwrap_or_default();
+            for row in rows {
+                if !brought_back.contains(&row.sid) && !parked.contains(&row.sid) {
+                    table.write(row);
+                }
+            }
+            if !table.flush() {
+                crate::logging::stderr_line!(
+                    "aterm-gui: the session table's rows did not all reach disk (a write failed, or \
+                     {} ms passed); the rows left are lost with the process",
+                    crate::session_table::FLUSH_WAIT.as_millis()
+                );
+            }
+        }
+        if !table.loaded_within(crate::session_table::LOAD_WAIT) {
+            crate::logging::stderr_line!(
+                "aterm-gui: the session table did not load within {} ms; the quit's sweep keeps \
+                 every result",
+                crate::session_table::LOAD_WAIT.as_millis()
+            );
+        }
         if !self.handoff_successor
             && let Some(drain) = self.restore_drain.as_deref()
         {
@@ -160,7 +197,6 @@ impl App {
         let restored = published
             .map(crate::task_launch::restored_results)
             .unwrap_or_default();
-        let parked = self.pool.predecessors_sessions();
         let closed = std::mem::take(&mut self.quit_closed_tasks);
         crate::task_launch::retire_task_files_at_quit(&self.store, &parked, &closed, &restored);
     }
@@ -227,6 +263,9 @@ impl App {
         // the watchdog's rest at `about_to_wait`'s park awake, so the teardown is judged at
         // `ShutdownWait` from its first step.
         crate::watchdog::beat(crate::watchdog::Breadcrumb::ShutdownWait);
+        // A survey taken once this window is gone reads it as having run until now: written first,
+        // one write with no wait, so a logout's kill during the bounded waits below still finds it.
+        crate::window_presence::quit();
         #[cfg(unix)]
         crate::fleet_listen::node_serve::window_stops_applying();
         #[cfg(all(unix, not(test)))]
@@ -271,7 +310,6 @@ impl App {
         self.settle_quit_desk_and_tasks(Self::write_quit_desk, |app, desk| {
             app.end_desk_and_sessions(desk.wrote, end.root_sid, &carried);
         });
-        self.forget_retired_workers_at_quit();
         crate::crash_signal::remove_marker_on_clean_exit();
         let input_replies = crate::control::input_replies_of(&self.store);
         if !crate::control::settle_final_replies(

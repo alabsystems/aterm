@@ -53,6 +53,7 @@
 use super::*;
 use crate::client::log_entries_tests::home_content::{Content, Known};
 use crate::commons::binding::Request;
+use crate::membership_log::encode_records;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 

@@ -545,7 +545,7 @@ impl Dispatcher {
     }
 
     /// How many looks this dispatch began ([`Self::begin_look`]).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))] // read by the macOS-only admission bench's tests
     pub(crate) const fn looks(&self) -> u64 {
         self.looks
     }

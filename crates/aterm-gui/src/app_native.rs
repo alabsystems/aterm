@@ -3992,7 +3992,7 @@ impl App {
         if !outcome.effects.iter().any(|effect| {
             matches!(
                 effect,
-                AppEffect::RepaintSelf(_) | AppEffect::RepaintInstance(_)
+                AppEffect::RepaintSelf(_) | AppEffect::RepaintInstance(_) | AppEffect::Unchanged
             )
         }) {
             self.invalidate_native_view_cache(wid, view, DamageRegion::All);
@@ -4004,6 +4004,8 @@ impl App {
             self.drain_system_state_actions();
         } else if kind == crate::native_app::AppKind::Workers {
             self.drain_workers_actions(wid, instance);
+        } else if kind == crate::native_app::AppKind::Navigator {
+            self.drain_navigator_actions(wid, instance);
         } else if kind == crate::native_app::AppKind::Settings {
             self.take_settings_pane_dialog(view);
         }
@@ -4312,6 +4314,10 @@ impl App {
             .app(instance)
             .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings);
         let markdown_active = workspace_reader_active;
+        let navigator_active = self
+            .native_runtime
+            .app(instance)
+            .is_some_and(|app| app.kind() == crate::native_app::AppKind::Navigator);
         let tables_active = self
             .native_runtime
             .app(instance)
@@ -4321,7 +4327,9 @@ impl App {
             || self.native_runtime.app(instance).is_some_and(|app| {
                 matches!(
                     app.kind(),
-                    crate::native_app::AppKind::Workers | crate::native_app::AppKind::Tables
+                    crate::native_app::AppKind::Workers
+                        | crate::native_app::AppKind::Tables
+                        | crate::native_app::AppKind::Navigator
                 )
             });
         // System State, like Settings, is a scrolling list with text fields: a
@@ -4334,6 +4342,7 @@ impl App {
                     crate::native_app::AppKind::SystemState
                         | crate::native_app::AppKind::Mail
                         | crate::native_app::AppKind::Tables
+                        | crate::native_app::AppKind::Navigator
                 )
             });
         let config_completion_page =
@@ -4636,6 +4645,21 @@ impl App {
                 {
                     Some(AppEvent::Action(crate::native_app::ActionInvocation {
                         id: crate::native_ui::ActionId::new("settings/search"),
+                        value: None,
+                    }))
+                } else if navigator_active
+                    && command
+                    && !extend
+                    && matches!(key, Key::Character('[' | ']'))
+                {
+                    // Step In and Step Out, as a browser's forward and back.
+                    let step = if matches!(key, Key::Character(']')) {
+                        crate::navigator::STEP_IN
+                    } else {
+                        crate::navigator::STEP_OUT
+                    };
+                    Some(AppEvent::Action(crate::native_app::ActionInvocation {
+                        id: crate::native_ui::ActionId::new(step),
                         value: None,
                     }))
                 } else if tables_active
@@ -5445,6 +5469,7 @@ impl App {
             AppEffect::RepaintSelf(damage) => {
                 self.repaint_native_view(wid, view, damage);
             }
+            AppEffect::Unchanged => {}
             AppEffect::RepaintInstance(damage) => {
                 self.repaint_native_instance(instance, damage);
             }

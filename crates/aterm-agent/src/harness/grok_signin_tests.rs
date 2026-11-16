@@ -2081,7 +2081,7 @@ fn a_stop_for_a_person_goes_on_to_the_need_with_the_same_code() {
     }
 }
 
-/// Cloudflare's bot check that did not clear ends the sign-in `bot-check` with no need: nobody
+/// Cloudflare's bot check ends the sign-in `bot-check` with no need: nobody
 /// is asked to pass it (design R-13), nothing is placed, and the ledger names it, with the
 /// person not asked. CONTROL: a stop for a person on the same gate raises the one need
 /// ([`a_stop_for_a_person_goes_on_to_the_need_with_the_same_code`]).
@@ -2094,8 +2094,8 @@ fn a_bot_check_ends_the_sign_in_on_record_and_asks_nobody() {
     let bed = Bed::new("sign");
     let seen = Seen::default();
     let mut owner = Counted::new(&seen, Some(bed.root().join("approve")));
-    let said = "Cloudflare's bot check on `accounts.x.ai/sign-in` did not clear in 90 s; aterm \
-                never tries to pass it";
+    let said = "the sign-in page `accounts.x.ai/sign-in` carries Cloudflare's bot check; aterm \
+                pressed nothing there and never tries to pass it";
     let mut rung = Rung::ready(
         bed.root(),
         "grok-one@example.com",
@@ -2113,7 +2113,10 @@ fn a_bot_check_ends_the_sign_in_on_record_and_asks_nobody() {
     assert!(!bed.login().exists(), "nothing is placed");
     assert!(
         ledger[0].starts_with("accounts.x.ai device bot-check; ")
-            && ledger[0].contains("headless(bot check: Cloudflare")
+            && ledger[0].contains(
+                "headless(bot check: the sign-in page `accounts.x.ai/sign-in` carries \
+                 Cloudflare's bot check"
+            )
             && ledger[0].ends_with("person(not asked)"),
         "{ledger:?}"
     );

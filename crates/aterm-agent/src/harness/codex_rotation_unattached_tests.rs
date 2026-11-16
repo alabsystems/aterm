@@ -90,7 +90,7 @@ fn ended(
     let proposal = {
         let mut session = weekly_session(&world);
         session.sid = "s-one";
-        codex_rotation::prepare(
+        codex_rotation::prepare_once(
             &world.seat(),
             &session,
             &source,

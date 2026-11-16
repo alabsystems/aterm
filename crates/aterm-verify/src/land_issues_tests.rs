@@ -1008,7 +1008,7 @@ fn resume_handed(world: &World, handoff: Handoff) -> (i32, Vec<String>, Vec<Stri
             autofix: &mut |_: &Path, _: &[String]| Ok(()),
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );

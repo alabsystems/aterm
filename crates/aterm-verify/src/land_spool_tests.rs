@@ -5,6 +5,47 @@ use super::*;
 use crate::checks::Check;
 use crate::land_record::tests::{BASE, DAY, NOW, T, record, signer};
 
+#[test]
+fn interrupted_spool_cleanup_keeps_the_unpublished_record_visible() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let spool = Dir::at(tmp.path().join("spool"));
+    let me = signer(7);
+    let mut record = record(Check::Fmt, Word::Ok, T, BASE, NOW);
+    let appended = record.sign(Some(&me)).unwrap();
+    record.run.id = "newer".into();
+    let newer = record.sign(Some(&me)).unwrap();
+    spool.put(&newer).unwrap();
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let excluded = AtomicBool::new(false);
+    let stopped = std::panic::catch_unwind(|| {
+        spool.done_with(&appended, |_| {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(spool.path().join(LOCK))
+                .unwrap();
+            excluded.store(
+                matches!(
+                    aterm_toolchain::record_lock::RecordLock::try_lock(file, 0),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ),
+                Ordering::Relaxed,
+            );
+            panic!("cleanup stopped before comparison")
+        })
+    });
+    assert!(stopped.is_err());
+    assert!(
+        excluded.load(Ordering::Relaxed),
+        "another writer cannot enter during comparison"
+    );
+    assert_eq!(spool.pending().unwrap().records, [newer.clone()]);
+    spool.done(&appended).unwrap();
+    assert_eq!(spool.pending().unwrap().records, [newer.clone()]);
+    spool.done(&newer).unwrap();
+    assert_eq!(spool.pending().unwrap(), Pending::default());
+}
+
 /// A spooled record reads back byte for byte at its journal path until `done` forgets it, in name
 /// order; a FAIL put again at its path keeps its first record while a pass takes the newer one;
 /// a file no record's name spells (an atomic write's temporary, a stray) is no record; a put
@@ -234,12 +275,18 @@ fn done_forgets_a_record_only_while_its_path_holds_its_bytes() {
     };
     assert_eq!(unread, &file);
     assert!(!why.is_empty());
+    assert!(spool.done(&big).is_err());
+    assert_eq!(spool.pending().unwrap(), pending);
     let mut names: Vec<String> = std::fs::read_dir(spool.path())
         .unwrap()
         .map(|item| item.unwrap().file_name().into_string().unwrap())
         .collect();
     names.sort();
-    let mut want = vec![file_of(&fail.path).unwrap(), file_of(&big.path).unwrap()];
+    let mut want = vec![
+        LOCK.to_owned(),
+        file_of(&fail.path).unwrap(),
+        file_of(&big.path).unwrap(),
+    ];
     want.sort();
-    assert_eq!(names, want, "no claim is left behind");
+    assert_eq!(names, want, "only records and the stable lock remain");
 }

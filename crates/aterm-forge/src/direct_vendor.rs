@@ -21,7 +21,8 @@ const ROLLBACK_TRAILER: &str = "astream-pin-rollback:";
 const CRATE_PREFIX: &str = "astream-";
 const CONSUMER: &str = "crates/aterm-link/Cargo.toml";
 const CONSUMER_DEPS: [&str; 2] = ["astream-broker", "astream-cap"];
-const REPO_ENV: [&str; 6] = [
+/// The variables that redirect git away from the repository at its working directory.
+pub(crate) const REPO_ENV: [&str; 6] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
     "GIT_INDEX_FILE",

@@ -3,6 +3,7 @@
 
 //! Clone missing GitHub repositories into `~` and fast-forward clean worktrees that are behind.
 
+use super::checkout_inputs::{PassWrites, Wrote};
 use crate::checkout::{AcquisitionFailure, Origin, Stands, git, github_origin as origin_matches};
 use crate::github_pages::Page;
 use crate::model::{Probe, User};
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PAGE_SIZE: usize = 30;
-const CLONE_BUDGET: Duration = Duration::from_secs(1800);
 
 /// What every clone's staging directory in a home is named after (`Scratch::new_in`'s prefix
 /// for the label `github-clone`).
@@ -29,6 +29,26 @@ const OWNER: &str = ".owner";
 
 /// The name [`OWNER`] is locked under before it is renamed into place.
 const MARKING: &str = ".owner.new";
+
+/// What a clone's staging holds while its one fetch runs ([`clone_advertised`]): a refspec for
+/// each reference GitHub advertised, which the fetch reads on its standard input.
+const ADVERTISED: &str = ".advertised";
+
+/// Where `git clone` puts origin's branches, the one fetch refspec a clone configures for origin.
+const ORIGIN_FETCH: &str = "+refs/heads/*:refs/remotes/origin/*";
+
+/// The arguments of a clone's one fetch ([`fetch_command`]), before the URL: the advertised
+/// objects named on standard input, and nothing else (no tag that follows them, no submodule, no
+/// `FETCH_HEAD`), with progress for [`System::run_repository`] to read.
+const FETCH_ADVERTISED: [&str; 7] = [
+    "fetch",
+    "--stdin",
+    "--progress",
+    "--no-recurse-submodules",
+    "--no-tags",
+    "--no-write-fetch-head",
+    "--",
+];
 
 const NAMED: usize = 4;
 
@@ -46,6 +66,22 @@ pub(super) struct Partition {
     pub(super) notes: Vec<String>,
     /// Dependencies whose local inspection waits for a capable Git, without touching them.
     pub(super) git_waits: Vec<String>,
+}
+
+impl Partition {
+    /// How many repositories stand in each class: the one count the acquisition row,
+    /// `sync.clone` and System State give ([`crate::init_observe::RepositoryCounts::summary`]).
+    /// Each listed repository is in exactly one class, so the classes add up to the listing.
+    pub(super) fn counts(&self) -> crate::init_observe::RepositoryCounts {
+        crate::init_observe::RepositoryCounts {
+            ready: self.present.len(),
+            unborn: self.unborn.len(),
+            dependencies: self.dependencies.len(),
+            missing: self.missing.len(),
+            preserved: self.notes.len(),
+            git_waits: self.git_waits.len(),
+        }
+    }
 }
 
 /// A complete empty advertisement, bound to this pass's unchanged physical checkout.
@@ -241,7 +277,7 @@ fn standing(sys: &dyn System, user: &User, repo: &Repo, empty: &[EmptyCheckout])
         Err(error) if error.kind() == io::ErrorKind::NotFound => Standing::Missing,
         Ok(stat) if stat.dir && !stat.symlink => {
             match verify_existing_head(sys, user, &repo.owner, repo, &path) {
-                Ok(head) => match unborn_from(sys, user, &path, &head) {
+                Ok(facts) => match facts.unborn() {
                     Ok(Some(_))
                         if !empty
                             .iter()
@@ -269,24 +305,6 @@ fn standing(sys: &dyn System, user: &User, repo: &Repo, empty: &[EmptyCheckout])
             repo.name
         )),
         Err(_) => Standing::Note(format!("cannot inspect ~/{}; left untouched", repo.name)),
-    }
-}
-
-/// Whether the checkout at `path` is unborn ([`crate::checkout::unborn`]), given `head`, the HEAD
-/// read [`verify_existing_head`] judged it by. A read that found the commit says it is not, so
-/// that read is not made again. A read that found none is: everything [`crate::checkout::unborn`]
-/// decides is then read as it always was, so a commit made since the first read is seen here,
-/// not taken for an unborn branch whose ref exists.
-fn unborn_from(
-    sys: &dyn System,
-    user: &User,
-    path: &Path,
-    head: &Ran,
-) -> Result<Option<String>, String> {
-    if head.success() {
-        crate::checkout::unborn_after(sys, user, path, head)
-    } else {
-        crate::checkout::unborn(sys, user, path)
     }
 }
 
@@ -473,13 +491,15 @@ pub(super) struct Refreshed {
 /// private inventory. Cached refs establish eligibility, never remote freshness.
 /// Every preservation decision precedes a remote read; Git's existing guarded
 /// alignment owns the fetch and fast-forward. Up to [`LANES`] independent stores
-/// run together; unknown or shared storage keeps the serial path.
+/// run together; unknown or shared storage keeps the serial path. With `writes`, each
+/// alignment is recorded as the pass's own write ([`PassWrites::around`]).
 pub(super) fn refresh_existing(
     sys: &dyn System,
     user: &User,
     standing: &Partition,
     recorded: &BTreeSet<PathBuf>,
     current: &(dyn Fn() -> Result<(), String> + Sync),
+    writes: Option<&PassWrites>,
 ) -> Result<Refreshed, String> {
     struct Job<'a> {
         index: usize,
@@ -583,7 +603,7 @@ pub(super) fn refresh_existing(
                         }
                         checked
                     };
-                    let result = refresh_one(sys, user, job.repo, job.path, &admitted);
+                    let result = refresh_one(sys, user, job.repo, job.path, &admitted, writes);
                     if result.as_ref().is_err_and(|unread| unread.offline) {
                         batch
                             .lock()
@@ -645,6 +665,7 @@ fn refresh_one(
     repo: &Repo,
     path: &Path,
     current: &(dyn Fn() -> Result<(), String> + Sync),
+    writes: Option<&PassWrites>,
 ) -> Result<Option<Stands>, crate::checkout::Unread> {
     current()?;
     // Linked worktrees and foreign/linked object storage are preserved, as
@@ -663,7 +684,8 @@ fn refresh_one(
         return Ok(None);
     }
     let origin = repo.origin();
-    let branch = match crate::checkout::read_fetched(sys, user, path, &origin) {
+    // No status here: align's own read runs it before it reaches origin.
+    let branch = match crate::checkout::stands_fetched(sys, user, path, &origin) {
         Ok(Stands::Kept(_)) | Err(crate::checkout::NotFetched::Unrecorded { .. }) => {
             return Ok(None);
         }
@@ -695,7 +717,17 @@ fn refresh_one(
         }
         Ok(())
     };
-    crate::checkout::align_guarded(sys, user, path, &origin, &admitted).map(Some)
+    let align = || {
+        (
+            crate::checkout::align_guarded(sys, user, path, &origin, &admitted),
+            Wrote::Own,
+        )
+    };
+    let aligned = match writes {
+        Some(writes) => writes.around(sys, path, align),
+        None => align().0,
+    };
+    aligned.map(Some)
 }
 
 /// Admit the account's destination without requiring a tool for an empty selection.
@@ -997,39 +1029,19 @@ fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result
 }
 
 /// Whether the repository at `path` borrows objects from another store: its
-/// `objects/info/alternates` is there, or what is at that path cannot be read. The path git
-/// computes reads no object, so no lazy fetch can start: the read runs on every git, with no
+/// `objects/info/alternates` is there, or what is at that path cannot be read. Where that file
+/// is comes from the checkout's record of facts ([`crate::checkout::Facts::alternates`]), whose
+/// reads name no object, so no lazy fetch can start: they run on every git, with no
 /// `--no-lazy-fetch`, which a git before 2.45 refuses.
 ///
 /// # Errors
-/// git could not name the path.
+/// The checkout's facts could not be read.
 pub(super) fn alternate_store(sys: &dyn System, user: &User, path: &Path) -> Result<bool, String> {
-    let alternates = git_read(
-        sys,
-        user,
-        path,
-        &["rev-parse", "--git-path", "objects/info/alternates"],
-    )?;
-    let alternates = Path::new(alternates.trim());
-    let alternates = if alternates.is_absolute() {
-        alternates.to_owned()
-    } else {
-        path.join(alternates)
-    };
-    Ok(!matches!(sys.stat(&alternates), Err(error) if error.kind() == io::ErrorKind::NotFound))
+    let facts = crate::checkout::Facts::of(sys, user, path)?;
+    Ok(
+        !matches!(sys.stat(facts.alternates()), Err(error) if error.kind() == io::ErrorKind::NotFound),
+    )
 }
-
-/// What one run of git tells of a worktree: `true`, the path below the top level (an empty line
-/// at it), the top level, and where its index is (relative to the worktree for its own `.git`,
-/// else absolute, as a linked worktree's or a submodule's is).
-pub(super) const WORKTREE_READ: [&str; 6] = [
-    "rev-parse",
-    "--is-inside-work-tree",
-    "--show-prefix",
-    "--show-toplevel",
-    "--git-path",
-    "index",
-];
 
 /// The checkout at `path` is `owner`'s `repo` at its one GitHub origin ([`at_origin`]), and a
 /// HEAD that names a commit it has comes with its index ([`written`]): what a pass may count
@@ -1047,18 +1059,20 @@ pub(super) fn verify_existing(
     verify_existing_head(sys, user, owner, repo, path).map(drop)
 }
 
-/// [`verify_existing`], returning the read of HEAD it judged ([`written`]): exit 0 with the
-/// commit or exit 1 with none, so a caller that goes on to ask whether the checkout is unborn
-/// ([`unborn_from`]) does not run a read that found the commit a second time.
-fn verify_existing_head(
+/// [`verify_existing`], returning the checkout's record of facts it judged ([`written`]), so a
+/// caller that goes on to ask whether the checkout is unborn
+/// ([`crate::checkout::Facts::unborn`]), or what a commit declares of a gitlink
+/// ([`crate::checkout::Facts::gitlink`]), reads the same record and runs no git for it.
+pub(super) fn verify_existing_head(
     sys: &dyn System,
     user: &User,
     owner: &str,
     repo: &Repo,
     path: &Path,
-) -> Result<Ran, String> {
-    let index = at_origin(sys, user, owner, repo, path)?;
-    written(sys, user, repo, path, &index)
+) -> Result<std::sync::Arc<crate::checkout::Facts>, String> {
+    let facts = at_origin(sys, user, owner, repo, path)?;
+    written(sys, repo, &facts)?;
+    Ok(facts)
 }
 
 /// The top-level worktree at `path` has `owner`'s `repo` as its one GitHub origin, whether or
@@ -1081,109 +1095,76 @@ fn unread(repo: &Repo) -> String {
     )
 }
 
-/// [`verify_origin`], returning where the worktree's index is.
+/// [`verify_origin`], returning the checkout's record of facts it judged
+/// ([`crate::checkout::Facts::of`]: the pass's record where its files stand as they were, else
+/// read again).
 fn at_origin(
     sys: &dyn System,
     user: &User,
     owner: &str,
     repo: &Repo,
     path: &Path,
-) -> Result<PathBuf, String> {
-    let read = git_read(sys, user, path, &WORKTREE_READ).map_err(|_| unread(repo))?;
-    let mut lines = read.split('\n');
-    if lines.next() != Some("true")
-        || lines.next().is_none_or(|prefix| !prefix.trim().is_empty())
-        || lines
-            .next()
-            .is_none_or(|top| !Path::new(top.trim()).is_absolute())
-    {
+) -> Result<std::sync::Arc<crate::checkout::Facts>, String> {
+    let facts = crate::checkout::Facts::of(sys, user, path).map_err(|_| unread(repo))?;
+    if !facts.top() {
         return Err(format!(
             "~/{} is not a top-level Git worktree; left untouched",
             repo.name
         ));
     }
-    let index = match lines.next().map(str::trim) {
-        Some(index) if !index.is_empty() => path.join(index),
-        _ => return Err(unread(repo)),
-    };
-    let origin = git_read(
-        sys,
-        user,
-        path,
-        &["config", "--get-all", "remote.origin.url"],
-    )
-    .map_err(|_| unread(repo))?;
-    let origins = origin.lines().collect::<Vec<_>>();
-    if origins.len() != 1 || !origin_matches(origins[0], owner, &repo.name) {
+    let origins = facts.values("remote.origin.url");
+    if origins.is_empty() {
+        return Err(unread(repo));
+    }
+    if origins.len() != 1 || !origin_matches(&origins[0], owner, &repo.name) {
         return Err(format!(
             "~/{} has a different or credential-bearing GitHub origin; left untouched",
             repo.name
         ));
     }
-    Ok(index)
+    Ok(facts)
 }
 
-/// Whether the worktree at `path`, whose index git keeps at `index`, wrote the files of the
-/// commit its HEAD names. git writes the index last, under its lock, so a `git clone` cut off
-/// (killed, a power loss) after it fetched and before it wrote the files leaves a commit and no
-/// index, lock or no lock; a finished clone with a commit always has one (an empty-tree
-/// commit's included, measured). The read is [`crate::checkout::head_commit`], which fetches
-/// nothing a partial clone lacks; a HEAD that names no commit here (exit 1) is not judged here
+/// Whether the worktree whose record of facts is `facts` wrote the files of the commit its HEAD
+/// names. git writes the index last, under its lock, so a `git clone` cut off (killed, a power
+/// loss) after it fetched and before it wrote the files leaves a commit and no index, lock or no
+/// lock; a finished clone with a commit always has one (an empty-tree commit's included,
+/// measured). The commit is the record's ([`crate::checkout::Facts::head_commit`], read with no
+/// fetch of what a partial clone lacks); a HEAD that names no commit here is not judged here
 /// ([`verify_existing`]). A deliberately shallow or partial checkout is finished: nothing here
-/// reads its history. A checkout that passes hands back the read it was judged by.
-fn written(
-    sys: &dyn System,
-    user: &User,
-    repo: &Repo,
-    path: &Path,
-    index: &Path,
-) -> Result<Ran, String> {
-    let head = sys
-        .run_complete_stdout(&crate::checkout::head_commit(sys, user, path))
-        .map_err(|_| unread(repo))?;
-    match head.status {
-        Some(0) => match sys.stat(index) {
-            Ok(_) => Ok(head),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!(
-                "~/{} has a commit and no index, as a clone cut off before it wrote its files \
-                 leaves it; left untouched",
-                repo.name
-            )),
-            Err(_) => Err(unread(repo)),
-        },
-        Some(1) => Ok(head),
-        _ => Err(unread(repo)),
+/// reads its history.
+fn written(sys: &dyn System, repo: &Repo, facts: &crate::checkout::Facts) -> Result<(), String> {
+    if facts.head_commit().is_none() {
+        return Ok(());
+    }
+    match sys.stat(facts.index()) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(format!(
+            "~/{} has a commit and no index, as a clone cut off before it wrote its files \
+             leaves it; left untouched",
+            repo.name
+        )),
+        Err(_) => Err(unread(repo)),
     }
 }
 
-/// The keys that make a repository a partial clone, one a read of an object it lacks fetches
-/// lazily: `extensions.partialclone`, and a promisor remote's `promisor` or
-/// `partialclonefilter`, whatever its name.
-const PARTIAL_KEYS: &str =
-    r"^(extensions\.partialclone|remote\..*\.(promisor|partialclonefilter))$";
-
-/// The listing [`verify_integrity`] runs: `git`, a command already in the repository, asked for
-/// [`PARTIAL_KEYS`] in the C locale, where git's regular expressions match bytes (under a UTF-8
-/// locale, the account's, `.` matches no byte that is not UTF-8, so a promisor remote named in
-/// such bytes would go unlisted while git still fetched through it).
-pub(super) fn partial_listing(git: Cmd) -> Cmd {
-    git.env("LC_ALL", "C")
-        .args(["config", "--get-regexp", PARTIAL_KEYS])
-}
-
+/// That the repository at `path` is neither shallow nor a partial clone, by its record of facts
+/// ([`crate::checkout::Facts::shallow`], [`crate::checkout::Facts::partial`]: the record's
+/// config listing names every key that makes a partial clone, in any bytes).
+///
+/// # Errors
+/// It is shallow or partial, or its facts could not be read.
 pub(super) fn verify_integrity(sys: &dyn System, user: &User, path: &Path) -> Result<(), String> {
-    if git_read(sys, user, path, &["rev-parse", "--is-shallow-repository"])?.trim() != "false" {
+    let facts = crate::checkout::Facts::of(sys, user, path)?;
+    if facts.shallow() {
         return Err("the new clone is shallow; not published".into());
     }
-    let partial = sys
-        .run_complete_stdout(&partial_listing(git(sys, user, Some(path))))
-        .map_err(|_| "cannot inspect partial-clone configuration")?;
-    if partial.status != Some(1) || !partial.stdout.is_empty() || !partial.stderr.is_empty() {
+    if facts.partial() {
         return Err(
             "the new clone has partial or unreadable clone configuration; not published".into(),
         );
     }
-    // The clone itself checked that every object it fetched is connected (git's
+    // The fetch that filled it checked that every object it took is connected (git's
     // `check_connected`), so no `fsck` reads the objects again.
     Ok(())
 }
@@ -1346,7 +1327,8 @@ pub(super) fn clone_one(
     .map_err(|why| why.to_string())
 }
 
-/// How many clones run at once ([`clone_all`]).
+/// How many acquisitions run at once ([`clone_all`]): clones and unfinished checkouts' first
+/// fetches alike, each a full-history download.
 const LANES: usize = 4;
 
 /// What [`clone_all`] did.
@@ -1357,7 +1339,8 @@ pub(super) struct Cloned {
     pub(super) cloned: Vec<Repo>,
     /// The ones it left for want of room ([`no_room`]), as [`short_of_room`] names them.
     pub(super) left: Vec<String>,
-    /// Why each clone that failed did, `~/<name>: <why>`, in list order.
+    /// Why each acquisition that failed did, `~/<name>: <why>`: the clones in list order, then
+    /// the unfinished checkouts in theirs.
     pub(super) failed: Vec<String>,
     pub(super) network_failed: bool,
     /// What each clone it published made of the hook installer it carries
@@ -1403,17 +1386,45 @@ const HOOK_INSTALLER_BUDGET: Duration = Duration::from_secs(300);
 /// The longest outcome line [`install_hooks`] keeps of what an installer printed.
 const HOOK_LINE: usize = 160;
 
-/// Clone `missing` into `~`, up to [`LANES`] at once. The disk is read once: each clone runs only
-/// while it fits beside the clones taken before it ([`no_room`]); the rest are left. A lane makes
-/// a clone's staging directory as it takes the clone, under the queue's lock: the directories are
+/// One acquisition of [`clone_all`]'s queue.
+enum Acquire<'a> {
+    /// A repository with nothing at its destination, cloned through its own staging.
+    Clone(&'a Repo, Progress),
+    /// A matching checkout without a commit, given its origin's first commit in place
+    /// ([`acquire_unborn`]).
+    Unborn(&'a (Repo, PathBuf)),
+}
+
+/// What one lane of [`clone_all`] ended with.
+enum Acquired<'a> {
+    Clone(
+        &'a Repo,
+        Result<(Placed, Option<EmptyCheckout>), AcquisitionFailure>,
+        bool,
+        Option<String>,
+    ),
+    Unborn(&'a Repo, Result<Vec<EmptyCheckout>, AcquisitionFailure>),
+}
+
+/// Clone `missing` into `~` and give each of `unborn`, a matching checkout without a commit, its
+/// origin's first commit ([`acquire_unborn`]; `recorded` names the checkouts `[develop]` keeps),
+/// up to [`LANES`] at once in one queue: each is a full-history download, and one slow transfer
+/// holds back no other. The clones go first. The disk is read once: each clone runs only while
+/// it fits beside the clones taken before it ([`no_room`]); the rest are left. A lane makes a
+/// clone's staging directory as it takes the clone, under the queue's lock: the directories are
 /// made in list order, and no more than [`LANES`] exist at once, so a pass cut short (a crash, a
-/// `kill -9`) leaves at most that many behind. One clone that fails leaves the others to finish;
-/// with `guard`, a vault snapshot that changed starts no further clone.
+/// `kill -9`) leaves at most that many behind. One acquisition that fails leaves the others to
+/// finish; with `guard`, a vault snapshot that changed starts no further one. With `writes`,
+/// each acquisition is recorded as the pass's own write ([`PassWrites::around`]): one that
+/// made its checkout, or none where a clone found another's in place.
 pub(super) fn clone_all(
     sys: &dyn System,
     user: &User,
     missing: &[Repo],
+    unborn: &[(Repo, PathBuf)],
+    recorded: &BTreeSet<PathBuf>,
     guard: Option<&CloneGuard<'_>>,
+    writes: Option<&PassWrites>,
 ) -> Cloned {
     let home = Path::new(&user.home);
     let volume = sys.volume(home);
@@ -1431,12 +1442,14 @@ pub(super) fn clone_all(
         reserved = reserved.saturating_add(need(repo));
         let progress = Progress::new(&repo.name, home.join(&repo.name));
         sys.repository_progress(&progress);
-        queue.push_back((repo, progress));
+        queue.push_back(Acquire::Clone(repo, progress));
     }
+    queue.extend(unborn.iter().map(Acquire::Unborn));
     let lanes = queue.len().min(LANES);
     let queue = std::sync::Mutex::new(queue);
     let results = std::sync::Mutex::new(Vec::new());
     let stopped = std::sync::atomic::AtomicBool::new(false);
+    let current = || guard.map_or(Ok(()), |guard| (guard.current)());
     std::thread::scope(|scope| {
         for _ in 0..lanes {
             scope.spawn(|| {
@@ -1448,62 +1461,103 @@ pub(super) fn clone_all(
                         let mut queue = queue
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        let Some((repo, progress)) = queue.pop_front() else {
-                            return;
+                        match queue.pop_front() {
+                            None => return,
+                            Some(Acquire::Unborn(candidate)) => {
+                                drop(queue);
+                                let (repo, path) = candidate;
+                                // A first commit can declare required dependencies, which are
+                                // repaired as a new clone's are; an empty origin has none.
+                                let acquire = || {
+                                    let result = acquire_unborn(
+                                        sys,
+                                        user,
+                                        std::slice::from_ref(candidate),
+                                        recorded,
+                                        &current,
+                                    )
+                                    .and_then(|empty| {
+                                        if empty.is_empty() {
+                                            super::dependencies::repair(
+                                                sys, user, path, repo, &current,
+                                            )?;
+                                        }
+                                        Ok(empty)
+                                    });
+                                    (result, Wrote::Made)
+                                };
+                                let result = match writes {
+                                    Some(writes) => writes.around(sys, path, acquire),
+                                    None => acquire().0,
+                                };
+                                if result.is_err() && current().is_err() {
+                                    stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                results
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .push(Acquired::Unborn(&candidate.0, result));
+                                continue;
+                            }
+                            Some(Acquire::Clone(repo, progress)) => {
+                                (repo, progress, Scratch::new_in(sys, home, "github-clone"))
+                            }
+                        }
+                    };
+                    let folder = home.join(&repo.name);
+                    let acquire = || {
+                        // It reads the snapshot first and between its steps.
+                        let parent = match staging {
+                            Ok(staging) => clone_one_with(
+                                sys,
+                                user,
+                                &repo.owner,
+                                repo,
+                                guard,
+                                Some(staging),
+                                &mut progress,
+                            ),
+                            Err(_) => Err(AcquisitionFailure::Local(
+                                "cannot allocate private repository staging in this home"
+                                    .to_owned(),
+                            )),
                         };
-                        (repo, progress, Scratch::new_in(sys, home, "github-clone"))
+                        let published = matches!(
+                            parent,
+                            Ok(ClonePlacement {
+                                placed: Placed::Published | Placed::PublishedStagingLeft,
+                                ..
+                            })
+                        );
+                        // Published with its staging left behind, whatever its dependencies do.
+                        let staging_left = matches!(
+                            parent,
+                            Ok(ClonePlacement {
+                                placed: Placed::PublishedStagingLeft,
+                                ..
+                            })
+                        );
+                        let result = parent.and_then(|placement| {
+                            let empty = placement.completion?;
+                            progress.enter(Phase::Dependencies);
+                            sys.repository_progress(&progress);
+                            super::dependencies::repair(sys, user, &folder, repo, &current)?;
+                            Ok((placement.placed, empty))
+                        });
+                        if result.is_err() && current().is_err() {
+                            stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // Only a clone this lane published: one found in place is another's.
+                        let hooks = published
+                            .then(|| install_hooks(sys, user, repo, guard))
+                            .flatten();
+                        let wrote = if published { Wrote::Made } else { Wrote::Not };
+                        ((result, staging_left, hooks), wrote)
                     };
-                    // It reads the snapshot first and between its steps.
-                    let parent = match staging {
-                        Ok(staging) => clone_one_with(
-                            sys,
-                            user,
-                            &repo.owner,
-                            repo,
-                            guard,
-                            Some(staging),
-                            &mut progress,
-                        ),
-                        Err(_) => Err(AcquisitionFailure::Local(
-                            "cannot allocate private repository staging in this home".to_owned(),
-                        )),
+                    let (result, staging_left, hooks) = match writes {
+                        Some(writes) => writes.around(sys, &folder, acquire),
+                        None => acquire().0,
                     };
-                    let published = matches!(
-                        parent,
-                        Ok(ClonePlacement {
-                            placed: Placed::Published | Placed::PublishedStagingLeft,
-                            ..
-                        })
-                    );
-                    // Published with its staging left behind, whatever its dependencies do.
-                    let staging_left = matches!(
-                        parent,
-                        Ok(ClonePlacement {
-                            placed: Placed::PublishedStagingLeft,
-                            ..
-                        })
-                    );
-                    let result = parent.and_then(|placement| {
-                        let empty = placement.completion?;
-                        progress.enter(Phase::Dependencies);
-                        sys.repository_progress(&progress);
-                        let current = || guard.map_or(Ok(()), |guard| (guard.current)());
-                        super::dependencies::repair(
-                            sys,
-                            user,
-                            &home.join(&repo.name),
-                            repo,
-                            &current,
-                        )?;
-                        Ok((placement.placed, empty))
-                    });
-                    if result.is_err() && guard.is_some_and(|guard| (guard.current)().is_err()) {
-                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    // Only a clone this lane published: one found in place is another's.
-                    let hooks = published
-                        .then(|| install_hooks(sys, user, repo, guard))
-                        .flatten();
                     match &result {
                         Ok(_) => progress.enter(Phase::Ready),
                         Err(why) => why.record_progress(&mut progress),
@@ -1513,7 +1567,7 @@ pub(super) fn clone_all(
                     results
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((repo, result, staging_left, hooks));
+                        .push(Acquired::Clone(repo, result, staging_left, hooks));
                 }
             });
         }
@@ -1521,27 +1575,42 @@ pub(super) fn clone_all(
     let mut results = results
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let order = |repo: &Repo| missing.iter().position(|listed| listed.name == repo.name);
-    results.sort_by_key(|(repo, _, _, _)| order(repo));
-    for (repo, result, staging_left, hooks) in results {
-        match result {
-            Ok((_, empty)) => {
-                done.cloned.push(repo.clone());
-                done.empty.extend(empty);
+    let order = |acquired: &Acquired<'_>| match acquired {
+        Acquired::Clone(repo, ..) => missing.iter().position(|listed| listed.name == repo.name),
+        Acquired::Unborn(repo, _) => unborn
+            .iter()
+            .position(|(listed, _)| listed.name == repo.name)
+            .map(|at| missing.len() + at),
+    };
+    results.sort_by_key(order);
+    for acquired in results {
+        match acquired {
+            Acquired::Clone(repo, result, staging_left, hooks) => {
+                match result {
+                    Ok((_, empty)) => {
+                        done.cloned.push(repo.clone());
+                        done.empty.extend(empty);
+                    }
+                    Err(why) => {
+                        done.network_failed |= why.is_network();
+                        done.failed.push(format!("~/{}: {why}", repo.name));
+                    }
+                }
+                if staging_left {
+                    done.failed.push(format!(
+                        "~/{}: repository published, but its private empty staging directory \
+                         could not be removed",
+                        repo.name
+                    ));
+                }
+                done.hooks.extend(hooks);
             }
-            Err(why) => {
+            Acquired::Unborn(_, Ok(empty)) => done.empty.extend(empty),
+            Acquired::Unborn(repo, Err(why)) => {
                 done.network_failed |= why.is_network();
                 done.failed.push(format!("~/{}: {why}", repo.name));
             }
         }
-        if staging_left {
-            done.failed.push(format!(
-                "~/{}: repository published, but its private empty staging directory could not \
-                 be removed",
-                repo.name
-            ));
-        }
-        done.hooks.extend(hooks);
     }
     done
 }
@@ -1772,7 +1841,9 @@ fn in_place(sys: &dyn System, user: &User, owner: &str, repo: &Repo, destination
 }
 
 /// Clone `repo` into `~`, in `staging` when its place is already made ([`clone_all`]), else
-/// in one made once the remote reads as listed.
+/// in one made once the remote reads as listed. The clone is made of exactly what GitHub
+/// advertised when the remote was read ([`clone_advertised`]), so a push since changes nothing
+/// it takes, and verified against that advertisement ([`verify_new`]) before it is published.
 fn clone_one_with(
     sys: &dyn System,
     user: &User,
@@ -1854,32 +1925,20 @@ fn clone_one_with(
         .exclusive(&marking, Duration::ZERO)
         .map_err(|_| "cannot mark the private repository staging as this clone's")?;
     let _ = sys.rename(&marking, &staging.path().join(OWNER));
-    let clone = staging.path().join("repo");
+    let clone = staged(staging.path());
     progress.staging = Some(clone.clone());
     sys.repository_progress(progress);
     current()?;
-    let command = clone_command(sys, user, git(sys, user, None), owner, repo, &url)?
-        .budget(CLONE_BUDGET)
-        .args([
-            "clone",
-            "--no-single-branch",
-            "--tags",
-            "--origin",
-            "origin",
-            "--template=",
-            "--progress",
-            "--",
-            &url,
-        ])
-        .arg(&clone);
-    let acquired = sys.run_repository(&command, progress).map_err(|_| {
-        AcquisitionFailure::Local("GitHub clone failed; existing destination left untouched".into())
-    })?;
-    if !acquired.success() {
-        return Err(AcquisitionFailure::Network(
-            "GitHub clone failed; existing destination left untouched".into(),
-        ));
-    }
+    let route = clone_command(sys, user, git(sys, user, None), owner, repo, &url)?;
+    clone_advertised(
+        sys,
+        &route,
+        &url,
+        &source,
+        clone_branch(repo, &source),
+        staging.path(),
+        progress,
+    )?;
     progress.enter(Phase::Verifying);
     sys.repository_progress(progress);
     verify_existing(sys, user, owner, repo, &clone)?;
@@ -1932,6 +1991,258 @@ fn clone_one_with(
     Ok(ClonePlacement { placed, completion })
 }
 
+/// Where a clone makes its repository in its private `staging` ([`clone_one_with`]).
+fn staged(staging: &Path) -> PathBuf {
+    staging.join("repo")
+}
+
+/// The branch a new clone of `repo` is on: the default branch `source` advertised, else, for an
+/// empty remote that advertised none, the one the inventory saved.
+fn clone_branch<'a>(repo: &'a Repo, source: &'a Remote) -> Option<&'a str> {
+    source.branch.as_deref().or(repo.default_branch.as_deref())
+}
+
+/// The name a clone gives the advertised `reference`: a branch is origin's remote-tracking
+/// branch, as `git clone` names it, and a tag keeps its own name.
+fn cloned_name(reference: &str) -> String {
+    reference.strip_prefix("refs/heads/").map_or_else(
+        || reference.to_owned(),
+        |name| format!("refs/remotes/origin/{name}"),
+    )
+}
+
+/// The object format `source`'s identities are written in ([`oid`]): SHA-1's 40 hexadecimal
+/// digits or SHA-256's 64, the one its clone is made in, as `git clone` makes one in its remote's.
+/// An empty remote names none; its clone is SHA-1, GitHub's.
+fn object_format(source: &Remote) -> Result<&'static str, String> {
+    let mut formats = source
+        .head
+        .iter()
+        .chain(source.refs.values())
+        .map(|oid| if oid.len() == 64 { "sha256" } else { "sha1" });
+    let first = formats.next().unwrap_or("sha1");
+    if formats.any(|format| format != first) {
+        return Err("GitHub advertised object identities in two formats".into());
+    }
+    Ok(first)
+}
+
+/// The `git init` that makes `clone` ([`clone_advertised`]): `route` with no template, in
+/// `format`, its HEAD naming `branch` when there is one.
+fn init_command(route: &Cmd, format: &str, branch: Option<&str>, clone: &Path) -> Cmd {
+    let init = route
+        .clone()
+        .args(["init", "--quiet", "--template="])
+        .arg(format!("--object-format={format}"));
+    let init = match branch {
+        Some(branch) => init.arg(format!("--initial-branch={branch}")),
+        None => init,
+    };
+    init.arg("--").arg(clone)
+}
+
+/// `route` setting `key` to `value` in `clone`'s own config ([`clone_advertised`]).
+fn config_command(route: &Cmd, clone: &Path, key: &str, value: &str) -> Cmd {
+    route
+        .clone()
+        .arg("-C")
+        .arg(clone)
+        .args(["config", key, value])
+}
+
+/// The one fetch that fills `clone` ([`clone_advertised`]): `route` reading the refspecs in
+/// `refspecs` from `url`, over protocol version 2, which takes an object by its name whether or
+/// not a reference still names it, and starts no hook, filesystem monitor or maintenance.
+fn fetch_command(route: &Cmd, clone: &Path, url: &str, refspecs: &Path) -> Cmd {
+    route
+        .clone()
+        .arg("-C")
+        .arg(clone)
+        .args(crate::checkout::NO_SIDE_RUNS)
+        .args(["-c", "protocol.version=2"])
+        .args(FETCH_ADVERTISED)
+        .arg(url)
+        .stdin_file(refspecs)
+}
+
+/// `route` pointing `clone`'s `refs/remotes/origin/HEAD` at origin's `branch`, as `git clone`
+/// records origin's default branch ([`clone_advertised`]).
+fn origin_head_command(route: &Cmd, clone: &Path, branch: &str) -> Cmd {
+    route.clone().arg("-C").arg(clone).args([
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+        &format!("refs/remotes/origin/{branch}"),
+    ])
+}
+
+/// `route` making `branch` in `clone` at origin's, tracking it, and checking it out with its
+/// progress, as `git clone` checks out the default branch ([`clone_advertised`]).
+fn checkout_command(route: &Cmd, clone: &Path, branch: &str) -> Cmd {
+    route.clone().arg("-C").arg(clone).args([
+        "checkout",
+        "--progress",
+        "--no-recurse-submodules",
+        "-b",
+        branch,
+        "--track",
+        &format!("refs/remotes/origin/{branch}"),
+        "--",
+    ])
+}
+
+/// Run `command`, a step of a clone on this Mac alone ([`clone_advertised`]): a failure is a
+/// local one, `why` and Git's own reason ([`crate::checkout::git_failed`]).
+fn run_local(sys: &dyn System, command: &Cmd, why: &str) -> Result<(), AcquisitionFailure> {
+    let ran = sys
+        .run_complete_stdout(command)
+        .map_err(|failed| AcquisitionFailure::Local(format!("{why} ({failed})")))?;
+    if ran.success() {
+        Ok(())
+    } else {
+        Err(AcquisitionFailure::Local(crate::checkout::git_failed(
+            why, &ran,
+        )))
+    }
+}
+
+/// Why the fetch of what `source` advertised failed, from `ran`, what it said: each advertised
+/// reference whose object Git named as it failed, which GitHub no longer has (a push rewrote or
+/// deleted it after GitHub was read, and the object went with it), else Git's own reason. Only
+/// the advertisement's own names and identities are repeated, never what Git said around them.
+fn fetch_failed(source: &Remote, ran: &Ran) -> String {
+    let said = String::from_utf8_lossy(&ran.stderr);
+    let gone: Vec<String> = source
+        .refs
+        .iter()
+        .filter(|(_, oid)| said.contains(oid.as_str()))
+        .map(|(reference, oid)| format!("{reference} ({oid})"))
+        .collect();
+    if gone.is_empty() {
+        crate::checkout::git_failed(
+            "GitHub clone failed; existing destination left untouched",
+            ran,
+        )
+    } else {
+        format!(
+            "GitHub no longer has what it advertised for {}; existing destination left untouched",
+            gone.join(", ")
+        )
+    }
+}
+
+/// Make a repository in `staging` ([`staged`]) of exactly what `source` advertised at `url`, as
+/// `git clone` makes one, every step `route`'s (aterm's credential route on the person's own git,
+/// [`clone_command`]): `git init` with no template, in `source`'s object format
+/// ([`object_format`]) and on `branch`, its default branch ([`clone_branch`]); origin configured
+/// as `git clone` configures it; then, for a remote with a commit, one fetch of each advertised
+/// object into its advertised name ([`cloned_name`]), origin's HEAD naming origin's `branch`,
+/// and `branch` made at the advertised HEAD, tracking origin's, and checked out. A push made after
+/// GitHub was read changes nothing the clone takes, so [`verify_new`] holds by construction:
+/// `git clone` took the references current when its own transfer started, and one push between
+/// the two discarded the clone. An empty remote fetches nothing; its unborn `branch` tracks
+/// origin's, as `git clone` leaves it. The fetch and the checkout are transfers, bounded by
+/// their progress rather than a wall clock ([`System::run_repository`]): a large history over a
+/// slow link finishes, and one whose link stopped is a network failure. Git 2.29 or later
+/// (`fetch --stdin`).
+///
+/// # Errors
+/// A step on this Mac failed (local); the fetch failed or stalled (network, naming each
+/// advertised object GitHub no longer has, [`fetch_failed`]); or the checkout failed.
+fn clone_advertised(
+    sys: &dyn System,
+    route: &Cmd,
+    url: &str,
+    source: &Remote,
+    branch: Option<&str>,
+    staging: &Path,
+    progress: &mut Progress,
+) -> Result<(), AcquisitionFailure> {
+    let clone = staged(staging);
+    run_local(
+        sys,
+        &init_command(route, object_format(source)?, branch, &clone),
+        "cannot make the new repository in its private staging",
+    )?;
+    let configure = |key: &str, value: &str| {
+        run_local(
+            sys,
+            &config_command(route, &clone, key, value),
+            "cannot configure the new repository's origin",
+        )
+    };
+    configure("remote.origin.url", url)?;
+    configure("remote.origin.fetch", ORIGIN_FETCH)?;
+    let Some(branch) = branch else {
+        return match source.head {
+            None => Ok(()),
+            Some(_) => Err("nonempty GitHub repository has no advertised default branch".into()),
+        };
+    };
+    if source.head.is_none() {
+        configure(&format!("branch.{branch}.remote"), "origin")?;
+        return configure(
+            &format!("branch.{branch}.merge"),
+            &format!("refs/heads/{branch}"),
+        );
+    }
+    let refspecs = staging.join(ADVERTISED);
+    let wanted: String = source
+        .refs
+        .iter()
+        .map(|(reference, oid)| format!("{oid}:{}\n", cloned_name(reference)))
+        .collect();
+    sys.write_file(&refspecs, wanted.as_bytes(), 0o600)
+        .map_err(|_| "cannot stage the advertised references for the clone's fetch")?;
+    let fetched = sys
+        .run_repository(&fetch_command(route, &clone, url, &refspecs), progress)
+        .map_err(|failed| {
+            AcquisitionFailure::unfinished(
+                &failed,
+                format!(
+                    "GitHub clone did not finish ({failed}); existing destination left untouched"
+                ),
+            )
+        })?;
+    if !fetched.success() {
+        return Err(AcquisitionFailure::Network(fetch_failed(source, &fetched)));
+    }
+    run_local(
+        sys,
+        &origin_head_command(route, &clone, branch),
+        "cannot record origin's default branch in the new clone",
+    )?;
+    progress.enter(Phase::Checkout);
+    sys.repository_progress(progress);
+    let checked = sys
+        .run_repository(&checkout_command(route, &clone, branch), progress)
+        .map_err(|failed| {
+            AcquisitionFailure::unfinished(
+                &failed,
+                format!(
+                    "the new clone's checkout did not finish ({failed}); existing destination \
+                     left untouched"
+                ),
+            )
+        })?;
+    if !checked.success() {
+        return Err(AcquisitionFailure::Local(crate::checkout::git_failed(
+            "the new clone's checkout failed; existing destination left untouched",
+            &checked,
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `call`, a command as a test double records it ([`Cmd::display`]), is a clone's one
+/// fetch of what GitHub advertised ([`fetch_command`]).
+#[cfg(any(test, debug_assertions))]
+pub(super) fn fetches_advertised(call: &str) -> bool {
+    call.contains(&format!(
+        " {} {} ",
+        FETCH_ADVERTISED[0], FETCH_ADVERTISED[1]
+    ))
+}
+
 /// Remove what clones left in `user`'s home when their process ended mid-clone (a crash, a kill,
 /// a power loss): each staging directory of theirs whose owner mark no process holds now, so its
 /// clone is gone. One whose mark is held belongs to a clone still running; one with no mark (an
@@ -1973,6 +2284,12 @@ pub(crate) fn sweep_staging(sys: &dyn System, user: &User) -> usize {
     swept
 }
 
+/// The guard a new clone of `repo` at `clone` passes before it is published: it is whole
+/// (neither shallow nor partial, [`verify_integrity`]); it holds exactly the references `source`
+/// advertised, under the names a clone gives them ([`cloned_name`]); it is on its default branch
+/// ([`clone_branch`]) at the advertised HEAD (unborn, for an empty remote), which tracks origin's
+/// where there is a commit; and its worktree is clean. It only reads: [`clone_advertised`] makes
+/// a clone so, and this holds the clone to that.
 fn verify_new(
     sys: &dyn System,
     user: &User,
@@ -1980,9 +2297,7 @@ fn verify_new(
     clone: &Path,
     source: &Remote,
 ) -> Result<(), String> {
-    // A fresh advertisement chooses the new checkout's branch. Only a truly empty
-    // remote that advertises no unborn HEAD needs the inventory's saved fallback.
-    let default_branch = source.branch.as_ref().or(repo.default_branch.as_ref());
+    let default_branch = clone_branch(repo, source);
     verify_integrity(sys, user, clone)?;
     let head = sys
         .run_complete_stdout(&git(sys, user, Some(clone)).args([
@@ -1991,30 +2306,19 @@ fn verify_new(
             "HEAD^{commit}",
         ]))
         .map_err(|_| "cannot verify cloned HEAD")?;
-    match &source.head {
-        Some(expected)
-            if head.success()
+    let advertised_head = match &source.head {
+        Some(expected) => {
+            head.success()
                 && std::str::from_utf8(&head.stdout)
                     .ok()
-                    .is_some_and(|value| value.trim() == expected) => {}
-        None if matches!(head.status, Some(1 | 128)) && head.stdout.is_empty() => {
-            if let Some(branch) = default_branch {
-                text(
-                    sys,
-                    &git(sys, user, Some(clone)).args([
-                        "symbolic-ref",
-                        "HEAD",
-                        &format!("refs/heads/{branch}"),
-                    ]),
-                    "cannot establish the empty repository's default branch",
-                )?;
-            }
+                    .is_some_and(|value| value.trim() == expected)
         }
-        _ => {
-            return Err(
-                "cloned HEAD does not match the advertised GitHub commit or empty state".into(),
-            );
-        }
+        None => matches!(head.status, Some(1 | 128)) && head.stdout.is_empty(),
+    };
+    if !advertised_head {
+        return Err(
+            "cloned HEAD does not match the advertised GitHub commit or empty state".into(),
+        );
     }
     let listed = git_read(
         sys,
@@ -2033,11 +2337,7 @@ fn verify_new(
     }
     let mut wanted = BTreeMap::new();
     for (reference, oid) in &source.refs {
-        let target = reference.strip_prefix("refs/heads/").map_or_else(
-            || reference.clone(),
-            |name| format!("refs/remotes/origin/{name}"),
-        );
-        wanted.insert(target, oid.clone());
+        wanted.insert(cloned_name(reference), oid.clone());
     }
     if let (Some(branch), Some(head)) = (default_branch, &source.head) {
         wanted.insert(format!("refs/heads/{branch}"), head.clone());

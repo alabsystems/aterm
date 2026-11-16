@@ -47,11 +47,7 @@ fn sid_of(ctx: &SessionCtx) -> String {
 
 /// `local` leaves the registry as `reason` by `actor`, through the close's one choke point.
 fn deregister(app: &App, local: u64, reason: ExitReason, actor: ExitActor) {
-    let _ = app
-        .store
-        .write()
-        .unwrap_or_else(PoisonError::into_inner)
-        .deregister_closing(local, reason, actor);
+    let _ = crate::session_table::close_leaving_row(&app.store, local, reason, actor);
 }
 
 /// The value of `key=` on `line`.

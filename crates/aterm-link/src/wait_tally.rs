@@ -40,7 +40,7 @@ pub const FILE: &str = "wait-tally";
 
 /// What the line starts with: the format's name and version. The head's fields follow it,
 /// each fixed-width, the row count ([`ROWS`]) first.
-pub const FORMAT: &str = "wait-tally v=8";
+pub const FORMAT: &str = "wait-tally v=9";
 
 /// What `astream_sys::flush_tally`, in the head, counts of this build's flushes
 /// (`aterm_durable::ASTREAM_COUNTS`): one word for every line a build writes, so every line
@@ -85,9 +85,11 @@ pub enum Row {
     DirAppend,
     /// State-dir flushes of a file in place or of a directory.
     DirFlush,
-    /// `StateDir::set_post_pin`.
+    /// `StateDir::set_post_pin`, and `StateDir::stage_posts`: a drain group's whole append,
+    /// its reservations and its in-flight entries (ATERM-KI-1111-5, v=9; at v=8 a fresh post's
+    /// entry was [`Row::SetInFlight`]'s, so a v=8 line's two rows together compare with this).
     SetPostPin,
-    /// `StateDir::set_in_flight`.
+    /// `StateDir::set_in_flight`: an entry journaled alone, apart from its reservation.
     SetInFlight,
     /// `StateDir::clear_in_flight`: an in-flight entry ended alone. Every own record's but a
     /// landed post's or owed receipt's, whose entry ends with its group ([`Row::ClearPostSeq`]);
@@ -120,6 +122,15 @@ pub enum Row {
     PostPublish,
     /// The posts each outbox peek listed (a count; 0 is an empty peek).
     DrainPosts,
+    /// The fresh posts each post-journal append that reserved them carried (a count): a drain
+    /// pass's group of own-lane posts, their reservations and in-flight entries in one append
+    /// (ATERM-KI-1111-5), or one post to another lane, its reservation alone. Its count over
+    /// its total is the appends per fresh post.
+    PostsPerAppend,
+    /// The posts each send write to the broker carried (a count): a drain pass's group, in
+    /// bursts as the window's room allows (ATERM-KI-1111-5), or a retry, a keyed post or one
+    /// to another lane alone.
+    PostsPerWrite,
     /// The loop parked on its mailbox.
     Park,
     /// This tally's own idle writes.
@@ -127,7 +138,7 @@ pub enum Row {
 }
 
 /// How many rows a line holds.
-pub const ROWS: usize = 31;
+pub const ROWS: usize = 33;
 
 impl Row {
     /// Every row, in the line's order.
@@ -161,6 +172,8 @@ impl Row {
         Row::QueuedRecord,
         Row::PostPublish,
         Row::DrainPosts,
+        Row::PostsPerAppend,
+        Row::PostsPerWrite,
         Row::Park,
         Row::TallyWrite,
     ];
@@ -204,6 +217,8 @@ impl Row {
             Row::QueuedRecord => "queued_record",
             Row::PostPublish => "post_publish",
             Row::DrainPosts => "drain_posts",
+            Row::PostsPerAppend => "posts_per_append",
+            Row::PostsPerWrite => "posts_per_write",
             Row::Park => "park",
             Row::TallyWrite => "tally_write",
         }
@@ -213,7 +228,7 @@ impl Row {
     #[must_use]
     pub const fn unit(self) -> Unit {
         match self {
-            Row::DrainPosts => Unit::Count,
+            Row::DrainPosts | Row::PostsPerAppend | Row::PostsPerWrite => Unit::Count,
             _ => Unit::Ns,
         }
     }
@@ -270,6 +285,8 @@ impl Row {
         !matches!(
             self,
             Row::DrainPosts
+                | Row::PostsPerAppend
+                | Row::PostsPerWrite
                 | Row::Park
                 | Row::WakeEvent
                 | Row::WakeRecord
@@ -310,7 +327,7 @@ pub fn lane_row(line: &str) -> Row {
 }
 
 /// The loop's time since this process started, and where its inbox group cursor stood at the write.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tally {
     /// The bridge process the counts belong to.
     pub pid: u32,
@@ -331,6 +348,22 @@ pub struct Tally {
     /// The process's slow calls: how many, and its last [`CALLS_KEPT`] with their starts on
     /// [`FLUSH_CLOCK`].
     pub calls: SlowCalls,
+}
+
+impl Default for Tally {
+    /// Written by hand: an array past 32 rows derives no `Default`.
+    fn default() -> Self {
+        Self {
+            pid: 0,
+            committed: 0,
+            at_ns: 0,
+            dir: false,
+            flushes: astream_sys::FlushTally::default(),
+            times: Flushed::default(),
+            rows: [Hist::default(); ROWS],
+            calls: SlowCalls::default(),
+        }
+    }
 }
 
 /// The clock [`Tally::calls`] and [`Tally::times`] are on: astream-sys's, the machine's on
@@ -1026,11 +1059,22 @@ impl Stamp {
 
 /// Rows another part of the bridge keeps for the recorder, under a lock of its own.
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Kept {
     on: AtomicBool,
     /// The rows, and the slow calls among them ([`Tally::calls`]).
     rows: Mutex<([Hist; ROWS], SlowCalls)>,
+}
+
+#[cfg(any(test, debug_assertions, feature = "dev-seams"))]
+impl Default for Kept {
+    /// Written by hand: an array past 32 rows derives no `Default`.
+    fn default() -> Self {
+        Self {
+            on: AtomicBool::new(false),
+            rows: Mutex::new(([Hist::default(); ROWS], SlowCalls::default())),
+        }
+    }
 }
 
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]

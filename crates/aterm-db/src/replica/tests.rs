@@ -24,6 +24,7 @@ mod hooks;
 mod inventory;
 mod policy;
 mod recovery;
+mod reuse;
 pub(crate) mod witness;
 pub(super) use policy::{session_boundary, table_admission};
 
@@ -221,7 +222,7 @@ fn automatic_batches_recheck_local_policy_and_new_catalog_conflicts() {
 fn automatic_application_refusal_preserves_control_for_retired_members() {
     use aterm_secrets::{
         client::{load_records, retain_records_for_commons, save_records, test_found},
-        membership_log::{Body, Entrant, Log, Record, encode_records},
+        membership_log::{Body, Entrant, Log, Record, read_records},
     };
 
     let p = Pair::new(false, 0);
@@ -240,7 +241,7 @@ fn automatic_application_refusal_preserves_control_for_retired_members() {
             &p.lab.paths[1],
             source.trust().network,
             source.trust().authority,
-            &[foreign.bytes().to_vec()],
+            &[foreign.wire_bytes().unwrap().to_vec()],
         )
         .unwrap(),
         vec![false],
@@ -265,8 +266,12 @@ fn automatic_application_refusal_preserves_control_for_retired_members() {
             .sign(seed, *request.binding().incarnation())
             .unwrap()
     });
-    save_records(&p.lab.paths[0], &encode_records([&genesis, &removal])).unwrap();
-    save_records(&p.lab.paths[1], &encode_records([&genesis])).unwrap();
+    save_records(
+        &p.lab.paths[0],
+        &read_records([&genesis, &removal]).unwrap(),
+    )
+    .unwrap();
+    save_records(&p.lab.paths[1], &read_records([&genesis]).unwrap()).unwrap();
     assert!(
         !load_records(&p.lab.paths[1])
             .unwrap()
@@ -299,7 +304,7 @@ fn automatic_application_refusal_preserves_control_for_retired_members() {
     assert!(ra.application().is_none() && rb.application().is_none());
     assert!(ra.application_error().is_some() && rb.application_error().is_some());
     let retained = load_records(&p.lab.paths[1]).unwrap();
-    assert_eq!(retained.get_bytes(removal.id()), Some(removal.bytes()));
+    assert!(retained.contains(removal.id()));
     assert!(
         retained
             .log()
@@ -372,7 +377,7 @@ fn deferred_membership_records_hold_up_no_table_repair() {
     use crate::control::mutants::{self, Mutant};
     use aterm_secrets::{
         client::{load_records, save_records, test_found},
-        membership_log::{Body, Entrant, Log, RecordBudgets, encode_records},
+        membership_log::{Body, Entrant, Log, RecordBudgets, read_records},
     };
     const FULL: RecordBudgets = RecordBudgets {
         held: 2,
@@ -405,7 +410,7 @@ fn deferred_membership_records_hold_up_no_table_repair() {
                     .sign(seed, *request.binding().incarnation())
                     .unwrap()
             });
-            save_records(&p.lab.paths[n], &encode_records([&genesis, &name])).unwrap();
+            save_records(&p.lab.paths[n], &read_records([&genesis, &name]).unwrap()).unwrap();
         }
         let endpoints = FULL.within(|| [p.endpoint(0, true), p.endpoint(1, true)]);
         let session = |endpoint: &Endpoint, connection, side, repair: &mut PeerRepair| {
@@ -470,7 +475,7 @@ fn deferred_membership_records_hold_up_no_table_repair() {
 fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
     use aterm_secrets::{
         client::{load_records, save_records, test_found},
-        membership_log::{Body, Entrant, Log, encode_records},
+        membership_log::{Body, Entrant, Log, read_records},
     };
     const HELD: usize = 4_071;
     for crossed in [false, true] {
@@ -505,7 +510,7 @@ fn a_mac_not_crossed_completes_table_sync_with_a_legacy_peer_of_4071_records() {
         });
         assert_eq!(log.held_count(), HELD);
         for paths in &p.lab.paths {
-            save_records(paths, &encode_records(log.records())).unwrap();
+            save_records(paths, &read_records(log.records()).unwrap()).unwrap();
         }
         if crossed {
             aterm_secrets::fsx::write_atomic(

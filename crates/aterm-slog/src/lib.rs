@@ -34,7 +34,9 @@ pub use fold::{
     need_raised, need_takes_amend, need_words, observed_need_words, rank_of, shown, shown_label,
     shown_proven_label, shown_verdicts, starts_epoch, turn_out_rebucket,
 };
-pub use limit::{MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed};
+pub use limit::{
+    Bucket, MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed,
+};
 pub use line::{
     BusRec, DecodeError, EncodeError, MAX_RECORD_BYTES, decode, decode_bus, encode, encode_bus,
     encode_mirror, encode_with_table,

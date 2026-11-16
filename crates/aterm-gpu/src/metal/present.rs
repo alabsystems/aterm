@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use super::acquire_worker::{AcquireOutcome, AcquireWorker, result_is_current};
+use super::acquire_worker::{AcquireOutcome, AcquireWorker, Awaited, Completed, result_is_current};
 use super::encoder::{CommandBuffer, PassEncoder, RenderPassDesc, StoreAction};
 #[cfg(test)]
 use super::ffi::PixelFormat;
@@ -126,9 +126,18 @@ impl MetalWindowSurface {
         self.worker.is_some()
     }
 
+    /// Whether a request may be queued now: only against a layer that already has the wanted
+    /// configuration. A request is stamped with the current generation, and a drawable of the
+    /// current generation is handed to a frame as it is, so one queued while a reshape is owed
+    /// would hand out a drawable of the configuration the layer had before it. `reconcile`
+    /// reshapes once nothing is in flight.
+    fn request_admitted(&self) -> bool {
+        self.config == self.wanted
+    }
+
     /// Request the next frame's drawable asynchronously on the worker thread.
     pub(crate) fn prefetch_drawable(&mut self) {
-        if self.ready.is_some() {
+        if self.ready.is_some() || !self.request_admitted() {
             return;
         }
         let Some(worker) = self.worker.as_mut() else {
@@ -162,9 +171,14 @@ impl MetalWindowSurface {
     }
 
     fn collect_acquire(&mut self) {
-        let Some(completed) = self.worker.as_mut().and_then(AcquireWorker::try_take) else {
-            return;
-        };
+        if let Some(completed) = self.worker.as_mut().and_then(AcquireWorker::try_take) {
+            self.adopt_acquired(completed);
+        }
+    }
+
+    /// Record a taken result: its timings, and the drawable or the terminal refusal it leaves
+    /// ready for the next frame. A drawable of an earlier generation is dropped.
+    fn adopt_acquired(&mut self, completed: Completed<AcquiredDrawable>) {
         match completed.outcome {
             AcquireOutcome::Ready(output) => {
                 self.completed_wait_ns = Some(output.wait_ns);
@@ -221,18 +235,40 @@ impl MetalWindowSurface {
             return Err(AcquireRefusal::LatchLost);
         }
         let (want_w, want_h) = (self.config.width, self.config.height);
+        let admitted = self.request_admitted();
         let frame = if let Some(worker) = self.worker.as_mut() {
             if let Some(ready) = self.ready.take() {
                 self.swapchain
                     .frame_from_acquired(ready?)
                     .map_err(|_| AcquireRefusal::LatchLost)?
             } else {
-                if !worker.is_pending() {
-                    worker
-                        .try_request(self.generation, self.swapchain.acquire_request())
-                        .map_err(|_| terminal_worker_refusal(self.swapchain.latch()))?;
+                // No drawable in hand: this frame waits, so the worker owes it the wake. It
+                // queues its own request only against a layer of the wanted configuration.
+                let swapchain = &self.swapchain;
+                let awaited = worker.await_result(self.generation, || {
+                    admitted.then(|| swapchain.acquire_request())
+                });
+                let (taken, refusal) = match awaited {
+                    Awaited::Result(completed) => (Some(completed), Some(AcquireRefusal::Pending)),
+                    Awaited::Waiting { stale } => (stale, Some(AcquireRefusal::Pending)),
+                    // A reshape is owed and nothing is in flight to hold it back: the retry's
+                    // `reconcile` reshapes the layer before anything is requested of it.
+                    Awaited::Unqueued { stale } => (stale, Some(AcquireRefusal::Drift)),
+                    Awaited::Refused { stale } => (stale, None),
+                };
+                if let Some(completed) = taken {
+                    self.adopt_acquired(completed);
                 }
-                return Err(AcquireRefusal::Pending);
+                match (self.ready.take(), refusal) {
+                    (Some(ready), _) => self
+                        .swapchain
+                        .frame_from_acquired(ready?)
+                        .map_err(|_| AcquireRefusal::LatchLost)?,
+                    (None, Some(refusal)) => return Err(refusal),
+                    (None, None) => {
+                        return Err(terminal_worker_refusal(self.swapchain.latch()));
+                    }
+                }
             }
         } else {
             self.swapchain
@@ -315,7 +351,8 @@ pub(crate) enum AcquireRefusal {
     Pending,
     /// The process device-loss latch is set (acquire refuses before FFI).
     LatchLost,
-    /// The drawable's geometry no longer matches the retained config.
+    /// The drawable's geometry no longer matches the retained config, or the layer owes a
+    /// reshape to the wanted config and no request is in flight to wait for.
     Drift,
     /// `nextDrawable` returned nil after the bounded wait: pool exhausted or
     /// the window server throttling an invisible window.

@@ -5,6 +5,33 @@ use super::*;
 use crate::TokenCount;
 use std::time::{Duration, Instant};
 
+/// The largest grant a sweep covers whole. No branch of `branch_shares.rs` or `jobserver.rs`
+/// turns on a slot count above it: the first split reads only whether any slot is free, the lend
+/// floor is half rounded up (every lend of 0 to 3 at both parities occurs by 6 free slots), a
+/// resume needs more than one build slot and a fixture loan a tree of two, reached at 3.
+const SWEPT: u32 = 6;
+
+/// The production grant, kept as each sweep's witness of a two-digit share and a large pool.
+/// NOT covered: real-FIFO conservation at 7 to 17 slots, and at 18 the exports [`exports`]
+/// leaves out. Each world costs the same files and renames whatever its slots, so the whole
+/// range to 18 was 3,404 worlds for the arithmetic of the first 548.
+const LARGE: u32 = 18;
+
+/// Every grant from `from` to [`SWEPT`], then [`LARGE`].
+fn grants(from: u32) -> impl Iterator<Item = u32> {
+    (from..=SWEPT).chain([LARGE])
+}
+
+/// The export reservations judged at `slots`, none above `most`: all of them to [`SWEPT`], and
+/// at [`LARGE`] the shapes a release runs (none, four) with the most the sweep allows.
+fn exports(slots: u32, most: u32) -> Vec<u32> {
+    if slots <= SWEPT {
+        (0..=most).collect()
+    } else {
+        vec![0, 4, most]
+    }
+}
+
 fn take(pool: &Jobserver) -> Vec<crate::Token<'_>> {
     let mut held = Vec::new();
     while let Some(token) = pool.try_acquire().unwrap() {
@@ -34,8 +61,8 @@ fn fixture_loan(shares: &BranchShares) -> FixtureShare<'_> {
 
 #[test]
 fn shared_tree_lending_preserves_live_tokens_and_half_the_build_allocation() {
-    for slots in 2..=18 {
-        for export in 0..=slots {
+    for slots in grants(2) {
+        for export in exports(slots, slots) {
             for serial in [false, true] {
                 for live_limit in [0, 1, u32::MAX] {
                     let dir = aterm_tempfile::tempdir().unwrap();
@@ -111,8 +138,8 @@ fn export_returns_can_expand_a_shared_tree_loan_without_stealing_live_build_work
 
 #[test]
 fn resuming_an_admitted_tree_moves_a_free_token_without_reminting_live_build_work() {
-    for slots in 2..=18 {
-        for export in 0..=slots - 2 {
+    for slots in grants(2) {
+        for export in exports(slots, slots - 2) {
             for order in [
                 [0, 1, 2],
                 [0, 2, 1],
@@ -251,8 +278,8 @@ fn a_resumed_tree_can_finish_while_build_clients_still_hold_their_tokens() {
 
 #[test]
 fn drained_compilers_return_idle_tokens_and_fixture_loans_survive_every_end_order() {
-    for slots in 3..=18 {
-        for export in 0..=slots - 2 {
+    for slots in grants(3) {
+        for export in exports(slots, slots - 2) {
             for serial in [false, true] {
                 for order in [[1, 2], [2, 1]] {
                     let dir = aterm_tempfile::tempdir().unwrap();
@@ -1045,7 +1072,7 @@ fn a_live_tree_client_keeps_the_eventual_ceiling_while_its_fifo_widens() {
 
 #[test]
 fn every_completion_order_conserves_the_build_first_grant_for_every_plan() {
-    for slots in 1..=18 {
+    for slots in grants(1) {
         for (active, export) in [
             ([true, true], 0),
             ([true, true], 1),

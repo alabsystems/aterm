@@ -26,6 +26,16 @@ pub(crate) enum Tool {
 /// How a remote step is run: [`run`], or [`run_unless`].
 pub(crate) type Runner<'a> = dyn Fn(Tool, &[OsString]) -> Result<Output, String> + 'a;
 
+/// The caller's explicit ownership policy for a mutation, separate from remote discovery.
+#[cfg(unix)]
+pub(crate) struct WriteRunner<'a>(pub(crate) &'a Runner<'a>);
+
+#[cfg(unix)]
+#[path = "remote_mutation.rs"]
+mod mutation;
+#[cfg(unix)]
+pub(crate) use mutation::run as run_mutation;
+
 #[cfg(unix)]
 pub(crate) fn run(
     root: &Path,
@@ -82,22 +92,26 @@ pub(crate) fn command(
                 .env("GIT_TERMINAL_PROMPT", "0");
             cmd
         }
-        Tool::Agh => {
-            #[cfg(target_os = "linux")]
-            let image = std::path::PathBuf::from("/proc/self/exe");
-            #[cfg(target_os = "macos")]
-            let image = crate::remote_host::image()?;
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-            let image = std::env::current_exe()
-                .map_err(|e| format!("cannot name the remote transport host: {e}"))?;
-            let mut cmd = aterm_uds::spawnfd::command(image);
-            cmd.arg(crate::remote_cli::FLAG)
-                .arg(std::process::id().to_string())
-                .current_dir(root);
-            cmd
-        }
+        Tool::Agh => agh_command(root, false)?,
     };
     cmd.args(args);
+    Ok(cmd)
+}
+
+fn agh_command(root: &Path, owned: bool) -> Result<Command, String> {
+    #[cfg(target_os = "linux")]
+    let image = std::path::PathBuf::from("/proc/self/exe");
+    #[cfg(target_os = "macos")]
+    let image = crate::remote_host::image()?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let image = std::env::current_exe()
+        .map_err(|e| format!("cannot name the remote transport host: {e}"))?;
+    let mut cmd = aterm_uds::spawnfd::command(image);
+    cmd.arg(crate::remote_cli::FLAG);
+    if owned {
+        cmd.arg("owned");
+    }
+    cmd.arg(std::process::id().to_string()).current_dir(root);
     Ok(cmd)
 }
 
@@ -131,13 +145,32 @@ fn kind(url: &str) -> Result<Kind, String> {
         }
     } else if !url.is_empty()
         && !url.starts_with('-')
-        && !url.contains(':')
+        && !past_drive(url).contains(':')
         && !url.chars().any(char::is_control)
     {
         return Ok(Kind::Local(url.to_owned()));
     }
     // A remote URL can contain credentials; never include it in a diagnostic.
     Err("remote must name an unambiguous GitHub OWNER/REPO or a local repository path".into())
+}
+
+/// The part of a local repository's spelling in which a colon makes git read it as `host:path`,
+/// a remote it reaches over ssh: all of it.
+#[cfg(not(windows))]
+const fn past_drive(url: &str) -> &str {
+    url
+}
+
+/// The part of a local repository's spelling in which a colon makes git read it as `host:path`,
+/// a remote it reaches over ssh: on Windows all but the drive an absolute path starts with
+/// (`C:\…`, `C:/…`), which git reads as a local path. A drive with no separator after it
+/// (`C:repo`, relative to that drive's working directory) is left whole, so it is refused.
+#[cfg(windows)]
+fn past_drive(url: &str) -> &str {
+    match url.as_bytes() {
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => &url[2..],
+        _ => url,
+    }
 }
 
 fn words(args: &[&str]) -> Vec<OsString> {
@@ -547,9 +580,12 @@ impl<'a> Remote<'a> {
     /// included (a fast-forward plain git would take), refuses it. An unknown outcome stops the
     /// caller; only a typed refusal which sent nothing permits observation of the blocking
     /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]).
+    /// Publish using an explicitly supplied mutation owner; discovery continues to use the
+    /// remote's reader. No command text is used to guess which lifetime a step needs.
     #[cfg(unix)]
-    pub(crate) fn push(
+    pub(crate) fn push_with(
         &self,
+        write: WriteRunner<'_>,
         reference: &str,
         before: Option<&str>,
         after: &str,
@@ -558,7 +594,7 @@ impl<'a> Remote<'a> {
             Kind::Local(_) => {
                 let destination = format!("{after}:{reference}");
                 let lease = format!("--force-with-lease={reference}:{}", before.unwrap_or(""));
-                let out = (self.run)(
+                let out = (write.0)(
                     Tool::Git,
                     &local_words(&["push", "--porcelain", &lease, self.name, &destination]),
                 )?;
@@ -587,7 +623,7 @@ impl<'a> Remote<'a> {
                     "--input".into(),
                     input.into_os_string(),
                 ]);
-                let out = (self.run)(Tool::Agh, &args)?;
+                let out = (write.0)(Tool::Agh, &args)?;
                 if out.status.success() {
                     return Ok(Pushed::Done);
                 }

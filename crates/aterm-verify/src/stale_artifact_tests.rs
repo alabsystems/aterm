@@ -28,11 +28,31 @@ fn passed() -> Run {
     }
 }
 
+/// An absolute directory as this host's compiler spells one in a note.
+#[cfg(not(windows))]
+const B: &str = "/b";
+/// An absolute directory as this host's compiler spells one in a note.
+#[cfg(windows)]
+const B: &str = r"C:\b";
+
+/// `rest`, a `/`-separated relative path, under `base`, spelled with this host's separator as
+/// the compiler spells the paths it names.
+fn under(base: impl AsRef<Path>, rest: &str) -> PathBuf {
+    let mut path = base.as_ref().to_path_buf();
+    path.extend(rest.split('/'));
+    path
+}
+
+/// [`under`] [`B`], as text.
+fn at(rest: &str) -> String {
+    under(B, rest).display().to_string()
+}
+
 /// What the 2026-11-13 landing's test compile printed, with its build directory at `build`:
 /// `aterm_gui_fabric` was left finished by an interrupted judgment and `aterm_core` was not.
 fn measured(build: &Path) -> String {
-    let core = build.join("debug/build/aterm-core/4895e5f07226384e/out");
-    let fabric = build.join("debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out");
+    let core = under(build, "debug/build/aterm-core/4895e5f07226384e/out");
+    let fabric = under(build, "debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out");
     format!(
         "   Compiling aterm-gui-fabric v0.0.0 (/w/crates/aterm-gui-fabric)\n\
          error[E0460]: found possibly newer version of crate `aterm_core` which `aterm_gui_fabric` depends on\n \
@@ -43,14 +63,17 @@ fn measured(build: &Path) -> String {
          |\n  \
          = note: perhaps that crate needs to be recompiled?\n  \
          = note: the following crate versions were found:\n          \
-         crate `aterm_core`: {core}/libaterm_core-4895e5f07226384e.rmeta\n          \
-         crate `aterm_core`: {core}/libaterm_core-4895e5f07226384e.rlib\n          \
-         crate `aterm_gui_fabric`: {fabric}/libaterm_gui_fabric-a4a6d302d12e5ad2.rlib\n\n\
+         crate `aterm_core`: {core_rmeta}\n          \
+         crate `aterm_core`: {core_rlib}\n          \
+         crate `aterm_gui_fabric`: {fabric_rlib}\n\n\
          For more information about this error, try `trustc --explain E0460`.\n\
          error: could not compile `aterm-gui-fabric` (test \"production_clock\") due to 1 previous error\n\
          warning: build failed, waiting for other jobs to finish...\n",
-        core = core.display(),
-        fabric = fabric.display(),
+        core_rmeta = core.join("libaterm_core-4895e5f07226384e.rmeta").display(),
+        core_rlib = core.join("libaterm_core-4895e5f07226384e.rlib").display(),
+        fabric_rlib = fabric
+            .join("libaterm_gui_fabric-a4a6d302d12e5ad2.rlib")
+            .display(),
     )
 }
 
@@ -74,7 +97,7 @@ fn word(run: &Run) -> Outcome {
 
 #[test]
 fn the_measured_interrupted_build_error_is_stale_and_names_its_three_files() {
-    let stale = find(&measured(Path::new("/b"))).expect("E0460 is the build directory's");
+    let stale = find(&measured(Path::new(B))).expect("E0460 is the build directory's");
     assert_eq!(
         stale.error,
         "error[E0460]: found possibly newer version of crate `aterm_core` which \
@@ -83,40 +106,70 @@ fn the_measured_interrupted_build_error_is_stale_and_names_its_three_files() {
     assert_eq!(
         stale.artifacts,
         [
-            "/b/debug/build/aterm-core/4895e5f07226384e/out/libaterm_core-4895e5f07226384e.rmeta",
-            "/b/debug/build/aterm-core/4895e5f07226384e/out/libaterm_core-4895e5f07226384e.rlib",
-            "/b/debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out/libaterm_gui_fabric-a4a6d302d12e5ad2.rlib",
+            "debug/build/aterm-core/4895e5f07226384e/out/libaterm_core-4895e5f07226384e.rmeta",
+            "debug/build/aterm-core/4895e5f07226384e/out/libaterm_core-4895e5f07226384e.rlib",
+            "debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out/libaterm_gui_fabric-a4a6d302d12e5ad2.rlib",
         ]
-        .map(PathBuf::from)
+        .map(|rest| under(B, rest))
+    );
+}
+
+/// NEGATIVE CONTROL: a note naming a path this host does not read as absolute names no artifact
+/// (on Windows a path with no drive, as no compiler there prints one).
+#[test]
+fn a_note_naming_no_absolute_path_names_no_artifact() {
+    #[cfg(not(windows))]
+    let relative = "b/libx-0123456789abcdef.rlib";
+    #[cfg(windows)]
+    let relative = "/b/libx-0123456789abcdef.rlib";
+    let output = format!(
+        "error[E0464]: multiple candidates for `rlib` dependency `x` found\n  \
+         = note: candidate #1: {relative}\n\
+         error: could not compile `d` (lib) due to 1 previous error\n"
+    );
+    assert_eq!(
+        find(&output).expect("E0464").artifacts,
+        Vec::<PathBuf>::new()
     );
 }
 
 #[test]
 fn each_stale_class_is_found_and_no_error_of_the_source_is() {
     let compiled = "error: could not compile `d` (lib) due to 1 previous error\n";
+    let (spaced_one, spaced_two) = (
+        at("a b/libx-0123456789abcdef.rlib"),
+        at("a b/libx-fedcba9876543210.rlib"),
+    );
+    let (rmeta, rlib) = (
+        at("libx-0123456789abcdef.rmeta"),
+        at("libx-0123456789abcdef.rlib"),
+    );
     for (error, artifacts) in [
         (
-            "error[E0464]: multiple candidates for `rlib` dependency `x` found\n  \
-             = note: candidate #1: /b/a b/libx-0123456789abcdef.rlib\n  \
-             = note: candidate #2: /b/a b/libx-fedcba9876543210.rlib\n",
-            vec![
-                "/b/a b/libx-0123456789abcdef.rlib",
-                "/b/a b/libx-fedcba9876543210.rlib",
-            ],
+            format!(
+                "error[E0464]: multiple candidates for `rlib` dependency `x` found\n  \
+                 = note: candidate #1: {spaced_one}\n  \
+                 = note: candidate #2: {spaced_two}\n"
+            ),
+            vec![spaced_one.as_str(), spaced_two.as_str()],
         ),
         (
-            "error[E0786]: found invalid metadata files for crate `x` which `d` depends on\n  \
-             = note: failed to mmap file '/b/libx-0123456789abcdef.rmeta': Invalid argument\n",
-            vec!["/b/libx-0123456789abcdef.rmeta"],
+            format!(
+                "error[E0786]: found invalid metadata files for crate `x` which `d` depends on\n  \
+                 = note: failed to mmap file '{rmeta}': Invalid argument\n"
+            ),
+            vec![rmeta.as_str()],
         ),
         (
-            "error[E0463]: can't find crate for `x` which `d` depends on\n",
+            "error[E0463]: can't find crate for `x` which `d` depends on\n".to_owned(),
             vec![],
         ),
         (
-            "\u{1b}[1m\u{1b}[91merror[E0460]\u{1b}[0m: found possibly newer version of crate `x` which `d` depends on\n          \
-             crate `x`: /b/libx-0123456789abcdef.rlib\n",
-            vec!["/b/libx-0123456789abcdef.rlib"],
+            format!(
+                "\u{1b}[1m\u{1b}[91merror[E0460]\u{1b}[0m: found possibly newer version of crate `x` which `d` depends on\n          \
+                 crate `x`: {rlib}\n"
+            ),
+            vec![rlib.as_str()],
         ),
     ] {
         let stale = find(&format!("{error}{compiled}")).unwrap_or_else(|| panic!("{error}"));
@@ -126,7 +179,7 @@ fn each_stale_class_is_found_and_no_error_of_the_source_is() {
             "{error}"
         );
         assert_eq!(
-            find(error),
+            find(&error),
             None,
             "the same text is no failed compile's without Cargo's line for one: {error}"
         );
@@ -140,15 +193,16 @@ fn each_stale_class_is_found_and_no_error_of_the_source_is() {
     };
     let stale = find(&json(
         "E0460",
-        "error[E0460]: found possibly newer version of crate `x` which `d` depends on\\n  \
-         = note: the following crate versions were found:\\n          \
-         crate `x`: /b/libx-0123456789abcdef.rlib\\n",
+        &format!(
+            "error[E0460]: found possibly newer version of crate `x` which `d` depends on\\n  \
+             = note: the following crate versions were found:\\n          \
+             crate `x`: {}\\n",
+            // A JSON string spells each backslash of a Windows path twice.
+            rlib.replace('\\', "\\\\")
+        ),
     ))
     .expect("a JSON message's rendered diagnostic is read");
-    assert_eq!(
-        stale.artifacts,
-        [PathBuf::from("/b/libx-0123456789abcdef.rlib")]
-    );
+    assert_eq!(stale.artifacts, [PathBuf::from(&rlib)]);
     assert_eq!(
         find(&json("E0308", "error[E0308]: mismatched types\\n")),
         None
@@ -169,7 +223,7 @@ fn each_stale_class_is_found_and_no_error_of_the_source_is() {
 
 #[test]
 fn a_stale_compile_is_could_not_run_and_a_type_error_is_still_a_finding() {
-    let stale = failed(measured(Path::new("/b")));
+    let stale = failed(measured(Path::new(B)));
     assert_eq!(word(&stale), Outcome::Fail(Severity::CouldNotRun));
     let why = stale.environment_failure().expect("the directory's");
     assert!(
@@ -195,16 +249,18 @@ impl Built {
     fn new() -> Self {
         let scratch = aterm_tempfile::tempdir().expect("a scratch directory");
         let build = aterm_uds::runs::canonical(scratch.path()).join("build");
-        let core = build.join("debug/build/aterm-core/4895e5f07226384e/out");
-        let fabric = build.join("debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out");
+        let core = under(&build, "debug/build/aterm-core/4895e5f07226384e/out");
+        let fabric = under(&build, "debug/build/aterm-gui-fabric/a4a6d302d12e5ad2/out");
         let named = [
             core.join("libaterm_core-4895e5f07226384e.rmeta"),
             core.join("libaterm_core-4895e5f07226384e.rlib"),
             fabric.join("libaterm_gui_fabric-a4a6d302d12e5ad2.rlib"),
         ];
         let unnamed = fabric.join("libaterm_gui_fabric-a4a6d302d12e5ad2.rmeta");
-        let toolchain = aterm_uds::runs::canonical(scratch.path())
-            .join("toolchain/lib/libstd-0123456789abcdef.rlib");
+        let toolchain = under(
+            aterm_uds::runs::canonical(scratch.path()),
+            "toolchain/lib/libstd-0123456789abcdef.rlib",
+        );
         let built = Self {
             _scratch: scratch,
             build,

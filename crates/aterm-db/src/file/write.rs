@@ -559,7 +559,7 @@ pub fn verb(
     #[expect(
         clippy::disallowed_methods,
         reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve (this fn's \
-                  own clippy.toml row lets only `aterm file`'s entry run it)"
+                  own clippy.toml row lets only `aterm file`'s entry and `rename_nick` run it)"
     )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;

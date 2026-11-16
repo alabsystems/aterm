@@ -18,7 +18,7 @@ fn follower(world: &World, reader: &Reader, at: i64) -> Result<Option<Proposal>,
         window: "seven_day".into(),
         at: Some(at),
     };
-    codex_rotation::prepare(
+    codex_rotation::prepare_once(
         &Seat {
             now: at,
             ..world.seat()
@@ -145,6 +145,7 @@ fn a_held_lock_leaves_a_completion_busy_and_a_changed_source_refuses_it() {
 }
 
 /// `main`'s roster row with `extra` (TOML lines) added to it.
+#[cfg(unix)] // its one caller seeds through a unix-only seam
 fn mark_main(world: &World, extra: &str) {
     let roster = world.cfg.join(Cli::Codex.accounts().roster_file);
     let text = std::fs::read_to_string(&roster).unwrap();

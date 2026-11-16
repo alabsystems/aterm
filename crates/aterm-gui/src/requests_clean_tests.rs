@@ -1030,24 +1030,126 @@ fn a_claim_missing_at_a_first_cleanup_is_not_recorded_deleted() {
     );
 }
 
+/// Folder `path`'s entries' [`times`] alone, in the walk's order: what its shape would tell with
+/// nothing counting its entries' changes.
+fn times_of(path: &Path, home: Option<&Path>) -> Vec<String> {
+    let mut lines = Vec::new();
+    let whole = walk_claim(
+        path,
+        home,
+        &mut Budget::new(),
+        &mut |rel, seen, entry, _| {
+            lines.push(times(rel, seen, &entry.meta));
+            true
+        },
+    );
+    assert!(whole, "walked whole");
+    lines
+}
+
+/// Turn off the last-write-time updates the writes through `file` make (`SetFileTime` with
+/// 0xFFFFFFFF_FFFFFFFF as the last write): a write through it leaves that time as it was, as a
+/// write in the clock step of the write before it does, and the call itself changes nothing of
+/// the file.
+#[cfg(windows)]
+fn keep_write_time(file: &std::fs::File) {
+    use std::os::windows::io::AsRawHandle as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Each time a `FILETIME` (two `DWORD`s, low first: one little-endian `u64`), or null to
+        /// leave it as it is.
+        fn SetFileTime(
+            file: *mut core::ffi::c_void,
+            creation: *const u64,
+            access: *const u64,
+            write: *const u64,
+        ) -> i32;
+    }
+    let off = u64::MAX;
+    // SAFETY: `file` keeps its handle open across the call; the creation and access times are
+    // null (left as they are), and `off` is a readable `FILETIME`'s eight bytes that outlive the
+    // call.
+    let ok = unsafe {
+        SetFileTime(
+            file.as_raw_handle(),
+            std::ptr::null(),
+            std::ptr::null(),
+            &raw const off,
+        )
+    };
+    assert_ne!(ok, 0, "SetFileTime: {}", std::io::Error::last_os_error());
+}
+
 /// A folder's shape reads every change a write, a new entry or a removal makes after its
-/// listing; CONTROL: an unchanged folder reads the shape its listing did.
+/// listing, where the entries' times do not tell it among them, by what counts each entry's
+/// changes: on Windows its change-journal USN, on unix its status change.
+///
+/// On Windows, a write of as many bytes that leaves the file's modified time as it was (as a
+/// write in the clock step of the write before it does; here through a handle whose time updates
+/// are off) reads another shape while that handle is still open and nothing else of the file has
+/// changed, by the journal's record of the write alone. CONTROL: the handle opened and its time
+/// updates turned off, nothing written, reads the listed shape.
+///
+/// On every platform, a rewrite of as many bytes whose modified time is then put back where the
+/// write before left it (as a copy that keeps a file's times leaves it) reads another shape: on
+/// unix by the status change the put-back sets to the clock's now, on Windows by the journal's
+/// records of the write and of the put-back. On unix a rewrite in the clock step of the write
+/// before it, with no put-back, leaves the status change as it was where the clock steps coarser
+/// than the writes (ATERM-KI-1115-47201), so no unix case here stands for one.
+///
+/// CONTROL throughout: an unchanged folder reads the shape its listing did, and each rewrite
+/// leaves every entry's kind, path, size and modified time ([`times`]) as the listing read them,
+/// so only the count tells it.
 #[test]
 fn a_folder_changed_after_its_listing_reads_another_shape() {
     let here = Here::new();
     let scratch = here.folder("scratch");
     let base = Path::new(&scratch);
     std::fs::create_dir_all(base.join("deep")).unwrap();
-    std::fs::write(base.join("deep/notes.md"), b"one").unwrap();
+    let notes = base.join("deep/notes.md");
+    std::fs::write(&notes, b"one").unwrap();
     let mut archive = Archiving::begin(&here.dir, "r-shape").unwrap();
     let home = Some(here.home.as_path());
     let listed = archive
         .list(base, home, &mut Budget::new())
         .expect("listed whole");
+    let listed_times = times_of(base, home);
     assert_eq!(shape_of(base, home), Some(listed), "unchanged");
-    std::fs::write(base.join("deep/notes.md"), b"two").unwrap();
+    #[cfg(windows)]
+    let listed = {
+        use std::io::Write as _;
+        assert!(
+            entry_at(&notes).expect("read").usn.is_some(),
+            "the temp volume keeps a change journal"
+        );
+        let mut held = std::fs::File::options().write(true).open(&notes).unwrap();
+        keep_write_time(&held);
+        assert_eq!(
+            shape_of(base, home),
+            Some(listed),
+            "opened, its time updates off, nothing written"
+        );
+        held.write_all(b"two").unwrap();
+        assert_eq!(times_of(base, home), listed_times, "the write's times");
+        let written = shape_of(base, home).expect("whole");
+        assert_ne!(written, listed, "a write the times do not show");
+        drop(held);
+        shape_of(base, home).expect("whole")
+    };
+    let modified = std::fs::symlink_metadata(&notes)
+        .unwrap()
+        .modified()
+        .unwrap();
+    std::fs::write(&notes, b"six").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&notes)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_eq!(times_of(base, home), listed_times, "the rewrite's times");
     let written = shape_of(base, home).expect("whole");
-    assert_ne!(written, listed, "a write");
+    assert_ne!(written, listed, "a rewrite with its time put back");
     std::fs::write(base.join("new.txt"), b"").unwrap();
     let made = shape_of(base, home).expect("whole");
     assert_ne!(made, written, "a new file");

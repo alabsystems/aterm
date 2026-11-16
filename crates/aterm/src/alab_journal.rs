@@ -95,7 +95,7 @@ fn event(note: &Note) -> Option<Event> {
         reset: note.reset,
         res: word(note.res, Res::parse)?,
         until: note.until,
-        plan: None,
+        plan: word(note.plan, Word::new)?,
         src: Source::parse(note.src)?,
         why: word(note.why, Word::new)?,
         to: word(note.to.as_ref().map(journal::Key::as_str), Pk::new)?,
@@ -108,6 +108,8 @@ fn event(note: &Note) -> Option<Event> {
     })
     // Only a kind about one tab's run names a tab or a harness, as every reader admits it.
     .filter(|event| (event.tab.is_none() && event.harness.is_none()) || event.kind.names_tab())
+    // A plan word rides only on a `plan-seen`, and a `plan-seen` always carries one.
+    .filter(|event| (event.kind == Kind::PlanSeen) == event.plan.is_some())
 }
 
 static GLUE: OnceLock<Glue> = OnceLock::new();

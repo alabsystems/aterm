@@ -106,7 +106,7 @@ impl Running {
                         Arc::new(move || (FleetScope::Content, serves)),
                         deny,
                     ),
-                    ask,
+                    (ask, None),
                     &stop,
                     HANG,
                     move |served, op| {

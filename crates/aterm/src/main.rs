@@ -45,6 +45,8 @@ mod setup_resume;
 mod setup_take_up;
 #[cfg(target_os = "macos")]
 mod subscriber_scheduling;
+#[cfg(test)]
+mod test_log;
 #[cfg(target_os = "macos")]
 mod withheld_preferences;
 
@@ -5746,11 +5748,16 @@ struct SetupActivity {
     subjects: Vec<aterm_types::macos_setup::Subject>,
     /// The epoch of the last stage event that could change each row.
     touched: Vec<(aterm_types::macos_setup::Subject, u64)>,
-    /// The workstation stage that owns the current native readback. This is a
-    /// publication fence, not a saved readiness or permission receipt.
+    /// The stage that owns the current readback: a workstation stage's native one, or the
+    /// Repositories stage's. The main loop runs these one at a time, so one slot holds it. This
+    /// is a publication fence, not a saved readiness or permission receipt.
     readback: Option<SetupReadback>,
     /// Rows read by this owned pass, so its final refresh need not repeat them.
     readback_subjects: Vec<aterm_types::macos_setup::Subject>,
+    /// The settings whose stages started in this owned pass ([`with_setup_activity`]): its final
+    /// refresh reads only their rows, those no stage read back. A row no stage of the pass ran
+    /// keeps its reading, since nothing of the pass changed it.
+    ran: Vec<aterm_types::macos_setup::Setting>,
     /// Captured before this job reads its execution target, never rebased by START.
     readback_owner: Option<SetupReadbackScope>,
     /// The one keeper's actual activation/read-failure batch. It has separate
@@ -5824,6 +5831,7 @@ static SETUP_ACTIVITY: std::sync::Mutex<SetupActivity> = std::sync::Mutex::new(S
     touched: Vec::new(),
     readback: None,
     readback_subjects: Vec::new(),
+    ran: Vec::new(),
     readback_owner: None,
     input_readback: false,
 });
@@ -6452,14 +6460,16 @@ struct SetupIo {
     /// (`aterm_cli::macos_doctor::alab_mac`).
     alab: fn() -> bool,
     /// Read rows for a plan under their current observation admission, the network's too when
-    /// asked (`aterm_cli::macos_doctor::observe_initial_setup`). Plan mode alone permits no
-    /// hidden query of another app's data.
+    /// asked (`aterm_cli::macos_doctor::observe_initial_setup`), handing each batch read to the
+    /// last argument as it completes, the repositories' last. Plan mode alone permits no hidden
+    /// query of another app's data.
     read: fn(
         &aterm_types::macos_setup::Plan,
         &[aterm_types::macos_setup::Subject],
         bool,
         aterm_cli::macos_doctor::ObservationRead,
-    ) -> Vec<aterm_types::macos_setup::Observation>,
+        &mut dyn FnMut(Vec<aterm_types::macos_setup::Observation>),
+    ),
     /// The wall clock a reading is stamped with as it starts, in Unix seconds
     /// (`aterm_time::unix_secs`; 0 where it cannot be read, which dates the reading as old as
     /// can be, never as new).
@@ -6795,18 +6805,20 @@ fn setup_stage(event: aterm_cli::macos_doctor::StageEvent<'_>) {
 fn record_setup_stage(
     event: aterm_cli::macos_doctor::StageEvent<'_>,
 ) -> Vec<aterm_types::macos_setup::Subject> {
-    // A stage whose own run reads its rows natively (the Mac settings, the sign-outs, Spotlight).
-    let native = event
-        .settings
-        .iter()
-        .any(|setting| aterm_types::macos_setup::Subject::Setting(*setting).reads_privately());
+    // A stage whose own run reads its rows back: natively (the Mac settings, the sign-outs,
+    // Spotlight), or the Repositories stage, whose run reads the repositories row as it ends
+    // (`aterm_cli::macos_doctor::repositories_readback`).
+    let reads_back = event.settings.iter().any(|setting| {
+        aterm_types::macos_setup::Subject::Setting(*setting).reads_privately()
+            || *setting == aterm_types::macos_setup::Setting::Repositories
+    });
     let current = !event.running
         && setup_run() == Some(event.revision)
         && !setup_stop_requested(event.revision);
     // The journal as the stage ends, after its own changes, read before either lock.
     let fence = (!event.running).then(|| (setup_io().fence)()).flatten();
-    // The display history a native stage's read-back keeps ([`SetupReadback::history_ticket`]).
-    let stage_history = if event.running && native {
+    // The display history a stage's read-back keeps ([`SetupReadback::history_ticket`]).
+    let stage_history = if event.running && reads_back {
         begin_setup_history(None, None)
     } else {
         None
@@ -6820,7 +6832,15 @@ fn record_setup_stage(
         if event.running {
             activity.mark(event.settings, event.subjects, true);
             retire_observed_rows(&mut rows, event.subjects);
-            if native {
+            // A stage of the owned pass: its end reads its rows again, those no stage read back.
+            if activity.readback_owner.is_some() {
+                for setting in event.settings {
+                    if !activity.ran.contains(setting) {
+                        activity.ran.push(*setting);
+                    }
+                }
+            }
+            if reads_back {
                 activity.readback = activity.readback_owner.and_then(|owner| {
                     (owner.revision == Some(event.revision))
                         .then_some(owner.choices)
@@ -6835,7 +6855,7 @@ fn record_setup_stage(
                 });
             }
         } else {
-            let frame = native.then(|| activity.readback.take()).flatten();
+            let frame = reads_back.then(|| activity.readback.take()).flatten();
             let readback: Vec<_> = event
                 .readback
                 .observations()
@@ -6924,16 +6944,24 @@ fn with_setup_activity<T>(pass: impl FnOnce() -> T) -> T {
         fn drop(&mut self) {
             // A panic may have missed the stage's normal end hook.
             end_setup_activity();
-            let read = SETUP_ACTIVITY.lock().map_or_else(
-                |_| Vec::new(),
-                |mut activity| std::mem::take(&mut activity.readback_subjects),
+            let (read, ran) = SETUP_ACTIVITY.lock().map_or_else(
+                |_| (Vec::new(), Vec::new()),
+                |mut activity| {
+                    (
+                        std::mem::take(&mut activity.readback_subjects),
+                        std::mem::take(&mut activity.ran),
+                    )
+                },
             );
-            // A complete owned readback already paid for these native reads. An
-            // interrupted or invalidated stage contributes no such exemption.
+            // Only the rows of the stages that ran are read again (the Access rows ride the
+            // Permissions setting, [`aterm_types::macos_setup::Subject::setting`]): a row no
+            // stage of the pass ran keeps its reading, since nothing of the pass changed it. A
+            // complete owned readback already paid for these native reads. An interrupted or
+            // invalidated stage contributes no such exemption.
             refresh_observation(
                 aterm_types::macos_setup::Subject::all()
                     .into_iter()
-                    .filter(|subject| !read.contains(subject))
+                    .filter(|subject| ran.contains(&subject.setting()) && !read.contains(subject))
                     .collect(),
             );
         }
@@ -6975,6 +7003,7 @@ impl Drop for SetupReadbackOwner {
             activity.readback_owner = self.0;
             // What the pass read is spent with it: no later pass is spared a read by it.
             activity.readback_subjects.clear();
+            activity.ran.clear();
         }
         publish_setup_readings();
     }
@@ -8086,7 +8115,7 @@ fn observe_rows(request: ObserveRequest) {
 /// published status are left as they were.
 #[cfg(target_os = "macos")]
 fn observe_rows_as(request: ObserveRequest, again: bool) {
-    use aterm_types::macos_setup::{Observation, Setting, Standing, Subject};
+    use aterm_types::macos_setup::{Observation, Setting, Subject};
     let repositories = Subject::Setting(Setting::Repositories);
     let mut pending = None;
     if request.pending_repositories {
@@ -8202,198 +8231,299 @@ fn observe_rows_as(request: ObserveRequest, again: bool) {
             rows.generation += 1;
         }
     }
-    let read = std::panic::catch_unwind(|| (setup_io().read)(&plan, &subjects, network, admission))
-        .unwrap_or_else(|_| {
-            // Do not keep a previous success as this reading's result, nor
-            // retry the failed batch. The worker still drains accepted work;
-            // publication below retains its choice, source and stage fences.
-            aterm_log::warn!("System State's row reading unwound; the requested rows are unknown");
-            subjects
-                .iter()
-                .map(|subject| Observation {
-                    note: Some("This reading did not finish. Check again.".into()),
-                    ..Observation::unknown(*subject)
-                })
-                .collect()
-        });
-    let read: Vec<Observation> = read.into_iter().map(|seen| seen.stamped(read_at)).collect();
-    // A private row this process has no reading of, read withheld: what a previous launch kept
-    // of it, looked for once (design §3.5), so a relaunch nobody watches does not leave a
-    // finished Mac's rows unread.
-    let remembered = if read
-        .iter()
-        .any(|seen| seen.is_withheld() && seen.subject.reads_privately())
-        && OBSERVED_ROWS
-            .lock()
-            .is_ok_and(|mut rows| !std::mem::replace(&mut rows.remembered_looked, true))
-    {
-        (setup_io().remembered)()
-    } else {
-        Vec::new()
+    // The read hands each batch over as it completes
+    // ([`aterm_cli::macos_doctor::observe_initial_setup`]), and each is kept and published at
+    // once: a slow batch (the repositories, which may wait on the network, come last) holds up
+    // no row another batch read.
+    let mut batches = ObservedBatches {
+        request: &request,
+        again,
+        plan: &plan,
+        choices,
+        pending: pending.as_ref(),
+        history_ticket,
+        started,
+        fence,
+        read_at,
+        read: Vec::new(),
+        handed: 0,
+        stale: false,
     };
-    // Display history dates its values in milliseconds; `read_at` above stamps readings in seconds.
-    let history_at = aterm_time::unix_millis().unwrap_or(0);
-    // A child's status supplies no readiness. Only a fresh native reading for the same
-    // still-pending plan/revision can settle its park, even when the displayed row was
-    // already ready or had no previous reading. This never lifts a stage's ledger hold.
-    let repository_ready_can_wake = pending.is_some_and(|before| {
-        (setup_io().pending_repositories)()
-            .ok()
-            .flatten()
-            .is_some_and(|now| {
-                now.revision == before.revision
-                    && !now.completed
-                    && now.plan == plan
-                    && !setup_stop_requested(now.revision)
-            })
-    });
-    if request.pending_repositories && !repository_ready_can_wake {
-        return;
-    }
-    let access_steps = aterm_cli::macos_doctor::initial_setup_access_revision()
-        .ok()
-        .zip(aterm_types::dirs::state_dir())
-        .map_or(0, |(revision, dir)| {
-            aterm_types::macos_setup::access_record::read(&dir, revision).len()
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (setup_io().read)(&plan, &subjects, network, admission, &mut |part: Vec<
+            Observation,
+        >| {
+            batches.keep(part)
         });
-    let (changed, wake, retained) = {
-        // Hold activity through publication, in Restore's lock order, so a reader checked just
-        // before a change cannot slip its old rows back after that change retired them.
-        let Ok(activity) = SETUP_ACTIVITY.lock() else {
-            return;
-        };
-        let Ok(mut rows) = OBSERVED_ROWS.lock() else {
-            return;
-        };
-        // A choice (or its refusal) retires the whole reading, not just the
-        // plan it names: its vault, account state and access count were read
-        // for the earlier plan. Read again under the current choice without
-        // carrying a superseded Check's forced personal/network scope.
-        if rows.choices != choices {
-            let choices = rows.choices;
-            drop(rows);
-            drop(activity);
-            queue_observation(ObserveRequest {
-                plan: None,
-                choices,
-                subjects: request.subjects,
-                forced: false,
-                pending_repositories: request.pending_repositories,
-            });
-            return;
-        }
-        let source = plan.vault_url.trim();
-        let mut changed = rows.vault_url.as_deref() != Some(source);
-        if changed {
-            rows.rows.retain(|row| !row.subject.uses_vault_source());
-            rows.last_known
-                .retain(|row| !row.subject.uses_vault_source());
-            rows.retained_reads
-                .retain(|row| !row.subject.uses_vault_source());
-            rows.unconfirmed
-                .retain(|subject| !subject.uses_vault_source());
-            rows.vault_url = Some(source.to_owned());
-        }
-        rows.plan = Some(plan);
-        let mut retained = false;
-        // A row a person fixed, or an access step the window recorded, is what a
-        // parked run waits for.
-        let mut wake = rows.access_steps != access_steps;
-        rows.access_steps = access_steps;
-        // A reading taken while its own stage or Restore ran may be half of a change.
-        let current_subject = |subject: &Subject| {
-            !activity.subjects.contains(subject)
-                && !(activity.input_readback && *subject == Subject::Setting(Setting::CapsLock))
-                && activity
-                    .touched
-                    .iter()
-                    .all(|(row, epoch)| row != subject || *epoch <= started)
-        };
-        for seen in read
-            .into_iter()
-            .filter(|seen| current_subject(&seen.subject))
+    }))
+    .is_err();
+    if unwound {
+        // Do not keep a previous success as this reading's result, nor
+        // retry the failed batch. The worker still drains accepted work;
+        // publication below retains its choice, source and stage fences.
+        // What the read handed over before it unwound stands.
+        aterm_log::warn!("System State's row reading unwound; the requested rows are unknown");
+        let rest = subjects
+            .iter()
+            .filter(|subject| !batches.read.contains(subject))
+            .map(|subject| Observation {
+                note: Some("This reading did not finish. Check again.".into()),
+                ..Observation::unknown(*subject)
+            })
+            .collect();
+        batches.keep(rest);
+    } else if batches.handed == 0 {
+        // A read that handed nothing over still says whose plan the rows are.
+        batches.keep(Vec::new());
+    }
+}
+
+/// One read of System State's rows as its batches come in ([`observe_rows_as`]): what each
+/// batch is kept under. Every batch shares the read's request, plan, journal fence and date;
+/// `started` moves with each batch kept to the stage epoch the next batch's read starts at.
+#[cfg(target_os = "macos")]
+struct ObservedBatches<'a> {
+    request: &'a ObserveRequest,
+    /// [`observe_rows_as`]' `again`: a reading that says what the kept one says changes nothing.
+    again: bool,
+    plan: &'a aterm_types::macos_setup::Plan,
+    /// The person's choice the read was made under ([`ObservedRows::choices`]).
+    choices: u64,
+    /// The pending Repositories stage the read may settle.
+    pending: Option<&'a aterm_cli::macos_doctor::InitialSetupAdmission>,
+    history_ticket: Option<SetupHistoryTicket>,
+    /// The setup activity's epoch as the next batch's read started: a stage that touched a row
+    /// after it may have changed the row under that read.
+    started: u64,
+    /// The journal as the read started ([`ObservedRows::fences`]).
+    fence: Option<aterm_cli::macos_doctor::Fence>,
+    /// The Unix second the read started, which dates every batch of it.
+    read_at: u64,
+    /// The rows handed over so far, kept or not.
+    read: Vec<aterm_types::macos_setup::Subject>,
+    /// The batches handed over so far.
+    handed: usize,
+    /// A person's newer choice retired the read: the rows are read again under it, and no later
+    /// batch of this read is kept.
+    stale: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl ObservedBatches<'_> {
+    /// Keep the batch `part` the read handed over: each reading no stage changed meanwhile,
+    /// published at once.
+    fn keep(&mut self, part: Vec<aterm_types::macos_setup::Observation>) {
+        use aterm_types::macos_setup::{Setting, Standing, Subject};
+        let repositories = Subject::Setting(Setting::Repositories);
+        self.handed += 1;
+        self.read.extend(part.iter().map(|seen| seen.subject));
+        // These rows are read: the page no longer says they are being read, while the rest of
+        // the read goes on.
+        if let Ok(mut queue) = OBSERVE_QUEUE.lock()
+            && let Some(current) = queue.current.as_mut()
         {
-            if again && says_what_is_kept(&rows, &seen) {
-                continue;
+            current
+                .subjects
+                .retain(|subject| !self.read.contains(subject));
+        }
+        if self.stale {
+            publish_setup_readings();
+            return;
+        }
+        let read_at = self.read_at;
+        let read: Vec<_> = part.into_iter().map(|seen| seen.stamped(read_at)).collect();
+        // A private row this process has no reading of, read withheld: what a previous launch
+        // kept of it, looked for once (design §3.5), so a relaunch nobody watches does not leave
+        // a finished Mac's rows unread.
+        let remembered = if read
+            .iter()
+            .any(|seen| seen.is_withheld() && seen.subject.reads_privately())
+            && OBSERVED_ROWS
+                .lock()
+                .is_ok_and(|mut rows| !std::mem::replace(&mut rows.remembered_looked, true))
+        {
+            (setup_io().remembered)()
+        } else {
+            Vec::new()
+        };
+        // Display history dates its values in milliseconds; `read_at` above stamps readings in
+        // seconds.
+        let history_at = aterm_time::unix_millis().unwrap_or(0);
+        // A child's status supplies no readiness. Only a fresh native reading for the same
+        // still-pending plan/revision can settle its park, even when the displayed row was
+        // already ready or had no previous reading. This never lifts a stage's ledger hold. The
+        // batch that holds the repositories' row asks; another has nothing to settle it with.
+        let repository_ready_can_wake = self.pending.is_some_and(|before| {
+            (self.request.pending_repositories
+                || read.iter().any(|seen| seen.subject == repositories))
+                && (setup_io().pending_repositories)()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|now| {
+                        now.revision == before.revision
+                            && !now.completed
+                            && now.plan == *self.plan
+                            && !setup_stop_requested(now.revision)
+                    })
+        });
+        if self.request.pending_repositories && !repository_ready_can_wake {
+            return;
+        }
+        let access_steps = aterm_cli::macos_doctor::initial_setup_access_revision()
+            .ok()
+            .zip(aterm_types::dirs::state_dir())
+            .map_or(0, |(revision, dir)| {
+                aterm_types::macos_setup::access_record::read(&dir, revision).len()
+            });
+        let (changed, wake, retained) = {
+            // Hold activity through publication, in Restore's lock order, so a reader checked
+            // just before a change cannot slip its old rows back after that change retired them.
+            let Ok(activity) = SETUP_ACTIVITY.lock() else {
+                return;
+            };
+            let Ok(mut rows) = OBSERVED_ROWS.lock() else {
+                return;
+            };
+            // A choice (or its refusal) retires the whole reading, not just the
+            // plan it names: its vault, account state and access count were read
+            // for the earlier plan. Read again under the current choice without
+            // carrying a superseded Check's forced personal/network scope.
+            if rows.choices != self.choices {
+                let choices = rows.choices;
+                drop(rows);
+                drop(activity);
+                self.stale = true;
+                queue_observation(ObserveRequest {
+                    plan: None,
+                    choices,
+                    subjects: self.request.subjects.clone(),
+                    forced: false,
+                    pending_repositories: self.request.pending_repositories,
+                });
+                publish_setup_readings();
+                return;
             }
-            // A withheld read ran no reader, so it supplies no evidence either way: the row's
-            // unconfirmed mark and its display history stay as they were. An attempted read that
-            // said nothing marks it.
-            if !seen.is_withheld() {
-                retained |= retain_completed_read(&mut rows, &seen, history_at);
-                let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
-                if seen.standing == Standing::Unknown {
-                    if !was_unconfirmed {
-                        rows.unconfirmed.push(seen.subject);
+            let source = self.plan.vault_url.trim();
+            let mut changed = rows.vault_url.as_deref() != Some(source);
+            if changed {
+                rows.rows.retain(|row| !row.subject.uses_vault_source());
+                rows.last_known
+                    .retain(|row| !row.subject.uses_vault_source());
+                rows.retained_reads
+                    .retain(|row| !row.subject.uses_vault_source());
+                rows.unconfirmed
+                    .retain(|subject| !subject.uses_vault_source());
+                rows.vault_url = Some(source.to_owned());
+            }
+            rows.plan = Some(self.plan.clone());
+            let mut retained = false;
+            // A row a person fixed, or an access step the window recorded, is what a
+            // parked run waits for.
+            let mut wake = rows.access_steps != access_steps;
+            rows.access_steps = access_steps;
+            let started = self.started;
+            // A reading taken while its own stage or Restore ran may be half of a change.
+            let current_subject = |subject: &Subject| {
+                !activity.subjects.contains(subject)
+                    && !(activity.input_readback && *subject == Subject::Setting(Setting::CapsLock))
+                    && activity
+                        .touched
+                        .iter()
+                        .all(|(row, epoch)| row != subject || *epoch <= started)
+            };
+            for seen in read
+                .into_iter()
+                .filter(|seen| current_subject(&seen.subject))
+            {
+                if self.again && says_what_is_kept(&rows, &seen) {
+                    continue;
+                }
+                // A withheld read ran no reader, so it supplies no evidence either way: the
+                // row's unconfirmed mark and its display history stay as they were. An attempted
+                // read that said nothing marks it.
+                if !seen.is_withheld() {
+                    retained |= retain_completed_read(&mut rows, &seen, history_at);
+                    let was_unconfirmed = rows.unconfirmed.contains(&seen.subject);
+                    if seen.standing == Standing::Unknown {
+                        if !was_unconfirmed {
+                            rows.unconfirmed.push(seen.subject);
+                            changed = true;
+                        }
+                    } else if was_unconfirmed {
+                        rows.unconfirmed.retain(|subject| *subject != seen.subject);
                         changed = true;
                     }
-                } else if was_unconfirmed {
-                    rows.unconfirmed.retain(|subject| *subject != seen.subject);
-                    changed = true;
                 }
+                let subject = seen.subject;
+                wake |= repository_ready_can_wake
+                    && subject == repositories
+                    && seen.standing == Standing::InPlace;
+                // A withheld read read nothing: the row's earlier reading stands, with its own
+                // time, which says how old it is, unless a stage that could change the row ran
+                // since that reading started (or nothing says when it started), which leaves
+                // the row unread.
+                let kept_from = rows
+                    .read_epochs
+                    .iter()
+                    .find(|(row, _)| *row == subject)
+                    .map_or(0, |(_, epoch)| *epoch);
+                let changed_since = activity
+                    .touched
+                    .iter()
+                    .any(|(row, epoch)| *row == subject && *epoch > kept_from);
+                // What a previous launch kept stands for a withheld row this process has no
+                // reading of, while no stage of this process touched the row: one that did may
+                // have changed it after that reading.
+                let (seen, fence) =
+                    match remembered.iter().find(|(kept, _)| kept.subject == subject) {
+                        Some((kept, kept_fence))
+                            if seen.is_withheld()
+                                && !rows.rows.iter().any(|row| row.subject == subject)
+                                && !activity.touched.iter().any(|(row, _)| *row == subject) =>
+                        {
+                            (kept.clone(), Some(*kept_fence))
+                        }
+                        _ => (seen, self.fence),
+                    };
+                match rows.rows.iter_mut().find(|row| row.subject == subject) {
+                    Some(_) if seen.is_withheld() && !changed_since => continue,
+                    Some(row) if *row == seen => {}
+                    Some(row) => {
+                        wake |= !row.standing.settled() && seen.standing.settled();
+                        *row = seen;
+                        changed = true;
+                    }
+                    None => {
+                        rows.rows.push(seen);
+                        changed = true;
+                    }
+                }
+                match rows.read_epochs.iter_mut().find(|(row, _)| *row == subject) {
+                    Some(kept) => kept.1 = started,
+                    None => rows.read_epochs.push((subject, started)),
+                }
+                rows.fence(subject, fence);
             }
-            let subject = seen.subject;
-            wake |= repository_ready_can_wake
-                && subject == repositories
-                && seen.standing == Standing::InPlace;
-            // A withheld read read nothing: the row's earlier reading stands, with its own time,
-            // which says how old it is, unless a stage that could change the row ran since that
-            // reading started (or nothing says when it started), which leaves the row unread.
-            let kept_from = rows
-                .read_epochs
-                .iter()
-                .find(|(row, _)| *row == subject)
-                .map_or(0, |(_, epoch)| *epoch);
-            let changed_since = activity
-                .touched
-                .iter()
-                .any(|(row, epoch)| *row == subject && *epoch > kept_from);
-            // What a previous launch kept stands for a withheld row this process has no
-            // reading of, while no stage of this process touched the row: one that did may have
-            // changed it after that reading.
-            let (seen, fence) = match remembered.iter().find(|(kept, _)| kept.subject == subject) {
-                Some((kept, kept_fence))
-                    if seen.is_withheld()
-                        && !rows.rows.iter().any(|row| row.subject == subject)
-                        && !activity.touched.iter().any(|(row, _)| *row == subject) =>
-                {
-                    (kept.clone(), Some(*kept_fence))
-                }
-                _ => (seen, fence),
-            };
-            match rows.rows.iter_mut().find(|row| row.subject == subject) {
-                Some(_) if seen.is_withheld() && !changed_since => continue,
-                Some(row) if *row == seen => {}
-                Some(row) => {
-                    wake |= !row.standing.settled() && seen.standing.settled();
-                    *row = seen;
-                    changed = true;
-                }
-                None => {
-                    rows.rows.push(seen);
-                    changed = true;
-                }
+            if changed {
+                rows.generation += 1;
             }
-            match rows.read_epochs.iter_mut().find(|(row, _)| *row == subject) {
-                Some(kept) => kept.1 = started,
-                None => rows.read_epochs.push((subject, started)),
-            }
-            rows.fence(subject, fence);
+            // The next batch's read starts once this one is kept: a stage that touches a row
+            // after this may change it under that read.
+            self.started = activity.epoch;
+            (changed, wake, retained)
+        };
+        if retained {
+            persist_setup_history(self.history_ticket.clone());
         }
         if changed {
-            rows.generation += 1;
+            remember_private_readings();
+            aterm_gui::publish_initial_setup_status(initial_setup_status());
+        } else {
+            publish_setup_readings();
         }
-        (changed, wake, retained)
-    };
-    if retained {
-        persist_setup_history(history_ticket);
-    }
-    if changed {
-        remember_private_readings();
-        aterm_gui::publish_initial_setup_status(initial_setup_status());
-    }
-    if wake {
-        wake_setup();
+        if wake {
+            wake_setup();
+        }
     }
 }
 

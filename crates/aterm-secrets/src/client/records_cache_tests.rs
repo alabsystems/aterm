@@ -176,7 +176,7 @@ fn the_cache_keeps_its_entries_within_its_byte_budget() {
     for wire in &wires {
         fsx::write_atomic(&paths.records_file(), wire, 0o600).unwrap();
         meter.read(&paths, vault(), base(&SIGNER)).unwrap();
-        costs.push(meter.entries.lock().unwrap().back().unwrap().kept);
+        costs.push(meter.entries.lock().unwrap().back().unwrap().kept());
     }
     let lineage = base(&SIGNER).keys().map_or(0, |keys| {
         keys.to_vec().capacity() * 2 * size_of::<[u8; 32]>()
@@ -198,9 +198,9 @@ fn the_cache_keeps_its_entries_within_its_byte_budget() {
         let store = cache.read(&paths, vault(), base(&SIGNER)).unwrap();
         assert_eq!(store.encode(), *wire);
         let entries = cache.entries.lock().unwrap();
-        let kept: usize = entries.iter().map(|entry| entry.kept).sum();
+        let kept: usize = entries.iter().map(Entry::kept).sum();
         assert!(kept <= budget, "{kept} bytes kept within {budget}");
-        assert_eq!(entries.back().unwrap().kept, *cost);
+        assert_eq!(entries.back().unwrap().kept(), *cost);
     }
     assert!(cache.entries.lock().unwrap().len() < wires.len());
 
@@ -244,8 +244,12 @@ fn empty_stores_still_spend_entry_and_context_budget() {
             entries.len() < 12,
             "empty files must still evict old contexts"
         );
-        assert!(entries.iter().all(|entry| entry.kept >= size_of::<Entry>()));
-        assert!(entries.iter().map(|entry| entry.kept).sum::<usize>() <= budget);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.kept() >= size_of::<Entry>())
+        );
+        assert!(entries.iter().map(Entry::kept).sum::<usize>() <= budget);
         assert!(!entries.iter().any(|entry| entry.vault == "empty-0"));
     }
 
@@ -649,7 +653,7 @@ fn the_decoding_digest_includes_the_entire_ignored_tail() {
     let mut reader = Hashed::new(std::io::Cursor::new(&wire));
     let recovered = base(&SIGNER).recovering_read(&mut reader).unwrap();
     assert!(recovered.log().is_some());
-    assert_eq!(reader.finish(), sha256(&wire));
+    assert_eq!(reader.finish(), crate::membership_log::head::digest(&wire));
 }
 
 #[test]
@@ -700,7 +704,11 @@ fn reversion_after_decoder_reads_cannot_authenticate_different_bytes() {
         changed: false,
         restored: false,
     };
-    let outcome = recover_observation(base(&SIGNER), &mut reader, sha256(&original));
+    let outcome = recover_observation(
+        base(&SIGNER),
+        &mut reader,
+        crate::membership_log::head::digest(&original),
+    );
     assert!(reader.changed && reader.restored);
     assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(outcome.is_err());
@@ -743,7 +751,7 @@ fn a_read_that_brackets_an_append_reads_the_file_again() {
         assert!(alone.is_err(), "warm={warm}: one read refuses the append");
 
         let tries = std::cell::Cell::new(0);
-        let read = cache.read_moving(&paths, String::new(), empty(), |attempt| {
+        let read = cache.read_moving(&paths, String::new(), empty(), &|| None, |attempt| {
             tries.set(tries.get() + 1);
             if attempt == 0 {
                 append(&paths, c.admit.bytes());
@@ -758,7 +766,7 @@ fn a_read_that_brackets_an_append_reads_the_file_again() {
         );
 
         tries.set(0);
-        let moving = cache.read_moving(&paths, String::new(), empty(), |_| {
+        let moving = cache.read_moving(&paths, String::new(), empty(), &|| None, |_| {
             tries.set(tries.get() + 1);
             append(&paths, b"\0");
         });

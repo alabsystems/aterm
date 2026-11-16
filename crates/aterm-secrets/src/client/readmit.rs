@@ -71,7 +71,7 @@ use crate::members::Allowed;
 use crate::members::bundle::Reader;
 use crate::membership_log::{
     Body, Budget, Entrant, EpochAudience, Evidence, Kind, Log, MemberId, NodeStanding,
-    OpenedAudienceEntries, Record, RecordCounts, RecordId, Signer, encode_records,
+    OpenedAudienceEntries, Record, RecordCounts, RecordId, Signer, read_records,
 };
 
 /// How long after a seat took a new key it may take another by proof: two Macs that hold one
@@ -1306,11 +1306,8 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         )));
     }
     if !signed.is_empty() {
-        store.ingest(&encode_records(&signed))?;
-        if signed
-            .iter()
-            .any(|record| store.get_bytes(record.id()).is_none())
-        {
+        store.ingest(&read_records(&signed)?)?;
+        if signed.iter().any(|record| !store.contains(record.id())) {
             return Err(Error::new("the proof admission cannot be retained in full"));
         }
     }
@@ -1333,7 +1330,7 @@ pub fn admit_by_proof(paths: &Paths, proven: &Proven<'_>, now_ms: u64) -> crate:
         vault,
         &allowed,
         LogAdmission {
-            records: store.encode_held(),
+            records: super::admit::held_records(&store)?,
             ..admission
         },
         policy,

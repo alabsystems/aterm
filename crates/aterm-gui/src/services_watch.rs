@@ -3,23 +3,29 @@
 
 //! Background watch of what macOS's own services hold in memory ([`aterm_vitals::services`]).
 //!
-//! Once a [`crate::harness_host::DISK_TICK`] the watch reads every resource coalition of the
-//! system's accounts alone (no root: the kernel's coalition figure) and the memory strain, and
-//! the window hears each change in what the judge tells ([`HostNote::ServiceMemory`]): which
-//! services it follows, which it tells, their sizes, a figure moved by a sixteenth, the
-//! pressure. The Vitals split reads the same figures only while a Deck is in view; this read is
-//! the one that runs while no one looks.
+//! The watch reads every resource coalition of the system's accounts alone (no root: the
+//! kernel's coalition figure) and the memory strain, and the window hears each change in what the
+//! judge tells ([`HostNote::ServiceMemory`]): which services it follows, which it tells, their
+//! sizes, a figure moved by a sixteenth, the pressure. It reads once a [`DISK_TICK`] while it
+//! follows a service or memory is pressed, else once a [`SERVICES_CALM`] ([`next_read`]), and at
+//! once when the kernel's memory pressure moves or the Mac wakes ([`BELL`], `crate::wake_rings`).
+//! The Vitals split reads the same figures only while a Deck is in view; this read is the one
+//! that runs while no one looks.
 //!
 //! One aterm process per Mac and account watches: the installed app's, holding the state root's
-//! [`LOCK`]. A lab instance, the dev app and a build run from `target/` never watch, so their
-//! windows and the checks that photograph them never raise the alert.
+//! [`LOCK`]; another waits on the lock, blocked, not on a timer. A lab instance, the dev app and a
+//! build run from `target/` never watch, so their windows and the checks that photograph them
+//! never raise the alert.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use aterm_vitals::services::{Judge, Reading, Seen, Size, Told, followed_from, restart_of};
+use aterm_vitals::services::{
+    HOLD_MS, Judge, Reading, Seen, Size, Told, followed_from, restart_of,
+};
 
-use crate::harness_host::HostNote;
+use crate::harness_host::{DISK_TICK, HostNote};
+use crate::park_bell::ParkBell;
 
 /// The file under the state root whose lock the one watching process holds.
 pub(crate) const LOCK: &str = "services-watch.lock";
@@ -27,6 +33,14 @@ pub(crate) const LOCK: &str = "services-watch.lock";
 /// How long after a press of a service's restart another press opens nothing: the first tab's
 /// `sudo` may still be asking, or the old process still ending.
 pub(crate) const PRESS_QUIET: Duration = Duration::from_mins(5);
+
+/// How long the watch rests between readings while it follows no service and memory is not
+/// pressed ([`next_read`]).
+pub(crate) const SERVICES_CALM: Duration = Duration::from_mins(5);
+
+// A calm rest delays a service's first reading past its bar by at most the rest, and the judge
+// dates its hold from that reading: the delay stays within half the hold.
+const _: () = assert!(2 * SERVICES_CALM.as_secs() * 1000 <= HOLD_MS);
 
 /// What the watch knows: the judge, what the window last heard, and the account.
 #[derive(Debug, Default)]
@@ -198,12 +212,41 @@ pub(crate) fn filed() -> Vec<String> {
     FILED.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
+/// How long the watch waits after a reading folded into `board`: [`DISK_TICK`] while it follows
+/// a service (one read at or past [`followed_from`], told or not, or unread since it was), while
+/// memory is pressed, and before a first reading; [`SERVICES_CALM`] otherwise.
+///
+/// A move of the kernel's pressure level rings the rest short ([`BELL`]); swap traffic does not.
+/// The judge's swap rate spans the gap between two readings, so a burst within a calm rest is
+/// spread over [`SERVICES_CALM`] and can read under its bar where a minute's gap would read it
+/// pressed. That changes no alert: the window reads `pressed` only for a service told past the
+/// huge bar (`App::service_memory`), and a told service was followed for the judge's hold at a
+/// [`DISK_TICK`] a reading, so each reading it is told on measures its swap over that minute.
+pub(crate) fn next_read(board: &Board) -> Duration {
+    match board.judge.told() {
+        Some(told) if told.services.is_empty() && !told.pressed => SERVICES_CALM,
+        _ => DISK_TICK,
+    }
+}
+
 /// Whether the service aterm restarts as `service` ([`aterm_vitals::services::Restart::name`])
 /// holds past its bar: as the watch's last reading follows it (told, or not yet told again by
 /// a relaunched watch), or, in a process whose watch has read nothing (before its first
 /// reading, or one that does not watch), as a read now finds it ([`read_holds`]).
+///
+/// The board answers however long ago it read, and the press (on the window's thread) never
+/// walks the process table where a watch runs: a board that follows a service is read again
+/// each [`DISK_TICK`] ([`next_read`]), and one that rests [`SERVICES_CALM`] follows none, so it
+/// answers no, which a read now could only turn into a restart for a service no alert names (an
+/// alert stands only on a reading that follows its service).
 pub(crate) fn holds(service: &str) -> bool {
-    let followed = board()
+    holds_in(board(), service, aterm_uds::services::read)
+}
+
+/// [`holds`] over `board`, `read` taking a reading now where the watch has read nothing; the
+/// board is not held during that read.
+fn holds_in(board: &Mutex<Board>, service: &str, read: impl FnOnce() -> Option<Reading>) -> bool {
+    let followed = board
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .judge
@@ -213,7 +256,7 @@ pub(crate) fn holds(service: &str) -> bool {
                 .iter()
                 .any(|o| o.size != Size::Usual && o.restart.is_some_and(|r| r.name == service))
         });
-    followed.unwrap_or_else(|| read_holds(service, aterm_uds::services::read().as_ref()))
+    followed.unwrap_or_else(|| read_holds(service, read().as_ref()))
 }
 
 /// Whether `reading` finds the service aterm restarts as `service` from the margin under the
@@ -335,10 +378,57 @@ fn waiting_shell_command() -> Vec<std::ffi::OsString> {
         .collect()
 }
 
+/// What wakes the watch from its rest before [`next_read`]'s deadline ([`ring_on`]): whether
+/// it was rung since the watch last rested.
+pub(crate) static BELL: ParkBell<bool> = ParkBell::new(false);
+
+/// Ring `bell` ([`BELL`] in production): the resting watch reads now.
+pub(crate) fn ring_on(bell: &ParkBell<bool>) {
+    bell.ring(|rung| *rung = true);
+}
+
+/// Rest on `bell` at most `rest`, or until rung (a ring before the rest included, which the
+/// rest takes): whether it was rung.
+pub(crate) fn rest_on(bell: &ParkBell<bool>, rest: Duration) -> bool {
+    bell.wait(rest, |rung| std::mem::take(rung).then_some(()))
+        .is_some()
+}
+
+/// THE WATCH: take the lock (`acquire`, which blocks until it is free: production's is
+/// [`aterm_update_core::FileLock::acquire`], never a poll; a failed take rests a [`DISK_TICK`] and
+/// asks again), then `read` (a reading folded into the board, with the note owed to the window and
+/// the rest the board owes, [`next_read`]), hand `note` the note, and `rest`; `rest` answers
+/// `false` to end (a test's).
+pub(crate) fn watch_loop<L>(
+    mut acquire: impl FnMut() -> Option<L>,
+    mut read: impl FnMut() -> (Option<HostNote>, Duration),
+    mut note: impl FnMut(HostNote),
+    mut rest: impl FnMut(Duration) -> bool,
+) {
+    let _held = loop {
+        if let Some(held) = acquire() {
+            break held;
+        }
+        if !rest(DISK_TICK) {
+            return;
+        }
+    };
+    aterm_log::info!("services: this process watches macOS's services");
+    loop {
+        let (owed, wait) = read();
+        if let Some(owed) = owed {
+            note(owed);
+        }
+        if !rest(wait) {
+            return;
+        }
+    }
+}
+
 /// Starts the background watcher thread, in the installed app on macOS only: a lab instance,
 /// the dev app and a build from `target/` leave it to the installed app. Of several installed
 /// app processes (an update's successor beside its predecessor), the one holding [`LOCK`]
-/// watches; another takes the lock once it is free.
+/// watches; another waits on the lock and takes it once it is free ([`watch_loop`]).
 pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
     if !cfg!(target_os = "macos") {
         return;
@@ -357,34 +447,29 @@ pub(crate) fn start(note: Arc<dyn Fn(HostNote) + Send + Sync>) {
     let spawned = std::thread::Builder::new()
         .name(format!("{}services", crate::harness_host::THREAD_PREFIX))
         .spawn(move || {
-            let mut held: Option<aterm_update_core::FileLock> = None;
-            loop {
-                if held.is_none() {
-                    held = aterm_update_core::FileLock::acquire_within(&lock, Duration::ZERO).ok();
-                    if held.is_none() {
-                        std::thread::sleep(crate::harness_host::DISK_TICK);
-                        continue;
-                    }
-                    aterm_log::info!("services: this process watches macOS's services");
-                }
-                let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let reading = aterm_uds::services::read();
-                    step(
-                        &mut board().lock().unwrap_or_else(PoisonError::into_inner),
-                        now_ms(),
-                        reading.as_ref(),
-                    )
-                }));
-                match read {
-                    Ok(Some(owed)) => note(owed),
-                    Ok(None) => {}
-                    Err(_) => aterm_log::warn!(
-                        "services: a read stopped after an internal panic; the next is taken at \
-                         its time"
-                    ),
-                }
-                std::thread::sleep(crate::harness_host::DISK_TICK);
-            }
+            watch_loop(
+                || aterm_update_core::FileLock::acquire(&lock).ok(),
+                || {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let reading = aterm_uds::services::read();
+                        let mut board = board().lock().unwrap_or_else(PoisonError::into_inner);
+                        let owed = step(&mut board, now_ms(), reading.as_ref());
+                        (owed, next_read(&board))
+                    }))
+                    .unwrap_or_else(|_| {
+                        aterm_log::warn!(
+                            "services: a read stopped after an internal panic; the next is taken \
+                             at its time"
+                        );
+                        (None, DISK_TICK)
+                    })
+                },
+                |owed| note(owed),
+                |rest| {
+                    rest_on(&BELL, rest);
+                    true
+                },
+            );
         });
     if let Err(e) = spawned {
         aterm_log::warn!("services: could not start its watch: {e}");

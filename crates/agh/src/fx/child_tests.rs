@@ -551,24 +551,55 @@ fn source_inventory_spools_more_than_tail_capacity_with_bounded_records() {
 #[cfg(unix)]
 #[test]
 fn source_inventory_stop_retires_the_actual_writer_before_returning() {
-    let root = aterm_tempfile::Builder::new()
-        .prefix("agh-inventory-stop-")
-        .tempdir()
-        .unwrap();
-    let marker = root.path().join("started");
-    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
-    let mut spec = ChildSpec::new(&sh).arg("-c")
-        .arg("printf '1111111111111111111111111111111111111111\\n'; printf '%s' $$ > \"$1\"; /bin/sleep 60")
-        .arg("sh").arg(marker.as_os_str()).budget(Duration::from_secs(60));
-    spec.stdout_records = Some(root.path().join("records"));
-    let error = super::run_unless(&spec, &mut || marker.exists()).unwrap_err();
-    assert_eq!(
-        (error.kind, error.side_effect),
-        (Kind::Interrupted, SideEffect::Unknown)
-    );
-    let pid: i32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
-    assert_eq!(
-        aterm_uds::process::process_presence(pid),
-        aterm_uds::process::ProcessPresence::Absent
-    );
+    for progress in [false, true] {
+        for incomplete in [b"".as_slice(), b"123".as_slice()] {
+            let root = aterm_tempfile::Builder::new()
+                .prefix("agh-inventory-stop-")
+                .tempdir()
+                .unwrap();
+            let marker = root.path().join("started");
+            // Redirection can expose an empty or incomplete PID before publication finishes.
+            // Starting in that state makes stop-on-existence fail deterministically.
+            std::fs::write(&marker, incomplete).unwrap();
+            let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+            let mut spec = ChildSpec::new(&sh).arg("-c")
+                .arg("printf '1111111111111111111111111111111111111111\\n'; printf '%s\\n' $$ > \"$1\"; /bin/sleep 60")
+                .arg("sh").arg(marker.as_os_str()).budget(Duration::from_secs(60));
+            if progress {
+                spec = spec.progressing(Duration::from_secs(60), "owned source inventory writer");
+            }
+            spec.stdout_records = Some(root.path().join("records"));
+            let mut identity = None;
+            let error = super::run_unless(&spec, &mut || {
+                if identity.is_some() {
+                    return true;
+                }
+                let Ok(text) = std::fs::read_to_string(&marker) else {
+                    return false;
+                };
+                let Some(record) = text.strip_suffix('\n') else {
+                    return false;
+                };
+                let Ok(pid) = record.parse::<i32>() else {
+                    return false;
+                };
+                if pid <= 0 {
+                    return false;
+                }
+                identity = aterm_uds::process::read_identity(pid);
+                identity.is_some()
+            })
+            .unwrap_err();
+            assert_eq!(
+                (error.kind, error.side_effect),
+                (Kind::Interrupted, SideEffect::Unknown)
+            );
+            let writer = identity.expect("the actual writer published its complete PID record");
+            let retired = original_process_retired(writer, false);
+            assert!(
+                retired.0,
+                "the original writer was reaped before return: {retired:?}"
+            );
+        }
+    }
 }

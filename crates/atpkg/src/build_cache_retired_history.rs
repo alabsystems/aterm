@@ -742,6 +742,86 @@ fn check(git: &dyn Git, checkout: &Path, wt: &Path, admin: Option<&Path>) -> Res
     Ok(())
 }
 
+/// One private module store of a linked worktree whose canonical witness lacks roots of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unrooted {
+    /// The private store: a submodule's git directory in git's entry for the worktree.
+    pub store: PathBuf,
+    /// Its canonical witness in the checkout's git directory.
+    pub witness: PathBuf,
+    /// The roots of the store (its refs' and its reflogs' commits) the witness's refs do not
+    /// hold, in order.
+    pub roots: Vec<String>,
+}
+
+/// The private module stores of `wt`, the linked worktree of `checkout` whose entry is `admin`,
+/// that hold a root their canonical witness does not ([`check`]'s first read, which no store
+/// may fail): the roots a pin must copy into each witness before the worktree can go.
+pub(super) fn unrooted(
+    git: &dyn Git,
+    checkout: &Path,
+    wt: &Path,
+    admin: &Path,
+) -> Result<Vec<Unrooted>, String> {
+    let private = registry::clear(wt, Some(admin))?;
+    let mut budget = Budget::new();
+    let read = Read {
+        git,
+        checkout,
+        deadline: Instant::now() + ELAPSED,
+    };
+    let cuts = vec![location(wt)?, location(admin)?];
+    let mut out = Vec::new();
+    for directory in &private {
+        let snapshot =
+            Snapshot::read(directory, false, &mut budget).map_err(|error| error.to_string())?;
+        let width = read.format(&snapshot, false)?;
+        let candidate = witness_path(checkout, wt, Some(admin), &directory.path)?;
+        let path = outside(&candidate, &cuts, &private)?;
+        let witness = Directory::root(&path)
+            .map_err(|error| error.to_string())?
+            .ok_or("canonical Git module witness is missing")?;
+        let witness_snapshot =
+            Snapshot::read(&witness, true, &mut budget).map_err(|error| error.to_string())?;
+        if read.format(&witness_snapshot, true)? != width {
+            return Err("canonical Git witness uses another object format".to_owned());
+        }
+        let objects = witness.path.join("objects");
+        let roots = read.roots(&directory.path, &snapshot, width, true, Some(&objects))?;
+        let witness_roots = read.roots(&witness.path, &witness_snapshot, width, false, None)?;
+        let input = witness_roots
+            .iter()
+            .map(|root| format!("{root}\n"))
+            .collect::<String>();
+        let listed = read.git(
+            &witness.path,
+            &[
+                "rev-list",
+                "--objects",
+                "--no-object-names",
+                "--missing=print",
+                "--stdin",
+            ],
+            input.as_bytes(),
+            None,
+        )?;
+        let covered: BTreeSet<&str> = listed.lines().collect();
+        let missing: Vec<String> = roots
+            .iter()
+            .filter(|root| !covered.contains(root.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            out.push(Unrooted {
+                store: directory.path.clone(),
+                witness: witness.path.clone(),
+                roots: missing,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Recheck registry custody and all private history before either retiring tree is removed.
 pub(super) fn clear(
     git: &dyn Git,

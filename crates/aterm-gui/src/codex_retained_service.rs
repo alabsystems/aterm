@@ -16,6 +16,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+#[cfg(debug_assertions)]
+#[path = "codex_retained_diagnostics.rs"]
+mod stderr_diagnostics;
+
 #[path = "codex_retained_settings.rs"]
 mod settings;
 pub(crate) use settings::Settings;
@@ -433,11 +437,18 @@ fn run(
         };
     drop(control); // OwnedService obtains the original constructor's own endpoint.
     let mut drains_ok = true;
+    #[cfg(debug_assertions)]
+    let stderr_capture = Arc::new(stderr_diagnostics::Capture::new());
     if let Some(output) = worker.take_stdout() {
         drains_ok &= drain(output, scope.clone(), diagnostics.clone()).is_ok();
     }
     if let Some(output) = worker.take_stderr() {
+        #[cfg(debug_assertions)]
+        let output = stderr_diagnostics::Stderr::new(output, stderr_capture.clone());
         drains_ok &= drain(output, scope.clone(), diagnostics).is_ok();
+    } else {
+        #[cfg(debug_assertions)]
+        stderr_capture.unavailable();
     }
     if !drains_ok {
         state(&status, "failed");
@@ -492,6 +503,40 @@ fn run(
         running.service.take()
     };
     if let Some(service) = &mut service {
+        #[cfg(debug_assertions)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            let status = service.observe_child_exit_status();
+            let drain_wait = if matches!(&status, Ok(Some(_))) {
+                Duration::from_millis(200)
+            } else {
+                Duration::ZERO
+            };
+            match status {
+                Ok(Some(status)) => match (status.code(), status.signal()) {
+                    (Some(code), None) => eprintln!(
+                        "Retained native owner: phase=before-service-stop child-exit=Exited exit-code={code} signal=none core=false other-stop=unknown"
+                    ),
+                    (None, Some(signal)) => eprintln!(
+                        "Retained native owner: phase=before-service-stop child-exit=Exited exit-code=none signal={signal} core={} other-stop=unknown",
+                        status.core_dumped()
+                    ),
+                    _ => eprintln!(
+                        "Retained native owner: phase=before-service-stop child-exit=Unavailable other-stop=unknown"
+                    ),
+                },
+                Ok(None) => eprintln!(
+                    "Retained native owner: phase=before-service-stop child-exit=NotExited other-stop=unknown"
+                ),
+                Err(_) => eprintln!(
+                    "Retained native owner: phase=before-service-stop child-exit=Unavailable other-stop=unknown"
+                ),
+            }
+            let report = stderr_capture.report(drain_wait);
+            eprintln!(
+                "Retained native owner: phase=before-service-stop {report} other-stop=unknown"
+            );
+        }
         while service.stop().is_err() {
             std::thread::park_timeout(Duration::from_millis(100));
         }

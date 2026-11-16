@@ -46,6 +46,14 @@ pub(super) trait LaneService: Send + Sync {
     }
     fn is_wait(&self, request: &Request, scope: Scope) -> bool;
     fn subscribe(&self, request: Request, scope: Scope, stream: CtlStream);
+    /// Serve the record stream `request` opened ([`ServeDisposition::Stream`]) on its own lane,
+    /// for the stream's whole life, as the connection: its serial, its claims, its principal and
+    /// its caller are the thread's while this runs. `buffered` is what the request lane had read
+    /// past the verb line. Returning ends the connection (and releases its claims). A service
+    /// that opens no stream never returns [`ServeDisposition::Stream`]; this then closes.
+    fn stream(&self, request: Request, stream: &CtlStream, buffered: Vec<u8>) {
+        let _ = (request, stream, buffered);
+    }
     fn release(&self, id: u64);
     /// Whether a live supervisor or drive lease still ends with connection `id`.
     #[cfg(unix)]
@@ -64,10 +72,17 @@ pub(super) struct LaneLimits {
     /// Placed connections while the parker runs — its parking capacity.
     pub(super) open: usize,
     /// Subscription lanes, at most: push streams served at once, each holding its lane for its whole life and no open-connection slot.
+    /// Record streams (`stream @<sid> v=1`) take the same number of lanes, in a pool of their
+    /// own ("aterm-stream") counted apart from the subscriptions; each keeps its
+    /// open-connection slot, because it stays the claim's connection.
     pub(super) subscriptions: usize,
 }
 
 const SUBSCRIPTION_BUSY_LINE: &[u8] = b"ERR subscription capacity busy; retry\n";
+
+/// The answer to a `stream` verb when every stream lane is taken: written before any `OK`, with
+/// the connection kept in request mode, so the claim bound to it stands.
+const STREAM_BUSY_LINE: &[u8] = b"ERR busy streams\n";
 
 /// How many times in a row the parker's loop may panic, with no pass completed
 /// between them, before it stops: it closes every connection it holds, and none parks after.
@@ -1194,6 +1209,9 @@ enum Lane {
 enum Here {
     Closed,
     Subscribe(Request, Scope),
+    /// A record stream opened: move the whole connection (its tenure, scope, principal, caller
+    /// and what was read past the verb) to a stream lane.
+    Stream(Request),
     /// Between requests — idle, or waiting on its peer for the rest of its
     /// next request or to take the rest of its answer: park it.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -1207,6 +1225,12 @@ struct Push {
     stream: CtlStream,
     request: Request,
     scope: Scope,
+}
+
+/// A connection that flipped to a record stream, with the verb that opened it.
+struct Streaming {
+    conn: Conn,
+    request: Request,
 }
 
 struct GrowPool<J> {
@@ -1430,6 +1454,8 @@ pub(super) struct Lanes {
     rpc: BoundedDispatch<Job>,
     waits: GrowPool<(Conn, Request)>,
     subscriptions: GrowPool<Push>,
+    /// The record streams' lanes, each serving one connection for the stream's whole life.
+    streams: GrowPool<Streaming>,
     /// Request lanes serving a wait right now (bounded by `limits.inline`).
     inline: Arc<Slots>,
     /// Connections open now: bounded by `limits.open` while a parker runs,
@@ -1489,6 +1515,9 @@ pub(super) struct Census {
     /// Push streams on subscription lanes, queued plus running.
     pub(super) subscriptions: usize,
     pub(super) subscription_threads: usize,
+    /// Record streams, each a connection on its own stream lane (queued or handed to a starting
+    /// lane, plus running).
+    pub(super) streams: usize,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1568,6 +1597,7 @@ impl Lanes {
             rpc: BoundedDispatch::with_resume_room(limits.rpc, limits.open),
             waits: GrowPool::new("aterm-control-wait", limits.wait),
             subscriptions: GrowPool::new("aterm-subscribe", limits.subscriptions),
+            streams: GrowPool::new("aterm-stream", limits.subscriptions),
             inline: Arc::new(Slots::new(limits.inline)),
             open: Arc::new(Slots::new(limits.open)),
             #[cfg(unix)]
@@ -1808,6 +1838,7 @@ impl Lanes {
             }),
             subscriptions,
             subscription_threads,
+            streams: self.streams.census().0,
         }
     }
 
@@ -1932,6 +1963,63 @@ impl Lanes {
         }
     }
 
+    fn stream_lane(self: &Arc<Self>, first: Option<Handed<Streaming>>) {
+        self.streams
+            .work(first, |streaming| self.serve_stream(streaming));
+    }
+
+    /// Hand a connection that opened a record stream to an idle or newly spawned stream lane,
+    /// whole: its tenure (so its claims stand), scope, principal, caller and unread bytes go
+    /// with it. `Err` when every stream lane is taken, so the caller answers
+    /// [`STREAM_BUSY_LINE`] and keeps serving the connection's requests.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "ControlLaneTenure",
+            action = "Stream",
+            project = "aterm_gui::control::control_lanes::conformance::project"
+        )
+    )]
+    fn stream(self: &Arc<Self>, streaming: Streaming) -> Result<(), Box<Streaming>> {
+        self.streams
+            .submit(streaming, |name, first| {
+                self.grow(name, first, Self::stream_lane)
+            })
+            .map_err(Box::new)
+    }
+
+    /// One record stream, for its whole life, as its connection: the lane enters the
+    /// connection's serial and claim flag, its descriptor, its direct peer, its principal and
+    /// its caller, exactly as a request lane does per request, and ends the connection (its
+    /// claims released by its tenure) when the service returns.
+    fn serve_stream(&self, streaming: Streaming) {
+        let Streaming { mut conn, request } = streaming;
+        {
+            let Conn {
+                stream,
+                principal,
+                caller,
+                tenure,
+                carry,
+                mode,
+                ..
+            } = &mut conn;
+            let stream: &CtlStream = stream;
+            let _serving = Serving::enter(tenure.id, &mut tenure.claimed);
+            let _hangup = super::ServingFd::enter(stream);
+            #[cfg(unix)]
+            let _direct = super::DirectPeer::enter();
+            let _principal = super::ServingPrincipal::enter(*principal);
+            let _caller = super::ServingCaller::enter(caller);
+            if mode.set(stream, false).is_ok() {
+                let buffered = LaneReader::new(stream, carry).take_buffered();
+                self.service().stream(request, stream, buffered);
+            }
+            mode.forget();
+        }
+        close_streamed(conn);
+    }
+
     fn drive(self: &Arc<Self>, mut conn: Conn, mut request: Option<Request>, lane: Lane) {
         let mut may_park = true;
         let mut may_defer = true;
@@ -1950,6 +2038,17 @@ impl Lanes {
                         scope,
                     });
                     return;
+                }
+                Here::Stream(request) => {
+                    match self.stream(Streaming { conn, request }) {
+                        Ok(()) => return,
+                        Err(back) => {
+                            // Every stream lane is taken: the verb is refused before any `OK`
+                            // and the connection, with its claim, stays in request mode.
+                            conn = back.conn;
+                            conn.reply.extend_from_slice(STREAM_BUSY_LINE);
+                        }
+                    }
                 }
                 Here::Idle => match self.park(conn) {
                     Ok(()) => return,
@@ -2130,6 +2229,9 @@ impl Lanes {
                 Some(ServeDisposition::Close) => reply.then_close = true,
                 Some(ServeDisposition::Subscribe { request, scope }) => {
                     return Here::Subscribe(request, scope);
+                }
+                Some(ServeDisposition::Stream { request }) => {
+                    return Here::Stream(request);
                 }
             }
         }
@@ -2908,6 +3010,20 @@ fn refuse_wait(out: &mut Outbox) {
     )
 )]
 fn close_parked(conn: Conn) {
+    conn.close();
+}
+
+/// A record stream ended (its peer closed, a sequence gap, its claim placed on another
+/// connection): the connection ends with it, its tenure releasing whatever claim it still holds.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "ControlLaneTenure",
+        action = "StreamClose",
+        project = "aterm_gui::control::control_lanes::conformance::project"
+    )
+)]
+fn close_streamed(conn: Conn) {
     conn.close();
 }
 

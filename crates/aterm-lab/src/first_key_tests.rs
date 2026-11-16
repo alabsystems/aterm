@@ -184,6 +184,47 @@ fn rows_round_trip_through_the_tsv_and_summarize() {
     assert!(s.contains("input p99 +2.30 ms"), "{s}");
 }
 
+/// The summary counts, per arm, the presses that met an attended window; a burst press's rows
+/// are one press, and rows written before the column say nothing.
+#[test]
+fn the_summary_counts_the_presses_that_met_an_attended_window() {
+    let row = |press: &str, arm: &str, burst: &str, attended: Option<&str>| -> Row {
+        [
+            ("press", press),
+            ("arm", arm),
+            ("burst", burst),
+            ("input_ms", "1.0"),
+        ]
+        .into_iter()
+        .chain(attended.map(|v| ("attended", v)))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+    };
+    let rows = [
+        row("0", "A", "0", Some("false")),
+        row("1", "F", "0", Some("true")),
+        row("2", "Fb", "2", Some("true")),
+        row("2", "Fb", "3", Some("true")),
+        row("3", "A", "0", Some("false")),
+        row("4", "A", "0", Some("true")),
+        row("5", "Old", "0", None),
+    ];
+    let s = summarize(&rows);
+    assert!(
+        s.contains("A: 1 of 3 presses met an attended window"),
+        "{s}"
+    );
+    assert!(
+        s.contains("F: 1 of 1 presses met an attended window"),
+        "{s}"
+    );
+    assert!(
+        s.contains("Fb: 1 of 1 presses met an attended window"),
+        "a burst's rows are one press: {s}"
+    );
+    assert!(!s.contains("Old:"), "no column, no count: {s}");
+}
+
 #[test]
 fn burst_keys_are_compared_with_the_first_burst_arm_alone() {
     let row = |arm: &str, burst: &str, input: f64| -> Row {

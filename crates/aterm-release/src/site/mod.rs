@@ -1353,7 +1353,7 @@ fn steps(
     // made on the older base would conflict, in the pull before the push, over the very files this
     // sync rewrites. A checkout holding commits origin lacks keeps them for that pull.
     halt(launch, "the fetch")?;
-    match git.out(&site_root, &["fetch", "--quiet", "origin", &branch]) {
+    match git.out(&site_root, &["fetch", "--quiet", "origin", &branch_ref]) {
         Err(e) => say(
             out,
             &format!(
@@ -2005,10 +2005,18 @@ fn steps(
     }
 
     halt(launch, "the site commit")?;
+    let mut inventory = vec!["ls-files", "-z", "--"];
+    inventory.extend(OWNED_FILES);
+    let tracked = git
+        .out(&site_dir, &inventory)
+        .map_err(|e| child_failed("git ls-files", e))?;
+    let tracked: Vec<&str> = tracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .collect();
     let mut stage: Vec<&str> = vec!["add", "-A", "--"];
     for f in OWNED_FILES {
-        if site_dir.join(f).exists() || git.ok(&site_dir, &["ls-files", "--error-unmatch", "--", f])
-        {
+        if site_dir.join(f).exists() || tracked.contains(&f) {
             stage.push(f);
         }
     }
@@ -2017,9 +2025,10 @@ fn steps(
             .any(|e| e.file_name().as_encoded_bytes().starts_with(b"aterm_wasm."))
     });
     if pair_on_disk
-        || git
-            .line(&site_dir, &["ls-files", "--", OWNED_GLOB])
-            .is_some()
+        || !git
+            .out(&site_dir, &["ls-files", "-z", "--", OWNED_GLOB])
+            .map_err(|e| child_failed("git ls-files", e))?
+            .is_empty()
     {
         stage.push(OWNED_GLOB);
     }

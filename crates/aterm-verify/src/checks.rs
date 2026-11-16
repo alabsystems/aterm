@@ -733,15 +733,19 @@ pub fn list_table() -> String {
     out.push_str(&tools_table());
     out.push_str(
         "\nEvery check needs targo: without it verify runs none (COULD NOT RUN, exit 3).\n\
-         Every run first holds vendor/astream to forge's OB-1 pin rule: checked out at its\n\
-         gitlink, unmodified, and not moved back from origin/main's pin at the merge-base\n\
-         unless a commit says `astream-pin-rollback: <reason>` (else FAIL, exit 1, none run).\n\
+         Every check run first holds vendor/astream to forge's OB-1 pin rule: checked out at\n\
+         its gitlink, unmodified, and not moved back from origin/main's pin at the merge-base\n\
+         unless a commit says `astream-pin-rollback: <reason>` (else FAIL, exit 1, none run),\n\
+         and each copy the roster pins by tree id to its vendor/<dir>.pin: the index holds\n\
+         that tree, and nothing under it is unstaged, untracked or ignored (else FAIL, exit 1;\n\
+         a repin is ~/alab-harness/tools/pin <checkout> <tag>; without git, exit 3).\n\
          \n\
          dev      released-shim fmt census export-scan lint test: the bare command, on the\n\
          \x20        change cone (test runs the selection's doctests after its test binaries)\n\
          release  what `ship release` requires: --all implied, --app required, a skip is exit 3\n\
          perf     not a check: the performance lanes, `verify perf --list`\n\
-         vendor-out  not a check: sealed copies of alab-policy, aterm-phase and\n\
+         vendor-out  not a check: sealed copies of alab-policy (the pinned alab-harness copy\n\
+         \x20           in vendor/alab-harness, held to its pin first), aterm-phase and\n\
          \x20           aterm-agent-names for another repository, `verify vendor-out --help`\n",
     );
     out

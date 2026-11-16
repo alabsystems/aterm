@@ -3185,8 +3185,8 @@ pub struct Binding {
 /// Claude sign-in's ([`super::open_url::MetWord::is_bot_protection`]: Cloudflare's check or
 /// block page, in the headless page or in aterm's sign-in window, or the consent page's human
 /// check), or another CLI's renewal whose page a bot protection answered
-/// ([`super::login_drive::Outcome::BotCheck`]: Cloudflare's check that did not clear, or a
-/// bot-protection block page). Nothing with nobody there signs that account in again, on any
+/// ([`super::login_drive::Outcome::BotCheck`]: Cloudflare's check, a human check or a
+/// bot-protection block page, met on its first read). Nothing with nobody there signs that account in again, on any
 /// clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3), so the record outlasts what the
 /// row's attempt does not: a later stop no bot protection made (a window a person closed), a run
 /// on the row's token, a hand run that failed for another reason, another account signed in,

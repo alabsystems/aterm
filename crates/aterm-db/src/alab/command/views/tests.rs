@@ -86,7 +86,12 @@ fn view(
         read_stdin: &mut read,
         store,
         // A test's refusing floor stands for one Mac holding the roll back.
-        holding: &|| Ok(usize::from(store.admit().is_err())),
+        holding: &|| {
+            Ok(aterm_secrets::client::Holding {
+                older: usize::from(store.admit().is_err()),
+                ..aterm_secrets::client::Holding::default()
+            })
+        },
         now_ms: NOW,
     };
     run(paths, noun, &words(list), &mut io)
@@ -663,6 +668,7 @@ fn the_unjournaled_opener_opens_no_secret_column() {
     assert!(
         att::open_every_ordinary(&handle, address, &cells)
             .unwrap()
+            .0
             .is_empty()
     );
     let opened = att::open_ordinary(&handle, phones, "number", &cells).unwrap();

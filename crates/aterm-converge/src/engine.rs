@@ -199,7 +199,8 @@ pub fn run_with(
 }
 
 /// Run `items` within `scope` and pass each completed row to `on_row`. Every row carries
-/// the time the engine spent on it ([`ItemReport::elapsed_ms`]) by the time `on_row` sees it.
+/// the time the engine spent on it ([`ItemReport::elapsed_ms`]) by the time `on_row` sees it,
+/// and its item has been told the row ended ([`Item::row_ended`]).
 ///
 /// # Errors
 /// As [`run`].
@@ -297,6 +298,7 @@ pub fn run_scoped(
             // Only an actual activation needs another read; this item changes nothing.
             passive.push((activation.id(), rows.len(), index));
         } else {
+            item.row_ended();
             on_row(&row);
         }
         rows.push(row);
@@ -371,6 +373,7 @@ fn settle(
                 journal_failure(journal, row);
             }
             add_elapsed(row, started.elapsed());
+            item.row_ended();
             on_row(row);
             continue;
         }
@@ -402,6 +405,7 @@ fn settle(
                 .elapsed()
                 .saturating_add(shared.take().unwrap_or_default()),
         );
+        item.row_ended();
         on_row(row);
     }
 }

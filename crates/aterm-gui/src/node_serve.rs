@@ -1090,8 +1090,9 @@ fn relay_ask(
 
 /// Serve this window's `wf-<pid>.sock` relay in `relay_dir` until `stop` (or for good): each
 /// header node serve hands over is `attach`ed, except a drive naming a session `hosts` says this
-/// window neither hosts nor keeps a retired worker's row of, which it answers `ELSEWHERE` so node
-/// serve asks the next window ([`handle_relay_accept`]).
+/// window neither hosts nor keeps a row of in the machine's session table
+/// (`control::hosts_or_keeps`), which it answers `ELSEWHERE` so node serve asks the next window
+/// ([`handle_relay_accept`]).
 #[cfg(test)]
 pub(crate) fn serve_window_relay_at<H, F>(
     relay_dir: &Path,
@@ -5029,17 +5030,51 @@ fn open_mesh(cfg: &NodeServeConfig) -> std::io::Result<Arc<aterm_mesh::Mesh>> {
     })
 }
 
-/// Where the overlay dials a seat: the node job's address cache, each address held to every
-/// fleet dial's guards ([`dial_units_at`]'s).
-fn mesh_hints(state_dir: PathBuf) -> aterm_mesh::overlay::Hints {
+/// Where the overlay dials a seat: the node job's address cache first, then every address the
+/// seat's own signed presence row names ([`aterm_mesh::Mesh::seat_addresses`]), each address held
+/// to every fleet dial's guards ([`dial_units_at`]'s). Both sources are authenticated (the cache
+/// holds only an address a handshake proved), so each may name an address beyond one LAN
+/// ([`aterm_net::fleet::Provenance::Proved`], LT-B8); every dial proves the node again.
+fn mesh_hints(
+    state_dir: PathBuf,
+    mesh: std::sync::Weak<aterm_mesh::Mesh>,
+) -> aterm_mesh::overlay::Hints {
     Arc::new(move || {
-        aterm_agent::node_service::mesh_addresses(&state_dir)
+        let mut hints = aterm_agent::node_service::mesh_addresses(&state_dir);
+        if let Some(mesh) = mesh.upgrade() {
+            for hint in mesh.seat_addresses() {
+                if !hints.contains(&hint) {
+                    hints.push(hint);
+                }
+            }
+        }
+        hints
             .into_iter()
-            .filter(|(_, at)| aterm_net::fleet::is_fleet_source(at.ip()))
+            .filter(|(_, at)| {
+                aterm_net::fleet::is_fleet_dial(at.ip(), aterm_net::fleet::Provenance::Proved)
+            })
             .filter(|(_, at)| {
                 aterm_net::loopback::check(aterm_net::loopback::Reach::Dial(*at)).is_ok()
             })
             .collect()
+    })
+}
+
+/// The addresses beyond one LAN the node listener admits a connection from, to its proofs
+/// ([`aterm_net::fleet::admits_source`]): one a current seat's signed presence row names
+/// ([`aterm_mesh::Mesh::seat_addresses`]), or one the node job's address cache holds. A source
+/// none of them names is refused before TLS, as every source beyond the LAN was before LT-B8.
+fn proved_sources(
+    state_dir: PathBuf,
+    mesh: std::sync::Weak<aterm_mesh::Mesh>,
+) -> aterm_net::fleet::ProvedSources {
+    Arc::new(move |ip| {
+        let named = |at: &SocketAddr| at.ip().to_canonical() == ip;
+        mesh.upgrade()
+            .is_some_and(|mesh| mesh.seat_addresses().iter().any(|(_, at)| named(at)))
+            || aterm_agent::node_service::mesh_addresses(&state_dir)
+                .iter()
+                .any(|(_, at)| named(at))
     })
 }
 
@@ -5468,11 +5503,14 @@ fn serve_one_node_generation(
                     }
                     // The overlay and the relays over this generation's links (B7a).
                     let attached = mesh_logs.and_then(|mesh| {
-                        mesh.attach(&table, mesh_hints(cfg.state_dir.clone()))
-                            .inspect_err(|e| {
-                                aterm_log::warn!("node: the mesh overlay did not start: {e}");
-                            })
-                            .ok()
+                        mesh.attach(
+                            &table,
+                            mesh_hints(cfg.state_dir.clone(), Arc::downgrade(mesh)),
+                        )
+                        .inspect_err(|e| {
+                            aterm_log::warn!("node: the mesh overlay did not start: {e}");
+                        })
+                        .ok()
                     });
                     // The mail pushes over them (C3), once the mesh hosts its logs.
                     let mail = mesh_logs.and_then(|mesh| {
@@ -5480,7 +5518,7 @@ fn serve_one_node_generation(
                             me,
                             mesh,
                             &table,
-                            mesh_hints(cfg.state_dir.clone()),
+                            mesh_hints(cfg.state_dir.clone(), Arc::downgrade(mesh)),
                         )
                     });
                     // A wake or a network path change re-proves every link, kicks the relays
@@ -5843,6 +5881,9 @@ fn serve_one_node_generation(
         std::process::id(),
         aterm_stamp::app_version(),
     );
+    // A seat beyond the LAN reaches this listener only from an address an authenticated source
+    // names (LT-B8); with the mesh off it serves its LAN alone.
+    let proved = mesh_logs.map(|mesh| proved_sources(state_dir.clone(), Arc::downgrade(mesh)));
     aterm_net::fleet::serve_offering_with_ask_within(
         &listener,
         (
@@ -5853,7 +5894,7 @@ fn serve_one_node_generation(
             }),
             deny_now,
         ),
-        Some(ask),
+        (Some(ask), proved),
         &listener_stop,
         HANDSHAKE,
         move |served, op| {
@@ -7172,10 +7213,12 @@ const UNITS_CONNECT: Duration = Duration::from_millis(750);
 const UNITS_CONNECT: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// [`dial_units`] of the node service at `ip` among `addresses`, as `me`. Each address is a dial
-/// hint, held to every fleet dial's guards: a fleet source ([`aterm_net::fleet::is_fleet_source`])
-/// that this aterm may reach ([`aterm_net::loopback::check`]: a private aterm never dials the
-/// person's fleet port), connected through the one funnel ([`aterm_uds::connect_tcp`], kept out of
-/// child processes and cut by a debug partition).
+/// hint, held to every fleet dial's guards: an address an authenticated source may name
+/// ([`aterm_net::fleet::is_fleet_dial`], [`aterm_net::fleet::Provenance::Proved`]: the address
+/// cache holds only an address a handshake proved) that this aterm may reach
+/// ([`aterm_net::loopback::check`]: a private aterm never dials the person's fleet port),
+/// connected through the one funnel ([`aterm_uds::connect_tcp`], kept out of child processes and
+/// cut by a debug partition).
 fn dial_units_at(
     addresses: &[(String, SocketAddr)],
     me: &aterm_net::fleet::NodeIdentity,
@@ -7188,7 +7231,9 @@ fn dial_units_at(
     addresses
         .iter()
         .filter(|(_, at)| at.ip().to_canonical() == ip)
-        .filter(|(_, at)| aterm_net::fleet::is_fleet_source(at.ip()))
+        .filter(|(_, at)| {
+            aterm_net::fleet::is_fleet_dial(at.ip(), aterm_net::fleet::Provenance::Proved)
+        })
         .filter(|(_, at)| aterm_net::loopback::check(aterm_net::loopback::Reach::Dial(*at)).is_ok())
         .find_map(|(_, at)| {
             let tcp = aterm_uds::connect_tcp(at, UNITS_CONNECT).ok()?;

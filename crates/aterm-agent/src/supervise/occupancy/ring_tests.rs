@@ -81,3 +81,65 @@ fn idle_while_ready_counts_each_look_once() {
     ];
     assert_eq!(idle_ready_ms(&gap, 0), (2 * MIN + MIN) as u64);
 }
+
+/// One random draw (xorshift), for the property test.
+struct Draw(u64);
+
+impl Draw {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}
+
+/// THE RING'S FILE MAY LEAVE OUT A LOOK THAT NAMED NO SESSION (the window writes none,
+/// `occupancy_host::append_look`): over rows whose consecutive looks lie at least
+/// [`LOOK_EVERY_MS`] apart, the slot-time idle while ready is the same with those rows left out.
+/// Such a row counts nothing itself, and the span of the row after it is a whole look either way.
+/// The precondition is this test's, not the ring's: a row's time is its held snapshot's, which
+/// two ticks can share, and a row whose snapshot an empty row's shares spans nothing after it and
+/// a whole look without it, so a successor seeded from the file can count up to one look more
+/// for each session that starts ready on such a snapshot. NEGATIVE CONTROL: an `idle_ready_ms`
+/// that stops clamping each span to a look counts the left-out minute into the next row's span,
+/// and the two differ.
+#[test]
+fn rows_a_look_apart_with_no_session_change_no_idle_while_ready() {
+    let mut draw = Draw(0x9e37_79b9_7f4a_7c15);
+    for case in 0..500 {
+        let mut at = T0;
+        let rows: Vec<RingRow> = (0..2 + draw.below(30))
+            .map(|_| {
+                at += LOOK_EVERY_MS + i64::try_from(draw.below(3 * 60)).expect("small") * 1000;
+                let mut m = machine(at, u16::try_from(draw.below(4)).expect("small"));
+                m.stale = draw.below(8) == 0;
+                let sessions = if draw.below(3) == 0 {
+                    Vec::new()
+                } else {
+                    (0..1 + draw.below(3))
+                        .map(|i| session(&format!("s-{i}"), draw.below(2) == 0))
+                        .collect()
+                };
+                RingRow::of(&m, sessions)
+            })
+            .collect();
+        let kept: Vec<RingRow> = rows
+            .iter()
+            .filter(|r| !r.sessions.is_empty())
+            .cloned()
+            .collect();
+        let since = T0 + i64::try_from(draw.below(20)).expect("small") * MIN;
+        assert_eq!(
+            idle_ready_ms(&rows, since),
+            idle_ready_ms(&kept, since),
+            "case {case}: {rows:?}"
+        );
+    }
+}

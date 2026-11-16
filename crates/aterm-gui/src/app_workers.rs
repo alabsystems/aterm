@@ -92,8 +92,7 @@ impl App {
     }
 
     /// Open the window's Workers tab when it gets its first parked tab, behind what it shows, and
-    /// remove it once its last goes and no Finished row of the window's is left
-    /// ([`crate::retired_workers`]). Where it is the window's only tab it stays, saying no workers
+    /// remove it once its last goes. Where it is the window's only tab it stays, saying no workers
     /// are running: a worker's end never takes a window away, and the person closes it.
     pub(crate) fn settle_workers_tab(&mut self, wid: WindowId) {
         let Some((parked, home, shown)) = self.windows.get(&wid).map(|ws| {
@@ -105,39 +104,23 @@ impl App {
         }) else {
             return;
         };
-        let finished = self.finished_rows_of(wid).len();
         // Reading rows takes each worker's terminal lock, and a sync comes with every switch and
         // resize: a list behind a tab reads as it comes to the front, when a task moves, or when
         // which sessions it stands for moved, which its chip's marks and tooltip also say.
-        match (parked, finished, home) {
-            (0, 0, Some(home)) if shown > 1 => self.retire_workers_tab(wid, home),
-            (1.., _, None) => {
+        match (parked, home) {
+            (0, Some(home)) if shown > 1 => self.retire_workers_tab(wid, home),
+            (1.., None) => {
                 if self.install_workers_tab(wid) {
                     self.publish_workers(wid);
                 }
             }
-            (_, _, Some(_)) => {
+            (_, Some(_)) => {
                 if self.workers_list_on_screen(wid) || self.worker_rows_stale(wid) {
                     self.publish_workers(wid);
                 }
             }
-            (0, _, None) => {}
+            (0, None) => {}
         }
-    }
-
-    /// Window `wid`'s retired workers ([`crate::retired_workers`]), oldest first: its Workers
-    /// page's Finished rows, each with the local id its row is keyed by.
-    pub(crate) fn finished_rows_of(
-        &self,
-        wid: WindowId,
-    ) -> Vec<(u64, crate::retired_workers::Retired)> {
-        self.store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers()
-            .listed_on(wid)
-            .map(|(local, row)| (local, row.clone()))
-            .collect()
     }
 
     fn install_workers_tab(&mut self, wid: WindowId) -> bool {
@@ -223,29 +206,15 @@ impl App {
         sessions
     }
 
-    /// Whether the window's page lists other sessions than its parked tabs hold now, and its
-    /// Finished rows after them.
+    /// Whether the window's page lists other sessions than its parked tabs hold now.
     fn worker_rows_stale(&self, wid: WindowId) -> bool {
         self.workers_page(wid).is_some_and(|(_, _, instance)| {
-            let mut listed = self.parked_sessions(wid);
-            listed.extend(self.finished_rows_of(wid).iter().map(|(local, _)| *local));
-            self.native_runtime.workers_listed(instance) != listed
+            self.native_runtime.workers_listed(instance) != self.parked_sessions(wid)
         })
     }
 
-    /// The window's parked workers as the page shows them, then its Finished rows.
-    pub(crate) fn worker_rows(&self, wid: WindowId) -> Vec<WorkerRow> {
-        let mut rows = self.live_worker_rows(wid);
-        rows.extend(
-            self.finished_rows_of(wid)
-                .iter()
-                .map(|(local, row)| finished_worker_row(*local, row)),
-        );
-        rows
-    }
-
     /// The window's parked workers as the page shows them.
-    fn live_worker_rows(&self, wid: WindowId) -> Vec<WorkerRow> {
+    pub(crate) fn worker_rows(&self, wid: WindowId) -> Vec<WorkerRow> {
         let sessions = self.parked_sessions(wid);
         let hosting = self.harness_hosting();
         // Off the store's lock before a row is read: a row reads the store again for its manager,
@@ -355,7 +324,6 @@ impl App {
             },
             has_result: record.as_ref().is_some_and(result_to_read),
             stoppable: chip.stoppable,
-            finished: false,
         }
     }
 
@@ -456,12 +424,6 @@ impl App {
 
     fn run_workers_action(&mut self, wid: WindowId, action: WorkersAction) {
         match action {
-            // A Finished row has no tab to open: its press reads what it left.
-            WorkersAction::Open(session) if self.finished_row(session).is_some() => {
-                if let Err(why) = self.read_result(wid, session) {
-                    aterm_log::info!("workers: open finished {session}: {why}");
-                }
-            }
             WorkersAction::Open(session) => {
                 if !self.focus_session_preferring(Some(wid), session) {
                     aterm_log::info!("workers: session {session} is gone");
@@ -487,8 +449,6 @@ impl App {
             WorkersAction::Keep(session) => {
                 self.keep_as_tab(session);
             }
-            WorkersAction::Dismiss(session) => self.dismiss_finished(session),
-            WorkersAction::ClearFinished => self.clear_finished(wid),
         }
     }
 
@@ -545,60 +505,6 @@ impl App {
         self.session_chrome.remove(&session);
         self.resync_active_or_window(wid);
         true
-    }
-
-    /// The Finished row ([`crate::retired_workers`]) of the worker whose session was `session`.
-    pub(crate) fn finished_row(&self, session: u64) -> Option<crate::retired_workers::Retired> {
-        self.store
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers()
-            .by_local(session)
-            .cloned()
-    }
-
-    /// Dismiss: the Finished row of `session` leaves its page. What it left stays, so its manager
-    /// still reads it, until its row ages out ([`crate::retired_workers`]).
-    pub(crate) fn dismiss_finished(&mut self, session: u64) {
-        let unlisted = self
-            .store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers_mut()
-            .unlist_local(session);
-        if let Some(wid) = unlisted
-            && self.windows.contains_key(&wid)
-        {
-            self.settle_workers_tab(wid);
-        }
-    }
-
-    /// A closed worker's row goes at a plain quit, its results with it. A seamless update's Commit
-    /// never reaches here (the outgoing process ends at it): its manifest carried the rows, whose
-    /// results the successor keeps. A candidate that ends before its Commit leaves both: it only
-    /// adopted its predecessor's rows, and the predecessor still answers from those files.
-    pub(crate) fn forget_retired_workers_at_quit(&self) {
-        if self.incoming_handoff_pending {
-            return;
-        }
-        let retired = self
-            .store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers_mut()
-            .drop_all();
-        crate::retired_workers::forget_results(&self.store, &retired);
-    }
-
-    /// Clear Finished: window `wid`'s Finished rows leave its page, what they left kept as
-    /// Dismiss keeps it.
-    pub(crate) fn clear_finished(&mut self, wid: WindowId) {
-        self.store
-            .write()
-            .unwrap_or_else(|p| p.into_inner())
-            .retired_workers_mut()
-            .unlist_window(wid);
-        self.settle_workers_tab(wid);
     }
 
     /// Agents ▸ Workers… and `open app workers`: the front window's list, else the first window
@@ -779,34 +685,6 @@ fn request_end_words((out, why): (aterm_requests::Out, aterm_requests::EndWhy)) 
         EndWhy::Relaunch => format!("request {} at a relaunch", out.word()),
         EndWhy::Kept => "request kept".to_owned(),
         EndWhy::TabsLeft | EndWhy::SpawnRefused => format!("request {}", out.word()),
-    }
-}
-
-/// A retired worker's row on its window's page, under Finished: what it was, how its task ended,
-/// and when its tab closed.
-fn finished_worker_row(session: u64, row: &crate::retired_workers::Retired) -> WorkerRow {
-    let record = &row.record;
-    let now = aterm_time::unix_millis().unwrap_or(0);
-    WorkerRow {
-        session,
-        group: crate::native_workers::FINISHED_GROUP.to_owned(),
-        under: if record.from == crate::task_record::FROM_CTL {
-            RowGroup::Aterm
-        } else {
-            RowGroup::Manager(record.from.clone())
-        },
-        state: row_state(Some(record), false),
-        title: row.title.clone(),
-        agent: record.agent.map(|program| program.name().to_owned()),
-        elapsed: format!(
-            "closed {} ago",
-            crate::app_overview::coarse_age(now.saturating_sub(row.closed_unix_ms))
-        ),
-        last_words: row.last_words.clone(),
-        why: why_words(record),
-        has_result: result_to_read(record),
-        stoppable: false,
-        finished: true,
     }
 }
 

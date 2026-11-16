@@ -6,8 +6,22 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-/// Default reserve file size in bytes (256 MiB).
+/// The least reserve file size in bytes (256 MiB), and its size where no room was read
+/// ([`sized`]).
 pub const RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The reserve's size on a volume whose ROOM is `room` ([`super::room`]: the second-largest
+/// daily two-hour fall of free space over the week, clamped, and its least until two days are
+/// measured) and whose emergency line is `line`: a twelfth of the room, so ten minutes of that
+/// fall, never over the line and never under [`RESERVE_BYTES`] (which wins where the line is
+/// under it); [`RESERVE_BYTES`] where no room was read.
+#[must_use]
+pub fn sized(room: Option<u64>, line: u64) -> u64 {
+    // `min` then `max`, never `clamp`: `clamp` panics where its bounds cross (a line under
+    // RESERVE_BYTES), in a release build too.
+    room.map_or(RESERVE_BYTES, |r| (r / 12).min(line))
+        .max(RESERVE_BYTES)
+}
 
 /// The reserve's folder under aterm's cache folder (`.noindex`: Spotlight
 /// skips it) and its file name.

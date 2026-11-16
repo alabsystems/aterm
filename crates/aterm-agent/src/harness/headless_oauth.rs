@@ -2947,6 +2947,25 @@ pub(super) fn with_browser_profile(
     )
 }
 
+/// Mark the fresh profile `dir` unproven ([`PROFILE_UNPROVEN_MARK`]) until a sign-in in it is
+/// kept ([`adopt_browser_profile`]).
+/// # Errors
+/// The mark could not be made, or one is already there.
+pub fn mark_profile_unproven(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        write_profile_unproven(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(PROFILE_UNPROVEN_MARK))?;
+        file.write_all(b"1\n")
+    }
+}
+
 #[cfg(unix)]
 fn write_profile_unproven(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -6668,10 +6687,16 @@ const CODE_INPUT_HELPERS_JS: &str = r#"
 
 /// An enabled control or native form submission must be attempted before latching a step.
 /// Missing actions leave input-event-driven pages to advance on their next DOM observation.
+/// Nothing is pressed or submitted while the page carries a check: `submitInput` reads
+/// [`CHECK_PAGE_JS`]'s `checkMet()` at the press, so every script that splices it in splices
+/// the predicate in before it. A form is submitted itself (`requestSubmit`) only where it owns
+/// no submit control at all and no disabled control the step's label names: a form whose
+/// `Continue` is held disabled until a check answers is never submitted past it.
 const SUBMIT_INPUT_HELPERS_JS: &str = r#"
   const disallowedSubmitLabel = label =>
     /cancel|deny|decline|reject|revoke|logout|log out|sign out|signout|not you|sign up|create|with |without |switch |another |do not |don't |dont |agree|accept|cookie|terms|policy|allow all|同意|接受|取消|拒绝|注册|退出|登出|注销|切换|条款|协议/i.test(label);
   const submitInput = (input, buttons, labelPattern) => {
+    if (checkMet()) return false;
     const enabled = control => !control.disabled && !control.hidden &&
       !control.matches(":disabled") && control.getAttribute("aria-disabled") !== "true";
     if (!enabled(input) || input.readOnly || input.type === "hidden") return false;
@@ -6689,7 +6714,9 @@ const SUBMIT_INPUT_HELPERS_JS: &str = r#"
       button.click();
       return true;
     }
-    if (form && !owned.some(isSubmit) && typeof form.requestSubmit === "function") {
+    const controls = form ? Array.from(form.elements || []).filter(c => c.tagName === "BUTTON" || c.tagName === "INPUT") : [];
+    const held = controls.some(c => isSubmit(c) || (!enabled(c) && labelPattern.test(btnLabel(c))));
+    if (form && !held && !owned.some(isSubmit) && typeof form.requestSubmit === "function") {
       form.requestSubmit();
       return true;
     }
@@ -6698,20 +6725,22 @@ const SUBMIT_INPUT_HELPERS_JS: &str = r#"
 "#;
 
 /// Build the JavaScript expression evaluated inside the OAuth page to inspect and advance the
-/// flow. Cloudflare's block page answers `block_page`, its bot check `bot_check` ([`block_page`],
-/// [`bot_check`]), and a page that holds a human check's widget anywhere in it
-/// ([`HUMAN_CHECK_WIDGETS`]: hCaptcha, reCAPTCHA or Turnstile, whether the button it is bound
-/// to stands enabled or not) `human_check`. All three are read before anything on the page is
-/// pressed or filled, and then nothing is: nobody is at this profile to answer a check, and an
-/// invisible one runs on the press of the button it is bound to.
+/// flow. The check a page carries ([`CHECK_PAGE_JS`]'s `checkMet()`: a block page, Cloudflare's
+/// bot check, or a human check's widget anywhere in it, in an open shadow root or a same-origin
+/// frame, whether the button it is bound to stands enabled or not) answers its kind,
+/// `block_page`, `bot_check` or `human_check`, with its name as `check`. It is read before
+/// anything on the page is pressed or filled, in the same evaluation, and then nothing is:
+/// nobody is at this profile to answer a check, and an invisible one runs on the press of the
+/// button it is bound to.
 ///
 /// A consent control (`Authorize`, `Allow`, `Continue as …`, an approval form's own enabled
 /// submit button) is pressed only while it is enabled (neither `disabled` nor
 /// `aria-disabled`), and at most once per page load: `consent_pressed` names the page
 /// address and the document (`performance.timeOrigin`) the drive's one press was made in, as a
-/// `clicked_consent` answer's `url` and `doc` said, and that document answers
-/// `consent_pressed` with nothing pressed again. An approval form is never submitted past its
-/// own controls, so a disabled `Authorize` stays unpressed.
+/// `clicked_consent` (or `switched_account`) answer's `url` and `doc` said, and that document
+/// answers `consent_pressed` with nothing pressed again, its account switch included. An
+/// approval form is never submitted past its own controls, so a disabled `Authorize` stays
+/// unpressed.
 #[must_use]
 pub fn oauth_step_js(
     email: Option<&str>,
@@ -6742,11 +6771,9 @@ pub fn oauth_step_js(
   if (href.startsWith("http://127.0.0.1:") || href.startsWith("http://localhost:")) {{
     return {{ state: failedHref ? "callback_recovered" : "callback", url: href }};
   }}
-{BOT_CHECK_JS}
-  const pageText = String(document.body && document.body.innerText || "");
-  if (blockPageOf(pageText)) return {{ state: "block_page", url: href }};
-  if (botCheckOf(document.title, pageText, botCheckMarkers())) return {{ state: "bot_check", url: href }};
-  if (document.querySelector("{HUMAN_CHECK_WIDGETS}")) return {{ state: "human_check", url: href }};
+{CHECK_PAGE_JS}
+  const met = checkMet();
+  if (met) return {{ state: met.kind, check: met.name, url: href }};
   const pageDoc = String(window.performance && window.performance.timeOrigin || "");
   const consentSpent = href === {pressed_at} && pageDoc === {pressed_doc};
   const pressConsent = (control, target) => {{
@@ -6796,8 +6823,9 @@ pub fn oauth_step_js(
   );
   if (hasForeignAccount) {{
     if (switchBtn) {{
+      if (consentSpent) return {{ state: "consent_pressed", url: href }};
       switchBtn.click();
-      return {{ state: "switched_account", url: href }};
+      return {{ state: "switched_account", url: href, doc: pageDoc }};
     }}
     return {{ state: "wrong_account", url: href }};
   }}
@@ -7138,6 +7166,10 @@ pub(super) fn webmail_login_js(
     webmail_script(credentials, submitted, 0, &[], false)
 }
 
+/// The webmail page's one step: it reads the check the page carries before any fill, submit or
+/// press, and again before it opens a message. On a sign-in page that is the whole predicate
+/// ([`CHECK_PAGE_JS`]'s `checkMet()`); once the inbox is up (its message rows, and no sign-in
+/// field) it is the mailbox's (`mailboxCheckMet()`), which no mail's subject or body can trip.
 fn webmail_script(
     (email, password, mailbox_password, totp_code): (
         Option<&str>,
@@ -7170,6 +7202,13 @@ fn webmail_script(
     format!(
         r#"(() => {{
   const href = String(window.location && window.location.href || "");
+{CHECK_PAGE_JS}
+  const mailboxRows = "[data-testid*='message-item'], [data-shortcut-target='item-container'], .item-container, [role='listitem'], [role='row'], tr";
+  const signInField = "input[type='password'], input[type='email'], input[name='username'], input[name='email'], input[name='loginfmt'], input[name='totp'], input[name='twoFa'], input[autocomplete='one-time-code'], input#mailboxPassword";
+  const inboxUp = !document.querySelector(signInField) && Boolean(document.querySelector(mailboxRows));
+  const checkHere = () => inboxUp ? mailboxCheckMet() : checkMet();
+  const met = checkHere();
+  if (met) return {{ state: met.kind, check: met.name, url: href }};
   const setNativeValue = (el, val) => {{
     el.focus();
     const proto = Object.getPrototypeOf(el);
@@ -7290,7 +7329,7 @@ fn webmail_script(
     textParts.push(String(document.body.innerText || ""));
   }}
 
-  const rows = Array.from(document.querySelectorAll("[data-testid*='message-item'], [data-shortcut-target='item-container'], .item-container, [role='listitem'], [role='row'], tr"));
+  const rows = Array.from(document.querySelectorAll(mailboxRows));
   const senderWords = {senders_json};
   const vendorAuthRows = [];
   const senderRows = [];
@@ -7309,7 +7348,7 @@ fn webmail_script(
   }}
   const candidates = vendorAuthRows.concat(senderRows, authRows);
   let clickedRow = false;
-  if ({open_messages} && candidates.length > 0) {{
+  if ({open_messages} && candidates.length > 0 && !checkHere()) {{
     const limit = Math.min(candidates.length, 5);
     const idx = Math.floor({inbox_tick} / 2) % limit;
     const chosen = candidates[idx] || candidates[0];
@@ -7390,6 +7429,17 @@ fn poll_webmail_until(
     // A webmail login refused on this host within its wait is not tried again
     // ([`login_may_be_tried`]); a refusal over IMAP (a local Bridge) holds only IMAP.
     let source = super::mailbox_routes::login_source(webmail_url);
+    // A webmail whose sign-in page carried a check is not opened again by aterm: only a person
+    // clears that record ([`super::mailbox_routes::login_check`]). With no login named, the
+    // record is the source's, and holds every login on it.
+    let check_login = login_user.as_deref().unwrap_or("");
+    if let Some(kind) =
+        super::mailbox_routes::login_check(cfg.login_record.as_deref(), &source, check_login)
+    {
+        let check = CheckMet::parse(&kind).unwrap_or(CheckMet::HumanCheck("captcha".into()));
+        note_met(check.word(), None);
+        return Err(webmail_check_words(&check));
+    }
     if let Some(login) = login_user.as_deref()
         && !login_may_be_tried(cfg, &source, login, seen_digests)
     {
@@ -7499,6 +7549,27 @@ fn poll_webmail_until(
                 .and_then(Value::as_str)
                 .unwrap_or("loading");
             match state {
+                // The page carries a check: nothing on it was set, pressed or opened, and the
+                // poll ends now, naming it, and records it so nothing returns to it on a clock.
+                "block_page" | "bot_check" | "human_check" => {
+                    let check = CheckMet::of_value(&json!({
+                        "kind": state,
+                        "name": val.get("check").and_then(Value::as_str).unwrap_or(""),
+                    }))
+                    .unwrap_or(CheckMet::BotCheck);
+                    let host = val
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .and_then(super::login_drive::https_host);
+                    note_met(check.word(), host.as_deref());
+                    super::mailbox_routes::note_login_check(
+                        cfg.login_record.as_deref(),
+                        &source,
+                        check_login,
+                        &check.page_word(),
+                    );
+                    return Err(webmail_check_words(&check));
+                }
                 "needs_password" => {
                     super::mailbox_needs::record_observed_missing(
                         cfg,
@@ -7845,29 +7916,86 @@ pub fn drive_cdp_oauth(
     )
 }
 
-/// The most reads of the OAuth page one drive makes, Cloudflare's bot check and the gaps
-/// between its reads apart ([`drive_cdp_oauth_with_webmail`], [`BotCheckClock`]).
+/// The most reads of the OAuth page one drive makes ([`drive_cdp_oauth_with_webmail`]).
 const MAX_OAUTH_STEPS: usize = 120;
 
-/// A Claude sign-in's end on Cloudflare's bot check ([`bot_check`]) that did not clear within
-/// [`VENDOR_STALL`] or the drive's deadline.
-pub const BOT_CHECK_UNCLEARED: &str =
-    "Cloudflare's bot check on the sign-in page did not clear; aterm never tries to pass it";
+/// A headless Claude sign-in's end on Cloudflare's bot check ([`check_met`]), on its first read:
+/// nothing on the page was pressed or filled, and the drive did not wait for it to clear.
+pub const BOT_CHECK_MET: &str = "Cloudflare's bot check met the sign-in page; aterm pressed \
+                                 nothing there and never tries to pass it";
 
-/// A Claude sign-in's end on Cloudflare's block page ([`block_page`]).
-pub const BLOCK_PAGE_MET: &str =
-    "Cloudflare's block page answered the sign-in; aterm never tries to pass it";
+/// A Claude sign-in's end on a block page ([`block_page`]): Cloudflare's or Google's.
+pub const BLOCK_PAGE_MET: &str = "a block page answered the sign-in; aterm never tries to pass it";
 
 /// A headless Claude sign-in's end where a page of it carried a human check's widget
-/// (hCaptcha, reCAPTCHA or Turnstile, [`HUMAN_CHECK_WIDGETS`]) until the drive's deadline
-/// ([`MetWord::HumanCheck`]): nothing on that page was pressed or filled.
+/// ([`HUMAN_CHECK_KINDS`]), on its first read ([`MetWord::HumanCheck`]): nothing on that page
+/// was pressed or filled.
 pub const HUMAN_CHECK_MET: &str = "a page of the sign-in carried a human check (hCaptcha, \
-                                   reCAPTCHA or Turnstile); aterm never operates one, and \
-                                   pressed nothing there";
+                                   reCAPTCHA, Turnstile or Arkose); aterm never operates one, \
+                                   and pressed nothing there";
+
+/// The words a sign-in that met `check` ends with ([`BLOCK_PAGE_MET`], [`BOT_CHECK_MET`],
+/// [`HUMAN_CHECK_MET`]).
+#[must_use]
+pub const fn sign_in_check_words(check: &CheckMet) -> &'static str {
+    match check {
+        CheckMet::BlockPage => BLOCK_PAGE_MET,
+        CheckMet::BotCheck => BOT_CHECK_MET,
+        CheckMet::HumanCheck(_) => HUMAN_CHECK_MET,
+    }
+}
+
+/// Whether `why` is a sign-in's end on a check ([`sign_in_check_words`]): such an end is not
+/// tried again, by another attempt of the same drive or on a clock.
+#[must_use]
+pub fn is_sign_in_check_words(why: &str) -> bool {
+    [BLOCK_PAGE_MET, BOT_CHECK_MET, HUMAN_CHECK_MET].contains(&why)
+}
+
+/// A webmail poll's end where the webmail's sign-in page was a block page
+/// ([`CheckMet::BlockPage`]): nothing on it was set or pressed, and it is not opened again by
+/// aterm until a person clears its record ([`super::mailbox_routes::login_check`]).
+pub const WEBMAIL_BLOCK_PAGE: &str = "the webmail's page was a block page; aterm pressed nothing \
+                                      there and does not open it again until a person clears it";
+
+/// A webmail poll's end where the webmail's page carried Cloudflare's bot check
+/// ([`CheckMet::BotCheck`]), held as [`WEBMAIL_BLOCK_PAGE`] is.
+pub const WEBMAIL_BOT_CHECK: &str = "the webmail's page carried Cloudflare's bot check; aterm \
+                                     pressed nothing there and does not open it again until a \
+                                     person clears it";
+
+/// A webmail poll's end where the webmail's page carried a human check's widget
+/// ([`CheckMet::HumanCheck`]), held as [`WEBMAIL_BLOCK_PAGE`] is.
+pub const WEBMAIL_HUMAN_CHECK: &str = "the webmail's page carried a human check; aterm pressed \
+                                       nothing there and does not open it again until a person \
+                                       clears it";
+
+/// The words a webmail poll that met `check` ends with.
+#[must_use]
+pub const fn webmail_check_words(check: &CheckMet) -> &'static str {
+    match check {
+        CheckMet::BlockPage => WEBMAIL_BLOCK_PAGE,
+        CheckMet::BotCheck => WEBMAIL_BOT_CHECK,
+        CheckMet::HumanCheck(_) => WEBMAIL_HUMAN_CHECK,
+    }
+}
+
+/// The check a mailbox read's error names, where it is a webmail poll's end on one
+/// ([`webmail_check_words`]): a drive that meets it ends naming it, never as a mailbox that
+/// did not answer.
+#[must_use]
+pub fn mailbox_check(why: &str) -> Option<CheckMet> {
+    match why {
+        WEBMAIL_BLOCK_PAGE => Some(CheckMet::BlockPage),
+        WEBMAIL_BOT_CHECK => Some(CheckMet::BotCheck),
+        WEBMAIL_HUMAN_CHECK => Some(CheckMet::HumanCheck("captcha".into())),
+        _ => None,
+    }
+}
 
 /// A token consent page's end on the account's headless profile where it carried a human
-/// check's widget (hCaptcha, reCAPTCHA or Turnstile) until the drive's deadline
-/// ([`MetWord::HumanCheck`]): nothing was pressed.
+/// check's widget (hCaptcha, reCAPTCHA, Turnstile or Arkose), on its first read
+/// ([`MetWord::HumanCheck`]): nothing was pressed, and the drive did not wait for it to clear.
 pub const TOKEN_HUMAN_CHECK: &str = "the token's consent page carried a human check (hCaptcha, \
                                      reCAPTCHA or Turnstile); aterm never operates one, and \
                                      pressed nothing there";
@@ -7885,8 +8013,8 @@ pub const TOKEN_CONSENT_UNPROVEN: &str = "the token's consent page did not show 
 /// ([`super::setup_token::admit_url`]) under [`super::open_url::CLAUDE_PIN`], and the profile
 /// one a sign-in proved ([`has_browser_profile`]); none is made here. `Authorize` is pressed
 /// once, and only where the page shows `target_email` as the account signed in
-/// ([`shows_email`]); Cloudflare's check and the consent page's human check are waited on with
-/// nothing pressed. What it met is noted for [`take_met`].
+/// ([`shows_email`]); a check on the page (a block page, Cloudflare's bot check, a human check)
+/// ends it on its first read with nothing pressed. What it met is noted for [`take_met`].
 ///
 /// # Errors
 /// The request or profile is not one it serves, the browser could not start or be driven, or
@@ -7933,18 +8061,23 @@ pub const WINDOW_NO_DESKTOP: &str = "this session has no desktop to open aterm's
                                      on; run the sign-in from a terminal on this Mac's own \
                                      desktop";
 
-/// A Claude sign-in's end on Cloudflare's check in aterm's sign-in window, which stood until
-/// the sign-in's deadline ([`VisibleStop::BotCheck`]).
-pub const WINDOW_BOT_CHECK: &str = "Cloudflare's check in aterm's sign-in window did not clear; \
-                                    aterm never operates it, and a person at this Mac may \
-                                    complete it";
+/// A Claude sign-in's end in aterm's sign-in window where Cloudflare's check met it
+/// ([`VisibleStop::BotCheck`]): in a sign-in nobody started, at the read that found it; in one a
+/// person started, where nobody finished it before the run ended. From that page on the window
+/// pressed nothing.
+pub const WINDOW_BOT_CHECK: &str = "Cloudflare's check met the sign-in in aterm's sign-in \
+                                    window; aterm never operates it and pressed nothing after \
+                                    it, and a person at this Mac may complete it and the \
+                                    sign-in";
 
-/// A Claude sign-in's end on a consent page in aterm's sign-in window whose `Authorize` a
-/// human check (hCaptcha) held until the sign-in's deadline, or at all in a sign-in nobody
-/// started ([`VisibleStop::HumanCheck`]).
-pub const WINDOW_HUMAN_CHECK: &str = "the consent page in aterm's sign-in window held Authorize \
-                                      behind a human check (hCaptcha); aterm never operates \
-                                      it, and a person at this Mac may complete it there";
+/// A Claude sign-in's end in aterm's sign-in window where a page carried a human check (the
+/// consent page's hCaptcha, whether `Authorize` stood enabled or not): in a sign-in nobody
+/// started, at the read that found it; in one a person started, where nobody finished it before
+/// the run ended ([`VisibleStop::HumanCheck`]). From that page on the window pressed nothing.
+pub const WINDOW_HUMAN_CHECK: &str = "a page of the sign-in in aterm's sign-in window carried a \
+                                      human check; aterm never operates it and pressed nothing \
+                                      after it, and a person at this Mac may complete it and \
+                                      the sign-in there";
 
 /// A Claude sign-in's end on Cloudflare's block page in aterm's sign-in window
 /// ([`VisibleStop::BlockPage`]).
@@ -7992,12 +8125,13 @@ pub(super) enum VisibleDone {
 pub(super) enum VisibleStop {
     /// This process has no desktop session, so no window was opened.
     NoDesktop,
-    /// Cloudflare's check stood in the window until the sign-in's deadline, on this host.
+    /// Cloudflare's check met the window on this host: at the read that found it in a sign-in
+    /// nobody started, else standing until the run ended before its callback (its deadline, the
+    /// window closed, the window's host lost).
     BotCheck(Option<String>),
     /// Cloudflare's block page answered in the window, on this host.
     BlockPage(Option<String>),
-    /// The consent page held its `Authorize` behind a human check until the sign-in's
-    /// deadline, on this host.
+    /// A page on this host carried a human check, ended on as [`Self::BotCheck`] is.
     HumanCheck(Option<String>),
     /// A person closed the window before the sign-in finished.
     Closed,
@@ -8022,8 +8156,8 @@ pub(super) enum VisibleStop {
 /// grant ([`super::open_url::WINDOW_ENV`]), which only a sign-in this Mac started for its own
 /// rows carries. `scope` is the caller's account-work scope, which ends the wait when
 /// cancelled; the opener process (`aterm-open-url`) has none. `unattended`: nobody started the
-/// sign-in ([`super::open_url::UNATTENDED_ENV`]), so a code page no mailbox answers ends it at
-/// once. A test gets its thread's
+/// sign-in ([`super::open_url::UNATTENDED_ENV`]), so any check ends it at the read that finds it
+/// and a code page no mailbox answers ends it at once. A test gets its thread's
 /// substituted result instead ([`set_visible_sign_in_for_tests`]) and opens nothing.
 pub(super) fn visible_sign_in(
     authorize_url: &str,
@@ -8140,7 +8274,7 @@ pub(super) fn take_callback_offered() -> bool {
 }
 
 /// Notes why this thread's headless sign-in ended, with a host only for a page outcome.
-fn note_met(word: MetWord, host: Option<&str>) {
+pub(super) fn note_met(word: MetWord, host: Option<&str>) {
     let met = super::open_url::Met::new(word, host);
     MET.with(|slot| *slot.borrow_mut() = Some(met));
 }
@@ -8177,13 +8311,12 @@ pub(super) fn finish_deadline<T>(
 
 /// Drive an active CDP session (`cdp`) through the OAuth flow for `authorize_url`, passing
 /// `&mut CdpClient` to `mailbox_credential` so webmail inboxes can be polled in a secondary CDP
-/// tab. Cloudflare's bot check is waited on, its reads (and a gap of idle reads between two,
-/// [`BotCheckClock`]) not counted against the drive's steps. Software never operates that
-/// challenge, no other browser is opened after it and no other machine is asked: the drive
-/// ends on the page it met ([`BOT_CHECK_UNCLEARED`], [`BLOCK_PAGE_MET`]). A page that holds a
-/// human check's widget is pressed and filled nothing, and waited on, its reads uncounted,
-/// until the deadline, which names it ([`HUMAN_CHECK_MET`]); a consent control is pressed at
-/// most once per page load ([`oauth_step_js`]). Page outcomes are
+/// tab. A page that carries a check ([`oauth_step_js`]'s `checkMet()`: a block page,
+/// Cloudflare's bot check, a human check's widget) ends the drive on its first read, with
+/// nothing on it pressed or filled and no wait for it to clear: nobody is at this profile to
+/// answer it, no other browser is opened after it and no other machine is asked
+/// ([`BLOCK_PAGE_MET`], [`BOT_CHECK_MET`], [`HUMAN_CHECK_MET`]). A consent control is pressed
+/// at most once per page load ([`oauth_step_js`]). Page outcomes are
 /// noted for [`take_met`], as is a drive that reached no callback in time. (On macOS a Claude
 /// sign-in this Mac started runs in aterm's own window instead and never reaches this drive:
 /// [`visible_sign_in`].)
@@ -8204,61 +8337,35 @@ pub fn drive_cdp_oauth_with_webmail(
         authorize_url,
         target_email,
         (timeout, poll_interval),
-        VENDOR_STALL,
         mailbox_credential,
         deliver_callback,
     )
 }
 
-/// How a Claude drive whose deadline came at `now` ends, last on `last_host`, noted for
-/// [`take_met`]: [`BOT_CHECK_UNCLEARED`] where a bot check it waited on still stood
-/// ([`BotCheckClock::held`]), else timed out.
-fn oauth_out_of_time(bot: &BotCheckClock, last_host: Option<&str>, now: Instant) -> &'static str {
-    if bot.held(now).is_some() {
-        note_met(MetWord::BotCheck, last_host);
-        return BOT_CHECK_UNCLEARED;
-    }
+/// How the headless sign-in's drive whose deadline came ends, last on `last_host`, noted for
+/// [`take_met`]: timed out. A check is never waited on, so none stands at the deadline.
+fn sign_in_out_of_time(last_host: Option<&str>) -> &'static str {
     note_met(MetWord::Stall, last_host);
     "timed out waiting for headless browser OAuth completion"
-}
-
-/// How the headless sign-in's drive whose deadline came at `now` ends, noted for [`take_met`]:
-/// on the human check its last read stood on (`human`, [`HUMAN_CHECK_MET`]), else as
-/// [`oauth_out_of_time`] ends it.
-fn sign_in_out_of_time(
-    bot: &BotCheckClock,
-    human: bool,
-    last_host: Option<&str>,
-    now: Instant,
-) -> &'static str {
-    if human {
-        note_met(MetWord::HumanCheck, last_host);
-        return HUMAN_CHECK_MET;
-    }
-    oauth_out_of_time(bot, last_host, now)
 }
 
 /// What is left of the headless sign-in's `deadline`, or how its drive ends where nothing is
 /// ([`sign_in_out_of_time`]).
 fn oauth_time_left(
     deadline: Deadline<'_>,
-    bot: &BotCheckClock,
-    human: bool,
     last_host: Option<&str>,
 ) -> Result<Duration, &'static str> {
     deadline
         .remaining()
-        .map_err(|_| sign_in_out_of_time(bot, human, last_host, deadline.now()))
+        .map_err(|_| sign_in_out_of_time(last_host))
 }
 
-/// [`drive_cdp_oauth_with_webmail`] within `timeout`, reading every `poll_interval`, with
-/// `bot_stall` how long a bot check may stand (a test's short one; else [`VENDOR_STALL`]).
+/// [`drive_cdp_oauth_with_webmail`] within `timeout`, reading every `poll_interval`.
 pub(super) fn drive_cdp_oauth_within(
     cdp: &mut CdpClient,
     authorize_url: &str,
     target_email: Option<&str>,
     (timeout, poll_interval): (Duration, Duration),
-    bot_stall: Duration,
     mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
@@ -8273,7 +8380,6 @@ pub(super) fn drive_cdp_oauth_within(
             authorize_url,
             target_email,
             (deadline, poll_interval),
-            bot_stall,
             mailbox_credential,
             deliver_callback,
         ),
@@ -8286,7 +8392,6 @@ fn drive_cdp_oauth_until(
     authorize_url: &str,
     target_email: Option<&str>,
     (deadline, poll_interval): (Deadline<'_>, Duration),
-    bot_stall: Duration,
     mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
@@ -8299,7 +8404,6 @@ fn drive_cdp_oauth_until(
         (authorize_url, flow, None),
         target_email,
         (deadline, poll_interval),
-        bot_stall,
         mailbox_credential,
         deliver_callback,
     )
@@ -8445,7 +8549,6 @@ fn drive_cdp_oauth_flow_until(
     (authorize_url, flow, google_config): (&str, MailboxFlow, Option<&MailboxConfig>),
     target_email: Option<&str>,
     (deadline, poll_interval): (Deadline<'_>, Duration),
-    bot_stall: Duration,
     mut mailbox_credential: impl FnMut(
         &mut CdpClient,
         Option<&str>,
@@ -8488,20 +8591,13 @@ fn drive_cdp_oauth_flow_until(
     const MAX_MAILBOX_POLLS: usize = 3;
     let result = (|| {
         let mut steps = 0usize;
-        let mut bot = BotCheckClock::default();
-        // Whether the last read stood on a human check, which only the deadline ends.
-        let mut human = false;
         // Where the one consent press of the page load it was made in was made: its address
         // and its document, as the page answered them ([`oauth_step_js`]).
         let mut consent_at: Option<(String, String)> = None;
         let mut last_host: Option<String> = None;
-        let pause = || {
-            let _ = deadline.pause(poll_interval);
-        };
         loop {
-            let now = deadline.now();
             if deadline.expired() {
-                return Err(sign_in_out_of_time(&bot, human, last_host.as_deref(), now));
+                return Err(sign_in_out_of_time(last_host.as_deref()));
             }
             if steps >= MAX_OAUTH_STEPS {
                 note_met(MetWord::Stall, last_host.as_deref());
@@ -8528,43 +8624,21 @@ fn drive_cdp_oauth_flow_until(
             } else {
                 expr
             };
-            let within = oauth_time_left(deadline, &bot, human, last_host.as_deref())?;
-            let eval = match cdp.call(
-                Some(&session),
-                "Runtime.evaluate",
-                json!({
-                    "expression": expr,
-                    "awaitPromise": true,
-                    "returnByValue": true
-                }),
-                within,
-            ) {
-                Ok(eval) => eval,
-                // A read cut short while a bot check or a human check stood (the deadline came,
-                // or the check replaced its page under the read) is part of that wait.
-                Err(why) => {
-                    let now = deadline.now();
-                    if bot.held(now).is_none() && !human {
-                        return Err(browser_control_failed(why));
-                    }
-                    if deadline.expired() {
-                        return Err(sign_in_out_of_time(&bot, human, last_host.as_deref(), now));
-                    }
-                    bot.unread(now);
-                    if bot.held(now).is_none() && !human {
-                        return Err(browser_control_failed(why));
-                    }
-                    pause();
-                    continue;
-                }
-            };
+            let within = oauth_time_left(deadline, last_host.as_deref())?;
+            let eval = cdp
+                .call(
+                    Some(&session),
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expr,
+                        "awaitPromise": true,
+                        "returnByValue": true
+                    }),
+                    within,
+                )
+                .map_err(browser_control_failed)?;
             if deadline.expired() {
-                return Err(sign_in_out_of_time(
-                    &bot,
-                    human,
-                    last_host.as_deref(),
-                    deadline.now(),
-                ));
+                return Err(sign_in_out_of_time(last_host.as_deref()));
             }
             let val = eval
                 .pointer("/result/value")
@@ -8602,42 +8676,23 @@ fn drive_cdp_oauth_flow_until(
             if let Some(host) = super::login_drive::https_host(url) {
                 last_host = Some(host);
             }
+            // A page that carries a check ends the drive on its first read, named, with nothing
+            // on it pressed or filled: nobody is at this profile to answer it, and a check that
+            // cleared by itself would have let software past it.
             match state {
                 "block_page" => {
                     note_met(MetWord::BlockPage, last_host.as_deref());
                     return Err(BLOCK_PAGE_MET);
                 }
                 "bot_check" => {
-                    human = false;
-                    if bot.check(url, deadline.now()) >= bot_stall {
-                        note_met(MetWord::BotCheck, last_host.as_deref());
-                        return Err(BOT_CHECK_UNCLEARED);
-                    }
-                    pause();
-                    continue;
+                    note_met(MetWord::BotCheck, last_host.as_deref());
+                    return Err(BOT_CHECK_MET);
                 }
-                // A human check's widget in the page: nothing on it was pressed or filled, and
-                // nothing is. It is waited on, its reads none of the drive's steps, until the
-                // deadline, which then names it ([`sign_in_out_of_time`]).
                 "human_check" => {
-                    human = true;
-                    bot.other(url, false, deadline.now());
-                    pause();
-                    continue;
+                    note_met(MetWord::HumanCheck, last_host.as_deref());
+                    return Err(HUMAN_CHECK_MET);
                 }
-                // A page that did nothing (`loading`, or a consent page whose one press was made)
-                // between two reads of a bot check, on its host and within its gap, is part of
-                // that wait and none of the drive's steps: the check reloading itself, read
-                // half-parsed.
-                _ => {
-                    human = false;
-                    let now = deadline.now();
-                    bot.other(url, matches!(state, "loading" | "consent_pressed"), now);
-                    if bot.held(now).is_some() {
-                        pause();
-                        continue;
-                    }
-                }
+                _ => {}
             }
             steps += 1;
 
@@ -8645,7 +8700,8 @@ fn drive_cdp_oauth_flow_until(
                 "clicked_consent" | "switched_account" => {
                     if state == "switched_account" {
                         email_submitted = false;
-                    } else if let Some(doc) = val.get("doc").and_then(Value::as_str) {
+                    }
+                    if let Some(doc) = val.get("doc").and_then(Value::as_str) {
                         // Pressed in this document; it is pressed nothing again.
                         consent_at = Some((url.to_owned(), doc.to_owned()));
                     }
@@ -9063,7 +9119,7 @@ fn authorize_pinned_browser_until(
                         &mut cdp,
                         token,
                         (deadline, Duration::from_millis(200)),
-                        (VENDOR_STALL, token_consent::PROOF_STALL),
+                        token_consent::PROOF_STALL,
                         |cb_url| deliver_claude_callback(cb_url, deadline),
                     );
                 }
@@ -9080,7 +9136,6 @@ fn authorize_pinned_browser_until(
                 ),
                 email.as_deref(),
                 (deadline, Duration::from_millis(200)),
-                VENDOR_STALL,
                 |cdp_inner, em| {
                     let Some(mb) = mailbox_cfg.filter(|c| c.is_configured_for(em)) else {
                         if let Some(cfg) = mailbox_cfg {
@@ -9167,6 +9222,12 @@ pub struct Page {
     pub title: String,
     /// The marks of Cloudflare's challenge machinery on it ([`bot_check`]).
     pub markers: Vec<Marker>,
+    /// The check its reader found on it ([`CHECK_PAGE_JS`]'s `checkPageOf()`), where it found
+    /// one; [`check_met`] judges a page whose reader named none by its other fields.
+    pub check: Option<CheckMet>,
+    /// The document that was read (`performance.timeOrigin`): an act is made in that document
+    /// and in no other ([`vendor_act_js`]).
+    pub doc: String,
 }
 
 /// A mark of Cloudflare's challenge machinery on a [`Page`], read by [`VENDOR_PAGE_JS`] and
@@ -9420,17 +9481,14 @@ pub enum Step {
     Done,
     /// Only the person can go on from here: why, without the URL or code.
     Stop(String),
-    /// A bot protection's block page answered ([`block_page`]): only a person past it goes on,
-    /// and the sign-in ends as a bot protection's stop
-    /// ([`super::login_drive::Approval::BotCheck`]), which holds the row's account for a person
-    /// on no clock (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §3): why, without the
-    /// page's text.
-    Blocked(String),
     /// The page wants the person's own sign-in to the vendor's site (another identity provider,
     /// a password): why, without the URL or code, naming [`Gate::sign_in_once`] where it is set.
     SignIn(String),
     /// The page is refused: why.
     Refuse(String),
+    /// The page carries a check ([`check_met`]): nothing on it is pressed, filled or followed,
+    /// and the drive ends its attempt at once, naming it ([`check_reason`]).
+    Check(CheckMet),
 }
 
 /// The most consent presses one vendor sign-in makes.
@@ -9735,15 +9793,46 @@ fn asks_to_agree(page: &Page) -> bool {
         .any(|w| page.heading.contains(w))
 }
 
-/// Whether the page is a bot-protection block page (Cloudflare's `Sorry, you have been
-/// blocked`), which only a person past it can go on from.
+/// The words of Google's pages that stop a sign-in for a person, lowercase, each apostrophe a
+/// plain one: its `unusual traffic` page (`www.google.com/sorry`), its `This browser or app
+/// may not be secure` refusal and its `Verify it's you` challenge.
+pub const GOOGLE_STOP_WORDS: &[&str] = &[
+    "unusual traffic",
+    "this browser or app may not be secure",
+    "verify it's you",
+];
+
+/// Whether the page is a block page only a person past it can go on from: Cloudflare's
+/// (`Sorry, you have been blocked`), or one of Google's ([`GOOGLE_STOP_WORDS`] in its title or
+/// heading, or in its text on a Google host; its `/sorry` page).
 pub(super) fn block_page(page: &Page) -> bool {
     let lower = page.text.to_ascii_lowercase();
-    lower.contains("sorry, you have been blocked") && lower.contains("cloudflare")
+    (lower.contains("sorry, you have been blocked") && lower.contains("cloudflare"))
+        || google_stop(&page.url, &page.title, &page.heading, &page.text)
+}
+
+/// Whether the page at `url` with `title`, `heading` and `text` is one of Google's that stop a
+/// sign-in ([`GOOGLE_STOP_WORDS`]): its words in the title or a heading anywhere, in the text
+/// on a Google host, or Google's `/sorry` page.
+fn google_stop(url: &str, title: &str, heading: &str, text: &str) -> bool {
+    let plain = |s: &str| s.to_lowercase().replace('\u{2019}', "'");
+    let host = super::login_drive::https_host(url).unwrap_or_default();
+    let google = host == "google.com" || host.ends_with(".google.com");
+    let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let path = rest.find('/').map_or("", |at| &rest[at..]);
+    let (title, heading, text) = (plain(title), plain(heading), plain(text));
+    (google && path.starts_with("/sorry"))
+        || GOOGLE_STOP_WORDS
+            .iter()
+            .any(|w| title.contains(w) || heading.contains(w) || (google && text.contains(w)))
 }
 
 /// The titles of Cloudflare's managed challenge (its interstitial), lowercase.
-pub const CHALLENGE_TITLES: &[&str] = &["just a moment...", "just a moment…"];
+pub const CHALLENGE_TITLES: &[&str] = &[
+    "just a moment...",
+    "just a moment…",
+    "attention required! | cloudflare",
+];
 
 /// The words of Cloudflare's managed challenge in a page's text, lowercase.
 pub const CHALLENGE_WORDS: &[&str] = &[
@@ -9752,14 +9841,13 @@ pub const CHALLENGE_WORDS: &[&str] = &[
     "verifying you are human",
 ];
 
-/// Whether the page is Cloudflare's managed challenge (the "Just a moment..." interstitial
-/// that answered the headless shell at claude.ai/login on 2026-10-27): its title or its text
-/// says so ([`CHALLENGE_TITLES`], [`CHALLENGE_WORDS`]) AND at least one of its [`Marker`]s is
-/// on it. The words without a marker (a help page quoting them) and a marker without the words
-/// (a sign-in form carrying a Turnstile widget) are never one. aterm never tries to pass one: no
-/// user-agent change, no flag that hides automation, no press on its widget, no solver and no
-/// imported clearance cookie. A page that is one is waited on, with nothing pressed, filled or
-/// followed, until it clears by itself or its stall ends the sign-in naming it ([`PageStall`]).
+/// Whether the page is Cloudflare's managed challenge as a stop names it (the "Just a
+/// moment..." interstitial that answered the headless shell at claude.ai/login on
+/// 2026-10-27): its title or its text says so ([`CHALLENGE_TITLES`], [`CHALLENGE_WORDS`]) AND
+/// at least one of its [`Marker`]s is on it. This only names a stop: whether anything on a
+/// page may be pressed is [`check_met`]'s, for which its words alone, its title alone or a
+/// mark alone is a check. aterm never tries to pass one: no user-agent change, no flag that
+/// hides automation, no press on its widget, no solver and no imported clearance cookie.
 #[must_use]
 pub fn bot_check(page: &Page) -> bool {
     if page.markers.is_empty() {
@@ -9770,14 +9858,15 @@ pub fn bot_check(page: &Page) -> bool {
         || CHALLENGE_WORDS.iter().any(|w| text.contains(w))
 }
 
-/// The page reader's helpers for Cloudflare's pages, shared by [`VENDOR_PAGE_JS`] and
-/// [`oauth_step_js`]: `botCheckMarkers()` names the [`Marker`]s on the page, `blockPageOf(text)`
-/// is [`block_page`], and `botCheckOf(title, text, markers)` is [`bot_check`] (their word lists
-/// are [`CHALLENGE_TITLES`] and [`CHALLENGE_WORDS`]). They read the page and touch nothing.
+/// The page reader's helpers for Cloudflare's pages: `botCheckMarkers()` names the [`Marker`]s
+/// on the page, `blockPageOf(text)` is Cloudflare's half of [`block_page`], and
+/// `botCheckOf(title, text, markers)` is [`bot_check`] (their word lists are
+/// [`CHALLENGE_TITLES`] and [`CHALLENGE_WORDS`]). They read the page and touch nothing. Every
+/// script splices them in through [`check_page_js`], never alone.
 macro_rules! bot_check_helpers_js {
     () => {
         r##"
-  const botCheckTitles = ["just a moment...", "just a moment…"];
+  const botCheckTitles = ["just a moment...", "just a moment…", "attention required! | cloudflare"];
   const botCheckWords = ["enable javascript and cookies to continue", "verify you are human", "verifying you are human"];
   const botCheckMarkers = () => {
     const found = [];
@@ -9804,24 +9893,522 @@ macro_rules! bot_check_helpers_js {
     };
 }
 
-/// [`bot_check_helpers_js`] as a string.
-pub(super) const BOT_CHECK_JS: &str = bot_check_helpers_js!();
-
-/// The widgets of the human checks a page holds an action behind, as aterm's sign-in window
-/// reads them (`signin_window`'s `humanCheck`): hCaptcha's, reCAPTCHA's and Cloudflare
-/// Turnstile's response field or frame, as one CSS selector list ([`HUMAN_CHECK_WIDGETS`]).
-/// A page that holds any of them is pressed and filled nothing on a headless profile, by the
-/// sign-in's drive ([`oauth_step_js`]) and by a token's consent page (`token_consent`) alike.
-macro_rules! human_check_widgets {
+/// hCaptcha's widget: its response field, its frame, and its container before it renders.
+macro_rules! hcaptcha_widget {
     () => {
-        "textarea[name='h-captcha-response'], iframe[src*='hcaptcha.com'], \
-         textarea[name='g-recaptcha-response'], iframe[src*='recaptcha'], \
-         input[name='cf-turnstile-response'], iframe[src*='challenges.cloudflare.com']"
+        "textarea[name='h-captcha-response'], iframe[src*='hcaptcha.com'], .h-captcha"
     };
 }
 
-/// [`human_check_widgets`] as a string.
-pub(super) const HUMAN_CHECK_WIDGETS: &str = human_check_widgets!();
+/// reCAPTCHA's widget: its response field, its frame, and its container before it renders.
+macro_rules! recaptcha_widget {
+    () => {
+        "textarea[name='g-recaptcha-response'], iframe[src*='recaptcha'], .g-recaptcha"
+    };
+}
+
+/// Cloudflare Turnstile's widget: its response field, its frame, and its container.
+macro_rules! turnstile_widget {
+    () => {
+        "input[name='cf-turnstile-response'], iframe[src*='challenges.cloudflare.com'], .cf-turnstile"
+    };
+}
+
+/// Arkose Labs' (FunCaptcha's) widget: its enforcement frame, its token field, its container.
+macro_rules! arkose_widget {
+    () => {
+        "iframe[src*='arkoselabs'], iframe[src*='funcaptcha'], input[name='fc-token'], #FunCaptcha"
+    };
+}
+
+/// Proton's own human verification: its captcha frame, on Proton's account API or its
+/// verification host (a cross-origin frame no read looks into, so the frame itself is the
+/// widget), and its captcha node.
+macro_rules! proton_widget {
+    () => {
+        "iframe[src*='/core/v4/captcha'], iframe[src*='verify.proton.me'], [data-testid*='captcha']"
+    };
+}
+
+/// Any other widget a site key names (every vendor's container carries one before it renders).
+macro_rules! sitekey_widget {
+    () => {
+        "[data-sitekey]"
+    };
+}
+
+/// Each human check's name and its widget's CSS selectors, in the order a page is read for
+/// them: the one table [`CHECK_PAGE_JS`]'s `humanCheckKinds` and [`check_in_html`] are made
+/// from. A page that holds any of them, shown or not and whether the button it is bound to
+/// stands enabled or not, is pressed and filled nothing: an invisible check runs on the press
+/// of its button.
+pub(super) const HUMAN_CHECK_KINDS: [(&str, &str); 6] = [
+    ("hCaptcha", hcaptcha_widget!()),
+    ("reCAPTCHA", recaptcha_widget!()),
+    ("Turnstile", turnstile_widget!()),
+    ("Arkose", arkose_widget!()),
+    ("Proton", proton_widget!()),
+    ("captcha", sitekey_widget!()),
+];
+
+/// The words of a title or a heading that names a human check by itself (Proton's `Human
+/// verification` modal), lowercase: a human check by the general name wherever a page's title
+/// or heading holds one ([`check_met`], [`CHECK_PAGE_JS`]'s `humanCheckHeadings`).
+pub(super) const HUMAN_CHECK_HEADINGS: &[&str] = &["human verification"];
+
+/// The one predicate every script that presses, fills, submits or follows anything on a page
+/// calls at that act, in the same evaluation: [`bot_check_helpers_js`], then `humanCheckOf()`,
+/// the name of the first human check whose widget is in the page, its open shadow roots or its
+/// same-origin frames ([`HUMAN_CHECK_KINDS`], with no filter on whether it is shown), or of a
+/// control labelled `verify you are human` / `I'm not a robot`; `checkMet()`, the check the page
+/// carries as `{kind, name}` (`block_page`: Cloudflare's or Google's, [`block_page`];
+/// `bot_check`: Cloudflare's title, its words or any of its marks; `human_check`: a widget, or a
+/// title or heading of [`HUMAN_CHECK_HEADINGS`]), or `null`; and `checkPageOf()`, the same as one
+/// word ([`CheckMet::parse`]). A signed-in mailbox is read by `mailboxCheckMet()` and
+/// `mailboxCheckPageOf()` instead: the same check, judged from what no mail can put there (the
+/// top document's title against Cloudflare's whole titles, Cloudflare's marks, Google's `/sorry`
+/// page and a widget in the top document), never from the words of the page, its headings or
+/// its controls, or a frame, where a message's own subject and body are. They read the page and
+/// touch nothing.
+macro_rules! check_page_js {
+    () => {
+        concat!(
+            bot_check_helpers_js!(),
+            r##"
+  const humanCheckKinds = [
+    ["hCaptcha", ""##,
+            hcaptcha_widget!(),
+            r##""],
+    ["reCAPTCHA", ""##,
+            recaptcha_widget!(),
+            r##""],
+    ["Turnstile", ""##,
+            turnstile_widget!(),
+            r##""],
+    ["Arkose", ""##,
+            arkose_widget!(),
+            r##""],
+    ["Proton", ""##,
+            proton_widget!(),
+            r##""],
+    ["captcha", ""##,
+            sitekey_widget!(),
+            r##""],
+  ];
+  const humanCheckHeadings = ["human verification"];
+  const humanCheckControl = /verify (that )?you(['’]re| are) (a )?human|i(['’]m| am) (not a robot|a human|human)/i;
+  const checkRoots = () => {
+    const roots = [document];
+    for (let i = 0; i < roots.length && roots.length < 256; i++) {
+      let all = [];
+      try { all = Array.from(roots[i].querySelectorAll("*")); } catch (_) { all = []; }
+      for (const el of all) {
+        if (el.shadowRoot) roots.push(el.shadowRoot);
+        if (el.tagName === "IFRAME" || el.tagName === "FRAME") {
+          try { if (el.contentDocument) roots.push(el.contentDocument); } catch (_) {}
+        }
+      }
+    }
+    return roots;
+  };
+  const humanCheckOf = () => {
+    const roots = checkRoots();
+    for (const [name, selector] of humanCheckKinds) {
+      for (const root of roots) {
+        try { if (root.querySelector(selector)) return name; } catch (_) {}
+      }
+    }
+    for (const root of roots) {
+      let controls = [];
+      try { controls = Array.from(root.querySelectorAll("label, button, input[type='checkbox'], [role='checkbox'], [role='button']")); } catch (_) { controls = []; }
+      for (const el of controls) {
+        const labels = el.labels ? Array.from(el.labels).map(l => String(l.textContent || "")).join(" ") : "";
+        const said = [el.textContent, el.value, el.getAttribute && el.getAttribute("aria-label"), labels].map(v => String(v || "")).join(" ");
+        if (humanCheckControl.test(said)) return "captcha";
+      }
+    }
+    return null;
+  };
+  const checkMet = () => {
+    const plain = (v) => String(v || "").toLowerCase().replace(/’/g, "'");
+    const title = plain(document.title).trim();
+    const text = String(document.body && document.body.innerText || "");
+    const lower = plain(text);
+    const host = String(window.location && window.location.hostname || "").toLowerCase();
+    const google = host === "google.com" || host.endsWith(".google.com");
+    const heads = plain(Array.from(document.querySelectorAll("h1, h2, h3, [role='heading']")).map(h => h.textContent).join("\n"));
+    const googleWords = ["unusual traffic", "this browser or app may not be secure", "verify it's you"];
+    if (blockPageOf(text)) return { kind: "block_page", name: "Cloudflare" };
+    if ((google && String(window.location.pathname || "").startsWith("/sorry")) ||
+        googleWords.some(w => title.includes(w) || heads.includes(w) || (google && lower.includes(w)))) {
+      return { kind: "block_page", name: "Google" };
+    }
+    const markers = botCheckMarkers();
+    const words = botCheckWords.some(w => lower.includes(w));
+    if (botCheckTitles.includes(title) || (markers.length > 0 && words)) return { kind: "bot_check", name: "Cloudflare" };
+    const widget = humanCheckOf();
+    if (widget) return { kind: "human_check", name: widget };
+    if (humanCheckHeadings.some(w => title.includes(w) || heads.includes(w))) return { kind: "human_check", name: "captcha" };
+    if (markers.length > 0 || words) return { kind: "bot_check", name: "Cloudflare" };
+    return null;
+  };
+  const checkWord = (met) => met ? (met.kind === "human_check" ? "human_check:" + met.name : met.kind) : null;
+  const checkPageOf = () => checkWord(checkMet());
+  const mailboxCheckMet = () => {
+    const title = String(document.title || "").toLowerCase().replace(/’/g, "'").trim();
+    const host = String(window.location && window.location.hostname || "").toLowerCase();
+    const google = host === "google.com" || host.endsWith(".google.com");
+    if (google && String(window.location.pathname || "").startsWith("/sorry")) return { kind: "block_page", name: "Google" };
+    if (botCheckTitles.includes(title) || botCheckMarkers().length > 0) return { kind: "bot_check", name: "Cloudflare" };
+    for (const [name, selector] of humanCheckKinds) {
+      try { if (document.querySelector(selector)) return { kind: "human_check", name }; } catch (_) {}
+    }
+    return null;
+  };
+  const mailboxCheckPageOf = () => checkWord(mailboxCheckMet());
+"##
+        )
+    };
+}
+
+/// [`check_page_js`] as a string.
+pub(super) const CHECK_PAGE_JS: &str = check_page_js!();
+
+/// A check a page carries ([`check_met`], [`check_in_html`], [`CHECK_PAGE_JS`]'s `checkMet()`):
+/// nothing aterm drives presses, fills, submits or re-navigates on a page that carries one, and
+/// an unattended drive ends its attempt on the first read of one, naming it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckMet {
+    /// A block page: Cloudflare's, or one of Google's ([`block_page`]).
+    BlockPage,
+    /// Cloudflare's bot check: its interstitial's title, its words or any of its marks.
+    BotCheck,
+    /// A human check's widget, by its name ([`HUMAN_CHECK_KINDS`]; `captcha` for a control
+    /// labelled as one).
+    HumanCheck(String),
+}
+
+impl CheckMet {
+    /// The check a `checkPageOf()` word names (`block_page`, `bot_check`, `human_check` or
+    /// `human_check:<name>`); `None` for any other.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word {
+            "block_page" => Some(Self::BlockPage),
+            "bot_check" => Some(Self::BotCheck),
+            _ => {
+                let rest = word.strip_prefix("human_check")?;
+                if !(rest.is_empty() || rest.starts_with(':')) {
+                    return None;
+                }
+                Some(Self::HumanCheck(known_check_name(
+                    rest.strip_prefix(':').unwrap_or(""),
+                )))
+            }
+        }
+    }
+
+    /// The check a `checkMet()` answer (`{kind, name}`) or a `checkPageOf()` word names.
+    #[must_use]
+    pub fn of_value(value: &Value) -> Option<Self> {
+        if let Some(word) = value.as_str() {
+            return Self::parse(word);
+        }
+        match value.get("kind").and_then(Value::as_str)? {
+            "human_check" => Some(Self::HumanCheck(known_check_name(
+                value.get("name").and_then(Value::as_str).unwrap_or(""),
+            ))),
+            other => Self::parse(other),
+        }
+    }
+
+    /// The word an attempt that ended on it records.
+    #[must_use]
+    pub const fn word(&self) -> MetWord {
+        match self {
+            Self::BlockPage => MetWord::BlockPage,
+            Self::BotCheck => MetWord::BotCheck,
+            Self::HumanCheck(_) => MetWord::HumanCheck,
+        }
+    }
+
+    /// What it is, in a reason: its kind and a human check's name, never the page's text.
+    #[must_use]
+    pub fn named(&self) -> String {
+        match self {
+            Self::BlockPage => "a block page".to_owned(),
+            Self::BotCheck => "Cloudflare's bot check".to_owned(),
+            Self::HumanCheck(name) => format!("a human check ({name})"),
+        }
+    }
+
+    /// The `checkPageOf()` word for it, which [`Self::parse`] reads back.
+    #[must_use]
+    pub fn page_word(&self) -> String {
+        match self {
+            Self::BlockPage => "block_page".to_owned(),
+            Self::BotCheck => "bot_check".to_owned(),
+            Self::HumanCheck(name) => format!("human_check:{name}"),
+        }
+    }
+}
+
+/// The name a page's human check is known by: one of [`HUMAN_CHECK_KINDS`]'s, else `captcha`.
+/// A name a page gives is never kept as it stands.
+fn known_check_name(name: &str) -> String {
+    HUMAN_CHECK_KINDS
+        .iter()
+        .map(|(known, _)| *known)
+        .find(|known| known.eq_ignore_ascii_case(name))
+        .unwrap_or("captcha")
+        .to_owned()
+}
+
+/// The check `page` carries, judged in [`CHECK_PAGE_JS`]'s order where its reader named none
+/// ([`Page::check`]): a block page ([`block_page`]); Cloudflare's interstitial (its title, or
+/// its words beside one of its marks); Turnstile's container (a human check); then any other
+/// mark of Cloudflare's or its words alone, a bot check. The one Rust predicate for a page the
+/// browser rendered: whatever it names, nothing on the page is pressed, filled or followed.
+#[must_use]
+pub fn check_met(page: &Page) -> Option<CheckMet> {
+    page.check.clone().or_else(|| judged_check(page, None))
+}
+
+/// [`check_met`]'s order over `page`'s fields, with `widget` the human check its markup holds.
+fn judged_check(page: &Page, widget: Option<&str>) -> Option<CheckMet> {
+    if block_page(page) {
+        return Some(CheckMet::BlockPage);
+    }
+    let title = page.title.trim().to_lowercase();
+    let text = page.text.to_lowercase();
+    let words = CHALLENGE_WORDS.iter().any(|w| text.contains(w));
+    if CHALLENGE_TITLES.contains(&title.as_str()) || (!page.markers.is_empty() && words) {
+        return Some(CheckMet::BotCheck);
+    }
+    if let Some(name) = widget.or_else(|| {
+        page.markers
+            .contains(&Marker::Turnstile)
+            .then_some("Turnstile")
+    }) {
+        return Some(CheckMet::HumanCheck(known_check_name(name)));
+    }
+    let heading = page.heading.to_lowercase();
+    if HUMAN_CHECK_HEADINGS
+        .iter()
+        .any(|w| title.contains(w) || heading.contains(w))
+    {
+        return Some(CheckMet::HumanCheck("captcha".to_owned()));
+    }
+    (!page.markers.is_empty() || words).then_some(CheckMet::BotCheck)
+}
+
+/// The words of a control that asks a person to prove they are one, lowercase, each apostrophe
+/// a plain one ([`CHECK_PAGE_JS`]'s `humanCheckControl`, read from markup's text).
+const HUMAN_CHECK_CONTROL_WORDS: &[&str] = &[
+    "i'm not a robot",
+    "i am not a robot",
+    "i am human",
+    "i'm human",
+    "i am a human",
+    "verify you're human",
+    "verify that you are human",
+    "verify you're a human",
+];
+
+/// The check the HTML `html` of the page at `url` carries, judged as [`check_met`] judges a
+/// rendered page: its uncommented markup's tags for [`HUMAN_CHECK_KINDS`]' selectors and
+/// Cloudflare's marks, its title, headings and visible text (script and style apart) for the
+/// words. The one predicate for a page the HTTP engine fetched; nothing on a page it names is
+/// submitted or followed.
+#[must_use]
+pub(super) fn check_in_html(url: &str, html: &str) -> Option<CheckMet> {
+    let view = html_view(html);
+    let mut markers = Vec::new();
+    let mut widget = None;
+    for (name, tag) in &view.tags {
+        let attr = |key: &str| super::open_url::extract_attr(tag, key).unwrap_or_default();
+        let src = attr("src").to_ascii_lowercase();
+        let classes = attr("class").to_ascii_lowercase();
+        if classes.split_whitespace().any(|c| c == "cf-turnstile") {
+            markers.push(Marker::Turnstile);
+        }
+        if attr("id").trim().eq_ignore_ascii_case("challenge-form") {
+            markers.push(Marker::ChallengeForm);
+        }
+        if matches!(name.as_str(), "iframe" | "script") {
+            if src.contains("challenges.cloudflare.com") {
+                markers.push(Marker::ChallengeHost);
+            }
+            if src.contains("/cdn-cgi/challenge-platform/") {
+                markers.push(Marker::ChallengePlatform);
+            }
+        }
+        if name == "form" && attr("action").contains("__cf_chl_") {
+            markers.push(Marker::ChallengeToken);
+        }
+        if widget.is_none() {
+            widget = HUMAN_CHECK_KINDS.iter().find_map(|(kind, selectors)| {
+                selectors
+                    .split(',')
+                    .any(|selector| html_selects(selector, name, tag))
+                    .then_some(*kind)
+            });
+        }
+    }
+    if url.contains("__cf_chl_") {
+        markers.push(Marker::ChallengeToken);
+    }
+    if html.contains("_cf_chl_opt") {
+        markers.push(Marker::ChallengeOptions);
+    }
+    let plain = view.text.to_lowercase().replace('\u{2019}', "'");
+    if widget.is_none() && HUMAN_CHECK_CONTROL_WORDS.iter().any(|w| plain.contains(w)) {
+        widget = Some("captcha");
+    }
+    let page = Page {
+        url: url.to_owned(),
+        heading: view.heads,
+        text: view.text,
+        title: view.title.to_lowercase(),
+        markers,
+        ..Page::default()
+    };
+    judged_check(&page, widget)
+}
+
+/// Whether the opening tag `tag` named `name` matches `selector`, one simple selector of a
+/// widget list ([`HUMAN_CHECK_KINDS`]): an optional tag name, then one of `[a='v']`,
+/// `[a*='v']`, `[a]`, `.class` or `#id`, values compared case apart. Any other form matches
+/// nothing ([`html_selector_supported`] holds the lists to these forms).
+fn html_selects(selector: &str, name: &str, tag: &str) -> bool {
+    let selector = selector.trim();
+    let split = selector.find(['[', '.', '#']).unwrap_or(selector.len());
+    let (want, rule) = selector.split_at(split);
+    if !want.is_empty() && !want.eq_ignore_ascii_case(name) {
+        return false;
+    }
+    let attr = |key: &str| super::open_url::extract_attr(tag, key);
+    if let Some(class) = rule.strip_prefix('.') {
+        return attr("class")
+            .is_some_and(|v| v.split_whitespace().any(|c| c.eq_ignore_ascii_case(class)));
+    }
+    if let Some(id) = rule.strip_prefix('#') {
+        return attr("id").is_some_and(|v| v.trim().eq_ignore_ascii_case(id));
+    }
+    let Some(inner) = rule.strip_prefix('[').and_then(|r| r.strip_suffix(']')) else {
+        return false;
+    };
+    let unquote = |v: &str| v.trim().trim_matches(['\'', '"']).to_ascii_lowercase();
+    if let Some((key, value)) = inner.split_once("*=") {
+        let value = unquote(value);
+        return attr(key.trim()).is_some_and(|v| v.to_ascii_lowercase().contains(&value));
+    }
+    if let Some((key, value)) = inner.split_once('=') {
+        let value = unquote(value);
+        return attr(key.trim()).is_some_and(|v| v.trim().eq_ignore_ascii_case(&value));
+    }
+    super::open_url::has_html_attr(tag, inner.trim())
+}
+
+/// Whether `selector` is one simple selector [`html_selects`] reads.
+#[cfg(test)]
+pub(super) fn html_selector_supported(selector: &str) -> bool {
+    let selector = selector.trim();
+    let split = selector.find(['[', '.', '#']).unwrap_or(selector.len());
+    let (want, rule) = selector.split_at(split);
+    let tag_ok = want.bytes().all(|b| b.is_ascii_alphanumeric());
+    let rule_ok = rule
+        .strip_prefix('.')
+        .or_else(|| rule.strip_prefix('#'))
+        .map_or_else(
+            || {
+                rule.strip_prefix('[')
+                    .and_then(|r| r.strip_suffix(']'))
+                    .is_some_and(|inner| !inner.contains(['[', ']', ' ']))
+            },
+            |name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+        );
+    tag_ok && rule_ok
+}
+
+/// What [`check_in_html`] reads of a page's markup: its title, its first headings, its visible
+/// text, and each opening tag with its lowercase name.
+struct HtmlView {
+    title: String,
+    heads: String,
+    text: String,
+    tags: Vec<(String, String)>,
+}
+
+/// The [`HtmlView`] of `html`, comments removed; a script's or a style's content is no text.
+fn html_view(html: &str) -> HtmlView {
+    let html = super::open_url::strip_html_comments(html);
+    let mut view = HtmlView {
+        title: String::new(),
+        heads: String::new(),
+        text: String::new(),
+        tags: Vec::new(),
+    };
+    let mut into: Option<&'static str> = None;
+    let mut rest = html.as_str();
+    while let Some(lt) = rest.find('<') {
+        let chunk = super::open_url::decode_html_amp(&rest[..lt]);
+        view.text.push_str(&chunk);
+        view.text.push(' ');
+        match into {
+            Some("title") => view.title.push_str(&chunk),
+            Some("head") => {
+                view.heads.push_str(&chunk);
+                view.heads.push(' ');
+            }
+            _ => {}
+        }
+        let tail = &rest[lt..];
+        let Some(gt) = super::open_url::find_tag_close(tail) else {
+            break;
+        };
+        let tag = &tail[..=gt];
+        rest = &tail[gt + 1..];
+        let name: String = tag[1..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '/')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        match name.as_str() {
+            "title" => into = Some("title"),
+            "h1" | "h2" | "h3" => into = Some("head"),
+            "/title" | "/h1" | "/h2" | "/h3" => into = None,
+            _ => {}
+        }
+        if name.starts_with('/') {
+            continue;
+        }
+        if matches!(name.as_str(), "script" | "style") {
+            let close = format!("</{name}");
+            rest = rest
+                .to_ascii_lowercase()
+                .find(&close)
+                .map_or("", |at| &rest[at..]);
+        }
+        view.tags.push((name, tag.to_owned()));
+    }
+    view.text.push_str(&super::open_url::decode_html_amp(rest));
+    view.text = view.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    view.title = view.title.split_whitespace().collect::<Vec<_>>().join(" ");
+    view.heads = view.heads.trim().to_lowercase();
+    view
+}
+
+/// The reason an attempt ends with on a page carrying `check` at `url`: its place, never the
+/// page's text.
+#[must_use]
+pub fn check_reason(check: &CheckMet, url: &str) -> String {
+    format!(
+        "the sign-in page {} carries {}; aterm pressed nothing there and never tries to pass it",
+        url_place(url),
+        check.named()
+    )
+}
 
 /// Where `page` is: its host and path, without its query (which may carry a code or a
 /// challenge's token) or fragment.
@@ -9833,18 +10420,6 @@ pub(super) fn url_place(url: &str) -> String {
     let (authority, path) = authority_and_tail(place);
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     format!("`{}`", super::one_line(&format!("{host}{path}"), 80))
-}
-
-/// The reason a sign-in ends on Cloudflare's bot check ([`bot_check`]) at `url`, `held` after
-/// it was first read: the place, never the page's text (which carries this machine's public
-/// address and the challenge's ray id).
-#[must_use]
-pub fn bot_check_reason(url: &str, held: Duration) -> String {
-    format!(
-        "Cloudflare's bot check on {} did not clear in {} s; aterm never tries to pass it",
-        url_place(url),
-        held.as_secs()
-    )
 }
 
 const CONSENT_LABELS: &[&str] = &[
@@ -9894,8 +10469,9 @@ const SUCCESS_WORDS: &[&str] = &[
 
 /// The step one vendor sign-in page calls for (design §6): a pure judgment of the page's host,
 /// text, buttons and inputs. Nothing is pressed off the pinned hosts, on another identity
-/// provider, on a sign-up page, on a bot-protection block page or on Cloudflare's bot check
-/// ([`bot_check`], which is waited on); a device page is confirmed once,
+/// provider, on a sign-up page, or on a page that carries a check ([`check_met`]: a block page,
+/// Cloudflare's bot check or a human check's widget, which ends the attempt at once,
+/// [`Step::Check`]); a device page is confirmed once,
 /// and only when it shows the code the CLI printed (in its text, or in its URL on a card naming
 /// the account signed in); a page showing another code, or another account signed in, is
 /// refused; another provider's page or a password asks for the person's sign-in
@@ -9954,6 +10530,12 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
     {
         return Step::Wait;
     }
+    // A page that carries a check is acted on nowhere, on the pinned hosts or off them (a
+    // challenge host is named too): its press would run the check, and nobody is at this
+    // profile to answer it.
+    if let Some(check) = check_met(page) {
+        return Step::Check(check);
+    }
     let Some(host) = super::login_drive::https_host(url) else {
         return Step::Stop("the sign-in page left https".to_owned());
     };
@@ -9967,16 +10549,6 @@ fn page_step(page: &Page, gate: &Gate<'_>) -> Step {
         } else {
             Step::Stop(format!("the sign-in left its pinned hosts for {host}"))
         };
-    }
-    if block_page(page) {
-        return Step::Blocked(
-            "the vendor's site answered this browser with a bot-protection block page, so only \
-             a person can go on"
-                .to_owned(),
-        );
-    }
-    if bot_check(page) {
-        return Step::Wait;
     }
     if sign_up_page(page) {
         return Step::Stop("the page asks to create an account, which aterm never does".to_owned());
@@ -10057,7 +10629,7 @@ macro_rules! vendor_page_js {
     () => {
         concat!(
     "(() => {",
-    bot_check_helpers_js!(),
+    check_page_js!(),
     r#"  const visible = el => !el.disabled && !el.hidden && el.type !== "hidden" &&
     el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
   const label = b => String(b.innerText || b.value || b.getAttribute("aria-label") || "").trim().toLowerCase().slice(0, 80);
@@ -10082,7 +10654,9 @@ macro_rules! vendor_page_js {
     buttons: buttons.map(label),
     inputs,
     title: String(document.title || "").trim().toLowerCase().slice(0, 200),
-    markers: botCheckMarkers()
+    markers: botCheckMarkers(),
+    check: checkPageOf(),
+    doc: String(window.performance && window.performance.timeOrigin || "")
   };
 })()"#
         )
@@ -10090,15 +10664,17 @@ macro_rules! vendor_page_js {
 }
 
 /// Reads the page into a [`Page`]: its URL, first heading, visible text (8000 characters at
-/// most), enabled visible buttons' labels and inputs' kinds, title, and the [`Marker`]s of
-/// Cloudflare's challenge on it.
+/// most), enabled visible buttons' labels and inputs' kinds, title, the [`Marker`]s of
+/// Cloudflare's challenge on it, the check it carries ([`CHECK_PAGE_JS`]) and its document.
 pub const VENDOR_PAGE_JS: &str = vendor_page_js!();
 
-/// The JavaScript that carries out `step` on the page read by [`VENDOR_PAGE_JS`]: a press of the
-/// same enumeration's button, or `value` typed into the first input of the step's kind and
-/// submitted.
+/// The JavaScript that carries out `step` on `read`, the page [`VENDOR_PAGE_JS`] read: a press of
+/// the same enumeration's button, or `value` typed into the first input of the step's kind and
+/// submitted. In the same evaluation, before anything is touched, the page is read for a check
+/// ([`CHECK_PAGE_JS`]'s `checkMet()`, answering it as `check` with nothing done) and held to the
+/// address and document `read` was made in (answering `ok: false` in any other).
 #[must_use]
-pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
+pub fn vendor_act_js(step: &Step, value: Option<&str>, read: &Page) -> String {
     let (verb, index) = match step {
         Step::Press(at) => ("press", *at),
         Step::FillCode | Step::FillOtp => ("code", 0),
@@ -10106,8 +10682,15 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
         _ => ("none", 0),
     };
     let value_json = aterm_json::to_string(&value.unwrap_or("")).unwrap_or_else(|_| "\"\"".into());
+    let read_url = aterm_json::to_string(&read.url).unwrap_or_else(|_| "null".into());
+    let read_doc = aterm_json::to_string(&read.doc).unwrap_or_else(|_| "null".into());
     format!(
         r#"(() => {{
+{CHECK_PAGE_JS}
+  const met = checkMet();
+  if (met) return {{ ok: false, check: met }};
+  if (String(window.location && window.location.href || "") !== {read_url} ||
+      String(window.performance && window.performance.timeOrigin || "") !== {read_doc}) return {{ ok: false }};
   const setNativeValue = (el, val) => {{
     if (typeof el.focus === "function") el.focus();
     const proto = Object.getPrototypeOf(el);
@@ -10122,7 +10705,8 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
     el.getAttribute("aria-disabled") !== "true" && el.getClientRects().length > 0;
   const textInput = el => visible(el) && !el.readOnly &&
     !["hidden", "checkbox", "radio", "password", "submit", "button", "image", "reset"].includes(String(el.type || "").toLowerCase());
-  const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']")).filter(visible);
+  const allButtons = Array.from(document.querySelectorAll("button, input[type='submit'], [role='button']"));
+  const buttons = allButtons.filter(visible);
   const verb = "{verb}";
   const value = {value_json};
   if (verb === "press") {{
@@ -10141,14 +10725,14 @@ pub fn vendor_act_js(step: &Step, value: Option<&str>) -> String {
     const input = Array.from(document.querySelectorAll("input[type='email'], input[name*='email' i], input[autocomplete*='email' i], input[autocomplete='username' i]")).filter(el => !isCodeField(el)).find(textInput);
     if (!input || !value) return {{ ok: false }};
     setNativeValue(input, value);
-    return {{ ok: submitInput(input, buttons, /continue|next|sign in|log in|send|submit|下一步|继续|登录|发送|验证|确认|提交/i) }};
+    return {{ ok: submitInput(input, allButtons, /continue|next|sign in|log in|send|submit|下一步|继续|登录|发送|验证|确认|提交/i) }};
   }}
   if (verb === "code") {{
     const explicit = Array.from(document.querySelectorAll("input[autocomplete='one-time-code' i], input[name*='code' i], input[name*='otp' i], input[inputmode='numeric' i]")).filter(textInput);
     const boxes = Array.from(document.querySelectorAll("input[maxlength='1']")).filter(textInput);
     const filled = fillCodeInputs(codeInputsFor(explicit, boxes), value);
     if (!filled) return {{ ok: false }};
-    return {{ ok: submitInput(filled, buttons, /continue|verify|confirm|submit|next|sign in|log in|下一步|继续|验证|确认|提交|登录/i) }};
+    return {{ ok: submitInput(filled, allButtons, /continue|verify|confirm|submit|next|sign in|log in|下一步|继续|验证|确认|提交|登录/i) }};
   }}
   return {{ ok: false }};
 }})()"#
@@ -10197,6 +10781,8 @@ pub fn page_of(value: &Value) -> Page {
                     .collect()
             })
             .unwrap_or_default(),
+        check: value.get("check").and_then(CheckMet::of_value),
+        doc: text("doc"),
     }
 }
 
@@ -10204,109 +10790,18 @@ pub fn page_of(value: &Value) -> Page {
 const VENDOR_TICK: Duration = Duration::from_millis(400);
 
 /// How long a vendor drive waits on one unchanged page that shows nothing aterm presses or
-/// fills before it stops for a person, and on Cloudflare's bot check before it ends naming it
-/// ([`PageStall`]).
+/// fills before it stops for a person ([`PageStall`]). A check is never waited on.
 pub const VENDOR_STALL: Duration = Duration::from_secs(90);
-
-/// How long reads that are not Cloudflare's bot check may come between two that are, inside
-/// one wait on it ([`BotCheckClock`]): a check that reloads itself is read between its documents
-/// half-parsed (its title, no marker yet) or not at all. Such a gap, each read on the check's
-/// host with nothing on it to press, fill or follow, does not restart the wait; a longer one, a
-/// page on another host, or one with something to act on, ends it.
-pub const BOT_CHECK_GAP: Duration = Duration::from_secs(10);
-
-/// One wait on Cloudflare's bot check ([`bot_check`]), shared by the vendor drive
-/// ([`PageStall`]) and the Claude drive ([`drive_cdp_oauth_with_webmail`]): where it was last
-/// read, since when one has stood, and since when the reads have been a gap between two
-/// ([`BOT_CHECK_GAP`]).
-#[derive(Debug, Default, Clone)]
-pub struct BotCheckClock {
-    held: Option<BotWait>,
-}
-
-#[derive(Debug, Clone)]
-struct BotWait {
-    url: String,
-    since: Instant,
-    gap: Option<Instant>,
-}
-
-impl BotCheckClock {
-    /// Notes a read at `now` of `url` that is a bot check: how long one has stood, from the
-    /// first read of the wait it is part of. An expired gap or another HTTPS host starts a
-    /// fresh wait.
-    pub fn check(&mut self, url: &str, now: Instant) -> Duration {
-        let same_wait = self.held(now).is_some_and(|(before, _)| {
-            super::login_drive::https_host(before)
-                .is_some_and(|host| super::login_drive::https_host(url) == Some(host))
-        });
-        if !same_wait {
-            self.held = None;
-        }
-        let since = self.held.as_ref().map_or(now, |wait| wait.since);
-        self.held = Some(BotWait {
-            url: url.to_owned(),
-            since,
-            gap: None,
-        });
-        now.saturating_duration_since(since)
-    }
-
-    /// Notes a read at `now` of `url` that is not a bot check; `idle` says nothing on it is
-    /// aterm's to press, fill or follow. It ends the wait unless it is idle, on the host the
-    /// check was last read on, and within [`BOT_CHECK_GAP`] of the gap's first read.
-    pub fn other(&mut self, url: &str, idle: bool, now: Instant) {
-        let same_host = self.held.as_ref().is_some_and(|wait| {
-            super::login_drive::https_host(&wait.url)
-                .is_some_and(|host| super::login_drive::https_host(url) == Some(host))
-        });
-        if idle && same_host {
-            self.unread(now);
-        } else {
-            self.held = None;
-        }
-    }
-
-    /// Notes a read at `now` that answered nothing (the page was replaced under it): part of
-    /// the gap ([`Self::other`]), which ends the wait once it outlasts [`BOT_CHECK_GAP`].
-    pub fn unread(&mut self, now: Instant) {
-        if let Some(wait) = &mut self.held {
-            let gap = *wait.gap.get_or_insert(now);
-            if now.saturating_duration_since(gap) >= BOT_CHECK_GAP {
-                self.held = None;
-            }
-        }
-    }
-
-    /// The URL the bot check standing at `now` was last read at, and how long one has stood;
-    /// `None` where none was read, or reads that are not one have since ended the wait or
-    /// outlasted [`BOT_CHECK_GAP`].
-    #[must_use]
-    pub fn held(&self, now: Instant) -> Option<(&str, Duration)> {
-        self.held
-            .as_ref()
-            .filter(|wait| {
-                wait.gap
-                    .is_none_or(|gap| now.saturating_duration_since(gap) < BOT_CHECK_GAP)
-            })
-            .map(|wait| (wait.url.as_str(), now.saturating_duration_since(wait.since)))
-    }
-}
 
 /// The page a vendor drive is waiting on, and since when it is unchanged. A page that shows
 /// nothing aterm presses or fills for [`VENDOR_STALL`] waits for a person (a sign-in through
 /// another provider, a phone number), so the drive stops there, naming the page, instead of
 /// waiting out its whole budget; a device page already confirmed waits on the CLI, never on a
-/// person, and never stalls. Cloudflare's bot check ([`bot_check`]) is apart: it waits on no
-/// person, so it is timed from its first read however often it reloads itself (a gap of idle
-/// reads on its host shorter than [`BOT_CHECK_GAP`] included, [`BotCheckClock`]), and one that
-/// has not cleared within the stall ends the drive naming Cloudflare and the place
-/// ([`PageStall::note_bot_check`]).
+/// person, and never stalls. A page that carries a check is no such page: it ends the drive on
+/// its first read ([`Step::Check`]), and is never waited on.
 #[derive(Debug)]
 pub struct PageStall {
     seen: Option<(String, Instant)>,
-    /// The bot check being waited on.
-    bot: BotCheckClock,
     within: Duration,
 }
 
@@ -10321,42 +10816,11 @@ impl PageStall {
     /// [`VENDOR_STALL`]).
     #[must_use]
     pub fn within(within: Duration) -> PageStall {
-        PageStall {
-            seen: None,
-            bot: BotCheckClock::default(),
-            within,
-        }
-    }
-
-    /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once pages that are
-    /// Cloudflare's bot check ([`bot_check`]), waited on, have stood for the stall
-    /// ([`bot_check_reason`]). A page between them that is not one ends that wait, unless it is
-    /// part of a gap of [`Step::Wait`] pages on the check's host with no button or input,
-    /// shorter than [`BOT_CHECK_GAP`] ([`BotCheckClock::other`]).
-    pub fn note_bot_check(&mut self, page: &Page, step: &Step, now: Instant) -> Option<String> {
-        let wait = matches!(step, Step::Wait);
-        if wait && bot_check(page) {
-            let held = self.bot.check(&page.url, now);
-            return (held >= self.within).then(|| bot_check_reason(&page.url, held));
-        }
-        let idle = wait && page.buttons.is_empty() && page.inputs.is_empty();
-        self.bot.other(&page.url, idle, now);
-        None
-    }
-
-    /// The reason a drive whose deadline came at `now` ends with, where a bot check it was
-    /// waiting on still stood ([`Self::note_bot_check`], [`BotCheckClock::held`]); `None`
-    /// otherwise.
-    #[must_use]
-    pub fn bot_check_held(&self, now: Instant) -> Option<String> {
-        self.bot
-            .held(now)
-            .map(|(url, held)| bot_check_reason(url, held))
+        PageStall { seen: None, within }
     }
 
     /// Notes that the drive decided `step` on `page` at `now`; `Some(why)` once the same page
-    /// has asked nothing of aterm for its stall ([`VENDOR_STALL`]). Cloudflare's bot check is
-    /// never such a page ([`Self::note_bot_check`] times it).
+    /// has asked nothing of aterm for its stall ([`VENDOR_STALL`]).
     pub fn note(
         &mut self,
         page: &Page,
@@ -10364,7 +10828,7 @@ impl PageStall {
         gate: &Gate<'_>,
         now: Instant,
     ) -> Option<String> {
-        if !matches!(step, Step::Wait) || gate.confirmed || bot_check(page) {
+        if !matches!(step, Step::Wait) || gate.confirmed {
             self.seen = None;
             return None;
         }
@@ -10413,18 +10877,10 @@ pub fn page_place(page: &Page, gate: &Gate<'_>) -> String {
     }
 }
 
-/// How a vendor drive whose deadline came at `now` ends: [`super::login_drive::Approval::BotCheck`]
-/// where a bot check it waited on still stood ([`PageStall::bot_check_held`]), else not approved
-/// in time, last on `last_place`.
-fn vendor_out_of_time(
-    stall: &PageStall,
-    last_place: Option<&str>,
-    now: Instant,
-) -> super::login_drive::Approval {
+/// How a vendor drive whose deadline came ends: not approved in time, last on `last_place`. A
+/// check is never waited on, so none stands at the deadline.
+fn vendor_out_of_time(last_place: Option<&str>) -> super::login_drive::Approval {
     use super::login_drive::Approval;
-    if let Some(why) = stall.bot_check_held(now) {
-        return Approval::BotCheck(why);
-    }
     Approval::NeedsYou(match last_place {
         Some(place) => format!("the sign-in page was not approved in time (last on {place})"),
         None => "the sign-in page was not approved in time".to_owned(),
@@ -10435,9 +10891,10 @@ fn vendor_out_of_time(
 /// page approves it, `finished` says the CLI is done, or `deadline`, which counts the time the
 /// host slept ([`WakeDeadline`]); `mailbox` answers a
 /// [`Step::Mailbox`]. A page unchanged for [`VENDOR_STALL`] with nothing of aterm's on it ends
-/// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]); Cloudflare's bot check
-/// that has not cleared within it, or when `deadline` comes, ends it
-/// [`super::login_drive::Approval::BotCheck`].
+/// it [`super::login_drive::Approval::NeedsSignIn`] ([`PageStall`]); a page that carries a
+/// check ([`Step::Check`]), read so or met at an act, ends it at once
+/// [`super::login_drive::Approval::BotCheck`], naming the check, with nothing on it touched. A
+/// consent press is made at most once per document (its address and `performance.timeOrigin`).
 pub fn drive_cdp_vendor(
     cdp: &mut CdpClient,
     start: &str,
@@ -10536,13 +10993,14 @@ pub(super) fn drive_cdp_vendor_within(
     let mut mailbox_polls = 0usize;
     let mut post_otp_wait_ticks = 0usize;
     let mut last_place: Option<String> = None;
+    // The address and document the one consent press of a document was made in.
+    let mut pressed_in: Option<(String, String)> = None;
     let result = loop {
         if finished() {
             break Approval::Approved { page: page_proved };
         }
-        let now = Instant::now();
         if deadline.expired() {
-            break vendor_out_of_time(&stall, last_place.as_deref(), now);
+            break vendor_out_of_time(last_place.as_deref());
         }
         let eval = cdp.call_by(
             Some(&session),
@@ -10553,7 +11011,6 @@ pub(super) fn drive_cdp_vendor_within(
         let page = match eval {
             Ok(eval) => page_of(eval.pointer("/result/value").unwrap_or(&Value::Null)),
             Err(_) => {
-                stall.bot.unread(now);
                 std::thread::sleep(VENDOR_TICK);
                 continue;
             }
@@ -10571,8 +11028,8 @@ pub(super) fn drive_cdp_vendor_within(
         let step = vendor_step(&page, &view);
         last_place = Some(page_place(&page, &view));
         let now = Instant::now();
-        if let Some(why) = stall.note_bot_check(&page, &step, now) {
-            break Approval::BotCheck(why);
+        if let Step::Check(check) = &step {
+            break Approval::BotCheck(check_reason(check, &page.url));
         }
         if let Some(why) = stall.note(&page, &step, &view, now) {
             break Approval::NeedsSignIn(why);
@@ -10593,9 +11050,9 @@ pub(super) fn drive_cdp_vendor_within(
                 break Approval::Approved { page: page_proved };
             }
             Step::Stop(why) => break Approval::NeedsYou(why.clone()),
-            Step::Blocked(why) => break Approval::BotCheck(why.clone()),
             Step::SignIn(why) => break Approval::NeedsSignIn(why.clone()),
             Step::Refuse(why) => break Approval::Refused(why.clone()),
+            Step::Check(check) => break Approval::BotCheck(check_reason(check, &page.url)),
             Step::Wait => {
                 let lower = page.text.to_ascii_lowercase();
                 let still_wants_mail =
@@ -10642,22 +11099,38 @@ pub(super) fn drive_cdp_vendor_within(
                         );
                         gate.filled_otp = true;
                     }
+                    // The webmail's own sign-in carried a check: it ends here, named.
+                    Err(why) if mailbox_check(why).is_some() => {
+                        break Approval::BotCheck(why.to_owned());
+                    }
                     Err(why) => break Approval::NeedsYou(why.to_owned()),
                 }
             }
             Step::Press(_) | Step::FillCode | Step::FillEmail | Step::FillOtp => {
                 post_otp_wait_ticks = 0;
-                let acted = cdp
+                let here = (page.url.clone(), page.doc.clone());
+                if matches!(step, Step::Press(_)) && pressed_in.as_ref() == Some(&here) {
+                    // This document's one press was made; it is pressed nothing again.
+                    std::thread::sleep(VENDOR_TICK);
+                    continue;
+                }
+                let answer = cdp
                     .call_by(
                         Some(&session),
                         "Runtime.evaluate",
-                        json!({"expression": vendor_act_js(&step, value), "returnByValue": true}),
+                        json!({"expression": vendor_act_js(&step, value, &page), "returnByValue": true}),
                         deadline,
                     )
                     .ok()
-                    .and_then(|v| v.pointer("/result/value/ok").and_then(Value::as_bool))
-                    .unwrap_or(false);
-                if acted {
+                    .and_then(|v| v.pointer("/result/value").cloned())
+                    .unwrap_or(Value::Null);
+                if let Some(check) = answer.get("check").and_then(CheckMet::of_value) {
+                    break Approval::BotCheck(check_reason(&check, &page.url));
+                }
+                if answer.get("ok").and_then(Value::as_bool) == Some(true) {
+                    if matches!(step, Step::Press(_)) {
+                        pressed_in = Some(here);
+                    }
                     note_acted(&mut gate, &page, &step);
                 }
             }

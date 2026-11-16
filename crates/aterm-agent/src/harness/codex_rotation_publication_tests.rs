@@ -12,7 +12,7 @@ fn publication_fixture(prior: bool, commit: bool) -> (World, Env, Receipt) {
     env.state = world.state.clone();
     env.config = Some(world.cfg.join("aterm.toml"));
     env.now = NOW;
-    let proposal = codex_rotation::prepare(
+    let proposal = codex_rotation::prepare_once(
         &world.seat(),
         &weekly_session(&world),
         &Identity::from_native("source", "user"),

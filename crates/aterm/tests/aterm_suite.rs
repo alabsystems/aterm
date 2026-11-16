@@ -24,6 +24,9 @@ mod ctl_accept;
 #[cfg(unix)]
 #[path = "support/headless_boot.rs"]
 mod headless_boot;
+#[cfg(unix)]
+#[path = "support/headless_boot_log_tests.rs"]
+mod headless_boot_log_tests;
 #[cfg(target_os = "macos")]
 #[path = "support/keeper_world.rs"]
 mod keeper_world;

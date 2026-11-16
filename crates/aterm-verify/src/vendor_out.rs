@@ -4,14 +4,20 @@
 //! `verify vendor-out --into <dir> [--check]`: byte-identical copies of the crates another
 //! repository builds from aterm's sources ([`CRATES`]), written under `<dir>/vendor/`.
 //!
-//! Each crate's copy is `vendor/<crate>/`:
+//! Each crate is read from the folder aterm's root `[workspace.dependencies]` points it at (where
+//! every member that inherits it builds it from), else `crates/<crate>`; its copy is
+//! `vendor/<crate>/`:
 //! - the files its library's build reads with debug assertions on and without `cfg(test)`, byte
 //!   for byte: each module file it compiles and each file an `include_str!` or `include_bytes!`
 //!   there embeds, as the census reader follows them ([`crate::own_tests::closure`]), so no
 //!   `*_tests.rs` file and nothing only a test reads;
 //! - a `Cargo.toml` that builds it alone: the workspace keys it inherits spelled out, the
 //!   workspace's lints inlined, each dependency a path to another copy, and the library its one
-//!   target, whose tests and doctests stay in aterm beside the files they read.
+//!   target, whose tests and doctests stay beside the files they read: in aterm, or for a vendored
+//!   crate in the repository aterm vendors it from. Its workspace is
+//!   the one cargo builds it in, the nearest `[workspace]` manifest at or above its folder:
+//!   aterm's root for a member, and for a crate aterm vendors from another repository (under a
+//!   folder the root excludes) that repository's own root, whose version and lints are its own.
 //!
 //! A crate whose build depends on a crate outside the set is refused, as is one whose manifest
 //! says something this writer does not carry over (a build script, features, a registry or git
@@ -31,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use aterm_seal as seal;
 use aterm_toml::{Table, Value};
@@ -39,8 +45,9 @@ use aterm_toml::{Table, Value};
 use crate::exit;
 use crate::own_tests;
 
-/// The crates vendor-out copies, for claude-code-alab to build from: the turn-end readers, the
-/// screen reader and the agent name table it names agents by.
+/// The crates vendor-out copies, for claude-code-alab to build from: the turn-end readers
+/// (alab-policy, relayed from the alab-harness tag aterm carries pinned in `vendor/alab-harness`),
+/// the screen reader and the agent name table it names agents by.
 pub const CRATES: [&str; 3] = ["alab-policy", "aterm-agent-names", "aterm-phase"];
 
 /// The folder of `--into` the copies go in.
@@ -56,10 +63,16 @@ const GENERATOR: &str = "targo --unverified verify vendor-out";
 pub const USAGE: &str = "targo --unverified verify vendor-out --into <dir> [--check]
 
 Write byte-identical copies of alab-policy, aterm-agent-names and aterm-phase into
-<dir>/vendor/<crate>/ for another repository to build from: the files each library's
-build reads with debug assertions on (no test file, nothing only a test reads), a
-standalone Cargo.toml (edition and lints spelled out, path dependencies between the
-copies, no tests), and vendor/VENDORED, each file's FNV-1a 64 digest, sealed. A crate
+<dir>/vendor/<crate>/ for another repository to build from. Each crate is read where
+aterm's workspace points it: alab-policy from vendor/alab-harness, the alab-harness
+tag aterm carries pinned by tree id (change it in alab-harness and repin), the others
+from crates/. Nothing is read until each pinned copy holds to its pin (the index holds
+the pinned tree and nothing under it is unstaged, untracked or ignored; else exit 1,
+without git exit 3). The copy holds the files each library's build reads with debug
+assertions on (no test file, nothing only a test reads), a standalone Cargo.toml
+(the version, edition and lints of the workspace it builds in spelled out, path
+dependencies between the copies, no tests), and vendor/VENDORED, each file's FNV-1a
+64 digest, sealed. A crate
 that depends on one outside the set is refused. A write replaces each file at a path
 it writes, whoever made it, and removes a file it no longer writes only where the
 sealed list there names it; any other file under vendor/ (a stray) stops the write
@@ -161,11 +174,11 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
             into.display()
         ));
     }
-    let want = match vendored(&root, &CRATES) {
+    let want = match pinned_source(&root, &CRATES) {
         Ok(want) => want,
-        Err(why) => {
-            eprintln!("verify vendor-out: REFUSED — {why}");
-            return exit::FAILED;
+        Err((code, line)) => {
+            eprintln!("verify vendor-out: {line}");
+            return code;
         }
     };
     let shown = into.join(VENDOR);
@@ -242,6 +255,31 @@ pub fn verdict(shown: &Path, found: &[Drift], files: usize) -> String {
     )
 }
 
+/// What vendor-out copies from the checkout at `root`: [`vendored`] of `crates`, once every copy
+/// aterm vendors pinned by tree id holds to its pin ([`aterm_forge::tree_pins`]: the index holds
+/// the pinned tree and the working copy changes nothing under it). vendor-out reads the working
+/// files and runs before verify's own pin check, so without this a hand edit of
+/// `vendor/alab-harness` would be relayed to the receiving repository as the pinned tag.
+///
+/// # Errors
+/// The exit code and line [`run`] stops with: a pin that does not hold (refused, `[OB-1]`), git
+/// unable to judge one (could not run), or a crate [`vendored`] refuses.
+fn pinned_source(root: &Path, crates: &[&str]) -> Result<Copy, (i32, String)> {
+    match aterm_forge::tree_pins(root) {
+        Ok(_) => {}
+        Err(aterm_forge::TreePinError::Fail(why)) => {
+            return Err((
+                exit::FAILED,
+                format!("REFUSED — [OB-1] {why}; nothing was copied"),
+            ));
+        }
+        Err(aterm_forge::TreePinError::CouldNotRun(why)) => {
+            return Err((exit::COULD_NOT_RUN, format!("COULD NOT RUN — [OB-1] {why}")));
+        }
+    }
+    vendored(root, crates).map_err(|why| (exit::FAILED, format!("REFUSED — {why}")))
+}
+
 /// Whether `a` and `b` name one directory.
 fn same_dir(a: &Path, b: &Path) -> bool {
     match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
@@ -250,18 +288,19 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The copy of `crates` (each at `crates/<name>` of the checkout at `root`) that vendor-out
-/// writes, [`MANIFEST`] included.
+/// The copy of `crates` that vendor-out writes, [`MANIFEST`] included: each read from its
+/// `source_dir` in the checkout at `root`, and resolved against its `own_workspace`.
 ///
 /// # Errors
 /// A crate this writer refuses (the module's rules), or a file that does not read.
 pub fn vendored(root: &Path, crates: &[&str]) -> Result<Copy, String> {
-    let workspace = toml_table(root, "Cargo.toml")?;
+    let top = toml_table(root, "Cargo.toml")?;
     let mut copy = Copy::new();
     for &name in crates {
-        let dir = format!("crates/{name}");
+        let dir = source_dir(name, &top)?;
         let manifest = toml_table(root, &format!("{dir}/Cargo.toml"))?;
-        let cargo = standalone(name, &manifest, &workspace, crates)?;
+        let workspace = own_workspace(root, &dir, &top)?;
+        let cargo = standalone(name, &dir, &manifest, &workspace, crates)?;
         let lib = lib_path(name, &manifest)?;
         if root.join(&dir).join("build.rs").exists() {
             return Err(format!(
@@ -276,6 +315,134 @@ pub fn vendored(root: &Path, crates: &[&str]) -> Result<Copy, String> {
     let list = manifest_text(&copy)?;
     copy.insert(MANIFEST.to_string(), list.into_bytes());
     Ok(copy)
+}
+
+/// The folder of the checkout the crate `name` is read from: the path the root manifest's
+/// `[workspace.dependencies]` gives it, which every member that inherits it builds it from, else
+/// `crates/<name>`.
+///
+/// # Errors
+/// The root names it with no path (a registry or git crate, of which this checkout holds no
+/// source), or with one that is not a folder inside the checkout.
+fn source_dir(name: &str, top: &Table) -> Result<String, String> {
+    let Some(entry) = top
+        .get("workspace")
+        .and_then(|w| w.get("dependencies"))
+        .and_then(|d| d.get(name))
+    else {
+        return Ok(format!("crates/{name}"));
+    };
+    let Some(path) = entry
+        .as_table()
+        .and_then(|spec| spec.get("path"))
+        .and_then(Value::as_str)
+    else {
+        return Err(format!(
+            "the root's [workspace.dependencies] takes {name} from no path, so this checkout \
+             holds no source of it to copy"
+        ));
+    };
+    inside(path).ok_or_else(|| {
+        format!(
+            "the root's [workspace.dependencies] points {name} at {path}, which is not a folder \
+             inside this checkout"
+        )
+    })
+}
+
+/// `path`, relative to the checkout's root, as `/`-joined parts with `.` and `..` resolved; `None`
+/// when it is absolute, names the root itself or leaves the checkout.
+fn inside(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in Path::new(path).components() {
+        match part {
+            Component::Normal(part) => parts.push(part.to_str()?),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+/// The workspace the crate in `dir` builds in, as cargo finds it, by its manifest's path and table:
+/// the crate's own manifest where that has a `[workspace]` table, else the nearest manifest above
+/// `dir`, up to the checkout's root (`top`), whose `[workspace]` takes the crate in
+/// ([`takes_in`]): cargo passes over a root whose `exclude` covers the crate. That is the root's
+/// for a member under `crates/`, and a vendored repository's own root for a crate inside a folder
+/// the root excludes, so the crate inherits that repository's version and lints, never aterm's.
+///
+/// # Errors
+/// A manifest on the way up does not read as TOML or has a `workspace` that is no table, or none
+/// takes the crate in: cargo would then build it as a workspace of its own, where its `workspace =
+/// true` keys have nothing to inherit from, so no copy of it builds as aterm builds it (a vendored
+/// repository's copy that lost its own root manifest, say).
+fn own_workspace(root: &Path, dir: &str, top: &Table) -> Result<(String, Table), String> {
+    let mut passed = Vec::new();
+    let mut folder = Some(dir);
+    while let Some(at) = folder {
+        let (manifest, table) = if at.is_empty() {
+            ("Cargo.toml".to_string(), Some(top.clone()))
+        } else {
+            let manifest = format!("{at}/Cargo.toml");
+            let table = if root.join(&manifest).is_file() {
+                Some(toml_table(root, &manifest)?)
+            } else {
+                None
+            };
+            (manifest, table)
+        };
+        if let Some(table) = table
+            && let Some(workspace) = table.get("workspace")
+        {
+            let Some(workspace) = workspace.as_table() else {
+                return Err(format!("{manifest}'s workspace is not a table"));
+            };
+            if at == dir || takes_in(workspace, at, dir) {
+                return Ok((manifest, table));
+            }
+            passed.push(manifest);
+        }
+        folder = (!at.is_empty()).then(|| at.rsplit_once('/').map_or("", |(parent, _)| parent));
+    }
+    Err(format!(
+        "no workspace takes in {dir} ({} excludes it, and no other manifest at or above it has a \
+         [workspace]), so cargo builds it as a workspace of its own and its `workspace = true` \
+         keys have nothing to inherit: a vendored repository's copy needs its own root manifest",
+        if passed.is_empty() {
+            "no manifest".to_string()
+        } else {
+            passed.join(", ")
+        }
+    ))
+}
+
+/// Whether the `[workspace]` table `workspace`, in the manifest of the folder `at`, takes in the
+/// crate in `dir` below it, as cargo judges a root it finds above a package: unless an `exclude`
+/// entry covers the crate's manifest and no `members` entry names it, each entry a path from
+/// `at` compared component by component (cargo compares `members` here literally, before any glob
+/// is expanded).
+fn takes_in(workspace: &Table, at: &str, dir: &str) -> bool {
+    let manifest = format!("{dir}/Cargo.toml");
+    let covers = |key: &str| {
+        workspace
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|entry| {
+                inside(&if at.is_empty() {
+                    entry.to_string()
+                } else {
+                    format!("{at}/{entry}")
+                })
+            })
+            .any(|path| Path::new(&manifest).starts_with(path))
+    };
+    !covers("exclude") || covers("members")
 }
 
 /// `relative` under `root`, read as a TOML table.
@@ -369,15 +536,17 @@ const TOP_DROPPED: [&str; 6] = [
     "badges",
 ];
 
-/// The crate `name`'s standalone `Cargo.toml`, from its own `manifest` and the root's
-/// `workspace` table; `set` is every crate vendored with it.
+/// The crate `name`'s standalone `Cargo.toml`, from its own `manifest` in `dir` and its
+/// `workspace` manifest ([`own_workspace`]: its path and table); `set` is every crate vendored
+/// with it.
 ///
 /// # Errors
 /// Anything a copy cannot carry over (the module's rules).
 fn standalone(
     name: &str,
+    dir: &str,
     manifest: &Table,
-    workspace: &Table,
+    (from, workspace): &(String, Table),
     set: &[&str],
 ) -> Result<String, String> {
     let shared = workspace.get("workspace").and_then(Value::as_table);
@@ -402,7 +571,7 @@ fn standalone(
     };
     if package.get("name").and_then(Value::as_str) != Some(name) {
         return Err(format!(
-            "crates/{name}/Cargo.toml names another package; the set names crates by folder"
+            "{dir}/Cargo.toml names another package; the set names {name}, read from that folder"
         ));
     }
     for key in package.keys() {
@@ -416,7 +585,7 @@ fn standalone(
     let mut out = format!(
         "# SPDX-License-Identifier: Apache-2.0\n\
          # Copyright 2026 Andrew Yates\n\
-         # Written by `{GENERATOR}` from aterm's crates/{name}/Cargo.toml: rerun it there, never\n\
+         # Written by `{GENERATOR}` from aterm's {dir}/Cargo.toml: rerun it there, never\n\
          # edit this copy (../{MANIFEST} holds each file's digest).\n\
          \n[package]\n"
     );
@@ -425,7 +594,9 @@ fn standalone(
             None => continue,
             Some(Value::Table(spec)) if spec.get("workspace") == Some(&Value::Boolean(true)) => {
                 inherited.and_then(|p| p.get(key)).ok_or_else(|| {
-                    format!("{name}: {key}.workspace = true, and the workspace sets no {key}")
+                    format!(
+                        "{name}: {key}.workspace = true, and its workspace ({from}) sets no {key}"
+                    )
                 })?
             }
             Some(value) => value,
@@ -452,7 +623,18 @@ fn standalone(
             }
         }
     }
-    out.push_str("\n# The copy's one target. Its tests and doctests run in aterm, beside the files\n# they read.\n[lib]\n");
+    // Its tests stay with the files they read: in aterm for a member, in the repository aterm
+    // vendors it from (whose workspace it builds in) for a vendored crate.
+    if from.as_str() == "Cargo.toml" {
+        out.push_str("\n# The copy's one target. Its tests and doctests run in aterm, beside the files\n# they read.\n[lib]\n");
+    } else {
+        let _ = write!(
+            out,
+            "\n# The copy's one target. Its tests and doctests run in the repository aterm\n\
+             # vendors it from (the workspace of aterm's {from}), beside the files they read.\n\
+             [lib]\n"
+        );
+    }
     if let Some(lib_name) = lib.and_then(|lib| lib.get("name")) {
         let _ = writeln!(out, "name = {}", inline(lib_name)?);
     }
@@ -472,7 +654,10 @@ fn standalone(
                     .and_then(|w| w.get("lints"))
                     .and_then(Value::as_table)
                     .ok_or_else(|| {
-                        format!("{name}: lints.workspace = true, and the workspace has no [workspace.lints]")
+                        format!(
+                            "{name}: lints.workspace = true, and its workspace ({from}) has no \
+                             [workspace.lints]"
+                        )
                     })?,
             )
         }
@@ -527,8 +712,9 @@ fn standalone(
     Ok(out)
 }
 
-/// The copy's spelling of the dependency `dep` of `name` (`spec`, under the root's `shared`
-/// `[workspace]` where it says `workspace = true`): a path to the copy of a crate in `set`.
+/// The copy's spelling of the dependency `dep` of `name` (`spec`, under its own workspace's
+/// `shared` `[workspace]` where it says `workspace = true`): a path to the copy of a crate in
+/// `set`.
 ///
 /// # Errors
 /// It is no crate of `set`, or no path dependency: a copy depends only on copies beside it.

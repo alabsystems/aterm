@@ -57,7 +57,6 @@ fn row(session: u64, group: &str, state: RowState) -> WorkerRow {
         why: None,
         has_result: false,
         stoppable: !state.concluded(),
-        finished: false,
     }
 }
 
@@ -314,12 +313,10 @@ fn a_press_asks_the_host_by_session() {
     assert_eq!(action_of("workers/keep/7"), Some(WorkersAction::Keep(7)));
     assert_eq!(
         action_of("workers/dismiss/7"),
-        Some(WorkersAction::Dismiss(7))
+        None,
+        "Dismiss went with Finished"
     );
-    assert_eq!(
-        action_of("workers/clear-finished"),
-        Some(WorkersAction::ClearFinished)
-    );
+    assert_eq!(action_of("workers/clear-finished"), None);
     assert_eq!(action_of("workers/move/7"), None, "Move to Tab is gone");
     assert_eq!(action_of("workers/open/x"), None);
     assert_eq!(action_of("mail/open/7"), None);
@@ -347,52 +344,24 @@ fn one_row_offers_what_its_state_allows() {
         labels(&row(2, "a", RowState::Working)),
         ["workers/stop", "workers/keep"]
     );
-    // A worker whose tab aterm closed offers what it left, never a tab to keep.
-    let closed = WorkerRow {
-        finished: true,
-        ..finished.clone()
-    };
-    assert_eq!(labels(&closed), ["workers/result", "workers/dismiss"]);
-    let no_result = WorkerRow {
-        has_result: false,
-        stoppable: true,
-        ..closed
-    };
-    assert_eq!(labels(&no_result), ["workers/dismiss"], "nothing to stop");
 }
 
-/// FINISHED ROWS SIT UNDER FINISHED, LAST, IN THE ORDER THEIR TABS CLOSED, WHOEVER MANAGED
-/// THEM: a running group keeps its heading. CONTROL: with none finished there is no such group,
-/// and the page can be closed only when every row is a Finished one.
+/// THE PAGE CLOSES ONLY WITH NO ROW: a parked worker, running or concluded, keeps it. CONTROL:
+/// with none it can be closed.
 #[test]
-fn finished_rows_sit_last_under_their_own_heading() {
-    let done = |session, group: &str| WorkerRow {
-        finished: true,
-        ..row(session, group, RowState::Finished)
-    };
-    let rows = [
-        done(7, "lead"),
-        row(1, "lead", RowState::Working),
-        done(3, ATERM_GROUP),
-    ];
-    let groups = grouped(&rows);
-    let headings: Vec<&str> = groups.iter().map(|(heading, _)| heading.as_str()).collect();
-    assert_eq!(headings, ["lead", FINISHED_GROUP]);
-    let finished: Vec<u64> = groups[1].1.iter().map(|row| row.session).collect();
-    assert_eq!(finished, [7, 3]);
-    assert!(
-        grouped(&rows[1..2])
-            .iter()
-            .all(|(heading, _)| heading != FINISHED_GROUP)
-    );
+fn the_page_closes_only_with_no_row() {
     let app = |rows: Vec<WorkerRow>| WorkersApp {
         rows,
         actions: VecDeque::new(),
     };
     let view = WorkersViewState::default();
-    assert!(!app(rows.to_vec()).presentation(&view).closable);
     assert!(
-        app(vec![done(7, "lead"), done(3, ATERM_GROUP)])
+        !app(vec![row(1, "lead", RowState::Working)])
+            .presentation(&view)
+            .closable
+    );
+    assert!(
+        !app(vec![row(7, "lead", RowState::Finished)])
             .presentation(&view)
             .closable
     );

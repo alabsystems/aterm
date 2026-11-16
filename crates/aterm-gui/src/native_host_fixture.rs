@@ -358,6 +358,9 @@ fn serve_connection_observed(
             Some(ServeDisposition::Subscribe { .. }) => {
                 return Err(failure("fixture does not own a subscription worker"));
             }
+            Some(ServeDisposition::Stream { .. }) => {
+                return Err(failure("fixture does not own a stream worker"));
+            }
             None if out.closes() => return Ok(true),
             None => {}
         }

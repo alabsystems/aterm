@@ -694,12 +694,82 @@ macro_rules! att_collection {
     };
 }
 
+/// Who a person reads as a collection's writer, which places it on the Tables page
+/// (docs/DESIGN-tables-app-2026-11-14.md §3.1). It is how the collection is shown, never how it
+/// merges, so it stays outside [`Collection::schema_row`], whose content is fixed at its
+/// collection version.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Face {
+    /// What the owner states: a person writes its rows, through a grid, a verb or an import.
+    Owner,
+    /// What each Mac states about itself, or writes for its own upkeep.
+    Mac,
+    /// A tool's rows: an importer's record of what it read.
+    Tool,
+    /// Reference rows every build compiles, or that the first Mac to report one is born with.
+    Seeded,
+    /// Rows that carry another generation's records: read as the rows they carry, never shown
+    /// as rows of their own.
+    Carried,
+}
+
+/// How a person is shown one collection: its name for many rows and for one, its face, and the
+/// order its columns are laid out in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Faced {
+    pub collection: &'static str,
+    /// `AI accounts`.
+    pub title: &'static str,
+    /// `AI account`.
+    pub singular: &'static str,
+    pub face: Face,
+    /// The columns a page lays out first, in this order ([`Self::laid_out`]): the column that
+    /// names a row first (a machine's `label`, an address's `addr`; [`ROW_KEY`] where the row's
+    /// own key is the word a person reads, a provider's `openai`), then the ones a person reads
+    /// next. Every other column follows them as the collection declares it. A column an order
+    /// names is one its collection has in some generation ([`Table::orders_name_columns`]).
+    pub order: &'static [&'static str],
+}
+
+/// The name a display order ([`Faced::order`]) gives the row's own key, which no column holds.
+pub const ROW_KEY: &str = "pk";
+
+impl Faced {
+    /// The column that names a row, where the order says: [`ROW_KEY`] for the row's own key.
+    pub fn naming(&self) -> Option<&'static str> {
+        self.order.first().copied()
+    }
+
+    /// The live columns of `collection` (this face's), in the order a page lays them out: the
+    /// ones [`Self::order`] names, in its order, then every other as the collection declares it.
+    /// The row's key is not a column and is not among them.
+    pub fn laid_out(&self, collection: &'static Collection) -> Vec<&'static Column> {
+        let live = |column: &&'static Column| column.live_at(collection.version);
+        let mut columns: Vec<&'static Column> = self
+            .order
+            .iter()
+            .filter_map(|name| collection.columns.iter().find(|c| c.name == *name))
+            .filter(live)
+            .collect();
+        columns.extend(
+            collection
+                .columns
+                .iter()
+                .filter(live)
+                .filter(|column| !self.order.contains(&column.name)),
+        );
+        columns
+    }
+}
+
 /// One typed table: an application role and the collections it holds.
 #[derive(Clone, Copy, Debug)]
 pub struct Table {
     pub application: &'static str,
     pub role: &'static str,
     pub collections: &'static [&'static Collection],
+    /// How a person is shown each collection ([`Faced`]); a table no page shows names none.
+    pub faces: &'static [Faced],
     /// Automatic records (owned rows, births, seeds) one writer may retain in one table
     /// generation; readers treat the rest as inert (design §3.7).
     pub self_quota: usize,
@@ -712,6 +782,76 @@ impl Table {
     /// The collection named `name`.
     pub fn collection(&self, name: &str) -> Option<&'static Collection> {
         self.collections.iter().copied().find(|c| c.name == name)
+    }
+
+    /// How a person is shown the collection named `name`, where the table says.
+    pub fn faced(&self, name: &str) -> Option<&'static Faced> {
+        self.faces.iter().find(|faced| faced.collection == name)
+    }
+
+    /// Whether the table says how a person is shown each of its collections, once: a face may
+    /// name a collection another generation of the table holds and this one does not.
+    pub const fn faces_every_collection(&self) -> bool {
+        let mut i = 0;
+        while i < self.collections.len() {
+            let mut found = 0;
+            let mut j = 0;
+            while j < self.faces.len() {
+                if str_eq(self.faces[j].collection, self.collections[i].name) {
+                    found += 1;
+                }
+                j += 1;
+            }
+            if found != 1 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    /// Whether every display order ([`Faced::order`]) of a collection this table holds names
+    /// only its columns or [`ROW_KEY`], each once: an order that names a column the collection
+    /// lacks would lay out nothing in its place, and one this generation's collection lacks is
+    /// a column of another generation's. A face for a collection the table does not hold is
+    /// another generation's and not read here.
+    pub const fn orders_name_columns(&self) -> bool {
+        let mut f = 0;
+        while f < self.faces.len() {
+            let faced = &self.faces[f];
+            let mut c = 0;
+            while c < self.collections.len() {
+                let collection = self.collections[c];
+                if str_eq(collection.name, faced.collection) {
+                    let mut o = 0;
+                    while o < faced.order.len() {
+                        let name = faced.order[o];
+                        let mut held = str_eq(name, ROW_KEY);
+                        let mut k = 0;
+                        while k < collection.columns.len() {
+                            if str_eq(collection.columns[k].name, name) {
+                                held = true;
+                            }
+                            k += 1;
+                        }
+                        let mut again = o + 1;
+                        while again < faced.order.len() {
+                            if str_eq(faced.order[again], name) {
+                                return false;
+                            }
+                            again += 1;
+                        }
+                        if !held {
+                            return false;
+                        }
+                        o += 1;
+                    }
+                }
+                c += 1;
+            }
+            f += 1;
+        }
+        true
     }
 
     /// Whether a secret cell of this table names a secret-store entry: one of its secret-named

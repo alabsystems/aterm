@@ -242,6 +242,8 @@ fn exact_commit_acquisition_preserves_checkout_and_full_source_across_native_pro
     for mode in ["cold", "mixed"] {
         let cache = world.path().join(format!("full-source-cache-{mode}.git"));
         let full = world.path().join(format!("full-source-{mode}.git"));
+        let wire = world.path().join(format!("full-source-wire-{mode}.git"));
+        let wire_by_observer = wire.clone();
         for dir in [&cache, &full] {
             host_git(
                 world.path(),
@@ -309,6 +311,14 @@ fn exact_commit_acquisition_preserves_checkout_and_full_source_across_native_pro
                     assert_eq!(body.parent(), parent_by_observer.get().map(PathBuf::as_path),
                         "body worker belongs to the SAME private input owner");
                     host_git(body, &["config", "protocol.version", "0"]);
+                }
+                if spec.args.iter().any(|arg| arg == "--refetch")
+                    && spec.args.iter().any(|arg| arg.to_string_lossy().ends_with(":refs/agh/cache-ancestor")) {
+                    assert_eq!(span.code, Some(0), "actual native cache DATA export");
+                    let body = spec.cwd.as_deref().unwrap();
+                    // Preserve the actual pre-network object state for replay,
+                    // including only the complete original ancestor it copied.
+                    host_git(body.parent().unwrap(), &["clone", "--quiet", "--mirror", "--no-hardlinks", body.to_str().unwrap(), wire_by_observer.to_str().unwrap()]);
                 }
                 if spec.args.iter().any(|arg| arg == remote_endpoint.as_str()) {
                     assert!(!spec.args.iter().any(|arg| arg.to_string_lossy()
@@ -407,11 +417,12 @@ fn exact_commit_acquisition_preserves_checkout_and_full_source_across_native_pro
                 // As in the original checkout control, independently replay the
                 // ACTUAL emitted argv with native v0 packet tracing. This is a
                 // wire control, never a retry or replacement for the API result.
-                let wire = world.path().join(format!("full-source-wire-{mode}.git"));
-                host_git(
-                    world.path(),
-                    &["init", "--quiet", "--bare", wire.to_str().unwrap()],
-                );
+                if !wire.exists() {
+                    host_git(
+                        world.path(),
+                        &["init", "--quiet", "--bare", wire.to_str().unwrap()],
+                    );
+                }
                 let trace = wire.join("native-packets.data");
                 let mut args = vec![OsString::from("-c"), OsString::from("protocol.version=0")];
                 args.extend(exact_root.args.clone());
@@ -428,9 +439,27 @@ fn exact_commit_acquisition_preserves_checkout_and_full_source_across_native_pro
                         .any(|line| line.contains(&format!("fetch> want {commit}")))
                 );
                 assert!(
-                    !packets.lines().any(|line| line.contains("fetch> have ")),
-                    "a filtered metadata commit is never a complete have"
+                    !packets
+                        .lines()
+                        .any(|line| line.contains(&format!("fetch> have {commit}"))),
+                    "the filtered wanted metadata is never a complete have"
                 );
+                if let Some(tip) = exact_root.args.iter().find_map(|arg| {
+                    arg.to_str()
+                        .and_then(|arg| arg.strip_prefix("--negotiation-tip="))
+                }) {
+                    assert!(
+                        packets
+                            .lines()
+                            .any(|line| line.contains(&format!("fetch> have {tip}"))),
+                        "the actual copied complete ancestor participates in v0 negotiation"
+                    );
+                } else {
+                    assert!(
+                        !packets.lines().any(|line| line.contains("fetch> have ")),
+                        "cold input supplies no haves"
+                    );
+                }
                 for id in [&blob, &other_blob, &retired_blob] {
                     assert!(
                         !packets

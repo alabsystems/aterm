@@ -54,6 +54,8 @@ pub fn control_lane_tenure_model() -> Model {
             const Inline = 1;
             const Cap = 3;
             const Arrivals = 6;
+            const Streams = 1;
+            var streaming = 0;
             var working = 0;
             var held = 0;
             var waiting = 0;
@@ -158,6 +160,16 @@ pub fn control_lane_tenure_model() -> Model {
                 queued = queued - 1;
                 working = working + 1;
             }
+            action Stream when (
+                working > 0 && (Buggy == 1 || streaming <= Streams - 1)
+            ) {
+                working = working - 1;
+                streaming = streaming + 1;
+            }
+            action StreamClose when (streaming > 0) {
+                streaming = streaming - 1;
+                open = open - 1;
+            }
             action Close when (working > 0) {
                 working = working - 1;
                 open = open - 1;
@@ -179,11 +191,12 @@ pub fn control_lane_tenure_model() -> Model {
             invariant NoRefusalBesideParked: refused_parked == 0;
             invariant RequestLanesBounded: working + held + inline <= Lanes;
             invariant WaitLanesBounded: waiting <= Waits;
+            invariant StreamLanesBounded: streaming <= Streams;
             invariant RequestLaneLeftForRequests: held + inline <= Lanes - 1;
             invariant WaitLaneTakenFirst: bypassed == 0;
             invariant ParkBounded: parked + queued <= Cap;
             invariant EveryConnectionPlaced:
-                working + held + waiting + inline + parked + queued == open;
+                working + held + waiting + inline + streaming + parked + queued == open;
         }
     }
 }

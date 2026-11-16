@@ -707,10 +707,15 @@ fn a_pinned_main_lane_keeps_its_intermediates_out_of_spotlight() {
         ]
     );
     let c = ctx(&repo, EnvSnapshot::default());
+    // The default target spelled with this host's separator, as the plan names the directory
+    // it captured (`DEFAULT_TARGET` is written with `/`).
     let repo_cfg = format!(
         "build.build-dir='{}'",
         aterm_toolchain::build_cache::target_build_path(
-            &repo.join(aterm_toolchain::build_cache::DEFAULT_TARGET)
+            &repo
+                .join(aterm_toolchain::build_cache::DEFAULT_TARGET)
+                .components()
+                .collect::<PathBuf>()
         )
         .display()
     );

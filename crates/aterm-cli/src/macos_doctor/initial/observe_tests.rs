@@ -5,6 +5,64 @@ use super::*;
 use aterm_secrets::alab_join::JoinPlace;
 use aterm_types::macos_setup::BASE_PLAN;
 
+/// [`read_batches`]' readings, each batch as it was handed over.
+fn batches(
+    subjects: &[Subject],
+    network: bool,
+    admission: ObservationRead,
+    read: impl FnMut(&[Subject], bool) -> Vec<Observation>,
+) -> Vec<Vec<Observation>> {
+    let mut kept = Vec::new();
+    read_batches(subjects, network, admission, read, &mut |batch: Vec<
+        Observation,
+    >| {
+        kept.push(batch)
+    });
+    kept
+}
+
+/// The GitHub repositories row is read in a batch of its own, after every other, and each batch
+/// is handed over as it completes: the grants and the vault are kept before the repositories'
+/// read, which may wait on the network, begins (FL-160). NEGATIVE CONTROL: without the network
+/// the repositories are not read at all, and the other batches are handed over as before.
+#[test]
+fn the_repositories_are_read_last_in_a_batch_of_their_own() {
+    use std::cell::RefCell;
+    let fda = Subject::Access(Access::FullDiskAccess);
+    let vault = Subject::Setting(Setting::Secrets);
+    let repositories = Subject::Setting(Setting::Repositories);
+    let dock = Subject::Setting(Setting::Dock);
+    for network in [true, false] {
+        let events = RefCell::new(Vec::new());
+        read_batches(
+            &[repositories, fda, dock, vault],
+            network,
+            ObservationRead::ExplicitCheck,
+            |batch, network| {
+                events
+                    .borrow_mut()
+                    .push(format!("read {batch:?} {network}"));
+                batch.iter().copied().map(Observation::unknown).collect()
+            },
+            &mut |kept: Vec<Observation>| {
+                let kept: Vec<Subject> = kept.iter().map(|row| row.subject).collect();
+                events.borrow_mut().push(format!("kept {kept:?}"));
+            },
+        );
+        let mut expected = vec![
+            format!("read {:?} false", [fda, vault]),
+            format!("kept {:?}", [fda, vault]),
+            format!("read {:?} false", [dock]),
+            format!("kept {:?}", [dock]),
+        ];
+        if network {
+            expected.push(format!("read {:?} true", [repositories]));
+            expected.push(format!("kept {:?}", [repositories]));
+        }
+        assert_eq!(events.into_inner(), expected, "network={network}");
+    }
+}
+
 /// Ordinary reads admit each private batch only where the page is still in front. A
 /// queued visibility observation and an earlier safe or private batch grant nothing to
 /// the next one. An explicit Check retains its existing intent instead.
@@ -17,11 +75,14 @@ fn ordinary_private_reads_require_current_visibility_at_each_batch() {
         FRONT.load(Ordering::SeqCst)
     }
     let fda = Subject::Access(Access::FullDiskAccess);
-    let safe = vec![
-        fda,
-        Subject::Setting(Setting::Secrets),
-        Subject::Setting(Setting::Repositories),
-    ];
+    let repositories = Subject::Setting(Setting::Repositories);
+    let safe = vec![fda, Subject::Setting(Setting::Secrets), repositories];
+    // The rows read in this process, apart from the repositories, which come last on their own.
+    let local: Vec<_> = safe
+        .iter()
+        .copied()
+        .filter(|subject| *subject != repositories)
+        .collect();
     let workstation = vec![
         Subject::Setting(Setting::Dock),
         Subject::Setting(Setting::Messages),
@@ -49,9 +110,9 @@ fn ordinary_private_reads_require_current_visibility_at_each_batch() {
         };
         FRONT.store(current, Ordering::SeqCst);
         let mut calls = Vec::new();
-        let seen = read_batches(&subjects, true, admission, |batch, network| {
+        let seen = batches(&subjects, true, admission, |batch, network| {
             calls.push((batch.to_vec(), network));
-            let change = if batch == safe {
+            let change = if batch == local {
                 after_safe
             } else if batch == workstation {
                 after_workstation
@@ -69,14 +130,16 @@ fn ordinary_private_reads_require_current_visibility_at_each_batch() {
                     ..Observation::unknown(*subject)
                 })
                 .collect()
-        });
-        let mut expected = vec![(safe.clone(), true)];
+        })
+        .concat();
+        let mut expected = vec![(local.clone(), false)];
         if ws_read {
             expected.push((workstation.clone(), false));
         }
         if sp_read {
             expected.push((spotlight.clone(), false));
         }
+        expected.push((vec![repositories], true));
         assert_eq!(
             calls, expected,
             "private readers must not be invoked without admission"
@@ -106,22 +169,24 @@ fn ordinary_private_reads_require_current_visibility_at_each_batch() {
         );
     }
     FRONT.store(false, Ordering::SeqCst);
-    let seen = read_batches(
+    let seen = batches(
         &workstation,
         false,
         ObservationRead::Ordinary { page_front: front },
         |_, _| panic!("a hidden private-only refresh invoked its native reader"),
-    );
+    )
+    .concat();
     assert!(
         seen.iter()
             .all(|row| row.standing == Standing::Unknown && row.now.is_none() && row.is_withheld())
     );
-    let attempted = read_batches(
+    let attempted = batches(
         &workstation,
         false,
         ObservationRead::ExplicitCheck,
         |subjects, _| subjects.iter().copied().map(Observation::unknown).collect(),
-    );
+    )
+    .concat();
     assert_eq!(attempted.len(), workstation.len());
     assert!(
         attempted
@@ -140,7 +205,7 @@ fn an_unwound_batch_retires_only_its_attempted_rows_and_preserves_independent_re
     for private in [false, true] {
         for failed in subjects {
             let mut calls = Vec::new();
-            let rows = read_batches(
+            let rows = batches(
                 &subjects,
                 true,
                 ObservationRead::Ordinary {
@@ -157,7 +222,8 @@ fn an_unwound_batch_retires_only_its_attempted_rows_and_preserves_independent_re
                         })
                         .collect()
                 },
-            );
+            )
+            .concat();
             let expected: Vec<_> = subjects
                 .into_iter()
                 .filter(|subject| private || *subject == safe)
@@ -196,7 +262,7 @@ fn a_local_batch_unwind_produces_no_repository_observation() {
     let access = Subject::Access(Access::FullDiskAccess);
     let repositories = Subject::Setting(Setting::Repositories);
     let mut called = Vec::new();
-    let rows = read_batches(
+    let rows = batches(
         &[access, repositories],
         false,
         ObservationRead::ExplicitCheck,
@@ -204,7 +270,8 @@ fn a_local_batch_unwind_produces_no_repository_observation() {
             called.extend_from_slice(batch);
             panic!("injected native unwind");
         },
-    );
+    )
+    .concat();
     assert_eq!(called, [access]);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].subject, access);

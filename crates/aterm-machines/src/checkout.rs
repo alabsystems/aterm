@@ -5,35 +5,37 @@
 //! one function `develop.checkout@<path>` and the GitHub item's existing checkouts share.
 
 use crate::model::{Probe, User};
-use crate::port::{Cmd, Ran, System};
+use crate::port::{Cmd, Ran, RunFailed, System};
 use crate::repository_progress::{FailureKind, PreservationReason, Progress};
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
+pub(crate) mod facts;
 pub(crate) mod lazy_fetch;
 
+pub(crate) use facts::Facts;
 pub(crate) use lazy_fetch::NoLazyFetch;
 
-/// A local read, or one `ls-remote`.
+/// A local read, or one `ls-remote`. A transfer (a fetch, a merge that may fetch) has no
+/// wall-clock budget: [`System::run_repository`] bounds it by its progress. An `ls-remote` keeps
+/// this one: Git writes nothing until it holds the remote's whole advertisement, which is small,
+/// so a progress window would bound it by the same five minutes. A local step that writes a
+/// worktree under `GIT_NO_LAZY_FETCH=1` ([`git`]), such as an unfinished checkout's first
+/// checkout, keeps it too: it reaches no remote, so its time is the disk's.
 const READ_BUDGET: Duration = Duration::from_secs(300);
-/// `git fetch origin` of a large history.
-const FETCH_BUDGET: Duration = Duration::from_secs(1800);
 /// Nothing else runs under a git that changes a ref or a worktree, for this one run: no hook,
 /// fsmonitor or automatic maintenance (agh's [`agh::git::lazy_fetch::NO_SIDE_RUNS`], which the
 /// lazy-fetch question runs under too), whose detached fork a drain would see holding the run's
 /// stdout and refuse its output for ([`System::run_complete_stdout`]).
 pub(crate) use agh::git::lazy_fetch::NO_SIDE_RUNS;
 
-/// The keys of every hook and filter driver a config names: a `hook` or `filter` section with a
-/// subsection, the empty one (`[hook ""]`) included.
-const PROGRAM_KEYS: &str = r"^(hook|filter)\..*\.[^.]+$";
-
 /// What a repository's config names that a git command there can start by itself, beyond what
 /// [`NO_SIDE_RUNS`] stops: each hook (`hook.<name>.*`) and each
 /// filter driver (`filter.<driver>.*`), whose `clean` runs whenever git hashes a worktree file an
 /// attributes file assigns it to (a `status` or `diff` of a stat-dirty file, an index rewrite of
-/// a racily clean one), in any scope the config reads, the empty name included.
+/// a racily clean one), in any scope the config reads, the empty name included: what the
+/// record of the repository's facts lists of them ([`Facts::programs`]).
 #[derive(Debug, Default)]
 pub(crate) struct Programs {
     hooks: BTreeSet<String>,
@@ -41,60 +43,6 @@ pub(crate) struct Programs {
 }
 
 impl Programs {
-    /// The listing [`Programs::named`] runs: `git`, a command already in the repository, asked
-    /// for [`PROGRAM_KEYS`] in the C locale, where git's regular expressions match bytes (under
-    /// a UTF-8 locale `.` matches no byte that is not UTF-8, so such a key would go unlisted).
-    pub(crate) fn listing(git: Cmd) -> Cmd {
-        git.env("LC_ALL", "C")
-            .args(["config", "--null", "--get-regexp", PROGRAM_KEYS])
-    }
-
-    /// Each one the repository `git` runs in names.
-    ///
-    /// # Errors
-    /// The config cannot be read, or names a hook or filter driver whose name is not UTF-8,
-    /// which no override can name: a command there could start it.
-    pub(crate) fn named(sys: &dyn System, git: Cmd) -> Result<Self, String> {
-        let ran = sys
-            .run_complete_stdout(&Self::listing(git))
-            .map_err(|why| format!("cannot run git: {why}"))?;
-        let mut named = Self::default();
-        match ran.status {
-            Some(0) => {}
-            Some(1) => return Ok(named),
-            _ => return Err("cannot read which hooks and filters its config names".into()),
-        }
-        for record in ran
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|record| !record.is_empty())
-        {
-            let key = record
-                .split(|byte| *byte == b'\n')
-                .next()
-                .unwrap_or_default();
-            let key = std::str::from_utf8(key).map_err(|_| {
-                "its config names a hook or filter whose name is not UTF-8, which aterm cannot \
-                 turn off"
-                    .to_owned()
-            })?;
-            // The section ends at the first dot and the variable starts after the last, so the
-            // name between them keeps any dot of its own, and may be empty.
-            let Some((section, rest)) = key.split_once('.') else {
-                continue;
-            };
-            let Some((name, _)) = rest.rsplit_once('.') else {
-                continue;
-            };
-            match section {
-                "hook" => named.hooks.insert(name.to_owned()),
-                "filter" => named.filters.insert(name.to_owned()),
-                _ => false,
-            };
-        }
-        Ok(named)
-    }
-
     /// `cmd` with every one turned off for its run, carried in `GIT_CONFIG_*` so no name is
     /// parsed as an option: `hook.<name>.enabled=false`; and for a driver an empty `process`,
     /// which also stops its `clean` on git 2.54 and 2.56 (git takes `clean` only where no
@@ -164,62 +112,12 @@ pub(crate) fn network(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd
     )
 }
 
-/// The read of the commit `path`'s HEAD names (`rev-parse --verify --quiet HEAD^{commit}`): exit
-/// 0 with the commit, 1 with no commit there (an unborn branch, or a commit never fetched), and
-/// with [`git`]'s `GIT_NO_LAZY_FETCH=1` never a fetch of a commit a partial clone lacks.
-pub(crate) fn head_commit(sys: &dyn System, user: &User, path: &Path) -> Cmd {
-    git(sys, user, Some(path)).args(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])
-}
-
-/// An absent HEAD is an unfinished branch only when its symbolic branch has no ref.
-/// A missing object, detached HEAD or unreadable ref is not an empty checkout.
+/// Whether the checkout at `path` is an unfinished branch, from its record of facts
+/// ([`Facts::unborn`]): an absent HEAD commit is an unfinished branch only when its symbolic
+/// branch has no ref. A missing object, detached HEAD or unreadable ref is not an empty
+/// checkout.
 pub(crate) fn unborn(sys: &dyn System, user: &User, path: &Path) -> Result<Option<String>, String> {
-    let head = sys
-        .run_complete_stdout(&head_commit(sys, user, path))
-        .map_err(|why| why.to_string())?;
-    unborn_after(sys, user, path, &head)
-}
-
-/// [`unborn`], judged from `head`, a [`head_commit`] read of `path` the caller has just made:
-/// the read is not run again, and everything after it is.
-pub(crate) fn unborn_after(
-    sys: &dyn System,
-    user: &User,
-    path: &Path,
-    head: &Ran,
-) -> Result<Option<String>, String> {
-    let git = git(sys, user, Some(path));
-    if head.success() {
-        return if oid(head.out().trim()) {
-            Ok(None)
-        } else {
-            Err("the checkout returned an invalid commit identity".into())
-        };
-    }
-    if head.status != Some(1) {
-        return Err("cannot inspect the checkout's HEAD".into());
-    }
-    let branch = sys
-        .run_complete_stdout(
-            &git.clone()
-                .args(["symbolic-ref", "--quiet", "--short", "HEAD"]),
-        )
-        .map_err(|why| why.to_string())?;
-    if !branch.success() {
-        return Err("the checkout has no readable symbolic branch".into());
-    }
-    let branch = branch.out().trim().to_owned();
-    if branch.is_empty() {
-        return Err("the checkout has no readable symbolic branch".into());
-    }
-    let reference = format!("refs/heads/{branch}");
-    let absent = sys
-        .run_complete_stdout(&git.args(["show-ref", "--verify", "--quiet", &reference]))
-        .map_err(|why| why.to_string())?;
-    if absent.status != Some(1) {
-        return Err("the checkout's branch exists without a readable commit".into());
-    }
-    Ok(Some(branch))
+    Facts::of(sys, user, path)?.unborn()
 }
 
 /// Preserve all owner work, including ignored files and an index without a commit.
@@ -236,18 +134,21 @@ pub(crate) fn virgin_unborn(
     }
 }
 
-/// Local owner work is a preservation reason; unreadable Git state remains unknown.
+/// Local owner work is a preservation reason; unreadable Git state remains unknown. The branch,
+/// the hooks and filters its reads turn off and its upstream are its record's ([`Facts::of`]),
+/// checked again after its files are read.
 pub(crate) fn unborn_preservation(
     sys: &dyn System,
     user: &User,
     path: &Path,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    if unborn(sys, user, path)?.as_deref() != Some(branch) {
+    let facts = Facts::of(sys, user, path)?;
+    if facts.unborn()?.as_deref() != Some(branch) {
         return Ok(Some("the unfinished branch changed; work preserved".into()));
     }
     let git = git(sys, user, Some(path));
-    let programs = Programs::named(sys, git.clone())?;
+    let programs = facts.programs()?;
     for args in [
         vec!["ls-files", "--stage", "-z"],
         vec![
@@ -269,6 +170,8 @@ pub(crate) fn unborn_preservation(
             ));
         }
     }
+    // An upstream it does not name is none; one it names is origin's same branch, once.
+    let now = Facts::of(sys, user, path)?;
     for (key, expected) in [
         (format!("branch.{branch}.remote"), "origin".to_owned()),
         (
@@ -276,13 +179,8 @@ pub(crate) fn unborn_preservation(
             format!("refs/heads/{branch}"),
         ),
     ] {
-        let read = sys
-            .run_complete_stdout(&git.clone().args(["config", "--get-all", &key]))
-            .map_err(|why| why.to_string())?;
-        if !matches!(read.status, Some(0 | 1)) {
-            return Err("cannot inspect the unfinished branch's upstream".into());
-        }
-        if read.success() && read.out().trim() != expected {
+        let named = now.values(&key);
+        if !named.is_empty() && named != [expected] {
             return Ok(Some(
                 "the unfinished branch has another upstream; left untouched".into(),
             ));
@@ -291,8 +189,12 @@ pub(crate) fn unborn_preservation(
     Ok(None)
 }
 
-/// Fetch an admitted first commit and create only the still-unborn ordinary branch.
+/// Fetch an admitted first commit and create only the still-unborn ordinary branch, its
+/// progress published under the checkout's name. The fetch is a transfer bounded by its
+/// progress ([`acquisition_transfer`]).
 /// The caller owns the repository pass and revalidates source, origin and physical storage.
+/// # Errors
+/// What [`hydrate_observed`] says.
 pub(crate) fn hydrate_unborn(
     sys: &dyn System,
     user: &User,
@@ -300,16 +202,49 @@ pub(crate) fn hydrate_unborn(
     branch: &str,
     tip: &str,
     current: &(dyn Fn() -> Result<(), String> + Sync),
-) -> Result<(), String> {
+) -> Result<(), AcquisitionFailure> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repository");
+    let mut progress = Progress::new(name, path.to_owned());
+    progress.placed = true;
+    let result = hydrate_observed(sys, user, path, branch, tip, current, &mut progress);
+    match &result {
+        Ok(()) => progress.enter(crate::repository_progress::Phase::Ready),
+        Err(failure) => failure.record_progress(&mut progress),
+    }
+    progress.usable = result.is_ok();
+    sys.repository_progress(&progress);
+    result
+}
+
+/// [`hydrate_unborn`], reporting its stages to `progress`.
+/// # Errors
+/// Authorization changed, owner work appeared, the fetch failed or stalled (a network failure),
+/// the advertised commit moved, or the checkout was refused.
+fn hydrate_observed(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    branch: &str,
+    tip: &str,
+    current: &(dyn Fn() -> Result<(), String> + Sync),
+    progress: &mut Progress,
+) -> Result<(), AcquisitionFailure> {
+    use crate::repository_progress::Phase;
     current()?;
     virgin_unborn(sys, user, path, branch)?;
-    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
+    let programs = Facts::of(sys, user, path)?.programs()?;
     let command = programs.off(network(sys, user, Some(path)).args(NO_SIDE_RUNS));
     current()?;
-    acquisition_read(
+    progress.enter(Phase::Connecting);
+    sys.repository_progress(progress);
+    acquisition_transfer(
         sys,
-        &command.clone().budget(FETCH_BUDGET).args([
+        &command.clone().args([
             "fetch",
+            "--progress",
             "--no-recurse-submodules",
             "--no-tags",
             "--",
@@ -318,8 +253,8 @@ pub(crate) fn hydrate_unborn(
             "refs/tags/*:refs/tags/*",
         ]),
         "cannot fetch the unfinished checkout's first commit",
-    )
-    .map_err(|why| why.to_string())?;
+        progress,
+    )?;
     current()?;
     virgin_unborn(sys, user, path, branch)?;
     let reference = format!("refs/remotes/origin/{branch}^{{commit}}");
@@ -336,6 +271,11 @@ pub(crate) fn hydrate_unborn(
         );
     }
     current()?;
+    progress.enter(Phase::Checkout);
+    sys.repository_progress(progress);
+    // A local step, under READ_BUDGET rather than a progress window: `command` is a [`network`]
+    // run, which keeps [`git`]'s `GIT_NO_LAZY_FETCH=1`, so the checkout reads only what the fetch
+    // above brought and reaches no remote.
     let target = format!("refs/remotes/origin/{branch}");
     let merged = sys
         .run_complete_stdout(&command.args([
@@ -407,6 +347,19 @@ impl From<String> for Unread {
     }
 }
 
+impl Unread {
+    /// A transfer that produced no result ([`System::run_repository`]): one that stalled is a
+    /// network failure, its origin having stopped sending (never offline: the host answered
+    /// before it stopped); any other a local one.
+    pub(crate) fn unfinished(failed: &RunFailed, why: String) -> Self {
+        Self {
+            why,
+            offline: false,
+            network: failed.is_stall(),
+        }
+    }
+}
+
 /// An acquisition error retains whether an admitted network command actually failed.
 /// A nonzero Git result alone never proves authentication refusal.
 #[derive(Debug)]
@@ -418,6 +371,16 @@ pub(crate) enum AcquisitionFailure {
 impl AcquisitionFailure {
     pub(crate) const fn is_network(&self) -> bool {
         matches!(self, Self::Network(_))
+    }
+
+    /// A transfer that produced no result ([`System::run_repository`]): one that stalled is a
+    /// network failure, its origin having stopped sending; any other a local one.
+    pub(crate) fn unfinished(failed: &RunFailed, why: String) -> Self {
+        if failed.is_stall() {
+            Self::Network(why)
+        } else {
+            Self::Local(why)
+        }
     }
 
     /// Publish only the typed classification. Error text may contain transport diagnostics.
@@ -450,7 +413,9 @@ impl std::fmt::Display for AcquisitionFailure {
     }
 }
 
-/// Read one admitted network command without inspecting its diagnostic text.
+/// Read one admitted network command. Its classification never depends on what Git said; the
+/// failure's line ends with Git's own reason ([`git_failed`]), or with why the run produced
+/// nothing.
 /// # Errors
 /// The process did not complete, or Git returned a nonzero status.
 pub(crate) fn acquisition_read(
@@ -460,11 +425,117 @@ pub(crate) fn acquisition_read(
 ) -> Result<Vec<u8>, AcquisitionFailure> {
     let ran = sys
         .run_complete_stdout(command)
-        .map_err(|_| AcquisitionFailure::Local(why.into()))?;
+        .map_err(|failed| AcquisitionFailure::Local(format!("{why} ({failed})")))?;
     if !ran.success() {
-        return Err(AcquisitionFailure::Network(why.into()));
+        return Err(AcquisitionFailure::Network(git_failed(why, &ran)));
     }
     Ok(ran.stdout)
+}
+
+/// Run one admitted network transfer ([`System::run_repository`]), bounded by its progress and
+/// reporting it to `progress`. One that stalled is a network failure, as is a nonzero Git
+/// result, whose line ends with Git's own reason ([`git_failed`]); one that produced nothing for
+/// any other reason is a local one ([`AcquisitionFailure::unfinished`]).
+/// # Errors
+/// The transfer did not complete, or Git returned a nonzero status.
+pub(crate) fn acquisition_transfer(
+    sys: &dyn System,
+    command: &Cmd,
+    why: &str,
+    progress: &mut Progress,
+) -> Result<Ran, AcquisitionFailure> {
+    let ran = sys
+        .run_repository(command, progress)
+        .map_err(|failed| AcquisitionFailure::unfinished(&failed, format!("{why} ({failed})")))?;
+    if !ran.success() {
+        return Err(AcquisitionFailure::Network(git_failed(why, &ran)));
+    }
+    Ok(ran)
+}
+
+/// The most characters of Git's own words [`git_said`] keeps.
+const SAID: usize = 240;
+
+/// `why`, then Git's reason for the failed `ran`: the last line it wrote to standard error
+/// ([`git_said`]), else how it ended.
+pub(crate) fn git_failed(why: &str, ran: &crate::port::Ran) -> String {
+    match git_said(&ran.stderr) {
+        Some(said) => format!("{why}: {said}"),
+        None => match ran.status {
+            Some(status) => format!("{why} (git exited {status}, saying nothing)"),
+            None => format!("{why} (git was ended by a signal)"),
+        },
+    }
+}
+
+/// Git's reason, from what it wrote to standard error, as one line for a failure's `why`: the
+/// last line it marked `fatal:` or `error:`, else its last line (a progress meter's
+/// carriage-return updates count as lines). The line never holds a URL or a credential
+/// ([`Unread`]): each URL (`https://<user>:<token>@host/…`) or SSH address Git names, quoted
+/// or not, is written `origin`, a path it quotes is cut to its file name, and any word shaped
+/// as a GitHub token is dropped. Control characters become spaces, and the line is cut at
+/// [`SAID`] characters. `None` where Git wrote nothing but space.
+pub(crate) fn git_said(stderr: &[u8]) -> Option<String> {
+    const TOKENS: [&str; 6] = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"];
+    let names_remote = |text: &str| {
+        text.contains("://")
+            || text
+                .split_once('@')
+                .is_some_and(|(_, host)| host.contains(':'))
+    };
+    let text = String::from_utf8_lossy(stderr);
+    let lines: Vec<&str> = text
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
+        .or(lines.last())?;
+    // The parts between single quotes, Git's quoting of what it names, are the odd ones.
+    let mut unquoted = String::with_capacity(line.len());
+    for (at, part) in line.split('\'').enumerate() {
+        if at % 2 == 0 {
+            unquoted.push_str(part);
+        } else if names_remote(part) {
+            unquoted.push_str("origin");
+        } else if part.starts_with('/') {
+            let name = Path::new(part).file_name().unwrap_or_default();
+            unquoted.push('\'');
+            unquoted.push_str(&name.to_string_lossy());
+            unquoted.push('\'');
+        } else {
+            unquoted.push('\'');
+            unquoted.push_str(part);
+            unquoted.push('\'');
+        }
+    }
+    let said = unquoted
+        .split(' ')
+        .map(|word| {
+            let bare = word.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+            if names_remote(word) {
+                "origin".to_owned()
+            } else if TOKENS.iter().any(|prefix| bare.starts_with(prefix)) {
+                "[token]".to_owned()
+            } else {
+                word.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ");
+    let said = said.trim();
+    if said.is_empty() {
+        None
+    } else if said.chars().count() <= SAID {
+        Some(said.to_owned())
+    } else {
+        Some(format!("{}…", said.chars().take(SAID).collect::<String>()))
+    }
 }
 
 /// Whether `url` names `github.com/<owner>/<name>` over HTTPS or SSH, with no credential in it
@@ -733,6 +804,18 @@ impl From<Unread> for Stop {
 struct Local {
     branch: String,
     head: String,
+    /// The commits its record's refs name ([`Facts::commits`]): each one is here.
+    here: BTreeSet<String>,
+}
+
+/// Whether [`local`] reads the worktree's files.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Worktree {
+    /// `status` says whether anything there is the person's own: what a read that goes on to
+    /// origin, or a judgement of a checkout left as it is, needs.
+    Read,
+    /// Not read: a later [`local`] reads them before the network is reached.
+    Unread,
 }
 
 fn run(sys: &dyn System, cmd: &Cmd, what: &str) -> Result<Ran, String> {
@@ -758,42 +841,44 @@ fn read_ok(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<
     Ok(stdout(&ran))
 }
 
-fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<Local, Stop> {
-    if read_ok(sys, user, path, &["rev-parse", "--is-inside-work-tree"])? != "true"
-        || !read_ok(sys, user, path, &["rev-parse", "--show-prefix"])?.is_empty()
-    {
+/// What the checkout at `path` says of itself, from its record of facts ([`Facts::of`]): the
+/// top of a worktree whose one origin `origin` admits, as git reaches it, on a branch with a
+/// commit, and, where `worktree` says so, with nothing of the person's own in its files.
+fn local(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+    worktree: Worktree,
+) -> Result<Local, Stop> {
+    let facts = Facts::of(sys, user, path)?;
+    if !facts.top() {
         return Err(Stop::from("not the top of a git worktree".to_owned()));
     }
-    let urls = run(
-        sys,
-        &git(sys, user, Some(path)).args(["config", "--get-all", "remote.origin.url"]),
-        "config",
-    )?;
-    match urls.status {
-        Some(0) => {}
-        Some(1) => {
+    let urls = facts.values("remote.origin.url");
+    match urls.as_slice() {
+        [] => {
             return Err(Stop::Kept(Preserved::new(
                 PreservationReason::MissingOrigin,
                 "it has no origin remote",
             )));
         }
-        _ => return Err(Stop::from("cannot read the checkout's origin".to_owned())),
+        [url] => {
+            if !origin.admits(url) {
+                return Err(Stop::Kept(Preserved::new(
+                    PreservationReason::DifferentOrigin,
+                    format!("its origin is not {}", origin.describe()),
+                )));
+            }
+        }
+        _ => {
+            return Err(Stop::Kept(Preserved::new(
+                PreservationReason::MultipleOrigins,
+                "origin has more than one URL",
+            )));
+        }
     }
-    let urls = stdout(&urls);
-    let urls: Vec<&str> = urls.lines().collect();
-    if urls.len() != 1 {
-        return Err(Stop::Kept(Preserved::new(
-            PreservationReason::MultipleOrigins,
-            "origin has more than one URL",
-        )));
-    }
-    if !origin.admits(urls[0]) {
-        return Err(Stop::Kept(Preserved::new(
-            PreservationReason::DifferentOrigin,
-            format!("its origin is not {}", origin.describe()),
-        )));
-    }
-    let effective = read_ok(sys, user, path, &["ls-remote", "--get-url", "origin"])?;
+    let effective = facts.effective_url(sys, user, path)?;
     if !origin.admits(&effective) {
         return Err(Stop::Kept(Preserved::new(
             PreservationReason::RewrittenOrigin,
@@ -803,68 +888,62 @@ fn local(sys: &dyn System, user: &User, path: &Path, origin: &Origin) -> Result<
             ),
         )));
     }
-    let symbolic = run(
-        sys,
-        &git(sys, user, Some(path)).args(["symbolic-ref", "--quiet", "HEAD"]),
-        "symbolic-ref",
-    )?;
-    let branch = match symbolic.status {
-        Some(0) => {
-            let reference = stdout(&symbolic);
-            match reference.strip_prefix("refs/heads/") {
-                Some(branch) if !branch.is_empty() => branch.to_owned(),
-                _ => {
-                    return Err(Stop::Kept(Preserved::new(
-                        PreservationReason::Detached,
-                        "HEAD is not on a branch",
-                    )));
-                }
+    let branch = match facts.head() {
+        facts::Head::Symbolic(reference) => match reference.strip_prefix("refs/heads/") {
+            Some(branch) if !branch.is_empty() => branch.to_owned(),
+            _ => {
+                return Err(Stop::Kept(Preserved::new(
+                    PreservationReason::Detached,
+                    "HEAD is not on a branch",
+                )));
             }
-        }
-        Some(1) => {
+        },
+        facts::Head::Detached(_) => {
             return Err(Stop::Kept(Preserved::new(
                 PreservationReason::Detached,
                 "HEAD is detached",
             )));
         }
-        _ => return Err(Stop::from("cannot read the checkout's HEAD".to_owned())),
     };
-    let head = run(sys, &head_commit(sys, user, path), "rev-parse")?;
-    let head = match head.status {
-        Some(0) => stdout(&head),
-        Some(1) => {
+    let Some(head) = facts.head_commit().map(str::to_owned) else {
+        return Err(Stop::Kept(Preserved::new(
+            PreservationReason::NoLocalCommit,
+            format!("{branch} has no commit yet"),
+        )));
+    };
+    if worktree == Worktree::Read {
+        // Even a status can invoke configured filters or fsmonitor. The same
+        // no-program overrides used for dependency reads keep eligibility local.
+        let programs = facts.programs()?;
+        let status = run(
+            sys,
+            &programs
+                .off(git(sys, user, Some(path)))
+                .args(NO_SIDE_RUNS)
+                .args([
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=normal",
+                    "--ignore-submodules=all",
+                ]),
+            "status",
+        )?;
+        if !status.success() {
+            return Err(Stop::from("git status failed in the checkout".to_owned()));
+        }
+        if !stdout(&status).is_empty() {
             return Err(Stop::Kept(Preserved::new(
-                PreservationReason::NoLocalCommit,
-                format!("{branch} has no commit yet"),
+                PreservationReason::LocalChanges,
+                "it has uncommitted changes or untracked files",
             )));
         }
-        _ => return Err(Stop::from("cannot read the checkout's HEAD".to_owned())),
-    };
-    // Even a status can invoke configured filters or fsmonitor. The same
-    // no-program overrides used for dependency reads keep eligibility local.
-    let git = || git(sys, user, Some(path));
-    let programs = Programs::named(sys, git())?;
-    let status = run(
-        sys,
-        &programs.off(git()).args(NO_SIDE_RUNS).args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=normal",
-            "--ignore-submodules=all",
-        ]),
-        "status",
-    )?;
-    if !status.success() {
-        return Err(Stop::from("git status failed in the checkout".to_owned()));
     }
-    if !stdout(&status).is_empty() {
-        return Err(Stop::Kept(Preserved::new(
-            PreservationReason::LocalChanges,
-            "it has uncommitted changes or untracked files",
-        )));
-    }
-    Ok(Local { branch, head })
+    Ok(Local {
+        branch,
+        head,
+        here: facts.commits(),
+    })
 }
 
 /// Origin's default branch and its tip (`git ls-remote --symref origin HEAD`): the one
@@ -876,14 +955,18 @@ fn remote_head(sys: &dyn System, user: &User, path: &Path) -> Result<(String, St
         "ls-remote",
     )?;
     if !ran.success() {
-        return Err(Stop::Failed(if unreachable(&ran.stderr) {
-            Unread {
-                why: "cannot reach origin to read its default branch (offline)".into(),
-                offline: true,
-                network: true,
-            }
-        } else {
-            Unread { why: "cannot read origin's default branch (no access to origin, or no such repository)".into(), offline: false, network: true }
+        let offline = unreachable(&ran.stderr);
+        return Err(Stop::Failed(Unread {
+            why: git_failed(
+                if offline {
+                    "cannot reach origin to read its default branch (offline)"
+                } else {
+                    "cannot read origin's default branch"
+                },
+                &ran,
+            ),
+            offline,
+            network: true,
         }));
     }
     let (mut branch, mut tip) = (None, None);
@@ -935,76 +1018,6 @@ impl From<String> for NotFetched {
     }
 }
 
-/// Origin's default branch and its tip as this checkout last fetched them
-/// (`refs/remotes/origin/HEAD`, which a clone writes, and the branch it names): no network read.
-pub(crate) fn fetched_head(
-    sys: &dyn System,
-    user: &User,
-    path: &Path,
-) -> Result<(String, String), NotFetched> {
-    fetched_head_by(sys, &|| git(sys, user, Some(path)))
-}
-
-/// [`fetched_head`], each read run by the git `in_checkout` builds in the checkout (one that
-/// never fetches a missing object, for a caller that reads no remote).
-pub(crate) fn fetched_head_by(
-    sys: &dyn System,
-    in_checkout: &dyn Fn() -> Cmd,
-) -> Result<(String, String), NotFetched> {
-    let symbolic = run(
-        sys,
-        &in_checkout().args(["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]),
-        "symbolic-ref",
-    )?;
-    let default = match symbolic.status {
-        Some(0) => match stdout(&symbolic).strip_prefix("refs/remotes/origin/") {
-            Some(branch) if !branch.is_empty() => branch.to_owned(),
-            _ => {
-                return Err(NotFetched::from(
-                    "refs/remotes/origin/HEAD names no branch of origin's".to_owned(),
-                ));
-            }
-        },
-        Some(1) => {
-            return Err(NotFetched::Unrecorded {
-                why: "this checkout records no default branch of origin's \
-                      (refs/remotes/origin/HEAD), so whether it is behind cannot be read \
-                      without the network"
-                    .to_owned(),
-                act: "remote set-head origin --auto",
-            });
-        }
-        _ => {
-            return Err(NotFetched::from(
-                "cannot read the checkout's refs/remotes/origin/HEAD".to_owned(),
-            ));
-        }
-    };
-    let tip = run(
-        sys,
-        &in_checkout().args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{default}^{{commit}}"),
-        ]),
-        "rev-parse",
-    )?;
-    match tip.status {
-        Some(0) if oid(&stdout(&tip)) => Ok((default, stdout(&tip))),
-        Some(1) => Err(NotFetched::Unrecorded {
-            why: format!(
-                "refs/remotes/origin/HEAD names origin/{default}, which this checkout does not \
-                 hold, so whether it is behind cannot be read without the network"
-            ),
-            act: "fetch origin",
-        }),
-        _ => Err(NotFetched::from(format!(
-            "cannot read origin/{default} in the checkout"
-        ))),
-    }
-}
-
 fn oid(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -1014,24 +1027,30 @@ fn count(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result<u6
         .ok_or_else(|| "git rev-list --count answered no number".to_owned())
 }
 
-/// Whether `ancestor` is an ancestor of `of` (`git merge-base --is-ancestor`).
-fn is_ancestor(
+/// How many commits `head` has that `tip` lacks, and `tip` has that `head` lacks: one `git
+/// rev-list --left-right --count head...tip`.
+fn apart(
     sys: &dyn System,
     user: &User,
     path: &Path,
-    ancestor: &str,
-    of: &str,
-) -> Result<bool, String> {
-    let ran = run(
+    head: &str,
+    tip: &str,
+) -> Result<(u64, u64), String> {
+    let counted = read_ok(
         sys,
-        &git(sys, user, Some(path)).args(["merge-base", "--is-ancestor", ancestor, of]),
-        "merge-base",
+        user,
+        path,
+        &[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{head}...{tip}"),
+        ],
     )?;
-    match ran.status {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err("git merge-base failed in the checkout".into()),
-    }
+    counted
+        .split_once('\t')
+        .and_then(|(ahead, behind)| Some((crate::parse_uint(ahead)?, crate::parse_uint(behind)?)))
+        .ok_or_else(|| "git rev-list --left-right --count answered no numbers".to_owned())
 }
 
 /// Where `local` stands against `tip`, origin's `default` branch. `fetched`: a fetch just
@@ -1045,7 +1064,7 @@ fn judge(
     tip: &str,
     fetched: bool,
 ) -> Result<Stands, String> {
-    let Local { branch, head } = local;
+    let Local { branch, head, here } = local;
     if branch != default {
         return Ok(Stands::Kept(Preserved::new(
             PreservationReason::DifferentBranch,
@@ -1058,78 +1077,66 @@ fn judge(
             head: head.clone(),
         });
     }
-    let here = run(
-        sys,
-        &git(sys, user, Some(path)).args([
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{tip}^{{commit}}"),
-        ]),
-        "rev-parse",
-    )?;
-    match here.status {
-        Some(0) => {}
-        Some(1) if fetched => {
-            return Err(format!(
-                "origin/{branch} is still not here after the fetch (its fetch refspec leaves it out)"
-            ));
-        }
-        Some(1) => {
-            let own = count(
-                sys,
-                user,
-                path,
-                &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
-            )?;
-            return Ok(if own > 0 {
-                Stands::Kept(Preserved::new(
-                    PreservationReason::Ahead,
-                    format!(
-                        "it has {} that origin lacks (as last fetched)",
-                        commits(own)
-                    ),
-                ))
-            } else {
-                Stands::Unfetched {
-                    branch: branch.clone(),
-                    tip: tip.to_owned(),
-                }
-            });
-        }
-        _ => return Err("cannot read origin's tip in the checkout".into()),
-    }
-    if is_ancestor(sys, user, path, head, tip)? {
-        let by = count(
+    // A tip a ref of the record names is here; any other is asked of the object store.
+    if !here.contains(tip) {
+        let found = run(
             sys,
-            user,
-            path,
-            &["rev-list", "--count", &format!("{head}..{tip}")],
+            &git(sys, user, Some(path)).args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{tip}^{{commit}}"),
+            ]),
+            "rev-parse",
         )?;
+        match found.status {
+            Some(0) => {}
+            Some(1) if fetched => {
+                return Err(format!(
+                    "origin/{branch} is still not here after the fetch (its fetch refspec leaves it out)"
+                ));
+            }
+            Some(1) => {
+                let own = count(
+                    sys,
+                    user,
+                    path,
+                    &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"],
+                )?;
+                return Ok(if own > 0 {
+                    Stands::Kept(Preserved::new(
+                        PreservationReason::Ahead,
+                        format!(
+                            "it has {} that origin lacks (as last fetched)",
+                            commits(own)
+                        ),
+                    ))
+                } else {
+                    Stands::Unfetched {
+                        branch: branch.clone(),
+                        tip: tip.to_owned(),
+                    }
+                });
+            }
+            _ => return Err("cannot read origin's tip in the checkout".into()),
+        }
+    }
+    // Two different commits: `head` is an ancestor of `tip` exactly when it has none of its
+    // own, and `tip` of `head` when that has none.
+    let (ahead, behind) = apart(sys, user, path, head, tip)?;
+    if ahead == 0 {
         return Ok(Stands::Behind {
             branch: branch.clone(),
             tip: tip.to_owned(),
-            by,
+            by: behind,
         });
     }
-    let ahead = count(
-        sys,
-        user,
-        path,
-        &["rev-list", "--count", &format!("{tip}..{head}")],
-    )?;
-    if is_ancestor(sys, user, path, tip, head)? {
+    if behind == 0 {
         return Ok(Stands::Kept(Preserved::new(
             PreservationReason::Ahead,
             format!("it has {} that origin/{branch} lacks", commits(ahead)),
         )));
     }
-    let behind = count(
-        sys,
-        user,
-        path,
-        &["rev-list", "--count", &format!("{head}..{tip}")],
-    )?;
     Ok(Stands::Kept(Preserved::new(
         PreservationReason::Diverged,
         format!(
@@ -1151,7 +1158,7 @@ pub(crate) fn kept_here(
     path: &Path,
     origin: &Origin,
 ) -> Result<Option<String>, String> {
-    match local(sys, user, path, origin) {
+    match local(sys, user, path, origin, Worktree::Read) {
         Ok(_) => Ok(None),
         Err(Stop::Kept(why)) => Ok(Some(why.why)),
         Err(Stop::Failed(unread)) => Err(unread.why),
@@ -1168,7 +1175,7 @@ pub(crate) fn read(
     path: &Path,
     origin: &Origin,
 ) -> Result<Stands, Unread> {
-    let stood = local(sys, user, path, origin).and_then(|local| {
+    let stood = local(sys, user, path, origin, Worktree::Read).and_then(|local| {
         let (default, tip) = remote_head(sys, user, path)?;
         judge(sys, user, path, &local, &default, &tip, false).map_err(Stop::from)
     });
@@ -1191,43 +1198,57 @@ pub(crate) fn read_fetched(
     path: &Path,
     origin: &Origin,
 ) -> Result<Stands, NotFetched> {
-    let local = match local(sys, user, path, origin) {
+    fetched_stand(sys, user, path, origin, Worktree::Read)
+}
+
+/// [`read_fetched`] without reading the worktree's files: what the refresh of a checkout
+/// already here reads before [`align_guarded`], whose own read runs `status` before it reaches
+/// origin, so a checkout is read for the person's own work once before each network read. A
+/// checkout with uncommitted work reads as [`read_fetched`] would read it clean.
+/// # Errors
+/// As [`read_fetched`].
+pub(crate) fn stands_fetched(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+) -> Result<Stands, NotFetched> {
+    fetched_stand(sys, user, path, origin, Worktree::Unread)
+}
+
+fn fetched_stand(
+    sys: &dyn System,
+    user: &User,
+    path: &Path,
+    origin: &Origin,
+    worktree: Worktree,
+) -> Result<Stands, NotFetched> {
+    let local = match local(sys, user, path, origin, worktree) {
         Ok(local) => local,
         Err(Stop::Kept(why)) => return Ok(Stands::Kept(why)),
         Err(Stop::Failed(unread)) => return Err(NotFetched::Unread(unread)),
     };
-    let (default, tip) = fetched_head(sys, user, path)?;
+    let (default, tip) = Facts::of(sys, user, path)?.fetched_head()?;
     Ok(judge(sys, user, path, &local, &default, &tip, true)?)
 }
 
 /// Whether this same active branch explicitly tracks origin's corresponding
-/// branch. Automatic default refresh preserves missing, unreadable or different
-/// tracking; explicit profile/develop alignment keeps its existing policy.
+/// branch, by the checkout's record of facts ([`Facts::tracks_origin`]), read again where its
+/// files changed; one that cannot be read does not. Automatic default refresh preserves
+/// missing, unreadable or different tracking; explicit profile/develop alignment keeps its
+/// existing policy.
 pub(crate) fn tracks_origin(sys: &dyn System, user: &User, path: &Path, branch: &str) -> bool {
-    let reference = format!("refs/heads/{branch}");
-    read_ok(sys, user, path, &["symbolic-ref", "--quiet", "HEAD"])
-        .is_ok_and(|value| value == reference)
-        && read_ok(
-            sys,
-            user,
-            path,
-            &["config", "--get-all", &format!("branch.{branch}.remote")],
-        )
-        .is_ok_and(|value| value == "origin")
-        && read_ok(
-            sys,
-            user,
-            path,
-            &["config", "--get-all", &format!("branch.{branch}.merge")],
-        )
-        .is_ok_and(|value| value == reference)
+    Facts::of(sys, user, path).is_ok_and(|facts| facts.tracks_origin(branch))
 }
 
 /// Bring the checkout at `path` to origin's default branch when [`read`] says it moves: `git fetch
 /// origin` (origin alone, no hook), the same judgement over what was fetched, then `git merge
-/// --ff-only` of the fetched tip (no autostash, no submodule worktree touched, no hook).
+/// --ff-only` of the fetched tip (no autostash, no submodule worktree touched, no hook). The
+/// fetch and the merge are transfers, bounded by their progress, not by a wall clock
+/// ([`System::run_repository`]).
 /// # Errors
-/// A read, the fetch or the merge failed; what the merge refused is left as it was.
+/// A read, the fetch or the merge failed, or the fetch or the merge stalled (a network failure);
+/// what the merge refused is left as it was.
 pub(crate) fn align(
     sys: &dyn System,
     user: &User,
@@ -1289,7 +1310,7 @@ fn align_observed(
         Stands::Behind { branch, .. } | Stands::Unfetched { branch, .. } => branch.clone(),
         Stands::Current { .. } | Stands::Kept(_) => return Ok(before),
     };
-    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
+    let programs = Facts::of(sys, user, path)?.programs()?;
     current().map_err(Unread::from)?;
     progress.enter(Phase::Fetching);
     sys.repository_progress(progress);
@@ -1297,74 +1318,93 @@ fn align_observed(
         .run_repository(
             &programs
                 .off(network(sys, user, Some(path)))
-                .budget(FETCH_BUDGET)
                 .args(NO_SIDE_RUNS)
                 .args(["fetch", "--progress", "--no-recurse-submodules", "origin"]),
             progress,
         )
-        .map_err(|_| Unread::from("git fetch origin did not finish".to_owned()))?;
+        .map_err(|failed| {
+            Unread::unfinished(
+                &failed,
+                format!("git fetch origin did not finish ({failed})"),
+            )
+        })?;
     if !fetch.success() {
-        return Err(if unreachable(&fetch.stderr) {
-            Unread {
-                why: "cannot reach origin to fetch from it (offline)".into(),
-                offline: true,
-                network: true,
-            }
-        } else {
-            Unread {
-                why: "git fetch origin failed (no access to origin, or no such repository)".into(),
-                offline: false,
-                network: true,
-            }
+        let offline = unreachable(&fetch.stderr);
+        return Err(Unread {
+            why: git_failed(
+                if offline {
+                    "cannot reach origin to fetch from it (offline)"
+                } else {
+                    "git fetch origin failed"
+                },
+                &fetch,
+            ),
+            offline,
+            network: true,
         });
     }
-    let local = match local(sys, user, path, origin) {
+    let local = match local(sys, user, path, origin, Worktree::Read) {
         Ok(local) => local,
         Err(Stop::Kept(why)) => return Ok(Stands::Kept(why)),
         Err(Stop::Failed(unread)) => return Err(unread),
     };
-    let tracking = run(
-        sys,
-        &git(sys, user, Some(path)).args([
+    let tracking = format!("refs/remotes/origin/{default}");
+    let facts = Facts::of(sys, user, path)?;
+    let tip = if facts.read_ref(&tracking) {
+        facts.commit_of(&tracking).map(str::to_owned)
+    } else {
+        // Origin's default branch is not the one its recorded HEAD names: asked of git.
+        let found = run(
+            sys,
+            &git(sys, user, Some(path)).args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{tracking}^{{commit}}"),
+            ]),
             "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/origin/{default}^{{commit}}"),
-        ]),
-        "rev-parse",
-    )?;
-    if !tracking.success() {
+        )?;
+        found.success().then(|| stdout(&found))
+    };
+    let Some(tip) = tip else {
         return Err(format!(
             "origin/{default} is not here after the fetch (its fetch refspec leaves it out)"
         )
         .into());
-    }
-    let tip = stdout(&tracking);
+    };
     let stands = judge(sys, user, path, &local, &default, &tip, true)?;
     let Stands::Behind { .. } = &stands else {
         return Ok(stands);
     };
-    let programs = Programs::named(sys, git(sys, user, Some(path)))?;
+    // The record as it stands now (read again where a file it came from changed since).
+    let programs = Facts::of(sys, user, path)?.programs()?;
     current().map_err(Unread::from)?;
     progress.enter(Phase::Updating);
     sys.repository_progress(progress);
-    let merge = run(
-        sys,
-        &programs
-            .off(lazily(network(sys, user, Some(path))))
-            .budget(FETCH_BUDGET)
-            .args(NO_SIDE_RUNS)
-            .args([
-                "-c",
-                "submodule.recurse=false",
-                "merge",
-                "--ff-only",
-                "--no-autostash",
-                "--quiet",
-                &tip,
-            ]),
-        "merge",
-    )?;
+    // A partial clone's merge fetches what it lacks, so it is a transfer too: bounded by its
+    // progress (its tree's work while it prints nothing), its stall a network failure.
+    let merge = sys
+        .run_repository(
+            &programs
+                .off(lazily(network(sys, user, Some(path))))
+                .args(NO_SIDE_RUNS)
+                .args([
+                    "-c",
+                    "submodule.recurse=false",
+                    "merge",
+                    "--ff-only",
+                    "--no-autostash",
+                    "--quiet",
+                    &tip,
+                ]),
+            progress,
+        )
+        .map_err(|failed| {
+            Unread::unfinished(
+                &failed,
+                format!("cannot run git merge in the checkout: {failed}"),
+            )
+        })?;
     if !merge.success() {
         let said = String::from_utf8_lossy(&merge.stderr);
         let said = said.lines().rev().find(|line| !line.trim().is_empty());

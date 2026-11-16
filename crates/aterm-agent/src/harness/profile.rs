@@ -921,6 +921,8 @@ pub struct LoginRecord {
     pub email: String,
     /// The account's key, where the record names an `accountUuid`.
     pub key: Option<AccountKey>,
+    /// The plan `oauthAccount.organizationType` names, where it names one ([`PlanWord`]).
+    pub plan: Option<PlanWord>,
 }
 
 /// The login record of the login `login` names (a row's absolute `dir`, as
@@ -988,12 +990,18 @@ pub(super) fn record_at(path: &Path) -> Result<Option<LoginRecord>, NoProfile> {
         let Some(Address(Some(email))) = who.and_then(|who| who.oauth.0).map(|o| o.address) else {
             return Ok(None);
         };
-        let key = aterm_json::from_slice::<Obj<RawKey>>(bytes)
+        let oauth = aterm_json::from_slice::<Obj<RawKey>>(bytes)
             .ok()
             .and_then(|Obj(raw)| raw)
-            .and_then(|file| file.oauth.0)
-            .and_then(|oauth| oauth.key.0);
-        Ok(Some(LoginRecord { email, key }))
+            .and_then(|file| file.oauth.0);
+        let (key, plan) = oauth.map_or((None, None), |oauth| {
+            let plan = oauth
+                .organization_type
+                .word()
+                .map(|w| PlanWord::of(w.as_str()));
+            (oauth.key.0, plan)
+        });
+        Ok(Some(LoginRecord { email, key, plan }))
     })
 }
 
@@ -4029,6 +4037,8 @@ struct RawKey {
 struct RawKeyOauth {
     #[serde(rename = "accountUuid")]
     key: Hashed,
+    #[serde(rename = "organizationType")]
+    organization_type: Leaf,
 }
 
 #[derive(Default, Deserialize)]

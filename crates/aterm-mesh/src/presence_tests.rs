@@ -570,8 +570,11 @@ fn a_digest_names_what_is_held() {
     assert!(!a.in_step_with(&b));
 }
 
+/// A row names, and a reader dials, the addresses another seat can dial: its LAN ones, and
+/// (LT-B8, since the row is signed) a shared-space or globally routed one; never loopback, an
+/// IPv6 link-local one, or a documentation, multicast, broadcast or unspecified one.
 #[test]
-fn a_row_names_only_addresses_a_lan_peer_can_dial() {
+fn a_row_names_only_addresses_another_seat_can_dial() {
     let ip = |text: &str| text.parse::<IpAddr>().expect("an address");
     for yes in [
         "192.168.1.20",
@@ -579,10 +582,26 @@ fn a_row_names_only_addresses_a_lan_peer_can_dial() {
         "172.16.4.1",
         "169.254.3.9",
         "fd12:3456::1",
+        "100.64.0.7",
+        "8.8.8.8",
+        "2606:4700::1111",
+        "::ffff:100.100.1.2",
     ] {
         assert!(dialable(ip(yes)), "{yes} is dialable");
     }
-    for no in ["127.0.0.1", "::1", "fe80::1", "8.8.8.8", "2001:db8::1"] {
+    for no in [
+        "127.0.0.1",
+        "::1",
+        "::ffff:127.0.0.1",
+        "fe80::1",
+        "2001:db8::1",
+        "192.0.2.1",
+        "224.0.0.251",
+        "255.255.255.255",
+        "0.0.0.0",
+        "::",
+        "ff02::1",
+    ] {
         assert!(!dialable(ip(no)), "{no} is not");
     }
 }

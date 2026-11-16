@@ -123,14 +123,14 @@ impl Fixture {
             1,
         )
         .unwrap();
-        let mut wire = genesis.bytes().to_vec();
+        let mut wire = genesis.wire_bytes().unwrap().to_vec();
         let mut log = Log::new(genesis).unwrap();
         let (draft, key) = log
             .draft_epoch(&actor, 2, EpochAudience::Everyone, 1)
             .unwrap();
         let epoch = draft.sign(&WRITER, INCARNATION).unwrap();
         let epoch_id = *epoch.id();
-        wire.extend_from_slice(epoch.bytes());
+        wire.extend_from_slice(epoch.wire_bytes().unwrap().as_ref());
         assert_eq!(log.insert(epoch).unwrap(), Inserted::Held);
         let prefix = wire.clone();
         let wrap = log
@@ -138,7 +138,7 @@ impl Fixture {
             .unwrap()
             .sign(&WRITER, INCARNATION)
             .unwrap();
-        wire.extend_from_slice(wrap.bytes());
+        wire.extend_from_slice(wrap.wire_bytes().unwrap().as_ref());
         assert_eq!(log.insert(wrap).unwrap(), Inserted::Held);
         for i in 0..VALUES {
             let entry = Entry {
@@ -153,7 +153,7 @@ impl Fixture {
                 .unwrap()
                 .sign(&WRITER, INCARNATION)
                 .unwrap();
-            wire.extend_from_slice(record.bytes());
+            wire.extend_from_slice(record.wire_bytes().unwrap().as_ref());
             assert_eq!(log.insert(record).unwrap(), Inserted::Held);
         }
         assert_eq!(log.held_count(), VALUES + 3);
@@ -164,7 +164,7 @@ impl Fixture {
             .under(&keys)
             .recovering(&wire);
         assert_eq!(accepted.complete_inventory().len(), VALUES + 3);
-        assert_eq!(accepted.encode_held(), wire);
+        assert_eq!(accepted.read_held().unwrap(), wire);
 
         // A real signed child waits on its absent parent. It must remain absent
         // from the server file even though the accepted Store owns it.
@@ -192,13 +192,13 @@ impl Fixture {
         let pending = *child.id();
         assert!(accepted.insert(child).unwrap());
         assert_eq!(accepted.len(), VALUES + 4);
-        assert!(accepted.complete_bytes(&pending).is_none());
+        assert!(!accepted.holds(&pending));
         assert_ne!(
-            accepted.encode(),
+            accepted.read_encoded().unwrap(),
             wire,
             "waiting bytes distinguish local encoding"
         );
-        assert_eq!(accepted.encode_held(), wire);
+        assert_eq!(accepted.read_held().unwrap(), wire);
 
         let path = directory.path().join(format!("{NAME}.records"));
         fsx::write_atomic(&path, &prefix, 0o600).unwrap();
@@ -225,7 +225,7 @@ impl Fixture {
         };
         let loaded = fixture.running().stored_records(NAME);
         assert_eq!(loaded.len(), 2);
-        assert_eq!(loaded.encode_held(), fixture.prefix);
+        assert_eq!(loaded.read_held().unwrap(), fixture.prefix);
         assert_eq!(fixture.running().test_records_on_file(NAME), Some(2));
         fixture.assert_values(&fixture.accepted);
         fixture
@@ -354,7 +354,13 @@ fn exercise(known_prefix: bool) {
         fixture.accepted.log().unwrap().heads()
     );
     for id in fixture.accepted.complete_inventory() {
-        assert_eq!(reloaded.get_bytes(&id), fixture.accepted.get_bytes(&id));
+        assert_eq!(
+            reloaded.record(&id).map(|r| r.wire_bytes().unwrap()),
+            fixture
+                .accepted
+                .record(&id)
+                .map(|r| r.wire_bytes().unwrap())
+        );
     }
     fixture.assert_values(&reloaded);
     println!(

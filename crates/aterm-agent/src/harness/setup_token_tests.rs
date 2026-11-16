@@ -1310,7 +1310,9 @@ fn a_window_capture_ends_with_what_its_opener_met() {
     );
     let words = error.to_string();
     assert!(
-        words.contains("Cloudflare's check did not clear"),
+        words.contains(
+            "met Cloudflare's bot check in aterm's sign-in window; aterm pressed nothing"
+        ),
         "{words}"
     );
     assert!(!words.contains("claude.ai"), "{words}");

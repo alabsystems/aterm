@@ -149,8 +149,9 @@ fn ring_reads_format_after_their_lock_is_released() {
         let mut g = store.write().unwrap();
         g.register(h.clone());
         g.register(test_handle(6));
-        g.deregister_local_as(6, ExitReason::UiClose, ExitActor::Human);
     }
+    crate::session_table::close_leaving_row(&store, 6, ExitReason::UiClose, ExitActor::Human)
+        .expect("a close");
     h.ctx.turns.lock().unwrap().push(TurnRecord {
         id: 1,
         started_ms: 1,
@@ -212,7 +213,17 @@ fn ring_reads_format_after_their_lock_is_released() {
         },
         {
             let g = store.read().unwrap();
-            exits_reply(&all.copy(g.closed_logs().exits_since(0)), &[])
+            let table = g.table();
+            let heads = table.exits_since(0).expect("a memory table is loaded");
+            let rows: Vec<_> = all
+                .copy(heads.iter())
+                .into_iter()
+                .map(|head| {
+                    let local = table.local_here(&head);
+                    (head, local)
+                })
+                .collect();
+            exits_reply(&rows, &[])
         },
     ];
     let probes = std::mem::take(&mut *held.lock().unwrap());
@@ -3106,4 +3117,373 @@ fn agent_settings_preserve_native_submission_refusals_and_skips() {
         "OK turn submitted=1 status=submitted settings_scope=subsequent-turns confirmation=pending\nscreen\n"
     );
     assert!(!reply.contains("applied"));
+}
+
+/// The bell-armed parks of a serving lane: the caller of the connection is a socket pair's
+/// client, the lane the test's own thread or one it starts. Each wait for something that must
+/// happen is the one-minute hang detector.
+#[cfg(unix)]
+mod bell_parks {
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use aterm_control::hangup::ServingFd;
+    use aterm_spec::wait::{MUST_HAPPEN, until_within};
+    use aterm_uds::CtlStream;
+    use aterm_uds::hangup::Bell;
+
+    use super::super::{OnHangup, Park, Parked, Stretch, cmd_await};
+    use crate::control::{HANGUP_POLL, HUNG_UP_REPLY, caller_hung_up, hangup_park};
+    use crate::park::Lane;
+    use crate::session_watch::{Subscription, Watchers};
+
+    #[track_caller]
+    fn until(what: &str, mut seen: impl FnMut() -> bool) {
+        until_within(MUST_HAPPEN, what, || seen().then_some(()));
+    }
+
+    /// A private bell whose thread has ended, seen through the ring of an arm standing then.
+    fn ended_bell() -> Bell {
+        let bell = Bell::new();
+        let (near, _far) = CtlStream::pair().expect("socket pair");
+        let (ring, rung) = std::sync::mpsc::sync_channel(1);
+        let armed = bell.arm(&near, ring).expect("the bell starts");
+        bell.end_thread_for_test();
+        rung.recv_timeout(MUST_HAPPEN)
+            .expect("the ending bell rings its arm");
+        assert!(!armed.ringing(), "the bell has ended");
+        drop(armed);
+        bell
+    }
+
+    /// AN `await agent` WHOSE CALLER CLOSES ANSWERS `ERR hangup` AND GIVES ITS LANE BACK, though
+    /// its own timeout is ten minutes. The caller closes only once the park has armed the
+    /// process's bell on the served connection, which it does at its first wait, after its loop
+    /// head last asked after the caller; that wait is one wait for the whole ten minutes, so only
+    /// the bell's ring can end it within the hang detector.
+    /// NEGATIVE CONTROL: arming the bell with a channel that is not the subscription's leaves the
+    /// park waiting past the hang detector.
+    #[test]
+    fn an_await_agent_whose_caller_closes_answers_hangup_and_frees_its_lane() {
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let served = server.as_raw_fd();
+        let handle = crate::session_store::test_handle(0);
+        let watchers = handle.ctx.watchers.clone();
+        let waiter = std::thread::spawn(move || {
+            let store = crate::session_store::new_store();
+            let _serving = ServingFd::enter(server.as_raw_fd());
+            cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                "agent busy timeout=600000",
+            )
+        });
+        until("the await's park to arm the bell on its connection", || {
+            Bell::process().armed_for_test(served)
+        });
+        assert_eq!(watchers.count(), 1, "the armed park holds its subscription");
+        drop(client);
+        until("the parked await to hear its caller hang up", || {
+            waiter.is_finished()
+        });
+        assert_eq!(waiter.join().expect("the lane"), HUNG_UP_REPLY);
+        assert_eq!(watchers.count(), 0, "the lane let its subscription go");
+    }
+
+    /// AN ARMED PARK WAITS ONCE, AN UNARMED ONE IS SLICED: each park runs over a served
+    /// connection on a lane thread of its own, ten minutes from its own end. Its first look
+    /// answers nothing and its second, which only a wake brings, answers; its lane says the caller
+    /// went once it has sliced twice. The park armed on a live bell asks its belled lane for one
+    /// slice, the whole wait, and never its sliced lane, and a wake sent once it waits ends it at
+    /// that second look. The park whose bell has ended cannot arm, keeps the lane's slices, each
+    /// no longer than HANGUP_POLL, and ends at the lane's second ask. Every count and every end
+    /// comes from the functions the parks call and the wake the test sends, never from time, so a
+    /// loaded machine changes none of them.
+    /// NEGATIVE CONTROL: with the arm skipped, the live bell's park is sliced as well and ends
+    /// hung up, never waiting on its belled lane.
+    #[test]
+    fn an_armed_park_waits_once_where_an_unarmed_one_is_sliced() {
+        static BELLED: AtomicUsize = AtomicUsize::new(0);
+        static SLICED: AtomicUsize = AtomicUsize::new(0);
+        static LONGEST: AtomicU64 = AtomicU64::new(0);
+        fn belled(left: Duration) -> Duration {
+            BELLED.fetch_add(1, Ordering::SeqCst);
+            left
+        }
+        fn sliced(left: Duration) -> Duration {
+            SLICED.fetch_add(1, Ordering::SeqCst);
+            let slice = hangup_park(left);
+            let nanos = u64::try_from(slice.as_nanos()).unwrap_or(u64::MAX);
+            LONGEST.fetch_max(nanos, Ordering::SeqCst);
+            slice
+        }
+        /// The caller, asked after a slice, has gone once the lane has sliced twice.
+        fn gone_after_two_slices() -> bool {
+            SLICED.load(Ordering::SeqCst) >= 2
+        }
+        fn counts() -> (usize, usize) {
+            (BELLED.load(Ordering::SeqCst), SLICED.load(Ordering::SeqCst))
+        }
+        /// The counted park over `server` on `bell`, on a lane thread of its own, so a park that
+        /// does not end is reported at the hang detector rather than after its own ten minutes.
+        fn counted_park(
+            bell: std::sync::Arc<Bell>,
+            server: CtlStream,
+            sub: Subscription,
+        ) -> std::thread::JoinHandle<&'static str> {
+            BELLED.store(0, Ordering::SeqCst);
+            SLICED.store(0, Ordering::SeqCst);
+            LONGEST.store(0, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let _serving = ServingFd::enter(server.as_raw_fd());
+                let alive = || false;
+                let mut park = Park::new(&sub, &alive, OnHangup::Abort, Stretch::None);
+                park.lane = Lane {
+                    slice: sliced,
+                    hung_up: gone_after_two_slices,
+                };
+                park.belled = Lane {
+                    slice: belled,
+                    hung_up: gone_after_two_slices,
+                };
+                park.bell = &bell;
+                let mut looks = 0;
+                let ended = park.run(
+                    Instant::now() + Duration::from_secs(600),
+                    |_, _, _| {
+                        looks += 1;
+                        ((looks > 1).then_some(()), None)
+                    },
+                    || {},
+                );
+                match ended {
+                    Parked::Done(()) => "answered",
+                    Parked::HungUp => "hung up",
+                    Parked::Deadline => "at its own end",
+                    Parked::Exited => "exited",
+                }
+            })
+        }
+
+        let watchers = std::sync::Arc::<Watchers>::default();
+        {
+            let sub = Subscription::single(&watchers);
+            let alive = || false;
+            let shipped = Park::new(&sub, &alive, OnHangup::Abort, Stretch::None);
+            assert!(
+                std::ptr::eq(shipped.bell, Bell::process()),
+                "a park arms the process's bell"
+            );
+            let long = Duration::from_secs(600);
+            assert_eq!(
+                (shipped.belled.slice)(long),
+                long,
+                "a belled park is unsliced"
+            );
+        }
+
+        let (_armed_client, armed_server) = CtlStream::pair().expect("socket pair");
+        let sub = Subscription::single(&watchers);
+        let wake = sub.bell();
+        let armed = counted_park(std::sync::Arc::new(Bell::new()), armed_server, sub);
+        until("the armed park to wait, or to end", || {
+            counts().0 == 1 || armed.is_finished()
+        });
+        let _ = wake.try_send(());
+        until("the armed park to end", || armed.is_finished());
+        let ended = armed.join().expect("the armed park's lane");
+        assert_eq!(
+            (ended, counts()),
+            ("answered", (1, 0)),
+            "the armed park waits once, for the whole of it, until the wake"
+        );
+
+        let (_ended_client, ended_server) = CtlStream::pair().expect("socket pair");
+        let unarmed = counted_park(
+            std::sync::Arc::new(ended_bell()),
+            ended_server,
+            Subscription::single(&watchers),
+        );
+        until("the unarmed park to end", || unarmed.is_finished());
+        let ended = unarmed.join().expect("the unarmed park's lane");
+        assert_eq!(
+            (ended, counts()),
+            ("hung up", (0, 2)),
+            "a bell that has ended arms nothing, and the park is sliced"
+        );
+        let longest = Duration::from_nanos(LONGEST.load(Ordering::SeqCst));
+        assert!(
+            longest <= HANGUP_POLL,
+            "a slice of {longest:?} outran HANGUP_POLL"
+        );
+    }
+
+    /// A PARK ARMS AT ITS FIRST WAIT, NOT BEFORE ITS ENTRY LOOK, so a park its entry look answers
+    /// never touches the bell, and holds the arm from that wait to its end. The look itself tries
+    /// to arm the served connection on the park's bell: at the entry look the try succeeds (the
+    /// park holds no arm yet), and at the look after the park's first wait it is refused, the
+    /// descriptor already armed.
+    /// NEGATIVE CONTROL: arming before the loop, as the first cut did, refuses the entry look's
+    /// try.
+    #[test]
+    fn a_park_arms_at_its_first_wait_not_before_its_entry_look() {
+        let (_client, server) = CtlStream::pair().expect("socket pair");
+        let _serving = ServingFd::enter(server.as_raw_fd());
+        let watchers = std::sync::Arc::<Watchers>::default();
+        let sub = Subscription::single(&watchers);
+        let alive = || false;
+        let bell = Bell::new();
+        let mut park = Park::new(&sub, &alive, OnHangup::Abort, Stretch::None);
+        park.bell = &bell;
+        let mut tries = Vec::new();
+        let ended = park.run(
+            Instant::now() + Duration::from_secs(600),
+            |now, _, _| {
+                let (ring, _rung) = std::sync::mpsc::sync_channel(1);
+                tries.push(bell.arm(&server, ring).err().map(|e| e.kind()));
+                // The entry look asks to be looked at again a moment on, after one wait; the
+                // second look answers.
+                if tries.len() == 1 {
+                    (None, Some(now + Duration::from_millis(1)))
+                } else {
+                    (Some(()), None)
+                }
+            },
+            || {},
+        );
+        assert!(matches!(ended, Parked::Done(())), "the second look answers");
+        assert_eq!(
+            tries,
+            [None, Some(std::io::ErrorKind::AlreadyExists)],
+            "unarmed at the entry look, armed by the look after the wait"
+        );
+        assert!(
+            !bell.armed_for_test(server.as_raw_fd()),
+            "the park's arm ended with the park"
+        );
+    }
+
+    /// A BELL THAT ENDS UNDER AN ARMED PARK LEAVES IT SLICED: the ending bell rings the park,
+    /// which from then on asks for itself again between slices and so still hears its caller
+    /// hang up, long before its own ten minutes.
+    /// NEGATIVE CONTROL: choosing the belled lane for as long as the arm is held, whether or not
+    /// the bell still serves it, leaves the park in one ten-minute wait, and the slices never
+    /// come.
+    #[test]
+    fn a_bell_that_ends_under_an_armed_park_leaves_it_sliced() {
+        static BELLED: AtomicUsize = AtomicUsize::new(0);
+        static SLICED: AtomicUsize = AtomicUsize::new(0);
+        fn belled(left: Duration) -> Duration {
+            BELLED.fetch_add(1, Ordering::SeqCst);
+            left
+        }
+        fn sliced(left: Duration) -> Duration {
+            SLICED.fetch_add(1, Ordering::SeqCst);
+            hangup_park(left)
+        }
+
+        let (client, server) = CtlStream::pair().expect("socket pair");
+        let bell = std::sync::Arc::new(Bell::new());
+        let lane_bell = std::sync::Arc::clone(&bell);
+        // An unscoped lane, so a failure below is reported at its hang detector rather than
+        // after the park's own ten minutes.
+        let lane = std::thread::spawn(move || {
+            let _serving = ServingFd::enter(server.as_raw_fd());
+            let watchers = std::sync::Arc::<Watchers>::default();
+            let sub = Subscription::single(&watchers);
+            let alive = || false;
+            let mut park = Park::new(&sub, &alive, OnHangup::Abort, Stretch::None);
+            park.lane = Lane {
+                slice: sliced,
+                hung_up: caller_hung_up,
+            };
+            park.belled = Lane {
+                slice: belled,
+                hung_up: caller_hung_up,
+            };
+            park.bell = &lane_bell;
+            let ended = park.run(
+                Instant::now() + Duration::from_secs(600),
+                |_, _, _| (None::<()>, None),
+                || {},
+            );
+            matches!(ended, Parked::HungUp)
+        });
+        until("the armed park to wait", || {
+            BELLED.load(Ordering::SeqCst) == 1
+        });
+        assert_eq!(SLICED.load(Ordering::SeqCst), 0, "armed, it is not sliced");
+        bell.end_thread_for_test();
+        until("the park to slice again once its bell ended", || {
+            SLICED.load(Ordering::SeqCst) >= 2
+        });
+        drop(client);
+        until("the sliced park to hear its caller hang up", || {
+            lane.is_finished()
+        });
+        assert!(lane.join().expect("the lane"), "the caller hung up");
+        assert_eq!(
+            BELLED.load(Ordering::SeqCst),
+            1,
+            "one belled wait, then slices"
+        );
+    }
+
+    /// A LANE THAT SERVED A HUNG-UP CALLER SERVES A LIVE ONE UNREFUSED: the bell's ring ends
+    /// connection A's park (A's caller closes only once that park has armed the bell, at its
+    /// one wait) and leaves nothing standing on the lane's thread, so connection B, served next
+    /// on the same thread, is not hung up, its await runs to its own timeout, and the main-thread
+    /// gate refuses nothing for a hang-up. The lane is a thread of its own, so a park of A's that
+    /// does not end is reported at the hang detector rather than after A's ten minutes.
+    /// NEGATIVE CONTROL: a thread-local flag the ring sets and the park reads beside the probe,
+    /// the design this replaces, answers B `ERR hangup`.
+    #[test]
+    fn a_lane_that_served_a_hung_up_caller_serves_a_live_one_unrefused() {
+        use crate::control::control_media::{CLIENT_HUNG_UP, MainHopError, main_thread_refusal};
+
+        let handle = crate::session_store::test_handle(0);
+        let (a_client, a_server) = CtlStream::pair().expect("socket pair");
+        let a_served = a_server.as_raw_fd();
+        let lane = std::thread::spawn(move || {
+            let store = crate::session_store::new_store();
+            let a_reply = {
+                let _serving = ServingFd::enter(a_server.as_raw_fd());
+                cmd_await(
+                    &handle.term,
+                    &store,
+                    0,
+                    &handle.ctx,
+                    "agent busy timeout=600000",
+                )
+            };
+            let (_b_client, b_server) = CtlStream::pair().expect("socket pair");
+            let _serving = ServingFd::enter(b_server.as_raw_fd());
+            let b_hung_up = caller_hung_up();
+            let b_refused = main_thread_refusal() == Some(MainHopError::Reason(CLIENT_HUNG_UP));
+            let b_reply = cmd_await(
+                &handle.term,
+                &store,
+                0,
+                &handle.ctx,
+                "agent busy timeout=300",
+            );
+            (a_reply, b_hung_up, b_refused, b_reply)
+        });
+        until("A's park to arm the bell on its connection", || {
+            Bell::process().armed_for_test(a_served)
+        });
+        drop(a_client);
+        until("the lane to serve A and then B", || lane.is_finished());
+        let (a_reply, b_hung_up, b_refused, b_reply) = lane.join().expect("the lane");
+        assert_eq!(a_reply, HUNG_UP_REPLY, "A hung up");
+        assert!(!b_hung_up, "B's caller is there");
+        assert!(
+            !b_refused,
+            "B's main-thread hops are not refused for A's hang-up"
+        );
+        assert_eq!(b_reply, "OK timeout\n", "B runs to its own timeout");
+    }
 }

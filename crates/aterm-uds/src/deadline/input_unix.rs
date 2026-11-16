@@ -301,6 +301,7 @@ pub(super) fn stream_until_stopped(
 
 pub(super) fn stream_until_stopped_observing_exit(
     cmd: &mut Command,
+    stdin: Option<Stdio>,
     deadline: Option<Instant>,
     spawned: impl FnOnce(u32),
     output: impl FnMut(ChildOutput, &[u8]) -> io::Result<()>,
@@ -310,7 +311,7 @@ pub(super) fn stream_until_stopped_observing_exit(
     run_with_input_until_watching(
         cmd,
         None,
-        None,
+        stdin,
         deadline,
         spawned,
         output,

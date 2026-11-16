@@ -696,7 +696,7 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
                 }
                 said.borrow_mut().push(line.to_owned());
             },
-            remote: &crate::remote::run,
+            remote: &remote_step,
             pause: &no_retry,
         },
     );
@@ -1060,7 +1060,7 @@ fn shared_markdown_a_members_file_may_read_is_judged_by_a_round_over_its_readers
         let (exit, said, bases, rechecks) = land_seamed(
             &world,
             &pathspecs,
-            &crate::remote::run,
+            &remote_step,
             &no_retry,
             &reach,
             |_, n, poll| {
@@ -1398,10 +1398,13 @@ fn a_message_that_cites_the_markdown_composes_and_a_read_of_it_is_judged_in_full
 
 /// The Markdown landings share most composes on this checkout: no file outside census may read
 /// `docs/KNOWN_ISSUES.md`, `docs/RELEASING.md` (which nearly every release fix keeps true, R35)
-/// or `docs/PROCESS.md` by the land-time search ([`aterm_census::no_reach::may_read`]), so a
-/// test fixture or helper that spells one in code (whose crate every overlap of it would then
-/// be judged for) fails here; a message may cite one as `(docs/RELEASING.md § …)`. Each path is spelled
-/// in two pieces so this file is not itself such a reader.
+/// or `docs/PROCESS.md` by the land-time search ([`reads`]), so a test fixture or helper that
+/// spells one in code (whose crate every overlap of it would then be judged for) fails here; a
+/// message may cite one as `(docs/RELEASING.md § …)`. Each path is spelled in two pieces, as it
+/// was while this file was itself searched. And no file of this crate reads a member's spec
+/// table or a tracker document by that search: its landing and cone rule sources are passed
+/// over ([`rule_source`]), and no other file of it spells one in code, so a landing that shares
+/// one with main is not judged again for this crate.
 #[test]
 fn the_live_tree_names_the_composing_markdown_in_no_code() {
     let paths = [
@@ -1436,8 +1439,19 @@ fn the_live_tree_names_the_composing_markdown_in_no_code() {
                 && let Ok(text) = std::fs::read_to_string(entry.path())
             {
                 for path in paths {
-                    if aterm_census::no_reach::may_read(&rel, &text, path) {
+                    if reads(&rel, &text, path) {
                         readers.push(format!("{rel} may read {path}"));
+                    }
+                }
+                if rel.starts_with("crates/aterm-verify/") {
+                    for path in [
+                        "crates/aterm-gui/SPECS.md",
+                        "docs/PLAN.md",
+                        "docs/STATUS.md",
+                    ] {
+                        if reads(&rel, &text, path) {
+                            readers.push(format!("{rel} may read {path}"));
+                        }
                     }
                 }
             }
@@ -1463,12 +1477,12 @@ fn a_resumed_round_of_shared_markdown_lands_as_markdown() {
     commit(&world.work, "a/x.txt", "a2\n");
     edit_line(&world.work, DOC, 1, "one");
     let moves = std::cell::Cell::new(0);
-    let racing: &RemoteStep<'_> = &|root, git, tool, args, until| {
+    let racing: &RemoteStep<'_> = &|root, git, tool, args, until, mode| {
         if args.iter().any(|word| word == "push") {
             moves.set(moves.get() + 1);
             rival_moves(&world, "b/y.txt", &format!("b moved {}\n", moves.get()));
         }
-        crate::remote::run(root, git, tool, args, until)
+        remote_step(root, git, tool, args, until, mode)
     };
     let (code, said, _, rounds) = land_wired(
         &world,

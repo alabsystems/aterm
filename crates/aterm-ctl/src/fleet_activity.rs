@@ -159,10 +159,9 @@ impl Record {
     /// window summarizes the rows it holds again as the clock moves.
     #[must_use]
     pub fn read_new(&self, seen: &mut Option<Seen>, now_ms: u64) -> Option<Kept> {
-        let now = std::fs::symlink_metadata(&self.rows).ok().map(|meta| Seen {
-            file: line_log::identity_of(&meta),
-            modified: meta.modified().ok(),
-        });
+        let now = line_log::identity_and_modified_at(&self.rows)
+            .ok()
+            .map(|(file, modified)| Seen { file, modified });
         if now == *seen {
             return None;
         }

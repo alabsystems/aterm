@@ -17,7 +17,8 @@ pub struct BsdInfoWithUniqId {
     pub p_uuid: [u8; 16],
     /// The process's unique id.
     pub p_uniqueid: u64,
-    /// Its parent's at its birth.
+    /// Its parent's unique id, set at its fork and again at each exec; launchd's adoption alone
+    /// leaves it.
     pub p_puniqueid: u64,
     /// Its pid version.
     pub p_idversion: i32,
@@ -248,6 +249,155 @@ pub fn read_lineage(_pid: i32) -> Option<Lineage> {
 #[must_use]
 pub fn read_identity(pid: i32) -> Option<super::Identity> {
     read_lineage(pid).map(|l| l.identity)
+}
+
+/// One step of a live same-uid process's lineage ([`read_hop`]): who it is, and the parent it
+/// names both by pid and by unique id, so a reader of that pid can tell its parent from another
+/// process that holds the pid since ([`walk`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hop {
+    /// Who it is.
+    pub identity: super::Identity,
+    /// Its unique id (`p_uniqueid`), which no other process in this boot holds; an exec keeps it.
+    pub uniqueid: u64,
+    /// Its parent's unique id (`p_puniqueid`), which the kernel sets at its fork and again at
+    /// each exec to the parent it has then. launchd's adoption alone leaves it, so an adopted
+    /// process names its exited launcher until it execs and launchd (`1`) from then on: it is
+    /// no record of an orphan's launcher.
+    pub parent_uniqueid: u64,
+    /// Its parent now (`pbi_ppid`): `1` once launchd adopted it.
+    pub parent: u32,
+    /// Its session's controlling terminal (`e_tdev`, the terminal's `st_rdev`); `None` for a
+    /// session with none (`NODEV`), as a `setsid` leaves it.
+    pub tty: Option<u32>,
+}
+
+/// Reads `pid`'s [`Hop`] from one record (flavor 18, [`bsdinfo_uniq`]), on [`read_lineage`]'s
+/// terms: `None` for pid ≤ 1, a process that is gone, another user's or a zombie, and a record
+/// that names another pid.
+#[cfg(target_vendor = "apple")]
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn read_hop(pid: i32) -> Option<Hop> {
+    const SZOMB: u32 = 5;
+    const NODEV: u32 = u32::MAX;
+    unsafe extern "C" {
+        fn geteuid() -> u32;
+    }
+    if pid <= 1 {
+        return None;
+    }
+    let info = bsdinfo_uniq(pid)?;
+    // SAFETY: A side-effect-free getter.
+    let ours = unsafe { geteuid() };
+    if info.pbsd.pbi_pid != pid.unsigned_abs()
+        || info.pbsd.pbi_uid != ours
+        || info.pbsd.pbi_status == SZOMB
+    {
+        return None;
+    }
+    Some(Hop {
+        identity: super::Identity {
+            pid,
+            birth: super::Birth::from(ProcessBirth {
+                seconds: info.pbsd.pbi_start_tvsec,
+                microseconds: info.pbsd.pbi_start_tvusec,
+            }),
+            idversion: Some(info.p_idversion),
+        },
+        uniqueid: info.p_uniqueid,
+        parent_uniqueid: info.p_puniqueid,
+        parent: info.pbsd.pbi_ppid,
+        tty: (info.pbsd.e_tdev != NODEV).then_some(info.pbsd.e_tdev),
+    })
+}
+
+/// See the Apple twin: no other kernel here names a parent by a unique id (Linux's
+/// [`Lineage::uniqueid`] is a start tick, which two forks can share), so no hop is read.
+#[cfg(not(target_vendor = "apple"))]
+#[must_use]
+pub fn read_hop(_pid: i32) -> Option<Hop> {
+    None
+}
+
+/// The most parents a [`walk`] reads before it ends [`Walk::TooDeep`].
+pub const MAX_HOPS: usize = 64;
+
+/// What a [`walk`]'s classifier makes of a process on the walk: its start or a parent it reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stop {
+    /// The process the walk looks for (the addressed tab's shell).
+    Tab,
+    /// A process that belongs to another owner or owns what runs below it (this aterm, another
+    /// of its tabs' shells, another aterm, a process on another terminal), so the walk ends
+    /// there short of the tab.
+    Other,
+}
+
+/// Where a [`walk`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Walk {
+    /// At the process it looked for.
+    Tab,
+    /// At another owner, this process: the walk's start or a parent.
+    Other(Hop),
+    /// At a process whose parent is launchd (`1`) or none (`0`).
+    Orphaned,
+    /// At a parent that does not read: gone, another user's or a zombie ([`read_hop`]).
+    Unread,
+    /// At a parent whose unique id is not the one its child names: the process at that pid is
+    /// not the child's parent (that parent exited and its pid went on between the reads).
+    Broken,
+    /// With [`MAX_HOPS`] parents read and none of them a stop.
+    TooDeep,
+}
+
+/// Climbs from `start` through its parents to the first process `stop` names, reading each
+/// parent by its pid with `hop` (`None` when it does not read). `stop` judges `start` first, so
+/// a run that belongs elsewhere (one on a terminal other than the tab's, whose parent is still
+/// on the tab's) ends the walk with nothing read. Then at each step from a child to its parent, in
+/// this order: a child whose parent is `1` or `0` ends [`Walk::Orphaned`], with nothing read; a
+/// parent that does not read ends [`Walk::Unread`]; a parent whose unique id is not the
+/// child's [`Hop::parent_uniqueid`] ends [`Walk::Broken`], never judged; then `stop` judges the
+/// parent. The first process it names ends the walk, so the nearest owner wins over any above
+/// it. The link is equality, not an order of unique ids: a process at that pid other than the
+/// child's parent is another process, whatever its age. No hop is read again to confirm the
+/// answer: a caller that acts on it reads `start` again.
+#[must_use]
+pub fn walk(
+    start: Hop,
+    mut hop: impl FnMut(u32) -> Option<Hop>,
+    mut stop: impl FnMut(&Hop) -> Option<Stop>,
+) -> Walk {
+    if let Some(end) = ends_at(stop(&start), start) {
+        return end;
+    }
+    let mut child = start;
+    for _ in 0..MAX_HOPS {
+        if child.parent <= 1 {
+            return Walk::Orphaned;
+        }
+        let Some(parent) = hop(child.parent) else {
+            return Walk::Unread;
+        };
+        if parent.uniqueid != child.parent_uniqueid {
+            return Walk::Broken;
+        }
+        if let Some(end) = ends_at(stop(&parent), parent) {
+            return end;
+        }
+        child = parent;
+    }
+    Walk::TooDeep
+}
+
+/// The end of a [`walk`] that `stop`'s answer for `at` makes: `None` goes on past it.
+const fn ends_at(stop: Option<Stop>, at: Hop) -> Option<Walk> {
+    match stop {
+        Some(Stop::Tab) => Some(Walk::Tab),
+        Some(Stop::Other) => Some(Walk::Other(at)),
+        None => None,
+    }
 }
 
 /// Maximum members listed for one process group ([`group_members`]).

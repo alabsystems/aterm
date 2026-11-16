@@ -69,6 +69,7 @@ fn full() -> MachineName {
         }),
         nick: nick("Heron"),
         nick_class: NickClass::Chosen,
+        row: RowSeen::Saw(Some(nick("Otter"))),
         migration: Some(Migration::Waiting),
         fleets: vec![FleetClaim {
             digest: [0xab; 8],
@@ -144,6 +145,8 @@ fn a_field_outside_its_grammar_is_refused() {
         ("nick = \"Heron\"", "nick = \"m12\""),
         ("class = \"chosen\"", "class = \"person\""),
         ("nick_class = \"chosen\"", "nick_class = \"drawn\""),
+        ("row_nick = \"Otter\"", "row_nick = \"m12\""),
+        ("row_seen = true", "row_seen = false"),
         ("migration = \"waiting\"", "migration = \"later\""),
         (
             "digest = \"abababababababab\"",

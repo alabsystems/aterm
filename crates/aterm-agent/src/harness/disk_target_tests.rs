@@ -1052,6 +1052,7 @@ fn reclaimable_totals_use_only_the_same_eligible_profiles_as_the_candidate_list(
             in_use,
             bytes: u64::MAX,
             bytes_partial: true,
+            died: Died::default(),
         });
     }
     assert_eq!(td.candidates(now, STALE), vec![&base]);
@@ -2113,6 +2114,234 @@ fn only_a_local_fixed_disk_passes_the_volume_fence() {
         let err = fixed_verdict(volume).expect_err("refused");
         assert!(err.contains(why), "{volume:?}: {err}");
     }
+}
+
+/// The folder or file at `path` dated `at` (unix seconds).
+#[cfg(unix)]
+fn dated(path: &Path, at: i64) {
+    let when = std::time::UNIX_EPOCH
+        + std::time::Duration::from_secs(u64::try_from(at).expect("after the epoch"));
+    std::fs::File::open(path)
+        .and_then(|f| f.set_modified(when))
+        .expect("dated");
+}
+
+/// The compiler's own names say what a build that died left: an unfinished session
+/// (`s-{stamp}-{random}-working`, base 36) and its lock, and a metadata temporary folder
+/// (`rmeta` and six letters or digits); nothing else, a finished session included.
+/// NEGATIVE CONTROL: a reader that took any `s-` folder hands back a finished session's lock
+/// (`s-abc-def-0123abcd`), and one that took any `rmeta` prefix takes `rmeta1234567`; each
+/// fails its `None`/`false` line.
+#[test]
+fn the_compilers_own_names_say_what_a_died_build_left() {
+    assert_eq!(
+        unfinished_session_lock("s-ab12-cd34-working").as_deref(),
+        Some("s-ab12-cd34.lock")
+    );
+    for name in [
+        "s-abc-def-0123abcd",
+        "s-abc-def",
+        "s--def-working",
+        "s-abc--working",
+        "s-ABC-def-working",
+        "s-abc-de_f-working",
+        "x-abc-def-working",
+    ] {
+        assert_eq!(unfinished_session_lock(name), None, "{name}");
+    }
+    assert!(metadata_temp("rmetaAb12Cd"));
+    for name in [
+        "rmeta1234567",
+        "rmetaAb12C",
+        "rmetaAb12C-",
+        "Rmeta123456",
+        "rmeta",
+    ] {
+        assert!(!metadata_temp(name), "{name}");
+    }
+}
+
+/// A died build's output is read by its age and its lock: an old unfinished session whose lock
+/// is free and an old metadata folder are listed, in `deps/` and in a build script's output
+/// folder laid out by unit (`build/<unit>/out/`, where a probe such as autocfg compiles); a young
+/// one of each ripens; a session whose lock a rustc holds is waited for and reads released once
+/// it is let go; a finished session, a session with no lock file and an `rmeta` file (no folder)
+/// are left.
+/// NEGATIVE CONTROL: a reader without the lock probe lists the held session as a piece to take,
+/// one without the age gate lists the young ones, and one that reads only
+/// `build/<unit>/<run>/out/` misses the build script's; each fails the `partials` line.
+#[cfg(unix)]
+#[test]
+fn a_died_build_is_read_by_age_and_lock_and_a_held_session_is_waited_for() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = Tmp::new("died-read");
+    let target = synthetic_target(&tmp, "t");
+    let profile = target.join("debug");
+    let now = now_after_write(0) + 3_600;
+    let krate = profile.join("incremental/lay-1x2y3z");
+    let session = |name: &str, lock: bool, at: i64| {
+        let dir = krate.join(format!("s-{name}-working"));
+        std::fs::create_dir_all(&dir).expect("session");
+        std::fs::write(dir.join("query-cache.bin"), vec![1u8; 4096]).expect("cache");
+        if lock {
+            std::fs::write(krate.join(format!("s-{name}.lock")), b"").expect("lock");
+        }
+        dated(&dir, at);
+        dir
+    };
+    let old = session("old1-a1", true, now - 600);
+    let young = session("young1-b2", true, now - 5);
+    let held = session("held1-c3", true, now - 600);
+    session("nolock1-d4", false, now - 600);
+    let finished = krate.join("s-abc-def-0123abcd");
+    std::fs::create_dir_all(&finished).expect("finished");
+    let metadata = |folder: &str, name: &str, at: i64| {
+        let dir = profile.join(folder).join(name);
+        std::fs::create_dir_all(&dir).expect("rmeta");
+        std::fs::write(dir.join("lib.rmeta"), vec![2u8; 4096]).expect("rmeta file");
+        dated(&dir, at);
+        dir
+    };
+    let old_meta = metadata("deps", "rmetaAb12Cd", now - 600);
+    let probe_meta = metadata("build/lay-0123456789abcdef/out", "rmetaPr0b3s", now - 600);
+    metadata("deps", "rmetaYo12Ng", now - 30);
+    std::fs::write(profile.join("deps/rmetaFi1E00"), b"a file").expect("rmeta file");
+    let build = Build::holds(&krate.join("s-held1-c3.lock"));
+    let dev = std::fs::symlink_metadata(&profile).expect("stat").dev();
+
+    let died = died_output(&profile, dev, now);
+    let mut partials: Vec<&Path> = died.partials.iter().map(|p| p.path.as_path()).collect();
+    partials.sort();
+    let mut want = vec![old.as_path(), old_meta.as_path(), probe_meta.as_path()];
+    want.sort();
+    assert_eq!(partials, want, "{died:?}");
+    let piece = died.partials.iter().find(|p| p.path == old).expect("old");
+    assert_eq!(piece.session_lock, Some(krate.join("s-old1-a1.lock")));
+    assert_eq!(piece.modified, now - 600);
+    assert!(piece.bytes >= 4096, "{piece:?}");
+    assert_eq!(
+        died.ripens,
+        Some(now - 5 + DIED_SESSION_MIN_AGE_S),
+        "{died:?}"
+    );
+    assert_eq!(
+        died.held,
+        vec![Held::Session(krate.join("s-held1-c3.lock"))]
+    );
+    assert!(!died.cut);
+    assert!(!died.held[0].released(), "a rustc still holds it");
+    drop(build);
+    assert!(died.held[0].released(), "let go");
+    assert!(young.exists() && held.exists() && finished.exists());
+}
+
+/// TIER 0's remover takes a died build's piece under the profile's locks and the session's own,
+/// and puts its folder's times back, so the profile's clock reads what it read before: a held
+/// session lock keeps the session; let go, the session goes and its lock file stays.
+/// NEGATIVE CONTROL: a remover that skipped the session lock removes the held session (the
+/// first `expect_err` fails), and one that did not put the times back leaves `deps/` dated
+/// the removal (the `modified` line fails).
+#[cfg(unix)]
+#[test]
+fn a_died_builds_piece_goes_under_its_locks_and_its_folders_times_stay() {
+    let tmp = Tmp::new("died-reclaim");
+    let target = synthetic_target(&tmp, "t");
+    let profile = target.join("debug");
+    let now = now_after_write(0) + 3_600;
+    let judge = Judge {
+        now,
+        threshold_days: 7,
+        device: None,
+        volume: None,
+    };
+    let meta = profile.join("deps/rmetaAb12Cd");
+    std::fs::create_dir_all(&meta).expect("rmeta");
+    std::fs::write(meta.join("lib.rmeta"), vec![2u8; 8192]).expect("rmeta file");
+    dated(&meta, now - 600);
+    let krate = profile.join("incremental/lay-1x2y3z");
+    let session = krate.join("s-old1-died1-working");
+    std::fs::create_dir_all(&session).expect("session");
+    std::fs::write(session.join("query-cache.bin"), vec![1u8; 8192]).expect("cache");
+    let lock = krate.join("s-old1-died1.lock");
+    std::fs::write(&lock, b"").expect("lock");
+    dated(&session, now - 600);
+    for dir in [profile.join("deps"), krate.clone()] {
+        dated(&dir, now - 7_200);
+    }
+    let modified = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .expect("mtime")
+    };
+    let (deps_at, krate_at) = (modified(&profile.join("deps")), modified(&krate));
+
+    let mut stages = Vec::new();
+    let went = reclaim_died_with(
+        &target,
+        &profile,
+        &meta,
+        &judge,
+        now - 600,
+        &mut || Ok(()),
+        &mut |stage, at| stages.push((stage, at.to_path_buf())),
+    )
+    .expect("the metadata folder goes");
+    assert_eq!(went.units, vec![meta.clone()]);
+    assert!(went.bytes >= 8192, "{went:?}");
+    assert!(went.trouble.is_empty(), "{went:?}");
+    assert!(!meta.exists());
+    let told: Vec<Stage> = stages
+        .iter()
+        .map(|(s, _)| *s)
+        .filter(|s| *s != Stage::Removing)
+        .collect();
+    assert_eq!(
+        told,
+        [Stage::Locked, Stage::Deleting, Stage::Released],
+        "{stages:?}"
+    );
+    assert_eq!(
+        modified(&profile.join("deps")),
+        deps_at,
+        "deps/ dated as before"
+    );
+
+    let build = Build::holds(&lock);
+    let why = reclaim_died(&target, &profile, &session, &judge, now - 600, &mut || {
+        Ok(())
+    })
+    .expect_err("a rustc holds its session");
+    assert!(why.to_string().contains("session lock"), "{why}");
+    assert!(session.exists());
+    drop(build);
+    let refused = reclaim_died(&target, &profile, &session, &judge, now - 601, &mut || {
+        Ok(())
+    })
+    .expect_err("written into since the survey");
+    assert!(
+        refused.to_string().contains("since the survey"),
+        "{refused}"
+    );
+    let went = reclaim_died(&target, &profile, &session, &judge, now - 600, &mut || {
+        Ok(())
+    })
+    .expect("let go, the session goes");
+    assert_eq!(went.units, vec![session.clone()]);
+    assert!(!session.exists());
+    assert!(
+        lock.exists(),
+        "rustc's own collection removes a lock with no session"
+    );
+    assert_eq!(
+        modified(&krate),
+        krate_at,
+        "its crate folder dated as before"
+    );
+    let finished = krate.join("s-abc-def-0123abcd");
+    std::fs::create_dir_all(&finished).expect("finished");
+    reclaim_died(&target, &profile, &finished, &judge, now, &mut || Ok(()))
+        .expect_err("a finished session is no piece of a died build");
+    assert!(finished.exists());
 }
 
 #[cfg(windows)]

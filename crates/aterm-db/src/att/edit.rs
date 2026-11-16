@@ -61,10 +61,13 @@ pub fn open_ordinary(
     open_with(collection, Some(column), cells, &mut |asked| {
         super::reopened(crate::admission::deadline(), || handle.open_cells(asked))
     })
+    .map(|(opened, _)| opened)
 }
 
 /// [`open_ordinary`] for every such column of `collection`: what a grid of the collection shows
-/// in place of the mask. Empty, and no store session opened, for a collection without one (every
+/// in place of the mask, and whether every token asked for opened (a reader that shows the mask
+/// for one that did not reads it again, since a key of its epoch may arrive without the table
+/// changing). Empty and whole, and no store session opened, for a collection without one (every
 /// collection of a generation whose numbers are plain).
 ///
 /// # Errors
@@ -73,13 +76,13 @@ pub fn open_every_ordinary(
     handle: &Handle,
     collection: &'static Collection,
     cells: &Cells,
-) -> Result<Opened> {
+) -> Result<(Opened, bool)> {
     if !collection
         .columns
         .iter()
         .any(|column| column.sealed_ordinary() && column.live_at(collection.version))
     {
-        return Ok(Opened::new());
+        return Ok((Opened::new(), true));
     }
     open_with(collection, None, cells, &mut |asked| {
         super::reopened(crate::admission::deadline(), || handle.open_cells(asked))
@@ -88,13 +91,13 @@ pub fn open_every_ordinary(
 
 /// The cells [`open_ordinary`] asks for (of the column `only`, or of each such column), opened
 /// by `open`: one value per asked `(collection, row, column, token)`, in order, `None` where it
-/// did not open.
+/// did not open; and whether every token asked for opened.
 fn open_with(
     collection: &'static Collection,
     only: Option<&str>,
     cells: &Cells,
     open: OpenCells<'_>,
-) -> Result<Opened> {
+) -> Result<(Opened, bool)> {
     let projection = crate::typed::cell::project(collection, cells);
     let mut wanted: Vec<Wanted> = Vec::new();
     for column in collection.columns.iter().filter(|c| {
@@ -140,10 +143,11 @@ fn open_with(
         })
         .collect();
     if asked.is_empty() {
-        return Ok(Opened::new());
+        return Ok((Opened::new(), true));
     }
     let mut values = open(&asked)?.into_iter();
     let mut opened = Opened::new();
+    let mut every = true;
     for ((pk, column), candidates) in wanted {
         let mut shown = Vec::with_capacity(candidates.len());
         let mut whole = true;
@@ -152,7 +156,10 @@ fn open_with(
                 None => shown.push(Secret::new(String::new())),
                 Some(_) => match values.next().flatten() {
                     Some(value) => shown.push(value),
-                    None => whole = false,
+                    None => {
+                        whole = false;
+                        every = false;
+                    }
                 },
             }
         }
@@ -166,7 +173,7 @@ fn open_with(
             opened.insert((pk, column.to_owned()), shown);
         }
     }
-    Ok(opened)
+    Ok((opened, every))
 }
 
 /// A private scratch folder for one grid ([`aterm_types::private_edit`]): `0700`, named for this
@@ -305,7 +312,7 @@ pub fn edit(
     let export = |view: &super::View, filters: &[Where]| -> Result<grid::Export> {
         Ok(view
             .export_grid(compiled.table, collection, filters)?
-            .showing(&open_every_ordinary(handle, collection, &view.cells)?))
+            .showing(&open_every_ordinary(handle, collection, &view.cells)?.0))
     };
     let name = format!("{}.tsv", collection.name);
     let path = scratch.path().join(&name);

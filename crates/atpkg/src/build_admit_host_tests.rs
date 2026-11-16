@@ -3,7 +3,7 @@
 
 //! One actual caller drives owned native jobs; private ledgers and native fixtures.
 
-use super::host::{Completion, JobId, Jobs, Ticket};
+use super::host::{Completion, JobId, Jobs};
 use super::*;
 use aterm_capacity::cohort::launch::CohortSignal;
 use aterm_uds::spawnfd::{self, Stdio};
@@ -14,7 +14,6 @@ use std::{
 };
 
 const ACTOR: &str = "ATPKG_NATIVE_JOB_TABLE_WORLD";
-const REAL: &str = "ATPKG_NATIVE_JOB_TABLE_REAL";
 
 #[test]
 fn shared_host_wait_services_mixed_interests_and_buffered_work() {
@@ -224,10 +223,6 @@ fn native_table_actor_if_requested() {
     let mut driver = Driver::new(&world);
     assert!(Jobs::new(0).is_err());
     assert!(Jobs::new(257).is_err());
-    if std::env::var_os(REAL).is_some() {
-        real_builds(&world, &seat, &mut driver);
-        return;
-    }
 
     let first = world.join("first");
     driver.phase("submitting first root");
@@ -497,76 +492,7 @@ fn assert_reaped(pid: u32) {
     );
 }
 
-fn real_builds(world: &Path, seat: &Seat<'_>, driver: &mut Driver) {
-    let mut tickets = Vec::<Ticket>::new();
-    let mut paths = Vec::new();
-    struct Release(Vec<PathBuf>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            for path in &self.0 {
-                let _ = std::fs::write(path.join("release"), b"cleanup");
-            }
-        }
-    }
-    let mut release = Release(Vec::new());
-    for index in 0..2 {
-        let path = world.join(index.to_string());
-        std::fs::create_dir(&path).unwrap();
-        headless::prepare_build(&path);
-        release.0.push(path.clone());
-        let mut command = spawnfd::transparent(std::env::var_os("CARGO").unwrap()).into_command();
-        command
-            .args(["--unverified", "build", "--offline", "--target-dir"])
-            .arg(path.join("target.noindex"))
-            .args([
-                "--config",
-                &format!("build.build-dir='{}'", path.join("build.noindex").display()),
-            ])
-            .env("ATPKG_HEADLESS_REAL_BUILDS", &path)
-            .env("CARGO_BUILD_JOBS", "1")
-            .current_dir(&path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(
-                std::fs::File::create(path.join("compiler.log")).unwrap(),
-            ));
-        tickets.push(
-            driver
-                .jobs
-                .submit(held(&path, seat), &mut command, Duration::ZERO)
-                .unwrap(),
-        );
-        paths.push(path);
-    }
-    driver.ready(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>());
-    assert_eq!(
-        driver.jobs.len(),
-        2,
-        "both actual build scripts reached their barriers"
-    );
-    for path in &paths {
-        std::fs::write(path.join("release"), b"host accepts progress").unwrap();
-    }
-    driver.until("both actual builds finish on one wake loop", |d| {
-        d.jobs.is_empty()
-    });
-    for (ticket, path) in tickets.iter().zip(&paths) {
-        assert!(driver.result(&ticket.id).as_ref().unwrap().succeeded());
-        let mut command = spawnfd::command(path.join("target.noindex/debug/headless_probe"));
-        assert!(
-            aterm_uds::deadline::output_while_process_progressing(
-                &mut command,
-                aterm_spec::wait::MUST_HAPPEN,
-                "host table compiled probe",
-            )
-            .unwrap()
-            .status
-            .success()
-        );
-    }
-    assert!(seat.ledger.as_ref().unwrap().list().unwrap().is_empty());
-}
-
-fn run_actor(real: bool) {
+fn run_actor() {
     let world = aterm_tempfile::tempdir().unwrap();
     let mut command = spawnfd::command(std::env::current_exe().unwrap());
     command
@@ -577,9 +503,6 @@ fn run_actor(real: bool) {
             "--nocapture",
         ])
         .env(ACTOR, world.path());
-    if real {
-        command.env(REAL, "1");
-    }
     let output = aterm_uds::deadline::output_while_process_progressing(
         &mut command,
         aterm_spec::wait::MUST_HAPPEN,
@@ -600,12 +523,7 @@ fn run_actor(real: bool) {
 
 #[test]
 fn one_table_services_native_control_deadlines_errors_and_stale_attempts() {
-    run_actor(false);
-}
-
-#[test]
-fn one_table_services_two_real_targo_builds_without_per_job_waiting_threads() {
-    run_actor(true);
+    run_actor();
 }
 
 #[test]

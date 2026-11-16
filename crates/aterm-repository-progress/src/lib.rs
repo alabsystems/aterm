@@ -268,6 +268,31 @@ pub struct Progress {
     pub previous: Vec<Transition>,
 }
 
+/// The longest name, in bytes, a record keeps and a reader admits ([`Progress::new`]).
+pub const NAME_MAX: usize = 255;
+
+/// What [`bounded`] puts where it elides a name's middle.
+const ELIDED: char = '\u{2026}';
+
+/// `name`, cut to [`NAME_MAX`] bytes where it is longer: its head and its tail kept, the middle
+/// between them elided ([`ELIDED`]) at character boundaries, so the record is admitted and both
+/// ends still say whose it is (a parent repository's name, a dependency path's last component).
+fn bounded(name: &str) -> String {
+    if name.len() <= NAME_MAX {
+        return name.to_owned();
+    }
+    let room = NAME_MAX - ELIDED.len_utf8();
+    let mut head = room / 2;
+    while !name.is_char_boundary(head) {
+        head -= 1;
+    }
+    let mut tail = name.len() - (room - head);
+    while !name.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!("{}{ELIDED}{}", &name[..head], &name[tail..])
+}
+
 /// Epoch time for observations only.
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -276,13 +301,14 @@ pub fn now_ms() -> u64 {
 }
 
 impl Progress {
-    /// A new attempt waiting for a lane.
+    /// A new attempt waiting for a lane, its name bounded to [`NAME_MAX`] bytes: a longer one
+    /// keeps its head and its tail, its middle elided, so no reader drops the record.
     pub fn new(name: &str, destination: PathBuf) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let started_ms = now_ms();
         let pid = std::process::id();
         Self {
-            name: name.into(),
+            name: bounded(name),
             destination,
             staging: None,
             pid,
@@ -500,7 +526,9 @@ fn snapshot(dir: &std::path::Path, entry: &std::fs::DirEntry) -> Option<Progress
     }
     let bytes = aterm_uds::private_file::read_private(dir, name, 32768).ok()?;
     let row = aterm_json::from_slice::<Progress>(&bytes).ok()?;
-    (name == format!("{}.json", row.attempt) && row.name.len() <= 255 && row.history.len() <= 32)
+    (name == format!("{}.json", row.attempt)
+        && row.name.len() <= NAME_MAX
+        && row.history.len() <= 32)
         .then_some(row)
 }
 

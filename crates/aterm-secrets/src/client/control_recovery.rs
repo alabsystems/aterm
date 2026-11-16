@@ -443,7 +443,7 @@ pub fn restore_commons_control(
         log_entries::commit_authored_records(
             paths,
             &mut context.store,
-            &crate::membership_log::encode_records(&records),
+            &crate::membership_log::read_records(&records)?,
             &records,
         )?;
         CommonsRecovery {

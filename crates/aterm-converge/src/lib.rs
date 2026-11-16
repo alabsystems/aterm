@@ -130,4 +130,11 @@ pub trait Item: Send + Sync {
     fn read_aside(&self) -> Option<StoodAside> {
         None
     }
+
+    /// The engine is done with this row: no apply, refresh or read-back follows its last probe
+    /// in this run, whatever became of the change that probe found (made, held back, stood
+    /// aside, refused by the journal, or only planned). What the item kept from that probe for
+    /// an apply that did not come, a lease on a lock other runs wait for, goes here. A wrapper
+    /// that probes its inner item passes this on.
+    fn row_ended(&self) {}
 }

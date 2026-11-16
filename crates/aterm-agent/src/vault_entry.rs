@@ -24,10 +24,10 @@ pub const SOURCE_PREFIX: &str = "vault:";
 pub(crate) enum Read {
     /// The verified value, as bounded UTF-8 text.
     #[cfg_attr(
-        not(unix),
+        all(not(unix), not(test)),
         expect(
             dead_code,
-            reason = "the vault client builds on unix only: every other host's reader answers absent"
+            reason = "the vault client builds on unix only: every other host's reader answers absent (tests build one)"
         )
     )]
     Present(String),

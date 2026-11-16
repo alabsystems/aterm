@@ -1040,13 +1040,21 @@ fn an_acknowledgement_alone_reads_the_store_again() {
     assert!(ensure_local_node_key_in_log(&lab.m9_paths, &rotated, None));
     // m9's rotation, written into this Mac's records by a write cut before its acknowledgement.
     let mut ahead = client::load_records(&lab.paths).unwrap();
-    let m9_records = client::load_records(&lab.m9_paths).unwrap().encode();
+    let m9_records = client::load_records(&lab.m9_paths)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     assert!(ahead.ingest(&m9_records).unwrap() > 0);
     assert!(
         crate::fleet_log::log_member_keys(ahead.log().unwrap()).holds_out(&lab.m9.key()),
         "PRECONDITION: the records ahead hold m9's first key out"
     );
-    aterm_secrets::fsx::write_atomic(&lab.paths.records_file(), &ahead.encode(), 0o600).unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &lab.paths.records_file(),
+        &ahead.read_encoded().unwrap(),
+        0o600,
+    )
+    .unwrap();
     assert!(
         client::load_acknowledged_records(&lab.paths).is_ok_and(|store| {
             crate::fleet_log::log_member_keys(store.log().unwrap()).admits(&lab.m9.key())
@@ -1156,9 +1164,17 @@ fn a_service_activation_compares_the_acknowledged_frontier() {
     let rotated = NodeIdentity::from_seed(&"e6".repeat(16), &[0x9a; 32]).unwrap();
     assert!(ensure_local_node_key_in_log(&lab.m9_paths, &rotated, None));
     let mut ahead = client::load_records(&lab.paths).unwrap();
-    let m9_records = client::load_records(&lab.m9_paths).unwrap().encode();
+    let m9_records = client::load_records(&lab.m9_paths)
+        .unwrap()
+        .read_encoded()
+        .unwrap();
     assert!(ahead.ingest(&m9_records).unwrap() > 0);
-    aterm_secrets::fsx::write_atomic(&lab.paths.records_file(), &ahead.encode(), 0o600).unwrap();
+    aterm_secrets::fsx::write_atomic(
+        &lab.paths.records_file(),
+        &ahead.read_encoded().unwrap(),
+        0o600,
+    )
+    .unwrap();
     let raw = heads(&client::load_records(&lab.paths).unwrap());
     assert!(
         raw.len() > acknowledged.len() && acknowledged.iter().all(|head| raw.contains(head)),

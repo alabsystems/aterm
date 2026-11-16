@@ -1373,3 +1373,37 @@ fn a_budget_pass_counts_its_tiers_as_one_run() {
     assert_eq!(both.removed.len(), 2, "{both:?}");
     assert!(both.stops.is_empty(), "{both:?}");
 }
+
+/// The live digest, now one function the emergency's wait reads too, keeps DC-04b's values: the
+/// session ids sorted and once, each ended by a 0 byte, then a 1 byte, then the working
+/// directories sorted and once, each ended by a 0 byte, through FNV-1a 64, in whatever order
+/// they came.
+/// NEGATIVE CONTROL: a digest that kept the order given, or counted a working directory twice,
+/// fails the reversed line.
+#[test]
+fn live_digest_keeps_dc_04bs_values() {
+    let want = aterm_hash::fnv1a_64(b"a\0b\0\x01/x\0/y\0");
+    let live = Live {
+        sessions: ["b", "a"].into_iter().map(str::to_owned).collect(),
+        cwds: vec![
+            PathBuf::from("/y"),
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+        ],
+        ..Live::default()
+    };
+    assert_eq!(live.digest(), want);
+    assert_eq!(
+        live_digest(["a", "b"], [Path::new("/x"), Path::new("/y")]),
+        want
+    );
+    assert_eq!(
+        live_digest(
+            ["b", "a", "a"],
+            [Path::new("/y"), Path::new("/x"), Path::new("/y")],
+        ),
+        want,
+        "reversed and repeated"
+    );
+    assert_ne!(live_digest(["a"], [Path::new("/x")]), want);
+}

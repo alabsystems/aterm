@@ -215,9 +215,21 @@ fn the_environment_digest_leaves_out_shaping_and_the_session() {
             .map(|(name, value)| ((*name).into(), (*value).into()))
             .collect()
     };
+    // `PATH` as this host names it and joins its entries: Windows names its own `Path`.
+    let path_name = if cfg!(windows) { "Path" } else { "PATH" };
+    let search = |dirs: &[&str]| {
+        std::env::join_paths(dirs)
+            .expect("plain entries")
+            .into_string()
+            .expect("UTF-8")
+    };
+    let (path, repeated) = (
+        search(&["/usr/bin", "/bin"]),
+        search(&["/usr/bin", "/bin", "/usr/bin"]),
+    );
     let base = [
         ("HOME", "/Users//a"),
-        ("PATH", "/usr/bin:/bin"),
+        (path_name, path.as_str()),
         ("TMPDIR", "/tmp/a/"),
     ];
     let digest_of = |extra: &[(&str, &str)]| {
@@ -240,7 +252,7 @@ fn the_environment_digest_leaves_out_shaping_and_the_session() {
     for shaping in [
         ("CARGO_BUILD_JOBS", "4"),
         ("TMPDIR", "/tmp/b/"),
-        ("PATH", "/usr/bin:/bin:/usr/bin"),
+        (path_name, repeated.as_str()),
         ("SSH_CONNECTION", "1 2 3 4"),
     ] {
         assert_eq!(digest_of(&[shaping]), plain, "{} is left out", shaping.0);
