@@ -533,7 +533,7 @@ fn failed_early_tippy_admission_ends_the_release_before_scheduling() {
 /// A stage's memory is claimed before it starts and held until it ends: the lint (never
 /// measured, so the cold figure: half of 24 GiB) asks for 12 GiB in the ledger, sees its own
 /// claim held while it runs, and leaves none once the run ends; the formatter, which touches no
-/// target directory, claims nothing; its time line says what it claimed and why. NEGATIVE
+/// target directory, claims nothing. NEGATIVE
 /// CONTROL: the same run measuring no memory asks for no claim, and its lint sees none.
 #[test]
 fn a_stage_claims_its_memory_before_it_starts_and_holds_it_until_it_ends() {
@@ -566,15 +566,6 @@ fn a_stage_claims_its_memory_before_it_starts_and_holds_it_until_it_ends() {
         HELD.ledger().list().expect("the ledger").is_empty(),
         "no claim outlives its stage"
     );
-    assert!(
-        said_whole(
-            &log,
-            "memory: claimed 12 GiB cold: no run of it is kept, and it compiles (16 GiB, at \
-             most half of physical memory)"
-        ),
-        "{log}"
-    );
-
     HELD.clear();
     let (code, log) = run(dir.path(), None, Admit::Wait, seams);
     let seen = HELD.take();

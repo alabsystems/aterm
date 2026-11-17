@@ -388,6 +388,81 @@ unsafe extern "system" {
     ) -> i32;
 }
 
+/// DPAPI's `DATA_BLOB` (`dpapi.h`): a length and a pointer to that many bytes.
+#[repr(C)]
+pub(crate) struct DataBlob {
+    pub cbData: u32,
+    pub pbData: *mut u8,
+}
+
+#[link(name = "crypt32")]
+unsafe extern "system" {
+    /// Seals `pDataIn` under this user's DPAPI master key and `pOptionalEntropy` ([`crate::dpapi`]);
+    /// `pDataOut` is the blob, in a buffer the caller frees with [`LocalFree`].
+    pub(crate) fn CryptProtectData(
+        pDataIn: *const DataBlob,
+        szDataDescr: *const u16,
+        pOptionalEntropy: *const DataBlob,
+        pvReserved: *mut core::ffi::c_void,
+        pPromptStruct: *mut core::ffi::c_void,
+        dwFlags: u32,
+        pDataOut: *mut DataBlob,
+    ) -> i32;
+    /// Opens a blob [`CryptProtectData`] sealed; `pDataOut` is the plain bytes, in a buffer the
+    /// caller wipes and frees with [`LocalFree`].
+    pub(crate) fn CryptUnprotectData(
+        pDataIn: *const DataBlob,
+        ppszDataDescr: *mut *mut u16,
+        pOptionalEntropy: *const DataBlob,
+        pvReserved: *mut core::ffi::c_void,
+        pPromptStruct: *mut core::ffi::c_void,
+        dwFlags: u32,
+        pDataOut: *mut DataBlob,
+    ) -> i32;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    /// Frees a buffer a call allocated with `LocalAlloc` (DPAPI's output); null on success.
+    pub(crate) fn LocalFree(hMem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+}
+
+/// A COM `GUID` (`guiddef.h`): a known folder's id.
+#[repr(C)]
+pub(crate) struct Guid {
+    pub Data1: u32,
+    pub Data2: u16,
+    pub Data3: u16,
+    pub Data4: [u8; 8],
+}
+
+/// `FOLDERID_Profile` (`KnownFolders.h`, `{5E6C858F-0E22-4760-9AFE-EA3317B67173}`): the user's
+/// profile folder, `%USERPROFILE%` at logon.
+pub(crate) const FOLDERID_PROFILE: Guid = Guid {
+    Data1: 0x5E6C_858F,
+    Data2: 0x0E22,
+    Data3: 0x4760,
+    Data4: [0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73],
+};
+
+#[link(name = "shell32")]
+unsafe extern "system" {
+    /// A known folder's path for the token's user (null: this process's), in a buffer the caller
+    /// frees with [`CoTaskMemFree`] whether the call succeeded or not. Returns an HRESULT.
+    pub(crate) fn SHGetKnownFolderPath(
+        rfid: *const Guid,
+        dwFlags: u32,
+        hToken: RawHandle,
+        ppszPath: *mut *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    /// Frees a buffer the shell allocated for its caller (null is allowed).
+    pub(crate) fn CoTaskMemFree(pv: *mut core::ffi::c_void);
+}
+
 #[cfg(all(test, target_pointer_width = "64"))]
 #[path = "ffi_layout_tests.rs"]
 mod layout_tests;

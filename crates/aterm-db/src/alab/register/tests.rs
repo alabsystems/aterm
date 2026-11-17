@@ -242,12 +242,130 @@ fn disconnected_number_claims(roll_generation: bool, person_choice: bool) {
     }
 }
 
+/// A label an owner wrote to this Mac's row stands: registration puts neither the signed choice
+/// it replaced, nor another bound row's number, nor a fresh one over it, and a choice another
+/// bound row holds no longer fails the pass while it does (tracker package FL-170: this Mac
+/// takes the owner's number instead).
+#[test]
+fn an_owner_label_is_never_written_back() {
+    let own = keys::machine_pk(ME);
+    let other = keys::machine_pk(OLD);
+    let records = vec![
+        machine(
+            &own,
+            &[
+                ("label", json!("m12")),
+                ("node", json!(NODE)),
+                ("row", json!("live")),
+            ],
+        ),
+        machine(
+            &other,
+            &[
+                ("label", json!("m9")),
+                ("node", json!(OTHER_NODE)),
+                ("row", json!("live")),
+            ],
+        ),
+    ];
+    let held = facts(&[(ME, old_row(&own, day_of(NOW)))]);
+    for chosen in [Some("m3"), Some("m9"), None] {
+        let me = Me {
+            label: Some("m3".into()),
+            chosen: chosen.map(Into::into),
+            signed: chosen.map(Into::into),
+            ..me()
+        };
+        let plan = run(&me, &probe(), &[ME, OLD], true, &apply(&records), &held);
+        let mut all = records.clone();
+        all.push(plan.changes);
+        let rows = cell::project(&MACHINE, &apply(&all));
+        assert_eq!(
+            rows.rows[&own].get("label"),
+            Some(&json!("m12")),
+            "{chosen:?}"
+        );
+    }
+}
+
+/// An owner's label the vault gives another member is one this Mac's rename refuses, so nothing
+/// would ever sign it: registration writes this Mac's own number back over it (a fresh automatic
+/// one where this Mac signed none), and the other member's row keeps its claim.
+#[test]
+fn an_owner_label_another_member_holds_is_written_back() {
+    let own = keys::machine_pk(ME);
+    let records = vec![machine(
+        &own,
+        &[
+            ("label", json!("m12")),
+            ("node", json!(NODE)),
+            ("row", json!("live")),
+        ],
+    )];
+    let held = facts(&[(ME, old_row(&own, day_of(NOW)))]);
+    for chosen in [Some("m3"), None] {
+        let me = Me {
+            label: Some("m3".into()),
+            chosen: chosen.map(Into::into),
+            signed: chosen.map(Into::into),
+            held: BTreeSet::from(["m12".to_owned()]),
+            ..me()
+        };
+        let plan = run(&me, &probe(), &[ME], true, &apply(&records), &held);
+        let mut all = records.clone();
+        all.push(plan.changes);
+        let rows = cell::project(&MACHINE, &apply(&all));
+        let label = rows.rows[&own].get("label").and_then(Value::as_str);
+        match chosen {
+            Some(number) => assert_eq!(label, Some(number)),
+            None => {
+                assert!(label.is_some_and(|label| label != "m12"), "{label:?}");
+                assert!(
+                    rows.rows[&own].fields["label"]
+                        .candidates()
+                        .iter()
+                        .all(|candidate| candidate.value.a),
+                    "a fresh automatic number"
+                );
+            }
+        }
+    }
+}
+
+/// The number this Mac signed, which a rename here wrote to its row as an owner's act, follows
+/// what the vault settled it as: after a concurrent loss the row takes the clash label the vault
+/// gives, so the registry and the vault never name two holders of one number.
+#[test]
+fn a_number_this_mac_signed_follows_the_vaults_settling() {
+    let own = keys::machine_pk(ME);
+    let records = vec![machine(
+        &own,
+        &[
+            ("label", json!("m12")),
+            ("node", json!(NODE)),
+            ("row", json!("live")),
+        ],
+    )];
+    let held = facts(&[(ME, old_row(&own, day_of(NOW)))]);
+    let me = Me {
+        label: Some("m12-ab12".into()),
+        chosen: Some("m12-ab12".into()),
+        signed: Some("m12".into()),
+        ..me()
+    };
+    let plan = run(&me, &probe(), &[ME], true, &apply(&records), &held);
+    let mut all = records.clone();
+    all.push(plan.changes);
+    let rows = cell::project(&MACHINE, &apply(&all));
+    assert_eq!(rows.rows[&own].get("label"), Some(&json!("m12-ab12")));
+}
+
 #[test]
 fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
     let own = keys::machine_pk(ME);
     let other = keys::machine_pk(OLD);
     let initial = vec![
-        machine(
+        automatic_machine(
             &own,
             &[
                 ("label", json!("m87")),
@@ -280,7 +398,7 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
     assert_eq!(rows.rows[&other].get("label"), Some(&json!("m87")));
 
     let other_holds = apply(&[
-        machine(&own, &[("label", json!("m87")), ("row", json!("live"))]),
+        automatic_machine(&own, &[("label", json!("m87")), ("row", json!("live"))]),
         machine(
             &other,
             &[
@@ -473,6 +591,8 @@ fn me() -> Me {
         uuid: ME.into(),
         label: Some("m7".into()),
         chosen: None,
+        signed: None,
+        held: BTreeSet::new(),
         hw_hint: HINT.into(),
         enrolled_ms: None,
         former: Vec::new(),
@@ -508,6 +628,25 @@ fn machine(pk: &str, cells: &[(&str, Value)]) -> Vec<Change> {
                     elem: None,
                 },
                 &CellValue::owner(MACHINE.version, x.clone()),
+            )
+            .unwrap()
+        })
+        .collect()
+}
+
+/// [`machine`], written as registration's own automatic writes are.
+fn automatic_machine(pk: &str, cells: &[(&str, Value)]) -> Vec<Change> {
+    cells
+        .iter()
+        .map(|(col, x)| {
+            cell::change(
+                &MACHINE,
+                CellKey {
+                    pk,
+                    col,
+                    elem: None,
+                },
+                &CellValue::automatic(MACHINE.version, x.clone()),
             )
             .unwrap()
         })
@@ -3693,6 +3832,8 @@ impl Unfixed {
             uuid: successor.clone(),
             label: Some("m34".into()),
             chosen: None,
+            signed: None,
+            held: BTreeSet::new(),
             hw_hint: hint.clone(),
             enrolled_ms: None,
             former: Vec::new(),

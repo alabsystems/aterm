@@ -36,19 +36,13 @@ pub const JOURNAL_MAX: u64 = 64 << 20;
 /// open. `append` refuses any other record (an Intent, an `Observed` that found nothing, or
 /// one of an intent already closed) once the file is within one largest frame (a 4 KiB body
 /// and its headers) of `JOURNAL_MAX - JOURNAL_RESERVE`, whatever that record's own size. So
-/// once one Intent is refused every later one is, and an empty `agh intent list --open`
+/// once an ordinary Intent is refused every later one is, and an empty `agh intent list --open`
 /// stays empty until the file is moved aside. A full journal can still settle, observe and
 /// retract every intent it holds open, and a discovery rerun cannot use the reserve up.
 /// Moving a journal aside with an intent open would drop the open-intent rule for its key.
 pub const JOURNAL_RESERVE: u64 = 1 << 20;
 /// The one-minute hang detector while `append` waits for journal custody.
 pub const LOCK_WAIT: Duration = Duration::from_secs(60);
-/// How long a probe of an atomic intent's holder lock tries before it reads the lock held:
-/// past another reader's own probe of it (`Journal::closable`).
-const PROBE_WAIT: Duration = Duration::from_millis(50);
-/// Holder metadata is one canonical bounded phase record, never an append-only history.
-#[cfg(unix)]
-const HOLDER_BYTES_MAX: u64 = 64;
 /// How long an intent may stay open before it becomes a need (`needs::raise`): 6 h. That is
 /// longer than the longest lane between a create and its discovery (a 20-asset upload at
 /// 12 KB/s), and short enough to be seen the same day.
@@ -108,6 +102,115 @@ impl std::fmt::Display for IntentId {
     }
 }
 
+/// A process identity that survives PID reuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriterProcess {
+    /// Kernel process ID.
+    pub pid: u32,
+    /// Kernel start on this boot's clock.
+    pub start: u64,
+}
+
+impl WriterProcess {
+    /// Read one exact process identity.
+    pub fn read(pid: u32) -> Option<Self> {
+        let start = aterm_uds::process::read_process_start(i32::try_from(pid).ok()?)?;
+        Some(Self {
+            pid,
+            start: start.boot.0,
+        })
+    }
+
+    /// Unreadable identities remain held unless the process is proven absent.
+    fn may_live(&self) -> bool {
+        Self::read(self.pid).map_or_else(
+            || aterm_uds::process::pid_alive(self.pid),
+            |now| now == *self,
+        )
+    }
+}
+
+/// Custody of an intent, including a native child released to send its write.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum IntentWriter {
+    /// Every native child is registered durably before execution. `git: null`
+    /// records absence of a released child, rather than missing data.
+    Tracked {
+        /// Boot identity; a different boot proves both processes gone.
+        boot: String,
+        /// The agh frontend.
+        agh: WriterProcess,
+        /// The native Git child, registered durably before execution.
+        #[serde(deserialize_with = "recorded_child")]
+        git: Option<WriterProcess>,
+    },
+    /// Historical v1 records retained only the frontend. They provide no
+    /// evidence that a native child ended on this same boot.
+    Legacy {
+        /// The recorded boot identity.
+        boot: String,
+        /// The historical frontend's process ID.
+        pid: u32,
+        /// Its kernel start on that boot.
+        start: u64,
+    },
+}
+
+fn recorded_child<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<WriterProcess>, D::Error> {
+    serde::Deserialize::deserialize(deserializer)
+}
+
+impl IntentWriter {
+    /// This agh process; unavailable identity refuses a new write.
+    pub fn current() -> Result<Self> {
+        Ok(Self::Tracked {
+            boot: aterm_uds::process::boot_id()
+                .ok_or_else(|| Error::local("this boot's identity cannot be read"))?,
+            agh: WriterProcess::read(std::process::id())
+                .ok_or_else(|| Error::local("this writer's process start cannot be read"))?,
+            git: None,
+        })
+    }
+
+    /// The recorded frontend identity, without claiming child custody.
+    #[must_use]
+    pub fn frontend(&self) -> WriterProcess {
+        match self {
+            Self::Tracked { agh, .. } => *agh,
+            Self::Legacy { pid, start, .. } => WriterProcess {
+                pid: *pid,
+                start: *start,
+            },
+        }
+    }
+
+    /// The boot that owns the recorded process identities.
+    #[must_use]
+    pub fn boot(&self) -> &str {
+        match self {
+            Self::Tracked { boot, .. } | Self::Legacy { boot, .. } => boot,
+        }
+    }
+
+    /// Unknown boot or process evidence is held, never treated as death.
+    pub fn dead(&self) -> bool {
+        match aterm_uds::process::boot_id() {
+            Some(boot) if boot != self.boot() => true,
+            Some(_) => match self {
+                Self::Tracked { agh, git, .. } => {
+                    !agh.may_live() && !git.as_ref().is_some_and(WriterProcess::may_live)
+                }
+                Self::Legacy { .. } => false,
+            },
+            None => false,
+        }
+    }
+}
+
 /// What a write asks `begin` to record. `begin` adds the id and the time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -135,6 +238,10 @@ pub struct IntentDraft {
     /// lock and refuses when the journal has moved past it. It is not recorded: the Intent
     /// record's body is unchanged.
     pub after: Option<IntentId>,
+    /// Writer override for an imported intent; otherwise begin records this process.
+    pub writer: Option<IntentWriter>,
+    /// Exact atomic ref transitions, retained for read-only recovery.
+    pub refs: Vec<crate::github::refs::RefUpdate>,
 }
 
 impl IntentDraft {
@@ -163,6 +270,8 @@ impl IntentDraft {
             body_digest: None,
             grant: permit.grant().map(str::to_string),
             after: None,
+            writer: None,
+            refs: Vec::new(),
         }
     }
 
@@ -184,6 +293,13 @@ impl IntentDraft {
     #[must_use]
     pub fn with_request(mut self, request: String) -> IntentDraft {
         self.request = request;
+        self
+    }
+
+    /// Retain the exact atomic batch before sending it.
+    #[must_use]
+    pub fn with_refs(mut self, refs: Vec<crate::github::refs::RefUpdate>) -> Self {
+        self.refs = refs;
         self
     }
 
@@ -221,6 +337,10 @@ pub struct Intent {
     pub grant: Option<String>,
     /// `Fx::wall_secs` at `begin`.
     pub at_secs: u64,
+    /// Absent for legacy records and tapes, which carry no host-local identity.
+    pub writer: Option<IntentWriter>,
+    /// Each ref's before and after, zero meaning absence.
+    pub refs: Vec<crate::github::refs::RefUpdate>,
 }
 
 /// How an attempt ended (design §10.2's table).
@@ -253,10 +373,18 @@ pub enum Settled {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum JournalRecord {
-    /// Made durable before the first byte of the write is sent. Boxed: an `Intent` is about
-    /// 256 bytes against about 56 for the next variant, right at clippy's
-    /// `large_enum_variant` line (200), so one more field would fail `-D warnings`.
+    /// Made durable before the first byte of the write is sent. Boxed to keep
+    /// the enum compact as intent metadata grows.
     Intent(Box<Intent>),
+    /// Additive v1 observation: older agh reads it as an empty observation.
+    WriterChild {
+        /// Intent whose native child is held at its entry barrier.
+        intent: IntentId,
+        /// Exact child identity.
+        child: WriterProcess,
+        /// Observation time.
+        at_secs: u64,
+    },
     /// How the attempt ended: one per Intent, after the answer or its absence. `settle`
     /// refuses a second, and a view reads the first.
     Settled {
@@ -274,9 +402,7 @@ pub enum JournalRecord {
         /// `Fx::wall_secs`.
         at_secs: u64,
     },
-    /// `agh intent retract`: the intent was closed after a look at GitHub; or `begin`
-    /// closed an atomic ref intent whose writer can send nothing more
-    /// (`IntentStore::begin`).
+    /// `agh intent retract`: the intent was closed after a look at GitHub.
     Retracted {
         /// The intent.
         intent: IntentId,
@@ -318,19 +444,6 @@ pub trait IntentStore: Send + Sync {
     ///   `Reference already exists`, and `Refs::create` resolves that;
     /// - the newest intent of the draft's op and key is not `draft.after`, so another run
     ///   began, or closed, one since the caller looked.
-    ///
-    /// A `WriteOp::RefUpdateAtomic` intent in a file journal stops every atomic batch while
-    /// its writer may still send it and for at least `git::GRANT_MAX` after its recorded
-    /// retirement or its first persisted observation as free after a crash
-    /// ([`Journal::closable`]). An atomic `begin` holds the lock on
-    /// `<repo>.steps.holder.<id>` beside the journal until `settle`, or until its process
-    /// ends, when the kernel lets it go. Before it judges, `begin` closes with `Retracted`
-    /// each open atomic intent whose free lock has completed that window: its writer settled
-    /// it `Unknown`, ended without settling, or was an agh before holders. That window is the
-    /// time a request left unanswered is given to land late. Every atomic batch is a
-    /// compare-and-swap on each ref's exact old id, so a write begun after it, a resend of
-    /// the same batch included, is refused at GitHub where the old write landed, and every
-    /// caller reads what landed before it sends again.
     ///
     /// Before either, it refuses a draft whose `key` or `target_commitish` `Redactor::shapes`
     /// would change. The journal passes every string through the Redactor, and `latest`,
@@ -386,14 +499,25 @@ pub trait IntentStore: Send + Sync {
     /// The journal's refusals. A damaged journal is Refused `journal_fault`, as `open`'s,
     /// because a record past the fault may have settled or closed the intent.
     fn latest(&self, op: WriteOp, key: &str) -> Result<Option<IntentView>>;
-    /// Whether the open intent `view` stops a `begin` of its op and key, as a dry run judges
-    /// it: an open one does, except one the next `begin` closes (`Journal::closable`).
-    ///
+    /// A dry run cannot close an open intent: only the next real writer's origin
+    /// reads can establish BEFORE or AFTER.
     /// # Errors
-    ///
-    /// The store's clock.
+    /// A custom store's read failure.
     fn stops(&self, view: &IntentView) -> Result<bool> {
         Ok(view.open)
+    }
+
+    /// Close an abandoned intent whose batch was read unchanged from origin.
+    fn retract(&self, _id: &IntentId) -> Result<()> {
+        Err(Error::local(
+            "this intent store cannot retract an abandoned write",
+        ))
+    }
+    /// Bind a native child durably before its entry barrier is released.
+    fn writer_child(&self, _id: &IntentId, _pid: u32) -> Result<()> {
+        Err(Error::local(
+            "this intent store cannot record a native writer",
+        ))
     }
 }
 
@@ -412,18 +536,7 @@ pub struct Journal {
     dir_synced: AtomicBool,
     /// Under a tape: the records this run appended, at their steps; `None` for a file journal.
     taped: Option<Mutex<Vec<(u64, JournalRecord)>>>,
-    /// The holder locks of the atomic ref intents this value began and has not settled, by
-    /// intent id (`IntentStore::begin`).
-    holders: Mutex<HashMap<String, HolderLock>>,
 }
-
-/// What holds an atomic intent's holder file while its writer may send: the file's
-/// `flock`, which the kernel lets go when the process ends.
-#[cfg(unix)]
-type HolderLock = aterm_uds::private_file::PrivateLock;
-/// Off unix no file journal is made, so nothing holds a holder file.
-#[cfg(not(unix))]
-type HolderLock = ();
 
 impl Journal {
     /// The journal of `slug` under `dirs.journal()`: `<owner>/<repo>.steps`, owner and repo
@@ -459,7 +572,6 @@ impl Journal {
                 dirs: Some(dirs.clone()),
                 dir_synced: AtomicBool::new(false),
                 taped: None,
-                holders: Mutex::new(HashMap::new()),
             })
         }
         #[cfg(not(unix))]
@@ -485,7 +597,6 @@ impl Journal {
             dirs: None,
             dir_synced: AtomicBool::new(false),
             taped: Some(Mutex::new(Vec::new())),
-            holders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -604,9 +715,6 @@ impl Journal {
         if retracted.is_ok() || moot {
             self.clear_stale(id);
         }
-        if retracted.is_ok() {
-            self.drop_holder_file(id);
-        }
         retracted.map(|_| ())
     }
 
@@ -627,324 +735,16 @@ impl Journal {
         }
     }
 
-    /// Whether a `begin` of `op` holds a holder lock: an atomic ref intent in a file journal
-    /// (a taped journal keeps no file).
-    fn holds_writer(&self, op: WriteOp) -> bool {
-        cfg!(unix) && op == WriteOp::RefUpdateAtomic && self.taped.is_none()
-    }
-
-    /// Whether the next atomic `begin` closes the intent `view`, rather than stopping on it
-    /// (`IntentStore::begin` says when): an open `WriteOp::RefUpdateAtomic` intent of this
-    /// file journal whose writer has been recorded retired or first observed free for at least
-    /// `git::GRANT_MAX`. No begin timestamp alone establishes that the writer has ended.
-    /// `agh intent show` and `list` print it as `closable`, and a write that waits on an
-    /// intent (verify land, the release cutter) stops waiting once it reads true.
-    ///
+    /// Whether this open atomic intent can be reconciled by the next writer.
+    /// This local observation permits origin reads, never closure by itself.
+    /// Legacy intents and unknown process evidence remain held.
     /// # Errors
-    ///
-    /// The clock's, or the free observation could not be safely persisted.
+    /// None; unknown evidence answers false.
     pub fn closable(&self, view: &IntentView) -> Result<bool> {
-        if !view.open || !self.holds_writer(view.intent.op) {
-            return Ok(false);
-        }
-        #[cfg(unix)]
-        {
-            self.free_for_window(view)
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(false)
-        }
-    }
-
-    /// Intent `id`'s holder file beside the journal: its directory and `<repo>.steps.holder.<id>`.
-    #[cfg(unix)]
-    fn holder_file(&self, id: &IntentId) -> (PathBuf, String) {
-        let dir = self
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let name = self
-            .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        (dir, format!("{name}.holder.{id}"))
-    }
-
-    /// A legacy intent with no holder gets a distinct first-free fence, never a recreated
-    /// holder file. Closed-intent cleanup removes both names when their locks are free.
-    #[cfg(unix)]
-    fn free_file(&self, id: &IntentId) -> (PathBuf, String) {
-        let (dir, name) = self.holder_file(id);
-        (dir, format!("{name}.free"))
-    }
-
-    #[cfg(unix)]
-    fn holder_io(&self, dir: &Path, name: &str, error: std::io::Error) -> Error {
-        Error::local(format!(
-            "the holder fence {} could not be read or written: {error}",
-            dir.join(name).display()
-        ))
-        .with_repo(self.repo())
-    }
-
-    /// A lock acquired on an unlinked old inode is not custody of its current name.
-    #[cfg(unix)]
-    fn named_holder(dir: &Path, name: &str, lock: &HolderLock) -> std::io::Result<bool> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let held = lock.file().metadata()?;
-        let named = match std::fs::symlink_metadata(dir.join(name)) {
-            Ok(named) => named,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
-        Ok(named.is_file()
-            && held.nlink() == 1
-            && (held.dev(), held.ino()) == (named.dev(), named.ino()))
-    }
-
-    /// Change only the bytes of the held inode; a partial write is not a phase record.
-    #[cfg(unix)]
-    fn write_holder(
-        dir: &Path,
-        name: &str,
-        lock: &HolderLock,
-        bytes: &[u8],
-    ) -> std::io::Result<()> {
-        use std::io::{Seek as _, SeekFrom, Write as _};
-
-        if !Self::named_holder(dir, name, lock)? {
-            return Err(std::io::Error::other(
-                "holder path no longer names its lock",
-            ));
-        }
-        let mut file = lock.file();
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(bytes)?;
-        aterm_durable::durable_data(file)?;
-        aterm_durable::durable_dir(dir)?;
-        if !Self::named_holder(dir, name, lock)? {
-            return Err(std::io::Error::other(
-                "holder path changed while recording its phase",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Only an exact retirement record supplies a time. Active, old empty, oversized or
-    /// partially written files require a fresh full first-free window.
-    #[cfg(unix)]
-    fn retired_at(lock: &HolderLock) -> std::io::Result<Option<u64>> {
-        use std::io::{Read as _, Seek as _, SeekFrom};
-
-        let mut file = lock.file();
-        file.seek(SeekFrom::Start(0))?;
-        let mut bytes = Vec::new();
-        file.take(HOLDER_BYTES_MAX + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > HOLDER_BYTES_MAX {
-            return Ok(None);
-        }
-        let Some(text) = std::str::from_utf8(&bytes)
-            .ok()
-            .and_then(|text| text.strip_prefix("retired-v1 "))
-            .and_then(|text| text.strip_suffix('\n'))
-        else {
-            return Ok(None);
-        };
-        Ok(text.parse::<u64>().ok().filter(|at| at.to_string() == text))
-    }
-
-    #[cfg(unix)]
-    fn remove_held(dir: &Path, name: &str, lock: &HolderLock) -> std::io::Result<()> {
-        if Self::named_holder(dir, name, lock)? {
-            aterm_uds::private_file::remove_private(dir, name)?;
-        }
-        Ok(())
-    }
-
-    /// Judge while retaining the same free lock. The integer wall clock rounds down, so the
-    /// persisted boundary rounds conservatively up by one second; rollback/future times do
-    /// not mature early, and a malformed record never falls back to the begin timestamp.
-    #[cfg(unix)]
-    fn free_stamp(
-        &self,
-        view: &IntentView,
-        dir: &Path,
-        name: &str,
-        lock: &HolderLock,
-    ) -> Result<bool> {
-        let now = self.fx.wall_secs()?;
-        let io = |error| self.holder_io(dir, name, error);
-        if !Self::named_holder(dir, name, lock).map_err(io)? {
-            return Ok(false);
-        }
-        let Some(at) = Self::retired_at(lock).map_err(io)? else {
-            let bytes = format!("retired-v1 {}\n", now.saturating_add(1));
-            Self::write_holder(dir, name, lock, bytes.as_bytes()).map_err(io)?;
-            return Ok(false);
-        };
-        let since = at.max(view.intent.at_secs);
-        Ok(now
-            .checked_sub(since)
-            .is_some_and(|age| age >= crate::git::GRANT_MAX.as_secs()))
-    }
-
-    #[cfg(unix)]
-    fn free_for_window(&self, view: &IntentView) -> Result<bool> {
-        use aterm_uds::private_file::PrivateLock;
-
-        let (dir, name) = self.holder_file(&view.intent.id);
-        match PrivateLock::take_existing(&dir, &name, PROBE_WAIT, "held") {
-            Ok(Some(lock)) => return self.free_stamp(view, &dir, &name, &lock),
-            Ok(None) => {}
-            Err(_) => return Ok(false),
-        }
-        let (dir, fence) = self.free_file(&view.intent.id);
-        let lock = match PrivateLock::take_private(&dir, &fence, PROBE_WAIT, "held") {
-            Ok(lock) => lock,
-            Err(_) => return Ok(false),
-        };
-        // Do not judge a legacy absence that acquired a real writer while this probe waited.
-        match std::fs::symlink_metadata(dir.join(&name)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            _ => return Ok(false),
-        }
-        self.free_stamp(view, &dir, &fence, &lock)
-    }
-
-    /// Take intent `id`'s holder lock, made fresh, and keep it in this value until
-    /// [`Self::release`] or the process's end.
-    ///
-    /// # Errors
-    ///
-    /// could_not_run, `Sub::Local`, why `the holder lock {path} could not be taken: {e}`.
-    #[cfg(unix)]
-    fn hold(&self, id: &IntentId) -> Result<()> {
-        let (dir, name) = self.holder_file(id);
-        let lock =
-            aterm_uds::private_file::PrivateLock::take_private(&dir, &name, Duration::ZERO, "held")
-                .map_err(|e| {
-                    Error::local(format!(
-                        "the holder lock {} could not be taken: {e}",
-                        dir.join(&name).display()
-                    ))
-                    .with_repo(self.repo())
-                })?;
-        // A failed earlier begin can reuse this deterministic id. Its old retirement must
-        // never authorize closing the new writer, even when that writer later crashes.
-        Self::write_holder(&dir, &name, &lock, b"active-v1\n")
-            .map_err(|error| self.holder_io(&dir, &name, error))?;
-        let (fence_dir, fence) = self.free_file(id);
-        if let Some(free) = aterm_uds::private_file::PrivateLock::take_existing(
-            &fence_dir, &fence, PROBE_WAIT, "held",
-        )
-        .map_err(|error| self.holder_io(&fence_dir, &fence, error))?
-        {
-            Self::remove_held(&fence_dir, &fence, &free)
-                .map_err(|error| self.holder_io(&fence_dir, &fence, error))?;
-        }
-        self.holders.lock_or_recover().insert(id.to_string(), lock);
-        Ok(())
-    }
-
-    /// Off unix no file journal is made, so no `begin` holds a lock.
-    #[cfg(not(unix))]
-    fn hold(&self, id: &IntentId) -> Result<()> {
-        let _ = (id, &self.holders);
-        Ok(())
-    }
-
-    /// Let intent `id`'s holder lock go: its writer sends nothing more. A successfully closed
-    /// intent loses its file; Unknown and failed settlements retain its retirement boundary.
-    /// If that best-effort stamp fails, its active/partial bytes require a fresh first-free
-    /// window rather than allowing the begin time to authorize closure.
-    #[cfg(unix)]
-    fn release(&self, id: &IntentId, closed: bool) {
-        let Some(lock) = self.holders.lock_or_recover().remove(id.as_str()) else {
-            return;
-        };
-        let (dir, name) = self.holder_file(id);
-        if closed {
-            let _ = Self::remove_held(&dir, &name, &lock);
-        } else if let Ok(now) = self.fx.wall_secs() {
-            let bytes = format!("retired-v1 {}\n", now.saturating_add(1));
-            let _ = Self::write_holder(&dir, &name, &lock, bytes.as_bytes());
-        }
-        drop(lock);
-    }
-
-    /// Off unix no `begin` holds a lock, so none is let go.
-    #[cfg(not(unix))]
-    fn release(&self, id: &IntentId, closed: bool) {
-        let _ = (id, closed);
-    }
-
-    /// Remove a journal-proven closed intent's holder and legacy fence only while retaining
-    /// their existing free locks. Neither a missing file nor a stale snapshot recreates one.
-    #[cfg(unix)]
-    fn drop_holder_file(&self, id: &IntentId) {
-        if self.taped.is_some() {
-            return;
-        }
-        use aterm_uds::private_file::PrivateLock;
-
-        let (dir, name) = self.holder_file(id);
-        let lock = match PrivateLock::take_existing(&dir, &name, PROBE_WAIT, "held") {
-            Ok(lock) => lock,
-            Err(_) => return,
-        };
-        if let Some(lock) = &lock {
-            let _ = Self::remove_held(&dir, &name, lock);
-        }
-        let (dir, name) = self.free_file(id);
-        if let Ok(Some(free)) = PrivateLock::take_existing(&dir, &name, PROBE_WAIT, "held") {
-            let _ = Self::remove_held(&dir, &name, &free);
-        }
-    }
-
-    /// Off unix no holder file is made.
-    #[cfg(not(unix))]
-    fn drop_holder_file(&self, id: &IntentId) {
-        let _ = id;
-    }
-
-    /// Close with `Retracted` each open atomic intent of `draft`'s key that the next `begin`
-    /// would close ([`Self::closable`]). Sweep free holder files/fences of journal-proven closed
-    /// atomic intents too. No unknown or unrelated filename is cleanup authority.
-    ///
-    /// # Errors
-    ///
-    /// `read`'s, the clock's and `retract`'s, except a retract that finds its intent closed
-    /// meanwhile. A `JournalEnd::Fault` authorizes neither closure nor cleanup here:
-    /// `begin` refuses it itself.
-    fn close_finished(&self, draft: &IntentDraft) -> Result<()> {
-        let (records, end) = self.read()?;
-        if matches!(end, JournalEnd::Fault { .. }) {
-            return Ok(());
-        }
-        let mut finished = Vec::new();
-        for view in views_filtered(&records, |i| i.op == WriteOp::RefUpdateAtomic) {
-            if !view.open {
-                self.drop_holder_file(&view.intent.id);
-            } else if view.intent.op == draft.op
-                && view.intent.key == draft.key
-                && self.closable(&view)?
-            {
-                finished.push(view.intent.id);
-            }
-        }
-        for id in finished {
-            match self.retract(&id) {
-                Ok(()) => {}
-                Err(e) if matches!(e.sub, Sub::NotOpen { .. }) => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        Ok(view.open
+            && view.intent.op == WriteOp::RefUpdateAtomic
+            && !view.intent.refs.is_empty()
+            && view.intent.writer.as_ref().is_some_and(IntentWriter::dead))
     }
 
     /// Append the record `build` makes from the records already there and the step it will
@@ -974,8 +774,8 @@ impl Journal {
         let record = build(&records, step)?;
         refuse_shaped(&record)?;
         let body = encode(&record);
-        if body.len() > RECORD_MAX {
-            return Err(too_long(body.len(), 0));
+        if body.len() > record_max(&record) {
+            return Err(too_long(body.len(), 0, record_max(&record)));
         }
         reads_back(&record, 0, step, &body)?;
         let Some(taped_step) = self.fx.emit_journal(&body)? else {
@@ -1061,8 +861,10 @@ impl Journal {
         let record = build(&scan.records, step)?;
         refuse_shaped(&record)?;
         let body = encode(&record);
-        if body.len() > RECORD_MAX {
-            return Err(too_long(body.len(), scan.valid_len).with_repo(self.repo()));
+        if body.len() > record_max(&record) {
+            return Err(
+                too_long(body.len(), scan.valid_len, record_max(&record)).with_repo(self.repo())
+            );
         }
         reads_back(&record, scan.valid_len, step, &body).map_err(|e| e.with_repo(self.repo()))?;
         let frame_len =
@@ -1070,9 +872,10 @@ impl Journal {
         let worst =
             u64::try_from(FRAME_OVERHEAD.saturating_add(RECORD_MAX)).map_err(|_| self.too_far())?;
         let end = scan.valid_len.saturating_add(frame_len);
-        // Judged by the file's length and the largest frame, not this record's own: once one
-        // Intent is refused, every later one is, whatever its size.
-        let near = scan.valid_len.saturating_add(worst) > JOURNAL_MAX - JOURNAL_RESERVE;
+        // Ordinary records share their worst-case bound. A larger atomic batch
+        // must also leave the closing reserve intact.
+        let near =
+            scan.valid_len.saturating_add(worst.max(frame_len)) > JOURNAL_MAX - JOURNAL_RESERVE;
         if end > JOURNAL_MAX || (near && !may_use_reserve(&record, &scan.records)) {
             return Err(self.full(scan.valid_len));
         }
@@ -1353,6 +1156,36 @@ impl Journal {
 }
 
 impl IntentStore for Journal {
+    fn retract(&self, id: &IntentId) -> Result<()> {
+        Journal::retract(self, id)
+    }
+
+    fn writer_child(&self, id: &IntentId, pid: u32) -> Result<()> {
+        // A taped journal has no durable native writer and replay starts no child.
+        if self.taped.is_some() {
+            return Ok(());
+        }
+        let child = WriterProcess::read(pid)
+            .ok_or_else(|| Error::local("native writer's process start cannot be read"))?;
+        let at_secs = self.fx.wall_secs()?;
+        self.append_with(|records, _| {
+            let view = view_of(records, id).ok_or_else(|| Error::local(self.not_in(id)))?;
+            if !view.open
+                || !matches!(&view.intent.writer, Some(IntentWriter::Tracked { .. }))
+                || view.intent.writer.as_ref().map(IntentWriter::frontend)
+                    != WriterProcess::read(std::process::id())
+            {
+                return Err(Error::local("native writer no longer owns its open intent"));
+            }
+            Ok(JournalRecord::WriterChild {
+                intent: id.clone(),
+                child,
+                at_secs,
+            })
+        })?;
+        Ok(())
+    }
+
     fn begin(&self, draft: &IntentDraft) -> Result<IntentId> {
         let op = draft.op.slug();
         if draft.slug != self.slug {
@@ -1378,14 +1211,13 @@ impl IntentStore for Journal {
             }
         }
         let at_secs = self.fx.wall_secs()?;
-        let holds = self.holds_writer(draft.op);
-        if holds {
-            // An ended writer's intent must not stop this batch; closing it here, before the
-            // locked judging below, is sound: an ended writer stays ended.
-            self.close_finished(draft)?;
-        }
+        let writer = match (&draft.writer, &self.taped) {
+            (Some(writer), _) => Some(writer.clone()),
+            (None, None) => Some(IntentWriter::current()?),
+            (None, Some(_)) => None,
+        };
         let mut minted = None;
-        let began = self.append_with(|records, step| {
+        self.append_with(|records, step| {
             let of_key = views_filtered(records, |i| i.op == draft.op && i.key == draft.key);
             if draft.op != WriteOp::RefCreate
                 && let Some(open) = of_key.iter().rev().find(|v| v.open)
@@ -1408,11 +1240,6 @@ impl IntentStore for Journal {
                 });
             }
             let id = mint(step, &draft.slug, draft.op, &draft.key);
-            if holds {
-                // Under the journal's lock and before the intent is durable, so no `begin`
-                // ever reads this intent without its holder file.
-                self.hold(&id)?;
-            }
             minted = Some(id.clone());
             Ok(JournalRecord::Intent(Box::new(Intent {
                 id,
@@ -1425,20 +1252,17 @@ impl IntentStore for Journal {
                 target_commitish: draft.target_commitish.clone(),
                 body_digest: draft.body_digest.clone(),
                 grant: draft.grant.clone(),
+                writer: writer.clone(),
+                refs: draft.refs.clone(),
                 at_secs,
             })))
-        });
-        if let (Err(_), Some(id)) = (&began, &minted) {
-            // No intent of this id is journaled, so its holder file has nothing to hold.
-            self.release(id, true);
-        }
-        began?;
+        })?;
         minted.ok_or_else(|| Error::local("the journal appended an intent and minted no id"))
     }
 
     fn settle(&self, id: &IntentId, outcome: &Settled) -> Result<()> {
         let outcome = bounded(outcome);
-        let settled = self.append_with(|records, _| {
+        self.append_with(|records, _| {
             let Some(view) = view_of(records, id) else {
                 return Err(Error::usage(self.not_in(id)).with_repo(self.repo()));
             };
@@ -1452,12 +1276,7 @@ impl IntentStore for Journal {
                 intent: id.clone(),
                 outcome: outcome.clone(),
             })
-        });
-        // The writer's one attempt is over whether or not its outcome was recorded. Where it
-        // was not, the holder file stays with its lock free, so the open intent reads as an
-        // ended writer's.
-        self.release(id, settled.is_ok() && settles_closed(&outcome));
-        settled?;
+        })?;
         if settles_closed(&outcome) {
             self.clear_stale(id);
         }
@@ -1476,7 +1295,6 @@ impl IntentStore for Journal {
         })?;
         if found.is_some() {
             self.clear_stale(id);
-            self.drop_holder_file(id);
         }
         Ok(())
     }
@@ -1486,9 +1304,10 @@ impl IntentStore for Journal {
         if let JournalEnd::Fault { at, why } = &end {
             return Err(self.fault(*at, why));
         }
-        Ok(open_intents_filtered(&records, |_| true)
+        Ok(views_filtered(&records, |_| true)
             .into_iter()
-            .cloned()
+            .filter(|v| v.open)
+            .map(|v| v.intent)
             .collect())
     }
 
@@ -1504,10 +1323,6 @@ impl IntentStore for Journal {
             return Ok(None);
         };
         Ok(view_of(&records, id))
-    }
-
-    fn stops(&self, view: &IntentView) -> Result<bool> {
-        Ok(view.open && !self.closable(view)?)
     }
 }
 
@@ -1531,9 +1346,19 @@ struct Scan {
     created: bool,
 }
 
-/// The longest body a record may have: agh's records are under 4 KiB (design §6.8).
+/// The ordinary-record body bound; atomic intents also retain a bounded full batch.
 #[cfg(unix)]
 const RECORD_MAX: usize = 4096;
+
+/// 128 refs of up to 1024 bytes, two OIDs and bounded JSON escaping.
+#[cfg(unix)]
+fn record_max(record: &JournalRecord) -> usize {
+    if matches!(record, JournalRecord::Intent(i) if i.op == WriteOp::RefUpdateAtomic) {
+        1024 * 1024
+    } else {
+        RECORD_MAX
+    }
+}
 /// A frame's bytes before its body: the frame header and the step header.
 #[cfg(unix)]
 const FRAME_OVERHEAD: usize = astream_wire::frame::HEADER_SIZE + astream_wire::steps::STEP_HEADER;
@@ -1549,9 +1374,9 @@ fn missing(path: &Path) -> bool {
 
 /// Refused `journal_fault` for a body of `n` bytes, at `at`.
 #[cfg(unix)]
-fn too_long(n: usize, at: u64) -> Error {
+fn too_long(n: usize, at: u64, max: usize) -> Error {
     Error::refused(format!(
-        "a record of {n} bytes: agh's records are under 4 KiB"
+        "a record of {n} bytes exceeds agh's {max}-byte record bound"
     ))
     .with_sub(Sub::JournalFault { at })
 }
@@ -1587,6 +1412,13 @@ fn refuse_shaped(record: &JournalRecord) -> Result<()> {
             )));
         }
     }
+    for update in &intent.refs {
+        if shaped(&update.reference) {
+            return Err(Error::usage(
+                "an atomic ref is shaped like a credential; agh journals it as written or not at all",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1608,6 +1440,7 @@ fn reads_back(record: &JournalRecord, at: u64, step: u64, body: &[u8]) -> Result
 const fn type_name(record: &JournalRecord) -> &'static str {
     match record {
         JournalRecord::Intent(_) => "intent",
+        JournalRecord::WriterChild { .. } => "observed",
         JournalRecord::Settled { .. } => "settled",
         JournalRecord::Observed { .. } => "observed",
         JournalRecord::Retracted { .. } => "retracted",
@@ -1629,7 +1462,9 @@ fn may_use_reserve(record: &JournalRecord, records: &[(u64, JournalRecord)]) -> 
             found: Some(_),
             ..
         } => (intent, true),
-        JournalRecord::Intent(_) | JournalRecord::Observed { found: None, .. } => return false,
+        JournalRecord::Intent(_)
+        | JournalRecord::WriterChild { .. }
+        | JournalRecord::Observed { found: None, .. } => return false,
     };
     view_of(records, intent).is_some_and(|v| {
         if while_open {
@@ -1726,7 +1561,8 @@ const fn settles_closed(settled: &Settled) -> bool {
 }
 
 /// Every open intent matching `keep`, in step order, borrowed from `records` without cloning
-/// closed intents or outcome records.
+/// closed intents or outcome records. Unix only, as its caller (`Journal::raise_stale`) is.
+#[cfg(unix)]
 fn open_intents_filtered<'a>(
     records: &'a [(u64, JournalRecord)],
     keep: impl Fn(&Intent) -> bool,
@@ -1760,7 +1596,7 @@ fn open_intents_filtered<'a>(
                     *open = false;
                 }
             }
-            JournalRecord::Observed { found: None, .. } => {}
+            JournalRecord::Observed { found: None, .. } | JournalRecord::WriterChild { .. } => {}
             JournalRecord::Retracted { intent, .. } => {
                 if let Some((_, _, open)) = index.get(intent).and_then(|&i| tracked.get_mut(i)) {
                     *open = false;
@@ -1815,6 +1651,13 @@ fn views_filtered(
                     view.observed.push((*found, *at_secs));
                 }
             }
+            JournalRecord::WriterChild { intent, child, .. } => {
+                if let Some(view) = index.get(intent).and_then(|&i| views.get_mut(i))
+                    && let Some(IntentWriter::Tracked { git, .. }) = &mut view.intent.writer
+                {
+                    *git = Some(*child);
+                }
+            }
             JournalRecord::Retracted { intent, at_secs } => {
                 if let Some(view) = index.get(intent).and_then(|&i| views.get_mut(i)) {
                     view.retracted.get_or_insert(*at_secs);
@@ -1854,6 +1697,13 @@ pub(crate) fn view_of(records: &[(u64, JournalRecord)], id: &IntentId) -> Option
             } if intent == id => {
                 if let Some(view) = &mut view {
                     view.observed.push((*found, *at_secs));
+                }
+            }
+            JournalRecord::WriterChild { intent, child, .. } if intent == id => {
+                if let Some(view) = &mut view
+                    && let Some(IntentWriter::Tracked { git, .. }) = &mut view.intent.writer
+                {
+                    *git = Some(*child);
                 }
             }
             JournalRecord::Retracted { intent, at_secs } if intent == id => {
@@ -2019,6 +1869,37 @@ pub fn encode(record: &JournalRecord) -> Vec<u8> {
             object.insert("request".into(), text(&intent.request));
             object.insert("slug".into(), text(&intent.slug.key()));
             object.insert("target_commitish".into(), maybe(&intent.target_commitish));
+            if let Some(writer) = &intent.writer {
+                object.insert(
+                    "writer".into(),
+                    aterm_json::to_value(writer).expect("writer JSON"),
+                );
+            }
+            if !intent.refs.is_empty() {
+                object.insert(
+                    if matches!(&intent.writer, Some(IntentWriter::Legacy { .. })) {
+                        "batch"
+                    } else {
+                        "refs"
+                    }
+                    .into(),
+                    aterm_json::to_value(&intent.refs).expect("ref batch JSON"),
+                );
+            }
+        }
+        JournalRecord::WriterChild {
+            intent,
+            child,
+            at_secs,
+        } => {
+            object.insert("type".into(), Value::from("observed"));
+            object.insert("intent".into(), Value::from(intent.as_str()));
+            object.insert("found".into(), Value::Null);
+            object.insert("at_secs".into(), Value::from(*at_secs));
+            object.insert(
+                "writer_child".into(),
+                aterm_json::to_value(child).expect("child JSON"),
+            );
         }
         JournalRecord::Settled { intent, outcome } => {
             object.insert("type".into(), Value::from("settled"));
@@ -2110,6 +1991,8 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
                 request: fields.take_string("request")?,
                 target_commitish: fields.take_maybe_string("target_commitish")?,
                 body_digest: fields.take_maybe_string("body_digest")?,
+                writer: fields.optional("writer")?,
+                refs: fields.ref_batch()?,
                 grant: fields.take_maybe_string("grant")?,
                 at_secs: fields.number("at_secs")?,
             })))
@@ -2136,6 +2019,15 @@ pub fn decode(at: u64, step: u64, body: &[u8]) -> Result<JournalRecord> {
             };
             Ok(JournalRecord::Settled { intent, outcome })
         }
+        "observed" if fields.object.contains_key("writer_child") => {
+            Ok(JournalRecord::WriterChild {
+                intent: fields.intent()?,
+                child: fields
+                    .optional("writer_child")?
+                    .ok_or_else(|| fault("missing child".into()))?,
+                at_secs: fields.number("at_secs")?,
+            })
+        }
         "observed" => Ok(JournalRecord::Observed {
             intent: fields.intent()?,
             found: fields.maybe_number("found")?,
@@ -2159,9 +2051,33 @@ struct Fields<'a, F: Fn(String) -> Error> {
 }
 
 impl<'a, F: Fn(String) -> Error> Fields<'a, F> {
+    /// Both historical and current v1 names carry the complete exact ref batch.
+    /// Two names in one record are ambiguous even when their values happen to agree.
+    fn ref_batch(&mut self) -> Result<Vec<crate::github::refs::RefUpdate>> {
+        let refs = self.optional("refs")?;
+        let batch = self.optional("batch")?;
+        match (refs, batch) {
+            (Some(_), Some(_)) => Err((self.fault)(
+                "both refs and historical batch are present".into(),
+            )),
+            (Some(refs), None) | (None, Some(refs)) => Ok(refs),
+            (None, None) => Ok(Vec::new()),
+        }
+    }
+
     /// `{key} is missing or not a {kind}`.
     fn mistyped(&self, key: &str, kind: &str) -> Error {
         (self.fault)(format!("{key} is missing or not a {kind}"))
+    }
+
+    /// An additive v1 key, absent in legacy records.
+    fn optional<T: serde::de::DeserializeOwned>(&mut self, key: &str) -> Result<Option<T>> {
+        match self.object.remove(key) {
+            None => Ok(None),
+            Some(value) => aterm_json::from_value(value)
+                .map(Some)
+                .map_err(|_| self.mistyped(key, "valid recovery metadata")),
+        }
     }
 
     /// A borrowed string.

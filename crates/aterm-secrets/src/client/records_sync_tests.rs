@@ -11,7 +11,7 @@ use crate::membership_log::{
     Body, Draft, Entrant, Evidence, Log, MemberId, Record, RecordId, decode_records,
     encode_records, with_kind_code,
 };
-use crate::server::RECORDS_PULLS_AT_ONCE;
+use crate::pull_slots::RECORDS_PULLS_AT_ONCE;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -1720,6 +1720,7 @@ fn a_server_one_pass_behind_this_mac_keeps_what_it_could_not_take() {
 /// before the pass said what it left untaken) moves m7's seat ("a member whose server holds a
 /// removal it cannot take let the new key in: Let { bundle: SecretBytes(<8814 bytes redacted>),
 /// how: Seat { label: \"m7\" }, signed: 4 }").
+#[cfg(unix)]
 #[test]
 fn a_member_whose_server_holds_records_it_cannot_take_lets_no_key_in_by_proof() {
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
@@ -2290,6 +2291,7 @@ fn a_records_pass_reads_at_most_two_peers_long_answers_whole_at_once() {
 /// went dark moves to its new key), where m22's only answering server is a host serving m22's own
 /// log that states `bound` (`None`: a server before the fence), m22's crossed mark stored where
 /// `crossed`.
+#[cfg(unix)]
 fn proof_through_host(crossed: bool, bound: Option<crate::crossing::RecordsBound>) -> Readmit {
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
 
@@ -2367,6 +2369,7 @@ fn proof_through_host(crossed: bool, bound: Option<crate::crossing::RecordsBound
 /// turn on the bound alone. An uncrossed member's refusal is the pass's freshness itself: with
 /// `RecordsPass::fresh` ignoring `unstated` (the gate before this fix, which held only crossed
 /// members), that member lets the key in.
+#[cfg(unix)]
 #[test]
 fn a_member_whose_only_server_states_no_bound_lets_no_key_in_by_proof() {
     for crossed in [true, false] {
@@ -2493,6 +2496,10 @@ fn numeric_incompatible_source_never_changes_records_or_crossing_state() {
 
 /// Both branches fit an uncrossed server, but their union crosses the legacy bound.
 /// Only a server that can follow that union can make the resulting pass fresh.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn merging_uncrossed_branches_requires_a_source_compatible_with_the_result() {
     use crate::crossing::{RecordsBound, fixture::RAISED};
@@ -2567,6 +2574,10 @@ fn merging_uncrossed_branches_requires_a_source_compatible_with_the_result() {
 /// CONTROL (MUTANT `Faults::mark_after_take`, dying between): the Mac holds the crossed server's
 /// record with no mark, which it would then post to a server before the fence as an uncrossed
 /// Mac's.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_uncrossed_mac_stores_its_mark_before_it_holds_a_crossed_servers_records() {
     use crate::crossing::{Faults, RecordsBound};
@@ -2678,6 +2689,10 @@ fn a_crossed_servers_answer_of_records_the_mac_holds_stores_no_mark() {
 /// answer that brings the parent with it is taken, after the mark.
 /// CONTROL (MUTANT `Faults::mark_on_waiting`, the rule before this fix): the crossed answer
 /// stores the mark, and the Mac holds the record waiting.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_crossed_servers_answer_of_records_that_only_wait_stores_no_mark() {
     use crate::crossing::{Faults, RecordsBound};
@@ -2747,6 +2762,10 @@ fn a_crossed_servers_answer_of_records_that_only_wait_stores_no_mark() {
 /// one that failed, and the pass, with no other source, fails.
 ///
 /// CONTROL (in the test): the same server stating its bound is taken.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_crossed_mac_takes_nothing_from_a_server_that_states_no_bound() {
     use crate::crossing::{Faults, RecordsBound};

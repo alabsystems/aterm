@@ -189,31 +189,12 @@ fn address_birth(pk: &str, addr: &str) -> Result<Vec<Change>> {
     ])
 }
 
-/// The service a provider's observed CLI login runs, as the importer names it.
-fn service(provider: &str) -> &'static str {
-    match provider {
-        keys::ANTHROPIC => "claude-code",
-        keys::OPENAI => "codex",
-        keys::GOOGLE => "agy",
-        keys::META => "muse-code",
-        keys::KIMI => "kimi-code",
-        _ => "grok",
-    }
-}
-
 /// An observed account's birth: its provider, realm, login address (none where the address's one
-/// row is not live, [`matched`]), `status=active`, its default label, the service and `row=live`,
-/// every cell automatic. The label is left empty
-/// (which reads as the default) where `taken`, the labels live accounts and this pass's births
-/// hold, already holds it: `label` is unique among live accounts, and the rules every write
-/// passes would refuse the birth, and with it every later pass that plans it again
-/// (`typed::check::unique_clash`). A label it writes joins `taken`.
-fn account_birth(
-    pk: &str,
-    realm: &str,
-    login: Option<&str>,
-    taken: &mut BTreeSet<String>,
-) -> Result<Vec<Change>> {
+/// row is not live, [`matched`]), `status=pending` and `row=live`, every cell automatic and in
+/// one record. These are the account's Birth columns (`registry::ACCOUNT`, version 2): every
+/// other cell is the owner's, and the authority rules hold an automatic one inert on every read,
+/// so the birth names no label and no service, and only the owner makes the account `active`.
+fn account_birth(pk: &str, realm: &str, login: Option<&str>) -> Result<Vec<Change>> {
     let provider = keys::provider_of_realm(realm)
         .ok_or_else(|| crate::Error::new("account-obs: a realm no provider runs"))?;
     let mut out = vec![
@@ -224,36 +205,10 @@ fn account_birth(
         out.push(automatic(&ACCOUNT, pk, "login", Value::from(login))?);
     }
     out.extend([
-        automatic(&ACCOUNT, pk, "status", Value::from("active"))?,
-        cell::change(
-            &ACCOUNT,
-            CellKey {
-                pk,
-                col: "services",
-                elem: Some(service(provider)),
-            },
-            &CellValue::automatic(ACCOUNT.version, Value::Bool(true)),
-        )?,
+        automatic(&ACCOUNT, pk, "status", Value::from("pending"))?,
         automatic(&ACCOUNT, pk, LIFECYCLE, Value::from("live"))?,
     ]);
-    if let Ok(label) = keys::default_account_label(realm, pk)
-        && taken.insert(label.clone())
-    {
-        out.push(automatic(&ACCOUNT, pk, "label", Value::from(label))?);
-    }
     Ok(out)
-}
-
-/// Every label any live account's `label` cell holds, each candidate of a conflicted one too.
-fn live_labels(accounts: &cell::Projection) -> BTreeSet<String> {
-    accounts
-        .rows
-        .values()
-        .filter(|row| row.live())
-        .filter_map(|row| row.fields.get("label"))
-        .flat_map(cell::Field::candidates)
-        .filter_map(|candidate| candidate.value.x.as_str().map(str::to_owned))
-        .collect()
 }
 
 /// The tab count as the row's change rule reads it: none, one, or two or more.
@@ -341,15 +296,16 @@ fn matched(sighting: &Sighting, known: &Known) -> Result<Matched> {
     }
     let pk = keys::account_pk(realm, &keys::claims_email(None, Some(&email))?)?;
     // A row at the account's own key is this account, whatever its cells say: the sighting marks
-    // it and births nothing. A birth would be appended after the cells this Mac holds of it, and
-    // its automatic cells would replace them (`documents::apply` keeps no candidate a write
-    // observed): `row=live`, `status=active` and the default label over the owner's retire, end,
-    // merge or lock, or over a live row's status and label. A live row reaches here when no live
-    // row at the realm says the address: one born without a login while its address row was
-    // retired (below), whose address the owner has since made live again, or one whose login
-    // the owner pointed elsewhere. The row keeps the cells it has; observation writes no login
-    // onto a row it did not just give birth to. A machine's birth never revives an ended row
-    // either (`register::plan`).
+    // it and births nothing. A birth would be appended after the cells this Mac holds of it: the
+    // authority rules would hold its cells inert after the owner's lifecycle write (rule 3a), and
+    // a build before them would let its automatic cells replace what it observed
+    // (`documents::apply` keeps no candidate a write observed), `row=live` and `status` over the
+    // owner's retire, end, merge or lock, or over a live row's status. A live row reaches here
+    // when no live row at the realm says the address: one born without a login while its address
+    // row was retired (below), whose address the owner has since made live again, or one whose
+    // login the owner pointed elsewhere. The row keeps the cells it has; observation writes no
+    // login onto a row it did not just give birth to. A machine's birth never revives an ended
+    // row either (`register::plan`).
     if accounts.rows.contains_key(&pk) {
         return Ok(Matched::Row(pk));
     }
@@ -450,7 +406,6 @@ fn obs_row(n: u64, account: &str, s: &Sighting, first_at: u64, at: u64) -> Value
 /// A change does not fit its column.
 pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
     let known = Known::of(cells);
-    let mut labels = live_labels(&known.accounts);
     let today = day_of(input.now_ms);
     let mut out = Plan::default();
     let mut births: Vec<Change> = Vec::new();
@@ -488,8 +443,7 @@ pub fn plan(input: &Input<'_>, cells: &Cells, obs: &OwnedRead) -> Result<Plan> {
                 if seen.contains(&pk) {
                     pk
                 } else if input.room {
-                    let Ok(account) = account_birth(&pk, &s.realm, login.as_deref(), &mut labels)
-                    else {
+                    let Ok(account) = account_birth(&pk, &s.realm, login.as_deref()) else {
                         continue;
                     };
                     if let (Some(login), Some(addr)) = (&login, &addr) {

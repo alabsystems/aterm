@@ -6,6 +6,7 @@
 #![warn(missing_docs)]
 
 pub mod blockage;
+pub mod boot_cost;
 pub mod delegated;
 pub mod events;
 pub mod explain;

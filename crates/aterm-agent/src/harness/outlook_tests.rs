@@ -513,7 +513,14 @@ fn quota_clock_admission_survives_the_codec_without_current_claims() {
             here: true,
         },
     };
-    let five = win_of(Some(invalid), Fresh::ClockInvalid, 1, NOW, Window::Five);
+    let five = win_of(
+        Some(invalid),
+        Fresh::ClockInvalid,
+        None,
+        1,
+        NOW,
+        Window::Five,
+    );
     assert_eq!(five.known, Known::Unknown);
     assert_eq!(five.reset, None);
     assert_eq!(five.acc, 0);
@@ -1775,8 +1782,10 @@ fn plan_multiples() {
 /// T17: THE CLI'S TEXT AND JSON ARE ONE MODEL: the same stop instants and the same percents.
 /// Every stop of every pass in scenarios B and D is said in the text at its JSON instant
 /// rounded down by its lead; D's 5-hour stop starts off the ten-minute grid, so a rounding
-/// shows; the verdict's JSON `end` is the vendor reset the text says. Negative control: a text
-/// that rounds its stop's start up says another instant for D.
+/// shows; the verdict's JSON `end` is the vendor reset the text says; and each row's week line
+/// ends with the projection its JSON holds, or where the JSON holds none, with the lean it
+/// turns on ([`Outlook::turns_on`]) or nothing. Negative control: a text that rounds its stop's
+/// start up says another instant for D.
 #[test]
 fn text_and_json_one_model() {
     let mut off_grid = false;
@@ -1859,22 +1868,58 @@ fn text_and_json_one_model() {
         Some(from)
     );
     assert_eq!(stop.get("end"), Some(end));
-    // Each row's projected percent in its window line and in its JSON.
-    for row in &out.rows {
-        let lines = out.row_lines(&row.label).join("\n");
-        if let Some((_, proj)) = out.window_json(&row.label, accounts::WEEK_LIMIT)
-            && let Some(x10) = proj.get("at_reset_x10").and_then(aterm_json::Value::as_u64)
-        {
-            let x10 = u32::try_from(x10).unwrap();
-            let fills = proj.get("fills_at").is_some_and(|v| !v.is_null());
-            if !fills && x10 < 1000 {
-                assert!(
-                    lines.contains(&format!("~{}% by reset", whole(x10))),
-                    "{lines}"
-                );
-            }
+    // Each row's week projection in its window line and in its JSON: the same figure, or none
+    // in either. (Before 2026-11-16 this looked for `~N% by reset`, words the line never says,
+    // and only where nothing filled, which in B is no row.)
+    let mut projected = 0;
+    for fx in [
+        scenario_a(),
+        scenario_b(),
+        scenario_c(),
+        worst_case(),
+        walled_then_reset(),
+        out_at_the_lean(),
+    ] {
+        let out = fx.outlook();
+        for row in &out.rows {
+            let line = out.row_lines(&row.label).remove(0);
+            let (_, proj) = out
+                .window_json(&row.label, accounts::WEEK_LIMIT)
+                .expect("a week");
+            let x10 = proj.get("at_reset_x10").and_then(aterm_json::Value::as_u64);
+            let words = match (
+                x10,
+                proj.get("fills_at").and_then(aterm_json::Value::as_i64),
+            ) {
+                (_, Some(at)) => format!(
+                    " \u{b7} out ~{} before reset",
+                    out.cli_when(round_down(at, out.as_of, &out.offsets))
+                ),
+                (Some(x10), None) => {
+                    format!(" \u{b7} {} at reset", ahead(u32::try_from(x10).unwrap()))
+                }
+                // No projection: what the week turns on, where a lean's cases part on it.
+                (None, None) => match out.turns_on(&row.label, Window::Week) {
+                    Some(lean) => format!(
+                        " \u{b7} depends on {} after ~{}",
+                        lean.row,
+                        out.cli_when(round_down(lean.at, out.as_of, &out.offsets))
+                    ),
+                    None => {
+                        assert!(
+                            !line.ends_with(" reset") && !line.contains("depends on"),
+                            "{}: {line}",
+                            row.label
+                        );
+                        continue;
+                    }
+                },
+            };
+            assert!(line.ends_with(&words), "{}: {words:?} in {line}", row.label);
+            projected += 1;
         }
     }
+    assert!(projected >= 6, "projections said: {projected}");
 }
 
 /// The CLI's outlook says a projection short of a fill at most `~99%`: its whole percent is half
@@ -2442,6 +2487,643 @@ fn the_next_weeks_run_out_has_a_curve() {
             t: week.horizon,
             x10: Some(1000)
         })
+    );
+}
+
+// A projection is a figure of its row's own window, to its reset.
+
+/// Wed 28 Oct 00:30: `ada`'s week resets, its wall standing to 00:32:30.
+const ADA_RESET: i64 = NOW + 2 * D + 5 * H;
+/// Wed 28 Oct 01:30: `cy`'s week resets.
+const CY_RESET: i64 = NOW + 2 * D + 6 * H;
+/// Wed 28 Oct 19:30: `bea`'s week resets.
+const BEA_RESET: i64 = NOW + 3 * D;
+/// Sun 1 Nov 14:20: the work leaves `cy` at 97.5% of its next week, at 21.5% a day, and leans.
+const CY_LEAVES: i64 = CY_RESET + 391_814;
+
+/// `bea`, a pool row read at 40% five hours ago, its week resetting [`BEA_RESET`]; and `cy`, the
+/// tab's account, at 30% of a week resetting [`CY_RESET`], 21.5 points of it in the last day.
+fn bea_and_cy(fx: &mut Fx) {
+    fx.read("bea", None, Some((400, BEA_RESET)), NOW - 5 * H);
+    fx.fig("cy", NOW - 24 * H, None, Some((85, CY_RESET)));
+    fx.read("cy", None, Some((300, CY_RESET)), NOW);
+    fx.ran("cy", NOW);
+    fx.session("s-cy", "cy", NOW);
+}
+
+/// THE LIVE SHAPE OF 2026-11-16 (`aterm harness accounts` on m2): `ada` walled, its week
+/// resetting in 2 d 5 h, an hour before `cy`'s, its five hours as `ada_five` says; `dee`, read
+/// before a reset that passed two weeks ago; and [`bea_and_cy`], `cy` active; all Max 20x. The
+/// work stays on `cy` past its reset and leaves it at 97.5% of its next week ([`CY_LEAVES`], day
+/// 6.8), after every other row's reset: it leans on `ada`, by then a week this Mac has not read
+/// since its reset; the worst case walls the unread rows at once and `cy` runs out before the
+/// horizon, the best runs on `ada`.
+fn walled_then_reset_with(ada_five: Option<(u32, i64)>) -> Fx {
+    let mut fx = Fx::new(&[
+        ("ada", Class::Preferred),
+        ("dee", Class::Preferred),
+        ("bea", Class::Pool),
+        ("cy", Class::Preferred),
+    ]);
+    fx.state.active = Some("cy".into());
+    for label in ["ada", "dee", "bea", "cy"] {
+        fx.plan(label, "max", Some("20x"), NOW - D);
+    }
+    fx.read("dee", None, Some((400, NOW - 14 * D)), NOW - 15 * D);
+    let read = if let Some((pct_x10, reset)) = ada_five {
+        fx.fig(
+            "ada",
+            NOW - 50 * MIN,
+            Some((300, reset)),
+            Some((1000, ADA_RESET)),
+        );
+        fx.read(
+            "ada",
+            Some((pct_x10, reset)),
+            Some((1000, ADA_RESET)),
+            NOW - 20 * MIN,
+        );
+        NOW - 20 * MIN
+    } else {
+        fx.read("ada", None, Some((1000, ADA_RESET)), NOW - H);
+        NOW - H
+    };
+    accounts::note_wall(
+        &mut fx.state,
+        "ada",
+        accounts::WEEK_LIMIT,
+        Some(ADA_RESET),
+        read,
+        read,
+    );
+    bea_and_cy(&mut fx);
+    fx
+}
+
+/// [`walled_then_reset_with`] with no five-hour reading, as on m2.
+fn walled_then_reset() -> Fx {
+    walled_then_reset_with(None)
+}
+
+/// [`walled_then_reset_with`] with `ada`'s five hours read lately and `ada` the active row, as a
+/// walled tab's account is: the pace is read off it, five hours included, so a working pass runs
+/// on `cy`, whose five hours nothing read.
+fn five_paced_off_ada() -> Fx {
+    let mut fx = walled_then_reset_with(Some((450, NOW + 2 * H)));
+    fx.state.active = Some("ada".into());
+    fx
+}
+
+/// [`bea_and_cy`] alone: the work leans on `bea`, whose week resets before the lean.
+fn pool_reset_before_the_lean() -> Fx {
+    let mut fx = Fx::new(&[("cy", Class::Preferred), ("bea", Class::Pool)]);
+    for label in ["bea", "cy"] {
+        fx.plan(label, "max", Some("20x"), NOW - D);
+    }
+    bea_and_cy(&mut fx);
+    fx
+}
+
+/// [`frees_first`]'s `alt1` (90% of a week resetting in 29 h, 50% a day, `wall` mode) with only
+/// `pool1`, a shared row never read, beside it: `alt1` walls at 4 h 48 m and the work leans on
+/// `pool1` there, `alt1` out.
+fn out_at_the_lean() -> Fx {
+    let mut fx = Fx::new(&[("alt1", Class::Preferred), ("pool1", Class::Pool)]);
+    fx.mode = Mode::Wall;
+    fx.plan("alt1", "max", Some("20x"), NOW - D);
+    fx.plan("pool1", "max", Some("20x"), NOW - D);
+    fx.fig("alt1", NOW - 24 * H, None, Some((400, NOW + 29 * H)));
+    fx.read("alt1", None, Some((900, NOW + 29 * H)), NOW);
+    fx.ran("alt1", NOW);
+    fx.session("s-alt1", "alt1", NOW);
+    fx
+}
+
+/// [`five_paced_off_ada`] with `cy`'s five hours read three hours ago at 60%, a window whose
+/// reset passed an hour ago: read, but not held now, so the working pass opens it at first use.
+fn five_opens_on_first_use() -> Fx {
+    let mut fx = five_paced_off_ada();
+    fx.read("cy", Some((600, NOW - H)), None, NOW - 3 * H);
+    fx
+}
+
+/// Scenario C with a peer's bound of `pool1`'s week full (read three hours ago on m13, to
+/// [`SAT8`]): the lean's best case takes `pool1` up full.
+fn pool_full_by_a_peer() -> Fx {
+    let mut fx = scenario_c();
+    peer_week(&mut fx, "pool1", 1000, SAT8);
+    fx
+}
+
+/// Scenario D with `pool1`, a pool row read an hour ago at 99.9% of its week and 30% of 5 hours
+/// resetting at 19:50: the working pass leans on `pool1` at `alt1`'s 5-hour wall, after
+/// `pool1`'s 5 hours reset and while its week still holds what was read.
+fn working_lean_after_a_five_reset() -> Fx {
+    let mut fx = scenario_d();
+    fx.roster.rows.push(accounts::Row {
+        label: "pool1".into(),
+        class: Class::Pool,
+        dir: Some("/logins/pool1".into()),
+        ..accounts::Row::default()
+    });
+    fx.enrolled.insert("pool1".into());
+    fx.read(
+        "pool1",
+        Some((300, NOW + 20 * MIN)),
+        Some((999, SAT8)),
+        NOW - H,
+    );
+    fx
+}
+
+/// `me`, Max 20x, its week resetting [`THU9`] read `ago` seconds before now at `week` tenths
+/// (as of then), after 16 points of it in the day before that reading, in use here.
+fn me_read_ago(fx: &mut Fx, week: u32, ago: i64) {
+    fx.plan("me", "max", Some("20x"), NOW - D);
+    for (t, rose) in [(24 * H, 0), (16 * H, 53), (8 * H, 107), (H, 153)] {
+        fx.fig("me", NOW - ago - t, None, Some((week - 160 + rose, THU9)));
+    }
+    fx.read("me", None, Some((week, THU9)), NOW - ago);
+    fx.ran("me", NOW);
+    fx.session("s-me", "me", NOW);
+}
+
+fn proj_of(out: &Outlook, label: &str, w: Window) -> Option<Proj> {
+    out.row(label)
+        .and_then(|row| row.window(w))
+        .and_then(|win| win.projection)
+}
+
+fn lean_of(out: &Outlook) -> &Lean {
+    out.week
+        .as_ref()
+        .and_then(|p| p.lean.as_deref())
+        .unwrap_or_else(|| panic!("a lean:\n{}", out.text()))
+}
+
+/// A WALLED ROW NEVER SAYS A FILL PAST ITS RESET (m2, 2026-11-16: `week 0% left · ♻ Wed Nov 18
+/// 20:00 · walled to Wed Nov 18 20:02 · out ~Mon Nov 23 08:00 before reset`). In
+/// [`walled_then_reset`] the lean onto `ada` comes after its reset, and the worst case assumes
+/// `ada`, `dee` and `bea` full from there: weeks nobody read, no projection of any of them.
+/// `ada`'s line ends at its wall, `bea`'s at its bound, their JSON projections are null, and
+/// `cy`'s is its first week's at that week's reset; the outlook block keeps both cases' words.
+/// NEGATIVE CONTROL (run): the replay before this fix (`Pass::projections` taking the worst
+/// case's projections past the lean, `capture` taking any seen row's window) gives the unread
+/// rows `{1000, CY_LEAVES}`, and `ada: no projection` fails.
+#[test]
+fn a_walled_row_never_says_a_fill_past_its_reset() {
+    let out = walled_then_reset().outlook();
+    let text = out.text();
+    let lean = lean_of(&out);
+    assert_eq!((lean.row.as_str(), lean.at), ("ada", CY_LEAVES), "{text}");
+    assert!(lean.at > ADA_RESET.max(BEA_RESET), "after both resets");
+    for label in ["ada", "dee", "bea"] {
+        assert_eq!(
+            proj_of(&out, label, Window::Week),
+            None,
+            "{label}: no projection\n{text}"
+        );
+        let (_, json) = out
+            .window_json(label, accounts::WEEK_LIMIT)
+            .expect("its week");
+        assert!(json.is_null(), "{label}: {json}");
+    }
+    let line = out.row_lines("ada").remove(0);
+    let wall = format!(
+        " \u{b7} walled to {}",
+        out.cli_when(ADA_RESET + accounts::RESET_GRACE_S)
+    );
+    assert!(line.ends_with(&wall), "ada's line ends at its wall: {line}");
+    let line = out.row_lines("bea").remove(0);
+    assert!(
+        line.ends_with("others may use it"),
+        "bea's line ends at its bound: {line}"
+    );
+    let cy = proj_of(&out, "cy", Window::Week).expect("cy's first week");
+    assert_eq!((cy.reset, cy.fills_at), (CY_RESET, None), "{text}");
+    let (_, json) = out
+        .window_json("cy", accounts::WEEK_LIMIT)
+        .expect("cy's week");
+    assert_eq!(json["reset"].as_i64(), Some(CY_RESET), "{json}");
+    for words in ["  if it has nothing:\n", "  if it has a fresh week:\n"] {
+        assert!(text.contains(words), "{words:?} in {text}");
+    }
+}
+
+/// A LEAN SAYS ITS ROW'S CLASS AT THE LEAN: `ada` is walled now, but its week resets before the
+/// work reaches it, so the lean is onto a week this Mac has not read since its reset:
+/// `reset-unread` in the text's header, the JSON and the verdict, and the tab's quota view says
+/// it (`whose week aterm has not read since its reset`), never `walled` (a wall that ended days
+/// before) and never `which aterm has never read` (what a lean's class with no reason was said
+/// as). With no `ada` the lean is onto `bea`, read as a bound and reset before the lean:
+/// `reset-unread` there too, not `pool`. A row whose reset comes after the lean keeps its class:
+/// idle A's `alt1` (`idle-here`), C's `pool1` (`never-read`).
+/// NEGATIVE CONTROL (run): an `on_resets` that keeps a row's class as read says `walled`, and
+/// the quota view says `which aterm has never read`.
+#[test]
+fn a_lean_says_its_rows_class_at_the_lean() {
+    let out = walled_then_reset().outlook();
+    let lean = lean_of(&out);
+    assert_eq!(lean.why, Fresh::ResetUnread, "{}", out.text());
+    assert!(
+        matches!(&out.verdict, Verdict::Lean { row, why: Fresh::ResetUnread, .. } if row == "ada"),
+        "{:?}",
+        out.verdict
+    );
+    assert_eq!(Why::of_lean(lean.why), Why::ResetUnread);
+    assert_eq!(
+        out.json()["passes"][0]["lean"]["why"].as_str(),
+        Some("reset-unread")
+    );
+    assert!(
+        out.text().contains(" onto ada (reset-unread):\n"),
+        "{}",
+        out.text()
+    );
+    let view = out.quota("cy", None, true);
+    assert!(
+        view.spoken.contains(Why::ResetUnread.which())
+            && !view.spoken.contains(Why::NeverRead.which()),
+        "{}",
+        view.spoken
+    );
+    let pool = pool_reset_before_the_lean().outlook();
+    let lean = lean_of(&pool);
+    assert_eq!(
+        (lean.row.as_str(), lean.why),
+        ("bea", Fresh::ResetUnread),
+        "{}",
+        pool.text()
+    );
+    assert!(lean.at > BEA_RESET);
+    assert_eq!(lean_of(&scenario_a_idle().outlook()).why, Fresh::IdleHere);
+    assert_eq!(lean_of(&scenario_c().outlook()).why, Fresh::NeverRead);
+}
+
+/// A PROJECTION IS OF A WINDOW THE REPLAY KNOWS, THE ONE THE ROW WAS READ HOLDING: the weeks
+/// [`walled_then_reset`]'s worst case assumes of its unread rows (full from the lean, to the
+/// resume bound) are no projection, not even its own case's; in [`five_paced_off_ada`]'s working
+/// pass `cy`'s five hours, which nothing read and which have no reset, project nothing; and in
+/// [`five_opens_on_first_use`] `cy`'s five hours, read before a reset that passed, are a window
+/// the working pass opens at first use, not one `cy` holds: no projection in the JSON beside
+/// `reset-unread`, as the CLI's `opens on first use` says none.
+/// NEGATIVE CONTROLS (run): a `capture` of any seen row's window (as before this fix, its reset
+/// the capture's instant where it has none) puts `ada`'s assumed week in the worst case's
+/// projections, and `the worst case's assumption` fails; one that does not ask
+/// [`Win::held`] projects `cy`'s opened five hours to now plus 5 hours, and `opened` fails.
+#[test]
+fn a_projection_is_of_a_window_the_replay_knows() {
+    let out = walled_then_reset().outlook();
+    let lean = lean_of(&out);
+    for label in ["ada", "dee", "bea"] {
+        let key = (label.to_owned(), Window::Week);
+        assert_eq!(
+            lean.worst.proj.get(&key),
+            None,
+            "{label}: the worst case's assumption"
+        );
+    }
+    let out = five_paced_off_ada().outlook();
+    assert!(
+        out.working.is_some(),
+        "a working pass: {:?}",
+        out.demand.five
+    );
+    let cy = out.row("cy").and_then(|r| r.window(Window::Five)).unwrap();
+    assert_eq!((cy.fresh, cy.projection), (Fresh::NeverRead, None));
+    let (_, json) = out
+        .window_json("cy", accounts::SESSION_LIMIT)
+        .expect("cy's five hours");
+    assert!(json.is_null(), "{json}");
+    let out = five_opens_on_first_use().outlook();
+    let working = out.working.as_ref().expect("a working pass");
+    assert!(
+        working.chain.first().is_some_and(|l| l.label == "cy"),
+        "the work is on cy:\n{}",
+        out.text()
+    );
+    let cy = out.row("cy").and_then(|r| r.window(Window::Five)).unwrap();
+    assert_eq!(
+        (cy.fresh, cy.reset, cy.projection),
+        (Fresh::ResetUnread, Some(NOW - H), None),
+        "opened\n{}",
+        out.text()
+    );
+    let (fresh, json) = out
+        .window_json("cy", accounts::SESSION_LIMIT)
+        .expect("cy's five hours");
+    assert_eq!(
+        (fresh.as_str(), json.is_null()),
+        (Some("reset-unread"), true),
+        "{json}"
+    );
+    let lines = out.row_lines("cy");
+    let five = lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("5h"))
+        .unwrap_or_else(|| panic!("cy's five hours: {lines:?}"));
+    assert!(five.ends_with("passed: opens on first use"), "{five}");
+}
+
+/// PAST A LEAN, A PROJECTION IS WHAT BOTH CASES HOLD: in C the work leans on `pool1` before
+/// `me`'s and `alt1`'s weeks reset, both still filling, and what they hold there turns on
+/// `pool1` (the worst case runs them out, the best leaves them short): neither has a projection,
+/// as the chart's dashes from the lean say, where the worst case's run-out once stood
+/// (`me … out ~Wed 22:00 before reset`); in its place each line says what it turns on and from
+/// about when (`depends on pool1 after ~…`, [`Outlook::turns_on`]), and `pool1`, which neither
+/// case projects, says nothing of the kind. In [`out_at_the_lean`] `alt1` is out when the work
+/// leans on `pool1`, so out to its reset in either case: its projection stands, its instant the
+/// main pass's own.
+/// NEGATIVE CONTROLS (run): a fork that takes the worst case's projections (as before this fix)
+/// fails `me`; one that takes neither case's fails `alt1`; a window line without its
+/// `turns_on` arm fails `depends`.
+#[test]
+fn past_a_lean_a_projection_is_what_both_cases_hold() {
+    let c = scenario_c().outlook();
+    let lean = lean_of(&c);
+    assert!(lean.at < THU9);
+    let depends = format!(
+        " \u{b7} depends on pool1 after ~{}",
+        c.cli_when(round_down(lean.at, c.as_of, &c.offsets))
+    );
+    for label in ["me", "alt1", "pool1"] {
+        assert_eq!(
+            proj_of(&c, label, Window::Week),
+            None,
+            "{label}\n{}",
+            c.text()
+        );
+        let line = c.row_lines(label).remove(0);
+        assert!(!line.ends_with(" reset"), "no projection: {line}");
+        let turns = label != "pool1";
+        assert_eq!(
+            c.turns_on(label, Window::Week).map(|l| l.row.as_str()),
+            turns.then_some("pool1"),
+            "{label}"
+        );
+        assert_eq!(line.ends_with(&depends), turns, "depends: {line}");
+    }
+    let out = out_at_the_lean().outlook();
+    let lean = lean_of(&out);
+    let walls = NOW + 17_280;
+    assert_eq!(
+        (lean.row.as_str(), lean.at),
+        ("pool1", walls),
+        "{}",
+        out.text()
+    );
+    assert_eq!(
+        proj_of(&out, "alt1", Window::Week),
+        Some(Proj {
+            at_reset_x10: 1000,
+            fills_at: Some(walls),
+            reset: NOW + 29 * H,
+            pass: PassKind::Week,
+        }),
+        "alt1\n{}",
+        out.text()
+    );
+    assert_eq!(proj_of(&out, "pool1", Window::Week), None);
+}
+
+/// EACH CASE OF A LEAN SAYS ITS OWN PROJECTION: in the idle A the work leans on `alt1` (read
+/// three hours ago at 31%), and the case that holds what was read runs it past its reset Fri
+/// 14:00 to the horizon: its line says what that case holds at the reset (`~32% left`), never
+/// the worst case's assumption (`out`, said there before this fix) nor the next week at the
+/// horizon.
+/// NEGATIVE CONTROL (run): a horizon link that reads the row's reported projection says the next
+/// week `at the horizon`.
+#[test]
+fn each_case_of_a_lean_says_its_own_projection() {
+    let out = scenario_a_idle().outlook();
+    let text = out.text();
+    let best = text
+        .split("  if it holds what was read:\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the best case's words: {text}"));
+    let said = format!("~32% left at its reset {}", long_when(FRI14, &utc()));
+    assert!(
+        best.lines()
+            .any(|l| l.trim_start().starts_with("alt1") && l.ends_with(&said)),
+        "{said:?} in\n{text}"
+    );
+}
+
+/// A PROJECTION THAT SAYS A WINDOW OUT SAYS WHEN IT FILLED: `me`, read now at 100% with no wall
+/// noted, is out from that reading, so its projection fills now (`out ~19:30 before reset` and
+/// its JSON `fills_at`), never `{1000, null}` nor `out ~ before reset`; read full 40 minutes
+/// ago, it is out from that reading, not from now; read at 99.5% 50 minutes ago, the advance to
+/// now at the week's pace crosses full on the way, and it is out from that crossing, as a spend
+/// marks its own. (The Account card says `out since` of a week out before now: aterm-gui's
+/// forecast test.)
+/// NEGATIVE CONTROLS (run): a replay that marks no window taken up full holds `{1000, null}`;
+/// one that marks it out from now (the build's `out_from(now)` before this fix) fails `read`.
+#[test]
+fn a_projection_that_says_a_window_out_says_when() {
+    let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+    me_at(&mut fx, 1000);
+    alt1_read(&mut fx, 920);
+    let out = fx.outlook();
+    assert_eq!(
+        proj_of(&out, "me", Window::Week),
+        Some(Proj {
+            at_reset_x10: 1000,
+            fills_at: Some(NOW),
+            reset: THU9,
+            pass: PassKind::Week,
+        }),
+        "{}",
+        out.text()
+    );
+    let line = out.row_lines("me").remove(0);
+    let said = format!(
+        " \u{b7} out ~{} before reset",
+        out.cli_when(round_down(NOW, NOW, &utc()))
+    );
+    assert!(line.ends_with(&said), "{line}");
+    let (_, json) = out.window_json("me", accounts::WEEK_LIMIT).unwrap();
+    assert_eq!(json["fills_at"].as_i64(), Some(NOW), "{json}");
+    for (week, ago) in [(1000, 40 * MIN), (995, 50 * MIN)] {
+        let mut fx = Fx::new(&[("me", Class::Preferred), ("alt1", Class::Preferred)]);
+        me_read_ago(&mut fx, week, ago);
+        alt1_read(&mut fx, 920);
+        let out = fx.outlook();
+        let me = out.row("me").and_then(|r| r.window(Window::Week)).unwrap();
+        assert_eq!(me.fresh, Fresh::AsOf, "{}", out.text());
+        let read = NOW - ago;
+        let filled = if week >= 1000 {
+            read
+        } else {
+            // The week's pace in tenths times `86400 · M` a second, as the advance adds it.
+            let rate = i128::from(out.demand.week.expect("a pace").x10_m_per_day);
+            let m = i128::from(out.row("me").unwrap().plan.m);
+            let short = i128::from(1000 - week) * m * i128::from(D);
+            read + i64::try_from((short + rate - 1) / rate).unwrap()
+        };
+        assert!(filled >= read && filled < NOW, "{week}: {filled}");
+        let p = proj_of(&out, "me", Window::Week).unwrap_or_else(|| panic!("{}", out.text()));
+        assert_eq!(
+            (p.at_reset_x10, p.fills_at),
+            (1000, Some(filled)),
+            "read {week} {ago}s ago\n{}",
+            out.text()
+        );
+        let line = out.row_lines("me").remove(0);
+        let said = format!(
+            " \u{b7} out ~{} before reset",
+            out.cli_when(round_down(filled, NOW, &utc()))
+        );
+        assert!(line.ends_with(&said), "{line}");
+    }
+}
+
+/// The laws every projection keeps, the outlook's own and each lean case's ([`Proj`]): its reset
+/// after now; a fill instant exactly where it is out, never past its reset.
+fn proj_laws(out: &Outlook, p: &Proj, at: &dyn Fn() -> String) {
+    assert!(p.reset > out.as_of, "after now: {}", at());
+    assert_eq!(
+        p.fills_at.is_some(),
+        p.at_reset_x10 >= 1000,
+        "out: {}",
+        at()
+    );
+    if let Some(t) = p.fills_at {
+        assert!(t <= p.reset, "to its reset: {}", at());
+    }
+}
+
+/// EVERY PROJECTION IS A FIGURE OF ITS OWN WINDOW, TO ITS RESET: over the scenarios, the live
+/// shape and 300 random rosters, each projection the outlook reports, of the week or of the 5
+/// hours, is of a window whose class holds a figure, the window the row was read holding (at
+/// the reset its row says), after now, made by that window's pass; its fill instant, where it
+/// has one, lies at or before that reset, and it has one exactly where it is out; and past its
+/// pass's lean it is what both of the lean's cases hold. Each lean case's own projections (which
+/// its horizon links say) keep the same laws: [`pool_full_by_a_peer`]'s best case takes `pool1`
+/// up full from the peer's reading.
+/// NEGATIVE CONTROLS (run): a fork that takes the worst case's projections (as before this fix)
+/// fails `both cases of the lean` on the idle A's `me`; a `capture` that does not ask
+/// [`Win::held`] fails `a class with a figure` on [`five_opens_on_first_use`]'s `cy`, its 5
+/// hours `reset-unread`; a peer's full bound taken up with no fill instant fails `out` on
+/// `pool1`'s best case.
+#[test]
+fn every_projection_is_a_figure_of_its_own_window() {
+    let mut draw = Draw(0x2545_f491_4f6c_dd1d);
+    let named = [
+        scenario_a(),
+        scenario_a_idle(),
+        scenario_b(),
+        scenario_c(),
+        scenario_d(),
+        worst_case(),
+        frees_first(),
+        walled_then_reset(),
+        five_paced_off_ada(),
+        five_opens_on_first_use(),
+        pool_reset_before_the_lean(),
+        out_at_the_lean(),
+        pool_full_by_a_peer(),
+        working_lean_after_a_five_reset(),
+        crate::harness::quota_scenes::case_a(),
+        case_b(),
+        crate::harness::quota_scenes::case_c(),
+        crate::harness::quota_scenes::case_e(),
+    ];
+    let (mut judged, mut fives, mut cases) = (0usize, 0usize, 0usize);
+    let mut full_peer = false;
+    for fx in named
+        .into_iter()
+        .chain((0..300).map(|_| random_fixture(&mut draw)))
+    {
+        let out = fx.outlook();
+        for row in &out.rows {
+            for w in &row.windows {
+                let Some(p) = w.projection else {
+                    continue;
+                };
+                judged += 1;
+                fives += usize::from(w.window == Window::Five);
+                let at = || format!("{} {:?}: {p:?}\n{}", row.label, w.window, out.text());
+                proj_laws(&out, &p, &at);
+                assert!(
+                    !matches!(
+                        w.fresh,
+                        Fresh::NeverRead
+                            | Fresh::ResetUnread
+                            | Fresh::ClockInvalid
+                            | Fresh::SignedOut
+                            | Fresh::NotEnrolled
+                    ),
+                    "a class with a figure: {}",
+                    at()
+                );
+                assert_eq!(w.reset, Some(p.reset), "its row's window: {}", at());
+                let (pass, kind) = match w.window {
+                    Window::Week => (out.week.as_ref(), PassKind::Week),
+                    Window::Five => (out.working.as_ref(), PassKind::Working),
+                };
+                assert_eq!(p.pass, kind, "its window's pass: {}", at());
+                let lean = pass.and_then(|pass| pass.lean.as_deref());
+                if let Some(lean) = lean.filter(|l| l.at < p.reset) {
+                    let key = (row.label.clone(), w.window);
+                    assert_eq!(
+                        (lean.worst.proj.get(&key), lean.best.proj.get(&key)),
+                        (Some(&p), Some(&p)),
+                        "both cases of the lean: {}",
+                        at()
+                    );
+                }
+            }
+        }
+        for pass in [out.week.as_ref(), out.working.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let Some(lean) = pass.lean.as_deref() else {
+                continue;
+            };
+            for (case, of) in [("worst", &lean.worst), ("best", &lean.best)] {
+                for ((label, w), p) in &of.proj {
+                    cases += 1;
+                    full_peer |= case == "best"
+                        && label == "pool1"
+                        && matches!(lean.assumed, Assumed::Peer(_))
+                        && p.at_reset_x10 >= 1000;
+                    let at = || format!("{case} case {label} {w:?}: {p:?}\n{}", out.text());
+                    proj_laws(&out, p, &at);
+                }
+            }
+        }
+    }
+    assert!(judged > 100, "projections judged: {judged}");
+    assert!(fives > 0, "5-hour projections judged: {fives}");
+    assert!(cases > 50, "lean cases' projections judged: {cases}");
+    assert!(full_peer, "a best case took a full peer bound up");
+}
+
+/// A 5-HOUR RESET LEAVES A ROW'S WEEK AS READ: in [`working_lean_after_a_five_reset`] the working
+/// pass leans on `pool1` after its 5 hours reset, and its week still holds what was read: the
+/// lean says the week's class (`pool`), and its best case holds what was read of the week.
+/// NEGATIVE CONTROL (run): an `on_resets` that marks a row's week `reset-unread` at its 5-hour
+/// reset (its `Window::Week` guard dropped) says `reset-unread` and assumes a fresh week.
+#[test]
+fn a_five_hour_reset_leaves_a_rows_week_as_read() {
+    let out = working_lean_after_a_five_reset().outlook();
+    let lean = out
+        .working
+        .as_ref()
+        .and_then(|p| p.lean.as_deref())
+        .unwrap_or_else(|| panic!("a working lean:\n{}", out.text()));
+    assert_eq!(lean.row, "pool1", "{}", out.text());
+    assert!(
+        lean.at > NOW + 20 * MIN,
+        "after its 5-hour reset: {}",
+        lean.at
+    );
+    assert_eq!(
+        (lean.why, &lean.assumed),
+        (Fresh::Pool, &Assumed::Read),
+        "{}",
+        out.text()
     );
 }
 

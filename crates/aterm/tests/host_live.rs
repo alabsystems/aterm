@@ -211,22 +211,53 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Polls `probe` until `pred` holds of what it read, and returns that read. A hang detector, not
+/// a latency budget: it waits for as long as what this test process started (the instance, its
+/// stand-ins) keeps working, and fails, naming what it last read, once they made no CPU or I/O
+/// progress for one whole `within` ([`aterm_uds::deadline::ProcessProgressProbe::read_descendants`],
+/// the poll's own work left out), or once [`aterm_spec::wait::WORKING_GUARD`] passed in all. A
+/// loaded Mac stretches the wall clock without bound, so a wall-clock `within` failed a test whose
+/// instance was only slow (`a_wall_the_host_resumes_is_no_stop_and_one_nobody_answers_is` at
+/// 60 s, with every core of the Mac busy). A reading that fails or cannot be compared is no
+/// evidence of a stall: the window opens again at the next one, as in `aterm_spec::wait`.
 fn until(
     within: Duration,
     what: &str,
     probe: impl Fn() -> String,
     pred: impl Fn(&str) -> bool,
 ) -> String {
-    let deadline = Instant::now() + within;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        last = probe();
+    let own = std::process::id();
+    let mut tree = aterm_uds::deadline::ProcessProgressProbe::default();
+    let began = Instant::now();
+    let mut seen = tree.read_descendants(own);
+    let mut worked_at = began;
+    loop {
+        let last = probe();
         if pred(&last) {
             return last;
         }
+        let at = Instant::now();
+        match tree.read_descendants(own) {
+            Some(generation) if seen == Some(generation) => {}
+            reading => {
+                seen = reading;
+                worked_at = at;
+            }
+        }
+        if at.saturating_duration_since(worked_at) >= within {
+            panic!(
+                "{what}: what this test started made no CPU or I/O progress for {within:?}; \
+                 last: {last}"
+            );
+        }
+        if at.saturating_duration_since(began) >= aterm_spec::wait::WORKING_GUARD {
+            panic!(
+                "{what}: what this test started kept working for {:?} without it; last: {last}",
+                aterm_spec::wait::WORKING_GUARD
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    panic!("{what}: not within {within:?}; last: {last}");
 }
 
 fn timeline_since(inst: &Instance, after: u64) -> Vec<(u64, String, String)> {

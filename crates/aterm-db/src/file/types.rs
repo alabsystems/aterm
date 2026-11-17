@@ -15,11 +15,13 @@
 //! outbox: an owner file takes only an owner's write there, a Mac file only each Mac's
 //! statement of its own rows, and a derived file nothing. The class is checked against what the
 //! file is bound to when the build compiles ([`Type::check`]), and the publisher holds an intent
-//! the file's class does not take ([`Class::refuses`]). Code that writes the registry itself (a
-//! Mac's self-registration, the importer) passes no outbox, and the materializer projects its
-//! cells as any other until it judges them by the merge rules (`file::admit`, SF-07); a Mac
-//! file's rows are judged by their keys when they are read (`typed::owned`): a row or an entry
-//! at a key that does not name its signer's machine is inert.
+//! the file's class does not take ([`Class::refuses`]). That is all the class enforces: code
+//! that writes the registry itself (a Mac's self-registration, the importer) passes no outbox.
+//! What it writes is judged by every read instead, under the authority rules of a collection
+//! that opts into them ([`crate::typed::authority`]): there an automatic cell on an owner column
+//! is inert. A collection that does not opt in projects its cells as they were written. A Mac
+//! file's rows are judged by their keys when they are read (`typed::owned`): a row or an entry at
+//! a key that does not name its signer's machine is inert.
 //!
 //! A file is bound to one of three stores ([`Store`]): a collection of a table family the
 //! catalog declares (the registry's), a collection of the lab journal's week ring (each Mac's
@@ -40,8 +42,8 @@ use aterm_file::{Intent, Name};
 pub enum Class {
     /// The owner, through an explicit `aterm file` verb on any member Mac: a cells collection
     /// any current writer writes for the owner. Its outbox takes no Mac's statement of its own
-    /// row; a cell an automatic writer puts in the registry itself still projects until
-    /// `file::admit` is built.
+    /// row; a cell an automatic writer puts in the registry itself is held inert by the
+    /// authority rules once its collection opts into them ([`crate::typed::authority`]).
     Owner,
     /// Each Mac, only at keys that name its own Commons machine uuid: an owned collection, or a
     /// log. Its outbox takes no owner's write, and a row at another Mac's key is inert.
@@ -77,7 +79,11 @@ pub enum Computed {
     Links,
     /// `lab/machines`: `=seats`, the Commons seats whose own facts row binds the machine;
     /// `=here`, on the machine this Mac's own facts row binds; `=nickname_auto`, on a machine
-    /// whose one nickname an automatic write set.
+    /// whose one nickname an automatic write set; `=label_auto`, where an automatic write or an
+    /// import, not an owner, set its one label; and
+    /// `=label_claim`, the label the column's claim rule gives the machine (its label where it
+    /// holds it, a clash label where another row won it, empty while that is undecided or the
+    /// label conflicted).
     Machines,
     /// A file of the journal ring: `=seen`, when this Mac last saw the row change, which is how
     /// long its snapshot keeps the row once the ring's week tables no longer hold it
@@ -93,7 +99,13 @@ impl Computed {
             Self::None => &[],
             Self::Accounts => &["name", "slug", "email", "login_email", "links"],
             Self::Links => &["account_slug", "account_name", "machine_name"],
-            Self::Machines => &["seats", "here", "nickname_auto"],
+            Self::Machines => &[
+                "seats",
+                "here",
+                "nickname_auto",
+                "label_auto",
+                "label_claim",
+            ],
             Self::Kept => &[aterm_file::retain::SEEN],
         }
     }
@@ -153,7 +165,8 @@ pub struct Type {
     /// What it projects.
     pub store: Store,
     pub computed: Computed,
-    /// The columns a row is named by besides its key, in the order a name is tried.
+    /// The columns a row is named by besides its key, in the order a name is tried
+    /// (`aterm_file::resolve`).
     pub handles: &'static [&'static str],
 }
 
@@ -432,7 +445,9 @@ pub const ACCOUNTS: Type = Type {
         collection: &ACCOUNT,
     },
     computed: Computed::Accounts,
-    handles: &["slug", "name", "email"],
+    // What every account command takes besides the key (`aterm_file::resolve`): the slug, the
+    // provider word and address, and an address that names one account.
+    handles: &aterm_file::ACCOUNT_HANDLES,
 };
 
 /// `ai/links`: which machine prefers which account, in what order (§10, file 2), the registry's

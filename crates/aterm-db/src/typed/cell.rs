@@ -233,6 +233,7 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
             .map(drop)
             .ok_or("this column holds a whole number"),
         Ty::Text(max) => guard::text(text()?, *max).map_err(guard::Refusal::rule),
+        Ty::Handle(max) => guard::handle(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Prose(max) => guard::prose(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Command(max) => guard::command(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Commit => values::commit(text()?),
@@ -241,7 +242,6 @@ fn check(ty: &Ty, x: &Value, null: bool) -> std::result::Result<(), &'static str
         Ty::Decimal => values::decimal(text()?),
         Ty::Principal => values::principal(x),
         Ty::Evidence => values::evidence(x),
-        Ty::AccountLabel(max) => guard::account_label(text()?, *max).map_err(guard::Refusal::rule),
         Ty::Enum(words) => {
             let word = text()?;
             if words.contains(&word) {
@@ -1244,15 +1244,32 @@ pub enum ImportStep {
     Finding(&'static str),
 }
 
-/// Decide one cell of a re-import against the current projection: write only a cell that is
-/// absent or that an earlier import wrote (its value names a source); a cell the owner set,
-/// cleared or resolved since, or a conflicted one, is left alone and reported. For a set,
-/// pass the element's own field.
-pub fn import_step(current: Option<&Field>, new: &Value) -> ImportStep {
+/// Whether an import writes over `value`, the one value a cell of `collection` holds, for an
+/// automatic path having written it: in a collection under the authority rules
+/// ([`Collection::authority`]), where an automatic value stands only as a birth's (or from
+/// before the collection opted in), the owner's import outranks it, as the owner's own write
+/// does (rule 3b). Elsewhere an automatic value is a Mac's registration of itself, which an
+/// import leaves as it leaves the owner's. The importer's planner and [`import_step`] both ask
+/// this, so they keep one rule.
+pub fn import_outranks_automatic(collection: &Collection, value: &CellValue) -> bool {
+    value.a && value.s.is_none() && collection.authority.is_some()
+}
+
+/// Decide one cell of `collection` in a re-import against the current projection: write only a
+/// cell that is absent, that an earlier import wrote (its value names a source) or that an
+/// automatic path wrote where [`import_outranks_automatic`] says so (an observer's `pending`
+/// birth); a cell the owner set, cleared or resolved since, or a conflicted one, is left alone
+/// and reported. For a set, pass the element's own field.
+pub fn import_step(collection: &Collection, current: Option<&Field>, new: &Value) -> ImportStep {
     match current {
         None => ImportStep::Write,
         Some(Field::Value(candidate)) if candidate.value.x == *new => ImportStep::Unchanged,
-        Some(Field::Value(candidate)) if candidate.value.s.is_some() => ImportStep::Write,
+        Some(Field::Value(candidate))
+            if candidate.value.s.is_some()
+                || import_outranks_automatic(collection, &candidate.value) =>
+        {
+            ImportStep::Write
+        }
         Some(Field::Value(_)) => {
             ImportStep::Finding("the owner set this cell since the import; it is left as it is")
         }

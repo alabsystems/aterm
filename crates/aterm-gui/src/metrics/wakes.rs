@@ -18,6 +18,7 @@ pub(crate) static WAKES: WakeTable = WakeTable::new();
 /// listener's requests by peer and verb (`control_listener::note_request`).
 pub(crate) struct WakeTable {
     counts: [AtomicU64; WAKE_SLOTS],
+    lifetime: [AtomicU64; WAKE_SLOTS],
     names: [OnceLock<&'static str>; WAKE_SLOTS],
 }
 
@@ -25,6 +26,7 @@ impl WakeTable {
     pub(crate) const fn new() -> Self {
         Self {
             counts: [const { AtomicU64::new(0) }; WAKE_SLOTS],
+            lifetime: [const { AtomicU64::new(0) }; WAKE_SLOTS],
             names: [const { OnceLock::new() }; WAKE_SLOTS],
         }
     }
@@ -41,7 +43,32 @@ impl WakeTable {
 
     /// Count one event under `name`; a name past the table's 255 counts under `other`.
     pub(crate) fn note(&self, name: &str) {
-        self.counts[self.slot(name)].fetch_add(1, Ordering::Relaxed);
+        self.note_slot(self.slot(name));
+    }
+
+    fn note_slot(&self, slot: usize) {
+        self.counts[slot].fetch_add(1, Ordering::Relaxed);
+        let _ = self.lifetime[slot].try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            Some(old.saturating_add(1))
+        });
+    }
+
+    /// The table's lifetime delivered events, independent of `metrics reset`.
+    /// The counters are separate observations, not one simultaneous system-wide census.
+    pub(crate) fn lifetime(&self) -> (Vec<(&'static str, u64)>, bool) {
+        let mut rows: Vec<_> = self
+            .names
+            .iter()
+            .zip(&self.lifetime)
+            .filter_map(|(name, count)| {
+                let name = *name.get()?;
+                let count = count.load(Ordering::Relaxed);
+                (count != 0).then_some((name, count))
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let saturated = rows.iter().any(|(_, count)| *count == u64::MAX);
+        (rows, saturated)
     }
 
     /// Counts since the last reset, sorted busiest first (ties by name), omitting zeroes.
@@ -96,7 +123,7 @@ impl WakeCensus {
             .slots
             .entry(std::mem::discriminant(ev))
             .or_insert_with(|| table.slot(&variant_name(ev)));
-        table.counts[slot].fetch_add(1, Ordering::Relaxed);
+        table.note_slot(slot);
     }
 }
 

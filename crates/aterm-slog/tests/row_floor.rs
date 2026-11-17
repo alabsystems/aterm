@@ -361,6 +361,7 @@ fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
         ids: pred.id_counters(),
         limits: Limits::SESSION,
         at: at(10),
+        ident: aterm_slog::DescIdent::default(),
     };
     let lines = pred
         .carry(CarryBudget::SESSION, &[])

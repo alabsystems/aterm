@@ -42,6 +42,10 @@ pub struct Prompt {
     pub text: String,
     /// [`prompt_key`] of the prompt's whole words.
     pub key: u64,
+    /// Whether this entry is a Claude Code bash-mode command (`<bash-input>cmd</bash-input>`,
+    /// shown as `! cmd`): a command line the person ran, not words to the agent. Read from the
+    /// entry's kind, never from its text, which a typed prompt can also start with `! `.
+    pub shell: bool,
 }
 
 /// `text` as one line: every run of whitespace (newlines included) one space, the ends trimmed.
@@ -232,7 +236,7 @@ impl Scan {
                 let results = tool_results(content);
                 if results.is_empty() {
                     if let Some(words) = prompt_words(content) {
-                        self.note_prompt(&words);
+                        self.note_prompt(&words.words, words.shell);
                         self.flight = match std::mem::take(&mut self.flight) {
                             Flight::Open { .. } => Flight::Idle,
                             Flight::Message {
@@ -329,7 +333,7 @@ impl Scan {
         }
     }
 
-    fn note_prompt(&mut self, words: &str) {
+    fn note_prompt(&mut self, words: &str, shell: bool) {
         if self.prompts.len() >= PROMPTS_KEPT {
             return;
         }
@@ -340,6 +344,7 @@ impl Scan {
         self.prompts.push(Prompt {
             text: cap(&fold(words), EXCERPT_BYTES),
             key,
+            shell,
         });
     }
 
@@ -477,7 +482,7 @@ fn tool_results(content: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn prompt_words(content: Option<&Value>) -> Option<String> {
+fn prompt_words(content: Option<&Value>) -> Option<Cleaned> {
     let text = match content? {
         Value::String(text) => text.clone(),
         Value::Array(parts) => parts
@@ -491,7 +496,19 @@ fn prompt_words(content: Option<&Value>) -> Option<String> {
     clean_prompt_words(&text)
 }
 
-pub(crate) fn clean_prompt_words(text: &str) -> Option<String> {
+/// A prompt entry's words as [`clean_prompt_words`] keeps them, with the entry's kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Cleaned {
+    /// The words: a bash-mode command's as `! <command>`.
+    pub(crate) words: String,
+    /// Whether the entry is a bash-mode command ([`Prompt::shell`]).
+    pub(crate) shell: bool,
+}
+
+/// The words of one user entry `text` that are a prompt: `None` for an entry that is none (the
+/// harness's own lines, an interruption, a tag-wrapped entry such as a slash command's or a
+/// command's output); a Claude Code bash-mode command as `! <command>`, marked as one.
+pub(crate) fn clean_prompt_words(text: &str) -> Option<Cleaned> {
     let words = super::upgrade::typed_words(text);
     if words.is_empty()
         || words.starts_with("[aterm harness]")
@@ -501,9 +518,15 @@ pub(crate) fn clean_prompt_words(text: &str) -> Option<String> {
     }
     if let Some(command) = words.strip_prefix("<bash-input>") {
         let command = command.split("</bash-input>").next().unwrap_or(command);
-        return Some(format!("! {}", command.trim()));
+        return Some(Cleaned {
+            words: format!("! {}", command.trim()),
+            shell: true,
+        });
     }
-    (!words.starts_with('<')).then(|| words.to_owned())
+    (!words.starts_with('<')).then(|| Cleaned {
+        words: words.to_owned(),
+        shell: false,
+    })
 }
 
 /// What a `USER_INPUT` row's content says inside its `<USER_REQUEST>`, all of it where it has none.
@@ -514,21 +537,22 @@ pub(crate) fn agy_user_request(content: &str) -> &str {
         .unwrap_or(content)
 }
 
-fn agy_user_input_words(content: &str) -> Option<String> {
+fn agy_user_input_words(content: &str) -> Option<Cleaned> {
     clean_prompt_words(agy_user_request(content))
 }
 
-fn push_prompt(prompts: &mut Vec<Prompt>, words: &str) {
+fn push_prompt(prompts: &mut Vec<Prompt>, cleaned: &Cleaned) {
     if prompts.len() >= PROMPTS_KEPT {
         return;
     }
-    let key = prompt_key(words);
+    let key = prompt_key(&cleaned.words);
     if prompts.iter().any(|p| p.key == key) {
         return;
     }
     prompts.push(Prompt {
-        text: cap(&fold(words), EXCERPT_BYTES),
+        text: cap(&fold(&cleaned.words), EXCERPT_BYTES),
         key,
+        shell: cleaned.shell,
     });
 }
 
@@ -705,15 +729,16 @@ pub fn muse_excerpts_from(session_tail: &[u8]) -> Excerpts {
                     Some("started") => {
                         open_tasks.clear();
                         if let Some(prompt) = event.get("prompt").and_then(Value::as_str)
-                            && let Some(words) = clean_prompt_words(prompt)
+                            && let Some(cleaned) = clean_prompt_words(prompt)
                         {
-                            let key = prompt_key(&words);
+                            let key = prompt_key(&cleaned.words);
                             prompts.retain(|p| p.key != key);
                             prompts.insert(
                                 0,
                                 Prompt {
-                                    text: cap(&fold(&words), EXCERPT_BYTES),
+                                    text: cap(&fold(&cleaned.words), EXCERPT_BYTES),
                                     key,
+                                    shell: cleaned.shell,
                                 },
                             );
                             prompts.truncate(PROMPTS_KEPT);

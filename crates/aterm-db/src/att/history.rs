@@ -6,26 +6,31 @@
 //! A page is one store read. The causal clocks are folded over the whole authenticated index,
 //! which the order needs, and the quota over every eligible record, which a record's inertness
 //! needs; both judge each record in place. The filters and the cursor are then applied, and only
-//! the records the page keeps are copied out as [`Entry`]s, their writers' machines resolved.
+//! the records the page keeps are copied out as [`Entry`]s, their writers' machines resolved
+//! and each named by the Mac its facts bind ([`Mac`], design §4.5), from the table as the same
+//! read projects it.
 //! The cursor is the sort key, (causal clock, operation digest). A page carries the
 //! [`Revision`] it was read at; a page asked at another revision says so ([`Page::moved`]) and
 //! starts from the top, since an operation arriving late with an earlier clock, or a change of
 //! membership, can land inside a range already served. No fold is kept between calls: a reader
 //! asks [`Handle::revision`], which opens no payload, to learn whether to read again.
 
-use super::{Handle, decode};
+use super::{Handle, View, decode};
 use crate::{
     Error, Result,
+    alab::registry::{self, MACHINE, MACHINE_FACTS},
     database::{Change, Command, decode_hex},
     documents::{application, log::Log},
     typed::{
         self, Table,
-        cell::{CellKey, CellValue},
-        owned::{self},
+        cell::{CellKey, CellValue, Projection},
+        keys,
+        owned::{self, OwnedRead},
     },
 };
 use astream_wire::sync::{Actor, Digest};
 use aterm_codec::hex;
+use std::collections::BTreeMap;
 
 use crate::documents::log::Hlc;
 
@@ -113,6 +118,8 @@ pub struct Entry {
     pub actor: Actor,
     /// The writer's Commons machine, from the binding in the roster the record names.
     pub machine: Option<[u8; 16]>,
+    /// The Mac history names the writer by ([`Macs::name`]).
+    pub mac: Mac,
     /// The signed writer clock claim, retained separately from the derived causal order.
     pub authored_ms: u64,
     /// Read-time clock derived from the authenticated causal graph, including hidden parents.
@@ -134,6 +141,185 @@ impl Entry {
             operation: self.operation,
         }
     }
+}
+
+/// The Mac history names a writer by (design §4.5). Labels do not reliably name a Mac
+/// (`docs/KNOWN_ISSUES.md` ATERM-KI-1112-155), so the name is the machine row the writer's own
+/// facts bind, never a row found by its label.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Mac {
+    /// The `machine` row the writer's `machine-facts` row binds ([`registry::bound_machine`]:
+    /// its `merged_into`, else its `mac`).
+    Row {
+        key: String,
+        /// The row's label, where it holds one and no conflict.
+        label: Option<String>,
+        /// The end of the row's key, where another row holds the same label: the shortest of
+        /// four or more characters no other such row's key ends with.
+        ending: Option<String>,
+    },
+    /// No facts row binds the writer's Commons machine.
+    Machine([u8; 16]),
+    /// The roster the record names binds its writer to no Commons machine.
+    Actor(Actor),
+}
+
+impl Mac {
+    /// How a person reads it: the row's label (`m73`), with its key's ending where another row
+    /// shares the label (`m73 (…5c4f)`), else the row's key; a Commons machine id where no row
+    /// binds; the writer's actor where no machine does.
+    pub fn name(&self) -> String {
+        match self {
+            Self::Row {
+                label: Some(label),
+                ending: Some(ending),
+                ..
+            } => format!("{label} (\u{2026}{ending})"),
+            Self::Row {
+                label: Some(label), ..
+            } => label.clone(),
+            Self::Row { key, .. } => key.clone(),
+            Self::Machine(machine) => keys::uuid32(machine),
+            Self::Actor(actor) => hex::encode_lower(actor),
+        }
+    }
+
+    /// The machine row's key, where one binds.
+    pub fn row(&self) -> Option<&str> {
+        match self {
+            Self::Row { key, .. } => Some(key),
+            Self::Machine(_) | Self::Actor(_) => None,
+        }
+    }
+}
+
+/// Which machine row each Commons machine's facts bind, and what each such row is called: the
+/// join from a writer to its Mac, read from one projection of the table.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Macs {
+    /// The machine row each Commons machine's facts row binds; a predecessor (writer
+    /// succession) whose own facts row binds none takes its successor's.
+    bound: BTreeMap<[u8; 16], String>,
+    /// Each machine row's unconflicted label.
+    labels: BTreeMap<String, String>,
+    /// The key ending of each row whose label another row holds too.
+    endings: BTreeMap<String, String>,
+}
+
+impl Macs {
+    /// The join `view` holds: its `machine-facts` rows and its `machine` rows.
+    pub fn of(view: &View) -> Self {
+        let empty = OwnedRead::default();
+        Self::from_rows(
+            &view.project(&MACHINE),
+            view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty),
+        )
+    }
+
+    /// The join `facts` (each Mac's own statement, keyed by its Commons machine) and `machines`
+    /// (the registry's machine rows) hold. A facts row's `predecessor` is the same Mac before
+    /// writer succession: a predecessor whose own facts row binds no machine row, or that has
+    /// none, binds what its successor binds, however far back the chain runs.
+    pub fn from_rows(machines: &Projection, facts: &OwnedRead) -> Self {
+        let mut bound: BTreeMap<[u8; 16], String> = facts
+            .rows
+            .values()
+            .filter_map(|row| {
+                let key = registry::bound_machine(&row.value).filter(|key| !key.is_empty())?;
+                Some((row.machine, key.to_owned()))
+            })
+            .collect();
+        // Each pass carries a binding one predecessor back; a chain is no longer than the rows.
+        for _ in 0..facts.rows.len() {
+            let mut carried = false;
+            for row in facts.rows.values() {
+                let Some(before) = row
+                    .value
+                    .get("predecessor")
+                    .and_then(aterm_json::Value::as_str)
+                    .and_then(keys::parse_uuid32)
+                else {
+                    continue;
+                };
+                if bound.contains_key(&before) {
+                    continue;
+                }
+                if let Some(key) = bound.get(&row.machine).cloned() {
+                    bound.insert(before, key);
+                    carried = true;
+                }
+            }
+            if !carried {
+                break;
+            }
+        }
+        let labels: BTreeMap<String, String> = machines
+            .rows
+            .iter()
+            .filter_map(|(key, row)| {
+                if row.raw.contains("label")
+                    || row
+                        .fields
+                        .get("label")
+                        .is_some_and(|field| field.conflicted())
+                {
+                    return None;
+                }
+                let label = row
+                    .get("label")?
+                    .as_str()
+                    .filter(|label| !label.is_empty())?;
+                Some((key.clone(), label.to_owned()))
+            })
+            .collect();
+        let mut sharing: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (key, label) in &labels {
+            sharing.entry(label).or_default().push(key);
+        }
+        let mut endings = BTreeMap::new();
+        for group in sharing.values().filter(|group| group.len() > 1) {
+            for key in group {
+                endings.insert((*key).to_owned(), ending(key, group));
+            }
+        }
+        Self {
+            bound,
+            labels,
+            endings,
+        }
+    }
+
+    /// The Mac of the writer that signed as `actor` from Commons machine `machine`.
+    pub fn name(&self, actor: &Actor, machine: Option<&[u8; 16]>) -> Mac {
+        let Some(machine) = machine else {
+            return Mac::Actor(*actor);
+        };
+        match self.bound.get(machine) {
+            Some(key) => Mac::Row {
+                key: key.clone(),
+                label: self.labels.get(key).cloned(),
+                ending: self.endings.get(key).cloned(),
+            },
+            None => Mac::Machine(*machine),
+        }
+    }
+}
+
+/// The shortest end of `key`, four characters or more, that no other key of `group` ends with;
+/// the whole key where every end is another's.
+fn ending(key: &str, group: &[&str]) -> String {
+    let starts: Vec<usize> = key.char_indices().map(|(at, _)| at).rev().collect();
+    starts
+        .iter()
+        .skip(3)
+        .map(|&at| &key[at..])
+        .find(|end| {
+            group
+                .iter()
+                .all(|other| *other == key || !other.ends_with(end))
+        })
+        .unwrap_or(key)
+        .to_owned()
 }
 
 /// A position in history: the sort key of the last entry a page served. The next page holds
@@ -306,7 +492,10 @@ impl Handle {
                 let revision = Revision(store.revision(session)?);
                 let log = Log::read_with(session, store, scope, decode)?;
                 let resolve = owned::commons::historical(session);
-                page(table, &log, revision, ask, &resolve)
+                // The names come from the same read, so a page and its writers' names are of one
+                // revision.
+                let macs = Macs::of(&View::read(table, session, &log)?);
+                page(table, &log, revision, ask, &resolve, &macs)
             })
         })
     }
@@ -335,13 +524,14 @@ impl Handle {
 }
 
 /// The page `ask` names of `log`, which was read at `revision`; `resolve` finds a record's
-/// writer machine through the roster it names.
+/// writer machine through the roster it names, and `macs` that machine's Mac.
 fn page(
     table: &'static Table,
     log: &Log,
     revision: Revision,
     ask: &Ask,
     resolve: &dyn Fn(&Digest, &Actor) -> Option<[u8; 16]>,
+    macs: &Macs,
 ) -> Result<Page> {
     let order = log.causal_order()?;
     let (records, merges) = log.eligible_and_merges();
@@ -415,6 +605,7 @@ fn page(
             operation: id,
             actor,
             machine,
+            mac: macs.name(&actor, machine.as_ref()),
             authored_ms: operation.authored_ms,
             hlc,
             request: operation.request,

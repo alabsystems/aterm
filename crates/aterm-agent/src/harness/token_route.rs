@@ -925,6 +925,67 @@ pub fn row_token_serves(
     })
 }
 
+/// WHETHER A TURN SERVED TO THE SESSION `who` ON ITS ACCOUNT'S VAULT TOKEN PROVES `row`'S ACCOUNT
+/// (§5.2: attribution counts a token route as the row's), as one its stored login served does
+/// (`harness_host.rs`' served proof, [`accounts::prove_on_token`]): this Mac launches on tokens
+/// ([`LAUNCHES_ON_TOKEN`], the judgment's platform step), its route is the row's own token
+/// ([`accounts::AuthRoute::for_account`]), the vault's token is the one its wrapper served it
+/// ([`ServedToken::on`], not [`OnToken::Other`]), and that token is judged in use here or held
+/// for its basis, its record naming the row's email ([`standing_judged`]): the judgment a launch
+/// onto the row starts on the token by ([`row_token_serves`]). A token whose windows differ here
+/// (it may be another account's), one refused, ended, mismatched or not in use here unverified, a
+/// session still on a token a `--replace` replaced, a row the lab keys no entry or email for, and
+/// a vault that could not be read just now prove nothing: the next served turn asks again. The
+/// vault is read value-free with `claude_token::standing`'s brief wait, outside every store's
+/// lock; the judgment may write this Mac's token table (a held token's row, `note_held`).
+#[cfg(unix)]
+#[must_use]
+pub fn token_serves_row(
+    paths: &aterm_secrets::client::Paths,
+    store: &accounts::Store,
+    roster: &Roster,
+    row: &accounts::Row,
+    (who, served): (&ProcessLogin, ServedToken),
+    now: u64,
+) -> bool {
+    use aterm_secrets::claude_token::Lookup;
+    if !LAUNCHES_ON_TOKEN {
+        return false;
+    }
+    let (Some(entry), Some(email)) = (TokenEntry::of_row(row), row.expected_identity_email())
+    else {
+        return false;
+    };
+    if !matches!(
+        who.route.for_account(Some(entry)),
+        accounts::AuthRoute::VaultToken { .. }
+    ) {
+        return false;
+    }
+    let Some(key) = aterm_secrets::claude_token::Key::parse(entry.key().as_str()) else {
+        return false;
+    };
+    let Ok(standing) = aterm_secrets::claude_token::standing(paths, &key) else {
+        return false;
+    };
+    let served_this = match &standing {
+        Lookup::Found(found) => found
+            .meta
+            .as_ref()
+            .is_some_and(|meta| served.on(meta.minted_at) != OnToken::Other),
+        Lookup::Absent | Lookup::Unknown => false,
+    };
+    let account = Account {
+        label: Some(row.label.clone()),
+        email: email.to_owned(),
+    };
+    served_this
+        && matches!(
+            standing_judged(&standing, paths, store, Some(roster), &key, &account, now),
+            TokenFact::InUse | TokenFact::AwaitingBasis
+        )
+}
+
 /// [`row_token_serves`] for a launch on this Mac under the user's `home`; never off Unix.
 #[must_use]
 pub fn row_token_serves_at(

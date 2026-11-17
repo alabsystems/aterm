@@ -13,6 +13,10 @@
 //!   uuid, inert at any other key ([`owned`]);
 //! - **log**, append-only per writer, read through the eligible operations, never cells.
 //!
+//! A cells collection may opt into the authority rules from one of its versions
+//! ([`Collection::authority`]): every read then holds inert, as if it had never been written, a
+//! cell the column's writer would not have written ([`authority`]).
+//!
 //! Schemas are compiled constants checked by `const fn` at compile time
 //! ([`Collection::check`]); a stored copy is inert data for generic tools. Nothing here does
 //! I/O: callers read a table and hand its snapshot or eligible operations in.
@@ -21,6 +25,7 @@ use crate::database::Change;
 use aterm_digest::Sha256;
 use aterm_json::{Value, json};
 
+pub mod authority;
 pub mod cell;
 pub mod check;
 pub mod claim;
@@ -142,6 +147,9 @@ pub enum Writer {
     Mine,
     /// A compiled seed.
     Seed,
+    /// Only the owner's verb: a cell an automatic path or an import wrote there is inert at
+    /// every version, in a collection under the authority rules ([`authority`]).
+    Verb,
 }
 
 /// One member of a closed struct type.
@@ -163,6 +171,10 @@ pub enum Ty {
     Uint,
     /// Free text of at most this many bytes, guarded (`guard::text`).
     Text(usize),
+    /// A handle of at most this many bytes: words of lower-case letters and digits joined by one
+    /// `-`, never shaped like a credential (`guard::handle`). A word shaped like a machine name
+    /// is a word like any other.
+    Handle(usize),
     /// The lab tracker's prose of at most this many bytes (`guard::prose`): no control character
     /// and no real secret, where an `@`, a commit and a long path stand (design
     /// docs/DESIGN-lab-tracker-2026-11-14.md §7, finding 13).
@@ -182,9 +194,6 @@ pub enum Ty {
     Principal,
     /// One piece of evidence a change cites ([`values::Evidence`]).
     Evidence,
-    /// An account's owner-editable name of at most this many bytes: free text that names no
-    /// machine (`guard::account_label`).
-    AccountLabel(usize),
     Enum(&'static [&'static str]),
     /// Unix milliseconds: an author's claim, never an ordering input.
     Time,
@@ -270,6 +279,7 @@ impl Ty {
             Self::Int { min, max } => json!({"int": [min, max]}),
             Self::Uint => json!("uint"),
             Self::Text(max) => json!({"text": max}),
+            Self::Handle(max) => json!({"handle": max}),
             Self::Prose(max) => json!({"prose": max}),
             Self::Command(max) => json!({"command": max}),
             Self::Commit => json!("commit"),
@@ -278,7 +288,6 @@ impl Ty {
             Self::Decimal => json!("decimal"),
             Self::Principal => json!("principal"),
             Self::Evidence => json!("evidence"),
-            Self::AccountLabel(max) => json!({"account_label": max}),
             Self::Enum(words) => json!({"enum": words}),
             Self::Time => json!("time"),
             Self::Day => json!("day"),
@@ -414,6 +423,9 @@ pub struct Collection {
     pub unique: &'static [&'static [&'static str]],
     /// Largest canonical row of an owned or log collection.
     pub max_row: usize,
+    /// The collection version from which every read judges its cells by the authority rules
+    /// ([`authority`]); `None` reads every cell as it was written.
+    pub authority: Option<u32>,
 }
 
 /// The default cap of an owned row (design §3.1).
@@ -533,8 +545,11 @@ impl Collection {
 
     /// Whether this compiled declaration is well formed: the grammars, no reused column
     /// name, secret-named columns only as SecretRef, a lifecycle column on every
-    /// cells collection, and writers that fit the kind. Called by [`att_collection!`] at
-    /// compile time, so a bad schema never builds.
+    /// cells collection, and writers that fit the kind. The authority rules
+    /// ([`Self::authority`]) judge a cells collection from one of its versions, which then
+    /// declares no identity claim and is born by its owner or a birth, by a birth wherever a
+    /// column is a Birth column; only such a collection has a verb column. Called by
+    /// [`att_collection!`] at compile time, so a bad schema never builds.
     ///
     /// # Errors
     /// The first rule the declaration breaks.
@@ -560,10 +575,34 @@ impl Collection {
             | (Kind::Log, Writers::SelfSuffix) => {}
             _ => return Err("the writers do not fit the collection kind"),
         }
-        let mut lifecycle = false;
+        if let Some(from) = self.authority {
+            if !matches!(self.kind, Kind::Cells) {
+                return Err("the authority rules judge a cells collection");
+            }
+            if from == 0 || from > self.version {
+                return Err("the authority rules start at one of the collection's versions");
+            }
+        }
+        let mut lifecycle = None;
+        let mut birth = false;
         let mut i = 0;
         while i < self.columns.len() {
             let column = &self.columns[i];
+            match column.writer {
+                Writer::Birth => birth = true,
+                Writer::Verb => {
+                    if self.authority.is_none() {
+                        return Err(
+                            "a verb column belongs to a collection under the authority rules",
+                        );
+                    }
+                }
+                Writer::Owner | Writer::Mine | Writer::Seed => {}
+            }
+            // The claim reader reads its operations, not the cells the rules admit.
+            if column.claim.is_some() && self.authority.is_some() {
+                return Err("a collection under the authority rules declares no identity claim");
+            }
             if !column_name(column.name) {
                 return Err("column name breaks the column grammar");
             }
@@ -605,12 +644,24 @@ impl Collection {
                 if words.is_empty() || !str_eq(words[0], "live") {
                     return Err("the lifecycle column's first word is live");
                 }
-                lifecycle = true;
+                lifecycle = Some(column.writer);
             }
             i += 1;
         }
-        if matches!(self.kind, Kind::Cells) && !lifecycle {
+        if matches!(self.kind, Kind::Cells) && lifecycle.is_none() {
             return Err("a cells collection has the lifecycle column");
+        }
+        // A birth writes its Birth cells with the lifecycle in one record, and the rules judge
+        // a later automatic write by the lifecycle writes before it.
+        if self.authority.is_some() {
+            if !matches!(lifecycle, Some(Writer::Owner | Writer::Birth)) {
+                return Err("under the authority rules, a row is born by its owner or a birth");
+            }
+            if birth && !matches!(lifecycle, Some(Writer::Birth)) {
+                return Err(
+                    "under the authority rules, a collection with a Birth column is born by it",
+                );
+            }
         }
         if !matches!(self.kind, Kind::Cells) && (self.max_row == 0 || self.max_row > MAX_OWNED_ROW)
         {
@@ -655,6 +706,7 @@ impl Collection {
                     Writer::Birth => "birth",
                     Writer::Mine => "self",
                     Writer::Seed => "seed",
+                    Writer::Verb => "verb",
                 };
                 // `pii` is a retired member: no surface masks an address. It stays because a
                 // row's content is fixed at its collection version, and two different rows at
@@ -674,9 +726,17 @@ impl Collection {
                 encoded
             })
             .collect();
-        json!({"r": self.version, "x": {"format": FORMAT, "version": self.version, "kind": kind,
+        let mut row = json!({"format": FORMAT, "version": self.version, "kind": kind,
             "writers": writers, "pk": {"prefix": self.prefix, "derive": derive},
-            "columns": columns, "unique": self.unique, "max_row": self.max_row}})
+            "columns": columns, "unique": self.unique, "max_row": self.max_row});
+        // Only where it is set, so the row of a collection that never opted in is the one every
+        // earlier build wrote.
+        if let Some(from) = self.authority {
+            row.as_object_mut()
+                .unwrap()
+                .insert("authority".into(), json!(from));
+        }
+        json!({"r": self.version, "x": row})
     }
 }
 

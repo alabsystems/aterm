@@ -55,8 +55,9 @@ impl Run {
         }
     }
 
-    /// Append one record of `writer`'s to the owned and quota history.
-    fn record(&mut self, writer: u8, revert: bool, changes: Vec<Change>) -> Digest {
+    /// Append one record of `writer`'s to the owned and quota history, a revert of `revert`
+    /// where it names one.
+    fn record(&mut self, writer: u8, revert: Option<Digest>, changes: Vec<Change>) -> Digest {
         let sequence = self.sequences.entry(writer).or_default();
         *sequence += 1;
         let mut id = [0; 32];
@@ -197,7 +198,7 @@ fn step(state: &State, run: &mut Run, action: &str) -> State {
             };
             run.record(
                 writer,
-                false,
+                None,
                 vec![owned_change(&FACTS, &key, u64::try_from(n).unwrap())],
             );
             match count {
@@ -255,7 +256,7 @@ fn step(state: &State, run: &mut Run, action: &str) -> State {
         "Automatic" | "Owner" | "Revert" => {
             let n = i64::try_from(run.ops.len()).unwrap();
             if action == "Automatic" {
-                let id = run.record(1, false, vec![automatic(n)]);
+                let id = run.record(1, None, vec![automatic(n)]);
                 run.cost.insert(id, 1 + run.joins);
             } else {
                 // A revert restores an automatic value: still the owner's verb.
@@ -264,7 +265,9 @@ fn step(state: &State, run: &mut Run, action: &str) -> State {
                 } else {
                     automatic(n)
                 };
-                let id = run.record(1, action == "Revert", vec![change]);
+                let target =
+                    (action == "Revert").then(|| run.ops.last().map_or([0; 32], |op| op.id));
+                let id = run.record(1, target, vec![change]);
                 run.owner.insert(id);
                 next.insert("owner", state["owner"] + 1);
             }

@@ -258,8 +258,14 @@ pub fn check_signable(parsed: &atpkg::PkgManifest) -> Result<()> {
             parsed.program, parsed.build_number, parsed.version
         )));
     }
-    let is_bottle = crate::programs::get(&parsed.program)
-        .is_some_and(|d| matches!(d.shape, crate::programs::Shape::Bottle(_)));
+    // An upstream bottle and a keyed tree carry no Rust compiler record: no first-party crate
+    // was compiled into either.
+    let is_bottle = crate::programs::get(&parsed.program).is_some_and(|d| {
+        matches!(
+            d.shape,
+            crate::programs::Shape::Bottle(_) | crate::programs::Shape::Tree(_)
+        )
+    });
     for a in &parsed.artifacts {
         match &a.provenance {
             Some(p) => {

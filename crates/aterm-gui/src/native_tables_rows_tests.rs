@@ -338,10 +338,14 @@ fn the_lifecycle_filter_steps_through_the_words_a_row_can_take() {
     act(&mut app, "tables/sheet/machine", None);
     act(&mut app, FILTER, None);
     act(&mut app, &format!("tables/cell/{MC}/label"), None);
+    // The row's As of is the history drawer's, opened on the row from its pane.
+    render(&app);
+    act(&mut app, "tables/pane/history", None);
+    render(&app);
     act(
         &mut app,
         &format!(
-            "tables/pane/asof/{}",
+            "tables/history/asof/{}",
             aterm_codec::hex::encode_lower(&seeded)
         ),
         None,
@@ -577,7 +581,9 @@ fn split_seat(lab: &Lab) -> (String, String, String, String, String, String) {
 /// key's own words: `` left: "live, new, not written, refused: a preference names a machine and
 /// an account" right: "live, new, not written" ``; with `rows::name_references` reading a
 /// history's reference as it reads now (`said`, not `short`), the line carries the machine's
-/// status today: `` ["Row → added", "Machine: empty → m1-7765 · …a4f6 · planned ·…", …] ``.
+/// status today: `` ["Row → added", "Machine: empty → m1-7765 · …a4f6 · planned ·…", …] ``
+/// (quoted from the pane's history, which the history drawer has replaced; its line reads the
+/// value the same way).
 #[test]
 fn a_reference_is_chosen_from_its_rows_and_stored_by_key() {
     let lab = Lab::new(&[Role::Writer]);
@@ -679,15 +685,23 @@ fn a_reference_is_chosen_from_its_rows_and_stored_by_key() {
     let ui = render(&app);
     assert_eq!(cell_says(&ui, &pk, "machine"), split_says);
     assert_eq!(cell_says(&ui, &pk, "account"), account_says);
-    // Its history names the machine by what stays of it, not its status now.
+    // Its history, the drawer's at the row's scope, names the machine by what stays of it, not
+    // its status now.
     act(&mut app, &format!("tables/cell/{pk}/machine"), None);
+    render(&app);
+    act(&mut app, "tables/pane/history", None);
     let ui = render(&app);
-    let history: Vec<String> = (0..8)
-        .filter_map(|m| said(&ui, &format!("tables/pane/written/0/{m}")))
+    let history: Vec<String> = ui
+        .semantics
+        .iter()
+        .filter(|node| node.key.as_str().starts_with("tables/history/at/"))
+        .filter_map(|node| said(&ui, node.key.as_str()))
         .collect();
     let split_short = format!("{split_label} \u{b7} \u{2026}{}", ending(&split, &held_pk));
     assert!(
-        history.contains(&format!("Machine: empty \u{2192} {split_short}")),
+        history
+            .iter()
+            .any(|line| line.ends_with(&format!(" \u{b7} Machine: {split_short}"))),
         "{history:?}"
     );
     assert_eq!(

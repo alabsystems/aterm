@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::commons::{binding::Pending, node::Edit};
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 
 const ROOT: [u8; 32] = [11; 32];
@@ -746,6 +747,7 @@ fn concurrent_creators_reuse_one_encrypted_device_and_answer_joint_proof() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn unsafe_files_and_lost_control_identity_are_never_replaced() {
     for variant in 0..5 {
@@ -885,6 +887,7 @@ fn bootstrap_lock_outlives_control_loss_and_rechecks_retained_history() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn custody_wait_rejects_replacement_and_an_expired_deadline_stays_busy() {
     for replace_inode in [false, true] {
@@ -1102,6 +1105,7 @@ fn legacy_migration_requires_intact_history_before_retaining_a_claim() {
     assert!(!opened.journal_dir().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn bootstrap_refuses_unsafe_outer_lock_and_history_claim() {
     for (file, symlinked) in [
@@ -1283,6 +1287,7 @@ fn history_cache_combines_source_bounds_and_preserves_overwrites_and_leftover_bo
     assert!(history_capacity(dir.path(), &first, 1, 1).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn control_state_is_a_claim_a_pin_or_history_and_never_a_device_key_alone() {
     let (_root, paths) = fixture();
@@ -1386,6 +1391,10 @@ fn an_observation_waits_out_a_short_custody_hold_and_refuses_a_long_one_as_busy(
     assert_eq!(reopened.unwrap().trust(), opened.trust());
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-27509: a bounded bootstrap writer after a founding finds the journal's writer lock taken on Windows"
+)]
 #[test]
 fn settled_bounded_bootstrap_reads_beside_a_writer_but_pair_admission_requires_the_writer() {
     use std::time::{Duration, Instant};
@@ -1467,6 +1476,7 @@ fn established_observation_neither_initializes_nor_repairs_custody() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn established_observation_does_not_narrow_foreign_directory_permissions() {
     use std::time::{Duration, Instant};
@@ -1491,6 +1501,7 @@ fn established_observation_does_not_narrow_foreign_directory_permissions() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn established_custody_acquisition_never_recreates_a_lock_lost_after_precheck() {
     use std::time::{Duration, Instant};
@@ -1602,6 +1613,7 @@ fn a_journal_read_as_holding_the_descriptor_is_made_durable_first() {
 
 /// An open of the vault at `paths` that a bootstrap's judgement is held to: what
 /// `Replica`'s rounds open where the one they keep falls ([`Bootstrap::cached_until`]).
+#[cfg(unix)]
 fn stood_open(paths: &Paths) -> Result<Bootstrap> {
     use std::time::{Duration, Instant};
     Bootstrap::cached_until(paths, Instant::now() + Duration::from_secs(60))
@@ -1609,6 +1621,7 @@ fn stood_open(paths: &Paths) -> Result<Bootstrap> {
 }
 
 /// A vault this Mac created and the bootstrap an open of it gives, which stands.
+#[cfg(unix)]
 fn stood_established() -> (aterm_tempfile::TempDir, Paths, Bootstrap) {
     let home = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(home.path());
@@ -1626,10 +1639,12 @@ fn stood_established() -> (aterm_tempfile::TempDir, Paths, Bootstrap) {
 
 /// A change to a vault a bootstrap was opened from, by what it is, how it is made, and whether
 /// an open then repairs it.
+#[cfg(unix)]
 type StoodChange = (&'static str, fn(&Paths), bool);
 
 /// The changes [`Bootstrap::stands`] refuses a bootstrap after, as an open would give another one,
 /// repair or refuse ([`a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged`]).
+#[cfg(unix)]
 fn stood_changes() -> [StoodChange; 15] {
     fn mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1749,6 +1764,7 @@ fn stood_changes() -> [StoodChange; 15] {
 /// descriptor (`a linked control folder`, `a control journal that lost its history`). The locks'
 /// opens judge the vault's folder too, and so does its mode, so a `stands` that took that folder's
 /// verdict without refusing on it still refuses `a widened vault folder`.
+#[cfg(unix)]
 #[test]
 fn a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged() {
     let (_home, paths, bootstrap) = stood_established();
@@ -1797,6 +1813,7 @@ fn a_bootstrap_stands_only_while_its_open_would_give_it_back_unchanged() {
 /// `beside_custody` judging the custody locks only where it is given no journal (for `stands`
 /// alone), `a lost custody lock`; `beside_custody` holding any journal it is given to the
 /// descriptor, `a journal of another vault`.
+#[cfg(unix)]
 #[test]
 fn a_bootstrap_stands_through_a_sessions_look_exactly_where_it_stands_on_its_own_calls() {
     let read =
@@ -1866,6 +1883,7 @@ fn a_bootstrap_stands_through_a_sessions_look_exactly_where_it_stands_on_its_own
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_established_journal_missing_a_published_witness_takes_the_writer_to_ingest_it() {
     use std::{cell::Cell, os::unix::fs::MetadataExt as _, rc::Rc};
@@ -1998,6 +2016,10 @@ fn vault_revalidation_retains_busy_and_changed_kinds_without_trusting_error_word
     assert!(!is_transient_vault_revalidation(&missing));
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn bounded_bootstrap_retries_transient_vault_lock_after_releasing_custody() {
     use std::{cell::Cell, rc::Rc, time::Instant};

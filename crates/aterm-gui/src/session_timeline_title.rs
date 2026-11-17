@@ -11,10 +11,10 @@
 //! stays until a title write finds a claim standing or comes from an author whose claims can
 //! stand.
 
-use aterm_slog::{Actor, Described, Node, Rank, Src};
+use aterm_slog::{Actor, ClaimRefused, Described, Node, Rank, Src};
 
 use super::{MetaChange, MetaField, MetaWriteError, sanitize_metadata_value};
-use crate::session_log::{DESC_VALUE_MAX, DescRefused, DescWrite, desc_stored};
+use crate::session_log::{DescRefused, DescWrite, desc_stored};
 
 /// The slot a title claims.
 const TITLE_SLOT: &str = "title";
@@ -34,16 +34,17 @@ fn standing_title(desc: &Described) -> Option<String> {
 /// A claim's refusal as a title write's.
 const fn refusal(e: DescRefused) -> MetaWriteError {
     match e {
-        DescRefused::Empty => MetaWriteError::Empty,
-        DescRefused::TooLong => MetaWriteError::TooLongEncoded {
-            cap: DESC_VALUE_MAX,
-        },
+        DescRefused::Claim(ClaimRefused::Empty) => MetaWriteError::Empty,
+        DescRefused::Claim(ClaimRefused::TooLong { max }) => {
+            MetaWriteError::TooLongEncoded { cap: max }
+        }
+        DescRefused::Claim(ClaimRefused::Protocol) => MetaWriteError::ProtocolLine,
         DescRefused::Credential => MetaWriteError::Credential,
         DescRefused::Busy(retry_ms) => MetaWriteError::Busy { retry_ms },
-        // A session's title names a fixed slot, no node and no `upto=`: of the rest only the
-        // text's formatting can be refused.
-        DescRefused::Formatting
-        | DescRefused::Slot
+        // A session's title names a fixed slot, no node and no `upto=`, and its writers are a
+        // person, a control client or another session, which the rule refuses for no other
+        // reason: of the rest only the text's formatting can be refused.
+        DescRefused::Claim(_)
         | DescRefused::NoNode(_)
         | DescRefused::NotOpen(_)
         | DescRefused::NotAgent(_)
@@ -54,29 +55,34 @@ const fn refusal(e: DescRefused) -> MetaWriteError {
 
 /// WRITE THE TITLE (`value` validated; `None` clears) as `by`'s claim, under the metadata lock
 /// then the timeline's. The claim is the session's, not its agent's, so a tab's title does
-/// not lapse when an agent exits; a clear withdraws `by`'s own claim and nobody else's. The
+/// not lapse when an agent exits. A clear withdraws `by`'s own claim and nobody else's, unless
+/// `by` is a person: a person's clear also removes every title a control client, a program or
+/// another session put on the session ([`aterm_slog::Described::withdraws`]), so a person who
+/// empties a rename field that held a title can take it off their own tab whoever set it. The
 /// pinned title then becomes what stands ([`standing_title`]), and only when it moved is the
 /// `meta` record written (the timeline row, `EVENT meta` and every `user_title=` reader hang
-/// on that record) and `true` returned. So a control client's title under a person's rename
-/// is recorded and listed, answers OK, and changes nothing shown. Where no claim stands, the
-/// pinned title is cleared by an author whose claims can stand and left alone by one whose
-/// claims never do (another session, the bridge, another machine's driver).
+/// on that record) and `true` returned.
+/// So a control client's title under a person's rename is recorded and listed, answers OK, and
+/// changes nothing shown. Where no claim stands, the pinned title is cleared by an author
+/// whose claims can stand and left alone by one whose claims never do (another session, the
+/// bridge, another machine's driver).
 ///
-/// Two writes write nothing and return `false`. One repeats `by`'s own claim (the same text,
-/// held with no time limit) or withdraws one it does not hold, and would leave the pinned
-/// title where it is: what stands is already pinned, or nothing stands and `by`'s claims
-/// never do, so the pin is kept whatever it is. The other is a person's write of the text
-/// already pinned, where the person holds no claim: the rename field opens holding the pinned
-/// title, so committing it unedited states nothing and the title stays its author's (or no
-/// one's, where a restore pinned it).
-/// Every author's write counts as a driver's, these two included (the restore graft keeps
-/// its hands off the field). A log that takes no record (a closed session's) holds no claims
-/// to rank, so there the title is set as given.
+/// A write that repeats `by`'s own claim (the same text, held with no time limit) or is a clear
+/// that would remove no claim, and would leave the pinned title where it is, writes nothing and
+/// returns `false`: what stands is already pinned, or nothing stands and `by`'s claims never
+/// do, so the pin is kept whatever it is. A person's write is a claim like any other's, even of
+/// the text already pinned: a rename field committed as it opened never reaches here
+/// (`crate::App::commit_session_rename` judges that by what the field opened holding), so a
+/// person's write is text the person changed.
+/// Every author's write counts as a driver's, a repeat included (the restore graft keeps its
+/// hands off the field). A log that takes no record (a closed session's) holds no claims to
+/// rank, so there the title is set as given.
 ///
 /// # Errors
-/// A title over [`DESC_VALUE_MAX`] bytes percent-encoded, one from anyone but a person of
-/// which redaction leaves nothing but its notices (it is nothing but a credential), and an
-/// author short of a mark token.
+/// A title over its slot's bound ([`aterm_slog::slot_bound`]) percent-encoded, one from anyone
+/// but a person of which redaction leaves nothing but its notices (it is nothing but a
+/// credential) or in which the harness's turn-end readers read a head
+/// ([`MetaWriteError::ProtocolLine`]), and an author short of a mark token.
 pub(super) fn apply_title_claim(
     ctx: &crate::SessionCtx,
     value: Option<String>,
@@ -84,30 +90,28 @@ pub(super) fn apply_title_claim(
 ) -> Result<bool, MetaWriteError> {
     let stored = value
         .as_deref()
-        .map(|v| desc_stored(v, by))
+        .map(|v| desc_stored(TITLE_SLOT, v, by, Src::Mark))
         .transpose()
         .map_err(refusal)?;
     let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
     meta.driver_writes |= MetaField::Title.bit();
     let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
     let at = timeline.slog().now();
-    let (repeats, unedited, stands, listed) = {
+    let (repeats, stands, listed) = {
         let desc = &timeline.slog().log().state().desc;
         let own = desc.claim_of(Node::SESSION, TITLE_SLOT, by, Src::Mark, None);
-        // The claim this write leaves has no time limit, so one `by` holds with a `ttl` (a
-        // `mark`'s) is not repeated by it, whatever its text.
-        let repeats = match (own, stored.as_deref()) {
-            (None, None) => true,
-            (Some(claim), Some(text)) => claim.value.as_str() == text && claim.live(u64::MAX),
-            _ => false,
+        let repeats = match stored.as_deref() {
+            // A clear repeats where it would remove nothing: `by` holds no claim, and, for a
+            // person, neither does anyone whose title a person's clear takes off.
+            None => !desc.withdraws(Node::SESSION, TITLE_SLOT, by, Src::Mark, None),
+            // The claim this write leaves has no time limit, so one `by` holds with a `ttl` (a
+            // `mark`'s) is not repeated by it, whatever its text.
+            Some(text) => {
+                own.is_some_and(|claim| claim.value.as_str() == text && claim.live(u64::MAX))
+            }
         };
-        // A person who commits the rename field as it opened (the pin, which they do not
-        // hold) states nothing: the title stays its author's.
-        let unedited =
-            by == Actor::Human && own.is_none() && stored.is_some() && stored == meta.user_title;
         (
             repeats,
-            unedited,
             standing_title(desc),
             // An author's rank hangs on who the session is, which no claim changes: it is
             // the same after the write below.
@@ -116,7 +120,7 @@ pub(super) fn apply_title_claim(
     };
     // A repeat changes no claim, so what stands after it is what stands now: the pin moves
     // only where that is not yet pinned, and a listed author keeps the pin where none stands.
-    if unedited || (repeats && (stands == meta.user_title || (listed && stands.is_none()))) {
+    if repeats && (stands == meta.user_title || (listed && stands.is_none())) {
         return Ok(false);
     }
     let write = DescWrite::of_session(TITLE_SLOT, value.as_deref());

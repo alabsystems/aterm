@@ -566,15 +566,7 @@ pub fn put_tried(store: &Store, key: &str, tried: Option<&Tried>) -> io::Result<
 /// ([`mailbox_read`]).
 #[must_use]
 pub fn route_at(store: &Store, home: Option<&Path>, email: &str) -> Option<u64> {
-    use super::headless_oauth::MAILBOX_TOML_FILE;
-    let mut paths: Vec<PathBuf> = vec![store.dir.join(MAILBOX_TOML_FILE)];
-    #[cfg(target_os = "macos")]
-    paths.push(super::signin_window::store_marker(&store.dir, email));
-    if let Some(home) = home {
-        paths.push(home.join(".config/aterm").join(MAILBOX_TOML_FILE));
-        paths.extend(aterm_mail::oauth::session::grant_file(home, email));
-    }
-    paths
+    route_paths(store, home, email)
         .iter()
         .filter_map(|path| {
             let modified = std::fs::symlink_metadata(path).ok()?.modified().ok()?;
@@ -586,6 +578,23 @@ pub fn route_at(store: &Store, home: Option<&Path>, email: &str) -> Option<u64> 
             )
         })
         .max()
+}
+
+/// The files whose last write [`route_at`] reads for the account `email`: the window store's
+/// record of its sign-in (macOS), the mailbox configuration files (the store's and
+/// `~/.config/aterm`'s) and its saved Google mail grant. The vault's two mailbox entries are no
+/// files, and none is named here.
+#[must_use]
+pub fn route_paths(store: &Store, home: Option<&Path>, email: &str) -> Vec<PathBuf> {
+    use super::headless_oauth::MAILBOX_TOML_FILE;
+    let mut paths: Vec<PathBuf> = vec![store.dir.join(MAILBOX_TOML_FILE)];
+    #[cfg(target_os = "macos")]
+    paths.push(super::signin_window::store_marker(&store.dir, email));
+    if let Some(home) = home {
+        paths.push(home.join(".config/aterm").join(MAILBOX_TOML_FILE));
+        paths.extend(aterm_mail::oauth::session::grant_file(home, email));
+    }
+    paths
 }
 
 /// Where a mailbox read looks: the home it reads under, and the environment variable reader.
@@ -606,6 +615,19 @@ pub fn mailbox_read(
     email: &str,
 ) -> bool {
     super::accounts_sync::window_reads_mailbox_for_row_with(var, home, store, label, Some(email))
+}
+
+/// The files and folders [`mailbox_read`] reads for any account of `store`, under `home` and
+/// with the environment read through `var`: every mailbox configuration and roster its discovery
+/// reads, the default mail folders whose presence it checks, the local `ai-signin.toml` files and
+/// the path the mailbox override variable names
+/// ([`super::headless_oauth::mailbox_config_files_with_env`]). The account's saved Google mail
+/// grant, which the window's read also checks, is [`route_paths`]'. Not named, being no files of
+/// their own: the vault's entries (read from the vault's own files), the lab registry's mailboxes
+/// and the environment; nor a secret file a configuration names by a `*_file` key.
+#[must_use]
+pub fn mailbox_paths(store: &Store, (home, var): EnvRead<'_>) -> Vec<PathBuf> {
+    super::headless_oauth::mailbox_config_files_with_env(home, Some(&store.dir), var)
 }
 
 #[cfg(test)]

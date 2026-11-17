@@ -9,6 +9,96 @@ const HOME: Routes = [Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7))), None, None];
 const AWAY: Routes = [Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9))), None, None];
 const MINUTE: u64 = 60 * 1000;
 
+#[test]
+fn a_standing_row_arms_no_retry_and_preserves_its_work_until_inputs_move() {
+    let mut due = Due::default();
+    assert!(due.at_start(MINUTE, HOME, Last::None));
+    let owed = due.repository_request();
+    assert!(!due.poll(MINUTE + 1, HOME, Last::Standing));
+    assert_eq!(due.next_at(), None);
+    for at in [MINUTE + FIRST_RETRY_MS, 60 * MINUTE, 24 * 60 * MINUTE, 0] {
+        assert!(!due.after_pass(&unchanged(), at, HOME, Last::None));
+        assert_eq!(due.next_at(), None, "unchanged inputs at {at}");
+    }
+    assert!(due.after_request(RepositoryRequest::Repair, 2 * MINUTE, HOME, Last::None));
+    assert_eq!(
+        due.repository_request(),
+        owed,
+        "a repair wake keeps the owed refresh"
+    );
+    assert!(
+        !due.poll(2 * MINUTE + 1, HOME, Last::Ended),
+        "one successor for the input wake"
+    );
+    assert!(
+        due.next_at().is_some(),
+        "completion restores ordinary maintenance"
+    );
+
+    let mut retry = RunnerRetry::default();
+    retry.reaped(Last::Failed, 0);
+    assert_eq!(
+        retry.remaining(0),
+        Some(std::time::Duration::from_millis(FIRST_RETRY_MS))
+    );
+    retry.reaped(Last::Standing, 1);
+    assert_eq!(retry.remaining(1), None);
+    retry.reaped(Last::Unfinished, 2);
+    assert_eq!(
+        retry.remaining(2),
+        Some(std::time::Duration::from_millis(FIRST_RETRY_MS))
+    );
+}
+
+#[test]
+fn a_standing_row_keeps_input_and_identity_debt_arriving_during_its_pass() {
+    let mut due = Due::default();
+    due.identity_changed();
+    assert!(due.at_start(0, HOME, Last::None));
+    let owed = due.repository_request();
+    assert!(!due.poll(1, HOME, Last::Standing));
+    assert_eq!(due.next_at(), None);
+    assert!(due.parked_identity);
+    due.identity_changed();
+    assert!(due.poll(2, HOME, Last::None));
+    assert!(due.identity_running);
+    assert_eq!(due.repository_request(), owed);
+    due.request(RepositoryRequest::Repair);
+    due.identity_changed();
+    assert!(!due.poll(3, HOME, Last::Running));
+    assert!(
+        due.poll(4, HOME, Last::Standing),
+        "new inputs are not parked with the old pass"
+    );
+    assert!(due.identity_running);
+    assert_eq!(due.repository_request(), owed);
+    assert!(!due.poll(5, HOME, Last::Standing));
+    assert_eq!(due.next_at(), None);
+    assert!(
+        due.poll(6, AWAY, Last::None),
+        "a route transition wakes parked work"
+    );
+    assert!(
+        due.identity_running,
+        "the new pass carries still-owed identity"
+    );
+    assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+}
+
+#[test]
+fn a_standing_row_does_not_cancel_an_independent_transient_refresh_retry() {
+    let mut due = Due::default();
+    assert!(due.at_start(0, HOME, Last::None));
+    assert!(!due.poll(1, HOME, Last::Failed));
+    let retry_at = due.next_at().unwrap();
+    assert!(due.after_request(RepositoryRequest::Repair, 2, HOME, Last::None));
+    assert_eq!(due.repository_work(), RepositoryWork::Repair);
+    assert!(!due.poll(3, HOME, Last::Standing));
+    assert_eq!(due.next_at(), Some(retry_at));
+    assert!(due.poll(retry_at, HOME, Last::None));
+    assert_eq!(due.repository_work(), RepositoryWork::Refresh);
+}
+
 fn applied() -> SyncOutcome {
     SyncOutcome::Applied {
         seq: 3,
@@ -931,6 +1021,7 @@ fn starting_a_runner_never_waits_for_it_and_gives_it_its_own_session() {
         (1, Last::Failed),
         (HELD, Last::Failed),
         (UNFINISHED, Last::Unfinished),
+        (STANDING, Last::Standing),
     ] {
         let exe = script(&format!("exit-{code}"), format!("exit {code}"));
         let mut runner =

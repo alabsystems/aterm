@@ -475,11 +475,54 @@ impl LoginHalf {
             accounts::LoginHere::OnToken => return Self::InUse,
             accounts::LoginHere::In => {}
         }
-        match accounts::login_forecast(row, logins, state) {
+        Self::of_forecast(accounts::login_forecast(row, logins, state), now)
+    }
+
+    /// The half of a login here and not signed out whose records forecast its end at `end`
+    /// (`None`: no end known), at `now`.
+    #[must_use]
+    pub fn of_forecast(end: Option<i64>, now: i64) -> Self {
+        match end {
             Some(end) if end <= now => Self::Ended { at: Some(end) },
             Some(end) if end - now < ENDING_S => Self::Ending { end },
             _ => Self::Ok,
         }
+    }
+
+    /// The first second after `now` at which [`Self::of_row`] of `row` can answer otherwise with
+    /// its records as they stand, by the clock alone: for a login made here and signed out, the
+    /// vault token's reading turning ([`accounts::on_token_turns`]: [`Self::InUse`] or
+    /// [`Self::SignedOut`]); for one not signed out, its forecast end's turns
+    /// ([`Self::forecast_turns`]). `None` for a login not made here, which no clock turns, and
+    /// where no such second is ahead.
+    #[must_use]
+    pub fn turns_after(
+        row: &Row,
+        logins: &Logins,
+        state: &State,
+        enrolled: bool,
+        now: i64,
+    ) -> Option<i64> {
+        if !enrolled {
+            return None;
+        }
+        if accounts::signed_out_here(row, state) {
+            return accounts::on_token_turns(row, state, now);
+        }
+        Self::forecast_turns(accounts::login_forecast(row, logins, state), now)
+    }
+
+    /// The first second after `now` at which [`Self::of_forecast`] of `end` answers otherwise:
+    /// [`ENDING_S`] before the end, where [`Self::Ok`] turns [`Self::Ending`], and the end, where
+    /// that turns [`Self::Ended`]. `None` with no end known, or once it has passed.
+    #[must_use]
+    pub fn forecast_turns(end: Option<i64>, now: i64) -> Option<i64> {
+        let end = end?;
+        [end.checked_sub(ENDING_S - 1), Some(end)]
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now)
+            .min()
     }
 
     /// The half's word in the pair and in the report.

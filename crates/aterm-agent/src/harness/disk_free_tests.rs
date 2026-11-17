@@ -41,6 +41,7 @@ impl Home {
 
     /// [`Home::cache`], the folder `rel`'s first two components name (`.cache/<name>`) tagged a
     /// cache by its tool ([`CACHEDIR_TAG`]), so the pass may take it ([`evidence`]).
+    #[cfg(not(windows))]
     fn tagged(&self, rel: &str, len: usize) -> PathBuf {
         let dir = self.cache(rel, len);
         let top: PathBuf = rel.split('/').take(2).collect();

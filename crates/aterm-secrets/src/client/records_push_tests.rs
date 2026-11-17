@@ -12,15 +12,20 @@
 //! another, the first holds its request until the hang detector and the rest hear nothing, so
 //! the test fails; at once, every one of them holds one and the test passes at once.
 
+#[cfg(unix)]
 use super::log_entries_tests::two_macs;
 use super::*;
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(unix)]
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// How many held servers each test stands up: the Macs whose aterm had wedged at once.
+#[cfg(unix)]
 const HELD: usize = 8;
 
 /// The requests [`HeldServers`] hold while a hold is on.
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Holds {
     /// `POST <url>/records`.
@@ -30,6 +35,7 @@ enum Holds {
 }
 
 /// What the held servers saw.
+#[cfg(unix)]
 #[derive(Default)]
 struct Held {
     /// Whether a request is held now until [`HeldServers::release`].
@@ -44,6 +50,7 @@ struct Held {
     puts: usize,
 }
 
+#[cfg(unix)]
 struct Shared {
     held: Mutex<Held>,
     changed: Condvar,
@@ -53,6 +60,7 @@ struct Shared {
     holds: Holds,
 }
 
+#[cfg(unix)]
 impl Shared {
     fn held(&self) -> std::sync::MutexGuard<'_, Held> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
@@ -80,12 +88,14 @@ impl Shared {
 /// with a 503) but the requests a hold holds ([`Holds`]) while [`HeldServers::hold`] is on: one
 /// of those each takes and reads none of until [`HeldServers::release`], and then answers as
 /// any other.
+#[cfg(unix)]
 struct HeldServers {
     urls: Vec<String>,
     shared: Arc<Shared>,
     listeners: Vec<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl HeldServers {
     /// `count` servers whose hold holds records posts.
     fn start(count: usize, need: bool) -> Self {
@@ -163,6 +173,7 @@ impl HeldServers {
     }
 }
 
+#[cfg(unix)]
 impl Drop for HeldServers {
     fn drop(&mut self) {
         {
@@ -185,6 +196,7 @@ impl Drop for HeldServers {
 }
 
 /// One request to held server `index`, answered as [`HeldServers`] says.
+#[cfg(unix)]
 fn answer(shared: &Shared, index: usize, stream: std::net::TcpStream) {
     let _ = stream.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN));
     let Ok(read) = stream.try_clone() else {
@@ -258,6 +270,7 @@ fn answer(shared: &Shared, index: usize, stream: std::net::TcpStream) {
 /// { let _ = transport::post_records(url, &wire); }`, main before this fix): the first held server
 /// holds its post until the hang detector, no other hears one, and the test fails "never: every
 /// server held its records post at once".
+#[cfg(unix)]
 #[test]
 fn a_landed_publish_posts_its_records_to_every_server_at_once() {
     let macs = two_macs(&[(Audience::Everyone, "gh-token", b"token-v1".as_slice())]);
@@ -298,6 +311,7 @@ fn a_landed_publish_posts_its_records_to_every_server_at_once() {
 /// NEGATIVE CONTROL: post to them one after another in `sync_records_until` (`for url in
 /// &push_urls { … transport::post_records_answered(url, body) … }`, main before this fix): fails
 /// "never: every server lacking the frontier held its post at once".
+#[cfg(unix)]
 #[test]
 fn a_records_pass_posts_to_every_server_lacking_its_frontier_at_once() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -331,6 +345,7 @@ fn a_records_pass_posts_to_every_server_lacking_its_frontier_at_once() {
 ///
 /// NEGATIVE CONTROL: post to one server after another in `post_records_to_servers` (main before
 /// this fix): fails "never: every policy server held its post at once".
+#[cfg(unix)]
 #[test]
 fn posting_the_records_reaches_every_server_at_once() {
     let servers = HeldServers::start(HELD, false);
@@ -380,6 +395,7 @@ fn posting_the_records_reaches_every_server_at_once() {
 /// NEGATIVE CONTROL: give either round its own deadline (`None` in place of `Some(posts_by)` at
 /// `publish_as_with`'s `keep_drafted_until` or `sync_without_reconcile`): servers are posted
 /// records, and the test fails "a records post past the publish's one deadline went out".
+#[cfg(unix)]
 #[test]
 fn every_records_post_after_a_landed_publish_shares_one_deadline() {
     let macs = two_macs(&[(Audience::Everyone, "gh-token", b"token-v1".as_slice())]);
@@ -447,6 +463,7 @@ fn a_server_whose_put_ran_out_is_not_posted_the_store() {
 /// NEGATIVE CONTROL: read the candidates one after another (`for url in candidates {
 /// transport::fetch_within_as(&url, None, servers_within(PROBE_DEADLINE), reader) … }`, main
 /// before this fix): fails "never: every candidate held its read at once".
+#[cfg(unix)]
 #[test]
 fn an_admin_open_reads_every_candidate_at_once() {
     let macs = two_macs(&[]);
@@ -484,6 +501,7 @@ fn an_admin_open_reads_every_candidate_at_once() {
 /// NEGATIVE CONTROL: read them one after another (`for url in candidate_server_urls(..) {
 /// transport::fetch_within_as(&url, None, servers_within(SERVER_HEAD_DEADLINE), ..) … }`, main
 /// before this fix): fails "never: every server held its head read at once".
+#[cfg(unix)]
 #[test]
 fn the_server_heads_are_read_from_every_candidate_at_once() {
     let macs = two_macs(&[]);
@@ -529,6 +547,7 @@ fn the_server_heads_are_read_from_every_candidate_at_once() {
 ///
 /// NEGATIVE CONTROL: post to every peer that lacks the frontier (`let post = needs;` in
 /// `sync_records_until`): fails "a mirror was posted records".
+#[cfg(unix)]
 #[test]
 fn a_mirror_lacking_the_frontier_is_never_posted_records() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);

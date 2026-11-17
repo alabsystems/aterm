@@ -7,28 +7,28 @@
 
 use crate::{SecretBytes, age::Recipient};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod accounts;
 pub mod binding;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod bootstrap;
 pub mod constraints;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod everyone_key;
 pub mod finality;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod fold;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod hearing;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod history;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod journal;
 pub mod membership;
 pub mod node;
 mod observation;
 pub use observation::{Observation, Unavailable};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod roster;
 
 /// Reserved entry in one explicitly named Commons-member audience.
@@ -62,7 +62,7 @@ pub fn reserved_name(name: &str) -> bool {
 /// network policy: a consumer must validate those before granting access.
 #[derive(Clone)]
 pub struct Snapshot {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     source_config: Box<crate::client::Config>,
     vault: String,
     signer: [u8; 32],
@@ -84,7 +84,7 @@ impl std::fmt::Debug for Snapshot {
 }
 
 impl Snapshot {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn verified(
         config: crate::client::Config,
         envelope: &crate::envelope::Envelope,
@@ -103,7 +103,7 @@ impl Snapshot {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn verified_from_log(
         config: crate::client::Config,
         signer: [u8; 32],
@@ -159,7 +159,7 @@ impl Snapshot {
         self.control.as_slice()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     /// Whether both authenticated observations name the exact same configured
     /// source, signing pin/lineage, applied version, recipient and control bytes.
     /// Equal envelope digests alone do not establish the same local source
@@ -183,7 +183,7 @@ impl Snapshot {
 /// # Errors
 /// Returns an error for unreadable/corrupt local state, an invalid signed cache,
 /// or a malformed/ambiguous control audience. A plaintext source never qualifies.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn cached(paths: &crate::client::Paths) -> crate::Result<Option<Snapshot>> {
     observe(paths).map(Observation::into_snapshot)
 }
@@ -191,7 +191,7 @@ pub fn cached(paths: &crate::client::Paths) -> crate::Result<Option<Snapshot>> {
 /// Explain an unavailable offline control observation without creating state or
 /// contacting the vault. Missing visibility never authorizes a fresh network.
 /// Corrupt or ambiguous authenticated state remains an error.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn observe(paths: &crate::client::Paths) -> crate::Result<Observation> {
     crate::client::observe_commons(paths)
 }
@@ -204,7 +204,7 @@ pub fn observe(paths: &crate::client::Paths) -> crate::Result<Observation> {
 /// # Errors
 /// Returns [`observe`]'s errors. A vault still busy at the deadline remains
 /// [`Unavailable::Busy`]; other unavailable reasons return immediately.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn observe_until(
     paths: &crate::client::Paths,
     deadline: std::time::Instant,
@@ -216,7 +216,7 @@ pub fn observe_until(
 /// publication wakes, to let the vault's state lock go: its apply of one version holds the lock
 /// for a moment. A founding's read-back waits so ([`crate::client::admin_commons_init`]), and so
 /// does `sync.shared-data`'s read, which may follow one ([`observe_until_settled`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// [`observe`] for a reader that asks again every few seconds whatever it found (the Commons
@@ -228,7 +228,7 @@ pub const SETTLE: std::time::Duration = std::time::Duration::from_secs(60);
 ///
 /// # Errors
 /// As [`observe`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn observe_settled(paths: &crate::client::Paths) -> crate::Result<Observation> {
     crate::client::observe_commons_now(paths)
 }
@@ -238,7 +238,7 @@ pub fn observe_settled(paths: &crate::client::Paths) -> crate::Result<Observatio
 ///
 /// # Errors
 /// As [`observe_until`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn observe_until_settled(
     paths: &crate::client::Paths,
     deadline: std::time::Instant,
@@ -246,7 +246,7 @@ pub fn observe_until_settled(
     observe_until_by(paths, deadline, || {}, observe_settled)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn observe_until_with(
     paths: &crate::client::Paths,
     deadline: std::time::Instant,
@@ -256,7 +256,7 @@ pub(crate) fn observe_until_with(
 }
 
 /// [`observe_until`]'s busy-vault wait around `observe`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn observe_until_by(
     paths: &crate::client::Paths,
     deadline: std::time::Instant,

@@ -2,10 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+#[cfg(unix)]
 use aterm_spec::interp::State as ModelState;
 
 /// `bytes` at `path` as only its owner may write it, whatever the umask: an import refuses a
 /// file others can write, which a umask of 002 (Ubuntu's) gives a plain write.
+#[cfg(unix)]
 fn private_file(path: &std::path::Path, bytes: &[u8]) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, bytes).unwrap();
@@ -32,6 +34,7 @@ fn prepare(
     super::prepare(paths, source, import, host, Approval::Open)
 }
 
+#[cfg(unix)]
 pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelState {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(&root.path().join("m1"));
@@ -159,6 +162,7 @@ pub(crate) fn creation_transition(state: &ModelState, action: &str) -> ModelStat
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn creation_outbox_conforms_across_restart_damage_and_newer_state() {
     let model = aterm_models_db::creation_outbox_model();
@@ -190,6 +194,7 @@ fn creation_outbox_conforms_across_restart_damage_and_newer_state() {
     assert!(!model.check_invariant("ExactPublication", &mutant));
 }
 
+#[cfg(unix)]
 #[test]
 fn lost_http_ack_resumes_retained_creation_without_second_put() {
     use std::io::{Read, Write};
@@ -283,6 +288,7 @@ fn first_publication_preserves_a_file_created_after_the_absence_check() {
     assert!(config(&paths).unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn unpublished_preparation_resumes_from_its_durable_request() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -317,6 +323,7 @@ fn unpublished_preparation_resumes_from_its_durable_request() {
 /// A local step that fails once the vault is published (here the Commons bootstrap, its custody
 /// lock's path held by a folder) leaves the creation unfinished, and a resume finishes it from
 /// the retained, authenticated bytes offline, publishing nothing again.
+#[cfg(unix)]
 #[test]
 fn failed_local_installation_resumes_without_republishing() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -442,6 +449,7 @@ fn invalid_import_and_orphan_history_do_not_reserve_or_publish_a_vault() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn unfinished_creation_refuses_a_join_and_completed_resume_does_no_outbox_io() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -509,6 +517,7 @@ fn missing_cache_recovers_the_exact_initial_or_a_twice_rotated_remote_version() 
 
 /// A vault server that holds nothing at `/v1/first`: every GET is a 404, and each PUT takes the
 /// next of `puts` (a status line and its reason). [`stop`](Self::stop) gives the methods it read.
+#[cfg(unix)]
 struct Unheld {
     url: String,
     addr: std::net::SocketAddr,
@@ -516,6 +525,7 @@ struct Unheld {
     worker: std::thread::JoinHandle<Vec<String>>,
 }
 
+#[cfg(unix)]
 impl Unheld {
     fn start(puts: &[(&'static str, &'static str)]) -> Unheld {
         use std::io::{Read, Write};
@@ -595,6 +605,7 @@ impl Unheld {
     }
 }
 
+#[cfg(unix)]
 const NOT_FROM_HERE: (&str, &str) = (
     "403 Forbidden",
     "the first version of a vault is accepted only from the server's own Mac",
@@ -602,6 +613,7 @@ const NOT_FROM_HERE: (&str, &str) = (
 
 /// What a free slot shows: no claim or outbox, nothing to resume or recover, joins permitted,
 /// and the machine identity and device it had.
+#[cfg(unix)]
 fn assert_free(paths: &Paths, recipient: &str) {
     assert!(claim(paths).unwrap().is_none());
     assert!(!paths.dir.join("creation-outbox").exists());
@@ -624,6 +636,7 @@ fn assert_free(paths: &Paths, recipient: &str) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_first_publication_the_server_refuses_frees_the_slot_for_another_vault() {
     for refusal in [
@@ -652,6 +665,7 @@ fn a_first_publication_the_server_refuses_frees_the_slot_for_another_vault() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_conflict_keeps_the_intent_and_a_later_refusal_retires_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -687,6 +701,7 @@ fn a_conflict_keeps_the_intent_and_a_later_refusal_retires_it() {
     assert_eq!(server.stop(), ["GET", "GET", "PUT", "GET", "PUT"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_refusal_after_a_publication_whose_reply_was_lost_keeps_the_intent() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -711,6 +726,7 @@ fn a_refusal_after_a_publication_whose_reply_was_lost_keeps_the_intent() {
     assert_eq!(server.stop(), ["GET", "GET", "PUT", "GET", "PUT"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_retired_claim_a_crash_left_frees_the_slot_and_goes_at_the_next_creation() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -745,6 +761,7 @@ fn a_retired_claim_a_crash_left_frees_the_slot_and_goes_at_the_next_creation() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_path_whose_folder_is_missing_strands_nothing() {
     let root = aterm_tempfile::tempdir().unwrap();

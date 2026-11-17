@@ -1028,6 +1028,44 @@ fn cells_before_the_first_reading_are_blank() {
     );
 }
 
+/// A PAST `↺` SAYS WHAT IT MARKS. Over case (b)'s view at 12 cells a day, the `↺` of a week
+/// that reset at −6 h is titled `main's week reset`, and the `↺` of a refill barrier at −15 h
+/// under one reset (a limit reset spent, a refill or a raised allowance, which no reading tells
+/// apart) is titled `main's week refilled or raised`, never a reset. Negative control: titling
+/// every past `↺` as a reset (the arm without [`Chart::turned`]) fails the second assertion.
+#[test]
+fn a_past_reset_mark_says_what_it_marks() {
+    let utc = Offsets::fixed(0);
+    let mut view = case_b().outlook().quota("main", None, true);
+    let old = T5 - 6 * H;
+    view.chart.past = vec![
+        Read {
+            reset: old,
+            ..read(T5 - 20 * H, 900)
+        },
+        Read {
+            reset: old + 7 * D,
+            ..read(T5 - H, 50)
+        },
+    ];
+    assert_eq!(cells(&view.chart, 12)[9], Cell::Reset);
+    let title = view.column_title(12, 9, &utc).unwrap_or_default();
+    assert!(title.ends_with(" \u{b7} main's week reset"), "{title}");
+    view.chart.past = vec![
+        read(T5 - 20 * H, 500),
+        Read {
+            epoch: Some(T5 - 15 * H),
+            ..read(T5 - 10 * H, 100)
+        },
+    ];
+    assert_eq!(cells(&view.chart, 12)[4], Cell::Reset);
+    let title = view.column_title(12, 4, &utc).unwrap_or_default();
+    assert!(
+        title.ends_with(" \u{b7} main's week refilled or raised"),
+        "{title}"
+    );
+}
+
 /// SIXTY-THREE AND NINETY-EIGHT ARE DIFFERENT LEVELS: the chart draws what is left, so in
 /// eighths 63% used is level 4 and 98% level 2 (level 1, the floor, is kept for a week used
 /// up), each with its glyph: `▄` read, `🭹` and `🭻` projected; in case (b) the last past cell is
@@ -2991,9 +3029,6 @@ fn a_lean_on_a_bound_says_it_was_read() {
         }
     }
 }
-
-/// Every reason a signed-in account's week has no figure ([`Why::unread`]).
-const UNREAD: [Why; 3] = [Why::NeverRead, Why::ResetUnread, Why::ClockInvalid];
 
 /// Every state of an account with no figure to say, as its [`Named`] holds it: a signed-in
 /// week unread for each reason, and each login the row says in the figure's place.

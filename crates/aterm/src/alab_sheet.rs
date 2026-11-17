@@ -74,7 +74,7 @@ impl Vendors for Harness {
         places: &aterm_db::alab::journal::place::Places,
         current: &std::collections::BTreeMap<String, String>,
     ) -> Result<Vec<(String, String)>, String> {
-        let mut lab = crate::alab_view::harness_lab(view, false, &Default::default());
+        let mut lab = crate::alab_view::harness_lab(view, &Default::default());
         lab.places = crate::alab_view::placements(view, places);
         Ok(aterm_agent::harness::alab_exports::render(&lab, current)?
             .into_iter()

@@ -306,3 +306,43 @@ fn done_forgets_a_record_only_while_its_path_holds_its_bytes() {
     want.sort();
     assert_eq!(names, want, "only records and the stable lock remain");
 }
+
+#[test]
+fn linked_spool_records_are_unreadable_and_are_not_acknowledged_or_kept() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let spool = Dir::at(tmp.path().join("spool"));
+    let fail = record(Check::Lint, Word::Fail, T, BASE, NOW)
+        .sign(Some(&signer(7)))
+        .unwrap();
+    spool.put(&fail).unwrap();
+    assert_eq!(spool.pending().unwrap().records, [fail.clone()]);
+    spool.done(&fail).unwrap();
+    let target = tmp.path().join("outside-record");
+    let file = spool.path().join(file_of(&fail.path).unwrap());
+    std::fs::write(&target, &fail.bytes).unwrap();
+    symlink(&target, &file).unwrap();
+    for dangling in [false, true] {
+        if dangling {
+            std::fs::remove_file(&target).unwrap();
+        }
+        let pending = spool.pending().unwrap();
+        assert!(
+            pending.records.is_empty(),
+            "linked bytes are not spool custody"
+        );
+        assert_eq!(pending.unreadable.len(), 1);
+        assert_eq!(pending.unreadable[0].0, file);
+        assert!(!pending.unreadable[0].1.is_empty());
+        assert!(spool.done(&fail).is_err(), "cleanup must retain the link");
+        assert!(
+            spool.put(&fail).is_err(),
+            "a linked FAIL is not a kept FAIL"
+        );
+        assert_eq!(std::fs::read_link(&file).unwrap(), target);
+        if !dangling {
+            assert_eq!(std::fs::read(&target).unwrap(), fail.bytes);
+        }
+    }
+}

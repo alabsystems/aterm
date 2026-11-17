@@ -522,7 +522,7 @@ fn a_dispatch_keeps_its_place_from_its_first_binary_to_its_last() {
         })
         .unwrap()
         .expect("the first binary fits");
-    assert_eq!(waiters.place_ms(), Some(t0));
+    assert_eq!(waiters.place(), Some((t0, false)));
     let large = Waiter::enter_stand_in(
         &ledger,
         &machine,
@@ -638,7 +638,7 @@ fn a_dispatch_keeps_its_place_from_its_first_binary_to_its_last() {
     assert_eq!(waiting(), 0, "a halted dispatch hands nothing on");
     // With every record of the dispatch gone, so is its place.
     drop((running, beside));
-    assert_eq!(waiters.place_ms(), None);
+    assert_eq!(waiters.place(), None);
     let Polled::Admitted(_) = large.poll(&machine) else {
         panic!("the large claim is admitted once the dispatch has left the queue");
     };
@@ -1220,6 +1220,7 @@ fn a_runs_binaries_together_hold_the_share_one_claim_would_be_granted() {
             pid: std::process::id(),
             ancestors: Vec::new(),
             rank: aterm_capacity::Rank::Ordinary,
+            person: false,
             since_ms: 0,
         };
         let (at, machine) = (at.clone(), &machine);

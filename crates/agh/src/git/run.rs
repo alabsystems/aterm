@@ -585,7 +585,7 @@ impl HelperCommand {
 ///
 /// The refusals of each step; off unix `write::unix_only()`.
 pub(crate) fn run(gh: &Github, run: &GitRun) -> Result<GitOut> {
-    run_inner(gh, run, None, None)
+    run_inner(gh, run, None, None, None)
 }
 
 /// Journaled operations pass the same credential Arc that named their durable intent.
@@ -594,8 +594,9 @@ pub(crate) fn run_with_credential(
     run: &GitRun,
     credential: Option<std::sync::Arc<crate::identity::Credential>>,
     admission: &mut dyn FnMut() -> Result<()>,
+    record: &dyn Fn(u32) -> Result<()>,
 ) -> Result<GitOut> {
-    run_inner(gh, run, credential, Some(admission))
+    run_inner(gh, run, credential, Some(admission), Some(record))
 }
 
 fn run_inner(
@@ -603,14 +604,15 @@ fn run_inner(
     run: &GitRun,
     credential: Option<std::sync::Arc<crate::identity::Credential>>,
     admission: Admission<'_>,
+    record: Option<&dyn Fn(u32) -> Result<()>>,
 ) -> Result<GitOut> {
     #[cfg(unix)]
     {
-        unix::run(gh, run, credential, admission)
+        unix::run(gh, run, credential, admission, record)
     }
     #[cfg(not(unix))]
     {
-        let _ = (gh, run, credential, admission);
+        let _ = (gh, run, credential, admission, record);
         Err(crate::write::unix_only())
     }
 }
@@ -625,9 +627,70 @@ fn into_ok(into: &str) -> bool {
             .any(|kept| into.starts_with(kept))
 }
 
+/// A word every git child agh runs carries at command scope (over any repository's config),
+/// and the guarded config key it overrides or forbids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overriding {
+    /// The child's config key.
+    pub key: &'static str,
+    /// Its value.
+    pub value: &'static str,
+    /// The guarded key it answers for, lower case as `git config --list` names it.
+    pub answers: &'static str,
+}
+
+/// The guarded keys a repository agh only reads objects from may set, each beside the word
+/// every child carries that makes it inert: no hook from `core.hooksPath`, no fsmonitor
+/// command, and no ssh transport (`protocol.allow=never`, with https alone allowed), so no
+/// `core.sshCommand`. A clone agh fetches into or pushes from is screened without them, and
+/// every other guarded key (a URL rewrite, `core.gitProxy`, `core.alternateRefsCommand`, a
+/// remote or promisor redirect, `hook.*`) is refused for an object source too. A caller that
+/// runs its own git in such a repository carries these words (`atpkg-publish`'s
+/// `SourceRepo::query`).
+pub const OBJECT_SOURCE_WORDS: [Overriding; 3] = [
+    Overriding {
+        key: "core.hooksPath",
+        value: "/dev/null",
+        answers: "core.hookspath",
+    },
+    Overriding {
+        key: "core.fsmonitor",
+        value: "false",
+        answers: "core.fsmonitor",
+    },
+    Overriding {
+        key: "protocol.allow",
+        value: "never",
+        answers: "core.sshcommand",
+    },
+];
+
+/// What a repository's config is screened for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigAccess {
+    /// A clone agh pushes from or writes.
+    Write,
+    /// A clone agh fetches into or reads commits of: a remote's `pushurl` is inert.
+    Read,
+    /// A repository agh only reads objects from (`repo check-local`, a source object cache,
+    /// a checkout cache): also each [`OBJECT_SOURCE_WORDS`] key.
+    ObjectSource,
+}
+
+impl ConfigAccess {
+    /// The word a screen's tape key names it by.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Read => "read-only",
+            Self::ObjectSource => "object-source",
+        }
+    }
+}
+
 #[cfg(unix)]
-pub(crate) fn project_config_names(listed: &[u8], read_only: bool) -> Vec<u8> {
-    unix::project_config_names(listed, read_only)
+pub(crate) fn project_config_names(listed: &[u8], access: ConfigAccess) -> Vec<u8> {
+    unix::project_config_names(listed, access)
 }
 
 #[cfg(unix)]
@@ -644,7 +707,10 @@ mod unix {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use super::{ANONYMOUS_READ_PROGRESS_WINDOW, Admission, GitOp, GitOut, GitRun};
+    use super::{
+        ANONYMOUS_READ_PROGRESS_WINDOW, Admission, ConfigAccess, GitOp, GitOut, GitRun,
+        OBJECT_SOURCE_WORDS,
+    };
     use crate::client::Github;
     use crate::config::Dirs;
     use crate::error::{Error, Forbid, Kind, Result, SideEffect, Sub};
@@ -769,8 +835,8 @@ mod unix {
         }
     }
 
-    fn config_names_request(slug: &Slug, read_only: bool, scope: &str) -> Vec<u8> {
-        let access = if read_only { "read-only" } else { "write" };
+    fn config_names_request(slug: &Slug, access: ConfigAccess, scope: &str) -> Vec<u8> {
+        let access = access.word();
         format!("{CONFIG_LIST} {slug} names {access} {scope}").into_bytes()
     }
 
@@ -987,6 +1053,8 @@ mod unix {
     #[derive(Clone)]
     struct Children<'a> {
         gh: &'a Github,
+        /// Durable identity callback for the actual receive-capable child.
+        record: Option<&'a dyn Fn(u32) -> Result<()>>,
         /// The absolute `git`, or the bare `git` of a run nothing runs.
         git: PathBuf,
         /// The whole environment of every child.
@@ -1218,7 +1286,13 @@ mod unix {
             if let Some(admit) = admission {
                 admit().map_err(unsent)?;
             }
-            let out = self.gh.fx().git(&spec, canonical);
+            let record = self.record.filter(|_| {
+                args.iter().any(|a| a == "push") && !args.iter().any(|a| a == "--dry-run")
+            });
+            let out = match record {
+                Some(record) => self.gh.fx().git_observing(&spec, canonical, Some(record)),
+                None => self.gh.fx().git(&spec, canonical),
+            };
             if self.reads {
                 out.map_err(|e| e.with_side_effect(SideEffect::None))
             } else {
@@ -1479,22 +1553,26 @@ mod unix {
 
     /// The pairs after the helper's.
     fn config_rest() -> Vec<(&'static str, String)> {
-        vec![
-            ("credential.useHttpPath", "true".to_string()),
-            ("http.followRedirects", "false".to_string()),
-            ("http.sslVerify", "true".to_string()),
-            ("protocol.allow", "never".to_string()),
-            ("protocol.https.allow", "always".to_string()),
-            ("core.askPass", String::new()),
-            // Off for the hook directory only: git 2.54 also runs `hook.<name>.command` from
-            // config, which this pair does not stop, so step 3's screen refuses `hook.*`.
-            ("core.hooksPath", "/dev/null".to_string()),
-            ("core.fsmonitor", "false".to_string()),
-            // A fetch would otherwise start a detached `git maintenance run --auto`, which
-            // outlives the run's bound and its scratch, holds the helper's environment, and can
-            // fetch lazily from a remote the clone names. Command scope overrides the clone's.
-            ("maintenance.auto", "false".to_string()),
-        ]
+        // `OBJECT_SOURCE_WORDS`: `core.hooksPath=/dev/null` is off for the hook directory
+        // only: git 2.54 also runs `hook.<name>.command` from config, which it does not stop,
+        // so step 3's screen refuses `hook.*`. `protocol.allow=never` is the default the
+        // https pair below lifts for https alone.
+        OBJECT_SOURCE_WORDS
+            .iter()
+            .map(|word| (word.key, word.value.to_string()))
+            .chain([
+                ("credential.useHttpPath", "true".to_string()),
+                ("http.followRedirects", "false".to_string()),
+                ("http.sslVerify", "true".to_string()),
+                ("protocol.https.allow", "always".to_string()),
+                ("core.askPass", String::new()),
+                // A fetch would otherwise start a detached `git maintenance run --auto`, which
+                // outlives the run's bound and its scratch, holds the helper's environment, and
+                // can fetch lazily from a remote the clone names. Command scope overrides the
+                // clone's.
+                ("maintenance.auto", "false".to_string()),
+            ])
+            .collect()
     }
 
     /// `GIT_CEILING_DIRECTORIES`: the scratch, and for a fetch also the parent of its clone
@@ -1724,7 +1802,7 @@ mod unix {
     /// past `SCREEN_MAX` may have lost its head, and a key cut off there would pass the screen
     /// while git still reads it: the screen fails closed on the length alone. Listing names
     /// only keeps a value from padding the listing; a long subsection name still can.
-    pub(super) fn project_config_names(listed: &[u8], read_only: bool) -> Vec<u8> {
+    pub(super) fn project_config_names(listed: &[u8], access: ConfigAccess) -> Vec<u8> {
         if listed.len() > SCREEN_MAX {
             return aterm_json::to_vec(&ConfigVerdict::TooLong {
                 bytes: listed.len(),
@@ -1747,7 +1825,17 @@ mod unix {
                             && var.eq_ignore_ascii_case("pushurl")
                     })
             });
-            if rewrites(&key) && !(read_only && write_only) {
+            let inert = match access {
+                ConfigAccess::Write => false,
+                ConfigAccess::Read => write_only,
+                ConfigAccess::ObjectSource => {
+                    write_only
+                        || OBJECT_SOURCE_WORDS
+                            .iter()
+                            .any(|word| key.eq_ignore_ascii_case(word.answers))
+                }
+            };
+            if rewrites(&key) && !inert {
                 return aterm_json::to_vec(&ConfigVerdict::Refused {
                     class: ConfigClass::of(&key),
                 })
@@ -1786,10 +1874,11 @@ mod unix {
     }
 
     /// Step 9: an exit that is not 0, mapped. Each phrase is looked for on stderr and stdout
-    /// both, because `push --porcelain` reports a refused lease on stdout. `sent` is true only
-    /// for the exit of the leased delete's own `git push`: an exit no phrase names there (a
-    /// hung-up remote, an HTTP error, a signal agh did not send) may follow a delete GitHub
-    /// applied, so it is could_not_run with `SideEffect::Unknown`, never read as not sent.
+    /// both, because `push --porcelain` reports a refused lease on stdout. `sent` is true for
+    /// a leased delete or a mutable PushRefs/PushControl's own released `git push`: an exit
+    /// no phrase names (a hung-up remote, HTTP error or signal agh did not send) may follow
+    /// a write GitHub applied. A sent atomic failure proves non-application only with a
+    /// complete request-bound rejection, independently of its diagnostic prose.
     /// Policy and unknown porcelain rejection reasons are Refused. Known receive
     /// infrastructure failures are CouldNotRun with an unknown side effect.
     pub(super) fn failed(
@@ -1802,6 +1891,9 @@ mod unix {
         let stderr = kept(&out.stderr, redactor);
         let stdout = kept(&out.stdout, redactor);
         let said = |needle: &str| stderr.contains(needle) || stdout.contains(needle);
+        let atomic = matches!(op, GitOp::PushRefs { .. } | GitOp::PushControl { .. });
+        let atomic_rejection = atomic_ref_rejection(op, out);
+        let atomic_nonapplication_proved = atomic_rejection.is_some();
         let last = stderr
             .lines()
             .rev()
@@ -1817,7 +1909,7 @@ mod unix {
                 Kind::Unauthenticated,
                 format!("git {} was not let in: {last}", op_word(op)),
             )
-        } else if said("stale info") {
+        } else if !atomic && said("stale info") {
             // `push --porcelain` reports a refused lease on stdout (`!\t(delete):{ref}\t
             // [rejected] (stale info)`), and stderr holds only git's generic line.
             let what = stdout
@@ -1838,8 +1930,25 @@ mod unix {
             .with_sub(Sub::Forbid(Forbid::Scope {
                 needed: "workflow".to_string(),
             }))
+        } else if let Some((kind, line)) = atomic_rejection {
+            let line = kept(line.as_bytes(), redactor);
+            let error = Error::new(kind, format!("Git rejected the atomic push: {line}"));
+            if kind == Kind::Conflict {
+                error.with_sub(Sub::GuardFailed { what: line })
+            } else {
+                error
+            }
+        } else if atomic {
+            Error::could_not_run(format!(
+                "atomic rejection lacks complete request-bound evidence: {stderr}\n{stdout}"
+            ))
+            .with_side_effect(if sent {
+                SideEffect::Unknown
+            } else {
+                SideEffect::None
+            })
         } else if let Some(line) = rejected(op, &stdout) {
-            if ref_lock_conflict(op, &line) {
+            if !atomic && ref_lock_conflict(op, &line) {
                 Error::new(
                     Kind::Conflict,
                     format!("the ref changed during the push: {line}"),
@@ -1876,6 +1985,13 @@ mod unix {
             } else {
                 error
             }
+        };
+        // Auth and scope diagnostics keep their useful kind, but capped text
+        // cannot prove non-application of a sent atomic receive either.
+        let error = if atomic && sent && !atomic_nonapplication_proved {
+            error.with_side_effect(SideEffect::Unknown)
+        } else {
+            error
         };
         error.with_repo(slug.to_string())
     }
@@ -1949,40 +2065,167 @@ mod unix {
         else {
             return false;
         };
-        let Some((reference, identities)) = reason.split_once("': is at ") else {
+        let Some((reference, reason)) = reason.split_once("': ") else {
             return false;
         };
         if spec.rsplit_once(':').map(|(_, reference)| reference) != Some(reference) {
             return false;
         }
-        let Some((actual, expected)) = identities
-            .strip_suffix(')')
+        ref_lock_reason(op, reference, reason.strip_suffix(')').unwrap_or_default())
+    }
+
+    /// Exact expected-old failures from Git's ref backend, bound to this request.
+    fn ref_lock_reason(op: &GitOp, reference: &str, reason: &str) -> bool {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        let before = match op {
+            GitOp::PushDelete {
+                reference: asked,
+                expect,
+            } if asked == reference => Some(expect.as_str()),
+            GitOp::PushRefs { batch, .. } => batch
+                .updates()
+                .iter()
+                .find(|update| update.reference == reference)
+                .map(|update| update.before.as_str()),
+            GitOp::PushControl { transaction, .. } => transaction
+                .changes()
+                .iter()
+                .find(|change| change.reference == reference)
+                .map(|change| change.before.as_deref().unwrap_or(ZERO)),
+            _ => None,
+        };
+        let Some(before) = before else {
+            return false;
+        };
+        if reason == "reference already exists" {
+            return before == ZERO;
+        }
+        if let Some(expected) = reason.strip_prefix("reference is missing but expected ") {
+            return before != ZERO && expected == before;
+        }
+        let Some((actual, expected)) = reason
+            .strip_prefix("is at ")
             .and_then(|identities| identities.split_once(" but expected "))
         else {
             return false;
         };
-        if !crate::path::is_sha(actual) || !crate::path::is_sha(expected) || actual == expected {
-            return false;
+        crate::path::is_sha(actual) && actual != expected && expected == before
+    }
+
+    /// Atomic receive-pack reports its transaction failure on every porcelain row,
+    /// but puts the concrete ref-backend error on stderr. Only a complete rejection
+    /// of every requested transition plus an exact expected-old mismatch proves
+    /// this receive applied none of them. A partial or lost reply stays uncertain.
+    fn atomic_ref_rejection(op: &GitOp, out: &ChildOut) -> Option<(Kind, String)> {
+        const ZERO: &str = "0000000000000000000000000000000000000000";
+        if out.code != Some(1)
+            || out.stdout_may_be_truncated()
+            || out.stderr.len() >= ChildOut::OUTPUT_KEEP
+        {
+            return None;
         }
-        match op {
-            GitOp::PushDelete {
-                reference: asked,
-                expect,
-            } => asked == reference && expect == expected,
+        // Proof consumes the complete native capture, never kept()'s redacted
+        // 64-KiB diagnostic tail. Rendering/redaction happens after judgment.
+        let stdout = std::str::from_utf8(&out.stdout).ok()?;
+        let stderr = std::str::from_utf8(&out.stderr).ok()?;
+        let updates: Vec<_> = match op {
             GitOp::PushRefs { batch, .. } => batch
                 .updates()
                 .iter()
-                .any(|update| update.reference == reference && update.before == expected),
-            GitOp::PushControl { transaction, .. } => transaction.changes().iter().any(|change| {
-                change.reference == reference
-                    && change
-                        .before
-                        .as_deref()
-                        .unwrap_or("0000000000000000000000000000000000000000")
-                        == expected
-            }),
-            _ => false,
+                .map(|u| (u.reference.as_str(), u.after.as_str()))
+                .collect(),
+            GitOp::PushControl { transaction, .. } => transaction
+                .changes()
+                .iter()
+                .map(|u| (u.reference.as_str(), u.after.as_deref().unwrap_or(ZERO)))
+                .collect(),
+            _ => return None,
+        };
+        let mut rejected = std::collections::BTreeSet::new();
+        let mut direct = None;
+        let mut policy = None;
+        let mut generic_failure = false;
+        for line in stdout.lines() {
+            if line.is_empty() || line.starts_with("To ") || line == "Done" {
+                if line.chars().any(char::is_control) {
+                    return None;
+                }
+                continue;
+            }
+            let mut fields = line.split('\t');
+            let (Some("!"), Some(spec), Some(reason)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                return None;
+            };
+            if fields.next().is_some() {
+                return None;
+            }
+            if reason.chars().any(char::is_control) {
+                return None;
+            }
+            let (source, reference) = spec.rsplit_once(':')?;
+            if !updates.iter().any(|(asked, after)| {
+                *asked == reference
+                    && if *after == ZERO {
+                        matches!(source, "" | "(delete)")
+                    } else {
+                        *after == source
+                    }
+            }) || !rejected.insert(reference)
+            {
+                return None;
+            }
+            if reason == "[rejected] (stale info)" || ref_lock_conflict(op, line) {
+                direct = Some(line.to_owned());
+            } else if matches!(
+                reason,
+                "[rejected] (atomic push failed)"
+                    | "[remote rejected] (atomic push failure)"
+                    | "[remote rejected] (atomic transaction failed)"
+            ) {
+                // Canonical atomic aborts need a concrete conflict or policy reason.
+            } else if server_rejection(line) {
+                generic_failure = true;
+            } else if reason
+                .strip_prefix("[rejected] (")
+                .or_else(|| reason.strip_prefix("[remote rejected] ("))
+                .and_then(|reason| reason.strip_suffix(')'))
+                .is_some_and(|reason| !reason.is_empty())
+            {
+                policy = Some(line.to_owned());
+            } else {
+                return None;
+            }
         }
+        if rejected.len() != updates.len() || updates.is_empty() {
+            return None;
+        }
+        // A generic receive failure is not an atomic-abort acknowledgement;
+        // matching prose elsewhere cannot turn its unknown outcome into proof.
+        if generic_failure {
+            return None;
+        }
+        if let Some(line) = policy {
+            return Some((Kind::Refused, line));
+        }
+        if let Some(line) = direct {
+            return Some((Kind::Conflict, line));
+        }
+        let mut conflict = None;
+        for line in stderr.lines() {
+            let line = line.trim_end_matches([' ', '\t', '\r']);
+            let diagnostic = line.strip_prefix("remote: ").unwrap_or(line);
+            let Some(reason) = diagnostic.strip_prefix("error: cannot lock ref '") else {
+                continue;
+            };
+            let (reference, reason) = reason.split_once("': ")?;
+            if !ref_lock_reason(op, reference, reason) {
+                return None;
+            }
+            conflict = Some((Kind::Conflict, diagnostic.to_owned()));
+        }
+        conflict
     }
 
     /// Exact receive-pack infrastructure reasons; unknown and policy reasons
@@ -2033,6 +2276,7 @@ mod unix {
         run: &GitRun,
         credential: Option<std::sync::Arc<crate::identity::Credential>>,
         admission: Admission<'_>,
+        record: Option<&dyn Fn(u32) -> Result<()>>,
     ) -> Result<GitOut> {
         check_op(run)?;
         let slug = &run.slug;
@@ -2109,6 +2353,7 @@ mod unix {
         if gh.fx().mode().replays() {
             let mut children = Children {
                 gh,
+                record,
                 git: PathBuf::from("git"),
                 env: Vec::new(),
                 work: None,
@@ -2214,6 +2459,7 @@ mod unix {
         let clone_stage = CloneStage::for_op(&run.op)?;
         let mut children = Children {
             gh,
+            record,
             git,
             env,
             work: Some(root.join("work")),
@@ -2256,18 +2502,33 @@ mod unix {
     /// Git setup can follow includes before a --local/--worktree listing even
     /// with --no-includes, so those repository-scoped queries are not admission.
     fn screened(children: &Children<'_>, run: &GitRun, dir: &Path) -> Result<PathBuf> {
+        let access = match &run.op {
+            GitOp::CheckLocal { .. } => ConfigAccess::ObjectSource,
+            GitOp::CommitRead { .. }
+            | GitOp::Fetch { .. }
+            | GitOp::FetchMain { .. }
+            | GitOp::FetchRef { .. }
+            | GitOp::FetchBatch { .. } => ConfigAccess::Read,
+            _ => ConfigAccess::Write,
+        };
+        screen(children, run, dir, access)
+    }
+
+    /// Step 3 for a repository a fetch only reads objects from: a source object cache or a
+    /// checkout cache, never the clone it fetches into.
+    fn screened_source(children: &Children<'_>, run: &GitRun, dir: &Path) -> Result<PathBuf> {
+        screen(children, run, dir, ConfigAccess::ObjectSource)
+    }
+
+    fn screen(
+        children: &Children<'_>,
+        run: &GitRun,
+        dir: &Path,
+        access: ConfigAccess,
+    ) -> Result<PathBuf> {
         let slug = &run.slug;
         let dir = std::path::absolute(dir)
             .map_err(|e| Error::local(format!("{}: {e}", dir.display())))?;
-        let read_only = matches!(
-            &run.op,
-            GitOp::CheckLocal { .. }
-                | GitOp::CommitRead { .. }
-                | GitOp::Fetch { .. }
-                | GitOp::FetchMain { .. }
-                | GitOp::FetchRef { .. }
-                | GitOp::FetchBatch { .. }
-        );
         let mut source = None;
         let admitted =
             children
@@ -2309,8 +2570,8 @@ mod unix {
                 (ConfigQuery::CommitRead, commit_config_request(slug, scope))
             } else {
                 (
-                    ConfigQuery::Names { read_only },
-                    config_names_request(slug, read_only, scope),
+                    ConfigQuery::Names { access },
+                    config_names_request(slug, access, scope),
                 )
             };
             let listed = children.config(query, input, &request).map_err(unsent)?;
@@ -3771,7 +4032,7 @@ mod unix {
                 .ok_or_else(|| Error::refused("source operation deadline overflow"))?;
             // Metadata came from the authenticated remote into an EMPTY private
             // repository. Cache refs never decide which commit the remote owns.
-            let cache = screened(&children, run, cache)?;
+            let cache = screened_source(&children, run, cache)?;
             let cache_view = step("source-cache", source_view_args(&cache), None)?;
             let (cache_common, shallow) = source_view(&cache_view.stdout)?;
             if shallow {
@@ -4169,7 +4430,7 @@ mod unix {
         if let Some((_, cache)) = checkout {
             let mut checkout_cache_ancestor = None;
             let checkout_cache_common = if let Some(cache) = cache {
-                let cache = screened(&children, run, cache)?;
+                let cache = screened_source(&children, run, cache)?;
                 let view = step("checkout-cache", source_view_args(&cache), None)?;
                 let (common, shallow) = source_view(&view.stdout)?;
                 if shallow {
@@ -4788,40 +5049,63 @@ mod unix {
         Ok(updated)
     }
 
-    pub(super) fn inventory_change(
+    /// Judge a native write's guarded refs, listed again after preparation or
+    /// after an uncertain receive, one ref at a time, never as a whole listing.
+    /// Each requested ref must still hold its BEFORE (receive leases it too),
+    /// and a control transaction's unrequested sibling must still satisfy
+    /// `ControlRefTransaction::check_before`. Main is guarded only to witness
+    /// objects the remote already holds. A listed main that moved is returned
+    /// as `(judged, current)`: the caller proves the move a fast-forward, which
+    /// keeps that witness true. A main that appeared was no witness.
+    ///
+    /// # Errors
+    /// Conflict when a requested ref moved or a control sibling broke its
+    /// invariant; could_not_run when a listed main disappeared.
+    pub(super) fn judge_inventory<'a>(
         updates: &[crate::github::refs::RefUpdate],
-        bytes: &[u8],
-    ) -> Error {
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return Error::protocol("git returned non-UTF-8 refs");
-        };
-        let mut refs = std::collections::BTreeMap::new();
-        for line in text.lines() {
-            let Some((oid, reference)) = line.split_once('\t') else {
-                return Error::protocol("git returned malformed refs");
-            };
-            if !crate::path::is_sha(oid) || refs.insert(reference, oid).is_some() {
-                return Error::protocol("git returned invalid or duplicate refs");
-            }
-        }
+        control: Option<&crate::git::ControlRefTransaction>,
+        judged_main: Option<&'a str>,
+        current: &std::collections::BTreeMap<&str, &'a str>,
+    ) -> Result<Option<(&'a str, &'a str)>> {
         for update in updates {
-            let observed = refs
+            let observed = current
                 .get(update.reference.as_str())
                 .copied()
                 .unwrap_or("0000000000000000000000000000000000000000");
             if observed != update.before {
-                return Error::new(
+                return Err(Error::new(
                     Kind::Conflict,
                     format!(
-                        "{} changed during push preparation: expected {}, observed {observed}",
+                        "{} moved from its expected {} to {observed}",
                         update.reference, update.before
                     ),
-                );
+                ));
             }
         }
+        if let Some(control) = control {
+            control.check_before(
+                current.get(crate::git::RELEASE_LEASE_REF).copied(),
+                current.get(crate::git::PUBLISHER_FENCE_REF).copied(),
+            )?;
+        }
+        match (judged_main, current.get("refs/heads/main").copied()) {
+            (Some(before), Some(after)) if before != after => Ok(Some((before, after))),
+            (Some(_), None) => Err(Error::could_not_run(
+                "remote main disappeared during a native ref write",
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// Main advanced under a write whose caller bound its policy to main
+    /// (`AtomicRefBatch::observing_main`). Nothing was sent and the requested
+    /// refs hold their expected values; only the caller can re-judge its
+    /// policy against the new main.
+    fn main_bound_moved(main: &str) -> Error {
         Error::could_not_run(
             "the remote inventory changed outside the requested refs; their expected values are unchanged",
         )
+        .with_sub(Sub::GitInventoryChanged { main: main.into() })
     }
 
     enum NativeRefBatch<'a> {
@@ -4844,6 +5128,14 @@ mod unix {
             match self {
                 Self::Ordinary(_) => None,
                 Self::Control { transaction, .. } => Some(transaction),
+            }
+        }
+
+        /// The main a caller bound its policy to, if any.
+        fn observed_main(&self) -> Option<&str> {
+            match self {
+                Self::Ordinary(batch) => batch.observed_main(),
+                Self::Control { .. } => None,
             }
         }
 
@@ -5079,6 +5371,9 @@ mod unix {
         // A newly created tag has no BEFORE of its own. Observe main too, so
         // a tag of an already published commit need not import its history.
         // This is remote authority, never origin/main or a source accelerator.
+        // Main is an object witness here, not a lease: a fast-forward keeps
+        // every object it witnessed on the remote (`judge_inventory`). Only a
+        // batch whose caller bound its policy to main needs main unchanged.
         let mut guards = batch.guard_refs();
         if !guards.contains(&"refs/heads/main") {
             guards.push("refs/heads/main");
@@ -5120,17 +5415,14 @@ mod unix {
                 found.get(crate::git::PUBLISHER_FENCE_REF).copied(),
             )?;
         }
-        if let NativeRefBatch::Ordinary(batch) = &batch
-            && let Some(expected) = batch.observed_main()
+        if let Some(expected) = batch.observed_main()
             && found.get("refs/heads/main").copied() != Some(expected)
         {
             let main = found.get("refs/heads/main").ok_or_else(|| {
                 Error::could_not_run("remote main disappeared during push preparation")
             })?;
             forward_main(expected, main)?;
-            return Err(Error::could_not_run(
-                "the remote inventory changed outside the requested refs; their expected values are unchanged",
-            ).with_sub(Sub::GitInventoryChanged { main: (*main).into() }));
+            return Err(main_bound_moved(main));
         }
         // Only freshly observed remote objects can exclude an old object
         // closure. Source refs, grafts, replacement objects and accelerator
@@ -5624,22 +5916,21 @@ mod unix {
                 return Err(Error::protocol("git returned unexpected or duplicate refs"));
             }
         }
-        if final_refs.stdout != listed.stdout {
-            // The inventory also guards main and sibling control refs, so a
-            // changed inventory does not prove an expected-old mismatch.
-            let mut error = inventory_change(batch.updates(), &final_refs.stdout);
-            if error.kind == Kind::CouldNotRun {
-                let main = final_found.get("refs/heads/main").copied();
-                if let (Some(before), Some(after)) = (found.get("refs/heads/main"), main) {
-                    forward_main(before, after)?;
-                    // Only the caller can re-evaluate its policy against main.
-                    // Uncertain-receive recovery never emits this marker.
-                    error = error.with_sub(Sub::GitInventoryChanged {
-                        main: after.to_owned(),
-                    });
-                }
+        // Judge each guarded ref on its own. A main that advanced fast-forward
+        // still holds every object the preparation above excluded by it, so
+        // the write goes ahead; a rewind, divergence or disappearance refuses.
+        if let Some((before, after)) = judge_inventory(
+            batch.updates(),
+            batch.control(),
+            found.get("refs/heads/main").copied(),
+            &final_found,
+        )? {
+            forward_main(before, after)?;
+            // Only the caller can re-evaluate its policy against main.
+            // Uncertain-receive recovery never emits this marker.
+            if batch.observed_main().is_some() {
+                return Err(main_bound_moved(after));
             }
-            return Err(error);
         }
         let mut args = vec![
             os("-c"),
@@ -5676,161 +5967,215 @@ mod unix {
         }
         let started = children.gh.fx().mono()?;
         let mut pause = std::time::Duration::from_secs(1);
-        let out = loop {
-            let result = match admission.take().filter(|_| !dry_run) {
-                Some(admit) => children.git_admitted(&args, scratch, &canonical, admit),
-                None => children.git(&args, scratch, &canonical),
-            };
-            let out = result.map_err(|e| if dry_run { unsent(e) } else { e })?;
-            if out.code == Some(0) {
-                break out;
-            }
-            let error = failed(&run.op, &out, children.gh.redactor(), &run.slug, !dry_run);
-            if dry_run
-                || error.kind != Kind::CouldNotRun
-                || error.side_effect != SideEffect::Unknown
-            {
-                return Err(error);
-            }
-            // A receive failure says nothing about whether the CAS committed.
-            // Read all guarded refs, including the control refs we do not change.
-            let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
-            list.extend(guards.iter().map(|reference| os(*reference)));
-            let read = checked("remote-recover", list, scratch).map_err(|read| {
-                Error::could_not_run(format!(
-                    "{}; remote re-read failed: {}",
-                    error.why, read.why
-                ))
-                .with_side_effect(SideEffect::Unknown)
-            })?;
-            if read.stdout_may_be_truncated() {
-                return Err(Error::protocol(
-                    "remote recovery refs exceed the complete output bound",
-                )
-                .with_side_effect(SideEffect::Unknown));
-            }
-            let text = std::str::from_utf8(&read.stdout).map_err(|_| {
-                Error::protocol("git returned non-UTF-8 refs").with_side_effect(SideEffect::Unknown)
-            })?;
-            let mut observed = BTreeMap::new();
-            for line in text.lines() {
-                let (oid, reference) = line.split_once('\t').ok_or_else(|| {
-                    Error::protocol("git returned malformed refs")
-                        .with_side_effect(SideEffect::Unknown)
+        // The main the push was last judged against (`judge_inventory`).
+        let mut judged_main = final_found
+            .get("refs/heads/main")
+            .map(|main| (*main).to_owned());
+        let mut prior_receive_uncertain = false;
+        let receive = (|| -> Result<ChildOut> {
+            let out = loop {
+                let result = match admission.take().filter(|_| !dry_run) {
+                    Some(admit) => children.git_admitted(&args, scratch, &canonical, admit),
+                    None => children.git(&args, scratch, &canonical),
+                };
+                let out = result.map_err(|e| {
+                    if dry_run {
+                        unsent(e)
+                    } else {
+                        prior_receive_uncertain |= e.side_effect == SideEffect::Unknown;
+                        e
+                    }
                 })?;
-                if !crate::path::is_sha(oid)
-                    || !guards.contains(&reference)
-                    || observed.insert(reference, oid).is_some()
-                {
-                    return Err(Error::protocol("git returned unexpected or duplicate refs")
-                        .with_side_effect(SideEffect::Unknown));
+                if out.code == Some(0) {
+                    break out;
                 }
-            }
-            if batch
-                .updates()
-                .iter()
-                .all(|u| observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after)
-            {
-                return Ok(ChildOut {
-                    code: Some(0),
-                    stdout: b"remote re-read confirmed all requested refs\n".to_vec(),
-                    stderr: Vec::new(),
-                });
-            }
-            // A main-bound claim may restart selection only before receive.
-            // A read of BEFORE cannot exclude a delayed commit or an ABA, and
-            // a different holder cannot turn our uncertain send into an unsent
-            // conflict. Keep its intent open unless every requested AFTER was
-            // confirmed above; never repeat receive behind the caller's policy.
-            if matches!(&batch, NativeRefBatch::Ordinary(batch) if batch.observed_main().is_some())
-            {
-                return Err(error);
-            }
-            if observed != found {
-                let partial = batch.updates().iter().any(|u| {
-                    observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after
-                });
-                if partial {
-                    return Err(Error::new(
-                        Kind::OutcomeUnknown,
-                        format!(
-                            "remote refs partially changed after an uncertain push: {}",
-                            error.why
-                        ),
+                let error = failed(&run.op, &out, children.gh.redactor(), &run.slug, !dry_run);
+                if dry_run
+                    || error.kind != Kind::CouldNotRun
+                    || error.side_effect != SideEffect::Unknown
+                {
+                    return Err(error);
+                }
+                prior_receive_uncertain = true;
+                // A receive failure says nothing about whether the CAS committed.
+                // Read all guarded refs, including the control refs we do not change.
+                let mut list = vec![os("ls-remote"), os("--refs"), os(remote.url())];
+                list.extend(guards.iter().map(|reference| os(*reference)));
+                let read = checked("remote-recover", list, scratch).map_err(|read| {
+                    Error::could_not_run(format!(
+                        "{}; remote re-read failed: {}",
+                        error.why, read.why
+                    ))
+                    .with_side_effect(SideEffect::Unknown)
+                })?;
+                if read.stdout_may_be_truncated() {
+                    return Err(Error::protocol(
+                        "remote recovery refs exceed the complete output bound",
                     )
                     .with_side_effect(SideEffect::Unknown));
                 }
-                let mut changed = inventory_change(batch.updates(), &read.stdout);
-                changed.why = format!("{}; prior push: {}", changed.why, error.why);
-                return Err(changed);
-            }
-            // No ref progress: use elapsed patience, never an attempt count.
-            // Repeated healthy reads of BEFORE are not progress and cannot
-            // keep a broken receive service alive forever.
-            if children.gh.fx().mono()?.saturating_sub(started) >= run.budget {
-                return Err(
-                    Error::could_not_run(format!("no remote ref progress: {}", error.why))
-                        .with_side_effect(SideEffect::None),
-                );
-            }
-            children.gh.fx().note_round(&format!(
-                "native push: {}; re-read confirmed all guarded refs unchanged; repeating expected-old push within {:?} budget",
+                let text = std::str::from_utf8(&read.stdout).map_err(|_| {
+                    Error::protocol("git returned non-UTF-8 refs")
+                        .with_side_effect(SideEffect::Unknown)
+                })?;
+                let mut observed = BTreeMap::new();
+                for line in text.lines() {
+                    let (oid, reference) = line.split_once('\t').ok_or_else(|| {
+                        Error::protocol("git returned malformed refs")
+                            .with_side_effect(SideEffect::Unknown)
+                    })?;
+                    if !crate::path::is_sha(oid)
+                        || !guards.contains(&reference)
+                        || observed.insert(reference, oid).is_some()
+                    {
+                        return Err(Error::protocol("git returned unexpected or duplicate refs")
+                            .with_side_effect(SideEffect::Unknown));
+                    }
+                }
+                if batch
+                    .updates()
+                    .iter()
+                    .all(|u| observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) == u.after)
+                {
+                    return Ok(ChildOut {
+                        code: Some(0),
+                        stdout: b"remote re-read confirmed all requested refs\n".to_vec(),
+                        stderr: Vec::new(),
+                    });
+                }
+                // A main-bound claim may restart selection only before receive.
+                // A read of BEFORE cannot exclude a delayed commit or an ABA, and
+                // a different holder cannot turn our uncertain send into an unsent
+                // conflict. Keep its intent open unless every requested AFTER was
+                // confirmed above; never repeat receive behind the caller's policy.
+                if batch.observed_main().is_some() {
+                    return Err(error);
+                }
+                // Not every requested ref holds its AFTER. One that left its
+                // BEFORE, whether to its AFTER or to a third value, may carry our
+                // uncertain receive (a later writer can move what we wrote), so
+                // its outcome is unknown and the intent stays open; it is never a
+                // never-sent conflict.
+                let left = batch.updates().iter().any(|u| {
+                    observed.get(u.reference.as_str()).copied().unwrap_or(ZERO) != u.before
+                });
+                if left {
+                    return Err(Error::new(
+                    Kind::OutcomeUnknown,
+                    format!(
+                        "requested remote refs left their expected values after an uncertain push: {}",
+                        error.why
+                    ),
+                )
+                .with_side_effect(SideEffect::Unknown));
+                }
+                // Every requested ref holds its BEFORE, so the re-read judges only
+                // the control sibling and main: a sibling that moved conflicts; a
+                // main that advanced fast-forward is no ref progress of ours, so
+                // the same expected-old push repeats against the main it moved to.
+                let judged =
+                    judge_inventory(&[], batch.control(), judged_main.as_deref(), &observed)
+                        .and_then(|moved| {
+                            let Some((before, after)) = moved else {
+                                return Ok(None);
+                            };
+                            forward_main(before, after)?;
+                            Ok(Some(after.to_owned()))
+                        });
+                match judged {
+                    Err(mut changed) => {
+                        changed.why = format!("{}; prior push: {}", changed.why, error.why);
+                        return Err(changed);
+                    }
+                    Ok(Some(main)) => judged_main = Some(main),
+                    Ok(None) => {}
+                }
+                // No ref progress: use elapsed patience, never an attempt count.
+                // Repeated healthy reads of BEFORE are not progress and cannot
+                // keep a broken receive service alive forever.
+                if children.gh.fx().mono()?.saturating_sub(started) >= run.budget {
+                    return Err(Error::could_not_run(format!(
+                        "no remote ref progress: {}",
+                        error.why
+                    ))
+                    .with_side_effect(SideEffect::None));
+                }
+                children.gh.fx().note_round(&format!(
+                "native push: {}; re-read confirmed every requested ref at its expected old value; repeating expected-old push within {:?} budget",
                 error.why, run.budget
             ))?;
-            children.gh.fx().sleep(pause)?;
-            pause = (pause * 2).min(std::time::Duration::from_secs(30));
-        };
-        // Git omits a lease when its advertisement already equals AFTER. That
-        // can race our earlier read even when BEFORE != AFTER in every input.
-        // Other rows may have landed, so never call that a complete CAS success.
-        let mut acknowledged = std::collections::BTreeSet::new();
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        for line in stdout.lines() {
-            let mut fields = line.split('\t');
-            let (Some(flag), Some(spec), Some(_summary)) =
-                (fields.next(), fields.next(), fields.next())
-            else {
-                continue;
+                children.gh.fx().sleep(pause)?;
+                pause = (pause * 2).min(std::time::Duration::from_secs(30));
             };
-            let Some((source, reference)) = spec.split_once(':') else {
-                continue;
-            };
-            let matches = batch.updates().iter().any(|update| {
-                if update.reference != reference {
-                    return false;
-                }
-                if batch.control().is_none() {
-                    return matches!(flag, " " | "*") && update.after == source;
-                }
-                if update.after == ZERO {
-                    return flag == "-" && matches!(source, "" | "(delete)");
-                }
-                let acknowledged = if update.before == ZERO {
-                    flag == "*"
-                } else {
-                    // Only the validated annotated control token can rotate.
-                    update.reference == crate::git::PUBLISHER_FENCE_REF && matches!(flag, " " | "+")
+            // Git omits a lease when its advertisement already equals AFTER. That
+            // can race our earlier read even when BEFORE != AFTER in every input.
+            // Other rows may have landed, so never call that a complete CAS success.
+            let mut acknowledged = std::collections::BTreeSet::new();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                let mut fields = line.split('\t');
+                let (Some(flag), Some(spec), Some(_summary)) =
+                    (fields.next(), fields.next(), fields.next())
+                else {
+                    continue;
                 };
-                acknowledged && update.after == source
-            });
-            if !matches || !acknowledged.insert(reference) {
-                return Err(Error::new(Kind::OutcomeUnknown, "native push did not acknowledge every explicit lease; concurrent changes or partial effects are possible")
+                let Some((source, reference)) = spec.split_once(':') else {
+                    continue;
+                };
+                let matches = batch.updates().iter().any(|update| {
+                    if update.reference != reference {
+                        return false;
+                    }
+                    if batch.control().is_none() {
+                        return matches!(flag, " " | "*") && update.after == source;
+                    }
+                    if update.after == ZERO {
+                        return flag == "-" && matches!(source, "" | "(delete)");
+                    }
+                    let acknowledged = if update.before == ZERO {
+                        flag == "*"
+                    } else {
+                        // Only the validated annotated control token can rotate.
+                        update.reference == crate::git::PUBLISHER_FENCE_REF
+                            && matches!(flag, " " | "+")
+                    };
+                    acknowledged && update.after == source
+                });
+                if !matches || !acknowledged.insert(reference) {
+                    return Err(Error::new(Kind::OutcomeUnknown, "native push did not acknowledge every explicit lease; concurrent changes or partial effects are possible")
                     .with_side_effect(if dry_run { SideEffect::None } else { SideEffect::Unknown }).with_repo(run.slug.to_string()));
+                }
             }
-        }
-        if acknowledged.len() != batch.updates().len() {
-            return Err(Error::new(
-                Kind::OutcomeUnknown,
-                "native push has missing per-ref acknowledgements",
-            )
-            .with_side_effect(if dry_run {
-                SideEffect::None
+            if acknowledged.len() != batch.updates().len() {
+                return Err(Error::new(
+                    Kind::OutcomeUnknown,
+                    "native push has missing per-ref acknowledgements",
+                )
+                .with_side_effect(if dry_run {
+                    SideEffect::None
+                } else {
+                    SideEffect::Unknown
+                })
+                .with_repo(run.slug.to_string()));
+            }
+            Ok(out)
+        })();
+        // After an uncertain receive, every error exit (including a fallible
+        // clock, observation, guard, budget, note or sleep) must keep the intent
+        // open. Only the closure's complete acknowledgement/all-AFTER success
+        // resolves it; repeated BEFORE reads cannot prove that nothing was sent.
+        receive.map_err(|error| {
+            if prior_receive_uncertain {
+                Error::new(
+                    Kind::OutcomeUnknown,
+                    format!("native receive remains uncertain: {}", error.why),
+                )
+                .with_side_effect(SideEffect::Unknown)
+                .with_repo(run.slug.to_string())
             } else {
-                SideEffect::Unknown
-            })
-            .with_repo(run.slug.to_string()));
-        }
-        Ok(out)
+                error
+            }
+        })
     }
 
     /// Steps 3, 7 and 9: the config screen of a fetch, the children, and the exit's mapping.
@@ -6152,6 +6497,22 @@ mod unix {
         {
             return Err(Error::refused(
                 "remote ref advertisement exceeds the complete output bound",
+            )
+            .with_repo(slug.to_string()));
+        }
+        // Git also matches full-looking ref patterns at slash-separated tails.
+        // A retained suffix could omit the requested ref while remaining valid
+        // advertisement text, so it cannot establish that ref's absence.
+        if let GitOp::LsRemote {
+            reference: Some(reference),
+            anonymous: false,
+            peeled: false,
+        } = &run.op
+            && crate::path::ref_name_ok(reference)
+            && (out.stdout_may_be_truncated() || out.stdout.len() > OUT_KEEP)
+        {
+            return Err(Error::protocol(
+                "exact remote ref observation exceeds the complete output bound",
             )
             .with_repo(slug.to_string()));
         }

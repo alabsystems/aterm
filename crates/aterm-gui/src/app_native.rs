@@ -3281,6 +3281,9 @@ impl App {
             window_focused: self.motion_focus(wid, focused_window),
             system_reduced: self.system_reduce_motion,
             focused: self.motion_focus(wid, focused_leaf && focused_window),
+            page_dark: crate::native_app::page_is_dark(
+                self.chrome_palette(crate::app_render::ChromeSurface::NativePage),
+            ),
             performance_reduced: self.perf_reduced,
             system_dark: self.os_appearance == aterm_types::Appearance::Dark,
             serious: self.serious_mode_enabled(),
@@ -4573,22 +4576,26 @@ impl App {
             if !editor_active && *event_type == KeyEventType::Press {
                 // On a sheet's cell Tab moves to the cell beside it, as in a spreadsheet; past
                 // the sheet's first or last cell it leaves the grid as Tab leaves any control.
+                // On an open list of a column's values, one stop of Tab's, Tab closes the list
+                // with the keys back on the control it opened from and goes on from there.
                 let backwards = mods.contains(Modifiers::SHIFT);
-                let in_sheet = match (
+                let (in_sheet, leaves_list) = match (
                     self.native_runtime.app(instance),
                     self.native_runtime.view_state(active_view),
                 ) {
                     (
                         Some(crate::native_app::NativeApp::Tables(app)),
                         Some(crate::native_app::AppViewState::Tables(state)),
-                    ) => app.tab_stays(state, backwards),
-                    _ => false,
+                    ) => (app.tab_stays(state, backwards), app.tab_leaves_list(state)),
+                    _ => (false, false),
                 };
-                if in_sheet {
+                if in_sheet || leaves_list {
                     let _ = self.dispatch_native_event(
                         wid,
                         AppEvent::StepAcross(if backwards { -1 } else { 1 }),
                     );
+                }
+                if in_sheet {
                     return true;
                 }
                 let _ = self.move_native_focus(wid, backwards);

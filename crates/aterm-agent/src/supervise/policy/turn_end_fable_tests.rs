@@ -342,13 +342,21 @@ fn resumed() -> TurnEndReading {
     )
 }
 
-fn switch(from: &str, launch: Option<&str>, back_at: Option<Instant>) -> ModelSwitch {
+/// The switch a move made at `since` leaves, its return timed by its notice at `back_at`.
+fn switch(
+    from: &str,
+    launch: Option<&str>,
+    back_at: Option<Instant>,
+    since: Instant,
+) -> ModelSwitch {
     ModelSwitch {
         from: Some(from.to_string()),
         to: FABLE_FALLBACK.to_string(),
         launch: launch.map(str::to_string),
+        since,
         back_at,
         back_by: back_at.map(|_| BackBy::Notice),
+        lifted_over: None,
         sample_at: None,
         samples: 0,
         proc: None,
@@ -486,7 +494,10 @@ fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
         waits_until(otherwise_of(&a), reset + GRACE),
         "unmade, the reset is waited out: {a:?}"
     );
-    assert_eq!(st.model_switch(), Some(&switch("fable", None, Some(reset))));
+    assert_eq!(
+        st.model_switch(),
+        Some(&switch("fable", None, Some(reset), t))
+    );
     let later = idle("Stage 3 done.", Some(30 * MIN));
     let a = at(&mut st, &later, reset + MIN);
     assert!(
@@ -507,7 +518,7 @@ fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
     assert!(falls_back(&act(&mut st, &named, t)));
     assert_eq!(
         st.model_switch(),
-        Some(&switch("fable", Some("claude-fable-5"), Some(reset)))
+        Some(&switch("fable", Some("claude-fable-5"), Some(reset), t))
     );
     let a = at(&mut st, &later, reset + MIN);
     assert!(
@@ -525,7 +536,7 @@ fn a_fable_limit_relaunches_on_opus_and_back_at_its_reset_never_by_model() {
     act(&mut st, &fable(None), t);
     assert_eq!(
         st.model_switch(),
-        Some(&switch("fable", None, None)),
+        Some(&switch("fable", None, None, t)),
         "no reset named: no return scheduled"
     );
     let a = at(&mut st, &later, t + 10 * 24 * 60 * MIN);
@@ -621,7 +632,10 @@ fn a_fable_bucket_under_the_generic_banner_relaunches_on_the_fallback() {
     let mut st = TurnEndState::default();
     let a = act(&mut st, &r, t);
     assert!(falls_back(&a), "{a:?}");
-    assert_eq!(st.model_switch(), Some(&switch("fable", None, Some(reset))));
+    assert_eq!(
+        st.model_switch(),
+        Some(&switch("fable", None, Some(reset), t))
+    );
     let goes_on = |a: &TurnEndAction| {
         matches!(a, TurnEndAction::WaitUntil { until, why, .. }
             if *until == reset + 10 * MIN && why == "model-bucket goes on by itself")
@@ -814,7 +828,7 @@ fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
         restartable: true,
         ..resumed()
     };
-    let switched = switch("fable", None, Some(reset));
+    let switched = |made: Instant| switch("fable", None, Some(reset), made);
     let mut st = TurnEndState::default();
     let a = at(&mut st, &armed, t);
     assert!(
@@ -823,7 +837,7 @@ fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
     );
     let a = act(&mut st, &resumed, t + MIN);
     assert!(falls_back(&a), "the bucket's own rule where it left: {a:?}");
-    assert_eq!(st.model_switch(), Some(&switched));
+    assert_eq!(st.model_switch(), Some(&switched(t + MIN)));
     let mut st = TurnEndState::default();
     let a = act(
         &mut st,
@@ -834,7 +848,7 @@ fn a_relaunch_where_the_buckets_notice_left_knows_the_bucket() {
         t,
     );
     assert!(falls_back(&a), "{a:?}");
-    assert_eq!(st.model_switch(), Some(&switched));
+    assert_eq!(st.model_switch(), Some(&switched(t)));
     let mut st = TurnEndState::default();
     at(&mut st, &launched(&armed, LaunchModel::Unread), t);
     let a = act(&mut st, &launched(&resumed, LaunchModel::Unread), t + MIN);
@@ -1032,7 +1046,7 @@ fn a_model_switch_is_its_relaunched_process_and_another_programs_bucket_falls_ba
         let mut st = TurnEndState::default();
         st.seed_model(ModelSwitch {
             proc,
-            ..switch("fable", None, Some(reset))
+            ..switch("fable", None, Some(reset), t)
         });
         st
     };
@@ -1955,6 +1969,139 @@ fn a_return_on_room_left_that_meets_the_limit_again_waits_a_rung_before_the_next
         st.model_sampled(Some((10, None)), named + MIN),
         Some(Sampled::Room { at: named + MIN })
     );
+}
+
+/// A FABLE TURN SERVED ON THE ACCOUNT AFTER THE SWITCH RETURNS IT BEFORE THE RESET ITS NOTICE
+/// NAMED (FL-116, [`TurnEndState::fable_lifted`]): the lift the account's record holds, dated
+/// after the switch was made, is Fable serving again, so the return is due at the next quiet
+/// moment, to the launch's own model; it is told once a lift, keeps an earlier return a reading
+/// already timed, and is not counted among the returns made on a sample's room.
+/// CONTROLS: a lift dated before the switch, or at its own instant, and no lift at all, each
+/// leave the return at the notice's reset, and the session is not returned before it.
+/// NEGATIVE CONTROL: with `fable_lifted` leaving `back_at` as it was, the decision ten minutes
+/// in is the continue policy's and not `Restart { why: ModelBack { to: None }, .. }`; with
+/// `restarted` counting a `BackBy::Lifted` return among `room_backs`, the last sample is
+/// `Room { at: +30 min }`, not due at once.
+#[test]
+fn a_fable_turn_served_on_the_account_returns_the_switch_before_its_reset() {
+    let t = t0();
+    let reset = t + 180 * MIN;
+    let now = t + 10 * MIN;
+    let quiet = idle("Fixed it.", Some(JOB));
+    let timing = |st: &TurnEndState| st.model_switch().map(|m| (m.back_at, m.back_by));
+    let mut st = TurnEndState::default();
+    assert!(falls_back(&act(&mut st, &fable(Some(reset)), t)));
+    assert_eq!(st.model_switch().map(|m| m.since), Some(t));
+    assert_eq!(timing(&st), Some((Some(reset), Some(BackBy::Notice))));
+
+    assert_eq!(st.fable_lifted(Some(t - MIN), now), None, "too early");
+    assert_eq!(st.fable_lifted(Some(t), now), None, "at its own instant");
+    assert_eq!(st.fable_lifted(None, now), None, "no lift on record");
+    assert_eq!(timing(&st), Some((Some(reset), Some(BackBy::Notice))));
+    let mut unlifted = st.clone();
+    let a = at(&mut unlifted, &quiet, now);
+    assert!(!restores(&a), "CONTROL: not before the reset: {a:?}");
+
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), now),
+        Some(LiftTold::Due { at: now })
+    );
+    assert_eq!(timing(&st), Some((Some(now), Some(BackBy::Lifted))));
+    let a = at(&mut st, &quiet, now);
+    assert!(
+        restarts(&a, &Restart::ModelBack { to: None }, RULE_MODEL_RESTORE),
+        "the return, two hours and fifty minutes before the reset: {a:?}"
+    );
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), now + MIN),
+        None,
+        "told once a lift"
+    );
+    st.restarted(&Restart::ModelBack { to: None }, true, &quiet, now);
+    st.acted(&a, &quiet, now);
+    assert_eq!(st.model_switch(), None, "the return closes the switch");
+
+    // The return was made on a served turn, not on a sample's room: the next sample's room is
+    // due at once, where a return on room left would hold it a rung.
+    let again = now + MIN;
+    assert!(falls_back(&act(&mut st, &fable(None), again)));
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), again + MIN),
+        None,
+        "the old lift is before the new switch"
+    );
+    assert_eq!(
+        st.model_sampled(Some((10, None)), again + MIN),
+        Some(Sampled::Room { at: again + MIN })
+    );
+
+    // A return a reading already timed earlier stays where it was.
+    let mut st = TurnEndState::default();
+    let passed = t + 5 * MIN;
+    assert!(falls_back(&act(&mut st, &fable(Some(passed)), t)));
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), now),
+        Some(LiftTold::Due { at: passed })
+    );
+    assert_eq!(timing(&st), Some((Some(passed), Some(BackBy::Lifted))));
+}
+
+/// A LIFT THE RECORD TAKES BACK BEFORE THE RETURN IS MADE TIMES THE RETURN AS BEFORE IT (FL-116,
+/// [`TurnEndState::fable_lifted`]): once a lift after the switch made the return due, a record
+/// that holds no lift any more (a session of the account met Fable's limit again while this one
+/// worked on Opus) withdraws it, so the session is not returned into the limit: the notice's reset
+/// times it again, and a switch no reading had timed is sampled again. A later lift makes it due
+/// again. CONTROLS: told again with no lift, nothing moves; the return is made once the record
+/// lifts the limit anew.
+/// NEGATIVE CONTROL: with `fable_lifted` leaving a withdrawn lift's timing standing, the decision
+/// after the withdrawal returns the session (`Restart { why: ModelBack { to: None }, .. }`) and
+/// the sample is not due.
+#[test]
+fn a_lift_the_record_takes_back_before_the_return_times_it_as_before() {
+    let t = t0();
+    let reset = t + 180 * MIN;
+    let now = t + 10 * MIN;
+    let quiet = idle("Fixed it.", Some(JOB));
+    let timing = |st: &TurnEndState| st.model_switch().map(|m| (m.back_at, m.back_by));
+    let mut st = TurnEndState::default();
+    assert!(falls_back(&act(&mut st, &fable(Some(reset)), t)));
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), now),
+        Some(LiftTold::Due { at: now })
+    );
+    assert_eq!(st.fable_lifted(None, now + MIN), Some(LiftTold::Withdrawn));
+    assert_eq!(timing(&st), Some((Some(reset), Some(BackBy::Notice))));
+    let a = at(&mut st, &quiet, now + 2 * MIN);
+    assert!(!restores(&a), "not into a limit the record holds: {a:?}");
+    assert_eq!(
+        st.fable_lifted(None, now + 3 * MIN),
+        None,
+        "CONTROL: told once"
+    );
+
+    let lifted = now + 20 * MIN;
+    assert_eq!(
+        st.fable_lifted(Some(lifted - MIN), lifted),
+        Some(LiftTold::Due { at: lifted })
+    );
+    let a = at(&mut st, &quiet, lifted);
+    assert!(
+        restarts(&a, &Restart::ModelBack { to: None }, RULE_MODEL_RESTORE),
+        "CONTROL: the record's new lift returns it: {a:?}"
+    );
+
+    // A switch no reading timed waits on a sample again once its lift is withdrawn.
+    let mut st = TurnEndState::default();
+    assert!(falls_back(&act(&mut st, &fable(None), t)));
+    assert!(st.model_sample_due(now), "no reading timed it");
+    assert_eq!(
+        st.fable_lifted(Some(t + 9 * MIN), now),
+        Some(LiftTold::Due { at: now })
+    );
+    assert!(!st.model_sample_due(now), "the lift timed it");
+    assert_eq!(st.fable_lifted(None, now + MIN), Some(LiftTold::Withdrawn));
+    assert_eq!(timing(&st), Some((None, None)));
+    assert!(st.model_sample_due(now + MIN), "sampled again");
 }
 
 /// THE SAMPLE TAKES THE PROBE'S `/usage` AT A QUIET TURN END WITH NO ACCOUNT ADVISING A PROBE:

@@ -514,6 +514,20 @@ fn a_walled_state_with_no_kind_reads_wall_and_await_agent_wall_answers() {
             .map(|row| row.payload.to_string())
     });
     assert_eq!(row.as_deref(), Some("wall rev=1 hseq=1"));
+    // It is treated as every wall is: a wall step that names no kind, and its need.
+    let walls = |rig: &Rig| -> Vec<(Op, Option<&'static str>)> {
+        records(rig, ONE)
+            .into_iter()
+            .filter(|rec| rec.k == Kind::Wall)
+            .map(|rec| (rec.op, rec.f.get_word(Key::Wall)))
+            .collect()
+    };
+    assert_eq!(
+        walls(&rig),
+        [(Op::Open, None)],
+        "a wall step, no kind guessed"
+    );
+    assert_eq!(shown(&rig, ONE).needs, ["wall"], "and the need it raises");
 
     assert_eq!(
         await_agent(&rig, ONE, "wall timeout=60000"),
@@ -533,6 +547,16 @@ fn a_walled_state_with_no_kind_reads_wall_and_await_agent_wall_answers() {
     screen(&rig, ONE, "wall:usage-session", None);
     assert_eq!(published(&rig, ONE), ("wall:usage-session", None, 2));
     assert_eq!(
+        walls(&rig),
+        [
+            (Op::Open, None),
+            (Op::Close, None),
+            (Op::Open, Some("usage-session"))
+        ],
+        "the wall of the named kind replaces the bare one"
+    );
+    assert_eq!(shown(&rig, ONE).needs, ["wall:usage-session"]);
+    assert_eq!(
         await_agent(&rig, ONE, "wall timeout=60000"),
         "OK agent wall:usage-session rev=2\n"
     );
@@ -544,14 +568,24 @@ fn a_walled_state_with_no_kind_reads_wall_and_await_agent_wall_answers() {
         await_agent(&rig, ONE, "wall:usage-week timeout=50"),
         "OK timeout\n"
     );
+    // NEGATIVE HALF: a state that is no wall leaves no wall step open and no wall's need.
+    assert_eq!(stream.record(2, state(State::Working)), (2, None));
+    assert_eq!(
+        walls(&rig).iter().map(|(op, _)| *op).collect::<Vec<_>>(),
+        [Op::Open, Op::Close, Op::Open, Op::Close],
+        "the wall step closed"
+    );
+    assert!(shown(&rig, ONE).needs.is_empty());
 }
 
 /// THE ROW A `state` RECORD WRITES is `mark agent word= rev= hseq= holder=` by the tab's own
 /// session, `src=harness conf=claim`, with the record's `seq` as `hseq` and no `gen=` or `fp=`;
-/// the `agent-change` row prints `hseq=`. It spends none of the session's mark budget: it is
-/// written with that budget spent.
-/// NEGATIVE HALF: at that moment a `mark` claim by the same session is refused, and a screen
-/// reader's row carries `gen=` and `fp=` and neither `hseq=` nor `holder=`.
+/// the `agent-change` row prints `hseq=`. It neither reads nor spends the session's mark
+/// budget: with three tokens left, three stream marks leave exactly three, and with none left
+/// a record is still written.
+/// NEGATIVE HALF: a write arm that spent a token a mark would leave fewer than three acts
+/// admitted; with the budget at zero a `mark` claim by the same session is refused; and a
+/// screen reader's row carries `gen=` and `fp=` and neither `hseq=` nor `holder=`.
 #[test]
 fn a_state_record_is_written_with_holder_src_harness_conf_claim_and_by_the_session() {
     let rig = Rig::new(2);
@@ -570,15 +604,46 @@ fn a_state_record_is_written_with_holder_src_harness_conf_claim_and_by_the_sessi
     stream.open(ONE);
     assert_eq!(stream.record(1, Body::Beat), (1, None));
 
-    // Spend the session's own mark budget to the last token.
-    let spent = timeline(&rig, ONE, |timeline| {
-        (0..10_000)
-            .take_while(|_| timeline.note_harness_act("approve", &holder, by).is_some())
-            .count()
+    // The session's whole mark budget on this clock, counted on the other tab, whose budget is
+    // its own.
+    let acts = |sid: &str, by: Actor, most: usize| {
+        timeline(&rig, sid, |timeline| {
+            (0..most)
+                .take_while(|_| timeline.note_harness_act("approve", &holder, by).is_some())
+                .count()
+        })
+    };
+    timeline(&rig, TWO, |timeline| {
+        timeline
+            .slog_mut()
+            .set_clock(crate::session_log::Clock::reading(|| {
+                aterm_slog::Stamp::new(1_792_000_000_000, 5_000)
+            }));
     });
+    let other = crate::session_log::sid_actor(TWO).expect("a minted session id");
+    let budget = acts(TWO, other, 10_000);
+    const LEFT: usize = 3;
     assert!(
-        (1..10_000).contains(&spent),
-        "CONTROL: the budget was there and ran out: {spent}"
+        (LEFT + 1..10_000).contains(&budget),
+        "CONTROL: the budget is finite and holds more than {LEFT}: {budget}"
+    );
+    // Spend this session's budget down to exactly LEFT tokens.
+    assert_eq!(acts(ONE, by, budget - LEFT), budget - LEFT);
+
+    // The stream writes three marks by this same session with LEFT tokens in its budget.
+    for (seq, body) in [
+        (2, state(State::Working)),
+        (3, state(State::Idle)),
+        (4, state(State::Working)),
+    ] {
+        assert_eq!(stream.record(seq, body), (seq, None));
+    }
+    // NEGATIVE HALF of "nor spends": a write arm that spent a token for each mark would have
+    // left none. Exactly LEFT acts are still admitted, and the next is refused.
+    assert_eq!(
+        acts(ONE, by, LEFT + 1),
+        LEFT,
+        "the stream's three marks spent none of the session's mark budget"
     );
     let refused = |rig: &Rig| {
         timeline(rig, ONE, |timeline| {
@@ -589,17 +654,26 @@ fn a_state_record_is_written_with_holder_src_harness_conf_claim_and_by_the_sessi
         refused(&rig),
         "NEGATIVE HALF: a `mark` claim is refused now"
     );
-
-    for (seq, body) in [
-        (2, state(State::Working)),
-        (3, state(State::Idle)),
-        (4, state(State::Working)),
-    ] {
-        assert_eq!(stream.record(seq, body), (seq, None));
-    }
+    // "Neither reads": with the budget spent, a record is still written.
+    assert_eq!(stream.record(5, state(State::Idle)), (5, None));
+    assert_eq!(
+        agent_marks(&rig, ONE)
+            .last()
+            .and_then(|rec| rec.f.get_u(Key::Hseq)),
+        Some(5),
+        "a mark written with the session's mark budget at zero"
+    );
     assert!(refused(&rig), "and the stream's rows gave it nothing back");
+    let marks: Vec<Rec> = agent_marks(&rig, ONE).into_iter().take(3).collect();
+    let rows: Vec<String> = timeline(&rig, ONE, |timeline| {
+        timeline
+            .since(None)
+            .filter(|row| row.kind == "agent-change")
+            .map(|row| row.payload.to_string())
+            .take(3)
+            .collect()
+    });
 
-    let marks = agent_marks(&rig, ONE);
     let read: Vec<_> = marks
         .iter()
         .map(|rec| {
@@ -657,13 +731,6 @@ fn a_state_record_is_written_with_holder_src_harness_conf_claim_and_by_the_sessi
     ] {
         assert!(line.contains(word), "{word} in {line}");
     }
-    let rows: Vec<String> = timeline(&rig, ONE, |timeline| {
-        timeline
-            .since(None)
-            .filter(|row| row.kind == "agent-change")
-            .map(|row| row.payload.to_string())
-            .collect()
-    });
     assert_eq!(
         rows,
         [
@@ -697,26 +764,25 @@ fn a_state_record_is_written_with_holder_src_harness_conf_claim_and_by_the_sessi
     );
 }
 
-/// A STREAM'S TAB WITH NO AGENT RUN GETS ONE FROM THE CLAIM'S REGISTRY ROW: nothing read the
-/// screen and no process name was resolved, and the first `state` record opens an agent run for
-/// the agent the row names, with the record's mark on it. The fixture's row leads no word, so
-/// its agent is read from its id.
-/// NEGATIVE HALF: a stream that applies no `state` opens no run, and `ended` closes the run the
-/// row opened.
+/// A STREAM'S TAB WITH NO AGENT RUN GETS ONE FROM THE CLAIM'S REGISTRY ROW (D15): nothing read
+/// the screen and no process name was resolved, and the first record the stream APPLIES, of
+/// any kind (here a `beat`), opens an agent run for the agent the claim's row names. Two rows
+/// name two agents: claude-code-alab leads no word, so its agent is read from its id
+/// (`claude`); grok-alab's is `grok`.
+/// NEGATIVE HALF: a claim with no stream, a record acknowledged and not applied, and a record
+/// dropped for its scope each open no run; a second applied record opens no second run;
+/// `ended` closes the run, and a `beat` after `ended` opens none.
 #[test]
 fn a_stream_tab_opens_its_agent_run_from_the_claims_row() {
     let rig = Rig::new(2);
-    let by = crate::session_log::sid_actor(ONE).expect("a minted session id");
-    let runs = |rig: &Rig| -> Vec<Rec> {
-        records(rig, ONE)
+    let runs = |rig: &Rig, sid: &str| -> Vec<Rec> {
+        records(rig, sid)
             .into_iter()
             .filter(|rec| rec.k == Kind::Agent && rec.op != Op::Mark)
             .collect()
     };
-    let mut stream = rig.claimant(ONE, "state");
-    stream.open(ONE);
-    let row = {
-        let handle = rig.service.handle(ONE);
+    let row_of = |sid: &str| {
+        let handle = rig.service.handle(sid);
         let meta = handle
             .ctx
             .meta
@@ -727,46 +793,367 @@ fn a_stream_tab_opens_its_agent_run_from_the_claims_row() {
             .claim
             .row
     };
-    assert_eq!((row.id, row.program), ("claude-code-alab", Program::Claude));
+    // Two tabs, two rows, two agents.
+    let mut claude = rig.claimant(ONE, "state");
+    let mut grok = rig.dial("owner");
     assert_eq!(
-        aterm_phase::program_of(row.id),
-        Some(Program::Claude),
-        "CONTROL: the row's agent is its id's"
+        grok.request(&format!("claim {TWO} 4 state grok-alab")),
+        "OK claim"
+    );
+    let row = row_of(ONE);
+    assert_eq!(row.id, "claude-code-alab");
+    assert_eq!(
+        (row.program, aterm_phase::program_of(row.id)),
+        (Program::Claude, Some(Program::Claude)),
+        "CONTROL: a row that leads nothing names its id's agent"
+    );
+    let row = row_of(TWO);
+    assert_eq!(row.id, "grok-alab");
+    assert_eq!(
+        row.program,
+        Program::Grok,
+        "CONTROL: the second row names another agent, so no constant is both"
     );
 
-    // NEGATIVE HALF: a stream that applied no `state` opened nothing.
-    assert_eq!(stream.record(1, Body::Beat), (1, None));
-    assert_eq!(stream.record(2, goal()), (2, None));
-    assert!(runs(&rig).is_empty(), "{:?}", runs(&rig));
-    assert!(timeline(&rig, ONE, |timeline| {
-        let agent = timeline.agent();
-        agent.reader.is_none() && agent.program.is_none()
-    }));
+    for (sid, stream, agent) in [(ONE, &mut claude, "claude"), (TWO, &mut grok, "grok")] {
+        let by = crate::session_log::sid_actor(sid).expect("a minted session id");
+        // NEGATIVE HALF: the claim alone, with no stream and no record, opened nothing.
+        assert!(runs(&rig, sid).is_empty(), "{sid}: {:?}", runs(&rig, sid));
+        stream.open(sid);
+        // NEGATIVE HALF: a record acknowledged and not applied, and one the grant drops.
+        assert_eq!(stream.record(1, goal()), (1, None));
+        assert_eq!(
+            stream.record(2, title()),
+            (2, None),
+            "a title is acknowledged and applied by nothing"
+        );
+        assert_eq!(
+            stream.record(
+                3,
+                Body::Wall {
+                    kind: "usage".to_string(),
+                    resets_ms: None,
+                }
+            ),
+            (3, Some("scope".to_string())),
+            "the grant holds no `walls`"
+        );
+        assert!(runs(&rig, sid).is_empty(), "{sid}: {:?}", runs(&rig, sid));
+        assert!(timeline(&rig, sid, |timeline| {
+            let agent = timeline.agent();
+            agent.reader.is_none() && agent.program.is_none() && agent.word == "-"
+        }));
 
-    assert_eq!(stream.record(3, state(State::Working)), (3, None));
+        // The first applied record, a `beat`: the run opens for the row's agent.
+        assert_eq!(stream.record(4, Body::Beat), (4, None));
+        let opened = runs(&rig, sid);
+        assert_eq!(opened.len(), 1, "{sid}: {opened:?}");
+        let run = &opened[0];
+        assert_eq!(run.op, Op::Open);
+        assert_eq!(
+            run.f.get_str(Key::Agent),
+            Some(agent),
+            "{sid}: the agent is the claim's row's"
+        );
+        assert_eq!((run.src, run.conf, run.by), (Src::Harness, Conf::Claim, by));
+        assert_eq!(published(&rig, sid).0, "-", "a beat moves no agent word");
+        // A second applied record, and a `state`, open no second run; the record's mark is on
+        // the one the row opened.
+        assert_eq!(stream.record(5, Body::Beat), (5, None));
+        assert_eq!(stream.record(6, state(State::Working)), (6, None));
+        assert_eq!(runs(&rig, sid).len(), 1);
+        let marks = agent_marks(&rig, sid);
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].node, run.node, "the record's mark is on the run");
+        assert!(timeline(&rig, sid, |timeline| {
+            timeline.slog().log().is_open(run.node)
+        }));
+
+        // `ended` closes it, and a beat after `ended` opens none: the record said it is gone.
+        assert_eq!(stream.record(7, state(State::Ended)), (7, None));
+        assert!(!timeline(&rig, sid, |timeline| {
+            timeline.slog().log().is_open(run.node)
+        }));
+        assert_eq!(stream.record(8, Body::Beat), (8, None));
+        assert_eq!(
+            runs(&rig, sid).iter().map(|rec| rec.op).collect::<Vec<_>>(),
+            [Op::Open, Op::Close]
+        );
+        // A `state` that says the agent is back opens the next run, again from the row.
+        assert_eq!(stream.record(9, state(State::Idle)), (9, None));
+        let reopened = runs(&rig, sid);
+        assert_eq!(reopened.len(), 3);
+        assert_eq!(reopened[2].f.get_str(Key::Agent), Some(agent));
+    }
+}
+
+/// A `state` THAT REPEATS THE PUBLISHED WORD STILL OPENS THE ROW'S RUN (D15): the screen reader
+/// published `idle` for a tab whose reader names no agent, so no run is open; the stream's
+/// `idle` moves no word and writes no mark, and the run opens all the same.
+/// NEGATIVE HALF: before the record there is no run, and the record writes no `mark agent`.
+#[test]
+fn a_state_that_moves_no_word_still_opens_the_rows_run() {
+    let rig = Rig::new(2);
+    let runs = |rig: &Rig| -> Vec<Rec> {
+        records(rig, ONE)
+            .into_iter()
+            .filter(|rec| rec.k == Kind::Agent && rec.op != Op::Mark)
+            .collect()
+    };
+    // The screen's word with no reader named: the reader opens no run.
+    timeline(&rig, ONE, |timeline| {
+        timeline.publish_agent(
+            "idle",
+            None,
+            None,
+            None,
+            AgentStamp {
+                generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                fp: 1,
+            },
+        )
+    });
+    assert_eq!(published(&rig, ONE), ("idle", None, 1));
+    let screen_marks = agent_marks(&rig, ONE).len();
+    let mut stream = rig.claimant(ONE, "state");
+    stream.open(ONE);
+    assert!(
+        runs(&rig).is_empty(),
+        "NEGATIVE HALF: no run before a record"
+    );
+
+    assert_eq!(stream.record(1, state(State::Idle)), (1, None));
+    assert_eq!(
+        published(&rig, ONE),
+        ("idle", None, 1),
+        "the word did not move"
+    );
+    assert_eq!(
+        agent_marks(&rig, ONE).len(),
+        screen_marks,
+        "and no mark was written for it"
+    );
     let opened = runs(&rig);
     assert_eq!(opened.len(), 1, "{opened:?}");
-    let run = &opened[0];
-    assert_eq!(run.op, Op::Open);
-    assert_eq!(run.f.get_str(Key::Agent), Some("claude"));
-    assert_eq!((run.src, run.conf, run.by), (Src::Harness, Conf::Claim, by));
-    let marks = agent_marks(&rig, ONE);
-    assert_eq!(marks.len(), 1);
-    assert_eq!(marks[0].node, run.node, "the record's mark is on the run");
-    assert!(timeline(&rig, ONE, |timeline| {
-        timeline.slog().log().is_open(run.node)
-    }));
-    // A second record opens no second run.
-    assert_eq!(stream.record(4, state(State::Idle)), (4, None));
-    assert_eq!(runs(&rig).len(), 1);
+    assert_eq!(opened[0].f.get_str(Key::Agent), Some("claude"));
+    assert_eq!(opened[0].src, Src::Harness);
+}
 
-    // `ended` closes it.
-    assert_eq!(stream.record(5, state(State::Ended)), (5, None));
-    assert!(!timeline(&rig, ONE, |timeline| {
-        timeline.slog().log().is_open(run.node)
-    }));
+/// THE STAND-DOWN ENDS WHEN THE CLAIM NO LONGER FEEDS `state`, though the claim's holder still
+/// holds the tab and no `meta-change` is written: a renewal whose grant drops `state`, and a
+/// renewal by another process under the same holder name. Each hands the agent word and the
+/// composer back to the screen reader at once, from what it reads.
+/// NEGATIVE HALF: a renewal in place, and one that widens the grant and keeps `state`, leave
+/// the reader down; and the new claimant's own `state` record stands it down again.
+#[test]
+fn the_stand_down_ends_when_a_renewal_drops_state_or_changes_the_claimant() {
+    // A lane for each stream this test opens: a stream whose claim moved to another
+    // connection closes within its tick, and no open here waits on that.
+    let rig = Rig::new(4);
+    let fed = |sid: &str| timeline(&rig, sid, |timeline| timeline.agent().stream.is_some());
+    let supervisor_rows = |sid: &str| {
+        timeline(&rig, sid, |timeline| {
+            timeline
+                .since(None)
+                .filter(|row| row.kind == "meta-change" && row.payload.contains("supervisor"))
+                .count()
+        })
+    };
+
+    // A renewal whose grant drops `state`.
+    let mut stream = rig.claimant(ONE, "state");
+    let id = stream.id();
+    stream.open(ONE);
     assert_eq!(
-        runs(&rig).iter().map(|rec| rec.op).collect::<Vec<_>>(),
-        [Op::Open, Op::Close]
+        stream.record(1, state_with(State::Working, Composer::Draft)),
+        (1, None)
+    );
+    assert!(!screen(&rig, ONE, "idle", None));
+    timeline(&rig, ONE, |timeline| {
+        timeline.set_composer(ComposerState::Empty)
+    });
+    assert_eq!(published(&rig, ONE), ("busy", None, 1));
+    assert_eq!(composer(&rig, ONE), "draft");
+    let rows = supervisor_rows(ONE);
+    // NEGATIVE HALF: renewals that keep `state` keep the reader down.
+    let handle = rig.service.handle(ONE);
+    place(
+        &handle,
+        4,
+        &[Duty::State],
+        id,
+        running(),
+        "claude-code-alab",
+    )
+    .expect("in place");
+    assert!(fed(ONE), "a renewal in place keeps the stand-down");
+    place(
+        &handle,
+        4,
+        &[Duty::State, Duty::Walls],
+        id,
+        running(),
+        "claude-code-alab",
+    )
+    .expect("a wider grant");
+    assert!(
+        fed(ONE),
+        "a renewal that keeps `state` keeps the stand-down"
+    );
+    assert_eq!(published(&rig, ONE), ("busy", None, 1));
+    // The renewal without `state`, from the same process on another connection.
+    let mut renewed = rig.dial("owner");
+    assert_eq!(renewed.request(&format!("claim {ONE} 4 walls")), "OK claim");
+    assert_eq!(
+        supervisor_rows(ONE),
+        rows,
+        "CONTROL: a renewal by the same claimant writes no meta-change"
+    );
+    assert!(!fed(ONE), "the claim no longer holds `state`");
+    assert_eq!(
+        published(&rig, ONE),
+        ("idle", None, 2),
+        "the screen reader's kept reading is published"
+    );
+    assert_eq!(composer(&rig, ONE), "empty");
+    assert!(screen(&rig, ONE, "busy", None), "and it decides again");
+    // The grant drops the record from here on, and it stands nothing down.
+    renewed.open(ONE);
+    let acked = rig.state(ONE).acked;
+    assert_eq!(
+        renewed.record(acked + 1, state(State::Idle)),
+        (acked + 1, Some("scope".to_string()))
+    );
+    assert!(!fed(ONE));
+    assert_eq!(published(&rig, ONE).0, "busy");
+    drop(stream);
+
+    // A renewal by another process under the same holder name.
+    let mut first = rig.claimant(TWO, "state");
+    first.open(TWO);
+    assert_eq!(first.record(1, state(State::Asking)), (1, None));
+    assert_eq!(published(&rig, TWO), ("prompt", None, 1));
+    assert!(!screen(&rig, TWO, "idle", None));
+    let rows = supervisor_rows(TWO);
+    let mut second = rig.dial("owner");
+    assert_eq!(
+        second.request(&format!("claim {TWO} 4 state other")),
+        "OK claim"
+    );
+    assert_eq!(
+        supervisor_rows(TWO),
+        rows,
+        "CONTROL: the same holder name renews, and writes no meta-change"
+    );
+    assert!(!fed(TWO), "the stream's state was another claimant's");
+    assert_eq!(published(&rig, TWO), ("idle", None, 2));
+    // NEGATIVE HALF: the new claimant's own `state` stands the reader down again.
+    second.open(TWO);
+    assert_eq!(second.record(1, state(State::Working)), (1, None));
+    assert!(fed(TWO));
+    assert_eq!(published(&rig, TWO), ("busy", None, 3));
+    assert!(!screen(&rig, TWO, "question", None));
+}
+
+/// A CLAIM RELEASED WITH ITS `ttl=` ALREADY PAST ENDS THE STAND-DOWN: the release of a claim
+/// that is no longer live writes no `meta-change`, and no lapse follows a claim that is gone,
+/// so the release itself hands the tab back to the screen reader.
+/// NEGATIVE HALF: until the claim is released the record stands, and the release wrote no
+/// `meta-change` that could have ended it.
+#[test]
+fn a_stream_claim_released_past_its_ttl_ends_the_stand_down() {
+    let rig = Rig::new(2);
+    let mut stream = rig.claimant(ONE, "state");
+    let id = stream.id();
+    stream.open(ONE);
+    assert_eq!(stream.record(1, state(State::Working)), (1, None));
+    assert!(!screen(&rig, ONE, "question", None));
+    assert_eq!(published(&rig, ONE), ("busy", None, 1));
+    let supervisor_rows = || {
+        timeline(&rig, ONE, |timeline| {
+            timeline
+                .since(None)
+                .filter(|row| row.kind == "meta-change" && row.payload.contains("supervisor"))
+                .count()
+        })
+    };
+    let rows = supervisor_rows();
+
+    // The claim's `ttl=` passes. Nothing has released it yet: the record still stands.
+    {
+        let handle = rig.service.handle(ONE);
+        let mut meta = handle
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        meta.supervisor.as_mut().expect("the claim").expires_us = Some(1);
+        assert!(meta.live_claim(crate::metrics::now_us()).is_none());
+    }
+    assert!(
+        timeline(&rig, ONE, |timeline| timeline.agent().stream.is_some()),
+        "NEGATIVE HALF: an expired claim nobody released has moved nothing"
+    );
+
+    // Its connection ends and releases it, before any lapse ran.
+    drop(stream);
+    rig.ended(id);
+    assert!(
+        rig.service
+            .handle(ONE)
+            .ctx
+            .meta
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .supervisor
+            .is_none(),
+        "the claim is gone"
+    );
+    assert_eq!(
+        supervisor_rows(),
+        rows,
+        "CONTROL: releasing a claim past its ttl writes no meta-change"
+    );
+    assert!(timeline(&rig, ONE, |timeline| timeline
+        .agent()
+        .stream
+        .is_none()));
+    assert_eq!(published(&rig, ONE), ("question", None, 2));
+    assert!(screen(&rig, ONE, "idle", None), "the reader decides again");
+}
+
+/// `await agent stopped` IS A WAIT aterm TAKES, and it answers when the published word is
+/// `stopped`; the word is logged as itself.
+/// NEGATIVE HALF: a word outside the vocabulary is still a usage error, and `stopped` is not
+/// answered by another word.
+#[test]
+fn await_agent_takes_stopped_and_answers_on_it() {
+    let rig = Rig::new(2);
+    assert!(screen(&rig, ONE, "busy", None));
+    assert_eq!(
+        await_agent(&rig, ONE, "stopped timeout=50"),
+        "OK timeout\n",
+        "the word is taken, and `busy` does not answer it"
+    );
+    let refused = await_agent(&rig, ONE, "stoppedx timeout=50");
+    assert!(
+        refused.starts_with("ERR usage"),
+        "NEGATIVE HALF: a word outside the vocabulary: {refused}"
+    );
+    assert!(screen(&rig, ONE, "stopped", None));
+    assert_eq!(
+        await_agent(&rig, ONE, "stopped timeout=60000"),
+        "OK agent stopped rev=2\n"
+    );
+    assert_eq!(
+        await_agent(&rig, ONE, "idle,stopped since=1 timeout=60000"),
+        "OK agent stopped rev=2\n"
+    );
+    assert_eq!(
+        agent_marks(&rig, ONE)
+            .last()
+            .and_then(|rec| rec.f.get_word(Key::Word)),
+        Some("stopped"),
+        "the row's word is `stopped`, not `unknown`"
     );
 }

@@ -8,8 +8,8 @@ use crate::harness::accounts::rename_tests::{NOW, seed_reference};
 use crate::harness::alab_roster::test_machine;
 use crate::harness::alab_roster::{self, Lab, LabAccount};
 
-#[path = "accounts_native_migration_tests.rs"]
-mod native_migration_tests;
+#[path = "accounts_native_identity_tests.rs"]
+mod native_identity_tests;
 
 fn email(local: &str) -> String {
     format!("{local}@example.com")
@@ -113,7 +113,6 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
         .unwrap();
     let lab = Lab {
         me: Some(test_machine("m22")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![
             lab_account("ann", "claude-aaaaaa", &[("m22", Some(1))]),
@@ -195,15 +194,17 @@ fn a_sync_from_the_lab_adds_preferred_accounts_and_drops_no_row() {
     );
 }
 
-/// A CLI pool's sync with a settled lab renames an old-style row (`kimi-m16`) to its account's
-/// label before it reads the fleet, keeping the row's login directory and its records, and
-/// signs nobody out; with the lab unsettled the row keeps its label. The `held_by` an old
-/// `ai-pool.toml` left on the row is cleared by the first sync from the lab.
-/// NEGATIVE CONTROL: with the provider source's held migration call removed, the
-/// settled sync leaves `kimi-m16` (`renamed before the fleet is read`); with its `alab` arm that
-/// clears `held_by` removed, the hold stays (`left: Some("m3") right: None`).
+/// A CLI pool's sync renames no row: an old-style row under its account's legacy label
+/// (`kimi-m16`) keeps that label, its login directory and login, its sign-in word, its session
+/// and its claim, and nothing is kept under the lab's label (`kimi-eeeeee`). The `held_by` an old
+/// `ai-pool.toml` left on the row is cleared by the sync from the lab, and a repeat changes
+/// nothing.
+/// NEGATIVE CONTROL: with the deleted rename (`ProviderSource::migrate`, calling
+/// `alab_roster::migrate_held`) back before the sync reads its fleet, the sync leaves no
+/// `kimi-m16` row (`keeps its legacy label`); with the `alab` arm that clears `held_by` removed,
+/// the hold stays (`left: Some("m3") right: None`).
 #[test]
-fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
+fn a_cli_sync_from_the_lab_keeps_a_legacy_labelled_row_and_its_state() {
     let root = aterm_tempfile::TempDir::new().unwrap();
     let (home, state_dir, config) = (
         root.path().join("home"),
@@ -240,13 +241,20 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
     .unwrap();
     store
         .transact_logins(NOW, &mut None, |state, logins| {
-            seed_reference(state, logins, "kimi-m16", 3);
+            for kind in [3, 7] {
+                seed_reference(state, logins, "kimi-m16", kind);
+            }
             Ok(Vec::new())
         })
         .unwrap();
-    let lab = |settled: bool| Lab {
+    let records = || {
+        let (state, _) = store.load(NOW).unwrap();
+        let (logins, _) = store.load_logins(NOW).unwrap();
+        (state, logins)
+    };
+    let (before, _) = records();
+    let lab = || Lab {
         me: Some(test_machine("m16")),
-        settled,
         bound: Default::default(),
         accounts: vec![LabAccount {
             cli,
@@ -264,8 +272,8 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
         places: Default::default(),
     };
     let fetch = |_: &Env, _: &str| -> Result<String, String> { panic!("the lab is the source") };
-    let sync = |settled: bool| {
-        alab_roster::with_lab(lab(settled), || {
+    let sync = || {
+        alab_roster::with_lab(lab(), || {
             sync_cli_with_replan(
                 cli,
                 (&home, &state_dir, &toml),
@@ -277,36 +285,32 @@ fn a_cli_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
             )
         })
     };
-    sync(false).unwrap();
+    sync().unwrap();
     let roster = Roster::load_for(cli, &roster_path).unwrap();
-    let unsettled = roster
-        .row("kimi-m16")
-        .expect("an unsettled lab renames nothing");
+    let row = roster.row("kimi-m16").expect("keeps its legacy label");
+    assert!(roster.row("kimi-eeeeee").is_none());
     assert_eq!(
-        unsettled.held_by, None,
+        row.held_by, None,
         "an old pool's hold does not outlive its source"
     );
-    sync(true).unwrap();
-    let roster = Roster::load_for(cli, &roster_path).unwrap();
-    assert!(
-        roster.row("kimi-m16").is_none(),
-        "renamed before the fleet is read"
-    );
-    let row = roster.row("kimi-eeeeee").expect("the account's label");
     assert_eq!(
         row.dir.as_deref(),
         login.to_str(),
         "the login stays where it was"
     );
     assert_eq!(fs::read(login.join("login")).unwrap(), b"kimi-m16");
-    let (state, _) = store.load(NOW).unwrap();
+    let (state, logins) = records();
     assert_eq!(
-        state.accounts.get("kimi-eeeeee").map(|a| a.auth),
-        Some(accounts::Auth::Ok),
-        "still signed in, under its new label"
+        state.accounts.get("kimi-m16"),
+        before.accounts.get("kimi-m16"),
+        "its sign-in word and time stay under its label"
     );
+    assert_eq!(state.sessions, before.sessions);
+    assert_eq!(state.claimed_at, before.claimed_at);
+    assert!(!state.accounts.contains_key("kimi-eeeeee"));
+    assert!(!logins.labels.contains_key("kimi-eeeeee"));
     let text = fs::read(&roster_path).unwrap();
-    sync(true).unwrap();
+    sync().unwrap();
     assert_eq!(
         fs::read(&roster_path).unwrap(),
         text,
@@ -356,7 +360,6 @@ fn a_cli_sync_from_a_lab_that_prefers_nothing_here_keeps_every_row_and_clears_ho
     .unwrap();
     let lab = Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         bound: Default::default(),
         accounts: vec![LabAccount {
             cli,
@@ -513,10 +516,9 @@ impl Bed {
     }
 }
 
-fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
+fn lab_of(accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine("m22")),
-        settled,
         bound: Default::default(),
         accounts,
         aliases: BTreeMap::new(),
@@ -527,10 +529,17 @@ fn lab_of(settled: bool, accounts: Vec<LabAccount>) -> Lab {
     }
 }
 
-/// A settled native sync projects legacy labels before composing the final roster, then
-/// publishes their records together. An unsettled lab keeps the legacy label.
+/// The lab renames no row: Claude Code's row under its account's legacy label (`m22-2`) keeps
+/// that label, its login directory and login, and every record this Mac keys by it (its sign-in
+/// word and time, its session and claim, its sign-in receipt), and a repeat writes nothing.
+/// Nothing is kept under the lab's label (`claude-bbbbbb`). A rename would leave the row's usage
+/// series, browser profile and vault snapshot under the old label, drop its sign-in receipt, and
+/// leave a running session's login environment naming no row.
+/// NEGATIVE CONTROL: with the deleted rename (`alab_roster::renames` and its
+/// `accounts::move_accounts` of the records) back in `persist_accounts_sync_with_pool`, the sync
+/// leaves no `m22-2` row (`keeps its legacy label`).
 #[test]
-fn claude_codes_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login() {
+fn claude_codes_sync_from_the_lab_keeps_a_legacy_labelled_row_and_its_state() {
     let bed = Bed::new(None);
     let login = bed.login("m22-2");
     bed.seed(&[Row {
@@ -539,40 +548,65 @@ fn claude_codes_sync_from_a_settled_lab_migrates_the_label_and_keeps_the_login()
         email: Some(email("bob")),
         ..Row::default()
     }]);
-    let lab = |settled: bool| {
-        lab_of(
-            settled,
-            vec![LabAccount {
-                legacy_label: Some("m22-2".into()),
-                ..lab_account("bob", "claude-bbbbbb", &[("m22", Some(1))])
-            }],
-        )
+    bed.store
+        .transact_logins(NOW, &mut None, |state, logins| {
+            seed_reference(state, logins, "m22-2", 7);
+            Ok(accounts::note_checked_sign_in(state, logins, "m22-2", NOW))
+        })
+        .unwrap();
+    let records = || {
+        let (state, _) = bed.store.load(NOW).unwrap();
+        let (logins, _) = bed.store.load_logins(NOW).unwrap();
+        (state, logins)
     };
-    bed.sync(&lab(false)).unwrap();
-    assert!(
-        bed.roster().row("m22-2").is_some(),
-        "an unsettled lab renames nothing"
-    );
-    bed.sync(&lab(true)).unwrap();
+    let (before, before_logins) = records();
+    assert!(before_logins.sign_in_receipts.contains_key("m22-2"));
+    let lab = lab_of(vec![LabAccount {
+        legacy_label: Some("m22-2".into()),
+        ..lab_account("bob", "claude-bbbbbb", &[("m22", Some(1))])
+    }]);
+    bed.sync(&lab).unwrap();
     let roster = bed.roster();
-    assert!(
-        roster.row("m22-2").is_none(),
-        "the settled projection uses the native label"
-    );
-    let row = roster.row("claude-bbbbbb").expect("the account's label");
+    let row = roster.row("m22-2").expect("keeps its legacy label");
+    assert!(roster.row("claude-bbbbbb").is_none());
     assert_eq!(row.dir.as_deref(), Some(login.as_str()), "the login stays");
     assert_eq!(fs::read(Path::new(&login).join("login")).unwrap(), b"m22-2");
-    let (state, _) = bed.store.load(NOW).unwrap();
+    let (state, logins) = records();
     assert_eq!(
-        state.accounts.get("claude-bbbbbb").map(|a| a.auth),
-        Some(accounts::Auth::Ok),
-        "still signed in, under its new label"
+        state.accounts.get("m22-2"),
+        before.accounts.get("m22-2"),
+        "its sign-in word and time stay under its label"
     );
+    assert_eq!(state.sessions, before.sessions);
+    assert_eq!(state.claimed_at, before.claimed_at);
+    assert_eq!(
+        logins.sign_in_receipts.get("m22-2"),
+        before_logins.sign_in_receipts.get("m22-2"),
+        "its sign-in receipt stands"
+    );
+    assert!(!state.accounts.contains_key("claude-bbbbbb"));
+    assert!(!logins.labels.contains_key("claude-bbbbbb"));
+    let files = [
+        bed.roster.clone(),
+        bed.store.state_file(),
+        bed.store.logins_file(),
+    ];
+    let image = || {
+        files
+            .iter()
+            .map(|path| fs::read(path).ok())
+            .collect::<Vec<_>>()
+    };
+    let synced = image();
+    bed.sync(&lab).unwrap();
+    assert_eq!(image(), synced, "a repeat writes nothing");
 }
 
+/// A refused native publication writes nothing, from a row under its account's legacy label
+/// too: the roster, the records, the ledger and the wake file read as before.
 #[cfg(unix)]
 #[test]
-fn refused_native_publication_does_not_publish_label_migration() {
+fn a_refused_native_publication_writes_nothing() {
     let bed = Bed::new(None);
     let login = bed.login("m22-2");
     bed.seed(&[Row {
@@ -597,23 +631,16 @@ fn refused_native_publication_does_not_publish_label_migration() {
             .collect::<Vec<_>>()
     };
     let before = image();
-    let lab = lab_of(
-        true,
-        vec![LabAccount {
-            legacy_label: Some("m22-2".into()),
-            ..lab_account("bob", "claude-bbbbbb", &[("m22", Some(1))])
-        }],
-    );
+    let lab = lab_of(vec![LabAccount {
+        legacy_label: Some("m22-2".into()),
+        ..lab_account("bob", "claude-bbbbbb", &[("m22", Some(1))])
+    }]);
     let error = bed
         .sync(&lab)
         .err()
         .expect("overlapping authority must be refused");
     assert!(error.contains("overlaps"), "{error}");
-    assert_eq!(
-        image(),
-        before,
-        "migration must share the refused publication"
-    );
+    assert_eq!(image(), before, "a refused publication writes nothing");
 }
 
 /// Under the lab the default login's row takes the account's lab label, never a label with a
@@ -628,13 +655,10 @@ fn refused_native_publication_does_not_publish_label_migration() {
 #[test]
 fn the_default_login_takes_its_lab_label_and_an_unknown_one_none() {
     let bed = Bed::new(Some("ann"));
-    let lab = lab_of(
-        false,
-        vec![
-            lab_account("ann", "claude-aaaaaa", &[("m20", Some(1))]),
-            lab_account("gilbert", "claude-gggggg", &[("m22", Some(1))]),
-        ],
-    );
+    let lab = lab_of(vec![
+        lab_account("ann", "claude-aaaaaa", &[("m20", Some(1))]),
+        lab_account("gilbert", "claude-gggggg", &[("m22", Some(1))]),
+    ]);
     bed.sync(&lab).unwrap();
     let roster = bed.roster();
     assert!(
@@ -648,10 +672,11 @@ fn the_default_login_takes_its_lab_label_and_an_unknown_one_none() {
     assert!(roster.row("claude-gggggg").is_some_and(|r| r.dir.is_some()));
 
     let unknown = Bed::new(Some("zed"));
-    let lab = lab_of(
-        false,
-        vec![lab_account("gilbert", "claude-gggggg", &[("m22", Some(1))])],
-    );
+    let lab = lab_of(vec![lab_account(
+        "gilbert",
+        "claude-gggggg",
+        &[("m22", Some(1))],
+    )]);
     unknown.sync(&lab).unwrap();
     let roster = unknown.roster();
     let labels: Vec<&str> = roster.rows.iter().map(|r| r.label.as_str()).collect();
@@ -666,10 +691,11 @@ fn the_default_login_takes_its_lab_label_and_an_unknown_one_none() {
         ..Row::default()
     }]);
     let before = fs::read(&empty.roster).unwrap();
-    let lab = lab_of(
-        false,
-        vec![lab_account("gilbert", "claude-gggggg", &[("m20", Some(1))])],
-    );
+    let lab = lab_of(vec![lab_account(
+        "gilbert",
+        "claude-gggggg",
+        &[("m20", Some(1))],
+    )]);
     empty.sync(&lab).unwrap();
     assert_eq!(
         fs::read(&empty.roster).unwrap(),
@@ -705,10 +731,10 @@ fn the_lab_trigger_sees_a_moved_browser_and_growth_of_a_large_roster() {
     }]);
     let mut moved = lab_account("gil", "claude-gggggg", &[("m22", Some(1))]);
     moved.browser = Some("new".into());
-    let lab = lab_of(false, vec![moved]);
+    let lab = lab_of(vec![moved]);
     let due = |lab: &Lab| {
         alab_roster::with_lab(lab.clone(), || {
-            alab_roster::sync_due(Cli::Claude, &bed.roster, |_| false)
+            alab_roster::sync_due(Cli::Claude, &bed.roster)
         })
     };
     assert!(due(&lab), "a moved browser is due");
@@ -736,13 +762,14 @@ fn the_lab_trigger_sees_a_moved_browser_and_growth_of_a_large_roster() {
             })
             .collect()
     };
-    let lab = lab_of(
-        false,
-        vec![lab_account("gil", "claude-gggggg", &[("m22", Some(1))])],
-    );
+    let lab = lab_of(vec![lab_account(
+        "gil",
+        "claude-gggggg",
+        &[("m22", Some(1))],
+    )]);
     let due = |lab: &Lab| {
         alab_roster::with_lab(lab.clone(), || {
-            alab_roster::sync_due(Cli::Claude, &full.roster, |_| false)
+            alab_roster::sync_due(Cli::Claude, &full.roster)
         })
     };
     full.seed(&rows(96));
@@ -765,13 +792,10 @@ fn a_retired_default_login_gets_no_row() {
     let bed = Bed::new(Some("rex"));
     let mut retired = lab_account("rex", "claude-rrrrrr", &[]);
     retired.joinable = false;
-    let lab = lab_of(
-        false,
-        vec![
-            retired,
-            lab_account("gil", "claude-gggggg", &[("m22", Some(1))]),
-        ],
-    );
+    let lab = lab_of(vec![
+        retired,
+        lab_account("gil", "claude-gggggg", &[("m22", Some(1))]),
+    ]);
     bed.sync(&lab).unwrap();
     let roster = bed.roster();
     let labels: Vec<&str> = roster.rows.iter().map(|r| r.label.as_str()).collect();
@@ -801,13 +825,10 @@ fn the_first_adds_main_is_the_default_login_under_the_lab() {
             ..Row::default()
         },
     ]);
-    let lab = lab_of(
-        false,
-        vec![
-            lab_account("ann", "claude-aaaaaa", &[("m20", Some(1))]),
-            lab_account("dee", "claude-dddddd", &[("m21", Some(1))]),
-        ],
-    );
+    let lab = lab_of(vec![
+        lab_account("ann", "claude-aaaaaa", &[("m20", Some(1))]),
+        lab_account("dee", "claude-dddddd", &[("m21", Some(1))]),
+    ]);
     bed.sync(&lab).expect("the sync is not refused");
     let roster = bed.roster();
     let dirless: Vec<&str> = roster
@@ -866,10 +887,11 @@ fn a_mac_the_lab_names_reads_no_sheet_in_its_upkeep() {
     .unwrap();
     let edit =
         |text: &str| crate::vault_entry::seed(&home, &[(ACCOUNTS_CSV_FILE, text.as_bytes())]);
-    let lab = lab_of(
-        false,
-        vec![lab_account("ann", "claude-aaaaaa", &[("m22", Some(1))])],
-    );
+    let lab = lab_of(vec![lab_account(
+        "ann",
+        "claude-aaaaaa",
+        &[("m22", Some(1))],
+    )]);
     let digests = || {
         (
             sync_inputs(&home, &state_dir, &roster_path, NOW),
@@ -1044,7 +1066,6 @@ fn a_first_lab_sync_lists_the_default_login_under_its_lab_label() {
         }
         let lab = Lab {
             me: Some(test_machine("m16")),
-            settled: true,
             bound: Default::default(),
             accounts: vec![
                 codex("ann", "codex-aaaaaa", &[("m16", Some(1))]),
@@ -1219,7 +1240,6 @@ fn a_known_codex_default_enrolls_without_a_local_preference() {
             }
             let lab = Lab {
                 me: Some(test_machine("m16")),
-                settled: true,
                 accounts: vec![LabAccount {
                     cli: Cli::Codex,
                     joinable: case != "held",

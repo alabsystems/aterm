@@ -513,6 +513,7 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
         (7, "put"),
         (8, "delete"),
         (9, "node"),
+        (10, "checkpoint"),
     ] {
         let of_kind: Vec<(u8, &[u8])> = census
             .iter()
@@ -521,7 +522,7 @@ fn vault_fill_commons_status_meter_equals_a_header_census() {
             .collect();
         assert_eq!(by_kind[word], json!(bytes(&of_kind)), "{word}");
     }
-    assert_eq!(by_kind.len(), 9, "each kind and no other");
+    assert_eq!(by_kind.len(), 10, "each kind and no other");
     assert_eq!(
         by_kind.values().filter_map(Value::as_u64).sum::<u64>(),
         observed["held_bytes"].as_u64().unwrap(),

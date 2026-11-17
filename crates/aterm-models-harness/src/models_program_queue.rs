@@ -82,7 +82,9 @@ pub fn program_resolver_queue_model() -> Model {
     }
 }
 
-/// One Claude footer resolver watch.
+/// One Claude footer resolver watch: which foreground group of a tab it is for, and when a stop
+/// ends it. When a watched session is read is the cause model's
+/// ([`claude_footer_cause_model`]), not this one's.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_footer_watch_model() -> Model {
@@ -111,9 +113,6 @@ pub fn claude_footer_watch_model() -> Model {
                 retired = 1;
                 watch = if Buggy == 1 { watch } else { 0 };
             }
-            action IdleRead when (watch > 0 && retired == 0) {
-                watch = watch;
-            }
 
             invariant StaleStopKeepsReplacement:
                 if asked_new == 1 && old_stopped == 1 && retired == 0 {
@@ -123,6 +122,72 @@ pub fn claude_footer_watch_model() -> Model {
                 if retired == 1 || (old_stopped == 1 && asked_new == 0) {
                     watch == 0
                 } else { watch <= 2 };
+        }
+    }
+}
+
+/// WHY A WATCHED CLAUDE CODE SESSION IS READ (the footer cause design's model): one file a
+/// session's footer read looked at, the version of it on `disk`, the version its last read
+/// `held`, whether a watch on it is `armed`, and whether a read of the session is `owed`.
+/// - `Ask`: the tab wrote and the status sweep asks: a read is owed.
+/// - `Read`: a read takes the file as it is on disk and pays what was owed. Under `Buggy = 2` a
+///   read runs with nothing owed (a clock).
+/// - `Place`: a settle places the watch the read's look wants, after that read; a file that moved
+///   since the read (a write in the gap between the read and the placement, which no watch
+///   heard) owes a read. Under `Buggy = 1` a placement owes nothing.
+/// - `Write`: a writer changes the file; an armed watch hears it and owes a read.
+/// - `Lose`: the watch stops hearing (the kernel let it go, or a rename replaced the file under
+///   it); the next settle places it again.
+///
+/// `causes` counts the reads owed (each time `owed` goes 0 to 1), `reads` the reads run.
+/// `NoLostChange` (law L3 PlaceBeforeRead): a file whose version the footer does not hold has a
+/// read owed, or no watch yet (a placement to come, which owes one). `NoReadWithoutCause`: every
+/// read paid a cause. A session on the clocks arm (no watch can be placed) is outside the model:
+/// its reads are its clock's. The resolver is bound to it by aterm-gui's
+/// `the_cause_model_binds_the_schedule`.
+///
+/// NEGATIVE CONTROLS (run 2026-11-16): committed as `Buggy = 1`, that test fails at the placement
+/// after a write in the gap ("the placement owes the read the gap's write needs"), the model
+/// owing nothing where the resolver owes the read; as `Buggy = 2`, at "the hour after owes the
+/// model no read", a read enabled with `reads: 4, causes: 4`.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn claude_footer_cause_model() -> Model {
+    aterm_spec::ty_model! {
+        ClaudeFooterCause {
+            const Buggy = 0;
+            var disk = 0;
+            var held = 0;
+            var armed = 0;
+            var owed = 0;
+            var reads = 0;
+            var causes = 0;
+
+            action Ask when (owed == 0 && reads <= 4) {
+                owed = 1;
+                causes = causes + 1;
+            }
+            action Read when (reads <= 4 && (owed == 1 || Buggy == 2)) {
+                held = disk;
+                owed = 0;
+                reads = reads + 1;
+            }
+            action Place when (reads > 0 && armed == 0) {
+                armed = 1;
+                owed = if held == disk || Buggy == 1 { owed } else { 1 };
+                causes = if held == disk || Buggy == 1 || owed == 1 { causes } else { causes + 1 };
+            }
+            action Write when (disk <= 2) {
+                disk = disk + 1;
+                owed = if armed == 1 { 1 } else { owed };
+                causes = if armed == 1 && owed == 0 { causes + 1 } else { causes };
+            }
+            action Lose when (armed == 1) {
+                armed = 0;
+            }
+
+            invariant NoLostChange: held == disk || owed == 1 || armed == 0;
+            invariant NoReadWithoutCause: reads <= causes;
         }
     }
 }

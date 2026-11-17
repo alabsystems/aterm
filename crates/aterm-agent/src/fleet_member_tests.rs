@@ -9710,8 +9710,8 @@ fn a_members_drive_grant_follows_its_issuers_book() {
             && removed.ends_with(&format!(
                 "  holds      node {} may drive this Mac no more: an aterm running here refuses \
                  its next drive from now on, and cuts its open drives and lifts any hold it took \
-                 here at its next read of [fleet] (each 2 s), so a write here before then may \
-                 still meet `ERR halted`\n",
+                 here at its next read of [fleet] (within 2 s of this write), so a write here \
+                 before then may still meet `ERR halted`\n",
                 short(&node)
             )),
         "{removed}"

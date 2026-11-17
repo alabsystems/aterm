@@ -461,6 +461,7 @@ enum AdviceWire {
 enum AskAgainWire {
     Unwritten,
     Reset,
+    WallRead,
 }
 
 impl AdviceWire {
@@ -486,6 +487,7 @@ impl AdviceWire {
                 why: match why {
                     AskAgain::Unwritten => AskAgainWire::Unwritten,
                     AskAgain::Reset => AskAgainWire::Reset,
+                    AskAgain::WallRead => AskAgainWire::WallRead,
                 },
             },
             AccountAdvice::Resume { cleared_at } => AdviceWire::Resume {
@@ -516,6 +518,7 @@ impl AdviceWire {
                 why: match why {
                     AskAgainWire::Unwritten => AskAgain::Unwritten,
                     AskAgainWire::Reset => AskAgain::Reset,
+                    AskAgainWire::WallRead => AskAgain::WallRead,
                 },
             },
             AdviceWire::Resume { cleared_at } => AccountAdvice::Resume { cleared_at },
@@ -1228,6 +1231,40 @@ impl TapeValue for Option<crate::supervise::policy::turn_end::FableWeek> {
 
     fn absent() -> Option<Self> {
         Some(None)
+    }
+}
+
+/// `fable_lift`'s answer as a tape holds it ([`crate::supervise::policy::turn_end::FableLift`]).
+#[derive(Serialize, Deserialize)]
+enum FableLiftWire {
+    Unread,
+    Unlifted,
+    Lifted(i64),
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.fable_lift` asked nothing there,
+/// and its loop returned a moved session only at the time its notice or the account's week gave
+/// ([`TapeValue::absent`]: `Unread`, which moves nothing), where the tape's header says that
+/// build lacked the door, and only there. The tape holds a lift's unix seconds.
+impl TapeValue for crate::supervise::policy::turn_end::FableLift {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match *self {
+            Self::Unread => FableLiftWire::Unread,
+            Self::Unlifted => FableLiftWire::Unlifted,
+            Self::Lifted { at } => FableLiftWire::Lifted(at),
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json::<FableLiftWire>(bytes)? {
+            FableLiftWire::Unread => Self::Unread,
+            FableLiftWire::Unlifted => Self::Unlifted,
+            FableLiftWire::Lifted(at) => Self::Lifted { at },
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Self::Unread)
     }
 }
 

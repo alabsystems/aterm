@@ -2397,6 +2397,15 @@ pub(crate) struct ViewMotionCx {
     /// Whether this view's window is focused (or recorded): what a page's motion follows,
     /// where [`Self::focused`] is this leaf's own focus too.
     pub(crate) window_focused: bool,
+    /// The ground native pages paint on is dark (the page role of the native page's palette):
+    /// the setup screen bakes its images for that ground alone.
+    pub(crate) page_dark: bool,
+}
+
+/// Whether native pages painted in `chrome` paint on a dark ground.
+pub(crate) fn page_is_dark(chrome: crate::chrome_band::ChromePalette) -> bool {
+    let roles = crate::settings::Roles::from_theme(chrome);
+    crate::native_appearance::surface_is_dark(crate::system_state::marks::page_ground(&roles))
 }
 
 impl ViewMotionCx {
@@ -2435,6 +2444,9 @@ impl Default for ViewMotionCx {
             shed: false,
             low_power: false,
             window_focused: true,
+            page_dark: page_is_dark(crate::chrome_band::ChromePalette::from(
+                aterm_render::Theme::default(),
+            )),
         }
     }
 }
@@ -2726,7 +2738,13 @@ impl NativeRuntime {
     /// Take the Tables reader's answers; whether the page changed. An answer can change what
     /// a view's grid draws (a Write that ends the change a hidden column was drawn for), so
     /// each view's selection is moved off a column no longer drawn
-    /// ([`crate::native_tables::TablesViewState::settle_columns`]).
+    /// ([`crate::native_tables::TablesViewState::settle_columns`]); what a column's open list
+    /// of values offers (a read took the last row holding one), so keys left on a line it no
+    /// longer offers go to the line now in its place
+    /// ([`crate::native_tables::TablesViewState::settle_filters`]); and what its history
+    /// drawer lists (a staged line written), so keys left on a line no longer drawn rest on a
+    /// control still drawn
+    /// ([`crate::native_tables::TablesViewState::settle_history_keys`]).
     pub(crate) fn poll_tables(&mut self) -> bool {
         let mut changed = false;
         for app in self.instances.values_mut() {
@@ -2741,7 +2759,11 @@ impl NativeRuntime {
         let mut settled = false;
         for mut state in self.views.values_mut() {
             if let AppViewState::Tables(view) = &mut *state {
-                let moved = tables.is_some_and(|tables| view.settle_columns(tables));
+                let moved = tables.is_some_and(|tables| {
+                    view.settle_columns(tables)
+                        | view.settle_filters(tables)
+                        | view.settle_history_keys(tables)
+                });
                 if changed || moved {
                     view.common.presentation_revision =
                         view.common.presentation_revision.wrapping_add(1);
@@ -2881,6 +2903,15 @@ impl NativeRuntime {
         if matches!(state, AppViewState::Tables(_)) {
             self.sync_tables_shown();
         }
+        // The last System State view gone: nothing draws the lockup's images any more.
+        if matches!(state, AppViewState::SystemState(_))
+            && !self
+                .views
+                .values()
+                .any(|view| matches!(view, AppViewState::SystemState(_)))
+        {
+            crate::system_state::release_lockup_images();
+        }
         Some(state)
     }
 
@@ -2969,9 +3000,9 @@ impl NativeRuntime {
         })
     }
 
-    /// A kitty pose the setup screen's lockup waits on was baked (`Wake::KittyBaked`): each
-    /// System State view renders again, and draws it.
-    pub(crate) fn kitty_baked(&mut self) {
+    /// An image the setup screen's lockup waits on was baked (`Wake::LockupBaked`): each System
+    /// State view renders again, and draws it.
+    pub(crate) fn lockup_baked(&mut self) {
         self.touch_system_state_views();
     }
 

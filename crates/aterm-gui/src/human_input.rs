@@ -465,7 +465,7 @@ impl crate::App {
             .iter()
             .map(|&(id, _, _)| id)
             .collect();
-        let written = self.write_person_stamps_of(&live, path);
+        let written = self.write_person_stamps_of(&live, path, std::time::Instant::now());
         if written.is_some() {
             // The keep seam's second copy (inert in a shipped build), of what the stamps added:
             // after the grant, inside the Commit window, before the Commit that lets the
@@ -479,12 +479,16 @@ impl crate::App {
         &self,
         ids: &[u64],
         path: std::path::PathBuf,
+        now: std::time::Instant,
     ) -> Option<std::path::PathBuf> {
         use crate::seamless::PersonStamp;
         let now_us = crate::metrics::now_us();
-        let now = std::time::Instant::now();
         let job_seen = &self.worker_job_seen;
-        let stamps: Vec<(u64, PersonStamp)> = ids
+        #[cfg_attr(
+            not(target_os = "macos"),
+            expect(unused_mut, reason = "no sheet off macOS")
+        )]
+        let mut stamps: Vec<(u64, PersonStamp)> = ids
             .iter()
             .filter_map(|&id| Some((id, &self.pool.get(id)?.ctx.human_input)))
             .flat_map(|(id, stamp)| {
@@ -510,6 +514,9 @@ impl crate::App {
                     .map(move |carried| (id, carried))
             })
             .collect();
+        // The password sheet's spacing crosses with the session its window shows.
+        #[cfg(target_os = "macos")]
+        stamps.extend(self.askpass_spacing_rows(ids, now));
         if stamps.is_empty() {
             return None;
         }
@@ -533,6 +540,8 @@ impl crate::App {
     /// without that provenance, a legacy keyed age conservatively counts as a possible key. The
     /// reaper's last sight of someone else's program in a concluded worker's tab crosses too
     /// (`App::worker_job_seen`), so the tab's reading time after that program is not cut short.
+    /// So does the password sheet's spacing of a window still quiet
+    /// (`App::adopt_askpass_spacing`), so an update gives a program that re-asks no fresh start.
     pub(crate) fn take_carried_person_stamps(&mut self) {
         let now_us = crate::metrics::now_us();
         for session in self.pool.iter() {
@@ -561,7 +570,16 @@ impl crate::App {
             .collect();
         let mut carried = 0_usize;
         let mut job_seen = Vec::new();
+        let mut quiet = Vec::new();
         for (named, stamp) in stamps {
+            if let crate::seamless::PersonStamp::SheetQuiet {
+                streak,
+                remaining_ms,
+            } = stamp
+            {
+                quiet.push((named, streak, remaining_ms));
+                continue;
+            }
             if let Some(session) = self
                 .pool
                 .iter()
@@ -587,6 +605,7 @@ impl crate::App {
                     }
                     crate::seamless::PersonStamp::Untyped => {}
                     crate::seamless::PersonStamp::JobSeen(age_ms) => job_seen.push((named, age_ms)),
+                    crate::seamless::PersonStamp::SheetQuiet { .. } => {}
                 }
             }
         }
@@ -605,6 +624,31 @@ impl crate::App {
                 self.worker_job_seen.insert(adopted, seen);
             }
         }
+        // Rows name the outgoing process's session ids; this process's windows show the
+        // sessions it adopted under its own.
+        let quiet: Vec<(u64, u32, u64)> = quiet
+            .into_iter()
+            .filter_map(|(named, streak, remaining_ms)| {
+                let adopted = self
+                    .pool
+                    .sessions
+                    .iter()
+                    .find(|(_, pooled)| pooled.session.handoff_local_id == Some(named))
+                    .map(|(&id, _)| id)?;
+                Some((adopted, streak, remaining_ms))
+            })
+            .collect();
+        #[cfg(target_os = "macos")]
+        if !quiet.is_empty() {
+            let unplaced = self.adopt_askpass_spacing(&quiet, now);
+            aterm_log::info!(
+                "update apply: carried the password sheet's spacing of {} session(s), {unplaced} \
+                 of them shown in no window",
+                quiet.len()
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        drop(quiet);
         if carried > 0 {
             aterm_log::info!(
                 "update apply: carried the person's stamps of {carried} adopted session(s)"

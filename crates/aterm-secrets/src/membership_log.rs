@@ -5,7 +5,10 @@
 //! Mac evaluates the same way, so membership needs no leader and a rejoin is a set union.
 //!
 //! - [`Record`]: one signed record, addressed by the SHA-256 of its bytes, that names its causal
-//!   parents. A `Genesis` founds a network, whose id is the genesis record's id, and names the
+//!   parents. Record version 2 ([`VERSION_TWO`]) signs a `Put`'s or `Delete`'s ciphertext by its
+//!   digest, so the ciphertext can be shed under the same id, and carries the `Checkpoint` kind;
+//!   only a reader whose format admits it reads it ([`Reading`]), and nothing in this build
+//!   writes it. A `Genesis` founds a network, whose id is the genesis record's id, and names the
 //!   Commons root ([`Root`]) every member's binding names. `Admit`, `Remove`, `Name` and `Node`
 //!   are signed by a member's device key: the Ed25519 writer key of its Commons binding, with the
 //!   binding's incarnation as the rest of its 48-byte actor.
@@ -67,21 +70,23 @@ pub fn empty_heads_digest() -> [u8; 32] {
 
 pub mod admission;
 pub mod budgets;
+pub mod checkpoint;
 mod down_set;
 pub mod entries;
 mod epochs;
 mod eval;
 mod fold;
 pub mod genesis;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod head;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod history;
 mod payload;
 mod reach;
 pub mod rekey;
+pub mod rooted;
 pub mod store;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod untaken;
 
 pub use admission::{Gap, SeatAudience, Signer, admission_audiences};
@@ -99,13 +104,14 @@ pub use fold::{NETWORK_KEY_INFO, fold_network_key};
 pub use genesis::Proof;
 pub use payload::Payload;
 pub use rekey::{RekeyDue, Turn, audience_tag, secure_twins};
-#[cfg(unix)]
+pub use rooted::{Rooting, Stub};
+#[cfg(any(unix, windows))]
 pub(crate) use store::decode_records_before_cut;
 #[cfg(test)]
 pub(crate) use store::encode_records;
 pub use store::{
     MAX_RECORDS_STREAM, MemberVerdict, Store, Written, decode_records, decode_records_bounded,
-    on_written, read_records,
+    decode_records_in, on_written, read_records,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -198,7 +204,45 @@ pub type RecordId = astream_wire::sync::Digest;
 pub type MemberId = astream_wire::sync::Actor;
 
 const MAGIC: &[u8; 4] = b"ALM1";
+/// Record layout version 1: every record every build since 0.146 reads and writes.
 const VERSION: u8 = 1;
+/// Record layout version 2 (`docs/DESIGN-vault-log-2026-11-14.md` step 4): it signs a `Put`'s or
+/// `Delete`'s clear fields and its ciphertext's length and SHA-256, not the ciphertext, so the
+/// ciphertext can be shed and the record still verifies ([`Record::is_shed`]). Only a reader
+/// whose format admits it reads it ([`Reading`]); nothing in this build signs it.
+///
+/// The layout, byte by byte (every number big-endian):
+///
+/// | bytes | field |
+/// |---|---|
+/// | 4 | `ALM1` |
+/// | 1 | `2` |
+/// | 32 | network |
+/// | 1 | kind: `Put` (7), `Delete` (8) or `Checkpoint` (10), and no other |
+/// | 48 | actor |
+/// | 8 | sequence |
+/// | 32 | previous, zero for none |
+/// | 1 | parent count, at most [`MAX_PARENTS`] |
+/// | 32 each | parents |
+/// | 8 | authored clock |
+/// | 4 | clear length `c` |
+/// | 4 | tail length `t`: the ciphertext's length; zero where it is shed, and for a checkpoint |
+/// | `c` | the clear fields ([`Statement`], [`Body::Checkpoint`]) |
+/// | 64 | Ed25519 signature |
+/// | `t` | the ciphertext |
+///
+/// A `Put`'s or `Delete`'s clear fields are its audience (as version 1 writes it), its epoch
+/// (32), its salt (32), its [`Statement`] (a `u16` count and that many ids it supersedes, then 32
+/// bytes it carries, zero for none), its ciphertext's length (`u32`) and its ciphertext's SHA-256
+/// (32). A `Checkpoint`'s are its predecessor (32, zero for none), its cut (`u64` milliseconds),
+/// a `u16` count and that many heads, its state digest (32) and its dropped digest (32).
+///
+/// The signature is over [`SIGNING_DOMAIN_TWO`] and every byte before it but the tail length,
+/// which is not signed: it is the one field shedding changes. The id is the SHA-256 of the
+/// record's shed form, every byte through the signature with a zero tail length, so a whole
+/// record and its shed frame share one id, and a shed record's id is the SHA-256 of its bytes,
+/// as every version-1 record's is.
+const VERSION_TWO: u8 = 2;
 /// Where a record's kind byte sits: after the magic, the layout version and the network.
 const KIND_AT: usize = 4 + 1 + 32;
 /// Bytes through the parent-count field, before the variable parent list.
@@ -206,7 +250,92 @@ const FRAME_PREFIX_LEN: usize = 4 + 1 + 32 + 1 + 48 + 8 + 32 + 1;
 /// The most bytes a record takes around its body: the header with [`MAX_PARENTS`] parents and
 /// its signed clock, the body's length, and the signature.
 const MOST_FRAME: usize = FRAME_PREFIX_LEN + 32 * MAX_PARENTS + 8 + 4 + 64;
+/// [`MOST_FRAME`] of a version-2 record: its clear and tail lengths in place of the body's.
+const MOST_FRAME_TWO: usize = FRAME_PREFIX_LEN + 32 * MAX_PARENTS + 8 + 4 + 4 + 64;
 const SIGNING_DOMAIN: &[u8] = b"aterm/members/record/1\0";
+/// What a version-2 record's signature is over, ahead of its signed bytes ([`VERSION_TWO`]).
+const SIGNING_DOMAIN_TWO: &[u8] = b"aterm/members/record/2\0";
+/// The most records a version-2 `Put` or `Delete` states it supersedes ([`Statement`]): 128 KiB
+/// of ids. The record holds them within [`MAX_RECORD`] beside its ciphertext, whole or shed
+/// ([`Record::decode`] refuses a frame whose whole record would pass it), so a `Put` of a
+/// value near [`crate::text::MAX_VALUE`] names fewer (2,004 at the largest ciphertext and one
+/// parent): a writer bounds its statement by both.
+pub const MAX_SUPERSEDES: usize = 4096;
+/// The most heads a `Checkpoint` names ([`Body::Checkpoint`]): a cut's heads are its newest
+/// records, one of each actor that did not fork (an actor's records follow one another), and every
+/// actor got its seat by a weighed record, of which a log holds [`MAX_WEIGHED_RECORDS`]. An actor
+/// that forked (signed two records at one sequence) can head a cut twice; a cut whose forks give
+/// it more heads than this has no checkpoint ([`checkpoint::plan_at`] refuses it).
+pub const MAX_CHECKPOINT_HEADS: usize = MAX_WEIGHED_RECORDS;
+
+/// Which record layouts a reader admits: the records format of the node it reads for
+/// ([`crate::crossing::RecordsBound::format`]), or a follow copy. A node at format 1 reads
+/// record version 1 and the nine kinds before `Checkpoint` and refuses the rest exactly as
+/// 0.204 does: version 2 is "not a membership record", and a version-1 frame of the
+/// `Checkpoint` code is "of an unknown kind". A node at format 2 or later, and a follow copy,
+/// read version 2 and `Checkpoint` too.
+///
+/// The format is a property of the decode, never a rule of [`Log::insert`]
+/// (`docs/DESIGN-vault-log-2026-11-14.md` §6): a log takes any record it is handed, and which
+/// records reach it is decided where their bytes are read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// A node whose records are at this format: [`crate::crossing::FORMAT_ONE`] until its
+    /// format mark says otherwise.
+    Format(u32),
+    /// A copy no reader sees that a format-1 node ingests a format-2 peer's records into, to
+    /// learn whether they hold a signed record of format 2 before it stores its own mark
+    /// (tracker FL-148e). Nothing it holds is served or written.
+    Follow,
+}
+
+impl Default for Reading {
+    /// [`Reading::ONE`].
+    fn default() -> Self {
+        Self::ONE
+    }
+}
+
+impl Reading {
+    /// What every node of this build reads: no build stores a format mark yet.
+    pub const ONE: Self = Self::Format(crate::crossing::FORMAT_ONE);
+
+    /// Whether this reader reads record version 2 and the `Checkpoint` kind.
+    #[must_use]
+    pub const fn admits_two(self) -> bool {
+        match self {
+            Self::Format(format) => format >= crate::crossing::FORMAT_TWO,
+            Self::Follow => true,
+        }
+    }
+
+    /// The layout `version` names, where this reader reads it.
+    fn version(self, version: u8) -> Result<u8> {
+        match version {
+            VERSION => Ok(VERSION),
+            VERSION_TWO if self.admits_two() => Ok(VERSION_TWO),
+            _ => Err(Error::new("not a membership record")),
+        }
+    }
+}
+
+/// What a version-2 `Put` or `Delete` states of its register, signed among its clear fields so
+/// that a Mac with no key of its audience can classify it from its frame alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Statement {
+    /// The ops of its register in its causal past that its writer's resolve read as replaced at
+    /// it (each it replaces, and each an op in its past replaced): sorted, distinct, non-zero, at
+    /// most [`MAX_SUPERSEDES`]. Replacement is a fact of two ops, so an op named here stays
+    /// replaced however the log grows; a prune drops an op only where an op of its own signer in
+    /// the same register stands beside it, and only by a name the frames show could be true: the
+    /// op has the namer's audience and lies in its past, and the namer holds its own epoch
+    /// ([`checkpoint`]). An op the resolve still reads, a
+    /// sibling a carry of another value leaves standing, is not named.
+    pub supersedes: Vec<RecordId>,
+    /// The op whose value a `Put` seals again (a carry); `None` for a `Delete`, which seals
+    /// no value.
+    pub carries: Option<RecordId>,
+}
 /// The largest record [`Record::decode`] reads: a 1 MiB secret value (`Put`) plus headers fits
 /// with room.
 pub const MAX_RECORD: usize = crate::text::MAX_VALUE + 64 * 1024;
@@ -240,6 +369,9 @@ pub enum Kind {
     Delete,
     /// A member's own fleet node key, which the key itself vouches for.
     Node,
+    /// A cut of the log and the digests a checkpoint names ([`Body::Checkpoint`]): record
+    /// version 2 alone, and nothing in this build signs one.
+    Checkpoint,
 }
 
 impl Kind {
@@ -254,6 +386,20 @@ impl Kind {
             Kind::Put => 7,
             Kind::Delete => 8,
             Kind::Node => 9,
+            Kind::Checkpoint => 10,
+        }
+    }
+    /// The kind of `code` in a record of layout `version`: version 1 knows the nine kinds before
+    /// `Checkpoint` and refuses its code as of an unknown kind, as 0.204 does; version 2 is a
+    /// `Put`, a `Delete` or a `Checkpoint`, and no other.
+    fn in_layout(code: u8, version: u8) -> Result<Self> {
+        let kind = Self::from_code(code)?;
+        match (version, kind) {
+            (VERSION, Kind::Checkpoint) => Err(Error::new("membership record of an unknown kind")),
+            (VERSION, _) | (VERSION_TWO, Kind::Put | Kind::Delete | Kind::Checkpoint) => Ok(kind),
+            _ => Err(Error::new(
+                "a version-2 membership record is a Put, a Delete or a Checkpoint",
+            )),
         }
     }
     fn from_code(code: u8) -> Result<Self> {
@@ -267,6 +413,7 @@ impl Kind {
             7 => Kind::Put,
             8 => Kind::Delete,
             9 => Kind::Node,
+            10 => Kind::Checkpoint,
             _ => return Err(Error::new("membership record of an unknown kind")),
         })
     }
@@ -275,10 +422,13 @@ impl Kind {
     /// header ([`MAX_PARENTS`] parents) and this kind's fields; [`MAX_RECORD`], the bound of
     /// every record, for a genesis, an `Epoch`, a `Put` and a `Delete`, whose founder, host and
     /// ciphertext fields this does not total. Every kind is named, so a new one is bounded where
-    /// it is added.
+    /// it is added. A `Checkpoint` is bounded in its version-2 layout, the one it has.
     #[must_use]
     pub const fn most_bytes(self) -> usize {
         let body = match self {
+            Kind::Checkpoint => {
+                return MOST_FRAME_TWO + 32 + 8 + 2 + 32 * MAX_CHECKPOINT_HEADS + 32 + 32;
+            }
             Kind::Admit => REQUEST_LEN + 32 + (1 + MAX_NAME) + (1 + MAX_LABEL) + 1,
             Kind::Remove => 48 + 32,
             Kind::Name => 1 + MAX_NAME,
@@ -498,6 +648,25 @@ pub enum Body {
         /// refuses a record whose proof does not verify.
         proof: [u8; 64],
     },
+    /// A checkpoint of the log (`docs/DESIGN-vault-log-2026-11-14.md` step 4): a cut, the
+    /// heads of the records authored before it, and the digests of the state at those heads and
+    /// of the records a prune drops. Record version 2 alone; weighed by no quorum and counted
+    /// against the keyed budget; a membership-class record ([`budgets::Class::Membership`]).
+    Checkpoint {
+        /// The checkpoint this one follows, where there is one: the newest final checkpoint in
+        /// the cut, by its id ([`checkpoint::checkpoint_id`]), which every share of it carries
+        /// alike, not by one share's record id.
+        predecessor: Option<RecordId>,
+        /// The cut, in UTC milliseconds.
+        cut_ms: u64,
+        /// The heads of the cut: sorted, distinct, non-zero, from one to
+        /// [`MAX_CHECKPOINT_HEADS`].
+        heads: Vec<RecordId>,
+        /// The digest of the state at the heads; non-zero.
+        state: [u8; 32],
+        /// The digest of the ids a prune at the heads drops; non-zero.
+        dropped: [u8; 32],
+    },
 }
 
 impl Body {
@@ -513,6 +682,7 @@ impl Body {
             Body::Put { .. } => Kind::Put,
             Body::Delete { .. } => Kind::Delete,
             Body::Node { .. } => Kind::Node,
+            Body::Checkpoint { .. } => Kind::Checkpoint,
         }
     }
 }
@@ -530,7 +700,12 @@ pub struct Draft {
     /// and drops repeats.
     pub parents: Vec<RecordId>,
     /// The signer's claimed wall clock, in UTC milliseconds. It is signed and shown, and never
-    /// orders, authorizes or expires anything.
+    /// orders or authorizes a record. It places one in time for what reads a window by it: an
+    /// automatic writer's day ([`budgets::AUTOMATIC_WINDOW_MS`]), a checkpoint's cut, whose heads
+    /// were authored before it (a record is placed no later than one that follows it), and the
+    /// recent seats a checkpoint's finality counts ([`checkpoint`]). The cut and the recent seats
+    /// compare signed clocks with the cut itself; only a proposer's choice of the cut's day
+    /// ([`checkpoint::cut_day`]) allows [`budgets::WINDOW_SKEW_MS`], for its own clock.
     pub authored_ms: u64,
     /// What it says.
     pub body: Body,
@@ -544,19 +719,34 @@ impl Draft {
     /// The seed is not an Ed25519 seed, the body is a genesis ([`Record::found`] signs those),
     /// or the record is malformed (see [`Record::decode`]).
     pub fn sign(self, seed: &[u8; 32], incarnation: [u8; 16]) -> Result<Record> {
-        if self.body.kind() == Kind::Genesis {
-            return Err(Error::new(
-                "a genesis is founded with Record::found, not signed as a draft",
-            ));
+        match self.body.kind() {
+            Kind::Genesis => {
+                return Err(Error::new(
+                    "a genesis is founded with Record::found, not signed as a draft",
+                ));
+            }
+            Kind::Checkpoint => {
+                return Err(Error::new(
+                    "a checkpoint is record version 2, which this build does not sign",
+                ));
+            }
+            _ => {}
         }
         let pair = key_pair(seed)?;
+        let header = self.header(VERSION, &pair, incarnation);
+        Record::seal(&header, &encode_body(&self.body), &pair)
+    }
+
+    /// The header this draft signs at layout `version`, by `pair` as `incarnation`.
+    fn header(&self, version: u8, pair: &Ed25519KeyPair, incarnation: [u8; 16]) -> Header {
         let mut actor = [0; 48];
         actor[..32].copy_from_slice(pair.public_key().as_ref());
         actor[32..].copy_from_slice(&incarnation);
-        let mut parents = self.parents;
+        let mut parents = self.parents.clone();
         parents.sort_unstable();
         parents.dedup();
-        let header = Header {
+        Header {
+            version,
             network: self.network,
             kind: self.body.kind(),
             actor,
@@ -564,8 +754,35 @@ impl Draft {
             previous: self.previous,
             parents,
             authored_ms: self.authored_ms,
-        };
-        Record::seal(&header, &encode_body(&self.body), &pair)
+        }
+    }
+
+    /// Sign as [`Draft::sign`] does, but as record version 2 ([`VERSION_TWO`]), stating
+    /// `statement` for a `Put` or `Delete` (`None` for a `Checkpoint`). A test's alone: nothing in
+    /// this build signs version 2 (tracker FL-148f writes it, behind the format fence).
+    ///
+    /// # Errors
+    /// The seed is not an Ed25519 seed, the body is of a kind version 2 does not carry, or the
+    /// record is malformed (see [`Record::decode_in`]).
+    #[cfg(test)]
+    pub(crate) fn sign_two(
+        self,
+        seed: &[u8; 32],
+        incarnation: [u8; 16],
+        statement: Option<&Statement>,
+    ) -> Result<Record> {
+        let pair = key_pair(seed)?;
+        let header = self.header(VERSION_TWO, &pair, incarnation);
+        let (clear, tail) = encode_clear(&self.body, statement)?;
+        let mut wire = encode_header(&header);
+        put_len(&mut wire, clear.len(), 4)?;
+        let lens = wire.len() - 4;
+        put_len(&mut wire, tail.len(), 4)?;
+        wire.extend_from_slice(&clear);
+        let signature = pair.sign(&signed_two(&wire, lens, wire.len()));
+        wire.extend_from_slice(signature.as_ref());
+        wire.extend_from_slice(&tail);
+        Record::decode_in(&wire, Reading::Format(crate::crossing::FORMAT_TWO))
     }
 }
 
@@ -578,11 +795,15 @@ pub struct Record {
     id: RecordId,
     header: Arc<Header>,
     body: Arc<Body>,
+    /// What a version-2 `Put` or `Delete` states of its register; `None` for every other record.
+    statement: Option<Arc<Statement>>,
     wire: payload::Wire,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Header {
+    /// The layout version: [`VERSION`] or [`VERSION_TWO`].
+    version: u8,
     network: RecordId,
     kind: Kind,
     actor: MemberId,
@@ -631,6 +852,7 @@ impl Record {
             .try_into()
             .map_err(|_| Error::new("an Ed25519 public key is 32 bytes"))?;
         let header = Header {
+            version: VERSION,
             network: [0; 32],
             kind: Kind::Genesis,
             actor: [0; 48],
@@ -656,81 +878,94 @@ impl Record {
         Self::decode(&wire)
     }
 
-    /// Read and verify exact bytes: the layout, every bound, and the signature, by the actor's
-    /// writer key or, for a genesis, by the key it names. It does not check the record against a
-    /// log ([`Log::insert`] does that).
+    /// Read and verify exact bytes as a node of format 1 reads them ([`Reading::ONE`]), which
+    /// every node of this build is: [`Record::decode_in`].
     ///
     /// # Errors
-    /// Anything in the bytes is malformed, out of bound, trailing or unsigned.
+    /// As [`Record::decode_in`] at format 1.
     pub fn decode(wire: &[u8]) -> Result<Self> {
+        Self::decode_in(wire, Reading::ONE)
+    }
+
+    /// Read and verify exact bytes as `reading` reads them: the layout, every bound, the
+    /// ciphertext's SHA-256 where a version-2 record carries it, and the signature, by the
+    /// actor's writer key or, for a genesis, by the key it names. A version-2 record and a
+    /// `Checkpoint` are read only where `reading` admits them ([`Reading::admits_two`]). It does
+    /// not check the record against a log ([`Log::insert`] does that).
+    ///
+    /// # Errors
+    /// Anything in the bytes is malformed, out of bound, trailing or unsigned, or of a layout
+    /// `reading` does not read.
+    pub fn decode_in(wire: &[u8], reading: Reading) -> Result<Self> {
         #[cfg(any(test, debug_assertions))]
         RECORD_DECODE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if wire.len() > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
         let owned = payload::Wire::Whole(Arc::from(wire));
-        let (header, body, body_end) = Self::parse(owned.bytes(), &owned)?;
-        let key: &[u8] = match &body {
+        let parsed = Self::parse(owned.bytes(), &owned, reading)?;
+        let key: &[u8] = match &parsed.body {
             Body::Genesis { signer, .. } => signer,
-            _ => &header.actor[..32],
+            _ => &parsed.header.actor[..32],
         };
         let bytes = owned.bytes();
-        if !crate::ed25519::verifies(key, &signed_message(&bytes[..body_end]), &bytes[body_end..]) {
+        let (message, signature) = parsed.layout.signed(bytes);
+        if !crate::ed25519::verifies(key, &message, signature) {
             return Err(Error::new("membership record signature failed"));
         }
-        Ok(Self {
-            id: digest(bytes),
-            header: Arc::new(header),
-            body: Arc::new(body),
-            wire: owned,
-        })
+        Ok(parsed.into_record(owned))
     }
 
-    /// Read exact bytes as [`Record::decode`] does, but for their signature: a record this Mac
-    /// verified in full before and whose bytes the vault's head, sealed under this Mac's key,
-    /// holds ([`head`]). Its id is the SHA-256 of the bytes.
+    /// Read exact bytes as [`Record::decode_in`] does, but for their signature: a record this
+    /// Mac verified in full before and whose bytes the vault's head, sealed under this Mac's
+    /// key, holds ([`head`]).
     ///
     /// # Errors
-    /// Anything in the bytes is malformed, out of bound or trailing.
-    #[cfg(unix)]
-    pub(crate) fn vouched(wire: &[u8]) -> Result<Self> {
+    /// Anything in the bytes is malformed, out of bound or trailing, or of a layout `reading`
+    /// does not read.
+    #[cfg(any(unix, windows))]
+    pub(crate) fn vouched(wire: &[u8], reading: Reading) -> Result<Self> {
         if wire.len() > MAX_RECORD {
             return Err(Error::new("membership record is too long"));
         }
         let owned = payload::Wire::Whole(Arc::from(wire));
-        let (header, body, _) = Self::parse(owned.bytes(), &owned)?;
-        Ok(Self {
-            id: digest(owned.bytes()),
-            header: Arc::new(header),
-            body: Arc::new(body),
-            wire: owned,
-        })
+        let parsed = Self::parse(owned.bytes(), &owned, reading)?;
+        Ok(parsed.into_record(owned))
     }
 
     /// A record whose bytes stay in its records file ([`payload::Shelved`]): its frame (every byte
-    /// before its payload, which is the last field of a `Wrap`, `Put` or `Delete`), its id, its
-    /// length and where it starts in `source`. What the frame says is read as
-    /// [`Record::vouched`] reads it; the payload and the signature are read back, and checked
-    /// against the id, the first time they are asked for.
+    /// before its payload: the last field of a version-1 `Wrap`, `Put` or `Delete`'s body, or a
+    /// version-2 record's ciphertext after its signature), its id, its length and where it starts
+    /// in `source`. What the frame says is read as [`Record::vouched`] reads it under `reading`;
+    /// the payload and the signature are read back, and checked against the id, the first time
+    /// they are asked for.
     ///
     /// # Errors
-    /// The frame is malformed, out of bound, ends anywhere but at its payload, or is of a kind
-    /// with no payload; or the length is not the one the frame declares.
-    #[cfg(unix)]
+    /// The frame is malformed, out of bound, of a layout `reading` does not read, ends anywhere
+    /// but at its payload, or is of a kind with no payload; or the length is not the one the
+    /// frame declares.
+    #[cfg(any(unix, windows))]
     pub(crate) fn shelved(
         id: RecordId,
         len: usize,
         frame: &[u8],
         at: u64,
         source: Arc<payload::Source>,
+        reading: Reading,
     ) -> Result<Self> {
         if len > MAX_RECORD || frame.len() >= len {
             return Err(Error::new("a shelved membership record is out of bound"));
         }
-        let kind = Kind::from_code(
+        let version = reading.version(
+            *frame
+                .get(MAGIC.len())
+                .ok_or_else(|| Error::new("membership record is truncated"))?,
+        )?;
+        let kind = Kind::in_layout(
             *frame
                 .get(KIND_AT)
                 .ok_or_else(|| Error::new("membership record is truncated"))?,
+            version,
         )?;
         if !matches!(kind, Kind::Wrap | Kind::Put | Kind::Delete) {
             return Err(Error::new("only a record with a payload is shelved"));
@@ -742,24 +977,30 @@ impl Record {
             at,
             source,
         )));
-        let (header, body, _) = Self::parse(frame, &wire)?;
+        let parsed = Self::parse(frame, &wire, reading)?;
+        if matches!(parsed.layout, Layout::Two { .. }) && frame.len() != parsed.layout.sealed() {
+            return Err(Error::new("a shelved membership record is out of bound"));
+        }
+        let statement = parsed.statement.map(Arc::new);
         Ok(Self {
             id,
-            header: Arc::new(header),
-            body: Arc::new(body),
+            header: Arc::new(parsed.header),
+            body: Arc::new(parsed.body),
+            statement,
             wire,
         })
     }
 
-    /// The header and body `available` frames, and where the body ends: `available` is every
-    /// byte of `wire`, or a shelved record's frame, which ends where its payload begins.
-    fn parse(available: &[u8], wire: &payload::Wire) -> Result<(Header, Body, usize)> {
+    /// The header and body `available` frames, and where they lie in `wire`: `available` is
+    /// every byte of `wire`, or a shelved record's frame, which ends where its payload begins.
+    fn parse(available: &[u8], wire: &payload::Wire, reading: Reading) -> Result<Parsed> {
         let mut reader = Reader::new(available);
-        if reader.take(4)? != MAGIC || reader.byte()? != VERSION {
+        if reader.take(4)? != MAGIC {
             return Err(Error::new("not a membership record"));
         }
+        let version = reading.version(reader.byte()?)?;
         let network = reader.array::<32>()?;
-        let kind = Kind::from_code(reader.byte()?)?;
+        let kind = Kind::in_layout(reader.byte()?, version)?;
         let actor = reader.array::<48>()?;
         let sequence = reader.u64()?;
         let previous = Some(reader.array::<32>()?).filter(|p| *p != [0; 32]);
@@ -772,31 +1013,8 @@ impl Record {
             parents.push(reader.array::<32>()?);
         }
         let authored_ms = reader.u64()?;
-        let length = reader.len(4)?;
-        let body_start = reader.at;
-        let body_end = body_start
-            .checked_add(length)
-            .ok_or_else(|| Error::new("membership record is too long"))?;
-        let signed_end = body_end
-            .checked_add(64)
-            .ok_or_else(|| Error::new("membership record is too long"))?;
-        match signed_end.cmp(&wire.len()) {
-            std::cmp::Ordering::Greater => {
-                return Err(Error::new("membership record is truncated"));
-            }
-            std::cmp::Ordering::Less => {
-                return Err(Error::new("membership record has trailing bytes"));
-            }
-            std::cmp::Ordering::Equal => {}
-        }
-        let in_frame = available.get(body_start..body_end.min(available.len()));
-        let body = decode_body(
-            kind,
-            wire,
-            in_frame.ok_or_else(|| Error::new("membership record is truncated"))?,
-            body_start..body_end,
-        )?;
         let header = Header {
+            version,
             network,
             kind,
             actor,
@@ -805,19 +1023,78 @@ impl Record {
             parents,
             authored_ms,
         };
+        let (body, statement, layout) = if version == VERSION {
+            let length = reader.len(4)?;
+            let body_start = reader.at;
+            let body_end = body_start
+                .checked_add(length)
+                .ok_or_else(|| Error::new("membership record is too long"))?;
+            let end = body_end
+                .checked_add(64)
+                .ok_or_else(|| Error::new("membership record is too long"))?;
+            exact_end(end, wire.len())?;
+            let layout = Layout::One {
+                signature: body_end,
+                end,
+            };
+            let in_frame = available.get(body_start..body_end.min(available.len()));
+            let body = decode_body(
+                kind,
+                wire,
+                in_frame.ok_or_else(|| Error::new("membership record is truncated"))?,
+                body_start..body_end,
+            )?;
+            (body, None, layout)
+        } else {
+            let lens = reader.at;
+            let clear_len = reader.len(4)?;
+            let tail = reader.len(4)?;
+            let clear_end = reader
+                .at
+                .checked_add(clear_len)
+                .ok_or_else(|| Error::new("membership record is too long"))?;
+            let sealed = clear_end
+                .checked_add(64)
+                .ok_or_else(|| Error::new("membership record is too long"))?;
+            let end = sealed
+                .checked_add(tail)
+                .ok_or_else(|| Error::new("membership record is too long"))?;
+            exact_end(end, wire.len())?;
+            let layout = Layout::Two {
+                lens,
+                signature: clear_end,
+            };
+            let clear = reader.take(clear_len)?;
+            if available.len() < sealed {
+                return Err(Error::new("membership record is truncated"));
+            }
+            let (body, statement) = decode_clear(kind, clear, wire, available, sealed..end)?;
+            (body, statement, layout)
+        };
         check_shape(&header, &body)?;
-        Ok((header, body, body_end))
+        if let Some(statement) = &statement {
+            check_statement(kind, statement)?;
+        }
+        Ok(Parsed {
+            header,
+            body,
+            statement,
+            layout,
+        })
     }
 
-    /// The SHA-256 of [`Record::wire_bytes`].
+    /// The record's id: the SHA-256 of [`Record::wire_bytes`] for a version-1 record and a shed
+    /// version-2 one, and of its shed form for a whole version-2 one ([`VERSION_TWO`]), so a
+    /// record and its shed frame share it.
     pub const fn id(&self) -> &RecordId {
         &self.id
     }
-    /// The exact signed bytes, keeping none it reads: borrowed where they are in memory (a
-    /// record decoded, drafted or taken whole), and a shelved record's ([`Record::shelved`]) read
-    /// back from its records file and checked against its id for this use alone. It is the one
-    /// way to a record's bytes, so nothing that sends, writes or copies records sends a short
-    /// stream, or keeps a replaced body in memory, for one that does not read back.
+    /// The exact bytes, keeping none it reads: borrowed where they are in memory (a record
+    /// decoded, drafted or taken whole, and a shed version-2 record's frame, which is all of it),
+    /// and a shelved record's ([`Record::shelved`]) read back from its records file and checked
+    /// against its id for this use alone. It is the one way to a record's bytes, so nothing that
+    /// sends, writes or copies records sends a short stream, or keeps a replaced body in memory,
+    /// for one that does not read back.
     ///
     /// # Errors
     /// A shelved record cannot be read back as it was.
@@ -829,6 +1106,52 @@ impl Record {
     pub fn wire_len(&self) -> usize {
         self.wire.len()
     }
+    /// The record's layout version: 1, or 2 ([`VERSION_TWO`]).
+    #[must_use]
+    pub fn version(&self) -> u8 {
+        self.header.version
+    }
+    /// What a version-2 `Put` or `Delete` states of its register; `None` for every other record.
+    #[must_use]
+    pub fn statement(&self) -> Option<&Statement> {
+        self.statement.as_deref()
+    }
+    /// Whether it is a version-2 `Put` or `Delete` whose ciphertext was shed: its frame alone,
+    /// which verifies and keeps the record's id, and whose ciphertext reads as no bytes.
+    #[must_use]
+    pub fn is_shed(&self) -> bool {
+        match self.body.as_ref() {
+            Body::Put { ciphertext, .. } | Body::Delete { ciphertext, .. } => ciphertext.is_shed(),
+            _ => false,
+        }
+    }
+    /// This version-2 `Put` or `Delete` with its ciphertext shed: the same id and every field but
+    /// the ciphertext; `None` for any other record, or one that cannot be read. A test's alone:
+    /// nothing in this build sheds (tracker FL-148f).
+    #[cfg(test)]
+    pub(crate) fn shed(&self) -> Option<Self> {
+        if self.version() != VERSION_TWO || !matches!(self.kind(), Kind::Put | Kind::Delete) {
+            return None;
+        }
+        let bytes = self.wire_bytes().ok()?;
+        let (_, count, _) = Self::frame_prefix_reader(&bytes, Reading::Follow).ok()?;
+        let lens = header_len(count, VERSION_TWO) - 8;
+        let clear = usize::try_from(u32::from_be_bytes(
+            bytes.get(lens..lens + 4)?.try_into().ok()?,
+        ))
+        .ok()?;
+        let sealed = lens + 8 + clear + 64;
+        let mut shed = bytes.get(..lens + 4)?.to_vec();
+        shed.extend_from_slice(&[0; 4]);
+        shed.extend_from_slice(bytes.get(lens + 8..sealed)?);
+        let shed = Self::decode_in(&shed, Reading::Follow).ok()?;
+        (shed.id == self.id).then_some(shed)
+    }
+    /// Whether `whole` is this record with its ciphertext, where this one is shed: the one
+    /// record a shed frame gives its place to ([`Log::insert`]).
+    fn is_whole_of(&self, whole: &Self) -> bool {
+        self.is_shed() && whole.id == self.id && !whole.is_shed()
+    }
     /// The bytes of the record kept in memory: all of them, or a shelved record's frame and
     /// whatever was read back.
     #[must_use]
@@ -836,14 +1159,14 @@ impl Record {
         self.wire.resident()
     }
     /// Whether its payload and signature are still in its records file, never read back.
-    #[cfg(all(unix, test))]
+    #[cfg(all(any(unix, windows), test))]
     #[must_use]
     pub(crate) fn is_shelved(&self) -> bool {
         self.wire.is_shelved()
     }
     /// Whether an open through the vault's head shelved it ([`Record::shelved`]), read back
     /// since or not: what the head says of it stands either way.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub(crate) const fn on_shelf(&self) -> bool {
         self.wire.on_shelf()
@@ -875,9 +1198,9 @@ impl Record {
         }
     }
     /// The exact byte length of the first record at the start of `wire`, bounded by [`MAX_RECORD`],
-    /// refusing a kind this build does not know.
-    pub(super) fn wire_len_prefix(wire: &[u8]) -> Result<usize> {
-        let len = Self::known_frame_header(wire)?;
+    /// refusing a layout `reading` does not read and a kind its layout does not carry.
+    pub(super) fn wire_len_prefix(wire: &[u8], reading: Reading) -> Result<usize> {
+        let len = Self::known_frame_header(wire, reading)?;
         if wire.len() < len {
             return Err(Error::new("membership record is truncated"));
         }
@@ -885,22 +1208,29 @@ impl Record {
     }
 
     /// Whether `wire` is the start of one record and no more: bytes a record's frame begins with
-    /// (its magic and version, a kind this build knows, a parent count and a length it frames),
-    /// stopping short of that frame's end. What an append of whole records leaves on the end of
-    /// a file when it is cut short ([`store::decode_records_before_cut`]); nothing else is: no
-    /// bytes at all, a whole frame, or bytes no frame begins with.
-    #[cfg(any(unix, test))]
-    pub(super) fn is_cut_frame(wire: &[u8]) -> bool {
-        let starts = |at: usize, with: &[u8]| {
-            wire.get(at..)
-                .is_none_or(|rest| rest.iter().zip(with).all(|(have, want)| have == want))
-        };
-        if wire.is_empty() || !starts(0, MAGIC) || !starts(MAGIC.len(), &[VERSION]) {
+    /// (its magic and a version `reading` reads, a kind its layout carries, a parent count and the
+    /// lengths it frames), stopping short of that frame's end. What an append of whole records
+    /// leaves on the end of a file when it is cut short ([`store::decode_records_before_cut`]);
+    /// nothing else is: no bytes at all, a whole frame, or bytes no frame `reading` reads begins
+    /// with.
+    #[cfg(any(unix, windows, test))]
+    pub(super) fn is_cut_frame(wire: &[u8], reading: Reading) -> bool {
+        let magic = wire
+            .iter()
+            .zip(MAGIC.iter())
+            .all(|(have, want)| have == want);
+        if wire.is_empty() || !magic {
             return false;
         }
+        let Some(&version) = wire.get(MAGIC.len()) else {
+            return true;
+        };
+        let Ok(version) = reading.version(version) else {
+            return false;
+        };
         if wire
             .get(KIND_AT)
-            .is_some_and(|code| Kind::from_code(*code).is_err())
+            .is_some_and(|code| Kind::in_layout(*code, version).is_err())
         {
             return false;
         }
@@ -910,28 +1240,32 @@ impl Record {
         if count > MAX_PARENTS {
             return false;
         }
-        if wire.len() < FRAME_PREFIX_LEN + count * 32 + 8 + 4 {
+        if wire.len() < header_len(count, version) {
             return true;
         }
-        Self::known_frame_header(wire).is_ok_and(|len| wire.len() < len)
+        Self::known_frame_header(wire, reading).is_ok_and(|len| wire.len() < len)
     }
 
     /// Length from a complete header, before allocating or reading its body.
-    fn known_frame_header(wire: &[u8]) -> Result<usize> {
-        let (len, _) = Self::frame_header(wire)?;
+    fn known_frame_header(wire: &[u8], reading: Reading) -> Result<usize> {
+        let (len, _) = Self::frame_header(wire, reading)?;
         let code = wire
             .get(KIND_AT)
             .copied()
             .ok_or_else(|| Error::new("membership record is truncated"))?;
-        Kind::from_code(code)?;
+        let version = reading.version(wire[MAGIC.len()])?;
+        Kind::in_layout(code, version)?;
         Ok(len)
     }
 
-    fn frame_prefix_reader(wire: &[u8]) -> Result<(Reader<'_>, usize)> {
+    /// A reader past a frame's fixed prefix, the parent count it names and its layout version,
+    /// where `reading` reads that version.
+    fn frame_prefix_reader(wire: &[u8], reading: Reading) -> Result<(Reader<'_>, usize, u8)> {
         let mut reader = Reader::new(wire);
-        if reader.take(4)? != MAGIC || reader.byte()? != VERSION {
+        if reader.take(4)? != MAGIC {
             return Err(Error::new("not a membership record"));
         }
+        let version = reading.version(reader.byte()?)?;
         let _network = reader.take(32)?;
         let _kind = reader.byte()?;
         let _actor = reader.take(48)?;
@@ -942,39 +1276,46 @@ impl Record {
             return Err(Error::new("membership record names too many parents"));
         }
         debug_assert_eq!(reader.at, FRAME_PREFIX_LEN);
-        Ok((reader, count))
+        Ok((reader, count, version))
     }
 
-    #[cfg(unix)]
-    fn frame_header_len(wire: &[u8]) -> Result<usize> {
-        let (reader, count) = Self::frame_prefix_reader(wire)?;
-        Ok(reader.at + count * 32 + 8 + 4)
+    /// The bytes of a frame through the lengths that give its whole length ([`header_len`]).
+    #[cfg(any(unix, windows))]
+    fn frame_header_len(wire: &[u8], reading: Reading) -> Result<usize> {
+        let (_, count, version) = Self::frame_prefix_reader(wire, reading)?;
+        Ok(header_len(count, version))
     }
 
-    fn frame_header(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
-        let (mut reader, count) = Self::frame_prefix_reader(wire)?;
+    fn frame_header(wire: &[u8], reading: Reading) -> Result<(usize, Vec<RecordId>)> {
+        let (mut reader, count, version) = Self::frame_prefix_reader(wire, reading)?;
         let mut parents = Vec::with_capacity(count);
         for _ in 0..count {
             parents.push(reader.array::<32>()?);
         }
         let _authored_ms = reader.take(8)?;
         let body_len = reader.len(4)?;
+        let tail = if version == VERSION_TWO {
+            reader.len(4)?
+        } else {
+            0
+        };
         let len = reader
             .at
             .checked_add(body_len)
             .and_then(|len| len.checked_add(64))
+            .and_then(|len| len.checked_add(tail))
             .filter(|&len| len <= MAX_RECORD)
             .ok_or_else(|| Error::new("membership record is too long"))?;
         Ok((len, parents))
     }
 
     /// [`Record::wire_len_prefix`] without judging the kind byte, with the parents the frame
-    /// names. The layout (`VERSION` 1) frames a record of a kind only a newer build writes as it
-    /// frames any other, so a stream holding one still splits into its records' ids
+    /// names. Each layout `reading` reads frames a record of a kind only a newer build writes as
+    /// it frames any other, so a stream holding one still splits into its records' ids
     /// (`store::frames`). Nothing is verified: the parents are whatever the bytes say.
-    #[cfg(all(test, unix))]
-    pub(super) fn frame_prefix(wire: &[u8]) -> Result<(usize, Vec<RecordId>)> {
-        let (len, parents) = Self::frame_header(wire)?;
+    #[cfg(all(test, any(unix, windows)))]
+    pub(super) fn frame_prefix(wire: &[u8], reading: Reading) -> Result<(usize, Vec<RecordId>)> {
+        let (len, parents) = Self::frame_header(wire, reading)?;
         if wire.len() < len {
             return Err(Error::new("membership record is truncated"));
         }
@@ -996,7 +1337,7 @@ impl Record {
     pub fn parents(&self) -> &[RecordId] {
         &self.header.parents
     }
-    /// The signer's claimed wall clock, in UTC milliseconds.
+    /// The signer's claimed wall clock, in UTC milliseconds ([`Draft::authored_ms`]).
     pub fn authored_ms(&self) -> u64 {
         self.header.authored_ms
     }
@@ -1152,7 +1493,48 @@ fn check_shape(header: &Header, body: &Body) -> Result<()> {
         {
             return Err(Error::new("a node record's proof is not its node key's"));
         }
+        Body::Checkpoint {
+            predecessor,
+            heads,
+            state,
+            dropped,
+            ..
+        } => {
+            if header.version != VERSION_TWO {
+                return Err(Error::new("membership record of an unknown kind"));
+            }
+            if heads.is_empty()
+                || heads.len() > MAX_CHECKPOINT_HEADS
+                || !strictly_sorted_nonzero(heads)
+                || predecessor == &Some([0; 32])
+                || *state == [0; 32]
+                || *dropped == [0; 32]
+            {
+                return Err(Error::new(
+                    "a Checkpoint names from one to 4096 sorted distinct heads and non-zero digests",
+                ));
+            }
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Whether `ids` are sorted, distinct and none of them zero.
+fn strictly_sorted_nonzero(ids: &[RecordId]) -> bool {
+    ids.windows(2).all(|w| w[0] < w[1]) && !ids.contains(&[0; 32])
+}
+
+/// The checks of a version-2 `Put`'s or `Delete`'s [`Statement`] that need no other record.
+fn check_statement(kind: Kind, statement: &Statement) -> Result<()> {
+    if statement.supersedes.len() > MAX_SUPERSEDES
+        || !strictly_sorted_nonzero(&statement.supersedes)
+        || statement.carries == Some([0; 32])
+        || (kind == Kind::Delete && statement.carries.is_some())
+    {
+        return Err(Error::new(
+            "a register statement supersedes at most 4096 sorted distinct records, and only a Put carries one",
+        ));
     }
     Ok(())
 }
@@ -1189,10 +1571,302 @@ fn signed_message(unsigned: &[u8]) -> Vec<u8> {
     [SIGNING_DOMAIN, unsigned].concat()
 }
 
+/// What a version-2 record's signature is over: [`SIGNING_DOMAIN_TWO`] and `wire`'s bytes before
+/// `signature` but its tail length, the four bytes after its clear length at `lens`.
+fn signed_two(wire: &[u8], lens: usize, signature: usize) -> Vec<u8> {
+    [
+        SIGNING_DOMAIN_TWO,
+        &wire[..lens + 4],
+        &wire[lens + 8..signature],
+    ]
+    .concat()
+}
+
+/// A version-2 record's id: the SHA-256 of its shed form, `wire`'s bytes through `sealed` (the
+/// end of its signature) with a zero tail length at `lens + 4`.
+fn id_two(wire: &[u8], lens: usize, sealed: usize) -> RecordId {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(&wire[..lens + 4]);
+    context.update(&[0; 4]);
+    context.update(&wire[lens + 8..sealed]);
+    let mut out = [0; 32];
+    out.copy_from_slice(context.finish().as_ref());
+    out
+}
+
+/// The bytes of a frame through the lengths that give its whole length: its fixed prefix, `count`
+/// parents, its clock and its body length, and for version 2 its tail length.
+const fn header_len(count: usize, version: u8) -> usize {
+    let lengths = if version == VERSION_TWO { 8 } else { 4 };
+    FRAME_PREFIX_LEN + count * 32 + 8 + lengths
+}
+
+/// Whether a record whose layout ends at `end` is exactly `len` bytes.
+fn exact_end(end: usize, len: usize) -> Result<()> {
+    match end.cmp(&len) {
+        std::cmp::Ordering::Greater => Err(Error::new("membership record is truncated")),
+        std::cmp::Ordering::Less => Err(Error::new("membership record has trailing bytes")),
+        std::cmp::Ordering::Equal => Ok(()),
+    }
+}
+
+/// Where a record's signed parts lie in its bytes.
+#[derive(Clone, Copy, Debug)]
+enum Layout {
+    /// Version 1: the signature at `signature`, after the body; `end` is the record's length.
+    One { signature: usize, end: usize },
+    /// Version 2: the clear and tail lengths at `lens`, the signature at `signature`, after the
+    /// clear fields; its ciphertext, if any, after the signature.
+    Two { lens: usize, signature: usize },
+}
+
+impl Layout {
+    /// The end of the signature: every byte of a version-1 record, and a version-2 record's
+    /// frame before its ciphertext.
+    const fn sealed(self) -> usize {
+        match self {
+            Self::One { signature, .. } | Self::Two { signature, .. } => signature + 64,
+        }
+    }
+
+    /// What the signature in `wire` is over, and the signature.
+    fn signed(self, wire: &[u8]) -> (Vec<u8>, &[u8]) {
+        match self {
+            Self::One { signature, end } => {
+                (signed_message(&wire[..signature]), &wire[signature..end])
+            }
+            Self::Two { lens, signature } => (
+                signed_two(wire, lens, signature),
+                &wire[signature..signature + 64],
+            ),
+        }
+    }
+
+    /// The record's id from `wire`, which holds at least [`Layout::sealed`] of its bytes.
+    fn id(self, wire: &[u8]) -> RecordId {
+        match self {
+            Self::One { end, .. } => digest(&wire[..end]),
+            Self::Two { lens, signature } => id_two(wire, lens, signature + 64),
+        }
+    }
+}
+
+/// A record's parts as [`Record::parse`] read them.
+struct Parsed {
+    header: Header,
+    body: Body,
+    statement: Option<Statement>,
+    layout: Layout,
+}
+
+impl Parsed {
+    /// The record these parts are, whose every byte `wire` holds.
+    fn into_record(self, wire: payload::Wire) -> Record {
+        Record {
+            id: self.layout.id(wire.bytes()),
+            header: Arc::new(self.header),
+            body: Arc::new(self.body),
+            statement: self.statement.map(Arc::new),
+            wire,
+        }
+    }
+}
+
+/// The id of a record whose every byte `wire` holds, as [`Record::decode_in`] gives it, where
+/// it is of version 1 or carries a ciphertext whose SHA-256 its signed clear fields name: what a
+/// shelved record's bytes read back are checked by ([`payload::Shelved`]). `None` for bytes no
+/// layout frames or whose ciphertext is not the one signed.
+#[cfg(any(unix, windows))]
+pub(crate) fn whole_id(wire: &[u8]) -> Option<RecordId> {
+    let (len, _) = Record::frame_header(wire, Reading::Follow).ok()?;
+    if len != wire.len() {
+        return None;
+    }
+    match wire.get(MAGIC.len())? {
+        &VERSION => Some(digest(wire)),
+        &VERSION_TWO => {
+            let (_, count, _) = Record::frame_prefix_reader(wire, Reading::Follow).ok()?;
+            let lens = header_len(count, VERSION_TWO) - 8;
+            let clear = usize::try_from(u32::from_be_bytes(
+                wire.get(lens..lens + 4)?.try_into().ok()?,
+            ))
+            .ok()?;
+            let clear_end = lens.checked_add(8)?.checked_add(clear)?;
+            let sealed = clear_end.checked_add(64)?;
+            let tail = wire.get(sealed..)?;
+            if !tail.is_empty() {
+                let signed = wire.get(clear_end.checked_sub(32)?..clear_end)?;
+                if clear < 36 || digest(tail) != signed {
+                    return None;
+                }
+            }
+            Some(id_two(wire, lens, sealed))
+        }
+        _ => None,
+    }
+}
+
+/// A version-2 record's clear fields and ciphertext, as [`VERSION_TWO`] lays them out: for a
+/// `Put` or `Delete`, its audience, epoch, salt, `statement`, and its ciphertext's length and
+/// SHA-256, with the ciphertext as the tail; for a `Checkpoint`, its fields and no tail.
+#[cfg(test)]
+fn encode_clear(body: &Body, statement: Option<&Statement>) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut out = Vec::new();
+    match (body, statement) {
+        (
+            Body::Put {
+                audience,
+                epoch,
+                salt,
+                ciphertext,
+            }
+            | Body::Delete {
+                audience,
+                epoch,
+                salt,
+                ciphertext,
+            },
+            Some(statement),
+        ) => {
+            entries::encode_audience_wire(&mut out, audience);
+            out.extend_from_slice(epoch);
+            out.extend_from_slice(salt);
+            encode_statement(&mut out, statement)?;
+            put_len(&mut out, ciphertext.len(), 4)?;
+            out.extend_from_slice(&digest(ciphertext));
+            Ok((out, ciphertext.to_vec()))
+        }
+        (Body::Checkpoint { .. }, None) => Ok((encode_body(body), Vec::new())),
+        _ => Err(Error::new(
+            "version 2 is a Put or a Delete with a statement, or a Checkpoint",
+        )),
+    }
+}
+
+#[cfg(test)]
+fn encode_statement(out: &mut Vec<u8>, statement: &Statement) -> Result<()> {
+    put_len(out, statement.supersedes.len(), 2)?;
+    for id in &statement.supersedes {
+        out.extend_from_slice(id);
+    }
+    out.extend_from_slice(&statement.carries.unwrap_or([0; 32]));
+    Ok(())
+}
+
+/// A version-2 record's body and statement from its clear fields `clear`, its ciphertext at
+/// `tail` in `wire` where `available` holds it: a shed record's tail is empty and its ciphertext
+/// reads as no bytes ([`Payload::is_shed`]), and a shelved record's ciphertext is checked when
+/// it is read back ([`whole_id`]).
+fn decode_clear(
+    kind: Kind,
+    clear: &[u8],
+    wire: &payload::Wire,
+    available: &[u8],
+    tail: std::ops::Range<usize>,
+) -> Result<(Body, Option<Statement>)> {
+    let mut reader = Reader::new(clear);
+    if kind == Kind::Checkpoint {
+        let predecessor = Some(reader.array::<32>()?).filter(|p| *p != [0; 32]);
+        let cut_ms = reader.u64()?;
+        let count = reader.len(2)?;
+        if count > MAX_CHECKPOINT_HEADS {
+            return Err(Error::new("a Checkpoint names too many heads"));
+        }
+        let mut heads = Vec::with_capacity(count);
+        for _ in 0..count {
+            heads.push(reader.array::<32>()?);
+        }
+        let body = Body::Checkpoint {
+            predecessor,
+            cut_ms,
+            heads,
+            state: reader.array::<32>()?,
+            dropped: reader.array::<32>()?,
+        };
+        reader.finish()?;
+        if !tail.is_empty() {
+            return Err(Error::new("a Checkpoint carries no ciphertext"));
+        }
+        return Ok((body, None));
+    }
+    let audience = entries::decode_audience_wire(&mut reader)?;
+    let epoch = reader.array::<32>()?;
+    let salt = reader.array::<32>()?;
+    let count = reader.len(2)?;
+    if count > MAX_SUPERSEDES {
+        return Err(Error::new(
+            "a register statement supersedes too many records",
+        ));
+    }
+    let mut supersedes = Vec::with_capacity(count);
+    for _ in 0..count {
+        supersedes.push(reader.array::<32>()?);
+    }
+    let carries = Some(reader.array::<32>()?).filter(|c| *c != [0; 32]);
+    let len = reader.len(4)?;
+    let signed = reader.array::<32>()?;
+    reader.finish()?;
+    let most = if kind == Kind::Put {
+        entries::MAX_PUT_CIPHERTEXT
+    } else {
+        entries::MAX_DELETE_CIPHERTEXT
+    };
+    if !(17..=most).contains(&len) {
+        return Err(Error::new("membership ciphertext length out of bounds"));
+    }
+    // The record the frame stands for, whole: within `MAX_RECORD`, shed or not, so no id names
+    // a record no reader takes whole. The ciphertext's bound and the statement's are each
+    // within it alone, not together.
+    if tail.start.saturating_add(len) > MAX_RECORD {
+        return Err(Error::new("membership record is too long"));
+    }
+    let ciphertext = if tail.is_empty() {
+        Payload::shed(len)
+    } else if tail.len() != len {
+        return Err(Error::new(
+            "a version-2 record's ciphertext is the length it signs",
+        ));
+    } else {
+        if let Some(bytes) = available.get(tail.clone())
+            && digest(bytes) != signed
+        {
+            return Err(Error::new(
+                "a version-2 record's ciphertext is not the one it signs",
+            ));
+        }
+        if available.len() != tail.end && available.len() != tail.start {
+            return Err(Error::new("membership record is truncated"));
+        }
+        Payload::in_wire(wire, tail)?
+    };
+    let body = if kind == Kind::Put {
+        Body::Put {
+            audience,
+            epoch,
+            salt,
+            ciphertext,
+        }
+    } else {
+        Body::Delete {
+            audience,
+            epoch,
+            salt,
+            ciphertext,
+        }
+    };
+    Ok((
+        body,
+        Some(Statement {
+            supersedes,
+            carries,
+        }),
+    ))
+}
+
 fn encode_header(header: &Header) -> Vec<u8> {
     let mut wire = Vec::with_capacity(192 + 32 * header.parents.len());
     wire.extend_from_slice(MAGIC);
-    wire.push(VERSION);
+    wire.push(header.version);
     wire.extend_from_slice(&header.network);
     wire.push(header.kind.code());
     wire.extend_from_slice(&header.actor);
@@ -1294,6 +1968,24 @@ fn encode_body(body: &Body) -> Vec<u8> {
         Body::Node { node_key, proof } => {
             out.extend_from_slice(node_key);
             out.extend_from_slice(proof);
+        }
+        Body::Checkpoint {
+            predecessor,
+            cut_ms,
+            heads,
+            state,
+            dropped,
+        } => {
+            // Its clear fields ([`VERSION_TWO`]): a checkpoint has no other layout. More than
+            // `MAX_CHECKPOINT_HEADS` heads encode a count the decoder refuses.
+            out.extend_from_slice(&predecessor.unwrap_or([0; 32]));
+            out.extend_from_slice(&cut_ms.to_be_bytes());
+            out.extend_from_slice(&u16::try_from(heads.len()).unwrap_or(u16::MAX).to_be_bytes());
+            for head in heads {
+                out.extend_from_slice(head);
+            }
+            out.extend_from_slice(state);
+            out.extend_from_slice(dropped);
         }
     }
     out
@@ -1432,6 +2124,9 @@ fn decode_body(
             node_key: reader.array::<32>()?,
             proof: reader.array::<64>()?,
         },
+        // Version 1 carries no checkpoint ([`Kind::in_layout`]); its clear fields are read by
+        // `decode_clear`.
+        Kind::Checkpoint => return Err(Error::new("membership record of an unknown kind")),
     };
     reader.finish()?;
     Ok(body)
@@ -1653,6 +2348,11 @@ pub struct Log {
     /// The bytes of `order`'s records, kept as they change: by [`Log::hold`] alone, since
     /// `order` only grows.
     held_bytes: usize,
+    /// How many of `order`'s records are shed version-2 frames ([`Record::is_shed`]), kept by
+    /// [`Log::hold`] and [`Log::take_whole`]: while any is held, [`Log::merge`] offers the other
+    /// log's records even where it holds all of their ids, so a whole record takes its frame's
+    /// place.
+    shed: usize,
     /// The bytes of `waiting`'s records, kept by every change to `waiting`: the waiting insert,
     /// [`Log::land_waiting`]'s remove and [`Log::drop_last_waiting`]. Summing either set on each
     /// insert walked every record, and a store at its bound repeated that walk for each record
@@ -1673,6 +2373,9 @@ pub struct Log {
     // Its pure evaluation is shared too; no disk observation or grant is cached.
     membership: Arc<OnceLock<Membership>>,
     effective: Arc<OnceLock<eval::Effective>>,
+    /// What each checkpoint's cut says, by its id ([`checkpoint::Cuts`]): a function of that cut
+    /// alone, shared by this log's clones and the projections of its cuts, and kept as it grows.
+    cuts: checkpoint::Cuts,
     /// The quorum weighing of the held weighed records ([`eval::Weighing`]), which every
     /// evaluation reads: `hold` lets it go only when it holds a weighed record, since a record of
     /// another kind changes nothing it weighed. Clones share it until one holds a weighed record.
@@ -1692,10 +2395,11 @@ pub struct Log {
     /// holds a record.
     advertised: Arc<OnceLock<store::Advertised>>,
     /// The identity of the held records in their order that each history lease is taken under
-    /// ([`history::Generation`]): a digest of every record's id, which a quiet repair round's
-    /// leases took again at each lease, 6.5% of such a round over a log of 9,605 records
-    /// (2026-11-08). `hold` lets it go; clones share it until one holds a record.
-    #[cfg(unix)]
+    /// ([`history::Generation`]): a digest of every record's id and of which are shed frames
+    /// ([`Record::is_shed`]), which a quiet repair round's leases took again at each lease, 6.5%
+    /// of such a round over a log of 9,605 records (2026-11-08). `hold` and `take_whole` let it
+    /// go; clones share it until one changes.
+    #[cfg(any(unix, windows))]
     generation: Arc<OnceLock<history::Generation>>,
     /// What every epoch's historical writers, the seats and the known actors read of the held
     /// records, with the seats found ([`eval::Historical`]): a quiet repair round's history
@@ -1708,19 +2412,28 @@ pub struct Log {
     /// on each side (`aterm-db`'s `Session::history_needs`), and unwrapping each again took 7.7%
     /// of such a round over a log of 9,605 records (2026-11-09). It holds no key. `hold` lets it
     /// go; clones share it until one holds a record.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     opened: Arc<history::Opened>,
     /// What the vault's head said the resolve of this Mac's entries read of the ops it opened,
     /// where this log was read through a head ([`head::open`]): carried by every log made from
     /// it (a projection, records it holds since), since what it says of an op is the op's own
     /// under any epoch keys that open it. The head leaves out every inner-sealed entry, the
     /// one whose reading the keys a log holds change ([`head`]).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     head: Option<Arc<head::Ops>>,
     /// The records file this log is exactly, as it stood when it was read ([`head::Origin`]),
     /// whose head a resolve writes; `hold` lets it go, since the log is then no longer the file.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     origin: Option<Arc<head::Origin>>,
+    /// The final checkpoints this log was pruned at and the stubs of the records they dropped
+    /// ([`rooted`]); `None` for a whole log. Clones share it.
+    rooting: Option<Arc<rooted::Rooting>>,
+    /// What the evaluators read of `rooting`'s stubs, and the held records that name each as a
+    /// parent ([`rooted::Stubbed`]); `None` for a whole log.
+    stubbed: Option<rooted::Stubbed>,
+    /// The bytes `rooting`'s stubs take ([`rooted::Stub::bytes`]), counted against the byte bound
+    /// with `held_bytes`; `0` for a whole log.
+    stub_bytes: usize,
 }
 
 /// The Macs a log let back in after a removal, named as a roster names them: canonical `m<N>`
@@ -1798,6 +2511,7 @@ impl Log {
             heads,
             waiting: BTreeMap::new(),
             held_bytes,
+            shed: 0,
             waiting_bytes: 0,
             budgets: RecordBudgets::current(),
             counts,
@@ -1806,25 +2520,29 @@ impl Log {
             seats,
             membership: Arc::default(),
             effective: Arc::default(),
+            cuts: checkpoint::Cuts::default(),
             weighing: Arc::default(),
             epochs: Arc::default(),
             restored: Arc::default(),
             advertised: Arc::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             generation: Arc::default(),
             historical: Arc::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             opened: Arc::default(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             head: None,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             origin: None,
+            rooting: None,
+            stubbed: None,
+            stub_bytes: 0,
         })
     }
 
     /// Restrict a verified graph to the causal past of held heads, preserving its budgets
     /// and seat checks. The new graph starts with empty evaluator caches.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn project_heads(&self, heads: &[RecordId]) -> Result<Self> {
         let mut records = self.ancestor_closure(heads).into_iter();
         let first = records
@@ -1834,9 +2552,14 @@ impl Log {
         projected.budgets = self.budgets;
         projected.enforce_seats = self.enforce_seats;
         projected.head.clone_from(&self.head);
+        // A rooted log's projection keeps the stubs in the heads' past, and the dropped heads
+        // among them stay heads ([`rooted`]).
+        projected.rooting = self.rooting_within(&self.stubs_in_past(heads));
+        projected.restub();
         for record in records {
             let _ = projected.insert(record)?;
         }
+        projected.stub_heads();
         Ok(projected)
     }
 
@@ -1846,11 +2569,18 @@ impl Log {
             records: &self.order,
             at: &self.held,
             reach: &self.reach,
+            stubs: self.stub_view(),
         }
     }
 
-    /// The indexes of the held records among `ids`, in order; ids not held are skipped.
+    /// The indexes of the held records among `ids`, in order; ids not held are skipped. In a
+    /// rooted log a dropped id stands for the held records it resolves to ([`Log::placed`]),
+    /// which with their pasts are its strict past, so a dropped head reaches what it reaches in
+    /// the whole log.
     fn indexes(&self, ids: &[RecordId]) -> Vec<usize> {
+        if self.rooting.is_some() {
+            return self.rooted_indexes(ids);
+        }
         ids.iter()
             .filter_map(|id| self.held.get(id).copied())
             .collect()
@@ -1865,7 +2595,7 @@ impl Log {
 
     /// Every `previous` head lies in the complete causal prefix of these held `heads`.
     /// Missing heads are unknown, never evidence of inclusion.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn prefix_covers(&self, heads: &[RecordId], previous: &[RecordId]) -> bool {
         if heads.is_empty() || heads.iter().any(|head| !self.held.contains_key(head)) {
             return false;
@@ -1881,7 +2611,7 @@ impl Log {
     /// The held `Remove` records that are the held record `from` or lie in its causal past, in
     /// order: those [`Log::ancestor_closure`] of `from` holds, read by a bit test each rather than
     /// a copy of every record in that past. None where `from` is not held.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn removes_upto(&self, from: &RecordId) -> impl Iterator<Item = &Record> {
         let at = self.held.get(from).copied();
         self.order
@@ -1895,7 +2625,7 @@ impl Log {
     }
 
     /// Whether a held `Remove` of `member` is the held record `from` or lies in its causal past.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn removal_upto(&self, from: &RecordId, member: &MemberId) -> bool {
         self.removes_upto(from).any(
             |record| matches!(record.body(), Body::Remove { member: out, .. } if out == member),
@@ -1947,20 +2677,29 @@ impl Log {
         self.budgets
     }
     /// The first bound that holding `more` records of `more_bytes` wire bytes past what it holds
-    /// would pass ([`RecordBudgets::passed_with_bytes`]); `None` where they fit every one.
+    /// would pass ([`RecordBudgets::passed_with_bytes`]); `None` where they fit every one. What it
+    /// holds counts a rooted log's stubs' bytes ([`rooted::Stub::bytes`]) with its records', and
+    /// no stub against a count: a stub is neither weighed, opened nor served, and a log full by
+    /// count frees room by a prune.
     #[must_use]
     pub fn passed_by(&self, more: RecordCounts, more_bytes: usize) -> Option<Budget> {
-        self.budgets
-            .passed_with_bytes(self.counts, more, self.held_bytes, more_bytes)
+        self.budgets.passed_with_bytes(
+            self.counts,
+            more,
+            self.held_bytes.saturating_add(self.stub_bytes),
+            more_bytes,
+        )
     }
-    /// The held records no held record follows, sorted.
+    /// The records no record follows, sorted: held ones, and in a rooted log each dropped record
+    /// nothing held or dropped follows ([`rooted`]), as the whole log's heads are.
     pub fn heads(&self) -> Vec<RecordId> {
         self.heads.iter().copied().collect()
     }
 
     /// SHA-256 of `ALHD1` followed by [`Log::heads`], in their sorted order: one value for the
     /// whole held log. A log only grows and holds a record only after its parents, so two logs
-    /// with equal heads hold the same records. A vault server advertises it as its TXT `rec=`
+    /// with equal heads hold the same records: the same ids, though one may hold a version-2
+    /// record whole where the other holds its shed frame ([`Record::is_shed`]). A vault server advertises it as its TXT `rec=`
     /// (`crate::server::VaultTxt::rec`) and states it on each records reply, and a Mac keeps it
     /// as the records digest its applied state was read from.
     #[must_use]
@@ -1990,18 +2729,28 @@ impl Log {
         body: Body,
         follow: &[RecordId],
     ) -> Draft {
-        let previous = self
+        // The signer's newest record, held or dropped ([`rooted`]): a draft never takes the
+        // sequence of a record a prune dropped.
+        let dropped = self.rooting().into_iter().flat_map(|r| {
+            r.stubs
+                .iter()
+                .filter(|(_, stub)| stub.actor == *actor)
+                .map(|(id, stub)| (*id, stub.sequence))
+        });
+        let previous: Option<(RecordId, u64)> = self
             .order
             .iter()
             .filter(|r| r.kind() != Kind::Genesis && r.actor() == actor)
-            .max_by(|a, b| a.sequence().cmp(&b.sequence()).then(b.id.cmp(&a.id)));
+            .map(|r| (r.id, r.sequence()))
+            .chain(dropped)
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)));
         let heads = self.heads();
-        let mut parents: Vec<RecordId> = previous.map(|r| r.id).into_iter().collect();
+        let mut parents: Vec<RecordId> = previous.map(|(id, _)| id).into_iter().collect();
         let room = MAX_PARENTS - parents.len();
         parents.extend(
             heads
                 .iter()
-                .filter(|&head| Some(head) != previous.map(|r| &r.id))
+                .filter(|&head| Some(*head) != previous.map(|(id, _)| id))
                 .take(room)
                 .copied(),
         );
@@ -2023,7 +2772,7 @@ impl Log {
             }
             _ => None,
         };
-        let mut pinned: Vec<RecordId> = previous.map(|r| r.id).into_iter().collect();
+        let mut pinned: Vec<RecordId> = previous.map(|(id, _)| id).into_iter().collect();
         for needed in [seat, body_ref]
             .into_iter()
             .flatten()
@@ -2060,8 +2809,8 @@ impl Log {
         }
         Draft {
             network: *self.network(),
-            sequence: previous.map_or(1, |r| r.sequence() + 1),
-            previous: previous.map(|r| r.id),
+            sequence: previous.map_or(1, |(_, sequence)| sequence + 1),
+            previous: previous.map(|(id, _)| id),
             parents,
             authored_ms,
             body,
@@ -2073,6 +2822,20 @@ impl Log {
     /// A record whose parents are all held is checked against them and held. One with a
     /// parent missing waits, and is checked and held when the last one arrives; one that fails
     /// that check then is dropped. In a store's log only a signer that holds a seat already waits.
+    /// A whole version-2 record takes the place of its shed frame, held or waiting, under the one
+    /// id they share, where its bytes fit ([`Log::take_whole`]); a frame never takes a whole
+    /// record's place. Which layouts reach a log is decided where their bytes are decoded
+    /// ([`Reading`]): insert has no rule of its own for them.
+    ///
+    /// In a log rooted at a final checkpoint ([`rooted`]) a record the checkpoint's prune dropped
+    /// is [`Inserted::Known`] and never held again. A parent in the dropped set counts as
+    /// arrived: the record follows that parent's place, the newest records in its past the prune
+    /// kept, and a dropped `previous` or cutoff is checked against its stub. A record
+    /// concurrent with the cut F (outside F's past, and not following F) is held as the whole
+    /// log holds it, where M7 refuses it: the stubs place it, and refusing it would refuse the
+    /// other side of a split, which no rule one side applies tells from a Mac that slept across
+    /// the cut. A dropped record it names as a cutoff, or as the op it carries, is read off its
+    /// stub ([`rooted`]).
     ///
     /// # Errors
     /// The record is another network's, or another genesis; its previous is not its signer's
@@ -2164,12 +2927,21 @@ impl Log {
             return Err(Error::new("a membership record of another network"));
         }
         if self.held.contains_key(&record.id) {
+            self.take_whole(&record);
+            return Ok(Inserted::Known);
+        }
+        #[cfg(test)]
+        let take_back = rooted::mutant(rooted::Mutant::TakeBack);
+        #[cfg(not(test))]
+        let take_back = false;
+        if self.is_dropped(&record.id) && !take_back {
             return Ok(Inserted::Known);
         }
         if self.waiting.contains_key(&record.id) {
+            self.take_whole(&record);
             return Ok(Inserted::Waiting);
         }
-        if !record.parents().iter().all(|p| self.held.contains_key(p)) {
+        let Some(parents) = self.parent_indexes(&record) else {
             // In a store's log a record waits only for a signer that already holds a seat: a key
             // no founder or `Admit` names cannot fill the waiting room with records whose made-up
             // parents never arrive. A peer sends every seat before the records that need it
@@ -2189,15 +2961,19 @@ impl Log {
             }
             self.wait(record);
             return Ok(Inserted::Waiting);
-        }
+        };
         if let Some(budget) = self.passed_by(budgets::counted(record.kind()), record.wire_len()) {
             return Err(Error::of_kind(
                 crate::ErrorKind::MembershipCapacity,
                 format!("membership log holds its limit of {}", budget.counts()),
             ));
         }
-        self.check_against_parents(&record)?;
-        self.hold(record);
+        self.check_against_parents(&record, &parents)?;
+        #[cfg(test)]
+        if self.refuses_concurrent(&record, &parents) {
+            return Err(Error::new("a record concurrent with the checkpoint's cut"));
+        }
+        self.hold(record, &parents);
         self.land_waiting();
         Ok(Inserted::Held)
     }
@@ -2209,14 +2985,15 @@ impl Log {
     /// records (2026-11-08).
     #[must_use]
     pub fn holds_all(&self, other: &Log) -> bool {
-        other.network() == self.network()
-            && other.heads.iter().all(|head| self.held.contains_key(head))
+        other.network() == self.network() && other.heads.iter().all(|head| self.knows(head))
     }
 
     /// Insert every record `other` holds or keeps waiting. A record `other` holds that this log
     /// refuses is skipped and the rest come in: both logs check records the same way, so that
     /// happens only at this log's bounds (its [`RecordBudgets`], [`MAX_WAITING`]), which depend on
-    /// what reached each log first.
+    /// what reached each log first. Of a log rooted at a checkpoint ([`rooted`]) it takes the
+    /// records alone, no root and no stub: a record that follows one `other` dropped and this
+    /// log lacks waits for it.
     ///
     /// # Errors
     /// `other` is another network's log.
@@ -2224,7 +3001,7 @@ impl Log {
         if other.network() != self.network() {
             return Err(Error::new("cannot merge another network's membership log"));
         }
-        if !self.holds_all(other) {
+        if !self.holds_all(other) || self.shed != 0 {
             for record in other.order.iter().skip(1) {
                 let _ = self.insert(record.clone());
             }
@@ -2232,10 +3009,9 @@ impl Log {
         loop {
             let mut progressed = false;
             for record in other.waiting.values() {
-                if !self.held.contains_key(&record.id)
-                    && !self.waiting.contains_key(&record.id)
-                    && self.insert(record.clone()).is_ok()
-                {
+                if self.knows(&record.id) || self.waiting.contains_key(&record.id) {
+                    self.take_whole(record);
+                } else if self.insert(record.clone()).is_ok() {
                     progressed = true;
                 }
             }
@@ -2279,7 +3055,7 @@ impl Log {
     /// arrives and shared by this log's clones. `derive` is the roster overlay's one derivation
     /// (`client::roster`), a pure function of the records, so what is kept is what it would
     /// derive again.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn restored(&self, derive: impl FnOnce(&Self) -> Restored) -> &Restored {
         self.restored.get_or_init(|| derive(self))
     }
@@ -2293,16 +3069,20 @@ impl Log {
 
     /// This log with `membership` as its evaluation, for a test of a caller's judgement on a
     /// membership no record set here gives (the Unix client's enrollment tests).
-    #[cfg(all(test, unix))]
+    #[cfg(all(test, any(unix, windows)))]
     pub(crate) fn with_membership(mut self, membership: Membership) -> Self {
         self.membership = Arc::new(OnceLock::from(membership));
         self.restored = Arc::default();
         self
     }
 
+    /// Which records count, and the keyed epochs: the evaluation of these records, with none a
+    /// settled checkpoint's prune drops counting ([`checkpoint::gone`]).
     fn effective(&self) -> &eval::Effective {
-        self.effective
-            .get_or_init(|| eval::effective_records(self.history(), self.weighing()))
+        self.effective.get_or_init(|| {
+            let gone = checkpoint::gone(self);
+            eval::effective_records(self.history(), self.weighing(), gone.as_ref())
+        })
     }
 
     /// What the counting epochs and wraps say, read once while no `Epoch`, `Wrap` or weighed
@@ -2450,18 +3230,24 @@ impl Log {
         })
     }
 
-    fn check_against_parents(&self, record: &Record) -> Result<()> {
-        let parents = self.indexes(record.parents());
-        if self.enforce_seats && !self.has_seat_in_past(record, &parents) {
+    fn check_against_parents(&self, record: &Record, parents: &[usize]) -> Result<()> {
+        if self.enforce_seats && !self.has_seat_in_past(record, parents) {
             return Err(Error::new(
                 "a membership record's signer has no seat in its causal past",
             ));
         }
         if let Some(previous) = record.previous() {
-            let before = self.get(previous).filter(|p| p.kind() != Kind::Genesis);
-            if !before.is_some_and(|p| {
-                p.actor() == record.actor() && p.sequence() + 1 == record.sequence()
-            }) {
+            let follows = match self.get(previous) {
+                Some(p) => {
+                    p.kind() != Kind::Genesis
+                        && p.actor() == record.actor()
+                        && p.sequence() + 1 == record.sequence()
+                }
+                None => self.stub(previous).is_some_and(|p| {
+                    p.actor == *record.actor() && p.sequence + 1 == record.sequence()
+                }),
+            };
+            if !follows {
                 return Err(Error::new(
                     "a record's previous is its signer's record at the sequence before",
                 ));
@@ -2491,7 +3277,7 @@ impl Log {
             }
         }
         if let Body::Remove { member, cutoff } = record.body() {
-            if !self.precedes(cutoff, &parents) {
+            if !self.precedes(cutoff, record, parents) {
                 return Err(Error::new(
                     "a removal's cutoff is a record in its own causal past",
                 ));
@@ -2499,13 +3285,19 @@ impl Log {
             // §3.3.7: the removed Mac's last record the remover accepted, else the record that
             // let it in. A cutoff elsewhere would let a removed Mac pick one that leaves its own
             // removal out of view.
-            let names_it = self.get(cutoff).is_some_and(|at| match at.body() {
-                Body::Genesis { founders, .. } => {
-                    founders.iter().any(|f| f.member() == Some(*member))
-                }
-                Body::Admit { entrant, .. } => at.actor() == member || entrant.member() == *member,
-                _ => at.actor() == member,
-            });
+            let names_it = match self.get(cutoff) {
+                Some(at) => match at.body() {
+                    Body::Genesis { founders, .. } => {
+                        founders.iter().any(|f| f.member() == Some(*member))
+                    }
+                    Body::Admit { entrant, .. } => {
+                        at.actor() == member || entrant.member() == *member
+                    }
+                    _ => at.actor() == member,
+                },
+                // A prune drops no `Genesis` or `Admit`: a dropped cutoff is the removed Mac's.
+                None => self.stub(cutoff).is_some_and(|at| at.actor == *member),
+            };
             if !names_it {
                 return Err(Error::new(
                     "a removal's cutoff is the removed Mac's record or the one that let it in",
@@ -2514,7 +3306,7 @@ impl Log {
         }
         match record.body() {
             Body::Wrap { epoch, .. }
-                if !self.precedes(epoch, &parents)
+                if !self.precedes(epoch, record, parents)
                     || !matches!(self.get(epoch).map(Record::body), Some(Body::Epoch { .. })) =>
             {
                 return Err(Error::new("a Wrap names an Epoch in its causal past"));
@@ -2524,7 +3316,7 @@ impl Log {
             }
             | Body::Delete {
                 audience, epoch, ..
-            } if !self.precedes(epoch, &parents)
+            } if !self.precedes(epoch, record, parents)
                 || !matches!(
                     self.get(epoch).map(Record::body),
                     Some(Body::Epoch { audience: ep_aud, .. }) if ep_aud == audience
@@ -2557,12 +3349,13 @@ impl Log {
         })
     }
 
-    /// Whether the held record `ancestor` lies in the causal past of a record whose parents are
-    /// the held records at `parents`.
-    fn precedes(&self, ancestor: &RecordId, parents: &[usize]) -> bool {
-        self.held
-            .get(ancestor)
-            .is_some_and(|&at| self.reach.in_past_of(at, parents))
+    /// Whether the record `ancestor`, held or dropped ([`rooted`]), lies in the causal past of
+    /// `record`, which follows the held records at `parents`.
+    fn precedes(&self, ancestor: &RecordId, record: &Record, parents: &[usize]) -> bool {
+        match self.held.get(ancestor) {
+            Some(&at) => self.reach.in_past_of(at, parents),
+            None => self.is_dropped(ancestor) && self.stub_in_past(record.parents(), ancestor),
+        }
     }
 
     /// The bytes of every held record: what the records of `order` take on the wire, and what a
@@ -2633,7 +3426,7 @@ impl Log {
             }
         });
         budgets::Fill {
-            bytes: self.held_bytes,
+            bytes: self.held_bytes.saturating_add(self.stub_bytes),
             bound: budgets::held_bytes_bound(),
             by_kind,
             stops: budgets::Class::ALL.map(budgets::author_stop),
@@ -2712,7 +3505,8 @@ impl Log {
                 batch.put_bytes,
             ),
         };
-        match batch.refusal(less(self.held_bytes, batch.bytes), signed, author) {
+        let bytes = self.held_bytes.saturating_add(self.stub_bytes);
+        match batch.refusal(less(bytes, batch.bytes), signed, author) {
             Some(why) => Err(Error::of_kind(crate::ErrorKind::MembershipCapacity, why)),
             None => Ok(()),
         }
@@ -2723,13 +3517,18 @@ impl Log {
         self.waiting_bytes
     }
 
+    /// The bytes of every held and waiting record, and of a rooted log's stubs
+    /// ([`rooted::Stub::bytes`]): what the byte bound holds them all within.
     pub(super) fn total_bytes(&self) -> usize {
-        self.held_bytes().saturating_add(self.waiting_bytes())
+        self.held_bytes()
+            .saturating_add(self.waiting_bytes())
+            .saturating_add(self.stub_bytes)
     }
 
     /// The bytes held and waiting records keep in memory ([`Record::resident_len`]: a shelved
-    /// record's frame alone until it is read back) plus the reachability index's bytes. A cache
-    /// of decoded logs counts both rather than only the input wire.
+    /// record's frame alone until it is read back) plus the reachability index's bytes, and a
+    /// rooted log's stubs' ([`rooted::Stub::bytes`]), roots' bodies and what its evaluators read
+    /// of the stubs. A cache of decoded logs counts them all rather than only the input wire.
     #[must_use]
     pub fn footprint(&self) -> usize {
         self.order
@@ -2739,49 +3538,110 @@ impl Log {
                 sum.saturating_add(record.resident_len())
             })
             .saturating_add(self.reach.bytes())
+            .saturating_add(self.stub_bytes)
+            .saturating_add(self.rooted_footprint())
     }
 
-    fn hold(&mut self, record: Record) {
+    /// Hold `record`, which follows the held records at `parents` ([`Log::parent_indexes`]).
+    fn hold(&mut self, record: Record, parents: &[usize]) {
         // The evaluation goes first: an `Effective` shares the index's chunks, and a lone log
         // whose cache let go of it extends its last chunk in place.
+        self.let_go(record.kind());
+        let at = self.order.len();
+        self.reach.push(parents.iter().copied());
+        if let Some(member) = seated_by(&record) {
+            self.seats.entry(member).or_default().admits.push(at);
+        }
+        Arc::make_mut(&mut self.held).insert(record.id, at);
+        for &parent in parents {
+            self.heads.remove(&self.order[parent].id);
+        }
+        if self.rooting.is_some() {
+            // A dropped parent a root kept as a head ([`rooted`]) is followed now.
+            for parent in record.parents() {
+                self.heads.remove(parent);
+            }
+            self.note_followers(&record, at);
+        }
+        self.heads.insert(record.id);
+        self.held_bytes = self.held_bytes.saturating_add(record.wire_len());
+        self.shed += usize::from(record.is_shed());
+        self.counts = self.counts.plus(budgets::counted(record.kind()));
+        Arc::make_mut(&mut self.order).push(record);
+    }
+
+    /// Let go of what was derived from the held records, where a held record of `kind` arrives
+    /// or changes its bytes ([`Log::hold`], [`Log::take_whole`]): the evaluations, the
+    /// [`history::Generation`] of the exact bytes, and the records file this log was.
+    fn let_go(&mut self, kind: Kind) {
         self.membership = Arc::default();
         self.effective = Arc::default();
         self.restored = Arc::default();
         self.advertised = Arc::default();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.generation = Arc::default();
             self.opened = Arc::default();
         }
         self.historical = Arc::default();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.origin = None;
         }
         #[cfg(test)]
-        let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(record.kind()));
+        let carried = eval::MUTANT.get() == Some(eval::Mutant::CarryAcross(kind));
         #[cfg(not(test))]
         let carried = false;
-        if record.kind().weighed() && !carried {
+        if kind.weighed() && !carried {
             self.weighing = Arc::default();
         }
-        if epochs::resets(record.kind()) {
+        if epochs::resets(kind) {
             self.epochs = Arc::default();
         }
-        let at = self.order.len();
-        self.reach
-            .push(record.parents().iter().map(|parent| self.held[parent]));
-        if let Some(member) = seated_by(&record) {
-            self.seats.entry(member).or_default().admits.push(at);
+    }
+
+    /// Put `whole` in the place of the shed frame of it ([`Record::is_shed`]) that this log holds
+    /// or keeps waiting: a whole record always wins over its frame, and a frame over its whole
+    /// record never does. They share an id, a header, every signed field and so every place the
+    /// log keeps the record by; only the ciphertext and the bytes differ. A held one is taken only
+    /// where its added bytes stay within the byte bound ([`Log::passed_by`]), as any record is;
+    /// the frame then stays. `true` where it took `whole`.
+    pub(super) fn take_whole(&mut self, whole: &Record) -> bool {
+        if let Some(&at) = self.held.get(&whole.id) {
+            if !self.order[at].is_whole_of(whole) {
+                return false;
+            }
+            let more = whole.wire_len().saturating_sub(self.order[at].wire_len());
+            if self.passed_by(RecordCounts::default(), more).is_some() {
+                return false;
+            }
+            self.held_bytes = self.held_bytes.saturating_add(more);
+            self.shed -= 1;
+            // What was derived from the frame's bytes: an evaluation that read its ciphertext as
+            // none, and the generation of the bytes held.
+            self.let_go(whole.kind());
+            Arc::make_mut(&mut self.order)[at] = whole.clone();
+            return true;
         }
-        Arc::make_mut(&mut self.held).insert(record.id, at);
-        for parent in record.parents() {
-            self.heads.remove(parent);
+        let Some(frame) = self.waiting.get_mut(&whole.id) else {
+            return false;
+        };
+        if !frame.is_whole_of(whole) {
+            return false;
         }
-        self.heads.insert(record.id);
-        self.held_bytes = self.held_bytes.saturating_add(record.wire_len());
-        self.counts = self.counts.plus(budgets::counted(record.kind()));
-        Arc::make_mut(&mut self.order).push(record);
+        let more = whole.wire_len().saturating_sub(frame.wire_len());
+        if self
+            .held_bytes
+            .saturating_add(self.waiting_bytes)
+            .saturating_add(self.stub_bytes)
+            .saturating_add(more)
+            > MAX_RECORDS_STREAM
+        {
+            return false;
+        }
+        *frame = whole.clone();
+        self.waiting_bytes = self.waiting_bytes.saturating_add(more);
+        true
     }
 
     /// Keep `record` waiting for a parent, with [`Log::waiting_bytes`] and its seat.
@@ -2818,7 +3678,7 @@ impl Log {
             let ready: Vec<RecordId> = self
                 .waiting
                 .values()
-                .filter(|r| r.parents().iter().all(|p| self.held.contains_key(p)))
+                .filter(|r| self.parent_indexes(r).is_some())
                 .map(|r| r.id)
                 .collect();
             #[cfg(test)]
@@ -2829,12 +3689,13 @@ impl Log {
                     continue;
                 };
                 self.unwaited(&record);
+                let parents = self.parent_indexes(&record).unwrap_or_default();
                 if self
                     .passed_by(budgets::counted(record.kind()), record.wire_len())
                     .is_none()
-                    && self.check_against_parents(&record).is_ok()
+                    && self.check_against_parents(&record, &parents).is_ok()
                 {
-                    self.hold(record);
+                    self.hold(record, &parents);
                     landed = true;
                     continue;
                 }
@@ -2924,7 +3785,7 @@ pub fn membership_log_environment() {}
 /// `record`'s bytes with its kind byte set to `code`: a test's stand-in for a record of a kind
 /// only a newer build writes, which this build frames ([`Record::frame_prefix`]) and refuses to
 /// read ([`Record::decode`]).
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn with_kind_code(record: &Record, code: u8) -> Vec<u8> {
     let mut wire = record.bytes().to_vec();
     wire[KIND_AT] = code;

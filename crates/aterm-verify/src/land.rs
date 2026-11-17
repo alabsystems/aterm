@@ -114,10 +114,13 @@
 //!    after a re-judge of it that was killed or went red is judged in full again, never by a
 //!    round, which judges less.
 //! 7. Each judgment's and each round's verdicts are recorded, signed with this Mac's fleet
-//!    node key, in the journal's `land/` ([`records`], [`crate::land_record`]), once the run
-//!    ended by itself with the checkout still at its commit: every FAIL, and every other row
-//!    its plan keyed where its run was whole. Nothing reads them to decide a landing yet: steps
-//!    1 to 6 are the same with them as without them.
+//!    node key ([`records`], [`crate::land_record`]), once the run ended by itself with the
+//!    checkout still at its commit: every FAIL, and every other row its plan keyed where its run
+//!    was whole. Each goes to the clone's spool as it is made and reaches the journal's `land/`
+//!    with the append of a landing that lands: this one's, after its verdict and with the
+//!    checkout's landing lock let go, or, where this one pushed nothing and the spool confirms
+//!    it keeps them, the clone's next one ([`records::finish`], [`records::deliver`]). Nothing reads them to decide a landing yet: steps 1 to 6 are the
+//!    same with them as without them.
 //!
 //! Each judgment and each round runs as the verifier built from the tree it judges: the argv
 //! its child gets, that child's parse of it, the reading of its record and every rule after it
@@ -204,8 +207,11 @@ pub const STOPPED: i32 = 75;
 /// The exit of `verify land --tab` whose worker started ([`tab`]): nothing has landed yet, and
 /// the worker's task concludes the landing. Not 0, which says a landing landed.
 pub const STARTED: i32 = 5;
-/// The file in the checkout's own git directory whose lock a landing holds while it runs
-/// ([`Git::hold`]), so a second landing of the checkout refuses at once instead of racing it.
+/// The file in the checkout's own git directory whose lock a landing holds from its start until
+/// its verdict is said ([`Git::hold`]), so a second landing of the checkout refuses at once
+/// instead of racing it. The landing lets it go before it delivers its records
+/// ([`records::deliver`]): a landing that landed appends them to the journal while the checkout
+/// can land again.
 pub const LOCK_FILE: &str = "aterm-land.lock";
 /// The exit a landing that panicked records ([`concluded`]): the one a Rust panic gives the
 /// process, which then dies of it as without the record.
@@ -223,9 +229,9 @@ pub const RETRY_PAUSE: Duration = Duration::from_secs(2);
 /// establishes a deadline for the complete operation's cleanup. Killing the owner before it
 /// records its outcome would leave its durable intent open.
 const WRITE: Duration = agh::git::GRANT_MAX;
-/// How long a push waits on another writer's open atomic intent: agh's full grace period
-/// (`agh::Journal::closable`, `GRANT_MAX` from retirement or the first free observation)
-/// and half a minute for the reads. A writer still running may outlast this wait.
+/// How long a push waits on another writer's open atomic intent: one credential
+/// lifetime and half a minute for observations. A live writer may outlast this wait;
+/// a dead writer permits origin reconciliation (`agh::Journal::closable`).
 const INTENT_WAIT: Duration = Duration::from_secs(agh::git::GRANT_MAX.as_secs() + 30);
 const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
 /// Where a passed judgment is kept until its landing is on main ([`Git::keep`]): a ref of this
@@ -543,8 +549,9 @@ pub struct Seams<'a> {
     /// meanwhile.
     pub judge: &'a mut dyn FnMut(&Path, &Path, &str, Poll<'_>) -> Ran,
     /// Where each judgment's and each round's verdicts ([`records::record`]) and this run's
-    /// records ([`Records::run_record`], [`records::finish`]) go: the journal's append, the
-    /// clone's spool, this Mac's signer and host, the clock, this run and the interrupt it took.
+    /// records ([`Records::run_record`], [`records::finish`], [`records::deliver`]) go: the
+    /// journal's append, the clone's spool, this Mac's signer and host, the clock, this run, the
+    /// interrupt it took and the checkout's landing lock it holds.
     pub records: Records<'a>,
     /// What changed paths reach in the checkout as it stands: with no paths, the change since
     /// the base commit (the branch's own reach); else those paths, as changed since it (what
@@ -633,9 +640,12 @@ pub fn land(root: &Path, own: &Own<'_>, seams: &mut Seams<'_>) -> i32 {
 
 /// How a landing that ran as `ran` ends, whatever ended it: an error is said (as the interrupt
 /// it came after, where the landing took one it has not said) and could not run; then the run's
-/// end record and its delivery ([`records::finish`]), the closing verdict of `tally`
-/// ([`say_verdict`]) and the exit. A landing that panicked records its end as [`PANICKED`] and
-/// then goes on panicking, so it dies as without the record, and says no verdict.
+/// end record ([`records::finish`]), the closing verdict of `tally` ([`say_verdict`]), which
+/// waits on no remote, and only then the records' delivery ([`records::deliver`]): it lets the
+/// checkout's landing lock go, and a run that landed appends its records to the journal while
+/// the checkout can land again. The exit is the run's, whatever the delivery came to. A landing
+/// that panicked records its end as [`PANICKED`], delivers, and then goes on panicking, so it
+/// dies as without the record, and says no verdict.
 fn concluded(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
@@ -657,23 +667,14 @@ fn concluded(
             exit::COULD_NOT_RUN
         }
         Err(panic) => {
-            records::finish(
-                git,
-                &mut seams.records,
-                &mut *seams.say,
-                PANICKED,
-                records::Delivery::Publish,
-            );
+            let delivery = records::finish(git, &mut seams.records, &mut *seams.say, PANICKED);
+            records::deliver(git.root, &mut seams.records, &mut *seams.say, delivery);
             std::panic::resume_unwind(panic);
         }
     };
-    let delivery = if code == exit::CONFLICT {
-        records::Delivery::DeferIfKept
-    } else {
-        records::Delivery::Publish
-    };
-    records::finish(git, &mut seams.records, &mut *seams.say, code, delivery);
+    let delivery = records::finish(git, &mut seams.records, &mut *seams.say, code);
     say_verdict(git, seams, code, tally);
+    records::deliver(git.root, &mut seams.records, &mut *seams.say, delivery);
     code
 }
 
@@ -1586,7 +1587,7 @@ impl<'a> Wire<'a> {
             if left.is_zero() {
                 *self.unsettled.borrow_mut() = Some(format!(
                     "agh intent {} stayed open for this wait's {}s budget, its writer or \
-                     late-arrival grace still stopping it (`agh intent show`); the next run \
+                     unresolved origin state still stopping it (`agh intent show`); the next run \
                      waits on it again",
                     intent.as_str(),
                     INTENT_WAIT.as_secs()
@@ -4426,7 +4427,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         eprintln!("verify land: COULD NOT RUN — this landing's own image could not be read");
         return exit::COULD_NOT_RUN;
     };
-    let _held = match git.hold() {
+    let held = match git.hold() {
         Ok(held) => held,
         Err(why) => {
             eprintln!("verify land: COULD NOT RUN — {why}");
@@ -4438,7 +4439,7 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         image,
         at: at.as_deref(),
     };
-    interruptible(|| with_live_seams(&root, &options, |seams| land(&root, &own, seams)))
+    interruptible(|| with_live_seams(&root, &options, held, |seams| land(&root, &own, seams)))
 }
 
 /// `run`'s words apart: whether `--tab` asks for a worker, the commit `--at` names, and the
@@ -4584,22 +4585,22 @@ fn resume_cli(
                 file.display()
             ));
             let run = taken.ok().and_then(|bytes| Handoff::run_of(&bytes));
-            return refused(&git, run.as_ref(), records, refuse);
+            return refused(&git, run.as_ref(), None, records, refuse);
         }
     };
     // The sender's lock ended with its exec: take it again before anything of the landing runs.
-    let _held = match git.hold() {
+    let held = match git.hold() {
         Ok(held) => held,
         Err(why) => {
             refuse(&format!("verify land: COULD NOT RUN — {why}; {RERUN}"));
-            return refused(&git, handoff.run.as_ref(), records, refuse);
+            return refused(&git, handoff.run.as_ref(), None, records, refuse);
         }
     };
     let Some(image) = crate::report::running_driver() else {
         refuse(&format!(
             "verify land: COULD NOT RUN — this landing's own image could not be read; {RERUN}"
         ));
-        return refused(&git, handoff.run.as_ref(), records, refuse);
+        return refused(&git, handoff.run.as_ref(), Some(held), records, refuse);
     };
     let words = handoff.words.clone();
     let Some(options) = options(&words) else {
@@ -4608,10 +4609,10 @@ fn resume_cli(
              words `{}`; {RERUN}",
             words.join(" ")
         ));
-        return refused(&git, handoff.run.as_ref(), records, refuse);
+        return refused(&git, handoff.run.as_ref(), Some(held), records, refuse);
     };
     interruptible(|| {
-        with_live_seams(&root, &options, |seams| {
+        with_live_seams(&root, &options, held, |seams| {
             resume(
                 &root,
                 &Own {
@@ -4627,24 +4628,23 @@ fn resume_cli(
 }
 
 /// End the run `carried` (where a refused handoff carried one) as [`resume`] ends one that
-/// could not run: its end record, through `records` of the checkout ([`records::finish`]), each
-/// line it says going to `say`. [`exit::COULD_NOT_RUN`].
+/// could not run: its end record, through `records` of the checkout ([`records::finish`]), and
+/// its delivery, which first lets `held` (the checkout's landing lock, where the refusal came
+/// once this image took it) go ([`records::deliver`]), each line they say going to `say`.
+/// [`exit::COULD_NOT_RUN`].
 fn refused(
     git: &Git<'_>,
     carried: Option<&handoff::Carried>,
+    held: Option<aterm_toolchain::record_lock::RecordLock>,
     records: &mut dyn FnMut(&Path) -> Records<'static>,
     say: &mut dyn FnMut(&str),
 ) -> i32 {
     if let Some(carried) = carried {
         let mut records = records(git.root);
         records.adopt(carried);
-        records::finish(
-            git,
-            &mut records,
-            say,
-            exit::COULD_NOT_RUN,
-            records::Delivery::Publish,
-        );
+        records.lock = held;
+        let delivery = records::finish(git, &mut records, say, exit::COULD_NOT_RUN);
+        records::deliver(git.root, &mut records, say, delivery);
     }
     exit::COULD_NOT_RUN
 }
@@ -4714,14 +4714,17 @@ fn live_ctl(args: &[String], stdin: &[u8]) -> std::io::Result<(Vec<u8>, Vec<u8>)
     Ok((said.stdout, said.stderr))
 }
 
-/// Run `f` with the live seams under the person's resource controls `options`.
+/// Run `f` with the live seams under the person's resource controls `options`, the records
+/// holding `held`, the checkout's landing lock, until they let it go ([`records::deliver`]).
 fn with_live_seams<R>(
     root: &Path,
     options: &LandResources,
+    held: aterm_toolchain::record_lock::RecordLock,
     f: impl FnOnce(&mut Seams<'_>) -> R,
 ) -> R {
     let mut say = |line: &str| println!("{line}");
-    let records = records::live(root);
+    let mut records = records::live(root);
+    records.lock = Some(held);
     if records.signer.is_none() {
         say(
             "verify land: this Mac has no fleet node identity: its verdict records are written \

@@ -302,14 +302,92 @@ fn the_bare_band_arms_a_move_and_a_double_click_does_not() {
         .expect("bare band between the tabs and the buttons");
     let (x, y) = strip_point(&app, wid, bare);
     app.on_cursor_moved(wid, x, y);
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    // Both presses at one instant: a double click by when its presses came, never by how long
+    // the test took between them.
+    let at = std::time::Instant::now();
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
     assert_eq!(app.windows[&wid].caption_move, Some((x, y)));
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
     assert_eq!(app.windows[&wid].caption_move, None, "the release disarms");
-    app.on_mouse_input(wid, ElementState::Pressed, MouseButton::Left);
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
     assert_eq!(
         app.windows[&wid].caption_move, None,
         "the double-click's second press maximizes; it never moves"
     );
-    app.on_mouse_input(wid, ElementState::Released, MouseButton::Left);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+}
+
+/// THE HEADER ABOVE THE DOCK (Wayland's client-side decorations). The dock's side inset runs up
+/// beside the strip, and the header's band is drawn across it above the dock: a left press
+/// there is a press on the header's bare band, as one on the strip where no segment lies is
+/// (on Linux it arms the move, and a second press maximizes, never moves), so the window is
+/// dragged by its title across its whole width. The rule is platform-neutral
+/// (`App::side_inset_band_at`); only the band press's effect is Linux's. CONTROL: a press in the
+/// inset below the strip, on the dock, is the dock's, and with no strip beside it, nobody's.
+#[test]
+fn a_press_on_the_header_above_the_dock_presses_its_band() {
+    let (mut app, wid) = framed(Some(FRAME));
+    let now = std::time::Instant::now();
+    app.set_dock_at(wid, 30, now)
+        .expect("PRECONDITION: room for the dock");
+    let inset = app.win_side_inset_px(wid) as f64;
+    let (_, ch) = app.win_cell_size(wid);
+    let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+    let (x, y) = (inset * 0.5, top + ch as f64 * 0.5);
+    app.on_cursor_moved(wid, x, y);
+    assert!(app.in_side_inset(wid, x), "PRECONDITION: in the inset");
+    assert_eq!(
+        app.windows[&wid].frame_edge, None,
+        "PRECONDITION: on no handle"
+    );
+    assert_eq!(
+        app.dock_under_pointer(wid),
+        None,
+        "PRECONDITION: above the dock"
+    );
+    assert!(app.side_inset_band_at(wid, x, y));
+    // Every press at one instant: the double press is judged by when its presses came, never by
+    // how long the test took between them.
+    let at = std::time::Instant::now();
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
+    assert!(
+        app.windows[&wid].strip_band_press.is_some(),
+        "a press on the header's band"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        app.windows[&wid].caption_move,
+        Some((x, y)),
+        "the move armed"
+    );
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
+    assert_eq!(
+        app.windows[&wid].strip_band_press, None,
+        "the double press's second is the maximize's"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(app.windows[&wid].caption_move, None, "it never moves");
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+
+    // CONTROL: below the strip the inset is the dock's.
+    let below = top + ch as f64 * 2.5;
+    app.on_cursor_moved(wid, x, below);
+    assert!(
+        app.dock_under_pointer(wid).is_some(),
+        "PRECONDITION: on the dock"
+    );
+    assert!(!app.side_inset_band_at(wid, x, below));
+    app.on_mouse_input_at(wid, ElementState::Pressed, MouseButton::Left, at);
+    assert_eq!(
+        app.windows[&wid].strip_band_press, None,
+        "CONTROL: the dock's press"
+    );
+    #[cfg(target_os = "linux")]
+    assert_eq!(app.windows[&wid].caption_move, None);
+    app.on_mouse_input_at(wid, ElementState::Released, MouseButton::Left, at);
+
+    // CONTROL: no strip beside the inset, no band.
+    app.tab_strip_rows = 0;
+    assert!(!app.side_inset_band_at(wid, x, y));
 }

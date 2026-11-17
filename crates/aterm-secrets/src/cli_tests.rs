@@ -490,7 +490,7 @@ fn mirrors_add_refuses_what_is_no_address_of_this_vault() {
     let unanswered = format!("http://{}/v1/team", gone.local_addr().unwrap());
     drop(gone);
     assert_eq!(
-        unix::mirrors(&paths, Some(true), std::slice::from_ref(&unanswered)).unwrap(),
+        member::mirrors(&paths, Some(true), std::slice::from_ref(&unanswered)).unwrap(),
         std::process::ExitCode::SUCCESS
     );
     assert_eq!(
@@ -499,7 +499,7 @@ fn mirrors_add_refuses_what_is_no_address_of_this_vault() {
     );
     let other = format!("http://{}/v1/other", server.addr);
     assert!(
-        unix::mirrors(&paths, Some(true), &[other]).is_err(),
+        member::mirrors(&paths, Some(true), &[other]).is_err(),
         "another vault's address is refused"
     );
     // An address serving bytes no pin of this vault verifies: the other vault's store.
@@ -509,7 +509,7 @@ fn mirrors_add_refuses_what_is_no_address_of_this_vault() {
     let foreign_url = format!("http://{}/v1/team", foreign_server.addr);
     client::create(&foreign, &foreign_url, None, Some("other")).unwrap();
     assert!(
-        unix::mirrors(&paths, Some(true), std::slice::from_ref(&foreign_url)).is_err(),
+        member::mirrors(&paths, Some(true), std::slice::from_ref(&foreign_url)).is_err(),
         "a vault this pin does not verify is refused"
     );
     assert_eq!(
@@ -517,9 +517,9 @@ fn mirrors_add_refuses_what_is_no_address_of_this_vault() {
         std::slice::from_ref(&unanswered),
         "nothing saved"
     );
-    assert!(unix::mirrors(&paths, Some(false), std::slice::from_ref(&url)).is_err());
+    assert!(member::mirrors(&paths, Some(false), std::slice::from_ref(&url)).is_err());
     assert_eq!(
-        unix::mirrors(&paths, Some(false), &[unanswered]).unwrap(),
+        member::mirrors(&paths, Some(false), &[unanswered]).unwrap(),
         std::process::ExitCode::SUCCESS
     );
     assert!(client::config(&paths).unwrap().unwrap().mirrors.is_empty());
@@ -545,7 +545,7 @@ fn removing_an_unknown_mirror_never_echoes_url_credentials() {
         format!("https://mirror.example/v1/team#{credential}"),
         format!("https://user:{credential}@mirror.example/v1/team"),
     ] {
-        let error = unix::mirrors(&paths, Some(false), &[url]).unwrap_err();
+        let error = member::mirrors(&paths, Some(false), &[url]).unwrap_err();
         let shown = error.to_string();
         assert!(!shown.contains(credential));
         assert!(shown.contains("not a mirror of this vault"));
@@ -571,7 +571,7 @@ fn sync_diagnostic_reports_a_real_config_failure_without_its_path_or_contents() 
         0o600,
     )
     .unwrap();
-    let result = unix::sync_diagnostic(&paths);
+    let result = member::sync_diagnostic(&paths);
     assert_eq!(
         result,
         crate::sync_diagnostic::SyncDiagnostic::Failed(crate::ErrorKind::Other)
@@ -605,7 +605,7 @@ fn signed_get_reads_the_vault_in_place_whatever_the_file_holds() {
             .unwrap();
     });
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"authentic-value"
     );
     // The file an older build wrote, changed after the sync, then gone: get returns the vault's
@@ -614,13 +614,13 @@ fn signed_get_reads_the_vault_in_place_whatever_the_file_holds() {
     fsx::ensure_private_dir(path.parent().unwrap()).unwrap();
     fsx::write_atomic(&path, b"changed-after-sync", 0o600).unwrap();
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"authentic-value"
     );
     assert_eq!(std::fs::read(&path).unwrap(), b"changed-after-sync");
     std::fs::remove_file(&path).unwrap();
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"authentic-value"
     );
     // NEGATIVE CONTROL: the vault is what get follows; an entry unset there is gone, whatever
@@ -629,7 +629,7 @@ fn signed_get_reads_the_vault_in_place_whatever_the_file_holds() {
         doc.unset_entry(&Audience::Everyone, "token").unwrap();
     });
     fsx::write_atomic(&path, b"authentic-value", 0o600).unwrap();
-    assert!(unix::get_value(&paths, "token").is_err());
+    assert!(member::get_value(&paths, "token").is_err());
     publish(&|doc| {
         doc.set_entry(&Audience::Everyone, "token", b"authentic-value")
             .unwrap();
@@ -646,12 +646,12 @@ fn signed_get_reads_the_vault_in_place_whatever_the_file_holds() {
     fsx::write_atomic(&config_file, unsigned.as_bytes(), 0o600).unwrap();
     assert!(client::config(&paths).unwrap().unwrap().signer.is_none());
     assert!(
-        unix::get_value(&paths, "token").is_err(),
+        member::get_value(&paths, "token").is_err(),
         "removing the pin cannot make signed state plaintext"
     );
     std::fs::rename(config_file, root.path().join("kept-config")).unwrap();
     assert!(
-        unix::get_value(&paths, "token").is_err(),
+        member::get_value(&paths, "token").is_err(),
         "unconfigured state cannot read a previous vault's file"
     );
 }
@@ -711,7 +711,7 @@ fn every_read_refuses_set_apart_names_and_folded_pairs_an_older_vault_holds() {
             "{name}"
         );
         assert!(client::read_in_place(m7, name).is_err(), "{name}");
-        assert!(unix::get_value(m7, name).is_err(), "{name}");
+        assert!(member::get_value(m7, name).is_err(), "{name}");
     }
     for name in FOLDED {
         assert!(in_log(name), "the vault holds {name}");
@@ -722,7 +722,7 @@ fn every_read_refuses_set_apart_names_and_folded_pairs_an_older_vault_holds() {
             "{name}"
         );
         assert!(client::read_in_place(m7, name).unwrap().is_none(), "{name}");
-        assert!(unix::get_value(m7, name).is_err(), "{name}");
+        assert!(member::get_value(m7, name).is_err(), "{name}");
     }
     let control = client::read_verified_entry(m7, &expected, "shared-control")
         .unwrap()
@@ -736,7 +736,7 @@ fn every_read_refuses_set_apart_names_and_folded_pairs_an_older_vault_holds() {
         b"control-value"
     );
     assert_eq!(
-        unix::get_value(m7, "shared-control").unwrap().as_slice(),
+        member::get_value(m7, "shared-control").unwrap().as_slice(),
         b"control-value",
         "CONTROL"
     );
@@ -766,7 +766,7 @@ fn plaintext_get_reads_the_plain_source_in_place_and_never_the_old_file() {
     )
     .unwrap();
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"plain-value"
     );
     let expected = client::config(&paths).unwrap().unwrap();
@@ -781,13 +781,13 @@ fn plaintext_get_reads_the_plain_source_in_place_and_never_the_old_file() {
     fsx::ensure_private_dir(old.parent().unwrap()).unwrap();
     fsx::write_atomic(&old, b"local-edit", 0o600).unwrap();
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"plain-value"
     );
     // The person's own plain file is the store: its edit is what the next get reads, in place.
     fsx::write_atomic(&source, b"token=edited-plain-value\n", 0o600).unwrap();
     assert_eq!(
-        unix::get_value(&paths, "token").unwrap().as_slice(),
+        member::get_value(&paths, "token").unwrap().as_slice(),
         b"edited-plain-value"
     );
     assert_eq!(std::fs::read(&old).unwrap(), b"local-edit");
@@ -799,9 +799,9 @@ fn plaintext_get_reads_the_plain_source_in_place_and_never_the_old_file() {
         0o600,
     )
     .unwrap();
-    assert!(unix::get_value(&paths, "absent").is_err());
+    assert!(member::get_value(&paths, "absent").is_err());
     std::fs::remove_file(&source).unwrap();
-    assert!(unix::get_value(&paths, "token").is_err());
+    assert!(member::get_value(&paths, "token").is_err());
 }
 
 fn words(line: &str) -> Vec<String> {
@@ -2422,11 +2422,11 @@ fn agent_on_force_restarts_and_plain_on_does_not() {
 #[cfg(unix)]
 #[test]
 fn a_join_without_a_terminal_does_not_wait_for_its_approval() {
-    assert_eq!(unix::join_wait(true, false), std::time::Duration::ZERO);
-    assert_eq!(unix::join_wait(false, true), std::time::Duration::ZERO);
+    assert_eq!(member::join_wait(true, false), std::time::Duration::ZERO);
+    assert_eq!(member::join_wait(false, true), std::time::Duration::ZERO);
     // CONTROL: at a terminal, a join waits ten minutes for the approval.
     assert_eq!(
-        unix::join_wait(true, true),
+        member::join_wait(true, true),
         std::time::Duration::from_secs(600)
     );
 }
@@ -2539,15 +2539,15 @@ fn a_waiting_machine_is_told_how_a_mistyped_join_password_is_fixed() {
     use crate::transport::Source;
     let code = "abcd-efgh-ijkm-npqr";
     let alab = Source::Url(crate::ALAB_DEFAULT_URL.into());
-    let hint = unix::retype(&alab, None, false).expect("a URL has a join queue");
+    let hint = member::retype(&alab, None, false).expect("a URL has a join queue");
     assert!(
         hint.contains("mistyped join password is fixed by running aterm secrets join again"),
         "{hint}"
     );
     let approve = format!("aterm secrets approve {code}");
     for line in [
-        unix::waiting_line("m9", code, &approve, Some(&hint)),
-        unix::pending_membership(&approve, Some(&hint)),
+        member::waiting_line("m9", code, &approve, Some(&hint)),
+        member::pending_membership(&approve, Some(&hint)),
     ] {
         assert!(
             line.contains(&format!("aterm secrets approve {code}")),
@@ -2555,17 +2555,17 @@ fn a_waiting_machine_is_told_how_a_mistyped_join_password_is_fixed() {
         );
         assert!(line.contains(&hint), "{line}");
     }
-    assert!(!unix::waiting_line("m9", code, &approve, None).contains("mistyped"));
-    let other = unix::retype(&Source::Url("http://h:1/v1/x".into()), Some("m9"), false)
+    assert!(!member::waiting_line("m9", code, &approve, None).contains("mistyped"));
+    let other = member::retype(&Source::Url("http://h:1/v1/x".into()), Some("m9"), false)
         .expect("a URL has a join queue");
     assert!(
         other.contains("running aterm secrets join <vault-url> --name m9 again"),
         "{other}"
     );
     let private = Source::Url("https://h/v1/x?token=private-query#private-pin".into());
-    assert_eq!(unix::source_text(&private), "https://h/v1/x");
+    assert_eq!(member::source_text(&private), "https://h/v1/x");
     for piped in [false, true] {
-        let hint = unix::retype(&private, Some("m9"), piped).expect("a URL");
+        let hint = member::retype(&private, Some("m9"), piped).expect("a URL");
         assert!(hint.contains("<vault-url>"), "{hint}");
         assert!(hint.contains("full configured URL"), "{hint}");
         assert!(
@@ -2573,13 +2573,13 @@ fn a_waiting_machine_is_told_how_a_mistyped_join_password_is_fixed() {
             "{hint}"
         );
     }
-    let piped = unix::retype(&alab, None, true).expect("a URL has a join queue");
+    let piped = member::retype(&alab, None, true).expect("a URL has a join queue");
     assert!(
         piped.contains("piping it again to aterm secrets join --password-stdin"),
         "{piped}"
     );
     assert_eq!(
-        unix::retype(&Source::Path("/v/x.vault".into()), None, false),
+        member::retype(&Source::Path("/v/x.vault".into()), None, false),
         None
     );
 }
@@ -2750,13 +2750,16 @@ fn get_refuses_a_claude_token_and_ls_describe_names_no_file() {
         key.meta_entry(),
         key.entry().to_ascii_uppercase(),
     ] {
-        let Err(error) = unix::get_value(m7, &name) else {
+        let Err(error) = member::get_value(m7, &name) else {
             panic!("{name}: get returned a value");
         };
-        assert!(error.0.contains(unix::CLAUDE_TOKEN_GET), "{name}: {error}");
+        assert!(
+            error.0.contains(member::CLAUDE_TOKEN_GET),
+            "{name}: {error}"
+        );
     }
     assert_eq!(
-        unix::get_value(m7, "shared-control").unwrap().as_slice(),
+        member::get_value(m7, "shared-control").unwrap().as_slice(),
         b"control-value",
         "CONTROL"
     );
@@ -2967,7 +2970,7 @@ fn a_piped_value_loses_its_line_end_only_when_it_is_one_line_of_text() {
 fn a_piped_password_is_refused_rather_than_cut_or_split() {
     let read = |bytes: &[u8]| {
         let mut input = bytes;
-        unix::read_piped_password("--password-stdin", &mut input)
+        member::read_piped_password("--password-stdin", &mut input)
             .map(|password| password.as_slice().to_vec())
     };
     let mut exact = vec![b'p'; crate::join::MAX_LEN];
@@ -3200,15 +3203,15 @@ fn status_names_a_machine_of_a_signed_vault_by_its_code() {
         host: "m5".to_string(),
     };
     let code = "abcd-efgh-ijkm-npqr";
-    let signed = unix::machine_line(Some(&config(Some([7; 32]))), "age1k", code);
+    let signed = member::machine_line(Some(&config(Some([7; 32]))), "age1k", code);
     assert_eq!(
         signed,
         format!("machine: code {code}, key age1k, asked to join as m5")
     );
-    let plain = unix::machine_line(Some(&config(None)), "age1k", code);
+    let plain = member::machine_line(Some(&config(None)), "age1k", code);
     assert_eq!(plain, format!("machine: m5, code {code}, key age1k"));
     assert_eq!(
-        unix::machine_line(None, "age1k", code),
+        member::machine_line(None, "age1k", code),
         format!("machine: code {code}, key age1k")
     );
 }

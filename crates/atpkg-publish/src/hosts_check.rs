@@ -18,8 +18,8 @@ use crate::artifact::lineage_switch::{self, Switch};
 use crate::ctx::{Ctx, HostChoice};
 use crate::error::{Error, Result};
 use crate::host::agh::{AghHost, CALLER};
-use crate::lane::install::Machine;
-use crate::lane::{LaneKind, linux};
+use crate::lane::install::{self, Machine};
+use crate::lane::{LaneKind, linux, units};
 
 /// The runbook every provisioning step points at.
 const RUNBOOK: &str = "docs/RUNBOOK-atpkg-republish.md";
@@ -31,7 +31,7 @@ const NEEDS_CONFIG: &str = "needs valid configured identity routing";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCheck {
     /// `config`, `staging_writer`, `public_writer`, `grants`, `drafts` or `trust_origin`; for
-    /// the tip lane also `program_grants`.
+    /// the tip lane also `program_grants` and `armed`.
     pub name: &'static str,
     /// Whether it holds.
     pub ok: bool,
@@ -116,6 +116,78 @@ pub fn check_tip(ctx: &Ctx, dirs: &agh::config::Dirs, choice: HostChoice) -> Vec
         },
     ));
     checks
+}
+
+/// The `armed` row of `--lane tip`: it holds only when launchd lists both of the tip lane's
+/// jobs ([`units::TIP_LABEL`], [`units::TIP_READY_LABEL`]). A lane installed and not loaded
+/// fails it, naming when its units were rendered and who stopped its jobs where aterm did
+/// ([`install::tip_stopped`]), else that they were removed outside aterm. `loaded` reads
+/// launchd ([`install::launchd_loaded`]).
+pub(crate) fn armed_check(
+    ctx: &Ctx,
+    loaded: &mut dyn FnMut(&str) -> std::result::Result<bool, String>,
+) -> HostCheck {
+    const NEXT: &str = "next: atpkg-publish lane install tip --staged-only";
+    let mut missing = Vec::new();
+    for label in [units::TIP_LABEL, units::TIP_READY_LABEL] {
+        match loaded(label) {
+            Ok(true) => {}
+            Ok(false) => missing.push(label),
+            Err(why) => {
+                return HostCheck::new(
+                    "armed",
+                    false,
+                    format!("cannot read whether launchd lists {label}: {why}"),
+                );
+            }
+        }
+    }
+    if missing.is_empty() {
+        return HostCheck::new(
+            "armed",
+            true,
+            format!(
+                "launchd lists {} and {}",
+                units::TIP_LABEL,
+                units::TIP_READY_LABEL
+            ),
+        );
+    }
+    let unit = ctx
+        .state_dir
+        .join("units")
+        .join(format!("{}.plist", units::TIP_LABEL));
+    let rendered = std::fs::metadata(&unit)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let mut detail = format!("launchd lists no {}", missing.join(" and no "));
+    match rendered {
+        None => detail.push_str(&format!(
+            "; no tip lane is installed here (no {})",
+            ctx.shown(&unit)
+        )),
+        Some(at) => {
+            detail.push_str(&format!(
+                ", though the lane's units were rendered {} ({})",
+                aterm_types::rfc3339::format_rfc3339(at.as_secs()),
+                ctx.shown(&unit)
+            ));
+            detail.push_str(&match install::tip_stopped(&ctx.state_dir) {
+                Some(stopped) => format!(
+                    "; aterm stopped its jobs {} with `atpkg-publish {}`, run by {}",
+                    aterm_types::rfc3339::format_rfc3339(
+                        u64::try_from(stopped.unix).unwrap_or_default()
+                    ),
+                    stopped.verb,
+                    stopped.caller
+                ),
+                None => "; aterm recorded no stop of its jobs: they were removed outside aterm"
+                    .to_string(),
+            });
+        }
+    }
+    HostCheck::new("armed", false, format!("{detail} — {NEXT}"))
 }
 
 fn granted(client: &agh::Github, slug: &str) -> bool {
@@ -469,7 +541,7 @@ pub(crate) fn render(choice: HostChoice, checks: &[HostCheck]) -> String {
 }
 
 /// The CLI verb: `atpkg-publish hosts check [--host agh-staging|agh] [--unit-env] [--keyless]
-/// [--lane alab|linux]`. Linux scope authenticates the fresh signed channel; without a lane,
+/// [--lane alab|linux|tip]`. Tip scope adds the `armed` row ([`armed_check`]). Linux scope authenticates the fresh signed channel; without a lane,
 /// this is the local check of the alab lane's repositories ([`alab_program_repos`]).
 /// It prints one JSON object, `{"checks":[…],"host":"…","ok":…}`, and exits 0 when every
 /// check holds, else 1 (Refused). `--keyless` judges a staging-only lane only on a builder
@@ -501,7 +573,9 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let checks = if lane == Some(LaneKind::Linux) {
         check_linux(ctx, &dirs, choice, stages_only(ctx, keyless))?
     } else if lane == Some(LaneKind::Tip) {
-        check_tip(ctx, &dirs, choice)
+        let mut checks = check_tip(ctx, &dirs, choice);
+        checks.push(armed_check(ctx, &mut install::launchd_loaded));
+        checks
     } else {
         check(
             ctx,
@@ -571,7 +645,7 @@ fn parse(args: &[String]) -> Result<CheckFlags> {
                 None => {
                     return Err(Error::usage(format!(
                         "hosts check does not take `{other}` (--host agh-staging|agh, \
-                         --unit-env, --keyless, --lane alab|linux)"
+                         --unit-env, --keyless, --lane alab|linux|tip)"
                     )));
                 }
             },

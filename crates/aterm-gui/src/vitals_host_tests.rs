@@ -1675,7 +1675,12 @@ fn a_busy_reader_keeps_its_pending_messages_and_forgoes_newer_work() {
     };
     let pid_of = |m: Msg| match m {
         Msg::Read(r) | Msg::Facts(r) => r.self_pid,
-        Msg::Pull | Msg::AssessmentReady | Msg::CpuPolicy(_) | Msg::Name(_) | Msg::Told(_) => 0,
+        Msg::Pull
+        | Msg::AssessmentReady
+        | Msg::BootReady
+        | Msg::CpuPolicy(_)
+        | Msg::Name(_)
+        | Msg::Told(_) => 0,
     };
     assert!(host.offer(request(1)));
     assert!(
@@ -1842,6 +1847,10 @@ fn readings_land_mid_slot_on_the_wall_clock() {
 /// The window's cadence keeps to the wall clock it reads ([`Wall`]): a shown deck's first reading
 /// is asked at once, the next is due at the following half-slot, and one asked late keeps to the
 /// half-slot after it. CONTROL: with no wall clock read the next is a period after each ask.
+///
+/// Negative control, run once by hand and restored by copy: `serve_vitals` arming the next
+/// reading a period after each ask whatever the wall clock reads (`Some(now + period)` in place
+/// of `Some(due_on_phase(Some(now), None, period, now, wall_ms))`) fails "phased: true".
 #[cfg(unix)]
 #[test]
 fn a_shown_decks_readings_are_asked_on_the_half_slot() {
@@ -4478,12 +4487,23 @@ fn a_resting_focused_window_reads_every_five_seconds_and_a_stir_asks_at_once() {
     assert_eq!(app.vitals_deadline(), Some(stirred + FOCUSED_PERIOD));
 }
 
-/// A woken window asks a reading only where its wake changes the readings' cadence: an unfocused
-/// window that a key or its tab's output wakes asks none, and one that its focus or its tab's
-/// output wakes while focused asks one at once.
+/// A woken window asks a reading only where its wake can give the readings a person's audience,
+/// which needs a focused aterm window: with none, the only window, which a key or its tab's
+/// output wakes, asks none, though it is attended and on screen, and one that its focus wakes,
+/// or that its tab's output wakes while it is focused, asks one at once. Each wake here finds
+/// the window still attended, so the focus's reading is the focus's own, which `App::touch_rest`
+/// asks for the focus whether or not it ends a lapse; `App::stir_rest` asks none for it, with
+/// no window focused before the event. Where another window is focused, the wake of an attended
+/// unfocused window on screen asks one too (`App::stir_rest`), as the touch that ends such a
+/// window's lapse does
+/// (`window_rest::attended_tests::a_touch_beside_a_lapsed_focused_window_keeps_the_focused_cadence`).
+///
+/// Negative control, run once by hand and restored by copy: `App::touch_rest` asking only where
+/// the touch ended a lapse (`if lapsed && …` in place of `if (lapsed || focusing) && …`) fails
+/// "the focus that wakes it asks a reading at once".
 #[cfg(unix)]
 #[test]
-fn only_a_focused_window_that_wakes_asks_a_reading() {
+fn a_wake_asks_a_reading_only_where_a_window_is_or_becomes_focused() {
     static BOARD: JobsBoard = JobsBoard::new();
     let _bars = crate::stats_deck::tests::attach_stats();
     let mut app = crate::App::headless_for_test();
@@ -4496,9 +4516,12 @@ fn only_a_focused_window_that_wakes_asks_a_reading() {
     // Window 0's tab shows session 0.
     let session = 0;
     let mut at = Instant::now() + Duration::from_secs(31);
+    // Each wake below comes 2 s after a rest that finds the window attended, and nothing between
+    // the two settles the attention again, so the window is still attended at its wake.
     let rest = |app: &mut crate::App, at: Instant| {
         app.settle_rest(at);
-        assert!(app.windows[&wid].rest.resting());
+        let rest = app.windows[&wid].rest;
+        assert!(rest.resting() && rest.attended(), "resting and attended");
         app.service_vitals(at);
         assert_eq!(app.vitals_deadline(), Some(at + BACKGROUND_PERIOD));
     };
@@ -4515,6 +4538,18 @@ fn only_a_focused_window_that_wakes_asks_a_reading() {
     at += Duration::from_secs(31);
     rest(&mut app, at);
     at += Duration::from_secs(2);
+    app.note_rest_event(wid, &aterm_window::event::WindowEvent::Focused(true), at);
+    assert!(!app.windows[&wid].rest.resting(), "its focus wakes it");
+    assert_eq!(
+        app.vitals_deadline(),
+        Some(at),
+        "the focus that wakes it asks a reading at once"
+    );
+
+    // The test stores no focus: the window is unfocused again, as after the focus left it.
+    at += Duration::from_secs(31);
+    rest(&mut app, at);
+    at += Duration::from_secs(2);
     assert!(app.admit_output_redraws(session, at));
     assert!(
         !app.windows[&wid].rest.resting(),
@@ -4526,18 +4561,9 @@ fn only_a_focused_window_that_wakes_asks_a_reading() {
         "an unfocused window's output wake asks no reading"
     );
 
-    at += Duration::from_secs(31);
-    rest(&mut app, at);
-    at += Duration::from_secs(2);
-    app.note_rest_event(wid, &aterm_window::event::WindowEvent::Focused(true), at);
-    assert!(!app.windows[&wid].rest.resting(), "its focus wakes it");
-    assert_eq!(
-        app.vitals_deadline(),
-        Some(at),
-        "the focus that wakes it asks a reading at once"
-    );
-
+    // Focused now, it takes a key, which attends it again (output attends nothing).
     app.windows.get_mut(&wid).expect("the window").focused = true;
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), at);
     at += Duration::from_secs(31);
     rest(&mut app, at);
     at += Duration::from_secs(2);

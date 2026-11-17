@@ -191,27 +191,54 @@ impl Dir {
     }
 }
 
+/// Read a bounded record from its own regular file, never from a final-component link.
+fn read_record_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let max = crate::land_record::MAX_BYTES;
+    let too_large = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file exceeds {max} bytes"),
+        )
+    };
+    let (file, metadata) = aterm_uds::regular_file::open(path)?;
+    if metadata.len() > max {
+        return Err(too_large());
+    }
+    let capacity = usize::try_from(metadata.len().saturating_add(1)).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 impl Spool for Dir {
     fn put(&self, record: &Signed) -> Result<(), String> {
         let (day, _, fail) = kept_as(&record.path, 0)?;
         let file = self.dir.join(file_of(&record.path)?);
         let _lock = self.lock()?;
         self.expire(day);
-        let kept = if fail && file.exists() {
-            // Preserve the first FAIL's exact bytes, but do not treat an unreadable or merely
-            // present entry as evidence that the spool durably kept this record.
-            let (bytes, _) =
-                aterm_uds::atomic_file::read_regular(&file, crate::land_record::MAX_BYTES)
-                    .map_err(|e| format!("{} was not read: {e}", file.display()))?;
-            crate::land_record::Entry::read(
-                &record.path,
-                &bytes,
-                crate::land_record::Origin::Spool,
-            )
-            .body
-            .map(drop)
-            .map_err(|why| format!("{} does not read: {why}", file.display()))?;
-            Some(bytes)
+        let kept = if fail {
+            // Preserve the first FAIL's exact bytes, but do not treat an unreadable or linked
+            // entry as evidence that the spool durably kept this record.
+            match read_record_file(&file) {
+                Ok(bytes) => {
+                    crate::land_record::Entry::read(
+                        &record.path,
+                        &bytes,
+                        crate::land_record::Origin::Spool,
+                    )
+                    .body
+                    .map(drop)
+                    .map_err(|why| format!("{} does not read: {why}", file.display()))?;
+                    Some(bytes)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("{} was not read: {e}", file.display())),
+            }
         } else {
             None
         };
@@ -265,10 +292,9 @@ impl Spool for Dir {
         }
         found.sort();
         let mut pending = Pending::default();
-        let max = crate::land_record::MAX_BYTES;
         for (file, path) in found {
-            match aterm_uds::atomic_file::read_regular(&file, max) {
-                Ok((bytes, _)) => pending.records.push(Signed { path, bytes }),
+            match read_record_file(&file) {
+                Ok(bytes) => pending.records.push(Signed { path, bytes }),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => pending.unreadable.push((file, e.to_string())),
             }
@@ -277,10 +303,7 @@ impl Spool for Dir {
     }
 
     fn done(&self, record: &Signed) -> Result<(), String> {
-        self.done_with(record, |path| {
-            aterm_uds::atomic_file::read_regular(path, crate::land_record::MAX_BYTES)
-                .map(|(bytes, _)| bytes)
-        })
+        self.done_with(record, read_record_file)
     }
 }
 

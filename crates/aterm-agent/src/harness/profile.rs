@@ -3,6 +3,7 @@
 
 //! Claude Code's profile, read by an allowlist.
 
+use std::borrow::Borrow;
 use std::fmt;
 use std::io::Read as _;
 use std::marker::PhantomData;
@@ -525,7 +526,7 @@ impl Selection {
         let mut selected = None;
         for (_, value) in env
             .into_iter()
-            .filter(|(name, _)| *name == "CLAUDE_CODE_CUSTOM_OAUTH_URL")
+            .filter(|(name, _)| *name == CUSTOM_OAUTH_ENV)
         {
             let custom = !value.is_empty();
             if selected.is_some_and(|old| old != custom) {
@@ -574,6 +575,86 @@ fn exec_var<'a>(env: &'a [String], name: &str) -> Option<Option<&'a str>> {
         found = Some(value);
     }
     Some(found)
+}
+
+/// The variable whose non-empty value has Claude Code read its custom-OAuth profile
+/// ([`Selection::CustomOauth`]).
+pub const CUSTOM_OAUTH_ENV: &str = "CLAUDE_CODE_CUSTOM_OAUTH_URL";
+
+/// What a Claude Code process's exec environment says to this module's readers of one
+/// ([`subscription_and_plan_with`], and `login_profile_of`, by which
+/// [`super::observe::claude_with`] finds a stored login's profile), kept for a reader that holds
+/// a process's image for the image's life and asks the kernel for its environment once (the
+/// footer's resolver): the entries those readers read, and no other, so no credential.
+///
+/// Only an environment on a stored login is kept ([`super::accounts::AuthRoute::Stored`], as
+/// [`super::accounts::ProcessLogin::of_exec_env`] judges it), and of it only its login and home
+/// selectors ([`super::accounts::LOGIN_ENV`], [`super::accounts::HOME_ENV`],
+/// [`super::accounts::HOMEDIR_ENV`]) and its profile's ([`CUSTOM_OAUTH_ENV`]): once its route is
+/// known to be a stored login's, no other variable moves either reader's answer. Of an unread
+/// environment, or one on any other route, nothing is kept: `claude_with` reads no environment
+/// off a stored login (its caller gives it the route), and `subscription_and_plan_with` answers
+/// `None` to such an environment as it does to an empty one. Where a stored login's environment
+/// names none of those variables, one entry that names no variable (`=`), which every reader
+/// passes over, stands for the rest, since an empty one reads as unread. So each reader answers
+/// [`Self::entries`] as it answers the whole environment
+/// (`profile_tests::a_kept_profile_env_reads_as_the_whole_one`).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProfileEnv(Vec<String>);
+
+impl ProfileEnv {
+    /// What `env`, a process's kernel exec environment (`KEY=value` entries), keeps.
+    #[must_use]
+    pub fn of_exec_env(env: &[String]) -> Self {
+        let stored = super::accounts::ProcessLogin::of_exec_env(env)
+            .is_some_and(|who| who.route.is_stored());
+        if !stored {
+            return Self::default();
+        }
+        let mut kept: Vec<String> = env
+            .iter()
+            .filter(|entry| {
+                entry
+                    .split_once('=')
+                    .is_some_and(|(name, _)| Self::reads(name))
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            kept.push("=".to_owned());
+        }
+        Self(kept)
+    }
+
+    /// Its `KEY=value` entries, in the process's order: what the readers take as `env`.
+    #[must_use]
+    pub fn entries(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether the readers read variable `name` of a stored login's environment.
+    fn reads(name: &str) -> bool {
+        [
+            super::accounts::LOGIN_ENV,
+            super::accounts::HOME_ENV,
+            super::accounts::HOMEDIR_ENV,
+            CUSTOM_OAUTH_ENV,
+        ]
+        .contains(&name)
+    }
+}
+
+/// Names only, so no value reaches a log line.
+impl fmt::Debug for ProfileEnv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(
+                self.0
+                    .iter()
+                    .filter_map(|entry| entry.split_once('=').map(|(name, _)| name)),
+            )
+            .finish()
+    }
 }
 
 impl Context {
@@ -665,7 +746,7 @@ pub(super) fn effective_of(env: &[String], user_home: &Path) -> Option<PathBuf> 
     Some(effective(
         &plain,
         Some(records.dir()?),
-        custom_oauth(var("CLAUDE_CODE_CUSTOM_OAUTH_URL").map(std::ffi::OsStr::new)),
+        custom_oauth(var(CUSTOM_OAUTH_ENV).map(std::ffi::OsStr::new)),
     ))
 }
 
@@ -761,8 +842,7 @@ fn identity_evidence_at(
         return Ok(IdentityEvidence::Missing);
     }
     read_with(&selected, |bytes| {
-        let Obj(raw) =
-            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let Obj(raw) = decode::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
         let raw = raw.ok_or(NoProfile::Unreadable)?;
         let email_digest = raw
             .oauth
@@ -883,8 +963,7 @@ fn answers_to_path(path: &Path, email: &str) -> Option<bool> {
 }
 
 fn answers_from_bytes(bytes: &[u8], email: &str) -> Result<Option<bool>, NoProfile> {
-    let Obj(raw) =
-        aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let Obj(raw) = decode::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
     let Some(Address(Some(address))) = raw.and_then(|who| who.oauth.0).map(|o| o.address) else {
         return Ok(None);
     };
@@ -901,8 +980,7 @@ fn answers_from_bytes(bytes: &[u8], email: &str) -> Result<Option<bool>, NoProfi
 pub fn account_of(env: &[String], user_home: &Path) -> Option<AccountKey> {
     let path = effective_of(env, user_home)?;
     read_with(&path, |bytes| {
-        let Obj(raw) =
-            aterm_json::from_slice::<Obj<RawKey>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+        let Obj(raw) = decode::<Obj<RawKey>>(bytes).map_err(|_| NoProfile::Unreadable)?;
         Ok(raw
             .and_then(|file| file.oauth.0)
             .and_then(|oauth| oauth.key.0))
@@ -930,43 +1008,34 @@ pub struct LoginRecord {
 /// `user_home`), where it names an account by its address.
 #[must_use]
 pub fn login_record(user_home: &Path, login: Option<&str>) -> Option<LoginRecord> {
+    record_at(&login_record_path(user_home, login)?)
+        .ok()
+        .flatten()
+}
+
+/// The profile [`login_record`] reads for the login `login` names: a row's absolute `dir`'s own,
+/// or for the machine's default login the one Claude Code reads under `user_home`
+/// ([`login_profile_of`] of no environment). `None` for a relative `dir`, which names none.
+#[must_use]
+pub fn login_record_path(user_home: &Path, login: Option<&str>) -> Option<PathBuf> {
     match login.filter(|login| !login.is_empty()) {
         Some(login) => {
             let home = Path::new(login);
-            if !home.is_absolute() {
-                return None;
-            }
-            record_at(&profile_in_home(home)).ok().flatten()
+            home.is_absolute().then(|| profile_in_home(home))
         }
-        None => login_record_of(&[], user_home).map(|(record, _, _)| record),
+        None => login_profile_of(&[], user_home),
     }
 }
 
-/// The login record of the profile that names the login a process's exec environment `env`
-/// runs on, with that file's path and its modification time: what a tab's CLI really runs on
-/// (`docs/DESIGN-account-discovery-2026-11-09.md`), read afresh each call. Under a login
-/// directory ([`super::accounts::LOGIN_ENV`]) it is that directory's profile, as
-/// [`login_record`] reads it; otherwise the one Claude Code reads for the home `env` names
-/// ([`effective_of`]: `CLAUDE_CONFIG_DIR`, `HOME`, the legacy `.config.json`, the custom-OAuth
-/// file). `None` where the file is absent or names no account by its address.
-#[must_use]
-pub fn login_record_of(
-    env: &[String],
-    user_home: &Path,
-) -> Option<(LoginRecord, PathBuf, std::time::SystemTime)> {
-    let path = login_profile_of(env, user_home)?;
-    let record = record_at(&path).ok()??;
-    let mtime = std::fs::metadata(&path)
-        .and_then(|meta| meta.modified())
-        .ok()?;
-    Some((record, path, mtime))
-}
-
-/// The profile naming the login `env` runs on ([`login_record_of`]): a login directory's own, an
-/// empty login directory being none, else the home's. An empty `env` names no login directory
-/// and no home variable, so it is the default home's profile ([`login_record`]'s default login,
-/// a process whose environment carries none of the selectors); only a login directory `env`
-/// names twice with two values names no profile.
+/// The profile naming the login a process's exec environment `env` runs on: what a tab's CLI
+/// really runs on (`docs/DESIGN-account-discovery-2026-11-09.md`, [`super::observe::claude`]).
+/// Under a login directory ([`super::accounts::LOGIN_ENV`]) it is that directory's own, as
+/// [`login_record`] reads it, an empty login directory being none; otherwise the one Claude Code
+/// reads for the home `env` names ([`effective_of`]: `CLAUDE_CONFIG_DIR`, `HOME`, the legacy
+/// `.config.json`, the custom-OAuth file). An empty `env` names no login directory and no home
+/// variable, so it is the default home's profile ([`login_record`]'s default login, a process
+/// whose environment carries none of the selectors); only a login directory `env` names twice
+/// with two values names no profile. It looks at the legacy file's metadata and reads none.
 pub(super) fn login_profile_of(env: &[String], user_home: &Path) -> Option<PathBuf> {
     let login = if env.is_empty() {
         None
@@ -983,26 +1052,82 @@ pub(super) fn login_profile_of(env: &[String], user_home: &Path) -> Option<PathB
 }
 
 /// The login record the profile at `path` holds: `Ok(None)` for a file that names no account.
-pub(super) fn record_at(path: &Path) -> Result<Option<LoginRecord>, NoProfile> {
-    read_with(path, |bytes| {
-        let Obj(who) =
-            aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
-        let Some(Address(Some(email))) = who.and_then(|who| who.oauth.0).map(|o| o.address) else {
-            return Ok(None);
-        };
-        let oauth = aterm_json::from_slice::<Obj<RawKey>>(bytes)
-            .ok()
-            .and_then(|Obj(raw)| raw)
-            .and_then(|file| file.oauth.0);
-        let (key, plan) = oauth.map_or((None, None), |oauth| {
-            let plan = oauth
-                .organization_type
-                .word()
-                .map(|w| PlanWord::of(w.as_str()));
-            (oauth.key.0, plan)
-        });
-        Ok(Some(LoginRecord { email, key, plan }))
-    })
+fn record_at(path: &Path) -> Result<Option<LoginRecord>, NoProfile> {
+    read_with(path, |bytes| Ok(decode_facts(bytes)?.record()))
+}
+
+/// What one decode of a Claude Code profile's bytes says ([`read_facts`]): the account's
+/// address as `oauthAccount.emailAddress` names it, and the profile [`parse`] reads. A login
+/// record ([`Self::record`]) and a process's selected profile (`subscription_and_plan_with`)
+/// are both of it, so a reader that holds one read while the file's stamp stands (the footer's
+/// resolver) decodes the file once a change, whatever it shows of it. It holds no credential;
+/// the address is zeroed when it is dropped, as every address this module reads is.
+#[derive(Clone, PartialEq)]
+pub struct ProfileFacts {
+    address: Option<String>,
+    profile: Profile,
+}
+
+impl ProfileFacts {
+    /// The login record these facts name: `None` where the file names no address. Its plan is
+    /// the profile's plan word (`oauthAccount.organizationType`, [`Plan::word`]).
+    #[must_use]
+    pub fn record(&self) -> Option<LoginRecord> {
+        Some(LoginRecord {
+            email: self.address.clone()?,
+            key: self.profile.key,
+            plan: self.profile.plan.word,
+        })
+    }
+
+    /// The profile ([`parse`]).
+    #[must_use]
+    pub const fn profile(&self) -> &Profile {
+        &self.profile
+    }
+}
+
+impl Drop for ProfileFacts {
+    fn drop(&mut self) {
+        if let Some(address) = self.address.take() {
+            wipe(&mut address.into_bytes());
+        }
+    }
+}
+
+impl std::fmt::Debug for ProfileFacts {
+    /// The profile, and whether an address was read: never the address.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileFacts")
+            .field("address", &self.address.as_ref().map(|_| "…"))
+            .field("profile", &self.profile)
+            .finish()
+    }
+}
+
+/// One read of a profile file ([`read_facts`]): what its one decode says, or why nothing was
+/// read, and what a look at the path just after the read found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProfileRead {
+    /// [`ProfileFacts`], or why none were read ([`read_with`]'s refusals and [`parse`]'s).
+    pub facts: Result<ProfileFacts, NoProfile>,
+    /// The file's modification time, where the look found it.
+    pub modified: Option<std::time::SystemTime>,
+    /// The path names a regular file (`Path::is_file`).
+    pub is_file: bool,
+}
+
+/// [`ProfileRead`] of the file at `path`: its bytes read once and decoded once, then zeroed, and
+/// the path looked at once.
+#[must_use]
+pub fn read_facts(path: &Path) -> ProfileRead {
+    let facts = read_with(path, decode_facts);
+    let meta = std::fs::metadata(path).ok();
+    ProfileRead {
+        facts,
+        modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
+        is_file: meta.is_some_and(|meta| meta.is_file()),
+    }
 }
 
 /// The provider key in an attributed login's retained profile, if its address matches.
@@ -1026,7 +1151,7 @@ pub fn account_for_login(
         }
         None => effective_of(env, user_home)?,
     };
-    let selected = read_with(&path, parse_selected).ok()?;
+    let selected = Selected::of(read_facts(&path).facts.as_ref().ok()?);
     selected
         .email
         .as_deref()
@@ -1044,8 +1169,7 @@ pub fn principal_at(path: &Path) -> Option<[u8; 32]> {
 }
 
 fn principal_from_bytes(bytes: &[u8]) -> Result<Option<[u8; 32]>, NoProfile> {
-    let Obj(raw) =
-        aterm_json::from_slice::<Obj<RawPrincipal>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let Obj(raw) = decode::<Obj<RawPrincipal>>(bytes).map_err(|_| NoProfile::Unreadable)?;
     let Some(Address(Some(id))) = raw.and_then(|file| file.oauth.0).map(|oauth| oauth.id) else {
         return Ok(None);
     };
@@ -1097,6 +1221,18 @@ pub fn usage_read_age(at: i64, now: i64) -> Option<i64> {
         return None;
     }
     now.checked_sub(at).filter(|age| *age >= -USAGE_SKEW_S)
+}
+
+/// The wall seconds at which the one age rule judges a reading taken at `at` otherwise
+/// ([`usage_read_age`], [`WeeklyFigure::words`]): it comes within the skew (`at − 60`), it is no
+/// longer current (`at + 901`), and it is no longer shown (`at + 3601`).
+#[must_use]
+pub fn reading_terms(at: i64) -> [i64; 3] {
+    [
+        at.saturating_sub(USAGE_SKEW_S),
+        at.saturating_add(USAGE_CURRENT_S + 1),
+        at.saturating_add(USAGE_SHOWN_S + 1),
+    ]
 }
 
 /// The weekly words of a standing 7-day wall: `out`, never an inferred percentage
@@ -1206,6 +1342,19 @@ impl WeeklyFigure {
     #[must_use]
     pub fn current(&self, now: i64) -> bool {
         self.words(now).is_some() && now.saturating_sub(self.at) <= USAGE_CURRENT_S
+    }
+
+    /// The earliest wall second after `now` at which [`Self::words`] (and [`Self::current`]) can
+    /// say otherwise, with nothing read since: where a figure stamped ahead comes within
+    /// [`USAGE_SKEW_S`] (`at − 60`), where the exact figure turns a bound (`at + 901`), where the
+    /// bound goes (`at + 3601`), and its reset. `None` once none is ahead.
+    #[must_use]
+    pub fn changes_after(&self, now: i64) -> Option<i64> {
+        reading_terms(self.at)
+            .into_iter()
+            .chain([self.resets_at])
+            .filter(|t| *t > now)
+            .min()
     }
 
     /// The newer of `a` and `b` by [`Self::at`] (`a` on a tie).
@@ -1377,7 +1526,8 @@ pub fn subscription_for(
     roster: Option<&super::accounts::Roster>,
     now: i64,
 ) -> Option<SubscriptionDisplay> {
-    selected_profile(env, user_home, records, roster).map(|selected| selected.subscription(now))
+    selected_profile(env, user_home, records, roster, read_facts)
+        .map(|selected| selected.subscription(now))
 }
 
 /// The plan usage of this process's selected profile at `now`, for the tab's `model`.
@@ -1390,7 +1540,7 @@ pub fn plan_usage_for(
     now: i64,
     model: Option<&str>,
 ) -> Option<PlanUsage> {
-    selected_profile(env, user_home, records, roster)?.plan_usage(now, model)
+    selected_profile(env, user_home, records, roster, read_facts)?.plan_usage(now, model)
 }
 
 /// [`subscription_for`] and [`plan_usage_for`] from one read of the selected profile.
@@ -1403,9 +1553,28 @@ pub fn subscription_and_plan_for(
     now: i64,
     model: Option<&str>,
 ) -> Option<(SubscriptionDisplay, Option<PlanUsage>)> {
-    let selected = selected_profile(env, user_home, records, roster)?;
+    subscription_and_plan_with(env, user_home, records, roster, (now, model), read_facts)
+        .map(|(shown, plan, _)| (shown, plan))
+}
+
+/// [`subscription_and_plan_for`] at wall second `now` for the tab's `model`, of what `read`
+/// gives of the selected profile's file: [`read_facts`] of it, or a read a caller holds while
+/// the file's stamp stands (the footer's resolver, which decodes each profile once a change).
+/// The third part is the earliest wall second after `now` at which the same read says otherwise
+/// (`Selected::changes_after`): its reading's age limits and each of its windows' resets.
+#[must_use]
+pub fn subscription_and_plan_with<R: Borrow<ProfileRead>>(
+    env: &[String],
+    user_home: &Path,
+    records: &Path,
+    roster: Option<&super::accounts::Roster>,
+    (now, model): (i64, Option<&str>),
+    read: impl FnOnce(&Path) -> R,
+) -> Option<(SubscriptionDisplay, Option<PlanUsage>, Option<i64>)> {
+    let selected = selected_profile(env, user_home, records, roster, read)?;
     let plan = selected.plan_usage(now, model);
-    Some((selected.subscription(now), plan))
+    let changes = selected.changes_after(now);
+    Some((selected.subscription(now), plan, changes))
 }
 
 pub(crate) struct FooterUse<'a> {
@@ -3291,12 +3460,14 @@ impl Drop for Selected {
     }
 }
 
-/// The one selection behind [`subscription_for`] and [`plan_usage_for`].
-fn selected_profile(
+/// The one selection behind [`subscription_for`] and [`plan_usage_for`], of the profile file
+/// `read` gives what was read of.
+fn selected_profile<R: Borrow<ProfileRead>>(
     env: &[String],
     user_home: &Path,
     records: &Path,
     roster: Option<&super::accounts::Roster>,
+    read: impl FnOnce(&Path) -> R,
 ) -> Option<Selected> {
     let who = super::accounts::ProcessLogin::of_exec_env(env)?;
     // A profile read leaves a token route out: its profile may be stale (§5.7).
@@ -3309,7 +3480,7 @@ fn selected_profile(
         Some(&context.records),
         context.selection == Selection::CustomOauth,
     );
-    let read = read_with(&file, parse_selected).ok()?;
+    let read = Selected::of(read(&file).borrow().facts.as_ref().ok()?);
     let selected = (who.default_home || who.login.is_some())
         .then(|| {
             roster.and_then(|listed| {
@@ -3341,31 +3512,13 @@ fn selected_profile(
     Some(read)
 }
 
-/// The profile ([`parse`]) and its address, from one file's bytes.
-fn parse_selected(bytes: &[u8]) -> Result<Selected, NoProfile> {
-    let profile = parse(bytes)?;
-    let Obj(raw) =
-        aterm_json::from_slice::<Obj<RawWho>>(bytes).map_err(|_| NoProfile::Unreadable)?;
-    let email = raw
-        .and_then(|who| who.oauth.0)
-        .and_then(|oauth| oauth.address.0)
-        .and_then(|email| {
-            if super::accounts::email_refusal(&email).is_none() {
-                return Some(email);
-            }
-            wipe(&mut email.into_bytes());
-            None
-        });
-    Ok(Selected { profile, email })
-}
-
 /// Match one roster row to the address and provider key captured from one profile read.
 /// This is retained local identity, not authentication or permission to dispatch credentials.
 pub(super) fn matching_row_key_in_home<'a>(
     home: &Path,
     rows: &'a [super::accounts::Row],
 ) -> Option<(&'a super::accounts::Row, AccountKey)> {
-    let selected = read_with(&profile_in_home(home), parse_selected).ok()?;
+    let selected = Selected::of(read_facts(&profile_in_home(home)).facts.as_ref().ok()?);
     let key = selected.profile.key?;
     let email = selected.email.as_deref()?;
     let mut matching = rows.iter().filter(|row| {
@@ -3377,6 +3530,19 @@ pub(super) fn matching_row_key_in_home<'a>(
 }
 
 impl Selected {
+    /// The selection of the profile `facts` says: its profile, and its address where it reads
+    /// as one ([`super::accounts::email_refusal`]).
+    fn of(facts: &ProfileFacts) -> Selected {
+        Selected {
+            profile: facts.profile.clone(),
+            email: facts
+                .address
+                .as_deref()
+                .filter(|email| super::accounts::email_refusal(email).is_none())
+                .map(str::to_owned),
+        }
+    }
+
     fn subscription(mut self, now: i64) -> SubscriptionDisplay {
         let figure = self
             .profile
@@ -3412,6 +3578,23 @@ impl Selected {
                 .and_then(|usage| cached_figure(usage, Bucket::FiveHour, now)),
             credits: self.profile.credits.state(),
         }
+    }
+
+    /// The earliest wall second after `now` at which [`Self::subscription`] or
+    /// [`Self::plan_usage`] of this read can say otherwise: where its cached `/usage` reading,
+    /// fetched at `fetched`, comes within the skew, turns current (`fetched`, [`current_windows`]),
+    /// stops being current and stops being shown ([`reading_terms`]), and where each of its
+    /// windows resets ([`cached_figure`]). The plan's title, the credits and the address hold no
+    /// time. `None` once none is ahead.
+    fn changes_after(&self, now: i64) -> Option<i64> {
+        let usage = self.profile.usage.as_ref()?;
+        let fetched = usage.fetched_at_ms.checked_div(1000);
+        fetched
+            .into_iter()
+            .flat_map(|at| reading_terms(at).into_iter().chain([at]))
+            .chain(usage.windows.iter().filter_map(|row| row.resets_at))
+            .filter(|t| *t > now)
+            .min()
     }
 
     /// The window that binds `model` at `now` ([`plan_usage_for`]).
@@ -3485,7 +3668,9 @@ fn cached_figure(usage: &UsageCache, bucket: Bucket, now: i64) -> Option<WeeklyF
     })
 }
 
-fn model_bucket(model: &str) -> Option<Bucket> {
+/// The weekly bucket a model id's family draws on beside the week of all models: Opus's,
+/// Sonnet's or Fable's, and none for any other id.
+pub(crate) fn model_bucket(model: &str) -> Option<Bucket> {
     let short = super::usage::model_short(model);
     let family: String = short
         .chars()
@@ -3548,6 +3733,15 @@ pub(super) fn read_with<T>(
     answer
 }
 
+/// One decode of a Claude Code profile's bytes as the fields `T` names: each decode this module
+/// makes of a profile's bytes (`oauthAccount`'s address, key, principal or plan) is this one, so
+/// a build with debug assertions counts them ([`super::test_counters::take_profile_decodes`]).
+fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> aterm_json::Result<T> {
+    #[cfg(any(test, debug_assertions))]
+    super::test_counters::count_profile_decode();
+    aterm_json::from_slice(bytes)
+}
+
 fn wipe(buf: &mut [u8]) {
     buf.fill(0);
     std::hint::black_box(&*buf);
@@ -3569,14 +3763,32 @@ fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
 /// # Errors
 /// [`NoProfile::Unreadable`] for bytes that are not one JSON object.
 pub fn parse(bytes: &[u8]) -> Result<Profile, NoProfile> {
-    let Obj(raw) =
-        aterm_json::from_slice::<Obj<RawFile>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let Obj(raw) = decode::<Obj<RawFile>>(bytes).map_err(|_| NoProfile::Unreadable)?;
     let raw = raw.ok_or(NoProfile::Unreadable)?;
     Ok(profile_of(raw))
 }
 
+/// [`ProfileFacts`] from a profile's bytes: one decode, of [`parse`]'s fields and the address.
+fn decode_facts(bytes: &[u8]) -> Result<ProfileFacts, NoProfile> {
+    let Obj(raw) = decode::<Obj<RawFile>>(bytes).map_err(|_| NoProfile::Unreadable)?;
+    let mut raw = raw.ok_or(NoProfile::Unreadable)?;
+    let address = raw
+        .oauth
+        .0
+        .as_mut()
+        .and_then(|oauth| oauth.address.0.take());
+    Ok(ProfileFacts {
+        address,
+        profile: profile_of(raw),
+    })
+}
+
 fn profile_of(raw: RawFile) -> Profile {
-    let oauth = raw.oauth.0.unwrap_or_default();
+    let mut oauth = raw.oauth.0.unwrap_or_default();
+    // A profile keeps no address: one [`decode_facts`] did not take is zeroed here.
+    if let Some(address) = oauth.address.0.take() {
+        wipe(&mut address.into_bytes());
+    }
     let key = oauth.key.0;
     let plan = Plan {
         word: oauth
@@ -3840,6 +4052,9 @@ struct RawFile {
 struct RawOauth {
     #[serde(rename = "accountUuid")]
     key: Hashed,
+    /// The account's address ([`ProfileFacts`]): [`parse`] keeps none of it.
+    #[serde(rename = "emailAddress")]
+    address: Address,
     #[serde(rename = "organizationType")]
     organization_type: Leaf,
     #[serde(rename = "userRateLimitTier")]
@@ -4037,8 +4252,6 @@ struct RawKey {
 struct RawKeyOauth {
     #[serde(rename = "accountUuid")]
     key: Hashed,
-    #[serde(rename = "organizationType")]
-    organization_type: Leaf,
 }
 
 #[derive(Default, Deserialize)]

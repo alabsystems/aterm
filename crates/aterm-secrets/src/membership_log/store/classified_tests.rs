@@ -252,11 +252,17 @@ fn a_last_record_cut_short_reads_as_the_records_before_it() {
         ids(decode_records_before_cut(&whole[..=two]).expect("the records before the cut"));
     assert_eq!(before, [*c.genesis.id(), *c.first_by_m1.id()]);
     for cut in two + 1..whole.len() {
-        assert!(Record::is_cut_frame(&whole[two..cut]), "cut at {cut}");
+        assert!(
+            Record::is_cut_frame(&whole[two..cut], Reading::ONE),
+            "cut at {cut}"
+        );
         assert!(decode_records(&whole[..cut]).is_err(), "strict at {cut}");
     }
-    assert!(!Record::is_cut_frame(&whole[two..]), "a whole frame");
-    assert!(!Record::is_cut_frame(&[]), "no bytes");
+    assert!(
+        !Record::is_cut_frame(&whole[two..], Reading::ONE),
+        "a whole frame"
+    );
+    assert!(!Record::is_cut_frame(&[], Reading::ONE), "no bytes");
     let cut_body = &whole[..whole.len() - 1];
     assert_eq!(ids(decode_records_before_cut(cut_body).unwrap()), before);
 

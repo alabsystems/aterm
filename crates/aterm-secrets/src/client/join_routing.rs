@@ -183,6 +183,6 @@ fn verified(config: &Config, pin: &[u8; 32], answer: transport::Answer) -> crate
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "join_routing_tests.rs"]
 mod tests;

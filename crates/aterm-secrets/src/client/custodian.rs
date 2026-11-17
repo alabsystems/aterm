@@ -22,6 +22,7 @@ pub const MAX_HOST_AUDIENCES: usize = 62;
 ///
 /// # Errors
 /// The bytes do not have the consumer's `use=aterm`, Apple id, team id and password shape.
+#[cfg(unix)]
 pub fn validate_notary_contribution(bytes: &[u8]) -> crate::Result<()> {
     super::release::parse_notary(bytes).map(|_| ())
 }

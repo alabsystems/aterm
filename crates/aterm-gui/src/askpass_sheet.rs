@@ -4,7 +4,7 @@
 //! macOS `sudo` askpass password sheet attached to the asking session's active window.
 
 use std::sync::mpsc::Sender;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aterm_objc::{CGPoint, CGRect, CGSize, Id, Obj, RcBlock, Sel, class, sel};
 
@@ -249,7 +249,7 @@ impl App {
         let now = Instant::now();
         if let Some(rem) = self.askpass_backoff.quiet_for(wid.0, now) {
             let _ = reply.send(AskpassAnswer::Refused(format!(
-                "a recent cancel; retry in {}s",
+                "a recent prompt was cancelled or left unanswered; retry in {}s",
                 rem.as_secs() + 1
             )));
             return;
@@ -512,7 +512,8 @@ impl App {
             }
             if secret.is_empty() {
                 let _ = sheet.reply.send(AskpassAnswer::Cancel);
-                self.askpass_backoff.on_cancel(sheet.window.0, now);
+                self.askpass_backoff
+                    .on_cancel(sheet.window.0, sheet.raised, now);
             } else {
                 if sheet.owned.as_ref().is_some_and(|op| !op.release_secret()) {
                     sheet.ticket.cancel();
@@ -523,7 +524,8 @@ impl App {
             }
         } else {
             let _ = sheet.reply.send(AskpassAnswer::Cancel);
-            self.askpass_backoff.on_cancel(sheet.window.0, now);
+            self.askpass_backoff
+                .on_cancel(sheet.window.0, sheet.raised, now);
         }
     }
 
@@ -555,13 +557,22 @@ impl App {
         let _ = sheet.reply.send(AskpassAnswer::Refused(format!(
             "nobody answered it within {backstop}s while an update waited; ask again"
         )));
-        self.askpass_backoff.on_cancel(sheet.window.0, now);
+        self.askpass_backoff
+            .on_cancel(sheet.window.0, sheet.raised, now);
         true
     }
 
-    pub(crate) fn withdraw_askpass_sheet(&mut self, id: u64) {
+    /// The waiting lane's word that request `id` ended, posted after every end. A sheet still
+    /// standing then got no answer: its deadline passed, its caller hung up, or its request
+    /// was withdrawn (the `aterm ctl sudo` call ended). It is dropped, and its window waits
+    /// before the next sheet as after a Cancel, or a program that re-asks keeps a sheet
+    /// standing with no gap. A sheet a person already answered or cancelled is gone by now and
+    /// is counted there, once.
+    pub(crate) fn withdraw_askpass_sheet(&mut self, id: u64, now: Instant) {
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.id == id) {
             sheet.ticket.cancel();
+            self.askpass_backoff
+                .on_cancel(sheet.window.0, sheet.raised, now);
         }
     }
 
@@ -572,11 +583,72 @@ impl App {
         }
     }
 
-    pub(crate) fn withdraw_askpass_session(&mut self, session: u64) {
+    /// A session that closes under its sheet withdraws it unanswered, and spaces its window's
+    /// next sheet as [`Self::withdraw_askpass_sheet`] does: a new tab does not escape the
+    /// spacing. A closing window ([`Self::withdraw_askpass_window`]) takes its key with it and
+    /// spaces nothing.
+    pub(crate) fn withdraw_askpass_session(&mut self, session: u64, now: Instant) {
         crate::cpu_policy_authorization::cancel_session(session);
         if let Some(sheet) = self.askpass_sheet.take_if(|sheet| sheet.session == session) {
             sheet.ticket.cancel();
+            self.askpass_backoff
+                .on_cancel(sheet.window.0, sheet.raised, now);
         }
+    }
+
+    /// The sidecar rows that carry the password sheet's spacing to an update's successor: for
+    /// each of the handed sessions `ids`, the longest quiet window still running on a window
+    /// that shows it ([`crate::askpass::Backoff::carried`]). Window ids are a process's own, so
+    /// the spacing crosses by the session.
+    pub(crate) fn askpass_spacing_rows(
+        &self,
+        ids: &[u64],
+        now: Instant,
+    ) -> Vec<(u64, crate::seamless::PersonStamp)> {
+        ids.iter()
+            .filter_map(|&id| {
+                let (streak, remaining) = self
+                    .windows
+                    .keys()
+                    .filter(|wid| self.window_contains_session(**wid, id))
+                    .filter_map(|wid| self.askpass_backoff.carried(wid.0, now))
+                    .max_by_key(|(_, remaining)| *remaining)?;
+                Some((
+                    id,
+                    crate::seamless::PersonStamp::SheetQuiet {
+                        streak,
+                        remaining_ms: u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Take up the spacing the outgoing process carried ([`Self::askpass_spacing_rows`]): each
+    /// row, named by the session this process adopted, spaces every window that shows that
+    /// session ([`crate::askpass::Backoff::adopt`]). Returns how many rows found no window.
+    pub(crate) fn adopt_askpass_spacing(
+        &mut self,
+        rows: &[(u64, u32, u64)],
+        now: Instant,
+    ) -> usize {
+        let mut unplaced = 0;
+        for &(session, streak, remaining_ms) in rows {
+            let windows: Vec<_> = self
+                .windows
+                .keys()
+                .copied()
+                .filter(|wid| self.window_contains_session(*wid, session))
+                .collect();
+            if windows.is_empty() {
+                unplaced += 1;
+            }
+            for wid in windows {
+                self.askpass_backoff
+                    .adopt(wid.0, streak, Duration::from_millis(remaining_ms), now);
+            }
+        }
+        unplaced
     }
 }
 

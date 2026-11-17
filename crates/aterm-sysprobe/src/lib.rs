@@ -67,6 +67,8 @@ mod situation_macos;
 pub mod slots;
 pub mod test_binary;
 pub mod timeline;
+pub mod vm_guest;
+pub use vm_guest::vm_guest;
 pub mod volumes;
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod win;
@@ -112,8 +114,8 @@ pub fn hv_support() -> Option<bool> {
 }
 
 /// Whether this macOS runs as a virtual machine's guest (`kern.hv_vmm_present` is 1), read by
-/// `sysctlbyname`: an identity aterm's vault makes there is a lab identity
-/// (`aterm_secrets::LabMark::VirtualMachine`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` A12).
+/// `sysctlbyname`: [`vm_guest`] on macOS, by which an identity aterm's vault makes there is a lab
+/// identity (`aterm_secrets::LabMark::VirtualMachine`, `docs/DESIGN-alab-one-mesh-2026-11-05.md` A12).
 /// `None` off macOS, or where the kernel has no such name.
 #[must_use]
 pub fn hv_vmm_present() -> Option<bool> {

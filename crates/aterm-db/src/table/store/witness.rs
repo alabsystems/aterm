@@ -19,7 +19,7 @@ impl Witness {
         }
         let count = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let hash = bytes[8..].try_into().unwrap();
-        if count > super::JOURNAL_RECORDS as u64 || (count == 0 && hash != [0; 32]) {
+        if count > super::journal_records() as u64 || (count == 0 && hash != [0; 32]) {
             return Err(Error::new("invalid table custody witness"));
         }
         Ok(Self { count, hash })
@@ -31,7 +31,7 @@ impl Witness {
         bytes
     }
     pub fn advance(self, offset: u64, id: Digest, received_ms: u64) -> Result<Self> {
-        if offset != self.count || self.count >= super::JOURNAL_RECORDS as u64 {
+        if offset != self.count || self.count >= super::journal_records() as u64 {
             return Err(Error::new("table custody witness is not contiguous"));
         }
         let mut hash = aterm_digest::Sha256::new();

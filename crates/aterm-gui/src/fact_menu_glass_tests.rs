@@ -94,6 +94,7 @@ fn a_transcript_limit_without_a_recovery_observation_has_a_menu_and_copy() {
         facts.usage.get_or_insert_with(Default::default).wall = Some(Wall {
             label: "7d",
             resets: "tomorrow at 3pm".into(),
+            resets_at: 0,
         });
         assert!(timeline.set_claude_footer(PGID, None, Some(facts)));
     }

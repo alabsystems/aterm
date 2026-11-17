@@ -36,6 +36,7 @@ fn index(build: u64, repos: &[(&str, &str)], pins: &[(&str, u64)]) -> Index {
             pin: pins.iter().map(|(p, b)| ((*p).to_string(), *b)).collect(),
             pin_by_target: BTreeMap::new(),
         }],
+        trees: BTreeMap::new(),
     }
 }
 

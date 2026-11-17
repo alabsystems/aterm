@@ -12,6 +12,15 @@
 //! differs from the one this build writes. Each of the three is readable without root: the image is
 //! `root:wheel` with read bits for everyone, and so is the plist.
 //!
+//! A Mac has one broker, and a team-signed one admits every client of its team (`aterm-lan`'s
+//! `server`). So a job that names another bundle asks no password where that bundle is a real
+//! one of this build's own signer and the image is its code, or adoptable by it ([`read`]): two
+//! copies of a release (the installed app and a release cut's bundle) that each read only their
+//! own name would each take the job from the other, at the price of the Mac password every
+//! time. The elevation itself is unchanged: it installs the bundle it ran from and no other,
+//! and judges the install against that bundle alone ([`read_own`]), so one that runs for any
+//! reason, `sudo aterm machines here apply --plain` included, takes the job for its own bundle.
+//!
 //! Code is compared by the executable's **CodeDirectory** blobs ([`CodeDirectories`]), read
 //! statically from the Mach-O file: for every architecture slice, every CodeDirectory its
 //! embedded signature carries (the primary and each alternate). A cdhash is a hash of one of
@@ -300,6 +309,12 @@ impl CodeDirectories {
         })
     }
 
+    /// Each CodeDirectory, with its slice's CPU type, in the signature's order: what a digest
+    /// of this identity reads.
+    pub fn slices(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        self.0.iter().map(|(cpu, bytes)| (*cpu, bytes.as_slice()))
+    }
+
     /// The code identity of the executable whose whole bytes are `bytes`.
     ///
     /// # Errors
@@ -506,6 +521,18 @@ pub trait Files {
     /// # Errors
     /// [`CodeDirectories::of_file`]'s, `NotFound` where nothing is there.
     fn code_directories(&self, path: &Path) -> io::Result<CodeDirectories>;
+
+    /// `path` with every link in it resolved, as [`std::fs::canonicalize`] answers.
+    ///
+    /// # Errors
+    /// The resolution's error; `NotFound` where nothing is there.
+    fn canonical(&self, path: &Path) -> io::Result<PathBuf>;
+
+    /// The uid that owns the file at `path` itself (a link is not followed).
+    ///
+    /// # Errors
+    /// The stat's error.
+    fn owner(&self, path: &Path) -> io::Result<u32>;
 }
 
 /// [`Files`] on this machine's disk.
@@ -539,21 +566,41 @@ impl Files for Disk {
     fn code_directories(&self, path: &Path) -> io::Result<CodeDirectories> {
         CodeDirectories::of_file(path)
     }
+
+    fn canonical(&self, path: &Path) -> io::Result<PathBuf> {
+        std::fs::canonicalize(path)
+    }
+
+    fn owner(&self, path: &Path) -> io::Result<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::symlink_metadata(path).map(|meta| meta.uid())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
 }
 
 /// How one installed part reads against what this build would install.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Part {
-    /// As this build installs it.
+    /// As the bundle the reading is of installs it: this build's, or in a reading of a job
+    /// another bundle of this build's signer holds ([`Reading::held_by`]), that bundle's.
     Current,
     /// Not there.
     Missing,
-    /// There, and not what this build installs (another build's image, another source's plist).
+    /// There, and not what this build installs: another build's image, or a plist that is
+    /// neither this bundle's nor one a bundle of this build's signer holds ([`read`]).
     Differs,
     /// The image is another build's, and it and the source state one non-ad-hoc [`Signer`]
     /// (the team named) with [`BUNDLE_ID`]: the running broker adopts the source by itself
     /// (`docs/DESIGN-lan-broker-2026-11-05.md` §3), so a release update owes no password. Not
-    /// current either: an elevation that runs for any reason renews it.
+    /// current either: an elevation that runs for any reason renews it. The source is the
+    /// bundle the job names: in a held reading ([`Reading::held_by`]) the holder, not the reader.
     Adopting(String),
     /// There, and it could not be read: not owed by this reading (an unreadable reading never
     /// asks for a password), the words say why.
@@ -585,10 +632,14 @@ impl Part {
 /// The broker's install as an account reads it ([`read`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reading {
-    /// The root-owned clone ([`super::IMAGE_BUNDLE`]) against the source bundle's code.
+    /// The root-owned clone ([`super::IMAGE_BUNDLE`]) against the code of the bundle the reading
+    /// is of: this build's, or the holder's ([`Self::held_by`]).
     pub image: Part,
-    /// [`super::PLIST_PATH`] against [`plist_text`].
+    /// [`super::PLIST_PATH`] against [`plist_text`] of that bundle.
     pub plist: Part,
+    /// The other bundle of this build's signer that holds the job, where the reading is of its
+    /// install ([`read`]); `None` for a reading against this build's own bundle.
+    pub held_by: Option<PathBuf>,
 }
 
 impl Reading {
@@ -623,49 +674,184 @@ impl Reading {
         owed && switched_off() != Some(true)
     }
 
-    /// Whether both parts are as this build installs them.
+    /// Whether both parts are as the bundle the reading is of installs them: this build's, or
+    /// the holder's ([`Self::held_by`]).
     #[must_use]
     pub fn current(&self) -> bool {
         self.image == Part::Current && self.plist == Part::Current
     }
 
-    /// The reading in one line: `image <state>, plist <state>`.
+    /// The reading in one line: `image <state>, plist <state>`, and the holder where another
+    /// bundle holds the job.
     #[must_use]
     pub fn words(&self) -> String {
-        format!("image {}, plist {}", self.image.words(), self.plist.words())
+        let parts = format!("image {}, plist {}", self.image.words(), self.plist.words());
+        match &self.held_by {
+            Some(holder) => format!(
+                "{parts}, held by another copy of this team at {}",
+                holder.display()
+            ),
+            None => parts,
+        }
     }
 }
 
-/// Read the broker's install against `source`, the app bundle this build runs from: the clone's
-/// code against the source executable's (another build's of the same team the broker adopts,
-/// [`Part::Adopting`]), and the plist against [`plist_text`].
-///
-/// # Errors
-/// The source's own code could not be read (there is nothing to compare the clone with), in one
-/// line.
-pub fn read(files: &dyn Files, source: &Path) -> Result<Reading, String> {
-    let ours_path = source.join(BUNDLE_EXECUTABLE);
-    let ours = files
-        .code_directories(&ours_path)
-        .map_err(|e| format!("{}: {e}", ours_path.display()))?;
-    let image = match files.code_directories(Path::new(super::IMAGE_EXECUTABLE)) {
-        Ok(theirs) if theirs == ours => Part::Current,
-        Ok(theirs) => match (theirs.signer(), ours.signer()) {
-            (Some(theirs), Some(ours)) if theirs == ours && ours.identifier == BUNDLE_ID => {
-                Part::Adopting(ours.team)
+/// The image ([`super::IMAGE_EXECUTABLE`]) against a source executable's code: the same code,
+/// another build's of the source's own team with [`BUNDLE_ID`] (which the broker adopts by
+/// itself), another's, missing or unread.
+fn image_against(files: &dyn Files, source: &CodeDirectories) -> Part {
+    match files.code_directories(Path::new(super::IMAGE_EXECUTABLE)) {
+        Ok(image) if image == *source => Part::Current,
+        Ok(image) => match (image.signer(), source.signer()) {
+            (Some(image), Some(source)) if image == source && source.identifier == BUNDLE_ID => {
+                Part::Adopting(source.team)
             }
             _ => Part::Differs,
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => Part::Missing,
         Err(e) => Part::Unread(format!("{}: {e}", super::IMAGE_EXECUTABLE)),
+    }
+}
+
+/// The bundle a job's plist names as its `--source`: `Some` only where `plist` is, byte for
+/// byte, the plist this build writes for that bundle ([`plist_text`]) and the path is absolute.
+fn named_source(plist: &[u8]) -> Option<PathBuf> {
+    const BEFORE: &str = "<string>--source</string>\n\t\t<string>";
+    let text = std::str::from_utf8(plist).ok()?;
+    let rest = &text[text.find(BEFORE)? + BEFORE.len()..];
+    let mut named = rest[..rest.find("</string>")?].to_owned();
+    // `&amp;` last: no other entity's text may come out of an escaped ampersand.
+    for (entity, c) in [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&amp;", "&"),
+    ] {
+        named = named.replace(entity, c);
+    }
+    let source = PathBuf::from(named);
+    (source.is_absolute() && plist == plist_text(&source).as_bytes()).then_some(source)
+}
+
+/// The reading of a job whose `plist` names another bundle, where that bundle holds the broker
+/// for this build too ([`read`]); `None` where it does not, and the reading against this build's
+/// own bundle `running` stands (`ours` is its code, `own_image` that reading's image).
+fn held_by_another(
+    files: &dyn Files,
+    running: &Path,
+    ours: &CodeDirectories,
+    own_image: &Part,
+    plist: &[u8],
+) -> Option<Reading> {
+    // An image that is missing or not this signer's is owed whoever the job names: it is no
+    // code of a holder of this signer, and none adopts it.
+    if own_image.owed() {
+        return None;
+    }
+    let signer = ours.signer().filter(|s| s.identifier == BUNDLE_ID)?;
+    let source = named_source(plist)?;
+    let exe = source.join(BUNDLE_EXECUTABLE);
+    // Root may read a bundle this account may not: a reading that then asked for the password
+    // would ask at every launch, for an install the root half may leave as it is.
+    let unread = |e: &io::Error| {
+        let why = format!("{}: {e}", exe.display());
+        Some(Reading {
+            image: Part::Unread(why.clone()),
+            plist: Part::Unread(why),
+            held_by: None,
+        })
     };
+    let denied = |e: &io::Error| e.kind() == io::ErrorKind::PermissionDenied;
+    // No link anywhere on the way to the executable: the broker clones none, and a linked
+    // folder would lend the holder another bundle's code.
+    match files.canonical(&exe) {
+        Ok(real) if real == exe => {}
+        Err(e) if denied(&e) => return unread(&e),
+        _ => return None,
+    }
+    let theirs = match files.code_directories(&exe) {
+        Ok(theirs) => theirs,
+        Err(e) if denied(&e) => return unread(&e),
+        Err(_) => return None,
+    };
+    if theirs.signer().as_ref() != Some(&signer) {
+        return None;
+    }
+    // Another account's bundle silences no debt of this one's.
+    match (
+        files.owner(&exe),
+        files.owner(&running.join(BUNDLE_EXECUTABLE)),
+    ) {
+        (Ok(theirs), Ok(ours)) if theirs == 0 || theirs == ours => {}
+        _ => return None,
+    }
+    let image = image_against(files, &theirs);
+    (!image.owed()).then_some(Reading {
+        image,
+        plist: Part::Current,
+        held_by: Some(source),
+    })
+}
+
+fn read_with(files: &dyn Files, source: &Path, held: bool) -> Result<Reading, String> {
+    let ours_path = source.join(BUNDLE_EXECUTABLE);
+    let ours = files
+        .code_directories(&ours_path)
+        .map_err(|e| format!("{}: {e}", ours_path.display()))?;
+    let image = image_against(files, &ours);
     let plist = match files.read(Path::new(super::PLIST_PATH)) {
         Ok(bytes) if bytes == plist_text(source).as_bytes() => Part::Current,
-        Ok(_) => Part::Differs,
+        Ok(bytes) => {
+            if held && let Some(held) = held_by_another(files, source, &ours, &image, &bytes) {
+                return Ok(held);
+            }
+            Part::Differs
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Part::Missing,
         Err(e) => Part::Unread(format!("{}: {e}", super::PLIST_PATH)),
     };
-    Ok(Reading { image, plist })
+    Ok(Reading {
+        image,
+        plist,
+        held_by: None,
+    })
+}
+
+/// Read the broker's install against `source`, the app bundle this build runs from, and that
+/// bundle alone: the clone's code against the source executable's (another build's of the same
+/// team the broker adopts, [`Part::Adopting`]), and the plist against [`plist_text`]. It is the
+/// elevation's reading: a root half installs its own bundle, so a job another bundle holds is
+/// another's to it ([`Part::Differs`]).
+///
+/// # Errors
+/// The source's own code could not be read (there is nothing to compare the clone with), in one
+/// line.
+pub fn read_own(files: &dyn Files, source: &Path) -> Result<Reading, String> {
+    read_with(files, source, false)
+}
+
+/// Read the broker's install as an account decides whether to ask for it: [`read_own`]'s
+/// reading, save that a job another bundle holds is read against that bundle
+/// ([`Reading::held_by`]) and is in place where all of this holds. The plist is byte for byte
+/// the one this build writes for that bundle. The bundle's executable is there under its own
+/// name, no link on the way to it. It states this build's own non-ad-hoc [`Signer`] of
+/// [`BUNDLE_ID`], and this build's executable's owner or root owns it. And the image is that
+/// bundle's code or adoptable by it.
+///
+/// The broker then serves this build as it serves that one (it admits its team), and no
+/// password is asked to move the job; where an elevation runs anyway it moves it
+/// ([`read_own`]), and the other bundle then reads this one as the holder. The signer is read,
+/// not verified, and decides nothing root installs or runs. What a holder does decide is which
+/// build of the team the broker adopts next, as a job's source always did: an account that
+/// reads a held job does not ask to take it back while the holder stays as above. A bundle
+/// with no team signature (a development build) shares no broker: an ad-hoc broker admits its
+/// own code alone.
+///
+/// # Errors
+/// [`read_own`]'s.
+pub fn read(files: &dyn Files, source: &Path) -> Result<Reading, String> {
+    read_with(files, source, true)
 }
 
 /// This process's own source: the app bundle its canonical executable runs from. `None` off

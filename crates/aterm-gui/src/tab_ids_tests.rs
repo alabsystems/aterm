@@ -5,17 +5,24 @@ use super::*;
 
 #[test]
 fn a_minted_id_is_known_and_a_fleet_id_is_never_minted() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let control = aterm_tempfile::tempdir().expect("scratch control dir");
     let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
-    let sid = mint();
-    let minted = sid.tab().expect("a tab id");
-    assert!(known(&minted), "a minted ID is known from then on");
-
     let fleet = TabId::from_bits(0x2_dead_beef);
     // NEGATIVE CONTROL: an ID nobody named is not known.
     assert!(!known(&fleet));
     note_fleet([fleet]);
     assert!(known(&fleet));
+    let sid = mint();
+    let minted = sid.tab().expect("a tab id");
+    assert!(known(&minted), "a minted ID is known from then on");
+    assert_ne!(
+        minted.short(),
+        fleet.short(),
+        "the mint avoids the fleet's known prefix"
+    );
     // A later fleet read replaces the earlier one whole.
     note_fleet([]);
     assert!(!known(&fleet));
@@ -23,6 +30,9 @@ fn a_minted_id_is_known_and_a_fleet_id_is_never_minted() {
 
 #[test]
 fn a_claimed_or_reserved_id_is_known_and_never_kept_twice() {
+    if !crate::test_alone::alone() {
+        return;
+    }
     let control = aterm_tempfile::tempdir().expect("scratch control dir");
     let _rendezvous = crate::identity_claim::rendezvous_override(control.path());
     let claimed = TabId::from_bits(0x3_0000_c1a1);

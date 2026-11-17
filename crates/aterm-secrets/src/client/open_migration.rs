@@ -34,7 +34,7 @@ impl Rounds {
     ) -> bool {
         if config.name != crate::ALAB_VAULT
             || !alab_vault(config)
-            || crate::service::subscriber_turned_off(&paths.home)
+            || crate::off_record::subscriber_turned_off(&paths.home)
         {
             self.checked = None;
             return false;

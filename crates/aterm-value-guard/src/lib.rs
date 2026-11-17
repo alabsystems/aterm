@@ -36,8 +36,8 @@ pub enum Refusal {
     Length,
     /// A full phone number.
     Phone,
-    /// An account's name that names a machine.
-    MachineLabel,
+    /// A handle outside its grammar: lower-case letters and digits, words joined by one `-`.
+    Handle,
     /// Nothing where the column needs something.
     Empty,
 }
@@ -52,8 +52,8 @@ impl Refusal {
             Self::Control => "text holds no control characters",
             Self::Length => "text is longer than its column allows",
             Self::Phone => "a phone number belongs in a phone row's number column",
-            Self::MachineLabel => {
-                "an account's label names no machine: a preference row maps it to one"
+            Self::Handle => {
+                "a handle is lower-case letters and digits, its words joined by one `-`"
             }
             Self::Empty => "this column needs something in it",
         }
@@ -399,33 +399,27 @@ pub fn text(value: &str, max: usize) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Whether `text` is shaped like a machine label or holds one: any of its words (split at
-/// anything but a letter or digit) is `m` or `M` and a digit (`m2`, `M109`, `m2.3`, `m106-m38`,
-/// `kimi-m16`, `m4max`). A word such as `max` or `muse` stays.
-pub fn machine_shaped(text: &str) -> bool {
-    text.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|word| {
-            let mut bytes = word.bytes();
-            matches!(bytes.next(), Some(b'm' | b'M'))
-                && bytes.next().is_some_and(|b| b.is_ascii_digit())
-        })
-}
-
-/// Check an account's owner-editable name of at most `max` bytes: free text ([`text`]) with
-/// something in it and no machine in it, since a place on a Mac never names an account
-/// (design §0). The old name a Mac already calls a row by stays in `legacy_label`.
+/// Check a handle of at most `max` bytes: words of lower-case letters and digits joined by one
+/// `-` (`[a-z0-9]+(-[a-z0-9]+)*`), what an account's owner names it by and what its slug holds
+/// after the provider word. A word shaped like a machine name (`m2`) is a word like any other:
+/// the address an account signs in with can hold one. The grammar admits a token's shape
+/// (`sk-ant-…`), so the handle is free text's refusals ([`text`]) first.
 ///
 /// # Errors
 /// The rule it breaks; the value is never quoted.
-pub fn account_label(value: &str, max: usize) -> Result<(), Refusal> {
+pub fn handle(value: &str, max: usize) -> Result<(), Refusal> {
     text(value, max)?;
-    if value.trim().is_empty() {
-        return Err(Refusal::Length);
+    let word = |word: &str| {
+        !word.is_empty()
+            && word
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    };
+    if value.split('-').all(word) {
+        Ok(())
+    } else {
+        Err(Refusal::Handle)
     }
-    if machine_shaped(value) {
-        return Err(Refusal::MachineLabel);
-    }
-    Ok(())
 }
 
 /// Words that, standing alone, say a note may carry a sign-in secret. A bulk copy of a cell nobody

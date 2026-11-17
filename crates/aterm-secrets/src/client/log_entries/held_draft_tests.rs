@@ -121,6 +121,7 @@ fn accepted_publication_at_a_full_held_store() {
 }
 
 /// The version `url` serves: its sequence and envelope digest.
+#[cfg(unix)]
 fn served(url: &str) -> (u64, [u8; 32]) {
     let Fetched::Body(bytes) = transport::fetch(
         &Source::Url(url.to_owned()),
@@ -144,6 +145,7 @@ fn held(paths: &Paths) -> Vec<(u64, [u8; 32])> {
 
 /// Whether `paths`' log holds every record the stamp of `url`'s version names, as `paths`' own
 /// identity reads it.
+#[cfg(unix)]
 fn log_covers_served(paths: &Paths, url: &str) -> bool {
     let Fetched::Body(bytes) = transport::fetch(
         &Source::Url(url.to_owned()),
@@ -163,6 +165,7 @@ fn log_covers_served(paths: &Paths, url: &str) -> bool {
 }
 
 /// What became of P1's rotation of `gh-token` ([`refused_retry_after_a_lost_reply`]).
+#[cfg(unix)]
 struct AfterTheRetry {
     /// What m7 reads at `gh-token` once every Mac synced.
     m7_reads: Vec<u8>,
@@ -176,6 +179,7 @@ struct AfterTheRetry {
 /// it, but its reply is lost, so P1 keeps nothing. P2, drafted from the version P1 was drafted from
 /// (`token-v3`), is refused as not newer. Nobody acts: m22 syncs twice, then m7. `single_slot`
 /// sets [`SINGLE_SLOT_HOLD`] for both publishes and every pass.
+#[cfg(unix)]
 fn refused_retry_after_a_lost_reply(single_slot: bool) -> AfterTheRetry {
     let macs = super::super::log_entries_tests::two_macs(&[(
         Audience::Everyone,
@@ -237,6 +241,7 @@ fn refused_retry_after_a_lost_reply(single_slot: bool) -> AfterTheRetry {
 /// NEGATIVE CONTROL: [`SINGLE_SLOT_HOLD`] (one hold for the Mac, as before), run in the test as
 /// the CONTROL: P2's hold replaces P1's and P2's refusal forgets it, so the head's records exist
 /// nowhere, neither log covers it, and m7 keeps `token-v1`.
+#[cfg(unix)]
 #[test]
 fn a_refused_publish_after_one_whose_reply_was_lost_keeps_the_first_edit() {
     let after = refused_retry_after_a_lost_reply(false);
@@ -262,6 +267,7 @@ fn a_refused_publish_after_one_whose_reply_was_lost_keeps_the_first_edit() {
 /// whose edit no server holds: m22 reads `token-v2` with no conflict. P2's hold stays until the
 /// one server its publish may have reached takes a version of its sequence or above from m22,
 /// which the next publish does; then no hold is left.
+#[cfg(unix)]
 #[test]
 fn only_the_refused_version_is_forgotten_and_the_stored_one_is_adopted_by_its_digest() {
     let macs = super::super::log_entries_tests::two_macs(&[(
@@ -617,6 +623,7 @@ fn a_landed_version_whose_records_were_not_kept_settles_by_reach_alone() {
 /// records, stored by the server with its reply lost, sit there instead of in a versioned hold.
 /// m22's next pass reads P1 back as the head and takes them in, then removes the file; once the
 /// pass after sends them, m7 reads P1's edit.
+#[cfg(unix)]
 #[test]
 fn the_unversioned_hold_of_an_earlier_build_is_adopted_by_the_head_it_completes() {
     let macs = super::super::log_entries_tests::two_macs(&[(
@@ -670,6 +677,7 @@ fn the_unversioned_hold_of_an_earlier_build_is_adopted_by_the_head_it_completes(
 /// removes that hold only once every record it holds is in the records store. Records of a
 /// publish no server took stay held through a landed head; the store's own records go with the
 /// next.
+#[cfg(unix)]
 #[test]
 fn the_unversioned_hold_goes_only_once_the_store_holds_every_record_in_it() {
     let macs = super::super::log_entries_tests::two_macs(&[(
@@ -724,6 +732,7 @@ fn the_unversioned_hold_goes_only_once_the_store_holds_every_record_in_it() {
 /// (another network's genesis): m22 reads P1 back and takes the hold in, since it completes P1's
 /// stamp, and keeps the file for the refused record, through the next landed head too. With
 /// [`UNVERSIONED_GOES_EARLY`] on, a landed head removes it once it reads, and the law breaks.
+#[cfg(unix)]
 #[test]
 fn the_unversioned_hold_stays_until_the_store_holds_every_record_and_an_early_removal_is_caught() {
     let macs = super::super::log_entries_tests::two_macs(&[(

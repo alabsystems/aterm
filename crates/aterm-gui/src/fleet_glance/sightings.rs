@@ -15,11 +15,10 @@
 //! (`aterm_types::look_words::target_of`, as the machine's own parser reads it), its two ages
 //! each a difference of two times on its own clock.
 
-use super::{AgentWord, MACS_MAX, TaskWord, dial_of, field, short_name};
+use super::{AgentWord, MACS_MAX, TaskWord, dial_of, field, glance_of, short_name};
 use aterm_db::fleet::read::{
     AGENTS_MAX, Access, AccountWord, AgentSeen, Answer, Answered, Harness, Limits, Load, Look,
-    MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
-    word,
+    MachineSeen, OutSrc, Pressure, Read, Tally, TurnFacts, WaitTally, Work, WorkTally, word,
 };
 use aterm_json::{Map, Value};
 use aterm_types::look_words;
@@ -248,17 +247,8 @@ impl Heard {
                 continue;
             };
             let task = TaskWord::of(field(row, "task"), field(row, "task_conclusion"));
-            // A stalled task says more than an agent's `busy` or `idle`; a wait on a person and
-            // a limit say more than it.
-            let stalled = task == Some(TaskWord::Stalled);
-            let (state, state_why) = match agent {
-                AgentWord::Waiting => (State::Waiting, None),
-                AgentWord::Walled(kind) => (State::Walled, word(&kind, 32)),
-                _ if stalled => (State::Stuck, None),
-                AgentWord::Busy => (State::Busy, None),
-                AgentWord::Idle => (State::Idle, None),
-                AgentWord::Unknown => (State::Unknown, None),
-            };
+            let (state, wall) = glance_of(&agent, task);
+            let state_why = wall.and_then(|kind| word(kind, 32));
             let turn = turn_of(row);
             let work = Work::of(state, &turn);
             self.tally.add(state);
@@ -276,13 +266,7 @@ impl Heard {
                 state,
                 state_why,
                 state_age_ms: count(row, "agent_ms"),
-                task: task.map(|task| match task {
-                    TaskWord::Working => Task::Working,
-                    TaskWord::Done => Task::Done,
-                    TaskWord::Failed => Task::Failed,
-                    TaskWord::Exited => Task::Exited,
-                    TaskWord::Stalled => Task::Stalled,
-                }),
+                task: task.map(TaskWord::fleet),
                 ctx_left_pct: percent(row, "ctx_left_pct"),
                 usage_5h_pct: percent(row, "usage_5h_pct"),
                 usage_7d_pct: percent(row, "usage_7d_pct"),

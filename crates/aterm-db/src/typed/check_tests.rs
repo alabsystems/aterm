@@ -346,6 +346,7 @@ crate::att_collection!(
         columns: &[Column::new("account", Ty::Ref("account")).writer(Writer::Mine)],
         unique: &[],
         max_row: 1024,
+        authority: None,
     }
 );
 
@@ -422,10 +423,13 @@ fn held(changes: &[Change]) -> crate::typed::cell::Cells {
 fn a_write_that_moves_both_rows_of_a_clash_onto_a_new_shared_value_is_refused() {
     use crate::typed::grid::tests::put;
     let mut view = View::empty_for_test();
+    // An account's unique set is its realm and label (`registry::ACCOUNT`, version 2).
     view.cells = held(&[
         put(&ACCOUNT, "ac-1", "row", json!("live")),
+        put(&ACCOUNT, "ac-1", "realm", json!("claude")),
         put(&ACCOUNT, "ac-1", "label", json!("x")),
         put(&ACCOUNT, "ac-2", "row", json!("live")),
+        put(&ACCOUNT, "ac-2", "realm", json!("claude")),
         put(&ACCOUNT, "ac-2", "label", json!("x")),
     ]);
     let label = |pk: &str, label: &str| put(&ACCOUNT, pk, "label", json!(label));

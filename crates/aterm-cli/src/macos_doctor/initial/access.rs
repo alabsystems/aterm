@@ -328,13 +328,11 @@ fn devtools_listing() -> DevTools {
 }
 
 /// Whether `selection` manages `access`'s row: the sign-outs' Accessibility while they are
-/// selected, every other grant while Permissions is.
+/// selected, every other required grant while Permissions is. App-level Local Network consent
+/// is a diagnostic, not a requirement of aterm's broker-owned traffic.
 fn managed(access: Access, selection: Selection) -> bool {
-    if access == Access::Accessibility {
-        access.needed_for(selection)
-    } else {
-        selection.contains(Setting::Permissions)
-    }
+    access.needed_for(selection)
+        && (access == Access::Accessibility || selection.contains(Setting::Permissions))
 }
 
 /// One Access row as `grants` read it. `selection` decides whether the row is
@@ -564,6 +562,7 @@ pub(super) fn stage_rows(grants: &Grants, records: &[(Access, AccessOutcome)]) -
         Access::NetworkHelper,
     ]
     .into_iter()
+    .filter(|access| access.needed_for(selection))
     .map(|access| {
         let read = reading(access, grants, selection);
         let seen = observation(access, grants, selection);

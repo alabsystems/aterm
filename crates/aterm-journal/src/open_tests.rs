@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::tests::{identity_of as identity, tempdir};
 use aterm_spec::interp::State;
 
 fn limits() -> Limits {
@@ -14,10 +15,6 @@ fn limits() -> Limits {
 
 fn open(dir: &Path) -> io::Result<Log> {
     Log::open(dir, "test", b"pinned", false, limits())
-}
-
-fn identity(path: &Path) -> Option<(u64, u64)> {
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 pub(crate) fn transition(state: &State, action: &str) -> State {
@@ -40,7 +37,7 @@ pub(crate) fn transition(state: &State, action: &str) -> State {
             next.insert("early", 1);
         }
         "Open" => {
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = tempdir();
             let mut initial = open(dir.path()).unwrap();
             initial.finish_open().unwrap();
             drop(initial);
@@ -117,7 +114,7 @@ fn journal_open_matches_model_and_rejects_an_unflushed_success() {
 #[test]
 fn early_fresh_directory_failures_leave_no_checkpoint_and_can_recover() {
     for successful_barriers in 0..2 {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let fault =
             aterm_durable::seam::FailingDirs::after(successful_barriers, aterm_durable::seam::EIO);
         assert!(open(dir.path()).is_err());
@@ -133,7 +130,7 @@ fn early_fresh_directory_failures_leave_no_checkpoint_and_can_recover() {
 /// refuses: the next open finds it, finishes its publication, and appends.
 #[test]
 fn a_fresh_checkpoint_whose_barrier_failed_is_finished_by_the_next_open() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let fault = aterm_durable::seam::FailingDirs::after(2, aterm_durable::seam::EIO);
     assert!(open(dir.path()).is_err());
     drop(fault);
@@ -146,7 +143,7 @@ fn a_fresh_checkpoint_whose_barrier_failed_is_finished_by_the_next_open() {
 
 #[test]
 fn a_visible_uncertain_checkpoint_is_flushed_without_replacement_on_reopen() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut initial = open(dir.path()).unwrap();
     initial.finish_open().unwrap();
     let fault = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
@@ -165,7 +162,7 @@ fn a_visible_uncertain_checkpoint_is_flushed_without_replacement_on_reopen() {
 
 #[test]
 fn an_unenrolled_nonempty_journal_cannot_invent_a_missing_checkpoint() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut initial = open(dir.path()).unwrap();
     initial.finish_open().unwrap();
     initial.append("app/1", vec![7]).unwrap();

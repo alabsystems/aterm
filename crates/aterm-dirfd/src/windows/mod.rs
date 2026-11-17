@@ -3,6 +3,7 @@
 
 //! Windows implementation of `aterm-dirfd`.
 
+pub mod acl;
 mod ffi;
 
 use std::ffi::{OsStr, OsString, c_void};
@@ -44,8 +45,17 @@ impl Errno {
     pub const ISDIR: Self = Self(ffi::ERROR_DIRECTORY_NOT_SUPPORTED);
     /// `ERROR_DELETE_PENDING`.
     pub const DELETE_PENDING: Self = Self(ffi::ERROR_DELETE_PENDING);
+    /// `ERROR_NOT_SAME_DEVICE`: a rename ([`renameat`], [`renameat_with`], [`renameat_judged`])
+    /// that would cross a volume, as unix's `EXDEV`.
+    pub const XDEV: Self = Self(ffi::ERROR_NOT_SAME_DEVICE);
     /// `ERROR_REPARSE_POINT_ENCOUNTERED`.
     pub const LOOP: Self = Self(ffi::ERROR_REPARSE_POINT_ENCOUNTERED);
+    /// `ERROR_ALREADY_EXISTS`: the name is taken ([`mkdirat`], an exclusive [`openat`], [`linkat`],
+    /// a [`RenameFlags::NOREPLACE`] rename), as unix's `EEXIST`.
+    pub const EXIST: Self = Self(ffi::ERROR_ALREADY_EXISTS);
+    /// `ERROR_CALL_NOT_IMPLEMENTED`: Windows has no such operation ([`RenameFlags::EXCHANGE`], a
+    /// [`fchmod`] that would grant the group or others anything), as unix's `ENOSYS`.
+    pub const NOSYS: Self = Self(ffi::ERROR_CALL_NOT_IMPLEMENTED);
     /// This crate's own: the name is a reparse point that is not a link.
     pub const FOREIGN_REPARSE: Self = Self(CUSTOMER | 1);
     /// This crate's own: the name no longer carries the identity the caller expected
@@ -58,6 +68,9 @@ impl Errno {
     pub const MOUNT_POINT: Self = Self(CUSTOMER | 4);
     /// This crate's own: this thread's cloud placeholders could not be exposed.
     pub const PLACEHOLDERS_HIDDEN: Self = Self(CUSTOMER | 5);
+    /// This crate's own: the object is another account's, and only its owner changes who may use
+    /// it ([`fchmod`]), as unix's `EPERM`; read as `PermissionDenied`.
+    pub const NOT_OWNER: Self = Self(CUSTOMER | 6);
 
     /// The raw code.
     #[must_use]
@@ -83,6 +96,11 @@ impl Errno {
                 .raw_os_error()
                 .unwrap_or(ffi::ERROR_INVALID_FUNCTION),
         )
+    }
+
+    /// A failed `acl` call's code (`ERROR_INVALID_DATA` for a refusal that carries none).
+    fn from_io(error: &std::io::Error) -> Self {
+        Self(error.raw_os_error().unwrap_or(ffi::ERROR_INVALID_DATA))
     }
 
     fn from_status(status: ffi::NTSTATUS) -> Self {
@@ -114,6 +132,9 @@ impl Errno {
                 "this thread's cloud placeholders could not be exposed, so one would read as a \
                  plain file: nothing was opened or removed",
             ),
+            Self::NOT_OWNER => Some(
+                "another account owns it, and only its owner changes who may use it: left as it is",
+            ),
             _ => None,
         }
     }
@@ -132,6 +153,9 @@ impl std::error::Error for Errno {}
 
 impl From<Errno> for std::io::Error {
     fn from(e: Errno) -> Self {
+        if e == Errno::NOT_OWNER {
+            return Self::new(std::io::ErrorKind::PermissionDenied, e);
+        }
         if e.own_text().is_some() {
             return Self::other(e);
         }
@@ -211,11 +235,13 @@ impl OFlags {
 }
 
 flags! {
-    /// [`unlinkat`]'s flags.
+    /// [`unlinkat`]'s, [`fstatat`]'s and [`linkat`]'s flags.
     AtFlags(u32) {
-        /// Remove a directory (it must be empty), as `rmdir(2)`.
+        /// Remove a directory (it must be empty), as `rmdir(2)`; refused by [`fstatat`] and
+        /// [`linkat`], as unix refuses it there.
         REMOVEDIR = 0x200;
-        /// Accepted for the unix call shape.
+        /// Accepted for the unix call shape: this half reads and links a link as itself whether
+        /// or not it is given.
         SYMLINK_NOFOLLOW = 0x100;
     }
 }
@@ -227,7 +253,14 @@ impl AtFlags {
 }
 
 flags! {
-    /// File mode bits, accepted for the unix call shape and ignored.
+    /// File mode bits, in the unix call shape. Windows keeps an access list where unix keeps a
+    /// mode, and this half reads one thing from a mode: whether it grants the group and others
+    /// nothing (`mode & 0o077 == 0`: 0o600, 0o700, 0o400, none), a private mode. A file or folder
+    /// [`openat`] or [`mkdirat`] makes with a private mode is owner-only from its creation: owned
+    /// by this token's user under a protected access list of the user and SYSTEM
+    /// ([`acl::owner_only_descriptor`]), as unix's 0600 and 0700 leave it to its owner alone; with
+    /// any other mode it takes its folder's entries, as before. The owner's own bits are not
+    /// kept: the user's entry allows everything, as a unix owner can always chmod a file back.
     Mode(u32) {
         /// 0o700.
         RWXU = 0o700;
@@ -241,10 +274,69 @@ flags! {
         RGRP = 0o040;
         /// 0o020.
         WGRP = 0o020;
+        /// 0o010.
+        XGRP = 0o010;
         /// 0o004.
         ROTH = 0o004;
         /// 0o002.
         WOTH = 0o002;
+        /// 0o001.
+        XOTH = 0o001;
+    }
+}
+
+impl Mode {
+    /// It grants the group and others nothing: what a create makes owner-only.
+    const fn is_private(self) -> bool {
+        self.0 & 0o077 == 0
+    }
+}
+
+/// The descriptor a create with `mode` is made with: the owner-only one for a private mode
+/// ([`Mode`]), `None` (its folder's entries) otherwise.
+fn descriptor_for(mode: Mode, inherit: acl::Inherit) -> Result<Option<acl::Descriptor>> {
+    if !mode.is_private() {
+        return Ok(None);
+    }
+    let user = acl::Sid::token_user().map_err(|e| Errno::from_io(&e))?;
+    acl::owner_only_descriptor(&user, inherit)
+        .map(Some)
+        .map_err(|e| Errno::from_io(&e))
+}
+
+/// Flags for [`renameat_with`], in the unix half's names, and for [`renameat_judged`], which takes
+/// [`Self::NOREPLACE`] alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RenameFlags(u8);
+
+impl RenameFlags {
+    /// Fail with [`Errno::EXIST`] if the destination already exists, instead of replacing it.
+    pub const NOREPLACE: Self = Self(1);
+
+    /// Exchange two existing entries: NTFS has no atomic exchange, so [`renameat_with`] refuses
+    /// it ([`Errno::NOSYS`]), as unix does where its kernel has none.
+    pub const EXCHANGE: Self = Self(2);
+
+    /// No flags — equivalent to a plain [`renameat`].
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// Whether every bit of `other` is set here.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for RenameFlags {
+    type Output = Self;
+    #[inline]
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -831,12 +923,15 @@ pub fn owner<Fd: AsHandle>(fd: Fd) -> Result<Sid> {
 
 static DONT_REPARSE: AtomicU32 = AtomicU32::new(ffi::OBJ_DONT_REPARSE);
 
+/// Open (or make, by `disposition`) `name` relative to `dir`, never following a reparse point;
+/// a new file or folder is made with `security` where given (its folder's entries otherwise).
 fn nt_open(
     dir: BorrowedHandle<'_>,
     name: &[u16],
     access: u32,
     disposition: u32,
     options: u32,
+    security: Option<&acl::Descriptor>,
 ) -> Result<OwnedHandle> {
     let bytes = u16::try_from(name.len() * 2).map_err(|_| Errno::INVAL)?;
     let attempt = |extra: u32| -> std::result::Result<OwnedHandle, ffi::NTSTATUS> {
@@ -850,7 +945,7 @@ fn nt_open(
             RootDirectory: dir.as_raw_handle(),
             ObjectName: &raw mut object_name,
             Attributes: ffi::OBJ_CASE_INSENSITIVE | extra,
-            SecurityDescriptor: std::ptr::null_mut(),
+            SecurityDescriptor: security.map_or(std::ptr::null_mut(), acl::Descriptor::as_ptr),
             SecurityQualityOfService: std::ptr::null_mut(),
         };
         let mut io = ffi::IO_STATUS_BLOCK {
@@ -859,8 +954,9 @@ fn nt_open(
         };
         let mut raw: ffi::HANDLE = std::ptr::null_mut();
         // SAFETY: every pointer is to a live local (`object_name` outlives the call, its buffer is
-        // `name`, valid for `bytes`), `dir` is a live handle, and no EA buffer or allocation size
-        // is passed.
+        // `name`, valid for `bytes`), `dir` is a live handle, the security descriptor (null, or
+        // the live self-relative `security`, which outlives the call) is read only during it, and
+        // no EA buffer or allocation size is passed.
         let status = unsafe {
             ffi::NtCreateFile(
                 &raw mut raw,
@@ -912,18 +1008,22 @@ const fn refuse_reparse(kind: FileType) -> Result<()> {
 }
 
 /// `openat(2)`'s twin: open `name` relative to the directory `dirfd`, never following anything.
+/// A file [`OFlags::CREATE`] makes is made with `mode`'s access list ([`Mode`]): owner-only from
+/// its creation for a private mode, its folder's entries otherwise; a file that already exists
+/// keeps its own, as unix keeps its mode.
 /// # Errors
-/// The open's code; [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point under
-/// [`OFlags::NOFOLLOW`]; [`Errno::ISDIR`] for a directory opened to write; [`Errno::INVAL`] for a
-/// refused name or flag combination ([`OFlags::CREATE`] with [`OFlags::DIRECTORY`] or
-/// [`OFlags::PATH`], a write mode with [`OFlags::PATH`]).
+/// The open's code ([`Errno::EXIST`] for [`OFlags::EXCL`] on a name that exists);
+/// [`Errno::LOOP`]/[`Errno::FOREIGN_REPARSE`] for a reparse point under [`OFlags::NOFOLLOW`];
+/// [`Errno::ISDIR`] for a directory opened to write; [`Errno::INVAL`] for a refused name or flag
+/// combination ([`OFlags::CREATE`] with [`OFlags::DIRECTORY`] or [`OFlags::PATH`], a write mode
+/// with [`OFlags::PATH`]); the token's or the descriptor's code where a private create's could
+/// not be built (nothing is made then).
 pub fn openat<Fd: AsHandle, P: Arg>(
     dirfd: Fd,
     name: P,
     flags: OFlags,
     mode: Mode,
 ) -> Result<OwnedHandle> {
-    let _ = mode;
     let directory = flags.has(OFlags::DIRECTORY);
     let write = flags.access() != OFlags::RDONLY.0;
     let facts = flags.has(OFlags::PATH);
@@ -958,9 +1058,21 @@ pub fn openat<Fd: AsHandle, P: Arg>(
     } else {
         0
     };
+    let security = if flags.has(OFlags::CREATE) {
+        descriptor_for(mode, acl::Inherit::No)?
+    } else {
+        None
+    };
     let _exposed = expose_placeholders()?;
     name.with_name(|name| {
-        let handle = nt_open(dirfd.as_handle(), name, access, disposition, options)?;
+        let handle = nt_open(
+            dirfd.as_handle(),
+            name,
+            access,
+            disposition,
+            options,
+            security.as_ref(),
+        )?;
         let kind = kind_of(handle.as_handle())?;
         if flags.has(OFlags::NOFOLLOW) {
             refuse_reparse(kind)?;
@@ -1026,6 +1138,7 @@ pub fn pin(path: &Path) -> Result<OwnedHandle> {
                 ffi::FILE_READ_ATTRIBUTES,
                 ffi::FILE_OPEN,
                 ffi::FILE_DIRECTORY_FILE,
+                None,
             )?;
             refuse_reparse(kind_of(handle.as_handle())?)?;
             Ok(handle)
@@ -1188,6 +1301,7 @@ pub fn unlinkat<Fd: AsHandle, P: Arg>(
             ffi::DELETE | ffi::FILE_READ_ATTRIBUTES,
             ffi::FILE_OPEN,
             if rmdir { ffi::FILE_DIRECTORY_FILE } else { 0 },
+            None,
         )?;
         if file_id(&handle)? != expect {
             return Err(Errno::CHANGED);
@@ -1334,6 +1448,388 @@ fn unsupported(e: Errno) -> bool {
     .contains(&e.0)
 }
 
+/// `fstatat(2)`'s twin: [`fstat`] of the entry `name` of the directory `dirfd` (`.`: `dirfd`'s
+/// own), opened for its attributes alone and as itself: a link at `name` is read as itself, with
+/// or without [`AtFlags::SYMLINK_NOFOLLOW`] (this half follows nothing). `name` is looked up in
+/// `dirfd` alone: no path above it is resolved again.
+/// # Errors
+/// The open's or the queries' code ([`Errno::NOENT`] for no such entry); [`Errno::INVAL`] for a
+/// refused name or [`AtFlags::REMOVEDIR`].
+pub fn fstatat<Fd: AsHandle, P: Arg>(dirfd: Fd, name: P, flags: AtFlags) -> Result<Stat> {
+    if flags.has(AtFlags::REMOVEDIR) {
+        return Err(Errno::INVAL);
+    }
+    let _exposed = expose_placeholders()?;
+    name.with_name(|name| {
+        let handle = nt_open(
+            dirfd.as_handle(),
+            name,
+            ffi::FILE_READ_ATTRIBUTES,
+            ffi::FILE_OPEN,
+            0,
+            None,
+        )?;
+        fstat(&handle)
+    })
+}
+
+/// `mkdirat(2)`'s twin: make the folder `name` in the directory `dirfd`, never over an entry there
+/// and never through a reparse point, with `mode`'s access list from its creation ([`Mode`]): for
+/// a private mode owner-only, its entries passed on to what is made inside it (`OICI`), as a 0700
+/// folder is its owner's alone; for any other its folder's entries.
+/// # Errors
+/// [`Errno::EXIST`] for a name that exists (a link or a junction included); [`Errno::INVAL`] for a
+/// refused name (`.` among them); the create's code; the token's or the descriptor's code where a
+/// private one's could not be built (nothing is made then).
+pub fn mkdirat<Fd: AsHandle, P: Arg>(dirfd: Fd, name: P, mode: Mode) -> Result<()> {
+    let security = descriptor_for(mode, acl::Inherit::ToChildren)?;
+    let _exposed = expose_placeholders()?;
+    name.with_name(|name| {
+        if name.is_empty() {
+            return Err(Errno::INVAL);
+        }
+        nt_open(
+            dirfd.as_handle(),
+            name,
+            ffi::FILE_READ_ATTRIBUTES,
+            ffi::FILE_CREATE,
+            ffi::FILE_DIRECTORY_FILE,
+            security.as_ref(),
+        )
+        .map(drop)
+    })
+}
+
+/// `renameat(2)`'s twin: give the entry `from` of `from_dir` the name `to` in `to_dir`, replacing
+/// an entry already there, as `rename(2)` does: with POSIX semantics, so an entry that is open is
+/// replaced too, and each handle on it (opened sharing deletion, as every open here and std's
+/// are) keeps the file it had, its old bytes read on; a read-only entry is replaced too. `from`
+/// is renamed as itself: a link moves, never its target. `from` is opened by name relative to
+/// `from_dir`'s handle and renamed through that handle, its new name relative to `to_dir`'s handle
+/// (`NtSetInformationFile`, which takes a name relative to `RootDirectory` by contract): no path
+/// above either folder is resolved again. A file system with no POSIX rename (FAT, exFAT) takes
+/// the legacy one, which refuses to replace an entry that is open ([`Errno::ACCESS_DENIED`]).
+/// # Errors
+/// The open's or the rename's code: [`Errno::ISDIR`] where the entry at `to` is a folder (NTFS
+/// replaces none); [`Errno::ACCESS_DENIED`] where `from` is a folder something inside is open in
+/// (or an image mapped to run); [`Errno::SHARING_VIOLATION`] where an entry at `from` or `to` is
+/// open without delete sharing; [`Errno::XDEV`] across volumes; [`Errno::NOENT`] where `from` is
+/// gone; [`Errno::INVAL`] for a refused name (`.` among them).
+pub fn renameat<F1: AsHandle, F2: AsHandle, P: Arg, Q: Arg>(
+    from_dir: F1,
+    from: P,
+    to_dir: F2,
+    to: Q,
+) -> Result<()> {
+    rename(
+        from_dir.as_handle(),
+        from,
+        to_dir.as_handle(),
+        to,
+        true,
+        None,
+    )
+}
+
+/// A rename with flags. [`RenameFlags::NOREPLACE`] renames as [`renameat`] does where nothing is at
+/// `to`, and where an entry is (of any kind: a file, a folder, a link) fails with [`Errno::EXIST`]
+/// and leaves both names as they were; the file system checks and renames in one step, so an
+/// entry made at `to` meanwhile is never replaced. [`RenameFlags::EXCHANGE`] (with or without
+/// `NOREPLACE`) is refused with [`Errno::NOSYS`]: NTFS has no atomic exchange. No flags is
+/// [`renameat`].
+/// # Errors
+/// As [`renameat`], with [`Errno::EXIST`] and [`Errno::NOSYS`] above.
+pub fn renameat_with<F1: AsHandle, F2: AsHandle, P: Arg, Q: Arg>(
+    from_dir: F1,
+    from: P,
+    to_dir: F2,
+    to: Q,
+    flags: RenameFlags,
+) -> Result<()> {
+    if flags.contains(RenameFlags::EXCHANGE) {
+        return Err(Errno::NOSYS);
+    }
+    let replace = !flags.contains(RenameFlags::NOREPLACE);
+    rename(
+        from_dir.as_handle(),
+        from,
+        to_dir.as_handle(),
+        to,
+        replace,
+        None,
+    )
+}
+
+/// [`renameat_with`]`(…, NOREPLACE)` of an entry the caller judged, as [`unlinkat`] removes one:
+/// move `from` of `from_dir` to `to` in `to_dir` only while `from` still names the file `expect`
+/// names, and never a third party's reparse point or a folder a volume is mounted on, which
+/// [`unlinkat`] keeps and a move must not carry either. `from` is opened by name relative to
+/// `from_dir`'s handle (never following a reparse point), judged through that handle, and renamed
+/// through it as [`renameat_with`] renames, never replacing an entry at `to`. It takes `flags` in
+/// the unix call shape and makes [`RenameFlags::NOREPLACE`] alone: a replace would remove an entry
+/// at `to` that nobody judged.
+/// # Errors
+/// * [`Errno::INVAL`] — `flags` other than [`RenameFlags::NOREPLACE`] alone, or a refused name;
+/// * [`Errno::CHANGED`] — `from` now names another file than `expect`: nothing moved;
+/// * [`Errno::FOREIGN_REPARSE`] — a reparse point that is not a link: kept;
+/// * [`Errno::MOUNT_POINT`] — a folder a volume is mounted on: kept (its target unreadable: that
+///   read's code, kept too);
+/// * [`Errno::EXIST`] — `to` is taken: nothing moved;
+/// * [`Errno::XDEV`] — the two folders are on different volumes: nothing moved;
+/// * [`Errno::ACCESS_DENIED`] — a folder with a file open under it, or an image mapped to run;
+///   [`Errno::SHARING_VIOLATION`] — held open without delete sharing: nothing moved;
+/// * [`Errno::NOENT`] — `from` is gone; anything else as the system said.
+pub fn renameat_judged<F1: AsHandle, F2: AsHandle, P: Arg, Q: Arg>(
+    from_dir: F1,
+    from: P,
+    to_dir: F2,
+    to: Q,
+    flags: RenameFlags,
+    expect: FileId,
+) -> Result<()> {
+    if flags != RenameFlags::NOREPLACE {
+        return Err(Errno::INVAL);
+    }
+    rename(
+        from_dir.as_handle(),
+        from,
+        to_dir.as_handle(),
+        to,
+        false,
+        Some(expect),
+    )
+}
+
+/// [`renameat`] (`replace`) or a [`RenameFlags::NOREPLACE`] rename; of `judged` alone where
+/// given ([`renameat_judged`]).
+fn rename<P: Arg, Q: Arg>(
+    from_dir: BorrowedHandle<'_>,
+    from: P,
+    to_dir: BorrowedHandle<'_>,
+    to: Q,
+    replace: bool,
+    judged: Option<FileId>,
+) -> Result<()> {
+    let _exposed = expose_placeholders()?;
+    from.with_name(|from| {
+        to.with_name(|to| {
+            if from.is_empty() || to.is_empty() {
+                return Err(Errno::INVAL);
+            }
+            let handle = nt_open(
+                from_dir,
+                from,
+                ffi::DELETE | ffi::FILE_READ_ATTRIBUTES,
+                ffi::FILE_OPEN,
+                0,
+                None,
+            )?;
+            if let Some(expect) = judged {
+                if file_id(&handle)? != expect {
+                    return Err(Errno::CHANGED);
+                }
+                let kind = kind_of(handle.as_handle())?;
+                if kind.is_foreign_reparse() {
+                    return Err(Errno::FOREIGN_REPARSE);
+                }
+                if mounts_volume(handle.as_handle(), kind)? {
+                    return Err(Errno::MOUNT_POINT);
+                }
+            }
+            if !legacy() {
+                let flags = if replace {
+                    ffi::FILE_RENAME_POSIX_SEMANTICS
+                        | ffi::FILE_RENAME_REPLACE_IF_EXISTS
+                        | ffi::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE
+                } else {
+                    ffi::FILE_RENAME_POSIX_SEMANTICS
+                };
+                match set_name(
+                    handle.as_handle(),
+                    ffi::FileRenameInformationEx,
+                    flags,
+                    to_dir,
+                    to,
+                ) {
+                    Err(e) if unsupported(e) => {}
+                    done => return done,
+                }
+            }
+            set_name(
+                handle.as_handle(),
+                ffi::FileRenameInformation,
+                u32::from(replace),
+                to_dir,
+                to,
+            )
+        })
+    })
+}
+
+/// `linkat(2)`'s twin: make `to` in `to_dir` a second name (a hard link) of the file `from` names
+/// in `from_dir`, never replacing an entry at `to`. `from` is linked as itself (this half follows
+/// nothing, [`AtFlags::SYMLINK_NOFOLLOW`] or not). Each name is looked up in its own directory
+/// alone.
+///
+/// Decision: the classic `FileLinkInformation`, not `FileLinkInformationEx`: a link never
+/// replaces here, and the Ex class differs only in what it does to an entry it replaces (POSIX
+/// semantics, a read-only one), so the classic class is the same law on every file system with
+/// hard links, those without the Ex class among them.
+/// # Errors
+/// [`Errno::EXIST`] where `to` names an entry; [`Errno::ISDIR`] for a folder, which NTFS gives no
+/// second name; the open's or the link's code (a file system with no hard links answers its own);
+/// [`Errno::INVAL`] for a refused name (`.` among them) or [`AtFlags::REMOVEDIR`].
+pub fn linkat<F1: AsHandle, F2: AsHandle, P: Arg, Q: Arg>(
+    from_dir: F1,
+    from: P,
+    to_dir: F2,
+    to: Q,
+    flags: AtFlags,
+) -> Result<()> {
+    if flags.has(AtFlags::REMOVEDIR) {
+        return Err(Errno::INVAL);
+    }
+    let _exposed = expose_placeholders()?;
+    from.with_name(|from| {
+        to.with_name(|to| {
+            if from.is_empty() || to.is_empty() {
+                return Err(Errno::INVAL);
+            }
+            let handle = nt_open(
+                from_dir.as_handle(),
+                from,
+                ffi::FILE_READ_ATTRIBUTES,
+                ffi::FILE_OPEN,
+                0,
+                None,
+            )?;
+            set_name(
+                handle.as_handle(),
+                ffi::FileLinkInformation,
+                0,
+                to_dir.as_handle(),
+                to,
+            )
+        })
+    })
+}
+
+/// Give the entry `handle` is open on the name `name` in `dir` (`class`: a rename, or a link, which
+/// adds it), with `flags` (a legacy class reads their first byte alone, its `ReplaceIfExists`).
+fn set_name(
+    handle: BorrowedHandle<'_>,
+    class: i32,
+    flags: u32,
+    dir: BorrowedHandle<'_>,
+    name: &[u16],
+) -> Result<()> {
+    type Info = ffi::FILE_RENAME_INFORMATION;
+    let name_at = offset_of!(Info, FileName);
+    let bytes_of_name = name.len().checked_mul(2).ok_or(Errno::INVAL)?;
+    let name_len = u32::try_from(bytes_of_name).map_err(|_| Errno::INVAL)?;
+    // The system refuses a length below the struct's own, which a one-letter name leaves.
+    let len = (name_at + bytes_of_name).max(size_of::<Info>());
+    let len32 = u32::try_from(len).map_err(|_| Errno::INVAL)?;
+    // As `u64`s, so the struct's pointer-sized field is aligned.
+    let mut words = vec![0u64; len.div_ceil(8)];
+    // SAFETY: any `u64` buffer is a valid `u8` buffer of eight times the length; the borrow of
+    // `words` outlives `bytes`, which is dropped before `words` is read again.
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), words.len() * 8) };
+    let mut put = |at: usize, field: &[u8]| bytes[at..at + field.len()].copy_from_slice(field);
+    put(offset_of!(Info, Flags), &flags.to_ne_bytes());
+    put(
+        offset_of!(Info, RootDirectory),
+        &(dir.as_raw_handle() as usize).to_ne_bytes(),
+    );
+    put(offset_of!(Info, FileNameLength), &name_len.to_ne_bytes());
+    for (i, unit) in name.iter().enumerate() {
+        put(name_at + 2 * i, &unit.to_ne_bytes());
+    }
+    let mut io = ffi::IO_STATUS_BLOCK {
+        Status: 0,
+        Information: 0,
+    };
+    // SAFETY: `handle` and `dir` are live for the call; `words` holds `len` readable bytes laid
+    // out as `class`'s input struct (its name within `len`), alive for the call; `io` is a
+    // writable local; the handle was opened for synchronous I/O, so the call completes before
+    // returning.
+    let status = unsafe {
+        ffi::NtSetInformationFile(
+            handle.as_raw_handle(),
+            &raw mut io,
+            words.as_ptr().cast::<c_void>(),
+            len32,
+            class,
+        )
+    };
+    if status < 0 {
+        Err(Errno::from_status(status))
+    } else {
+        Ok(())
+    }
+}
+
+/// `fchmod(2)`'s twin for a private mode ([`Mode`]): make what `fd` is open on owner-only in place,
+/// under a protected access list of the user and SYSTEM ([`acl::owner_only_descriptor`]; a
+/// folder's entries passed on to what is made inside it), as a chmod to 0600 or 0700 leaves a file
+/// to its owner alone. Only the owner changes who may use what it owns, as on unix, where a chmod
+/// by anyone but the owner is `EPERM`: an object this token's user does not own is refused
+/// ([`Errno::NOT_OWNER`]) and left as it is, never taken over (a takeover through a list that
+/// grants `WRITE_OWNER` would leave whoever planted it the handles it holds open). The object is
+/// reopened through `fd`, never by a name: once to read its owner, and once with `WRITE_DAC`,
+/// which its owner holds whatever its list says, through which the owner is read again and the
+/// list written. On a folder the system passes the new entries on to what inside takes entries
+/// from it (never to an owner-only file or folder, whose list is protected), so it narrows and
+/// never widens.
+/// # Errors
+/// [`Errno::NOSYS`] for a mode that grants the group or others anything (this half grants nothing
+/// in place: a file takes its folder's entries at its creation alone); [`Errno::NOT_OWNER`] for an
+/// object another account owns, or that names no owner; a reopen's or the write's code
+/// (`ERROR_ACCESS_DENIED`); the token's or the descriptor's.
+pub fn fchmod<Fd: AsHandle>(fd: Fd, mode: Mode) -> Result<()> {
+    if !mode.is_private() {
+        return Err(Errno::NOSYS);
+    }
+    let fd = fd.as_handle();
+    let io = |e: std::io::Error| Errno::from_io(&e);
+    let user = acl::Sid::token_user().map_err(io)?;
+    let _exposed = expose_placeholders()?;
+    let reopen = |access: u32| {
+        nt_open(
+            fd,
+            &[],
+            access | ffi::READ_CONTROL | ffi::FILE_READ_ATTRIBUTES,
+            ffi::FILE_OPEN,
+            0,
+            None,
+        )
+    };
+    let owned = |handle: &OwnedHandle| {
+        let owner = acl::Descriptor::of(handle, acl::Parts::OWNER)
+            .and_then(|descriptor| descriptor.owner())
+            .map_err(io)?;
+        if owner.as_ref() == Some(&user) {
+            Ok(())
+        } else {
+            Err(Errno::NOT_OWNER)
+        }
+    };
+    owned(&reopen(0)?)?;
+    let handle = reopen(ffi::WRITE_DAC)?;
+    owned(&handle)?;
+    let inherit = if kind_of(handle.as_handle())?.is_dir() {
+        acl::Inherit::ToChildren
+    } else {
+        acl::Inherit::No
+    };
+    acl::owner_only_descriptor(&user, inherit)
+        .and_then(|descriptor| {
+            descriptor.apply(&handle, acl::Parts::DACL | acl::Parts::PROTECTED_DACL)
+        })
+        .map_err(io)
+}
+
 /// One directory entry, as the directory index lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
@@ -1437,6 +1933,7 @@ impl Dir {
             ffi::FILE_LIST_DIRECTORY | ffi::FILE_READ_ATTRIBUTES,
             ffi::FILE_OPEN,
             ffi::FILE_DIRECTORY_FILE,
+            None,
         ) {
             Ok(handle) => Some(handle),
             Err(Errno::DELETE_PENDING) => None,
@@ -1841,6 +2338,37 @@ pub mod seam {
                 0,
                 &raw mut returned,
                 std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 { Err(Errno::last()) } else { Ok(()) }
+    }
+
+    /// Set the change time of the file `fd` is open on to `ticks` (filetime ticks, as
+    /// [`super::Stat::change_time`] reads them), its other times and its attributes left as they
+    /// are (a zero field of `FILE_BASIC_INFO` changes nothing): what any writer of its attributes
+    /// may do, which lets a test show a change that an unmoved change time hides.
+    /// # Errors
+    /// `SetFileInformationByHandle`'s code; [`Errno::INVAL`] for `ticks` 0, which would change
+    /// nothing.
+    pub fn set_change_time<Fd: AsHandle>(fd: Fd, ticks: i64) -> Result<()> {
+        if ticks == 0 {
+            return Err(Errno::INVAL);
+        }
+        let info = ffi::FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: ticks,
+            FileAttributes: 0,
+        };
+        // SAFETY: a live handle; `info` is `FileBasicInfo`'s input struct, alive for the call and
+        // exactly its length.
+        let ok = unsafe {
+            ffi::SetFileInformationByHandle(
+                fd.as_handle().as_raw_handle(),
+                ffi::FileBasicInfo,
+                (&raw const info).cast(),
+                size_of::<ffi::FILE_BASIC_INFO>() as u32,
             )
         };
         if ok == 0 { Err(Errno::last()) } else { Ok(()) }

@@ -3,33 +3,6 @@
 
 use super::*;
 
-/// An unconfigured roster reads as it is, without the harness's state, so a default-home
-/// footer keeps its own label; a configured one is only one bound to its logins.
-#[test]
-fn an_unconfigured_roster_reads_without_the_harness_state() {
-    let dir = aterm_tempfile::TempDir::new().unwrap();
-    let unasked = || -> Option<PathBuf> { panic!("an unconfigured roster asks for no state") };
-    assert_eq!(
-        roster_at(&dir.path().join("absent.toml"), unasked),
-        Some(accounts::Roster::default())
-    );
-    let configured = dir.path().join(accounts::ACCOUNTS_FILE);
-    std::fs::write(
-        &configured,
-        "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\n",
-    )
-    .unwrap();
-    assert_eq!(
-        accounts::Roster::load(&configured).map(|r| r.rows.len()),
-        Ok(1),
-        "configured"
-    );
-    assert!(
-        roster_at(&configured, || None).is_none(),
-        "no state to bind it in"
-    );
-}
-
 #[test]
 fn the_switch_and_the_label_give_words_up_in_order() {
     use crate::autopilot::{HarnessSwitch, SwitchOff};
@@ -411,12 +384,12 @@ fn stopped_footer_watch_has_no_followup_or_idle_reads() {
     );
     assert!(model.fire("AskOld", &mut state));
     assert_eq!(state["watch"], watch_model_projection(&schedule));
-    assert_eq!(
-        model.action_enabled("IdleRead", &state),
-        schedule.due_idle(now + IDLE_RECHECK).is_some()
+    assert!(
+        schedule.due_idle(now + IDLE_RECHECK).is_some(),
+        "a new watch starts on the clocks arm, whose idle clock reads it"
     );
     assert!(schedule.watched[&7].awaiting);
-    assert_eq!(schedule.next(now), Some(now + FOLLOW_UPS[0]));
+    assert_eq!(schedule.next(now, true), Some(now + FOLLOW_UPS[0]));
     let Accepted {
         latest: immediate,
         stopped,
@@ -430,11 +403,11 @@ fn stopped_footer_watch_has_no_followup_or_idle_reads() {
     assert!(immediate.is_empty());
     assert_eq!(stopped, [7]);
     assert_eq!(state["watch"], watch_model_projection(&schedule));
-    assert!(schedule.next(now).is_none());
+    assert!(schedule.next(now, true).is_none());
     assert!(schedule.due_followups(now + FOLLOW_UPS[1]).is_empty());
-    assert_eq!(
-        model.action_enabled("IdleRead", &state),
-        schedule.due_idle(now + IDLE_RECHECK).is_some()
+    assert!(
+        schedule.due_idle(now + IDLE_RECHECK).is_none(),
+        "no idle read of a stopped watch"
     );
     assert!(weak.upgrade().is_none(), "the watch released its timeline");
 }
@@ -495,9 +468,8 @@ fn stale_group_stop_preserves_replacement_footer_watch() {
     assert!(stopped.is_empty());
     let due = schedule
         .due_idle(now + IDLE_RECHECK)
-        .expect("active Claude keeps its idle refresh");
+        .expect("the replacement on the clocks arm keeps its idle refresh");
     assert_eq!(due.pgid, 43);
-    assert!(model.action_enabled("IdleRead", &state));
 }
 
 #[test]
@@ -1352,6 +1324,7 @@ fn facts_with_usage() -> FooterFacts {
             Some(Wall {
                 label: "5h",
                 resets: "3pm".into(),
+                resets_at: 0,
             }),
             None,
         ),
@@ -1485,7 +1458,7 @@ fn a_live_session_stays_watched_on_the_slow_clock() {
     let _ = schedule.due_followups(past);
     schedule.read(7, past, true);
     schedule.prune(past, |job| job.session == 7 && job.pgid == 42);
-    assert_eq!(schedule.next(past), Some(past + LONG_IDLE_RECHECK));
+    assert_eq!(schedule.next(past, true), Some(past + LONG_IDLE_RECHECK));
     assert!(schedule.due_idle(past + IDLE_RECHECK).is_none());
     assert!(schedule.due_idle(past + LONG_IDLE_RECHECK).is_some());
     schedule.prune(past, |_| false);
@@ -1510,24 +1483,7 @@ fn forgetting_a_session_drops_its_fold_and_watch() {
     let mut folds: HashMap<u64, footer::FooterCache> = HashMap::new();
     for session in [1, 2] {
         schedule.watch(job(session), now, true);
-        known.insert(
-            session,
-            Identity {
-                pid: 1,
-                started: None,
-                dir: None,
-                launch: LaunchFacts::default(),
-                launch_for: None,
-                login: None,
-                argv: Vec::new(),
-                task: None,
-                login_checked_for: None,
-                route: aterm_agent::harness::accounts::AuthRoute::Outside,
-                unoffered: None,
-                env_stamp: None,
-                first_seen: None,
-            },
-        );
+        known.insert(session, Identity::new(1, None));
         folds.insert(session, footer::FooterCache::default());
     }
     let Accepted {
@@ -1710,15 +1666,26 @@ fn unread_exec_directory_is_retried_for_the_same_process() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| None,
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let mut known = HashMap::new();
     let mut tails = ProcessTails::default();
     let mut fold = footer::FooterCache::default();
-    let mut roster = RosterMemo::default();
-    let first = resolve_and_post(&mut known, &mut tails, &mut fold, &mut roster, &job, asks);
+    let mut roster = MachineMemo::default();
+    let first = resolve_and_post(
+        &mut known,
+        &mut tails,
+        &mut fold,
+        &mut roster,
+        &job,
+        asks,
+        std::time::Instant::now(),
+    );
     assert!(!first.row);
     assert!(
         known.is_empty(),
@@ -1736,6 +1703,7 @@ fn unread_exec_directory_is_retried_for_the_same_process() {
             args: recovered_args,
             ..asks
         },
+        std::time::Instant::now(),
     );
     assert!(
         recovered.row,
@@ -1842,18 +1810,29 @@ fn readable_launcher_directory_is_provisional_until_the_registered_image_is_read
         files: |_| None,
         tap: NO_TAP,
         args: |_| args(false),
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| {
             AUTH_READS.set(AUTH_READS.get() + 1);
             accounts::AuthRoute::Stored
         },
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let mut known = HashMap::new();
     let mut tails = ProcessTails::default();
     let mut fold = footer::FooterCache::default();
-    let mut roster = RosterMemo::default();
-    let first = resolve_and_post(&mut known, &mut tails, &mut fold, &mut roster, &job, asks);
+    let mut roster = MachineMemo::default();
+    let first = resolve_and_post(
+        &mut known,
+        &mut tails,
+        &mut fold,
+        &mut roster,
+        &job,
+        asks,
+        std::time::Instant::now(),
+    );
     assert!(!first.row);
     let provisional = known.get(&job.session).unwrap();
     assert_eq!(provisional.dir.as_deref(), Some(launcher_dir.as_path()));
@@ -1871,6 +1850,7 @@ fn readable_launcher_directory_is_provisional_until_the_registered_image_is_read
         &mut roster,
         &job,
         selected,
+        std::time::Instant::now(),
     );
     assert!(
         recovered.row,
@@ -1904,9 +1884,14 @@ fn readable_launcher_directory_is_provisional_until_the_registered_image_is_read
             &mut roster,
             &job,
             selected,
+            std::time::Instant::now(),
         );
         assert_eq!(found.row, registry_present);
-        assert_eq!(EXEC_READS.get(), before + 1);
+        assert_eq!(
+            EXEC_READS.get(),
+            before,
+            "a confirmed image is held: no read of it again, row or none"
+        );
         assert_eq!(AUTH_READS.get(), 1);
         assert_eq!(known.get(&job.session), Some(&confirmed));
         assert_eq!(
@@ -1923,61 +1908,6 @@ fn readable_launcher_directory_is_provisional_until_the_registered_image_is_read
     std::fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn the_roster_is_read_at_most_every_recheck() {
-    let t0 = std::time::Instant::now();
-    let asked = std::cell::Cell::new(0);
-    let mut memo = RosterMemo::default();
-    let mut at = |now: std::time::Instant, answer: Option<accounts::Roster>| {
-        memo.at(now, || {
-            asked.set(asked.get() + 1);
-            answer
-        })
-        .cloned()
-    };
-    let two = two_accounts();
-    let mut three = two.clone();
-    three.rows.push(accounts::Row {
-        label: "pool-a".into(),
-        class: accounts::Class::Pool,
-        dir: Some("/logins/pool-a".into()),
-        ..accounts::Row::default()
-    });
-    let one = accounts::Roster {
-        rows: two.rows[..1].to_vec(),
-    };
-    assert_eq!(at(t0, Some(two.clone())), Some(two.clone()));
-    let within = t0 + ROSTER_RECHECK - Duration::from_millis(1);
-    assert_eq!(at(within, Some(three.clone())), Some(two.clone()), "kept");
-    assert_eq!(asked.get(), 1, "not read again within the period");
-    let t1 = t0 + ROSTER_RECHECK;
-    assert_eq!(at(t1, Some(three.clone())), Some(three), "read afresh");
-    assert_eq!(asked.get(), 2);
-    let t2 = t1 + ROSTER_RECHECK;
-    assert_eq!(
-        at(t2, Some(one.clone())),
-        Some(one.clone()),
-        "one account binds identity"
-    );
-    assert_eq!(
-        at(t2 + Duration::from_secs(1), Some(two.clone())),
-        Some(one),
-        "the answer is kept for the period"
-    );
-    assert_eq!(asked.get(), 3);
-    let t3 = t2 + ROSTER_RECHECK;
-    assert_eq!(at(t3, None), None, "a load that fails");
-    let t4 = t3 + ROSTER_RECHECK;
-    assert_eq!(
-        at(t4, Some(accounts::Roster::default())),
-        Some(accounts::Roster::default()),
-        "none listed"
-    );
-    let t5 = t4 + ROSTER_RECHECK;
-    assert_eq!(at(t5, Some(two.clone())), Some(two), "listed again");
-    assert_eq!(asked.get(), 6);
-}
-
 fn on_main(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
     Some(args_of(&["HOME=/home/someone"]))
 }
@@ -1992,25 +1922,14 @@ fn on_work(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
 
 fn unread(pid: i32, claude: &std::path::Path) -> Identity {
     Identity {
-        pid,
-        started: None,
         dir: Some(claude.to_path_buf()),
-        launch: LaunchFacts::default(),
-        launch_for: None,
-        login: None,
-        argv: Vec::new(),
-        task: None,
-        login_checked_for: None,
-        route: aterm_agent::harness::accounts::AuthRoute::Outside,
-        unoffered: None,
-        env_stamp: None,
-        first_seen: None,
+        ..Identity::new(pid, None)
     }
 }
 
 fn account_after(
     identity: &mut Identity,
-    roster: &mut RosterMemo,
+    roster: &mut MachineMemo,
     asks: Asks,
 ) -> Option<Option<String>> {
     let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -2022,6 +1941,7 @@ fn account_after(
         &mut footer::FooterCache::default(),
         roster,
         asks,
+        std::time::Instant::now(),
     );
     let timeline = timeline.lock().unwrap();
     timeline.claude_footer().map(|facts| facts.account.clone())
@@ -2070,7 +1990,7 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
     identity.started = Some(START);
     let mut tail = footer::TailCache::default();
     let mut fold = footer::FooterCache::default();
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     let asks = Asks {
         files: |_| None,
         tap: NO_TAP,
@@ -2081,9 +2001,12 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
                 &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
             ]))
         },
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let mut refresh = || {
         let _ = resolve_facts(
@@ -2093,6 +2016,7 @@ fn selected_profile_changes_replace_subscription_even_when_registry_is_unreadabl
             &mut fold,
             &mut memo,
             asks,
+            std::time::Instant::now(),
         );
         let held = timeline.lock().unwrap();
         let facts = held.claude_footer().unwrap();
@@ -2200,7 +2124,7 @@ fn a_muse_login_store_switch_drops_the_previous_accounts_card_facts() {
     let mut identity = unread(PID, &root.join("claude"));
     let mut tail = footer::TailCache::default();
     let mut fold = footer::FooterCache::default();
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     let asks = Asks {
         files: |_| None,
         tap: NO_TAP,
@@ -2212,14 +2136,17 @@ fn a_muse_login_store_switch_drops_the_previous_accounts_card_facts() {
                 ..Default::default()
             })
         },
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let refresh = |identity: &mut Identity,
                    tail: &mut footer::TailCache,
                    fold: &mut footer::FooterCache,
-                   memo: &mut RosterMemo,
+                   memo: &mut MachineMemo,
                    now| {
         let clock = footer::ReadClock {
             read_at: std::time::UNIX_EPOCH,
@@ -2233,7 +2160,7 @@ fn a_muse_login_store_switch_drops_the_previous_accounts_card_facts() {
             fold,
             memo,
             (asks, |_| None),
-            &clock,
+            (&clock, std::time::Instant::now()),
         );
         timeline
             .lock()
@@ -2440,12 +2367,12 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
     identity.started = Some(IMAGE);
     let mut tail = footer::TailCache::default();
     let mut fold = footer::FooterCache::default();
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     let asks = Asks {
         files: |_| None,
         tap: NO_TAP,
         args,
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |pid, argv, cwd| {
             assert_eq!(pid, PID as u32);
@@ -2454,8 +2381,18 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
             CHECKS.set(CHECKS.get() + 1);
             accounts::AuthRoute::Stored.unless(!ALLOWED.get())
         },
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
-    let mut refresh = |asks| {
+    // `exec`: the process exec'd since the last read, as its process watch tells the resolver,
+    // which drops the image it held ([`Resolver::execed`]) and reads the new one at the next
+    // read's start ([`resolve_and_post_hearing`]).
+    let mut refresh = |asks: Asks, exec: bool| {
+        if exec {
+            identity.image = None;
+            identity.read_image(&asks);
+        }
         resolve_facts(
             &timeline,
             &mut identity,
@@ -2463,6 +2400,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
             &mut fold,
             &mut memo,
             asks,
+            std::time::Instant::now(),
         );
         timeline
             .lock()
@@ -2475,11 +2413,11 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
     };
     let unavailable = aterm_agent::harness::profile::SubscriptionDisplay::default();
     assert_eq!(
-        refresh(asks),
+        refresh(asks, false),
         unavailable,
         "helper/provider/refused sources suppress every field"
     );
-    assert_eq!(refresh(asks), unavailable);
+    assert_eq!(refresh(asks, false), unavailable);
     assert_eq!(
         CHECKS.get(),
         1,
@@ -2487,7 +2425,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
     );
     ALLOWED.set(true);
     assert_eq!(
-        refresh(asks),
+        refresh(asks, false),
         unavailable,
         "the verdict belongs to the old image"
     );
@@ -2499,11 +2437,11 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
         .unwrap()
         .insert("startedAt".into(), aterm_json::json!((IMAGE + 60) * 1000));
     std::fs::write(&registry, aterm_json::to_string(&row).unwrap()).unwrap();
-    let display = refresh(asks);
+    let display = refresh(asks, false);
     assert_eq!(display.email.as_deref(), Some("auth@example.com"));
     assert_eq!(display.plan.as_deref(), Some("Max 5x"));
     assert_eq!(display.weekly.as_deref(), Some("weekly 29% left"));
-    assert_eq!(refresh(asks), display);
+    assert_eq!(refresh(asks, false), display);
     assert_eq!(CHECKS.get(), 2);
 
     let cwd = root.join("another-work");
@@ -2512,7 +2450,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
         .unwrap()
         .insert("cwd".into(), aterm_json::json!(cwd));
     std::fs::write(&registry, aterm_json::to_string(&row).unwrap()).unwrap();
-    assert_eq!(refresh(asks), display);
+    assert_eq!(refresh(asks, false), display);
     assert_eq!(
         CHECKS.get(),
         3,
@@ -2528,7 +2466,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
         ..asks
     };
     assert_eq!(
-        refresh(unregistered),
+        refresh(unregistered, true),
         unavailable,
         "an exec cannot borrow a prior image's verdict"
     );
@@ -2543,7 +2481,7 @@ fn subscription_requires_stored_auth_for_the_registered_image_and_directory() {
         ..asks
     };
     assert_eq!(
-        refresh(changed_home),
+        refresh(changed_home, true),
         unavailable,
         "the same argv with another HOME cannot borrow the old settings verdict"
     );
@@ -2574,9 +2512,12 @@ fn weekly_quota_expires_on_the_local_clock_while_its_live_session_is_watched() {
                 &format!("CLAUDE_CONFIG_DIR={}", root.join("claude").display()),
             ]))
         },
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     for (reset, expires_after) in [
         ("2099-01-01T00:00:00Z", 3600),
@@ -2606,7 +2547,7 @@ fn weekly_quota_expires_on_the_local_clock_while_its_live_session_is_watched() {
         identity.started = Some(START);
         let mut tail = footer::TailCache::default();
         let mut fold = footer::FooterCache::default();
-        let mut memo = RosterMemo::default();
+        let mut memo = MachineMemo::default();
         let mut refresh = |elapsed| {
             let (_, found) = resolve_facts_at(
                 &timeline,
@@ -2615,11 +2556,14 @@ fn weekly_quota_expires_on_the_local_clock_while_its_live_session_is_watched() {
                 &mut fold,
                 &mut memo,
                 asks,
-                &footer::ReadClock {
-                    read_at: std::time::SystemTime::now(),
-                    now: OBSERVED + elapsed,
-                    offset_at: &|_, _| Some(0),
-                },
+                (
+                    &footer::ReadClock {
+                        read_at: std::time::SystemTime::now(),
+                        now: OBSERVED + elapsed,
+                        offset_at: &|_, _| Some(0),
+                    },
+                    std::time::Instant::now(),
+                ),
             );
             let display = timeline
                 .lock()
@@ -2656,7 +2600,7 @@ fn weekly_quota_expires_on_the_local_clock_while_its_live_session_is_watched() {
         );
         for elapsed in (661..=3661).step_by(60) {
             let at = asked + Duration::from_secs(elapsed as u64);
-            assert_eq!(schedule.next(at), Some(at));
+            assert_eq!(schedule.next(at, true), Some(at));
             assert!(schedule.due_idle(at).is_some());
             let (found, display) = refresh(elapsed);
             assert_eq!(display.email.as_deref(), Some("expiry@example.com"));
@@ -2699,22 +2643,28 @@ fn a_read_that_answers_is_given_its_account() {
         files: |_| None,
         tap: NO_TAP,
         args,
-        roster: || Some(two_accounts()),
+        roster: RosterAsks::Given(|| Some(two_accounts())),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let unasked = |args| Asks {
         files: |_| None,
         tap: NO_TAP,
         args,
-        roster: || unreachable!("no login was read: the roster is not asked"),
+        roster: RosterAsks::Given(|| unreachable!("no login was read: the roster is not asked")),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let read = |asks: Asks| {
-        let mut memo = RosterMemo::default();
+        let mut memo = MachineMemo::default();
         let account = account_after(&mut unread(PID, &claude), &mut memo, asks);
-        (account, memo.read.is_some())
+        (account, memo.roster.given.is_some())
     };
     assert_eq!(read(listed(on_work)), (Some(Some("work-2".into())), true));
     assert_eq!(
@@ -2731,9 +2681,12 @@ fn a_read_that_answers_is_given_its_account() {
         files: |_| None,
         tap: NO_TAP,
         args: on_main,
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     assert_eq!(read(none), (Some(None), true), "no roster: asked, none");
     assert_eq!(
@@ -2742,7 +2695,7 @@ fn a_read_that_answers_is_given_its_account() {
         "an environment that reads empty"
     );
     let mut identity = unread(PID, &claude);
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     assert_eq!(
         account_after(&mut identity, &mut memo, unasked(|_| None)),
         Some(None)
@@ -2761,9 +2714,12 @@ fn a_read_that_answers_is_given_its_account() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| unreachable!("no registry row: the process is not read"),
-        roster: || unreachable!("no facts: the roster is not asked"),
+        roster: RosterAsks::Given(|| unreachable!("no facts: the roster is not asked")),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     assert_eq!(read(nothing), (None, false));
     let _ = std::fs::remove_dir_all(&root);
@@ -2791,9 +2747,12 @@ fn a_read_publishes_the_excerpts_beside_the_facts() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| Some(args_of(&["HOME=/home/someone"])),
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let read = |asks: Asks| {
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -2803,8 +2762,9 @@ fn a_read_publishes_the_excerpts_beside_the_facts() {
             &mut unread(PID, &claude),
             &mut footer::TailCache::default(),
             &mut footer::FooterCache::default(),
-            &mut RosterMemo::default(),
+            &mut MachineMemo::default(),
             asks,
+            std::time::Instant::now(),
         );
         let timeline = timeline.lock().unwrap();
         (
@@ -2824,9 +2784,12 @@ fn a_read_publishes_the_excerpts_beside_the_facts() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| unreachable!("no registry row: the process is not read"),
-        roster: || unreachable!("no facts: the roster is not asked"),
+        roster: RosterAsks::Given(|| unreachable!("no facts: the roster is not asked")),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     assert_eq!(read(nothing), (false, None));
     let _ = std::fs::remove_dir_all(&root);
@@ -2843,15 +2806,18 @@ fn the_side_rides_beside_the_facts() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| Some(args_of(&["HOME=/home/someone"])),
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Outside,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let mut identity = unread(PID, &claude);
     let (mut tail, mut fold, mut memo) = (
         footer::TailCache::default(),
         footer::FooterCache::default(),
-        RosterMemo::default(),
+        MachineMemo::default(),
     );
     let mut read = || {
         let (moved, ..) = resolve_into(
@@ -2861,6 +2827,7 @@ fn the_side_rides_beside_the_facts() {
             &mut fold,
             &mut memo,
             asks,
+            std::time::Instant::now(),
         );
         let timeline = timeline.lock().unwrap();
         (
@@ -2952,11 +2919,14 @@ fn the_login_is_the_registered_images() {
         files: |_| None,
         tap: NO_TAP,
         args,
-        roster: || Some(two_accounts()),
+        roster: RosterAsks::Given(|| Some(two_accounts())),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     let mut identity = Identity {
         login: login_of_args(on_main(PID).as_ref()),
         argv: vec!["shim".into()],
@@ -5695,23 +5665,29 @@ fn muse_signed_in_cards_populate_the_footer() {
         &mut identity,
         &mut footer::TailCache::default(),
         &mut footer::FooterCache::default(),
-        &mut RosterMemo::default(),
+        &mut MachineMemo::default(),
         (
             Asks {
                 files: |_| None,
                 tap: NO_TAP,
                 args: |_| None,
-                roster: || None,
+                roster: RosterAsks::Given(|| None),
                 home: || None,
                 route: |_, _, _| accounts::AuthRoute::Outside,
+                default: |_, _| {},
+                catalog: |_| {},
+                wall: |_| std::time::SystemTime::now(),
             },
             |_| None,
         ),
-        &footer::ReadClock {
-            read_at: std::time::UNIX_EPOCH,
-            now: now.get(),
-            offset_at: &|_, _| Some(0),
-        },
+        (
+            &footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now: now.get(),
+                offset_at: &|_, _| Some(0),
+            },
+            std::time::Instant::now(),
+        ),
     );
     {
         let held = timeline.lock().unwrap();
@@ -5937,9 +5913,12 @@ fn a_pane_with_no_context_reading_draws_no_context_fact() {
         files: |_| None,
         tap: NO_TAP,
         args: |_| Some(args_of(&["HOME=/home/someone"])),
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     // No reading, no context fact (nor a word for a value the rule does not know); the
     // reading's arrival after it is the control that the facts are drawn there.
@@ -5965,7 +5944,7 @@ fn a_pane_with_no_context_reading_draws_no_context_fact() {
     identity.started = Some(START);
     let mut tail = footer::TailCache::default();
     let mut fold = footer::FooterCache::default();
-    let mut memo = RosterMemo::default();
+    let mut memo = MachineMemo::default();
     resolve_facts(
         &timeline,
         &mut identity,
@@ -5973,6 +5952,7 @@ fn a_pane_with_no_context_reading_draws_no_context_fact() {
         &mut fold,
         &mut memo,
         asks,
+        std::time::Instant::now(),
     );
     assert_eq!(context(&timeline), None, "claude: no reading, no fact");
     let screen = claude_screen(false, "");
@@ -5990,6 +5970,7 @@ fn a_pane_with_no_context_reading_draws_no_context_fact() {
         &mut fold,
         &mut memo,
         asks,
+        std::time::Instant::now(),
     );
     assert_eq!(
         context(&timeline).as_deref(),
@@ -6030,8 +6011,9 @@ fn a_pane_with_no_context_reading_draws_no_context_fact() {
             identity,
             &mut footer::TailCache::default(),
             &mut footer::FooterCache::default(),
-            &mut RosterMemo::default(),
+            &mut MachineMemo::default(),
             asks,
+            std::time::Instant::now(),
         );
     };
     fill(&mut identity);
@@ -6073,15 +6055,19 @@ fn kimi_facts_resolve_outside_claudes_registry() {
         &mut identity,
         &mut footer::TailCache::default(),
         &mut footer::FooterCache::default(),
-        &mut RosterMemo::default(),
+        &mut MachineMemo::default(),
         Asks {
             files: |_| None,
             tap: NO_TAP,
             args: |_| Some(args_of(&["HOME=/home/someone"])),
-            roster: || None,
+            roster: RosterAsks::Given(|| None),
             home: scratch_home,
             route: |_, _, _| accounts::AuthRoute::Stored,
+            default: |_, _| {},
+            catalog: |_| {},
+            wall: |_| std::time::SystemTime::now(),
         },
+        std::time::Instant::now(),
     );
     let facts = timeline
         .lock()
@@ -7744,23 +7730,29 @@ fn agy_resolver_uses_process_presence_and_keeps_task_fallback() {
             &mut identity,
             &mut footer::TailCache::default(),
             &mut footer::FooterCache::default(),
-            &mut RosterMemo::default(),
+            &mut MachineMemo::default(),
             (
                 Asks {
                     files: test_files,
                     tap: NO_TAP,
                     args: test_args,
-                    roster: || None,
+                    roster: RosterAsks::Given(|| None),
                     home: test_home,
                     route: |_, _, _| accounts::AuthRoute::Outside,
+                    default: |_, _| {},
+                    catalog: |_| {},
+                    wall: |_| std::time::SystemTime::now(),
                 },
                 |_| None,
             ),
-            &footer::ReadClock {
-                read_at: std::time::UNIX_EPOCH,
-                now: 1_792_000_000,
-                offset_at: &|_, _| Some(0),
-            },
+            (
+                &footer::ReadClock {
+                    read_at: std::time::UNIX_EPOCH,
+                    now: 1_792_000_000,
+                    offset_at: &|_, _| Some(0),
+                },
+                std::time::Instant::now(),
+            ),
         );
         let held = timeline.lock().unwrap();
         (held.claude_footer_shown(), held.claude_excerpts().cloned())
@@ -7984,24 +7976,30 @@ fn muse_resolver_populates_model_effort_resume_and_excerpts_from_session_log() {
         &mut identity,
         &mut footer::TailCache::default(),
         &mut footer::FooterCache::default(),
-        &mut RosterMemo::default(),
+        &mut MachineMemo::default(),
         (
             Asks {
                 files: test_files,
                 tap: NO_TAP,
                 args: test_args,
                 // Claude Code's roster, which names no Muse account.
-                roster: || Some(two_accounts()),
+                roster: RosterAsks::Given(|| Some(two_accounts())),
                 home: test_home,
                 route: |_, _, _| accounts::AuthRoute::Outside,
+                default: |_, _| {},
+                catalog: |_| {},
+                wall: |_| std::time::SystemTime::now(),
             },
             |_| Some(home.clone()),
         ),
-        &footer::ReadClock {
-            read_at: std::time::UNIX_EPOCH,
-            now: 1_792_000_000,
-            offset_at: &|_, _| Some(0),
-        },
+        (
+            &footer::ReadClock {
+                read_at: std::time::UNIX_EPOCH,
+                now: 1_792_000_000,
+                offset_at: &|_, _| Some(0),
+            },
+            std::time::Instant::now(),
+        ),
     );
     let held = timeline.lock().unwrap();
     let shown = held.claude_footer_shown().expect("muse footer facts");

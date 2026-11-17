@@ -689,6 +689,11 @@ pub fn listed(paths: &Paths) -> Result<Lookup<Vec<Standing>>> {
 /// value-free, one per account.
 const REFUSALS: &str = "claude-token-refusals.json";
 
+/// Where this Mac keeps its refusals ([`REFUSALS`]), which every standing read here judges by.
+pub(crate) fn refusals_file(paths: &Paths) -> std::path::PathBuf {
+    paths.dir.join(REFUSALS)
+}
+
 /// The lock a refusal's writer takes.
 const REFUSALS_LOCK: &str = "claude-token-refusals.lock";
 
@@ -716,7 +721,7 @@ struct Refusal {
 /// none: each session here meets a refused token's refusal again at its next request, which
 /// records it again ([`note_refused`]).
 fn refusals(paths: &Paths) -> BTreeMap<String, Refusal> {
-    let Ok(Some(bytes)) = crate::fsx::read_private(&paths.dir.join(REFUSALS), MAX_REFUSALS) else {
+    let Ok(Some(bytes)) = crate::fsx::read_private(&refusals_file(paths), MAX_REFUSALS) else {
         return BTreeMap::new();
     };
     let Ok(value) = aterm_json::from_slice::<aterm_json::Value>(bytes.as_slice()) else {
@@ -824,7 +829,7 @@ pub fn note_refused(paths: &Paths, standing: &Standing, status: u16, now: u64) -
     let text =
         aterm_json::to_string(&aterm_json::json!({"schema": REFUSALS_SCHEMA, "refused": rows}))
             .map_err(|e| crate::Error::new(format!("{REFUSALS}: {e}")))?;
-    crate::fsx::write_atomic(&paths.dir.join(REFUSALS), text.as_bytes(), 0o600)?;
+    crate::fsx::write_atomic(&refusals_file(paths), text.as_bytes(), 0o600)?;
     Ok(true)
 }
 

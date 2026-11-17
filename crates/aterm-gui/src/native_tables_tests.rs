@@ -257,8 +257,8 @@ fn cell_text(tables: &TablesApp, pk: &str, column: &str) -> String {
 }
 
 /// The page lists the registry's stored tables with their rows, and a cell edited in the grid
-/// is written by one Write through the registry's save, after which the row's history names the
-/// operation that wrote it and the Mac it came from.
+/// is written by one Write through the registry's save, after which the row's history in the
+/// drawer names the operation that wrote it and the Mac it came from.
 /// NEGATIVE CONTROL: with `TablesApp::write` sending nothing to its reader (its send removed),
 /// the staged cell is never written and the registry keeps the old value:
 /// `assertion `left == right` failed: the registry holds the edit  left: Some(String("rack a"))
@@ -338,23 +338,31 @@ fn the_tables_page_lists_collections_and_writes_an_edited_cell() {
     let ui = render(&app);
     assert_eq!(cell_says(&ui, MC, "location"), "rack b");
     assert_eq!(said(&ui, "tables/note").as_deref(), Some("Wrote 1 cell"));
-    // The pane: the field's writer, and the Write as the newest history entry.
+    // The pane: the field's writer. It lists no history: the drawer does, opened on this row,
+    // and the Write is the row's newest record there.
     let by = said(&ui, "tables/pane/field/location/by").expect("the writer of the cell");
     let machine = aterm_db::typed::keys::uuid32(last.machine.as_ref().unwrap());
     assert!(machine.starts_with(&by), "{by} names {machine}");
-    assert_eq!(
-        said(&ui, "tables/pane/written/0/0").as_deref(),
-        Some("Location: rack a \u{2192} rack b")
-    );
-    // The entry names its writer, its place in the causal order and its writer's own clock.
-    assert_eq!(said(&ui, "tables/pane/written/0/who"), Some(by));
-    let when = said(&ui, "tables/pane/written/0/when").unwrap();
-    assert!(when.starts_with("\u{b7} "), "{when}");
-    assert!(when.contains(" \u{b7} claimed "), "{when}");
+    act(&mut app, "tables/pane/history", None);
+    let ui = render(&app);
+    // The line names its writer, its place in the causal order and its writer's own clock,
+    // then the cell and the value written: no earlier value.
+    let line = said(
+        &ui,
+        &format!(
+            "tables/history/at/{}/0",
+            aterm_codec::hex::encode_lower(&last.operation)
+        ),
+    )
+    .expect("the Write is a line of the row's history");
+    let (writer, cell) = line.split_once(", ").expect("who and when, then the cell");
+    assert!(writer.starts_with(&format!("{by} \u{b7} ")), "{line}");
+    assert!(writer.contains(" \u{b7} claimed "), "{line}");
+    assert_eq!(cell, "m9 \u{b7} Location: rack b");
 }
 
 /// The page reads the table as of a past operation through the registry's own as-of read: a
-/// history entry's As of shows the row as that operation's causal past holds it, read only, with
+/// record's As of in the history drawer shows the row as that operation's causal past holds it, read only, with
 /// each cell changed since marked and listed in the pane with what it holds now and who wrote it;
 /// Now returns to the table as it is.
 /// NEGATIVE CONTROL: with `tables_store::read` reading the head whatever point it is given
@@ -379,13 +387,16 @@ fn the_tables_page_reads_as_of_a_point_and_compares_it_with_now() {
     let ui = render(&app);
     assert_eq!(cell_says(&ui, MC, "location"), "rack b");
     assert!(said(&ui, "tables/asof").is_none(), "the table as it is");
+    // The history drawer lists the table's records; each offers its point.
+    act(&mut app, "tables/history/show", None);
+    let ui = render(&app);
     let as_of = format!(
-        "tables/pane/asof/{}",
+        "tables/history/asof/{}",
         aterm_codec::hex::encode_lower(&seeded)
     );
     assert!(
         said(&ui, &as_of).is_some(),
-        "the seeding entry offers its point"
+        "the seeding record offers its point"
     );
 
     act(&mut app, &as_of, None);
@@ -554,7 +565,7 @@ pub(crate) fn author(label: &str, at_ms: u64) -> Author {
 }
 
 /// The store entry the hand-made sheet's password cell names.
-const ENTRY: &str = "alab-machine-password-mc-0000000000000009";
+pub(super) const ENTRY: &str = "alab-machine-password-mc-0000000000000009";
 
 pub(crate) fn one_sheet(nickname: Shown) -> Snapshot {
     let column = |name: &str| SheetColumn {
@@ -943,9 +954,13 @@ fn a_sealed_number_changed_since_reads_as_the_number_it_is_now() {
     act(&mut app, "tables/sheet/phone", None);
     act(&mut app, &format!("tables/cell/{phone}/number"), None);
     assert_eq!(bar(&render(&app), "value").as_deref(), Some(NOW_IS));
+    act(&mut app, "tables/history/show", None);
     act(
         &mut app,
-        &format!("tables/pane/asof/{}", aterm_codec::hex::encode_lower(&then)),
+        &format!(
+            "tables/history/asof/{}",
+            aterm_codec::hex::encode_lower(&then)
+        ),
         None,
     );
     settle(&mut app);
@@ -1326,135 +1341,13 @@ fn a_cell_naming_a_missing_row_is_refused_before_write() {
     );
 }
 
-fn machine_at(pk: &str, column: &str, value: aterm_json::Value) -> aterm_db::database::Change {
-    cell::change(
-        &MACHINE,
-        CellKey {
-            pk,
-            col: column,
-            elem: None,
-        },
-        &CellValue::owner(MACHINE.version, value),
-    )
-    .unwrap()
-}
-
-/// A Mac's facts row as its own Commons machine `n` states it.
-fn facts_row(n: u8, value: aterm_json::Value) -> (String, aterm_db::typed::owned::OwnedRow) {
-    (
-        aterm_db::typed::keys::uuid32(&[n; 16]),
-        aterm_db::typed::owned::OwnedRow {
-            machine: [n; 16],
-            actor: [n; 48],
-            value,
-            rank: (0, 0, 0),
-            operation: [0; 32],
-        },
-    )
-}
-
-/// Each writer is named from what aterm holds, never made up: the registry's label of the
-/// machine its facts row binds (unless that label is conflicted), else the label its facts row
-/// states, else its seat's; a predecessor machine (writer succession) takes its successor's
-/// label, however far back; an actor whose machine is unknown takes its seat's; and a writer
-/// nothing names has no label, only the start of its machine id, else of its actor.
-/// NEGATIVE CONTROL: with `Writers::new`'s predecessor pass removed, machine 6 has no label:
-/// `assertion `left == right` failed: a predecessor  left: None  right: Some("m73")`.
-#[test]
-fn a_writer_is_named_through_its_seat_machine_and_label() {
-    use crate::tables_store::{Seat, Writers, short_id};
-    let lab = Lab::new(&[Role::Writer, Role::Writer]);
-    let here = Registry::at(lab.paths[0].clone());
-    here.open().unwrap();
-    let there = Registry::at(lab.paths[1].clone());
-    there.open().unwrap();
-    repair_commons(&lab, 4);
-    let (a, b) = ("mc-000000000000000a", "mc-000000000000000b");
-    here.write(vec![
-        vec![
-            machine_at(a, "label", json!("m73")),
-            machine_at(a, "row", json!("live")),
-        ],
-        vec![
-            machine_at(b, "label", json!("m55")),
-            machine_at(b, "row", json!("live")),
-        ],
-    ])
-    .unwrap();
-    repair_commons(&lab, 4);
-    // Two Macs relabel one machine apart: its label is conflicted, and names no writer.
-    here.write(vec![vec![machine_at(b, "label", json!("m56"))]])
-        .unwrap();
-    there
-        .write(vec![vec![machine_at(b, "label", json!("m57"))]])
-        .unwrap();
-    repair_commons(&lab, 4);
-    let machines = Handle::at(lab.paths[0].clone(), &REGISTRY)
-        .view()
-        .unwrap()
-        .project(&MACHINE);
-    assert!(machines.rows[b].fields["label"].conflicted());
-
-    let facts = aterm_db::typed::owned::OwnedRead {
-        rows: [
-            facts_row(1, json!({"mac": a, "label": "m1"})),
-            facts_row(2, json!({"mac": b, "label": "m2"})),
-            facts_row(3, json!({"mac": "mc-00000000000000ff", "label": "m3"})),
-            facts_row(
-                5,
-                json!({"mac": a, "label": "m5", "predecessor": aterm_db::typed::keys::uuid32(&[6; 16])}),
-            ),
-            facts_row(
-                6,
-                json!({"predecessor": aterm_db::typed::keys::uuid32(&[7; 16])}),
-            ),
-        ]
-        .into_iter()
-        .collect(),
-        inert: 0,
-    };
-    let seats = [
-        Seat {
-            actor: [8; 48],
-            machine: [8; 16],
-            label: "m8".into(),
-        },
-        Seat {
-            actor: [9; 48],
-            machine: [1; 16],
-            label: "m99".into(),
-        },
-    ];
-    let writers = Writers::new(&machines, &facts, &seats);
-    let of = |n: u8| writers.label(&[0; 48], Some(&[n; 16]));
-    assert_eq!(of(1).as_deref(), Some("m73"), "the registry's label first");
-    assert_eq!(
-        of(2).as_deref(),
-        Some("m2"),
-        "a conflicted label names no one"
-    );
-    assert_eq!(of(3).as_deref(), Some("m3"), "the facts row's own label");
-    assert_eq!(of(6).as_deref(), Some("m73"), "a predecessor");
-    assert_eq!(of(7).as_deref(), Some("m73"), "a predecessor's predecessor");
-    assert_eq!(of(8).as_deref(), Some("m8"), "a seat's machine");
-    assert_eq!(
-        writers.label(&[8; 48], None).as_deref(),
-        Some("m8"),
-        "an actor's seat"
-    );
-    assert_eq!(writers.label(&[10; 48], Some(&[10; 16])), None);
-    assert_eq!(writers.label(&[10; 48], None), None);
-    assert_eq!(short_id(&[10; 48], Some(&[10; 16])), "0a0a0a0a");
-    assert_eq!(short_id(&[0xab; 48], None), "abababab");
-}
-
 /// Where aterm holds a Mac's label, the page names the writer by it: here a registration names
 /// each Mac in the registry, and the cell another Mac wrote reads as written by that Mac's
-/// label, in WRITTEN BY and in the history.
-/// NEGATIVE CONTROL: with `tables_store::read` naming writers by `short_id` alone (its
-/// `label: writers.label(..)` set to `None`), WRITTEN BY reads the machine id: `assertion
+/// label, in WRITTEN BY and in the history drawer.
+/// NEGATIVE CONTROL: with `tables_store::named` giving a bound row no label (its `Mac::Row`
+/// arm answering `None`), WRITTEN BY reads the row's key: `assertion
 /// `left == right` failed: the writer of the cell is the other Mac, by its label  left:
-/// Some("28a48a48")  right: Some("m2")`.
+/// Some("mc-6c3d1ddb…")  right: Some("m2")`.
 #[test]
 fn the_page_names_a_writer_by_its_mac_label() {
     let lab = two_macs();
@@ -1505,14 +1398,29 @@ fn the_page_names_a_writer_by_its_mac_label() {
         style_of(&tree, "tables/pane/field/location/by"),
         Some(StyleRef::Note)
     );
-    let history: Vec<String> = (0..8)
-        .filter_map(|n| said(&ui, &format!("tables/pane/written/{n}/who")))
+    // The drawer on this row: a record's line starts with its writer, and the head of a record
+    // of several cells names it.
+    act(&mut app, "tables/pane/history", None);
+    let ui = render(&app);
+    let history: Vec<String> = ui
+        .semantics
+        .iter()
+        .map(|node| node.key.as_str())
+        .filter(|key| {
+            key.starts_with("tables/history/at/") || key.starts_with("tables/history/fold/")
+        })
+        .filter_map(|key| said(&ui, key))
         .collect();
-    assert!(history.contains(&label), "{history:?} names {label}");
+    assert!(
+        history
+            .iter()
+            .any(|line| *line == label || line.starts_with(&format!("{label} \u{b7} "))),
+        "{history:?} names {label}"
+    );
 }
 
-/// A writer aterm knows no label of shows the start of its machine id, dimmed, in every place the
-/// page names a writer; a known one shows its label in the page's usual ink.
+/// A writer whose facts bind no machine row shows the start of its machine id, dimmed, in every
+/// place the page names a writer; a known one shows its row's name in the page's usual ink.
 /// NEGATIVE CONTROL: with `Author::style` returning `known` always, WRITTEN BY is set as a Note:
 /// `assertion `left == right` failed: tables/pane/field/password/by  left: Some(Note)  right:
 /// Some(FaintNote)`.
@@ -1550,22 +1458,34 @@ fn an_unknown_writer_shows_its_short_id_dimmed() {
     });
     let mut app = open_with(snapshot);
     act(&mut app, &format!("tables/cell/{MC}/nickname"), None);
+    act(&mut app, "tables/history/show", None);
     let ui = render(&app);
     let tree = tree(&app);
     assert_eq!(
         said(&ui, "tables/pane/field/password/by").as_deref(),
         Some("c05f416f")
     );
-    // Dimmed at the size of what is beside it: the history's line is Plain, the rest notes.
+    // Dimmed at the size of what is beside it: the history drawer's line is Plain, the rest
+    // notes.
+    let written = format!(
+        "tables/history/at/{}/0",
+        aterm_codec::hex::encode_lower(&[7; 32])
+    );
     for (key, dim) in [
-        ("tables/pane/field/password/by", StyleRef::FaintNote),
-        ("tables/pane/written/0/who", StyleRef::Faint),
-        ("tables/pane/conflict/nickname/0/who", StyleRef::FaintNote),
+        (
+            "tables/pane/field/password/by".to_owned(),
+            StyleRef::FaintNote,
+        ),
+        (format!("{written}/who"), StyleRef::Faint),
+        (
+            "tables/pane/conflict/nickname/0/who".to_owned(),
+            StyleRef::FaintNote,
+        ),
     ] {
-        assert_eq!(style_of(&tree, key), Some(dim), "{key}");
+        assert_eq!(style_of(&tree, &key), Some(dim), "{key}");
     }
     assert_eq!(
-        style_of(&tree, "tables/pane/written/0/when"),
+        style_of(&tree, &format!("{written}/when")),
         Some(StyleRef::Plain)
     );
     assert_eq!(
@@ -1612,7 +1532,7 @@ fn wide_sheet(n: usize) -> Snapshot {
     snapshot
 }
 
-fn rect(ui: &CompiledUi, key: &str) -> LogicalRect {
+pub(super) fn rect(ui: &CompiledUi, key: &str) -> LogicalRect {
     ui.semantic(&UiKey::new(key.to_owned()))
         .unwrap_or_else(|| panic!("{key} is listed"))
         .rect
@@ -1772,6 +1692,36 @@ pub(crate) fn tall_sheet(rows: usize, columns: usize) -> Snapshot {
     snapshot
 }
 
+/// The columns past the grid's three ([`tall_sheet`]'s `label`, `c1` and `c2`) that
+/// [`chip_sheet`] adds and [`stand_chips`] hides and filters: enough that their chips fill the
+/// three lines the chips wrap onto at every width a test lays the page out at.
+pub(crate) const CHIP_COLUMNS: usize = 24;
+
+/// [`tall_sheet`] of `rows` rows and [`CHIP_COLUMNS`] more columns, which every row fills.
+pub(crate) fn chip_sheet(rows: usize) -> Snapshot {
+    tall_sheet(rows, 3 + CHIP_COLUMNS)
+}
+
+/// On the page of a [`chip_sheet`]: hide its extra columns, then stand `Only rows with a value`,
+/// which every row passes, on the first `n` of them. The grid draws what [`tall_sheet`]'s three
+/// columns draw and shows every row, and `n` chips stand under the tools: one line of them for
+/// one, the three lines they wrap onto at most for [`CHIP_COLUMNS`].
+pub(crate) fn stand_chips(app: &mut App, n: usize) {
+    use super::native_tables_filters::{HAS, MARK};
+    let extra = |at: usize| format!("c{}", at + 3);
+    act(app, "tables/columns", None);
+    for at in 0..CHIP_COLUMNS {
+        act(app, &format!("tables/columns/column/{}", extra(at)), None);
+    }
+    act(app, "tables/columns", None);
+    for at in 0..n {
+        let mark = format!("{MARK}{}", extra(at));
+        act(app, &mark, None);
+        act(app, HAS, None);
+        act(app, &mark, None);
+    }
+}
+
 /// [`tall_sheet`] with one short word in every cell beside the label, so each column is as
 /// narrow as a column starts and several show in a small window.
 fn narrow_sheet(rows: usize, columns: usize) -> Snapshot {
@@ -1800,7 +1750,7 @@ pub(crate) fn pk_of(n: usize) -> String {
 }
 
 /// The style group `key` is drawn in.
-fn group_style_of(tree: &UiTree, key: &str) -> Option<StyleRef> {
+pub(super) fn group_style_of(tree: &UiTree, key: &str) -> Option<StyleRef> {
     fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
         if node.key.as_str() == key {
             return Some(node);
@@ -3299,7 +3249,9 @@ fn a_sheets_order_is_worked_out_once_for_each_read_find_and_sort() {
     assert_eq!(built(&app), made + 1, "a header's press");
     act(&mut app, FIND, Some(SemanticInput::Text("m29".into())));
     assert_eq!(built(&app), made + 2, "the find's words");
-    assert!(said(&render(&app), "tables/count").is_some_and(|count| count.ends_with("of 300")));
+    assert!(
+        said(&render(&app), "tables/count").is_some_and(|count| count.ends_with("of 300 rows"))
+    );
     app.native_runtime
         .tables_mut()
         .unwrap()
@@ -3614,6 +3566,7 @@ const WIDGET: Collection = Collection {
     ],
     unique: &[],
     max_row: 0,
+    authority: None,
 };
 
 /// LT-23. The rail lists every collection of the registry generation in use, read from the
@@ -4413,17 +4366,46 @@ fn a_read_names_what_each_mac_reports_and_each_reference_row() {
     };
     assert!(date(&at, 16), "a date: {at}");
     assert!(date(&seen, 10), "a date: {seen}");
-    let lines: Vec<String> = (0..4)
-        .flat_map(|n| (0..40).map(move |m| format!("tables/pane/written/{n}/{m}")))
-        .filter_map(|key| said(&ui, &key))
-        .collect();
-    assert!(!lines.is_empty(), "the row's history is listed");
+    // The row's history, in the drawer the pane opens on it: listed, and no column the row
+    // never stated, or stated empty, is listed as set empty.
+    act(&mut app, "tables/pane/history", None);
+    let ui = render(&app);
     assert!(
-        lines
+        ui.semantics
             .iter()
-            .all(|line| !line.contains("empty \u{2192} empty")),
-        "nothing reads empty to empty: {lines:?}"
+            .any(|node| node.key.as_str().starts_with("tables/history/at/")),
+        "the row's history is listed"
     );
+    let tables = app.native_runtime.tables_mut().unwrap();
+    let sheet = tables.sheet("machine-facts").unwrap();
+    let (_, lines) = history::lines(
+        sheet,
+        history::Scope::Row,
+        Some((facts_key.as_str(), None)),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let mut written: Vec<(String, String)> = lines
+        .iter()
+        .filter_map(|line| match line {
+            history::Line::One { cell, .. } | history::Line::Cell { cell, .. } => {
+                Some((cell.column.clone(), cell.value.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(!written.is_empty(), "the row's history is listed");
+    written.reverse();
+    let mut held: BTreeMap<String, String> = BTreeMap::new();
+    for (column, value) in written {
+        let was = held.insert(column.clone(), value.clone());
+        let empty_to_empty = value == "empty" && was.as_deref().is_none_or(|was| was == "empty");
+        assert!(
+            !empty_to_empty,
+            "nothing reads empty to empty: {column} set empty over {was:?}"
+        );
+    }
 }
 
 /// Write is a person's own press: `act` (an agent's control request) is refused it and writes

@@ -17,7 +17,7 @@ use aterm_agent::harness::profile::{SubscriptionDisplay, WEEKLY_OUT, WeeklyFigur
 use aterm_agent::harness::tap::{self, Refusal};
 
 use super::{
-    Asks, Identity, LaunchFacts, RosterMemo, TapAsks, TapSeat, resolve_facts_at, store_week,
+    Asks, Identity, MachineMemo, RosterAsks, TapAsks, TapSeat, resolve_facts_at, store_week,
 };
 use crate::session_timeline::SessionTimeline;
 
@@ -131,7 +131,7 @@ fn asks(args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> Ta
     Asks {
         files: |_| None,
         args,
-        roster: || Some(accounts::Roster::default()),
+        roster: RosterAsks::Given(|| Some(accounts::Roster::default())),
         home: || Some(root()),
         route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
         tap: TapAsks {
@@ -140,6 +140,9 @@ fn asks(args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> Ta
             restart: |_, _| true,
             room: |_, _| true,
         },
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     }
 }
 
@@ -325,19 +328,8 @@ fn tab() -> Arc<Mutex<SessionTimeline>> {
 /// [`PID`] as the resolver first meets it, its records in `dir`.
 fn unread(dir: &Path) -> Identity {
     Identity {
-        pid: PID,
-        started: Some(START),
         dir: Some(dir.to_path_buf()),
-        launch: LaunchFacts::default(),
-        launch_for: None,
-        login: None,
-        argv: Vec::new(),
-        task: None,
-        login_checked_for: None,
-        route: aterm_agent::harness::accounts::AuthRoute::Outside,
-        unoffered: None,
-        env_stamp: None,
-        first_seen: None,
+        ..Identity::new(PID, Some(START))
     }
 }
 
@@ -359,13 +351,16 @@ fn reread(
         identity,
         &mut footer::TailCache::default(),
         &mut footer::FooterCache::default(),
-        &mut RosterMemo::default(),
+        &mut MachineMemo::default(),
         asks,
-        &footer::ReadClock {
-            read_at: std::time::SystemTime::now(),
-            now: NOW,
-            offset_at: &|_, _| Some(0),
-        },
+        (
+            &footer::ReadClock {
+                read_at: std::time::SystemTime::now(),
+                now: NOW,
+                offset_at: &|_, _| Some(0),
+            },
+            std::time::Instant::now(),
+        ),
     );
     let held = timeline.lock().unwrap();
     held.claude_footer()
@@ -668,7 +663,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
     }
     let listed =
         |args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>, seat: fn() -> TapSeat| Asks {
-            roster: one_row,
+            roster: RosterAsks::Given(one_row),
             ..asks(args, seat)
         };
     let pid = PID as u32;
@@ -711,7 +706,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
         Some(roster)
     }
     let several = |args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>| Asks {
-        roster: two_rows,
+        roster: RosterAsks::Given(two_rows),
         ..asks(args, stored)
     };
     let timeline = tab();
@@ -759,7 +754,7 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
         &timeline,
         &mut identity,
         Asks {
-            roster: two_rows_bound,
+            roster: RosterAsks::Given(two_rows_bound),
             ..asks(|pid| on_login(untapped(pid)), stored)
         },
     );
@@ -1365,7 +1360,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
         })
     }
     let shown = read(Asks {
-        roster: lone_row,
+        roster: RosterAsks::Given(lone_row),
         ..asks(untapped, stored)
     });
     // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`; an account is
@@ -1389,7 +1384,7 @@ fn a_process_outside_the_default_home_reads_none_of_the_stores_week() {
         })
     }
     let on_personal = Asks {
-        roster: personal,
+        roster: RosterAsks::Given(personal),
         ..asks(untapped, stored)
     };
     let shown = read(on_personal);
@@ -1452,7 +1447,7 @@ fn a_pane_whose_gate_refused_shows_no_quota_view() {
             &timeline,
             &mut unread(&records()),
             Asks {
-                roster,
+                roster: RosterAsks::Given(roster),
                 ..asks(untapped, stored)
             },
         );
@@ -1527,3 +1522,7 @@ fn the_live_seat_reads_the_directory_the_tap_writes() {
     assert!(seat.dir.is_some(), "a harness state directory");
     assert_eq!(seat.dir, tap::rl_dir());
 }
+
+/// Law L4 over these fixtures, the walls and the quota scenes.
+#[path = "claude_footer_deadline_tests.rs"]
+mod deadline;

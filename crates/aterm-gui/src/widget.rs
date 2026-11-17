@@ -33,6 +33,12 @@ pub(crate) enum TextFace {
     Ui,
     UiBold,
     Display(u8),
+    /// The setup screen lockup's words, set alike whatever terminal font the person chose: SF
+    /// Mono as the design sets them, its static Semibold for [`TextWeight::Bold`] (the terminal
+    /// face's bold sibling, which [`Self::Mono`] draws from, is missing for a variable face such
+    /// as SF Mono, whose weights are instances of the one file), else the bundled Iosevka Term
+    /// and its Bold where SF Mono's faces are missing.
+    Brand(TextWeight),
 }
 
 /// One variable-font axis request: an OpenType `tag` and its value as `f32` bits.
@@ -481,15 +487,18 @@ pub(crate) enum DrawPrim {
         icon: aterm_render::BandIcon,
         color: Rgba,
     },
-    /// A bitmap in the `w`×`h` rect at `(x, y)`, baked from `art` at the rect's exact device
-    /// size (cached per size), so it is never resampled, drawn at `alpha` (255 opaque, 0
-    /// nothing), so one pose can dissolve into the next.
+    /// A bitmap in the `w`×`h` rect at `(x, y)`: `art`'s bake at `device` pixels, drawn one to
+    /// one from the rect's top left (never resampled; where the canvas's scale is the one it
+    /// was baked for it fills the rect exactly), composited in sRGB as its art was drawn, at
+    /// `alpha` (255 opaque, 0 nothing). Only a bake already kept draws
+    /// ([`ImageArt::kept`]): the raster never bakes.
     Image {
         x: f32,
         y: f32,
         w: f32,
         h: f32,
         art: ImageArt,
+        device: (u32, u32),
         alpha: u8,
     },
 }
@@ -627,10 +636,11 @@ impl DrawPrim {
                 w,
                 h,
                 art,
+                device,
                 alpha,
             } => {
                 f32_bits(state, &[*x, *y, *w, *h]);
-                (art, alpha).hash(state);
+                (art, device, alpha).hash(state);
             }
         }
     }
@@ -647,87 +657,83 @@ fn f32_bits(state: &mut impl Hasher, values: &[f32]) {
 /// device size it is drawn at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ImageArt {
-    /// The aterm · ALab rainbow kitty in one of the pet roster's poses (the setup screen's lockup
-    /// draws the run's moments with them, `docs/DESIGN-init-on-by-default-2026-10-25.md` §4.5),
-    /// in the brand coat, its keyline pale on a dark ground.
-    Kitty {
-        pose: aterm_effects::pet_glyphs_gen::PetGlyphId,
-        dark: bool,
-    },
+    /// The setup screen's rainbow road at a moment of the run
+    /// (`docs/DESIGN-init-on-by-default-2026-10-25.md` §4.5): its box is the road's length of the
+    /// design and its whole height.
+    Road(aterm_effects::rainbow_road::RoadArt),
+    /// The cat standing on the setup screen's road, in a pose, at its lean.
+    Cat(aterm_effects::rainbow_road::CatArt),
 }
 
 impl ImageArt {
-    /// The pose of the brand image `assets/aterm-rainbow-kitty.png`, the tail raised behind the
-    /// caret.
-    #[cfg(test)]
-    pub(crate) const BRAND_POSE: aterm_effects::pet_glyphs_gen::PetGlyphId =
-        aterm_effects::pet_glyphs_gen::PetGlyphId::PetStretchHind;
-
     /// The art's authored width ÷ height: a caller sizes its rect from it, so
     /// the bake is never stretched.
     pub(crate) fn aspect(self) -> f32 {
         match self {
-            Self::Kitty { pose, .. } => aterm_effects::pet_baker::PetBaker::aspect(pose),
+            Self::Road(road) => road.aspect(),
+            Self::Cat(_) => aterm_effects::rainbow_road::CatArt::ASPECT,
         }
     }
 
     /// Straight-alpha RGBA8 rows of the art at exactly `w`×`h` device pixels.
     pub(crate) fn bake(self, w: u32, h: u32) -> Vec<u8> {
         match self {
-            Self::Kitty { pose, dark } => aterm_effects::pet_baker::bake_pose(
-                pose,
-                &aterm_effects::cat_baker::ResolvedFills::from_indices(13, 4, dark),
-                w,
-                h,
-            )
-            .pixels()
-            .to_vec(),
+            Self::Road(road) => road.bake(w, h),
+            Self::Cat(cat) => cat.bake(w, h),
         }
+        .pixels()
+        .to_vec()
     }
 
-    /// The art baked at exactly `w`×`h` device pixels: from the bakes kept ([`IMAGES_KEPT`]),
-    /// else baked now, on the calling thread, and kept. The setup screen bakes the poses it draws
-    /// ahead, on a background thread (`system_state::kitty`), so a raster thread finds them here.
-    pub(crate) fn baked(self, w: u32, h: u32) -> std::sync::Arc<[u8]> {
+    /// The art's bake at exactly `w`×`h` device pixels, if one is kept. Nothing bakes here: the
+    /// raster draws only what is kept, and the setup screen bakes what it will draw ahead, on
+    /// its own worker (`system_state::prebake`).
+    pub(crate) fn kept(self, w: u32, h: u32) -> Option<std::sync::Arc<[u8]>> {
         let key = (self, w, h);
-        if let Some(pixels) = with_baked_images(|kept| {
-            kept.iter()
-                .find(|(baked, _)| *baked == key)
-                .map(|(_, pixels)| std::sync::Arc::clone(pixels))
-        }) {
-            return pixels;
-        }
-        let pixels: std::sync::Arc<[u8]> = self.bake(w, h).into();
         with_baked_images(|kept| {
-            kept.retain(|(baked, _)| *baked != key);
-            if kept.len() >= IMAGES_KEPT {
-                kept.remove(0);
-            }
-            kept.push((key, std::sync::Arc::clone(&pixels)));
-        });
-        pixels
+            let at = kept.images.iter().position(|(baked, _)| *baked == key)?;
+            // The newest last: a bake drawn is the last evicted.
+            let image = kept.images.remove(at);
+            let pixels = std::sync::Arc::clone(&image.1);
+            kept.images.push(image);
+            Some(pixels)
+        })
     }
 
     /// Whether a bake of the art at `w`×`h` device pixels is kept now.
-    pub(crate) fn is_baked(self, w: u32, h: u32) -> bool {
-        with_baked_images(|kept| kept.iter().any(|(baked, _)| *baked == (self, w, h)))
+    pub(crate) fn is_kept(self, w: u32, h: u32) -> bool {
+        with_baked_images(|kept| kept.images.iter().any(|(baked, _)| *baked == (self, w, h)))
     }
 
-    /// Where the art draws, baked once per process for each art at [`ArtMask::HEIGHT`]
-    /// pixels tall: its visible edges, whatever size it is drawn at.
-    pub(crate) fn mask(self) -> &'static ArtMask {
-        // A handful of poses on two grounds: each mask is made once and kept for the process.
-        static MASKS: std::sync::Mutex<Vec<(ImageArt, &'static ArtMask)>> =
-            std::sync::Mutex::new(Vec::new());
-        let mut masks = MASKS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((_, mask)) = masks.iter().find(|(art, _)| *art == self) {
+    /// Keep `pixels`, the art baked at `w`×`h` device pixels, evicting the bakes drawn least
+    /// recently while the kept ones' bytes pass [`IMAGES_BUDGET`] (never this one).
+    pub(crate) fn keep(self, w: u32, h: u32, pixels: std::sync::Arc<[u8]>) {
+        let key = (self, w, h);
+        with_baked_images(|kept| {
+            kept.images.retain(|(baked, _)| *baked != key);
+            kept.images.push((key, pixels));
+            let mut bytes: usize = kept.images.iter().map(|(_, pixels)| pixels.len()).sum();
+            while bytes > IMAGES_BUDGET && kept.images.len() > 1 {
+                let (_, evicted) = kept.images.remove(0);
+                bytes -= evicted.len();
+            }
+        });
+    }
+
+    /// Where the art draws, baked at [`ArtMask::HEIGHT`] pixels tall: its visible edges,
+    /// whatever size it is drawn at. The last [`MASKS_KEPT`] arts' masks are kept.
+    pub(crate) fn mask(self) -> std::sync::Arc<ArtMask> {
+        if let Some(mask) = with_baked_images(|kept| {
+            kept.masks
+                .iter()
+                .find(|(art, _)| *art == self)
+                .map(|(_, mask)| std::sync::Arc::clone(mask))
+        }) {
             return mask;
         }
         let h = ArtMask::HEIGHT;
         let w = (h as f32 * self.aspect()).round().max(1.0) as u32;
-        let mask: &'static ArtMask = Box::leak(Box::new(ArtMask::new(
+        let mask = std::sync::Arc::new(ArtMask::new(
             w,
             h,
             self.bake(w, h)
@@ -735,33 +741,59 @@ impl ImageArt {
                 .0
                 .iter()
                 .map(|pixel| pixel[3]),
-        )));
-        masks.push((self, mask));
+        ));
+        with_baked_images(|kept| {
+            kept.masks.retain(|(art, _)| *art != self);
+            if kept.masks.len() >= MASKS_KEPT {
+                kept.masks.remove(0);
+            }
+            kept.masks.push((self, std::sync::Arc::clone(&mask)));
+        });
         mask
     }
 }
 
-/// How many baked [`ImageArt`] bitmaps are kept: the setup screen's working set, each pose its
-/// lockup draws (nine) on both grounds at two display scales.
-pub(crate) const IMAGES_KEPT: usize = 9 * 2 * 2;
+/// How many bytes of baked [`ImageArt`] bitmaps may be kept at most. What is kept is what the
+/// live System State views want and last drew (`system_state::prebake` drops the rest as each
+/// drawing pass records what it drew, and all but each view's last drawn moment once no view is
+/// on screen): a view keeps at most the moment it drew and the one it wants, each two images,
+/// the road and the cat. The longest road ([`aterm_effects::rainbow_road::MAX_LENGTH`] at Mono 22
+/// on a 2x display) is 7.8 MB and its cat 0.5 MB, so a view at its widest keeps 17 MB on a 2x
+/// display, less across a move to a display of another scale (one moment at each); a page at an
+/// ordinary width keeps a few MB. This cap is only a backstop for several wide views at once:
+/// past it the bake drawn least recently goes first.
+pub(crate) const IMAGES_BUDGET: usize = 32 << 20;
+
+/// How many arts' ink masks are kept: an ink audit of the page reads the images it draws, two a
+/// moment over the two moments a page holds. Each is a few hundred KB at most.
+const MASKS_KEPT: usize = 4;
 
 /// A bake kept: the art and its device width and height, and its pixels.
 type BakedImage = ((ImageArt, u32, u32), std::sync::Arc<[u8]>);
 
-/// The bakes, newest last: one set for the process, which the setup screen's bake thread fills
-/// and every raster thread reads.
+/// The bakes kept, newest (or most recently drawn) last, and the arts' ink masks.
+#[derive(Default)]
+struct Kept {
+    images: Vec<BakedImage>,
+    masks: Vec<(ImageArt, std::sync::Arc<ArtMask>)>,
+}
+
+/// The bakes, for the process: the setup screen's bake worker fills them and every raster
+/// thread reads them.
 #[cfg(not(test))]
-static BAKED_IMAGES: std::sync::Mutex<Vec<BakedImage>> = std::sync::Mutex::new(Vec::new());
+static BAKED_IMAGES: std::sync::Mutex<Kept> = std::sync::Mutex::new(Kept {
+    images: Vec::new(),
+    masks: Vec::new(),
+});
 
 #[cfg(test)]
 thread_local! {
     /// A test thread's own bakes, so tests running side by side never evict each other's.
-    static BAKED_IMAGES: std::sync::Mutex<Vec<BakedImage>> =
-        const { std::sync::Mutex::new(Vec::new()) };
+    static BAKED_IMAGES: std::sync::Mutex<Kept> = std::sync::Mutex::new(Kept::default());
 }
 
 /// Run `f` on the bakes kept.
-fn with_baked_images<T>(f: impl FnOnce(&mut Vec<BakedImage>) -> T) -> T {
+fn with_baked_images<T>(f: impl FnOnce(&mut Kept) -> T) -> T {
     #[cfg(not(test))]
     {
         f(&mut BAKED_IMAGES
@@ -776,6 +808,22 @@ fn with_baked_images<T>(f: impl FnOnce(&mut Vec<BakedImage>) -> T) -> T {
                 .unwrap_or_else(std::sync::PoisonError::into_inner))
         })
     }
+}
+
+/// Keep only the bakes of `wanted` (each its art and device size), and the ink masks of their
+/// arts: the rest no live System State view wants or drew. Empty, it drops every bake and mask.
+pub(crate) fn retain_images(wanted: &[(ImageArt, u32, u32)]) {
+    with_baked_images(|kept| {
+        kept.images.retain(|(key, _)| wanted.contains(key));
+        kept.masks
+            .retain(|(art, _)| wanted.iter().any(|(wanted, _, _)| wanted == art));
+    });
+}
+
+/// The bytes of bakes kept now (a test's read).
+#[cfg(test)]
+pub(crate) fn images_kept_bytes() -> usize {
+    with_baked_images(|kept| kept.images.iter().map(|(_, pixels)| pixels.len()).sum())
 }
 
 /// Which pixels of an [`ImageArt`] are drawn, at a reference size: for each row, how many
@@ -797,6 +845,7 @@ pub(crate) struct ArtSpan {
     pub(crate) bottom: f32,
 }
 
+#[cfg(test)]
 impl ArtSpan {
     /// The whole box.
     pub(crate) const BOX: Self = Self {

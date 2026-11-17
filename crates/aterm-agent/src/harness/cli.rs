@@ -304,7 +304,10 @@ const HELP_LIMITS: &str = "\
 `limits` reads the session's screen (`text --json`) and prints:
   - `wall=<kind>` and `resets_at=`: the wall the last turn ended on, read by the foreground
     program's grammar (Claude Code, agy, Muse Code; Codex screens are not read).
-  - `windows=`: usage windows painted on screen (Claude Code's `/usage` panel).
+  - `windows=`: usage windows painted on screen (Claude Code's `/usage` panel). They are
+    recorded as the account's reading, except a window aterm read refilled or raised less than
+    an hour before: a screen cannot say when its panel was drawn, so that window's figure is held
+    back (its ledger row says so) and the refilled figure stands.
   - `credits=in-use|-`: whether Claude Code's notice says usage credits carry the session
     (the supervisor continues a session on credits only under `[harness] usage_credits = true`).
   At a wall, when `accounts.toml` lists accounts, a second line (not in `--json`) gives
@@ -558,11 +561,12 @@ JSON report (`--cli codex --json`), which carries each row's `email` and `identi
 retained Commons rows listed after them show a shared account's email where the catalog has
 one, and for one CLI the local label it matches (`--json`: `shared_accounts`, or
 `shared_catalog` under `--cli all` unless it finds no pool and reports Claude's alone).
-A label names one login, never a machine. Where the lab registry names this Mac, a row takes its
-account's lab label (`claude-<6 hex>`, or the owner's), the default login's too. On a Mac the lab
-does not name, a row found by itself is still named for the Mac or Macs it runs on, with a number
-past the first (`m2`, `m2-2`, or `m106-m38`), and its `email` in the roster says which account
-that is.
+A label names one login, never a machine. Where the lab registry names this Mac, a row the lab
+adds takes its account's lab label (`claude-<6 hex>`, or the owner's), the default login's too.
+A row already here keeps the label it has, an older one named for a Mac (`m2-2`, `kimi-m16`)
+included: no sync renames a row. On a Mac the lab does not name, a row found by itself is still
+named for the Mac or Macs it runs on, with a number past the first (`m2`, `m2-2`, or
+`m106-m38`), and its `email` in the roster says which account that is.
 
 REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
   Prints `active: <label>, N of M sessions on it`; a row per account with its class, its
@@ -647,7 +651,10 @@ VERBS:
     the lab registry names this Mac, a `<label>` that is a lab account's label, legacy label or
     account key (`ac-…`), given with no `--email`, is that account asked for by name: the row
     takes the lab's label, address, identity and vendor keys, it runs here like any row, and no
-    preference is written (a paused or retired account is refused). `--pool` lists a row this Mac does not prefer. Labels match
+    preference is written (a paused or retired account is refused). Where a row already lists
+    the account, under `<label>` or another label (an older `m22-2` the lab calls
+    `claude-<6 hex>`, or a row with the same address), `add` names that row and writes nothing.
+    `--pool` lists a row this Mac does not prefer. Labels match
     `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). A row stays `not-enrolled` until signed in.
     Where a fleet file on this machine writes the roster (`fleet-accounts.toml` beside it),
     the row is listed there too, for this machine, so the next sync keeps it (it then needs
@@ -795,17 +802,24 @@ VERBS:
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
     state, and running sessions for the current home (`--json` is schema 2 `account-stats`).
     Each window also says how far it moved over `--since` (1m to 90d, default 24h), read off
-    this Mac's readings series: `+18 since 24h`, `new window since 13:00` or `reset used since
-    13:00`, never a negative number; where the series holds no reading near the span's start,
-    the span it did compare (`+5 since 3h`, `+30 since 2d1h`). It never compares two accounts.
+    this Mac's readings series: `18 used since 24h`, `new window since 13:00`, `refilled or
+    raised since 13:00`, or `reset used since 13:00` where the record says this Mac's aterm
+    spent a limit reset then (as `reset used 13:00, no reading since` says before a reading
+    comes), never a negative number; where the
+    series holds no reading near the span's start, the span it did compare (`5 used since 3h`,
+    `30 used since 2d1h`). It never compares two accounts.
     Another CLI's pool keeps no series and takes no `--since`.
   - `accounts history [<label|key>] [--since 30d] [--rows] [--json]`
     One account's days, named by its row label, lab label or key (`ac-…` or `c-…`, never an
     address), or every roster row's in roster order: one line a local day from this Mac's
     readings series (the week's first and last figure and its reset, how many five-hour windows
-    closed and how many of them read full, the day's highest five-hour figure, and each limit
-    reset used or sign-in of another account), with that day's ledger rows and every Mac's
-    journal lines beneath, never a ledger row's free text. Only this account's readings count: a
+    closed and how many of them read full, the day's highest five-hour figure, each sign-in of
+    another account, and each time a window was refilled or raised: `week reset used 09:00` where
+    this Mac's ledger shows its aterm spent a limit reset then, else `week refilled or raised
+    09:00` or `5h refilled or raised 14:10`, since a reading cannot tell a reset someone else
+    spent from a refill or a raised allowance), with that day's ledger rows and every Mac's
+    journal lines beneath in the registry's own words (a journal line's `reset-used` names any
+    of these), never a ledger row's free text. Only this account's readings count: a
     row renamed here keeps its old series, found by its key, and a label given to another
     account shows none of the one before. Where the roster has one login, the home's row also
     shows each five-hour or weekly window Claude Code's own transcripts record reaching its
@@ -821,9 +835,9 @@ VERBS:
   - `accounts sync [alab | <source>] [--machine <mN>] [--json]`
     Synchronizes this machine's `accounts.toml`. The default source is the lab registry
     (`alab`) wherever the lab names this Mac, ahead of every other default: its rows are the
-    accounts this Mac prefers in rank order, each labelled `claude-<6 hex>` (or the owner's
-    label), plus the default login's account under its lab label; every row already here
-    stays, an account another Mac prefers can still run here, an empty lab roster stays
+    accounts this Mac prefers in rank order, plus the default login's account, each new row
+    labelled `claude-<6 hex>` (or the owner's label); every row already here stays under the
+    label it has, an account another Mac prefers can still run here, an empty lab roster stays
     empty, and no fleet file is written. A `[fleet] accounts_source` in aterm.toml still wins.
     Elsewhere it syncs `accounts.toml` and `fleet-accounts.toml` from `<source>` (a file, `~/`
     for the home; an http(s) URL fetched with curl, a Sheets `/edit` link read as its CSV
@@ -886,10 +900,10 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
   - `accounts sync --cli <id> [alab | <source>] [--machine <mN>] [--json]` adds this machine's
     rows of the CLI's fleet to its roster, each with a login directory of its own, and removes
     no row. Under the lab it clears a hold an old pool file left and gives each row the lab knows
-    its derived order, on a settled lab Mac after migrating row labels to the lab's, and an
-    `ai-pool.toml` source sets each row's hold. The fleet is the
-    source named, else the lab registry (`alab`) wherever the lab names this Mac: the accounts
-    this Mac prefers, labelled `<cli>-<6 hex>` (or the owner's label), and no sheet or vault file
+    its derived order, and every row keeps the label it has; an `ai-pool.toml` source sets each
+    row's hold. The fleet is the source named, else the lab registry (`alab`) wherever the lab
+    names this Mac: the accounts this Mac prefers, each new row labelled `<cli>-<6 hex>` (or the
+    owner's label), and no sheet or vault file
     is read. On a Mac the lab does not name it is the vault entry `ai-pool.toml`, else
     `ai-accounts-<cli>.toml` (the rows of `fleet-accounts.toml`, with `region` or `flow`), else
     the CLI's column of `ai-accounts.csv` (`Open AI`
@@ -1372,7 +1386,7 @@ impl Env {
         );
         let claude_config_unusable = config_dir.filter(|_| claude_dir.is_none());
         let claude_custom_oauth =
-            profile::custom_oauth(std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").as_deref());
+            profile::custom_oauth(std::env::var_os(profile::CUSTOM_OAUTH_ENV).as_deref());
         let claude_session = std::env::var("CLAUDE_CODE_SESSION_ID")
             .ok()
             .filter(|id| footer::is_session_id(id));
@@ -4633,7 +4647,9 @@ pub fn limits_json(view: &LimitsView) -> String {
 /// recorded session row, else the active row, else the default row. Only a reading of a known
 /// launch is walled: each full window (100% used) stands as a wall until its placed reset
 /// ([`accounts::note_wall`]), so a launch passes that row over until then; a tab's panel whose
-/// login aterm cannot name records its sample alone.
+/// login aterm cannot name records its sample alone. Only a launched CLI's panel is known to be
+/// served after the read began ([`accounts::note_panel_sample`]); a screen read of any other
+/// tab's panel is held back for [`accounts::SCREEN_PANEL_HOLD_S`] after a window's refill barrier.
 fn record_limits_usage(
     env: &Env,
     target: &str,
@@ -4688,8 +4704,11 @@ fn record_limits_usage(
         .iter()
         .find(|(window, _)| window.name == accounts::MONTH_LIMIT);
     store.transact(env.now, &mut None, |state| {
+        // A CLI aterm launched for this read drew its panel after the read began; a screen read
+        // of any other tab may show a panel drawn at any time before it.
+        let served_after = launched.map(|_| env.now);
         let mut events = sample.map_or_else(Vec::new, |sample| {
-            accounts::note_sample(state, label, sample, env.now)
+            accounts::note_panel_sample(state, label, sample, served_after, env.now)
         });
         if let Some((window, reset)) = monthly {
             events.extend(accounts::note_panel_window(
@@ -14686,13 +14705,14 @@ fn run_accounts_add(
             return ExitCode::from(1);
         }
     };
+    let named = asked.label.as_str();
     let asked = from_lab.as_ref().unwrap_or(asked);
     let (label, class) = (asked.label.as_str(), asked.class);
     let _ends = WindowEnds::hold();
     match accounts_add_admitted(
         cli,
         env,
-        asked,
+        (named, asked),
         &|| !window_end_noted(),
         &mut |position| {
             let _ = writeln!(out, "{}: {}", asked.label, signin_queue_words(position));
@@ -14810,7 +14830,7 @@ pub(super) fn roster_target(path: &Path) -> Result<(PathBuf, Option<u32>), Strin
 fn accounts_add_admitted(
     cli: Cli,
     env: &Env,
-    asked: &accounts::Row,
+    (named, asked): (&str, &accounts::Row),
     current: &dyn Fn() -> bool,
     queued: &mut dyn FnMut(accounts::SigninPosition),
     source: Option<&super::alab_roster::ReceiptGuard>,
@@ -14863,14 +14883,30 @@ fn accounts_add_admitted(
             path.display()
         )
     })?;
-    if let Some(row) = roster.row(label) {
+    // The account may be listed under another label than the one asked for: a lab account's row
+    // keeps the label it had (`m22-2`) when the lab calls it `claude-bbbbbb`, and a name the lab
+    // knows (`named`) resolves to the lab's label. Either way the roster lists it already.
+    if let Some(row) = roster
+        .row(label)
+        .or_else(|| roster.row(named))
+        .or_else(|| roster.row_of_account(cli, asked))
+    {
+        let listed = if row.label == named {
+            format!("`{named}` is already listed in {}", path.display())
+        } else {
+            format!(
+                "the account `{named}` names is already listed in {} as `{}`",
+                path.display(),
+                row.label
+            )
+        };
         if cli != Cli::Claude {
-            return Err(format!("`{label}` is already listed in {}", path.display()));
+            return Err(listed);
         }
         return Err(format!(
-            "`{label}` is already listed in {}; `aterm harness accounts {} {label}` signs it in",
-            path.display(),
-            cli.sign_in_verb(row.email.is_some())
+            "{listed}; `aterm harness accounts {} {}` signs it in",
+            cli.sign_in_verb(row.email.is_some()),
+            row.label
         ));
     }
     let listed_own = roster.rows.is_empty();
@@ -14983,7 +15019,7 @@ fn accounts_add(
     current: &dyn Fn() -> bool,
     queued: &mut dyn FnMut(accounts::SigninPosition),
 ) -> Result<Added, String> {
-    accounts_add_admitted(cli, env, asked, current, queued, None)
+    accounts_add_admitted(cli, env, (&asked.label, asked), current, queued, None)
 }
 
 /// Take the sign-in lock before the writer lock, as a managed renewal does.

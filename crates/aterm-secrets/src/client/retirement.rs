@@ -2359,6 +2359,7 @@ fn expire_denied_swarm_lease(
 #[cfg(test)]
 mod tests;
 
+#[cfg(unix)]
 #[cfg(test)]
 #[test]
 fn a_configured_retirement_reuses_its_writer_for_commons_authorization() {

@@ -510,7 +510,8 @@ pub(super) fn convergence_inputs(
     if role != aterm_secrets::client::ConvergenceRole::Subscriber {
         return inputs;
     }
-    match spawn_background(rung) {
+    let ended = rung.map(|rung| Arc::new(move || rung.ring()) as Arc<dyn Fn() + Send + Sync>);
+    match spawn_background(ended) {
         Some(maintain) => inputs.with_maintenance(Box::new(move || maintain())),
         None => inputs,
     }
@@ -527,21 +528,28 @@ pub(super) fn node_serve(startup: impl FnOnce() -> Option<aterm_gui::NodeMainten
         node_background,
         |inputs| match (inputs, startup()) {
             (Some(inputs), Some(commons)) => Some(Arc::new(move || {
-                inputs();
-                commons();
+                // Both run each time; the job's next look is the earlier of their deadlines.
+                let keeper = inputs();
+                earlier(keeper, commons())
             }) as aterm_gui::NodeMaintenance),
             (inputs, commons) => inputs.or(commons),
         },
     )
 }
 
-/// The keeper's upkeep for the node's own maintenance, which runs at its own pace.
+/// The earlier of two deadlines, either alone where the other is none.
+fn earlier(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// The keeper's upkeep for the node's own maintenance: the deadline it names is the job's next
+/// look for it, and its worker's end wakes the job ([`aterm_gui::wake_node_maintenance`]), whose
+/// waits keep no clock of their own for it.
 fn node_background() -> Option<aterm_gui::NodeMaintenance> {
-    spawn_background(None).map(|upkeep| {
-        Arc::new(move || {
-            let _ = upkeep();
-        }) as aterm_gui::NodeMaintenance
-    })
+    spawn_background(Some(Arc::new(aterm_gui::wake_node_maintenance)))
 }
 
 fn node_serve_with<'a, R, S: 'a>(
@@ -555,19 +563,20 @@ fn node_serve_with<'a, R, S: 'a>(
     }))
 }
 
-/// Start the keeper off the window's lane, its end ringing `rung` where there is one.
-fn spawn_background(rung: Option<Arc<aterm_uds::ready::Doorbell>>) -> Option<Upkeep> {
+/// Start the keeper off the window's lane, its end calling `ended` where there is one.
+fn spawn_background(ended: Option<Arc<dyn Fn() + Send + Sync>>) -> Option<Upkeep> {
     background_maintenance(
         supervisor_allowed(),
         aterm_machines::port::Live::new,
-        move || background_supervisor(rung.clone()),
+        move || background_supervisor(ended.clone()),
         Supervisor::maintain,
     )
 }
 
 /// The keeper's upkeep once this login's session admits it ([`BackgroundStartup`]): its
-/// maintenance's deadline once an owner runs. An admission still unread retries at each call and
-/// names no deadline of its own, nor does a keeper just started: its end rings.
+/// maintenance's deadline once an owner runs. An admission still unread is read again at each
+/// call and names [`UPKEEP_LOOK`] from now, so a host that wakes only for the deadlines it is
+/// told asks again; a keeper just started names none: its end rings.
 fn background_maintenance<S: aterm_machines::port::System>(
     permitted: bool,
     system: impl Fn() -> S + Send + Sync + 'static,
@@ -586,29 +595,44 @@ fn background_maintenance<S: aterm_machines::port::System>(
     // sampler, notification watch or preference/HID read exists until a positive read.
     let background = Mutex::new((startup, owner));
     Some(Arc::new(move || {
-        // Another caller holds the keeper's upkeep: its own call names the deadline.
-        let Ok(mut background) = background.try_lock() else {
-            return None;
+        let mut background = match background.try_lock() {
+            Ok(background) => background,
+            // Another caller holds the keeper's upkeep: look again soon, so no wait loses the
+            // deadline that caller's call names.
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Some(Instant::now() + UPKEEP_LOOK);
+            }
+            // A call that panicked ended this upkeep, as it always did.
+            Err(std::sync::TryLockError::Poisoned(_)) => return None,
         };
         let (startup, owner) = &mut *background;
         if let Some(owner) = owner {
             return maintain(owner);
         }
-        if startup.decision.is_none() && startup.take(&system()) {
-            *owner = start();
+        if startup.decision.is_none() {
+            if startup.take(&system()) {
+                *owner = start();
+            } else if startup.decision.is_none() {
+                return Some(Instant::now() + UPKEEP_LOOK);
+            }
         }
         None
     }) as Upkeep)
 }
 
-/// The keeper of a lane that is not the window's, its end ringing `rung` where there is one.
-fn background_supervisor(rung: Option<Arc<aterm_uds::ready::Doorbell>>) -> Option<Supervisor> {
+/// How soon a background keeper's upkeep whose answer is not known yet (its login session could
+/// not be read, another caller holds it) is called again: the node job's old tick, which called
+/// it at each pass.
+const UPKEEP_LOOK: Duration = aterm_net::fleet::KEY_READ_EVERY;
+
+/// The keeper of a lane that is not the window's, its end calling `ended` where there is one.
+fn background_supervisor(ended: Option<Arc<dyn Fn() + Send + Sync>>) -> Option<Supervisor> {
     supervisor(Notifications {
         changed: || {},
         invalidated: || {},
         console_return: None,
         pending: None,
-        ended: rung.map(|rung| Arc::new(move || rung.ring()) as Arc<dyn Fn() + Send + Sync>),
+        ended,
     })
 }
 

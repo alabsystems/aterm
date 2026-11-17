@@ -67,6 +67,10 @@ fn counted(cache: &ReadCache, before: RetainedHistoryReadCounts) -> RetainedHist
 /// which no read of the journal reads, left a directory the records selection refuses, leave it
 /// unmoved. NEGATIVE CONTROL: with the records' selection stamped beside the journal's files
 /// (`vault_memo::stamp_inputs`, eb0e73e0f1), the read finds no stamps and reads the journal again.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn a_kept_history_is_unmoved_by_the_membership_records() {
     let mut fixture = Receipts::new();
@@ -90,6 +94,10 @@ fn a_kept_history_is_unmoved_by_the_membership_records() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn incremental_reader_keeps_old_snapshots_and_publishes_only_valid_suffixes() {
     let mut fixture = Receipts::new();
@@ -181,6 +189,10 @@ fn incremental_reader_keeps_old_snapshots_and_publishes_only_valid_suffixes() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn warm_reader_rechecks_disk_bytes_and_enrollment() {
     use std::io::{Seek, SeekFrom, Write};
@@ -245,6 +257,10 @@ fn warm_reader_rechecks_disk_bytes_and_enrollment() {
     assert_eq!(read(&fixture.paths).unwrap().1, 1);
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn reader_retains_only_one_path_and_rebuilds_after_replacement() {
     let mut first = Receipts::new();
@@ -309,6 +325,10 @@ fn reader_retains_only_one_path_and_rebuilds_after_replacement() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn an_unavailable_cache_still_validates_and_replays_without_publishing() {
     let mut fixture = Receipts::new();
@@ -338,6 +358,10 @@ fn an_unavailable_cache_still_validates_and_replays_without_publishing() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn concurrent_read_counts_conserve_joined_work_without_assuming_cache_order() {
     let mut first = Receipts::new();
@@ -393,6 +417,10 @@ fn concurrent_read_counts_conserve_joined_work_without_assuming_cache_order() {
 ///
 /// NEGATIVE CONTROL (2026-11-06): with the stamps never compared (every read validated, as
 /// before), the hundred reads read the journal a hundred times (`left: 100, right: 1`).
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn a_journal_nobody_wrote_is_validated_once() {
     let mut fixture = Receipts::new();
@@ -502,6 +530,10 @@ pub(crate) fn writer_replay_transition(
     next
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn writer_replay_model_conforms_to_opened_journals() {
     let model = aterm_models_swarm::retained_replay_model();
@@ -526,6 +558,10 @@ fn writer_replay_model_conforms_to_opened_journals() {
     assert!(!model.successors("Replay", &lost).contains(&unsafe_reuse));
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn writer_replay_rejects_a_committed_malformed_suffix_after_a_cached_prefix() {
     let mut fixture = Receipts::new();

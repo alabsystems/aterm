@@ -244,6 +244,21 @@ const TABLE: &[Verb] = &[
         run: cmd_serve_units,
     },
     Verb {
+        name: "tree",
+        tier: Tier::Plumbing,
+        usage: "aterm pkg tree <program> <key> --into <dir>  — a keyed build tree (llvm-tree, \
+                trust-stage0) as copy-on-write clones at <dir>, which must not exist: from this \
+                store, else the signed pack the index names for <key>, taken from LAN peers and \
+                the release host at once",
+        arity: Arity::Own,
+        program_flags: None,
+        // Each tree is held by its own lock (`keyed_tree`), so a fetch of minutes never holds
+        // the store's writer lock.
+        mutates_store: false,
+        applies_machine: false,
+        run: cmd_tree,
+    },
+    Verb {
         name: "repair",
         tier: Tier::Occasional,
         usage: "aterm pkg repair [--json] [--only <item-id>] — restore installed commands, shell integration, \
@@ -2934,6 +2949,85 @@ fn print_unreachable_followup(e: &crate::FlowError, rerun: &str) {
 
 /// `serve-units`: serve this store's kept units on the LAN in the foreground until stopped;
 /// `--off` turns LAN sharing off for good and `--on` back on.
+/// `aterm pkg tree <program> <key> --into <dir>` ([`crate::keyed_tree`]).
+fn cmd_tree(rest: &[String]) -> ExitCode {
+    let (mut words, mut into) = (Vec::new(), None);
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--into" => match args.next() {
+                Some(dir) if into.is_none() => into = Some(std::path::PathBuf::from(dir)),
+                _ => return usage_error("tree", Some("--into takes one directory")),
+            },
+            flag if flag.starts_with('-') => {
+                return usage_error("tree", Some(&format!("unknown flag `{flag}`")));
+            }
+            word => words.push(word),
+        }
+    }
+    let ([program, key], Some(into)) = (words.as_slice(), into) else {
+        return usage_error("tree", None);
+    };
+    if crate::keyed_tree::program(program).is_none() {
+        let known: Vec<&str> = crate::keyed_tree::TREES.iter().map(|p| p.name).collect();
+        return usage_error(
+            "tree",
+            Some(&format!(
+                "{program} is not a keyed tree ({})",
+                known.join(", ")
+            )),
+        );
+    }
+    let Some(key) = crate::keyed_tree::TreeKey::parse(key) else {
+        return usage_error("tree", Some("<key> is 64 lowercase hex"));
+    };
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    let target = current_triple();
+    if !crate::keyed_tree::holds(&layout, program, target, &key) {
+        if !manager_enabled() {
+            eprintln!("atpkg: disabled (no root key pinned) — no tree can be fetched");
+            return ExitCode::from(1);
+        }
+        let fetcher = resolve_fetcher(&layout);
+        let index = match crate::resolve_verified_index(
+            &*fetcher,
+            &layout,
+            &effective_anchor(&layout),
+            build_floor(&layout),
+            now_unix(),
+        ) {
+            Ok(index) => index,
+            Err(e) => {
+                eprintln!("atpkg: tree {program} {key}: no signed index ({e})");
+                return ExitCode::from(1);
+            }
+        };
+        if let Err(e) = crate::keyed_tree::fetch(&layout, &*fetcher, &index, program, target, &key)
+        {
+            eprintln!("atpkg: tree {program} {key}: {e}");
+            return ExitCode::from(1);
+        }
+    }
+    match crate::keyed_tree::hand_out(&layout, program, target, &key, &into) {
+        Ok(laid) => {
+            println!(
+                "atpkg: {program} {key} at {}: {} files, {} directories, each file a \
+                 copy-on-write clone of the store's",
+                into.display(),
+                laid.files,
+                laid.dirs
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("atpkg: tree {program} {key}: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn cmd_serve_units(rest: &[String]) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
@@ -5082,12 +5176,32 @@ fn print_left_alone(left_alone: &[String]) {
     );
 }
 
+/// `uninstall --all`'s removal of every keyed build tree ([`crate::keyed_tree::remove_all`]): a
+/// tree a hand-out holds at that moment stays, and is named.
+fn remove_keyed_trees(layout: &crate::store::Layout) {
+    let had = std::fs::symlink_metadata(crate::keyed_tree::root(layout)).is_ok();
+    match crate::keyed_tree::remove_all(layout) {
+        Ok(held) if held.is_empty() => {
+            if had {
+                println!("atpkg: removed every keyed build tree");
+            }
+        }
+        Ok(held) => eprintln!(
+            "atpkg: warn — kept the keyed tree(s) a hand-out holds now: {}; `aterm pkg gc` \
+             evicts them once idle",
+            held.join(", ")
+        ),
+        Err(e) => eprintln!("atpkg: warn — the keyed build trees were not all removed ({e})"),
+    }
+}
+
 fn cmd_uninstall_all() -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
     let targets = uninstall_all_targets(&layout);
     detach_rustup_seams(&layout);
+    remove_keyed_trees(&layout);
     if targets.is_empty() {
         clear_adoption(&layout);
         record_decline(&layout);
@@ -5197,6 +5311,8 @@ const fn gc_freed_nothing(report: &crate::gc::GcReport) -> bool {
         && report.swept_scratch.is_empty()
         && report.swept_staging.is_empty()
         && report.swept_exec_roots.is_empty()
+        && report.swept_trees.evicted.is_empty()
+        && report.swept_trees.interrupted.is_empty()
 }
 
 fn print_gc_sweeps(verb: &str, report: &crate::gc::GcReport) {
@@ -5234,6 +5350,19 @@ fn gc_sweep_lines(verb: &str, report: &crate::gc::GcReport) -> Vec<String> {
         lines.push(format!(
             "atpkg {verb}: removed unused build copy {}",
             path.display()
+        ));
+    }
+    for (p, keys) in &report.swept_trees.evicted {
+        lines.push(format!(
+            "atpkg {verb}: removed {p} tree(s) unused for {} days: {}",
+            crate::keyed_tree::KEEP.as_secs() / 86_400,
+            keys.join(", ")
+        ));
+    }
+    for (p, keys) in &report.swept_trees.interrupted {
+        lines.push(format!(
+            "atpkg {verb}: removed what interrupted {p} tree installs left: {}",
+            keys.join(", ")
         ));
     }
     for (p, builds) in &report.laid_aside {

@@ -489,7 +489,8 @@ pub use models_host_ended_relaunch::host_ended_relaunch_model;
 pub use models_left::{left_write_liveness, left_write_model};
 pub use models_occupancy::{occupancy_door_liveness, occupancy_door_model};
 pub use models_program_queue::{
-    claude_footer_model_model, claude_footer_watch_model, program_resolver_queue_model,
+    claude_footer_cause_model, claude_footer_model_model, claude_footer_watch_model,
+    program_resolver_queue_model,
 };
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_relaunch_prompt::{relaunch_prompt_read_liveness, relaunch_prompt_read_model};

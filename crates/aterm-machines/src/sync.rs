@@ -1748,7 +1748,7 @@ impl Item for Synced<'_> {
                 // A Stop pressed, or the group turned off, since the row read what is owed holds
                 // the clone it has not begun (principle 4): the row reads it was not cloned.
                 Some(why) => {
-                    self.stand_aside(StoodAside::Waiting(why));
+                    self.stand_aside(StoodAside::Inputs(why));
                     return Ok(());
                 }
                 None => match self.ports.clone_owed(self.repository_execution.clone()) {
@@ -1767,7 +1767,7 @@ impl Item for Synced<'_> {
                             .ports
                             .owed_clone(None, aterm_secrets::converge::RepositoryWork::Repair)
                         {
-                            self.stand_aside(StoodAside::Waiting(how));
+                            self.stand_aside(StoodAside::Inputs(how));
                             return Ok(());
                         }
                         return Err(format!("{why}; the next pass tries again"));
@@ -1778,7 +1778,7 @@ impl Item for Synced<'_> {
                 // A Stop pressed, or the group turned off, since the row read its controls
                 // holds the refresh as it holds the owed clone.
                 if let Some(why) = self.owed_clone_held()? {
-                    self.stand_aside(StoodAside::Waiting(why));
+                    self.stand_aside(StoodAside::Inputs(why));
                     return Ok(());
                 }
                 match self
@@ -1799,7 +1799,7 @@ impl Item for Synced<'_> {
                 // owed clone ([`Self::owed_clone_held`]); the apply reads System State's
                 // repositories hold again itself.
                 if let Some(why) = self.ports.vault_held() {
-                    self.stand_aside(StoodAside::Waiting(why));
+                    self.stand_aside(StoodAside::Inputs(why));
                     return Ok(());
                 }
                 let tuned = self
@@ -2249,6 +2249,43 @@ impl Pass {
     #[must_use]
     pub fn complete(&self) -> bool {
         self.unrecorded.is_none() && rows_complete(&self.rows)
+    }
+
+    /// Every unfinished admitted row waits for an input change. A failed record write and
+    /// any transient row retain the ordinary retry; no completed work is invented here.
+    #[must_use]
+    pub fn waits_for_input(&self) -> bool {
+        if self.unrecorded.is_some() {
+            return false;
+        }
+        let mut waiting = false;
+        for row in &self.rows {
+            if !row.outcome.is_failure() && !unfinished(row) {
+                continue;
+            }
+            waiting = true;
+            // The engine names the first row of an inherited wait, rather than copying its
+            // human explanation. Its original typed reading decides what can end the wait.
+            let source = row
+                .waits_on
+                .as_ref()
+                .and_then(|id| self.rows.iter().find(|source| source.id == *id))
+                .unwrap_or(row);
+            let standing = source.outcome == Outcome::Person
+                || matches!(
+                    source.stood_aside,
+                    Some(StoodAside::Inputs(_) | StoodAside::Permission(_))
+                )
+                || matches!(
+                    crate::init_observe::Reading::of(source),
+                    Some(crate::init_observe::Reading::Waits(wait))
+                        if wait.kind() == aterm_types::macos_setup::FailureKind::NeedsPerson
+                );
+            if !standing {
+                return false;
+            }
+        }
+        waiting
     }
 }
 

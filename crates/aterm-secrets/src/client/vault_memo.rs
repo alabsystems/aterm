@@ -18,10 +18,11 @@ use super::{Paths, StateLock, StateObservation};
 use crate::fsx;
 #[cfg(test)]
 use crate::swarm_roster::SwarmRoster;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 use std::{
     cell::{Cell, Ref, RefCell},
     collections::VecDeque,
-    os::unix::fs::MetadataExt as _,
     path::PathBuf,
     sync::Mutex,
 };
@@ -1238,6 +1239,20 @@ pub(super) fn observation_inputs(paths: &Paths) -> Option<Vec<PathBuf>> {
     Some(files)
 }
 
+/// Every file the memos above stamp, [`observation_inputs`], but the state lock: what a reader
+/// that keeps no memo of its own and re-reads through these memos watches, so a change any of
+/// them would read again is heard. The lock is left out: its presence decides a read while a
+/// writer holds the vault, and every write it guards ends by rewriting a file named here, so the
+/// end of a write is heard without the churn of every vault operation's lock.
+pub(super) fn watched_inputs(paths: &Paths) -> Vec<PathBuf> {
+    let lock = paths.lock_file();
+    observation_inputs(paths)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|file| *file != lock)
+        .collect()
+}
+
 /// The Commons device files [`observation_inputs`] adds to [`inputs`], in its order: this Mac's
 /// device age identity and the claim it is held to.
 fn device_files(paths: &Paths) -> [PathBuf; 2] {
@@ -1314,19 +1329,66 @@ pub fn desk_inputs_quiet(paths: &Paths) -> Option<DeskInputs> {
     }
 }
 
+/// What a read of this Mac's Claude Code token standings is judged by
+/// ([`claude_token::listed`](crate::claude_token::listed),
+/// [`claude_token::waiting_here`](crate::claude_token::waiting_here) and this Mac's refusals): the
+/// stamps of [`token_view_files`], with `state.toml` by what it holds but when the vault last
+/// heard this Mac and the receipts of its rounds, which the subscriber rewrites about once a
+/// minute and no standing is read from (as [`DeskInputs`] stamps it). A reader that shows the
+/// standings and holds these from before its read need not read again while they stand as they
+/// were; equal only to the stamps of the same files unchanged.
+#[derive(PartialEq, Eq)]
+pub struct TokenViewInputs {
+    stamps: InputStamps,
+}
+
+/// The stamps of the files a read of this Mac's token standings is judged by, now
+/// ([`TokenViewInputs`]); `None` where a file's metadata, the vault folder, its records'
+/// selection or `state.toml` cannot be read safely, so a reader stamps the files as they are.
+#[must_use]
+pub fn token_view_inputs(paths: &Paths) -> Option<TokenViewInputs> {
+    Some(TokenViewInputs {
+        stamps: stamp_memo_inputs_in(paths, token_view_named, true, None)?,
+    })
+}
+
+/// Every file a read of this Mac's token standings opens, for a reader to watch: the files
+/// [`token_view_inputs`] stamps by name and the membership records' selection as it stands
+/// ([`records_storage::standing_files`](crate::records_storage::standing_files)), which names
+/// the log's entry, pin, intent, header and data file whatever the entry is now.
+#[must_use]
+pub fn token_view_files(paths: &Paths) -> Vec<PathBuf> {
+    let mut files = token_view_named(paths).unwrap_or_default();
+    if let Ok(records) = crate::records_storage::standing_files(&paths.records_file()) {
+        files.extend(records);
+    }
+    files
+}
+
+/// The files a token standings read is judged by, by name: [`observation_inputs`] (the vault's
+/// source, lock, state, identity, sealed cache and acknowledged history, and the Commons device
+/// files), this Mac's waiting writes and pending sets ([`super::log_entries::wait_files`]), and
+/// the refusals file.
+fn token_view_named(paths: &Paths) -> Option<Vec<PathBuf>> {
+    let mut files = observation_inputs(paths)?;
+    files.extend(super::log_entries::wait_files(paths));
+    files.push(crate::claude_token::refusals_file(paths));
+    Some(files)
+}
+
 /// The files [`Local::of`](crate::members::desk::Local::of) and
 /// [`undo_offers`](super::undo_offers) take their answer from, but `state.toml`, which
 /// [`desk_inputs`] stamps by what it holds: [`observation_inputs`], the vault slot's creation
 /// claim, the Commons custody that seats this Mac (the retained claim, the custody locks, the
 /// pinned anchor), in a debug build a lab vault's home LAN file, and the control journal, by its
 /// directory (an entry came or went) and each entry in it and in the folders it holds (an
-/// append). `None` where the journal cannot be listed.
+/// append), as [`fsx::tree_paths`] lists them. `None` where the journal cannot be listed, or its
+/// directory is a symlink.
 pub(super) fn desk_files(paths: &Paths) -> Option<Vec<PathBuf>> {
     let mut files = observation_inputs(paths)?;
     let state = paths.state_file();
     files.retain(|file| *file != state);
     let commons = paths.dir.join("commons");
-    let control = commons.join("control");
     files.extend([
         super::creation::claim_file(paths),
         paths.dir.join("commons.claim"),
@@ -1335,34 +1397,9 @@ pub(super) fn desk_files(paths: &Paths) -> Option<Vec<PathBuf>> {
         commons.join("default.pin"),
     ]);
     // A debug build's lab vault names its home LAN in its own file (`members::lab_lan`).
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(all(unix, any(test, debug_assertions)))]
     files.push(paths.dir.join(crate::members::lab_lan::FILE));
-    let mut folders = vec![control];
-    while let Some(folder) = folders.pop() {
-        fsx::look_afresh();
-        let entries = match std::fs::read_dir(&folder) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                files.push(folder);
-                continue;
-            }
-            Err(_) => return None,
-        };
-        let (mut inside, mut below) = (Vec::new(), Vec::new());
-        for entry in entries {
-            let entry = entry.ok()?;
-            if entry.file_type().ok()?.is_dir() {
-                below.push(entry.path());
-            } else {
-                inside.push(entry.path());
-            }
-        }
-        inside.sort();
-        below.sort_unstable_by(|a, b| b.cmp(a));
-        files.push(folder);
-        files.extend(inside);
-        folders.extend(below);
-    }
+    files.extend(fsx::tree_paths(&commons.join("control"), &[])?);
     Some(files)
 }
 
@@ -1372,13 +1409,14 @@ pub(super) fn desk_files(paths: &Paths) -> Option<Vec<PathBuf>> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Stamp {
     dev: u64,
-    inode: u64,
+    inode: fsx::Ino,
     len: u64,
     modified: (i64, i64),
     changed: (i64, i64),
 }
 
 impl Stamp {
+    #[cfg(unix)]
     fn of(meta: &std::fs::Metadata) -> Self {
         Self {
             dev: meta.dev(),
@@ -1388,11 +1426,25 @@ impl Stamp {
             changed: (meta.ctime(), meta.ctime_nsec()),
         }
     }
+
+    /// Off Unix the volume and 128-bit file id, the length, and the last write and change times
+    /// in their own 100 ns ticks, which a write and an access-list change move.
+    #[cfg(windows)]
+    const fn of(meta: &fsx::Meta) -> Self {
+        Self {
+            dev: meta.st_dev,
+            inode: meta.st_ino,
+            len: meta.size,
+            modified: (meta.last_write, 0),
+            changed: (meta.change_time, 0),
+        }
+    }
 }
 
 /// The directory's identity and access metadata, without the content timestamps that an
 /// unrelated job or server write moves. A symlink here is refused by [`StateLock`], even when
 /// every input path still resolves to the files from an earlier read.
+#[cfg(unix)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectoryStamp {
     dev: u64,
@@ -1400,6 +1452,18 @@ struct DirectoryStamp {
     uid: u32,
     gid: u32,
     mode: u32,
+}
+
+/// The directory's identity and access metadata off Unix: its volume and file id, its attributes
+/// and the digest of its owner and access list ([`fsx::access_digest`]), what its owner, group
+/// and mode are on Unix.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DirectoryStamp {
+    dev: u64,
+    inode: fsx::Ino,
+    attributes: u32,
+    access: [u8; 32],
 }
 
 /// The vault directory and each of a set of files as they stood ([`stamp_files`]).
@@ -1472,7 +1536,7 @@ pub(super) fn selection_now(
 
 /// Every file `inputs`' stamps stand for: its own and the membership records' selection's
 /// ([`records_storage::standing_files`](crate::records_storage::standing_files)).
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 pub(super) fn stamped_files(
     paths: &Paths,
     inputs: fn(&Paths) -> Option<Vec<PathBuf>>,
@@ -1483,9 +1547,11 @@ pub(super) fn stamped_files(
 }
 
 /// Every file [`desk_inputs`] stands for: [`stamped_files`] of [`desk_files`], and `state.toml`,
-/// which it stamps by what it holds.
-#[cfg(test)]
-pub(super) fn desk_stamped_files(paths: &Paths) -> Option<Vec<PathBuf>> {
+/// which it stamps by what it holds. A seam of the laws of another crate's keeper that stamps
+/// with [`desk_inputs`] (aterm-db's accounts sample), which sweep the files it leaves out.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn desk_stamped_files(paths: &Paths) -> Option<Vec<PathBuf>> {
     let mut files = stamped_files(paths, desk_files)?;
     files.push(paths.state_file());
     Some(files)
@@ -1599,6 +1665,7 @@ fn stamp_paths_in(
     files: &[PathBuf],
     glance: Option<&fsx::Glance>,
 ) -> Option<FileStamps> {
+    #[cfg(unix)]
     let directory = match fsx::lstat_in(glance, &paths.dir) {
         Ok(Some(meta)) if meta.is_dir() => Some(DirectoryStamp {
             dev: meta.dev(),
@@ -1606,6 +1673,17 @@ fn stamp_paths_in(
             uid: meta.uid(),
             gid: meta.gid(),
             mode: meta.mode(),
+        }),
+        Ok(Some(_)) | Err(_) => return None,
+        Ok(None) => None,
+    };
+    #[cfg(windows)]
+    let directory = match fsx::lstat_in(glance, &paths.dir) {
+        Ok(Some(meta)) if meta.file_type().is_dir() => Some(DirectoryStamp {
+            dev: meta.st_dev,
+            inode: meta.st_ino,
+            attributes: meta.attributes,
+            access: fsx::access_digest(&paths.dir).ok()?,
         }),
         Ok(Some(_)) | Err(_) => return None,
         Ok(None) => None,
@@ -1724,15 +1802,18 @@ struct Held<T, K> {
 }
 
 /// The record budgets and byte bound every log and store made on this thread now takes.
-type RecordBounds = (crate::membership_log::RecordBudgets, usize);
+pub type RecordBounds = (crate::membership_log::RecordBudgets, usize);
 
 /// This thread's record bounds ([`RecordBudgets::current`], [`held_bytes_bound`]): the
 /// production ones outside a test, and under a test's own (`RecordBudgets::within`,
-/// `RecordBudgets::within_bytes`) the same files recover to other records, or are refused.
+/// `RecordBudgets::within_bytes`) the same files recover to other records, or are refused. A
+/// keeper of an answer read from the membership records keeps it under these beside the files'
+/// stamps, as the vault memos keep theirs.
 ///
 /// [`RecordBudgets::current`]: crate::membership_log::RecordBudgets::current
 /// [`held_bytes_bound`]: crate::membership_log::budgets::held_bytes_bound
-fn record_bounds() -> RecordBounds {
+#[must_use]
+pub fn record_bounds() -> RecordBounds {
     (
         crate::membership_log::RecordBudgets::current(),
         crate::membership_log::budgets::held_bytes_bound(),

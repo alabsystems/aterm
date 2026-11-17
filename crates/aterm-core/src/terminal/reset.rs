@@ -44,7 +44,14 @@ impl ResetGroups<'_> {
         self.dcs.reset();
         self.notifications.reset();
         *self.taskbar_progress = None;
+        let titled = self.program_state.title_seq();
         self.program_state.reset();
+        // A program's title the reset took away is a title change, as the window title's is.
+        if self.program_state.title_seq() != titled {
+            self.title
+                .epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 

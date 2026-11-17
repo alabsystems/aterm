@@ -131,6 +131,6 @@ path = "benches/rainbow_kitty_v2_frame_cost.rs"
 harness = false
 
 [[bench]]
-name = "pet_pose_bake"
-path = "benches/pet_pose_bake.rs"
+name = "rainbow_road_bake"
+path = "benches/rainbow_road_bake.rs"
 harness = false

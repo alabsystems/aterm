@@ -5594,6 +5594,54 @@ fn link_log_continues_takes_only_an_earlier_generation_of_the_same_log() {
     });
 }
 
+/// A PROVED MOVE TO ANOTHER LOG (`aterm_types::control_verbs::LINK_PROVED_LANE`): astream gives a
+/// log whose identity sidecar does not read another id, keeping every record, and a bridge that
+/// proved by the records it told this endpoint that the new log holds the old one's below the
+/// fork says so with `proved=1`; the endpoint keeps what it holds below the fork, so mail it was
+/// shown there is answered from its memory, and forgets what is at or above it. NEGATIVE CONTROL:
+/// the same move without `proved=1` is refused, as is `proved=1` between two generations of one
+/// log (a lineage's move, which needs no proof) and any other spelling of it, each forgetting
+/// nothing.
+#[test]
+fn link_log_proved_continues_another_log_below_its_fork() {
+    with_link(|| {
+        let store = new_store();
+        let (sid, _ctx) = registered(&store);
+        let generation = next_bridge_generation();
+        attach_up(&store, generation);
+        let a0 = format!("{}.0", "aa".repeat(16));
+        let a1 = format!("{}.1", "aa".repeat(16));
+        let b0 = format!("{}.0", "bb".repeat(16));
+        let tell = |line: String| cmd_link(&store, &format!("log {line}"), Some(generation));
+        let at =
+            |off: u64, text: &str| deliver(&store, &sid, off, "t0000100000@n-lab", "note", text);
+        assert_eq!(tell(a0.clone()), "OK\n");
+        assert_eq!(at(7, "seven"), "OK 1\n");
+        assert_eq!(at(25, "twenty-five"), "OK 2\n");
+        for line in [
+            format!("{b0} continues=20 was={a0}"),
+            format!("{a1} continues=20 was={a0} proved=1"),
+            format!("{b0} continues=20 was={a0} proved=0"),
+            format!("{b0} continues=20 was={a0} proved=1 proved=1"),
+            format!("{b0} proved=1"),
+            format!("{b0} was={a0} proved=1"),
+        ] {
+            assert_eq!(tell(line.clone()), LINK_USAGE, "{line}");
+            assert_eq!(at(7, "seven"), "OK 1\n", "nothing forgotten by {line}");
+        }
+        assert_eq!(
+            tell(format!("{b0} continues=20 was={a0} proved=1")),
+            "OK forgot=1\n"
+        );
+        assert_eq!(at(7, "seven"), "OK 1\n", "7 is below the proved fork");
+        assert_eq!(
+            at(25, "another-twenty-five"),
+            "OK 3\n",
+            "25 is at or above the fork: another record there is shown"
+        );
+    });
+}
+
 /// A log identity is astream's value, not its text: a bridge that names the clock this
 /// endpoint holds with a zero-padded generation (`<id>.01`, or padded past the 20 digits of
 /// `u64::MAX`) names the same clock, so nothing is forgotten, and a move from a padded

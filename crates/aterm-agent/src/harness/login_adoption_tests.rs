@@ -97,11 +97,13 @@ pub(in crate::harness) fn tap_path(state_dir: &Path) -> PathBuf {
 
 /// Sets when the fixture process's usage-tap file was last written, as a tap that stopped
 /// then leaves it.
+#[cfg(unix)]
 pub(in crate::harness) fn tap_written_at(state_dir: &Path, at: i64) {
     written_at(&tap_path(state_dir), at);
 }
 
 /// Sets when the file `path` was last written.
+#[cfg(unix)]
 fn written_at(path: &Path, at: i64) {
     let written =
         std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::try_from(at).unwrap());
@@ -1352,6 +1354,7 @@ fn login_adopted_the_tab_a_person_used_is_read_however_many_idle_tabs_share_its_
 }
 
 /// The fixture row as the records hold it.
+#[cfg(unix)]
 fn struck_row(world: &World) -> Row {
     world
         .store()
@@ -1445,4 +1448,88 @@ fn login_adopted_writer_agrees_with_itself_and_notes_the_journal() {
         Err(accounts::NotAdopted::Future)
     );
     assert_eq!(state.account("w3").auth, Auth::SignedOut);
+}
+
+/// FL-116: A SERVED TURN IS DATED BY THE REQUEST ITS REPLY ANSWERED ([`served_request`]), so a
+/// limit met while the reply streamed is not one it speaks against. A tool's result written at
+/// `T`, after a response's tool call, answered by another response whose row is written ninety
+/// seconds later, is served as asked at `T`, by the model that answer names; a prompt typed
+/// after it starts a new request that nothing has answered yet.
+/// CONTROLS: the reply that is a later row of the response in flight when the tool's result was
+/// written (one API response that ran its tool while it streamed) shows no request served; nor
+/// does a tail whose last request no assistant row read precedes (the read's cut hid the
+/// response before it), an answer with no `message.id`, or one Claude Code wrote itself
+/// (`<synthetic>`).
+/// NEGATIVE CONTROL: dated by its reply's row, the first case gives `T + 90`; with the
+/// in-flight rule dropped, the second gives `Some`.
+#[test]
+fn a_served_request_is_dated_by_its_request_and_never_by_its_reply() {
+    let top = "\"isSidechain\":false,";
+    let tail = |rows: &[String]| {
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>()
+    };
+    let asked = tail(&[
+        response_row("a-call", "u-0", T - 30, top, Some("msg_call")),
+        tool_result_row("u-result", "a-call", T, "ok"),
+        response_row("a-reply", "u-result", T + 90, top, Some("msg_reply")),
+    ]);
+    assert_eq!(
+        served_request(&asked),
+        Some(ServedRequest {
+            asked: T,
+            model: "claude-opus-4-7".to_string(),
+        })
+    );
+    let pending = format!(
+        "{asked}{}\n",
+        prompt_row("u-next", Some("a-reply"), T + 100, "next")
+    );
+    assert_eq!(
+        served_request(&pending),
+        None,
+        "a request nothing answered yet"
+    );
+
+    let in_flight = tail(&[
+        response_row("a-call", "u-0", T - 30, top, Some("msg_call")),
+        tool_result_row("u-result", "a-call", T, "ok"),
+        response_row("a-more", "u-result", T + 90, top, Some("msg_call")),
+    ]);
+    assert_eq!(
+        served_request(&in_flight),
+        None,
+        "a row of the response in flight"
+    );
+    let cut = tail(&[
+        tool_result_row("u-result", "a-call", T, "ok"),
+        response_row("a-reply", "u-result", T + 90, top, Some("msg_reply")),
+    ]);
+    assert_eq!(
+        served_request(&cut),
+        None,
+        "no assistant row read before the request"
+    );
+    let unnamed = tail(&[
+        response_row("a-call", "u-0", T - 30, top, Some("msg_call")),
+        tool_result_row("u-result", "a-call", T, "ok"),
+        response_row("a-reply", "u-result", T + 90, top, None),
+    ]);
+    assert_eq!(
+        served_request(&unnamed),
+        None,
+        "an answer with no response id"
+    );
+    let synthetic = tail(&[
+        response_row("a-call", "u-0", T - 30, top, Some("msg_call")),
+        tool_result_row("u-result", "a-call", T, "ok"),
+        response_row("a-reply", "u-result", T + 90, top, Some("msg_reply"))
+            .replace("claude-opus-4-7", accounts::SYNTHETIC_MODEL),
+    ]);
+    assert_eq!(
+        served_request(&synthetic),
+        None,
+        "a row Claude Code wrote itself"
+    );
 }

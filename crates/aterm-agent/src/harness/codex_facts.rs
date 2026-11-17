@@ -262,16 +262,17 @@ impl CodexFactsFold {
         if words.is_empty() || std::mem::take(&mut self.starter_owed) {
             return;
         }
-        let Some(words) = clean_prompt_words(words) else {
+        let Some(cleaned) = clean_prompt_words(words) else {
             return;
         };
-        let key = prompt_key(&words);
+        let key = prompt_key(&cleaned.words);
         self.prompts.retain(|prompt| prompt.key != key);
         self.prompts.insert(
             0,
             Prompt {
-                text: cap(&fold(&words), EXCERPT_BYTES),
+                text: cap(&fold(&cleaned.words), EXCERPT_BYTES),
                 key,
+                shell: cleaned.shell,
             },
         );
         self.prompts.truncate(PROMPTS_KEPT);

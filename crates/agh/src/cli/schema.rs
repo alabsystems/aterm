@@ -84,6 +84,7 @@ const fn keys(noun: Noun) -> Option<&'static [(&'static str, &'static str)]> {
             ("retracted", "number|null"),
             ("settled", "string|null"),
             ("target_commitish", "string|null"),
+            ("writer", "object|null"),
         ]),
         Noun::Credential => Some(&[
             ("answer", "string"),

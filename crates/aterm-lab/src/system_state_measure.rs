@@ -642,6 +642,27 @@ pub fn solid_ink(px: &[Rgb], ground: Rgb) -> Option<Rgb> {
     best(true).or_else(|| best(false))
 }
 
+/// The wash a mark sits on: the most common colour of the ring [`WASH_RING`] pixels outside
+/// `inner`, inside `view`; `None` when no pixel of the ring is in the frame and the view.
+#[must_use]
+pub fn wash(frame: &Image, inner: PxBox, view: PxBox) -> Option<Rgb> {
+    let ring = PxBox {
+        x0: inner.x0 - WASH_RING.1,
+        y0: inner.y0 - WASH_RING.1,
+        x1: inner.x1 + WASH_RING.1,
+        y1: inner.y1 + WASH_RING.1,
+    };
+    let near = PxBox {
+        x0: inner.x0 - WASH_RING.0 + 1,
+        y0: inner.y0 - WASH_RING.0 + 1,
+        x1: inner.x1 + WASH_RING.0 - 1,
+        y1: inner.y1 + WASH_RING.0 - 1,
+    };
+    mode(pixels_where(frame, ring, |x, y| {
+        !near.holds(x, y) && view.holds(x, y)
+    }))
+}
+
 /// Text against its background: each visible node whose words a `paint-text` line audits, its
 /// background the most common colour of its undimmed part ([`Node::undimmed`]) and its ink
 /// [`solid_ink`]. Words a scroll edge cuts ([`text_scroll_cut`], which [`clip_check`] judges) or a
@@ -743,22 +764,7 @@ fn glyph_check(frame: &Image, layout: &Layout, surfaces: &Surfaces) -> Check {
         let (cx, cy) = (area.x + area.w / 2.0, area.y + area.h / 2.0);
         let ground = surfaces.ground_at(cx, cy);
         let inner = area.px(scale);
-        let ring = PxBox {
-            x0: inner.x0 - WASH_RING.1,
-            y0: inner.y0 - WASH_RING.1,
-            x1: inner.x1 + WASH_RING.1,
-            y1: inner.y1 + WASH_RING.1,
-        };
-        let near = PxBox {
-            x0: inner.x0 - WASH_RING.0 + 1,
-            y0: inner.y0 - WASH_RING.0 + 1,
-            x1: inner.x1 + WASH_RING.0 - 1,
-            y1: inner.y1 + WASH_RING.0 - 1,
-        };
-        let wash = mode(pixels_where(frame, ring, |x, y| {
-            !near.holds(x, y) && view.holds(x, y)
-        }))
-        .unwrap_or(ground);
+        let wash = wash(frame, inner, view).unwrap_or(ground);
         let px = frame.region(inner);
         let Some(ink) = solid_ink(&px, wash) else {
             check.skip("blank");

@@ -68,7 +68,7 @@ pub(super) fn resets(kind: Kind) -> bool {
     }
     match kind {
         Kind::Genesis | Kind::Admit | Kind::Remove | Kind::Epoch | Kind::Wrap => true,
-        Kind::Name | Kind::Put | Kind::Delete | Kind::Node => false,
+        Kind::Name | Kind::Put | Kind::Delete | Kind::Node | Kind::Checkpoint => false,
     }
 }
 

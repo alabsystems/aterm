@@ -14,6 +14,7 @@ pub mod limit;
 pub mod line;
 pub mod log;
 pub mod node_log;
+pub mod protocol;
 pub mod rec;
 pub mod turn;
 pub mod vocab;
@@ -24,15 +25,22 @@ pub use field::{
     BoundedText, BoundedToken, Cap, Charset, FIELDS, FieldError, Fields, Key, MAX_FIELDS, Tier, Val,
 };
 pub use fold::{
-    BusFacts, BusTotals, Claim, Clause, ClauseRow, ClosedNode, DESC_AGENTS, DESC_CARRY_BYTES,
-    DESC_CLAIMS, DESC_CLAIMS_MAX, DESC_HEAP_BYTES, DESC_SLOTS, DESC_TEXT_BYTES, DESC_TURN_RING,
-    DESC_UNKNOWN_SLOTS, DescClaim, DescIdent, DescRow, DescSlot, DescSubject, Described, Fold,
-    Hints, KNOWN_SLOTS, MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting,
-    Need, OpenNode, Phase, Rank, SessionState, Shown, SnapError, Tone, Totals, Words,
-    amend_refines_out, clause_of, clause_of_proven, clear_lifts, confidence_law, lifts_failure,
+    BusFacts, BusTotals, CardKey, Claim, ClaimRefused, Clause, ClauseRow, ClosedNode, DESC_AGENTS,
+    DESC_CARRY_BYTES, DESC_CLAIMS, DESC_CLAIMS_MAX, DESC_HEAP_BYTES, DESC_HISTORY, DESC_SLOTS,
+    DESC_STALE_TURNS, DESC_TEXT_BYTES, DESC_TURN_RING, DESC_UNKNOWN_SLOTS, DescClaim, DescIdent,
+    DescRow, DescSlot, DescSubject, Described, Fold, HISTORY, HISTORY_EVENTS, Hints, HistLine,
+    HistRow, KNOWN_SLOTS, MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting,
+    Need, OpenNode, PACKAGE_BYTES, PACKAGE_IDS, PER_TURN_SLOTS, Phase, Rank, STATED_SLOTS,
+    SessionState, Shown, SnapError, Tone, Totals, Words, amend_refines_out, clause_of,
+    clause_of_proven, clear_lifts, confidence_law, desc_admits, desc_text, lifts_failure,
     mail_in_window, mail_link_of, mark_may_raise, mark_need_node, may_observe, need_precedence,
-    need_raised, need_takes_amend, need_words, observed_need_words, rank_of, shown, shown_label,
-    shown_proven_label, shown_verdicts, starts_epoch, turn_out_rebucket,
+    need_raised, need_takes_amend, need_words, observed_need_words, rank_of, shown, shown_history,
+    shown_label, shown_proven_label, shown_verdicts, slot_bound, starts_epoch, turn_out_rebucket,
+};
+pub use fold::{
+    MATTERS_AS_CREATOR, MATTERS_AS_PACKAGE, MATTERS_AS_WHY, MattersSrc, PACKAGE_AS_SPAWN,
+    TITLE_AS_FOLDER, TITLE_AS_PROGRAM, TITLE_AS_PROMPT, TITLE_AS_TASK, TitleSrc, is_birth,
+    matters_src, title_src,
 };
 pub use limit::{
     Bucket, MARK_ACTORS, MARK_BURST, MARK_OWED_AUTHORS, MARK_REFILL_MS, MarkLimiter, Owed,

@@ -946,6 +946,7 @@ fn a_resume_of_a_file_that_is_not_the_checkouts_own_handoff_leaves_it_as_it_was(
 /// not it is honoured, so it is gone, and the run it carried ends there: one end record, under
 /// its id and from its next ordinal. A receiver that went on under its defaults instead would
 /// refuse this handoff for its image, which is not this build's, and say nothing of the words.
+/// After the refusal it says only where the carried run's records went.
 /// NEGATIVE CONTROL, run as a mutant: `resume_cli` returning at the words' refusal without
 /// [`refused`] left the carried run with no end record.
 #[test]
@@ -994,7 +995,12 @@ fn a_handoff_of_words_this_build_does_not_take_could_not_run_naming_them() {
         "verify land: COULD NOT RUN — this tree's verify land does not take the landing's words \
          `--checks fmt`; {RERUN}"
     );
-    assert_eq!(said, [refusal], "the words' refusal, and nothing after it");
+    let (first, after) = said.split_first().expect("the refusal");
+    assert_eq!(first, &refusal, "the words' refusal first");
+    assert!(
+        after.iter().all(|line| line.contains("this run's records")),
+        "after the refusal, only where the carried run's records went: {said:#?}"
+    );
     assert!(said[0].contains(FIX), "{said:#?}");
     // The run the handoff carried ends here: its end record, under its own id and from its
     // next ordinal, could not run.

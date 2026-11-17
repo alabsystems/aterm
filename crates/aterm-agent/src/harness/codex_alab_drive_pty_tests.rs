@@ -11,18 +11,98 @@ use super::*;
 /// The stand-in's own word on the pty, each time it starts.
 const UP: &str = "STAND-IN CODEX-ALAB UP";
 
+/// The sole reader drains ready bytes until EOF or its owner's cancellation, independently
+/// of whether a child still holds the terminal or the test can prove that child's identity.
+fn start_drain(
+    read: std::os::fd::OwnedFd,
+    heard: Arc<Mutex<Vec<u8>>>,
+) -> std::io::Result<(std::io::PipeWriter, std::thread::JoinHandle<()>)> {
+    use std::os::fd::AsRawFd as _;
+
+    let (stop_read, stop) = aterm_uds::pipe()?;
+    let drain = std::thread::Builder::new().spawn(move || {
+        let mut slots = [
+            libc::pollfd {
+                fd: stop_read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: read.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let mut buf = [0u8; 4096];
+        loop {
+            for slot in &mut slots {
+                slot.revents = 0;
+            }
+            // SAFETY: both initialized slots name descriptors this thread owns for the call.
+            let ready = unsafe { libc::poll(slots.as_mut_ptr(), slots.len() as _, -1) };
+            if ready < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                break;
+            }
+            // Closing the sole stop writer gives HUP, even while the terminal stays open.
+            if slots[0].revents != 0 || slots[1].revents & libc::POLLNVAL != 0 {
+                break;
+            }
+            if slots[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                // SAFETY: readiness preceded the read; this is the descriptor's sole reader,
+                // and buf is a live writable local buffer of the stated length.
+                let n = unsafe { libc::read(read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    let why = std::io::Error::last_os_error().kind();
+                    if why == std::io::ErrorKind::Interrupted
+                        || (why == std::io::ErrorKind::WouldBlock
+                            && slots[1].revents & (libc::POLLHUP | libc::POLLERR) == 0)
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
+                    break;
+                };
+                heard.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+        }
+    })?;
+    Ok((stop, drain))
+}
+
+#[test]
+fn cancelling_a_drain_ends_it_while_its_peer_still_holds_the_writer() {
+    let (read, peer) = aterm_uds::pipe().expect("the held-open peer");
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let (stop, drain) = start_drain(read.into(), heard).expect("the drain starts");
+    drop(stop);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the cancelled drain ends without peer EOF",
+        || drain.is_finished().then_some(()),
+    );
+    drain.join().expect("the drain ended");
+    drop(peer);
+}
+
 /// A zsh on a pty of its own, its parent launchd's (an orphan, as a shell aterm's window opened
 /// reads once its host is gone, [`crate::harness::upgrade_drive::owned_by_aterm`]), and everything it writes read.
 struct OrphanZsh {
     master: i32,
     shell: u32,
+    identity: aterm_pty::ShellIdentity,
     said: Arc<Mutex<Vec<u8>>>,
+    stop_drain: Option<std::io::PipeWriter>,
     drain: Option<std::thread::JoinHandle<()>>,
 }
 
 impl OrphanZsh {
     fn spawn(home: &Path, cwd: &Path) -> Self {
-        use std::os::fd::IntoRawFd as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
         use std::os::unix::process::CommandExt as _;
         let (master, slave, mut first) = aterm_pty::spawn_session_leader_on_pty(|slave| {
             let tty = || slave.try_clone().map(std::process::Stdio::from);
@@ -52,34 +132,39 @@ impl OrphanZsh {
         .expect("the orphan zsh");
         drop(slave);
         assert!(first.wait().expect("the first child").success());
-        let master = master.into_raw_fd();
+        let master_owner = master;
+        let master = master_owner.as_raw_fd();
         let said = Arc::new(Mutex::new(Vec::new()));
-        // SAFETY: `master` is this test's open pty master; the duplicate is the drain's own.
-        let read = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 0) };
-        assert!(read >= 0, "dup the master");
-        let heard = Arc::clone(&said);
-        let drain = std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                // SAFETY: reads into a local buffer from the drain's own descriptor.
-                let n = unsafe { libc::read(read, buf.as_mut_ptr().cast(), buf.len()) };
-                let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
-                    break;
-                };
-                heard.lock().unwrap().extend_from_slice(&buf[..n]);
+        let read = aterm_uds::kept_out(|| {
+            // SAFETY: master is this test's open pty; fcntl creates one fresh descriptor.
+            let read = unsafe { libc::fcntl(master, libc::F_DUPFD_CLOEXEC, 3) };
+            if read < 0 {
+                return Err(std::io::Error::last_os_error());
             }
-            aterm_pty::close_fd(read);
-        });
+            // SAFETY: this duplicate was just created and has no other owner.
+            Ok(unsafe { OwnedFd::from_raw_fd(read) })
+        })
+        .expect("dup the master, kept out of children");
+        let (stop_drain, drain) = start_drain(read, Arc::clone(&said)).expect("the pty drain");
         let mut zsh = Self {
-            master,
+            master: master_owner.into_raw_fd(),
             shell: 0,
+            identity: aterm_pty::ShellIdentity::unproven(0),
             said,
+            stop_drain: Some(stop_drain),
             drain: Some(drain),
         };
-        zsh.shell = zsh.until("the shell leads its pty, launchd's", || {
-            let group = zsh.front()?;
-            let row = aterm_sysprobe::kproc::record(group)?;
-            (row.ppid == 1 && zsh.said().contains("% ")).then_some(group)
+        // Spawn returned only once the orphan exec closed its status descriptor: setsid and
+        // TIOCSCTTY already established this group, before the shell can print its prompt.
+        zsh.shell = zsh.front().expect("the executed shell's foreground group");
+        zsh.identity = aterm_pty::record_adopted_shell(
+            i32::try_from(zsh.shell).expect("the shell's pid"),
+            master,
+        );
+        zsh.identity = zsh.until("the shell leads its pty, launchd's", || {
+            let identity = aterm_pty::record_adopted_shell(i32::try_from(zsh.shell).ok()?, master);
+            let row = aterm_sysprobe::kproc::record(zsh.shell)?;
+            (identity.verify() && row.ppid == 1 && zsh.said().contains("% ")).then_some(identity)
         });
         zsh
     }
@@ -96,34 +181,115 @@ impl OrphanZsh {
         String::from_utf8_lossy(&self.said.lock().unwrap()).into_owned()
     }
 
-    /// `look`'s answer, within the hang detector.
-    fn until<T>(&self, what: &str, mut look: impl FnMut() -> Option<T>) -> T {
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(seen) = look() {
-                return seen;
+    /// A minute without the shell tree's progress ends the wait; working time has no wall cap.
+    fn try_until<T>(
+        &self,
+        look: impl FnMut() -> Option<T>,
+    ) -> Result<T, aterm_spec::wait::Unanswered> {
+        aterm_spec::wait::within_while_working(
+            self.shell,
+            aterm_spec::wait::MUST_HAPPEN,
+            Duration::MAX,
+            Duration::from_millis(20),
+            look,
+        )
+    }
+
+    fn until<T>(&self, what: &str, look: impl FnMut() -> Option<T>) -> T {
+        self.try_until(look)
+            .unwrap_or_else(|why| panic!("{what}: {why:?}; the pty said:\n{}", self.said()))
+    }
+
+    /// The token still names a process in this test's shell session, on its held pty.
+    fn owns(&self, token: aterm_uds::process::Identity) -> bool {
+        self.identity.verify()
+            // SAFETY: both calls only read session ids; the master remains this value's.
+            && unsafe {
+                libc::tcgetsid(self.master) == self.identity.pid
+                    && libc::getsid(token.pid) == self.identity.pid
             }
-            assert!(
-                start.elapsed() < aterm_spec::wait::MUST_HAPPEN,
-                "{what}: not within the hang detector; the pty said:\n{}",
-                self.said()
-            );
-            std::thread::sleep(Duration::from_millis(20));
+            && aterm_uds::process::read_identity(token.pid) == Some(token)
+    }
+
+    fn signal_foreground(
+        &self,
+        token: aterm_uds::process::Identity,
+        signal: i32,
+    ) -> std::io::Result<()> {
+        use aterm_uds::process::EndControl as _;
+        if self.front() != u32::try_from(token.pid).ok() || !self.owns(token) {
+            return Err(std::io::Error::other(
+                "the test no longer owns this foreground process",
+            ));
         }
+        aterm_uds::process::EndControlLive.signal(&token, signal)
     }
 }
 
 impl Drop for OrphanZsh {
     fn drop(&mut self) {
-        if self.shell != 0 {
-            // SAFETY: the shell's pid, which this test's pty session still holds as its leader.
-            unsafe { libc::kill(i32::try_from(self.shell).unwrap_or(0), libc::SIGKILL) };
+        use aterm_uds::process::EndControl as _;
+        drop(self.stop_drain.take());
+        if let Some(front) = self.front().and_then(|pid| i32::try_from(pid).ok())
+            && front != self.identity.pid
+            && let Some(token) = aterm_uds::process::read_identity(front)
+        {
+            let _ = self.signal_foreground(token, libc::SIGKILL);
+        }
+        if let Some(token) = aterm_uds::process::read_identity(self.identity.pid)
+            && self.owns(token)
+        {
+            let _ = aterm_uds::process::EndControlLive.signal(&token, libc::SIGKILL);
         }
         aterm_pty::close_fd(self.master);
         if let Some(drain) = self.drain.take() {
             let _ = drain.join();
         }
     }
+}
+
+#[test]
+fn signals_require_the_current_foreground_birth_and_the_owned_shell_session() {
+    let dir = scratch("renewal-signal-custody-pty");
+    let mut owned = OrphanZsh::spawn(&dir, &dir);
+    let other = OrphanZsh::spawn(&dir, &dir);
+    let token = aterm_uds::process::read_identity(owned.identity.pid)
+        .expect("the owned shell's current token");
+    let foreign = aterm_uds::process::read_identity(other.identity.pid)
+        .expect("the other shell's current token");
+    assert_eq!(owned.front(), u32::try_from(token.pid).ok());
+    assert!(
+        owned.owns(token),
+        "the live foreground is a positive control"
+    );
+    owned
+        .signal_foreground(token, 0)
+        .expect("signal zero probes the owned foreground without ending it");
+
+    let mut stale = token;
+    stale.birth.0 ^= 1;
+    assert!(
+        !owned.owns(stale),
+        "the same pid with another birth is stale"
+    );
+    assert!(owned.signal_foreground(stale, 0).is_err());
+    assert!(other.owns(foreign), "the other token is independently live");
+    assert!(!owned.owns(foreign), "another held terminal is not ours");
+    assert!(owned.signal_foreground(foreign, 0).is_err());
+
+    let recorded = owned.identity;
+    owned.identity = aterm_pty::ShellIdentity::unproven(recorded.pid);
+    let owns_without_birth = owned.owns(token);
+    let signal_without_birth = owned.signal_foreground(token, 0);
+    owned.identity = recorded;
+    assert!(
+        !owns_without_birth,
+        "an unproven shell cannot authorize a signal"
+    );
+    assert!(signal_without_birth.is_err());
+    owned
+        .signal_foreground(token, 0)
+        .expect("restoring the recorded identity restores the positive control");
 }
 
 /// The runs `log` holds, as the stand-in wrote each: its pid, `CODEX_AUTH_PATH`, `CODEX_HOME`
@@ -179,8 +345,9 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
         .into_owned();
     // The stand-in: atpkg's launcher of a codex-alab package whose binary holds the auth-path
     // mark. Its interpreter is named `codex`, as the kernel names a codex-alab's process.
-    // It traps TERM before it writes anything, so a Signal at any point after its run's log line
-    // ends it through its own exit, as a codex-alab ends, never by the signal's default action.
+    // It traps TERM before it writes anything, so the renewal's Signal ends it through its own
+    // exit, as a codex-alab ends. A blocking read keeps the relaunch alive until this test ends
+    // it; any input the resumed turn sends is consumed without imposing a lifetime.
     let interp = dir.join("sh/codex");
     std::fs::create_dir_all(interp.parent().expect("its folder")).expect("sh");
     std::os::unix::fs::symlink("/bin/sh", &interp).expect("the interpreter");
@@ -189,10 +356,10 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     std::fs::write(
         &exe,
         format!(
-            "#!{interp}\n# {mark}\ntrap 'kill $! 2>/dev/null; exit 143' TERM\n\
+            "#!{interp}\n# {mark}\ntrap 'exit 143' TERM\n\
              printf '%s|%s|%s|%s\\n' \"$$\" \"${{CODEX_AUTH_PATH-unset}}\" \"${{CODEX_HOME-unset}}\" \
              \"$*\" >> '{log}'\nprintf '{UP} %s\\n' \"$$\"\n\
-             /bin/sleep \"${{STAND_IN_FOR:-2}}\" & wait $!\n",
+             while IFS= read -r ignored; do :; done\n",
             interp = interp.display(),
             mark = crate::harness::codex_alab::AUTH_PATH_MARK,
             log = log.display(),
@@ -258,7 +425,7 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     aterm_pty::write_all(
         master,
         format!(
-            "STAND_IN_FOR=60 CODEX_AUTH_PATH='{login}' CODEX_HOME={} {} resume {T2}\r",
+            "CODEX_AUTH_PATH='{login}' CODEX_HOME={} {} resume {T2}\r",
             quote(&home),
             quote(&twin)
         )
@@ -266,18 +433,19 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
     );
     // Up is its own line on the pty, which it prints after its run's log line: a signal sent once
     // the log line alone is there can end it before the pty sees it start.
-    let source = zsh.until("the source agent is up, leading the tab", || {
+    let (source, source_identity) = zsh.until("the source agent is up, leading the tab", || {
         let [pid, ..] = runs(&log).into_iter().next()?;
         let pid: u32 = pid.parse().ok()?;
-        (zsh.front() == Some(pid) && zsh.said().contains(&format!("{UP} {pid}"))).then_some(pid)
+        let identity = aterm_uds::process::read_identity(i32::try_from(pid).ok()?)?;
+        (zsh.front() == Some(pid)
+            && zsh.owns(identity)
+            && zsh.said().contains(&format!("{UP} {pid}")))
+        .then_some((pid, identity))
     });
     let start = <Live as AlabKernel>::birth(&Live, source).expect("its kernel start");
     // The renewal's Signal; no successor ever takes the session.
-    // SAFETY: the stand-in's pid, which leads the pty's foreground group this test watches.
-    assert_eq!(
-        unsafe { libc::kill(i32::try_from(source).unwrap(), libc::SIGTERM) },
-        0
-    );
+    zsh.signal_foreground(source_identity, libc::SIGTERM)
+        .expect("the renewal's Signal to its source");
     zsh.until("the shell holds the tab again", || {
         (zsh.front() == Some(zsh.shell) && !alive(source)).then_some(())
     });
@@ -331,19 +499,26 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
         Err(why) => format!("snapshot:{why}"),
     };
     let mut steps = Vec::new();
-    let handed = zsh.until("the hand-back ends", || {
+    let handed = zsh.try_until(|| {
         if witnesses.handled(source, &copy.start) {
             return Some(steps.last().cloned().unwrap_or_default());
         }
         let said = step();
         steps.push(said.clone());
         (!(said.starts_with("wait:") || said.starts_with("busy:"))).then_some(said)
+    }).unwrap_or_else(|why| {
+        panic!(
+            "the hand-back ends: {why:?}; steps: {steps:#?}; requests: {:#?}; the pty said:\n{}",
+            asked.lock().unwrap(),
+            zsh.said()
+        )
     });
     assert_eq!(
         handed,
         "done:resumed",
-        "{steps:?}\n{:#?}",
-        asked.lock().unwrap()
+        "{steps:?}\n{:#?}\n{}",
+        asked.lock().unwrap(),
+        zsh.said()
     );
     let typed_once = typed();
     assert_eq!(typed_once.len(), 1, "one line typed: {typed_once:#?}");
@@ -359,9 +534,15 @@ fn a_renewal_hand_back_on_a_real_pty_runs_the_source_line_once_on_its_login() {
         load(&opts, &key(TAB)).expect("the relaunch's record").cause,
         crate::harness::relaunch::CAUSE_RENEWAL
     );
-    // The relaunched agent ends in its turn, the shell holds the tab again, and the worker (or a
-    // second end of the same root) takes the step once more: the source is handled.
+    // End the owned stand-in only after the hand-back observed it. The shell holds the tab
+    // again, and the worker's next step (or a second end of the source) remains handled.
     let relaunched: u32 = pid.parse().expect("its pid");
+    let relaunched_identity = zsh.until("the relaunched stand-in leads its tab", || {
+        let token = aterm_uds::process::read_identity(i32::try_from(relaunched).ok()?)?;
+        (zsh.front() == Some(relaunched) && zsh.owns(token)).then_some(token)
+    });
+    zsh.signal_foreground(relaunched_identity, libc::SIGKILL)
+        .expect("the explicit end of the owned stand-in");
     zsh.until("the relaunched stand-in ends", || {
         (!alive(relaunched) && zsh.front() == Some(zsh.shell)).then_some(())
     });

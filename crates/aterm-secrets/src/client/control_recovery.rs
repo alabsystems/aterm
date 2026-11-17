@@ -347,7 +347,7 @@ pub fn restore_commons_control(
             ),
         ));
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     tests::before_lock();
     let result = {
         let _author = log_entries::RecordsAuthorLock::take(paths)?;
@@ -397,7 +397,7 @@ pub fn restore_commons_control(
                 changed: false,
             });
         }
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         tests::before_commit();
         let opened = context
             .log
@@ -457,6 +457,6 @@ pub fn restore_commons_control(
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "control_recovery_tests.rs"]
 mod tests;

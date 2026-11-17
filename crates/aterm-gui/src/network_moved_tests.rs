@@ -1122,3 +1122,38 @@ pub(crate) fn peer(
         lease_ms: None,
     }
 }
+
+/// A watch says when the move it has not heard is due without hearing it: none before a move,
+/// the spread's end after one, at once for a watch made at once, and none once heard.
+/// NEGATIVE CONTROL: the watch made at once has the same move due now, not at the spread's end,
+/// so the spread's end is the spread watch's own; and after `take_at` the spread watch says none,
+/// while saying `due` twice before it said the same, so `due` does not hear the move itself.
+#[cfg(unix)]
+#[test]
+fn a_watch_says_when_its_unheard_move_is_due() {
+    let spread = Duration::from_secs(30);
+    let moved = Arc::new(Moved::spread_by(spread));
+    let mut spread_watch = moved.watch();
+    let at_once = moved.watch_at_once();
+    assert_eq!(spread_watch.due(), None, "no move told");
+    let t0 = Instant::now() + Duration::from_secs(3600);
+    moved.tell_at(Woke::Route, t0);
+    assert_eq!(
+        spread_watch.due(),
+        Some(t0 + spread),
+        "due once its spread passed"
+    );
+    assert_eq!(
+        spread_watch.due(),
+        Some(t0 + spread),
+        "saying it hears nothing"
+    );
+    let before = Instant::now();
+    let now = at_once.due().expect("an unheard move");
+    assert!(
+        now >= before && now < t0,
+        "CONTROL: a watch at once has it due now, not at the spread's end"
+    );
+    assert_eq!(spread_watch.take_at(t0 + spread), Some(Woke::Route));
+    assert_eq!(spread_watch.due(), None, "nothing unheard once heard");
+}

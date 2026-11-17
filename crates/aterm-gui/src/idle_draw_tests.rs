@@ -21,7 +21,7 @@ const WID: WindowId = WindowId(0);
 /// Hides window 0 as its occlusion change does, minimised (`off_glass`, which a headless window
 /// has no OS window to read) or only covered.
 fn hide(app: &mut App, off_glass: bool) {
-    app.on_occlusion_changed(WID, true);
+    app.on_occlusion_changed(WID, true, std::time::Instant::now());
     app.windows.get_mut(&WID).expect("the window").off_glass = off_glass;
 }
 
@@ -61,7 +61,7 @@ fn a_minimised_window_presents_nothing_until_it_is_visible_unless_a_capture_wait
     app.redraw_window(WID);
     assert_eq!(commits(&mut app), captured, "and the window parks again");
     // Visible again, it draws its current state once.
-    app.on_occlusion_changed(WID, false);
+    app.on_occlusion_changed(WID, false, std::time::Instant::now());
     app.redraw_window(WID);
     assert!(commits(&mut app) > captured, "visible again, it draws");
 }
@@ -210,7 +210,7 @@ fn a_raised_window_draws_at_once_and_stays_hidden_until_its_occlusion_changes() 
     app.on_output_wake(0, Instant::now());
     app.redraw_window(WID);
     assert_eq!(commits(&mut app), raised, "then, still hidden, it parks");
-    app.on_occlusion_changed(WID, false);
+    app.on_occlusion_changed(WID, false, std::time::Instant::now());
     app.redraw_window(WID);
     assert!(commits(&mut app) > raised, "visible, it draws");
 }

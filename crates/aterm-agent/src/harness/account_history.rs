@@ -382,8 +382,8 @@ fn add_five(a: &DayFive, b: &DayFive) -> DayFive {
 
 /// Each five-hour window `parts` (local days by date, from every file) name by anchor, named only
 /// on the earliest date a part names it, full where any part read it full: two files' closes of
-/// one window end on two dates where one file saw the next window begin early (a limit reset
-/// used, another login on the home) and the other, a renamed label's, did not and closed it at
+/// one window end on two dates where one file saw the next window begin early (a refill or a
+/// raised allowance, another login on the home) and the other, a renamed label's, did not and closed it at
 /// its reset, and the window ended at the earlier. A part keeps every window it counts but names
 /// no anchor of.
 fn on_first_dates(parts: &mut [(i64, Day)]) {
@@ -413,7 +413,7 @@ fn on_first_dates(parts: &mut [(i64, Day)]) {
 /// `d` added to `into`, the same local day from another file or another part of one: readings
 /// summed, each five-hour window once ([`add_five`]), the earlier week's first figure and the
 /// later one's last (by its reset, then by its figure: in one week a figure only rises but where
-/// a limit reset was used).
+/// the week was refilled or raised).
 fn add_day(into: &mut Option<Day>, d: &Day) {
     let Some(a) = into.as_mut() else {
         *into = Some(d.clone());
@@ -447,15 +447,23 @@ fn add_day(into: &mut Option<Day>, d: &Day) {
     };
 }
 
-/// Something that happened on a day: a series `event` row's word, or `reset-used`.
+/// Something that happened on a day: a series `event` row's word, or [`RESET_USED`].
 #[derive(Debug, Clone)]
 pub(crate) struct Happened {
     pub(crate) t: i64,
     pub(crate) e: String,
     pub(crate) w: Option<String>,
+    /// A [`RESET_USED`] the ledger shows was a limit reset this Mac's aterm spent: a
+    /// [`super::accounts::Kind::ResetUsed`] row that names the window at the same instant
+    /// ([`days_of`]'s `spent`).
+    pub(crate) spent: bool,
 }
 
-/// The word a limit reset used is said by.
+/// The word a window refilled or raised is said by (`--json`'s `events[].e`): `reset-used`, the
+/// journal's word for every refill ([`super::journal`]), a limit reset spent, a refill or a raised
+/// allowance alike, since neither the series nor the journal tells them apart
+/// ([`account_series::refills`]); only this Mac's ledger knows a reset its aterm spent
+/// ([`Happened::spent`]).
 pub(crate) const RESET_USED: &str = "reset-used";
 
 /// One local day of a history.
@@ -521,11 +529,13 @@ fn day_entry(
 /// still holds, and a window two files' closes put on two dates counts on the earlier
 /// ([`on_first_dates`]). Over the account's rows of every file with their closes folded by anchor
 /// ([`merged_closes`]): the five-hour window still open, on the day of the row that read it,
-/// the series' events and each limit reset used ([`account_series::resets_used`]). And
-/// `lines`, the ledger and journal lines, each on its day.
+/// the series' events and each refill or raise ([`account_series::refills`]), marked spent where
+/// `spent` (each instant and window a limit reset this Mac's aterm spent refilled, by the ledger)
+/// names it. And `lines`, the ledger and journal lines, each on its day.
 pub(crate) fn days_of(
     series: &Series,
     lines: &[(i64, String)],
+    spent: &[(i64, String)],
     span: Span,
     tz_at: fn(i64) -> i64,
     now: i64,
@@ -609,12 +619,13 @@ pub(crate) fn days_of(
                         t: at,
                         e: e.e.as_str().to_owned(),
                         w: e.w.clone(),
+                        spent: false,
                     });
             }
         }
     }
     for w in [SESSION_LIMIT, WEEK_LIMIT] {
-        for at in account_series::resets_used(&rows, w, now) {
+        for at in account_series::refills(&rows, w, now) {
             if span.holds(at) {
                 day_entry(&mut days, local(at), tz_at)
                     .events
@@ -622,6 +633,7 @@ pub(crate) fn days_of(
                         t: at,
                         e: RESET_USED.to_owned(),
                         w: Some(w.to_owned()),
+                        spent: spent.iter().any(|(t, window)| *t == at && window == w),
                     });
             }
         }
@@ -697,7 +709,7 @@ pub fn read(
         s: since_s,
     };
     let series = gather(&files, who, span, false, now);
-    let days = days_of(&series, &[], span, tz_at, now);
+    let days = days_of(&series, &[], &[], span, tz_at, now);
     let mut rows: Vec<SeriesRow> = series
         .files
         .iter()

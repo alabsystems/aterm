@@ -66,7 +66,7 @@ impl Rounds {
     ) -> crate::Result<bool> {
         if config.name != crate::ALAB_VAULT
             || !alab_vault(config)
-            || crate::service::subscriber_turned_off(&paths.home)
+            || crate::off_record::subscriber_turned_off(&paths.home)
         {
             self.checked = None;
             return Ok(false);
@@ -99,7 +99,7 @@ impl Rounds {
             now,
         ) {
             Migration::Ready(doc) => {
-                if crate::service::subscriber_turned_off(&paths.home) {
+                if crate::off_record::subscriber_turned_off(&paths.home) {
                     return Ok(false);
                 }
                 // admin_publish retains the authenticated baseline and serializes its normal

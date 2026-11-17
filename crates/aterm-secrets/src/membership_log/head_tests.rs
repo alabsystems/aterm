@@ -10,10 +10,14 @@ use super::*;
 use crate::SecretBytes;
 use crate::age::Identity;
 use crate::membership_log::entries::{inner, resolves_and_opens};
+#[cfg(unix)]
+use crate::membership_log::read_records;
 use crate::membership_log::tests::signed::{Mac, founded, generated, three_macs};
-use crate::membership_log::{EpochAudience, Log, Store, encode_records, read_records};
+use crate::membership_log::{EpochAudience, Log, Store, encode_records};
 use crate::text::{Audience, Entry};
+#[cfg(unix)]
 use std::io::Read as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
@@ -80,7 +84,7 @@ impl Vault {
 
     fn through_head_in(&self, identity: &Identity, context: [u8; 32]) -> Option<Store> {
         let file = std::fs::File::open(&self.data).unwrap();
-        let stamp = fsx::FileStamp::of(&file.metadata().unwrap());
+        let stamp = fsx::FileStamp::of(&fsx::meta_of(&file).unwrap());
         open(&self.head, &file, stamp, context, identity, Self::empty()).map(|(store, _)| store)
     }
 
@@ -490,6 +494,7 @@ fn vault_head_open_reads_no_replaced_body() {
     assert!(full.footprint() >= file_len);
 }
 
+#[cfg(unix)]
 #[test]
 fn vault_head_serves_a_peer_the_replaced_bodies_byte_for_byte() {
     let (log, macs, _, _) = inventory_log(12, 16 * 1024, 4);
@@ -588,6 +593,7 @@ fn vault_head_serves_a_peer_the_replaced_bodies_byte_for_byte() {
 /// A shelved body that does not read back as it was (the file changed under the open store, a
 /// read that fails) fails what sends or copies it, never leaving the record out of a stream a
 /// peer would take short: the server's reply, a Mac's post, a bundle's records, a witness.
+#[cfg(unix)]
 #[test]
 fn vault_head_body_that_does_not_read_back_is_an_error_not_a_short_stream() {
     let (log, macs, _, _) = inventory_log(6, 16 * 1024, 2);
@@ -958,6 +964,7 @@ fn vault_head_names_a_moved_stamp_so_the_file_is_hashed_once() {
 /// The resolve after a full open writes the head from what that read found, without reading the
 /// records file again, and tries once: a head it cannot write is not tried again by the next
 /// resolve of the same log.
+#[cfg(unix)]
 #[test]
 fn vault_head_is_written_from_the_full_read_without_reading_the_file_again() {
     let (log, macs, _, _) = inventory_log(4, 1024, 2);
@@ -1089,8 +1096,18 @@ fn home_of(
     let paths = crate::client::Paths::for_home(home.path());
     fsx::ensure_private_dir(&paths.dir).unwrap();
     if let Some(identity) = identity {
-        let mut file = identity.to_bech32().as_slice().to_vec();
-        file.push(b'\n');
+        #[cfg(unix)]
+        let file = {
+            let mut file = identity.to_bech32().as_slice().to_vec();
+            file.push(b'\n');
+            file
+        };
+        // A Windows machine key is read only as this user's DPAPI sealed it.
+        #[cfg(windows)]
+        let file = crate::identity_file::stored_text(identity, None, 0)
+            .unwrap()
+            .as_slice()
+            .to_vec();
         fsx::write_atomic(&paths.dir.join("identity"), &file, 0o600).unwrap();
     }
     fsx::write_atomic(&paths.records_file(), &encode_records(log.records()), 0o600).unwrap();

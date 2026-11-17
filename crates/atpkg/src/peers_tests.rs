@@ -460,6 +460,22 @@ fn the_status_read_says_where_serving_stands_as_the_doctor_does_from_the_two_rec
     assert_eq!(read(2), (Serves::Serving(at), Serves::Serving(at)));
 }
 
+/// `serve-units --off` keeps no archive: a keyed tree's kept unit beside it goes with every
+/// build's, and the tree itself stays.
+#[test]
+fn an_off_removes_every_keyed_trees_kept_unit() {
+    let layout = crate::testdir::layout("atpkg-peers-off-trees-");
+    let program = crate::keyed_tree::program("llvm-tree").expect("a keyed program");
+    let key = crate::keyed_tree::TreeKey::parse(&"a".repeat(64)).expect("a key");
+    let tree = crate::keyed_tree::dir(&layout, program, "aarch64-apple-darwin", &key);
+    std::fs::create_dir_all(&tree).unwrap();
+    let unit = crate::store::sidecar_path(&tree, UNIT_SUFFIX).unwrap();
+    std::fs::write(&unit, b"archive").unwrap();
+    turn_off(&layout).unwrap();
+    assert!(!unit.exists(), "the tree's unit went");
+    assert!(tree.is_dir(), "the tree stays");
+}
+
 #[test]
 fn an_off_written_before_the_store_is_made_stands() {
     let layout = crate::testdir::absent_layout("atpkg-peers-off-early-");

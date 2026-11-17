@@ -311,8 +311,11 @@ pub fn canonical_repos(fake: &FakeGithub) -> (u64, u64) {
 /// words before `auth git-credential`.
 #[cfg(unix)]
 pub fn helper() -> HelperCommand {
+    let exe = aterm_tempfile::bin_exe("agh");
+    // Native writers must be held before exec while their identity is journaled.
+    aterm_uds::tether::through(exe.clone());
     HelperCommand {
-        exe: aterm_tempfile::bin_exe("agh"),
+        exe,
         args: Vec::new(),
     }
 }

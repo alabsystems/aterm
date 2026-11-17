@@ -97,7 +97,9 @@ impl MarkBucket {
         }
     }
 
-    fn spend(&mut self, now: u64, force: bool) -> bool {
+    /// Spend a token at `now` (monotonic ms), refilled since the last spend; `force` spends
+    /// one the bucket does not have. Whether a token was spent.
+    pub(crate) fn spend(&mut self, now: u64, force: bool) -> bool {
         let now = now.max(self.at);
         let earned = (now - self.at).saturating_mul(1_000) / PROGRAM_REFILL_MS;
         self.milli = self.milli.saturating_add(earned).min(PROGRAM_FULL_MILLI);
@@ -107,6 +109,16 @@ impl MarkBucket {
         }
         self.milli = self.milli.saturating_sub(1_000);
         true
+    }
+
+    /// The monotonic ms from which [`Self::spend`] next spends a token without `force`: the
+    /// last spend's instant while the bucket holds one, else the instant its refill earns one.
+    pub(crate) fn next_token_at(&self) -> u64 {
+        if self.milli >= 1_000 {
+            self.at
+        } else {
+            self.at + ((1_000 - self.milli) * PROGRAM_REFILL_MS).div_ceil(1_000)
+        }
     }
 }
 
@@ -317,6 +329,10 @@ pub(crate) struct Observed {
     program: ProgramMarks,
     /// The shown marks' tuple and bucket (6F-9).
     shown: ShownMarks,
+    /// The in-band title's author ([`super::inband`]): never carried. A successor claims the
+    /// carried window title again at its first flush (the program's next output), and a 7501
+    /// title only at the program's next report that names one.
+    pub(super) inband: super::inband::InbandTitle,
 }
 
 /// The meta fields a log keeps a value of: the user fields, the supervisor claim and the pin.

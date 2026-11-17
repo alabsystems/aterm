@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(unix)]
 use super::super::log_entries_tests::{TwoMacs, join_host, member_key, newcomer, two_macs};
 use super::*;
 use crate::age;
@@ -13,6 +14,7 @@ use ring::signature::{Ed25519KeyPair, KeyPair as _};
 const DAY: u64 = 24 * 60 * 60 * 1000;
 const T0: u64 = 1_000 * DAY;
 
+#[cfg(unix)]
 #[path = "proof_admission_tests.rs"]
 mod proof_admission;
 
@@ -1078,6 +1080,7 @@ fn an_admission_whose_batch_could_pass_the_record_bytes_is_refused_before_signin
 /// NEGATIVE CONTROL (in the test): the run with room shows the batch is more than its `Admit`,
 /// which alone would have fit the one record of room, so only refusing the whole batch up front
 /// keeps signing from starting.
+#[cfg(unix)]
 #[test]
 fn a_proof_whose_batch_cannot_fit_is_refused_with_nothing_signed() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1132,6 +1135,7 @@ fn a_proof_whose_batch_cannot_fit_is_refused_with_nothing_signed() {
 /// `membership_log.rs` decodes (`Kind::from_code` 1..=9, `Evidence::from_code` 1..=3; the framing
 /// has not changed since). Each record's kind code and, for an `Admit`, its evidence code; or why
 /// a 0.147 Mac refuses the whole stream.
+#[cfg(unix)]
 fn reader_0147(mut wire: &[u8]) -> Result<Vec<(u8, Option<u8>)>, String> {
     fn take<'a>(wire: &mut &'a [u8], n: usize) -> Result<&'a [u8], String> {
         if wire.len() < n {
@@ -1187,6 +1191,7 @@ fn reader_0147(mut wire: &[u8]) -> Result<Vec<(u8, Option<u8>)>, String> {
 /// `Refused("the membership log would seat this Mac as m7-…")`. `Evidence::Manual` coded 4 on the
 /// wire (both `code` and `from_code`): this build reads it, the 0.147 reader refuses the stream
 /// with "membership admission of an unknown evidence 4".
+#[cfg(unix)]
 #[test]
 fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
     // Every server it reads is its own on loopback, which answers.
@@ -1296,6 +1301,7 @@ fn a_mac_whose_vault_key_changed_takes_its_seat_back_by_proof_with_nobody() {
 ///
 /// NEGATIVE CONTROL: `admit_by_proof` taking every read as fresh (`let fresh = true;`): m22 with
 /// no server reachable moves the seat and the `Refused` match fails.
+#[cfg(unix)]
 #[test]
 fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
     // The server answers until it stops below.
@@ -1355,6 +1361,7 @@ fn a_member_that_reads_no_newer_records_lets_no_new_key_in() {
 /// clearing `sent` on any `NO`: the seated Mac's `signed_maybe` is false. The `unclaimed` answer
 /// removed: the Mac with no claim reads the book's sentence. No `read_newest` in the dry run: the
 /// `unread` Mac goes on to possession. A missing signer read as `None`: `said` is `None`.
+#[cfg(unix)]
 #[test]
 fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguous() {
     use crate::members::desk::{self, Desk, Local};
@@ -1534,6 +1541,7 @@ fn a_stranger_is_refused_before_possession_and_a_refusal_after_it_stays_ambiguou
 ///
 /// NEGATIVE CONTROL: let `refuses_before_possession_at_ms` return `None` for an absent log:
 /// the real proof exchange ends with `signed_maybe`, and no plain ask can follow it.
+#[cfg(unix)]
 #[test]
 fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
     use crate::commons::bootstrap::Device;
@@ -1637,6 +1645,7 @@ fn a_member_without_a_log_refuses_before_possession_so_the_mac_can_ask() {
 /// Calling `sync` or `ask_allowed` before returning the admission contacts the
 /// separate HTTP source, failing the zero-request assertion. The explicit
 /// deferred post then reaches it, so an inert request counter cannot pass.
+#[cfg(unix)]
 #[test]
 fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     use std::io::{BufRead as _, Write as _};
@@ -1830,6 +1839,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
 /// while the current signed Commons epochs leave it out of control (`control-excluded`), as they
 /// left 55 of ALab's 58 members on 2026-11-04. m7 opened Commons while it held control (the
 /// fixture enrolled it), so it pinned the network's anchor then.
+#[cfg(unix)]
 fn exclude_m7_from_commons(macs: &TwoMacs) {
     use crate::commons::{Observation, Unavailable};
     let (m22, m7) = (&macs.m22, &macs.m7);
@@ -1847,6 +1857,7 @@ fn exclude_m7_from_commons(macs: &TwoMacs) {
 }
 
 /// The admin `m22` addresses the Commons control entry to itself alone and publishes.
+#[cfg(unix)]
 fn narrow_commons_to_m22(m22: &Paths) {
     let admin = admin_open(m22).unwrap();
     let mut doc = admin.doc.clone();
@@ -1870,6 +1881,7 @@ fn narrow_commons_to_m22(m22: &Paths) {
 
 /// Every byte of the Commons custody at `paths` (its claim, device, pin and control journal), so a
 /// test can show that nothing granted, wrote or claimed Commons control there.
+#[cfg(unix)]
 fn commons_custody(paths: &Paths) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
     fn walk(dir: &Path, out: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
         for entry in std::fs::read_dir(dir).unwrap() {
@@ -1901,6 +1913,7 @@ fn commons_custody(paths: &Paths) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
 /// `Bootstrap::cached_until` was, which it is for this member (asserted below), so the old rule
 /// gave it no desk and "the excluded member has a desk" fails. By hand: the seated arm of
 /// `Local::of` answering `Ok(None)` fails there.
+#[cfg(unix)]
 #[test]
 fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof() {
     use crate::commons::bootstrap::{Bootstrap, Device};
@@ -2042,6 +2055,7 @@ fn a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof() {
 /// One connection to `desk`, served as the window's desk serves it (`desk::serve_with`, whose run
 /// hands the bundle [`hand_over`] builds on `member`) while `joiner` speaks, each end with a
 /// one-minute hang detector.
+#[cfg(unix)]
 fn served_by<T>(
     desk: &std::sync::Mutex<crate::members::desk::Desk>,
     member: &Paths,
@@ -2077,6 +2091,7 @@ fn served_by<T>(
 /// NEGATIVE CONTROL (in-test oracle): as in
 /// [`a_member_commons_control_leaves_out_lets_a_home_lan_mac_in_by_its_proof`], the old rule gave
 /// this member no desk, so "the excluded member has a desk" fails under it.
+#[cfg(unix)]
 #[test]
 fn a_member_commons_control_leaves_out_lets_in_a_mac_a_person_allowed() {
     use crate::commons::bootstrap::{Bootstrap, Device};
@@ -2196,6 +2211,7 @@ fn a_member_commons_control_leaves_out_lets_in_a_mac_a_person_allowed() {
 /// observing the state once (`StateLock::observe(paths)?`, the same error text): "no sooner than
 /// its deadline" fails, and with that assert cut, "the read waits for the pass that holds the
 /// state" fails.
+#[cfg(unix)]
 #[test]
 fn an_excluded_members_seat_read_waits_for_a_vault_pass() {
     use crate::commons::bootstrap::Bootstrap;
@@ -2256,6 +2272,7 @@ fn an_excluded_members_seat_read_waits_for_a_vault_pass() {
 /// not wait): it finds the state held, never reaches the hook, and "the read waits for the pass"
 /// fails. `log_seat` loading its log before the wait (as 04dc05e579 did): that log is behind the
 /// vault snapshot the pass wrote, and "m7's log seats it once the pass ends" fails.
+#[cfg(unix)]
 #[test]
 fn a_seated_members_allow_read_waits_for_a_vault_pass() {
     let _answering = ServersAnswering::set();
@@ -2322,6 +2339,7 @@ fn a_seated_members_allow_read_waits_for_a_vault_pass() {
 /// NEGATIVE CONTROL: `test_put_everyone` drafting under `author_and_commit_records` (one
 /// observation that does not wait, as before): it finds the state held, never reaches the hook,
 /// and "the write waits for the pass" fails.
+#[cfg(unix)]
 #[test]
 fn a_members_write_waits_for_its_own_vault_pass() {
     let _answering = ServersAnswering::set();
@@ -2385,6 +2403,7 @@ fn a_members_write_waits_for_its_own_vault_pass() {
 ///   reaches the hook, and "the removal waits for the pass" fails.
 /// - `vault_admin_named` read before the draft, as before: its read finds the state held and
 ///   names no admin, and "the removal says m7 keeps the signing key" fails.
+#[cfg(unix)]
 #[test]
 fn a_members_removal_waits_for_its_own_vault_pass() {
     let _answering = ServersAnswering::set();
@@ -2461,6 +2480,7 @@ fn a_members_removal_waits_for_its_own_vault_pass() {
 
 /// Copy the file or directory `from` to `to`, keeping each file's mode and making each directory
 /// this user's alone, as Commons custody is held.
+#[cfg(unix)]
 fn copy_private(from: &Path, to: &Path) {
     use std::os::unix::fs::PermissionsExt as _;
     let kind = std::fs::symlink_metadata(from).unwrap().file_type();
@@ -2479,6 +2499,7 @@ fn copy_private(from: &Path, to: &Path) {
 
 /// The parts of the pinned Commons anchor at `paths`: the pin, its claim, and the control journal
 /// that carries the anchor too.
+#[cfg(unix)]
 fn anchor_parts(paths: &Paths) -> [std::path::PathBuf; 3] {
     [
         paths.dir.join("commons/default.pin"),
@@ -2499,6 +2520,7 @@ fn anchor_parts(paths: &Paths) -> [std::path::PathBuf; 3] {
 /// Ok(Device::open_existing(paths).ok().map(|device| (device, *root)))`): `m9` gets a desk and "no
 /// seat" fails. `seated_member`'s root check cut (`if false && root != …`): the agreeing foreign
 /// anchor gets a desk and "an anchor naming another network than the log" fails.
+#[cfg(unix)]
 #[test]
 fn no_vault_no_seat_no_pinned_anchor_or_a_removal_gives_no_desk() {
     use crate::commons::bootstrap::{Bootstrap, Device, established_trust};
@@ -2635,6 +2657,7 @@ fn no_vault_no_seat_no_pinned_anchor_or_a_removal_gives_no_desk() {
 
 /// The seam other crates' tests build a Commons-excluded member with ([`test_commons_excluded`])
 /// builds one this crate's desk reads as a member that can allow.
+#[cfg(unix)]
 #[test]
 fn the_commons_excluded_seam_builds_a_seated_member_with_a_desk() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2654,6 +2677,7 @@ fn the_commons_excluded_seam_builds_a_seated_member_with_a_desk() {
 /// NEGATIVE CONTROLS: re-running only `decide` after `read_newest`: the roster-denied Mac goes on
 /// to possession (`missed.signed_maybe` is true), and the removed `m7` challenges possession first
 /// so `prove_first` stops at `a-m7:7` and never reaches `b-m22:7`.
+#[cfg(unix)]
 #[test]
 fn a_member_whose_newest_records_keep_it_or_the_mac_out_refuses_before_possession() {
     use crate::members::desk::{self, Desk, Local};
@@ -3175,6 +3199,7 @@ fn record_budgets_and_the_proof_reserve_conform() {
 /// challenge where the desk checks first ([`refuses_before_possession_at_ms`]), and at the
 /// decision where it does not ([`prove_at_ms`]), with nothing signed either way. The same proof on
 /// another genesis, a lab's, lets the Mac in. The pair shows the refusal bites.
+#[cfg(unix)]
 #[test]
 fn a_lab_identitys_proof_is_refused_on_the_live_genesis_and_let_in_on_another() {
     use crate::client::with_live_genesis;
@@ -3285,6 +3310,7 @@ fn a_lab_identitys_proof_is_refused_on_the_live_genesis_and_let_in_on_another() 
 
 /// The last `Remove` in `paths`'s log naming `seat`, and every epoch after it in the log's causal
 /// order that wraps `recipient`: a moved or removed seat's binding must be in none of them.
+#[cfg(unix)]
 fn epochs_after_remove_wrapping(
     paths: &Paths,
     seat: &MemberId,
@@ -3314,6 +3340,7 @@ fn epochs_after_remove_wrapping(
 }
 
 /// Whether `paths`'s newest `[everyone]` epochs each wrap `recipient`.
+#[cfg(unix)]
 fn newest_everyone_wraps(paths: &Paths, recipient: &age::Recipient) -> bool {
     let store = load_records(paths).unwrap();
     let log = store.log().unwrap();
@@ -3339,6 +3366,7 @@ fn newest_everyone_wraps(paths: &Paths, recipient: &age::Recipient) -> bool {
 ///
 /// NEGATIVE CONTROL: `sign_seat_move` without its `rotate_after_removal` (an early `return
 /// Ok(signed)` before it): the batch mints no epoch and the `Kind::Epoch` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_persons_allow_moves_a_kept_key_seat_that_signed_a_minute_ago() {
     let _answering = ServersAnswering::set();
@@ -3467,6 +3495,7 @@ fn a_persons_allow_moves_a_kept_key_seat_that_signed_a_minute_ago() {
 /// `Remove` of the old seat. The evaluator, over what was signed, does not seat the Mac under the
 /// old label with its node key (the old seat holds both still), so the person's Allow keeps
 /// nothing, and m22's records are what they were.
+#[cfg(unix)]
 #[test]
 fn a_seat_move_without_its_remove_is_refused_by_the_evaluator() {
     let _answering = ServersAnswering::set();
@@ -3625,6 +3654,7 @@ fn a_persons_allow_still_refuses_a_contested_key_a_quorums_removal_and_0147() {
 /// NEGATIVE CONTROL: the superseded-seat loop at the end of `Log::evaluate`'s membership
 /// (`membership_log/eval.rs`) cut: `rekey_dues` is empty after the restore and the `due` assert
 /// fails.
+#[cfg(unix)]
 #[test]
 fn allow_again_of_a_kept_node_key_rotates_out_the_removed_binding() {
     let _answering = ServersAnswering::set();
@@ -3807,6 +3837,7 @@ fn a_moved_seat_is_denied_by_no_roster_row_of_its_old_seat() {
 /// NEGATIVE CONTROL: write the proof's bundle as a phrase's is written (`prove_first` calling
 /// `client::write_from_log_bundle` for `client::readmit_from_log_bundle`): the Mac is let into
 /// B ("a proof never moves the Mac").
+#[cfg(unix)]
 #[test]
 fn a_proof_never_moves_a_mac_to_another_vault() {
     use crate::members::desk::{self, Desk, Local};

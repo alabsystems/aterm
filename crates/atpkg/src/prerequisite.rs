@@ -186,6 +186,9 @@ pub enum Prerequisite {
     Ay,
     /// Codex's retained process-update target.
     Codex,
+    /// The exact managed Trust frontend selected by its compiler shim.
+    /// Physical execution only: a command namespace could reroute via trust.lock.
+    Targo,
 }
 
 impl Prerequisite {
@@ -198,7 +201,7 @@ impl Prerequisite {
             Self::Python => Some(&upstream::CPYTHON),
             Self::OpenSslSigning => Some(&upstream::OPENSSL_SIGNING),
             Self::Lake => Some(&upstream::LEAN4),
-            Self::AtpkgKeys | Self::Ay | Self::Codex => None,
+            Self::AtpkgKeys | Self::Ay | Self::Codex | Self::Targo => None,
         }
     }
 
@@ -213,6 +216,7 @@ impl Prerequisite {
             Self::AtpkgKeys => "atpkg-keys",
             Self::Ay => "ay",
             Self::Codex => "codex",
+            Self::Targo => "trust",
         }
     }
 
@@ -227,6 +231,7 @@ impl Prerequisite {
             Self::AtpkgKeys => "atpkg-keys",
             Self::Ay => "ay",
             Self::Codex => "codex",
+            Self::Targo => "targo",
         }
     }
 
@@ -244,6 +249,14 @@ impl Prerequisite {
         ]
         .into_iter()
         .find(|want| want.executable() == name)
+    }
+
+    fn require_namespace(self) -> Result<(), String> {
+        if self == Self::Targo {
+            Err("a signed Targo prerequisite requires its exact physical invocation, not a rerouting command namespace".into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether the shared recipe admits this target, before source discovery.
@@ -630,6 +643,9 @@ impl<'a> Session<'a> {
     /// # Errors
     /// A tool cannot be admitted, or the private shim directory cannot be made.
     pub fn acquire_all(&self, wants: &[Prerequisite]) -> Result<HeldSet, String> {
+        for &want in wants {
+            want.require_namespace()?;
+        }
         let mut tools = Vec::new();
         for &want in wants {
             if tools.iter().any(|(known, _)| *known == want) {

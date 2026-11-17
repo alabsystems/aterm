@@ -32,6 +32,8 @@ fn lane(slots: Vec<Slot>, sizes: &[u64], budget: u64) -> Ahead {
                 links: Default::default(),
                 vendor: String::new(),
                 provenance: None,
+                key: String::new(),
+                key_inputs: String::new(),
             },
             dl: PathBuf::from(format!("/model/p{i}/p{i}.tar.zst")),
         })

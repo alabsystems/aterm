@@ -443,13 +443,14 @@ fn a_disabled_volume_is_left_as_it_is() {
     assert!(linux.calls().is_empty());
 }
 
-/// An ordinary account reads only the receipt (the configuration is root's): it is owed the
-/// step while a folder of its home is on no receipt, and only at the console. Folders an
-/// apply already failed to exclude are not owed again until the home gains another.
-/// NEGATIVE CONTROLS: a receipt naming every folder owes nothing; one that is not root's own
+/// An ordinary account reads only the receipt (the configuration is root's): the automatic ask
+/// owes the step while a folder of its home is indexed and no receipt or refusal names any
+/// folder of that home, and only at the console. Once one does, a folder the home gains later
+/// asks no password by itself; the person's own setup still has it to exclude.
+/// NEGATIVE CONTROLS: a receipt naming any folder owes nothing; one that is not root's own
 /// file, an unread indexing state, a disabled volume, another account at the console, root
-/// and Linux owe nothing either, and no reading runs `plutil`; a refusal that names only
-/// some of the indexed folders, or is not root's own file, is still owed.
+/// and Linux owe nothing either, and no reading runs `plutil`; a refusal that is not root's own
+/// file says nothing, so the never-scoped home is still owed.
 #[test]
 fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
     let console = |uid| Stat {
@@ -481,10 +482,13 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
         sys
     };
     let sys = account();
+    assert!(automatic_scope_owed(&sys));
     assert!(scope_owed(&sys));
     sys.file(SCOPE_RECEIPT, b"/Users//alice/Developer\n");
+    assert!(!automatic_scope_owed(&sys));
     assert!(scope_owed(&sys));
     sys.file(SCOPE_RECEIPT, FULL);
+    assert!(!automatic_scope_owed(&sys));
     assert!(!scope_owed(&sys));
     assert!(
         !sys.calls().iter().any(|call| call.contains("plutil")),
@@ -494,23 +498,26 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
 
     let refused = account();
     refused.file(SCOPE_REFUSED, b"/Users//alice/Developer\n");
+    assert!(!automatic_scope_owed(&refused));
     assert!(scope_owed(&refused));
     refused.file(SCOPE_REFUSED, FULL);
+    assert!(!automatic_scope_owed(&refused));
     assert!(!scope_owed(&refused));
     let new = format!("{ALICE}/Scratch");
     refused.file(&new, b"").stat_of(&new, folder());
+    assert!(!automatic_scope_owed(&refused));
     assert!(scope_owed(&refused));
     let forged = account();
     forged
         .file(SCOPE_REFUSED, FULL)
         .stat_of(SCOPE_REFUSED, theirs);
-    assert!(scope_owed(&forged));
+    assert!(automatic_scope_owed(&forged));
 
     let foreign = account();
     foreign
         .file(SCOPE_RECEIPT, b"")
         .stat_of(SCOPE_RECEIPT, theirs);
-    assert!(!scope_owed(&foreign));
+    assert!(!automatic_scope_owed(&foreign));
 
     let unread = account();
     unread.on(
@@ -518,30 +525,30 @@ fn an_ordinary_account_is_owed_the_scope_by_the_receipt() {
         Ran::ok("Spotlight server is disabled."),
     );
     // The scripted replies answer in order: the enabled one first, then the unrecognized one.
-    assert!(scope_owed(&unread));
-    assert!(!scope_owed(&unread));
+    assert!(automatic_scope_owed(&unread));
+    assert!(!automatic_scope_owed(&unread));
 
     let disabled = account();
     disabled.on(
         "/usr/bin/mdutil -s /System/Volumes/Data",
         Ran::ok("Indexing disabled."),
     );
-    assert!(scope_owed(&disabled));
-    assert!(!scope_owed(&disabled));
+    assert!(automatic_scope_owed(&disabled));
+    assert!(!automatic_scope_owed(&disabled));
 
     let elsewhere = account();
     elsewhere.stat_of("/dev/console", console(502));
-    assert!(!scope_owed(&elsewhere));
+    assert!(!automatic_scope_owed(&elsewhere));
 
     let root = Fake::root();
     home(&root);
     root.logged_in(&user("alice", 501))
         .stat_of("/dev/console", console(0));
-    assert!(!scope_owed(&root));
+    assert!(!automatic_scope_owed(&root));
 
     let mut linux = account();
     linux.linux = true;
-    assert!(!scope_owed(&linux));
+    assert!(!automatic_scope_owed(&linux));
 }
 
 fn run(sys: &Fake, mode: Mode) -> Vec<crate::model::ItemReport> {

@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The machine numbers this Mac's vault gives to other Macs, read from its local copy
-//! (`docs/DESIGN-machine-names-2026-11-04.md` §11.86): what a person's rename of this Mac
+//! (`docs/DESIGN-machine-names-2026-11-04.md` §5.3): what a person's rename of this Mac
 //! (`aterm name set`, Rename This Mac…) must not take on today's lab, where other Macs reach a Mac
 //! by its roster label and aliases and its log seat, not by a name record.
 //!

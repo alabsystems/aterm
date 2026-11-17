@@ -271,10 +271,7 @@ fn the_window_answers_the_default_from_the_resolvers_read() {
         mode: aterm_agent::harness::lights::Mode::Plan,
         source: "~/.claude/settings.json".to_owned(),
     });
-    DEFAULT_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .hold(tab, pid, Instant::now(), plan.clone());
+    with_reads(|reads| reads.hold(tab, pid, Instant::now(), plan.clone()));
     assert_eq!((defaults.0)(tab), Some(plan), "the resolver's read answers");
     snap.pid = pid + 1;
     crate::harness_host::publish_snapshot_for_test(tab, Some(&snap));

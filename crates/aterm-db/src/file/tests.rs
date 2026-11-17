@@ -128,6 +128,19 @@ impl Stand {
 
     /// A stand whose lab has a Mac in each of `roles`; the second is the one whose files are read.
     pub(super) fn with(roles: &[Role]) -> Self {
+        Self::seeded(roles, true)
+    }
+
+    /// A stand whose registry holds the two addresses and the machine but no account and no
+    /// link: no write names a collection that opts into the authority rules, so no read of it
+    /// judges (`typed::authority::read`). The model's reading and writing walks measure the
+    /// machines file alone, and their windows must not enter the judgment the authority walk's
+    /// steps are anchored on.
+    pub(super) fn machines_only() -> Self {
+        Self::seeded(&[Role::Writer, Role::Writer], false)
+    }
+
+    fn seeded(roles: &[Role], accounts: bool) -> Self {
         let lab = Lab::new(roles);
         let config = lab._home.path().join("aterm.toml");
         let registry = Registry::at(lab.paths[SEAT].clone());
@@ -156,14 +169,18 @@ impl Stand {
             put(&MACHINE, &machine, "status", json!("active")),
             // A cell the face must quote as the grid does.
             put(&MACHINE, &machine, "note", json!("the \"desk\" Mac")),
-            put(&PREFERENCE, &link, "machine", json!(machine)),
-            put(&PREFERENCE, &link, "account", json!(claude_ada)),
-            put(&PREFERENCE, &link, "rank", json!(1)),
-            put(&PREFERENCE, &link, "why", json!("owner")),
         ];
-        changes.extend(account(&claude_ada, "anthropic", "claude", &ada));
-        changes.extend(account(&oai_ada, "openai", "codex", &ada));
-        changes.extend(account(&claude_bea, "anthropic", "claude", &bea));
+        if accounts {
+            changes.extend([
+                put(&PREFERENCE, &link, "machine", json!(machine)),
+                put(&PREFERENCE, &link, "account", json!(claude_ada)),
+                put(&PREFERENCE, &link, "rank", json!(1)),
+                put(&PREFERENCE, &link, "why", json!("owner")),
+            ]);
+            changes.extend(account(&claude_ada, "anthropic", "claude", &ada));
+            changes.extend(account(&oai_ada, "openai", "codex", &ada));
+            changes.extend(account(&claude_bea, "anthropic", "claude", &bea));
+        }
         registry.write(vec![changes]).unwrap();
         // This Mac's harness states its login, its reading and an event of the account in the
         // journal's week ring, as its flusher's record would.
@@ -600,6 +617,12 @@ fn revoke(stand: &Stand) {
     client::sync(stand.paths(), None).unwrap();
 }
 
+/// The nickname this Mac's row shows as the naming read takes it ([`super::here_published`]),
+/// a retained snapshot's included.
+fn retained(paths: &Paths) -> Option<crate::alab::view::MachineNickname> {
+    super::here_published(paths).map(|here| here.nickname())
+}
+
 /// A Mac revoked from the vault, its writer lineage settled (no succession ever fenced it): the
 /// strict registry read refuses for the revocation, the pass records `held` (`membership`), and
 /// the reads answer the rows the live pass wrote.
@@ -642,10 +665,7 @@ fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_
     let mut status = aterm_file::State::decode(&status_bytes).unwrap();
     status.rev = status.rev.wrapping_add(1);
     aterm_secrets::fsx::write_atomic(&status_path, &status.encode(), 0o600).unwrap();
-    assert_eq!(
-        super::here_nickname(stand.paths()),
-        Some(nickname.1.clone())
-    );
+    assert_eq!(retained(stand.paths()), Some(nickname.1.clone()));
     assert_eq!(super::live_here_nickname(stand.paths()), None);
     aterm_secrets::fsx::write_atomic(&status_path, &status_bytes, 0o600).unwrap();
     assert_eq!(
@@ -656,10 +676,7 @@ fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_
     aterm_secrets::fsx::write_atomic(&stand.config, b"[commons]\nenabled = false\n", 0o600)
         .unwrap();
     all(&stand, &stand.pass(true), Word::Off, Some(Why::Policy));
-    assert_eq!(
-        super::here_nickname(stand.paths()),
-        Some(nickname.1.clone())
-    );
+    assert_eq!(retained(stand.paths()), Some(nickname.1.clone()));
     assert_eq!(super::live_here_nickname(stand.paths()), None);
     aterm_secrets::fsx::write_atomic(&stand.config, b"", 0o600).unwrap();
     all(&stand, &stand.pass(true), Word::Live, None);
@@ -682,8 +699,40 @@ fn a_revoked_macs_strict_read_refuses_for_the_revocation_and_its_snapshot_still_
         );
     }
     assert_eq!(reads(&stand, Word::Held, Some(Why::Membership)), live);
-    assert_eq!(super::here_nickname(stand.paths()), Some(nickname.1));
+    assert_eq!(retained(stand.paths()), Some(nickname.1));
     assert_eq!(super::live_here_nickname(stand.paths()), None);
+}
+
+/// The LabView the shared files hold names each account as the registry's own read does: the
+/// pass's `=slug`, `=name`, `=email` and `=login_email` are what `account_names` derives, and
+/// either view takes the same words for an account.
+/// NEGATIVE CONTROL: with `LabView::of_files` reading each account's name from `=email`
+/// (`name: shown(row, "email")`), the files name the account by its bare address: `` left:
+/// Some("ada.fb@alpha.example") right: Some("claude ada.fb@alpha.example") ``.
+#[test]
+fn the_files_lab_view_names_each_account_as_the_registrys_does() {
+    use crate::alab::{account_names::Found, view::LabView};
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let view = Registry::at(stand.paths().clone()).view().unwrap();
+    let empty = crate::typed::owned::OwnedRead::default();
+    let registry = LabView::read_view(&view, &empty, &empty, None);
+    let [accounts, links, machines] =
+        [&super::ACCOUNTS, &super::LINKS, &super::MACHINES].map(|file| stand.file(file).read());
+    let files = LabView::of_files(&accounts, &links, &machines);
+    let claude = stand.claude_ada.as_str();
+    assert_eq!(files.name(claude), Some(&*format!("claude {ADA}")));
+    assert_eq!(files.slug(claude), Some("claude-fb-alpha"));
+    assert_eq!(files.names, registry.names);
+    for lab in [&files, &registry] {
+        assert_eq!(
+            lab.account_named(&format!("claude:{ADA}")),
+            Found::One(claude)
+        );
+        assert_eq!(lab.account_named("claude-fb-alpha"), Found::One(claude));
+        assert!(matches!(lab.account_named(ADA), Found::Many(_)));
+        assert_eq!(lab.account_named("fb-alpha"), Found::None);
+    }
 }
 
 /// A face's cells, split at tabs: no cell of these fixtures holds one.
@@ -1132,6 +1181,102 @@ fn a_pass_projects_what_arrived_and_withholds_what_the_guards_refuse() {
         .map(|entry| entry["ms"].as_u64().unwrap())
         .collect();
     assert!(stamps.is_sorted(), "oldest first: {stamps:?}");
+}
+
+/// `lab/machines` says beside each machine's label whether an automatic write or an import set it
+/// rather than an owner (`=label_auto`) and the label the column's claim rule gives the machine
+/// (`=label_claim`): its own where it holds it, a clash label where another row won it (tracker
+/// package FL-170).
+#[test]
+fn the_machines_table_says_who_wrote_each_label_and_who_holds_it() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let row = |pk: &str| {
+        stand
+            .file(&super::MACHINES)
+            .read()
+            .rows()
+            .iter()
+            .find(|row| row.pk == pk)
+            .cloned()
+            .expect("the row")
+    };
+    let first = row(&stand.machine);
+    assert_eq!(
+        (
+            first.cell("label"),
+            first.cell("label_auto"),
+            first.cell("label_claim")
+        ),
+        ("m7", "", "m7"),
+        "an owner's label, which the machine holds"
+    );
+    let automatic = crate::database::Change {
+        collection: MACHINE.name.to_owned(),
+        key: format!("{}.label", stand.machine),
+        value: Some(crate::typed::cell::CellValue::automatic(1, json!("m7")).encode()),
+    };
+    let registry = Registry::at(stand.paths().clone());
+    registry.write(vec![vec![automatic]]).unwrap();
+    // A second machine wants m7 after the first holds it.
+    let rival = keys::machine_pk("m8");
+    registry
+        .write(vec![vec![
+            put(&MACHINE, &rival, "label", json!("m7")),
+            put(&MACHINE, &rival, "status", json!("active")),
+        ]])
+        .unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let first = row(&stand.machine);
+    assert_eq!(
+        (first.cell("label_auto"), first.cell("label_claim")),
+        ("yes", "m7"),
+        "an automatic write now, and the machine that held m7 first keeps it"
+    );
+    let rival = row(&rival);
+    assert_eq!(rival.cell("label"), "m7");
+    assert_eq!(rival.cell("label_auto"), "");
+    assert!(
+        rival.cell("label_claim").starts_with("m7-"),
+        "the later row goes by a clash label: {:?}",
+        rival.cell("label_claim")
+    );
+    assert_eq!(
+        crate::alab::view::MachineLabel::of_file_row(&rival),
+        crate::alab::view::MachineLabel::Named {
+            label: "m7".to_owned(),
+            automatic: false,
+            claim: Some(rival.cell("label_claim").to_owned()),
+        }
+    );
+    // An import's label is no owner's either.
+    let imported = keys::machine_pk("m9");
+    registry
+        .write(vec![vec![
+            crate::database::Change {
+                collection: MACHINE.name.to_owned(),
+                key: format!("{imported}.label"),
+                value: Some(
+                    crate::typed::cell::CellValue::imported(
+                        1,
+                        json!("m11"),
+                        &crate::typed::keys::source_pk(b"a sheet"),
+                    )
+                    .encode(),
+                ),
+            },
+            put(&MACHINE, &imported, "status", json!("active")),
+        ]])
+        .unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    assert_eq!(
+        crate::alab::view::MachineLabel::of_file_row(&row(&imported)),
+        crate::alab::view::MachineLabel::Named {
+            label: "m11".to_owned(),
+            automatic: true,
+            claim: Some("m11".to_owned()),
+        }
+    );
 }
 
 /// A computed cell is held to the guards its source cell is: a machine's label stored unchecked
@@ -1598,7 +1743,7 @@ fn run_verb(
         reason = "aterm-db's one test helper for the write verbs"
     )]
     let said = write::verb(paths, config, &words(list), env);
-    said
+    said.map(write::Wrote::printed)
 }
 
 /// One write verb of `aterm file` over `paths`: what it printed and its exit code.
@@ -1984,6 +2129,273 @@ fn a_write_whose_register_moved_is_held_until_a_person_resolves_it() {
     }
 }
 
+/// A write that follows this Mac's own published write of a cell, while a pass cut short left the
+/// frontier ahead of the snapshot, or the snapshot ahead of the status, follows that write
+/// (`intent:<id>`) and is published: only the frontier the status names for the snapshot at the
+/// baseline's revision says what that baseline holds (tracker package FL-170).
+///
+/// NEGATIVE CONTROL, observed: with the write's `follow` reading the frontier unvouched
+/// (`target.held.frontier()`), the second write expects the baseline's value and the publisher
+/// holds it against the first, in the cut before the snapshot: `held <id>: changed since it was
+/// written: <row>.note`.
+#[test]
+fn a_write_after_a_pass_cut_short_follows_this_macs_published_write() {
+    // What the cut pass had not written yet: everything but its frontier, or only its status.
+    for (cut, snapshot_too) in [("before the snapshot", true), ("before the status", false)] {
+        let stand = Stand::new();
+        all(&stand, &stand.pass(false), Word::Live, None);
+        let (paths, config, root) = (stand.paths(), &stand.config, stand.root());
+        let machine = stand.machine.clone();
+        let held = stand.file(&super::MACHINES);
+        let name = super::MACHINES.file();
+        stand.commons("[commons]\nenabled = false\n");
+        let (first, _) = wrote(paths, config, &["set", "lab/machines", "m7", "note", "one"]);
+        let first = id_of(&first);
+        std::fs::remove_file(config).unwrap();
+        assert!(matches!(
+            answer_of(&publish_pass(paths, config), &first),
+            Answer::Published { op: Some(_) }
+        ));
+        let mut unwritten = vec![root.state(&name), root.done(&name)];
+        if snapshot_too {
+            unwritten.push(root.snapshot(&name));
+        }
+        let kept: Vec<_> = unwritten
+            .into_iter()
+            .map(|path| (std::fs::read(&path).unwrap(), path))
+            .collect();
+        all(&stand, &stand.pass(false), Word::Live, None);
+        for (bytes, path) in &kept {
+            std::fs::write(path, bytes).unwrap();
+        }
+        assert!(
+            held.projected_from().is_none(),
+            "{cut}: no status names this snapshot and this frontier"
+        );
+        assert!(
+            held.projected_at(held.published().status.rev()).is_none(),
+            "{cut}"
+        );
+        assert_eq!(shown(&root, &machine, "note"), "one", "{cut}");
+        let (second, code) = wrote(paths, config, &["set", "lab/machines", "m7", "note", "two"]);
+        assert_eq!(code, aterm_file::exit::OK, "{cut}: {second}");
+        op_of(&second);
+        assert_eq!(stored(paths, &machine, "note"), Some(json!("two")), "{cut}");
+    }
+}
+
+/// This Mac's rename of its own row, number and nickname as one write, that met another writer's
+/// number is held and stays pending, and gives way through the naming code's door only once the
+/// row read here shows that number: until a pass brings it, the row still shows the number the
+/// write replaced, which a follow must not take. The nickname's register never moved, so the
+/// write gives way on the number alone, whole, as the one rename it is. Then the held write is
+/// dropped, the registry's values stand, and no person is asked (the owner's words of
+/// 2026-11-16, `docs/OWNER_RULINGS.md`).
+///
+/// NEGATIVE CONTROLS, observed: with `here_published` listing a held write whatever its row
+/// shows (`shown` always true), the write is offered against the row that still shows m7:
+/// `left: 1 right: 0`; with the write giving way only once every cell it writes shows another
+/// value (`edits.iter().all(shows)` for the cells the hold names), it never gives way:
+/// `left: [] right: [HeldName { .. }]`.
+#[test]
+fn a_held_name_write_gives_way_to_the_registrys_value() {
+    use super::{HeldName, Renamed};
+    use crate::alab::view::MachineLabel;
+    let stand = Stand::new();
+    let (paths, config) = (stand.paths(), &stand.config);
+    let machine = stand.machine.clone();
+    // This Mac's facts row binds the machine, so the pass marks its row `here`.
+    Registry::at(paths.clone())
+        .write(vec![vec![crate::database::Change {
+            collection: crate::alab::registry::MACHINE_FACTS.name.to_owned(),
+            key: uuid_of(&stand.lab, SEAT),
+            value: Some(json!({"r": 1, "n": 1, "mac": machine, "label": "m7"})),
+        }]])
+        .unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    // Another writer's number lands on the register after this Mac's snapshot.
+    Registry::at(paths.clone())
+        .write(vec![vec![put(&MACHINE, &machine, "label", json!("m9"))]])
+        .unwrap();
+    let cells = [(Renamed::Label, "m12"), (Renamed::Nickname, "Otter")];
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test of the rename door and of the door a held name write gives way through"
+    )]
+    let id = super::rename(paths, config, &machine, &cells, &env())
+        .expect("queued")
+        .expect("a write")
+        .id;
+    let held = stand.file(&super::MACHINES).outbox().held;
+    assert_eq!(
+        held.iter()
+            .map(|held| (held.intent.id.as_str(), held.intent.edits.len()))
+            .collect::<Vec<_>>(),
+        [(id.as_str(), 2)],
+        "one write holds the rename"
+    );
+    let label = |here: &super::HereRow| match here.label() {
+        MachineLabel::Named { label, .. } => label,
+        other => panic!("{other:?}"),
+    };
+    // The snapshot here is from before that number: the write waits, and nothing is offered.
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert_eq!(label(&here), "m7");
+    assert!(here.pending(Renamed::Label) && here.pending(Renamed::Nickname));
+    assert_eq!(here.held(), []);
+    // A pass brings it: the row shows what the write met, and the write gives way, whole.
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert_eq!(label(&here), "m9");
+    assert!(here.pending(Renamed::Label));
+    assert_eq!(
+        here.held(),
+        [HeldName {
+            id: id.clone(),
+            cells: vec![
+                ("label".to_owned(), "m12".to_owned()),
+                ("nickname".to_owned(), "Otter".to_owned())
+            ],
+        }]
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test of the door a held name write gives way through"
+    )]
+    super::yield_held(paths, config, &id, &env()).expect("dropped");
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert_eq!(label(&here), "m9");
+    assert!(!here.pending(Renamed::Label) && !here.pending(Renamed::Nickname));
+    assert_eq!(here.held(), []);
+    assert_eq!(stored(paths, &machine, "label"), Some(json!("m9")));
+    assert!(stand.file(&super::MACHINES).outbox().held.is_empty());
+}
+
+/// An owner's write of this Mac's own row that carries a name cell with another cell of the row
+/// (`aterm file set lab/machines <row> nickname=Otter note=desk`) gives way, whole, as a
+/// rename's does, once the row shows the value it met: no name cell of this Mac waits on a
+/// person's `aterm file resolve`.
+///
+/// NEGATIVE CONTROL, observed: with `here_published` taking only writes of the name cells alone,
+/// the write is never offered and its nickname stays pending for good: `left: [] right:
+/// [HeldName { .. }]`.
+#[test]
+fn a_held_write_with_a_name_cell_and_another_cell_gives_way_whole() {
+    use super::{HeldName, Renamed};
+    let stand = Stand::new();
+    let (paths, config) = (stand.paths(), &stand.config);
+    let machine = stand.machine.clone();
+    Registry::at(paths.clone())
+        .write(vec![vec![crate::database::Change {
+            collection: crate::alab::registry::MACHINE_FACTS.name.to_owned(),
+            key: uuid_of(&stand.lab, SEAT),
+            value: Some(json!({"r": 1, "n": 1, "mac": machine, "label": "m7"})),
+        }]])
+        .unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    // Another writer's note lands on the register after this Mac's snapshot.
+    Registry::at(paths.clone())
+        .write(vec![vec![put(&MACHINE, &machine, "note", json!("rack"))]])
+        .unwrap();
+    let (said, code) = run_verb(
+        paths,
+        config,
+        &[
+            "set",
+            "lab/machines",
+            &machine,
+            "nickname=Otter",
+            "note=desk",
+        ],
+        &env(),
+    )
+    .expect("a write");
+    assert_eq!(code, aterm_file::exit::CONFLICT, "{said}");
+    let id = stand.file(&super::MACHINES).outbox().held[0]
+        .intent
+        .id
+        .clone();
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert!(here.pending(Renamed::Nickname));
+    assert_eq!(here.held(), [], "the row does not show the note it met yet");
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert_eq!(
+        here.held(),
+        [HeldName {
+            id: id.clone(),
+            cells: vec![
+                ("nickname".to_owned(), "Otter".to_owned()),
+                ("note".to_owned(), "desk".to_owned())
+            ],
+        }]
+    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test of the door a held name write gives way through"
+    )]
+    super::yield_held(paths, config, &id, &env()).expect("dropped");
+    let here = super::here_published(paths).expect("this Mac's row");
+    assert!(!here.pending(Renamed::Nickname));
+    assert_eq!(stored(paths, &machine, "note"), Some(json!("rack")));
+}
+
+/// A follow-up edit of one cell is compared with what the earlier intent it follows left in that
+/// cell's own register, as the publisher compares it, never with another register of that
+/// intent: a rename writes the number and the nickname as one intent, and the registers it left
+/// can differ (a peer had written the number first, so the number's register holds the peer's
+/// operation).
+///
+/// NEGATIVE CONTROL, observed: with `against` reading the intent's first register
+/// (`done.left.values().next()`), the nickname edit reads the number's:
+/// `left: Some(["aaaa…"]) right: Some(["bbbb…"])`.
+#[test]
+fn a_follow_up_is_compared_with_its_own_register_of_the_intent_it_follows() {
+    let pk = "mc-0123456789abcdef";
+    let (peer, mine) = ("a".repeat(64), "b".repeat(64));
+    let earlier = "1".repeat(32);
+    let done = aterm_file::Done {
+        intent: aterm_file::Intent {
+            id: earlier.clone(),
+            file: super::MACHINES.file(),
+            ms: NOW,
+            by: "person".to_owned(),
+            session: None,
+            born: false,
+            revert: None,
+            edits: Vec::new(),
+            resolves: None,
+        },
+        op: Some(mine.clone()),
+        ms: NOW,
+        seen: true,
+        generation: Some(1),
+        source: None,
+        left: std::collections::BTreeMap::from([
+            (format!("{pk}.label"), vec![peer.clone()]),
+            (format!("{pk}.nickname"), vec![mine.clone()]),
+        ]),
+    };
+    let outbox = aterm_file::Outbox {
+        done: vec![done],
+        ..aterm_file::Outbox::default()
+    };
+    let nickname = aterm_file::Edit {
+        key: pk.to_owned(),
+        column: "nickname".to_owned(),
+        elem: None,
+        value: json!("Heron"),
+        text: "Heron".to_owned(),
+        expected: vec![format!("{}{earlier}", aterm_file::outbox::INTENT)],
+    };
+    assert_eq!(super::against(&outbox, &nickname), Some(vec![mine]));
+    let label = aterm_file::Edit {
+        column: "label".to_owned(),
+        ..nickname
+    };
+    assert_eq!(super::against(&outbox, &label), Some(vec![peer]));
+}
+
 /// The write verbs on a stand-in lab: two writes of one cell queued while sharing is off are
 /// published in order, the second following the first; `add` bears a row under the key the
 /// publisher derives; `rm` retires it; `revert` restores what an operation replaced; a Mac's
@@ -2286,6 +2698,156 @@ fn set_takes_the_documented_words_clears_reads_stdin_and_answers_json() {
     }
 }
 
+/// `set <name> <row> <column>=<value>…` writes several cells of one row as one write: one
+/// intent holds every cell's edit, the publisher signs it as one operation, and [`super::offer`]
+/// says what became of it; an empty value clears its cell, and a column named twice or a word
+/// that is no assignment is a usage error.
+///
+/// An offer of a write another pass settled first says what its outbox holds of it.
+///
+/// NEGATIVE CONTROLS, observed: with `set_cells` taking only the first `<column>=<value>`, the
+/// write holds one edit: `left: [(.., 1)] right: [(.., 2)]`; with `said_of` not reading the
+/// outbox, the second offer says `queued <id>: the publisher has not reached it`.
+#[test]
+fn set_writes_several_cells_of_one_row_as_one_write() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let machine = stand.machine.clone();
+    let queue = write::Env {
+        attempt: Duration::ZERO,
+        ..env()
+    };
+    let words = ["set", "lab/machines", "m7", "note=both", "status=planned"];
+    let (answer, _) = run_verb(paths, config, &words, &queue).expect("queued");
+    let id = id_of(&answer);
+    let queued = stand.file(&super::MACHINES).outbox().queued;
+    assert_eq!(
+        queued
+            .iter()
+            .map(|intent| (intent.id.as_str(), intent.edits.len()))
+            .collect::<Vec<_>>(),
+        [(id.as_str(), 2)]
+    );
+    let write = super::Queued {
+        id: id.clone(),
+        unflushed: None,
+    };
+    let said = super::offer(paths, config, &write, aterm_spec::wait::MUST_HAPPEN, NOW);
+    let op = op_of(&said);
+    // Offered again, once another pass settled it: its outbox says what became of it.
+    let again = super::offer(paths, config, &write, aterm_spec::wait::MUST_HAPPEN, NOW);
+    assert_eq!(op_of(&again), op, "{again}");
+    assert_eq!(stored(paths, &machine, "note"), Some(json!("both")));
+    assert_eq!(stored(paths, &machine, "status"), Some(json!("planned")));
+    let (answer, _) = wrote(
+        paths,
+        config,
+        &["set", "lab/machines", "m7", "note=", "status=planned"],
+    );
+    op_of(&answer);
+    assert!(stored(paths, &machine, "note").is_none_or(|value| value.is_null()));
+    for refused in [
+        &["set", "lab/machines", "m7", "note=a", "note=b"][..],
+        &["set", "lab/machines", "m7", "note=a", "status"][..],
+    ] {
+        assert!(
+            matches!(
+                run_verb(paths, config, refused, &env()),
+                Err(write::Refusal::Usage(_))
+            ),
+            "{refused:?}"
+        );
+    }
+}
+
+/// `aterm file set` replaces a version-1 account label outside the handle grammar (`Team A`,
+/// which version 1's free-text label took): it reads raw under `Handle`, yet it is the owner's,
+/// so the set queues the new label and the publisher signs it, where it once refused the cell
+/// as one a newer build wrote. The account goes by `claude-team-a` until then, its handle
+/// derived from the label, and by `claude-team-b` after.
+/// NEGATIVE CONTROL: with `grid::replaceable` answering `false`, the set is refused: ``
+/// panicked … Problem("ai/accounts: label holds a value a newer build wrote; it is read-only
+/// here") ``.
+#[test]
+fn set_replaces_an_older_builds_label_the_handle_type_refuses() {
+    let stand = Stand::new();
+    let (paths, config) = (stand.paths(), &stand.config);
+    let bea = keys::account_pk("claude", BEA).unwrap();
+    let v1 = crate::database::Change {
+        collection: ACCOUNT.name.to_owned(),
+        key: format!("{bea}.label"),
+        value: Some(crate::typed::cell::CellValue::owner(1, json!("Team A")).encode()),
+    };
+    Registry::at(paths.clone()).write(vec![vec![v1]]).unwrap();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let accounts = stand.file(&super::ACCOUNTS).read();
+    assert_eq!(accounts.named("claude-team-a").len(), 1);
+    let (answer, code) = wrote(
+        paths,
+        config,
+        &["set", "ai/accounts", "claude-team-a", "label", "team-b"],
+    );
+    assert_eq!(code, aterm_file::exit::OK, "{answer}");
+    publish_pass(paths, config);
+    let label = att::Handle::at(paths.clone(), &att::REGISTRY)
+        .view()
+        .unwrap()
+        .project(&ACCOUNT)
+        .rows[&bea]
+        .get("label")
+        .cloned();
+    assert_eq!(label, Some(json!("team-b")));
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let accounts = stand.file(&super::ACCOUNTS).read();
+    assert_eq!(accounts.named("claude-team-b").len(), 1);
+    assert!(accounts.named("claude-team-a").is_empty());
+}
+
+/// `set` and `rm` name an account row as every account verb does, and a word that names no row,
+/// or several, is a usage refusal (exit 2) that writes nothing: one that names none lists none,
+/// so a typo prints no address, and the address two accounts sign in with lists both by slug.
+/// NEGATIVE CONTROL: with `Target::row` answering a resolver's refusal as a problem (`problem(…)`
+/// in place of `usage(…)`, exit 3, as before), each refusal is `Problem`: `` panicked … set
+/// ai/accounts fb-alpha note x: Err(Problem(…)) ``.
+#[test]
+fn a_write_to_a_word_that_names_no_account_or_several_is_a_usage_refusal() {
+    let stand = Stand::new();
+    all(&stand, &stand.pass(false), Word::Live, None);
+    let (paths, config) = (stand.paths(), &stand.config);
+    let refused = |list: &[&str]| match run_verb(paths, config, list, &env()) {
+        Err(write::Refusal::Usage(why)) => why,
+        other => panic!("{}: {other:?}", list.join(" ")),
+    };
+    for list in [
+        &["set", "ai/accounts", "fb-alpha", "note", "x"][..],
+        &["rm", "ai/accounts", "fb-alpha"],
+    ] {
+        let why = refused(list);
+        assert!(why.contains(&aterm_file::no_account("fb-alpha")), "{why}");
+        assert!(!why.contains('@'), "{why}");
+    }
+    for list in [
+        &["set", "ai/accounts", ADA, "note", "x"][..],
+        &["rm", "ai/accounts", ADA],
+    ] {
+        let why = refused(list);
+        assert!(
+            why.contains("names 2 accounts")
+                && why.contains("claude-fb-alpha")
+                && why.contains("oai-fb-alpha"),
+            "{why}"
+        );
+    }
+    let accounts = att::Handle::at(paths.clone(), &att::REGISTRY)
+        .view()
+        .unwrap()
+        .project(&ACCOUNT);
+    for row in accounts.rows.values() {
+        assert!(row.live() && row.get("note").is_none(), "{row:?}");
+    }
+}
+
 /// An edit that follows an earlier intent of this Mac's (`intent:<id>`) is compared with what
 /// that intent left in the register. Where the earlier one wrote nothing there, because a peer
 /// had already written the same value (it settled as `unchanged`, or its record carries only its
@@ -2338,10 +2900,10 @@ fn a_follow_up_is_compared_with_what_the_earlier_intent_left_in_the_register() {
     // The earlier intent's record carries only its other cell: the peer wrote its note first.
     all(&stand, &stand.pass(false), Word::Live, None);
     stand.commons("[commons]\nenabled = false\n");
-    let note = write::draft_set(paths, "lab/machines", "m7", "note", Some("both"))
+    let note = write::draft_set(paths, "lab/machines", "m7", &[("note", Some("both"))])
         .unwrap()
         .unwrap();
-    let status = write::draft_set(paths, "lab/machines", "m7", "status", Some("planned"))
+    let status = write::draft_set(paths, "lab/machines", "m7", &[("status", Some("planned"))])
         .unwrap()
         .unwrap();
     let a = held

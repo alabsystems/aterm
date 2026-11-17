@@ -388,6 +388,8 @@ fn relaunchable(
 /// among them). The host's hand (`not-supervised`, `halted`, a driver's lease or turn) is the
 /// act's to judge when it is asked: a hold or a lease passes, and the word stands after it.
 pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
+    #[cfg(test)]
+    crate::host_facts::noted("offered_for");
     crate::harness_host::published_snapshot(sid)
         .filter(|snap| snap.pid == pid)
         .is_some_and(|snap| relaunchable(sid, &snap, aterm_primer::home_dir().as_deref()))
@@ -400,6 +402,8 @@ pub(crate) fn offered_for(sid: &str, pid: u32) -> bool {
 /// tty's line ([`aterm_agent::harness::relaunch::tap_room`]). `false` where any of that is unread.
 pub(crate) fn tap_room_for(sid: &str, pid: u32) -> bool {
     use aterm_agent::harness::tap;
+    #[cfg(test)]
+    crate::host_facts::noted("tap_room_for");
     let Some(value) = tap::stable_exe().and_then(|exe| tap::settings_value_carrying(&exe, true))
     else {
         return false;

@@ -12,6 +12,9 @@ use aterm_vitals::sys::query::NameTarget;
 
 use crate::sys_host::Shared;
 
+#[path = "sys_naming_reports.rs"]
+mod reports;
+
 /// A request's hang detector, rather than a promise about sampling latency.
 pub(crate) const BOUND: Duration = Duration::from_secs(60);
 /// Check shutdown while a control worker waits for the probe.
@@ -216,6 +219,21 @@ pub(crate) fn command(
     if !owner {
         return "ERR scope\n".to_owned();
     }
+    command_with_reports(shared, session, target, json, true)
+}
+
+/// Automatic observations keep the typed result and discard their raw reports.
+pub(crate) fn automatic(shared: &Shared, session: u64, target: NameTarget) -> String {
+    command_with_reports(shared, session, target, false, false)
+}
+
+fn command_with_reports(
+    shared: &Shared,
+    session: u64,
+    target: NameTarget,
+    json: bool,
+    keep_report: bool,
+) -> String {
     if !cfg!(target_os = "macos") {
         return "ERR unavailable name why=unsupported\n".to_owned();
     }
@@ -232,19 +250,27 @@ pub(crate) fn command(
             .join("wait-samples.noindex");
         #[cfg(target_os = "macos")]
         aterm_uds::private_file::create_private_dir(&directory).map_err(|_| Error::Unavailable)?;
-        let sample = aterm_uds::wait_sample::sample(identity, &directory, || lease.canceled())
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::TimedOut => Error::Timeout,
-                std::io::ErrorKind::Interrupted => Error::Canceled,
-                std::io::ErrorKind::NotFound => Error::Engine(NamingError::Gone),
-                _ => Error::Unavailable,
-            })?;
-        let word = mapped(sample.kind);
+        let (kind, elapsed) = reports::observe(
+            &directory,
+            keep_report,
+            std::time::SystemTime::now(),
+            |staging| {
+                aterm_uds::wait_sample::sample(identity, staging, || lease.canceled())
+                    .map(|sample| (sample.kind, sample.elapsed))
+            },
+        )
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::TimedOut => Error::Timeout,
+            std::io::ErrorKind::Interrupted => Error::Canceled,
+            std::io::ErrorKind::NotFound => Error::Engine(NamingError::Gone),
+            _ => Error::Unavailable,
+        })?;
+        let word = mapped(kind);
         let answer = shared.request_name(&lease.live, Operation::Apply { ticket, word })?;
         let Answer::Applied { job, word } = answer else {
             return Err(Error::Unavailable);
         };
-        Ok(success(&job, word, sample.elapsed, json))
+        Ok(success(&job, word, elapsed, json))
     })();
     result.unwrap_or_else(Error::reply)
 }

@@ -205,6 +205,8 @@ pub fn running_build_number() -> u64 {
 }
 
 #[cfg(unix)]
+pub use fleet_listen::fleet_inputs::wake_node_maintenance;
+#[cfg(unix)]
 pub use fleet_listen::judge_mesh_dials;
 #[cfg(unix)]
 pub use fleet_listen::node_serve::dial_units;
@@ -298,9 +300,9 @@ mod chrome_label;
 mod claude_card;
 mod claude_facts;
 mod claude_footer;
+mod claude_inputs;
 mod claude_lights;
 mod claude_panel;
-mod claude_registry;
 mod claude_slash;
 mod cli;
 pub use cli::initial_setup_window_args;
@@ -319,6 +321,10 @@ mod close_sheet;
 mod code_readahead;
 mod codex_rollout_tap;
 mod command_registry;
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub mod comprehension_specimen;
+mod comprehension_words;
 pub(crate) use aterm_gui_consent::config_marker;
 mod config_watcher;
 #[cfg(test)]
@@ -728,6 +734,7 @@ mod harness_task;
 mod hdr_win;
 mod heap_relief;
 mod holder_image;
+mod host_facts;
 mod host_io_prefetch;
 mod host_quit;
 mod host_record;
@@ -819,6 +826,7 @@ mod document_journal_conformance;
 pub(crate) use aterm_gui_documents::document_store;
 mod account_menu_read;
 mod board_keeper;
+mod describe;
 #[cfg(test)]
 mod document_store_conformance;
 mod echo_rtt;
@@ -834,6 +842,7 @@ mod fleet_glance;
 mod fleet_listen;
 mod fleet_traffic;
 mod footer_card_plate;
+mod footer_inputs;
 mod foreground_handback;
 mod frame_key;
 mod frame_memo;
@@ -1062,6 +1071,8 @@ mod test_fork_settle;
 mod test_scratch;
 #[cfg(test)]
 mod test_socket;
+/// The vault token view's own lane: the one reader of this Mac's token view, on its own causes.
+mod token_lane;
 /// The vault token facts the window shows, and the quiet offer's step (`docs/DESIGN-claude-setup-token-2026-11-05.md` §5.9).
 mod token_shown;
 mod toolbar;
@@ -3224,9 +3235,9 @@ enum Wake {
     /// The join with the phrase typed on System State's Secrets vault row answered
     /// ([`system_state_host::PhraseJoinReceipt`]).
     InitialSetupPhraseJoined,
-    /// A kitty pose the setup screen's lockup draws was baked off the main thread
-    /// (`system_state::kitty`): a page waiting on it draws it now.
-    KittyBaked,
+    /// An image the setup screen's lockup draws was baked off the main thread
+    /// (`system_state::prebake`): a page waiting on it draws it now.
+    LockupBaked,
     Output {
         session: u64,
         window: WindowId,
@@ -3683,8 +3694,9 @@ enum Wake {
         /// parented to nothing, and its open records the requester's program, model and account
         /// (ATERM-KI-1109-3).
         fleet: Option<aterm_types::control_verbs::Requester>,
-        /// The request's `why=` line, which the new tab's open records (`why_text=`).
-        why: Option<String>,
+        /// What the spawn said of the session: its task line, `why=`, `package=` and `from=`, for
+        /// the new tab's open and its birth claims ([`session_log::Birth`]).
+        birth: Box<session_log::Birth>,
         /// The caller, whom the new tab's open names.
         by: session_store::ExitActor,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
@@ -3961,16 +3973,31 @@ enum Wake {
         origin: session_chrome::TerminalMenuOrigin,
         at_ms: u64,
     },
+    /// The macOS strip's double-click on a tab, which opens its rename field under the marks of
+    /// the click ([`app_take_over::GestureMarks`]).
     #[cfg(target_os = "macos")]
     BeginSessionRename {
         window: WindowId,
         tab: tab_model::TabId,
+        marks: app_take_over::GestureMarks,
     },
+    /// A key an `hwkey` burst posted changed the macOS rename field's text, as its delegate saw
+    /// it while AppKit dispatched the key ([`App::native_rename_edited`]).
+    #[cfg(target_os = "macos")]
+    NativeRenameEdited {
+        window: WindowId,
+        session: u64,
+        marks: app_take_over::GestureMarks,
+    },
+    /// The macOS rename field ended editing with `text`, under the marks of the key or click
+    /// that ended it; the commit's author is still who touched the field
+    /// ([`app_rename::TabRenameEdit::controller`]).
     #[cfg(target_os = "macos")]
     CommitSessionRename {
         window: WindowId,
         session: u64,
         text: String,
+        marks: app_take_over::GestureMarks,
     },
     #[cfg(target_os = "macos")]
     CancelSessionRename {
@@ -9713,9 +9740,11 @@ const fn handoff_deferrable_input(event: &WindowEvent) -> bool {
 impl Wake {
     /// Whether this wake's handler only refreshes an observation of the world that no restore
     /// image reads: a surface ready to draw, a vitals reading, the disk board and its looks,
-    /// a sibling scan, a fleet read, the fleet traffic, this machine's name; or only answers a
-    /// control client's read (`status`, `sessions`, `harness policy`, the setup status, a `dims`
-    /// and a `resize`'s look at a pane's grid). Such a wake is not activity for the crash journal
+    /// a sibling scan, a fleet read, the fleet traffic, this machine's name, a session's
+    /// presence after a control thread moved a lease or a turn; or only answers a control
+    /// client's read (`status`, `sessions status`, `harness policy`, the setup status, a `dims`
+    /// and a `resize`'s look at a pane's grid).
+    /// Such a wake is not activity for the crash journal
     /// ([`crash_journal::Lane::note_activity`]): it owes no capture and no settle, so a window
     /// at rest does not build a restore image after each reading or each client's read. Every
     /// other wake is activity, the safe side: a capture equal to the last one writes nothing.
@@ -9726,6 +9755,23 @@ impl Wake {
     /// typed last once, publishes the screen text it built to the frame slot, asks the
     /// program-check watch for a look when its last one is stale, and wakes the input hook of
     /// a session whose input sits unread with no stall watch armed.
+    ///
+    /// [`Wake::LeaseChanged`] names a session whose presence a control thread asks the loop to
+    /// read again (`presence::post_lease_changed`). The thread posts one for a session once it
+    /// has taken, released or handed back a drive lease or a turn's lease in that session's
+    /// `turn_lease` slot, ended a turn's input there (the turn's lease stops saying its driver
+    /// may type), or submitted a turn into it, which leaves the lease as it was; where it took,
+    /// released or handed back a turn's lease that names the session driving the turn, it posts
+    /// one for that driver too, whose own slot it leaves as it was. The handler
+    /// ([`App::on_presence_wake`]) takes `&mut App` and refreshes the named session's presence
+    /// from the leases as they stand: the presence table and its supervisor deadline, the
+    /// session's published need (its timeline's need, the need rechecks and ages, the API outage
+    /// notice), the menu's front holds, the task ends a look at the front tab marks seen, and the
+    /// tab chrome. A driver whose own slot gives it no hand reads the lease that names it in the
+    /// slot of the session it drives (`App::driving_target`). A restore image reads none of
+    /// these, and neither do its agents, holds and programs (`App::fill_desk_agents`,
+    /// `App::crash_journal_programs`); nor does a lease move a pane's program, its working
+    /// directory or the tabs, which the disk walker's facts read.
     #[must_use]
     const fn only_observes(&self) -> bool {
         match self {
@@ -9736,6 +9782,7 @@ impl Wake {
             | Wake::SiblingScan(_)
             | Wake::AgentsDiscoveryReady
             | Wake::FleetRead
+            | Wake::LeaseChanged { .. }
             | Wake::ReadSessionStatus { .. }
             | Wake::ReadSessionStatuses { .. }
             | Wake::ReadHarnessPolicy { .. }
@@ -10618,6 +10665,8 @@ struct App {
     lab_deck_feed: lab_deck::Feed,
     network_source: Option<NetworkSnapshotSource>,
     network_source_busy: bool,
+    /// How the services observer has derived, read only by a network inspection.
+    service_derivations: Option<ServiceDerivationsSource>,
     network_next_poll: Option<Instant>,
     /// What the band's poll keeps while it rides the reading's turns ([`network_deck::Ride`]).
     network_ride: network_deck::Ride,
@@ -15452,6 +15501,16 @@ impl App {
                 .native_runtime
                 .set_view_suspended(view, !visible.contains(&view));
         }
+        // The setup screen's lockup keeps its images only while a System State view is on
+        // screen: in its window's active tab, the window neither minimised nor covered.
+        let runtime = &self.native_runtime;
+        let lockup_shown = self.view_on_screen(|view| {
+            matches!(
+                runtime.view_state(view),
+                Some(native_app::AppViewState::SystemState(_))
+            )
+        });
+        system_state::lockup_shown(lockup_shown);
     }
 
     fn recompute_notify_suppress(&self) {
@@ -15868,6 +15927,7 @@ impl App {
             lab_deck_feed: lab_deck::Feed::default(),
             network_source: None,
             network_source_busy: false,
+            service_derivations: None,
             network_next_poll: None,
             network_ride: network_deck::Ride::default(),
             network_inspected: None,
@@ -16692,9 +16752,9 @@ impl App {
             visible = true;
             if output {
                 ws.pending_deco_birth = Some(now);
-                // Every window that shows the output wakes; only a focused one a person attends
-                // asks a reading ([`Self::stir_rest`]).
-                ask_reading |= ws.rest.stir(now) && ws.focused && ws.rest.attended();
+                // Every window that shows the output wakes; a woken one asks a reading only
+                // where the wake gives the readings a person's audience ([`Self::stir_rest`]).
+                ask_reading |= ws.rest.stir(now) && crate::vitals_host::attends_readings(ws, false);
             }
             let Some(w) = ws.os_window.as_ref() else {
                 continue;
@@ -16716,7 +16776,7 @@ impl App {
             }
         }
         if ask_reading {
-            self.vitals_ask_now(now);
+            self.vitals_ask_for_attention(now, false);
         }
         visible
     }
@@ -16731,10 +16791,15 @@ impl App {
     /// The same turn settles whether each window is attended
     /// ([`window_rest::Rest::settle_attended`], [`window_rest::ATTENTION`]). The same two
     /// windows are always attended, and so is every window under `motion = "full"`, a person's
-    /// own word that motion plays. A window whose attention lapsed here is asked for one frame,
-    /// which draws its deck still; no deadline is armed for the lapse, as none is for the rest:
-    /// the reading the focused cadence armed before the lapse is the last on that cadence, and
-    /// the next is due on the resting one ([`Self::vitals_audience`]).
+    /// own word that motion plays. A window whose attention this settles otherwise than it was
+    /// is asked for one frame where that changes whether its deck moves
+    /// (`live_facts(wid).motion` just before and just after): a lapse in a focused window on
+    /// screen that draws a moving deck, which that frame draws still. A lapse in an unfocused or
+    /// occluded window, or in one that draws no deck, changes nothing on screen and asks none.
+    /// No deadline is armed for the lapse, as none is for the rest: where the lapse leaves no
+    /// window giving the readings a person's audience and no page reads them, the reading the
+    /// focused cadence armed before it is the last on that cadence, and the next is due on the
+    /// resting one ([`Self::vitals_audience`]).
     pub(crate) fn settle_rest(&mut self, now: Instant) {
         let after = self
             .config
@@ -16744,35 +16809,48 @@ impl App {
             && self.config.motion_mode() != crate::motion::MotionMode::Full)
             .then_some(window_rest::ATTENTION);
         let filmed = self.video_rec.as_ref().map(|rec| rec.window);
+        let mut flips = Vec::new();
         for (wid, mut route_guard_ws) in &mut self.windows {
             let ws = &mut **route_guard_ws;
             let off_film = |quiet: Option<Duration>| quiet.filter(|_| filmed != Some(*wid));
             ws.rest.settle(now, off_film(after));
-            if ws.rest.settle_attended(now, off_film(attention)) {
+            let within = off_film(attention);
+            if ws.rest.attended_at(now, within) != ws.rest.attended() {
+                flips.push((*wid, within));
+            }
+        }
+        for (wid, within) in flips {
+            let moved = self.live_facts(wid).is_some_and(|facts| facts.motion);
+            if let Some(mut ws) = self.windows.get_mut(&wid) {
+                ws.rest.settle_attended(now, within);
+            }
+            if self.live_facts(wid).is_some_and(|facts| facts.motion) != moved
+                && let Some(ws) = self.windows.get(&wid)
+            {
                 ws.request_redraw();
             }
         }
     }
 
     /// A person's `event` in window `wid` at `now`, as it arrives and before it is handled: one
-    /// that [`window_rest::stirs`] stirs the window ([`Self::stir_rest`]). `Focused(true)` counts
-    /// the window as focused already, since its focus is stored only when the event is handled.
+    /// that [`window_rest::stirs`] stirs the window ([`Self::stir_rest`]).
     ///
     /// The same event is a touch ([`Self::touch_rest`]) unless aterm made it itself for a
     /// control client or a program: a key it posted ([`InputOrigin::Posted`], an `hwkey`
     /// burst), or the `Resized` that reports a size it asked the window for
     /// ([`Self::note_own_resize`]). A key another process posted may be a person's on-screen
     /// keyboard or Screen Sharing, and counts; so does the focus coming to the window, whoever
-    /// brought it.
+    /// brought it. The touch of `Focused(true)` counts the window as focused already, since its
+    /// focus is stored only when the event is handled.
     pub(crate) fn note_rest_event(&mut self, wid: WindowId, event: &WindowEvent, now: Instant) {
         if window_rest::stirs(event) {
-            let focusing = matches!(event, WindowEvent::Focused(true));
-            self.stir_rest(wid, now, focusing);
+            self.stir_rest(wid, now);
             let own = self
                 .windows
                 .get_mut(&wid)
                 .is_some_and(|mut ws| ws.rest.own(event));
             if self.input_origin != InputOrigin::Posted && !own {
+                let focusing = matches!(event, WindowEvent::Focused(true));
                 self.touch_rest(wid, now, focusing);
             }
         }
@@ -16796,39 +16874,58 @@ impl App {
     }
 
     /// A person touched window `wid` at `now`: it is attended, and its attention starts over.
-    /// Where its attention had lapsed and it is focused, or `focusing` focuses it, a reading is
-    /// asked at once, as a wake asks one ([`Self::stir_rest`]): the readings were on the resting
-    /// cadence while it was unattended ([`Self::vitals_audience`]) and are on the focused one
-    /// from that reading on, and the deck moves again from that reading, not in the touch's own
-    /// frame.
+    /// Where the touch ended a lapse of its attention, or the event focuses the window
+    /// (`focusing`), and the window is awake, it then gives the readings a person's audience
+    /// ([`crate::vitals_host::attends_readings`]) where it is focused, `focusing` focuses it or
+    /// it is on screen, and the next reading is brought forward wherever aterm has a focused
+    /// window or `focusing` gives it one ([`Self::vitals_ask_for_attention`]): due at once, or
+    /// at the focused cadence's next half-slot after the last ask if that is later. The focus
+    /// asks though the window stayed attended, since the focus alone can give the readings that
+    /// audience: it brings aterm to the front, or comes to a covered window. Readings on the
+    /// resting cadence, because no window or page gave them that audience
+    /// ([`Self::vitals_audience`]), are on the focused one from that reading on. Where the touch
+    /// ended the lapse of a window that is focused or that the event focuses, that window's deck
+    /// moves again from that reading, not in the touch's own frame. An unfocused window's touch
+    /// holds its deck for no reading ([`window_rest::Rest::touch`]), so the focus that follows it
+    /// moves the deck on its own turn where no wake's hold stands: a wake holds the deck of a
+    /// window, focused or not, until a reading lands after it ([`Self::stir_rest`]), and a touch
+    /// that finds the window resting (`idle_rest_secs`) wakes it first.
     pub(crate) fn touch_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
-        if self
-            .windows
-            .get_mut(&wid)
-            .is_some_and(|mut ws| ws.rest.touch(now) && (focusing || ws.focused))
-        {
-            self.vitals_ask_now(now);
+        let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let ws = &mut **route_guard_ws;
+        let lapsed = ws.rest.touch(now, focusing || ws.focused);
+        if (lapsed || focusing) && crate::vitals_host::attends_readings(ws, focusing) {
+            drop(route_guard_ws);
+            self.vitals_ask_for_attention(now, focusing);
         }
     }
 
     /// Window `wid` stirred at `now`: its quiet starts over, and a window that was resting wakes.
-    /// A woken window that is focused, or that `focusing` focuses, and that a person attends
-    /// asks a reading at once, so its deck is live again from the next reading rather than from
-    /// the background cadence's next. An unfocused window's wake asks none: the readings'
-    /// audience counts a window's focus ([`Self::vitals_audience`]), so that wake changes no
-    /// cadence, and a reading's frame would take the GPU's block back for nothing. Nor does the
-    /// wake of a window whose attention has lapsed (a key aterm posted, the `Resized` of its own
-    /// resize; its tab's output keeps the same rule in `admit_content_redraws`): the
-    /// audience counts the attention too, so its cadence stays the resting one and its deck
-    /// holds still on every reading; the touch that attends it again asks that reading
-    /// ([`Self::touch_rest`]).
+    /// A woken window that is attended, and is focused or on screen, now gives the readings a
+    /// person's audience ([`crate::vitals_host::attends_readings`]). It asks a reading at once
+    /// wherever aterm has a focused window ([`Self::vitals_ask_for_attention`]), so a focused
+    /// window's deck is live again from the next reading rather than from the background
+    /// cadence's next. The focus that wakes a window asks its reading as the touch it also is
+    /// ([`Self::touch_rest`], which counts the window as focused by it), not here. Any other
+    /// wake asks none: it leaves the readings' audience ([`Self::vitals_audience`]) as it was, so
+    /// it changes no cadence, and a reading's frame would take the GPU's block back for nothing.
+    /// A window whose attention lapsed asks its reading at the touch that ends the lapse
+    /// ([`Self::touch_rest`]), so a key into it asks one, and a wake that touches nothing (a key
+    /// aterm posted, the `Resized` of its own resize, and its tab's output, which keeps the same
+    /// rule in `admit_content_redraws`) asks none: the readings keep the cadence they had, and
+    /// its deck holds still on every reading until a touch attends it again.
+    ///
+    /// A wake holds the window's deck until a reading lands after it, focused or not
+    /// ([`window_rest::Rest::stir`]).
     ///
     /// A wake of a window that was focused before the event marks its next present a rest wake
     /// ([`crate::metrics::WindowPresentState::note_rest_wake`]), so the key that woke a resting
     /// deck, or the first key after a modifier, IME or pointer wake that presents before any
     /// other frame, counts in `n_rest_wake_key`. The focus that wakes an unfocused window marks
     /// nothing: that window's deck was already still.
-    pub(crate) fn stir_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
+    pub(crate) fn stir_rest(&mut self, wid: WindowId, now: Instant) {
         let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -16839,9 +16936,9 @@ impl App {
         if ws.focused {
             ws.present_metrics.note_rest_wake();
         }
-        if (focusing || ws.focused) && ws.rest.attended() {
+        if crate::vitals_host::attends_readings(ws, false) {
             drop(route_guard_ws);
-            self.vitals_ask_now(now);
+            self.vitals_ask_for_attention(now, false);
         }
     }
 
@@ -17028,7 +17125,12 @@ impl App {
     /// covered, on another Space or hidden). A minimised or hidden window presents nothing, and a
     /// covered one at most a frame every 5 s (`WindowState::park_hidden_frame`,
     /// `docs/ATERM_DESIGN.md` §7.4); visible again it draws its current state once.
-    fn on_occlusion_changed(&mut self, wid: WindowId, occluded: bool) {
+    ///
+    /// Uncovered at `now`, a window that is awake and attended gives the readings a person's
+    /// audience ([`crate::vitals_host::attends_readings`]), as on screen, so the uncover brings
+    /// the next reading forward wherever aterm has a focused window
+    /// ([`Self::vitals_ask_for_attention`]), as the wake of such a window does.
+    fn on_occlusion_changed(&mut self, wid: WindowId, occluded: bool, now: Instant) {
         let Some(mut route_guard_ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -17044,12 +17146,18 @@ impl App {
             ws.last_visible_views.clear();
             ws.rearm_present(true);
         }
+        let attends = !occluded && crate::vitals_host::attends_readings(ws, false);
         drop(route_guard_ws);
+        if attends {
+            self.vitals_ask_for_attention(now, false);
+        }
         if !occluded {
             self.note_done_seen(wid);
         }
         // A covered window's navigator reads no words and words no ages; uncovered it does.
         self.navigator_mark_structure();
+        // Covered or uncovered, a System State view may have left the screen or come back.
+        self.sync_native_visibility();
     }
 
     fn window_focus_event(&mut self, wid: WindowId, focused: bool) {
@@ -18800,15 +18908,17 @@ impl App {
             self.session_chrome_retry.remove(&session);
             return true;
         };
-        let Some((live_epoch, live_title, live_cwd, untitled, stands, timeline)) =
+        let Some((live_epoch, live_title, live_cwd, untitled, stands, program, timeline)) =
             s.term.try_lock().ok().map(|t| {
                 use crate::cwd_native::ReportedCwd as _;
+                let report = t.program_state();
                 (
                     t.title_epoch(),
                     t.title().to_string(),
                     t.native_working_directory().map(|cwd| cwd.into_owned()),
                     crate::app_take_over::untitled_by_its_program(&t),
                     crate::session_status::title_stands(&t),
+                    (report.title().map(str::to_string), report.title_seq),
                     s.ctx.timeline.clone(),
                 )
             })
@@ -18860,16 +18970,34 @@ impl App {
                 pool.get(*sid).is_some()
             });
         }
-        let cwd_changed = if targets.is_some() {
-            false
+        // A delivery to named windows only reads nothing of the session: no folder, no title
+        // mark, no in-band claim, and the log's settle wake stays as it was.
+        let (cwd_changed, log_wake) = if targets.is_some() {
+            (false, None)
         } else {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let cwd_moved = timeline.record_cwd_change(live_cwd.as_deref());
             let shown = crate::tab_label::informative(&live_title).to_string();
             let _ = timeline.record_title(&shown, stands);
+            // The title a program printed is also its claim, at the in-band rank: under this
+            // lock alone, whether or not the title mark moved.
+            let read = crate::session_log::InbandRead {
+                shown: &shown,
+                untitled,
+                stands,
+                program: program.0.as_deref(),
+                program_seq: program.1,
+            };
+            let at = timeline.slog().now();
+            timeline.slog_mut().observe_inband_title(&read, at);
             let _ = timeline.slog_take_wake();
-            cwd_moved
+            (cwd_moved, Some(timeline.slog_wake()))
         };
+        // A claim the in-band bucket held back is written at the log's settle tick, which runs
+        // whether or not tab status is on.
+        if let Some(wake) = log_wake {
+            self.session_status.slog_wakes.note(session, wake);
+        }
         if cwd_changed {
             crate::harness_host::disk_cwd_reported(session, live_cwd.as_deref());
         }
@@ -20504,8 +20632,7 @@ impl ApplicationHandler<Wake> for App {
                 .get(&target_id)
                 .and_then(|ws| ws.os_window.as_ref())
         {
-            let (x, y) = self.restored_origin(target_id, w, x, y);
-            w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+            w.set_outer_position(self.restored_origin(target_id, w, x, y));
         }
         if carried_position.is_none()
             && (!placed_hidden || cfg!(not(windows)))
@@ -20524,8 +20651,7 @@ impl ApplicationHandler<Wake> for App {
                 && let Some((x, y)) = outer
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
-                let (x, y) = self.restored_origin(target_id, w, x, y);
-                w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+                w.set_outer_position(self.restored_origin(target_id, w, x, y));
             }
             if maximized == Some(true) {
                 w.set_maximized(true);
@@ -21017,8 +21143,8 @@ impl App {
             Wake::InitialSetupReadings(read) => self.receive_system_state_readings(read),
             Wake::InitialSetupApplyResolved => self.resolve_system_state_apply(),
             Wake::InitialSetupPhraseJoined => self.resolve_system_state_phrase_join(),
-            Wake::KittyBaked => {
-                self.native_runtime.kitty_baked();
+            Wake::LockupBaked => {
+                self.native_runtime.lockup_baked();
                 self.request_redraw_system_state_windows();
             }
             Wake::ConsentProbeReady => self.on_consent_probe_ready(Instant::now()),
@@ -21119,18 +21245,29 @@ impl App {
                 self.dispatch_tab_menu_rewind(window, tab, origin, at_ms);
             }
             #[cfg(target_os = "macos")]
-            Wake::BeginSessionRename { window, tab } => {
+            Wake::BeginSessionRename { window, tab, marks } => {
                 self.clear_tab_surface_move_license(Some(window));
-                self.begin_session_rename(window, tab);
+                self.with_gesture_marks(marks, |app| app.begin_session_rename(window, tab));
+            }
+            #[cfg(target_os = "macos")]
+            Wake::NativeRenameEdited {
+                window,
+                session,
+                marks,
+            } => {
+                self.with_gesture_marks(marks, |app| app.native_rename_edited(window, session));
             }
             #[cfg(target_os = "macos")]
             Wake::CommitSessionRename {
                 window,
                 session,
                 text,
+                marks,
             } => {
                 self.clear_tab_surface_move_license(Some(window));
-                self.commit_session_rename(window, session, &text);
+                self.with_gesture_marks(marks, |app| {
+                    app.commit_session_rename(window, session, &text);
+                });
             }
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { window, session } => {
@@ -21834,7 +21971,7 @@ impl App {
                 task,
                 shell,
                 fleet,
-                why: asked,
+                birth,
                 by,
                 reply,
                 request,
@@ -21842,7 +21979,7 @@ impl App {
                 let reply = tab_spawn::SpawnReply::new(reply, request);
                 let why = if task.is_some() { "task" } else { "spawn" };
                 let parked = fleet.is_some();
-                let _act = tab_marks::ActScope::asking(by, why, asked.as_deref(), fleet);
+                let _act = tab_marks::ActScope::asking(by, why, *birth, fleet);
                 self.spawn_session_aimed(aim, cwd, split, raise, theme, task, shell, parked, reply);
             }
             Wake::TabSpawned(done) => self.land_tab_spawn(el, done),
@@ -22204,7 +22341,7 @@ impl App {
             #[cfg(target_os = "macos")]
             Wake::AskpassAnswered { id, proceed } => self.answer_askpass_sheet(id, proceed),
             #[cfg(target_os = "macos")]
-            Wake::AskpassWithdraw { id } => self.withdraw_askpass_sheet(id),
+            Wake::AskpassWithdraw { id } => self.withdraw_askpass_sheet(id, Instant::now()),
             Wake::EditRequest(call) => self.begin_edit(*call),
             Wake::EditCancel { ticket } => self.cancel_edit(ticket),
             Wake::EditAwait(call) => self.await_edit(*call),
@@ -22442,7 +22579,7 @@ impl App {
                 if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) {
                     w.focus_window();
                 }
-                self.on_occlusion_changed(wid, false);
+                self.on_occlusion_changed(wid, false, Instant::now());
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.on_modifiers_changed(wid, m.state());
@@ -22542,7 +22679,9 @@ impl App {
                 }
                 self.on_scale_factor_changed(wid, scale_factor);
             }
-            WindowEvent::Occluded(occluded) => self.on_occlusion_changed(wid, occluded),
+            WindowEvent::Occluded(occluded) => {
+                self.on_occlusion_changed(wid, occluded, Instant::now())
+            }
             WindowEvent::ThemeChanged(theme) => {
                 if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
                     let ws = &mut **route_guard_ws;
@@ -27175,7 +27314,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         clippy::disallowed_methods,
         reason = "compatibility entry delegates to the same window door"
     )]
-    main_entry_with_network(argv, first_run, None, None);
+    main_entry_with_network(argv, first_run, None, None, None);
 }
 
 /// A nonblocking read of a host-owned immutable network/service snapshot.
@@ -27185,6 +27324,12 @@ pub type NetworkSnapshotSource = Arc<
         + Send
         + Sync,
 >;
+
+/// A nonblocking read of how the host's services observer has derived
+/// (`aterm_db::service_state::ObservationHandle::derivations`, Unix), which asks it for no sample; only
+/// a network inspection reads it. `None` where no observer runs or its publication is held.
+pub type ServiceDerivationsSource =
+    Arc<dyn Fn() -> Option<aterm_db::service_derivations::Derivations> + Send + Sync>;
 
 /// What a [`NetworkSnapshotSource`] reader shows. Only a reader that shows the services'
 /// states (the band, its lens, the Lab page, a network inspection) asks for them, since a
@@ -27204,11 +27349,13 @@ pub use host_quit::install as install_host_quit;
 /// while its next start is owed; a live worker wakes the window when it ends.
 pub type HostMaintenance = Box<dyn FnMut() -> Option<Instant> + Send>;
 
-/// Window entry with an injected network observer; no provider runs in painting.
+/// Window entry with an injected network observer and the reader of its services' derivation
+/// counts; no provider runs in painting.
 pub fn main_entry_with_network(
     argv: Vec<std::ffi::OsString>,
     first_run: Option<fn() -> bool>,
     network_source: Option<NetworkSnapshotSource>,
+    service_derivations: Option<ServiceDerivationsSource>,
     maintenance: Option<HostMaintenance>,
 ) {
     #[cfg(target_os = "macos")]
@@ -28232,6 +28379,8 @@ pub fn main_entry_with_network(
         session_log_journal::admit(&config, desk, aterm_types::dirs::logs_dir),
         overlap_admitted,
     );
+    // After the journal's lane, whose append callback rings it, and before the first session.
+    describe::publish();
     crate::metrics::stamp_claim(crate::metrics::ClaimStamp::Journal);
     #[cfg(unix)]
     if overlap_admitted && let Some(parent) = incoming_exec_fds.parent_pid() {
@@ -28354,6 +28503,7 @@ pub fn main_entry_with_network(
     }
     presence::install_proxy(proxy.clone());
     claude_footer::install_proxy(proxy.clone());
+    host_facts::listen();
     notify::install_proxy(&proxy);
     #[cfg(target_os = "linux")]
     {
@@ -28636,6 +28786,7 @@ pub fn main_entry_with_network(
     })));
     let store = session_store::new_store();
     session_log_journal.start(store.clone());
+    describe::start(store.clone());
     if let Some(carried) = seamless_roster_seq {
         store
             .write()
@@ -28893,7 +29044,7 @@ pub fn main_entry_with_network(
     );
     // The first window's dock record and birth: its manifest row's, which a handoff carries
     // in its layout as a quit does (`WindowCarry` holds no dock).
-    (ws0.dock.pref, ws0.dock.birth) = restore::bootstrap_dock(
+    ws0.dock.take_bootstrap(
         restore_manifest.as_ref(),
         seamless_window
             .as_ref()
@@ -29221,6 +29372,7 @@ pub fn main_entry_with_network(
         lab_deck_feed: lab_deck::Feed::default(),
         network_source,
         network_source_busy,
+        service_derivations,
         network_next_poll: None,
         network_ride: network_deck::Ride::default(),
         network_inspected: None,

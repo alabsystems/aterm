@@ -101,6 +101,12 @@ pub(super) fn saved_google_session(
 /// What [`poll`] does with `target`'s mail, decided before it reads anything: [`poll`] acts on
 /// it, and [`MailboxConfig::reads_without_browser`] judges by it, so whether the mailbox is
 /// read and how are one decision. `S` is the saved Google session the loader gave.
+///
+/// The decision reveals nothing: where it turns on a password the lab registry holds it asks
+/// what that password holds ([`MailboxConfig::password_standing`]), and only a [`poll`] that
+/// signs in fetches the value ([`MailboxConfig::password_for`], one journalled reveal a
+/// discovery). The judge runs at every accounts upkeep; a reveal there journalled one row a
+/// pass, about two a minute on a Mac with one such row (ATERM-KI-1116-3478).
 pub(super) enum Plan<S> {
     /// [`poll`] answers nothing: the mailbox's other readers (its folder, IMAP, HTTP mailbox
     /// or the fleet's relay) read it.
@@ -114,14 +120,36 @@ pub(super) enum Plan<S> {
         imap: ParsedImapUrl,
         session: S,
     },
-    /// Gmail over IMAP, signed in to with a password.
-    GmailImap {
-        imap: ParsedImapUrl,
-        login: String,
-        password: String,
-    },
-    /// Proton's own API, signed in to with the mailbox's login and password.
-    Proton { login: String, password: String },
+    /// Gmail over IMAP, signed in to with a password: the one its URL carries, else the
+    /// mailbox's ([`gmail_password`]).
+    GmailImap { imap: ParsedImapUrl, login: String },
+    /// Proton's own API, signed in to with the mailbox's login and password
+    /// ([`proton_password`]).
+    Proton { login: String },
+}
+
+/// The password a [`Plan::GmailImap`] signs in with, whitespace removed (an app password is
+/// shown in groups): `None` where the plan's look found one and this read did not, as where
+/// the registry's cell changed between the two.
+fn gmail_password(
+    cfg: &MailboxConfig,
+    target: Option<&str>,
+    imap: &ParsedImapUrl,
+) -> Option<String> {
+    imap.password
+        .clone()
+        .or_else(|| cfg.password_for(target))
+        .map(|pw| {
+            pw.chars()
+                .filter(|ch| !ch.is_whitespace())
+                .collect::<String>()
+        })
+        .filter(|pw| !pw.is_empty())
+}
+
+/// The password a [`Plan::Proton`] signs in with: `None` as for [`gmail_password`].
+fn proton_password(cfg: &MailboxConfig, target: Option<&str>) -> Option<String> {
+    cfg.password_for(target).filter(|pw| !pw.trim().is_empty())
 }
 
 /// [`Plan`] for `target`'s mail in `source_cfg`, the saved Google grant loaded by `load` (an
@@ -158,9 +186,7 @@ pub(super) fn plan<S>(
         Ok(None) => {}
     }
     if managed_google_target(source_cfg, target).is_some()
-        && cfg
-            .password_for(target)
-            .is_none_or(|password| password.chars().all(char::is_whitespace))
+        && cfg.password_standing(target) != Some(true)
         && explicit_imap
             .as_deref()
             .and_then(parse_imap_url)
@@ -181,24 +207,15 @@ pub(super) fn plan<S>(
         else {
             return Plan::Defer;
         };
-        let Some(password) = imap
-            .password
-            .clone()
-            .or_else(|| cfg.password_for(target))
-            .map(|pw| {
-                pw.chars()
-                    .filter(|ch| !ch.is_whitespace())
-                    .collect::<String>()
-            })
-            .filter(|pw| !pw.is_empty())
-        else {
+        // As `gmail_password` reads it: the URL's own password decides where it has one.
+        let holds_password = match &imap.password {
+            Some(own) => !own.chars().all(char::is_whitespace),
+            None => cfg.password_standing(target) == Some(true),
+        };
+        if !holds_password {
             return Plan::Defer;
-        };
-        return Plan::GmailImap {
-            imap,
-            login,
-            password,
-        };
+        }
+        return Plan::GmailImap { imap, login };
     }
     let Some(url) = cfg.effective_webmail_url(target) else {
         return Plan::Defer;
@@ -206,14 +223,16 @@ pub(super) fn plan<S>(
     if !is_proton_webmail_url(&url) {
         return Plan::Defer;
     }
-    let (Some(login), Some(password)) = (
-        cfg.webmail_user_for(target)
-            .filter(|u| !u.trim().is_empty()),
-        cfg.password_for(target).filter(|pw| !pw.trim().is_empty()),
-    ) else {
+    let Some(login) = cfg
+        .webmail_user_for(target)
+        .filter(|u| !u.trim().is_empty())
+    else {
         return Plan::Defer;
     };
-    Plan::Proton { login, password }
+    if cfg.password_standing(target) != Some(true) {
+        return Plan::Defer;
+    }
+    Plan::Proton { login }
 }
 
 impl<S> Plan<S> {
@@ -317,11 +336,17 @@ pub(super) fn poll(
             )
             .map_err(expired),
         ),
-        Plan::GmailImap {
-            imap,
-            login,
-            password,
-        } => {
+        Plan::GmailImap { imap, login } => {
+            // The plan found a password with nothing revealed; this is the sign-in's one
+            // reveal. One that is gone by now (the cell changed, or its reveal could not be
+            // journalled) is answered as a plan that found none answers: a managed Google
+            // route is refused, any other is left to the mailbox's other readers. The URL
+            // holds no password here, or the read would have found it.
+            let Some(password) = gmail_password(cfg, target, &imap) else {
+                return managed_google_target(source_cfg, target)
+                    .is_some()
+                    .then_some(Err(GOOGLE_AUTH_MISSING));
+            };
             if deadline.left().is_err() {
                 return Some(Err(expiry_words));
             }
@@ -340,7 +365,10 @@ pub(super) fn poll(
                 .map_err(expired),
             )
         }
-        Plan::Proton { login, password } => {
+        Plan::Proton { login } => {
+            // As above; a plan that found no password leaves a Proton mailbox to its other
+            // readers.
+            let password = proton_password(cfg, target)?;
             if deadline.left().is_err() {
                 return Some(Err(expiry_words));
             }

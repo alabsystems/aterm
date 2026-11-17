@@ -8,9 +8,9 @@ use aterm_slog::journal::{
     complete_lines, decode_line, encode_frame, take, take_frames, view_of, view_picked,
 };
 use aterm_slog::{
-    Actor, CarryAdopt, CarryBudget, Close, Conf, Cursor, Fields, GapWhy, IdCounters, Key, Kind,
-    Limits, Log, Lvl, MAX_BYTES, MAX_RECORDS, Mark, Node, Op, Open, Out, Rec, RunOut, SessionOut,
-    ShortId, Src, TurnOut,
+    Actor, CarryAdopt, CarryBudget, Close, Conf, Cursor, DescIdent, Fields, GapWhy, IdCounters,
+    Key, Kind, Limits, Log, Lvl, MAX_BYTES, MAX_RECORDS, Mark, Node, Op, Open, Out, Rec, RunOut,
+    SessionOut, ShortId, Src, TurnOut,
 };
 use aterm_spec::rng::XorShift;
 
@@ -164,7 +164,14 @@ fn present_frames(tk: &aterm_slog::journal::Take, snap: bool, t: u64) -> Vec<Fra
 }
 
 pub(crate) fn view(chains: &[ChainRead]) -> View {
-    view_of(&sid(), chains, false, ViewRules::READER).expect("the session is in the journal")
+    view_of(
+        &sid(),
+        DescIdent::default(),
+        chains,
+        false,
+        ViewRules::READER,
+    )
+    .expect("the session is in the journal")
 }
 
 /// Every record a full read of `log` returns.
@@ -307,6 +314,7 @@ fn each_seq_is_shown_once_however_often_it_was_journaled() {
     assert_eq!(seqs, vec![1, 2, 3], "each seq once");
     let dup = view_of(
         &sid(),
+        DescIdent::default(),
         &chains,
         false,
         ViewRules {
@@ -369,6 +377,7 @@ fn a_dead_chain_reads_crash_closes_innermost_first() {
     }
     let open = view_of(
         &sid(),
+        DescIdent::default(),
         &[w.read(Liveness::Dead)],
         false,
         ViewRules {
@@ -464,6 +473,7 @@ fn a_pruned_prefix_and_an_unread_one_say_so() {
     for (unread, why) in [(false, GapWhy::Pruned), (true, GapWhy::Unread)] {
         let v = view_of(
             &sid(),
+            DescIdent::default(),
             std::slice::from_ref(&chain),
             unread,
             ViewRules::READER,
@@ -519,6 +529,7 @@ fn an_update_reads_once_across_both_chains_and_says_a_shortfall() {
                 ids: IdCounters::default(),
                 limits: Limits::SESSION,
                 at: at(50),
+                ident: aterm_slog::DescIdent::default(),
             },
         )
         .expect("carried");
@@ -571,6 +582,7 @@ fn the_journal_shows_the_relaunchs_own_open() {
         wb.pass(&b, 512);
         let v = view_of(
             &sid(),
+            DescIdent::default(),
             &[wa.read(Liveness::Dead), wb.read(Liveness::Live)],
             false,
             rules,
@@ -619,7 +631,16 @@ fn a_pick_before_the_relaunchs_log_answers_the_one_it_followed() {
     let mut wb = Writer::new("p2-bbbb", 100);
     wb.pass(&b, 512);
     let chains = [wa.read(Liveness::Dead), wb.read(Liveness::Live)];
-    let pick = |pick: Pick| view_picked(&sid(), &chains, false, ViewRules::READER, pick);
+    let pick = |pick: Pick| {
+        view_picked(
+            &sid(),
+            DescIdent::default(),
+            &chains,
+            false,
+            ViewRules::READER,
+            pick,
+        )
+    };
     let earlier = |recs: &[Rec]| {
         recs.len() == 7
             && recs.first().map(|r| r.k) == Some(Kind::Spawn)
@@ -666,7 +687,15 @@ fn a_pick_before_the_relaunchs_log_answers_the_one_it_followed() {
         ),
     ] {
         assert!(
-            view_picked(&sid(), &chains, false, ViewRules::READER, pick).is_none(),
+            view_picked(
+                &sid(),
+                DescIdent::default(),
+                &chains,
+                false,
+                ViewRules::READER,
+                pick
+            )
+            .is_none(),
             "{why}"
         );
     }
@@ -702,7 +731,16 @@ fn a_pick_of_a_log_its_process_was_killed_under_reads_the_crash() {
         chains[0].ended && !chains[1].ended,
         "PRECONDITION: the quit's chain ends, the kill's does not"
     );
-    let pick = |pick: Pick| view_picked(&sid(), &chains, false, ViewRules::READER, pick);
+    let pick = |pick: Pick| {
+        view_picked(
+            &sid(),
+            DescIdent::default(),
+            &chains,
+            false,
+            ViewRules::READER,
+            pick,
+        )
+    };
     let newest = pick(Pick::Newest).expect("the kill's relaunch's log");
     assert_eq!(newest.log.base_ep(), s + 2);
     assert!(!newest.crashed, "a live chain reads no crash");
@@ -792,6 +830,7 @@ fn a_handed_link_keeps_one_space_through_a_disagreement() {
             ids: IdCounters::default(),
             limits: Limits::SESSION,
             at: at(50),
+            ident: aterm_slog::DescIdent::default(),
         },
     )
     .expect("carried");
@@ -891,7 +930,8 @@ fn one_take_per_pass_never_invents_a_loss() {
         } else {
             ViewRules::READER
         };
-        let v = view_of(&sid(), &[w.read(live)], false, rules).expect("a view");
+        let v =
+            view_of(&sid(), DescIdent::default(), &[w.read(live)], false, rules).expect("a view");
         let mut wrong = Vec::new();
         let pruned: Vec<(u64, u64)> = v
             .log
@@ -1118,7 +1158,14 @@ fn a_read_that_missed_newer_lines_says_unread() {
     w.pass(&log, 512);
     let mut chain = w.read(Liveness::Unknown);
     chain.ended = false;
-    let v = view_of(&sid(), &[chain.clone()], true, ViewRules::READER).expect("a view");
+    let v = view_of(
+        &sid(),
+        DescIdent::default(),
+        &[chain.clone()],
+        true,
+        ViewRules::READER,
+    )
+    .expect("a view");
     let recs = all(&v.log);
     assert!(
         recs.iter()
@@ -1126,7 +1173,14 @@ fn a_read_that_missed_newer_lines_says_unread() {
         "{recs:?}"
     );
     assert!(!v.crashed);
-    let whole = view_of(&sid(), &[chain], false, ViewRules::READER).expect("a view");
+    let whole = view_of(
+        &sid(),
+        DescIdent::default(),
+        &[chain],
+        false,
+        ViewRules::READER,
+    )
+    .expect("a view");
     assert_eq!(all(&whole.log).len(), 1);
 }
 
@@ -1265,8 +1319,15 @@ fn a_cut_read_then_a_whole_one_skips_no_journaled_record() {
     let views = |rules: ViewRules| -> Vec<View> {
         let mut cut = w.read(Liveness::Unknown);
         cut.segments.truncate(1);
-        let first = view_of(&sid(), &[cut], true, rules).expect("a view");
-        let whole = view_of(&sid(), &[w.read(Liveness::Dead)], false, rules).expect("a view");
+        let first = view_of(&sid(), DescIdent::default(), &[cut], true, rules).expect("a view");
+        let whole = view_of(
+            &sid(),
+            DescIdent::default(),
+            &[w.read(Liveness::Dead)],
+            false,
+            rules,
+        )
+        .expect("a view");
         vec![first, whole]
     };
     let vs = views(ViewRules::READER);
@@ -1313,7 +1374,16 @@ fn a_growing_live_chain_read_twice_skips_no_journaled_record() {
     let views = |rules: ViewRules| -> Vec<View> {
         [&before, &after]
             .into_iter()
-            .map(|c| view_of(&sid(), std::slice::from_ref(c), false, rules).expect("a view"))
+            .map(|c| {
+                view_of(
+                    &sid(),
+                    DescIdent::default(),
+                    std::slice::from_ref(c),
+                    false,
+                    rules,
+                )
+                .expect("a view")
+            })
             .collect()
     };
     let vs = views(ViewRules::READER);
@@ -1414,7 +1484,13 @@ fn a_restatement_past_its_snaps_head_accounts_for_nothing() {
         start_t: 1,
     };
     let wrong = |rules: ViewRules| -> Vec<String> {
-        let Some(v) = view_of(&sid(), std::slice::from_ref(&chain), false, rules) else {
+        let Some(v) = view_of(
+            &sid(),
+            DescIdent::default(),
+            std::slice::from_ref(&chain),
+            false,
+            rules,
+        ) else {
             return vec!["no view".to_string()];
         };
         let mut wrong = Vec::new();
@@ -1491,8 +1567,14 @@ fn a_restatement_past_its_snaps_head_accounts_for_nothing() {
         if shape == "real-wins" {
             tail.push(rec(6, false));
         }
-        let kept = view_of(&sid(), &[prior.clone(), later], false, ViewRules::READER)
-            .expect("the two chains read");
+        let kept = view_of(
+            &sid(),
+            DescIdent::default(),
+            &[prior.clone(), later],
+            false,
+            ViewRules::READER,
+        )
+        .expect("the two chains read");
         let shown = all(&kept.log);
         for wanted in recs.iter().filter(|r| (4..=6).contains(&r.seq)) {
             let expected = host(wanted);
@@ -1642,7 +1724,13 @@ fn a_decoded_journal_seq_outside_the_logs_bound_is_refused_before_ranges() {
         });
         let chain = w.read(Liveness::Live);
         assert_eq!(chain.segments[0].frames.len(), 3, "all frames decoded");
-        view_of(&sid(), &[chain], false, ViewRules::READER)
+        view_of(
+            &sid(),
+            DescIdent::default(),
+            &[chain],
+            false,
+            ViewRules::READER,
+        )
     };
     let limit = aterm_slog::SEQ_LIMIT;
     let boundary = read(limit, limit, 1).expect("the inclusive limit is valid");

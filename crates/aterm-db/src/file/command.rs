@@ -5,7 +5,7 @@
 //! `aterm_file::cli`'s, which cannot open custody because their crate cannot reach this one;
 //! `refresh` is here, beside the materializer it runs, and the write verbs (`set`, `add`, `rm`,
 //! `revert`, `resolve`) beside the publisher they give two seconds (the private `write`
-//! module, which [`main_entry`] runs, and `super::rename_nick` for a rename of this Mac asked for
+//! module, which [`main_entry`] runs, and `super::rename` for a rename of this Mac asked for
 //! by name: each makes an owner act).
 
 use super::{
@@ -230,7 +230,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve"
         )]
         let said = write::verb(&paths, &config, &rest, &env);
-        return match said {
+        return match said.map(write::Wrote::printed) {
             Ok((text, code)) => aterm_uds::stdout::answer_exit(VERB, &text, code),
             Err(write::Refusal::Usage(why)) => usage(&why),
             Err(write::Refusal::Problem(why)) => {

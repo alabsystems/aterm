@@ -1489,12 +1489,27 @@ impl Fx {
     /// latched: it is the run's own answer, as a gh round trip's failure is).
     #[cfg(any(unix, test))]
     pub(crate) fn git(&self, spec: &child::ChildSpec, canonical: &[u8]) -> Result<child::ChildOut> {
+        self.git_observing(spec, canonical, None)
+    }
+
+    /// Preserve the native writer's durable child binding across the effect seam.
+    #[cfg(any(unix, test))]
+    pub(crate) fn git_observing(
+        &self,
+        spec: &child::ChildSpec,
+        canonical: &[u8],
+        record: Option<&dyn Fn(u32) -> Result<()>>,
+    ) -> Result<child::ChildOut> {
         let dispatch = || {
-            child::run_unless(spec, &mut || {
+            let mut stopped = || {
                 self.git_stop
                     .as_ref()
                     .is_some_and(|stop| stop.load(Ordering::Acquire))
-            })
+            };
+            match record {
+                Some(record) => child::run_observing(spec, &mut stopped, Some(record)),
+                None => child::run_unless(spec, &mut stopped),
+            }
         };
         match &self.seam {
             Seam::Live(_) => dispatch(),

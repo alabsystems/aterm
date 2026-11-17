@@ -63,8 +63,9 @@ fn claude_default_home_reads_dot_claude_json() {
 
 /// `CLAUDE_CONFIG_DIR` moves the profile into that directory: the default home's file is not
 /// what the process runs on.
-/// NEGATIVE CONTROL: with `login_record_of` reading `effective_of(&[], …)`, the default home's
-/// bronto is read: `` left: "brontosaurus…" right: "unicorn…" ``.
+/// NEGATIVE CONTROL (run while `profile::login_record_of` chose the stored login's profile): with
+/// that profile taken as `effective_of(&[], …)`, the default home's bronto is read:
+/// `` left: "brontosaurus…" right: "unicorn…" ``.
 #[test]
 fn claude_config_dir_wins() {
     let home = home("config");

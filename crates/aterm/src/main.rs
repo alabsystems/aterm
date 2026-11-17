@@ -317,13 +317,42 @@ fn machines_unavailable() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// `aterm secrets` where it cannot exist: the vault keeps its secrets private with POSIX file
-/// modes (a 0700 store of 0600 files), which Windows lacks, so `aterm-secrets` is a
-/// `cfg(unix)` dependency and the verb refuses by name (docs/DESIGN-secrets-2026-10-20.md §12).
-#[cfg(not(unix))]
+/// `aterm secrets` where the vault client does not build (every host but Unix and Windows): the
+/// verb stays on the roster and refuses by name (docs/DESIGN-secrets-2026-10-20.md §12).
+#[cfg(not(any(unix, windows)))]
 fn secrets_unavailable() -> ExitCode {
-    eprintln!("aterm secrets: not available on this platform (Unix only)");
+    eprintln!("aterm secrets: not available on this platform (Unix and Windows only)");
     ExitCode::FAILURE
+}
+
+/// `aterm secrets need` on Windows: its verbs read and write the lab's credential table, which
+/// aterm-db holds, and aterm-db builds on Unix only; `aterm secrets status` counts this PC's own
+/// needs.
+#[cfg(windows)]
+fn secrets_need_unavailable() -> ExitCode {
+    eprintln!(
+        "aterm secrets need: not available on Windows (the lab's credential table is aterm-db's, \
+         which builds on Unix only); aterm secrets status counts this PC's needs"
+    );
+    ExitCode::from(2)
+}
+
+/// `aterm members` where its verbs cannot run: a member's desk, its phrase and a joiner's proof
+/// travel the fleet port (`aterm-net`'s fleet membership, Unix only). A Windows PC joins with
+/// `aterm secrets join`, which asks the vault itself.
+#[cfg(not(unix))]
+fn members_unavailable(args: &[std::ffi::OsString]) -> ExitCode {
+    if args.first().is_some_and(|verb| verb == "join") {
+        eprintln!(
+            "aterm members join: not available on this platform: a joiner proves itself to ALab's \
+             members over the fleet port, which this platform neither dials nor serves yet; \
+             aterm secrets join asks the vault instead, where an admin Mac lets this PC in by its \
+             code"
+        );
+    } else {
+        eprintln!("aterm members: not available on this platform (Unix only)");
+    }
+    ExitCode::from(2)
 }
 
 /// `aterm node` where `systems.alab.aterm-node` cannot run (Unix only).
@@ -511,10 +540,15 @@ fn dispatch_node(forwarded: &[OsString]) -> ExitCode {
             quota_lifts::start();
             node_commons_startup().map(|startup| {
                 let startup = std::sync::Mutex::new(startup);
-                std::sync::Arc::new(move || {
-                    if let Ok(mut startup) = startup.try_lock() {
-                        let _ = startup.maintain();
+                std::sync::Arc::new(move || match startup.try_lock() {
+                    Ok(mut startup) => startup.maintain(),
+                    // Another caller holds it: look again at the job's old tick, so no wait
+                    // loses the deadline that caller's call names.
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        Some(std::time::Instant::now() + aterm_net::fleet::KEY_READ_EVERY)
                     }
+                    // A call that panicked ended this upkeep, as it always did.
+                    Err(std::sync::TryLockError::Poisoned(_)) => None,
                 }) as aterm_gui::NodeMaintenance
             })
         };
@@ -819,7 +853,7 @@ fn front_door_main(
     }
     // Before any vault path runs: the vault refuses every AI CLI's login file as an entry, as the
     // connector rows say where each keeps it (aterm-secrets cannot read them itself).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     aterm_secrets::text::on_cli_login(aterm_agent::ai::connector::login_file);
     // With the one mesh on, each durable table append and membership write of any aterm process
     // reaches the node service's egress (in-process there, by its wake socket elsewhere), which
@@ -1203,14 +1237,20 @@ fn front_door_main(
                 eprintln!("aterm status: not available on this platform (Unix and Windows only)");
                 ExitCode::from(2)
             }
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             aterm_cli::Verb::Secrets => {
                 let first = forwarded.first().and_then(|s| s.to_str());
                 if first == Some("need") {
                     // The need verbs read the lab's table, which aterm-db holds.
-                    forwarded.remove(0);
-                    return aterm_db::credentials::cli::main_entry(forwarded);
+                    #[cfg(unix)]
+                    {
+                        forwarded.remove(0);
+                        return aterm_db::credentials::cli::main_entry(forwarded);
+                    }
+                    #[cfg(windows)]
+                    return secrets_need_unavailable();
                 }
+                #[cfg(unix)]
                 if first == Some("service-repair") {
                     forwarded.remove(0);
                     return service_repair::run(forwarded);
@@ -1241,15 +1281,12 @@ fn front_door_main(
                 }
                 code
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             aterm_cli::Verb::Secrets => secrets_unavailable(),
             #[cfg(unix)]
             aterm_cli::Verb::Members => aterm_agent::members_cli::main_entry(forwarded),
             #[cfg(not(unix))]
-            aterm_cli::Verb::Members => {
-                eprintln!("aterm members: not available on this platform (Unix only)");
-                ExitCode::from(2)
-            }
+            aterm_cli::Verb::Members => members_unavailable(&forwarded),
             aterm_cli::Verb::Keeper => {
                 aterm_keeper::cli::main_entry(forwarded, aterm_stamp::app_version())
             }
@@ -1820,10 +1857,12 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let input_maintenance: Option<aterm_gui::HostMaintenance> = None;
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let (network_source, mut services) = ordinary
+    let (network_source, service_derivations, mut services) = ordinary
         .then(network_state_source)
         .flatten()
-        .map_or((None, None), |(source, startup)| (Some(source), startup));
+        .map_or((None, None, None), |(source, derivations, startup)| {
+            (Some(source), Some(derivations), startup)
+        });
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     let maintenance = if input_maintenance.is_some() || commons.is_some() || services.is_some() {
         Some(Box::new(move || {
@@ -1840,14 +1879,20 @@ fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> Ex
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let maintenance = input_maintenance;
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let network_source = None;
+    let (network_source, service_derivations) = (None, None);
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     aterm_gui::install_host_quit(commons_stop_at_quit);
     #[expect(
         clippy::disallowed_methods,
         reason = "the one window door: every window route reaches the GUI here"
     )]
-    aterm_gui::main_entry_with_network(args, first_run, network_source, maintenance);
+    aterm_gui::main_entry_with_network(
+        args,
+        first_run,
+        network_source,
+        service_derivations,
+        maintenance,
+    );
     ExitCode::SUCCESS
 }
 
@@ -2121,10 +2166,12 @@ fn start_commons_runtime(paths: aterm_secrets::client::Paths, config: &std::path
 }
 
 /// Join the independent producers, loading fallback history once before the GUI starts and
-/// retaining a failed service-owner start for the host's maintenance.
+/// retaining a failed service-owner start for the host's maintenance; with them, the reader of
+/// the service owner's derivation counts, which asks it for no sample.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn network_state_source() -> Option<(
     aterm_gui::NetworkSnapshotSource,
+    aterm_gui::ServiceDerivationsSource,
     Option<host_startup::Constructor>,
 )> {
     use std::sync::OnceLock;
@@ -2186,6 +2233,11 @@ fn network_state_source() -> Option<(
             },
             retained,
         ),
+        std::sync::Arc::new(|| {
+            SERVICES
+                .get()
+                .and_then(|services| services.observation().derivations())
+        }),
         startup,
     ))
 }

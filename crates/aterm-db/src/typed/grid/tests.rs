@@ -264,7 +264,11 @@ fn an_owner_edit_an_import_matched_meanwhile_is_still_written() {
     book.write(1, &book.all(), settled.rows.concat());
     let projection = cell::project(&MACHINE, &book.cells());
     assert!(matches!(
-        cell::import_step(projection.rows[MC].fields.get("status"), &json!("active")),
+        cell::import_step(
+            &MACHINE,
+            projection.rows[MC].fields.get("status"),
+            &json!("active")
+        ),
         cell::ImportStep::Finding(_)
     ));
 }
@@ -783,6 +787,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1320,6 +1325,101 @@ fn a_raw_text_set_shows_a_member_with_a_comma_as_one() {
         "{}",
         exported.text
     );
+}
+
+/// A version-1 account label outside the handle grammar (`Team A`: version 1's label was free
+/// text) reads raw under version 2's `Handle`, and stays the owner's to replace: the export shows
+/// it raw but not read-only, and a save that types a handle over it writes that handle over the
+/// candidate the export showed. A label a newer build wrote (at a version above this build's)
+/// stays read-only, and the save refuses an edit of it.
+/// NEGATIVE CONTROL: with `replaceable` answering `false`, the export marks the v1 label
+/// read-only: `` assertion failed: !seen(&ann).raw ``.
+#[test]
+fn an_older_builds_label_the_handle_type_refuses_is_the_owners_to_replace() {
+    let ann = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let bob = keys::account_pk("claude", "bob@example.invalid").unwrap();
+    let birth = |pk: &str, login: &str| {
+        vec![
+            put(&ACCOUNT, pk, "provider", json!("anthropic")),
+            put(&ACCOUNT, pk, "realm", json!("claude")),
+            put(
+                &ACCOUNT,
+                pk,
+                "login",
+                json!(keys::address_pk(login).unwrap()),
+            ),
+            put(&ACCOUNT, pk, "status", json!("active")),
+            put(&ACCOUNT, pk, "row", json!("live")),
+        ]
+    };
+    // As the build that wrote it stored it, unchecked by this build's type.
+    let label_at = |pk: &str, r: u32, text: &str| Change {
+        collection: ACCOUNT.name.to_owned(),
+        key: format!("{pk}.label"),
+        value: Some(CellValue::owner(r, json!(text)).encode()),
+    };
+    let mut book = Book::new();
+    let mut changes = birth(&ann, "ann@example.invalid");
+    changes.extend(birth(&bob, "bob@example.invalid"));
+    changes.push(label_at(&ann, 1, "Team A"));
+    changes.push(label_at(&bob, ACCOUNT.version + 1, "Team B"));
+    book.write(1, &[], changes);
+    let cells = book.cells();
+    let projection = cell::project(&ACCOUNT, &cells);
+    for pk in [&ann, &bob] {
+        assert!(projection.rows[pk].raw.contains("label"), "{pk}");
+    }
+    let exported = export(&REGISTRY, &ACCOUNT, &cells, &[]).unwrap();
+    let seen = |pk: &str| {
+        exported
+            .base
+            .rows
+            .iter()
+            .find(|(row, _)| row == pk)
+            .map(|(_, seen)| seen["label"].clone())
+            .unwrap()
+    };
+    assert_eq!(seen(&ann).shown, "\"Team A\"");
+    assert!(!seen(&ann).raw);
+    assert!(seen(&bob).raw);
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, &ann),
+        "label",
+        "team-a",
+    );
+    let plan = super::plan(&REGISTRY, &ACCOUNT, &exported.base, &saved, &no_birth).unwrap();
+    let edits: Vec<(&str, &str, &Value, &[Digest])> = plan
+        .rows
+        .iter()
+        .flat_map(|(_, edits)| edits)
+        .map(|edit| {
+            (
+                edit.pk.as_str(),
+                edit.column.as_str(),
+                &edit.x,
+                edit.expected.as_slice(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        edits,
+        [(
+            ann.as_str(),
+            "label",
+            &json!("team-a"),
+            seen(&ann).candidates.as_slice()
+        )]
+    );
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, &bob),
+        "label",
+        "team-b",
+    );
+    let problems = super::plan(&REGISTRY, &ACCOUNT, &exported.base, &saved, &no_birth).unwrap_err();
+    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(problems[0].rule.contains("newer build"), "{problems:?}");
 }
 
 /// A day shows as its date and reads back from it or from its number, on every surface that

@@ -48,6 +48,7 @@ fn a_client_is_read_while_connected_and_named_by_its_tab() {
             pid: 900,
             comm: Some("python3".to_string()),
             lineage: vec![(900, Some(900)), (800, Some(650)), (700, Some(700))],
+            cut: false,
         },
         "the lineage stops before pid 1"
     );
@@ -74,6 +75,49 @@ fn a_client_is_read_while_connected_and_named_by_its_tab() {
     assert_eq!(named(&gone, &[]).words, "pid 77");
     let unread = Who::client_with(None, 42, &parent, &group, &comm);
     assert_eq!(named(&unread, &[]).words, "a script");
+}
+
+/// A chain of parents longer than aterm reads is cut: a client 33 processes above launchd keeps
+/// the first 32, its last ancestor unread, and says so ([`Who::lineage_cut`]), through the
+/// process groups dropped too ([`Who::parent_chain`]).
+///
+/// CONTROL: a chain of 32 that ends at launchd and a chain whose parent could not be read are
+/// read whole, so neither is cut; nor is a caller with no lineage.
+#[test]
+fn a_lineage_longer_than_aterm_reads_is_cut() {
+    let chain = |top: i32| {
+        move |p: i32| match p {
+            1000..1032 if p < top => Some(p + 1),
+            _ if p == top => Some(1),
+            _ => None,
+        }
+    };
+    let deep = Who::client_with(Some(1000), 42, &chain(1032), &|_| None, &|_| None);
+    let Who::Process { lineage, .. } = &deep else {
+        panic!("a process: {deep:?}");
+    };
+    assert_eq!(lineage.len(), LINEAGE_MAX);
+    assert_eq!(lineage.last(), Some(&(1031, None)), "1032 is left unread");
+    assert!(deep.lineage_cut());
+    assert!(
+        deep.parent_chain().lineage_cut(),
+        "the parent chain keeps the cut"
+    );
+
+    let whole = Who::client_with(Some(1000), 42, &chain(1031), &|_| None, &|_| None);
+    assert!(!whole.lineage_cut(), "CONTROL: 32 deep, ending at launchd");
+    let unreadable = Who::client_with(
+        Some(9002),
+        42,
+        &|p| (p == 9002).then_some(4242),
+        &|_| None,
+        &|_| None,
+    );
+    assert!(
+        !unreadable.lineage_cut(),
+        "CONTROL: a parent aterm cannot read"
+    );
+    assert!(!Who::client_with(None, 42, &parent, &group, &comm).lineage_cut());
 }
 
 /// A DRIVER'S TYPING OUTLIVES aterm's OWN AFTER IT ([`TypedStamp::driven_ms`]): a lab's `/exit`
@@ -130,16 +174,30 @@ fn an_edge_is_who_presented_it_on_its_tab() {
         named(&edge(here, client(900)), &[]).words,
         "python3 (pid 900) on tab-3's edge"
     );
-    assert_eq!(
-        named(&edge("tfedcba9876", client(900)), &[]).words,
-        "python3 (pid 900) on tfedc's edge"
+    // An edge no tab names is named by its tab ID as it is shown (LT-20): its first five
+    // characters, longer while another ID this process knows shares them. The registry is the
+    // test binary's, which other tests' tabs (minted, adopted, restored) fill as they run, so
+    // the shown form is read from the one phrase itself, never from a second read of the
+    // registry another test can change between the two, and held to that rule.
+    let on_edge = |words: &str, who: &str, sid: &str| {
+        let shown = words
+            .strip_prefix(who)
+            .and_then(|rest| rest.strip_prefix(" on "))
+            .and_then(|rest| rest.strip_suffix("'s edge"))
+            .unwrap_or_else(|| panic!("{words:?} is not \"{who} on <tab>'s edge\""));
+        assert!(
+            shown.len() >= 5 && sid.starts_with(shown),
+            "{words:?}: {shown:?} is not {sid} as shown"
+        );
+    };
+    let away = "tfedcba9876";
+    on_edge(
+        &named(&edge(away, client(900)), &[]).words,
+        "python3 (pid 900)",
+        away,
     );
     let unread = Who::client_with(None, 42, &parent, &group, &comm);
-    assert_eq!(
-        Caller::new(edge(here, unread)).words(),
-        "a script on tqn5r's edge",
-        "unnamed"
-    );
+    on_edge(&Caller::new(edge(here, unread)).words(), "a script", here);
     assert_eq!(named(&Who::Bridge, &[(5, 700)]).words, "the message bus");
     let fleet = Who::Word("mini over the fleet".to_string());
     assert_eq!(named(&fleet, &[]).words, "mini over the fleet");

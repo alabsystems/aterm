@@ -220,9 +220,9 @@ mod unix {
         }
     }
 
-    /// The intent document (plan §8, body 12): fourteen sorted keys. The fingerprint and the
-    /// body digest are not printed. `closable` is `Journal::closable`: the next atomic write
-    /// closes this open intent rather than stopping on it.
+    /// The intent document (plan §8, body 12): fifteen sorted keys. The fingerprint and the
+    /// body digest are not printed. `closable` permits the next writer to
+    /// reconcile a dead writer from origin; it does not itself close an intent.
     pub(super) fn document(view: &IntentView, closable: bool) -> Value {
         let intent = &view.intent;
         let settled = view.settled.as_ref().map(|settled| match settled {
@@ -243,6 +243,12 @@ mod unix {
             .collect();
         let mut doc = Map::new();
         doc.insert("at_secs".into(), Value::from(intent.at_secs));
+        doc.insert(
+            "writer".into(),
+            intent.writer.as_ref().map_or(Value::Null, |writer| {
+                aterm_json::to_value(writer).expect("writer JSON")
+            }),
+        );
         doc.insert("closable".into(), Value::from(closable));
         doc.insert("grant".into(), Value::from(intent.grant.clone()));
         doc.insert("id".into(), Value::from(intent.id.as_str()));

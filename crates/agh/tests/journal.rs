@@ -234,3 +234,87 @@ fn two_journal_values_begin_one_permitted_write_once() {
     assert_eq!(open, [second]);
     assert!(fake.seen().is_empty(), "{:?}", fake.seen());
 }
+
+#[test]
+fn an_intent_records_its_writers_pid_start_and_boot() {
+    let root = common::scratch("writer-identity");
+    let fake = FakeGithub::start();
+    common::canonical_repos(&fake);
+    let (_, gh) = client(root.path(), &fake);
+    let journal = gh.journal(&common::slug("fixture-dev/app")).unwrap();
+    let id = journal
+        .begin(&draft("fixture-dev/app", &dev_permit(&gh), "writer"))
+        .unwrap();
+    let intent = journal.view(&id).unwrap().unwrap().intent;
+    let writer = intent.writer.as_ref().unwrap();
+    assert_eq!(*writer, agh::journal::IntentWriter::current().unwrap());
+    assert_eq!(writer.frontend().pid, std::process::id());
+    let record = journal::JournalRecord::Intent(Box::new(intent));
+    let encoded = journal::encode(&record);
+    assert_eq!(journal::decode(0, id.step(), &encoded).unwrap(), record);
+    let mut legacy: aterm_json::Value = aterm_json::from_slice(&encoded).unwrap();
+    legacy.as_object_mut().unwrap().remove("writer");
+    legacy.as_object_mut().unwrap().remove("refs");
+    let old = journal::decode(0, id.step(), legacy.to_string().as_bytes()).unwrap();
+    let journal::JournalRecord::Intent(old) = old else {
+        panic!("intent")
+    };
+    assert!(old.writer.is_none());
+    assert!(old.refs.is_empty());
+
+    journal.writer_child(&id, std::process::id()).unwrap();
+    let held = journal.view(&id).unwrap().unwrap();
+    assert_eq!(
+        match held.intent.writer.unwrap() {
+            agh::journal::IntentWriter::Tracked { git, .. } => git,
+            agh::journal::IntentWriter::Legacy { .. } =>
+                panic!("new writes must record child custody"),
+        },
+        agh::journal::WriterProcess::read(std::process::id())
+    );
+    let records = journal.read().unwrap().0;
+    let child = &records.last().unwrap().1;
+    let encoded = journal::encode(child);
+    assert_eq!(journal::decode(0, 1, &encoded).unwrap(), *child);
+    let mut older: aterm_json::Value = aterm_json::from_slice(&encoded).unwrap();
+    older.as_object_mut().unwrap().remove("writer_child");
+    assert!(matches!(
+        journal::decode(0, 1, older.to_string().as_bytes()).unwrap(),
+        journal::JournalRecord::Observed { found: None, .. }
+    ));
+
+    // Persistence failure must not release the actual native child to execute.
+    let _helper = common::helper();
+    let proof = root.path().join("child-ran");
+    let run = || {
+        let mut command = aterm_uds::spawnfd::command("/usr/bin/touch");
+        command.arg(&proof);
+        command
+    };
+    let result = aterm_uds::deadline::output_from_journaled(
+        &mut run(),
+        aterm_uds::spawnfd::Stdio::null(),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        None,
+        &mut || false,
+        &|_| Err(std::io::Error::other("injected persistence failure")),
+    );
+    assert!(result.is_err());
+    assert!(!proof.exists());
+    let result = aterm_uds::deadline::output_from_journaled(
+        &mut run(),
+        aterm_uds::spawnfd::Stdio::null(),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+        None,
+        &mut || false,
+        &|pid| {
+            assert!(!proof.exists(), "child still held before exec");
+            journal
+                .writer_child(&id, pid)
+                .map_err(|e| std::io::Error::other(e.why.clone()))
+        },
+    )
+    .unwrap();
+    assert!(result.status.success());
+    assert!(proof.exists());
+}

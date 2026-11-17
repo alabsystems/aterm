@@ -3,9 +3,18 @@
 
 //! Metadata-only service observations for Network State. These reads never
 //! activate an account, disclose a credential, or claim fleet convergence.
+//!
+//! Each service's standing (what its availability, detail, revision and counts are read from)
+//! is kept between samples under the stamps of the files it was read from, and given again,
+//! stamped with the sample's own times, while they stand ([`Observer`]): the secrets one by
+//! [`Reader`], the accounts one by [`kept`]. A standing is a face, a count or a blocker: never a
+//! value, a record or anything decrypted.
 
 use aterm_secrets::{
-    client::{self, Membership, Paths},
+    client::{
+        self, Paths,
+        service_reading::{self, Face, Reader, Reading, Standing},
+    },
     commons,
 };
 use aterm_types::network_state::{
@@ -66,10 +75,13 @@ impl Sample {
 pub struct Publication {
     accounts: Sample,
     secrets: Sample,
+    /// How the [`Observer`] that took this sample had derived by its end, this sample included
+    /// ([`Observer::derivations`]); all zero in a publication no observer took ([`Self::new`]).
+    derivations: Derivations,
 }
 
 impl Publication {
-    /// Both services as sampled together at one instant.
+    /// Both services as sampled together at one instant, by no [`Observer`].
     pub fn new(states: ServiceStates, sampled_at: Instant) -> Self {
         Self {
             accounts: Sample {
@@ -80,6 +92,7 @@ impl Publication {
                 state: states.secrets,
                 sampled_at,
             },
+            derivations: Derivations::default(),
         }
     }
 
@@ -140,6 +153,18 @@ impl ObservationHandle {
         }
     }
 
+    /// How the worker's [`Observer`] had derived by the last sample published through this handle
+    /// (all zero before the first), or none while another holds the publication (the worker
+    /// replacing it, a reader copying it). Unlike [`Self::try_publication`] it asks for no sample, so a
+    /// diagnostic that reads it never keeps the services observed.
+    pub fn derivations(&self) -> Option<Derivations> {
+        match self.0.publication.try_lock() {
+            Ok(publication) => Some(publication.derivations),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner().derivations),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+
     /// Ask for a sample, waking the worker only for the first ask since its last sample began.
     /// The worker clears `asked` with a swap too, so of an ask and its check one sees the other.
     fn ask(&self) {
@@ -169,18 +194,102 @@ fn sample_with(
     Publication {
         accounts: sampled(&clock, read_accounts),
         secrets: sampled(&clock, read_secrets),
+        derivations: Derivations::default(),
+    }
+}
+
+pub use crate::service_derivations::{Derivations, Part};
+
+/// The services' observer of one home: each service's standing kept between its samples, owned
+/// by the one worker that samples (or a one-sample reader), never by the process. Several
+/// observers in one process (a test's, a CLI sample's) never see each other's.
+pub struct Observer {
+    paths: Paths,
+    config: PathBuf,
+    secrets: Reader,
+    accounts: Option<kept::KeptAccounts>,
+    derivations: Derivations,
+}
+
+impl Observer {
+    /// An observer of the services of the home at `paths`, the sharing policy read from
+    /// `config`, with nothing kept.
+    #[must_use]
+    pub fn new(paths: Paths, config: PathBuf) -> Self {
+        Self {
+            secrets: Reader::new(paths.clone()),
+            paths,
+            config,
+            accounts: None,
+            derivations: Derivations::default(),
+        }
+    }
+
+    /// One sample: each service's standing kept or derived, stamped with this sample's clocks.
+    pub fn sample(&mut self) -> Publication {
+        self.sample_with(|| (Instant::now(), aterm_time::unix_millis()))
+    }
+
+    /// [`Self::sample`] on `clock`, which each service's sample reads just before its own read
+    /// ([`sample_with`]). The publication carries [`Self::derivations`] as they stand after it.
+    fn sample_with(&mut self, clock: impl Fn() -> (Instant, Option<u64>)) -> Publication {
+        let Self {
+            paths,
+            config,
+            secrets,
+            accounts,
+            derivations,
+        } = self;
+        let mut accounts_derived = (false, None);
+        let mut secrets_derived = (false, None);
+        let mut publication = sample_with(
+            clock,
+            |wall| {
+                let sampled = kept::sample(accounts, paths, config, wall);
+                accounts_derived = (sampled.derived, sampled.moved);
+                sampled.state
+            },
+            |wall| {
+                let reading = secrets.read();
+                secrets_derived = (
+                    reading.derived,
+                    reading.moved.map(|moved| match moved {
+                        service_reading::Moved::Vault => Part::Vault,
+                    }),
+                );
+                secrets_state(&reading, wall)
+            },
+        );
+        Derivations::count(
+            &mut derivations.accounts,
+            &mut derivations.moved,
+            accounts_derived.0,
+            accounts_derived.1,
+        );
+        Derivations::count(
+            &mut derivations.secrets,
+            &mut derivations.moved,
+            secrets_derived.0,
+            secrets_derived.1,
+        );
+        derivations.samples = derivations.samples.saturating_add(1);
+        publication.derivations = *derivations;
+        publication
+    }
+
+    /// How many samples this observer took, and how many of them derived each service's standing.
+    #[must_use]
+    pub const fn derivations(&self) -> Derivations {
+        self.derivations
     }
 }
 
 /// Read service metadata off the window thread, each service's sample starting just before its
-/// own potentially slow read. Existing table reads use the ordinary authenticated Commons custody
-/// path; no application table is created.
+/// own potentially slow read: one sample of a fresh [`Observer`], which derives both. Existing
+/// table reads use the ordinary authenticated Commons custody path; no application table is
+/// created.
 pub fn observe_publication(paths: &Paths, config: &Path) -> Publication {
-    sample_with(
-        || (Instant::now(), aterm_time::unix_millis()),
-        |wall| accounts(paths, config, wall),
-        |wall| secrets(paths, wall),
-    )
+    Observer::new(paths.clone(), config.to_path_buf()).sample()
 }
 
 fn state(availability: ServiceAvailability, now_ms: u64, detail: &str) -> ServiceState {
@@ -215,65 +324,58 @@ fn out_of_time(now_ms: u64) -> ServiceState {
     )
 }
 
-fn secrets(paths: &Paths, now_ms: u64) -> ServiceState {
-    secrets_reading_refresh(paths, now_ms, client::observe_network_refresh)
-}
-
-fn secrets_reading_refresh(
-    paths: &Paths,
-    now_ms: u64,
-    refresh: impl FnOnce(
-        &Paths,
-        &client::Config,
-    ) -> aterm_secrets::Result<Option<client::VaultNetworkRefresh>>,
-) -> ServiceState {
-    let status = match client::status(paths) {
-        Ok(status) => status,
-        Err(_) => {
+/// What Network State shows of the secrets service for `reading`, observed at `now_ms`: each
+/// [`Standing`] as the sample has always shown what its read found, and the receipts as the
+/// reading gives them. A ready vault shows its materialization receipt, a configured one its 204
+/// response and refresh outcome, and one whose receipts could not be read a refresh history that
+/// could not be read. A writer holding the state lock leaves the receipts last read
+/// ([`Reading::receipts`]).
+fn secrets_state(reading: &Reading, now_ms: u64) -> ServiceState {
+    let mut result = match reading.standing {
+        Standing::Unreadable => {
             return failed_observation(now_ms, "Local vault metadata could not be read");
         }
-    };
-    let Some(config) = &status.config else {
-        return secret_metadata(&status.membership, false, status.names.len(), now_ms);
-    };
-    let mut result = match client::observe_materialization(paths, config, || client::status(paths))
-    {
-        Ok(client::MaterializationObservation::Ready(held)) => {
-            let mut result = secret_metadata(
-                &held.inputs.membership,
-                true,
-                held.inputs.names.len(),
-                now_ms,
-            );
-            result.network_materialization =
-                held.snapshot.network_materialization().map(|receipt| {
-                    VaultNetworkMaterialization {
-                        source: match receipt.source() {
-                            client::VaultNetworkSource::ConfiguredUrl => {
-                                VaultNetworkSource::ConfiguredUrl
-                            }
-                            client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
-                        },
-                        sequence: receipt.sequence(),
-                        sampled_at_ms: receipt.sampled_at_ms(),
-                    }
+        Standing::Unconfigured {
+            membership,
+            entries,
+        } => return secret_metadata(membership, false, entries, now_ms),
+        Standing::Ready {
+            membership,
+            entries,
+        } => {
+            let mut result = secret_metadata(membership, true, entries, now_ms);
+            result.network_materialization = reading
+                .receipts
+                .and_then(|receipts| receipts.materialization)
+                .map(|receipt| VaultNetworkMaterialization {
+                    source: match receipt.source() {
+                        client::VaultNetworkSource::ConfiguredUrl => {
+                            VaultNetworkSource::ConfiguredUrl
+                        }
+                        client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
+                    },
+                    sequence: receipt.sequence(),
+                    sampled_at_ms: receipt.sampled_at_ms(),
                 });
             result
         }
-        Ok(client::MaterializationObservation::Blocked(reason)) => secret_blocker(reason, now_ms),
-        Err(_) => failed_observation(now_ms, "Local vault cache could not be verified"),
+        Standing::Blocked(reason) => secret_blocker(reason, now_ms),
+        Standing::Unverified => {
+            failed_observation(now_ms, "Local vault cache could not be verified")
+        }
     };
-    result.http204_response = client::observe_http204_response(paths, config)
-        .ok()
-        .flatten()
-        .map(|response| VaultHttp204Response {
-            source: match response.source() {
-                client::VaultNetworkSource::ConfiguredUrl => VaultNetworkSource::ConfiguredUrl,
-                client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
-            },
-            responded_at_ms: response.responded_at_ms(),
-        });
-    match refresh(paths, config) {
+    let (http204, refresh) = match reading.receipts {
+        Some(receipts) => (receipts.http204, Ok(receipts.refresh)),
+        None => (None, Err(())),
+    };
+    result.http204_response = http204.map(|response| VaultHttp204Response {
+        source: match response.source() {
+            client::VaultNetworkSource::ConfiguredUrl => VaultNetworkSource::ConfiguredUrl,
+            client::VaultNetworkSource::PeerUrl => VaultNetworkSource::PeerUrl,
+        },
+        responded_at_ms: response.responded_at_ms(),
+    });
+    match refresh {
         Ok(refresh) => {
             result.network_refresh = refresh.map(|refresh| VaultNetworkRefresh {
                 completed_at_ms: refresh.completed_at_ms(),
@@ -290,7 +392,7 @@ fn secrets_reading_refresh(
                 .network_refresh
                 .is_some_and(|refresh| refresh.outcome == VaultNetworkRefreshOutcome::Failed);
         }
-        Err(_) => {
+        Err(()) => {
             result.refresh_failed = true;
             result
                 .detail
@@ -348,34 +450,29 @@ fn secret_blocker(reason: client::MaterializationBlocker, now_ms: u64) -> Servic
     state(availability, now_ms, detail)
 }
 
-fn secret_metadata(
-    membership: &Membership,
-    ready: bool,
-    entries: usize,
-    now_ms: u64,
-) -> ServiceState {
+fn secret_metadata(membership: Face, ready: bool, entries: usize, now_ms: u64) -> ServiceState {
     match membership {
-        Membership::Unconfigured => state(
+        Face::Unconfigured => state(
             ServiceAvailability::Unavailable,
             now_ms,
             "No secrets vault configured",
         ),
-        Membership::Pending => state(
+        Face::Pending => state(
             ServiceAvailability::Unavailable,
             now_ms,
             "Vault admission is pending",
         ),
-        Membership::Revoked { .. } => state(
+        Face::Revoked => state(
             ServiceAvailability::Unavailable,
             now_ms,
             "Vault membership is revoked",
         ),
-        Membership::Plain => state(
+        Face::Plain => state(
             ServiceAvailability::Unknown,
             now_ms,
             "Local unsigned source; shared vault access is unverified",
         ),
-        Membership::In { seq, .. } => {
+        Face::In { seq } => {
             let mut result = if ready && entries > 0 {
                 state(
                     ServiceAvailability::Cached,
@@ -403,11 +500,15 @@ fn secret_metadata(
     }
 }
 
-pub(crate) fn accounts(paths: &Paths, config: &Path, now_ms: u64) -> ServiceState {
-    // This observer runs off the window thread. Give an active local batch the short admission
-    // time to release custody, and let the read go on until its sample would no longer be current.
-    let read_by = Instant::now() + CURRENT_FOR;
-    accounts_until(paths, config, now_ms, &crate::admission::deadline, read_by)
+/// Whether an accounts read's answer is one the same files give again ([`accounts_until`]): a
+/// finding of the files, or a moment's (a holder met, the read's own time spent, a read that
+/// failed), which a keeper never keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// What the files hold: a blocker they show, or the counts they hold.
+    Yes,
+    /// [`control_busy`], [`out_of_time`], [`failed_observation`], or Commons busy.
+    No,
 }
 
 /// Two bounds for two things. `wait` is asked as each stage that waits for a holder starts, and
@@ -424,15 +525,19 @@ pub(crate) fn accounts(paths: &Paths, config: &Path, now_ms: u64) -> ServiceStat
 /// is the session, so a read past that finishes. Either way a finished read is true however late
 /// it finished: a sample starts ageing when it is taken ([`Sample`]), so one read too slowly just
 /// shows as no longer current.
+///
+/// The read's answer comes with whether it is settled ([`Settled`]): what the files show (a
+/// blocker of theirs, or the counts) is; a holder met, the read's own time spent, a read that
+/// failed and Commons busy are not.
 pub(crate) fn accounts_until(
     paths: &Paths,
     config: &Path,
     now_ms: u64,
     wait: &dyn Fn() -> Instant,
     read_by: Instant,
-) -> ServiceState {
+) -> (ServiceState, Settled) {
     // A holder or the read's own time stopped it short, so it learned nothing. Any other
-    // error is a finding.
+    // error is shown as a failed observation.
     let stopped = |error: &crate::Error| {
         if error.is_busy() {
             Some(control_busy(now_ms))
@@ -447,39 +552,63 @@ pub(crate) fn accounts_until(
     let selected = match crate::generation::observed_generation_until(paths, read_by) {
         Ok(paths) => paths,
         Err(error) => {
-            return stopped(&error).unwrap_or_else(|| {
-                failed_observation(now_ms, "Commons writer recovery is pending")
-            });
+            return (
+                stopped(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Commons writer recovery is pending")
+                }),
+                Settled::No,
+            );
         }
     };
     let paths = &selected;
     // Sampled each 10 s while read, whatever it finds: unchanged vault files keep the last
     // observation.
     match commons::observe_settled(paths) {
+        Ok(commons::Observation::Unavailable(commons::Unavailable::Busy)) => {
+            return (
+                state(
+                    ServiceAvailability::Unknown,
+                    now_ms,
+                    commons::Unavailable::Busy.explanation(),
+                ),
+                Settled::No,
+            );
+        }
         Ok(commons::Observation::Unavailable(reason)) => {
-            let availability = if matches!(reason, commons::Unavailable::Busy) {
-                ServiceAvailability::Unknown
-            } else {
-                ServiceAvailability::Unavailable
-            };
-            return state(availability, now_ms, reason.explanation());
+            return (
+                state(
+                    ServiceAvailability::Unavailable,
+                    now_ms,
+                    reason.explanation(),
+                ),
+                Settled::Yes,
+            );
         }
         Err(_) => {
-            return failed_observation(now_ms, "Commons access could not be verified");
+            return (
+                failed_observation(now_ms, "Commons access could not be verified"),
+                Settled::No,
+            );
         }
         Ok(commons::Observation::Visible(_)) => {}
     }
     // Do not let observing an uninitialized service create its catalog or table.
     match paths.dir.join("commons/tables").try_exists() {
         Ok(false) => {
-            return state(
-                ServiceAvailability::Unavailable,
-                now_ms,
-                "Commons table storage not retained locally; harness rosters are separate",
+            return (
+                state(
+                    ServiceAvailability::Unavailable,
+                    now_ms,
+                    "Commons table storage not retained locally; harness rosters are separate",
+                ),
+                Settled::Yes,
             );
         }
         Err(_) => {
-            return failed_observation(now_ms, "Retained catalog storage could not be inspected");
+            return (
+                failed_observation(now_ms, "Retained catalog storage could not be inspected"),
+                Settled::No,
+            );
         }
         Ok(true) => {}
     }
@@ -488,9 +617,12 @@ pub(crate) fn accounts_until(
         match commons::bootstrap::Bootstrap::established_with_journal_until(paths, wait()) {
             Ok(established) => established,
             Err(error) => {
-                return stopped(&crate::table::failure(error)).unwrap_or_else(|| {
-                    failed_observation(now_ms, "Commons custody could not be verified")
-                });
+                return (
+                    stopped(&crate::table::failure(error)).unwrap_or_else(|| {
+                        failed_observation(now_ms, "Commons custody could not be verified")
+                    }),
+                    Settled::No,
+                );
             }
         };
     let directory = crate::catalog::Directory::new(paths, bootstrap.trust());
@@ -502,7 +634,10 @@ pub(crate) fn accounts_until(
     ) {
         Ok(descriptor) => descriptor,
         Err(_) => {
-            return failed_observation(now_ms, "Account catalog identity is unavailable");
+            return (
+                failed_observation(now_ms, "Account catalog identity is unavailable"),
+                Settled::No,
+            );
         }
     };
     #[cfg(test)]
@@ -512,18 +647,24 @@ pub(crate) fn accounts_until(
     let selection = match crate::generation::observe_generation(bootstrap.paths(), read_by, wait) {
         Ok(selection) => selection,
         Err(error) => {
-            return stopped(&error).unwrap_or_else(|| {
-                failed_observation(now_ms, "Commons writer recovery is pending")
-            });
+            return (
+                stopped(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Commons writer recovery is pending")
+                }),
+                Settled::No,
+            );
         }
     };
     let session =
         match crate::table::Session::observe_selected(&bootstrap, journal, selection, read_by) {
             Ok(session) => session,
             Err(error) => {
-                return stopped(&error).unwrap_or_else(|| {
-                    failed_observation(now_ms, "Account access could not be verified")
-                });
+                return (
+                    stopped(&error).unwrap_or_else(|| {
+                        failed_observation(now_ms, "Account access could not be verified")
+                    }),
+                    Settled::No,
+                );
             }
         };
     #[cfg(test)]
@@ -544,9 +685,12 @@ pub(crate) fn accounts_until(
     let catalog = match directory.observe_with_config(&session, config) {
         Ok(catalog) => catalog,
         Err(error) => {
-            return stale(&error).unwrap_or_else(|| {
-                failed_observation(now_ms, "Shared catalog metadata could not be read")
-            });
+            return (
+                stale(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Shared catalog metadata could not be read")
+                }),
+                Settled::No,
+            );
         }
     };
     let blocker = match catalog.entries.get(&descriptor.scope.digest()) {
@@ -572,23 +716,32 @@ pub(crate) fn accounts_until(
         },
     };
     if let Some(blocker) = blocker {
-        return state(ServiceAvailability::Unavailable, now_ms, blocker);
+        return (
+            state(ServiceAvailability::Unavailable, now_ms, blocker),
+            Settled::Yes,
+        );
     }
     let store = match directory.path(descriptor.scope).and_then(|path| {
         crate::table::store::Store::observe_if_exists(&session, &path, descriptor.scope)
     }) {
         Ok(Some(store)) => store,
         Ok(None) => {
-            return state(
-                ServiceAvailability::Unavailable,
-                now_ms,
-                "Account proposals not retained locally; harness rosters are separate",
+            return (
+                state(
+                    ServiceAvailability::Unavailable,
+                    now_ms,
+                    "Account proposals not retained locally; harness rosters are separate",
+                ),
+                Settled::Yes,
             );
         }
         Err(error) => {
-            return stale(&error).unwrap_or_else(|| {
-                failed_observation(now_ms, "Retained account storage could not be opened")
-            });
+            return (
+                stale(&error).unwrap_or_else(|| {
+                    failed_observation(now_ms, "Retained account storage could not be opened")
+                }),
+                Settled::No,
+            );
         }
     };
     #[cfg(test)]
@@ -597,9 +750,12 @@ pub(crate) fn accounts_until(
         match crate::accounts::proposals::Proposals::snapshot_from_store(&session, &store) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                return stale(&error).unwrap_or_else(|| {
-                    failed_observation(now_ms, "Retained account records could not be read")
-                });
+                return (
+                    stale(&error).unwrap_or_else(|| {
+                        failed_observation(now_ms, "Retained account records could not be read")
+                    }),
+                    Settled::No,
+                );
             }
         };
     let counts = account_counts(&snapshot.cells);
@@ -616,7 +772,7 @@ pub(crate) fn accounts_until(
         "{} operations retained; {} withheld",
         snapshot.retained, snapshot.withheld
     ));
-    result
+    (result, Settled::Yes)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -693,12 +849,25 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// The runtime of the home at `paths`, whose worker samples with one [`Observer`] for its
+    /// life, so each sample gives again each standing whose files stand.
     pub fn start(paths: Paths, config: PathBuf) -> crate::Result<Self> {
-        Self::start_with(
-            move || observe_publication(&paths, &config),
-            EVERY,
-            park_until,
-        )
+        Self::observing(paths, config, EVERY)
+    }
+
+    /// [`Self::start`] with its worker resting `every` after each sample in place of [`EVERY`]:
+    /// for another crate's law that takes several samples of one runtime.
+    #[cfg(any(test, debug_assertions))]
+    #[doc(hidden)]
+    pub fn start_resting(paths: Paths, config: PathBuf, every: Duration) -> crate::Result<Self> {
+        Self::observing(paths, config, every)
+    }
+
+    /// The runtime whose worker samples with one [`Observer`] of `paths` and `config` for its
+    /// life, resting `every`.
+    fn observing(paths: Paths, config: PathBuf, every: Duration) -> crate::Result<Self> {
+        let mut observer = Observer::new(paths, config);
+        Self::start_with(move || observer.sample(), every, park_until)
     }
 
     /// The runtime over `observe`, resting `every`, its worker waiting with `wait` ([`serve`]):
@@ -736,6 +905,8 @@ impl Drop for Runtime {
         }
     }
 }
+
+mod kept;
 
 #[cfg(test)]
 #[path = "service_state_tests.rs"]

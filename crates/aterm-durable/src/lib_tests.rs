@@ -101,6 +101,65 @@ fn directory_faults_preserve_strength_restore_nesting_and_stay_on_their_thread()
 }
 
 #[test]
+fn held_directory_flush_rejects_a_regular_file_without_recording_a_flush() {
+    let dir = scratch();
+    let file = std::fs::File::create(dir.path().join("file")).unwrap();
+    let recorded = seam::Recording::start();
+    let _failure = seam::FailingDirs::with(seam::EIO);
+    for flush in [Flush::Durable, Flush::Ordered] {
+        assert_eq!(
+            flush.dir_held(&file).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    assert_eq!(recorded.take(), []);
+    assert_eq!(recorded.take_plain(), 0);
+}
+
+#[cfg(unix)]
+fn held_directory_with_replaced_name() -> (aterm_tempfile::TempDir, std::fs::File) {
+    let dir = scratch();
+    let original = dir.path().join("directory");
+    std::fs::create_dir(&original).unwrap();
+    let held = std::fs::File::open(&original).unwrap();
+    std::fs::rename(&original, dir.path().join("moved-directory")).unwrap();
+    std::fs::write(&original, b"replacement regular file").unwrap();
+    assert!(original.is_file());
+    assert!(held.metadata().unwrap().is_dir());
+    (dir, held)
+}
+
+#[cfg(unix)]
+#[test]
+fn held_directory_flush_keeps_its_descriptor_and_records_each_strength_once() {
+    let (_dir, held) = held_directory_with_replaced_name();
+    let recorded = seam::Recording::start();
+    for flush in [Flush::Durable, Flush::Ordered] {
+        flush.dir_held(&held).unwrap();
+    }
+    assert_eq!(recorded.take(), [Flush::Durable, Flush::Ordered]);
+    assert_eq!(recorded.take_plain(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn held_directory_flush_preserves_refusal_and_io_error_for_each_strength() {
+    let (_dir, held) = held_directory_with_replaced_name();
+    let recorded = seam::Recording::start();
+    for flush in [Flush::Durable, Flush::Ordered] {
+        for errno in [seam::ENOTSUP, seam::EIO] {
+            let _failure = seam::FailingDirs::with(errno);
+            assert_eq!(
+                flush.dir_held(&held).unwrap_err().raw_os_error(),
+                Some(errno)
+            );
+            assert_eq!(recorded.take(), [flush]);
+            assert_eq!(recorded.take_plain(), 0);
+        }
+    }
+}
+
+#[test]
 fn the_seam_names_the_flush_each_operation_asked_for() {
     let dir = scratch();
     let mut file = std::fs::File::create(dir.path().join("f")).unwrap();

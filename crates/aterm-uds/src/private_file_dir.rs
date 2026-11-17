@@ -78,7 +78,7 @@ impl PrivateDirectory {
     /// # Errors
     /// Admission, opening or locking fails, including contention past the deadline.
     pub fn lock(&self, name: &str, within: Duration, busy: &str) -> io::Result<PrivateLock> {
-        let file = self.view()?.lock_file(name)?;
+        let file = self.view()?.open_lock(name)?;
         crate::file_lock::lock_exclusive_with_deadline(
             &file,
             Instant::now().checked_add(within),
@@ -93,7 +93,7 @@ impl PrivateDirectory {
     /// # Errors
     /// Admission, opening or locking fails.
     pub fn wait_lock(&self, name: &str, held: impl FnOnce()) -> io::Result<PrivateLock> {
-        let file = self.view()?.lock_file(name)?;
+        let file = self.view()?.open_lock(name)?;
         match crate::file_lock::lock_exclusive_until(&file, Instant::now(), "held") {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -122,7 +122,11 @@ impl DirectoryView<'_> {
         })
     }
 
-    fn lock_file(&self, name: &str) -> io::Result<File> {
+    /// Open or create a singly linked owner-private regular lock file in this directory.
+    /// This takes no lock; the caller supplies its guard and obtains a fresh view after waiting.
+    /// # Errors
+    /// The name, opening, kind, ownership, permissions, access list or link count is refused.
+    pub fn open_lock(&self, name: &str) -> io::Result<File> {
         let file = match self.open(
             name,
             OFlags::RDWR | OFlags::CREATE | OFlags::EXCL,
@@ -146,6 +150,15 @@ impl DirectoryView<'_> {
     /// # Errors
     /// As [`super::read_private`], with lookup confined to this open directory.
     pub fn read(&self, name: &str, max: usize) -> Result<Vec<u8>, PrivateFileError> {
+        let (file, metadata) = self.open_private(name)?;
+        super::read_capped_with_len(&file, metadata.len(), max, name)
+    }
+
+    /// Open a private regular file and retain the same description and metadata for later
+    /// identity checks. Lookup is confined to this directory; no path is reopened.
+    /// # Errors
+    /// As [`super::open_private`], with lookup confined to this open directory.
+    pub fn open_private(&self, name: &str) -> Result<(File, std::fs::Metadata), PrivateFileError> {
         let file = self
             .open(name, OFlags::RDONLY, Mode::empty())
             .map_err(|error| match error.kind() {
@@ -154,7 +167,7 @@ impl DirectoryView<'_> {
                 _ => PrivateFileError::Io(error),
             })?;
         let (file, metadata, _) = super::judge_opened(file, Opening::Read)?;
-        super::read_capped_with_len(&file, metadata.len(), max, name)
+        Ok((file, metadata))
     }
 
     /// Stream this directory's entry names from an independent file description.
@@ -198,6 +211,24 @@ impl DirectoryView<'_> {
         bytes: &[u8],
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        let landed = self.write_entry_landed(name, bytes, check)?;
+        aterm_durable::DirFlushed::classify(landed).map(|_| ())
+    }
+
+    /// Atomically replace a private entry through this held directory, preserving stages.
+    /// `check` runs after the temporary's durable flush and before descriptor-relative rename.
+    /// The directory's own privacy is checked again at commit. An outer error leaves the entry
+    /// unchanged; an inner error means the new bytes are published with unknown entry durability.
+    /// Unavailable directory flushes remain errors, and flushing never reopens its pathname.
+    /// # Errors
+    /// Invalid names, temporary preparation, privacy or `check` failures, and rename failures
+    /// are outer errors. A failed strict held-directory flush is an inner error.
+    pub fn write_entry_landed(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<io::Result<()>> {
         super::one_component_io(name)?;
         for _ in 0..8 {
             let temporary = crate::atomic_file::fresh_temp_component(name)?;
@@ -219,6 +250,7 @@ impl DirectoryView<'_> {
             file.write_all(bytes)?;
             aterm_durable::Flush::Durable.file(&file)?;
             check()?;
+            self.directory.view()?;
             aterm_dirfd::renameat(
                 &self.directory.file,
                 cleanup.name.as_str(),
@@ -226,10 +258,7 @@ impl DirectoryView<'_> {
                 name,
             )?;
             cleanup.armed = false;
-            return aterm_durable::DirFlushed::classify(
-                aterm_durable::Flush::Durable.file(&self.directory.file),
-            )
-            .map(|_| ());
+            return Ok(aterm_durable::Flush::Durable.dir_held(&self.directory.file));
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,

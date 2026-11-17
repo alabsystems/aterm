@@ -2118,8 +2118,9 @@ pub const HANDSHAKE_SEAM: &str = "ATERM_DEBUG_FLEET_HANDSHAKE_MS";
 /// Maximum lifetime (30 s) [`serve`] allows a proved connection before cutting it.
 pub const SERVED_WITHIN: Duration = Duration::from_secs(30);
 
-/// How often a running aterm's fleet listener reads its key again, so a join's new key is
-/// served within it (`aterm-gui`'s `fleet_listen::RETRY`).
+/// The longest a running aterm's fleet listener takes to read its key again once it changed, so a
+/// join's new key is served within it: at the write's file event, or on this old pace where its
+/// file watch did not start (`aterm-gui`'s `fleet_listen::RETRY`).
 pub const KEY_READ_EVERY: Duration = Duration::from_secs(2);
 
 /// Default maximum concurrent connections (handshaking or proved) on a fleet listener.

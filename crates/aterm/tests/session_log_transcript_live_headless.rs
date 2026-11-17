@@ -17,13 +17,28 @@ use headless_boot::{Instance, boot_session, ctl_ok, field, process_tree, status,
 
 const SESSION_ID: &str = "00000000-0000-4000-8000-0000000003b0";
 
+/// Transcript text that never leaves the transcript: no log line, menu, brief or file holds it.
 const SECRETS: &[&str] = &[
-    "QZHISTORYPROMPT",
     "QZHISTORYINPUT",
     "QZLIVEPROMPT",
     "QZLIVEINPUT",
-    "QZLIVEREPLY",
     "QZLIVERESULT",
+];
+
+/// Transcript text the session's card may carry as aterm's default writer's lines
+/// (`docs/DESIGN-comprehension-2026-11-14.md` §3.1): the kept first prompt as its title (CX-04)
+/// and the agent's last words as its description (ST-29), each redacted and cut at the write
+/// and held at the host tier as mark text is. Nothing else holds them: a line that names one is
+/// aterm's `desc` claim, and a file that holds one is the session log's own journal.
+const CARD_WORDS: &[(&str, &str)] = &[
+    (
+        "QZHISTORYPROMPT",
+        " desc field=title value=QZHISTORYPROMPT as=prompt by=aterm ",
+    ),
+    (
+        "QZLIVEREPLY",
+        " desc field=description value=QZLIVEREPLY by=aterm ",
+    ),
 ];
 
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -430,6 +445,13 @@ fn session_log_transcript_live_headless() {
             "{word} left the transcript: {answered:#?}"
         );
     }
+    for (word, claim) in CARD_WORDS {
+        let held = having(&answered, word);
+        assert!(
+            held.iter().all(|line| line.contains(claim)),
+            "{word} left the transcript other than as aterm's card line: {held:#?}"
+        );
+    }
     let mut files = Vec::new();
     files_under(
         &inst.tmp,
@@ -442,6 +464,14 @@ fn session_log_transcript_live_headless() {
             assert!(
                 !text.contains(word),
                 "{word} is in {} (the scratch world holds transcript text)",
+                path.display()
+            );
+        }
+        let journal = path.components().any(|c| c.as_os_str() == "session-log");
+        for (word, _) in CARD_WORDS {
+            assert!(
+                journal || !text.contains(word),
+                "{word} is in {}, which is not the session log's journal",
                 path.display()
             );
         }

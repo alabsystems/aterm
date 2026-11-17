@@ -722,6 +722,7 @@ fn publish(paths: &Paths, edit: impl FnOnce(&mut crate::text::Document)) {
     client::admin_publish(paths, &session, &doc).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_per_mac_need_posts_nothing_and_retires_never_copied() {
     let root = aterm_tempfile::tempdir().unwrap();

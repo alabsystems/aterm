@@ -142,24 +142,36 @@ impl Store {
         if self.log.is_none() {
             return Err(Error::new("read-only table observation cannot append"));
         }
-        let mut writers = BTreeMap::<Actor, WriterHeld>::new();
+        // The quotas count what the batch adds above the table's floor; a record below it is
+        // cold ([`Self::is_cold`]). Its checkpoints may use the room past the quotas, its other
+        // records may not.
+        let mut writers = BTreeMap::<Actor, [WriterHeld; 2]>::new();
+        let mut hot = [WriterHeld::default(); 2];
         let mut total_bytes = 0usize;
         for stored in &staged {
             total_bytes = total_bytes.saturating_add(stored.wire.len());
-            let held = writers.entry(stored.header.actor).or_default();
-            held.records += 1;
-            held.bytes = held.bytes.saturating_add(stored.wire.len());
+            if self.is_cold(&stored.header) {
+                continue;
+            }
+            let writer = writers.entry(stored.header.actor).or_default();
+            // [0] counts every hot record, [1] those that are not checkpoints.
+            let kinds = if stored.checkpoint.is_some() { 1 } else { 2 };
+            for held in hot
+                .iter_mut()
+                .take(kinds)
+                .chain(writer.iter_mut().take(kinds))
+            {
+                held.records += 1;
+                held.bytes = held.bytes.saturating_add(stored.wire.len());
+            }
         }
-        if self.records.len().saturating_add(staged.len()) > self.capacity.operations
-            || self.operation_bytes.saturating_add(total_bytes) > self.capacity.bytes
-        {
-            return Err(Error::repair(
-                "table operation capacity exhausted; conflict space is reserved",
-                aterm_types::network_state::RepairCause::Quota,
-            ));
+        for (held, checkpoint) in [(hot[0], true), (hot[1], false)] {
+            self.admit_table(held.records, held.bytes, checkpoint)?;
         }
         for (actor, usage) in writers {
-            self.admit_records(actor, usage.records, usage.bytes)?;
+            for (held, checkpoint) in [(usage[0], true), (usage[1], false)] {
+                self.admit_writer(actor, held.records, held.bytes, checkpoint)?;
+            }
         }
         self.index()?
             .check_insert_many(staged.iter().map(|stored| &stored.header))

@@ -805,13 +805,15 @@ fn a_pass_freezes_main_qualifies_packs_stages_and_enqueues_and_publishes_nothing
         Decision::Unread(_)
     ));
 
-    // Cheap source checks, then the pack of this machine's target at the frozen commit, then the
-    // control on the unpacked asset, and only then the upload.
+    // Its list read before any step runs (to order the candidates), then cheap source checks,
+    // then the pack of this machine's target at the frozen commit, then the control on the
+    // unpacked asset, and only then the upload.
     let frozen = &w.ay[4];
     assert_eq!(
         w.backend.events(),
         [
             "metadata ay".to_string(),
+            "metadata ay".into(),
             "run fmt --check".into(),
             "run test --locked".into(),
             format!("pack {ARM} at {frozen}"),
@@ -930,6 +932,51 @@ fn a_pass_freezes_main_qualifies_packs_stages_and_enqueues_and_publishes_nothing
             .join("logs/ay-5/attempt-1/unit.stdout")
             .is_file()
     );
+}
+
+/// RL-26: a pass reads every candidate's qualify list before it runs any step and qualifies the
+/// candidates in ascending order of their committed bound (the summed `within-secs`), not the
+/// programs table's order, and its decision table prints each bound. nn (fmt, build and a
+/// control: 3750 s) is queued before ay (fmt, unit, build and a control: 5550 s), which the
+/// table lists first. CONTROL: before RL-26 the pass took ay first, so ay's steps ran while nn,
+/// whose whole list is shorter, waited.
+#[test]
+fn a_pass_takes_the_candidate_with_the_smallest_committed_bound_first() {
+    let w = World::new("tip-cheapest-first");
+    let dev = w.fx.path("dev/nn");
+    std::fs::write(dev.join("Cargo.toml"), MANIFEST).expect("nn's manifest");
+    git(&dev, &["add", "Cargo.toml"]);
+    fixture::commit(&dev, "a manifest with a short qualify list", None);
+    const NN_VERSION: &str =
+        r#"{"name":"version","stage":"packed","run":["{bin}/nn","--version"],"within-secs":30}"#;
+    w.backend
+        .recipe("nn", recipe("nn", Some(&[FMT, BUILD, NN_VERSION])));
+
+    let (outcome, tx) = w.pass();
+    assert_eq!(outcome.enqueued, ["nn=4", "ay=5"], "{}", tx.text());
+    assert_eq!(row(&outcome, "nn").bound, Some(120 + 3600 + 30));
+    assert_eq!(row(&outcome, "ay").bound, Some(120 + 1800 + 3600 + 30));
+    let events = w.backend.events();
+    let first_run = events
+        .iter()
+        .position(|e| e.starts_with("run "))
+        .expect("a step ran");
+    assert!(
+        events[..first_run].contains(&"metadata ay".to_string())
+            && events[..first_run].contains(&"metadata nn".to_string()),
+        "both lists are read before any step runs: {events:?}"
+    );
+    let (nn, ay) = (
+        events.iter().position(|e| e == "stage nn=4"),
+        events.iter().position(|e| e == "stage ay=5"),
+    );
+    assert!(
+        nn.is_some() && nn < ay,
+        "nn is staged before ay: {events:?}"
+    );
+    let text = tx.text();
+    assert!(text.contains("BOUND"), "{text}");
+    assert!(text.contains("3750 s") && text.contains("5550 s"), "{text}");
 }
 
 #[test]

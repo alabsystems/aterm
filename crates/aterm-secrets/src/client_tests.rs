@@ -3,8 +3,10 @@
 
 use super::*;
 
+#[cfg(unix)]
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
+#[cfg(unix)]
 #[test]
 fn offline_materialization_keeps_convergence_due_for_the_returning_source() {
     use crate::converge::{Due, Last};
@@ -91,6 +93,7 @@ fn config_debug_omits_nested_url_credentials() {
 /// A wait after an error ends at the change the kernel tells of, not at a later look: the
 /// kernel's word that the routes changed 7 s in ends a minute's wait there. A message that
 /// leaves the routes as they were (a neighbour's entry) waits on to the end.
+#[cfg(unix)]
 #[test]
 fn a_wait_after_an_error_ends_once_the_network_changes() {
     // Each wait: the kernel's next message, this long after the last.
@@ -128,6 +131,7 @@ fn a_wait_after_an_error_ends_once_the_network_changes() {
     assert_eq!(slept, LONGEST_ERROR_RETRY);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pass_that_errs_is_tried_again_within_a_minute() {
     let mut backoff = Duration::from_secs(5);
@@ -146,6 +150,7 @@ fn a_pass_that_errs_is_tried_again_within_a_minute() {
 /// minute, and a move of this Mac's network (the way home) still asks again within seconds.
 /// NEGATIVE CONTROL: `retry_after` ignoring `away` backs off to the minute, and "away: a
 /// quarter hour" fails.
+#[cfg(unix)]
 #[test]
 fn away_a_pass_that_errs_waits_a_quarter_hour_and_a_move_ends_it() {
     let backoff = Duration::from_secs(5);
@@ -167,6 +172,7 @@ fn away_a_pass_that_errs_waits_a_quarter_hour_and_a_move_ends_it() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_look_tells_an_answering_vault_from_none_and_makes_nothing() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -205,6 +211,7 @@ fn a_look_tells_an_answering_vault_from_none_and_makes_nothing() {
     assert!(!reader.dir.exists(), "a look makes nothing");
 }
 
+#[cfg(unix)]
 struct ScriptedTries {
     brokers: std::collections::VecDeque<Result<(), String>>,
     answers: std::collections::VecDeque<Result<transport::Answer, transport::Unheard>>,
@@ -214,6 +221,7 @@ struct ScriptedTries {
     pauses: Vec<Duration>,
 }
 
+#[cfg(unix)]
 impl ScriptedTries {
     /// Each try takes `took`; the broker answers as `brokers` say (then answers), and each
     /// GET as `answers` say.
@@ -233,6 +241,7 @@ impl ScriptedTries {
     }
 }
 
+#[cfg(unix)]
 impl Tries for ScriptedTries {
     fn broker(&mut self, url: &str) -> Result<(), String> {
         assert_eq!(url, "http://alab-secrets.local:7484/v1/alab");
@@ -262,23 +271,27 @@ impl Tries for ScriptedTries {
     }
 }
 
+#[cfg(unix)]
 fn unheard(why: &str) -> Result<transport::Answer, transport::Unheard> {
     Err(transport::Unheard {
         why: Error::new(why),
     })
 }
 
+#[cfg(unix)]
 fn served_vault() -> Result<transport::Answer, transport::Unheard> {
     Ok(transport::Answer::Fetched(Fetched::Body(
         envelope::MAGIC.as_bytes().to_vec(),
     )))
 }
 
+#[cfg(unix)]
 fn alab() -> Source {
     Source::Url("http://alab-secrets.local:7484/v1/alab".into())
 }
 
 /// The broker's words while it is not installed.
+#[cfg(unix)]
 fn not_installed() -> Result<(), String> {
     Err(aterm_uds::lan::Unavailable::NotInstalled.to_string())
 }
@@ -289,6 +302,7 @@ fn not_installed() -> Result<(), String> {
 /// at once: nothing waits on a person.
 /// NEGATIVE CONTROL: a look that tries the vault before the broker answers takes the
 /// script's GET while the broker is still unavailable, and `gets` is 1 in the second case.
+#[cfg(unix)]
 #[test]
 fn a_look_waits_for_the_lan_broker_and_then_tries_once() {
     let said = std::cell::RefCell::new(Vec::new());
@@ -360,6 +374,7 @@ fn a_look_waits_for_the_lan_broker_and_then_tries_once() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -588,6 +603,7 @@ fn a_vault_too_large_to_seal_is_refused_saying_why() {
 }
 
 /// A pass the server answered at once, leaving this Mac's seq as it was.
+#[cfg(unix)]
 const ANSWERED_AT_ONCE: Pass = Pass {
     source: SourceSaid::AtOnce,
     moved: false,
@@ -597,6 +613,7 @@ const ANSWERED_AT_ONCE: Pass = Pass {
 /// out) or that the server held is followed by the next long-poll at once, so an approval
 /// that comes next is heard as it lands. Negative control: one answered at once with
 /// nothing new pauses, as before (30 s after a NotIn, 10 s after nothing newer).
+#[cfg(unix)]
 #[test]
 fn a_pass_that_moved_the_seq_or_was_held_is_followed_at_once() {
     let url = Source::Url("http://127.0.0.1:7484/v1/alab".to_string());
@@ -634,6 +651,7 @@ fn a_pass_that_moved_the_seq_or_was_held_is_followed_at_once() {
 /// version this Mac applies reads the seq it waits past. Negative control: a nap that
 /// watches the seq whatever its length reads the state of every member Mac ten times a
 /// second.
+#[cfg(unix)]
 #[test]
 fn a_resting_approver_reads_no_state_while_it_naps() {
     let stopped = aterm_uds::stop::Stop::new();
@@ -659,6 +677,7 @@ fn a_resting_approver_reads_no_state_while_it_naps() {
 /// on it ([`aterm_uds::stop::Stop::entered`]). Negative control (2026-11-10): a rest, or a
 /// watched wait's look, that sleeps without the stop never sleeps on it, which trips the
 /// one-minute hang detector.
+#[cfg(unix)]
 #[test]
 fn a_resting_approver_ends_its_nap_when_the_stop_is_set() {
     let naps: [fn(&aterm_uds::stop::Stop); 2] = [
@@ -691,6 +710,7 @@ fn a_resting_approver_ends_its_nap_when_the_stop_is_set() {
 /// rather than the scope waiting on the approver for good. Negative control (2026-11-10):
 /// with the stop set only after the subscriber returns, the approver's hour-long sleep trips
 /// the one-minute hang detector.
+#[cfg(unix)]
 #[test]
 fn a_subscriber_that_panics_ends_the_approver_beside_it() {
     use std::sync::Arc;
@@ -790,6 +810,7 @@ fn bound() -> std::net::TcpListener {
     std::net::TcpListener::bind("127.0.0.1:0").expect("bind")
 }
 
+#[cfg(unix)]
 fn serve(store: &Path, socket: &std::net::TcpListener) -> crate::server::Running {
     crate::server::start(
         socket.try_clone().expect("a copy of the socket"),
@@ -1014,6 +1035,7 @@ fn materialization_observation_reads_only_while_ready_and_holding_the_shared_loc
     assert_eq!(std::fs::read(paths.source_file()).unwrap(), before_config);
 }
 
+#[cfg(unix)]
 #[test]
 fn readiness_observation_creates_no_state_or_lock_and_never_changes_directory_mode() {
     use std::os::unix::fs::PermissionsExt;
@@ -1129,6 +1151,7 @@ fn readiness_refuses_a_changed_source_before_it_judges_the_apply() {
     assert!(materialization_ready_for(&reader, &expected).unwrap());
 }
 
+#[cfg(unix)]
 #[test]
 fn readiness_lock_admission_refuses_symlinks_and_nonregular_files() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1148,6 +1171,7 @@ fn readiness_lock_admission_refuses_symlinks_and_nonregular_files() {
     assert!(StateLock::try_take(&reader).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_store_holds_the_alab_vault_only_under_a_key_this_build_names_for_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1803,22 +1827,39 @@ fn a_new_identity_here_is_marked_in_its_file_and_its_key_reads_as_before() {
         .expect("read")
         .expect("the file");
     let text = file.as_str().expect("UTF-8");
-    assert!(
-        text.lines().any(|line| line
-            == "# aterm lab identity: test-binary (it founds its own lab and never joins the \
-                live ALab)"),
-        "the mark is in the file"
-    );
+    let mark_line = "# aterm lab identity: test-binary (it founds its own lab and never joins the \
+                     live ALab)";
     let key = text
         .lines()
         .map(str::trim)
         .rfind(|line| !line.is_empty() && !line.starts_with('#'))
         .expect("a key line");
-    assert_eq!(
-        Identity::parse(key).expect("a key").recipient(),
-        identity.recipient(),
-        "a build before the mark reads the same key"
-    );
+    #[cfg(unix)]
+    {
+        assert!(
+            text.lines().any(|line| line == mark_line),
+            "the mark is in the file"
+        );
+        assert_eq!(
+            Identity::parse(key).expect("a key").recipient(),
+            identity.recipient(),
+            "a build before the mark reads the same key"
+        );
+    }
+    // On Windows the key and its mark are sealed together to the user (DPAPI): neither shows in
+    // the file, and no build before the mark read a Windows key.
+    #[cfg(windows)]
+    {
+        assert!(
+            key.starts_with(crate::identity_file::SEALED),
+            "the key line is the sealed one"
+        );
+        assert!(
+            !text.lines().any(|line| line == mark_line),
+            "the mark is sealed with the key"
+        );
+        assert!(text.contains(&identity.recipient().to_bech32()));
+    }
     assert_eq!(
         lab_mark(&paths).expect("read"),
         Some(crate::LabMark::TestBinary)
@@ -2247,6 +2288,7 @@ fn a_guests_unmarked_identity_carries_the_virtual_machine_mark_on_the_wire() {
 ///
 /// NEGATIVE CONTROL: drop the guard in `request_join_until` and the pass-over in
 /// `ask_again_if_due`: the listener hears the lab identity's re-ask of ALab's vault.
+#[cfg(unix)]
 #[test]
 fn a_lab_identitys_automatic_reask_of_alabs_vault_is_refused_before_it_posts() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
@@ -2315,6 +2357,7 @@ fn a_lab_identitys_automatic_reask_of_alabs_vault_is_refused_before_it_posts() {
 ///
 /// NEGATIVE CONTROL: `on_live_genesis` reading a failed store as `false`: the unreadable
 /// config reads as off it.
+#[cfg(unix)]
 #[test]
 fn a_member_whose_vault_cannot_be_read_is_on_the_live_genesis() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -2354,6 +2397,7 @@ fn only_a_store_pinned_to_the_compiled_genesis_reads_as_live() {
     assert!(!live_genesis_store(&pinned), "the seam ends with its run");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_alab_vault_is_known_by_its_keys_whatever_url_reaches_it() {
     let key = |n: u8| envelope::signer_public(&[n; 32]).expect("public");
@@ -2402,6 +2446,7 @@ fn the_alab_vault_is_known_by_its_keys_whatever_url_reaches_it() {
     running.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reader_the_removed_admin_led_off_follows_the_vault_once_its_build_retires_the_key() {
     std::thread::scope(|scope| {
@@ -2518,6 +2563,7 @@ fn a_reader_the_removed_admin_led_off_follows_the_vault_once_its_build_retires_t
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn an_admin_gives_the_vault_back_to_a_store_the_removed_admin_fed() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2624,6 +2670,7 @@ fn a_membership_with_no_digest_floors_on_its_cache_unapplied() {
     assert!(floor(&admin, &state, &config.name, &config).is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2821,6 +2868,7 @@ fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
     assert_eq!(body(&current.source), before_b);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_to_another_vault_forgets_the_proof_made_for_the_last() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2886,6 +2934,7 @@ fn a_join_to_another_vault_forgets_the_proof_made_for_the_last() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_cut_off_before_its_request_is_queued_is_asked_for_by_the_next_pass() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2950,6 +2999,7 @@ fn a_join_cut_off_before_its_request_is_queued_is_asked_for_by_the_next_pass() {
     server.borrow_mut().take().expect("running").stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reask_begun_on_the_vault_left_never_sends_the_new_ones_proof_there() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3005,6 +3055,7 @@ fn a_reask_begun_on_the_vault_left_never_sends_the_new_ones_proof_there() {
     team_server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_reask_asks_under_the_name_source_toml_holds_now() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3054,6 +3105,7 @@ fn a_reask_asks_under_the_name_source_toml_holds_now() {
 
 /// A join cut off before posting its request is asked for by a running subscriber
 /// [`JOIN_GRACE`] after it saved the vault: not sooner, and not an hour on.
+#[cfg(unix)]
 #[test]
 fn a_join_cut_off_before_its_request_is_asked_for_after_the_grace() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3105,6 +3157,7 @@ fn a_join_cut_off_before_its_request_is_asked_for_after_the_grace() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_under_another_name_drops_the_old_names_proof() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3236,6 +3289,7 @@ fn a_reask_never_puts_back_a_proof_a_join_replaced() {
     gone.end();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_request_the_server_lost_with_its_store_is_asked_again_once_the_vault_is_back() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3552,6 +3606,7 @@ fn the_approver_remembers_only_what_is_still_listed() {
 /// in as `AdmissionMethod::Open` (the approver's former home-LAN branch with its `home=`
 /// check dropped), "a plain ask" fails; with `parse_join_line` refusing a ` home=` token,
 /// the older server's line is skipped and "an older server's tagged line" fails.
+#[cfg(unix)]
 #[test]
 fn the_alab_vaults_approver_lets_in_no_plain_ask() {
     // Every server it reads is its own on loopback, which answers.
@@ -3611,6 +3666,7 @@ fn the_alab_vaults_approver_lets_in_no_plain_ask() {
     server.stop();
 }
 
+#[cfg(unix)]
 fn serve_apart(
     store: &Path,
     socket: &std::net::TcpListener,
@@ -3630,6 +3686,7 @@ fn serve_apart(
     .expect("server starts")
 }
 
+#[cfg(unix)]
 fn a_vault_with_a_member(
     root: &Path,
     socket: &std::net::TcpListener,
@@ -3659,6 +3716,7 @@ fn a_vault_with_a_member(
     (server, url, admin, member)
 }
 
+#[cfg(unix)]
 fn served_at(source: &Source) -> Option<Vec<u8>> {
     match transport::fetch(source, None, Duration::from_secs(30)) {
         Ok(Fetched::Body(bytes)) => Some(bytes),
@@ -3667,11 +3725,13 @@ fn served_at(source: &Source) -> Option<Vec<u8>> {
     }
 }
 
+#[cfg(unix)]
 fn pin_of(paths: &Paths) -> Vec<(String, [u8; 32])> {
     let config = pinned(paths);
     vec![(config.name, config.signer.expect("signed"))]
 }
 
+#[cfg(unix)]
 #[test]
 fn a_machine_in_the_vault_puts_back_a_vault_its_server_lost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3723,6 +3783,7 @@ fn a_machine_in_the_vault_puts_back_a_vault_its_server_lost() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_put_back_the_source_keeps_no_more_backs_off_and_is_logged_once() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3775,6 +3836,7 @@ fn a_put_back_the_source_keeps_no_more_backs_off_and_is_logged_once() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_server_that_does_not_pin_the_vault_refuses_its_copy_and_the_pass_errs() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3803,6 +3865,7 @@ fn a_server_that_does_not_pin_the_vault_refuses_its_copy_and_the_pass_errs() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_machine_kept_out_or_without_a_verified_copy_puts_nothing_back() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3878,6 +3941,7 @@ fn a_machine_kept_out_or_without_a_verified_copy_puts_nothing_back() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_machine_in_the_vault_writes_nothing_to_a_path_that_holds_no_vault() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3915,6 +3979,7 @@ fn a_machine_in_the_vault_writes_nothing_to_a_path_that_holds_no_vault() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_admin_of_a_vault_closed_to_joins_puts_back_a_vault_its_server_lost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3947,6 +4012,7 @@ fn an_admin_of_a_vault_closed_to_joins_puts_back_a_vault_its_server_lost() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4093,6 +4159,7 @@ fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_member_join_and_sync_keep_normal_admission_and_materialization() {
     // Every server it reads is its own on loopback, which answers.
@@ -4145,6 +4212,7 @@ fn bounded_member_join_and_sync_keep_normal_admission_and_materialization() {
 ///
 /// NEGATIVE CONTROL: leave the mirrors out of the peers a pass reads (`purpose.vault_read()`
 /// false in `collect_sync_peer_urls`): fails "the newer mirror serves the Mac".
+#[cfg(unix)]
 #[test]
 fn a_mirror_serves_a_member_whose_url_is_down_and_never_rolls_it_back() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4238,6 +4306,7 @@ fn a_mirror_is_read_for_the_vault_and_never_sent_a_join() {
 /// NEGATIVE CONTROLS: save every join with no mirrors (`mirrors = Vec::new()` in
 /// `join_with_until`): fails "a rejoin keeps the mirrors"; keep them on every join (drop
 /// `.filter(|_| goes_on)` there): fails "a join elsewhere starts with no mirrors".
+#[cfg(unix)]
 #[test]
 fn a_rejoin_of_the_same_vault_keeps_its_mirrors_and_a_join_elsewhere_starts_with_none() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4282,6 +4351,7 @@ fn a_rejoin_of_the_same_vault_keeps_its_mirrors_and_a_join_elsewhere_starts_with
 /// !read_only.holds(url))` from `answering_bounds` in `sync_records_until`): fails "a mirror
 /// alone never vouches the pass fresh"; send it the subscriber (`subscriber_for` returns
 /// `subscriber`): fails "a mirror is not told who reads".
+#[cfg(unix)]
 #[test]
 fn a_mirror_alone_never_vouches_a_records_pass_fresh_nor_hears_who_reads() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4347,6 +4417,7 @@ fn a_mirror_alone_never_vouches_a_records_pass_fresh_nor_hears_who_reads() {
 /// NEGATIVE CONTROL: count every peer's head (drop `.filter(|p| !read_only().holds(&p.url))`
 /// from the heal's `observed` in `sync_repairing_inner`): fails "a mirror's head starts no
 /// heal".
+#[cfg(unix)]
 #[test]
 fn an_admins_pass_starts_no_heal_from_a_lagging_mirror() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4382,6 +4453,7 @@ fn an_admins_pass_starts_no_heal_from_a_lagging_mirror() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_member_sync_uses_a_verified_peer_when_the_primary_is_silent() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4409,6 +4481,7 @@ fn bounded_member_sync_uses_a_verified_peer_when_the_primary_is_silent() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_member_operations_do_not_wait_forever_for_the_state_lock() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4447,6 +4520,7 @@ fn bounded_member_operations_do_not_wait_forever_for_the_state_lock() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_member_sync_defers_putting_back_a_missing_server_envelope() {
     // Every server it reads is its own on loopback, which answers.
@@ -4479,6 +4553,7 @@ fn bounded_member_sync_defers_putting_back_a_missing_server_envelope() {
 /// running out of time is no news, not a failure. Negative control: a try on a fetch's
 /// deadline (its total plus [`transport::FETCH_MARGIN`], under test two hang detectors),
 /// as [`sync`] fetches, waits out the server's hold, past the detector.
+#[cfg(unix)]
 #[test]
 fn a_bounded_wait_ends_at_its_own_time_whatever_the_server_holds() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4510,9 +4585,13 @@ fn a_bounded_wait_ends_at_its_own_time_whatever_the_server_holds() {
 
 /// Every entry under `home` but the vault's own private folder `apart` (its key, state, cache and
 /// records) and the folders on the way to it, each with its mode and, for a file, its bytes, for
-/// a symlink its target: what a pass must leave as it found it.
-fn home_tree(home: &Path, apart: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
+/// a symlink its target: what a pass must leave as it found it. On Windows its attributes and the
+/// digest of its owner and access list ([`fsx::access_digest`]) stand for its mode.
+fn home_tree(home: &Path, apart: &Path) -> BTreeMap<PathBuf, (u32, [u8; 32], Vec<u8>)> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt as _;
     let mut tree = BTreeMap::new();
     let mut walk = vec![home.to_path_buf()];
     while let Some(dir) = walk.pop() {
@@ -4540,7 +4619,14 @@ fn home_tree(home: &Path, apart: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
             } else {
                 std::fs::read(&path).expect("a file")
             };
-            tree.insert(path, (meta.permissions().mode(), bytes));
+            #[cfg(unix)]
+            let (mode, access) = (meta.permissions().mode(), [0; 32]);
+            #[cfg(windows)]
+            let (mode, access) = (
+                meta.file_attributes(),
+                fsx::access_digest(&path).expect("an access list"),
+            );
+            tree.insert(path, (mode, access, bytes));
         }
     }
     tree
@@ -4557,6 +4643,9 @@ fn home_tree(home: &Path, apart: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>)> {
 /// materializer did, the test fails at the first sync: `assertion `left == right` failed: a
 /// pass wrote under the home (first sync)`. The control at its end shows that the same
 /// comparison sees a file written under the home.
+///
+/// A Windows member runs no subscriber (its job is a launchd or systemd one, `crate::service`), so
+/// there the subscriber pass is left out and the rest holds as it stands.
 #[test]
 fn a_sync_writes_nothing_under_the_home_and_every_entry_reads_in_place() {
     use crate::entry_class::{GH_HOSTS, GIT_CREDENTIALS};
@@ -4687,8 +4776,11 @@ fn a_sync_writes_nothing_under_the_home_and_every_entry_reads_in_place() {
     );
 
     // A subscriber pass, a changed value and a dropped entry change nothing under the home.
-    subscriber_pass(&reader, &mut None, &FOUND_NONE).expect("a pass");
-    unchanged("subscriber pass");
+    #[cfg(unix)]
+    {
+        subscriber_pass(&reader, &mut None, &FOUND_NONE).expect("a pass");
+        unchanged("subscriber pass");
+    }
     publish(&|doc| {
         doc.set_entry(&Audience::Everyone, "token", b"the-vaults-next-token")
             .expect("set");
@@ -4721,6 +4813,7 @@ fn a_sync_writes_nothing_under_the_home_and_every_entry_reads_in_place() {
 }
 
 /// A swarm roster whose one row names `recipient` under `label`.
+#[cfg(unix)]
 fn roster_naming(recipient: &str, label: &str) -> Vec<u8> {
     crate::swarm_roster::SwarmRoster {
         members: vec![crate::swarm_roster::SwarmMember {
@@ -4753,6 +4846,7 @@ fn roster_naming(recipient: &str, label: &str) -> Vec<u8> {
 /// fails the first `take_owed`, and the later quiet version shows what was lost: `moved: false`
 /// with nothing owed (run 2026-11-14). A `converge_after_pass` that ignores `owed` fails the
 /// runner assertion.
+#[cfg(unix)]
 #[test]
 fn a_pass_owed_by_an_apply_that_starts_no_runner_is_kept_for_the_next_starter() {
     use crate::converge::{Causes, Due, Last};
@@ -4866,6 +4960,7 @@ fn a_pass_owed_by_an_apply_that_starts_no_runner_is_kept_for_the_next_starter() 
 /// no input of it. One that changed a `[machines]` row still does.
 /// NEGATIVE CONTROL: a digest of the admin text as written (`steward_text` returning `None`)
 /// leaves the pass owed after each quiet publish (run 2026-11-14).
+#[cfg(unix)]
 #[test]
 fn a_publish_that_only_renews_the_code_only_note_owes_an_admin_no_pass() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4929,6 +5024,7 @@ fn a_publish_that_only_renews_the_code_only_note_owes_an_admin_no_pass() {
 /// never said its recorded digest differed is the apply under [`converge_inputs::blind`], run
 /// here for the first version after the older state: it owes no pass, and the same apply
 /// without it does.
+#[cfg(unix)]
 #[test]
 fn an_applied_version_moved_this_mac_only_where_it_changed_what_its_pass_reads() {
     let root = aterm_tempfile::tempdir().expect("tempdir");

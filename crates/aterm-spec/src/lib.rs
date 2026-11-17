@@ -8,10 +8,6 @@
 //! The model engine: [`ty_model`], the [`mod@derive`] types, the interpreter, [`verify`], and
 //! [`xref`].
 
-#![allow(
-    clippy::disallowed_types,
-    reason = "the specification checker's runs of external model checkers: no shipped path calls them"
-)]
 extern crate self as aterm_spec;
 
 #[cfg(feature = "anchors")]

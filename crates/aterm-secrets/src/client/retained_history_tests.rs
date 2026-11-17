@@ -806,9 +806,24 @@ impl PreReceipt {
         admin_publish(&this.lab.m22, &admin, &doc).unwrap();
         this.newer = load_records(&this.lab.m22).unwrap().encode();
         let applied_heads = heads_of(&this.applied);
-        // A record's id is a hash, and a reload orders concurrent records by id: sign records
-        // until one sorts among the applied ones.
-        this.concurrent = (0..64_u64)
+        // A record's id is a hash, and a reload orders records by id wherever their parents allow
+        // ([`crate::membership_log::store::causal`]): a record drafted over `base` is released
+        // beside the chain the reader applied past `base`, and ahead of that chain's end exactly
+        // when its id is below one of the chain's. Every draft races the same chain, so a fixed
+        // number of drafts fails whenever that chain's ids all sit low (64 drafts against two
+        // records: one build in 2,145). Sign drafts until one is below the chain's highest id:
+        // two drafts on average, and past 65,536 in one build of 2^32.
+        let in_base: std::collections::BTreeSet<_> = base.records().map(|r| *r.id()).collect();
+        let ceiling = this
+            .applied
+            .log()
+            .unwrap()
+            .records()
+            .map(|r| *r.id())
+            .filter(|id| !in_base.contains(id))
+            .max()
+            .expect("FIXTURE: the reader applied records past what the other Mac held");
+        this.concurrent = (0_u64..)
             .map(|n| {
                 peer_key
                     .with_seed(|seed| {
@@ -823,17 +838,16 @@ impl PreReceipt {
                     })
                     .unwrap()
             })
-            .find(|record| {
-                let mut grown = this.applied.clone();
-                grown.ingest(&this.newer).unwrap();
-                assert!(grown.insert(record.clone()).unwrap());
-                let reloaded = crate::membership_log::Store::with_compiled(Some(
-                    *this.applied.log().unwrap().network(),
-                ))
-                .recovering(&grown.encode());
-                !heads_of_a_prefix(reloaded.log().unwrap(), &applied_heads)
-            })
-            .expect("FIXTURE: no concurrent record sorts among the applied ones");
+            .find(|record| *record.id() < ceiling)
+            .expect("an endless search ends only with a find");
+        let reloaded = crate::membership_log::Store::with_compiled(Some(
+            *this.applied.log().unwrap().network(),
+        ))
+        .recovering(&this.grown().encode());
+        assert!(
+            !heads_of_a_prefix(reloaded.log().unwrap(), &applied_heads),
+            "FIXTURE: the concurrent record sorts among the applied ones"
+        );
         this
     }
 

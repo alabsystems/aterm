@@ -423,7 +423,7 @@ impl Builder {
         let boundary = boundary.into();
         let cap = usize::try_from(boundary.acknowledged().count)
             .unwrap_or(0)
-            .min(super::JOURNAL_RECORDS);
+            .min(super::journal_records());
         Self {
             pending,
             witness: Witness::default(),

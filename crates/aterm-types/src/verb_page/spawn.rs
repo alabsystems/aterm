@@ -17,7 +17,7 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
-             [why=<one line>] [req=<id>]",
+             [why=<one line>] [req=<id>] [package=<ids>]",
             "a new tab (or, with split=, a pane of the focused one), addressable at once",
         ),
         row(
@@ -62,7 +62,8 @@ pub(crate) const PAGE: Page = Page {
             "why=<one line>",
             "what it is for: visible text, at most 200 characters and 256 bytes encoded (a space or \
              a non-ASCII byte takes 3), no quote; its tab's open keeps it whole as `why_text=` \
-             (`log kinds=tab`); a fleet drive's plain shell must give one",
+             (`log kinds=tab`); a fleet drive's plain shell must give one; its reason at birth \
+             (`described`)",
         ),
         row(
             "req=<id>",
@@ -72,6 +73,10 @@ pub(crate) const PAGE: Page = Page {
              only a worker's); else `ERR spawn req=<id>: <why>`, `this caller makes no request` \
              from a person's shell or a client in no tab; not on the connected form",
         ),
+        row(
+            "package=<ids>",
+            "its `package` at birth: 1 to 4 tracker ids (`FL-04,CX-01`), never cut",
+        ),
         row("agent=<word>", "the worker's agent (`help spawn worker`)"),
         row("model=<m>", "the agent's model"),
         row(
@@ -80,9 +85,12 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "autopilot=<land|cruise>",
-            "the worker's Autopilot (default land); `meta set autopilot` switches later",
+            "the worker's Autopilot (default land; `meta set autopilot` changes it)",
         ),
-        row("from=<sid>", "who the task is from (`task from=`)"),
+        row(
+            "from=<sid>",
+            "who the task is from (`task from=`), its creator at birth",
+        ),
         row(
             "len=<n>",
             "the task's bytes after `GO <n>`: 1 to 65536, no NUL",
@@ -168,16 +176,17 @@ pub(crate) const PAGE: Page = Page {
                 ),
                 row(
                     "why=startup",
-                    "no agent composer (for `codex`, no proven claim, and a `codex` program a \
-                     fabric hold keeps from claiming is not judged until 120 s after the hold \
-                     lifts) within 120 s of `since_ms=` or sooner if its launcher gives up, with \
-                     what held it in `attention=` (each names the member too, where its label is \
-                     known, among them: a launch refused for a cause no wait ends, what mends it \
-                     first; a launch held because no account of its pool can take it now, and \
-                     when the first opens, which never starts later; an install or sign-in check \
-                     with no progress for 45 minutes; a program atpkg keeps off, and why; and `no \
-                     shell prompt`, with what the shell showed: one that drew nothing and used no \
-                     CPU is stuck at its start, as on a Mac that needs a restart)",
+                    "no agent composer (for `codex`, neither a proven claim nor a turn its own \
+                     OSC 7501 reports began, and a `codex` program a fabric hold keeps from \
+                     claiming is not judged until 120 s after the hold lifts) within 120 s of \
+                     `since_ms=` or sooner if its launcher gives up, with what held it in \
+                     `attention=` (each names the member too, where its label is known, among \
+                     them: a launch refused for a cause no wait ends, what mends it first; a \
+                     launch held because no account of its pool can take it now, and when the \
+                     first opens, which never starts later; an install or sign-in check with no \
+                     progress for 45 minutes; a program atpkg keeps off, and why; and `no shell \
+                     prompt`, with what the shell showed: one that drew nothing and used no CPU \
+                     is stuck at its start, as on a Mac that needs a restart)",
                 ),
                 row("why=held", "stuck 120 s at an unhandled screen"),
                 row(
@@ -284,7 +293,8 @@ pub(crate) const PAGE: Page = Page {
                      the driven Mac's home, resolved there and refused where it leaves the home, \
                      lies in a folder macOS guards, or is not there; quoted, since bash turns an \
                      unquoted `cwd=~/…` into this Mac's own home before aterm sees it), `from=`, \
-                     `why=<one line>`, `req=<id>` and `raise=false` alone, and each `ERR denied:` names the \
+                     `why=<one line>`, `req=<id>`, `package=<ids>` and `raise=false` alone, and each \
+                     `ERR denied:` names the \
                      word it refused. `aterm ctl … spawn agent=… label=<word>` keeps the label on \
                      this Mac's `board` and never sends it.",
                 ),

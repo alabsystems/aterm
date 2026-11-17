@@ -599,6 +599,20 @@ impl LocalLog {
         )
     }
 
+    /// Every file this log's verdict is read from: its store (for a vault's, the records entry,
+    /// and both places a layout can keep its data, [`aterm_secrets::client::Paths::standing_files`])
+    /// and each file beside it the reader stamps. A host that judges again whenever the verdict
+    /// may move, rather than on a clock, watches these.
+    #[must_use]
+    pub fn read_files(&self) -> Vec<PathBuf> {
+        let mut files = vec![self.file.clone()];
+        files.extend(self.aux_files.iter().cloned());
+        if let Some(paths) = &self.paths {
+            files.extend(paths.standing_files());
+        }
+        files
+    }
+
     fn reading(file: PathBuf, aux_files: Vec<PathBuf>, read: Reader) -> Self {
         Self {
             file,

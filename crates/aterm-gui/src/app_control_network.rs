@@ -5,6 +5,7 @@
 
 use std::hash::{Hash, Hasher};
 
+use aterm_db::service_derivations::{Derivations, Part};
 use aterm_json::{Value, json};
 use aterm_types::app_inspection::{InspectionEnvelope, InspectionSubject};
 use aterm_types::network_state::{
@@ -60,6 +61,39 @@ fn service(value: &ServiceState) -> Value {
                 VaultNetworkRefreshOutcome::Failed => "Failed",
             },
         })),
+    })
+}
+
+/// The wire name of a part of a kept service standing's key.
+const fn part(value: Part) -> &'static str {
+    match value {
+        Part::Vault => "vault",
+        Part::Custody => "custody",
+        Part::Tables => "tables",
+        Part::Generation => "generation",
+        Part::Config => "config",
+    }
+}
+
+/// How many samples the services observer took, how many derived each service's standing, and,
+/// of the derivations made where a standing was kept, how many found each part of its key moved
+/// first.
+fn derivations(value: &Derivations) -> Value {
+    let Derivations {
+        samples,
+        secrets,
+        accounts,
+        moved: _,
+    } = value;
+    let moved = Part::ALL
+        .into_iter()
+        .map(|each| (part(each).to_owned(), json!(value.moved_by(each))))
+        .collect::<aterm_json::Map>();
+    json!({
+        "samples": samples,
+        "secrets": secrets,
+        "accounts": accounts,
+        "moved": Value::Object(moved),
     })
 }
 
@@ -130,6 +164,14 @@ pub(super) fn inspect(app: &crate::App) -> Result<Vec<String>, String> {
             "accounts": service(&snapshot.services.accounts),
             "secrets": service(&snapshot.services.secrets),
         },
+        // Read now from the services observer, which this asks for no sample: none where the
+        // window has no reader of it, no observer runs or its publication is held.
+        "services_derived": app
+            .service_derivations
+            .as_ref()
+            .and_then(|read| read())
+            .as_ref()
+            .map(derivations),
     });
     let body = aterm_json::to_string(&value).map_err(|error| error.to_string())?;
     let mut fingerprint = std::collections::hash_map::DefaultHasher::new();

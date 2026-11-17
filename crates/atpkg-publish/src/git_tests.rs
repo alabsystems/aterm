@@ -196,3 +196,80 @@ fn an_index_longer_than_a_whole_capture_is_still_searched_for_hints() {
         None
     );
 }
+
+/// RL-30: a source repository whose local config sets the keys Trust's and Clean's hook
+/// installers write (a repository-relative `core.hooksPath`, a `core.sshCommand`, and here a
+/// `core.fsmonitor` too) is admitted, and no query through it runs any of them. CONTROL: the
+/// fixture's own git, with none of agh's words, runs all three in that repository.
+#[cfg(unix)]
+#[test]
+fn a_source_repository_with_trusts_hook_keys_is_admitted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    const HANG_DETECTOR: Duration = Duration::from_secs(60);
+    let dir = aterm_tempfile::TempDir::new().expect("scratch");
+    let repo = dir.path().join("trust");
+    let ran = dir.path().join("ran");
+    std::fs::create_dir_all(repo.join("scripts/hooks")).expect("mkdir");
+    std::fs::create_dir_all(&ran).expect("mkdir");
+    let git = |args: &[&str]| {
+        let mut git = crate::testkit::git();
+        git.arg("-C").arg(&repo).args(args);
+        // A hang detector, not a budget: each is one local git command.
+        aterm_uds::deadline::output_until(&mut git, Instant::now() + HANG_DETECTOR)
+            .expect("fixture git")
+    };
+    let script = |path: &Path, name: &str| {
+        let body = format!("#!/bin/sh\n: > '{}'\nexit 1\n", ran.join(name).display());
+        std::fs::write(path, body).expect("script");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    };
+    for hook in ["reference-transaction", "post-index-change"] {
+        script(&repo.join("scripts/hooks").join(hook), hook);
+    }
+    let (fsmonitor, ssh) = (dir.path().join("fsmonitor"), dir.path().join("ssh"));
+    script(&fsmonitor, "fsmonitor");
+    script(&ssh, "ssh");
+    assert!(git(&["init", "-q", "-b", "main"]).status.success());
+    assert!(
+        git(&["commit", "-q", "--allow-empty", "-m", "one"])
+            .status
+            .success()
+    );
+    for (key, value) in [
+        ("core.hookspath", "scripts/hooks"),
+        ("core.fsmonitor", fsmonitor.to_str().expect("UTF-8")),
+        ("core.sshcommand", ssh.to_str().expect("UTF-8")),
+    ] {
+        assert!(git(&["config", "--local", key, value]).status.success());
+    }
+
+    let source = SourceRepo::open(&repo)
+        .unwrap_or_else(|e| panic!("the source with Trust's hook keys is admitted: {e}"));
+    let head = source
+        .query(&["rev-parse", "HEAD"])
+        .expect("an object read");
+    let head = head.trim();
+    source
+        .query(&["update-ref", "refs/atpkg/probe", head])
+        .expect("a ref update of its own");
+    source.query(&["status", "--porcelain"]).expect("status");
+    assert!(
+        source
+            .query(&["ls-remote", "ssh://example.invalid/x"])
+            .is_err(),
+        "no ssh transport starts"
+    );
+    let ran_nothing = || std::fs::read_dir(&ran).expect("ran").next().is_none();
+    assert!(
+        ran_nothing(),
+        "a planted command ran: {:?}",
+        std::fs::read_dir(&ran).expect("ran").collect::<Vec<_>>()
+    );
+
+    git(&["update-ref", "-d", "refs/atpkg/probe"]);
+    git(&["status", "--porcelain"]);
+    git(&["ls-remote", "ssh://example.invalid/x"]);
+    for name in ["reference-transaction", "fsmonitor", "ssh"] {
+        assert!(ran.join(name).is_file(), "the control's git ran no {name}");
+    }
+}

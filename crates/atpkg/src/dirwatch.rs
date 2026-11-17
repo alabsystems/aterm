@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A blocking watch over directories and files, for a thread that sleeps until something it reads may have moved: a kqueue of vnode filters on macOS, an inotify instance on Linux, and none elsewhere ([`Watcher::new`](crate::dirwatch::Watcher::new) answers `Unsupported`; nothing names a watch on Windows).
+//! A blocking watch over directories, files, processes and readable descriptors, for a thread that sleeps until something it reads may have moved: a kqueue of vnode, process and read filters on macOS, an inotify instance, pidfds and polled descriptors on Linux, and none elsewhere ([`Watcher::new`](crate::dirwatch::Watcher::new) answers `Unsupported`; nothing names a watch on Windows).
 
 use std::io;
 use std::path::Path;
@@ -44,6 +44,18 @@ impl Watcher {
         self.imp.add(file, Kind::File)
     }
 
+    /// Watch the regular file `file`'s contents and its deletion, rename or revocation, but not
+    /// its attributes: a change of its times or mode alone (`touch`, `chmod`) names nothing
+    /// (no `NOTE_ATTRIB` on macOS; on Linux no `IN_ATTRIB`, and no `IN_CLOSE_WRITE`, which a
+    /// file opened for writing and closed unwritten fires). A write and a rename over its path
+    /// (the file it was goes) name the watch; a truncation with no write after it does not on
+    /// macOS, which tells it only as an attribute change.
+    /// # Errors
+    /// `file` cannot be opened or watched, is a symlink, or is not a regular file.
+    pub fn add_file_contents(&self, file: &Path) -> io::Result<WatchId> {
+        self.imp.add(file, Kind::Contents)
+    }
+
     /// Watch a directory while refusing a link anywhere on its path at the kernel open.
     /// # Errors
     /// The scoped open/watch fails, or this platform has no strict scoped opener.
@@ -74,12 +86,49 @@ impl Watcher {
         }
     }
 
+    /// Whether a process watch ([`Self::add_process`]) is named at its process's `exec` as well as
+    /// at its exit: on macOS (`NOTE_EXEC`), not on Linux, whose pidfd hears the exit alone.
+    pub const HEARS_EXEC: bool = cfg!(target_os = "macos");
+
+    /// Watch the process `pid`: [`Self::wait`] names the watch at each `exec` of it where
+    /// [`Self::HEARS_EXEC`], and at its exit, after which the watch [`Self::is_gone`]. A pid the
+    /// kernel later gives another process is not that process: the watch stays on the one it
+    /// was placed on.
+    /// # Errors
+    /// `NotFound`: no process has that pid, or on macOS the process has exited (a zombie too;
+    /// Linux watches a zombie, and the next wait names it gone). `InvalidInput`: pid 0, or one
+    /// past `pid_t`. Otherwise the kernel refused the watch (`ENOSYS` before Linux 5.3).
+    pub fn add_process(&self, pid: u32) -> io::Result<WatchId> {
+        // `pid_t` is an `i32` on both arms.
+        let pid = i32::try_from(pid)
+            .ok()
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        self.imp.add_process(pid)
+    }
+
+    /// Watch the descriptor `fd` for reading: [`Self::wait`] names the watch while there is
+    /// something to read on it, so its owner drains it before the next wait (a doorbell's pipe, a
+    /// libnotify registration, a timer: the descriptors `aterm_uds::wall_watch::WallWatch::fds`
+    /// says a wall clock's move on). The watch holds no descriptor of its own: the owner keeps
+    /// `fd` open until it removes the watch, and a descriptor closed first names nothing more
+    /// (macOS drops its filter with the close; Linux reads it gone). An end of file (every writer
+    /// of a pipe closed) is named once, and the watch is then gone.
+    /// # Errors
+    /// The kernel refused the watch: `fd` is not open (`EBADF`), or names nothing it can poll.
+    #[cfg(unix)]
+    pub fn add_readable(&self, fd: std::os::fd::BorrowedFd<'_>) -> io::Result<WatchId> {
+        use std::os::fd::AsRawFd as _;
+        self.imp.add_readable(fd.as_raw_fd())
+    }
+
     /// Stop watch `id`.
     pub fn remove(&self, id: WatchId) {
         self.imp.remove(id);
     }
 
-    /// Whether watch `id` will never fire again.
+    /// Whether watch `id` will never fire again: it was removed, its object was removed, or its
+    /// process exited.
     #[must_use]
     pub fn is_gone(&self, id: WatchId) -> bool {
         self.imp.is_gone(id)
@@ -114,6 +163,8 @@ impl Watcher {
 enum Kind {
     Dir,
     File,
+    /// A regular file, its contents alone ([`Watcher::add_file_contents`]).
+    Contents,
 }
 
 #[cfg(target_os = "macos")]
@@ -135,13 +186,28 @@ mod imp {
     pub(super) struct Watcher {
         kq: OwnedFd,
         next: AtomicU64,
-        /// Each watch not yet removed.
-        open: Mutex<HashMap<WatchId, Open>>,
+        /// Each watch not yet removed, and the watches of each watched process.
+        open: Mutex<Opens>,
+    }
+
+    #[derive(Default)]
+    struct Opens {
+        by_id: HashMap<WatchId, Open>,
+        /// Per process with a knote on the queue, its watches: the kernel keeps one knote per
+        /// process and queue, which they share; it goes with the process's exit (`EV_ONESHOT`)
+        /// or with the last of them.
+        pids: HashMap<i32, Vec<WatchId>>,
     }
 
     struct Open {
+        /// A vnode watch's descriptor, whose close removes its knote; `None` for a process
+        /// watch.
         #[expect(dead_code, reason = "held for its close, which removes the knote")]
-        fd: OwnedFd,
+        fd: Option<OwnedFd>,
+        /// The process a process watch is on.
+        pid: Option<i32>,
+        /// The descriptor a read watch is on, which its owner holds ([`Watcher::add_readable`]).
+        read: Option<libc::c_int>,
         gone: bool,
     }
 
@@ -159,7 +225,7 @@ mod imp {
             let watcher = Self {
                 kq,
                 next: AtomicU64::new(1),
-                open: Mutex::new(HashMap::new()),
+                open: Mutex::new(Opens::default()),
             };
             watcher.change(BELL, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0, 0)?;
             Ok(watcher)
@@ -213,7 +279,7 @@ mod imp {
         pub(super) fn add_scoped(&self, path: &Path, kind: Kind) -> io::Result<WatchId> {
             let want = match kind {
                 Kind::Dir => aterm_uds::nofollow::Kind::Dir,
-                Kind::File => aterm_uds::nofollow::Kind::File,
+                Kind::File | Kind::Contents => aterm_uds::nofollow::Kind::File,
             };
             let fd = aterm_uds::nofollow::open_evtonly(path, want)?;
             self.add_opened(std::fs::File::from(fd), kind)
@@ -237,8 +303,17 @@ mod imp {
                         | libc::NOTE_RENAME
                         | libc::NOTE_REVOKE
                 }
+                Kind::Contents if meta.is_file() => {
+                    libc::NOTE_WRITE
+                        | libc::NOTE_EXTEND
+                        | libc::NOTE_DELETE
+                        | libc::NOTE_RENAME
+                        | libc::NOTE_REVOKE
+                }
                 Kind::Dir => return Err(io::Error::from(io::ErrorKind::NotADirectory)),
-                Kind::File => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+                Kind::File | Kind::Contents => {
+                    return Err(io::Error::from(io::ErrorKind::InvalidInput));
+                }
             };
             let fd = OwnedFd::from(file);
             let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
@@ -250,7 +325,70 @@ mod imp {
                 fflags,
                 id.0,
             )?;
-            open.insert(id, Open { fd, gone: false });
+            open.by_id.insert(
+                id,
+                Open {
+                    fd: Some(fd),
+                    pid: None,
+                    read: None,
+                    gone: false,
+                },
+            );
+            Ok(id)
+        }
+
+        pub(super) fn add_process(&self, pid: i32) -> io::Result<WatchId> {
+            let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
+            let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            if !open.pids.contains_key(&pid) {
+                self.change(
+                    pid as libc::uintptr_t,
+                    libc::EVFILT_PROC,
+                    libc::EV_ADD | libc::EV_ENABLE | libc::EV_CLEAR,
+                    libc::NOTE_EXIT | libc::NOTE_EXEC,
+                    0,
+                )
+                .map_err(|e| {
+                    if e.raw_os_error() == Some(libc::ESRCH) {
+                        io::Error::from(io::ErrorKind::NotFound)
+                    } else {
+                        e
+                    }
+                })?;
+            }
+            open.pids.entry(pid).or_default().push(id);
+            open.by_id.insert(
+                id,
+                Open {
+                    fd: None,
+                    pid: Some(pid),
+                    read: None,
+                    gone: false,
+                },
+            );
+            Ok(id)
+        }
+
+        pub(super) fn add_readable(&self, fd: libc::c_int) -> io::Result<WatchId> {
+            let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
+            let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            // Level-triggered: named at each wait while something is there to read.
+            self.change(
+                fd as libc::uintptr_t,
+                libc::EVFILT_READ,
+                libc::EV_ADD | libc::EV_ENABLE,
+                0,
+                id.0,
+            )?;
+            open.by_id.insert(
+                id,
+                Open {
+                    fd: None,
+                    pid: None,
+                    read: Some(fd),
+                    gone: false,
+                },
+            );
             Ok(id)
         }
 
@@ -258,16 +396,46 @@ mod imp {
             self.open
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
+                .by_id
                 .get(&id)
                 .is_none_or(|open| open.gone)
         }
 
         pub(super) fn remove(&self, id: WatchId) {
-            let open = self
-                .open
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .remove(&id);
+            let mut opens = self.open.lock().unwrap_or_else(|p| p.into_inner());
+            let open = opens.by_id.remove(&id);
+            if let Some(fd) = open
+                .as_ref()
+                .filter(|open| !open.gone)
+                .and_then(|open| open.read)
+            {
+                // A descriptor its owner closed first took its filter with it (`EBADF`).
+                let _ = self.change(
+                    fd as libc::uintptr_t,
+                    libc::EVFILT_READ,
+                    libc::EV_DELETE,
+                    0,
+                    0,
+                );
+            }
+            if let Some(pid) = open.as_ref().and_then(|open| open.pid)
+                && let Some(ids) = opens.pids.get_mut(&pid)
+            {
+                ids.retain(|other| *other != id);
+                if ids.is_empty() {
+                    opens.pids.remove(&pid);
+                    // The process's last watch: its knote goes. One whose process exited is
+                    // gone already (`ENOENT`).
+                    let _ = self.change(
+                        pid as libc::uintptr_t,
+                        libc::EVFILT_PROC,
+                        libc::EV_DELETE,
+                        0,
+                        0,
+                    );
+                }
+            }
+            drop(opens);
             drop(open);
         }
 
@@ -307,20 +475,51 @@ mod imp {
                 if event.flags & libc::EV_ERROR != 0 {
                     return Err(io::Error::from_raw_os_error(event.data as i32));
                 }
-                if event.filter != libc::EVFILT_VNODE {
-                    continue;
+                let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+                match event.filter {
+                    libc::EVFILT_VNODE => {
+                        let id = WatchId(event.udata.addr() as u64);
+                        if event.fflags & (libc::NOTE_DELETE | libc::NOTE_REVOKE) != 0
+                            && let Some(open) = open.by_id.get_mut(&id)
+                        {
+                            open.gone = true;
+                        }
+                        ids.push(id);
+                    }
+                    libc::EVFILT_READ => {
+                        let id = WatchId(event.udata.addr() as u64);
+                        if event.flags & libc::EV_EOF != 0
+                            && let Some(open) = open.by_id.get_mut(&id)
+                            && !open.gone
+                        {
+                            // Every writer closed: readable for good, so named once and let go.
+                            open.gone = true;
+                            let _ =
+                                self.change(event.ident, libc::EVFILT_READ, libc::EV_DELETE, 0, 0);
+                        }
+                        ids.push(id);
+                    }
+                    libc::EVFILT_PROC => {
+                        let Ok(pid) = i32::try_from(event.ident) else {
+                            continue;
+                        };
+                        // An exit takes the knote with it (`EV_ONESHOT`), and every watch of
+                        // the process is gone.
+                        let exited = event.fflags & libc::NOTE_EXIT != 0;
+                        let of_pid = if exited {
+                            open.pids.remove(&pid).unwrap_or_default()
+                        } else {
+                            open.pids.get(&pid).cloned().unwrap_or_default()
+                        };
+                        for id in of_pid {
+                            if exited && let Some(open) = open.by_id.get_mut(&id) {
+                                open.gone = true;
+                            }
+                            ids.push(id);
+                        }
+                    }
+                    _ => {}
                 }
-                let id = WatchId(event.udata.addr() as u64);
-                if event.fflags & (libc::NOTE_DELETE | libc::NOTE_REVOKE) != 0
-                    && let Some(open) = self
-                        .open
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get_mut(&id)
-                {
-                    open.gone = true;
-                }
-                ids.push(id);
             }
             Ok(ids)
         }
@@ -337,8 +536,8 @@ mod imp {
     use std::io::{self, Read as _};
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::path::Path;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use super::{Kind, WatchId};
@@ -366,14 +565,40 @@ mod imp {
         | libc::IN_MOVE_SELF
         | libc::IN_DONT_FOLLOW;
 
+    /// A file's contents alone: `IN_MODIFY` names every write and truncation, so neither
+    /// `IN_ATTRIB` nor `IN_CLOSE_WRITE` (a close after an open for writing, written or not) is
+    /// heard.
+    const CONTENTS_MASK: u32 =
+        IN_MODIFY | libc::IN_DELETE_SELF | libc::IN_MOVE_SELF | libc::IN_DONT_FOLLOW;
+
     const HEAD: usize = 16;
 
     pub(super) struct Watcher {
         inotify: std::fs::File,
-        /// The eventfd [`Watcher::wake`] writes.
+        /// The eventfd [`Watcher::wake`] writes, and [`Watcher::add_process`] too.
         bell: std::fs::File,
+        /// Set by [`Watcher::wake`]: a bell rung only by a new process watch ends no wait.
+        woken: AtomicBool,
         next: AtomicU64,
         wds: Mutex<Wds>,
+        /// Each process watch's pidfd, which `poll` reports readable once its process exited.
+        procs: Mutex<HashMap<WatchId, Proc>>,
+        /// Each read watch's descriptor, which its owner holds ([`Watcher::add_readable`]).
+        reads: Mutex<HashMap<WatchId, Readable>>,
+    }
+
+    /// One read watch.
+    struct Readable {
+        fd: libc::c_int,
+        gone: bool,
+    }
+
+    /// One process watch.
+    struct Proc {
+        /// Shared with each wait that polls it: one removed during a wait is closed when that
+        /// wait is done with it.
+        fd: Arc<OwnedFd>,
+        gone: bool,
     }
 
     /// The kernel's watch descriptors against ours: one inode watched twice
@@ -406,8 +631,11 @@ mod imp {
             Ok(Self {
                 inotify,
                 bell,
+                woken: AtomicBool::new(false),
                 next: AtomicU64::new(1),
                 wds: Mutex::new(Wds::default()),
+                procs: Mutex::new(HashMap::new()),
+                reads: Mutex::new(HashMap::new()),
             })
         }
 
@@ -421,13 +649,17 @@ mod imp {
 
             let mask = match kind {
                 Kind::Dir => DIR_MASK,
-                Kind::File => {
+                Kind::File | Kind::Contents => {
                     // `IN_DONT_FOLLOW` would watch a symlink itself rather
                     // than refuse it; the kind is checked on the link.
                     if !std::fs::symlink_metadata(path)?.is_file() {
                         return Err(io::Error::from(io::ErrorKind::InvalidInput));
                     }
-                    FILE_MASK
+                    if kind == Kind::File {
+                        FILE_MASK
+                    } else {
+                        CONTENTS_MASK
+                    }
                 }
             };
             let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())?;
@@ -444,12 +676,88 @@ mod imp {
             Ok(id)
         }
 
+        pub(super) fn add_process(&self, pid: i32) -> io::Result<WatchId> {
+            // SAFETY: `pidfd_open` takes a pid and a flags word and returns a new descriptor,
+            // close-on-exec, or -1; nothing is borrowed.
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+            if raw < 0 {
+                let err = io::Error::last_os_error();
+                return Err(if err.raw_os_error() == Some(libc::ESRCH) {
+                    io::Error::from(io::ErrorKind::NotFound)
+                } else {
+                    err
+                });
+            }
+            let raw = libc::c_int::try_from(raw)
+                .map_err(|_| io::Error::other("a pidfd past the descriptor range"))?;
+            // SAFETY: `raw` is fresh and exclusively ours.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
+            self.procs.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                id,
+                Proc {
+                    fd: Arc::new(fd),
+                    gone: false,
+                },
+            );
+            // A wait polls the pidfds there were as it started: the bell has a running one
+            // take this one too.
+            self.ring()?;
+            Ok(id)
+        }
+
+        pub(super) fn add_readable(&self, fd: libc::c_int) -> io::Result<WatchId> {
+            // SAFETY: F_GETFD only reads the descriptor's flags; a closed one is `EBADF`.
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let id = WatchId(self.next.fetch_add(1, Ordering::Relaxed));
+            self.reads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id, Readable { fd, gone: false });
+            // As for a pidfd: a running wait polls this one too.
+            self.ring()?;
+            Ok(id)
+        }
+
         pub(super) fn is_gone(&self, id: WatchId) -> bool {
+            if let Some(read) = self
+                .reads
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+            {
+                return read.gone;
+            }
+            if let Some(proc) = self
+                .procs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&id)
+            {
+                return proc.gone;
+            }
             let wds = self.wds.lock().unwrap_or_else(|p| p.into_inner());
             !wds.of_id.contains_key(&id) || wds.gone.contains(&id)
         }
 
         pub(super) fn remove(&self, id: WatchId) {
+            if self
+                .procs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id)
+                .is_some()
+                || self
+                    .reads
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id)
+                    .is_some()
+            {
+                return;
+            }
             let mut wds = self.wds.lock().unwrap_or_else(|p| p.into_inner());
             wds.gone.remove(&id);
             let Some(wd) = wds.of_id.remove(&id) else {
@@ -468,46 +776,98 @@ mod imp {
 
         pub(super) fn wait(&self, timeout: Option<Duration>) -> io::Result<Vec<WatchId>> {
             let deadline = timeout.and_then(|t| Instant::now().checked_add(t));
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.inotify.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: self.bell.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-            ];
             loop {
-                let ms = deadline.map_or(-1, |at| {
-                    let left = at.saturating_duration_since(Instant::now());
-                    libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000))
-                        .unwrap_or(libc::c_int::MAX)
-                });
-                // SAFETY: two initialized pollfds that live for this call.
-                let rc = unsafe { libc::poll(fds.as_mut_ptr(), 2, ms) };
-                if rc >= 0 {
-                    break;
+                let procs: Vec<(WatchId, Arc<OwnedFd>)> = self
+                    .procs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .filter(|(_, proc)| !proc.gone)
+                    .map(|(id, proc)| (*id, Arc::clone(&proc.fd)))
+                    .collect();
+                let reads: Vec<(WatchId, libc::c_int)> = self
+                    .reads
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .iter()
+                    .filter(|(_, read)| !read.gone)
+                    .map(|(id, read)| (*id, read.fd))
+                    .collect();
+                let mut fds: Vec<libc::pollfd> = [self.inotify.as_raw_fd(), self.bell.as_raw_fd()]
+                    .into_iter()
+                    .chain(procs.iter().map(|(_, fd)| fd.as_raw_fd()))
+                    .chain(reads.iter().map(|(_, fd)| *fd))
+                    .map(|fd| libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    })
+                    .collect();
+                let count = libc::nfds_t::try_from(fds.len()).unwrap_or(libc::nfds_t::MAX);
+                let rc = loop {
+                    let ms = deadline.map_or(-1, |at| {
+                        let left = at.saturating_duration_since(Instant::now());
+                        libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000))
+                            .unwrap_or(libc::c_int::MAX)
+                    });
+                    // SAFETY: `count` initialized pollfds that live for this call; each pidfd
+                    // stays open while `procs` holds it.
+                    let rc = unsafe { libc::poll(fds.as_mut_ptr(), count, ms) };
+                    if rc >= 0 {
+                        break rc;
+                    }
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                };
+                let mut woken = false;
+                if fds[1].revents & libc::POLLIN != 0 {
+                    let mut count = [0u8; 8];
+                    let _ = (&self.bell).read(&mut count);
+                    woken = self.woken.swap(false, Ordering::AcqRel);
                 }
-                let err = io::Error::last_os_error();
-                if err.kind() != io::ErrorKind::Interrupted {
-                    return Err(err);
+                let mut ids = Vec::new();
+                if fds[0].revents != 0 {
+                    if fds[0].revents & libc::POLLIN == 0 {
+                        return Err(io::Error::other("the inotify descriptor failed"));
+                    }
+                    self.drain(&mut ids)?;
                 }
-            }
-            if fds[1].revents & libc::POLLIN != 0 {
-                let mut count = [0u8; 8];
-                let _ = (&self.bell).read(&mut count);
-            }
-            let mut ids = Vec::new();
-            if fds[0].revents != 0 {
-                if fds[0].revents & libc::POLLIN == 0 {
-                    return Err(io::Error::other("the inotify descriptor failed"));
+                let (proc_fds, read_fds) = fds[2..].split_at(procs.len());
+                {
+                    let mut held = self.reads.lock().unwrap_or_else(|p| p.into_inner());
+                    for ((id, _), polled) in reads.iter().zip(read_fds) {
+                        if polled.revents == 0 {
+                            continue;
+                        }
+                        // Closed by its owner (`POLLNVAL`), or every writer gone (`POLLHUP`):
+                        // named once, and gone.
+                        let ended = polled.revents & (libc::POLLNVAL | libc::POLLHUP) != 0;
+                        if let Some(read) = held.get_mut(id) {
+                            read.gone |= ended;
+                            ids.push(*id);
+                        }
+                    }
                 }
-                self.drain(&mut ids)?;
+                {
+                    let mut held = self.procs.lock().unwrap_or_else(|p| p.into_inner());
+                    for ((id, _), polled) in procs.iter().zip(proc_fds) {
+                        // Readable (or hung up, once reaped): the process exited.
+                        if polled.revents != 0
+                            && let Some(proc) = held.get_mut(id)
+                        {
+                            proc.gone = true;
+                            ids.push(*id);
+                        }
+                    }
+                }
+                let due = rc == 0 || deadline.is_some_and(|at| Instant::now() >= at);
+                if !ids.is_empty() || woken || due {
+                    return Ok(ids);
+                }
+                // Only a new process watch rang: poll again over the set it joined.
             }
-            Ok(ids)
         }
 
         fn drain(&self, ids: &mut Vec<WatchId>) -> io::Result<()> {
@@ -565,6 +925,12 @@ mod imp {
         }
 
         pub(super) fn wake(&self) -> io::Result<()> {
+            self.woken.store(true, Ordering::Release);
+            self.ring()
+        }
+
+        /// Ring the bell, which ends a running `poll`.
+        fn ring(&self) -> io::Result<()> {
             use std::io::Write as _;
 
             match (&self.bell).write(&1u64.to_ne_bytes()) {
@@ -593,6 +959,15 @@ mod imp {
         }
 
         pub(super) fn add(&self, _path: &Path, _kind: Kind) -> io::Result<WatchId> {
+            match self.0 {}
+        }
+
+        pub(super) fn add_process(&self, _pid: i32) -> io::Result<WatchId> {
+            match self.0 {}
+        }
+
+        #[cfg(unix)]
+        pub(super) fn add_readable(&self, _fd: std::os::fd::RawFd) -> io::Result<WatchId> {
             match self.0 {}
         }
 

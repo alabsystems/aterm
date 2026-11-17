@@ -2743,6 +2743,265 @@ fn in_the_tab_the_probe_notes_what_no_install_fixes() {
     }
 }
 
+/// alice (501), an administrator, as [`Fake::logged_in`] scripts her.
+fn alice() -> crate::model::User {
+    crate::model::User {
+        name: "alice".into(),
+        uid: 501,
+        gid: 20,
+        home: "/Users//alice".into(),
+        shell: "/bin/zsh".into(),
+        admin: true,
+    }
+}
+
+/// The installed build's check as the fake hears it: read-only (`--check`), waiting behind no
+/// System State pass, narrowed to the tools and the root steps, in alice's own home, under the
+/// tab's own marker (which makes that build answer by its tab's standing) and nothing else of
+/// this program's environment. A run without `--check` would apply.
+fn installed_check(leave: bool) -> String {
+    let leave = if leave {
+        " ATERM_COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE=1"
+    } else {
+        ""
+    };
+    format!(
+        "HOME=/Users//alice USER=alice LOGNAME=alice ATERM_COMMAND_LINE_TOOLS_TAB=1{leave} {ATERM} init --check --no-wait --only base.clt"
+    )
+}
+
+/// `found` as the Mac Setup tab's program, saying nothing.
+fn tab_item(found: Found) -> CommandLineTools {
+    item(found).in_tab(Tab::new(Arc::new(|_| {})))
+}
+
+/// A Mac Setup tab carried across an update waits at its password prompt with an older build's
+/// rules while `sudo` runs the build now at its path. Once its password ran (this run asked),
+/// what the build at the path reads decides the root steps' row: in place where that build's
+/// own check exits 0, though this program's older reading still names a step it owes. The
+/// check carries this run's standing: the tab's marker, and its leave of developer mode.
+/// NEGATIVE CONTROLS: the same reading with the image not replaced, unread, a check that finds a
+/// step owed (exit 77), and a check that could not run each keep this program's own reading,
+/// still owed after the password; a run somebody typed asks the installed build nothing.
+#[test]
+fn a_tab_an_update_replaced_takes_the_installed_builds_reading_after_its_password() {
+    use crate::root_steps::Owed;
+    let stale = |tab: bool| {
+        let found = Found::Present(CC.into());
+        let item = if tab { tab_item(found) } else { item(found) }
+            .with_owed(Box::new(|_: &dyn System| vec![Owed::LanBroker]));
+        item.asked.store(true, std::sync::atomic::Ordering::Relaxed);
+        item
+    };
+    let check = installed_check(false);
+    assert_eq!(
+        stale(true).installed_check(&alice(), false).display(),
+        check
+    );
+    assert_eq!(
+        stale(true).installed_check(&alice(), true).display(),
+        installed_check(true)
+    );
+    // A tab the person's own press opened says so to the installed build.
+    assert_eq!(
+        stale(true)
+            .with_explicit_tab(true)
+            .installed_check(&alice(), false)
+            .display(),
+        check.replacen(" /", " ATERM_COMMAND_LINE_TOOLS_TAB_EXPLICIT=1 /", 1)
+    );
+    let reads = |tab: bool, replaced: Option<bool>, reply: Option<Ran>| {
+        let mut sys = console();
+        sys.tty = false;
+        sys.image_replaced = replaced;
+        sys.logged_in(&alice());
+        if let Some(reply) = reply {
+            sys.on(&check, reply);
+        }
+        let (row, steps) = with_steps(&sys, &stale(tab), Mode::Plan);
+        (row, steps, sys.calls().contains(&check))
+    };
+
+    let (row, steps, checked) = reads(true, Some(true), Some(Ran::ok("")));
+    assert_eq!(row.outcome, Outcome::Ok, "{row:?}");
+    assert_eq!(steps.outcome, Outcome::Ok, "{steps:?}");
+    assert!(checked);
+
+    for (tab, replaced, reply, runs) in [
+        (true, Some(false), Some(Ran::ok("")), false),
+        (true, None, Some(Ran::ok("")), false),
+        (true, Some(true), Some(Ran::exit(77, "")), true),
+        (true, Some(true), None, true),
+        (false, Some(true), Some(Ran::ok("")), false),
+    ] {
+        let (_, steps, checked) = reads(tab, replaced, reply.clone());
+        assert_eq!(
+            steps.outcome,
+            Outcome::Deferred,
+            "{tab} {replaced:?} {reply:?}: {steps:?}"
+        );
+        assert!(
+            steps
+                .why
+                .as_deref()
+                .is_some_and(|why| why.starts_with("still owed after this run's Mac password")),
+            "{steps:?}"
+        );
+        assert_eq!(checked, runs, "{tab} {replaced:?} {reply:?}");
+    }
+
+    // A tab whose window read developer mode off as the person's choice says so to the
+    // installed build, which then leaves it too.
+    let leaving = stale(true).leaving_developer_mode(true);
+    let mut sys = console();
+    sys.image_replaced = Some(true);
+    sys.logged_in(&alice());
+    sys.on(&installed_check(true), Ran::ok(""));
+    assert_eq!(leaving.owed_now(&sys), Vec::<Owed>::new());
+    assert!(sys.calls().contains(&installed_check(true)));
+    assert!(!sys.calls().contains(&installed_check(false)));
+}
+
+/// A root half that ended unfinished still finishes the tab where the build now at this
+/// program's path, which an update put there while it ran, reads the run finished in place,
+/// whatever this program's own older readings say: here its tools probe refuses and its
+/// reading still names a step, so nothing but the installed build's answer can finish it.
+/// NEGATIVE CONTROL: the same end with that build finding something short, or with the image
+/// not replaced or unread, is the root half's own unfinished class.
+#[test]
+fn an_unfinished_root_exit_finishes_where_the_installed_build_reads_it_in_place() {
+    use crate::root_steps::Owed;
+    let stale = tab_item(Found::Refuses("license".into()))
+        .with_owed(Box::new(|_: &dyn System| vec![Owed::LanBroker]));
+    let check = installed_check(false);
+    let ends = |replaced: Option<bool>, reply: Ran| {
+        let mut sys = console();
+        sys.logged_in(&alice());
+        sys.image_replaced = replaced;
+        sys.on(&check, reply);
+        stale.ended(&sys, &Ok(Some(1)), None)
+    };
+    assert_eq!(ends(Some(true), Ran::ok("")), Ok(()));
+    assert_eq!(
+        ends(Some(true), Ran::exit(77, "")),
+        Err(Unfinished::Password)
+    );
+    assert_eq!(ends(Some(false), Ran::ok("")), Err(Unfinished::Password));
+    assert_eq!(ends(None, Ran::ok("")), Err(Unfinished::Password));
+}
+
+/// What the installed build answers a tab program an update replaced: finished where the tools
+/// are present, nothing is owed as the Mac Setup tab's program reads this Mac (developer mode
+/// left where that tab leaves it) and the LAN broker answers.
+/// NEGATIVE CONTROLS: a tab that does not leave developer mode still owes it; a run somebody
+/// typed never leaves it, whatever its window flag says; missing tools, another owed step and a
+/// broker that does not answer each read short.
+#[test]
+fn the_installed_build_answers_by_the_tabs_standing() {
+    use crate::root_steps::Owed;
+    let reads = |found: Found, owed: Vec<Owed>| {
+        item(found).with_owed(Box::new(move |_: &dyn System| owed.clone()))
+    };
+    let present = || Found::Present(CC.into());
+    let sys = console();
+    assert!(
+        reads(present(), vec![Owed::Debugger])
+            .reading_as_tab(true)
+            .finished_in_place(&sys)
+    );
+    assert!(
+        reads(present(), Vec::new())
+            .reading_as_tab(false)
+            .finished_in_place(&sys)
+    );
+
+    assert!(
+        !reads(present(), vec![Owed::Debugger])
+            .reading_as_tab(false)
+            .finished_in_place(&sys)
+    );
+    assert!(
+        !reads(present(), vec![Owed::Debugger])
+            .leaving_developer_mode(true)
+            .finished_in_place(&sys)
+    );
+    assert!(
+        !reads(Found::Refuses("license".into()), Vec::new())
+            .reading_as_tab(true)
+            .finished_in_place(&sys)
+    );
+    assert!(
+        !reads(present(), vec![Owed::Debugger, Owed::LanBroker])
+            .reading_as_tab(true)
+            .finished_in_place(&sys)
+    );
+    let mut silent = console();
+    silent.running_app = Some("/Applications/aterm.app".into());
+    assert!(
+        !reads(present(), Vec::new())
+            .reading_as_tab(true)
+            .finished_in_place(&silent)
+    );
+}
+
+/// A person's own run that applies or plans excludes from Spotlight the folders made in a home
+/// setup's password already scoped, which the automatic ask leaves to the next root
+/// transaction. Every run reads this Mac with the production reader
+/// ([`crate::root_steps::owed`]).
+/// NEGATIVE CONTROLS: a person's check and an automatic run on the same Mac owe no such folder;
+/// with nothing new in the home, no run owes the scope.
+#[test]
+fn only_a_persons_run_owes_a_new_folder_in_a_scoped_home() {
+    use crate::root_steps::Owed;
+    let sys = console();
+    crate::init_spotlight::tests::home(&sys);
+    sys.logged_in(&alice()).on(
+        "/usr/bin/mdutil -s /System/Volumes/Data",
+        Ran::ok("Indexing enabled."),
+    );
+    sys.file(
+        crate::init_spotlight::SCOPE_RECEIPT,
+        b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n",
+    );
+    let hold = || {
+        Unbidden::new(Some(MARK.into()), Some(asker()), || {
+            crate::init::Holds::NONE
+        })
+    };
+    let reads = || Box::new(crate::root_steps::owed) as Owing;
+    let persons = item(Found::Present(CC.into()))
+        .with_owed(reads())
+        .explicit(hold())
+        .scoping_new_folders(true);
+    let checks = item(Found::Present(CC.into()))
+        .with_owed(reads())
+        .explicit(hold());
+    // The flag is a person's alone: an automatic run that carried it would still owe nothing.
+    let automatic = item(Found::Present(CC.into()))
+        .with_owed(reads())
+        .unbidden(hold())
+        .scoping_new_folders(true);
+    assert!(!persons.owed_now(&sys).contains(&Owed::Spotlight));
+    assert!(!checks.owed_now(&sys).contains(&Owed::Spotlight));
+    assert!(!automatic.owed_now(&sys).contains(&Owed::Spotlight));
+
+    let worktree = "/Users//alice/codex-worktree";
+    sys.file(worktree, b"").stat_of(
+        worktree,
+        Stat {
+            uid: 501,
+            gid: 20,
+            mode: 0o755,
+            dir: true,
+            symlink: false,
+            len: 0,
+        },
+    );
+    assert!(persons.owed_now(&sys).contains(&Owed::Spotlight));
+    assert!(!checks.owed_now(&sys).contains(&Owed::Spotlight));
+    assert!(!automatic.owed_now(&sys).contains(&Owed::Spotlight));
+}
+
 #[test]
 fn an_existing_spotlight_scope_requires_an_explicit_password_extension() {
     use crate::root_steps::Owed;
@@ -2751,4 +3010,145 @@ fn an_existing_spotlight_scope_requires_an_explicit_password_extension() {
     assert!(automatic.owed_now(&sys).is_empty());
     let explicit = automatic.with_explicit_tab(true);
     assert_eq!(explicit.owed_now(&sys), vec![Owed::Spotlight]);
+}
+
+/// A root step whose apply already failed for good is not asked for by a run nobody asked for:
+/// with developer mode off and root's record holding that reading, the automatic run plans no
+/// password, asks none and claims no ask, while the step still reads owed (the run is not
+/// finished, the steps row says why nothing is asked and how to try again, and in the tab that
+/// row gives the tab its end). The same holds whatever plan the apply began under, and in Low
+/// Data Mode the refused step alone does not admit the ask that would wait for the download.
+/// NEGATIVE CONTROLS: with no record, or one of another reading, the same run asks; a person's
+/// own run and a tab their press opened ask despite the record; and a refused step beside one
+/// that is not refused is asked for and done in the same one password.
+#[test]
+fn a_step_root_already_failed_at_is_not_asked_for_by_itself() {
+    use crate::root_steps::Owed;
+    use aterm_types::macos_setup::refused::DEVELOPER_MODE;
+    const STATUS: &str = "/usr/sbin/DevToolsSecurity -status";
+    let root = format!("{} --root-steps-only", argv());
+    let made = |found: Found, owed: Vec<Owed>, person: bool| {
+        let record = Unbidden::new(Some(MARK.into()), Some(asker()), || {
+            crate::init::Holds::NONE
+        });
+        let item = item(found).with_owed(Box::new(move |_| owed.clone()));
+        if person {
+            item.explicit(record)
+        } else {
+            item.unbidden(record)
+        }
+    };
+    let healthy = || Found::Present("healthy".into());
+    let mac = |record: Option<&[u8]>| {
+        let sys = console();
+        sys.on(STATUS, Ran::ok("Developer mode is currently disabled.\n"))
+            .on(&root, Ran::ok(""));
+        if let Some(record) = record {
+            sys.file(DEVELOPER_MODE, record);
+        }
+        sys
+    };
+
+    let sys = mac(Some(b"off\n"));
+    let automatic = made(healthy(), vec![Owed::Debugger], false);
+    assert!(!matches!(automatic.read(&sys).0, Probe::Change { .. }));
+    assert!(automatic.apply(&sys, &ctx(&[])).is_ok());
+    assert!(asked(&sys).is_empty());
+    assert!(!marked(&sys));
+    assert_eq!(automatic.owed_now(&sys), [Owed::Debugger]);
+    assert!(!automatic.finished_in_place(&sys));
+    let Probe::Deferred { why } = automatic.steps().probe(&sys, &ctx(&[])) else {
+        panic!("the steps row reads the step owed");
+    };
+    assert!(
+        why.contains("debug") && why.contains("does not ask") && why.contains("`aterm init`"),
+        "{why}"
+    );
+
+    // In the tab the tools' row reads in place and says nothing; the steps row gives the end.
+    let tab = Tab::new(Arc::new(|_| {}));
+    let tabbed = made(healthy(), vec![Owed::Debugger], false).in_tab(tab.clone());
+    assert!(!matches!(tabbed.read(&sys).0, Probe::Change { .. }));
+    assert!(tab.unfinished().is_none());
+    assert!(matches!(
+        tabbed.steps().probe(&sys, &ctx(&[])),
+        Probe::Deferred { .. }
+    ));
+    assert_eq!(tab.unfinished(), Some(Unfinished::StepsOwed));
+
+    // An apply that never read first begins under the full plan: the tools there, or a
+    // compiler that refuses, still asks nothing for the refused step, and the refusing
+    // compiler's own reason is the apply's. CONTROL: with no record each asks for the steps.
+    for (found, fine) in [(healthy(), true), (Found::Refuses("broken".into()), false)] {
+        let sys = mac(Some(b"off\n"));
+        let item = made(found.clone(), vec![Owed::Debugger], false);
+        assert_eq!(item.root_plan(), RootPlan::WithTools);
+        let result = item.apply(&sys, &ctx(&[]));
+        assert_eq!(result.is_ok(), fine, "{found:?}: {result:?}");
+        if let Err(why) = result {
+            assert!(why.contains("broken"), "{why}");
+        }
+        assert!(asked(&sys).is_empty(), "{found:?}");
+
+        let sys = mac(None);
+        let item = made(found.clone(), vec![Owed::Debugger], false);
+        assert!(item.apply(&sys, &ctx(&[])).is_ok(), "{found:?}");
+        assert_eq!(asked(&sys), [root.clone()], "{found:?}");
+    }
+
+    // Low Data Mode holds the tools' download. A refused step alone does not admit the ask
+    // that would wait on it. CONTROL: with no record the step admits it.
+    let missing = || Found::Missing("no developer directory".into());
+    let mut sys = mac(Some(b"off\n"));
+    sys.low_data = Some(true);
+    let item = made(missing(), vec![Owed::Debugger], false);
+    let row = run(&sys, &item, Mode::Plan);
+    assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
+    assert!(
+        row.why.unwrap_or_default().contains("Low Data Mode is on"),
+        "the mode is the reason"
+    );
+    let mut sys = mac(None);
+    sys.low_data = Some(true);
+    let item = made(missing(), vec![Owed::Debugger], false);
+    assert_eq!(run(&sys, &item, Mode::Plan).outcome, Outcome::Planned);
+
+    for (why, record, owed, person, tab) in [
+        ("no record", None, vec![Owed::Debugger], false, false),
+        (
+            "another reading's record",
+            Some(&b"member 501\n"[..]),
+            vec![Owed::Debugger],
+            false,
+            false,
+        ),
+        (
+            "a person's own run",
+            Some(&b"off\n"[..]),
+            vec![Owed::Debugger],
+            true,
+            false,
+        ),
+        (
+            "a tab the person's press opened",
+            Some(&b"off\n"[..]),
+            vec![Owed::Debugger],
+            false,
+            true,
+        ),
+        (
+            "beside a step not refused",
+            Some(&b"off\n"[..]),
+            vec![Owed::Debugger, Owed::LanBroker],
+            false,
+            false,
+        ),
+    ] {
+        let sys = mac(record);
+        let item = made(healthy(), owed, person).with_explicit_tab(tab);
+        assert!(matches!(item.read(&sys).0, Probe::Change { .. }), "{why}");
+        assert_eq!(item.root_plan(), RootPlan::StepsOnly, "{why}");
+        assert!(item.apply(&sys, &ctx(&[])).is_ok(), "{why}");
+        assert_eq!(asked(&sys), [root.clone()], "{why}");
+    }
 }

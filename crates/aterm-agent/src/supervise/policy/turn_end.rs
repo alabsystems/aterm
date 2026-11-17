@@ -1305,6 +1305,10 @@ pub enum AskAgain {
     Unwritten,
     /// A limit reset is in flight on the session's account.
     Reset,
+    /// The session waits at its account's usage wall, whose ladder reads the account's `/usage`
+    /// at its next rung (`crate::harness::accounts::WallLadder::ask_at`): a lift that read makes
+    /// is this session's at that ask.
+    WallRead,
 }
 
 impl AskAgain {
@@ -1314,11 +1318,35 @@ impl AskAgain {
         match self {
             Self::Unwritten => "the limit's record is not written yet: asked again",
             Self::Reset => "a limit reset is in flight: asked again",
+            Self::WallRead => "the account's usage is read at its wall then: asked again",
         }
     }
 }
 
 impl AccountAdvice {
+    /// `advice` at a usage wall whose ladder asks the session again at `rung`
+    /// ([`AskAgain::WallRead`], `crate::harness::accounts::wall_ladder_step`): the rung's ask
+    /// where the advice says nothing or would wait longer, else the advice (a resume, a move, a
+    /// hold, a probe, or a sooner wait).
+    #[must_use]
+    pub fn or_wall_rung(advice: Option<Self>, rung: Instant) -> Option<Self> {
+        let ask = Self::Again {
+            until: rung,
+            why: AskAgain::WallRead,
+        };
+        match advice {
+            None => Some(ask),
+            Some(Self::Wait { until } | Self::Again { until, .. }) if until > rung => Some(ask),
+            other => other,
+        }
+    }
+
+    /// Whether this advice takes the session off its wall: a resume, or a move to another account.
+    #[must_use]
+    pub const fn leaves_wall(&self) -> bool {
+        matches!(self, Self::Resume { .. } | Self::Move { .. })
+    }
+
     /// The advice the decider acts on.
     #[must_use]
     pub fn past_probe(&self) -> Option<&AccountAdvice> {
@@ -3111,9 +3139,17 @@ pub struct ModelSwitch {
     /// The `--model` the session's launch named before the switch (`None`: it named none), which
     /// the return puts back ([`Restart::ModelBack`]).
     pub launch: Option<String>,
+    /// When the switch was made: a lift of Fable's limit on the account at or before it returns
+    /// nothing ([`TurnEndState::fable_lifted`]).
+    pub since: Instant,
     pub back_at: Option<Instant>,
     /// What timed [`Self::back_at`] ([`BackBy`]); `None` while nothing has.
     pub back_by: Option<BackBy>,
+    /// While a lift times the return ([`BackBy::Lifted`]): [`Self::back_at`] and
+    /// [`Self::back_by`] as they stood before it, which stand again where the account's record
+    /// no longer holds a lift made after the switch ([`TurnEndState::fable_lifted`]). `None`
+    /// while no lift times it.
+    pub lifted_over: Option<(Option<Instant>, Option<BackBy>)>,
     /// While no reading has timed the return: the instant before which no `/usage` sample of
     /// Fable's week is taken (`None`: the next quiet moment), and how many were taken that timed
     /// none ([`TurnEndState::model_sampled`]).
@@ -3138,6 +3174,9 @@ pub enum BackBy {
     Sample,
     /// A `/usage` sample's `Current week (Fable)` row with room left: Fable serves again.
     Room,
+    /// Fable's limit was lifted on the account's record after the switch was made
+    /// ([`TurnEndState::fable_lifted`]): Fable serves again.
+    Lifted,
 }
 
 /// FABLE'S WEEK AS ONE READING SHOWS IT: a `/usage` panel's `Current week (Fable)` row, or the
@@ -3148,6 +3187,36 @@ pub enum BackBy {
 pub struct FableWeek {
     pub pct: Option<u32>,
     pub reset: Option<i64>,
+}
+
+/// WHAT THE ACCOUNT'S RECORD SAYS OF FABLE'S LIMIT, as the host read it (`IdleHost::fable_lift`).
+/// A lift is evidence that Fable serves, which this Mac proved itself: a request a Fable model
+/// served on the account, dated by the request, a `/usage` sample whose Fable row showed room,
+/// or a limit reset the account used. A switch made before it returns
+/// ([`TurnEndState::fable_lifted`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FableLift {
+    /// The record was not read (a host that keeps none, a read that failed): it says nothing,
+    /// and the switch keeps the timing it has, a lift's included.
+    #[default]
+    Unread,
+    /// The record was read and holds no lift of Fable's limit: the limit stands on it, or was
+    /// never raised there.
+    Unlifted,
+    /// The record's newest word of Fable's limit is a lift, its proof dated `at` (unix seconds).
+    Lifted { at: i64 },
+}
+
+/// WHAT THE ACCOUNT'S RECORD OF FABLE'S LIMIT DID TO THE SWITCH THAT STANDS
+/// ([`TurnEndState::fable_lifted`]), for its journal record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiftTold {
+    /// A lift made after the switch: the return is due `at` (now, or where a reading already
+    /// timed it earlier).
+    Due { at: Instant },
+    /// The lift that timed the return is no longer the record's word (the limit was observed
+    /// standing again): the return is timed as it was before the lift.
+    Withdrawn,
 }
 
 /// WHAT A `/usage` SAMPLE OF FABLE'S WEEK DID TO THE SWITCH THAT WAITED ON IT
@@ -7760,7 +7829,11 @@ impl TurnEndState {
             }
         }
         if let Some(m) = self.model.as_mut() {
+            back(&mut m.since);
             for t in [&mut m.back_at, &mut m.sample_at].into_iter().flatten() {
+                back(t);
+            }
+            if let Some((Some(t), _)) = &mut m.lifted_over {
                 back(t);
             }
         }
@@ -7881,6 +7954,40 @@ impl TurnEndState {
             }
         };
         Some(said)
+    }
+
+    /// WHAT THE ACCOUNT'S RECORD SAYS OF FABLE'S LIMIT (`lift`: when it was lifted, on the loop's
+    /// clock; `None`: the record holds no lift, or one the loop's clock cannot place), told by
+    /// the loop at `now`, at each point it decides while a switch stands. A lift after the switch
+    /// was made ([`ModelSwitch::since`]) is evidence that Fable serves again: the return is due
+    /// now, or stays due where an earlier reading already timed it earlier, and what timed it
+    /// before is kept ([`ModelSwitch::lifted_over`]). A lift at or before the switch says nothing
+    /// of the limit the switch was made at and returns nothing. Where a lift timed the return
+    /// and the record no longer holds one after the switch (another session of the account met
+    /// the limit again before this one could return), the return is timed as it was before the
+    /// lift: a return is never made on a lift the record took back. `None` where nothing moved:
+    /// no switch stands, no lift is after it, or the lift already times the return. The return
+    /// is not counted among those made on a sample's room (`room_backs`): each needs evidence
+    /// after a later limit, never a figure a sample may have misread.
+    pub fn fable_lifted(&mut self, lift: Option<Instant>, now: Instant) -> Option<LiftTold> {
+        let m = self.model.as_mut()?;
+        let lifted = lift.is_some_and(|at| at > m.since);
+        match (lifted, m.lifted_over) {
+            (true, None) => {
+                m.lifted_over = Some((m.back_at, m.back_by));
+                let at = m.back_at.map_or(now, |timed| timed.min(now));
+                m.back_at = Some(at);
+                m.back_by = Some(BackBy::Lifted);
+                Some(LiftTold::Due { at })
+            }
+            (false, Some((back_at, back_by))) => {
+                m.lifted_over = None;
+                m.back_at = back_at;
+                m.back_by = back_by;
+                Some(LiftTold::Withdrawn)
+            }
+            (true, Some(_)) | (false, None) => None,
+        }
     }
 
     /// Whether the act [`Self::acted`] last recorded (a typed act; a restart is [`Self::restarted`]'s) was typed IN A LIMIT'S PLACE.
@@ -8487,6 +8594,69 @@ impl TurnEndState {
             // THE LAND CHECK GOES FIRST: it is one step of the landing, typed at its defense's
             // point ([`decide_turn_end`]); a probe there would put its panel between the defense
             // and the check, and the check's answer is what ends the task.
+            (
+                reading.autopilot == Autopilot::Land && self.land.check_owed,
+                ProbeGate::LandCheck,
+            ),
+            (
+                reading.person.is_some_and(|ago| ago < grace),
+                ProbeGate::Person,
+            ),
+        ];
+        checks
+            .into_iter()
+            .find_map(|(shut, gate)| shut.then_some(gate))
+    }
+
+    /// Whether the loop remembers a wall standing on this session (its track), shown or not.
+    #[must_use]
+    pub const fn wall_standing(&self) -> bool {
+        self.wall.is_some()
+    }
+
+    /// [`Self::probe_gate`] for a session that holds its account's due wall rung (FL-118b; the
+    /// host's [`crate::supervise::IdleHost::wall_read`]): at its usage wall, where `probe_gate`
+    /// shuts on [`ProbeGate::Wall`], the holder's rung opens the gate under every guard of a
+    /// person's tab — their draft, their input on its way, their question, their grace — and no
+    /// owed act or land check is passed over. A point with no usage wall standing is
+    /// [`Self::probe_gate`]'s.
+    #[must_use]
+    pub fn wall_probe_gate(
+        &self,
+        reading: &TurnEndReading,
+        cfg: &SupervisorConfig,
+        now: Instant,
+    ) -> Option<ProbeGate> {
+        let usage = |kind: WallKind| {
+            matches!(
+                kind,
+                WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. }
+            )
+        };
+        let walled = reading.wall.or_else(|| {
+            let t = self.wall.as_ref()?;
+            left_named(t, reading).map(|n| n.kind)
+        });
+        if !walled.is_some_and(usage) {
+            return self.probe_gate(reading, cfg, now);
+        }
+        let grace = Duration::from_secs(u64::from(cfg.human_grace_s));
+        let owed = self.awaiting.is_some() || self.after.is_some() || self.account_resume;
+        let checks = [
+            (
+                !matches!(reading.phase, Phase::Idle | Phase::Limited { .. }),
+                ProbeGate::NotIdle,
+            ),
+            (!reading.authoritative, ProbeGate::NotAuthoritative),
+            (reading.survey, ProbeGate::Survey),
+            (
+                !matches!(reading.composer, Composer::Empty | Composer::Placeholder(_)),
+                ProbeGate::Composer,
+            ),
+            (reading.pending_input, ProbeGate::PendingInput),
+            (reading.interrupted, ProbeGate::Interrupted),
+            (reading.asked().is_some(), ProbeGate::Question),
+            (owed, ProbeGate::ActOwed),
             (
                 reading.autopilot == Autopilot::Land && self.land.check_owed,
                 ProbeGate::LandCheck,
@@ -11335,8 +11505,10 @@ impl TurnEndState {
                     from,
                     to: to.clone(),
                     launch: reading.launch_model.back_to(),
+                    since: now,
                     back_at,
                     back_by,
+                    lifted_over: None,
                     sample_at: None,
                     samples: 0,
                     proc: None,

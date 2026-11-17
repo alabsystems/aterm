@@ -604,6 +604,97 @@ fn a_re_import_never_overwrites_the_owner_and_writes_nothing_when_unchanged() {
     assert!(settled.rows.is_empty(), "{:?}", settled.rows);
 }
 
+/// An observer's birth of an account (every cell automatic and in one record, `status=pending`,
+/// as `observe::account_birth` writes it) is no owner's word: the vault sheet that pauses the
+/// account writes `paused` over it, a later sheet that lists it again unpaused writes `pending`
+/// over that import, and no `owner-kept` finding names a cell no owner wrote. The owner's own
+/// `active` over the birth is still left, and found.
+/// NEGATIVE CONTROL: with `decide`'s automatic arm removed (`if false && cell::
+/// import_outranks_automatic(…)`), the observer's `pending` reads as the owner's: `` left:
+/// Some(Kept) right: Some(Write) ``.
+#[test]
+fn an_import_writes_over_an_observers_birth_but_never_over_the_owner() {
+    let ann = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let address = keys::address_pk("ann@example.invalid").unwrap();
+    let observed = |collection: &Collection, pk: &str, col: &str, x: Value| {
+        cell::change(
+            collection,
+            CellKey {
+                pk,
+                col,
+                elem: None,
+            },
+            &CellValue::automatic(collection.version, x),
+        )
+        .unwrap()
+    };
+    let address_birth = vec![
+        observed(&ADDRESS, &address, "addr", json!("ann@example.invalid")),
+        observed(&ADDRESS, &address, "domain", json!("example.invalid")),
+        observed(&ADDRESS, &address, "origin", json!("discovered")),
+        observed(&ADDRESS, &address, "row", json!("live")),
+    ];
+    let account_birth = vec![
+        observed(&ACCOUNT, &ann, "provider", json!("anthropic")),
+        observed(&ACCOUNT, &ann, "realm", json!("claude")),
+        observed(&ACCOUNT, &ann, "login", json!(address)),
+        observed(&ACCOUNT, &ann, "status", json!("pending")),
+        observed(&ACCOUNT, &ann, "row", json!("live")),
+    ];
+    let observe = |book: &mut Book| {
+        let first = book.write(5, &[], address_birth.clone());
+        book.write(5, &[first], account_birth.clone());
+    };
+    let mut book = Book::new();
+    observe(&mut book);
+    let status = |plan: &Plan| {
+        plan.planned
+            .iter()
+            .find(|p| p.collection == ACCOUNT.name && p.pk == ann && p.column == "status")
+            .map(|p| (p.x.clone(), p.step))
+    };
+    let owner_kept = |plan: &Plan| {
+        plan.findings
+            .iter()
+            .any(|f| f.kind == Kind::OwnerKept && f.pk.as_deref() == Some(ann.as_str()))
+    };
+    let paused = vault(&[",ann@example.invalid,m3,,1,,,,,,claude banned,,"]);
+    let next = plan(&input(std::slice::from_ref(&paused), &[]), &book.cells()).unwrap();
+    assert_eq!(
+        status(&next).map(|(_, step)| step),
+        Some(Step::Write),
+        "{:?}",
+        next.findings
+    );
+    assert_eq!(status(&next).map(|(x, _)| x), Some(json!("paused")));
+    assert!(!owner_kept(&next), "{:?}", next.findings);
+    let after = apply(&mut book, &next);
+    assert_eq!(
+        cell::project(&ACCOUNT, &after).rows[&ann].get("status"),
+        Some(&json!("paused"))
+    );
+    let listed = vault(&[",ann@example.invalid,m3,,1,,,,,,,,"]);
+    let again = plan(&input(std::slice::from_ref(&listed), &[]), &after).unwrap();
+    assert_eq!(
+        status(&again),
+        Some((json!("pending"), Step::Write)),
+        "{:?}",
+        again.findings
+    );
+    // The owner's `active` over the observer's birth stays the owner's.
+    let mut owned = Book::new();
+    observe(&mut owned);
+    let seen = owned.all();
+    owned.write(
+        1,
+        &seen,
+        vec![put(&ACCOUNT, &ann, "status", json!("active"))],
+    );
+    let kept = plan(&input(std::slice::from_ref(&paused), &[]), &owned.cells()).unwrap();
+    assert_eq!(status(&kept), Some((json!("paused"), Step::Kept)));
+    assert!(owner_kept(&kept), "{:?}", kept.findings);
+}
+
 /// Every label resolves before a placeholder is minted: through a live row's label or alias
 /// (a relabelled Mac keeps its row), then a Mac the roster knows by label or alias, whose row is
 /// found by its fleet node; only then a planned placeholder keyed by the label. Spellings fold
@@ -983,11 +1074,10 @@ fn every_account_of_a_row_gets_its_mappings_and_a_number_is_only_a_rank() {
     {
         assert_eq!(item.x, json!("import"));
     }
+    // The importer writes no label: the column is the owner's verb's alone.
     let ann = keys::account_pk("claude", "ann@example.invalid").unwrap();
-    assert_eq!(
-        planned(&plan, "account", &ann, "label"),
-        Some(&json!(keys::default_account_label("claude", &ann).unwrap()))
-    );
+    assert!(planned(&plan, "account", &ann, "realm").is_some());
+    assert_eq!(planned(&plan, "account", &ann, "label"), None);
     assert!(
         !plan
             .findings
@@ -1383,12 +1473,7 @@ fn a_harness_file_adds_below_the_sheets() {
         planned(&first, "account", &kimi, "legacy_label"),
         Some(&json!("kimi-m16"))
     );
-    assert_eq!(
-        planned(&first, "account", &kimi, "label"),
-        Some(&json!(
-            keys::default_account_label("kimi:global", &kimi).unwrap()
-        ))
-    );
+    assert_eq!(planned(&first, "account", &kimi, "label"), None);
     // The vault sheet gave Ann no Codex account: compared, no row.
     let codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
     assert!(planned(&first, "account", &codex, "realm").is_none());

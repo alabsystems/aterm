@@ -10,7 +10,8 @@
 //! [`Ledger`] holds every session's claims: a tool that needs memory, cores, disk or a quiet
 //! machine calls [`admit`] before its work starts and holds the [`Claim`] while it runs. Admit
 //! waits until the need fits beside the claims already held and those that waited longer
-//! (first in, first out; a later claim goes first only when it fits beside every earlier one's
+//! (first in, first out among claims of one [`Need::priority`], so a command a person typed at a
+//! tab's prompt goes ahead of the agents' claims of its rank, [`Need::person`]; a later claim goes first only when it fits beside every earlier one's
 //! reservation, or, past a waiter that cannot start yet, within what that waiter SPARES: the most
 //! it may take without delaying that waiter's turn by any claim's end or step, [`spared`]; past
 //! a waiter no claim's end can start, wherever it fits the room, [`Spared::Stuck`]),
@@ -417,6 +418,13 @@ pub struct Need {
     pub scratch: bool,
     /// It LEADS the waiters ([`Self::leads`]).
     pub leads: bool,
+    /// A PERSON asked for it ([`Self::priority`]): its asker's process group is the foreground
+    /// group of its controlling terminal, none of [`aterm_types::domain::AGENT_MARKERS`] is set
+    /// and it runs in no spawned worker's tab ([`Machine::person`], [`crate::reading::person_at`]).
+    /// Admission writes it from the machine when the claim enters the queue (or from the place
+    /// it enters at, [`crate::admit::Place::standing`]), for an Ordinary claim that does not
+    /// lead alone, and clears any a caller set; a record keeps it as `person: true`.
+    pub person: bool,
     /// It is a terminal unit on the Release's critical path ([`Self::critical_path`]).
     pub critical: bool,
     /// Admission-written evidence that retains a critical Release waiter's funded memory.
@@ -581,6 +589,16 @@ impl Need {
     pub const fn leads(mut self) -> Need {
         self.leads = true;
         self
+    }
+
+    /// Its PRIORITY among the waiters, after [`Self::leads`]: its rank, then a person's claim
+    /// ([`Self::person`]) ahead of the others of its rank. Waiters of one priority keep arrival
+    /// order. Every comparison that orders waiters reads this, so a command a person typed at a
+    /// tab's prompt goes ahead of the agents' claims of its rank that asked before it, and never
+    /// ahead of a Release or leading claim, nor a held one.
+    #[must_use]
+    pub const fn priority(&self) -> (Rank, bool) {
+        (self.rank, !self.person)
     }
 
     /// Mark this terminal Release unit as critical-path work.

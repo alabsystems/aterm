@@ -136,7 +136,7 @@ impl Retired {
     /// Whether a vault signed by `signer`, reached through `followed` (oldest first), is the ALab
     /// vault this build trusts: `signer` or a key before it is one this build names, and the pin
     /// does not give way ([`Retired::gives_way`]).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn names(&self, signer: &[u8; 32], followed: &[[u8; 32]]) -> bool {
         self.lineage(signer, followed) && !self.gives_way(signer, followed)
     }
@@ -145,7 +145,7 @@ impl Retired {
     /// before it is one this build names, whether or not the pin gives way. A server judges its
     /// store by this, since a version a retired key signed still waits there for the one that
     /// replaces it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn lineage(&self, signer: &[u8; 32], followed: &[[u8; 32]]) -> bool {
         self.knows(signer) || followed.iter().any(|key| self.knows(key))
     }
@@ -216,7 +216,7 @@ pub enum Verdict {
 }
 
 /// The next version to publish.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn next_seq(seq: u64) -> crate::Result<u64> {
     seq.checked_add(1).ok_or_else(|| {
         Error::new("the vault sequence is exhausted; create a new vault instead of wrapping it")
@@ -375,7 +375,7 @@ thread_local! {
 pub fn parse(bytes: &[u8]) -> crate::Result<Envelope> {
     #[cfg(test)]
     TEST_PARSES.with(|parses| parses.set(parses.get() + 1));
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     crate::pass_counts::add(crate::pass_counts::Count::Parses);
     if bytes.len() > MAX_ENVELOPE {
         return Err(Error::new(format!(
@@ -719,7 +719,7 @@ impl Envelope {
     pub fn verify_signature(&self) -> crate::Result<()> {
         #[cfg(test)]
         TEST_SIGNATURES.with(|asks| asks.set(asks.get() + 1));
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         crate::pass_counts::add(crate::pass_counts::Count::SignatureAsks);
         if crate::ed25519::verifies_cached(
             &self.signer,
@@ -807,7 +807,7 @@ impl Envelope {
     }
 
     /// Whether this version's chain names one of `keys` handing off and a link from there on does not verify: no key of the vault's endorsed what it claims, so the version is forged (or damaged), whoever signed it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn forges_handoff_from(&self, keys: &[[u8; 32]]) -> bool {
         self.handoff
             .iter()
@@ -818,7 +818,7 @@ impl Envelope {
     }
 
     /// The keys of this version's chain its signer was reached from, oldest first: each one from whose link on every endorsement verifies.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn reached_from(&self) -> Vec<[u8; 32]> {
         let start = (0..self.handoff.len())
             .rev()
@@ -864,7 +864,7 @@ impl Envelope {
     }
 
     /// The handoff chain an admin's next version carries after opening this one while it held a version signed by `held_signer` carrying `held`: this one's own when it carries `held` on ([`Envelope::check_extends`]), or, when this one only dropped links from the front of `held` (a rotation by a build before chains, through a server that took it), `held` with this one's links from `held_signer` on, so the next version restores what was dropped.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn chain_carried_on(
         &self,
         held_signer: &[u8; 32],
@@ -917,7 +917,7 @@ pub(crate) fn verify_for_reader_with(
     held: Option<&Floor>,
     retired: &Retired,
 ) -> crate::Result<(Envelope, Pin, Verdict)> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     crate::pass_counts::add(crate::pass_counts::Count::Verifies);
     let envelope = parse(bytes)?;
     let (pin, verdict) =

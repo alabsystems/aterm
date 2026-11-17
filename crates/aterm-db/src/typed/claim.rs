@@ -32,7 +32,7 @@ fn restored_value(
     operation: &Op,
     change: &crate::database::Change,
 ) -> Option<Value> {
-    if !operation.revert || change.collection != collection.name {
+    if operation.revert.is_none() || change.collection != collection.name {
         return None;
     }
     let key = cell::CellKey::parse(&change.key).ok()?;
@@ -78,7 +78,7 @@ pub(crate) fn restored_cells<'a>(
     let mut out = Cow::Borrowed(cells);
     for operation in operations {
         let operation = operation.borrow();
-        if !operation.revert {
+        if operation.revert.is_none() {
             continue;
         }
         for change in &operation.changes {

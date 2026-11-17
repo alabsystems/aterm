@@ -479,6 +479,29 @@ fn replace_with_lock(
     edit: impl FnOnce(&mut MachineName) -> io::Result<()>,
     take: impl FnOnce(&Path, Duration) -> io::Result<PrivateLock>,
 ) -> io::Result<MachineName> {
+    replace_admitted_with_lock(state, edit, |write| write(), take)
+}
+
+/// [`replace`], with the file written only inside `admit`: the name lock is taken and the edit
+/// made first, and `admit` runs the write it is handed where its source admits it, or answers
+/// why not, which leaves the file as it was. An edit that changes nothing asks no admission.
+///
+/// # Errors
+/// As [`replace`], and `admit`'s refusal.
+pub(super) fn replace_admitted(
+    state: &Path,
+    edit: impl FnOnce(&mut MachineName) -> io::Result<()>,
+    admit: impl FnOnce(&mut dyn FnMut() -> io::Result<()>) -> io::Result<()>,
+) -> io::Result<MachineName> {
+    replace_admitted_with_lock(state, edit, admit, take_name_lock)
+}
+
+fn replace_admitted_with_lock(
+    state: &Path,
+    edit: impl FnOnce(&mut MachineName) -> io::Result<()>,
+    admit: impl FnOnce(&mut dyn FnMut() -> io::Result<()>) -> io::Result<()>,
+    take: impl FnOnce(&Path, Duration) -> io::Result<PrivateLock>,
+) -> io::Result<MachineName> {
     let _lock = take(state, LOCK_HANG)?;
     let held = read(state)?.ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, format!("{FILE}: not created yet"))
@@ -487,7 +510,7 @@ fn replace_with_lock(
     edit(&mut name)?;
     if name != held {
         let text = name.to_toml().map_err(io::Error::other)?;
-        write_private(state, FILE, text.as_bytes())?;
+        admit(&mut || write_private(state, FILE, text.as_bytes()))?;
     }
     Ok(name)
 }

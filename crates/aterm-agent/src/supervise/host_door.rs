@@ -286,6 +286,18 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn fable_week(&self) -> Option<crate::supervise::policy::turn_end::FableWeek> {
         None
     }
+    /// FABLE'S LIMIT AS THE ACCOUNT'S RECORD SAYS IT WAS LIFTED
+    /// ([`crate::supervise::policy::turn_end::FableLift`]): when this Mac's evidence last lifted
+    /// Fable's weekly wall on the record of the account the session's process runs on
+    /// (`harness::accounts::Account::lifted_at`), as [`Self::answered_by`] and
+    /// [`Self::fable_room`] file it. Asked at each point the loop decides while the session is
+    /// moved onto another model: it is the evidence that brings such a session back before the
+    /// reset its notice named, and its absence on a record read takes back a return a lift made
+    /// due. `Unread` where the host keeps no such record or could not read it, which moves
+    /// nothing; `Unlifted` where the record read holds no lift.
+    fn fable_lift(&self) -> crate::supervise::policy::turn_end::FableLift {
+        crate::supervise::policy::turn_end::FableLift::Unread
+    }
     fn relaunch_off(&self) -> bool {
         false
     }
@@ -522,6 +534,30 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// there; a host that names no route books nothing.
     fn answered(&self, ago_ms: u64) {
         let _ = ago_ms;
+    }
+
+    /// THE MODEL THAT SERVED THE TURN [`Self::answered`] TOLD OF: told beside it, where Claude
+    /// Code's transcript ends on the model's reply to a request the tail shows served
+    /// (`harness::login_adoption::served_request`) and usage credits do not carry the session.
+    /// `model` is the request's first answer's `message.model` and `at` when the prompt or tool
+    /// result that began the request was written, in unix seconds: the request's own time, never
+    /// the reply's or the loop's clock, so the host lifts only the walls on the account's record
+    /// last seen standing before the request was made (`harness::accounts::record_served`). The
+    /// host reads no provider for it; one that keeps no account record does nothing.
+    fn answered_by(&self, model: &str, at: i64) {
+        let _ = (model, at);
+    }
+
+    /// A `/usage` SAMPLE THIS SESSION TOOK SHOWED FABLE'S WEEK WITH ROOM, the panel asked for at
+    /// `at` (unix seconds: when `/usage` was about to be typed, no later than the panel's read),
+    /// and the session's own return on it is due at once
+    /// ([`crate::supervise::policy::turn_end::Sampled::Room`], past the rung its returns on room
+    /// left climbed): the host lifts Fable's wall on the account's record where it was last seen
+    /// standing before `at` (`harness::accounts::record_model_room`), so the one sample returns
+    /// every session of the account moved off Fable ([`Self::fable_lift`]). The host reads no
+    /// provider for it; one that keeps no account record does nothing.
+    fn fable_room(&self, at: i64) {
+        let _ = at;
     }
 
     /// THE WITNESS ON THE SESSION'S ROUTE (v6 §14.17.5.4): when another session of this aterm on
@@ -780,6 +816,17 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
 
     fn account_probe_typed(&self, _use_token: crate::harness::provider_read::Use) {}
+
+    /// THE WALL DOOR (FL-118b): whether this session, waiting at its account's usage wall, holds
+    /// the ladder's due rung (`crate::harness::accounts::wall_read_due`) on a Claude Code build
+    /// whose panel was measured over a wall. Then its `/usage` is the rung's one read, claimed by
+    /// [`Self::account_probe`]; no other session of the account reads. `person`: a person typed in
+    /// this tab within their grace, so the ladder starts again at its first rung. `false` by
+    /// default: the wall ends on its schedule.
+    fn wall_read(&self, person: bool) -> bool {
+        let _ = person;
+        false
+    }
 
     fn account_probed(&self, read: Result<&crate::harness::accounts::Sample, ProbeMiss>) {
         let _ = read;

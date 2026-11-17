@@ -716,7 +716,7 @@ pub(crate) fn covers(
     for op in view
         .ops
         .iter()
-        .filter(|op| !op.revert && !view.quota.over.contains(&op.id))
+        .filter(|op| op.revert.is_none() && !view.quota.over.contains(&op.id))
     {
         if !op.changes.iter().any(|c| c.collection == ROLL.name) {
             continue;
@@ -781,7 +781,7 @@ pub(crate) fn rollers(
     for op in view
         .ops
         .iter()
-        .filter(|op| !op.revert && !view.quota.over.contains(&op.id))
+        .filter(|op| op.revert.is_none() && !view.quota.over.contains(&op.id))
     {
         if out.contains(&op.actor) {
             continue;

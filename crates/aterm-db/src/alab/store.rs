@@ -110,7 +110,7 @@ fn quota_room(session: &Session<'_>, log: &Log, view: &View, reserve: usize) -> 
 fn observed_records(view: &View, actor: astream_wire::sync::Actor) -> usize {
     view.ops
         .iter()
-        .filter(|op| op.actor == actor && !op.revert)
+        .filter(|op| op.actor == actor && op.revert.is_none())
         .filter(|op| {
             op.changes
                 .iter()
@@ -223,6 +223,23 @@ fn me(
             .label_after_choice(&actor)
             .map(str::to_owned)
     });
+    let signed = log.as_ref().and_then(|log| {
+        log.membership_ref()
+            .number_choice(&actor)
+            .map(str::to_owned)
+    });
+    let held = log
+        .as_ref()
+        .map(|log| {
+            let membership = log.membership_ref();
+            membership
+                .members()
+                .iter()
+                .filter(|(member, _)| **member != actor)
+                .filter_map(|(member, _)| membership.label(member).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
     let recipient = binding.recipient().to_bech32();
     let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
         .map_err(crate::table::failure)?;
@@ -248,6 +265,8 @@ fn me(
         uuid,
         label: chosen.clone().or_else(|| seat(binding)),
         chosen,
+        signed,
+        held,
         hw_hint: keys::hw_hint(&trust.network, &probe.platform_uuid),
         enrolled_ms,
         former,

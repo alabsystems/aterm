@@ -103,7 +103,7 @@ pub fn well_formed(bytes: &[u8]) -> bool {
 /// One line: this Mac holds no usable phrase (none, or bytes that are not one), why, and the
 /// `paper-master` need it filed with the lab's Macs (purpose `release.roster`), or why none was
 /// filed. The caller stops there and writes nothing.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read(paths: &crate::client::Paths) -> Result<crate::SecretBytes, String> {
     crate::registry::resolve(
         paths,
@@ -125,7 +125,7 @@ pub fn read(paths: &crate::client::Paths) -> Result<crate::SecretBytes, String> 
 
 /// The vault's phrase derives a master the caller does not trust (`why`): file `paper-master`
 /// again, as a value its consumer refused, and say so.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[must_use]
 pub fn refused(paths: &crate::client::Paths, why: &str) -> String {
     crate::need::blocked(
@@ -143,7 +143,7 @@ pub fn refused(paths: &crate::client::Paths, why: &str) -> String {
 /// The phrase is not one ([`symbols_into`]); this Mac cannot open the vault as its admin or
 /// publish; or the vault already holds a phrase, which a new one would replace for good (the
 /// master it derives would sign nothing again).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn store(paths: &crate::client::Paths, phrase: &[u8]) -> crate::Result<()> {
     if !well_formed(phrase) {
         return Err(crate::Error::new(

@@ -157,6 +157,133 @@ fn stop_never_interrupts_a_replaced_child_changed_receipt_or_another_user_progra
 const PROMPT_OVERDUE: std::time::Duration =
     super::UNTOUCHED_PROMPT_BACKSTOP.saturating_add(std::time::Duration::from_secs(1));
 
+/// A signer is read only from code the kernel holds valid now that names an identifier and a
+/// developer's team.
+/// NEGATIVE CONTROLS: a signature no longer valid, a refused status, no team (ad hoc) and no
+/// identifier each name no signer.
+#[test]
+fn a_signer_is_named_only_by_valid_code_with_a_team() {
+    use crate::clt_install::stop::{Signer, signer_of};
+    use aterm_sysprobe::identity::{CS_SIGNED, CS_VALID, Identity};
+    let release = Identity {
+        exe: "aterm".into(),
+        cs_status: Some(CS_SIGNED | CS_VALID),
+        category: Some(aterm_sysprobe::identity::CATEGORY_DEVELOPER_ID),
+        signing_id: Some("com.aterm.aterm".into()),
+        team: Some("ABCDE12345".into()),
+    };
+    assert_eq!(
+        signer_of(&release),
+        Some(Signer {
+            identifier: "com.aterm.aterm".into(),
+            team: "ABCDE12345".into(),
+        })
+    );
+    for (why, identity) in [
+        (
+            "no longer valid",
+            Identity {
+                cs_status: Some(CS_SIGNED),
+                ..release.clone()
+            },
+        ),
+        (
+            "a refused status",
+            Identity {
+                cs_status: None,
+                ..release.clone()
+            },
+        ),
+        (
+            "no team",
+            Identity {
+                team: None,
+                ..release.clone()
+            },
+        ),
+        (
+            "no identifier",
+            Identity {
+                signing_id: None,
+                ..release.clone()
+            },
+        ),
+    ] {
+        assert_eq!(signer_of(&identity), None, "{why}");
+    }
+}
+
+/// A setup program whose bundle an update or a rebuild replaced under it is still proved: the
+/// file at its path is a newer build's, and the code it runs is this window's own (the window
+/// that started it) or valid code of this window's signer (the window an update handed it to).
+/// NEGATIVE CONTROLS: with the file replaced or unread, code of another team, of another
+/// identifier, of no team and another hash, and code the kernel does not name prove nothing;
+/// neither does any code to a window with none of its own to compare.
+#[test]
+fn a_setup_program_is_proved_by_its_code_once_its_file_is_replaced() {
+    use crate::clt_install::stop::{Code, Signer, runs_this_app};
+    let signer = |identifier: &str, team: &str| {
+        Some(Signer {
+            identifier: identifier.into(),
+            team: team.into(),
+        })
+    };
+    let release = |hash: u8| Code {
+        hash: Some([hash; 20]),
+        signer: signer("com.aterm.aterm", "ABCDE12345"),
+    };
+    let ad_hoc = |hash: u8| Code {
+        hash: Some([hash; 20]),
+        signer: None,
+    };
+    for replaced in [Some(false), None] {
+        // The window that started the tab: the same image.
+        assert!(runs_this_app(replaced, &release(1), &release(1)));
+        assert!(runs_this_app(replaced, &ad_hoc(1), &ad_hoc(1)));
+        // The window an update handed the tab to: a newer build of the same signer.
+        assert!(runs_this_app(replaced, &release(1), &release(2)));
+        for (why, theirs, ours) in [
+            (
+                "another team",
+                Code {
+                    signer: signer("com.aterm.aterm", "ZZZZZ99999"),
+                    ..release(1)
+                },
+                release(2),
+            ),
+            (
+                "another identifier",
+                Code {
+                    signer: signer("com.example.tool", "ABCDE12345"),
+                    ..release(1)
+                },
+                release(2),
+            ),
+            ("no team, another hash", ad_hoc(1), ad_hoc(2)),
+            ("no team, in a release window", ad_hoc(1), release(2)),
+            ("code the kernel does not name", Code::default(), release(2)),
+            ("a window with no code", Code::default(), Code::default()),
+            (
+                "a release tab, a window with no code",
+                release(1),
+                Code::default(),
+            ),
+            (
+                "an ad-hoc tab, a window with no code",
+                ad_hoc(1),
+                Code::default(),
+            ),
+        ] {
+            assert!(!runs_this_app(replaced, &theirs, &ours), "{why}");
+        }
+    }
+    assert!(runs_this_app(
+        Some(true),
+        &Code::default(),
+        &Code::default()
+    ));
+}
+
 /// An owned install whose receipt no longer adopts its child, so its tab cannot travel with an
 /// update's handoff, served for `served` with nobody's gesture in it, or a person's last key
 /// `typed` ago (now, or carried as an earlier gesture's age: this process's clock starts with it).

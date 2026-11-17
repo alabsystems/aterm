@@ -338,6 +338,24 @@ impl Watch {
             .then_some((told.count, told.heard_since(self.seen)))
     }
 
+    /// When the move this watch has not heard is due to it (this Mac's spread after it was told,
+    /// or at once for a watch made at once), without hearing it; `None` with no such move. A
+    /// waiter that keeps its own deadlines (the fleet's heartbeat) wakes then rather than on a
+    /// clock.
+    #[cfg(unix)]
+    pub(crate) fn due(&self) -> Option<Instant> {
+        let told = self
+            .moved
+            .told
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (told.count != self.seen).then(|| {
+            told.due
+                .filter(|_| self.spread)
+                .unwrap_or_else(Instant::now)
+        })
+    }
+
     /// Complete one selected generation after its dispatch was accepted. A move
     /// told during dispatch remains newer than `seen` and belongs to the next round.
     #[cfg(any(unix, test))]

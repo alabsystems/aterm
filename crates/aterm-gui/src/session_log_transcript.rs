@@ -764,7 +764,8 @@ impl SessionLog {
             return;
         };
         let view = a.tracker.view(now.mono_ms);
-        let Some((node, ScreenStep::Wall(kind), under_turn)) = view.step else {
+        // A wall of no named kind has nothing for the transcript to confirm or refute.
+        let Some((node, ScreenStep::Wall(Some(kind)), under_turn)) = view.step else {
             return;
         };
         let step_t = self.log.open_entry(node).map_or(now.wall_ms, |e| e.t);

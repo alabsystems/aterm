@@ -134,6 +134,7 @@ pub(super) fn retain(
         return;
     };
     let _ = (|| -> crate::Result<()> {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         let Some(_guard) = StateLock::try_take_existing(paths)? else {
             return Ok(());
@@ -141,13 +142,20 @@ pub(super) fn retain(
         if config(paths)?.as_ref() != Some(expected) {
             return Ok(());
         }
-        let metadata = std::fs::symlink_metadata(paths.state_file())
-            .map_err(|error| Error::new(error.to_string()))?;
-        if !metadata.is_file()
-            || metadata.uid() != fsx::euid()
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
+        #[cfg(unix)]
         {
+            let metadata = std::fs::symlink_metadata(paths.state_file())
+                .map_err(|error| Error::new(error.to_string()))?;
+            if !metadata.is_file()
+                || metadata.uid() != fsx::euid()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o7777 != 0o600
+            {
+                return Ok(());
+            }
+        }
+        #[cfg(windows)]
+        if !fsx::private_file_settled(&paths.state_file()) {
             return Ok(());
         }
         let recipient = read_identity(paths)?.map(|key| key.recipient().0);
@@ -160,32 +168,6 @@ pub(super) fn retain(
         }
         Ok(())
     })();
-}
-
-/// Read retained route-response evidence under a nonblocking shared state guard. This does not
-/// fetch, repair permissions, create state or require vault membership or materialization.
-/// # Errors
-/// The existing local configuration, identity or state cannot be safely read.
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::refines(
-        machine = "DbVaultHttp204",
-        action = "Read",
-        project = "aterm_secrets::client::http204_observation::conformance_tests::http204_transition"
-    )
-)]
-pub fn observe_http204_response(
-    paths: &Paths,
-    expected: &Config,
-) -> crate::Result<Option<VaultHttp204Response>> {
-    let Some(_guard) = StateLock::observe(paths)? else {
-        return Ok(None);
-    };
-    if config(paths)?.as_ref() != Some(expected) {
-        return Ok(None);
-    }
-    let recipient = read_identity(paths)?.map(|key| key.recipient().0);
-    Ok(project(expected, recipient, &load_state(paths)?))
 }
 
 impl Receipt {
@@ -245,7 +227,7 @@ impl Receipt {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod conformance_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

@@ -70,6 +70,17 @@ fn held_generation(log: &Log) -> Generation {
         for record in log.records() {
             digest.update(record.id());
         }
+        // A shed version-2 frame shares its whole record's id, so the ids alone do not name the
+        // bytes: the place of each shed one follows them (none in a log of version-1 records,
+        // whose generation is the ids' as it was). The ids' count is fixed above, so the places
+        // are what remains.
+        if log.shed > 0 {
+            for (at, record) in log.records().enumerate() {
+                if record.is_shed() {
+                    digest.update((at as u64).to_le_bytes());
+                }
+            }
+        }
         Generation(digest.finalize())
     })
 }

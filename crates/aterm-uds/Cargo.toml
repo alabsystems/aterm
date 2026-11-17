@@ -50,9 +50,14 @@ aterm-sysprobe = { workspace = true }
 # this crate's, so no cycle.
 aterm-durable = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-# Bound private-directory transactions keep locks and I/O on the same open directory.
+# aterm-dirfd: on Unix, bound private-directory transactions keep locks and I/O on the same
+# open directory; on Windows, `acl` (re-exported) is its security descriptors, which
+# `private_file` makes and judges every private file and folder with, and with which
+# aterm-dirfd's own handle-relative creates make owner-only ones. Dependency-free (libc on
+# Unix, raw FFI on Windows); its own edge to this crate is dev-only.
 aterm-dirfd = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 # aterm-libc (package `libc`): generated, oracle-checked ABI declarations, no
 # code. The shared-memory module (`shm`) needs `shm_open` and `fcntl`, which
 # are variadic on Darwin: declared by hand as fixed-arity, their extra argument

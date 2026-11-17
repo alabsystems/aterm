@@ -82,13 +82,13 @@ const fn plain(ty: &Ty) -> bool {
             | Ty::Int { .. }
             | Ty::Uint
             | Ty::Text(_)
+            | Ty::Handle(_)
             | Ty::Prose(_)
             | Ty::Command(_)
             | Ty::Commit
             | Ty::Digest
             | Ty::Path
             | Ty::Decimal
-            | Ty::AccountLabel(_)
             | Ty::Enum(_)
             | Ty::Time
             | Ty::Day
@@ -315,7 +315,7 @@ pub fn read(ty: &Ty, text: &str) -> std::result::Result<Value, &'static str> {
     };
     match ty {
         Ty::Text(_) | Ty::Prose(_) | Ty::Command(_) => Ok(Value::String(text.to_owned())),
-        Ty::AccountLabel(_)
+        Ty::Handle(_)
         | Ty::Enum(_)
         | Ty::Url
         | Ty::Key
@@ -494,7 +494,12 @@ pub struct Seen {
     pub candidates: Vec<Digest>,
     /// Each set element's candidates (a set column).
     pub elements: BTreeMap<String, Vec<Digest>>,
-    /// The cell holds a value this build cannot read: read-only here.
+    /// The cell holds a value this build cannot read and the owner may not replace here: one a
+    /// newer build wrote (it does not decode, or names a collection version above this
+    /// build's), a secret, a set's element, or one shown masked or refused. Read-only here. A
+    /// plain value an older build wrote that this build's type no longer admits (a version-1
+    /// account label `Team A` under `Handle`) shows raw yet stays the owner's to replace
+    /// ([`replaceable`]).
     pub raw: bool,
 }
 
@@ -711,13 +716,13 @@ pub fn export_projected(
                 .remove(&(pk.as_str(), column.name.as_str()))
                 .unwrap_or_default();
             let raw = row.raw.contains(&column.name);
+            raw_lookup.1.clear();
+            raw_lookup.1.push_str(pk);
+            raw_lookup.1.push('.');
+            raw_lookup.1.push_str(&column.name);
             let shown = match column.source {
                 Source::Pk => pk.clone(),
                 Source::Unknown => {
-                    raw_lookup.1.clear();
-                    raw_lookup.1.push_str(pk);
-                    raw_lookup.1.push('.');
-                    raw_lookup.1.push_str(&column.name);
                     show_raw(None, cells.get(&raw_lookup), row.fields.get(&column.name))
                 }
                 Source::Schema(schema)
@@ -725,17 +730,11 @@ pub fn export_projected(
                 {
                     super::secret::MASK.to_owned()
                 }
-                Source::Schema(schema) if raw => {
-                    raw_lookup.1.clear();
-                    raw_lookup.1.push_str(pk);
-                    raw_lookup.1.push('.');
-                    raw_lookup.1.push_str(&column.name);
-                    show_raw(
-                        Some(schema),
-                        cells.get(&raw_lookup),
-                        row.fields.get(&column.name),
-                    )
-                }
+                Source::Schema(schema) if raw => show_raw(
+                    Some(schema),
+                    cells.get(&raw_lookup),
+                    row.fields.get(&column.name),
+                ),
                 Source::Schema(schema) => match row.claims.get(&column.name) {
                     Some(Some(value)) => show(&schema.ty, value),
                     Some(None) => format!(
@@ -745,6 +744,13 @@ pub fn export_projected(
                     None => show_field(schema, row.fields.get(&column.name)),
                 },
             };
+            let raw = raw
+                && match column.source {
+                    Source::Schema(schema) => {
+                        !replaceable(collection, schema, cells.get(&raw_lookup), &shown)
+                    }
+                    Source::Pk | Source::Unknown => true,
+                };
             seen.insert(
                 column.name.clone(),
                 Seen {
@@ -768,6 +774,35 @@ pub fn export_projected(
         text: render(&base),
         base,
     })
+}
+
+/// Whether a raw cell of `schema`, a column of `collection` that shows as `shown`, is the owner's
+/// to replace: a plain register (no set, no secret) every candidate of which this build decodes
+/// at a version it compiles, shown neither masked nor refused. Such a value is one an older build
+/// wrote, or this one, that the column's type no longer admits (a version-1 account label `Team
+/// A`, which `Handle` refuses): read raw and reported (`check::Finding::Raw`), and replaced by
+/// the owner's next write, which the type judges.
+fn replaceable(
+    collection: &Collection,
+    schema: &Column,
+    cell: Option<&crate::database::Cell>,
+    shown: &str,
+) -> bool {
+    if matches!(schema.ty, Ty::Set(_) | Ty::SecretRef | Ty::Secret)
+        || shown.contains(super::secret::MASK)
+        || shown.contains(REFUSED)
+    {
+        return false;
+    }
+    let Some(cell) = cell.filter(|cell| !cell.stopped) else {
+        return false;
+    };
+    let origins = cell::origins_refs(cell);
+    !origins.is_empty()
+        && origins.iter().all(|(_, value)| {
+            value.is_null()
+                || CellValue::decode(value).is_ok_and(|value| value.r <= collection.version)
+        })
 }
 
 /// The TSV of a baseline: its header, then each row's shown cells, amacs's quoting.

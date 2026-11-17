@@ -56,3 +56,40 @@ fn an_observer_sees_only_a_landed_snapshot_after_both_publication_locks_are_rele
     );
     assert_eq!(published_snapshot(SID), Some(landed));
 }
+
+/// A PUBLISHED SNAPSHOT RINGS THE FOOTER WHEN IT CHANGES (the footer cause design's step C8,
+/// [`crate::host_facts::Bell::Snapshot`]): the restart offer and the tap's room a footer read
+/// shows are judged by a tab's published snapshot, so a first publish, a changed one and a
+/// withdrawal each ring the footer's snapshot bell once, and a publish of the snapshot already
+/// held, or a withdrawal of none, rings nothing.
+///
+/// NEGATIVE CONTROL (run 2026-11-16): with the ring in `publish_snapshot_from` removed, the test
+/// fails at "a first publish rings" with `left: [] right: [Snapshot]`.
+#[test]
+fn a_published_snapshot_rings_the_footer_when_it_changes() {
+    use crate::host_facts::{Bell, take_rung};
+    const SID: &str = "test-snapshot-bell-3c1e0b7a";
+    publish_snapshot(SID, None);
+    let _ = take_rung();
+    let first = snap(SID);
+    publish_snapshot(SID, Some(&first));
+    assert_eq!(take_rung(), [Bell::Snapshot], "a first publish rings");
+    publish_snapshot(SID, Some(&first));
+    assert_eq!(
+        take_rung(),
+        Vec::<Bell>::new(),
+        "the same snapshot again rings nothing"
+    );
+    let mut moved = first.clone();
+    moved.pid += 1;
+    publish_snapshot(SID, Some(&moved));
+    assert_eq!(take_rung(), [Bell::Snapshot], "a changed snapshot rings");
+    publish_snapshot(SID, None);
+    assert_eq!(take_rung(), [Bell::Snapshot], "a withdrawal rings");
+    publish_snapshot(SID, None);
+    assert_eq!(
+        take_rung(),
+        Vec::<Bell>::new(),
+        "withdrawing none rings nothing"
+    );
+}

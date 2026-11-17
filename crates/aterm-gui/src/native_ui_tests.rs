@@ -64,10 +64,11 @@ fn icon_strokes_merge_as_a_restarted_scan_merges_them() {
                     words: (kind == 0).then(|| String::from("words")),
                     rect,
                     art: (kind == 1).then_some((
-                        crate::widget::ImageArt::Kitty {
-                            pose: crate::widget::ImageArt::BRAND_POSE,
+                        crate::widget::ImageArt::Cat(aterm_effects::rainbow_road::CatArt {
+                            pose: aterm_effects::rainbow_road::CatPose::Walk,
+                            tilt: 0,
                             dark: false,
-                        },
+                        }),
                         rect,
                     )),
                 })

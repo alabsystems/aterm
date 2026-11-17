@@ -427,6 +427,12 @@ pub(crate) enum StyleRef {
     SortUp,
     /// [`Self::SortUp`]'s twin for a column ordered from its greatest value down: point down.
     SortDown,
+    /// The mark on a sheet's header that opens its column's filter: a funnel drawn in lines (a
+    /// rim, two sides narrowing to a neck, a stem) in the note's ink. A shape, not a glyph of the
+    /// text face, and never a sort's triangle.
+    Filter,
+    /// [`Self::Filter`] in the primary ink: a filter stands on the column.
+    Filtered,
     /// A bar on a sheet, in the readable secondary ink: the thumb that says where its columns
     /// stand across, and the edge of its frozen column while columns lie under it.
     SheetBar,
@@ -534,8 +540,9 @@ impl GroupSpec {
     /// hero tinted with the accent), `code` (a code block), `unwritten` (a change not yet
     /// written), `cell`, `cell-head`, `cell-selected` and `cell-range` (a sheet's ruled cell, its
     /// header cell, the ring on its selected one and the wash on the rest of a range), `sort-up`
-    /// and `sort-down` (a sorted header's mark), `sheet-bar` (a sheet's scroll thumb and frozen
-    /// edge), or `none`.
+    /// and `sort-down` (a sorted header's mark), `filter` and `filtered` (a header's filter mark,
+    /// its column filtered or not), `sheet-bar` (a sheet's scroll thumb and frozen edge), or
+    /// `none`.
     pub(crate) const fn backdrop(&self) -> &'static str {
         match (self.role, self.style) {
             (SemanticRole::Application, _) => "page",
@@ -550,6 +557,8 @@ impl GroupSpec {
             (_, StyleRef::CellRange) => "cell-range",
             (_, StyleRef::SortUp) => "sort-up",
             (_, StyleRef::SortDown) => "sort-down",
+            (_, StyleRef::Filter) => "filter",
+            (_, StyleRef::Filtered) => "filtered",
             (_, StyleRef::SheetBar) => "sheet-bar",
             _ => "none",
         }
@@ -755,10 +764,10 @@ pub(crate) const DISPLAY_FACE_NAME_AUDIT: &str = "settings.text.display-face-nam
 pub(crate) const WORDMARK_AUDIT: &str = "settings.about.wordmark";
 
 /// The setup screen's lockup, its progress bar (`docs/DESIGN-init-on-by-default-2026-10-25.md`
-/// §4.5, [`crate::system_state::paint_lockup`]): `❯ aterm · ALab` in the terminal's mono face,
-/// the rainbow ribbon filled to the caret, the track beyond it, and the kitty behind the caret.
+/// §4.5, [`crate::system_state::paint_lockup`]): `❯ aterm · ALab` in the brand face, then the
+/// rainbow road travelled to the run's progress with the cat standing on it.
 /// A [`SemanticRole::ProgressIndicator`]; its value is the lockup's
-/// [`crate::system_state::LockupSpec`].
+/// [`crate::system_state::LockupPaint`].
 pub(crate) const SYSTEM_STATE_BRAND_AUDIT: &str = "system-state.brand";
 
 /// A setup screen state's mark (§4.4, [`crate::system_state::paint_mark`]): a ring, a spinner,
@@ -767,6 +776,13 @@ pub(crate) const SYSTEM_STATE_BRAND_AUDIT: &str = "system-state.brand";
 /// or row's label says the state in words. The working spinner is a moving node stepping at
 /// 12 Hz ([`NodeMotion`]) where the page may move in place, and its still glyph where it may not.
 pub(crate) const SYSTEM_STATE_MARK_AUDIT: &str = "system-state.mark";
+
+/// A track mark, an activity icon, the event mark or the unread `?`
+/// (`docs/DESIGN-comprehension-2026-11-14.md` §5.6, [`crate::comprehension_words::paint_mark`]):
+/// each its own form in one of four [`crate::native_appearance::NativeRoles`] inks, drawn from its
+/// typed word (its value, `track:off-track`), and spoken as that word (its label), never painted
+/// as a glyph.
+pub(crate) const COMPREHENSION_MARK_AUDIT: &str = "comprehension.mark";
 
 /// A setup screen surface (§4.1, §4.4, [`crate::system_state::paint_surface`]): the list's inset
 /// grouped card, the Needs-you card's wash and rim, or a working line's band. Paint only; its
@@ -3362,7 +3378,7 @@ fn ink_marks(
                 w,
                 h,
                 art: image,
-                alpha: _,
+                ..
             } => {
                 let frame = LogicalRect::new(*x, *y, *w, *h);
                 art = Some((*image, frame));
@@ -4445,6 +4461,12 @@ impl CompiledUi {
                 }
                 UiContent::TextViewport(spec) => {
                     lines.push(text_viewport_paint_audit(paint, spec));
+                }
+                UiContent::Custom(spec) if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT => {
+                    lines.push(crate::system_state::LockupPaint::audit_line(
+                        paint.key.as_str(),
+                        spec.paint.as_deref(),
+                    ));
                 }
                 _ => {}
             }
@@ -5672,7 +5694,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
         }
         UiContent::Custom(spec) => {
             let available = effective_horizontal_width(node, node.rect.x, node.rect.right());
-            if spec.audit_id == MESSAGES_SCROLL_AUDIT {
+            // A scroll indicator says nothing, and a comprehension mark says its label and
+            // paints no words: neither has words that could overflow.
+            if spec.audit_id == MESSAGES_SCROLL_AUDIT || spec.audit_id == COMPREHENSION_MARK_AUDIT {
                 return Some(finish_text_fit(
                     node,
                     "custom",
@@ -5690,7 +5714,9 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                 let (size, face) = wordmark_typography(&spec.label, node.rect.width);
                 crate::tray_raster::ui_text_width_for(face, &spec.label, size.get())
             } else if spec.audit_id == SYSTEM_STATE_BRAND_AUDIT {
-                crate::system_state::LockupSpec::parse(spec.paint.as_deref()).least_width()
+                crate::system_state::LockupPaint::parse(spec.paint.as_deref())
+                    .spec
+                    .least_width()
             } else if spec.audit_id == SYSTEM_STATE_MARK_AUDIT
                 || spec.audit_id == SYSTEM_STATE_SURFACE_AUDIT
                 || spec.audit_id == crate::system_state::repositories::BAR_AUDIT
@@ -6316,6 +6342,34 @@ fn paint_compiled_node_at(
                         h: 2.0,
                         radius: 0.0,
                         fill: rgba(roles.text_primary, 255),
+                    });
+                }
+            } else if matches!(spec.style, StyleRef::Filter | StyleRef::Filtered) {
+                // A header's filter mark: a funnel's rim, its sides narrowing to its neck, and
+                // its stem, drawn in lines at the middle of the mark's seat.
+                let ink = rgba(
+                    if spec.style == StyleRef::Filtered {
+                        roles.text_primary
+                    } else {
+                        readable_secondary(&roles)
+                    },
+                    255,
+                );
+                let (cx, cy) = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                for (x1, y1, x2, y2) in [
+                    (-4.5, -4.0, 4.5, -4.0),
+                    (-4.5, -4.0, -1.0, 0.5),
+                    (4.5, -4.0, 1.0, 0.5),
+                    (-1.0, 0.5, -1.0, 4.5),
+                    (1.0, 0.5, 1.0, 3.5),
+                ] {
+                    prims.push(DrawPrim::Line {
+                        x1: cx + x1,
+                        y1: cy + y1,
+                        x2: cx + x2,
+                        y2: cy + y2,
+                        width: 1.5,
+                        color: ink,
                     });
                 }
             } else if spec.style == StyleRef::SheetBar {
@@ -7226,6 +7280,11 @@ fn paint_compiled_node_at(
                 crate::system_state::paint_surface(prims, rect, spec.paint.as_deref(), &roles);
                 return;
             }
+            if spec.audit_id == COMPREHENSION_MARK_AUDIT {
+                // A mark paints its form; its word is its label, heard and never typeset.
+                crate::comprehension_words::paint_mark(prims, rect, spec.paint.as_deref(), &roles);
+                return;
+            }
             if spec.audit_id == WORDMARK_AUDIT {
                 let (size, face) = wordmark_typography(&spec.label, rect.width);
                 prims.push(text_prim(
@@ -8071,7 +8130,9 @@ fn paint_styled_markdown_rows(
     let px = base.size.get();
     let measure = |face: TextFace, weight, s: &str| match face {
         TextFace::Mono => measure_text(s, px, weight),
-        TextFace::Ui | TextFace::UiBold | TextFace::Display(_) => ui_text_width_for(face, s, px),
+        TextFace::Ui | TextFace::UiBold | TextFace::Display(_) | TextFace::Brand(_) => {
+            ui_text_width_for(face, s, px)
+        }
     };
     // One row past the shown ones, so a row the next continues is not ended in `…`
     // ([`crate::native_markdown::wrap_reader_text_window`]).
@@ -9825,7 +9886,8 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
         | StyleRef::Cell
         | StyleRef::CellHead
         | StyleRef::Note => readable_secondary(roles),
-        StyleRef::SheetBar => readable_secondary(roles),
+        StyleRef::SheetBar | StyleRef::Filter => readable_secondary(roles),
+        StyleRef::Filtered => roles.text_primary,
         StyleRef::Code
         | StyleRef::CellSelected
         | StyleRef::CellRange
@@ -9971,7 +10033,10 @@ struct Compiler {
     output: CompiledUi,
 }
 
-/// A segmented control's segments ([`UiNode::segmented`]).
+/// A segmented control's segments ([`UiNode::segmented`]). A button segment whose value says
+/// it is on is its control's choice, as a selected one is: a page that marks its choice in its
+/// own neutral paint (the Tables page's history scope) says it so, since a selected button
+/// paints the accent.
 pub(crate) fn segments_of(children: &[UiNode]) -> Vec<(UiKey, ControlState)> {
     fn walk(children: &[UiNode], out: &mut Vec<(UiKey, ControlState)>) {
         for child in children {
@@ -9979,7 +10044,14 @@ pub(crate) fn segments_of(children: &[UiNode]) -> Vec<(UiKey, ControlState)> {
                 continue;
             }
             match &child.content {
-                UiContent::Button(control) => out.push((child.key.clone(), control.state)),
+                UiContent::Button(control) => out.push((
+                    child.key.clone(),
+                    ControlState {
+                        selected: control.state.selected
+                            || matches!(control.value, SemanticValue::Bool(true)),
+                        ..control.state
+                    },
+                )),
                 UiContent::Switch(control) => out.push((child.key.clone(), control.state)),
                 _ => walk(&child.children, out),
             }

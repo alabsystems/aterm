@@ -57,9 +57,10 @@
 //! admitted ALONE at once ([`Alone`]), and so is one that asks to be ([`crate::Need::alone`])
 //! once nothing else holds memory; while a claim is held alone, every
 //! other memory claim waits ([`Short::Alone`]), so the machine runs one heavy claim at a time.
-//! Waits stay first in, first out behind claims that hold memory: a need short of memory waits
-//! for every claim ahead that holds it, and is admitted, beside what is left or alone, once they
-//! end. A waiter of the same process is not ahead of its memory: the process orders its own
+//! Waits stay first in, first out among claims of one priority ([`crate::Need::priority`]: a
+//! person's claim, [`crate::Need::person`], goes ahead of the agents' of its rank that asked
+//! before it) behind claims that hold memory: a need short of memory waits for every claim ahead
+//! that holds it, and is admitted, beside what is left or alone, once they end. A waiter of the same process is not ahead of its memory: the process orders its own
 //! claims (verify's run budget), so its later claim that fits never waits for an earlier one's
 //! room. Nor is any waiter ahead of a process that holds the quiet machine (QUIET-FIRST): it
 //! overtakes them by the timed stage it runs. Bounded so, the wait of a need that can be
@@ -1410,7 +1411,7 @@ fn reservations_as(
         (
             !holds(i),
             !ahead[i].record.need.leads,
-            ahead[i].record.need.rank,
+            ahead[i].record.need.priority(),
             ahead[i].record.order(),
         )
     });
@@ -1818,8 +1819,8 @@ fn may_bring(ends: &[End], short: u64) -> bool {
 /// with what it reserves ([`reservations`]), `available` read now and `reach` the most that can
 /// ever be available ([`Reading::reachable`]) (CAP3's passing rule). The held claims'
 /// reservations come off `available` first. Then each waiter, in its turn (the order [`decide`]
-/// and [`reservations`] keep: the waiters that lead first, [`Need::leads`], then by rank and
-/// [`Record::order`]), either can start now (its whole need and margin, as its own look asks
+/// and [`reservations`] keep: the waiters that lead first, [`Need::leads`], then by
+/// [`Need::priority`] and [`Record::order`]), either can start now (its whole need and margin, as its own look asks
 /// them, fit what is left, within what every earlier waiter that keeps its place spares), and
 /// its reservation comes off the room, or it cannot ([`MemoryTurn::standing`]), and what it lacks
 /// is its need and margin with every earlier waiter's reservation that keeps its place, less the
@@ -1958,7 +1959,11 @@ pub(crate) fn memory_turn(
         }
     }
     waiting.sort_unstable_by_key(|(_, (o, _))| {
-        (!o.record.need.leads, o.record.need.rank, o.record.order())
+        (
+            !o.record.need.leads,
+            o.record.need.priority(),
+            o.record.order(),
+        )
     });
     let mut turn = MemoryTurn::new(ahead.len(), available, reach);
     for (o, reserve) in &held {
@@ -2962,10 +2967,10 @@ pub(crate) fn reserving<'r>(
         .iter()
         .filter(|r| {
             let before = if r.need.mem == 0 && r.need.cores == 0 && r.need.disk == 0 {
-                (r.need.rank, r.laid_ms(), r.pid, r.seq)
-                    < (mine.need.rank, mine.laid_ms(), mine.pid, mine.seq)
+                (r.need.priority(), r.laid_ms(), r.pid, r.seq)
+                    < (mine.need.priority(), mine.laid_ms(), mine.pid, mine.seq)
             } else {
-                (r.need.rank, r.order()) < (mine.need.rank, mine.order())
+                (r.need.priority(), r.order()) < (mine.need.priority(), mine.order())
             };
             (r.held.is_some() || before)
                 && (matches!(
@@ -3023,8 +3028,9 @@ impl fmt::Display for Alone {
 }
 
 /// Whether `need` fits now beside every claim ahead of the waiter at `mine` (held, or waiting
-/// ahead: one that leads where `need` does not ([`Need::leads`]), else one of a higher rank or
-/// the same rank since earlier, less the disk of a waiter no claim's end can admit:
+/// ahead: one that leads where `need` does not ([`Need::leads`]), else one of a higher
+/// [`Need::priority`] (a higher rank, or a person's of the same rank, [`Need::person`]) or the
+/// same priority since earlier, less the disk of a waiter no claim's end can admit:
 /// [`reservations`]), and, for a need of memory, under memory pressure short of critical
 /// ([`Short::Pressure`]), with no claim held alone ([`Short::Alone`]), or alone where it is short
 /// only of memory no claim holds and either asked to be or is below what can ever be available
@@ -3090,8 +3096,11 @@ pub(crate) fn decide_with(
         .iter()
         .filter(|o| {
             o.record.held.is_some()
-                || (!o.record.need.leads, o.record.need.rank, o.record.order())
-                    < (!need.leads, need.rank, mine)
+                || (
+                    !o.record.need.leads,
+                    o.record.need.priority(),
+                    o.record.order(),
+                ) < (!need.leads, need.priority(), mine)
         })
         .collect();
     let volume = reading.volume.as_ref();
@@ -3378,8 +3387,8 @@ pub fn heavy_queue(records: &[Record]) -> Vec<&Record> {
     queue
 }
 
-/// Bound every new grant by physical room. Earlier waiters in rank/arrival order that need
-/// cores alone reserve their requested room without changing any running grant.
+/// Bound every new grant by physical room. Earlier waiters in priority/arrival order
+/// ([`Need::priority`]) that need cores alone reserve their requested room without changing any running grant.
 ///
 /// CORES-NO-CYCLE. A waiter that needs memory, disk or the quiet machine as well reserves no
 /// cores: it may wait for memory a holder keeps, and that holder's own later cores claim (a test
@@ -3411,7 +3420,7 @@ fn ranked_grant(
         .filter(|o| {
             o.record.held.is_none()
                 && reserves_cores(&o.record.need)
-                && (o.record.need.rank, o.record.order()) < (need.rank, mine)
+                && (o.record.need.priority(), o.record.order()) < (need.priority(), mine)
         })
         .map(|o| o.record.need.cores)
         .fold(0u32, u32::saturating_add);
@@ -3423,7 +3432,8 @@ fn ranked_grant(
         need.cores,
         reading,
         others.iter().filter(|o| {
-            o.record.held.is_some() || (o.record.need.rank, o.record.order()) < (need.rank, mine)
+            o.record.held.is_some()
+                || (o.record.need.priority(), o.record.order()) < (need.priority(), mine)
         }),
         now,
     )
@@ -3458,6 +3468,10 @@ mod turn_tests;
 #[cfg(test)]
 #[path = "admit_place_tests.rs"]
 mod place_tests;
+
+#[cfg(test)]
+#[path = "admit_person_tests.rs"]
+mod person_tests;
 
 /// The fair share before `ranked_grant` applies reservations and the physical core bound.
 /// - The room is the cores less what every held claim was granted. Past about half
@@ -4702,7 +4716,16 @@ impl Place {
     /// stands at it; `None` once none does.
     #[must_use]
     pub fn standing_ms(&self) -> Option<u64> {
-        self.0.upgrade().map(|stood| stood.ms)
+        self.standing().map(|(ms, _)| ms)
+    }
+
+    /// The place's order stamp, unix ms, and whether its claims are a person's
+    /// ([`crate::Need::person`]: the mark of the first record laid at it, which every entry at
+    /// it takes as it takes the stamp), while a record of this process stands at it; `None`
+    /// once none does.
+    #[must_use]
+    pub fn standing(&self) -> Option<(u64, bool)> {
+        self.0.upgrade().map(|stood| (stood.ms, stood.person))
     }
 
     /// The place as `ledger` keeps it for this process now: its stamp where a record at it
@@ -4723,15 +4746,21 @@ struct Stood {
     pid: u32,
     /// The ledger it is a place in.
     dir: PathBuf,
+    /// Whether the first record laid at it is a person's ([`crate::Need::person`]): every entry
+    /// at the place is, as it takes the place's stamp, so work that stands in the queue without
+    /// a break keeps the mark it entered with until its last claim ends.
+    person: bool,
 }
 
 impl Stood {
-    /// The place `record` stands at in the ledger at `dir`: its own stamp, newly minted.
+    /// The place `record` stands at in the ledger at `dir`: its own stamp and mark, newly
+    /// minted.
     fn of(record: &Record, dir: &Path) -> std::sync::Arc<Stood> {
         std::sync::Arc::new(Stood {
             ms: record.start_ms,
             pid: record.pid,
             dir: dir.to_path_buf(),
+            person: record.need.person,
         })
     }
 }
@@ -4837,6 +4866,15 @@ impl Waiter {
         if machine.release_run() {
             need.rank = crate::Rank::Release;
         }
+        // A PERSON's claim ([`Need::person`]) is read from the machine, once, as it enters, or
+        // taken from the place it enters at with the place's stamp: a caller's mark is none, and
+        // a Release, Background or leading claim is never marked.
+        let placed = stood
+            .as_ref()
+            .filter(|_| accounting == crate::Accounting::Holder);
+        need.person = need.rank == crate::Rank::Ordinary
+            && !need.leads
+            && placed.map_or_else(|| machine.person(), |stood| stood.person);
         if need.rank == crate::Rank::Background {
             #[cfg(unix)]
             // SAFETY: getpgrp has no pointer arguments. Background work may authorize
@@ -5200,8 +5238,8 @@ impl Waiter {
                     && (record.need.rank == crate::Rank::Release || record.need.leads)
                     && (record.accounting == crate::Accounting::CohortOwned
                         || record.pid != self.record.pid)
-                    && (!record.need.leads, record.need.rank, record.order())
-                        < (!need.leads, need.rank, mine)
+                    && (!record.need.leads, record.need.priority(), record.order())
+                        < (!need.leads, need.priority(), mine)
             });
         let others = others(&records, used.claimants, &used.trees, &used.lines, &wide);
         let mut decided = decide_with(&need, mine, &reading, &others, now, self.disk_rule);

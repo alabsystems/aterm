@@ -708,6 +708,61 @@ mod sign_in {
         );
     }
 
+    /// Whether a sign-in could be handed a credential is answered as a reveal would answer,
+    /// with nothing handed on: a held value is usable, one of whitespace alone is blank, an
+    /// empty one empty, and a reference the store lacks is withheld in the reveal's own words.
+    /// `usable_in` is handed no journal, so it can record nothing.
+    /// NEGATIVE CONTROL: with `usable_in` answering from the mailbox's `held` list alone, the
+    /// store-less, the blank and the empty cell all read usable.
+    #[test]
+    fn whether_a_credential_is_usable_is_answered_with_no_reveal() {
+        let Fixture {
+            book,
+            store,
+            mailbox,
+            ..
+        } = fixture();
+        let (addresses, mailboxes_rows) = projections(&book);
+        let ask = |which| Ask {
+            mailbox: &mailbox,
+            which,
+            when_ms: 1,
+        };
+        let usable =
+            |which| usable_in(&addresses, &mailboxes_rows, TABLE, &store, ask(which)).unwrap();
+        for which in Credential::ALL {
+            assert_eq!(usable(which), Ok(Standing::Usable), "{which:?}");
+        }
+        assert_eq!(
+            usable_in(
+                &addresses,
+                &mailboxes_rows,
+                TABLE,
+                &store,
+                Ask {
+                    mailbox: "mb-none",
+                    which: Credential::Password,
+                    when_ms: 1
+                }
+            )
+            .unwrap(),
+            Err(Withheld::NoMailbox)
+        );
+        let entry = crate::typed::secret::entry_name("mailbox", "totp", &mailbox).unwrap();
+        store.put(&entry, &Secret::new(" \t\n".to_owned())).unwrap();
+        assert_eq!(usable(Credential::Totp), Ok(Standing::Blank));
+        store.put(&entry, &Secret::new(String::new())).unwrap();
+        assert_eq!(usable(Credential::Totp), Ok(Standing::Empty));
+        store.remove(&entry).unwrap();
+        assert_eq!(usable(Credential::Totp), Err(Withheld::NotInStore));
+        // Still listed as held: the list says a cell names an entry, not that it opens here.
+        assert!(
+            mailboxes(&addresses, &mailboxes_rows)[0]
+                .held
+                .contains(&Credential::Totp)
+        );
+    }
+
     /// A reference whose entry this Mac's store lacks is withheld as `NotInStore`: no value is
     /// handed on and nothing is journalled.
     /// NEGATIVE CONTROL: with `open_credential` journalling or consuming before the store read

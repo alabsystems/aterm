@@ -556,7 +556,7 @@ fn binary_header(file: &[u8]) -> Result<Header<'_>, AgeError> {
 
 /// Only Commons history handoff uses an original file key. Authenticate the
 /// complete binary file before allowing that key to be wrapped to a new member.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn authenticated_file_key(
     identity: &Identity,
     file: &[u8],
@@ -572,7 +572,7 @@ pub(crate) fn authenticated_file_key(
 
 /// Opening with a handoff key still authenticates the original header and every
 /// payload chunk. This is crate-private, not another public decryption mode.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn decrypt_file_key(key: &[u8; FILE_KEY], file: &[u8]) -> Result<SecretBytes, AgeError> {
     open_after_header(key, file, &binary_header(file)?)
 }

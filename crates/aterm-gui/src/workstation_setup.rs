@@ -1178,6 +1178,7 @@ impl App {
     }
 
     pub(crate) fn tick_workstation_setup(&mut self, now: Instant) {
+        self.close_successful_developer_tools_tabs();
         if self.workstation_setup.pending()
             && !self
                 .windows
@@ -1187,6 +1188,14 @@ impl App {
             self.workstation_setup
                 .finish(WorkstationSetupDecision::Unavailable);
             return;
+        }
+        // The window's loop takes setup wakes before any setup may start: a System State page
+        // shown with no setup running (a lab capture's fixture, a page opened from the menu)
+        // still hears its lockup's bakes land.
+        if let Ok(mut proxy) = PROXY.lock()
+            && proxy.is_none()
+        {
+            proxy.clone_from(&self.proxy);
         }
         if !may_start(
             self.headless,

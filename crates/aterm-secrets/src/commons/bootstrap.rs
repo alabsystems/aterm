@@ -18,6 +18,7 @@ use crate::{
     client::{self, Paths},
     fsx,
 };
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +35,44 @@ const MAX_DEVICE: usize = 4096;
 fn custody_digest(path: &Path, glance: Option<&fsx::Glance>) -> Result<[u8; 32]> {
     fsx::private_digest(path, MAX_DEVICE, glance)?
         .ok_or_else(|| Error::new("Commons immutable custody is missing"))
+}
+
+/// The links the file `file` is open on has: `metadata`'s count on Unix, its handle's on Windows,
+/// whose `std::fs::Metadata` has none.
+#[cfg(unix)]
+fn links(_file: &std::fs::File, metadata: &std::fs::Metadata) -> std::io::Result<u64> {
+    Ok(metadata.nlink())
+}
+
+/// The links the file `file` is open on has: `metadata`'s count on Unix, its handle's on Windows,
+/// whose `std::fs::Metadata` has none.
+#[cfg(windows)]
+fn links(file: &std::fs::File, _metadata: &std::fs::Metadata) -> std::io::Result<u64> {
+    Ok(fsx::meta_of(file)?.st_nlink)
+}
+
+/// Whether the files `a` and `b`, each open with the metadata its open gave, are one file: the
+/// metadata's device and inode on Unix, the handles' volume and file id on Windows.
+#[cfg(unix)]
+fn same_file(
+    _a: &std::fs::File,
+    a_meta: &std::fs::Metadata,
+    _b: &std::fs::File,
+    b_meta: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    Ok((a_meta.dev(), a_meta.ino()) == (b_meta.dev(), b_meta.ino()))
+}
+
+/// Whether the files `a` and `b`, each open with the metadata its open gave, are one file: the
+/// metadata's device and inode on Unix, the handles' volume and file id on Windows.
+#[cfg(windows)]
+fn same_file(
+    a: &std::fs::File,
+    _a_meta: &std::fs::Metadata,
+    b: &std::fs::File,
+    _b_meta: &std::fs::Metadata,
+) -> std::io::Result<bool> {
+    Ok(fsx::id_of(&fsx::meta_of(a)?) == fsx::id_of(&fsx::meta_of(b)?))
 }
 
 fn established_files(paths: &Paths) -> Result<()> {
@@ -54,10 +93,11 @@ fn established_files(paths: &Paths) -> Result<()> {
         (&device, "default.pin"),
         (&journal, "control.anchor"),
     ] {
-        let (_, metadata) = dir
-            .open(name)
-            .map_err(|_| Error::new("existing Commons custody file is unavailable"))?;
-        if metadata.nlink() != 1 || metadata.len() > MAX_DEVICE as u64 {
+        let unavailable = || Error::new("existing Commons custody file is unavailable");
+        let (file, metadata) = dir.open(name).map_err(|_| unavailable())?;
+        if links(&file, &metadata).map_err(|_| unavailable())? != 1
+            || metadata.len() > MAX_DEVICE as u64
+        {
             return Err(Error::new(
                 "existing Commons custody file is not privately held",
             ));
@@ -180,6 +220,7 @@ impl CustodyLock {
         existing_only: bool,
         mut held: impl FnMut(),
     ) -> Result<Self> {
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         if existing_only {
             aterm_uds::private_file::check_private_dir(&paths.dir)?;
@@ -192,13 +233,16 @@ impl CustodyLock {
         // by concurrent private-file readers. Publish it with one name from
         // the first instant; never truncate or replace an existing lock.
         if !existing_only {
-            match std::fs::OpenOptions::new()
+            #[cfg(unix)]
+            let created = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(&path)
-            {
+                .open(&path);
+            #[cfg(windows)]
+            let created = fsx::create_private_file_new(&path);
+            match created {
                 Ok(file) => {
                     aterm_durable::durable(&file)?;
                     aterm_durable::durable_dir(&paths.dir)?;
@@ -247,9 +291,9 @@ impl CustodyLock {
             }
         })?;
         let lock = Self(custody_file);
-        let (_, current) = aterm_uds::private_file::open_private(&paths.dir, name)
+        let (current_file, current) = aterm_uds::private_file::open_private(&paths.dir, name)
             .map_err(|error| Error::new(format!("Commons custody lock is not private: {error}")))?;
-        if (current.dev(), current.ino()) != (metadata.dev(), metadata.ino()) {
+        if !same_file(&current_file, &current, &lock.0, &metadata)? {
             return Err(Error::new(
                 "Commons custody lock changed while acquiring it",
             ));

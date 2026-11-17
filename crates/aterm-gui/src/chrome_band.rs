@@ -160,8 +160,8 @@ pub(crate) fn band_colors(p: impl Into<ChromePalette>) -> BandColors {
     let inks = p.inks();
     let seeds = p.seeds();
     std::thread_local! {
-        static LAST: std::cell::Cell<Option<(ChromeSeeds, ThemeInks, BandColors)>> =
-            const { std::cell::Cell::new(None) };
+        static LAST: Box<std::cell::Cell<Option<(ChromeSeeds, ThemeInks, BandColors)>>> =
+            Box::new(std::cell::Cell::new(None));
     }
     LAST.with(|last| match last.get() {
         Some((was, was_inks, colors)) if was == seeds && was_inks == inks => colors,
@@ -250,8 +250,8 @@ impl ChromePalette {
     pub(crate) fn tokens(&self) -> ChromeTokens {
         let seeds = self.seeds();
         std::thread_local! {
-            static LAST: std::cell::Cell<Option<(ChromeSeeds, ChromeTokens)>> =
-                const { std::cell::Cell::new(None) };
+            static LAST: Box<std::cell::Cell<Option<(ChromeSeeds, ChromeTokens)>>> =
+                Box::new(std::cell::Cell::new(None));
         }
         LAST.with(|last| match last.get() {
             Some((was, tokens)) if was == seeds => tokens,

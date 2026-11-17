@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use aterm_agent::harness::footer;
 
-use super::{Asks, Identity, LaunchFacts, LogWake, NO_TAP, RosterMemo};
+use super::{Asks, Identity, LogWake, MachineMemo, NO_TAP, RosterAsks};
 use crate::session_log::transcript::Applied;
 use crate::session_timeline::SessionTimeline;
 
@@ -67,19 +67,8 @@ pub(crate) fn read(
     wake: &LogWake,
 ) -> Applied {
     let mut identity = Identity {
-        pid,
-        started: None,
         dir: Some(claude.to_path_buf()),
-        launch: LaunchFacts::default(),
-        launch_for: None,
-        login: None,
-        argv: Vec::new(),
-        task: None,
-        login_checked_for: None,
-        route: aterm_agent::harness::accounts::AuthRoute::Outside,
-        unoffered: None,
-        env_stamp: None,
-        first_seen: None,
+        ..Identity::new(pid, None)
     };
     let asks = Asks {
         files: |_| None,
@@ -91,17 +80,21 @@ pub(crate) fn read(
                 ..Default::default()
             })
         },
-        roster: || None,
+        roster: RosterAsks::Given(|| None),
         home: scratch_home,
         route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
+        default: |_, _| {},
+        catalog: |_| {},
+        wall: |_| std::time::SystemTime::now(),
     };
     let (_, _, applied) = super::resolve_into(
         timeline,
         &mut identity,
         tail,
         fold,
-        &mut RosterMemo::default(),
+        &mut MachineMemo::default(),
         asks,
+        std::time::Instant::now(),
     );
     wake.after(session, &applied);
     applied

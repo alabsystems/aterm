@@ -28,6 +28,7 @@ fn record(state: TaskState, why: Option<&'static str>, exit: Option<i32>) -> Tas
         since: now,
         started_unix_ms: at,
         started: now,
+        took_up: false,
         entered: 1,
         agent: None,
         program: None,

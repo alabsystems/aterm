@@ -934,6 +934,8 @@ fn face_code(face: TextFace) -> u16 {
         TextFace::Ui => 1,
         TextFace::UiBold => 2,
         TextFace::Display(index) => 3 + u16::from(index),
+        TextFace::Brand(TextWeight::Regular) => 0x200,
+        TextFace::Brand(TextWeight::Bold) => 0x201,
     }
 }
 
@@ -1770,9 +1772,10 @@ pub(crate) fn chrome_font_epoch_for_test() -> u64 {
     with_fonts(|fonts| fonts.semantic_ready_epoch)
 }
 
-/// For direct semantic-view tests, which build no renderer backend: install the proportional UI
-/// faces backend startup would, leaving any installed semantic renderer in place.
-#[cfg(test)]
+/// For direct semantic-view tests and debug specimens, which build no renderer backend: install
+/// the proportional UI faces backend startup would, leaving any installed semantic renderer in
+/// place.
+#[cfg(any(test, debug_assertions))]
 pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     let ui = prepared_ui_font_assets();
     with_fonts(|fonts| {
@@ -1916,11 +1919,59 @@ fn display_chrome_font(index: u8) -> Option<&'static Arc<ChromeFont>> {
         .as_ref()
 }
 
+/// Where macOS keeps SF Mono's static faces, its Medium and Bold: Terminal's own copies, on
+/// every macOS aterm runs on.
+#[cfg(target_os = "macos")]
+const SF_MONO_STATIC: [&str; 2] = [
+    "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/SF-Mono-Medium.otf",
+    "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/SF-Mono-Bold.otf",
+];
+
+/// [`TextFace::Brand`]'s faces, regular and strong, resolved once: SF Mono's Medium and Bold
+/// where this Mac has both, else the bundled Iosevka Term and its Bold, which every build
+/// carries. The design sets the words in SF Mono, `aterm` at weight 600 and `ALab` at 400, and
+/// its approved render was drawn with CoreText's font smoothing, which thickens each stem; this
+/// rasterizer draws unsmoothed, so a step heavier each (Medium, Bold) matches the render's stems
+/// at the same advances (§4.5). Never one of each family: the two runs sit on one baseline and
+/// must read as one face.
+fn brand_chrome_faces() -> &'static [Option<Arc<ChromeFont>>; 2] {
+    static FACES: OnceLock<[Option<Arc<ChromeFont>>; 2]> = OnceLock::new();
+    FACES.get_or_init(|| {
+        #[cfg(target_os = "macos")]
+        {
+            let mut files = UiFontFiles::default();
+            let [regular, strong] = SF_MONO_STATIC.map(|path| {
+                parse_ui_font(&mut files, std::path::Path::new(path), 0).map(|(font, _)| font)
+            });
+            if regular.is_some() && strong.is_some() {
+                return [regular, strong];
+            }
+        }
+        let parse = |id: &str| {
+            let bytes = aterm_render::bundled::face_for_id(id)?;
+            aterm_render::shared_parsed_face(bytes, 0)
+                .ok()
+                .map(|(_, font)| font)
+        };
+        [
+            parse(aterm_render::bundled::IOSEVKA_ID),
+            parse(aterm_render::bundled::IOSEVKA_BOLD_ID),
+        ]
+    })
+}
+
+/// [`TextFace::Brand`]'s face in `weight`: [`TextWeight::Bold`] is the brand's strong weight
+/// (SF Mono Bold, or Iosevka Term Bold where SF Mono is missing).
+fn brand_chrome_font(weight: TextWeight) -> Option<&'static Arc<ChromeFont>> {
+    brand_chrome_faces()[usize::from(weight == TextWeight::Bold)].as_ref()
+}
+
 impl ChromeFonts {
     fn ui_font(&self, face: TextFace) -> Option<&Arc<ChromeFont>> {
         match face {
             TextFace::UiBold => self.ui_semibold.as_ref().or(self.ui_regular.as_ref()),
             TextFace::Display(index) => display_chrome_font(index),
+            TextFace::Brand(weight) => brand_chrome_font(weight),
             TextFace::Mono | TextFace::Ui => self.ui_regular.as_ref(),
         }
     }
@@ -4568,30 +4619,66 @@ impl Canvas {
         }
     }
 
-    /// A [`DrawPrim::Image`] in the `w`×`h` device rect at `(x, y)`: `art`
-    /// baked at exactly that many device pixels ([`crate::widget::ImageArt::baked`]) and
-    /// composited pixel by pixel at its own alpha scaled by `alpha`, through the clip stack.
+    /// A [`DrawPrim::Image`] whose top left is the device point `(x, y)`: `art`'s bake at
+    /// `width`×`height` device pixels where one is kept ([`crate::widget::ImageArt::kept`];
+    /// nothing bakes here, and an image not kept draws nothing), one to one, each pixel at its
+    /// own alpha scaled by `alpha`, through the clip stack. Its art was drawn and its alphas
+    /// set in sRGB, so it composites in sRGB ([`Self::blend_srgb`]): blended in linear light,
+    /// a faint glow over a dark ground lands several times too strong and a shadow half as dark.
     fn image(
         &mut self,
-        (x, y, w, h): (f32, f32, f32, f32),
+        (x, y): (f32, f32),
         art: crate::widget::ImageArt,
+        (width, height): (u32, u32),
         alpha: u8,
     ) {
-        let (width, height) = (w.round().max(0.0) as u32, h.round().max(0.0) as u32);
         if width == 0 || height == 0 || alpha == 0 {
             return;
         }
+        let Some(pixels) = art.kept(width, height) else {
+            return;
+        };
         let coverage = f32::from(alpha) / 255.0;
-        let pixels = art.baked(width, height);
         let (x0, y0) = (x.round() as i32, y.round() as i32);
         for (row, line) in pixels.chunks_exact(width as usize * 4).enumerate() {
             for (col, pixel) in line.as_chunks::<4>().0.iter().enumerate() {
                 if pixel[3] == 0 {
                     continue;
                 }
-                self.blend(x0 + col as i32, y0 + row as i32, *pixel, coverage);
+                self.blend_srgb(x0 + col as i32, y0 + row as i32, *pixel, coverage);
             }
         }
+    }
+
+    /// Source-over `c` at `cov` onto the pixel `(x, y)` in sRGB values, as a browser composites
+    /// an SVG and as the setup screen's art is authored ([`Self::image`]); every other prim
+    /// blends in linear light ([`Self::blend`]).
+    fn blend_srgb(&mut self, x: i32, y: i32, c: [u8; 4], cov: f32) {
+        let local_x = x.saturating_sub(self.origin_x);
+        let local_y = y.saturating_sub(self.origin_y);
+        if local_x < 0 || local_y < 0 || local_x as u32 >= self.w || local_y as u32 >= self.h {
+            return;
+        }
+        if let Some(&(cx0, cy0, cx1, cy1)) = self.clip.last()
+            && (x < cx0 || y < cy0 || x >= cx1 || y >= cy1)
+        {
+            return;
+        }
+        let a = (f32::from(c[3]) / 255.0) * cov.clamp(0.0, 1.0);
+        if a <= 0.0 {
+            return;
+        }
+        let i = ((local_y as u32 * self.w + local_x as u32) * 4) as usize;
+        let da = f32::from(self.px[i + 3]) / 255.0;
+        let out_a = a + da * (1.0 - a);
+        if out_a > 0.0 {
+            for (k, &sc) in c.iter().take(3).enumerate() {
+                let d = f32::from(self.px[i + k]);
+                let out = f32::from(sc).mul_add(a, d * da * (1.0 - a)) / out_a;
+                self.px[i + k] = out.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        self.px[i + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
     }
 
     fn disc(&mut self, cx: f32, cy: f32, r: f32, c: [u8; 4]) {
@@ -5902,11 +5989,11 @@ fn replay_tray(
             DrawPrim::Image {
                 x,
                 y,
-                w,
-                h,
                 art,
+                device,
                 alpha,
-            } => cv.image((x * s, y * s, w * s, h * s), *art, *alpha),
+                ..
+            } => cv.image((x * s, y * s), *art, *device, *alpha),
             DrawPrim::ClipPush { .. }
             | DrawPrim::ClipPop
             | DrawPrim::FadePush { .. }

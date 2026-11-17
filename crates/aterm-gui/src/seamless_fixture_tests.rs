@@ -2048,6 +2048,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.204.0", "stalled-sequence"),
     ("v0.204.0", "twelve-panes"),
     ("v0.204.0", "variants"),
+    ("v0.205.0", "carried-state"),
+    ("v0.205.0", "claude-code-1049"),
+    ("v0.205.0", "colour-and-shell"),
+    ("v0.205.0", "engine-state"),
+    ("v0.205.0", "fold"),
+    ("v0.205.0", "held-failed"),
+    ("v0.205.0", "held-pane"),
+    ("v0.205.0", "held-withheld"),
+    ("v0.205.0", "history"),
+    ("v0.205.0", "history-carry"),
+    ("v0.205.0", "incident-55x149"),
+    ("v0.205.0", "link-dense"),
+    ("v0.205.0", "link-dense-history"),
+    ("v0.205.0", "lone-workers-list"),
+    ("v0.205.0", "policy-repaint"),
+    ("v0.205.0", "policy-visible"),
+    ("v0.205.0", "shell-integration"),
+    ("v0.205.0", "stalled-sequence"),
+    ("v0.205.0", "twelve-panes"),
+    ("v0.205.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -2265,7 +2285,7 @@ struct SessionExpectation {
     /// state (the REP character every session that printed has, an open link, the XTPUSHSGR
     /// stack...), and the rows of render debt the record carries for a carried alternate screen
     /// (`"<shift>,<pushed>"`, absent for none; its columns are the record's own,
-    /// [`carried_render_debt_cuts`]).
+    /// [`wire_render_debt_cuts`]).
     #[serde(default)]
     output_state: Option<bool>,
     #[serde(default)]
@@ -3329,15 +3349,17 @@ fn recorded_render_debt(label: &str, row: &str) -> aterm_core::terminal::RenderD
         .unwrap_or_else(|| panic!("{label}: a recorded render debt reads: {row:?}"))
 }
 
-fn carried_render_debt_cuts(desk: &Desk) -> std::collections::BTreeMap<u64, u64> {
-    let wire = String::from_utf8(desk.read(&desk.parent.manifest)).expect("UTF-8 manifest");
-    wire_render_debt_cuts(&desk.label(), &wire)
+/// Parse the producer's raw wire independently of `SessionHandoff`, so a dropped serde
+/// field cannot also erase the expected carried state.
+fn parse_wire_manifest(label: &str, manifest: &str) -> aterm_toml::Value {
+    let (_, wire) = manifest.split_once('\n').expect("nonce header");
+    aterm_toml::from_str(wire).unwrap_or_else(|error| panic!("{label}: manifest TOML: {error}"))
 }
 
-fn wire_render_debt_cuts(label: &str, manifest: &str) -> std::collections::BTreeMap<u64, u64> {
-    let (_, wire) = manifest.split_once('\n').expect("nonce header");
-    let tree = aterm_toml::from_str::<aterm_toml::Value>(wire)
-        .unwrap_or_else(|error| panic!("{label}: manifest TOML: {error}"));
+fn wire_render_debt_cuts(
+    label: &str,
+    tree: &aterm_toml::Value,
+) -> std::collections::BTreeMap<u64, u64> {
     let sessions = tree
         .as_table()
         .and_then(|table| table.get("sessions"))
@@ -3496,12 +3518,40 @@ fn assert_settings_drafts_placed(desk: &Desk, incoming: &IncomingHandoff) -> usi
     count
 }
 
+fn assert_last_launches_carried(
+    label: &str,
+    tree: &aterm_toml::Value,
+    incoming: &IncomingHandoff,
+) -> usize {
+    let rows = tree
+        .get("last_launches")
+        .map(|value| {
+            value
+                .as_array()
+                .unwrap_or_else(|| panic!("{label}: last_launches is a list"))
+                .iter()
+                .map(|row| {
+                    row.as_str()
+                        .unwrap_or_else(|| panic!("{label}: each last launch is a string"))
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        incoming.last_launches, rows,
+        "{label}: every last launch crosses the reader in its staged order and bytes"
+    );
+    rows.len()
+}
+
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     const BATCH: &str = "ATERM_SHIPPED_DESK_BATCH";
     const STARTED: &str = "shipped desk started: ";
     const COMPLETED: &str = "shipped desk completed: ";
     const DRAFTS: &str = "settings drafts placed: ";
+    const LAUNCHES: &str = "last launches carried: ";
     let paths = every_desk_path();
     let batches = shipped_desk_batches(&paths);
     let batch = crate::test_alone::in_child().then(|| {
@@ -3525,6 +3575,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         }
         let mut completed = std::collections::BTreeSet::new();
         let mut drafts_carried = 0usize;
+        let mut launches_carried = 0usize;
         // Each desk needs real PTYs. Finish a batch before starting another so checked-in
         // releases share one desk's PTY footprint instead of multiplying the kernel's use.
         for (index, desks) in batches.iter().enumerate() {
@@ -3550,21 +3601,26 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             for label in actual {
                 assert!(completed.insert(label), "no desk runs in two batches");
             }
-            let counts: Vec<_> = stdout
-                .lines()
-                .filter_map(|line| {
-                    line.split_once(DRAFTS).map(|(_, count)| {
-                        count
-                            .trim()
-                            .parse::<usize>()
-                            .expect("the draft count is a number")
+            for (prefix, total) in [
+                (DRAFTS, &mut drafts_carried),
+                (LAUNCHES, &mut launches_carried),
+            ] {
+                let counts: Vec<_> = stdout
+                    .lines()
+                    .filter_map(|line| {
+                        line.split_once(prefix).map(|(_, count)| {
+                            count
+                                .trim()
+                                .parse::<usize>()
+                                .expect("the carry count is a number")
+                        })
                     })
-                })
-                .collect();
-            let [count] = counts.as_slice() else {
-                panic!("batch {index} reported no unique draft count");
-            };
-            drafts_carried += *count;
+                    .collect();
+                let [count] = counts.as_slice() else {
+                    panic!("batch {index} reported no unique {prefix}count");
+                };
+                *total += *count;
+            }
         }
         assert_eq!(
             completed, expected,
@@ -3574,21 +3630,30 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             drafts_carried > 0,
             "the guard reads at least one shipped Settings draft (v0.98.0/link-dense-history)"
         );
+        assert!(
+            launches_carried > 0,
+            "the guard reads at least one shipped last launch"
+        );
         println!("shipped desks completed: {}", completed.len());
         println!("{DRAFTS}{drafts_carried}");
+        println!("{LAUNCHES}{launches_carried}");
         return;
     };
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let desks = batches.get(batch).expect("the selected batch exists");
     let mut drafts_carried = 0usize;
+    let mut launches_carried = 0usize;
     for path in *desks {
         println!("{STARTED}{}", path.label());
         let desk = path.read();
-        drafts_carried += assert_desk_adopts_exactly_and_proves(&desk);
+        let (drafts, launches) = assert_desk_adopts_exactly_and_proves(&desk);
+        drafts_carried += drafts;
+        launches_carried += launches;
         println!("{COMPLETED}{}", path.label());
     }
     println!("{DRAFTS}{drafts_carried}");
+    println!("{LAUNCHES}{launches_carried}");
 }
 
 /// THE GUARD OVER THIS BUILD'S OWN DESKS: every desk the generator just wrote in `dir` (`fixture_generator::generate_handoff_fixtures`), filed as this build's release, through [`assert_desk_adopts_exactly_and_proves`].
@@ -3605,7 +3670,7 @@ pub(super) fn assert_written_desks_adopt(dir: &std::path::Path) {
     }
 }
 
-fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
+fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> (usize, usize) {
     let label = desk.label();
     assert_eq!(
         format!("v{}", desk.parent.producer_version),
@@ -3617,6 +3682,19 @@ fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
 
     let mut staged = stage(desk, None);
     let mut incoming = take_incoming_as(ReceiverShape::Current);
+    let (launches, cuts) = {
+        let manifest = String::from_utf8(desk.read(&desk.parent.manifest))
+            .expect("UTF-8 manifest")
+            .replace(
+                &desk.parent.dir_placeholder,
+                staged.dir.to_str().expect("a UTF-8 scratch dir"),
+            );
+        let tree = parse_wire_manifest(&label, &manifest);
+        (
+            assert_last_launches_carried(&label, &tree, &incoming),
+            wire_render_debt_cuts(&label, &tree),
+        )
+    };
     assert_eq!(
         incoming.adopted.len(),
         desk.parent.session.len(),
@@ -3649,7 +3727,6 @@ fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
     let drafts = assert_settings_drafts_placed(desk, &incoming);
     assert_held_panes_shown(desk, &incoming);
     let held = std::mem::take(&mut incoming.held);
-    let cuts = carried_render_debt_cuts(desk);
     for expected in &desk.parent.session {
         let adopted = incoming
             .adopted
@@ -3746,7 +3823,7 @@ fn assert_desk_adopts_exactly_and_proves(desk: &Desk) -> usize {
     drop(ready);
     staged.ready_write = None;
     staged.teardown();
-    drafts
+    (drafts, launches)
 }
 
 #[test]
@@ -3839,7 +3916,7 @@ fn a_consumer_that_drops_column_debt_fails_the_exact_debt_check() {
     let label = desk.label();
     let expected = desk.expected(8);
     let wire = String::from_utf8(desk.read(&desk.parent.manifest)).expect("UTF-8 manifest");
-    let cuts = wire_render_debt_cuts(&label, &wire);
+    let cuts = wire_render_debt_cuts(&label, &parse_wire_manifest(&label, &wire));
     let cut = *cuts.get(&8).expect("session 8 on the wire");
     assert_eq!(cut, 19, "the immutable producer carries a cut-only debt");
     assert!(

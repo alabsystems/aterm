@@ -52,6 +52,36 @@ impl Journal {
             .ok_or_else(|| Error::new("local reveal journal is unavailable"))
     }
 
+    /// Whether a reveal could be recorded here, as far as that shows with nothing written:
+    /// the journal's file, where there is one, is the private regular file [`Self::record`]
+    /// requires before it appends. A file or folder not made yet is ready, since `record`
+    /// makes both; an append or a sync that then fails (a full volume) shows only at the
+    /// reveal. A look that decides whether a sign-in can start asks this
+    /// ([`super::mail::usable`]'s callers), so it does not say yes where every reveal fails.
+    ///
+    /// # Errors
+    /// The file is not a private regular file of this user, or cannot be inspected.
+    #[cfg(unix)]
+    pub fn ready(&self) -> Result<()> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) => private_regular(&meta),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(Error::new("cannot inspect reveal journal")),
+        }
+    }
+
+    /// [`Self::ready`] where no journal can be written.
+    ///
+    /// # Errors
+    /// Always: this platform has no local reveal journal.
+    #[cfg(not(unix))]
+    pub fn ready(&self) -> Result<()> {
+        let _ = &self.path;
+        Err(Error::new(
+            "local reveal journal is unavailable on this platform",
+        ))
+    }
+
     #[cfg(unix)]
     fn record(&self, cell: Cell<'_>, surface: Surface, when_ms: u64) -> Result<()> {
         use std::io::Write;
@@ -61,7 +91,7 @@ impl Journal {
             .ok_or_else(|| Error::new("invalid reveal journal"))?;
         aterm_journal::create_private_dir_durable(directory)
             .map_err(|_| Error::new("cannot create local reveal journal"))?;
-        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -72,15 +102,7 @@ impl Journal {
         let meta = file
             .metadata()
             .map_err(|_| Error::new("cannot inspect reveal journal"))?;
-        if !meta.is_file()
-            || meta.uid() != aterm_uds::peer::our_uid()
-            || meta.nlink() != 1
-            || meta.mode() & 0o077 != 0
-        {
-            return Err(Error::new(
-                "local reveal journal is not a private regular file",
-            ));
-        }
+        private_regular(&meta)?;
         #[derive(serde::Serialize)]
         struct RevealRecord<'a> {
             collection: &'a str,
@@ -113,6 +135,23 @@ impl Journal {
             "local reveal journal is unavailable on this platform",
         ))
     }
+}
+
+/// The journal file as [`Journal::record`] appends to it: a regular file of this user alone,
+/// with one name.
+#[cfg(unix)]
+fn private_regular(meta: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    if !meta.is_file()
+        || meta.uid() != aterm_uds::peer::our_uid()
+        || meta.nlink() != 1
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(Error::new(
+            "local reveal journal is not a private regular file",
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn record_reveal(

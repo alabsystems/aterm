@@ -675,17 +675,27 @@ fn run_died(
                 *modified,
                 &mut || Ok(()),
                 &mut |stage, at| {
+                    // A died build's piece is taken under its profile's locks (and its
+                    // session's) into a stage the profile holds, which is deleted once they
+                    // are let go; deleted in place, it goes under them. The hook names the
+                    // piece, and the stage it deletes: both stand for the profile here.
                     let e = match stage {
                         disk::target::Stage::Locked => {
-                            Event::Locked(row.path.clone(), at.to_path_buf())
+                            Event::Locked(row.path.clone(), profile.to_path_buf())
                         }
-                        disk::target::Stage::Deleting => {
+                        disk::target::Stage::Staged => {
+                            Event::Staged(row.path.clone(), profile.to_path_buf())
+                        }
+                        disk::target::Stage::Released => {
+                            Event::Released(row.path.clone(), profile.to_path_buf())
+                        }
+                        disk::target::Stage::Deleting if disk::target::is_stage_path(at) => {
                             Event::Deleting(row.path.clone(), at.to_path_buf())
                         }
-                        // A died build's piece is deleted where it is, under its locks.
-                        disk::target::Stage::Staging
-                        | disk::target::Stage::Staged
-                        | disk::target::Stage::Released => return,
+                        disk::target::Stage::Deleting => {
+                            Event::Deleting(row.path.clone(), profile.to_path_buf())
+                        }
+                        disk::target::Stage::Staging => return,
                     };
                     events.borrow_mut().push(e);
                 },

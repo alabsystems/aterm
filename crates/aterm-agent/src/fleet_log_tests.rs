@@ -1006,3 +1006,34 @@ fn ensure_local_node_key_in_log_binds_founder_and_retires_rotated_key() {
 
     running.stop();
 }
+
+/// A VAULT'S LOG NAMES EVERY FILE ITS VERDICT IS STAMPED BY: a host that judges again only when
+/// one of [`LocalLog::read_files`] moves (the serving node's watch) sees each move after which
+/// [`LocalLog::keys`] reads the store again: the store's data file wherever its layout keeps it,
+/// each file beside the store, and the vault's `state.toml`.
+/// NEGATIVE CONTROL: a lab's log, which keeps no vault, names its store and what is beside it
+/// alone; and `read_files` without the vault's standing files fails this on `state.toml`
+/// (2026-11-14).
+#[test]
+fn a_vaults_log_names_every_file_its_verdict_is_stamped_by() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let (_running, paths) = seeded_vault(root.path());
+    let log = LocalLog::of(&paths);
+    let watched = log.read_files();
+    let data = paths.records_data_file().expect("the store's data file");
+    for stamped in [data, paths.dir.join("state.toml")]
+        .iter()
+        .chain(&log.aux_files)
+    {
+        assert!(
+            watched.contains(stamped),
+            "{} stamps the verdict but is not watched: {watched:?}",
+            stamped.display()
+        );
+    }
+
+    let store = root.path().join("lab-records");
+    let beside = root.path().join("lab-beside");
+    let lab = LocalLog::reading(store.clone(), vec![beside.clone()], Box::new(|| Ok(None)));
+    assert_eq!(lab.read_files(), [store, beside]);
+}

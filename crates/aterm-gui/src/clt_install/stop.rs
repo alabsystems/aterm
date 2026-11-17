@@ -2,6 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Cancel only the receipt-bound installer program, never a terminal's replacement job.
+//!
+//! The program is proved by what stays true of it across an update: the pid and birth its tab
+//! session holds, its fixed argv, and the code it runs ([`runs_this_app`]). Its loaded image
+//! being the file at its path proves it too, but cannot be the only proof: an update or a
+//! rebuild replaces the bundle under a running tab while the tab keeps the image it loaded.
 
 use aterm_uds::process::Identity;
 
@@ -63,6 +68,68 @@ pub(crate) fn untouched_prompt_overdue(at_prompt: bool, idle_ms: Option<u64>) ->
         && idle_ms.is_some_and(|ms| u128::from(ms) >= super::UNTOUCHED_PROMPT_BACKSTOP.as_millis())
 }
 
+/// Who signed valid running code: its signing identifier and its team.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Signer {
+    pub(super) identifier: String,
+    pub(super) team: String,
+}
+
+/// The [`Signer`] the kernel's reading of a process names: `None` unless the kernel holds its
+/// signature valid now and names both an identifier and a developer's team (an ad-hoc or
+/// linker-signed image has none).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[must_use]
+pub(super) fn signer_of(identity: &aterm_sysprobe::identity::Identity) -> Option<Signer> {
+    (identity.cs_status? & aterm_sysprobe::identity::CS_VALID != 0).then_some(())?;
+    Some(Signer {
+        identifier: identity.signing_id.clone()?,
+        team: identity.team.clone()?,
+    })
+}
+
+/// The code a process runs, as the kernel holds it from its exec (so it stays readable after an
+/// update replaces the file at its path): its CodeDirectory hash and, where its signature is
+/// valid and names a team, its signer.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct Code {
+    pub(super) hash: Option<[u8; 20]>,
+    pub(super) signer: Option<Signer>,
+}
+
+#[cfg(target_os = "macos")]
+impl Code {
+    fn of(pid: i32) -> Self {
+        Self {
+            hash: aterm_uds::process::read_code_directory_hash(pid),
+            signer: u32::try_from(pid)
+                .ok()
+                .and_then(aterm_sysprobe::identity::identity)
+                .and_then(|identity| signer_of(&identity)),
+        }
+    }
+}
+
+/// Whether a process whose argv is a setup command's runs this app: its loaded image is the
+/// file at its path (`at_path`), or `theirs`, the code it runs, is this window's own (`ours`)
+/// by its hash, or valid code of this window's own signer. The last two hold where the file at
+/// the path is a newer build's: a window whose own executable is the tab's `aterm` runs the
+/// same code as a tab it started and whose bundle was rebuilt under both, and the window an
+/// update handed a tab to runs the same signer's. Code the kernel names neither a hash nor a
+/// signer for proves nothing, and neither does any code to a window with none of its own.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+#[must_use]
+pub(super) fn runs_this_app(at_path: Option<bool>, theirs: &Code, ours: &Code) -> bool {
+    at_path == Some(true)
+        || theirs.hash.is_some_and(|hash| ours.hash == Some(hash))
+        || theirs
+            .signer
+            .as_ref()
+            .is_some_and(|signer| ours.signer.as_ref() == Some(signer))
+}
+
 #[cfg(target_os = "macos")]
 fn read(pid: i32) -> Option<Running> {
     use aterm_uds::process::{image_matches_file, read_identity, read_process_argv};
@@ -86,7 +153,15 @@ fn read(pid: i32) -> Option<Running> {
         } else {
             return None;
         };
-        (image_matches_file(pid, path) == Some(true)).then_some(program)
+        let at_path = image_matches_file(pid, path);
+        // The kernel is asked for code only where the file does not already prove it.
+        (at_path == Some(true)
+            || runs_this_app(
+                at_path,
+                &Code::of(pid),
+                &Code::of(i32::try_from(std::process::id()).ok()?),
+            ))
+        .then_some(program)
     });
     (read_identity(pid) == Some(identity)).then_some(Running { identity, program })
 }
@@ -192,6 +267,10 @@ impl crate::App {
             };
             // Re-read the program too: an exec can preserve pid and birth.
             let Some(running) = exact().filter(|running| exact() == Some(*running)) else {
+                aterm_log::info!(
+                    "System State: the untouched Mac Setup tab was sent nothing: its child is \
+                     not proved to be its setup program"
+                );
                 continue;
             };
             match interrupt(&running.identity) {
@@ -248,17 +327,29 @@ impl crate::App {
                 })
         };
         if !owns() {
+            aterm_log::info!(
+                "System State: Stop sent the Mac Setup tab nothing: its receipt does not name \
+                 the tab's child"
+            );
             return;
         }
         let Some(running) = read(child.pid).filter(|running| {
             running.program == Some(Program::Tools)
                 && Some(running.identity.birth.0) == child.shell_identity.birth
         }) else {
+            aterm_log::info!(
+                "System State: Stop sent the Mac Setup tab nothing: its child is not proved to \
+                 be the setup program"
+            );
             return;
         };
         // Re-read the program too: an exec can preserve pid and birth. Custody is checked at
         // the signal boundary, so a changed receipt or replacement session gets no interrupt.
         if read(child.pid) != Some(running) || !owns() {
+            aterm_log::info!(
+                "System State: Stop sent the Mac Setup tab nothing: its child changed while it \
+                 was read"
+            );
             return;
         }
         match interrupt(&running.identity) {

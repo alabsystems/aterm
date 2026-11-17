@@ -8,9 +8,9 @@
 //!   weighing reads. Its candidates and their 1 MiB relation payload (`eval/weigh/relations.rs`)
 //!   are sized by [`MAX_WEIGHED_RECORDS`], so no flood of other records grows the weighing past
 //!   it.
-//! - **Keyed** records (every other kind: `Epoch`, `Wrap`, `Put`, `Delete`, `Node`, `Name`) carry
-//!   keys, secrets and names; the weighing never reads them. They hold at most
-//!   [`MAX_KEYED_RECORDS`].
+//! - **Keyed** records (every other kind: `Epoch`, `Wrap`, `Put`, `Delete`, `Node`, `Name`,
+//!   `Checkpoint`) carry keys, secrets, names and checkpoints; the weighing never reads them.
+//!   They hold at most [`MAX_KEYED_RECORDS`].
 //! - **Held** is both together, [`MAX_HELD_RECORDS`]: also the record bound of every stream a
 //!   member reads (a records file, a pull's answer, a POST).
 //!
@@ -70,7 +70,7 @@ const _: () = assert!(AUTOMATIC_KEYED_STOP < MAX_KEYED_RECORDS);
 /// POST, a records file) and a Commons control inventory (`commons::journal::MAX_NODES`) of at
 /// most this many, and refuses a longer one whole.
 pub const LEGACY_RECORDS: usize = 4096;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const _: () = assert!(LEGACY_RECORDS == crate::commons::journal::MAX_NODES);
 /// The most records a [`Log`](super::Log) holds in all, which a [`Store`](super::Store) counts
 /// its waiting records in too, and the record bound of every stream it reads or writes.
@@ -82,7 +82,7 @@ pub const MAX_HELD_RECORDS: usize = MAX_WEIGHED_RECORDS + MAX_KEYED_RECORDS;
 
 impl Kind {
     /// Every kind, in the order a [`Fill`] lists them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Kind::Genesis,
         Kind::Admit,
         Kind::Remove,
@@ -92,6 +92,7 @@ impl Kind {
         Kind::Put,
         Kind::Delete,
         Kind::Node,
+        Kind::Checkpoint,
     ];
 
     /// What a [`Fill`] calls records of this kind.
@@ -107,6 +108,7 @@ impl Kind {
             Kind::Put => "put",
             Kind::Delete => "delete",
             Kind::Node => "node",
+            Kind::Checkpoint => "checkpoint",
         }
     }
 
@@ -118,7 +120,13 @@ impl Kind {
     pub const fn weighed(self) -> bool {
         match self {
             Kind::Genesis | Kind::Admit | Kind::Remove => true,
-            Kind::Name | Kind::Epoch | Kind::Wrap | Kind::Put | Kind::Delete | Kind::Node => false,
+            Kind::Name
+            | Kind::Epoch
+            | Kind::Wrap
+            | Kind::Put
+            | Kind::Delete
+            | Kind::Node
+            | Kind::Checkpoint => false,
         }
     }
 }
@@ -144,7 +152,7 @@ impl Budget {
         match self {
             Budget::Held => "records",
             Budget::Weighed => "weighed records (Genesis, Admit, Remove)",
-            Budget::Keyed => "keyed records (Epoch, Wrap, Put, Delete, Node, Name)",
+            Budget::Keyed => "keyed records (Epoch, Wrap, Put, Delete, Node, Name, Checkpoint)",
             Budget::Bytes => "record bytes",
         }
     }
@@ -494,14 +502,19 @@ impl Class {
     /// person's write where the edit changed it and carries its batch where the edit only
     /// seals it again ([`Authoring`]), and for an `Epoch` and a `Wrap`, which carry what their
     /// batch seals and take its class. A `Node` is membership: it binds the fleet key of a Mac
-    /// the log let in, and an admission whose Mac no peer admits is half done. Every kind is
-    /// named, so a new one is classed where it is added.
+    /// the log let in, and an admission whose Mac no peer admits is half done. A `Checkpoint` is
+    /// membership: it is what lets a full log be pruned, so it fits in the reserve
+    /// (`docs/DESIGN-vault-log-2026-11-14.md` step 4). Every kind is named, so a new one is
+    /// classed where it is added.
     #[must_use]
     pub const fn of_kind(kind: Kind) -> Option<Self> {
         match kind {
-            Kind::Genesis | Kind::Admit | Kind::Remove | Kind::Delete | Kind::Node => {
-                Some(Self::Membership)
-            }
+            Kind::Genesis
+            | Kind::Admit
+            | Kind::Remove
+            | Kind::Delete
+            | Kind::Node
+            | Kind::Checkpoint => Some(Self::Membership),
             Kind::Name => Some(Self::Person),
             Kind::Epoch | Kind::Wrap | Kind::Put => None,
         }
@@ -767,12 +780,13 @@ pub enum Projected {
 /// no body is opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fill {
-    /// The wire bytes of the held records.
+    /// The wire bytes of the held records, and those a rooted log's stubs take
+    /// ([`super::rooted::Stub::bytes`]).
     pub bytes: usize,
     /// The byte bound ([`held_bytes_bound`]).
     pub bound: usize,
     /// Each kind's held records and their wire bytes, in [`Kind::ALL`]'s order.
-    pub by_kind: [(Kind, usize, usize); 9],
+    pub by_kind: [(Kind, usize, usize); 10],
     /// Where each class stops ([`author_stop`]), in [`Class::ALL`]'s order.
     pub stops: [usize; 3],
     /// What was signed in the last [`AUTOMATIC_WINDOW_MS`]; `None` where that is not measured

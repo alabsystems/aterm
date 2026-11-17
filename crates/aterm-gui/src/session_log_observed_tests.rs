@@ -1670,7 +1670,12 @@ fn the_meta_writers_mark_the_log_by_their_writer() {
         .expect("a front terminal")
         .session;
     assert_eq!(
-        app.write_session_meta_field(session, crate::session_timeline::MetaField::Role, "lead"),
+        app.write_session_meta_field(
+            session,
+            crate::session_timeline::MetaField::Role,
+            "lead",
+            aterm_slog::Actor::Human,
+        ),
         Ok(true)
     );
     let ctx = std::sync::Arc::clone(&app.pool.get(session).expect("pooled").ctx);

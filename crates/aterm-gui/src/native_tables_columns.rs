@@ -18,20 +18,21 @@
 //!   staged.
 //! - **The list.** The tools row's Columns button (`Columns 15 of 21`: the columns the grid draws
 //!   of all the table's) opens a list under it, laid over the page and right-aligned to it: the
-//!   switch that folds the columns no row fills, with how many it folds; then each column under
-//!   its group's word, a mark where the grid draws it, its name (in the note's ink where no row
-//!   fills it) and its fill (`31 of 156`); then Show all, and a line that says the list writes
-//!   nothing. The key column is always drawn and not offered. A press on a column hides it where
-//!   the grid draws it and shows it where it does not; a column with a change not written, or a
-//!   refused cell (a new row's key column left empty), is never hidden, and its line says so. Hiding the column the rows are sorted by puts them back
-//!   in the table's order, since its header, which says so, goes with it. Show all shows every
-//!   column and turns the fold off. The arrows move among the list's lines, Space or Return
-//!   presses one, and Escape, the Columns button again or a press anywhere else closes it. Every
-//!   line is a button that says what it holds. The list is a surface over the page
-//!   ([`UiNode::surface`]): a press on its words or its frame, and the wheel over it, are its
-//!   own, and reach nothing under it. However it closes, the keys are left on a control the page
-//!   still draws, never on a line it no longer does, which Return would pass to the page's
-//!   default button, Write.
+//!   switch that folds the columns no row fills, with how many it folds; then each column under its
+//!   group's word, a mark where the grid draws it, its name (in the note's ink where no row fills
+//!   it) and its fill (`31 of 156`); then Show all, and a line that says the list writes nothing.
+//!   The key column is always drawn and not offered. A press on a column hides it where the grid
+//!   draws it and shows it where it does not; a column with a change not written, or a refused cell
+//!   (a new row's key column left empty), is never hidden, and its line says so. Hiding the column
+//!   the rows are sorted by puts them back in the table's order, since its header, which says so,
+//!   goes with it. Show all shows every column and turns the fold off. The arrows move among the
+//!   list's lines, Space or Return presses one, and Escape, the Columns button again or a press
+//!   anywhere else closes it. Every line is a button that says what it holds. The list is a surface
+//!   over the page ([`UiNode::surface`]): a press on its words or its frame, and the wheel over it,
+//!   are its own, and reach nothing under it, the history drawer's lines included; Escape closes
+//!   the list first, and a drawer open under it stays open. However it closes, the keys are left on
+//!   a control the page still draws, never on a line it no longer does, which Return would pass to
+//!   the page's default button, Write.
 //! - **The fold.** On by default: the columns no row the filter shows fills fold into one narrow
 //!   stub at the end of their group, headed `5 EMPTY`; a press on it unfolds that group, and only
 //!   it, until the tab closes or the switch folds every group again, and the keys go to the first
@@ -47,7 +48,9 @@
 //!   address go through the columns the grid draws alone ([`TablesViewState::shown_columns`]);
 //!   a selected cell whose column is hidden moves to the nearest drawn column of its row, after
 //!   a press and after a reply of the reader's alike (a Write that ends the change a hidden
-//!   column was drawn for).
+//!   column was drawn for). A press on a line of the history drawer names a cell, and shows its
+//!   column as the column's line in the list does: hidden no longer, and out of the fold where
+//!   no row fills it ([`TablesViewState::show_column`]).
 //! - **The header's fill.** Each column's header wears a thin bar along its lower edge in the
 //!   sheet's bar ink, as long across the header as the share of rows that fill the column, and
 //!   its press's name says the fill after what the press does (`Sort by Chip, 94 of 156 rows
@@ -92,7 +95,7 @@ const FILL_BAR: f32 = 2.0;
 /// How wide the open list is, at the text scale of 1.
 const LIST_WIDTH: f32 = 340.0;
 /// How far apart a line of the list sets its words.
-const LINE_GAP: f32 = 6.0;
+pub(crate) const LINE_GAP: f32 = 6.0;
 
 /// One table's choice of its columns: view state, kept while the tab lives.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -481,6 +484,23 @@ impl TablesViewState {
         )
     }
 
+    /// Show `column` of `sheet` in the grid as its line in the list shows it: hidden no longer,
+    /// and, where no row fills it, pinned, so the fold leaves it drawn after the selection leaves
+    /// it while the group's other empty columns stay folded. A press elsewhere that names one of
+    /// its cells (a line of the history drawer) asks to see that cell; [`Self::settle_columns`]
+    /// then scrolls across to it where the grid had no place for it.
+    pub(crate) fn show_column(&mut self, app: &TablesApp, sheet: &Sheet, column: &str) {
+        if column == sheet.key {
+            return;
+        }
+        let folds = self.fill(app, sheet, column) == 0;
+        let chosen = self.columns.chosen_mut(sheet.name);
+        chosen.hidden.remove(column);
+        if folds {
+            chosen.pinned.insert(column.to_owned());
+        }
+    }
+
     /// Scroll across so `column` of `sheet` shows whole, its place worked out as [`super::grid`]
     /// will lay it out: a column the grid did not lay out last has no place there yet.
     fn reveal_laid(&mut self, app: &TablesApp, sheet: &Sheet, column: &str) {
@@ -794,7 +814,7 @@ pub(crate) fn act(
 
 /// A press the size of its parent under painted words, `spoken` its name: one that takes no
 /// press where not `enabled`.
-fn line_press(key: &str, spoken: String, enabled: bool) -> UiNode {
+pub(crate) fn line_press(key: &str, spoken: String, enabled: bool) -> UiNode {
     UiNode::new(
         key.to_owned(),
         UiContent::Button(

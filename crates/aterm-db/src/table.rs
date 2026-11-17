@@ -417,6 +417,26 @@ impl ReadBatch<'_, '_> {
         self.open_envelope(Envelope::parse_identified(self.scope, wire)?)
     }
 
+    /// [`Self::authenticate`] of a record whose payload this Mac opened once and kept
+    /// (`table::store::cold`), from its `envelope` as [`Envelope::parse`] or
+    /// [`Envelope::parse_identified`] gives it: its signature, its writer's historical grant and
+    /// the current key are asked as for any record, and `payload` stands for the opening.
+    fn authenticate_held(&self, envelope: Envelope<'_>, payload: &[u8]) -> Result<Record> {
+        self.session
+            .with_payload_key(self.scope, &envelope, false, self.keys.as_ref(), |_, _| {
+                Ok(Some(()))
+            })?
+            .ok_or_else(|| Error::new("table payload authentication failed"))?;
+        Ok(Record {
+            scope: self.scope,
+            roster: envelope.roster,
+            epoch: envelope.epoch,
+            header: envelope.header,
+            authored_ms: envelope.authored_ms,
+            payload: SecretBytes::new(payload.to_vec()),
+        })
+    }
+
     fn open_envelope(&self, envelope: Envelope<'_>) -> Result<Record> {
         self.session
             .decode_envelope(self.scope, envelope, false, self.keys.as_ref())?
@@ -1850,6 +1870,21 @@ impl<'a> Session<'a> {
         self.bootstrap.device().with_seed(|seed| {
             let prk = Zeroizing::new(aterm_digest::hkdf_extract(
                 b"aterm/commons/pending-table-write/1\0",
+                seed,
+            ));
+            Ok(Zeroizing::new(aterm_digest::hkdf_expand_32(
+                &prk,
+                &scope.bytes(),
+            )))
+        })
+    }
+    /// The key this Mac seals the payloads below a table's floor under (`table::store::cold`):
+    /// derived from its table writer's device seed, so the file opens only on the Mac and in the
+    /// table that kept it.
+    pub(crate) fn cold_key(&self, scope: &Scope) -> Result<Zeroizing<[u8; 32]>> {
+        self.bootstrap.device().with_seed(|seed| {
+            let prk = Zeroizing::new(aterm_digest::hkdf_extract(
+                b"aterm/commons/table-cold-payloads/1\0",
                 seed,
             ));
             Ok(Zeroizing::new(aterm_digest::hkdf_expand_32(

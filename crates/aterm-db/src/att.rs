@@ -46,7 +46,9 @@ pub use crate::documents::log::Hlc;
 pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
 pub use edit::{Edited, Opener, amacs, open_every_ordinary, open_ordinary};
-pub use history::{Ask, Cursor, Entry, EntryKind, Filter, Inert, Page, Revision, Writer};
+pub use history::{
+    Ask, Cursor, Entry, EntryKind, Filter, Inert, Mac, Macs, Page, Revision, Writer,
+};
 pub use values::{Held, Source, Wrote};
 
 /// How a table keys the row a new grid row becomes, from the typed values of its cells and the
@@ -116,15 +118,18 @@ impl Compiled {
     }
 
     /// Its rules on a write's `rows` (one record each) that this Mac authors over `view`, the
-    /// table as the writer reads it: for the owner's own word the table's own ([`Self::guard`]),
-    /// which may add derived cells; then, whoever authors it, the rules every table keeps
-    /// ([`typed::check::refused`]): a reference the write makes names a row the table holds once
-    /// the write lands or compiles ([`Self::seeded`]), no two live rows come to share a unique
-    /// set, no row live rows reference is retired, and no live row comes to name a row that is
-    /// not live. Every path that appends a record this
-    /// Mac authors to a typed table passes it once over the whole write, before the first
-    /// record; a roll's restatement, which carries what the sealed generation's Macs wrote, does
-    /// not. Answers the first refusal.
+    /// table as the writer reads it: for the owner's own word, that a fixed column is written
+    /// only at its row's birth ([`typed::check::fixed_after_birth`]) and the table's own
+    /// ([`Self::guard`]), which may add derived cells; then, whoever authors it, the rules every
+    /// table keeps ([`typed::check::refused`]): a reference the write makes names a row the table
+    /// holds once the write lands or compiles ([`Self::seeded`]), no two live rows come to share
+    /// a unique set, no row live rows reference is retired, and no live row comes to name a row
+    /// that is not live. Every path that appends a record this Mac authors to a typed table
+    /// passes it once over the whole write, before the first record: a grid save, an owner verb,
+    /// a revert, the shared files' publisher and every derived plan; a roll's restatement, which
+    /// carries what the sealed generation's Macs wrote, does not. A derived write to a fixed
+    /// column after birth is not refused here: the authority rules hold it inert on every read
+    /// (`typed::authority`). Answers the first refusal.
     ///
     /// # Errors
     /// A change is not a typed cell of its collection.
@@ -134,10 +139,13 @@ impl Compiled {
         view: &View,
         author: Author,
     ) -> Result<Option<Refused>> {
-        if author == Author::Owner
-            && let Some(refused) = (self.guard)(rows, &view.cells)?
-        {
-            return Ok(Some(refused));
+        if author == Author::Owner {
+            if let Some(refused) = typed::check::fixed_after_birth(self.table, rows, &view.cells) {
+                return Ok(Some(refused));
+            }
+            if let Some(refused) = (self.guard)(rows, &view.cells)? {
+                return Ok(Some(refused));
+            }
         }
         Ok(typed::check::refused(self.table, rows, view, self.seeded))
     }
@@ -519,7 +527,11 @@ impl View {
             resolved.bindings.get(&(*roster, *actor)).copied().flatten()
         };
         let awaited = log.awaited(resolved.actor);
-        let (mut cells, refused) = log.cells_and_refused(&quota.over, &awaited);
+        let refused = log.refused(&awaited);
+        let (mut cells, inert) =
+            typed::authority::read(table, within, log.causal_index(), |before, unwritten| {
+                log.cells_without(before, &quota.over, unwritten)
+            });
         for collection in table.collections {
             if collection
                 .columns
@@ -572,6 +584,7 @@ impl View {
             table: Some(table),
             causal: log.causal_index().clone(),
             cells,
+            inert,
             complete: awaited.is_empty() && restated,
             awaiting,
             refused,
@@ -847,7 +860,7 @@ fn carried<'a>(
                     sequence: header.sequence,
                     roster: *record.roster(),
                     period: 0,
-                    revert: false,
+                    revert: None,
                     changes: changes
                         .into_iter()
                         .filter(|change| {
@@ -1611,9 +1624,11 @@ impl Handle {
 
     /// Append the exact compensation of `operation` while every key it wrote still holds it as
     /// the sole candidate (`Log::compensate`); a later edit stays. The target, current value and
-    /// preimage use the same quota-filtered history as [`Self::view`]. The compensation passes
-    /// the table's rules as any owner write does ([`Compiled::rules`]), and is written exactly:
-    /// a cell the rules would add is not. An exact retry of `request` returns the first operation.
+    /// preimage use the same history as [`Self::view`]: past-quota records and the writes the
+    /// authority rules hold inert left out, so a revert never restores an inert write, and a key
+    /// where the target's own write is inert is restated as it reads now. The compensation passes
+    /// the table's rules as any owner write does ([`Compiled::rules`]), and is written exactly: a
+    /// cell the rules would add is not. An exact retry of `request` returns the first operation.
     ///
     /// # Errors
     /// No Commons writer, the operation is not an eligible typed record here, a key it wrote
@@ -1632,7 +1647,8 @@ impl Handle {
                     return Ok(id);
                 }
                 let view = View::read(table, session, &log)?;
-                let command = log.compensate(request, operation, &view.quota.over)?;
+                let command =
+                    log.compensate(request, operation, &view.quota.over, &view.inert.changes)?;
                 if let Some(changes) = command.changes() {
                     refuse_secret_revert(table, changes)?;
                 }

@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn admission_publishes_one_recipient_replays_and_respects_a_hold() {
     let _answering = ServersAnswering::set();

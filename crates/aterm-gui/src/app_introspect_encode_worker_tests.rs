@@ -3301,7 +3301,7 @@ fn a_covered_docks_old_raster_cannot_outgrow_its_capture_reservation() {
         .unwrap()
         .rgba
         .len();
-    app.on_occlusion_changed(wid, true);
+    app.on_occlusion_changed(wid, true, std::time::Instant::now());
     let short = aterm_window::dpi::PhysicalSize::new(tall.width, frame.height / 4);
     app.windows.get_mut(&wid).unwrap().win_px = Some(short);
     app.on_resize(wid, short);

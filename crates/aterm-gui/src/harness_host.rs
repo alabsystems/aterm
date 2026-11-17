@@ -104,15 +104,41 @@ pub(crate) fn stall_term_after() -> Option<std::time::Duration> {
     }
 }
 
-static USAGE_TAP: AtomicBool = AtomicBool::new(false);
+/// The window switches read with no host at hand, as the last [`Switches::set`] stored them: a
+/// store that moves one rings the footer's [`crate::host_facts::Bell::Config`], which re-reads
+/// every session it watches, so the footer polls none of them.
+struct HostPolicy {
+    /// [`usage_tap_on`].
+    usage_tap: AtomicBool,
+    /// [`usage_credits`].
+    usage_credits: AtomicBool,
+    /// `[harness] accounts` ranked ([`ACCOUNTS_OFF`], [`ACCOUNTS_WALL`], [`ACCOUNTS_EARLY`]): the
+    /// footer's accounts outlook replays the executor's policy under this mode
+    /// (`claude_footer`). Its high bits record Claude supervision
+    /// ([`ACCOUNTS_SUPERVISED`]) and usage credits ([`ACCOUNTS_USAGE_CREDITS`]) in the same
+    /// atomic observation ([`cold_intent_current`]).
+    accounts: AtomicU8,
+}
 
-static USAGE_CREDITS: AtomicBool = AtomicBool::new(false);
+impl HostPolicy {
+    const fn new() -> HostPolicy {
+        HostPolicy {
+            usage_tap: AtomicBool::new(false),
+            usage_credits: AtomicBool::new(false),
+            accounts: AtomicU8::new(ACCOUNTS_OFF),
+        }
+    }
 
-/// `[harness] accounts` as the last [`Switches::set`] ranked it ([`ACCOUNTS_OFF`],
-/// [`ACCOUNTS_WALL`], [`ACCOUNTS_EARLY`]), for readers with no host at hand: the footer's
-/// accounts outlook replays the executor's policy under this mode (`claude_footer`).
-/// The high bit records Claude supervision in the same atomic policy observation.
-static LIVE_ACCOUNTS_MODE: AtomicU8 = AtomicU8::new(ACCOUNTS_OFF);
+    /// Store all three; whether any of them moved.
+    fn store(&self, usage_tap: bool, usage_credits: bool, accounts: u8) -> bool {
+        let tap = self.usage_tap.swap(usage_tap, Ordering::SeqCst) != usage_tap;
+        let credits = self.usage_credits.swap(usage_credits, Ordering::SeqCst) != usage_credits;
+        let mode = self.accounts.swap(accounts, Ordering::SeqCst) != accounts;
+        tap || credits || mode
+    }
+}
+
+static HOST_POLICY: HostPolicy = HostPolicy::new();
 
 const TAP_NOT_OWN: &str = "reading not this machine's own login's";
 /// A tap reading of an account no roster row lists: the journal takes it, no row's record does
@@ -138,21 +164,30 @@ static AGENTS_OFF: Mutex<Vec<Program>> = Mutex::new(Vec::new());
 
 /// [`UPGRADE_ASK`], read now.
 pub(crate) fn upgrade_ask() -> bool {
+    #[cfg(test)]
+    crate::host_facts::noted("upgrade_ask");
     UPGRADE_ASK.load(Ordering::SeqCst)
 }
 
-/// [`USAGE_CREDITS`], read now.
+/// `[harness] usage_credits`, as the last [`Switches::set`] stored it ([`HostPolicy`]), read now.
 pub(crate) fn usage_credits() -> bool {
-    USAGE_CREDITS.load(Ordering::SeqCst)
+    #[cfg(test)]
+    crate::host_facts::noted("usage_credits");
+    HOST_POLICY.usage_credits.load(Ordering::SeqCst)
 }
 
-/// [`LIVE_ACCOUNTS_MODE`], read now.
+/// `[harness] accounts`, as the last [`Switches::set`] stored it ([`HostPolicy::accounts`]), read
+/// now.
 pub(crate) fn accounts_mode() -> accounts::Mode {
-    mode_of_rank(LIVE_ACCOUNTS_MODE.load(Ordering::SeqCst) & ACCOUNTS_MODE)
+    #[cfg(test)]
+    crate::host_facts::noted("accounts_mode");
+    mode_of_rank(HOST_POLICY.accounts.load(Ordering::SeqCst) & ACCOUNTS_MODE)
 }
 
 pub(crate) fn cold_intent_current(intent: &aterm_agent::harness::native_act::ColdIntent) -> bool {
-    let policy = LIVE_ACCOUNTS_MODE.load(Ordering::SeqCst);
+    #[cfg(test)]
+    crate::host_facts::noted("cold_intent_current");
+    let policy = HOST_POLICY.accounts.load(Ordering::SeqCst);
     policy & ACCOUNTS_SUPERVISED != 0
         && mode_of_rank(policy & ACCOUNTS_MODE) == intent.mode
         && (intent.billing != aterm_agent::harness::native_act::ColdBilling::UsageCredits
@@ -167,12 +202,15 @@ const fn mode_of_rank(rank: u8) -> accounts::Mode {
     }
 }
 
-/// [`USAGE_TAP`]: `[harness] usage_tap` is on and the harness supervises Claude Code
-/// ([`SupervisorConfig::usage_tap_on`]). It decides whether the relaunch lines aterm types are
-/// offered the usage tap ([`window_drive_opts_with_tap`]) and what the Claude Code footer says
-/// of a weekly figure it has not got (`claude_footer`, `profile::WeeklyGap`).
+/// `[harness] usage_tap` is on and the harness supervises Claude Code
+/// ([`SupervisorConfig::usage_tap_on`]), as the last [`Switches::set`] stored it
+/// ([`HostPolicy`]). It decides whether the relaunch lines aterm types are offered the usage tap
+/// ([`window_drive_opts_with_tap`]) and what the Claude Code footer says of a weekly figure it
+/// has not got (`claude_footer`, `profile::WeeklyGap`).
 pub(crate) fn usage_tap_on() -> bool {
-    USAGE_TAP.load(Ordering::SeqCst)
+    #[cfg(test)]
+    crate::host_facts::noted("usage_tap_on");
+    HOST_POLICY.usage_tap.load(Ordering::SeqCst)
 }
 
 /// Whether `cfg` supervises this instance's agent sessions.
@@ -385,7 +423,6 @@ impl Switches {
         self.ask.store(cfg.upgrade_ask, Ordering::SeqCst);
         UPGRADE_ASK.store(cfg.upgrade_ask, Ordering::SeqCst);
         STALL_TERM_AFTER_S.store(cfg.stall_term_after_s, Ordering::SeqCst);
-        USAGE_CREDITS.store(cfg.usage_credits, Ordering::SeqCst);
         *AGENTS_OFF.lock().unwrap_or_else(PoisonError::into_inner) = cfg.off.clone();
         // The pool's own switches (`accounts_for`, `logins_for`), which a launch and the
         // upkeep read too, and the host's: it moves and signs in only what it supervises here.
@@ -406,7 +443,9 @@ impl Switches {
         };
         let claude = controls(Program::Claude);
         self.account_controls.store(claude, Ordering::SeqCst);
-        LIVE_ACCOUNTS_MODE.store(
+        let policy_moved = HOST_POLICY.store(
+            cfg.usage_tap_on(),
+            cfg.usage_credits,
             (claude & ACCOUNTS_MODE)
                 | if accounts_on { ACCOUNTS_SUPERVISED } else { 0 }
                 | if cfg.usage_credits {
@@ -414,8 +453,10 @@ impl Switches {
                 } else {
                     0
                 },
-            Ordering::SeqCst,
         );
+        if policy_moved {
+            crate::host_facts::ring(crate::host_facts::Bell::Config);
+        }
         let pools = aterm_agent::harness::accounts_sync::OTHER_CLIS
             .iter()
             .enumerate()
@@ -431,7 +472,6 @@ impl Switches {
             .store(supervises && cfg.limit_reset_on(), Ordering::SeqCst);
         self.usage_tap
             .store(supervises && cfg.usage_tap_on(), Ordering::SeqCst);
-        USAGE_TAP.store(cfg.usage_tap_on(), Ordering::SeqCst);
         self.usage_notes
             .store(accounts_on && cfg.usage_notes, Ordering::SeqCst);
         self.autopilot
@@ -1733,6 +1773,10 @@ struct AccountKept {
     wall_again: u8,
     lagged: u8,
     probing: Option<Probing>,
+    /// The account whose wall ladder this session waits on ([`WorkerIdle::wall_ladder`]): it
+    /// leaves it at its next account point that is no usage wall, and only a session at its wall
+    /// claims a rung ([`WorkerIdle::wall_claim`]).
+    wall_waits: Option<String>,
     read_authority_taken: bool,
     /// No turn ran on this session since its last `/usage` read was claimed: time alone never
     /// makes another one due ([`WorkerIdle::probe_claim`], the owner's no-polling rule). A session
@@ -2359,6 +2403,41 @@ struct MoveObservation {
 enum MoveReply {
     Served,
     Failed,
+}
+
+/// What told a served turn that proves its account ([`WorkerIdle::served_proof`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServedProof {
+    /// The supervisor's answer to this session's own account move ([`IdleHost::account_served`]).
+    Move,
+    /// A served turn of the session ([`WorkerIdle::turn_proof`]), the model's reply that ended
+    /// it written at the unix second given: it proves only an unproven `active` the session runs
+    /// on, and only where that reply is no older than the rotation that chose it.
+    Turn(i64),
+}
+
+/// The accounts state one observation reads unlocked, once, when it first needs it.
+struct StateRead<'a> {
+    seat: &'a AccountSeat,
+    read: Option<Result<accounts::State, String>>,
+}
+
+impl<'a> StateRead<'a> {
+    const fn of(seat: &'a AccountSeat) -> Self {
+        Self { seat, read: None }
+    }
+
+    fn get(&mut self) -> Result<&accounts::State, &str> {
+        let seat = self.seat;
+        self.read
+            .get_or_insert_with(|| {
+                seat.bounded_claude_store()
+                    .load(seat.now)
+                    .map(|(state, _)| state)
+            })
+            .as_ref()
+            .map_err(String::as_str)
+    }
 }
 
 impl MoveObservation {
@@ -3088,6 +3167,10 @@ type StartupsFn = dyn Fn(&std::collections::HashSet<String>) -> Vec<Startup> + S
 /// The startup deadline's mark for the task observation it judged ([`Acts::startup_mark`]).
 /// True when it landed; false keeps the decision's next look armed.
 type StartupMarkFn = dyn Fn(&Startup, &StartupMark<'_>) -> bool + Send + Sync;
+/// The startup deadline's judgment that a worker started, carried on the task record its look
+/// read ([`Acts::startup_took_up`]). True when that record carries it now; false arms a look that
+/// writes it again.
+type StartupTookUpFn = dyn Fn(&Startup) -> bool + Send + Sync;
 /// The NEEDS YOU set the window holds for tab `sid`'s needs entry standing, with the entry's text it was told with ([`Acts::needs_told`]).
 type NeedsToldFn = dyn Fn(&str) -> Option<(Vec<String>, String)> + Send + Sync;
 /// The limit row the conversation of a tab's agent stands at, by its transcript.
@@ -3101,6 +3184,42 @@ type AccountWallFn = dyn Fn(&str, &WalledAgent<'_>, &dyn Fn() -> bool) -> (&'sta
 type AccountUsageFn = dyn Fn(&str, &WalledAgent<'_>, &dyn Fn() -> bool, &UsageSeen, bool) -> &'static str
     + Send
     + Sync;
+/// What a session's turn end or its own `/usage` sample proved of its account, recorded for it
+/// ([`Acts::account_reply`]).
+type AccountReplyFn = dyn Fn(&str, &WalledAgent<'_>, &dyn Fn() -> bool, &Proved<'_>, bool) -> &'static str
+    + Send
+    + Sync;
+
+/// WHAT A SESSION PROVED OF ITS ACCOUNT ITSELF, which lifts walls on the account's record
+/// ([`Acts::account_reply`]): a request its model served ([`IdleHost::answered_by`]), or its
+/// own `/usage` sample showing a model's week with room ([`IdleHost::fable_room`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Proved<'a> {
+    /// A request a model served (`accounts::record_served`).
+    Served(accounts::ServedTurn<'a>),
+    /// A sample, asked for at `at` (unix seconds), showing `window`'s row with room
+    /// (`accounts::record_model_room`).
+    Room { window: &'a str, at: i64 },
+}
+
+impl Proved<'_> {
+    /// Whether it lifts a wall of `record` ([`accounts::Account::served_lifts`],
+    /// [`accounts::Account::room_lifts`]).
+    fn lifts(&self, record: &accounts::Account) -> bool {
+        match *self {
+            Self::Served(ref served) => record.served_lifts(served),
+            Self::Room { window, at } => record.room_lifts(window, at),
+        }
+    }
+
+    /// The model or window it speaks of, for the host's log.
+    const fn of(&self) -> &str {
+        match self {
+            Self::Served(served) => served.model,
+            Self::Room { window, .. } => window,
+        }
+    }
+}
 /// A session the accounts recorder keeps nothing of any more ([`Acts::account_gone`]).
 type AccountGoneFn = dyn Fn(&str) + Send + Sync;
 /// Where the accounts live for this host, and its clock ([`Acts::account_seat`]).
@@ -3956,6 +4075,10 @@ pub(crate) struct Acts {
     pub(crate) startups: Arc<StartupsFn>,
     /// The deadlines' mark ([`StartupMark`]).
     pub(crate) startup_mark: Arc<StartupMarkFn>,
+    /// A worker the deadlines judged started, noted on the task record their look read
+    /// ([`crate::task_record::TaskRecord::took_up`]; live [`startup_took_up_live`]): a fact, not
+    /// a mark, so a seamless update's successor judges no start again.
+    pub(crate) startup_took_up: Arc<StartupTookUpFn>,
     /// The limit only the transcript shows ([`WorkerIdle::standing_limit`]).
     pub(crate) standing_limit: Arc<StandingLimitFn>,
     /// The NEEDS YOU set a loop before this worker's left standing ([`WorkerIdle::needs_told`], live [`needs_told_of`]).
@@ -3966,6 +4089,9 @@ pub(crate) struct Acts {
     pub(crate) accounts_upkeep: AccountsUpkeep,
     /// What the session's screen says of its account's usage, recorded for the account ([`WorkerIdle::usage_seen`]).
     pub(crate) account_usage: Arc<AccountUsageFn>,
+    /// What the session proved of its account, recorded for it: a request its model served
+    /// ([`WorkerIdle::answered_by`]) or its own sample's room ([`WorkerIdle::fable_room`]).
+    pub(crate) account_reply: Arc<AccountReplyFn>,
     /// The session is over for the accounts recorder (`accounts::record_gone`).
     pub(crate) account_gone: Arc<AccountGoneFn>,
     /// Where the accounts live, and the time ([`AccountSeat`]).
@@ -5957,6 +6083,55 @@ impl std::fmt::Debug for WorkerIdle {
     }
 }
 
+impl WorkerIdle {
+    /// Files what this session proved of its account ([`Proved`]) with the account its process
+    /// runs on ([`Acts::account_reply`]). Claude Code's alone, and only where the roster or the
+    /// usage notes are on, as [`IdleHost::usage_seen`]. It reads no provider and no network, and
+    /// logs only where it changed or could not file something.
+    fn file_proof(&self, proof: &Proved<'_>) {
+        let listed = self.switches.accounts() != accounts::Mode::Off;
+        let own = self.switches.notes();
+        let claude = match self.agent {
+            Program::Claude => true,
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Generic => false,
+        };
+        if !claude || !(listed || own) {
+            return;
+        }
+        let agent = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .clone()
+            .and_then(|s| Some((s.session.clone()?, s)));
+        let Some((session, snap)) = agent else {
+            return;
+        };
+        let settled = || self.settled(snap.pid, &snap.start, &snap.argv, &snap.cwd);
+        let walled = WalledAgent {
+            snap: &snap,
+            session: &session,
+            own,
+            screen_wall: None,
+            sync: true,
+        };
+        let word = (self.hooks.acts.account_reply)(&self.sid, &walled, &settled, proof, listed);
+        if word != "unchanged" {
+            aterm_log::info!(
+                "harness @{}: account proof {word}: {}",
+                self.sid,
+                proof.of()
+            );
+        }
+    }
+}
+
 impl IdleHost for WorkerIdle {
     /// A point asked for, or a look the worker scheduled come due.
     fn wants(&self) -> bool {
@@ -6465,6 +6640,39 @@ impl IdleHost for WorkerIdle {
         })
     }
 
+    /// What the account's record says of Fable's limit ([`IdleHost::fable_lift`]): when this
+    /// Mac's evidence last lifted Fable's weekly wall there ([`accounts::Account::lifted_at`]: a
+    /// request Fable served, as [`Self::answered_by`] of any session of the account files it, a
+    /// sample's room, as [`Self::fable_room`] files it, a refill or a reset step), for the account
+    /// this session's process is observed on; `Unlifted` where the record read holds no such
+    /// lift (the wall stands, it was never raised, or another Mac lifted it, whose clock this one
+    /// does not keep). `Unread` for an agent this host moves off no model's limit, and wherever
+    /// the record or the account the process runs on is not read: that moves nothing.
+    fn fable_lift(&self) -> aterm_agent::supervise::policy::turn_end::FableLift {
+        use aterm_agent::supervise::policy::turn_end::FableLift;
+        if !aterm_agent::supervise::policy::turn_end::has_fable_fallback(self.agent)
+            || !accounts_for(self.agent)
+        {
+            return FableLift::Unread;
+        }
+        let read = || {
+            let seat = (self.hooks.acts.account_seat)()?;
+            let roster = account_roster_or_own(&seat)?;
+            let look = self.account_look(&seat, &roster)?;
+            let label = look.me(&roster).label()?.to_owned();
+            let (state, _) = seat.claude_store().load(seat.now).ok()?;
+            let window = accounts::week_bucket(aterm_phase::WeekModel::Fable);
+            Some(
+                state
+                    .accounts
+                    .get(&label)
+                    .and_then(|record| record.lifted_at(window, &state.machine))
+                    .map_or(FableLift::Unlifted, |at| FableLift::Lifted { at }),
+            )
+        };
+        read().unwrap_or(FableLift::Unread)
+    }
+
     /// The restart in place its loop asks for ([`Restart`]), as `ask` ([`RestartAsk`], which the
     /// relaunch's claim keeps), answered with the relaunch's step and its claim
     /// ([`RestartAnswer`], said once by the relaunch, [`relaunch::Restarted::claim`]); the
@@ -6707,6 +6915,23 @@ impl IdleHost for WorkerIdle {
                 self.net.answered(key, &self.sid, at);
             }
         }
+    }
+
+    /// The model that served the turn this session just ended, and when the request it answered
+    /// was made ([`IdleHost::answered_by`]): filed with the account its process runs on
+    /// ([`Self::file_proof`]), which lifts the walls the served request proves gone and wakes the
+    /// account's waiting sessions.
+    fn answered_by(&self, model: &str, at: i64) {
+        self.file_proof(&Proved::Served(accounts::ServedTurn { model, at }));
+    }
+
+    /// This session's own `/usage` sample showed Fable's week with room, asked for at `at`
+    /// ([`IdleHost::fable_room`]): filed with the account its process runs on
+    /// ([`Self::file_proof`]), which lifts Fable's wall there, so every session of the account
+    /// moved off Fable reads the lift ([`Self::fable_lift`]).
+    fn fable_room(&self, at: i64) {
+        let window = accounts::week_bucket(aterm_phase::WeekModel::Fable);
+        self.file_proof(&Proved::Room { window, at });
     }
 
     /// The newest answer of another session on this session's route ([`IdleHost::witness`],
@@ -7191,6 +7416,7 @@ impl IdleHost for WorkerIdle {
         let request = turn.capture(&self.kept)?;
         let mut judged = None;
         let advice = self.account_advice(point, owed, &mut judged);
+        let advice = self.wall_ladder(point, advice);
         let progress =
             self.read_account_progress(&request, point, advice.as_ref(), judged.as_mut());
         let scoped = self.scoped_pooled();
@@ -7349,65 +7575,7 @@ impl IdleHost for WorkerIdle {
         let Some((seat, roster, look)) = self.account_ctx() else {
             return;
         };
-        // The believed row, on purpose: whose login this is is read at the writer, under its
-        // lock ([`Self::login_identity_permits`]), so a profile the look read stale never decides
-        // (`AccountServedIdentity`); a profile that names another account is refused there.
-        let me = look.who.me(&roster);
-        let Some(label) = me
-            .account
-            .filter(|_| me.default_home && me.route.on_account())
-        else {
-            return;
-        };
-        if with_kept_of(&self.kept, |k| k.account.flying.is_some()) {
-            aterm_log::info!(
-                "harness @{}: account {label} served: a move's landing is unread; nothing proven",
-                self.sid
-            );
-            return;
-        }
-        let done = login_transact_of(
-            &self.sid,
-            &self.hooks,
-            &seat,
-            &roster,
-            &look,
-            label,
-            |state, logins, now| {
-                let account = state.account(label);
-                let signed_out = account.auth == accounts::Auth::SignedOut
-                    || (account.auth != accounts::Auth::Unseen
-                        && roster.row(label).is_some_and(|row| {
-                            account.current_auth(row) == accounts::Auth::Unseen
-                        }));
-                if !self.login_identity_permits(&seat, &roster, &look, label, signed_out) {
-                    return Err("sign-in identity is not confirmed; nothing proven".into());
-                }
-                let mut events = if signed_out {
-                    accounts::note_signed_back(state, logins, label, now)
-                } else {
-                    Vec::new()
-                };
-                events.extend(accounts::prove_in_context(state, logins, label, now));
-                if let Some(notes) =
-                    look.note_session(&self.kept, state, &self.sid, label, None, now)
-                {
-                    events.extend(notes);
-                }
-                Ok(events)
-            },
-        );
-        if done.is_ok()
-            && let Some(moved) = moved
-        {
-            moved.publish(&self.kept, &seat, &look.snap, MoveReply::Served);
-        }
-        let word = match &done {
-            Ok(events) if events.iter().any(|e| e.kind == accounts::Kind::Proven) => "proven",
-            Ok(_) => "served",
-            Err(_) => "served: not recorded",
-        };
-        aterm_log::info!("harness @{}: account {label} {word}", self.sid);
+        self.served_proof(ServedProof::Move, moved, &seat, &roster, &look);
     }
 
     /// The account this session moved to answered with a lost login or a usage limit ([`IdleHost::account_answered`]).
@@ -7670,6 +7838,9 @@ impl IdleHost for WorkerIdle {
     }
 
     fn account_probe(&self) -> Result<provider_read::Use, NoProbe> {
+        if let Some(rung) = self.wall_claim() {
+            return rung;
+        }
         self.probe_claim()?;
         let running = provider_read::Running::host_use(self).ok_or(NoProbe::NoAccounts)?;
         Ok(provider_read::Use::session_read_use(running))
@@ -7694,6 +7865,12 @@ impl IdleHost for WorkerIdle {
                 None,
             );
         }
+    }
+
+    /// Whether this session holds its account's due wall rung ([`IdleHost::wall_read`]):
+    /// [`Self::wall_rung`].
+    fn wall_read(&self, person: bool) -> bool {
+        self.wall_rung(person)
     }
 
     /// What the claimed probe read ([`IdleHost::account_probed`]): [`Self::probe_record`].
@@ -7872,6 +8049,184 @@ fn account_answered(this: &WorkerIdle, bad: AccountBad) {
 }
 
 impl WorkerIdle {
+    /// A TURN THE SESSION'S OWN PROCESS SERVED ON ITS ACCOUNT'S OWN CREDENTIAL PROVES THAT ACCOUNT
+    /// ([`accounts::State::proven`]): told as the answer to the session's own account move
+    /// ([`ServedProof::Move`]), or as a served turn of a session on the unproven `active`
+    /// ([`Self::turn_proof`]). The believed row, on purpose: whose login this is is read at the
+    /// writer, under its lock ([`Self::login_identity_permits`]), so a profile the look read stale
+    /// never decides (`AccountServedIdentity`); a profile that names another account is refused
+    /// there. A session on its row's vault token proves the account by the token's standing
+    /// instead, read value-free before the writer ([`token_proves`]), and its stored login's word
+    /// stands: the token served, not the login ([`accounts::prove_on_token`]; m2, 2026-11-16: the
+    /// move onto `m2-3` relaunched its session on the row's token, which no served turn could
+    /// prove, so every rotation off `m2-3` was held).
+    fn served_proof(
+        &self,
+        proof: ServedProof,
+        moved: Option<MoveObservation>,
+        seat: &AccountSeat,
+        roster: &accounts::Roster,
+        look: &AccountLook,
+    ) {
+        let me = look.who.me(roster);
+        let Some(label) = me
+            .account
+            .filter(|_| me.default_home && me.route.on_account())
+        else {
+            return;
+        };
+        let what = match proof {
+            ServedProof::Move => "served",
+            ServedProof::Turn(_) => "served a turn",
+        };
+        if with_kept_of(&self.kept, |k| k.account.flying.is_some()) {
+            aterm_log::info!(
+                "harness @{}: account {label} {what}: a move's landing is unread; nothing proven",
+                self.sid
+            );
+            return;
+        }
+        let token = match me.route {
+            accounts::AuthRoute::VaultToken { .. } => Some(token_proves(seat, roster, label, look)),
+            accounts::AuthRoute::Stored | accounts::AuthRoute::Outside => None,
+        };
+        let done = login_transact_of(
+            &self.sid,
+            &self.hooks,
+            seat,
+            roster,
+            look,
+            label,
+            |state, logins, now| {
+                if let ServedProof::Turn(at) = proof {
+                    if state.active.as_deref() != Some(label) || state.proven {
+                        return Err("its account is no unproven active; nothing proven".into());
+                    }
+                    if !accounts::served_since_chosen(state, at.min(now)) {
+                        return Err("served before the account was chosen; nothing proven".into());
+                    }
+                }
+                let mut events = match token {
+                    Some(false) => {
+                        return Err(
+                            "its vault token is not judged the row's; nothing proven".into()
+                        );
+                    }
+                    Some(true) => accounts::prove_on_token(state, label, now)
+                        .into_iter()
+                        .collect(),
+                    None => {
+                        let account = state.account(label);
+                        let signed_out = account.auth == accounts::Auth::SignedOut
+                            || (account.auth != accounts::Auth::Unseen
+                                && roster.row(label).is_some_and(|row| {
+                                    account.current_auth(row) == accounts::Auth::Unseen
+                                }));
+                        if signed_out && matches!(proof, ServedProof::Turn(_)) {
+                            return Err("its login is on record signed out; nothing proven".into());
+                        }
+                        if !self.login_identity_permits(seat, roster, look, label, signed_out) {
+                            return Err("sign-in identity is not confirmed; nothing proven".into());
+                        }
+                        let mut events = if signed_out {
+                            accounts::note_signed_back(state, logins, label, now)
+                        } else {
+                            Vec::new()
+                        };
+                        events.extend(accounts::prove_in_context(state, logins, label, now));
+                        events
+                    }
+                };
+                if let Some(notes) =
+                    look.note_session(&self.kept, state, &self.sid, label, None, now)
+                {
+                    events.extend(notes);
+                }
+                Ok(events)
+            },
+        );
+        if done.is_ok()
+            && let Some(moved) = moved
+        {
+            moved.publish(&self.kept, seat, &look.snap, MoveReply::Served);
+        }
+        let by = match proof {
+            ServedProof::Move => "",
+            ServedProof::Turn(_) => " by a served turn",
+        };
+        match &done {
+            Ok(events) if events.iter().any(|e| e.kind == accounts::Kind::Proven) => {
+                aterm_log::info!("harness @{}: account {label} proven{by}", self.sid);
+            }
+            Ok(_) => aterm_log::info!("harness @{}: account {label} {what}", self.sid),
+            Err(why) => aterm_log::info!(
+                "harness @{}: account {label} {what}: not recorded: {why}",
+                self.sid
+            ),
+        }
+    }
+
+    /// A SERVED TURN OF A SESSION ON THE UNPROVEN `active` PROVES IT ([`ServedProof::Turn`]): an
+    /// unproven `active` holds every rotation off it and its canary waits on it
+    /// (`accounts::begin_rotation_for`, `accounts::advise`), and every session on it is that
+    /// canary whoever moved it there (`accounts::prove` asks no session id), so its first served
+    /// turn proves the account where the answer its own move was owed went elsewhere (a move
+    /// closed where the host could not record it, a loop that took over past the move's window,
+    /// an aterm restart between), as the pooled CLIs' turn ends prove their rows
+    /// (`accounts_pool::record_session`) and as the rotation model's `Served` reads either
+    /// session on the active. Run after the served lift ([`Self::claude_login_word`]): a stored
+    /// login on record signed out proves nothing until its strike is lifted. Dated by the reply:
+    /// `served_at`, a break's ([`IdleHost::login_served_at`]), else the newest model reply the
+    /// session's transcript holds since its process started
+    /// ([`aterm_agent::supervise::run::served_since`]), so a point with none (a relaunch's
+    /// start-up, which asks the API nothing) proves nothing, and one older than the rotation
+    /// that chose the account proves nothing of it ([`accounts::served_since_chosen`]). `state` is
+    /// the observation's one unlocked read: a session on another account, or an `active` proven
+    /// already, reads no transcript and takes no writer.
+    fn turn_proof(
+        &self,
+        served_at: Option<i64>,
+        moved: Option<MoveObservation>,
+        (seat, roster, look): (&AccountSeat, &accounts::Roster, &AccountLook),
+        state: &mut StateRead<'_>,
+    ) {
+        if !self.switches.accounts_live() || !accounts_for(self.agent) || !self.accounts_act(roster)
+        {
+            return;
+        }
+        let me = look.who.me(roster);
+        let Some(label) = me
+            .account
+            .filter(|_| me.default_home && me.route.on_account())
+        else {
+            return;
+        };
+        if !state
+            .get()
+            .is_ok_and(|state| state.active.as_deref() == Some(label) && !state.proven)
+        {
+            return;
+        }
+        let Some(at) = served_at.or_else(|| self.reply_since_start(look)) else {
+            aterm_log::info!(
+                "harness @{}: account {label} served a turn: no model reply since its process \
+                 started; nothing proven",
+                self.sid
+            );
+            return;
+        };
+        self.served_proof(ServedProof::Turn(at), moved, seat, roster, look);
+    }
+
+    /// When the model last answered the process `look` read, since that process started
+    /// ([`aterm_agent::supervise::run::served_since`] of its transcript's tail): `None` where it
+    /// has not, or its start or transcript cannot be read.
+    fn reply_since_start(&self, look: &AccountLook) -> Option<i64> {
+        let started = process_started(&look.snap.start)?;
+        let tail = (self.hooks.acts.transcript_tail)(&look.snap)?;
+        aterm_agent::supervise::run::served_since(&tail, started)
+    }
+
     /// A pooled CLI's own sign-in wall or served turn, recorded on the row its process runs on
     /// ([`accounts_pool::session_seen`]): for every pool, whatever its switches say and
     /// whoever answers its walls, and nothing is renewed, moved or asked for it.
@@ -7969,8 +8324,12 @@ impl WorkerIdle {
     /// stood is one line of aterm's log, once per change ([`Self::login_unrecorded`]). A served
     /// turn is evidence of the time it served: `served_at`, the model's reply that ended a
     /// break's turn ([`IdleHost::login_served_at`]; no later than now), else now, a point's own
-    /// time.
+    /// time. A served turn of a session on the unproven `active` then proves it, on its stored
+    /// login or its vault token ([`Self::turn_proof`]), the accounts read once for both.
     fn claude_login_seen(&self, seen: LoginSeen, served_at: Option<i64>) {
+        let moved = (seen == LoginSeen::Served)
+            .then(|| MoveObservation::capture(&self.kept))
+            .flatten();
         let what = format!("{} login {}", self.agent.name(), login_seen_word(seen));
         let Some(seat) = (self.hooks.acts.account_seat)() else {
             return self.login_unrecorded(&what, "this host has no accounts seat");
@@ -7981,39 +8340,56 @@ impl WorkerIdle {
         let Some(look) = self.account_look(&seat, &roster) else {
             return self.login_unrecorded(&what, "its process's login could not be read");
         };
-        if seen == LoginSeen::Lost && token_refused_at(&seat, &roster, &look).is_some() {
+        let mut state = StateRead::of(&seat);
+        self.claude_login_word(seen, served_at, (&seat, &roster, &look), &mut state, &what);
+        if seen == LoginSeen::Served {
+            self.turn_proof(served_at, moved, (&seat, &roster, &look), &mut state);
+        }
+    }
+
+    /// [`Self::claude_login_seen`]'s word of the login: the served lift or the login's end, read
+    /// from `state`, the observation's one unlocked read of the accounts.
+    fn claude_login_word(
+        &self,
+        seen: LoginSeen,
+        served_at: Option<i64>,
+        (seat, roster, look): (&AccountSeat, &accounts::Roster, &AccountLook),
+        state: &mut StateRead<'_>,
+        what: &str,
+    ) {
+        if seen == LoginSeen::Lost && token_refused_at(seat, roster, look).is_some() {
             return self.login_unrecorded(
-                &what,
+                what,
                 "it runs on its vault token, whose refusal is judged instead",
             );
         }
-        let me = look.me(&roster);
+        let me = look.me(roster);
         let Some(label) = me
             .account
             .filter(|_| me.default_home && me.route.is_stored())
         else {
             return self.login_unrecorded(
-                &what,
+                what,
                 &format!("not a roster row's stored login: {}", not_own_stored(&me)),
             );
         };
         // One unlocked read first: a turn end that changes nothing takes no writer.
         let Some(row) = roster.row(label) else {
-            return self.login_unrecorded(&what, &format!("account {label}: its row is gone"));
+            return self.login_unrecorded(what, &format!("account {label}: its row is gone"));
         };
         // A process on a row's empty directory holds no login of it: its sign-in wall ends none,
         // and recording one would ask this Mac to sign in an account it only borrows (FL-135).
         if !accounts::login_made_here(row) {
             return self.login_unrecorded(
-                &what,
+                what,
                 &format!("account {label}: no login of it was made on this Mac"),
             );
         }
-        let state = match seat.bounded_claude_store().load(seat.now) {
-            Ok((state, _)) => state,
+        let state = match state.get() {
+            Ok(state) => state,
             Err(why) => {
                 return self.login_unrecorded(
-                    &what,
+                    what,
                     &format!("account {label}: the accounts state could not be read: {why}"),
                 );
             }
@@ -8026,10 +8402,10 @@ impl WorkerIdle {
                     || (account.auth != accounts::Auth::Unseen && word == accounts::Auth::Unseen)
                 {
                     let at = served_at.map_or(seat.now, |at| at.min(seat.now));
-                    self.served_back(&seat, &roster, &look, label, at, &what);
+                    self.served_back(seat, roster, look, label, at, what);
                 } else {
                     self.login_unrecorded(
-                        &what,
+                        what,
                         &format!("account {label}: its login is not signed out; nothing to lift"),
                     );
                 }
@@ -8038,14 +8414,14 @@ impl WorkerIdle {
                 let told = word == accounts::Auth::SignedOut;
                 if told {
                     return self
-                        .login_unrecorded(&what, &format!("account {label}: already signed out"));
+                        .login_unrecorded(what, &format!("account {label}: already signed out"));
                 }
                 let done = login_transact_of(
                     &self.sid,
                     &self.hooks,
-                    &seat,
-                    &roster,
-                    &look,
+                    seat,
+                    roster,
+                    look,
                     label,
                     |state, logins, now| Ok(accounts::note_login_end(state, logins, label, now)),
                 );
@@ -8055,11 +8431,11 @@ impl WorkerIdle {
                         aterm_log::info!("harness @{}: account {label}: its login ended", self.sid);
                     }
                     Ok(_) => self.login_unrecorded(
-                        &what,
+                        what,
                         &format!("account {label}: its login's end was already on record"),
                     ),
                     Err(why) => self.login_unrecorded(
-                        &what,
+                        what,
                         &format!("account {label}: its login's end not recorded: {why}"),
                     ),
                 }
@@ -10861,6 +11237,209 @@ impl WorkerIdle {
         }
     }
 
+    /// THE CLAUDE CODE BUILD THIS SESSION RUNS, where it is the one `lab claude-wall-panel`
+    /// measured the panel over a wall on (`ai::connector::CLAUDE_ACCOUNTS.wall_panel_measured_on`):
+    /// read from its process's executable. `None` on any other build, or one unread: no wall ladder
+    /// runs there, and the wall ends on its schedule.
+    fn wall_panel_build(&self) -> Option<String> {
+        let measured = aterm_agent::ai::connector::CLAUDE_ACCOUNTS.wall_panel_measured_on?;
+        match self.agent {
+            Program::Claude => {}
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Generic => return None,
+        }
+        let pid = with_kept_of(&self.kept, |k| k.snapshot.as_ref().map(|s| s.pid))?;
+        upgrade_drive::claude_build_of(pid).filter(|running| running == measured)
+    }
+
+    /// The account row this session's wall ladder is kept under: its judged row, on its stored
+    /// login (a vault token's session reads no stored login's `/usage`), with what a transaction on
+    /// it needs.
+    fn wall_row(&self) -> Option<(AccountSeat, AccountLook, String, accounts::Row)> {
+        if self.switches.accounts() == accounts::Mode::Off {
+            return None;
+        }
+        let (seat, roster, look) = self.account_ctx()?;
+        if !look.who.route.is_stored() {
+            return None;
+        }
+        let label = look.judged(&roster)?.to_owned();
+        let row = roster.row(&label)?.clone();
+        Some((seat, look, label, row))
+    }
+
+    /// THE WALL LADDER at `point` (FL-118b): a Claude Code session at its account's usage wall,
+    /// on a build whose panel was measured over a wall ([`Self::wall_panel_build`]), waits on its
+    /// account's ladder (`accounts::note_wall_wait`), and is asked again by its next rung
+    /// (`accounts::WallLadder::ask_at`, [`AskAgain::WallRead`]) where `advice` would wait longer:
+    /// its holder reads then, and every other waiter resumes at that ask once the read lifted the
+    /// wall. A session the advice takes off the wall (a resume, a move), or asked at a point that
+    /// is no usage wall (a person's message served, a sign-in elsewhere), leaves the ladder, which
+    /// stops when nothing waits.
+    fn wall_ladder(
+        &self,
+        point: AccountPoint,
+        advice: Option<AccountAdvice>,
+    ) -> Option<AccountAdvice> {
+        use alab_policy::vocab::WallKind;
+        let AccountPoint::Wall {
+            kind: WallKind::UsageSession | WallKind::UsageWeekly | WallKind::ModelBucket { .. },
+        } = point
+        else {
+            self.wall_left();
+            return advice;
+        };
+        if self.wall_panel_build().is_none() {
+            self.wall_left();
+            return advice;
+        }
+        let Some((seat, look, label, row)) = self.wall_row() else {
+            self.wall_left();
+            return advice;
+        };
+        let leaves = advice.as_ref().is_some_and(AccountAdvice::leaves_wall);
+        let mut ask = None;
+        let kept = self.account_observed(&seat, &row, (&look.who, &look.seen), |state, now| {
+            ask = accounts::wall_ladder_step(state, &label, &self.sid, leaves, now);
+            Ok(Vec::new())
+        });
+        if let Err(why) = &kept {
+            aterm_log::info!(
+                "harness @{}: wall ladder of {label} not kept: {why}",
+                self.sid
+            );
+        }
+        let ask = ask.filter(|_| kept.is_ok());
+        let waits = ask.is_some().then(|| label.clone());
+        with_kept_of(&self.kept, |k| k.account.wall_waits = waits);
+        let Some(after) = ask else {
+            return advice;
+        };
+        let again = Instant::now() + Duration::from_secs(u64::try_from(after).unwrap_or(0));
+        AccountAdvice::or_wall_rung(advice, again)
+    }
+
+    /// This session stands at no usage wall it waits on a ladder for: where it waited on one
+    /// ([`AccountKept::wall_waits`]), it leaves every ladder (`accounts::wall_wait_left`).
+    fn wall_left(&self) {
+        let Some(label) = with_kept_of(&self.kept, |k| k.account.wall_waits.take()) else {
+            return;
+        };
+        let Some((seat, roster, look)) = self.account_ctx() else {
+            return;
+        };
+        let Some(row) = look
+            .judged(&roster)
+            .and_then(|judged| roster.row(judged))
+            .cloned()
+        else {
+            return;
+        };
+        let left = self.account_observed(&seat, &row, (&look.who, &look.seen), |state, _| {
+            accounts::wall_wait_left(state, &self.sid);
+            Ok(Vec::new())
+        });
+        if let Err(why) = left {
+            aterm_log::info!(
+                "harness @{}: left the wall ladder of {label}; not kept: {why}",
+                self.sid
+            );
+        }
+    }
+
+    /// Whether this session holds its account's due wall rung ([`IdleHost::wall_read`]):
+    /// `accounts::wall_read_due` on its build ([`Self::wall_panel_build`]). A person who typed in
+    /// its tab (`person`) starts the ladder again at its first rung (`accounts::note_wall_person`).
+    fn wall_rung(&self, person: bool) -> bool {
+        let Some(running) = self.wall_panel_build() else {
+            return false;
+        };
+        let Some((seat, look, label, row)) = self.wall_row() else {
+            return false;
+        };
+        let measured = aterm_agent::ai::connector::CLAUDE_ACCOUNTS.wall_panel_measured_on;
+        let mut due = false;
+        let read = self.account_observed(&seat, &row, (&look.who, &look.seen), |state, now| {
+            if person && accounts::note_wall_person(state, &label, &self.sid, now) {
+                aterm_log::info!(
+                    "harness @{}: a person typed at {label}'s wall: its ladder starts again",
+                    self.sid
+                );
+            }
+            due = accounts::wall_read_due(
+                state,
+                &label,
+                &self.sid,
+                measured,
+                Some(running.as_str()),
+                now,
+            );
+            Ok(Vec::new())
+        });
+        read.is_ok() && due
+    }
+
+    /// The claim of this session's account's due wall rung ([`IdleHost::account_probe`]), where
+    /// the session waits on its account's ladder: `accounts::claim_wall_read`, whose read is the
+    /// rung's one (`accounts::WallClaim::read_use`, reason `at-wall`). `None` where it waits on
+    /// none: the turn end's probe claims then ([`Self::probe_claim`]).
+    fn wall_claim(&self) -> Option<Result<provider_read::Use, NoProbe>> {
+        with_kept_of(&self.kept, |k| k.account.wall_waits.clone())?;
+        self.wall_panel_build()?;
+        let (seat, look, label, row) = self.wall_row()?;
+        let mut claimed = None;
+        let mut refused = None;
+        let done = self.account_observed(&seat, &row, (&look.who, &look.seen), |state, now| {
+            match accounts::claim_wall_read(state, &label, &self.sid, now) {
+                Ok(claim) => {
+                    let event = claim.event.clone();
+                    claimed = Some(claim.read_use());
+                    Ok(vec![event])
+                }
+                Err(no) => {
+                    refused = Some(no);
+                    Ok(Vec::new())
+                }
+            }
+        });
+        if refused == Some(accounts::WallNo::NotWaiting) {
+            return None;
+        }
+        let taken = match (done, claimed, refused) {
+            (Ok(_), Some(token), _) => Ok(token),
+            (Ok(_), None, Some(accounts::WallNo::NotDue { .. })) => Err(NoProbe::NotDue),
+            (Ok(_), None, _) => Err(NoProbe::Claimed),
+            (Err(why), ..) if why == accounts::LOCK_HELD => Err(NoProbe::LockHeld),
+            (Err(_), ..) => Err(NoProbe::State),
+        };
+        let word = match (&taken, refused) {
+            (Ok(_), _) => "claimed".to_string(),
+            (Err(_), Some(no)) => no.word().to_string(),
+            (Err(why), None) => why.word().to_string(),
+        };
+        aterm_log::info!("harness @{}: wall rung of {label}: {word}", self.sid);
+        let probing = taken.is_ok().then(|| Probing {
+            at: seat.now,
+            label: label.clone(),
+            pid: look.snap.pid,
+            start: look.snap.start.clone(),
+            row,
+            who: look.who.clone(),
+            roster: seat.roster.clone().unwrap_or_default(),
+            state: seat.state.clone(),
+        });
+        with_kept_of(&self.kept, |k| {
+            k.account.probing = probing;
+            k.account.read_authority_taken = true;
+        });
+        (self.hooks.note)(HostNote::AccountProgress);
+        Some(taken)
+    }
+
     /// What the claimed probe read, told by the loop once after a claim ([`IdleHost::account_probed`]).
     fn probe_record(&self, read: Result<&accounts::Sample, &'static str>) {
         let Some(probing) = with_kept_of(&self.kept, |k| k.account.probing.take()) else {
@@ -10903,11 +11482,11 @@ impl WorkerIdle {
             &probing.row,
             (&probing.who, &look.seen),
             |state, now| {
-                let sample = accounts::Sample {
-                    at: now,
-                    ..sample.clone()
-                };
-                let events = accounts::note_sample(state, &probing.label, sample, now);
+                // A panel showing the wall's window with room lifts a wall written before it was
+                // read (FL-118b): every session waiting at it resumes at its next ask
+                // (`accounts::advise`'s Resume).
+                let events =
+                    accounts::note_panel_read(state, &probing.label, sample, probing.at, now);
                 low_or_limited = !events.is_empty()
                     && state
                         .accounts
@@ -12429,14 +13008,17 @@ fn publish_snapshot(sid: &str, snap: Option<&Snapshot>) -> bool {
 fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bool {
     let carried = |snap: &Snapshot| crate::restore::AgentRestore::of(snap.clone());
     let snap = snap.map(|snap| with_self_claimed_line(sid, snap.clone(), handed));
-    let moved = {
+    let (moved, changed) = {
         let mut map = PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner);
         let map = map.get_or_insert_with(HashMap::new);
         let before = match &snap {
             Some(snap) => map.insert(sid.to_string(), snap.clone()),
             None => map.remove(sid),
         };
-        before.as_ref().map(carried) != snap.as_ref().map(carried)
+        (
+            before.as_ref().map(carried) != snap.as_ref().map(carried),
+            before != snap,
+        )
     };
     if let Some(snap) = &snap {
         let mut last = LAST_LAUNCH.lock().unwrap_or_else(PoisonError::into_inner);
@@ -12444,6 +13026,11 @@ fn publish_snapshot_from(sid: &str, snap: Option<&Snapshot>, handed: bool) -> bo
         if moved || !last.contains_key(sid) {
             last.insert(sid.to_string(), carried(snap));
         }
+    }
+    // The footer's restart offer and the tap's room are judged by the whole snapshot
+    // (`restart_act::offered_for`, `tap_room_for`): any change of it re-reads the footers watched.
+    if changed {
+        crate::host_facts::ring(crate::host_facts::Bell::Snapshot);
     }
     if moved && let Some(snap) = &snap {
         aterm_log::info!(
@@ -12521,6 +13108,8 @@ pub(crate) fn publish_native_fixture_snapshot(sid: &str, snap: &Snapshot) {
 
 /// The relaunch snapshot the host keeps for session `sid`, as last published ([`publish_snapshot`]).
 pub(crate) fn published_snapshot(sid: &str) -> Option<Snapshot> {
+    #[cfg(test)]
+    crate::host_facts::noted("published_snapshot");
     PUBLISHED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -12531,6 +13120,8 @@ pub(crate) fn published_snapshot(sid: &str) -> Option<Snapshot> {
 /// The agent the relaunch snapshot kept for session `sid` names ([`published_snapshot`]), read
 /// without cloning the snapshot.
 pub(crate) fn published_pid(sid: &str) -> Option<u32> {
+    #[cfg(test)]
+    crate::host_facts::noted("published_pid");
     PUBLISHED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -12540,6 +13131,8 @@ pub(crate) fn published_pid(sid: &str) -> Option<u32> {
 
 /// The relaunch snapshot that names agent `pid`, whichever session it is kept for.
 pub(crate) fn published_snapshot_of_pid(pid: u32) -> Option<Snapshot> {
+    #[cfg(test)]
+    crate::host_facts::noted("published_snapshot_of_pid");
     PUBLISHED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -18155,6 +18748,9 @@ pub(crate) struct Startup {
     pub(crate) record_rev: u64,
     /// When the record entered its state (its `since_ms=`): where the deadline counts from.
     pub(crate) since: Instant,
+    /// The record's carried start judgment ([`crate::task_record::TaskRecord::took_up`]): a
+    /// deadline of this process or a predecessor's judged its worker started.
+    pub(crate) took_up: bool,
     /// What its screen shows.
     pub(crate) seen: StartupSeen,
     /// What the held deadline reads of it ([`HeldRead`]).
@@ -18210,9 +18806,10 @@ pub(crate) enum StartupSeen {
     Holds(StartupHold),
     /// Not read (another thread held the screen, or the record is not one to judge).
     Unread,
-    /// A codex worker's program stands in front, and codex-alab may not claim the tab now
-    /// ([`unclaimed`]). Only a claim proves a codex start, so this is not judged, and the deadline
-    /// falls a whole one after the last look that found it so.
+    /// A codex worker's program stands in front, its reports have begun no turn, and codex-alab
+    /// may not claim the tab now ([`unclaimed`]). Only a claim or such a turn proves a codex start
+    /// ([`codex_took_a_turn`]), so this is not judged, and the deadline falls a whole one after the
+    /// last look that found it so.
     CannotClaim,
 }
 
@@ -18964,6 +19561,11 @@ fn look_at_startups(
             },
             None => from,
         };
+        // A START A DEADLINE JUDGED BEFORE, carried on the record ([`Startup::took_up`]): this
+        // process's own, or a seamless update predecessor's, whose books this one never had.
+        if w.took_up {
+            books.started.insert(w.sid.clone());
+        }
         match (w.state, &w.seen) {
             (StartupState::Other, _) => {}
             (StartupState::StallOver, _) => {
@@ -19068,6 +19670,21 @@ fn look_at_startups(
                     soonest(now + HELD_RELOOK);
                 }
             }
+        }
+    }
+    // THE START CARRIED: each open record whose worker the books hold started and that does not
+    // say so yet is told ([`Acts::startup_took_up`]), so a seamless update's successor, whose
+    // books start empty, judges only the held deadline on it. On every look, not only the one
+    // that found the start: a record that moved under the write (a stall's end marked by this
+    // look, a mark of another writer) takes it at the next. A record a stall stands on takes it
+    // once that stall's end has moved it to `working`.
+    for w in reads.iter().filter(|w| {
+        !w.took_up
+            && matches!(w.state, StartupState::Working | StartupState::Reopened)
+            && books.started.contains(&w.sid)
+    }) {
+        if !(hooks.acts.startup_took_up)(w) {
+            soonest(now + HELD_RELOOK);
         }
     }
     next
@@ -19202,9 +19819,10 @@ fn look_at_held_stall(
     (!landed).then_some(now + HELD_RELOOK)
 }
 
-/// What screen read `seen` says of a worker of kind `expected` that no proven claim carries.
-/// A codex worker starts only when codex-alab claims its tab, so a codex screen that reads as
-/// started is OpenAI's codex or a codex-alab that has not carried it
+/// What screen read `seen` says of a worker of kind `expected` that no proven claim carries and
+/// whose program's own reports began no turn ([`codex_took_a_turn`]). A codex worker starts only
+/// when codex-alab claims its tab or codex's reports begin a turn, so a codex screen that reads as
+/// started with neither is OpenAI's codex or a codex-alab that has not carried it
 /// ([`StartupHold::NoComposer`]). While codex-alab may not claim the tab (`claimable` false: a
 /// halt stands, or the session's Autopilot is off), a program in front is not judged
 /// ([`StartupSeen::CannotClaim`]): the deadline would be judging the halt, not the worker. A shell
@@ -19279,6 +19897,60 @@ fn claim_hold_applies(seen: &StartupSeen, expected: Option<Program>) -> bool {
             | Program::Generic,
         )
         | None => false,
+    }
+}
+
+/// WHETHER CODEX'S OWN REPORTS SAY IT TOOK ITS TASK UP, read off terminal `t`: the engine kept
+/// a turn of `app=codex` (OSC 7501, [`ProgramTurns`]) that one of its reports began, or resumed (a
+/// restore installing a report that stands in a turn resumes one); or codex's report standing
+/// says a turn ended (`done`, `error`). Codex says those only after a turn, and stands at them
+/// until a key acknowledges the turn; a restore (a seamless update's successor) installs such a
+/// report without the turn it closed, as it keeps no turn backlog, so the successor reads the
+/// start its predecessor read. Once a key has acknowledged the turn codex says `idle`, which a
+/// restore installs with no turn either, so a successor reads no start here: the deadline's
+/// judgment rides the task record instead ([`crate::task_record::TaskRecord::took_up`]). This
+/// proves a codex worker's start as a claim does ([`startups_on`]). Codex writes these reports
+/// unasked, codex-alab and the vendor build alike, and none at its sign-in, onboarding or
+/// folder-trust screens, which come before the chat that writes them; at rest before its first
+/// turn it says `idle`, which begins none. codex-alab with its ALab hooks on leaves its MCP
+/// servers' start out of them; the vendor build, and codex-alab with its hooks off, report that
+/// start as a turn (`working`, then `idle`), which this cannot tell from its task's
+/// (ATERM-KI-1116-2211). A worker's codex has its task as its first prompt, so the turn it
+/// begins is that task's.
+/// codex-alab can run its task holding no claim (it gives back one aterm did not prove, and makes
+/// none while aterm's policy for it reads off), and no reader of aterm's reads a codex screen
+/// ([`aterm_phase::reader::CodexReader`]): without its reports such a worker read `stalled
+/// why=startup` however long it worked.
+///
+/// [`ProgramTurns`]: aterm_core::terminal::program_state::ProgramTurns
+#[must_use]
+pub(crate) fn codex_took_a_turn(t: &aterm_core::terminal::Terminal) -> bool {
+    use aterm_core::terminal::program_state::{ProgramApp, ProgramStateWord};
+    let ended = t.program_state().state.is_some_and(|report| {
+        report.app == ProgramApp::Codex
+            && matches!(
+                report.state,
+                ProgramStateWord::Done | ProgramStateWord::Error
+            )
+    });
+    ended
+        || t.program_turns()
+            .iter()
+            .any(|turn| turn.app == ProgramApp::Codex && turn.began.is_some())
+}
+
+/// Whether a worker of `agent` has started once codex's own reports began a turn
+/// ([`codex_took_a_turn`]): codex's alone, whose reports these are; another agent's start is read
+/// from its screen or its claim.
+const fn starts_by_codex_reports(agent: Program) -> bool {
+    match agent {
+        Program::Codex => true,
+        Program::Claude
+        | Program::Agy
+        | Program::Muse
+        | Program::Grok
+        | Program::Kimi
+        | Program::Generic => false,
     }
 }
 
@@ -21617,6 +22289,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let claim_sock = sock.clone();
     let startups_store = store.clone();
     let startup_store = store.clone();
+    let took_up_store = store.clone();
     let fact_store = store.clone();
     let resume_sock = sock.clone();
     let disk_store = store.clone();
@@ -21633,6 +22306,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
     let wall_upkeep = upkeep.clone();
     let screen_wall_store = store.clone();
     let usage_home = home.clone();
+    let reply_home = home.clone();
     let seat_home = home.clone();
     let cold_home = home.clone();
     let codex_cold_home = home.clone();
@@ -22139,6 +22813,7 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         }),
         startups: Arc::new(move |judged| startups_of(&startups_store, judged)),
         startup_mark: Arc::new(move |worker, mark| startup_mark_live(&startup_store, worker, mark)),
+        startup_took_up: Arc::new(move |worker| startup_took_up_live(&took_up_store, worker)),
         standing_limit: Arc::new(move |sid, snap| {
             let tail = upgrade_drive::snapshot_transcript_tail(snap)?;
             relaunch::standing_limit(&standing_opts(sid, 0)?, snap, &tail)
@@ -22150,6 +22825,9 @@ fn live_acts(store: Store, sock: String, window: WindowShares) -> Acts {
         accounts_upkeep: upkeep,
         account_usage: Arc::new(move |sid, agent, settled, seen, listed| {
             account_usage_live(usage_home.as_deref(), sid, agent, settled, seen, listed)
+        }),
+        account_reply: Arc::new(move |sid, agent, settled, proof, listed| {
+            account_reply_live(reply_home.as_deref(), sid, agent, settled, proof, listed)
         }),
         account_gone: Arc::new(account_gone_live),
         account_seat: Arc::new(move || account_seat_live(seat_home.as_deref())),
@@ -22832,8 +23510,10 @@ fn startups_on(
             };
             // A PROGRAM WORKER (`crate::program_worker`) has started once its shell ran the line
             // its launcher typed (a command a person ran in its tab is none): no screen of an
-            // agent's says so, and no box of one can hold it.
+            // agent's says so, and no box of one can hold it. A CODEX WORKER has started once
+            // codex's own reports began a turn ([`codex_took_a_turn`]), claim or none.
             let program_worker = record.runs_a_program();
+            let codex_worker = record.agent.is_some_and(starts_by_codex_reports);
             let rows_of =
                 |t: &aterm_core::terminal::Terminal| -> Option<(Vec<String>, bool, bool)> {
                     (!crate::frame_unfinished_now(t)).then(|| {
@@ -22842,12 +23522,16 @@ fn startups_on(
                                 .map(|r| crate::control::visible_row(t, r))
                                 .collect(),
                             shell_reached_prompt(t),
-                            program_worker && crate::program_worker::started(t, &record),
+                            (program_worker && crate::program_worker::started(t, &record))
+                                || (codex_worker && codex_took_a_turn(t)),
                         )
                     })
                 };
+            // A record that carries a deadline's start judgment (`took_up`, this process's or a
+            // seamless update predecessor's) is not read for its start again, as one these books
+            // judged is not: the restored codex report keeps no turn at rest.
             let for_start = state == StartupState::StalledAtStartup
-                || (state == StartupState::Working && !judged.contains(&sid))
+                || (state == StartupState::Working && !judged.contains(&sid) && !record.took_up)
                 || (state == StartupState::Reopened && installing);
             let for_held = !program_worker
                 && matches!(state, StartupState::Working | StartupState::Reopened)
@@ -22869,12 +23553,13 @@ fn startups_on(
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 })
                 .flatten();
-            let (rows, prompt, ran) = read.map_or((None, false, false), |(rows, prompt, ran)| {
-                (Some(rows), prompt, ran)
-            });
+            let (rows, prompt, began) = read
+                .map_or((None, false, false), |(rows, prompt, began)| {
+                    (Some(rows), prompt, began)
+                });
             let mut claim_hold = None;
             let seen = match (&rows, for_start, &pool_hold) {
-                _ if for_start && (carried || ran) => StartupSeen::Started,
+                _ if for_start && (carried || began) => StartupSeen::Started,
                 // Nothing was typed, so the screen says nothing of the worker: what holds it is
                 // the launcher's, whoever may claim the tab.
                 (_, true, Some(hold)) => StartupSeen::Holds(StartupHold::LaunchHeld {
@@ -22944,6 +23629,7 @@ fn startups_on(
                 state,
                 record_rev: record.rev,
                 since: record.since,
+                took_up: record.took_up,
                 seen,
                 held,
                 standing: standing.filter(|s| s.starts_with(STARTUP_HEAD)),
@@ -22967,6 +23653,36 @@ fn startup_mark_live(store: &Store, worker: &Startup, mark: &StartupMark<'_>) ->
     } else {
         false
     }
+}
+
+/// The product's [`Acts::startup_took_up`]: [`crate::task_record::note_task_took_up`] on the
+/// record the look read, in the session incarnation it read, waiting on a committing update's
+/// fence for at most the fabric's own wait. False where that session is gone or another
+/// incarnation holds its sid.
+fn startup_took_up_live(store: &Store, worker: &Startup) -> bool {
+    let Some(h) = aterm_session::SessionId::parse(&worker.sid).and_then(|id| {
+        store
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .by_sid(&id)
+            .cloned()
+    }) else {
+        return false;
+    };
+    let noted = worker.nonce == h.ctx.nonce
+        && crate::task_record::note_task_took_up(
+            &h.ctx,
+            worker.record_rev,
+            h.ctx.fabric.fence_wait(),
+        );
+    if noted {
+        aterm_log::info!(
+            "harness @{}: task rev={}: its start noted on the record (took_up=1)",
+            worker.sid,
+            worker.record_rev
+        );
+    }
+    noted
 }
 
 /// The task door's fact word on session `sid`'s record ([`Acts::task_fact`]): `NoTask` where no
@@ -23358,6 +24074,104 @@ fn account_usage_of(
         );
     }
     recorded.as_str()
+}
+
+/// The production [`Acts::account_reply`]: what the session proved (`proof`: a request its model
+/// served, its own sample's room) on the account the agent's process runs on, filed with the
+/// accounts store (`accounts::record_served`, `accounts::record_model_room`). It reads the store
+/// once and stops there where no account of it holds a wall the proof would lift, before any
+/// roster, exec environment or login file is read: a turn end on a machine with nothing to lift
+/// costs one read of the state file. No provider is read on any path.
+fn account_reply_live(
+    home: Option<&Path>,
+    sid: &str,
+    agent: &WalledAgent<'_>,
+    settled: &dyn Fn() -> bool,
+    proof: &Proved<'_>,
+    listed: bool,
+) -> &'static str {
+    let Some(state) = harness_state() else {
+        return "no-state";
+    };
+    let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+        return "no-clock";
+    };
+    let store = accounts::Store::at(&state);
+    if let Ok((kept, _)) = store.load(now)
+        && !kept.accounts.values().any(|record| proof.lifts(record))
+    {
+        return "unchanged";
+    }
+    let roster = match usage_roster(
+        accounts::default_roster_path().as_deref(),
+        &store,
+        (agent.own, listed),
+        now,
+    ) {
+        Ok(roster) => roster,
+        Err(word) => return word,
+    };
+    let Some(env) = upgrade_drive::snapshot_login_env(agent.snap) else {
+        return "no-env";
+    };
+    let read = ReplyRead {
+        env: &env,
+        started: process_started(&agent.snap.start),
+        settled,
+    };
+    account_reply_of((&store, home), &roster, sid, &read, proof, now)
+}
+
+/// What [`account_reply_live`] read of a session's agent.
+struct ReplyRead<'a> {
+    env: &'a [String],
+    started: Option<i64>,
+    settled: &'a dyn Fn() -> bool,
+}
+
+/// The proof's recorder's call, assembled ([`account_reply_live`]), on the accounts `store`, for
+/// the account the process's login file names under `home` ([`login_seen`]; unread with no
+/// home). A served request of a process whose start is not read files nothing: a request is its
+/// account's only where it is no older than the process (`accounts::record_served`). A sample's
+/// room was read by this process, on the screen it shows now.
+fn account_reply_of(
+    (store, home): (&accounts::Store, Option<&Path>),
+    captured: &accounts::UsageRoster,
+    sid: &str,
+    read: &ReplyRead<'_>,
+    proof: &Proved<'_>,
+    now: i64,
+) -> &'static str {
+    let roster = captured.roster();
+    let Some(who) = accounts::ProcessLogin::of_exec_env(read.env) else {
+        return "no-env";
+    };
+    let who = accounts::ProcessLogin {
+        route: who
+            .route
+            .unless(accounts::judged_label(roster, &who).is_none() || !(read.settled)()),
+        ..who
+    };
+    let seen = |who: &accounts::ProcessLogin| {
+        home.map_or(Observation::Unread, |home| {
+            login_seen(read.env, home, who.route, roster)
+        })
+    };
+    match *proof {
+        Proved::Served(ref served) => {
+            let Some(started) = read.started else {
+                return "no-start";
+            };
+            let seen = seen(&who);
+            accounts::record_served(store, captured, sid, (&who, &seen), served, started, now)
+                .as_str()
+        }
+        Proved::Room { window, at } => {
+            let seen = seen(&who);
+            accounts::record_model_room(store, captured, sid, (&who, &seen), window, at, now)
+                .as_str()
+        }
+    }
 }
 
 /// The production [`Acts::account_gone`].
@@ -24499,6 +25313,39 @@ fn token_refused_at(
     _look: &AccountLook,
 ) -> Option<bool> {
     None
+}
+
+/// Whether a turn the session `look` reads served on its row `label`'s vault token proves that
+/// row's account ([`aterm_agent::harness::token_route::token_serves_row`]): the token it was
+/// served is the vault's, in use here or held for its basis. Read value-free from this Mac's vault
+/// in `seat`'s home, outside every store's lock; never off Unix, where no session runs on a token.
+#[cfg(unix)]
+fn token_proves(
+    seat: &AccountSeat,
+    roster: &accounts::Roster,
+    label: &str,
+    look: &AccountLook,
+) -> bool {
+    roster.row(label).is_some_and(|row| {
+        aterm_agent::harness::token_route::token_serves_row(
+            &aterm_secrets::client::Paths::for_home(&seat.home),
+            &seat.claude_store(),
+            roster,
+            row,
+            (&look.who, look.token_served),
+            u64::try_from(seat.now).unwrap_or(0),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn token_proves(
+    _seat: &AccountSeat,
+    _roster: &accounts::Roster,
+    _label: &str,
+    _look: &AccountLook,
+) -> bool {
+    false
 }
 
 fn cold_admission_needed(seat: &AccountSeat, snap: &Snapshot) -> bool {
@@ -30695,6 +31542,8 @@ fn disk_pass_outcome(
 /// The harness state directory the upgrade and the relaunch file their records under (`<aterm state>/harness/<HARNESS>`), or `None` without one.
 pub(crate) fn harness_state() -> Option<std::path::PathBuf> {
     #[cfg(test)]
+    crate::host_facts::noted("harness_state");
+    #[cfg(test)]
     if let Some(dir) = STATE_FOR_TEST.with(|dir| dir.borrow().clone()) {
         return Some(dir);
     }
@@ -32079,11 +32928,14 @@ impl Acts {
             window_ending: Arc::new(|| false),
             startups: Arc::new(|_| Vec::new()),
             startup_mark: Arc::new(|_, _| false),
+            // An inert host carries no record, so no look is armed to write one again.
+            startup_took_up: Arc::new(|_| true),
             standing_limit: Arc::new(|_, _| None),
             needs_told: Arc::new(|_| None),
             account_wall: Arc::new(|_, _, _| ("inert", None)),
             accounts_upkeep: AccountsUpkeep::Inert,
             account_usage: Arc::new(|_, _, _, _, _| "inert"),
+            account_reply: Arc::new(|_, _, _, _, _| "inert"),
             account_gone: Arc::new(|_| {}),
             account_seat: Arc::new(|| None),
             account_env: Arc::new(|_| None),

@@ -22,6 +22,7 @@ fn asker_after(ledger: &Ledger) -> Asker {
         pid: std::process::id(),
         ancestors: Vec::new(),
         rank: Rank::Ordinary,
+        person: false,
         since_ms: ledger
             .list()
             .expect("lists")
@@ -439,4 +440,84 @@ fn the_subprocess_slots_follow_the_share() {
         6,
         "the run's hold ends with it"
     );
+}
+
+/// The machine as a command a person typed at a tab's prompt reads it
+/// ([`aterm_capacity::Machine::person`]).
+struct AtATab<'a>(&'a Fixed);
+
+impl aterm_capacity::Machine for AtATab<'_> {
+    fn person(&self) -> bool {
+        true
+    }
+    fn read(&self, path: Option<&Path>) -> Reading {
+        self.0.read(path)
+    }
+    fn procs(&self) -> Option<aterm_capacity::Procs> {
+        self.0.procs()
+    }
+}
+
+/// A PERSON'S WAITER IS AHEAD OF A TEST RUN THAT ASKED BEFORE IT, as the ledger orders it
+/// ([`aterm_capacity::Need::priority`]): a person's claim of 3 cores laid after an agent's run
+/// began is a party to the run's share, and its cores are kept for it, so the share is what the
+/// ledger grants a new agent claim beside it (6 of 12). A run a person started is behind no later
+/// waiter.
+///
+/// NEGATIVE CONTROLS. An unmarked later waiter is not counted ahead in the run's share, which is
+/// then the 12 it asked; a later person's waiter is behind a run a person started.
+#[test]
+fn a_test_runs_share_counts_a_persons_later_waiter_ahead_of_it() {
+    use aterm_capacity::admit::Waiter;
+    let reading = machine(0.0);
+    let fixed = Fixed::new(reading.clone());
+    for (person, ahead) in [(true, 1), (false, 0)] {
+        let tmp = aterm_tempfile::tempdir().expect("scratch");
+        let ledger = Ledger::at(tmp.path().join("ledger"));
+        let need = Need::new("a later waiter").cores(3);
+        let _waiter = if person {
+            Waiter::enter(&ledger, &AtATab(&fixed), need)
+        } else {
+            Waiter::enter(&ledger, &fixed, need)
+        }
+        .expect("entered");
+        let records = ledger.list().expect("lists");
+        assert_eq!(records[0].need.person, person);
+        // The run began before the waiter was laid.
+        let since_ms = records[0].start_ms - 1;
+        let mut asker = Asker {
+            since_ms,
+            ..asker_after(&ledger)
+        };
+        let others = Others::of(&records, &asker, unix_ms());
+        assert_eq!(
+            (others.waiting, others.reserved),
+            (ahead, 3 * ahead),
+            "{others:?}"
+        );
+        let ours = fair(12, &reading, &others, 0.0);
+        // The ledger's own grant to one claim laid when the run began.
+        let run = Waiter::enter_stand_in(
+            &ledger,
+            &fixed,
+            Need::new("one claim for the run").cores(12),
+            None,
+            since_ms,
+        )
+        .expect("entered");
+        let theirs = match run.poll(&fixed) {
+            aterm_capacity::admit::Polled::Admitted(claim) => claim.cores(),
+            aterm_capacity::admit::Polled::Waiting(_, short) => panic!("waits: {short}"),
+            aterm_capacity::admit::Polled::Gone(e) => panic!("gone: {e}"),
+            aterm_capacity::admit::Polled::Unqualified(why) => panic!("unqualified: {why}"),
+        };
+        assert_eq!(
+            (ours, theirs),
+            if person { (6, 6) } else { (12, 12) },
+            "person {person}: {others:?}"
+        );
+        // A run a person started is behind no later waiter, a person's included.
+        asker.person = true;
+        assert_eq!(Others::of(&records, &asker, unix_ms()).waiting, 0);
+    }
 }

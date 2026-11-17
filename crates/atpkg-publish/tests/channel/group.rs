@@ -105,6 +105,10 @@ impl ReleaseHost for Hiding {
 struct Probe {
     vv: RefCell<String>,
     switch: Switch,
+    /// cargo's answer for each checkout whose graph does not resolve.
+    unresolved: RefCell<BTreeMap<PathBuf, String>>,
+    /// Every checkout whose graph was probed, in order.
+    resolved: RefCell<Vec<PathBuf>>,
 }
 
 impl SealProbe for Probe {
@@ -113,6 +117,13 @@ impl SealProbe for Probe {
     }
     fn lineage_switch(&self, _: &Ctx, _: &Path) -> Switch {
         self.switch.clone()
+    }
+    fn resolves(&self, _: &Path, checkout: &Path) -> std::result::Result<(), String> {
+        self.resolved.borrow_mut().push(checkout.to_path_buf());
+        self.unresolved
+            .borrow()
+            .get(checkout)
+            .map_or(Ok(()), |why| Err(why.clone()))
     }
 }
 
@@ -258,6 +269,8 @@ fn cut_unstaged(label: &str, pins: &[(&str, u64)], overlay: &[(&str, u64)]) -> C
         probe: Probe {
             vv: RefCell::new(vv(&commit, MAC)),
             switch: Switch::Dormant,
+            unresolved: RefCell::default(),
+            resolved: RefCell::default(),
         },
         packs: Packs::default(),
         rig,
@@ -338,6 +351,9 @@ fn native_preview_rejects_a_local_origin_before_running_any_seal_probe() {
         }
         fn lineage_switch(&self, _: &Ctx, _: &Path) -> Switch {
             panic!("invalid source origin must stop before lineage inspection")
+        }
+        fn resolves(&self, _: &Path, _: &Path) -> std::result::Result<(), String> {
+            panic!("invalid source origin must stop before a dependency probe")
         }
     }
 
@@ -507,6 +523,50 @@ fn a_sibling_behind_or_level_with_the_floor_is_refused_before_anything_packs() {
     let mut forced = request(&c, Mode::Stage);
     forced.force_same_build = true;
     ok(&c, &forced);
+}
+
+/// RL-33: a sibling whose dependency graph does not resolve with the seal's targo and the
+/// pack's Cargo home is refused by the preflight, naming the sibling, its checkout and cargo's
+/// own lines, so neither a dry run nor a staged cut packs the bundle first. The 82bb group
+/// staged the bundle and two siblings before trust-vc failed on its `[patch]` to `../ay`.
+/// Every sibling's graph is probed, and a graph that resolves refuses nothing.
+#[test]
+fn a_sibling_whose_dependencies_do_not_resolve_is_refused_before_anything_packs() {
+    let c = cut("group-unresolved", &FLOOR, &[]);
+    let vc = c.checkouts["trust-vc"].clone();
+    c.probe.unresolved.borrow_mut().insert(
+        vc.clone(),
+        "error: failed to load source for dependency `ay-core`\n\
+         patch location `../ay/crates/ay-core` does not contain packages matching `ay-core`"
+            .into(),
+    );
+    for mode in [Mode::DryRun, Mode::Stage] {
+        let e = refused(&c, &request(&c, mode));
+        assert!(
+            e.contains("trust-vc: its dependencies do not resolve in"),
+            "{e}"
+        );
+        assert!(e.contains(&c.rig.ctx.shown(&vc)), "names the checkout: {e}");
+        assert!(
+            e.contains("does not contain packages matching `ay-core`"),
+            "cargo's own words: {e}"
+        );
+        assert_eq!(e.matches("do not resolve").count(), 1, "{e}");
+    }
+    assert!(
+        c.packs.bundles.borrow().is_empty() && c.packs.packs.borrow().is_empty(),
+        "nothing packs after a refusal"
+    );
+    let probed = c.probe.resolved.borrow().clone();
+    for sibling in ["trust-ir", "trust-cg", "trust-vc"] {
+        assert!(
+            probed.contains(&c.checkouts[sibling]),
+            "{sibling} was probed: {probed:?}"
+        );
+    }
+
+    c.probe.unresolved.borrow_mut().clear();
+    ok(&c, &request(&c, Mode::DryRun));
 }
 
 #[test]

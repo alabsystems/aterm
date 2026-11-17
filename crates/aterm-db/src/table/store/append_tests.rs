@@ -131,7 +131,7 @@ fn ingest_refusals_preserve_the_journal_index_and_writer_usage() {
     assert!(store.writers.is_empty());
     assert_eq!(store.operation_bytes, 0);
 
-    store.index = OnceLock::from(Index::new(INDEX_CAPACITY));
+    store.index = OnceLock::from(Index::new(usize::MAX));
     APPEND_FAILS.with(|fails| fails.set(true));
     let failed = store.ingest(&session, &wire);
     APPEND_FAILS.with(|fails| fails.set(false));

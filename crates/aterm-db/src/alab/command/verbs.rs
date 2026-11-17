@@ -4,15 +4,20 @@
 //! The lab verbs of design §8 over LabView and the journal window: the readers (`machines`,
 //! `accounts`, `preferences`, `mail`, `who`, `quota`, `log`, `signins`) and the owner's writers
 //! (`add machine|account`, `retire`, `relabel`, `edit`). A reader prints keys, labels, counts,
-//! times and words, never an address: an account is its key and its label, an address its key
-//! and its mailbox's label. A writer writes only the cells that change, as the owner (one record
-//! a row, a random request id, `att::Handle::commit_owner`), and touches no Mac's login: nothing
-//! here reaches an account directory, so no one is signed out by a retire or a relabel.
+//! times and words. An account is its key (`ac`), its slug and its name, its provider word and
+//! address (docs/DESIGN-shared-files-2026-11-11.md §10); an address row is its key and its
+//! mailbox's label, never its text, and `mail` names each account by key and slug alone. Every
+//! verb that takes an account takes its slug, its key, its provider word and address, or an
+//! address that names one account ([`crate::alab::account_names`]). A writer writes only the
+//! cells that change, as the owner (one record a row, a random request id,
+//! `att::Handle::commit_owner`), and touches no Mac's login: nothing here reaches an account
+//! directory, so no one is signed out by a retire or a relabel.
 
-use super::{Args, Io, named_row};
+use super::{Args, Io, account_row, named_row};
 use crate::{
     Error, Result,
     alab::{
+        account_names::{self, Found},
         journal::{
             self,
             event::{Event, Window},
@@ -84,40 +89,20 @@ fn at(t: u64, now: u64) -> Value {
     }
 }
 
-fn label_str<'a>(lab: &'a LabView, pk: &str) -> Option<&'a str> {
-    lab.accounts
-        .get(pk)
-        .and_then(|account| account.label.as_deref())
+fn slug_of(lab: &LabView, pk: &str) -> Option<String> {
+    lab.slug(pk).map(str::to_owned)
 }
 
-fn label_of(lab: &LabView, pk: &str) -> Option<String> {
-    label_str(lab, pk).map(str::to_owned)
+fn name_of(lab: &LabView, pk: &str) -> Option<String> {
+    lab.name(pk).map(str::to_owned)
 }
 
-/// The account `name` names: its key, its label or its legacy label, live or not. Never an
-/// address, which never goes on a command line.
-fn account_named(lab: &LabView, name: &str) -> Result<String> {
-    if name.contains('@') {
-        return Err(Error::new(
-            "an account is named by its label, legacy label or key, never its address",
-        ));
-    }
-    if lab.accounts.contains_key(name) {
-        return Ok(name.to_owned());
-    }
-    let found: Vec<&String> = lab
-        .accounts
-        .values()
-        .filter(|a| a.label.as_deref() == Some(name) || a.legacy_label.as_deref() == Some(name))
-        .map(|a| &a.pk)
-        .collect();
-    match found.as_slice() {
-        [pk] => Ok((*pk).clone()),
-        [] => Err(Error::new("no account goes by that name")),
-        _ => Err(Error::new(
-            "more than one account goes by that name: name it by its key",
-        )),
-    }
+/// The account `word` names ([`account_names::one`]), live or not: its slug, its key, its
+/// provider word and address, or an address that names one account.
+fn account_named(lab: &LabView, word: &str) -> Result<String> {
+    account_names::one(&lab.names, word)
+        .map(str::to_owned)
+        .map_err(|why| Error::new(&why))
 }
 
 /// The machine `name` names: its key, else the one live row its label or an alias names (a
@@ -222,13 +207,13 @@ pub(super) fn runs_on(
         (
             a.rank.is_none(),
             a.rank,
-            label_str(lab, &a.account),
+            lab.slug(&a.account),
             a.account.as_str(),
         )
             .cmp(&(
                 b.rank.is_none(),
                 b.rank,
-                label_str(lab, &b.account),
+                lab.slug(&b.account),
                 b.account.as_str(),
             ))
     });
@@ -236,7 +221,8 @@ pub(super) fn runs_on(
         let found = lab.accounts.get(pk);
         json!({
             "ac": pk,
-            "label": label_of(lab, pk),
+            "slug": slug_of(lab, pk),
+            "name": name_of(lab, pk),
             "status": found.and_then(|a| a.status.clone()),
             "plan": plans(pk),
             "quota": seen.quota(pk).iter().map(|q| usage_json(lab, q, seen.now)).collect::<Vec<_>>(),
@@ -386,8 +372,9 @@ pub(super) fn machines(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> 
     Ok(json!({"complete": view.complete, "machines": out}))
 }
 
-/// `accounts`: every account by key and label, its words and which machines prefer it; never its
-/// login.
+/// `accounts`: every account by its key, its slug and its name (its provider word and address),
+/// its words, the label a Mac called it before labels named no machine, and which machines
+/// prefer it.
 pub(super) fn accounts(paths: &Paths) -> Result<Value> {
     let (view, lab) = lab(paths)?;
     let mut out = Vec::new();
@@ -399,10 +386,11 @@ pub(super) fn accounts(paths: &Paths) -> Result<Value> {
             .collect();
         out.push(json!({
             "ac": pk,
-            "label": account.label,
-            "legacy_label": account.legacy_label,
+            "slug": slug_of(&lab, pk),
+            "name": name_of(&lab, pk),
             "realm": account.realm,
             "status": account.status,
+            "legacy_label": account.legacy_label,
             "row": if account.live { "live" } else { "not live" },
             "preferred_by": preferring,
         }));
@@ -410,8 +398,8 @@ pub(super) fn accounts(paths: &Paths) -> Result<Value> {
     Ok(json!({"complete": view.complete, "accounts": out}))
 }
 
-/// `preferences`: every preference row, by machine label and account label, with its rank, its
-/// reason and its lifecycle.
+/// `preferences`: every preference row, by machine label and account slug and name, with its
+/// rank, its reason and its lifecycle.
 pub(super) fn preferences(paths: &Paths) -> Result<Value> {
     let (view, lab) = lab(paths)?;
     let rows = view.project(&PREFERENCE);
@@ -425,7 +413,8 @@ pub(super) fn preferences(paths: &Paths) -> Result<Value> {
                 "pf": pk,
                 "machine": lab.machine_label(machine),
                 "mc": machine,
-                "account": label_of(&lab, account),
+                "slug": slug_of(&lab, account),
+                "name": name_of(&lab, account),
                 "ac": account,
                 "rank": text(row, "rank"),
                 "why": text(row, "why"),
@@ -446,7 +435,8 @@ pub(super) fn preferences(paths: &Paths) -> Result<Value> {
 
 /// `mail`: every address by key (never its text), its kind, the mailbox the lab says its codes
 /// arrive in (by key and label) and how, its `alias_of` link, and the accounts that sign in with
-/// it; then every mailbox by key and label.
+/// it, by key and slug (an account's name holds the address); then every mailbox by key and
+/// label.
 pub(super) fn mail(paths: &Paths) -> Result<Value> {
     let (view, lab) = lab(paths)?;
     let addresses = view.project(&ADDRESS);
@@ -458,7 +448,7 @@ pub(super) fn mail(paths: &Paths) -> Result<Value> {
         let login = a.get("login").and_then(Value::as_str);
         let identity = a.get("identity").and_then(Value::as_str);
         if login.is_some() || identity.is_some() {
-            let entry = json!({"ac": ac, "label": label_of(&lab, ac)});
+            let entry = json!({"ac": ac, "slug": slug_of(&lab, ac)});
             if let Some(addr) = login {
                 signing_by_address
                     .entry(addr)
@@ -578,7 +568,7 @@ fn usage_json(lab: &LabView, q: &WindowQuota, now: u64) -> Value {
 pub(super) fn who(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> Result<Value> {
     let [name] = args.operands.as_slice() else {
         return Err(Error::new(
-            "name one account: its label, legacy label or key",
+            "name one account: its slug, its key, or its provider word and address",
         ));
     };
     let (_, lab) = lab(paths)?;
@@ -586,7 +576,8 @@ pub(super) fn who(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> Resul
     let seen = seen(paths, io, now_ms / 1000, now_ms)?;
     Ok(json!({
         "ac": pk,
-        "label": label_of(&lab, &pk),
+        "slug": slug_of(&lab, &pk),
+        "name": name_of(&lab, &pk),
         "last_use": seen.last_use.get(&pk).map(|(uuid, t)| {
             let mut out = mac(&lab, uuid);
             if let (Value::Object(o), Value::Object(when)) = (&mut out, at(*t, seen.now)) {
@@ -627,7 +618,8 @@ pub(super) fn quota(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> Res
         .map(|pk| {
             json!({
                 "ac": pk,
-                "label": label_of(&lab, pk),
+                "slug": slug_of(&lab, pk),
+                "name": name_of(&lab, pk),
                 "windows": seen.quota(pk).iter().map(|q| usage_json(&lab, q, seen.now)).collect::<Vec<_>>(),
             })
         })
@@ -640,7 +632,8 @@ fn event_json(lab: &LabView, event: &Event) -> Value {
         "kind": event.kind.word(),
         "cli": event.cli.as_str(),
         "ac": event.account.map(|a| a.as_str().to_owned()),
-        "label": event.account.and_then(|a| label_of(lab, a.as_str())),
+        "slug": event.account.and_then(|a| slug_of(lab, a.as_str())),
+        "name": event.account.and_then(|a| name_of(lab, a.as_str())),
         "window": event.window.map(Window::word),
         "used_pct_x10": event.pct_x10,
         "reset": event.reset,
@@ -662,16 +655,29 @@ pub(super) fn log(paths: &Paths, args: &Args, io: &Io<'_>, now_ms: u64) -> Resul
     let now = now_ms / 1000;
     let since = now.saturating_sub(days.saturating_mul(86_400));
     let (_, lab) = lab(paths)?;
-    let account = account_named(&lab, name).ok();
     let machine = machine_named(&lab, name);
-    let (account, machine) = match (account, machine) {
-        (Some(_), Some(_)) => {
+    let (account, machine) = match (lab.account_named(name), machine) {
+        (Found::One(_), Some(_)) => {
             return Err(Error::new(
                 "an account and a machine both go by that name: name it by its key",
             ));
         }
-        (None, None) => return Err(Error::new("no account or machine goes by that name")),
-        pair => pair,
+        (Found::One(pk), None) => (Some(pk.to_owned()), None),
+        // Only an address names several accounts, and no machine is named by one.
+        (Found::Many(_), _) => {
+            return Err(Error::new(
+                &account_names::one(&lab.names, name)
+                    .err()
+                    .unwrap_or_default(),
+            ));
+        }
+        (Found::None, Some(machine)) => (None, Some(machine)),
+        (Found::None, None) => {
+            return Err(Error::new(&format!(
+                "no account or machine is named `{name}`: name an account by its slug, its key, \
+                 or its provider word and address, a machine by its label or its key"
+            )));
+        }
     };
     let seen = seen(paths, io, since, now_ms)?;
     let events: Vec<Value> = seen
@@ -722,7 +728,8 @@ pub(super) fn signins(paths: &Paths, io: &Io<'_>, now_ms: u64) -> Result<Value> 
         .map(|(pk, by)| {
             json!({
                 "ac": pk,
-                "label": label_of(&lab, pk),
+                "slug": slug_of(&lab, pk),
+                "name": name_of(&lab, pk),
                 "machines": by.iter().map(|(uuid, s)| {
                     let mut out = mac(&lab, uuid);
                     if let Value::Object(o) = &mut out {
@@ -839,7 +846,8 @@ fn add_machine(paths: &Paths, args: &Args) -> Result<Value> {
 /// `add account <provider|realm>`: an account row of that realm for the address read from stdin
 /// (never argv, §8), born `pending` under the canonical account key, signing in with the row
 /// whose `addr` says that address now ([`registry::AddressIndex`]), or with a row born for it
-/// where no row says it and none holds the key it derives. The address is never printed back.
+/// where no row says it and none holds the key it derives. It answers the account's key, its
+/// slug and its name, its provider word and the address.
 /// An account the registry already holds is refused, and so is an address several rows say, one
 /// whose birth key a row renamed since holds, and one whose row is retired; the write passes the
 /// registry's rules ([`registry::guard`]), which refuse it beside a live account of the realm
@@ -926,10 +934,17 @@ fn add_account(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> {
         Ok(((address, born), rows))
     })?;
     let (address, born) = born;
-    let label = keys::default_account_label(realm, &account).ok();
+    // Its slug is the lab's, read once the birth is in: a second account of the realm with the
+    // same handle moves both to the long one.
+    let names = handle
+        .view()
+        .map(|view| account_names::of(&view))
+        .unwrap_or_default();
+    let names = names.get(&account);
     Ok(json!({
         "ac": account,
-        "label": label,
+        "slug": names.map(|names| &names.slug),
+        "name": names.and_then(|names| names.name.as_ref()),
         "realm": realm,
         "ad": address,
         "address_born": born,
@@ -961,7 +976,9 @@ pub(super) fn add(paths: &Paths, args: &Args, io: &mut Io<'_>) -> Result<Value> 
 /// a live row names is refused until that row ends or names another
 /// (`typed::check::retired_referenced`): a machine a live preference names (`unprefer` ends
 /// it), an account a live preference, auth route or subaccount names (no verb ends a route or a
-/// subaccount: its `row` cell is set to `ended` in the table's grid, `aterm db table edit`).
+/// subaccount: its `row` cell is set to `ended` in the table's grid, `aterm db table edit`). An
+/// account is named as every account verb names it ([`account_row`]), a machine by its label, an
+/// alias or its key.
 pub(super) fn retire(paths: &Paths, args: &Args) -> Result<Value> {
     let [what, name] = args.operands.as_slice() else {
         return Err(Error::new(
@@ -977,22 +994,14 @@ pub(super) fn retire(paths: &Paths, args: &Args) -> Result<Value> {
             ));
         }
     };
-    if name.contains('@') {
-        return Err(Error::new(
-            "an account is named by its label, legacy label or key, never its address",
-        ));
-    }
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     let (pk, applied) = handle.commit_owner(|view| {
         let rows = view.project(collection);
         let pk = if collection.name == "account" {
-            named_row("account", &rows, name, false, |pk, row| {
-                registry::account_label(pk, row).as_deref() == Some(name.as_str())
-                    || row.get("legacy_label").and_then(Value::as_str) == Some(name.as_str())
-            })?
+            account_row(view, name, false)?
         } else {
             let wanted = Label::parse(name).ok().map(|label| label.canonical());
-            named_row("machine", &rows, name, false, |_, row| {
+            named_row("machine", &rows, name, false, |row| {
                 wanted.as_deref().is_some_and(|label| {
                     row.get("label").and_then(Value::as_str) == Some(label)
                         || row
@@ -1044,7 +1053,7 @@ pub(super) fn relabel(paths: &Paths, args: &Args) -> Result<Value> {
     let ((pk, from), applied) = handle.commit_owner(|view| {
         let machines = view.project(&MACHINE);
         let wanted = Label::parse(old).ok().map(|label| label.canonical());
-        let pk = named_row("machine", &machines, old, true, |_, row| {
+        let pk = named_row("machine", &machines, old, true, |row| {
             wanted.as_deref().is_some_and(|label| {
                 row.get("label").and_then(Value::as_str) == Some(label)
                     || row

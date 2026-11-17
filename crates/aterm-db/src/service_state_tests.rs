@@ -8,6 +8,20 @@ fn hang_detector() -> Instant {
     Instant::now() + aterm_spec::wait::MUST_HAPPEN
 }
 
+/// What an accounts sample with nothing kept shows at `now_ms`: a derivation, given the short
+/// admission time to wait for a holder and until its sample would no longer be current to read
+/// ([`kept::sample`]), whether or not it is one a keeper keeps.
+pub(crate) fn accounts(paths: &Paths, config: &Path, now_ms: u64) -> ServiceState {
+    let read_by = Instant::now() + CURRENT_FOR;
+    accounts_until(paths, config, now_ms, &crate::admission::deadline, read_by).0
+}
+
+/// What a secrets sample with nothing kept shows at `now_ms`: a derivation by a reader of its
+/// own ([`Reader`]).
+fn secrets(paths: &Paths, now_ms: u64) -> ServiceState {
+    secrets_state(&Reader::new(paths.clone()).read(), now_ms)
+}
+
 fn observe(paths: &Paths, config: &Path, now_ms: u64) -> ServiceStates {
     ServiceStates {
         accounts: accounts(paths, config, now_ms),
@@ -164,6 +178,63 @@ fn busy_and_repeated_handle_reads_preserve_the_original_publication() {
             .accounts
             .availability,
         ServiceAvailability::Cached
+    );
+}
+
+/// An observer's publication carries the observer's counts as they stand after its sample, and a
+/// handle gives the counts of the publication it holds without asking for a sample (so a
+/// diagnostic that reads them never keeps the services observed), all zero before any sample and
+/// none while the publication is held.
+///
+/// NEGATIVE CONTROLS (2026-11-15), each run and then restored:
+/// - `Observer::sample_with` leaving its publication's counts as [`sample_with`] made them (no
+///   `publication.derivations = *derivations`), run again on the merge of main f581bd69910, whose
+///   vault writes no file under the home and so leaves no delivered part to count: `left:
+///   Derivations { samples: 0, secrets: 0, accounts: 0, moved: [0, 0, 0, 0, 0] }`, `right:
+///   Derivations { samples: 1, secrets: 1, accounts: 1, moved: [0, 0, 0, 0, 0] }`, `the first
+///   sample's publication`.
+/// - `ObservationHandle::derivations` asking first, as a publication read does (`self.ask()`):
+///   `a derivations read asks for no sample`.
+#[test]
+fn a_handle_gives_its_observers_derivations_and_asks_for_no_sample() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&scratch.path().join("home"));
+    let mut observer = Observer::new(paths, scratch.path().join("aterm.toml"));
+    for n in 1..=2u64 {
+        let publication = observer.sample();
+        assert_eq!(observer.derivations().samples, n, "CONTROL: counted");
+        assert_eq!(
+            publication.derivations,
+            observer.derivations(),
+            "{}",
+            if n == 1 {
+                "the first sample's publication"
+            } else {
+                "the second sample's publication"
+            }
+        );
+    }
+    let published = observer.sample();
+
+    let handle = ObservationHandle::default();
+    assert_eq!(
+        handle.derivations(),
+        Some(Derivations::default()),
+        "no sample published yet"
+    );
+    handle.0.replace(published.clone());
+    assert_eq!(handle.derivations(), Some(published.derivations));
+    assert!(
+        !handle.0.asked.load(Ordering::Acquire),
+        "a derivations read asks for no sample"
+    );
+    let held = handle.0.publication.lock().unwrap();
+    assert_eq!(handle.derivations(), None, "the publication is held");
+    drop(held);
+    let _ = handle.try_publication();
+    assert!(
+        handle.0.asked.load(Ordering::Acquire),
+        "CONTROL: a publication read asks"
     );
 }
 
@@ -540,31 +611,30 @@ fn malformed_service_metadata_warns_and_a_later_read_clears_the_warning() {
 
 #[test]
 fn membership_is_not_usable_cache_or_remote_currency() {
-    let membership = Membership::In { seq: 66, heard: 12 };
-    let missing = secret_metadata(&membership, false, 11, 15_000);
+    use client::Membership;
+    let membership = Face::of(&Membership::In { seq: 66, heard: 12 });
+    let missing = secret_metadata(membership, false, 11, 15_000);
     assert_eq!(missing.availability, ServiceAvailability::Unknown);
-    let cached = secret_metadata(&membership, true, 11, 15_000);
+    let cached = secret_metadata(membership, true, 11, 15_000);
     assert_eq!(cached.availability, ServiceAvailability::Cached);
     assert_eq!(cached.last_success_ms, None);
     assert_eq!(cached.network_materialization, None);
     assert!(!cached.refresh_failed);
     assert_eq!(
-        secret_metadata(&membership, true, 0, 15_000).availability,
+        secret_metadata(membership, true, 0, 15_000).availability,
         ServiceAvailability::Unknown
     );
     assert_eq!(
-        secret_metadata(&membership, true, 11, 10_000).last_success_ms,
+        secret_metadata(membership, true, 11, 10_000).last_success_ms,
         None
     );
-    let heartbeat = secret_metadata(
-        &Membership::In {
-            seq: 66,
-            heard: u64::MAX,
-        },
-        true,
-        11,
-        15_000,
-    );
+    // When the vault last heard this Mac is no part of what Network State shows.
+    let heartbeat = Face::of(&Membership::In {
+        seq: 66,
+        heard: u64::MAX,
+    });
+    assert_eq!(heartbeat, membership);
+    let heartbeat = secret_metadata(heartbeat, true, 11, 15_000);
     assert_eq!(heartbeat.last_success_ms, None);
     assert_eq!(heartbeat.network_materialization, None);
 }
@@ -623,6 +693,20 @@ impl Drop for VaultFixture {
     }
 }
 
+/// A network refresh that failed leaves the usable cache and its receipts: the secrets service is
+/// Cached with `refresh_failed`, the failed refresh, the signed body's receipt and the 204 response
+/// as they were, and reading it writes nothing and shows no byte of the server's error. A writer
+/// holding the state lock, having renamed a `state.toml` in, is no unreadable refresh history: a
+/// reader that read before gives the state it gave, receipts and all, and one with nothing read
+/// yet shows no receipt and no failure. A refresh that succeeds clears only the failure.
+///
+/// NEGATIVE CONTROL (2026-11-15), run and then restored: with the receipts reader's busy
+/// observation giving no receipts (`Ok(Observed::Busy) => None` in `Reader::receipts_now`, the
+/// unreadable history main's two readers made of contention), it fails at `assert_eq!(raced,
+/// unraced)`: `left: ServiceState { availability: Cached, …, network_materialization: None,
+/// http204_response: None, network_refresh: None, …, detail: "1 manifest entries; …; network-
+/// refresh history could not be read", refresh_failed: true }`, where the unraced state holds the
+/// signed body's materialization and the failed refresh.
 #[test]
 fn failed_network_refresh_keeps_cache_and_receipts_and_recovery_clears_only_failure() {
     use aterm_secrets::server;
@@ -700,40 +784,48 @@ fn failed_network_refresh_keeps_cache_and_receipts_and_recovery_clears_only_fail
             .contains("private-error-body-inert")
     );
 
-    // Materialization has completed before this reader runs. A writer can win
-    // precisely the later history-read race without making the usable cache vanish.
+    // Materialization has completed before this reader runs. A writer that holds the state lock
+    // makes neither the usable cache nor the receipts last read vanish, and contention is not an
+    // unreadable refresh history: a reader that read before gives what it read, though the
+    // writer renamed a state.toml in (one of the same bytes: a round that moved nothing it
+    // shows), so its receipts' stamps moved and it meets the writer; one with nothing read yet
+    // meets the writer and shows no receipt.
     let retained_bytes = std::fs::read(&state_path).unwrap();
-    for discard_busy in [false, true] {
-        let raced = secrets_reading_refresh(paths, 120_001, |paths, config| {
-            let _writer = aterm_uds::private_file::PrivateLock::take(
-                &paths.dir,
-                ".lock",
-                Duration::from_secs(60),
-                "fixture vault writer is busy",
-            )
-            .unwrap();
-            let actual = client::observe_network_refresh(paths, config);
-            assert!(
-                actual.is_err(),
-                "the actual history read meets a held OS lock"
-            );
-            if discard_busy {
-                // Executable former policy: collapse that actual busy read into absence.
-                actual.or(Ok(None))
-            } else {
-                actual
-            }
-        });
+    let mut reader = Reader::new(paths.clone());
+    let unraced = secrets_state(&reader.read(), 120_001);
+    {
+        let _writer = aterm_uds::private_file::PrivateLock::take(
+            &paths.dir,
+            ".lock",
+            Duration::from_secs(60),
+            "fixture vault writer is busy",
+        )
+        .unwrap();
+        aterm_secrets::fsx::write_atomic(&state_path, &retained_bytes, 0o600).unwrap();
+        assert!(
+            matches!(
+                client::observe_receipts(paths, &client::config(paths).unwrap().unwrap()),
+                Ok(client::Observed::Busy)
+            ),
+            "CONTROL: the receipts read meets a held OS lock"
+        );
+        let raced = secrets_state(&reader.read(), 120_001);
+        assert_eq!(raced, unraced);
         assert_eq!(raced.availability, ServiceAvailability::Cached);
         assert_eq!(raced.network_materialization, Some(signed_receipt));
-        assert_eq!(raced.network_refresh, None);
-        assert_eq!(raced.refresh_failed, !discard_busy);
-        assert_eq!(
-            raced
+        assert_eq!(raced.network_refresh, Some(refresh));
+        assert!(raced.refresh_failed, "the refresh last read failed");
+        assert!(
+            !raced
                 .detail
-                .contains("network-refresh history could not be read"),
-            !discard_busy
+                .contains("network-refresh history could not be read")
         );
+        let unread = secrets(paths, 120_001);
+        assert_eq!(unread.availability, ServiceAvailability::Unknown);
+        assert_eq!(unread.network_materialization, None);
+        assert_eq!(unread.http204_response, None);
+        assert_eq!(unread.network_refresh, None);
+        assert!(!unread.refresh_failed, "{unread:?}");
         assert_eq!(std::fs::read(&state_path).unwrap(), retained_bytes);
     }
     let readable = secrets(paths, 120_002);
@@ -911,13 +1003,14 @@ fn a_guarded_vault_receipt_keeps_its_original_time_and_excludes_changed_local_in
 
 #[test]
 fn unavailable_or_unsigned_membership_never_advertises_access() {
+    use client::Membership;
     for membership in [
         Membership::Unconfigured,
         Membership::Pending,
         Membership::Revoked { seq: 9 },
         Membership::Plain,
     ] {
-        let result = secret_metadata(&membership, true, 11, 15_000);
+        let result = secret_metadata(Face::of(&membership), true, 11, 15_000);
         assert!(!matches!(
             result.availability,
             ServiceAvailability::Cached | ServiceAvailability::Current
@@ -1053,7 +1146,7 @@ fn a_read_out_of_time_says_so_rather_than_busy_or_unavailable() {
     for paths in [&paths, &lab.paths[0]] {
         let config = paths.home.join("config.toml");
         let spent = Instant::now();
-        let state = accounts_until(paths, &config, 1000, &hang_detector, spent);
+        let state = accounts_until(paths, &config, 1000, &hang_detector, spent).0;
         assert_eq!(state, out_of_time(1000), "{}", paths.home.display());
     }
     assert!(!paths.home.exists());
@@ -1070,7 +1163,7 @@ fn a_spent_holder_wait_still_reads_what_nobody_holds() {
     let paths = &lab.paths[0];
     let config = paths.home.join("config.toml");
     Proposals::at(paths.clone()).initialize().unwrap();
-    let read = accounts_until(paths, &config, 1000, &Instant::now, hang_detector());
+    let read = accounts_until(paths, &config, 1000, &Instant::now, hang_detector()).0;
     assert_eq!(read.availability, ServiceAvailability::Cached, "{read:?}");
     assert_eq!(read.last_success_ms, Some(1000));
 }
@@ -1088,7 +1181,8 @@ fn the_wait_for_a_holder_is_not_taken_before_the_custody_stage() {
         1000,
         &|| panic!("a read that stops before custody took a wait for a holder"),
         hang_detector(),
-    );
+    )
+    .0;
     assert_eq!(read.availability, ServiceAvailability::Unavailable);
 }
 
@@ -1360,8 +1454,24 @@ thread_local! {
     /// Run once the account table's witnessed snapshot has opened.
     static STORE_OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+    /// How many reads of this thread admitted their home's custody, observed their session and
+    /// opened the account table, in that order ([`stages_reached`]).
+    static STAGES: std::cell::Cell<[u64; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+/// How many accounts reads of this thread reached each stage: custody admitted, the session
+/// observed, the account table opened.
+pub(crate) fn stages_reached() -> [u64; 3] {
+    STAGES.with(std::cell::Cell::get)
+}
+fn reached(stage: usize) {
+    STAGES.with(|stages| {
+        let mut counts = stages.get();
+        counts[stage] += 1;
+        stages.set(counts);
+    });
 }
 pub(super) fn bootstrapped() {
+    reached(0);
     let hook = BOOTSTRAPPED.with(|hook| hook.borrow_mut().take());
     if let Some(mut hook) = hook {
         hook();
@@ -1376,12 +1486,14 @@ pub(crate) fn after_observed(hook: impl FnMut() + 'static) {
     OBSERVED.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 pub(super) fn observed() {
+    reached(1);
     let hook = OBSERVED.with(|hook| hook.borrow_mut().take());
     if let Some(mut hook) = hook {
         hook();
     }
 }
 pub(super) fn store_observed() {
+    reached(2);
     let hook = STORE_OBSERVED.with(|hook| hook.borrow_mut().take());
     if let Some(mut hook) = hook {
         hook();
@@ -1450,7 +1562,7 @@ fn account_observation_waits_on_custody_but_reads_beside_table_writers() {
         "held",
     )
     .unwrap();
-    let busy = accounts_until(paths, &config, 1000, &Instant::now, hang_detector());
+    let busy = accounts_until(paths, &config, 1000, &Instant::now, hang_detector()).0;
     assert_eq!(busy, control_busy(1000), "{busy:?}");
     drop(custody);
 

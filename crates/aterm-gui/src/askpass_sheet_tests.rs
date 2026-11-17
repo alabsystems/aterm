@@ -188,3 +188,61 @@ fn an_untouched_sheet_is_refused_only_once_nothing_else_holds_the_attempt() {
         "the sudo hears nothing"
     );
 }
+
+/// A sheet nobody answered (its deadline passed, its caller hung up, its request was withdrawn:
+/// all one wake from the waiting lane, which finds the sheet still standing) spaces its window's
+/// next sheet exactly as a Cancel does, and a second one, raised as that quiet time ran out and
+/// left to its own deadline, widens it.
+/// NEGATIVE CONTROLS: a withdrawal that names another request leaves the sheet and spaces
+/// nothing; the lane's late withdrawal of a sheet a person already cancelled counts nothing
+/// more; a session that closes under its sheet spaces the window, another session's close does
+/// nothing, and a closing window drops its sheet and spaces nothing.
+#[test]
+fn a_sheet_withdrawn_unanswered_spaces_its_window_as_a_cancel_does() {
+    use crate::askpass::{QUIET_BASE, QUIET_MAX};
+    let now = Instant::now();
+    let quiet = |app: &App| app.askpass_backoff.quiet_for(WINDOW.0, now);
+    let streak = |app: &App| app.askpass_backoff.carried(WINDOW.0, now).map(|(n, _)| n);
+
+    let (mut app, answer) = app_with_sheet(Duration::ZERO, false);
+    app.withdraw_askpass_sheet(1, now);
+    assert!(app.askpass_sheet.is_none());
+    assert_eq!(quiet(&app), Some(QUIET_BASE));
+    assert!(matches!(answer.try_recv(), Err(TryRecvError::Disconnected)));
+    let (reply, _answer) = channel();
+    let raised = now + QUIET_BASE;
+    let deadline = raised + crate::askpass::ASKPASS_DEADLINE;
+    app.askpass_sheet = Some(AskpassSheet::headless_for_test(WINDOW, 0, raised, reply).0);
+    app.withdraw_askpass_sheet(1, deadline);
+    assert_eq!(
+        app.askpass_backoff.quiet_for(WINDOW.0, deadline),
+        Some(QUIET_BASE * 2)
+    );
+    assert!(QUIET_BASE * 2 < QUIET_MAX);
+
+    let (mut app, _answer) = app_with_sheet(Duration::ZERO, false);
+    app.withdraw_askpass_sheet(2, now);
+    assert!(app.askpass_sheet.is_some());
+    assert_eq!(quiet(&app), None);
+
+    // A person's Cancel takes the sheet and counts it; the lane's wake then finds nothing.
+    let (mut app, answer) = app_with_sheet(Duration::ZERO, false);
+    app.answer_askpass_sheet(1, false);
+    assert!(matches!(answer.try_recv(), Ok(AskpassAnswer::Cancel)));
+    assert_eq!(streak(&app), Some(1));
+    app.withdraw_askpass_sheet(1, now);
+    assert_eq!(streak(&app), Some(1), "one sheet, counted once");
+
+    let (mut app, _answer) = app_with_sheet(Duration::ZERO, false);
+    app.withdraw_askpass_session(99, now);
+    assert!(app.askpass_sheet.is_some());
+    assert_eq!(quiet(&app), None);
+    app.withdraw_askpass_session(0, now);
+    assert!(app.askpass_sheet.is_none());
+    assert_eq!(quiet(&app), Some(QUIET_BASE));
+
+    let (mut app, _answer) = app_with_sheet(Duration::ZERO, false);
+    app.withdraw_askpass_window(WINDOW);
+    assert!(app.askpass_sheet.is_none());
+    assert_eq!(quiet(&app), None);
+}

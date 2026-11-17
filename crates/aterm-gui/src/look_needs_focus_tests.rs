@@ -149,7 +149,7 @@ fn an_unfocused_window_looks_at_nothing() {
         "the front tab still never wears the `•`"
     );
     app.note_done_seen_looking();
-    app.on_occlusion_changed(W, false);
+    app.on_occlusion_changed(W, false, std::time::Instant::now());
     app.switch_tab_in(W, 1);
     assert_eq!(
         marks(&app)[0],
@@ -283,7 +283,7 @@ fn a_controllers_focus_in_is_no_look() {
     end_after(&mut app, &sid, 45 * SEC);
     ctl_focus(&mut app, W, true);
     app.note_done_seen_looking();
-    app.on_occlusion_changed(W, false);
+    app.on_occlusion_changed(W, false, std::time::Instant::now());
     assert_eq!(
         end_seen(&app),
         "0",

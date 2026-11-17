@@ -384,6 +384,7 @@ impl Shared {
                 let _armed = jobs.arm();
                 self.fresh_by(fresh, fresh_ms == 0, Part::Jobs, false)
             }
+            View::Boot => self.fresh_by(fresh, fresh_ms == 0, Part::Whole, false),
             View::Cores | View::Report => {
                 let _armed = hardware.arm();
                 self.fresh_by(fresh, fresh_ms == 0, Part::Whole, true)

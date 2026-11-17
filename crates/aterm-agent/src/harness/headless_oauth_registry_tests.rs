@@ -148,6 +148,133 @@ fn looking_at_a_registry_mailbox_reveals_nothing() {
     });
 }
 
+/// The registry's mailbox `mb-fixture` as a Proton one: a route the window reads by itself,
+/// with the login's password, where the registry holds one.
+fn proton_mailbox() -> LabMailbox {
+    LabMailbox {
+        service: Some("proton".into()),
+        webmail: Some("https://mail.proton.me/u/0/inbox".into()),
+        held: vec![Part::Password],
+        ..mailbox()
+    }
+}
+
+/// On a fresh discovery, the value-free look answers exactly as the getter a sign-in reads
+/// would, on the configuration (by its route) and on its routed view (by its registry
+/// mailbox): none where the getter returns none, else whether the value holds a character
+/// other than whitespace. Returns that answer.
+fn look_matches_the_getter(home: &std::path::Path, target: Option<&str>) -> Option<bool> {
+    let looked = discover_mailbox_config_files(Some(home), None, None).unwrap();
+    let read = discover_mailbox_config_files(Some(home), None, None).unwrap();
+    let usable = |value: String| !value.chars().all(char::is_whitespace);
+    let by_route = looked.password_standing(target);
+    assert_eq!(by_route, read.password_for(target).map(usable));
+    let by_view = looked.routed_for(target).password_standing(target);
+    assert_eq!(
+        by_view,
+        read.routed_for(target).password_for(target).map(usable)
+    );
+    assert_eq!(by_route, by_view);
+    by_route
+}
+
+/// Whether the window reads a registry mailbox by itself, the question every accounts upkeep
+/// asks of every signed-in row, is answered with nothing revealed: the plan asks the registry
+/// what the password holds, once a discovery, and the answer follows the value a sign-in
+/// would be handed. Only the sign-in's own read of the password is a reveal, and what a
+/// discovery revealed answers its later looks.
+/// The look answers as the getter would for each of them ([`look_matches_the_getter`]).
+/// NEGATIVE CONTROLS: a password the registry lists and this Mac cannot open (withheld), one
+/// of whitespace alone and an empty one each read as no mailbox, so the judge is not the
+/// `held` list; with `native_mail::plan` reading `password_for` (before this change) the
+/// first `reveals() == 0` reads 1.
+#[test]
+fn judging_whether_the_window_reads_a_registry_mailbox_reveals_nothing() {
+    let home = bare_home();
+    let target = Some("ai1@example.test");
+    let reads = |cfg: &MailboxConfig| cfg.window_reads_with(target, &|_| GoogleGrant::Absent);
+    // Only the unix plan asks the registry: elsewhere the judge reads no native route.
+    let asked = |looks: usize| if cfg!(unix) { looks } else { 0 };
+    let password = (("mb-fixture", Part::Password), "fixture-login-pass"); // gitleaks:allow
+    alab_roster::with_mail(vec![proton_mailbox()], vec![password], || {
+        let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+        // Proton's own API is counted on macOS alone.
+        assert_eq!(reads(&cfg), cfg!(target_os = "macos"));
+        assert_eq!(reads(&cfg), cfg!(target_os = "macos"));
+        assert_eq!(alab_roster::reveals(), 0, "the judge reveals nothing");
+        assert_eq!(alab_roster::looks(), asked(1), "and asks once a discovery");
+        #[cfg(unix)]
+        assert!(matches!(
+            native_mail::plan(&cfg, target, |_| Ok(None::<()>)),
+            native_mail::Plan::Proton { login } if login == "owner@example.test"
+        ));
+        assert_eq!(
+            (alab_roster::reveals(), alab_roster::looks()),
+            (0, asked(1))
+        );
+
+        // The next upkeep pass makes its own discovery: one more look, still no reveal.
+        let next = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+        assert_eq!(reads(&next), cfg!(target_os = "macos"));
+        assert_eq!(
+            (alab_roster::reveals(), alab_roster::looks()),
+            (0, asked(2))
+        );
+
+        // The sign-in's read is the one reveal, and it answers the discovery's later looks.
+        let signing_in = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+        assert_eq!(
+            signing_in
+                .routed_for(target)
+                .password_for(target)
+                .as_deref(),
+            Some("fixture-login-pass")
+        );
+        assert_eq!(reads(&signing_in), cfg!(target_os = "macos"));
+        assert_eq!(
+            (alab_roster::reveals(), alab_roster::looks()),
+            (1, asked(2))
+        );
+        assert_eq!(look_matches_the_getter(home.path(), target), Some(true));
+    });
+    for (what, secrets, standing) in [
+        ("withheld", Vec::new(), None),
+        (
+            "blank",
+            vec![(("mb-fixture", Part::Password), " \t ")],
+            Some(false),
+        ),
+        ("empty", vec![(("mb-fixture", Part::Password), "")], None),
+    ] {
+        alab_roster::with_mail(vec![proton_mailbox()], secrets, || {
+            let cfg = discover_mailbox_config_files(Some(home.path()), None, None).unwrap();
+            assert!(
+                cfg.holds_for(Part::Password, target),
+                "{what}: listed as held"
+            );
+            assert!(!reads(&cfg), "{what}");
+            #[cfg(unix)]
+            assert!(
+                matches!(
+                    native_mail::plan(&cfg, target, |_| Ok(None::<()>)),
+                    native_mail::Plan::Defer
+                ),
+                "{what}"
+            );
+            assert_eq!(
+                (alab_roster::reveals(), alab_roster::looks()),
+                (0, asked(1)),
+                "{what}"
+            );
+            assert_eq!(
+                look_matches_the_getter(home.path(), target),
+                standing,
+                "{what}"
+            );
+        });
+    }
+}
+
 /// The registry decides before a file: an `ai-mailbox.toml` entry for the same login fills
 /// only what the registry leaves empty, and an entry for another login stays a fallback for
 /// the addresses only it receives (until B13).

@@ -8,8 +8,8 @@ use std::fmt::Write as _;
 use aterm_codec::pct;
 
 use super::{
-    Claim, ClosedNode, Fold, Held, MAX_MAIL_WAITING, MAX_NEEDS, MAX_TRACKED, MailLink, MailWaiting,
-    Need, NodeFields, OpenNode, Phase, SessionState, Totals,
+    Claim, ClosedNode, DescIdent, Fold, Held, MAX_MAIL_WAITING, MAX_NEEDS, MAX_TRACKED, MailLink,
+    MailWaiting, Need, NodeFields, OpenNode, Phase, SessionState, Totals,
 };
 use crate::field::{Key, MAX_FIELDS, Tier};
 use crate::line::{decode_val, push_val};
@@ -479,16 +479,29 @@ impl Fold {
         out
     }
 
-    /// The fold a [`Fold::snapshot`] wrote.
+    /// The fold a [`Fold::snapshot`] wrote, read for a session nobody has said who it is
+    /// ([`Fold::from_snapshot_as`] with no identity).
+    /// # Errors
+    /// As [`Fold::from_snapshot_as`].
+    pub fn from_snapshot(lines: &[&str]) -> Result<Fold, SnapError> {
+        Fold::from_snapshot_as(lines, DescIdent::default())
+    }
+
+    /// THE FOLD A [`Fold::snapshot`] WROTE, read as the session `ident` names
+    /// ([`Fold::set_desc_ident`]): no snapshot line holds who the session is, so the reader says
+    /// it, and the carried claims are ranked, settled and keyed for the card under it as they are
+    /// read. A host that says the same identity again after the read moves nothing.
     /// # Errors
     /// A [`SnapError`] for anything this build does not read; the whole snapshot is refused, never a part.
-    pub fn from_snapshot(lines: &[&str]) -> Result<Fold, SnapError> {
+    pub fn from_snapshot_as(lines: &[&str], ident: DescIdent) -> Result<Fold, SnapError> {
         let mut it = lines.iter();
         let head = it.next().ok_or(SnapError::Version)?;
         if !head.starts_with("fold v=1 ") {
             return Err(SnapError::Version);
         }
         let mut fold = Fold::default();
+        // An empty store: this says who the session is and moves neither revision.
+        fold.set_desc_ident(ident.own, ident.creator);
         let st: &mut SessionState = &mut fold.st;
         st.as_of = num(head, 2, "as_of")?;
         st.ep = num(head, 2, "ep")?;
@@ -622,7 +635,7 @@ impl Fold {
                     fold.st.label_trusted = trusted;
                     fold.st.label_proven = proven;
                 }
-                "desc" | "desc-sub" | "desc-left" => {
+                "desc" | "desc-sub" | "desc-line" | "desc-left" => {
                     fold.st.desc.read_line(tag, line, &fold.tracked)?;
                 }
                 _ => return Err(SnapError::Line),
@@ -636,10 +649,11 @@ impl Fold {
         let closed_turns = [t.done, t.asked, t.walled, t.interrupted, t.errors, t.other]
             .iter()
             .fold(0u32, |n, b| n.saturating_add(*b));
-        fold.st.desc.finish_read(closed_turns);
+        fold.st.desc.finish_read(closed_turns, fold.st.last_t);
         fold.links.sort_by_key(|(n, _)| *n);
         fold.links.dedup_by_key(|(n, _)| *n);
         fold.reproject();
+        fold.desc_card_read();
         Ok(fold)
     }
 

@@ -2,9 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! Whether setup's administrator step owes an account's home folder its Spotlight scope, read
-//! with no prompt: the one reading `aterm init` (`aterm_machines::root_steps::owed`) and System
-//! State's window share, and the receipt reading the root step itself goes by
-//! (`aterm_machines::init_spotlight::Scope`).
+//! with no prompt: the work `aterm init` names ([`owed`], `aterm_machines::root_steps::owed`),
+//! the automatic ask it and System State's window share ([`automatic_owed`]), and the receipt
+//! reading the root step itself goes by (`aterm_machines::init_spotlight::Scope`).
 //!
 //! The decision is here, over a port ([`Reads`]): the window does not link `aterm-machines`
 //! outside its tests, so a reading kept there would be one the window had to write again.
@@ -22,10 +22,12 @@ use std::path::{Path, PathBuf};
 pub const RECEIPT: &str = "/Library/Application Support/aterm/spotlight-scope";
 
 /// The folders a failed apply could not exclude, in a root-owned file beside the receipt.
-/// While it names every folder an account's reading finds indexed, that account is not owed
-/// the step ([`owed`]): a Mac whose configuration cannot be edited is not asked for its
-/// password again and again. A new folder in the home is owed again, any root transaction
-/// that runs for another step tries once more, and an apply that succeeds removes the file.
+/// Like the receipt, a line of it under a home says setup's password already scoped that home
+/// once, so no automatic ask is owed for it again ([`automatic_owed`]): a Mac whose
+/// configuration cannot be edited is not asked for its password again and again. A person's own
+/// setup has only a folder it does not name left to exclude ([`owed`]), any root transaction
+/// that runs setup's root steps for another of them tries every folder once more, and an apply
+/// that succeeds removes the file.
 pub const REFUSED: &str = "/Library/Application Support/aterm/spotlight-scope.refused";
 
 /// The most a receipt is read for, in bytes.
@@ -204,23 +206,18 @@ pub fn state(reads: &dyn Reads, home: &Path) -> Result<State, String> {
     })
 }
 
-/// Whether setup's administrator step owes this account's home folder its Spotlight scope, as
-/// the account reads it with no prompt. Only the account at the console is owed it, since that
-/// is the home the root step scopes. A state that cannot be read is not owed: no password is
-/// asked for want of a reading. Nor are folders an apply already failed to exclude
-/// ([`REFUSED`]).
+/// Whether a folder of this account's home is still Spotlight's to index though setup excludes
+/// it, as the account reads it with no prompt: a folder indexed that no receipt names, unless an
+/// apply already failed to exclude every such folder ([`REFUSED`]). It is work setup has, not a
+/// password owed: a folder made since setup's password scoped the home (a checkout, a clone, an
+/// agent's worktree, made all day long) is excluded by the next root transaction that runs
+/// setup's root steps for another of them, by the person's own press of Finish setup, or by
+/// their own typed `aterm init` that applies or plans. What asks by itself is
+/// [`automatic_owed`]. Only the account at the console is read, since that is the home the root
+/// step scopes, and a state that cannot be read is not owed.
 #[must_use]
 pub fn owed(reads: &dyn Reads) -> bool {
-    if !reads.macos() || reads.euid() == 0 {
-        return false;
-    }
-    if !reads
-        .entry(Path::new(CONSOLE))
-        .is_ok_and(|console| console.uid == reads.euid())
-    {
-        return false;
-    }
-    let Some(home) = reads.home() else {
+    let Some(home) = console_home(reads) else {
         return false;
     };
     match state(reads, &home) {
@@ -231,14 +228,34 @@ pub fn owed(reads: &dyn Reads) -> bool {
     }
 }
 
-/// Whether Spotlight needs its first setup. Extending an existing receipt is explicit work:
-/// a new checkout must not reopen the administrator prompt at an update or restart.
+/// Whether setup's automatic ask owes this account's home folder its Spotlight scope: only
+/// while setup's password has never scoped this home, a folder of it still indexed and neither
+/// [`RECEIPT`] nor [`REFUSED`] naming any folder in it. Once a password scoped the home, a
+/// folder made in it since asks no password again by itself ([`owed`] says who excludes it):
+/// asking again for each new folder is a nag, at an update or a restart as at any other time,
+/// and the one password is asked early and batched. The home is read by itself, so another
+/// account's receipt lines do not scope this one, and a home whose every folder an apply failed
+/// to exclude is not asked for again when a folder is made in it. A state that cannot be read
+/// is not owed (a receipt that is not root's own among them): no password is asked for want of
+/// a reading.
 #[must_use]
 pub fn automatic_owed(reads: &dyn Reads) -> bool {
-    owed(reads) && listed(reads, RECEIPT).is_ok_and(|receipt| receipt.is_empty())
+    let Some(home) = console_home(reads) else {
+        return false;
+    };
+    if !matches!(state(reads, &home), Ok(State::Indexed(_))) {
+        return false;
+    }
+    // A receipt that cannot be read made `state` an error above; a refusal that cannot be read
+    // (not root's own file) says nothing of this home.
+    let mut noted = listed(reads, RECEIPT).unwrap_or_default();
+    noted.extend(listed(reads, REFUSED).unwrap_or_default());
+    !noted
+        .iter()
+        .any(|path| path.parent() == Some(home.as_path()))
 }
 
-/// The first-setup decision on this Mac, with no prompt.
+/// [`automatic_owed`] for this account on this Mac ([`Live`]): `false` off macOS.
 #[must_use]
 pub fn automatic_owed_here() -> bool {
     #[cfg(target_os = "macos")]
@@ -249,6 +266,19 @@ pub fn automatic_owed_here() -> bool {
     {
         false
     }
+}
+
+/// The home of the ordinary account this process runs as, while that account is the one at the
+/// console on macOS: the home the root step scopes.
+fn console_home(reads: &dyn Reads) -> Option<PathBuf> {
+    if !reads.macos() || reads.euid() == 0 {
+        return None;
+    }
+    reads
+        .entry(Path::new(CONSOLE))
+        .is_ok_and(|console| console.uid == reads.euid())
+        .then(|| reads.home())
+        .flatten()
 }
 
 /// How long [`Live`] waits for `mdutil -s` before the state counts as unread.
@@ -332,19 +362,6 @@ fn read_owned(path: &Path, owner: u32, max: usize) -> io::Result<Vec<u8>> {
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(bytes)
-}
-
-/// [`owed`] for this account on this Mac ([`Live`]): `false` off macOS.
-#[must_use]
-pub fn owed_here() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        owed(&Live)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
 }
 
 #[cfg(test)]

@@ -45,6 +45,7 @@ fn a_transcript_only_limit_exposes_unknown_recovery_without_a_retry_promise() {
     footer.usage.get_or_insert_with(Default::default).wall = Some(Wall {
         label: "5h",
         resets: "3pm".into(),
+        resets_at: 0,
     });
     let mut progress = footer.account_progress_view().unwrap().into_owned();
     progress.details.push(format!(

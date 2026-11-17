@@ -2565,13 +2565,26 @@ pub(crate) fn strip_col_for_pixel(
     pad_top: usize,
     head: usize,
 ) -> Option<u16> {
-    let gx = (x as usize).saturating_sub(pad);
-    let gy = (y as usize).saturating_sub(pad_top + head);
-    let strip_px = strip_rows as usize * ch.max(1);
-    if gy >= strip_px {
+    if !strip_band_holds_row(y, ch, strip_rows, pad_top, head) {
         return None;
     }
+    let gx = (x as usize).saturating_sub(pad);
     Some((gx / cw.max(1)).min(cols.saturating_sub(1) as usize) as u16)
+}
+
+/// Whether frame pixel row `y` lies in the strip's band: the top pad and head above its
+/// `strip_rows` rows of `ch` px, and those rows. [`strip_col_for_pixel`] reads a strip column
+/// only there, and a press there on the side inset beside the strip is a press on the header's
+/// bare band (`App::side_inset_band_at`).
+pub(crate) fn strip_band_holds_row(
+    y: f64,
+    ch: usize,
+    strip_rows: u16,
+    pad_top: usize,
+    head: usize,
+) -> bool {
+    let gy = (y as usize).saturating_sub(pad_top + head);
+    gy < strip_rows as usize * ch.max(1)
 }
 
 /// Selection-drag autoscroll.

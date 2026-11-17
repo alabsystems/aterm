@@ -245,74 +245,104 @@ fn state_goes_by_the_receipt() {
     assert_eq!(state(&mac, home), Ok(State::Disabled));
 }
 
-/// The account at the console is owed the step while a folder of its home is on no receipt.
-/// NEGATIVE CONTROLS: a receipt naming every folder owes nothing; nor does one that is not
-/// root's own file, an unread indexing state, a volume that is not indexed, another account at
-/// the console, no console owner, no home, root, or a system that is not macOS.
+/// The account at the console is owed the automatic ask while a folder of its home is indexed
+/// and setup's password never scoped that home, and has work left ([`owed`]) while a folder is
+/// on no receipt.
+/// NEGATIVE CONTROLS: a receipt naming any folder of the home owes no automatic ask, though the
+/// folders it does not name are still work; a receipt that is not root's own file, an unread
+/// indexing state, a volume that is not indexed, another account at the console, no console
+/// owner, no home, root, and a system that is not macOS owe neither.
 #[test]
-fn only_the_console_account_with_an_unlisted_folder_is_owed() {
+fn only_the_console_account_whose_home_was_never_scoped_is_owed() {
     let mac = Mac::alice();
-    assert!(owed(&mac));
+    assert!(automatic_owed(&mac) && owed(&mac));
     mac.file(RECEIPT, 0, b"/Users//alice/Developer\n");
+    assert!(!automatic_owed(&mac));
     assert!(owed(&mac));
     mac.file(RECEIPT, 0, FULL);
-    assert!(!owed(&mac));
+    assert!(!automatic_owed(&mac) && !owed(&mac));
 
     let foreign = Mac::alice();
     foreign.file(RECEIPT, 501, b"");
-    assert!(!owed(&foreign));
+    assert!(!automatic_owed(&foreign) && !owed(&foreign));
 
     let unread = Mac::alice();
     unread.prints(Ok("Spotlight server is disabled."));
-    assert!(!owed(&unread));
+    assert!(!automatic_owed(&unread) && !owed(&unread));
     unread.prints(Err("Spotlight status: timed out"));
-    assert!(!owed(&unread));
+    assert!(!automatic_owed(&unread) && !owed(&unread));
 
     let disabled = Mac::alice();
     disabled.prints(Ok("Indexing disabled."));
-    assert!(!owed(&disabled));
+    assert!(!automatic_owed(&disabled) && !owed(&disabled));
 
     let elsewhere = Mac::alice();
     elsewhere.put(CONSOLE, file_of(502));
-    assert!(!owed(&elsewhere));
+    assert!(!automatic_owed(&elsewhere) && !owed(&elsewhere));
     elsewhere.entries.borrow_mut().remove(Path::new(CONSOLE));
-    assert!(!owed(&elsewhere));
+    assert!(!automatic_owed(&elsewhere) && !owed(&elsewhere));
 
     let homeless = Mac {
         home: None,
         ..Mac::alice()
     };
-    assert!(!owed(&homeless));
+    assert!(!automatic_owed(&homeless) && !owed(&homeless));
 
     let root = Mac {
         euid: 0,
         ..Mac::alice()
     };
     root.put(CONSOLE, file_of(0));
-    assert!(!owed(&root));
+    assert!(!automatic_owed(&root) && !owed(&root));
 
     let linux = Mac {
         macos: false,
         ..Mac::alice()
     };
-    assert!(!owed(&linux));
+    assert!(!automatic_owed(&linux) && !owed(&linux));
 }
 
-/// Folders an apply already failed to exclude are not owed again.
-/// NEGATIVE CONTROLS: a refusal naming only some of the indexed folders is still owed, as is
-/// one that is not root's own file, and a new folder in the home is owed again.
+/// A folder made in a home setup's password already scoped asks no password by itself: the
+/// person's own setup still has it to exclude ([`owed`]).
+/// NEGATIVE CONTROLS: a receipt naming only another account's folders leaves this home asked
+/// for; a home with nothing left to exclude is work for nobody.
 #[test]
-fn a_refusal_naming_every_indexed_folder_is_not_owed() {
+fn a_new_folder_in_a_scoped_home_is_work_but_asks_no_password() {
+    let mac = Mac::alice();
+    mac.file(RECEIPT, 0, FULL);
+    assert!(!automatic_owed(&mac));
+    assert!(!owed(&mac));
+    mac.put(&format!("{ALICE}/codex-worktree"), FOLDER);
+    assert!(!automatic_owed(&mac));
+    assert!(owed(&mac));
+
+    let other = Mac::alice();
+    other.file(RECEIPT, 0, b"/Users//bob/Developer\n/Users//bob/Downloads\n");
+    assert!(automatic_owed(&other));
+    assert!(owed(&other));
+}
+
+/// Folders an apply already failed to exclude are owed neither by the automatic ask nor, while
+/// the refusal names every indexed folder, by the person's own setup.
+/// NEGATIVE CONTROLS: a refusal naming only some of the indexed folders is still work; one
+/// that is not root's own file says nothing, so the never-scoped home is asked for; a new
+/// folder in the home is work again but asks no password by itself.
+#[test]
+fn a_refusal_scopes_the_home_once() {
     let mac = Mac::alice();
     mac.file(REFUSED, 0, b"/Users//alice/Developer\n");
+    assert!(!automatic_owed(&mac));
     assert!(owed(&mac));
     mac.file(REFUSED, 0, FULL);
+    assert!(!automatic_owed(&mac));
     assert!(!owed(&mac));
     mac.put(&format!("{ALICE}/Scratch"), FOLDER);
+    assert!(!automatic_owed(&mac));
     assert!(owed(&mac));
 
     let forged = Mac::alice();
     forged.file(REFUSED, 501, FULL);
+    assert!(automatic_owed(&forged));
     assert!(owed(&forged));
 }
 

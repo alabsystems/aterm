@@ -9,17 +9,23 @@
 //! fetched envelope against the pinned signer and choose the highest **verified** `seq`. An
 //! `_alab._tcp` advert is a hint the same way: whoever dials it still proves who answers.
 
-use crate::server::VaultTxt;
 use crate::transport::{self, Source};
+use crate::vault_txt::VaultTxt;
+#[cfg(unix)]
 use crate::wake::{Bell, Wake};
 #[cfg(all(target_os = "macos", not(test)))]
 use aterm_uds::lan::{self, LanError};
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 use aterm_uds::lan::{Event, Instance};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 /// Cap on candidate URLs probed in one pass.
 pub const MAX_CANDIDATES: usize = 16;
@@ -43,7 +49,7 @@ pub struct DiscoveredVault {
 
 /// Whether `instance` (as a browse heard it) is of `service`: DNS-SD names the type with its
 /// trailing dot (`_alab._tcp.`).
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn of_service(instance: &Instance, service: &str) -> bool {
     instance
         .service
@@ -55,7 +61,7 @@ fn of_service(instance: &Instance, service: &str) -> bool {
 /// The instances of `service` a browse's `events` leave heard, in first-seen order: each
 /// [`Event::Added`] on an interface, until the [`Event::Removed`] of the last interface it was
 /// heard on.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn heard_instances(events: impl IntoIterator<Item = Event>, service: &str) -> Vec<String> {
     let mut instances: Vec<(String, Vec<u32>)> = Vec::new();
     for event in events {
@@ -74,14 +80,9 @@ fn heard_instances(events: impl IntoIterator<Item = Event>, service: &str) -> Ve
         .collect()
 }
 
-/// The environment variable that points [`browse_members`] at a lab's own members service in
-/// place of [`MEMBER_SERVICE`]: `lab mac nux --scenario vault-phrase` sets it on its joiner, whose
-/// guest hears the members the lab Mac's LAN advertises and must never ask them. Which Bonjour
-/// type a Mac browses is no credential (whoever answers still proves who it is), but this build
-/// takes only a [`lab_service`] here and fails the browse on any other value
-/// ([`member_service`]), so a value it cannot take never falls back to the real members. No
-/// install sets it.
-pub const LAB_MEMBER_SERVICE_ENV: &str = "ATERM_LAB_MEMBER_SERVICE";
+/// The members browse's lab knob: set, [`browse_members`] browses the lab service it names and
+/// no other ([`member_service`]).
+pub use crate::making::LAB_MEMBER_SERVICE_ENV;
 
 /// Whether `service` is a lab's members service, `_alab-lab-<1 to 6 lowercase letters or
 /// digits>._tcp`: a type no ALab member advertises, whose name (`alab-lab-` and the rest) keeps
@@ -118,27 +119,22 @@ pub fn member_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> 
     }
 }
 
-/// The environment variable that points the client's vault look at a lab's own vault service in
-/// place of [`crate::server::SERVICE_TYPE`]: every vault browse the look runs ([`browse_alab`],
-/// [`browse_names`], the subscriber's standing [`Watch::start_look`]) browses the type it names,
-/// and the look asks no compiled-in [`crate::ALAB_DEFAULT_URLS`] ([`look_defaults`]), so it names
-/// only what its lab browse heard. This changes a browse's target, without starting a browse
-/// or admitting an automatic default-vault join: a lab identity is still refused before that
-/// join looks (A12). As with [`LAB_MEMBER_SERVICE_ENV`], this build takes only a
-/// [`lab_service`] here ([`vault_service`]), so a value it cannot take browses for no vault, and
-/// the variable set marks the process a lab's ([`crate::Making`]). A vault server's own browse
-/// ([`Watch::start`]) and advert keep `_alab-vault._tcp` whatever it says. No install sets it.
-pub const LAB_VAULT_SERVICE_ENV: &str = "ATERM_LAB_VAULT_SERVICE";
+/// The vault look's lab knob: set, every vault browse the look runs ([`browse_alab`],
+/// [`browse_names`], the subscriber's standing [`Watch::start_look`]) browses the lab service it
+/// names ([`vault_service`]), and the look asks no compiled-in [`crate::ALAB_DEFAULT_URLS`]
+/// ([`look_defaults`]). A vault server's own browse ([`Watch::start`]) and advert keep
+/// `_alab-vault._tcp` whatever it says.
+pub use crate::making::LAB_VAULT_SERVICE_ENV;
 
 /// The type a vault browse browses, given [`LAB_VAULT_SERVICE_ENV`]'s value (`None`: unset):
-/// [`crate::server::SERVICE_TYPE`], or the [`lab_service`] the variable names.
+/// [`crate::vault_txt::SERVICE_TYPE`], or the [`lab_service`] the variable names.
 ///
 /// # Errors
 /// The variable is set to anything but a lab service (`_alab-vault._tcp` itself, an empty value
 /// and one that is no UTF-8 included): the browse then looks for no vault, never for the real one.
 pub fn vault_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> {
     let Some(value) = value else {
-        return Ok(crate::server::SERVICE_TYPE.to_owned());
+        return Ok(crate::vault_txt::SERVICE_TYPE.to_owned());
     };
     match value.to_str().filter(|v| lab_service(v)) {
         Some(lab) => Ok(lab.to_owned()),
@@ -150,6 +146,7 @@ pub fn vault_service(value: Option<&std::ffi::OsStr>) -> crate::Result<String> {
 }
 
 /// [`vault_service`] of this process's [`LAB_VAULT_SERVICE_ENV`].
+#[cfg(unix)]
 fn vault_type() -> crate::Result<String> {
     vault_service(std::env::var_os(LAB_VAULT_SERVICE_ENV).as_deref())
 }
@@ -174,19 +171,19 @@ pub(crate) fn look_default_urls() -> &'static [&'static str] {
 }
 
 /// The `aterm.log` line for the look hearing vault instance `instance` of `service`.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn vault_heard_line(service: &str, instance: &str) -> String {
     format!("vault look: heard {instance} on {service}")
 }
 
 /// The most distinct vault instances one process logs hearing ([`note_vault_heard`]); mDNS is
 /// anyone's to write on the LAN, so what it logs is bounded.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 const MOST_LOGGED: usize = 64;
 
 /// Whether `instance` of `service` is new to `logged` (then added to it, while it holds fewer
 /// than [`MOST_LOGGED`]): each instance is logged once per process, not at every look.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn first_heard(logged: &mut Vec<(String, String)>, service: &str, instance: &str) -> bool {
     if logged.len() >= MOST_LOGGED
         || logged
@@ -201,7 +198,7 @@ fn first_heard(logged: &mut Vec<(String, String)>, service: &str, instance: &str
 
 /// Log to `aterm.log` ([`vault_heard_line`]) each vault instance of `service` in `heard` this
 /// process has not logged before.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn note_vault_heard<'a>(service: &str, heard: impl IntoIterator<Item = &'a str>) {
     static LOGGED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
     let mut logged = LOGGED.lock().unwrap_or_else(PoisonError::into_inner);
@@ -213,6 +210,7 @@ fn note_vault_heard<'a>(service: &str, heard: impl IntoIterator<Item = &'a str>)
 }
 /// Apply one browse row to `instances` (each name with the interfaces it is heard on, in
 /// first-seen order): whether the row added a name, or an interface to one.
+#[cfg(unix)]
 fn apply_row(
     instances: &mut Vec<(String, Vec<u32>)>,
     add: bool,
@@ -248,7 +246,7 @@ pub const MEMBER_SERVICE: &str = "_alab._tcp";
 /// The host, lowercase without its trailing dot, and the port a service resolve's `event`
 /// answers (`m3.local.`, `7484`). `None` for another event, port 0, or a host of other
 /// characters than a DNS name's.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn reached(event: &Event) -> Option<(String, u16)> {
     let Event::Resolved { host, port, .. } = event else {
         return None;
@@ -258,7 +256,7 @@ fn reached(event: &Event) -> Option<(String, u16)> {
 }
 
 /// A resolve's TXT strings that are UTF-8: one that is not names no key aterm reads.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn txt_strings(event: &Event) -> Vec<&str> {
     match event {
         Event::Resolved { txt, .. } => txt
@@ -270,7 +268,7 @@ fn txt_strings(event: &Event) -> Vec<&str> {
 }
 
 /// The `host:port` a member's resolve answers ([`reached`]).
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn member_target(event: &Event) -> Option<String> {
     reached(event).map(|(host, port)| format!("{host}:{port}"))
 }
@@ -278,7 +276,7 @@ fn member_target(event: &Event) -> Option<String> {
 /// The vault `vault` a `_alab-vault._tcp` resolve answers: its URL, and the [`VaultTxt`] hint its
 /// TXT carries. `None` for no usable target, or a TXT naming another path than `/v1` or another
 /// vault (each key case-insensitive, its first string winning, as [`VaultTxt::from_txt`] reads).
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn resolved_vault(event: &Event, vault: &str) -> Option<DiscoveredVault> {
     let (host, port) = reached(event)?;
     let strings = txt_strings(event);
@@ -305,7 +303,7 @@ fn resolved_vault(event: &Event, vault: &str) -> Option<DiscoveredVault> {
 
 /// `instance`'s advert as its resolve's `event` answers it: where it can be reached and its TXT
 /// strings as `key=value` pairs, a string with no `=` or an empty key left out.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn advert_of(instance: &str, event: &Event) -> Option<Advert> {
     let (host, port) = reached(event)?;
     let txt = txt_strings(event)
@@ -551,7 +549,7 @@ pub(crate) fn same_endpoint(a: &str, b: &str) -> bool {
     transport::describe(a).eq_ignore_ascii_case(&transport::describe(b))
 }
 
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn plain_host(host: &str) -> bool {
     !host.is_empty()
         && !host.starts_with('-')
@@ -698,7 +696,7 @@ pub(crate) fn resolve_all(_instances: &[String], _budget: Duration) -> Vec<Disco
 /// Resolve each of `instances` within `budget` without collapsing equal-URL instances: two
 /// holders after a heal both resolve `alab-secrets.local:7484`, distinguished by `label=` in
 /// their TXT (`DESIGN-fluid-swarm` §4.1 F7), and a vault server's round gates its pulls on each
-/// instance's TXT, so one instance must not replace another's TXT ([`crate::server::VaultTxt`]:
+/// instance's TXT, so one instance must not replace another's TXT ([`crate::vault_txt::VaultTxt`]:
 /// each instance counts in what its endpoints are pulled for). An exact repeat is kept once.
 #[cfg(all(target_os = "macos", not(test)))]
 fn resolve_instances(instances: &[String], budget: Duration) -> Vec<DiscoveredVault> {
@@ -713,7 +711,7 @@ fn resolve_instances(instances: &[String], budget: Duration) -> Vec<DiscoveredVa
     out
 }
 
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 fn resolve_instances(_instances: &[String], _budget: Duration) -> Vec<DiscoveredVault> {
     Vec::new()
 }
@@ -764,7 +762,7 @@ fn resolve_adverts(service: &str, instances: &[String], budget: Duration) -> Vec
 }
 
 /// A test build, or one off macOS, resolves nothing.
-#[cfg(any(test, not(target_os = "macos")))]
+#[cfg(all(unix, any(test, not(target_os = "macos"))))]
 fn resolve_adverts(_service: &str, _instances: &[String], _budget: Duration) -> Vec<Advert> {
     Vec::new()
 }
@@ -772,10 +770,12 @@ fn resolve_adverts(_service: &str, _instances: &[String], _budget: Duration) -> 
 /// How long a browse's first events are its baseline on a watch of a service other than the
 /// vault's (the node job's `_alab._tcp`): what it hears then was there before this process
 /// looked, so it is held but rings nothing.
+#[cfg(unix)]
 const SETTLE: Duration = Duration::from_secs(30);
 
 /// The most instances a watch of a service other than the vault's holds: one more is neither
 /// held nor rung for (mDNS is anyone's to write on the LAN).
+#[cfg(unix)]
 const MOST_HELD: usize = 256;
 
 /// How long every member but this process's own must go unheard, on a watch of a service other
@@ -786,13 +786,15 @@ const MOST_HELD: usize = 256;
 /// minute: counted a member at a time, the browse ran the window's converge pass 1,138 times in
 /// two days, at its move source's rest floor, where route changes ran it 52 times (0.155.0,
 /// 2026-11-03 to 05).
+#[cfg(unix)]
 pub const SILENCE: Duration = Duration::from_secs(2 * 60);
 
 /// A watch of `service`'s settle window and the most instances it holds. The vault's watch rings
 /// from a browse's first event and holds every instance it hears, as it always has; a watch
 /// of another service takes [`SETTLE`] and [`MOST_HELD`].
+#[cfg(unix)]
 fn holding(service: &str) -> (Duration, usize) {
-    if service == crate::server::SERVICE_TYPE {
+    if service == crate::vault_txt::SERVICE_TYPE {
         (Duration::ZERO, usize::MAX)
     } else {
         (SETTLE, MOST_HELD)
@@ -811,10 +813,12 @@ fn holding(service: &str) -> (Duration, usize) {
 /// unheard for longer than [`SILENCE`], or before it held any: this Mac back on a LAN, not a
 /// peer's comings and goings. Adds of this process's own instances ring nothing, and nor do those
 /// a browse hears within the watch's settle window. Dropping it ends the browse.
+#[cfg(unix)]
 pub struct Watch {
     watched: Arc<Watched>,
 }
 
+#[cfg(unix)]
 impl std::fmt::Debug for Watch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Watch")
@@ -825,13 +829,14 @@ impl std::fmt::Debug for Watch {
 }
 
 /// A test's resolver for [`Watch::adverts`] ([`Watch::idle_resolving`]).
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 type Resolver = Box<dyn Fn(&str) -> Option<Advert> + Send + Sync>;
 
 /// What a test's watch resolves its vault servers' names through ([`Watch::idle_resolving_vaults`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type VaultResolver = Box<dyn Fn(&[String], Duration) -> Vec<DiscoveredVault> + Send + Sync>;
 
+#[cfg(unix)]
 struct Watched {
     /// The service watched (`_alab-vault._tcp`, `_alab._tcp`).
     service: &'static str,
@@ -874,12 +879,13 @@ struct Watched {
     resolve_vaults: Option<VaultResolver>,
 }
 
+#[cfg(unix)]
 impl Watch {
     /// Start a standing `_alab-vault._tcp` browse that rings `bell` ([`Watch::start_for`]): a
     /// vault server's, which [`LAB_VAULT_SERVICE_ENV`] does not move.
     #[must_use]
     pub fn start(bell: &Arc<Bell>, own: &[&str]) -> Watch {
-        Watch::start_for(crate::server::SERVICE_TYPE, bell, own)
+        Watch::start_for(crate::vault_txt::SERVICE_TYPE, bell, own)
     }
 
     /// Start the client look's standing vault browse that rings `bell`: [`Watch::start`], whose
@@ -888,7 +894,8 @@ impl Watch {
     /// names no lab service.
     #[must_use]
     pub fn start_look(bell: &Arc<Bell>, own: &[&str]) -> Watch {
-        let mut watched = Watched::new(crate::server::SERVICE_TYPE, vault_type().ok(), bell, own);
+        let mut watched =
+            Watched::new(crate::vault_txt::SERVICE_TYPE, vault_type().ok(), bell, own);
         watched.look = true;
         Watch::running(watched)
     }
@@ -929,7 +936,7 @@ impl Watch {
     /// An `_alab-vault._tcp` watch that runs no browse ([`Watch::idle_for`]).
     #[must_use]
     pub fn idle(bell: &Arc<Bell>, own: &[&str]) -> Watch {
-        Watch::idle_for(crate::server::SERVICE_TYPE, bell, own)
+        Watch::idle_for(crate::vault_txt::SERVICE_TYPE, bell, own)
     }
 
     /// A watch of `service` that runs no browse: what it hears reaches it only through
@@ -967,7 +974,7 @@ impl Watch {
         own: &[&str],
         resolve: impl Fn(&[String], Duration) -> Vec<DiscoveredVault> + Send + Sync + 'static,
     ) -> Watch {
-        let service = crate::server::SERVICE_TYPE;
+        let service = crate::vault_txt::SERVICE_TYPE;
         let mut watched = Watched::new(service, Some(service.to_owned()), bell, own);
         watched.resolve_vaults = Some(Box::new(resolve));
         Watch {
@@ -1171,6 +1178,7 @@ impl Watch {
 /// Rotate only as many ALab instances as fit beside the valid, distinct defaults in the final
 /// candidate list. Resolving a full batch first would discard its tail in [`candidate_urls`]
 /// on every pass for some fleet sizes, even though the name-selection cursor rotates.
+#[cfg(unix)]
 fn alab_candidate_names(names: Vec<String>, from: &AtomicUsize) -> Vec<String> {
     let defaults = candidate_urls(look_default_urls(), &[], crate::ALAB_VAULT);
     rotated_names(names, from, MAX_CANDIDATES - defaults.len())
@@ -1178,6 +1186,7 @@ fn alab_candidate_names(names: Vec<String>, from: &AtomicUsize) -> Vec<String> {
 
 /// Stabilize a name snapshot before advancing a cursor kept across browse restarts.
 /// The parser and watch still retain event order for consumers that need it.
+#[cfg(unix)]
 fn rotated_names(mut names: Vec<String>, from: &AtomicUsize, limit: usize) -> Vec<String> {
     names.sort_unstable();
     rotated(names, from, limit)
@@ -1195,6 +1204,7 @@ pub(crate) fn rotated<T>(mut names: Vec<T>, from: &AtomicUsize, limit: usize) ->
     names
 }
 
+#[cfg(unix)]
 impl Watched {
     /// A watch of `service` whose browse browses `browsed` (none where `None`).
     fn new(
@@ -1234,7 +1244,7 @@ impl Watched {
 
     /// Whether this is the vault's `_alab-vault._tcp` watch.
     fn is_vault(&self) -> bool {
-        self.service == crate::server::SERVICE_TYPE
+        self.service == crate::vault_txt::SERVICE_TYPE
     }
 
     /// A browse began `ago` ago: what it hears while younger than [`Watched::settle`] is its
@@ -1308,7 +1318,7 @@ impl Watched {
     /// Take one event of a browse of this watch's browsed type, heard at `now`: an add or a
     /// removal ([`Watched::hear`]), the look's add logged ([`note_vault_heard`]); any other
     /// event, or another type's, is none, and so is every event of a watch with no browsed type.
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(all(test, unix), target_os = "macos"))]
     fn hear_event(&self, event: &Event, now: Instant) {
         let (add, instance) = match event {
             Event::Added(instance) => (true, instance),
@@ -1343,6 +1353,7 @@ impl Watched {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Watch {
     /// The standing browse sees the watch closed within [`LOOK_CLOSED_EVERY`] and ends its
     /// request to the broker.
@@ -1354,15 +1365,15 @@ impl Drop for Watch {
 /// The first pause before a standing browse that ended (or could not start for a reason other
 /// than the broker's absence) starts again, doubled each time it ends within [`RESTART_LONGEST`]
 /// of its start, up to that.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 const RESTART_FIRST: Duration = Duration::from_secs(5);
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 const RESTART_LONGEST: Duration = Duration::from_secs(60);
 
 /// How often a standing browse asks again while the LAN broker is unavailable: its socket is
 /// what it waits for (setup's Mac password installs it), and a browse starts as soon as it
 /// answers, never on the doubled backoff of a browse that ran and ended.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 const BROKER_PAUSE: Duration = Duration::from_secs(2);
 
 /// How long the standing browse waits for an event before it looks whether its watch was
@@ -1371,7 +1382,7 @@ const BROKER_PAUSE: Duration = Duration::from_secs(2);
 const LOOK_CLOSED_EVERY: Duration = Duration::from_secs(1);
 
 /// How a standing browse's last start went ([`restart_pause`]).
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Started {
     /// The LAN broker was unavailable: nothing started.
@@ -1384,7 +1395,7 @@ enum Started {
 /// `pause` it holds, and the backoff the next end gets: the broker's absence waits
 /// [`BROKER_PAUSE`] and leaves the backoff at [`RESTART_FIRST`]; another end waits `pause`
 /// (reset to [`RESTART_FIRST`] once a browse ran [`RESTART_LONGEST`]) and doubles it, up to that.
-#[cfg(any(test, target_os = "macos"))]
+#[cfg(any(all(test, unix), target_os = "macos"))]
 fn restart_pause(last: Started, pause: Duration) -> (Duration, Duration) {
     match last {
         Started::NoBroker => (BROKER_PAUSE, RESTART_FIRST),
@@ -1442,6 +1453,7 @@ fn browse_standing(watched: &Watched) {
     }
 }
 
-#[cfg(test)]
+// The browse, resolve and standing-watch laws read the LAN broker's events, which only Unix has.
+#[cfg(all(test, unix))]
 #[path = "discover_tests.rs"]
 mod tests;

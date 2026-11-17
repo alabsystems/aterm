@@ -17,6 +17,100 @@ pub(super) fn open(dir: &Path) -> Log {
     }
 }
 
+/// A scratch folder a journal can live in, removed when this drops: a temporary folder, which
+/// Unix makes `0700`; on Windows, where a temporary folder takes its access list from the one
+/// it is in, a private folder made in one.
+pub(crate) struct Scratch {
+    _root: aterm_tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl Scratch {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// A new [`Scratch`].
+pub(crate) fn tempdir() -> Scratch {
+    let root = aterm_tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let path = root.path().to_path_buf();
+    #[cfg(windows)]
+    let path = {
+        let path = root.path().join("journal");
+        private_file::create_private_dir(&path).unwrap();
+        path
+    };
+    Scratch { _root: root, path }
+}
+
+/// The identity of the file at `path`, as the journal compares files, or `None` where none
+/// opens.
+pub(super) fn identity_of(path: &Path) -> Option<FileIdentity> {
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    seen(&file, &metadata).ok().map(|seen| seen.identity)
+}
+
+/// Lets others read the file or folder it names until it drops, and then takes that back: a
+/// group read bit on Unix; on Windows an allow entry for Everyone in its protected list (passed
+/// on to what a folder holds that takes entries from it, and taken back from it the same way).
+pub(super) struct Exposed {
+    path: PathBuf,
+    #[cfg(unix)]
+    private: std::fs::Permissions,
+    #[cfg(windows)]
+    private: aterm_uds::acl::Descriptor,
+}
+
+impl Exposed {
+    #[cfg(unix)]
+    pub(super) fn new(path: &Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let private = std::fs::metadata(path).unwrap().permissions();
+        let mut exposed = private.clone();
+        exposed.set_mode(private.mode() | 0o040);
+        std::fs::set_permissions(path, exposed).unwrap();
+        Self {
+            path: path.into(),
+            private,
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn new(path: &Path) -> Self {
+        use aterm_uds::acl::{Descriptor, Parts, Sid};
+        let private = Descriptor::of_path(path, Parts::DACL).unwrap();
+        let me = Sid::token_user().unwrap();
+        let passed = if path.is_dir() { "OICI" } else { "" };
+        Descriptor::from_sddl(&format!(
+            "D:P(A;{passed};FA;;;{me})(A;{passed};FA;;;SY)(A;{passed};FR;;;WD)"
+        ))
+        .unwrap()
+        .apply_to_path(path, Parts::DACL | Parts::PROTECTED_DACL)
+        .unwrap();
+        Self {
+            path: path.into(),
+            private,
+        }
+    }
+}
+
+impl Drop for Exposed {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        std::fs::set_permissions(&self.path, self.private.clone()).unwrap();
+        #[cfg(windows)]
+        self.private
+            .apply_to_path(
+                &self.path,
+                aterm_uds::acl::Parts::DACL | aterm_uds::acl::Parts::PROTECTED_DACL,
+            )
+            .unwrap();
+    }
+}
+
 /// The production window stays bounded while append, cold replay and reopen preserve every
 /// acknowledged record. Removing the budget retains twice its bytes and fails this oracle.
 #[test]
@@ -28,7 +122,7 @@ fn a_long_log_keeps_its_decoded_window_within_budget() {
         bytes: 3 * DECODED_WINDOW_BYTES,
         record_bytes: BODY,
     };
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = Log::open(dir.path(), "long", b"pinned", false, limits).unwrap();
     log.finish_open().unwrap();
     for index in 0..count {
@@ -69,10 +163,13 @@ fn a_long_log_keeps_its_decoded_window_within_budget() {
 
 /// A same-length fault in a cold frame is an error. The raw broker's empty page is the
 /// negative control: treating it as EOF would silently hide acknowledged history.
+/// Unix only: the fault is planted by a write through another descriptor while the log is open,
+/// which astream's lock refuses on Windows, where it is mandatory.
+#[cfg(unix)]
 #[test]
 fn an_unreadable_cold_record_is_not_the_end_of_the_journal() {
     use std::os::unix::fs::FileExt as _;
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.log.set_resident_budget(0);
     log.append("app/1", vec![0xa5; 128]).unwrap();
@@ -103,7 +200,7 @@ fn an_unreadable_cold_record_is_not_the_end_of_the_journal() {
 
 #[test]
 fn writer_contention_is_typed_and_does_not_admit_a_second_writer() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner.append("app/1", vec![1]).unwrap();
     let blocked = Log::open(dir.path(), "test", b"pinned", true, limits())
@@ -119,7 +216,7 @@ fn writer_contention_is_typed_and_does_not_admit_a_second_writer() {
 
 #[test]
 fn physical_writer_contention_is_distinguished_from_dedicated_admission() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     drop(open(dir.path()));
     let file = OpenOptions::new()
         .read(true)
@@ -152,16 +249,21 @@ fn physical_writer_contention_is_distinguished_from_dedicated_admission() {
 
 #[test]
 fn lock_io_errors_keep_their_original_errno() {
+    #[cfg(unix)]
+    const NO_LOCK: i32 = libc::ENOLCK;
+    /// `ERROR_NOT_LOCKED`.
+    #[cfg(windows)]
+    const NO_LOCK: i32 = 158;
     let error = lock_error(std::fs::TryLockError::Error(io::Error::from_raw_os_error(
-        libc::ENOLCK,
+        NO_LOCK,
     )));
-    assert_eq!(error.raw_os_error(), Some(libc::ENOLCK));
+    assert_eq!(error.raw_os_error(), Some(NO_LOCK));
     assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
 }
 
 #[test]
 fn strict_checkpoint_keeps_acknowledged_prefix_and_archives_torn_suffix() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     assert_eq!(
         log.append("app/1", b"signed ciphertext".to_vec()).unwrap(),
@@ -170,19 +272,19 @@ fn strict_checkpoint_keeps_acknowledged_prefix_and_archives_torn_suffix() {
     drop(log);
     let path = dir.path().join("test.astream");
     let checkpoint = dir.path().join("test.checkpoint");
-    let before_checkpoint = std::fs::metadata(&checkpoint).unwrap().ino();
+    let before_checkpoint = identity_of(&checkpoint).unwrap();
     let before = std::fs::read(&path).unwrap();
     let mut file = OpenOptions::new().append(true).open(&path).unwrap();
     file.write_all(b"torn").unwrap();
     aterm_durable::durable(&file).unwrap();
     drop(file);
     let log = open(dir.path());
-    assert_eq!(
-        std::fs::metadata(checkpoint).unwrap().ino(),
-        before_checkpoint
-    );
-    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(identity_of(&checkpoint).unwrap(), before_checkpoint);
     assert_eq!(log.read_range(Offset::ZERO, 999).unwrap().len(), 1);
+    // The log goes before its file is read: on Windows astream's lock refuses that read beside
+    // it (ATERM-KI-1116-48213).
+    drop(log);
+    assert_eq!(std::fs::read(path).unwrap(), before);
     let archived = dir.path().join(format!(
         "test-uncommitted-{}",
         aterm_codec::hex::encode_lower(&aterm_digest::Sha256::digest(b"torn"))
@@ -192,7 +294,7 @@ fn strict_checkpoint_keeps_acknowledged_prefix_and_archives_torn_suffix() {
 #[test]
 fn partial_loss_or_wrong_anchor_cannot_reset_history() {
     for file in ["test.anchor", "test.checkpoint", "test.astream"] {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let mut log = open(dir.path());
         log.append("app/1", vec![3; 30]).unwrap();
         drop(log);
@@ -203,8 +305,13 @@ fn partial_loss_or_wrong_anchor_cannot_reset_history() {
 }
 #[test]
 fn checkpoint_io_failure_keeps_cause_and_fences_the_writer() {
-    for errno in [libc::EIO, libc::ENOSPC] {
-        let dir = aterm_tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let errnos = [libc::EIO, libc::ENOSPC];
+    // `ERROR_IO_DEVICE` (`aterm_durable::seam::EIO` there) and `ERROR_DISK_FULL`.
+    #[cfg(windows)]
+    let errnos = [aterm_durable::seam::EIO, 112];
+    for errno in errnos {
+        let dir = tempdir();
         let mut log = open(dir.path());
         let fault = aterm_durable::seam::FailingDirs::with(errno);
         let error = log.append("app/1", vec![2]).unwrap_err();
@@ -254,7 +361,7 @@ fn checkpoint_io_failure_keeps_cause_and_fences_the_writer() {
 
 #[test]
 fn checkpoint_failure_fences_reads_and_writes_until_exact_retry() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1]).unwrap();
     let cp = dir.path().join("test.checkpoint");
@@ -274,7 +381,7 @@ fn checkpoint_failure_fences_reads_and_writes_until_exact_retry() {
 }
 #[test]
 fn bounds_refuse_without_poison_and_replaced_lease_fences() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     assert!(log.append("app/1", vec![0; 1025]).is_err());
     assert!(!log.is_poisoned());
@@ -288,7 +395,7 @@ fn bounds_refuse_without_poison_and_replaced_lease_fences() {
 
 #[test]
 fn live_truncation_withholds_reads_and_new_acknowledgements() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1]).unwrap();
     OpenOptions::new()
@@ -307,7 +414,7 @@ fn live_truncation_withholds_reads_and_new_acknowledgements() {
 #[test]
 fn missing_live_anchor_or_checkpoint_is_not_recreated_by_append() {
     for name in ["test.anchor", "test.checkpoint"] {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let mut log = open(dir.path());
         log.append("app/1", vec![1]).unwrap();
         let path = dir.path().join(name);
@@ -320,7 +427,7 @@ fn missing_live_anchor_or_checkpoint_is_not_recreated_by_append() {
 
 #[test]
 fn a_one_record_journal_can_archive_a_torn_tail() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut bound = limits();
     bound.records = 1;
     let mut log = Log::open(dir.path(), "test", b"pinned", false, bound).unwrap();
@@ -405,8 +512,12 @@ fn rebuilt(dir: &Path) -> (Vec<BrokerRecord>, Prefix) {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock is mandatory on Windows and refuses a read beside a live writer"
+)]
 fn a_reader_needs_no_lock_while_a_writer_holds_the_journal() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner.append("app/1", b"first".to_vec()).unwrap();
     let blocked = Log::open(dir.path(), "test", b"pinned", true, limits())
@@ -439,13 +550,38 @@ fn a_reader_needs_no_lock_while_a_writer_holds_the_journal() {
     );
 }
 
+/// What Windows answers a reader beside a live writer until astream's lock stops refusing it
+/// (ATERM-KI-1116-48213): the read of the log's bytes is refused (`ERROR_LOCK_VIOLATION`, passed
+/// on as it is), never a stale or partial prefix, and the same read, once the writer drops,
+/// finds what it acknowledged.
+#[cfg(windows)]
+#[test]
+fn a_reader_beside_a_live_writer_is_refused_on_windows_and_reads_once_it_drops() {
+    /// `ERROR_LOCK_VIOLATION`.
+    const LOCK_VIOLATION: i32 = 33;
+    let dir = tempdir();
+    let mut owner = open(dir.path());
+    owner.append("app/1", b"first".to_vec()).unwrap();
+    let acknowledged = owner.acknowledged();
+    let refused = read(dir.path(), None).err().unwrap();
+    assert_eq!(refused.raw_os_error(), Some(LOCK_VIOLATION), "{refused}");
+    drop(owner);
+    let (records, prefix) = rebuilt(dir.path());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].body, b"first");
+    assert_eq!(prefix.acknowledged(), acknowledged);
+}
+
 #[test]
 fn unchanged_fresh_prefix_needs_no_repeated_digest_computation() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner
         .append("app/1", b"private journal value".to_vec())
         .unwrap();
+    // The writer goes before the reads: on Windows astream's lock refuses a read beside it
+    // (ATERM-KI-1116-48213), and the law here is the reader's own.
+    drop(owner);
     let (_, prefix) = rebuilt(dir.path());
     let before = HASHES.with(std::cell::Cell::get);
     for _ in 0..2 {
@@ -463,11 +599,13 @@ fn unchanged_fresh_prefix_needs_no_repeated_digest_computation() {
 
 #[test]
 fn retained_bytes_do_not_hide_a_changed_checkpoint_or_enter_debug_output() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner
         .append("app/1", b"private journal value".to_vec())
         .unwrap();
+    // The writer goes before the reads (ATERM-KI-1116-48213), as above.
+    drop(owner);
     let (_, prefix) = rebuilt(dir.path());
     let physical = std::fs::read(dir.path().join("test.astream")).unwrap();
     assert!(!format!("{prefix:?}").contains(&format!("{physical:?}")));
@@ -485,20 +623,16 @@ fn retained_bytes_do_not_hide_a_changed_checkpoint_or_enter_debug_output() {
 
 #[test]
 fn retained_prefix_requires_current_private_files_and_anchor() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner.append("app/1", b"value".to_vec()).unwrap();
+    // The writer goes before the reads (ATERM-KI-1116-48213), as above.
+    drop(owner);
     let (_, prefix) = rebuilt(dir.path());
     for name in ["test.anchor", "test.checkpoint", "test.astream"] {
-        let path = dir.path().join(name);
-        let private = std::fs::metadata(&path).unwrap().permissions();
-        let mut exposed = private.clone();
-        exposed.set_mode(private.mode() | 0o040);
-        std::fs::set_permissions(&path, exposed).unwrap();
+        let exposed = Exposed::new(&dir.path().join(name));
         let refused = read(dir.path(), Some(&prefix)).is_err();
-        std::fs::set_permissions(&path, private).unwrap();
+        drop(exposed);
         assert!(refused, "a retained prefix cannot admit a nonprivate file");
         assert!(matches!(
             read(dir.path(), Some(&prefix)).unwrap(),
@@ -516,7 +650,7 @@ fn retained_prefix_requires_current_private_files_and_anchor() {
 
 #[test]
 fn large_prefixes_still_verify_without_retaining_physical_bytes() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let capacity = Limits {
         records: 1,
         bytes: PREFIX_BYTES + 4096,
@@ -525,6 +659,8 @@ fn large_prefixes_still_verify_without_retaining_physical_bytes() {
     let mut owner = Log::open(dir.path(), "test", b"pinned", false, capacity).unwrap();
     owner.finish_open().unwrap();
     owner.append("app/1", vec![7; PREFIX_BYTES]).unwrap();
+    // The writer goes before the reads (ATERM-KI-1116-48213), as above.
+    drop(owner);
     let Committed::Rebuilt { prefix, .. } =
         read_committed(dir.path(), "test", b"pinned", capacity, None).unwrap()
     else {
@@ -640,7 +776,7 @@ fn a_digest_only_prefix_answers_as_a_retained_one() {
     ];
     let mut hashed = [0; 2];
     for (what, change, read_under) in changes {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let mut log = open(dir.path());
         log.append("app/1", vec![1; 30]).unwrap();
         log.append("app/1", vec![2; 30]).unwrap();
@@ -684,8 +820,12 @@ fn a_digest_only_prefix_answers_as_a_retained_one() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock is mandatory on Windows and refuses a read beside a live writer"
+)]
 fn a_reader_racing_an_append_sees_the_old_prefix_or_the_new_one() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1; 40]).unwrap();
     let (_, before) = rebuilt(dir.path());
@@ -723,8 +863,17 @@ fn a_reader_racing_an_append_sees_the_old_prefix_or_the_new_one() {
         *seen.borrow(),
         [Step::Published, Step::Checkpointed, Step::Committed]
     );
+}
 
-    // A writer cut off mid-frame leaves part of a record past the checkpoint.
+/// A writer cut off mid-frame leaves part of a record past the checkpoint: a reader reads the
+/// acknowledged prefix as it was, and never repairs or archives the tail.
+#[test]
+fn a_reader_never_repairs_or_archives_a_torn_tail() {
+    let dir = tempdir();
+    let mut log = open(dir.path());
+    log.append("app/1", vec![1; 40]).unwrap();
+    log.append("app/1", vec![2; 40]).unwrap();
+    drop(log);
     let (_, acknowledged) = rebuilt(dir.path());
     let frame = BrokerRecord {
         seq: Offset(2),
@@ -787,15 +936,19 @@ fn substitute(journal: &Path, at: u64, from: &[u8], to: &[u8]) {
 
 #[test]
 fn a_replaced_or_shorter_journal_rebuilds_and_changed_bytes_refuse() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1; 30]).unwrap();
+    // The writer goes before its files are read (on Windows astream's lock refuses a read
+    // beside it: ATERM-KI-1116-48213), and the next one appends after it.
+    drop(log);
     let journal = dir.path().join("test.astream");
     let checkpoint = dir.path().join("test.checkpoint");
     let old = (
         std::fs::read(&journal).unwrap(),
         std::fs::read(&checkpoint).unwrap(),
     );
+    let mut log = open(dir.path());
     log.append("app/1", vec![2; 30]).unwrap();
     log.append("app/1", vec![3; 30]).unwrap();
     drop(log);
@@ -841,10 +994,13 @@ fn a_replaced_or_shorter_journal_rebuilds_and_changed_bytes_refuse() {
 
 #[test]
 fn a_reader_refuses_an_extension_whose_bytes_do_not_hash_to_the_checkpoint() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1; 30]).unwrap();
+    // The writer goes before the read (ATERM-KI-1116-48213), and the next one appends.
+    drop(log);
     let (_, one) = rebuilt(dir.path());
+    let mut log = open(dir.path());
     log.append("app/1", vec![2; 30]).unwrap();
     drop(log);
     // The reader's prefix still heads the file; only the extension changed.
@@ -854,12 +1010,30 @@ fn a_reader_refuses_an_extension_whose_bytes_do_not_hash_to_the_checkpoint() {
     assert!(read(dir.path(), None).is_err());
 }
 
+/// A writer's open hashes the acknowledged prefix again and refuses bytes rewritten under its
+/// checkpoint, a whole in-order record with a valid CRC included. On Windows the bytes are
+/// hashed through the open log's own descriptor once astream's open holds its lock.
+/// NEGATIVE CONTROL: with the checkpoint's digest comparison gone, the rewritten journal opens.
+#[test]
+fn a_writer_open_refuses_acknowledged_bytes_rewritten_under_its_checkpoint() {
+    let dir = tempdir();
+    let mut log = open(dir.path());
+    log.append("app/1", vec![1; 30]).unwrap();
+    log.append("app/1", vec![2; 30]).unwrap();
+    drop(log);
+    substitute(&dir.path().join("test.astream"), 0, &[1; 30], &[9; 30]);
+    let refused = Log::open(dir.path(), "test", b"pinned", true, limits())
+        .err()
+        .unwrap();
+    assert!(
+        format!("{refused:?}").contains("acknowledged journal history changed"),
+        "{refused:?}"
+    );
+}
+
 #[test]
 fn a_divergent_history_written_over_the_same_inode_rebuilds() {
-    let (dir, other) = (
-        aterm_tempfile::tempdir().unwrap(),
-        aterm_tempfile::tempdir().unwrap(),
-    );
+    let (dir, other) = (tempdir(), tempdir());
     let mut log = open(dir.path());
     log.append("app/1", vec![1; 30]).unwrap();
     log.append("app/1", vec![2; 30]).unwrap();
@@ -868,10 +1042,14 @@ fn a_divergent_history_written_over_the_same_inode_rebuilds() {
     let mut log = open(other.path());
     log.append("app/1", vec![3; 30]).unwrap();
     log.append("app/1", vec![4; 30]).unwrap();
+    // The writer goes before its files are read (ATERM-KI-1116-48213), and the next one
+    // appends.
+    drop(log);
     let equal = (
         std::fs::read(other.path().join("test.astream")).unwrap(),
         std::fs::read(other.path().join("test.checkpoint")).unwrap(),
     );
+    let mut log = open(other.path());
     log.append("app/1", vec![5; 30]).unwrap();
     drop(log);
     let longer = (
@@ -897,13 +1075,19 @@ fn a_divergent_history_written_over_the_same_inode_rebuilds() {
     }
 }
 
+/// One append to the journal in `dir` by a writer that opens, appends and goes: a writer's save
+/// landing while a reader is mid-read, with no writer left beside the reader's read of the log
+/// (on Windows astream's lock refuses that read: ATERM-KI-1116-48213).
+fn append_once(dir: &Path, body: Vec<u8>) {
+    open(dir).append("app/1", body).unwrap();
+}
+
 #[test]
 fn a_reader_racing_an_append_after_its_checkpoint_read_keeps_the_old_prefix() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let log = std::rc::Rc::new(std::cell::RefCell::new(open(dir.path())));
-    log.borrow_mut().append("app/1", vec![1; 40]).unwrap();
+    let dir = tempdir();
+    append_once(dir.path(), vec![1; 40]);
     let (_, before) = rebuilt(dir.path());
-    let writer = std::rc::Rc::clone(&log);
+    let path = dir.path().to_path_buf();
     let fired = std::rc::Rc::new(std::cell::Cell::new(0));
     let count = std::rc::Rc::clone(&fired);
     on_read(move |step| {
@@ -911,7 +1095,7 @@ fn a_reader_racing_an_append_after_its_checkpoint_read_keeps_the_old_prefix() {
             return;
         }
         // A whole append lands between the checkpoint read and the astream open.
-        writer.borrow_mut().append("app/1", vec![2; 40]).unwrap();
+        append_once(&path, vec![2; 40]);
         count.set(count.get() + 1);
     });
     let raced = read(dir.path(), Some(&before));
@@ -927,12 +1111,11 @@ fn a_reader_racing_an_append_after_its_checkpoint_read_keeps_the_old_prefix() {
 
 #[test]
 fn a_checkpoint_renamed_over_mid_read_is_read_again_and_a_second_link_refused() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let log = std::rc::Rc::new(std::cell::RefCell::new(open(dir.path())));
-    log.borrow_mut().append("app/1", vec![1; 30]).unwrap();
+    let dir = tempdir();
+    append_once(dir.path(), vec![1; 30]);
     // A writer's append saves a new checkpoint over the name after the reader
     // opened the old one: that descriptor is left no link, and is read again.
-    let writer = std::rc::Rc::clone(&log);
+    let path = dir.path().to_path_buf();
     let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = std::rc::Rc::clone(&steps);
     on_read(move |step| {
@@ -940,7 +1123,7 @@ fn a_checkpoint_renamed_over_mid_read_is_read_again_and_a_second_link_refused() 
         seen.borrow_mut().push(step);
         if first {
             assert_eq!(step, Reading::Opened);
-            writer.borrow_mut().append("app/1", vec![2; 30]).unwrap();
+            append_once(&path, vec![2; 30]);
         }
     });
     let once = read(dir.path(), None);
@@ -958,7 +1141,6 @@ fn a_checkpoint_renamed_over_mid_read_is_read_again_and_a_second_link_refused() 
         panic!("a first read rebuilds");
     };
     assert_eq!(records.len(), 2, "the newer checkpoint was read");
-    drop(log);
 
     // A second link is refused, and not read again.
     std::fs::hard_link(dir.path().join("test.checkpoint"), dir.path().join("held")).unwrap();
@@ -991,17 +1173,16 @@ fn a_checkpoint_renamed_over_mid_read_is_read_again_and_a_second_link_refused() 
 
 #[test]
 fn past_three_rereads_the_checkpoint_read_last_stands() {
-    let dir = aterm_tempfile::tempdir().unwrap();
-    let log = std::rc::Rc::new(std::cell::RefCell::new(open(dir.path())));
-    log.borrow_mut().append("app/1", vec![1; 30]).unwrap();
+    let dir = tempdir();
+    append_once(dir.path(), vec![1; 30]);
     // Every read races a save: each open's checkpoint is renamed over before it is read.
-    let writer = std::rc::Rc::clone(&log);
+    let path = dir.path().to_path_buf();
     let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let seen = std::rc::Rc::clone(&steps);
     on_read(move |step| {
         seen.borrow_mut().push(step);
         if step == Reading::Opened {
-            writer.borrow_mut().append("app/1", vec![2; 30]).unwrap();
+            append_once(&path, vec![2; 30]);
         }
     });
     let read_last = read(dir.path(), None);
@@ -1022,13 +1203,13 @@ fn past_three_rereads_the_checkpoint_read_last_stands() {
 fn a_reader_refuses_an_unanchored_or_over_capacity_journal() {
     // Between Log::open and finish_open the checkpoint and the astream file
     // exist and the anchor does not: nothing is established to read.
-    let fresh = aterm_tempfile::tempdir().unwrap();
+    let fresh = tempdir();
     let opening = Log::open(fresh.path(), "test", b"pinned", false, limits()).unwrap();
     assert!(read(fresh.path(), None).is_err());
     drop(opening);
 
     // A real, hash-matching, decodable prefix past the reader's bounds.
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path());
     log.append("app/1", vec![1; 600]).unwrap();
     log.append("app/1", vec![2; 600]).unwrap();
@@ -1055,7 +1236,7 @@ fn a_reader_refuses_an_unanchored_or_over_capacity_journal() {
     assert!(read_committed(dir.path(), "test", b"pinned", small_record, Some(&known)).is_err());
     assert!(Log::open(dir.path(), "test", b"pinned", true, small_record).is_err());
 
-    let oversized = aterm_tempfile::tempdir().unwrap();
+    let oversized = tempdir();
     let over_log = open(oversized.path());
     drop(over_log);
     let max_bytes = (limits().bytes + limits().record_bytes) as u64;
@@ -1079,7 +1260,7 @@ fn a_reader_refuses_an_unanchored_or_over_capacity_journal() {
     drop(reopened);
 
     for bad_subject in ["", "/a/will", "/a/commit", "/a/bind", "/a/retire"] {
-        let crafted = aterm_tempfile::tempdir().unwrap();
+        let crafted = tempdir();
         let log = open(crafted.path());
         drop(log);
         let frame = BrokerRecord {
@@ -1122,7 +1303,7 @@ pub(super) fn lock_held() {
 
 #[test]
 fn a_writer_open_waits_out_a_held_lock_within_its_bound() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut owner = open(dir.path());
     owner.append("app/1", b"first".to_vec()).unwrap();
     let short = Log::open_until(
@@ -1209,7 +1390,7 @@ fn a_journal_an_earlier_pin_wrote_opens_and_reads_at_this_pin() {
             assert_eq!(record.body, body);
         }
     };
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     for (name, bytes) in FROZEN {
         write_private_durable(dir.path(), name, bytes).unwrap();
     }

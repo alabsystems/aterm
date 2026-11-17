@@ -991,10 +991,14 @@ fn the_worst_case_secrets_line_open_at_900_by_644_never_scrolls_the_page() {
     }
 }
 
-/// Collapsed, every fixture's page fits a 900 × 644 window with its list unscrolled (§4.1).
+/// Collapsed, every fixture's page fits a 900 × 644 window with its list unscrolled (§4.1): the
+/// window's measures reserve the room of the page's fullest ordinary moment, a card and a note
+/// beside the footer included. NEGATIVE CONTROL: the fixtures hold cards, notes and footers, so
+/// the room is used.
 #[test]
 fn every_collapsed_page_fits_900_by_644_with_no_scrolling() {
     crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let (mut carded, mut noted) = (0, 0);
     for &name in FIXTURES {
         let app = reading(&status_of(name));
         let view = SystemStateViewState::default();
@@ -1009,7 +1013,11 @@ fn every_collapsed_page_fits_900_by_644_with_no_scrolling() {
             "{name}: the list ends at {}",
             list.bottom()
         );
+        let has = |key: &str| compiled.paint.iter().any(|node| node.key.as_str() == key);
+        carded += usize::from(has("system-state/card"));
+        noted += usize::from(has("system-state/notes"));
     }
+    assert!(carded > 3 && noted > 3, "the fixtures hold cards and notes");
 }
 
 /// Every fixture renders at the window sizes the captures use (120 × 48 and ~46 columns of a
@@ -1181,11 +1189,12 @@ fn apples_installer_window_is_found_from_the_card() {
     );
 }
 
-/// The kitty's pose follows the run (§4.5): it looks up for the person, puts an ear back for a
-/// failure and settles into a loaf once the Mac is ready; Serious Mode shows the words alone.
+/// The cat's pose follows the run (§4.5): it walks while a step runs, looks up for the person,
+/// puts its ears back for a failure and settles into a loaf once the Mac is ready. The lockup
+/// spans the page's inner width, the width the view bakes its images ahead at.
 #[test]
-fn the_kitty_looks_up_for_you_and_loafs_once_the_mac_is_ready() {
-    use aterm_effects::pet_glyphs_gen::PetGlyphId;
+fn the_cat_looks_up_for_you_and_loafs_once_the_mac_is_ready() {
+    use aterm_effects::rainbow_road::CatPose;
     let pose = |name: &str| {
         let app = reading(&status_of(name));
         let compiled = compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
@@ -1197,12 +1206,20 @@ fn the_kitty_looks_up_for_you_and_loafs_once_the_mac_is_ready() {
         let crate::native_ui::UiContent::Custom(custom) = &node.content else {
             panic!("the lockup is a custom node");
         };
-        LockupSpec::parse(custom.paint.as_deref()).pose
+        // A regular page's side pad is 24 points, a compact one's 16.
+        assert!(
+            [24.0, 16.0]
+                .map(|pad| 900.0 - 2.0 * pad)
+                .contains(&node.rect.width),
+            "{name}: the page's inner width, not {}",
+            node.rect.width
+        );
+        LockupPaint::parse(custom.paint.as_deref()).spec.pose
     };
-    assert_eq!(pose("needs-you"), PetGlyphId::PetSitLookup);
-    assert_eq!(pose("failed"), PetGlyphId::PetSitEar);
-    assert_eq!(pose("set-up"), PetGlyphId::PetLoaf);
-    assert_eq!(pose("running"), PetGlyphId::PetStand);
+    assert_eq!(pose("needs-you"), CatPose::LookUp);
+    assert_eq!(pose("failed"), CatPose::Worried);
+    assert_eq!(pose("set-up"), CatPose::Loaf);
+    assert_eq!(pose("running"), CatPose::Walk);
 }
 
 /// The lockup says `❯ aterm · ALab` on an ALab Mac and `❯ aterm` elsewhere (§4.5).
@@ -1873,6 +1890,258 @@ fn a_needs_you_headline_has_its_card_item() {
     assert!(bare.is_empty(), "{}", bare.join("\n"));
 }
 
+/// The lockup node's rect and paint in `compiled`.
+fn lockup_of(compiled: &CompiledUi) -> (LogicalRect, LockupPaint) {
+    let node = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == "system-state/progress")
+        .expect("the lockup is drawn");
+    let crate::native_ui::UiContent::Custom(custom) = &node.content else {
+        panic!("the lockup is a custom node");
+    };
+    (node.rect, LockupPaint::parse(custom.paint.as_deref()))
+}
+
+/// What fixes the page's frame in a window: its side pad, the lockup's rect (none where the
+/// window is too short for it) and the headline's type step.
+fn measures(compiled: &CompiledUi) -> (f32, Option<LogicalRect>, crate::native_ui::StyleRef) {
+    let hero = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == "system-state/hero")
+        .expect("the hero")
+        .rect;
+    let lockup = compiled
+        .paint
+        .iter()
+        .find(|node| node.key.as_str() == "system-state/progress")
+        .map(|node| node.rect);
+    let style = compiled
+        .paint
+        .iter()
+        .find_map(|node| match &node.content {
+            crate::native_ui::UiContent::Text(text)
+                if node.key.as_str() == "system-state/headline"
+                    || node.key.as_str().starts_with("system-state/headline/line-") =>
+            {
+                Some(text.style)
+            }
+            _ => None,
+        })
+        .expect("the headline");
+    (hero.x, lockup, style)
+}
+
+/// THE PAGE NEVER REFLOWS DURING A RUN (§4.1): its measures are the window's alone, so in each
+/// window, the design's 900 × 644, narrow panes, and mid widths whose lines' phrases wrap in some
+/// moments and not others, every moment a run passes through (every fixture, with the line its
+/// host opens: running, a line opened, a note, a card that comes, the footer once it stops, the
+/// end) keeps the same side pad, the same lockup rect and the same headline step. A lockup that
+/// shows keeps its words legible, at Caption 11 or more, even where the list scrolls. NEGATIVE
+/// CONTROL: a larger window sets the lockup larger, so the rect read is the window's.
+#[test]
+fn a_windows_measures_hold_through_every_moment_of_a_run() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut lockups = Vec::new();
+    let mut windows = vec![
+        (900.0, 644.0),
+        (346.0, 642.0),
+        (900.0, 520.0),
+        (900.0, 800.0),
+        (1200.0, 800.0),
+        (346.0, 900.0),
+        (900.0, 420.0),
+        (640.0, 768.0),
+        (346.0, 750.0),
+    ];
+    for w in [480.0, 560.0, 640.0, 720.0, 800.0] {
+        windows.extend([(w, 700.0), (w, 756.0)]);
+    }
+    for (w, h) in windows {
+        // A run's moments share its plan: the fixtures of one selection and one set of lines
+        // are one run's moments (a plan with every group left as is runs nothing).
+        let mut runs: Vec<(Vec<String>, &str, _)> = Vec::new();
+        for &name in FIXTURES {
+            let app = reading(&status_of(name));
+            let view = SystemStateViewState::with_line_open(fixture_line(name));
+            let compiled = compile_in(&app, &view, w, h);
+            if let Some(px) = compiled.paint.iter().find_map(|node| {
+                (node.key.as_str() == "system-state/progress")
+                    .then(|| lockup_of(&compiled).1.spec.px)
+            }) {
+                assert!(px >= 11.0, "{w}×{h}: {name} set the lockup at Mono {px}");
+            }
+            let mut lines: Vec<String> = compiled
+                .paint
+                .iter()
+                .map(|node| node.key.as_str().to_owned())
+                .filter(|key| {
+                    key.strip_prefix("system-state/line/")
+                        .is_some_and(|slug| !slug.contains('/'))
+                })
+                .collect();
+            lines.sort();
+            lines.dedup();
+            lines.push(format!("{:?}", app.plan.selection));
+            let now = measures(&compiled);
+            match runs.iter().find(|(run, _, _)| *run == lines) {
+                None => runs.push((lines, name, now)),
+                Some((_, was, then)) => assert_eq!(
+                    &now, then,
+                    "{w}×{h}: {name} reflowed the page {was} drew (pad, lockup, headline step)"
+                ),
+            }
+        }
+        assert!(
+            runs.iter().any(|(lines, _, _)| lines.len() > 2),
+            "the fixtures hold runs of several lines"
+        );
+        lockups.push(runs[0].2.1);
+    }
+    let height = |at: usize| lockups[at].map_or(0.0, |rect| rect.height);
+    assert!(height(4) > height(0), "1200 × 800 sets a larger lockup");
+}
+
+/// A TALLER WINDOW NEVER SETS A SMALLER LOCKUP (§4.1): down each width, from a window too short
+/// for any lockup to one past the design's, each step taller sets the lockup at least as large
+/// (and a lockup that shows is legible, Caption 11 or more), so the fallback for a window too
+/// short for the fullest moment never outgrows the size the budget sets just above it.
+/// NEGATIVE CONTROL: the lockup grows down each sweep, so the sizes read are the window's.
+#[test]
+fn a_taller_window_never_sets_a_smaller_lockup() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let app = reading(&status_of("running"));
+    for w in [346.0, 640.0, 900.0] {
+        let mut sizes = Vec::new();
+        let mut h: f32 = 380.0;
+        while h <= 960.0 {
+            let compiled = compile_in(&app, &SystemStateViewState::default(), w, h);
+            let px = compiled
+                .paint
+                .iter()
+                .any(|node| node.key.as_str() == "system-state/progress")
+                .then(|| lockup_of(&compiled).1.spec.px);
+            if let Some(px) = px {
+                assert!(px >= 11.0, "{w}×{h}: Mono {px}");
+            }
+            sizes.push((h, px.unwrap_or(0.0)));
+            h += 4.0;
+        }
+        for pair in sizes.windows(2) {
+            assert!(
+                pair[1].1 >= pair[0].1,
+                "{w} wide: {} tall sets Mono {}, {} tall Mono {}",
+                pair[0].0,
+                pair[0].1,
+                pair[1].0,
+                pair[1].1
+            );
+        }
+        assert!(
+            sizes[sizes.len() - 1].1 > sizes[0].1,
+            "{w} wide: the lockup grows"
+        );
+    }
+}
+
+/// A PAGE THAT COMES BACK DRAWS THE MOMENT IT LEFT (§4.5): once no page is on screen (its tab
+/// behind another, its window minimised or covered) each view keeps the moment it last drew, so
+/// the first pass after it shows again draws that moment, not the words alone while a bake
+/// runs. NEGATIVE CONTROL: with every bake released, the same pass draws the words alone.
+#[test]
+fn a_page_shown_again_draws_the_moment_it_left_at_once() {
+    let app = reading(&status_of("running"));
+    let view = SystemStateViewState::default();
+    let (_, shown) = lockup_of(&compile_in(&app, &view, 900.0, 644.0));
+    let moment = shown.images.expect("its moment, baked");
+    assert_eq!(moment.spec, shown.spec);
+    super::prebake::hold(true);
+    super::prebake::set_shown(false);
+    let (_, hidden) = lockup_of(&compile_in(&app, &view, 900.0, 644.0));
+    assert_eq!(hidden.images, Some(moment), "hidden, it keeps what it drew");
+    super::prebake::set_shown(true);
+    let (_, back) = lockup_of(&compile_in(&app, &view, 900.0, 644.0));
+    assert_eq!(back.images, Some(moment), "back, its first pass draws it");
+    assert!(!back.pending);
+    super::prebake::release();
+    let (_, released) = lockup_of(&compile_in(&app, &view, 900.0, 644.0));
+    assert_eq!(released.images, None, "control: released, the words alone");
+    assert!(released.pending);
+    super::prebake::hold(false);
+}
+
+/// A VIEW WHOSE LOCKUP DRAWS NO ROAD KEEPS NO IMAGES (§4.5): a view that drew the road and then
+/// draws the words alone (here a pane too narrow for the road; Serious Mode, High Contrast and a
+/// window too short for the lockup take the same path) keeps none, and showing the page again
+/// bakes none for it. NEGATIVE CONTROL: at the wide pane the road is kept.
+#[test]
+fn a_view_whose_lockup_draws_no_road_keeps_no_images() {
+    let app = reading(&status_of("running"));
+    let view = SystemStateViewState::default();
+    let (_, wide) = lockup_of(&compile_in(&app, &view, 900.0, 644.0));
+    assert!(wide.images.is_some());
+    assert!(
+        crate::widget::images_kept_bytes() > 0,
+        "control: the road kept"
+    );
+    let (_, narrow) = lockup_of(&compile_in(&app, &view, 200.0, 644.0));
+    assert!(
+        !narrow.spec.kitty,
+        "too narrow for the road: {:?}",
+        narrow.spec
+    );
+    assert_eq!(crate::widget::images_kept_bytes(), 0, "nothing kept");
+    super::prebake::set_shown(false);
+    super::prebake::set_shown(true);
+    super::prebake::settle();
+    assert_eq!(crate::widget::images_kept_bytes(), 0, "nothing baked again");
+}
+
+/// THE LOCKUP ASKS ONLY FOR WHAT IT DRAWS (§4.5): a compact page measures itself at regular
+/// metrics first, and measuring asks for no image; the one request is the compact lockup's own
+/// images. A new moment then keeps painting the moment last drawn while its bake is pending,
+/// and paints its own once it lands. NEGATIVE CONTROL: the compact lockup is smaller than the
+/// regular one, so a regular request would differ.
+#[test]
+fn a_compact_page_asks_only_for_its_own_images_and_holds_the_last_moment_meanwhile() {
+    super::prebake::take_requests();
+    let mut app = reading(&status_of("running"));
+    let view = SystemStateViewState::default();
+    let compiled = compile_in(&app, &view, 900.0, 520.0);
+    let (rect, paint) = lockup_of(&compiled);
+    assert!(paint.spec.px <= 17.0, "a compact lockup: {:?}", paint.spec);
+    let requests = super::prebake::take_requests();
+    assert_eq!(
+        requests,
+        vec![paint.spec.wanted(rect.width).keys().to_vec()],
+        "one request, the compact lockup's"
+    );
+    let regular = LockupSpec {
+        px: 22.0,
+        ..paint.spec
+    };
+    assert!(!requests[0].contains(&regular.wanted(rect.width).keys()[0]));
+    let walking = paint.images.expect("its own images, baked");
+    assert_eq!(walking.spec, paint.spec);
+    // The run comes to need the person while bakes are held: the moment drawn last stays.
+    super::prebake::hold(true);
+    app.publish(status_of("needs-you"));
+    let (_, waiting) = lockup_of(&compile_in(&app, &view, 900.0, 520.0));
+    assert_eq!(
+        waiting.spec.pose,
+        aterm_effects::rainbow_road::CatPose::LookUp
+    );
+    assert_eq!(waiting.images, Some(walking), "the last moment stays drawn");
+    assert!(waiting.pending, "and the moment's own images are pending");
+    // Its bake lands: the new moment draws.
+    super::prebake::settle();
+    let (rect, landed) = lockup_of(&compile_in(&app, &view, 900.0, 520.0));
+    assert_eq!(landed.images, Some(landed.spec.wanted(rect.width)));
+    assert!(!landed.pending);
+    super::prebake::hold(false);
+}
+
 #[test]
 fn independent_password_steps_have_visible_actions_without_missing_tools() {
     let mut status = status_of("set-up");
@@ -1895,6 +2164,15 @@ fn independent_password_steps_have_visible_actions_without_missing_tools() {
         .find(|item| item.id == "mac-password")
         .expect("one shared password episode");
     assert!(item.title.contains("Mac password"));
+    let reason = item.reason.as_deref().unwrap();
+    for access in [
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkHelper,
+    ] {
+        assert!(reason.contains(access.name()), "{reason}");
+    }
+    assert!(!reason.contains("Your Mac password is required"));
     assert_eq!(item.button.as_ref().unwrap().face, "Finish setup…");
     status.mac_setup = Some(ToolsInstall::Password);
     let app = reading(&status);
@@ -1911,4 +2189,628 @@ fn independent_password_steps_have_visible_actions_without_missing_tools() {
         GO_TO_TOOLS_TAB
     );
     compile_in(&app, &SystemStateViewState::default(), 900.0, 644.0);
+}
+
+#[test]
+fn a_check_keeps_the_last_card_seated_without_keeping_its_authority() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let spotlight = Subject::Access(Access::SpotlightScope);
+    let mut status = status_of("set-up");
+    status.mac_setup = Some(ToolsInstall::Password);
+    let row = status
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == spotlight)
+        .unwrap();
+    row.standing = Standing::NeedsYou;
+    row.now = Some("Folders still indexed".into());
+    row.note = Some("Your Mac password excludes the new home folders from Spotlight.".into());
+    let mut app = reading(&status);
+    let mut view = SystemStateViewState::default();
+    let before = compile_in(&app, &view, 900.0, 824.0);
+    let compact_before = compile_in(&app, &view, 346.0, 824.0);
+    let card = drawn(&app).1;
+    assert_eq!(card.len(), 1);
+    let button = card[0].button.as_ref().unwrap().clone();
+    assert!(
+        semantic(&before, &button.key)
+            .state
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    let developer = format!("system-state/line/{}/switch", Line::Developer.slug());
+
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    let mut pending = status.clone();
+    pending.busy = true;
+    pending.operation = Some(SetupOperation::Check);
+    pending.last_known = std::mem::take(&mut pending.observed);
+    pending.observing = pending
+        .last_known
+        .iter()
+        .map(|row| {
+            (
+                row.subject,
+                row.subject
+                    .uses_vault_source()
+                    .then(|| app.plan.vault_url.clone()),
+                true,
+            )
+        })
+        .collect();
+    for queued in [true, false] {
+        for (_, _, waiting) in &mut pending.observing {
+            *waiting = queued;
+        }
+        app.publish(pending.clone());
+        let during = compile_in(&app, &view, 900.0, 824.0);
+        for key in [
+            "system-state/card",
+            button.key.as_str(),
+            developer.as_str(),
+            "system-state/progress",
+            "system-state/headline",
+        ] {
+            assert_eq!(
+                semantic(&during, key).rect,
+                semantic(&before, key).rect,
+                "{key}"
+            );
+        }
+        let compact = compile_in(&app, &view, 346.0, 824.0);
+        for key in [
+            "system-state/card",
+            developer.as_str(),
+            "system-state/headline",
+        ] {
+            assert_eq!(
+                semantic(&compact, key).rect,
+                semantic(&compact_before, key).rect,
+                "compact {key}"
+            );
+        }
+        assert!(
+            semantic(&during, "system-state/card")
+                .label
+                .contains("last read")
+        );
+        assert!(
+            semantic(&during, "system-state/phase")
+                .label
+                .contains(if queued { "queued" } else { "checking" })
+        );
+        assert!(
+            !semantic(&during, &button.key)
+                .state
+                .as_ref()
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !during
+                .focus_order
+                .contains(&UiKey::new(button.key.as_str()))
+        );
+        assert!(
+            during
+                .default_action
+                .as_ref()
+                .is_none_or(|(key, _)| key.as_str() != button.key)
+        );
+        assert!(!app.card_buttons().contains(&button.key));
+        assert_eq!(
+            app.reviewed_row(spotlight).standing,
+            Some(Standing::Unknown)
+        );
+        app.act(&mut view, &button.action, None);
+        assert!(
+            app.take_action().is_none(),
+            "a retained control has no dispatch authority"
+        );
+    }
+
+    let mut changed_need = pending.clone();
+    let mut latest = status
+        .observed
+        .iter()
+        .find(|row| row.subject == spotlight)
+        .unwrap()
+        .clone();
+    latest.note = Some("A newly observed folder needs exclusion".into());
+    changed_need.observed = vec![latest];
+    changed_need
+        .observing
+        .retain(|(subject, _, _)| *subject != spotlight);
+    app.publish(changed_need);
+    assert!(
+        app.check_card.is_none(),
+        "a new current requirement replaces its old presentation"
+    );
+    assert!(drawn(&app).1.iter().any(|item| {
+        !item.retained
+            && item
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("newly observed"))
+    }));
+    app.publish(status.clone());
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    app.publish(pending.clone());
+
+    let mut failed_stage = pending.clone();
+    failed_stage.rows = vec![SetupStatusRow {
+        name: Setting::Repositories.name().into(),
+        status: "error".into(),
+        detail: "The repository stage failed".into(),
+    }];
+    app.publish(failed_stage);
+    assert!(
+        app.check_card.is_none(),
+        "a current failed card supersedes history even without a failed reading"
+    );
+    let cards = drawn(&app).1;
+    assert!(cards.iter().any(|item| item.mark == Mark::Failed));
+    assert!(cards.iter().all(|item| !item.retained));
+    app.publish(status.clone());
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    app.publish(pending.clone());
+
+    let mut failure = pending.clone();
+    let mut failed = status
+        .observed
+        .iter()
+        .find(|row| row.subject == spotlight)
+        .unwrap()
+        .clone();
+    failed.standing = Standing::Failed;
+    failed.note = Some("The new read failed".into());
+    failure.observed = vec![failed];
+    app.publish(failure);
+    assert!(
+        app.check_card.is_none(),
+        "a current failure supersedes the retained card"
+    );
+    assert_eq!(app.reviewed_row(spotlight).standing, Some(Standing::Failed));
+    assert!(drawn(&app).1.iter().all(|item| !item.retained));
+
+    app.publish(status.clone());
+    let settled = compile_in(&app, &view, 900.0, 824.0);
+    for key in ["system-state/card", button.key.as_str(), developer.as_str()] {
+        assert_eq!(
+            semantic(&settled, key).rect,
+            semantic(&before, key).rect,
+            "{key}"
+        );
+    }
+    assert!(
+        semantic(&settled, &button.key)
+            .state
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    app.act(&mut view, &button.action, None);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::GoToToolsTab)
+    ));
+
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    let mut other_source = pending.clone();
+    other_source.observed_vault_url = Some("https://other.invalid/vault".into());
+    app.publish(other_source);
+    assert!(
+        app.check_card.is_none(),
+        "another source cannot inherit the card"
+    );
+    app.publish(status);
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    pending.stopped_wait = true;
+    app.publish(pending);
+    assert!(
+        app.check_card.is_none(),
+        "a current hold clears the retained card"
+    );
+}
+
+#[test]
+fn an_ordinary_partial_read_keeps_its_password_card_without_a_check_action() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let password_steps = [
+        Access::NameRule,
+        Access::SpotlightScope,
+        Access::NetworkHelper,
+    ];
+    let helper = Subject::Access(Access::NetworkHelper);
+    let spotlight = Subject::Access(Access::SpotlightScope);
+    let repositories = Subject::Setting(Setting::Repositories);
+    let mut prior = status_of("set-up");
+    prior.mac_setup = Some(ToolsInstall::Password);
+    for access in password_steps {
+        let row = prior
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Access(access))
+            .unwrap();
+        row.standing = Standing::NeedsYou;
+        row.note = Some(format!("{} is incomplete", access.name()));
+    }
+    let developer = format!("system-state/line/{}/switch", Line::Developer.slug());
+    let mut queued = prior.clone();
+    queued.observing = password_steps
+        .map(|access| (Subject::Access(access), None, true))
+        .to_vec();
+    queued
+        .observing
+        .push((repositories, prior.observed_vault_url.clone(), true));
+    for coalesced in [false, true] {
+        let mut app = reading(&prior);
+        let view = SystemStateViewState::default();
+        let before = compile_in(&app, &view, 900.0, 824.0);
+        let compact_before = compile_in(&app, &view, 346.0, 824.0);
+        let old = drawn(&app).1;
+        let button = old[0].button.as_ref().unwrap();
+
+        let mut unrelated = prior.clone();
+        unrelated.observing = vec![(repositories, prior.observed_vault_url.clone(), false)];
+        app.publish(unrelated);
+        assert!(
+            app.check_card.is_none(),
+            "a repository-only read is unrelated"
+        );
+        assert!(drawn(&app).1.iter().all(|item| !item.retained));
+        assert!(
+            semantic(&compile_in(&app, &view, 900.0, 824.0), &button.key)
+                .state
+                .unwrap()
+                .enabled
+        );
+        // The unrelated read is still active when focus broadens the observation.
+        if !coalesced {
+            app.publish(queued.clone());
+            assert!(drawn(&app).1.iter().all(|item| item.retained));
+            assert!(
+                semantic(&compile_in(&app, &view, 900.0, 824.0), "system-state/phase")
+                    .label
+                    .contains("queued")
+            );
+        }
+
+        // The early Access batch is already over when the GUI next receives status. One,
+        // then two members are unread while the repository batch continues: the surviving
+        // requests regroup from three to two to one without becoming different requests.
+        let mut early = queued.clone();
+        early.observing = vec![(repositories, prior.observed_vault_url.clone(), false)];
+        early.last_known = prior.observed.clone();
+        for unread in [helper, spotlight] {
+            early.observed.retain(|row| row.subject != unread);
+            early.observed.push(Observation::unknown(unread));
+            early.unconfirmed_observations.push(unread);
+            app.publish(early.clone());
+            assert!(!app.status.busy && app.status.operation.is_none());
+            for (width, expected) in [(900.0, &before), (346.0, &compact_before)] {
+                let during = compile_in(&app, &view, width, 824.0);
+                for key in [
+                    "system-state/card",
+                    button.key.as_str(),
+                    developer.as_str(),
+                    "system-state/headline",
+                    "system-state/progress",
+                ] {
+                    assert_eq!(
+                        semantic(&during, key).rect,
+                        semantic(expected, key).rect,
+                        "{width} {key}; coalesced={coalesced}"
+                    );
+                }
+                assert_eq!(
+                    semantic(&during, "system-state/headline").label,
+                    semantic(expected, "system-state/headline").label
+                );
+                assert!(
+                    semantic(&during, "system-state/card")
+                        .label
+                        .contains("last read")
+                );
+                assert!(
+                    semantic(&during, "system-state/phase")
+                        .label
+                        .contains("checking")
+                );
+                assert!(!semantic(&during, &button.key).state.unwrap().enabled);
+                assert!(
+                    !during
+                        .focus_order
+                        .contains(&UiKey::new(button.key.as_str()))
+                );
+                assert!(
+                    during
+                        .default_action
+                        .as_ref()
+                        .is_none_or(|(key, _)| { key.as_str() != button.key })
+                );
+            }
+            assert!(drawn(&app).1.iter().all(|item| item.retained));
+            assert_eq!(app.reviewed_row(unread).standing, Some(Standing::Unknown));
+            assert!(!app.reviewed_row(unread).settled());
+            assert!(app.card_buttons().is_empty());
+            assert!(
+                app.take_action().is_none(),
+                "no Check or setup was submitted"
+            );
+        }
+
+        app.publish(prior.clone());
+        assert!(
+            app.check_card.is_none(),
+            "completion retires presentation history"
+        );
+        let settled = compile_in(&app, &view, 900.0, 824.0);
+        assert_eq!(
+            semantic(&settled, "system-state/card").rect,
+            semantic(&before, "system-state/card").rect
+        );
+        assert!(semantic(&settled, &button.key).state.unwrap().enabled);
+        assert!(app.card_buttons().contains(&button.key));
+        assert!(app.take_action().is_none());
+
+        // A fresh requirement, failure, source, plan, hold or newer record still wins. None
+        // may reseed a reduced card during the remainder of this same observation episode.
+        let mut changed_need = early.clone();
+        changed_need
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == Subject::Access(Access::NameRule))
+            .unwrap()
+            .note = Some("A different current naming requirement".into());
+        let mut failed = early.clone();
+        let row = failed
+            .observed
+            .iter_mut()
+            .find(|row| row.subject == helper)
+            .unwrap();
+        row.standing = Standing::Failed;
+        row.note = Some("The new helper reading failed".into());
+        failed
+            .unconfirmed_observations
+            .retain(|subject| *subject != helper);
+        let mut other_source = early.clone();
+        other_source.observed_vault_url = Some("https://other.invalid/vault".into());
+        let mut held = early.clone();
+        held.stopped_wait = true;
+        let mut other_plan = early.clone();
+        other_plan
+            .plan
+            .as_mut()
+            .unwrap()
+            .selection
+            .set(Setting::Permissions, false);
+        let mut newer = status_of("newer");
+        newer.observing = early.observing.clone();
+        for invalidated in [changed_need, failed, other_source, held, other_plan, newer] {
+            let mut guarded = reading(&prior);
+            guarded.publish(early.clone());
+            assert!(guarded.check_card.is_some());
+            guarded.publish(invalidated.clone());
+            assert!(guarded.check_card.is_none());
+            assert!(drawn(&guarded).1.iter().all(|item| !item.retained));
+            guarded.publish(invalidated);
+            assert!(
+                guarded.check_card.is_none(),
+                "the same read cannot recapture"
+            );
+            assert!(guarded.take_action().is_none());
+        }
+    }
+
+    // A view can first receive the still-current requests after their read has started. It
+    // has no prior card to capture on that publication; the later unread edge must preserve
+    // the card actually shown, without needing a Check action or a new reading episode.
+    let mut first_seen = reading(&queued);
+    assert!(first_seen.check_card.is_none());
+    let view = SystemStateViewState::default();
+    let before = compile_in(&first_seen, &view, 346.0, 824.0);
+    let mut partial = queued;
+    partial.last_known = prior.observed;
+    partial.observed.retain(|row| row.subject != helper);
+    partial.observed.push(Observation::unknown(helper));
+    partial.unconfirmed_observations = vec![helper];
+    partial.observing = vec![(repositories, partial.observed_vault_url.clone(), false)];
+    first_seen.publish(partial);
+    let during = compile_in(&first_seen, &view, 346.0, 824.0);
+    for key in [
+        "system-state/card",
+        developer.as_str(),
+        "system-state/headline",
+        "system-state/progress",
+    ] {
+        assert_eq!(
+            semantic(&before, key).rect,
+            semantic(&during, key).rect,
+            "first reading {key}"
+        );
+    }
+    assert!(drawn(&first_seen).1.iter().all(|item| item.retained));
+    assert_eq!(
+        first_seen.reviewed_row(helper).standing,
+        Some(Standing::Unknown)
+    );
+    assert!(first_seen.card_buttons().is_empty());
+    assert!(first_seen.take_action().is_none());
+}
+
+#[test]
+fn optional_app_network_settings_require_a_current_diagnostic() {
+    let subject = Subject::Access(Access::LocalNetwork);
+    let status = status_of("set-up");
+    let mut app = reading(&status);
+    let row = app.reviewed_row(subject);
+    assert!(!row.managed);
+    assert_eq!(row.standing, Some(Standing::NotNeeded));
+    assert!(app.can_open_access(Access::LocalNetwork));
+    let mut pending = status.clone();
+    pending.last_known = std::mem::take(&mut pending.observed);
+    pending.observing = vec![(subject, None, true)];
+    app.publish(pending);
+    assert!(!app.can_open_access(Access::LocalNetwork));
+    app.publish(status);
+    assert!(app.can_open_access(Access::LocalNetwork));
+}
+
+#[test]
+fn an_observed_failure_keeps_its_card_until_the_new_read_supplies_a_current_result() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let dock = Subject::Setting(Setting::Dock);
+    let mut prior = status_of("set-up");
+    let failed = prior
+        .observed
+        .iter_mut()
+        .find(|row| row.subject == dock)
+        .unwrap();
+    failed.standing = Standing::Failed;
+    failed.note = Some("The Dock reading failed".into());
+    let original_failure = failed.clone();
+    assert!(
+        prior.rows.is_empty() && prior.check.is_none(),
+        "only the observation supplies this failure"
+    );
+    let mut app = reading(&prior);
+    let mut view = SystemStateViewState::default();
+    let before = compile_in(&app, &view, 900.0, 824.0);
+    let compact_before = compile_in(&app, &view, 346.0, 824.0);
+    assert!(drawn(&app).1.iter().any(|item| item.mark == Mark::Failed));
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+
+    let mut pending = prior.clone();
+    pending.busy = true;
+    pending.operation = Some(SetupOperation::Check);
+    app.publish(pending.clone());
+    assert!(
+        drawn(&app)
+            .1
+            .iter()
+            .any(|item| item.mark == Mark::Failed && !item.retained)
+    );
+    pending.last_known = pending
+        .observed
+        .iter()
+        .filter(|row| row.standing != Standing::Failed)
+        .cloned()
+        .collect();
+    pending.observing = pending
+        .observed
+        .iter()
+        .map(|row| {
+            (
+                row.subject,
+                row.subject
+                    .uses_vault_source()
+                    .then(|| app.plan.vault_url.clone()),
+                true,
+            )
+        })
+        .collect();
+    pending.observed = vec![Observation::unknown(dock)];
+    pending.unconfirmed_observations = vec![dock];
+    let developer = format!("system-state/line/{}/switch", Line::Developer.slug());
+    for queued in [true, false] {
+        for (_, _, waiting) in &mut pending.observing {
+            *waiting = queued;
+        }
+        app.publish(pending.clone());
+        let frame = compile_in(&app, &view, 900.0, 824.0);
+        let compact = compile_in(&app, &view, 346.0, 824.0);
+        for key in [
+            "system-state/card",
+            developer.as_str(),
+            "system-state/headline",
+            "system-state/progress",
+        ] {
+            assert_eq!(
+                semantic(&frame, key).rect,
+                semantic(&before, key).rect,
+                "{key}"
+            );
+            assert_eq!(
+                semantic(&compact, key).rect,
+                semantic(&compact_before, key).rect,
+                "compact {key}"
+            );
+        }
+        let cards = drawn(&app).1;
+        assert!(
+            cards
+                .iter()
+                .any(|item| item.mark == Mark::Failed && item.retained)
+        );
+        assert!(
+            semantic(&frame, "system-state/card")
+                .label
+                .contains("last read")
+        );
+        assert!(
+            semantic(&frame, "system-state/phase")
+                .label
+                .contains(if queued { "queued" } else { "checking" })
+        );
+        assert_eq!(app.reviewed_row(dock).standing, Some(Standing::Unknown));
+        assert!(!app.reviewed_row(dock).settled());
+        assert!(app.card_buttons().is_empty());
+        app.act(&mut view, "system-state/headline/start", None);
+        assert!(
+            app.take_action().is_none(),
+            "failure history cannot start setup"
+        );
+    }
+
+    let mut fresh = pending.clone();
+    fresh.observed = vec![original_failure.stamped(1_700_000_001)];
+    fresh.unconfirmed_observations.clear();
+    fresh.observing.retain(|(subject, _, _)| *subject != dock);
+    app.publish(fresh.clone());
+    assert_eq!(app.reviewed_row(dock).standing, Some(Standing::Failed));
+    assert!(
+        drawn(&app)
+            .1
+            .iter()
+            .any(|item| item.mark == Mark::Failed && !item.retained)
+    );
+    fresh.observed[0].note = Some("The new Dock reading failed differently".into());
+    app.publish(fresh);
+    assert!(
+        app.check_card.is_none(),
+        "a changed current failure supersedes the prior card"
+    );
+    assert!(drawn(&app).1.iter().any(|item| {
+        !item.retained
+            && item
+                .reason
+                .as_deref()
+                .is_some_and(|note| note.contains("failed differently"))
+    }));
 }

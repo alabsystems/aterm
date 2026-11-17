@@ -12649,6 +12649,59 @@ fn a_relaunchs_start_up_is_no_turn_asked_under_the_new_login() {
     assert_eq!(st.account_answer(&ran(240)), Some(AccountAnswer::Served));
 }
 
+/// m2, Claude Code 2.1.323, 2026-11-16, as the loop read it: the turn on `m2` ended on its weekly
+/// limit, the host relaunched the conversation under `m2-3`, the new process's first point drew
+/// `m2`'s limit again from the resumed transcript (seq 786), and the move's owed resume was typed
+/// there (seq 793). THE START-UP POINT ASKED NO TURN, SO THE LIMIT IT DRAWS ANSWERS NOTHING
+/// ([`TurnEndState::account_answer`]): the resume is the turn asked under the move, and the first
+/// point it works to with no wall answers the move served and is the login's served point, which
+/// the host proves the moved-to account by (`harness_host.rs`' `served_proof`, on the row's
+/// vault token there). NEGATIVE CONTROL: a limit drawn at a point the resume worked to is the
+/// moved-to login's own answer.
+#[test]
+fn a_move_at_a_limit_is_answered_by_the_resumed_turn_not_the_replayed_limit() {
+    let t = t0();
+    let s = Duration::from_secs;
+    let weekly = |worked: Option<Duration>| {
+        let mut r = walled(
+            WallKind::UsageWeekly,
+            "You've hit your weekly limit · resets Nov 18 at 8pm (America/Los_Angeles)",
+            worked,
+        );
+        r.reset_at = Some(t + 33 * 60 * MIN);
+        r
+    };
+    let mut st = TurnEndState::default();
+    st.observe(&weekly(Some(29 * 60 * MIN)), t);
+    st.restarted(
+        &to_account("m2-3", AccountAt::Wall),
+        true,
+        &weekly(None),
+        t + s(7),
+    );
+    let replayed = weekly(None);
+    assert_eq!(st.account_answer(&replayed), None, "no turn asked yet");
+    assert_eq!(st.login_seen(&replayed), None, "no login served or lost");
+    let resume = at(&mut st, &replayed, t + s(9));
+    assert_eq!(
+        resume,
+        typed(RULE_LIMIT_RESUME),
+        "the move's one owed resume"
+    );
+    st.acted(&resume, &replayed, t + s(18));
+    st.took();
+    assert_eq!(
+        st.clone().account_answer(&weekly(Some(s(30)))),
+        Some(AccountAnswer::Bad(AccountBad::Wall)),
+        "CONTROL: the moved-to login's own limit"
+    );
+    let served = idle("Stage 3 landed.", Some(105 * MIN));
+    assert_eq!(st.account_answer(&served), Some(AccountAnswer::Served));
+    assert_eq!(st.login_seen(&served), Some(LoginSeen::Served));
+    st.account_told(AccountAnswer::Served);
+    assert_eq!(st.account_move(), None, "answered once");
+}
+
 fn advised_resume(r: &TurnEndReading, cleared_at: i64) -> TurnEndReading {
     TurnEndReading {
         account: Some(AccountAdvice::Resume { cleared_at }),

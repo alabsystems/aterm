@@ -373,6 +373,57 @@ fn a_build_laid_aside_is_surveyed_once_under_its_name() {
     );
 }
 
+/// A keyed build tree `aterm pkg gc` would evict is counted as that command's row, named with
+/// the tree its program keeps, and never removed here; the scan reads the store's trees as gc
+/// judges them.
+#[test]
+fn an_idle_keyed_tree_is_reported_and_delegated_to_pkg_gc() {
+    let home = aterm_tempfile::tempdir().expect("scratch");
+    let layout = atpkg::store::Layout {
+        prefix: home.path().join("pkg"),
+    };
+    let program = atpkg::keyed_tree::program("llvm-tree").expect("a keyed program");
+    let lay = |fill: char, age: std::time::Duration| {
+        let key = atpkg::keyed_tree::TreeKey::parse(&fill.to_string().repeat(64)).expect("key");
+        let at = atpkg::keyed_tree::dir(&layout, program, "aarch64-apple-darwin", &key);
+        std::fs::create_dir_all(&at).expect("mkdir");
+        std::fs::write(at.join("libLLVM.dylib"), vec![0u8; 4096]).expect("write");
+        atpkg::store::mark_build_ready(&at).expect("ready");
+        let marker = atpkg::store::ready_marker_path(&at).expect("marker");
+        std::fs::File::options()
+            .write(true)
+            .open(marker)
+            .expect("open")
+            .set_modified(std::time::SystemTime::now() - age)
+            .expect("age");
+        at
+    };
+    let idle = lay('a', atpkg::keyed_tree::KEEP * 2);
+    lay('b', std::time::Duration::ZERO);
+
+    let mut survey = Survey::new(NOW);
+    scan_trees(&layout.prefix.join("store"), &mut survey);
+    let rep = report(&survey, applying());
+    let rows = rep.rows_of(Class::AtpkgGc);
+    assert_eq!(
+        rows.iter().map(|r| r.path.as_path()).collect::<Vec<_>>(),
+        [idle.as_path()],
+        "only the tree gc evicts: {rep:?}"
+    );
+    assert!(rows[0].bytes >= 4096, "its bytes are counted");
+    assert!(
+        matches!(&rows[0].witness, Witness::IdleTree { program, newest }
+            if program == "llvm-tree" && *newest == "b".repeat(64))
+    );
+    assert!(!rows[0].removable, "the store is another writer's tree");
+    assert!(
+        rows[0]
+            .blocked
+            .as_deref()
+            .is_some_and(|b| b.contains("aterm pkg gc"))
+    );
+}
+
 #[test]
 fn a_superseded_store_build_is_reported_and_delegated_never_removed_here() {
     let mut survey = Survey::new(NOW);

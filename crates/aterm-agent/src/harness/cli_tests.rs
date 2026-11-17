@@ -2258,6 +2258,96 @@ fn a_kimi_limits_read_persists_the_month_and_session() {
     assert!(!row.contains('?'), "{row}");
 }
 
+/// A CLAUDE `harness limits` READ IS A SCREEN READ, HELD BACK AFTER A REFILL. The store holds
+/// the week read 99% by one tapped process and then 69% by a process begun after it, which opened
+/// the week's refill barrier half an hour ago. `harness limits` of a Claude tab that shows the
+/// week at 99% (no launch made for the read: the panel may be one drawn before the refill) records
+/// the sample with the week's 69% kept and its ledger row saying the panel's figure was held back.
+/// Negative control: passing the read's own instant as the panel's served bound
+/// (`launched.map(|_| env.now)` made `Some(env.now)`), or recording it through `note_sample`,
+/// takes the 99% and the first assertion fails.
+#[test]
+fn a_claude_limits_read_after_a_refill_holds_the_week_back() {
+    let tmp = tmp_dir("claude-limits-refilled");
+    let env = env_at(&tmp);
+    let roster = accounts::append_row("", "main", Class::Preferred, None).unwrap();
+    std::fs::write(env.accounts_roster_for(Cli::Claude).unwrap(), roster).unwrap();
+    let window = usage::PanelWindow {
+        name: "seven_day".to_owned(),
+        used_pct: 99,
+        reset_text: Some("Sep 23 at 12pm".to_owned()),
+    };
+    let reset = usage::panel_sample_local(
+        std::slice::from_ref(&window),
+        env.now,
+        &|_| Some(0),
+        &limit::zone_offset_at,
+    )
+    .and_then(|s| s.week_reset)
+    .expect("the panel's week names its reset");
+    let tap = |pct_x10, at: i64, born: i64, seen_before| accounts::TapRead {
+        seven_day: Some(accounts::WindowRead {
+            pct_x10,
+            reset,
+            refilled: None,
+        }),
+        at,
+        seen_before,
+        born: Some(born),
+        ..accounts::TapRead::default()
+    };
+    let store = env.accounts_store_for(Cli::Claude).unwrap();
+    let (before, refilled) = (env.now - 2 * 3600, env.now - 30 * 60);
+    store
+        .transact(before, &mut None, |state| {
+            let mut events = accounts::note_reading(
+                state,
+                "main",
+                &tap(990, before, before - 3600, true),
+                before,
+            );
+            events.extend(accounts::note_reading(
+                state,
+                "main",
+                &tap(690, refilled, before + 60, false),
+                refilled,
+            ));
+            Ok(events)
+        })
+        .unwrap();
+    let (state, _) = store.load(env.now).unwrap();
+    assert_eq!(
+        state.account("main").windows[accounts::WEEK_LIMIT].epoch_at,
+        Some(refilled),
+        "the refill's barrier"
+    );
+    let view = LimitsView {
+        wall: None,
+        resets_at: None,
+        windows: vec![(window, Some(reset))],
+        credits: false,
+    };
+    record_limits_usage(&env, "@s-worker", Cli::Claude, &view, &|_| Some(0), None).unwrap();
+    let (state, _) = store.load(env.now).unwrap();
+    let sample = state.account("main").sample.clone().expect("a sample");
+    assert_eq!(
+        (sample.week_pct, sample.week_reset),
+        (Some(69), Some(reset)),
+        "the refilled week stands"
+    );
+    let ledger = store.tail(accounts::LEDGER_KEEP_ROWS).unwrap();
+    let row = ledger
+        .iter()
+        .rev()
+        .find(|e| e.kind == accounts::Kind::Sample)
+        .expect("the read's ledger row");
+    assert!(
+        row.why.contains("week 69% (the panel's 99% held back"),
+        "{}",
+        row.why
+    );
+}
+
 /// A KIMI ROW WITH NO MONTHLY READING SAYS SO, NEVER `monthly ?`; nor does one with no reading
 /// at all.
 #[test]

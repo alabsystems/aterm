@@ -91,6 +91,7 @@ use super::{
 use crate::{
     Error,
     alab::{
+        account_names,
         journal::{self, Event},
         registry,
         view::{LabView, MachineNickname},
@@ -685,77 +686,23 @@ pub(super) fn typed(column: &crate::typed::Column, field: &Field) -> Option<Valu
     }
 }
 
-/// The address the `address` row `pk` says now, in the spelling the grid shows it; `None` where
-/// the row is missing, conflicted to nothing, or says something this build refuses to show.
-fn address_of(addresses: &Projection, pk: &str) -> Option<String> {
-    let x = addresses.rows.get(pk)?.get("addr")?;
-    let shown = grid::show(&Ty::Email, x);
-    keys::address(&shown)
-        .ok()
-        .filter(|address| *address == shown)
-}
-
 fn text<'a>(row: &'a cell::Row, column: &str) -> Option<&'a str> {
     row.get(column).and_then(Value::as_str)
 }
 
-/// What the account files derive from the registry's other collections.
-struct Accounts {
-    /// Each account's claims address.
-    email: BTreeMap<String, String>,
-    /// Each account's login address, which a sign-in types: the claims address too unless an
-    /// identity is set.
-    login: BTreeMap<String, String>,
-    slug: BTreeMap<String, String>,
-    name: BTreeMap<String, String>,
-}
-
-impl Accounts {
-    fn read(compiled: &Compiled, projections: &Projections<'_>) -> Self {
-        let accounts = projections.project(&registry::ACCOUNT);
-        let addresses = compiled
-            .collection(registry::ADDRESS.name)
-            .map(|collection| projections.project(collection))
-            .unwrap_or_default();
-        let mut email = BTreeMap::new();
-        let mut login = BTreeMap::new();
-        for (pk, row) in &accounts.rows {
-            if let Some(address) = text(row, "login").and_then(|ad| address_of(&addresses, ad)) {
-                login.insert(pk.clone(), address);
-            }
-            // The claims address: the identity's when one is set, else the login's.
-            let claims = text(row, "identity").or_else(|| text(row, "login"));
-            if let Some(address) = claims.and_then(|ad| address_of(&addresses, ad)) {
-                email.insert(pk.clone(), address);
-            }
-        }
-        let rows: Vec<keys::Slugged<'_>> = accounts
-            .rows
-            .iter()
-            .map(|(pk, row)| keys::Slugged {
-                pk,
-                realm: text(row, "realm").unwrap_or_default(),
-                label: text(row, "label"),
-                claims_email: email.get(pk).map(String::as_str),
-                live: row.live(),
-            })
-            .collect();
-        let slug = keys::account_slugs(&rows);
-        let name = accounts
-            .rows
-            .iter()
-            .filter_map(|(pk, row)| {
-                let name = keys::account_name(text(row, "realm")?, email.get(pk)?)?;
-                Some((pk.clone(), name))
-            })
-            .collect();
-        Self {
-            email,
-            login,
-            slug,
-            name,
-        }
-    }
+/// Every account's names (`alab::account_names`), from the registry's account and address rows
+/// as this pass projected them ([`Projections`]): what `ai/accounts`, `ai/links` and the
+/// `ai/limits` view name an account by.
+fn account_names_of(
+    compiled: &Compiled,
+    projections: &Projections<'_>,
+) -> BTreeMap<String, account_names::Names> {
+    let accounts = projections.project(&registry::ACCOUNT);
+    let addresses = compiled
+        .collection(registry::ADDRESS.name)
+        .map(|collection| projections.project(collection))
+        .unwrap_or_default();
+    account_names::of_projected(&accounts, &addresses)
 }
 
 /// Each machine's label, by key, as a computed cell may carry it: the stored label where it is
@@ -826,7 +773,7 @@ fn computed(
         // A ring file's `=seen` is its snapshot's own (`aterm_file::retain`).
         Computed::None | Computed::Kept => {}
         Computed::Accounts => {
-            let accounts = Accounts::read(compiled, projections);
+            let accounts = account_names_of(compiled, projections);
             let machines = machine_labels(compiled, projections);
             // Each account's live links on live machines, smallest rank first, unranked last.
             let all = projections.project(&registry::MACHINE);
@@ -847,10 +794,15 @@ fn computed(
                     .push((rank, machines.get(machine).map_or(machine, String::as_str)));
             }
             for pk in projection.rows.keys() {
-                put(pk, "name", accounts.name.get(pk));
-                put(pk, "slug", accounts.slug.get(pk));
-                put(pk, "email", accounts.email.get(pk));
-                put(pk, "login_email", accounts.login.get(pk));
+                let names = accounts.get(pk);
+                put(pk, "name", names.and_then(|names| names.name.as_ref()));
+                put(pk, "slug", names.map(|names| &names.slug));
+                put(pk, "email", names.and_then(|names| names.email.as_ref()));
+                put(
+                    pk,
+                    "login_email",
+                    names.and_then(|names| names.login.as_ref()),
+                );
                 if let Some(mut linked) = links.remove(pk.as_str()) {
                     linked.sort_unstable();
                     let names: Vec<&str> = linked.into_iter().map(|(_, name)| name).collect();
@@ -859,12 +811,16 @@ fn computed(
             }
         }
         Computed::Links => {
-            let accounts = Accounts::read(compiled, projections);
+            let accounts = account_names_of(compiled, projections);
             let machines = machine_labels(compiled, projections);
             for (pk, row) in &projection.rows {
-                let account = text(row, "account").unwrap_or_default();
-                put(pk, "account_slug", accounts.slug.get(account));
-                put(pk, "account_name", accounts.name.get(account));
+                let names = accounts.get(text(row, "account").unwrap_or_default());
+                put(pk, "account_slug", names.map(|names| &names.slug));
+                put(
+                    pk,
+                    "account_name",
+                    names.and_then(|names| names.name.as_ref()),
+                );
                 put(
                     pk,
                     "machine_name",
@@ -876,9 +832,11 @@ fn computed(
             let view = projections.view();
             let empty = OwnedRead::default();
             let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
+            // The machines file reads the seats, `=here` and the nicknames, no account's names.
             let lab = LabView::read_projected(
                 &view.cells,
                 &projections.project(&registry::MACHINE),
+                BTreeMap::new(),
                 owned(registry::MACHINE_FACTS.name),
                 owned(registry::MAILBOX_OBS.name),
                 me,
@@ -904,6 +862,24 @@ fn computed(
                 ) {
                     put(pk, "nickname_auto", Some(&yes));
                 }
+            }
+            for (pk, row) in &projection.rows {
+                if row.raw.contains("label") {
+                    continue;
+                }
+                let Some(field) = row.fields.get("label").filter(|field| !field.conflicted())
+                else {
+                    continue;
+                };
+                // Only an owner's label is a number a Mac takes (registration's own rule).
+                if matches!(field, Field::Value(candidate)
+                    if candidate.value.a || candidate.value.s.is_some())
+                {
+                    put(pk, "label_auto", Some(&yes));
+                }
+                // The projection reads the claim rule's answer first (`cell::Row::get`).
+                let claim = row.get("label").and_then(Value::as_str).map(str::to_owned);
+                put(pk, "label_claim", claim.as_ref());
             }
         }
     }
@@ -1262,7 +1238,7 @@ fn ring_history(collection: &str, ring: &Ring) -> Vec<Value> {
             );
             entry.insert("by".to_owned(), Value::from(keys::actor_key(&op.actor)));
             entry.insert("ms".to_owned(), Value::from(ms));
-            entry.insert("revert".to_owned(), Value::from(op.revert));
+            entry.insert("revert".to_owned(), Value::from(op.revert.is_some()));
             entry.insert("keys".to_owned(), Value::Array(keys));
             Some((ms, op.id, Value::Object(entry)))
         })
@@ -1351,7 +1327,8 @@ fn ring_file(
 
 /// Project `ai/limits` from the `ai/usage` rows `usage` (this pass's projection, or the
 /// snapshot here), naming each account by the registry's view (`compiled`'s, its collections
-/// projected once a pass, [`Projections`]), and preferring a current member's reading
+/// projected once a pass, [`Projections`]) as `ai/accounts` names it (`alab::account_names`),
+/// and preferring a current member's reading
 /// (`members`) over its fenced predecessor's where the registry binds both to one Mac;
 /// `complete` is the ring's. Returns the snapshot and the cells withheld.
 fn limits_file(
@@ -1371,11 +1348,11 @@ fn limits_file(
     let lab = LabView::read_projected(
         &view.cells,
         &projections.project(&registry::MACHINE),
+        account_names_of(compiled, projections),
         owned(registry::MACHINE_FACTS.name),
         owned(registry::MAILBOX_OBS.name),
         None,
     );
-    let accounts = Accounts::read(compiled, projections);
     let seats = Seats {
         bound: lab.bound,
         current: members.clone(),
@@ -1384,9 +1361,10 @@ fn limits_file(
     let mut rows = Vec::new();
     for (pk, limit) in limits::fold(&readings, &seats) {
         let account = limit.account.as_deref().unwrap_or(pk.as_str());
-        let slug = accounts.slug.get(account);
-        let name = accounts.name.get(account);
-        let mut row = limit.row(&pk, slug.map(String::as_str), name.map(String::as_str));
+        let names = lab.names.get(account);
+        let slug = names.map(|names| names.slug.as_str());
+        let name = names.and_then(|names| names.name.as_deref());
+        let mut row = limit.row(&pk, slug, name);
         // Every computed text is held to the guards once more before it is written.
         for (column, text) in &mut row.cells {
             if !guarded(text) {
@@ -1430,13 +1408,14 @@ fn limits_file(
 }
 
 /// How many retained records of `file`'s collection `view` holds inert (§5): automatic records
-/// past their writer's quota ([`crate::typed::owned::Quota::over`]), and, in an owned
-/// collection, each row at a key that does not name its signer's machine or that is no bounded
-/// object with a counter ([`OwnedRead::inert`]). They stay in history with their authors; the
-/// status counts them. A file of the journal ring counts its own read's (`ring_file`): a row or
-/// an entry at a key that is not its signer's, and an event this build's vocabulary does not
-/// read.
-pub(super) fn inert(file: &Type, view: &View) -> u64 {
+/// past their writer's quota ([`crate::typed::owned::Quota::over`]); in a collection under the
+/// authority rules, each record holding a write they hold inert
+/// ([`crate::typed::authority::Inert::records`]); and, in an owned collection, each row at a key
+/// that does not name its signer's machine or that is no bounded object with a counter
+/// ([`OwnedRead::inert`]). They stay in history with their authors; the status counts them. A
+/// file of the journal ring counts its own read's (`ring_file`): a row or an entry at a key that
+/// is not its signer's, and an event this build's vocabulary does not read.
+pub(crate) fn inert(file: &Type, view: &View) -> u64 {
     let Some(collection) = file.collection() else {
         return 0;
     };
@@ -1452,7 +1431,13 @@ pub(super) fn inert(file: &Type, view: &View) -> u64 {
         })
         .count();
     let owned = view.owned.get(collection.name).map_or(0, |read| read.inert);
-    u64::try_from(over.saturating_add(owned)).unwrap_or(u64::MAX)
+    let authority = view
+        .inert
+        .records
+        .get(collection.name)
+        .copied()
+        .unwrap_or(0);
+    u64::try_from(over.saturating_add(owned).saturating_add(authority)).unwrap_or(u64::MAX)
 }
 
 /// The operations that wrote `file`'s collection, oldest claim first (by the time each says it
@@ -1519,7 +1504,7 @@ fn history(file: &Type, family: &Family, view: &View, held: &File) -> Vec<Value>
             entry.insert("op".to_owned(), Value::from(id));
             entry.insert("by".to_owned(), Value::from(keys::actor_key(&op.actor)));
             entry.insert("ms".to_owned(), Value::from(ms));
-            entry.insert("revert".to_owned(), Value::from(op.revert));
+            entry.insert("revert".to_owned(), Value::from(op.revert.is_some()));
             entry.insert("keys".to_owned(), Value::Array(keys));
             Some((ms, op.id, Value::Object(entry)))
         })

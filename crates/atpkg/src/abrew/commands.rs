@@ -16556,7 +16556,24 @@ mod livecheck {
             (c.version, c.url)
         } else {
             let f = tap::parse_rb_as_data(&text, qualified);
-            (f.version, f.stable_url)
+            // The agreement gate compares brew's file-loaded
+            // version against the API's. The tap record's URL
+            // heuristic is cruder than brew's `Version.detect`
+            // (`squirrel_3_2_stable` -> "3", `nauty2_9_3` ->
+            // "9"), so where the file has no explicit
+            // `version` stanza the gate uses the faithful
+            // detector instead (r408 corpus).
+            let has_stanza = text.lines().any(|l| {
+                l.trim()
+                    .strip_prefix("version")
+                    .is_some_and(|r| r.trim_start().starts_with(['"', '\'']))
+            });
+            let version = if has_stanza {
+                f.version
+            } else {
+                version_parse(&f.stable_url).unwrap_or(f.version)
+            };
+            (version, f.stable_url)
         };
         // Brew's cask `url.unversioned?`: the raw `url "..."`
         // string carries no interpolation (beyond `#{arch}`).
@@ -16588,7 +16605,9 @@ mod livecheck {
                 && s.json_block.is_none()
                 && s.xml_block.is_none()
                 && s.yaml_block.is_none()
-                && s.plist_block.is_none())
+                && s.plist_block.is_none()
+                && s.page_block.is_none()
+                && s.ghrel_block.is_none())
                 || s.url_options
         })
     }
@@ -17102,6 +17121,19 @@ mod livecheck {
 
     /// A Ruby livecheck regex compiled for `aterm_regex`,
     /// plus where the version sits in a match.
+    /// One capture group's split of the pattern
+    /// (prefix | body | suffix), each compiled for
+    /// full-match tests — the same recovery as group
+    /// 1's, for captures past the first.
+    struct GroupSplit {
+        body: aterm_regex::Regex,
+        body_full: aterm_regex::Regex,
+        pre_full: Option<aterm_regex::Regex>,
+        post_full: Option<aterm_regex::Regex>,
+        lazy_prefix: bool,
+        lazy_group: bool,
+    }
+
     struct LcRegex {
         /// The Ruby source verbatim (for `Regexp#inspect`).
         src: String,
@@ -17126,6 +17158,12 @@ mod livecheck {
         /// split search prefers the shortest group.
         lazy_group: bool,
         has_group: bool,
+        /// Total capturing groups in the pattern.
+        group_count: usize,
+        /// Splits for captures 2..=N (`None` where a
+        /// split cannot be built: quantified group, or
+        /// a part that does not compile).
+        extra_groups: Vec<Option<GroupSplit>>,
     }
 
     /// Translate + compile a Ruby regex. Ruby changes: `^`/`$`
@@ -17207,6 +17245,37 @@ mod livecheck {
                 }
                 None => (None, None, None, None, false, false, false),
             };
+        let spans = capture_spans(body);
+        let extra_groups: Vec<Option<GroupSplit>> = spans
+            .iter()
+            .skip(1)
+            .map(|span| {
+                if span.quantified {
+                    return None;
+                }
+                let prefix = rebalance_prefix(&body[..span.open]);
+                let suffix = rebalance_suffix(&body[span.suffix_at.min(body.len())..]);
+                let sub = &body[span.inner_start..span.close];
+                let lazy = ["*?", "+?", "??", "}?"].iter().any(|e| prefix.ends_with(e));
+                let group_lazy = ["*?", "+?", "??", "}?"].iter().any(|e| sub.ends_with(e));
+                Some(GroupSplit {
+                    body: compile(&flag_prefix(sub)).ok()?,
+                    body_full: compile(&anchored(sub)).ok()?,
+                    pre_full: if prefix.is_empty() {
+                        None
+                    } else {
+                        Some(compile(&anchored(&prefix)).ok()?)
+                    },
+                    post_full: if suffix.is_empty() {
+                        None
+                    } else {
+                        Some(compile(&anchored(&suffix)).ok()?)
+                    },
+                    lazy_prefix: lazy,
+                    lazy_group: group_lazy,
+                })
+            })
+            .collect();
         Ok(LcRegex {
             src: pattern.to_string(),
             flags: flags.to_string(),
@@ -17218,6 +17287,8 @@ mod livecheck {
             lazy_prefix,
             lazy_group,
             has_group,
+            group_count: spans.len(),
+            extra_groups,
         })
     }
 
@@ -17286,57 +17357,307 @@ mod livecheck {
         None
     }
 
-    /// Recover group 1's text inside a whole match: find
-    /// the split (prefix | group | suffix) all three parts
-    /// full-match, preferring the longest prefix for greedy
-    /// prefixes and the shortest for lazy ones (Ruby's
-    /// backtracking order). Long matches keep the simple
-    /// re-search (bounded work).
-    fn extract_group(re: &LcRegex, m: &str) -> Option<String> {
-        let g = re.group1.as_ref()?;
-        if m.len() > 512 {
-            return g.find(m).map(|mm| mm.as_str().to_string());
+    /// One capturing group's span in pattern text.
+    struct CapSpan {
+        open: usize,
+        inner_start: usize,
+        close: usize,
+        suffix_at: usize,
+        quantified: bool,
+    }
+
+    /// The byte length of a group-open marker at `i`
+    /// (`(`, `(?:`, `(?<name>`, `(?flags:`, …), or 0
+    /// for a self-contained `(?flags)` / `(?#…)`
+    /// (not a group). `None` = malformed.
+    fn group_marker(pattern: &str, i: usize) -> Option<usize> {
+        let rest = &pattern[i..];
+        if !rest.starts_with("(?") {
+            return Some(1);
         }
+        if rest.starts_with("(?#") {
+            return Some(0);
+        }
+        if let Some(r) = rest.strip_prefix("(?<") {
+            if r.starts_with('=') || r.starts_with('!') {
+                return Some(4);
+            }
+            return Some(rest.find('>')? + 1);
+        }
+        // (?: (?= (?! (?flags: (?flags)
+        let inner: String = rest[2..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic() || *c == '-' || *c == '=' || *c == '!')
+            .collect();
+        match rest[2..].chars().nth(inner.len()) {
+            Some(':') => Some(2 + inner.len() + 1),
+            Some(')') => Some(0),
+            _ if inner.len() <= 2 => Some(2 + inner.len()),
+            _ => None,
+        }
+    }
+
+    /// Whether the group opening at `i` captures.
+    fn group_captures(pattern: &str, i: usize) -> bool {
+        let rest = &pattern[i..];
+        !rest.starts_with("(?")
+            || (rest.starts_with("(?<") && !rest.starts_with("(?<=") && !rest.starts_with("(?<!"))
+    }
+
+    /// Every capturing group's span, in opening order
+    /// (Ruby's numbering), escapes and classes skipped.
+    fn capture_spans(pattern: &str) -> Vec<CapSpan> {
+        let bytes = pattern.as_bytes();
+        let mut spans: Vec<CapSpan> = Vec::new();
+        // (open, inner_start, span index if capturing)
+        let mut stack: Vec<(usize, usize, Option<usize>)> = Vec::new();
+        let mut in_class = false;
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' => in_class = true,
+                b']' => in_class = false,
+                b'(' if !in_class => {
+                    match group_marker(pattern, i) {
+                        Some(0) => {
+                            // Self-contained: skip to its close.
+                            if let Some(end) = pattern[i..].find(')') {
+                                i += end;
+                            }
+                        }
+                        Some(marker) => {
+                            let idx = if group_captures(pattern, i) {
+                                spans.push(CapSpan {
+                                    open: i,
+                                    inner_start: i + marker,
+                                    close: usize::MAX,
+                                    suffix_at: usize::MAX,
+                                    quantified: false,
+                                });
+                                Some(spans.len() - 1)
+                            } else {
+                                None
+                            };
+                            stack.push((i, i + marker, idx));
+                        }
+                        None => {}
+                    }
+                }
+                b')' if !in_class => {
+                    if let Some((_, _, idx)) = stack.pop()
+                        && let Some(k) = idx
+                    {
+                        let next = bytes.get(i + 1).copied();
+                        spans[k].close = i;
+                        spans[k].quantified = matches!(next, Some(b'+' | b'*' | b'{'));
+                        spans[k].suffix_at = if next == Some(b'?') { i + 2 } else { i + 1 };
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        spans.retain(|s| s.close != usize::MAX);
+        spans
+    }
+
+    /// Drop the markers of groups opened in `prefix`
+    /// but not closed there, so the text compiles
+    /// standalone (the enclosing group's contents
+    /// stay; `anchored` re-wraps them).
+    fn rebalance_prefix(prefix: &str) -> String {
+        let bytes = prefix.as_bytes();
+        let mut stack: Vec<(usize, usize)> = Vec::new(); // (pos, marker len) in output coords
+        let mut in_class = false;
+        let mut i = 0;
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'[' => in_class = true,
+                b']' => in_class = false,
+                b'(' if !in_class => {
+                    if let Some(marker) = group_marker(prefix, i) {
+                        if marker > 0 {
+                            stack.push((i, marker));
+                        }
+                    }
+                }
+                b')' if !in_class => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        for (pos, len) in stack {
+            spans.push((pos, len));
+        }
+        let mut out = prefix.to_string();
+        for (pos, len) in spans.iter().rev() {
+            out.replace_range(*pos..*pos + *len, "");
+        }
+        out
+    }
+
+    /// Drop closers (and their quantifiers) in
+    /// `suffix` for groups opened before it, so the
+    /// text compiles standalone.
+    fn rebalance_suffix(suffix: &str) -> String {
+        let chars: Vec<(usize, char)> = suffix.char_indices().collect();
+        let mut out = String::with_capacity(suffix.len());
+        let mut depth = 0i32;
+        let mut in_class = false;
+        let mut idx = 0usize;
+        while idx < chars.len() {
+            let (pos, c) = chars[idx];
+            match c {
+                '\\' => {
+                    out.push(c);
+                    if idx + 1 < chars.len() {
+                        out.push(chars[idx + 1].1);
+                        idx += 1;
+                    }
+                }
+                '[' => {
+                    in_class = true;
+                    out.push(c);
+                }
+                ']' => {
+                    in_class = false;
+                    out.push(c);
+                }
+                '(' if !in_class => {
+                    if group_marker(suffix, pos).is_some_and(|m| m > 0) {
+                        depth += 1;
+                    }
+                    out.push(c);
+                }
+                ')' if !in_class => {
+                    if depth == 0 {
+                        // Closer for a group opened before
+                        // the suffix: drop it and any
+                        // quantifier that bound to it.
+                        match chars.get(idx + 1).map(|&(_, c)| c) {
+                            Some('*' | '+' | '?') => idx += 1,
+                            Some('{') => {
+                                while idx + 1 < chars.len() && chars[idx + 1].1 != '}' {
+                                    idx += 1;
+                                }
+                                idx += usize::from(idx + 1 < chars.len());
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        depth -= 1;
+                        out.push(c);
+                    }
+                }
+                _ => out.push(c),
+            }
+            idx += 1;
+        }
+        out
+    }
+
+    /// Recover a capture's text inside a whole match:
+    /// find the split (prefix | group | suffix) all
+    /// three parts full-match, preferring the longest
+    /// prefix for greedy prefixes and the shortest
+    /// for lazy ones (Ruby's backtracking order).
+    /// Short matches enumerate every split; long ones
+    /// search candidate group starts (the body's own
+    /// occurrences) so work stays bounded — the old
+    /// re-search shortcut grabbed the first
+    /// version-shaped text anywhere in the match
+    /// (jasp's page-wide `href=.*?` matches).
+    fn extract_split(
+        pre_full: Option<&aterm_regex::Regex>,
+        body: &aterm_regex::Regex,
+        body_full: Option<&aterm_regex::Regex>,
+        post_full: Option<&aterm_regex::Regex>,
+        lazy_prefix: bool,
+        lazy_group: bool,
+        m: &str,
+    ) -> Option<String> {
         let full = |re: &aterm_regex::Regex, s: &str| re.find(s).is_some();
-        let mut bounds: Vec<usize> = m.char_indices().map(|(i, _)| i).collect();
-        bounds.push(m.len());
-        if !re.lazy_prefix {
-            bounds.reverse();
+        if m.len() <= 512 {
+            let mut bounds: Vec<usize> = m.char_indices().map(|(i, _)| i).collect();
+            bounds.push(m.len());
+            if !lazy_prefix {
+                bounds.reverse();
+            }
+            for k in bounds {
+                if let Some(pre) = pre_full
+                    && !full(pre, &m[..k])
+                {
+                    continue;
+                }
+                let rest = &m[k..];
+                let Some(gm) = body.find(rest) else { continue };
+                if gm.start() != 0 {
+                    continue;
+                }
+                let mut ends: Vec<usize> = rest.char_indices().map(|(i, _)| i).collect();
+                ends.push(rest.len());
+                if !lazy_group {
+                    ends.reverse();
+                }
+                for j in ends {
+                    if j == 0 {
+                        continue;
+                    }
+                    if let Some(gf) = body_full
+                        && !full(gf, &rest[..j])
+                    {
+                        continue;
+                    }
+                    if let Some(post) = post_full
+                        && !full(post, &rest[j..])
+                    {
+                        continue;
+                    }
+                    return Some(rest[..j].to_string());
+                }
+            }
+            return None;
         }
-        for k in bounds {
-            if let Some(pre) = &re.pre_full
-                && !full(pre, &m[..k])
+        // Long match: candidate starts are the body
+        // pattern's own occurrences, tried in prefix
+        // order; ends are the body-full matches from
+        // each start (captures are short), in group
+        // order.
+        let mut starts: Vec<usize> = body.find_iter(m).map(|mm| mm.start()).collect();
+        if !lazy_prefix {
+            starts.reverse();
+        }
+        for s0 in starts {
+            if let Some(pre) = pre_full
+                && !full(pre, &m[..s0])
             {
                 continue;
             }
-            let rest = &m[k..];
-            let Some(gm) = g.find(rest) else { continue };
-            if gm.start() != 0 {
-                continue;
+            let rest = &m[s0..];
+            let cap = rest.len().min(256);
+            let mut ends: Vec<usize> = rest[..rest.floor_char_boundary(cap)]
+                .char_indices()
+                .map(|(i, _)| i)
+                .filter(|&j| j > 0)
+                .collect();
+            if cap == rest.len() {
+                ends.push(rest.len());
             }
-            // Candidate group ends: every char boundary the
-            // group could end at (its own find picks only
-            // one).
-            let mut ends: Vec<usize> = rest.char_indices().map(|(i, _)| i).collect();
-            ends.push(rest.len());
-            // Ruby tries the shortest group first for a
-            // lazy group body, the longest for a greedy
-            // one (an optional `/?` after a lazy `(.*?)`
-            // belongs to the suffix, not the capture —
-            // Hackage's derived regex, r418).
-            if !re.lazy_group {
+            if !lazy_group {
                 ends.reverse();
             }
             for j in ends {
-                if j == 0 {
-                    continue;
-                }
-                if let Some(gf) = &re.group1_full
+                if let Some(gf) = body_full
                     && !full(gf, &rest[..j])
                 {
                     continue;
                 }
-                if let Some(post) = &re.post_full
+                if let Some(post) = post_full
                     && !full(post, &rest[j..])
                 {
                     continue;
@@ -17345,6 +17666,42 @@ mod livecheck {
             }
         }
         None
+    }
+
+    fn extract_group(re: &LcRegex, m: &str) -> Option<String> {
+        let g = re.group1.as_ref()?;
+        extract_split(
+            re.pre_full.as_ref(),
+            g,
+            re.group1_full.as_ref(),
+            re.post_full.as_ref(),
+            re.lazy_prefix,
+            re.lazy_group,
+            m,
+        )
+    }
+
+    /// Recover one later capture's text the same way.
+    fn extract_with_split(split: &GroupSplit, m: &str) -> Option<String> {
+        extract_split(
+            split.pre_full.as_ref(),
+            &split.body,
+            Some(&split.body_full),
+            split.post_full.as_ref(),
+            split.lazy_prefix,
+            split.lazy_group,
+            m,
+        )
+    }
+
+    /// All captures of a whole match (Ruby `scan`'s
+    /// per-match array), group 1 first.
+    fn extract_groups(re: &LcRegex, m: &str) -> Vec<Option<String>> {
+        let mut out = vec![extract_group(re, m)];
+        for split in &re.extra_groups {
+            out.push(split.as_ref().and_then(|s| extract_with_split(s, m)));
+        }
+        out
     }
 
     /// Ruby `String#scan` version extraction over content:
@@ -17399,6 +17756,7 @@ mod livecheck {
         RubyGems,
         Launchpad,
         Bitbucket,
+        ElectronBuilder,
         Json,
         Xml,
         Yaml,
@@ -18135,6 +18493,11 @@ mod livecheck {
         xml: Option<super::super::formula::XmlBlock>,
         /// The `:yaml` block shape, for `Strat::Yaml`.
         yaml: Option<super::super::formula::YamlBlock>,
+        /// A reduced `:page_match`-family strategy
+        /// block (`page.scan(regex).map { … }` as data).
+        page_block: Option<super::super::formula::PageBlock>,
+        /// A reduced `:github_releases` strategy block.
+        ghrel_block: Option<super::super::formula::GhRelBlock>,
         /// The checked unit's `version.major_minor`, for
         /// guarded `:json` map conditions.
         major_minor: String,
@@ -18173,6 +18536,7 @@ mod livecheck {
             Strat::RubyGems => "RubyGems",
             Strat::Launchpad => "Launchpad",
             Strat::Bitbucket => "Bitbucket",
+            Strat::ElectronBuilder => "ElectronBuilder",
             Strat::Json => "Json",
             Strat::Xml => "Xml",
             Strat::Yaml => "Yaml",
@@ -18513,6 +18877,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18544,6 +18910,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18651,6 +19019,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18716,6 +19086,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18875,6 +19247,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -18996,6 +19370,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19065,6 +19441,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19171,10 +19549,45 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
         })))
+    }
+
+    /// Whether the ElectronBuilder strategy applies
+    /// to `url` (its `URL_MATCH_REGEX` in
+    /// livecheck/strategy/electron_builder.rb):
+    /// an http(s) URL whose final path segment is a
+    /// `.yml`/`.yaml` file, with an optional simple
+    /// query. Explicit-only (priority 0).
+    fn electron_builder_match(url: &str) -> bool {
+        let Some(rest) = ["https://", "http://"].iter().find_map(|sch| {
+            url.to_ascii_lowercase()
+                .starts_with(sch)
+                .then(|| &url[sch.len()..])
+        }) else {
+            return false;
+        };
+        let (path_part, query) = match rest.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (rest, None),
+        };
+        if let Some(q) = query
+            && (q.is_empty() || q.contains('/') || q.contains('?'))
+        {
+            return false;
+        }
+        let Some((head, file)) = path_part.rsplit_once('/') else {
+            return false;
+        };
+        if head.is_empty() {
+            return false;
+        }
+        let lower = file.to_ascii_lowercase();
+        (lower.ends_with(".yml") && file.len() > 4) || (lower.ends_with(".yaml") && file.len() > 5)
     }
 
     /// The gem name of a rubygems.org download URL
@@ -19297,6 +19710,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19334,6 +19749,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block: None,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19347,6 +19764,17 @@ mod livecheck {
         candidates: Vec<&'static str>,
     ) -> Result<UrlPlan, Outside> {
         let ua = spec_ua(spec);
+        let ghrel_block = if strat == Strat::GithubReleases {
+            let block = spec.and_then(|sp| sp.ghrel_block.clone());
+            if let Some((pat, flags)) = block.as_ref().and_then(|b| b.name_skip.as_ref())
+                && lc_regex(pat, flags).is_err()
+            {
+                return Err(Outside);
+            }
+            block
+        } else {
+            None
+        };
         let (user, repo) = github_repo(url).ok_or(Outside)?;
         // brew names the REST endpoint as the strategy URL. agh's origin builds it, so no
         // shipped line here spells a GitHub API host beside the GHCR Bearer headers this file
@@ -19373,6 +19801,8 @@ mod livecheck {
             json: None,
             xml: None,
             yaml: None,
+            page_block: None,
+            ghrel_block,
             major_minor: String::new(),
             plist: None,
             apps: Vec::new(),
@@ -19443,6 +19873,11 @@ mod livecheck {
             ("sparkle", "Sparkle", http),
             ("json", "Json", http),
             ("extract_plist", "ExtractPlist", http),
+            (
+                "electron_builder",
+                "ElectronBuilder",
+                electron_builder_match(url),
+            ),
         ];
         for (sym, name, applies) in zero {
             if explicit == Some(sym) && *applies {
@@ -19499,6 +19934,8 @@ mod livecheck {
                 json: None,
                 xml: None,
                 yaml: None,
+                page_block: None,
+                ghrel_block: None,
                 major_minor: major_minor.to_string(),
                 plist: None,
                 apps: Vec::new(),
@@ -19621,6 +20058,17 @@ mod livecheck {
                     }
                     return Ok(plan);
                 }
+                "electron_builder" => {
+                    if !electron_builder_match(url) {
+                        return Ok(UrlPlan::SkipUrl);
+                    }
+                    let re = spec_regex()?;
+                    let mut plan = run(Strat::ElectronBuilder, url.to_string(), re, None);
+                    if let UrlPlan::Run(rp) = &mut plan {
+                        rp.yaml = spec.and_then(|sp| sp.yaml_block.clone());
+                    }
+                    return Ok(plan);
+                }
                 "yaml" => {
                     let Some(block) = spec.and_then(|sp| sp.yaml_block.clone()) else {
                         return Err(Outside);
@@ -19687,12 +20135,15 @@ mod livecheck {
                     if !url.starts_with("https://") && !url.starts_with("http://") {
                         return Ok(UrlPlan::SkipUrl);
                     }
-                    // Without a regex brew falls back to URL
-                    // version detection, which abrew lacks.
-                    return Ok(match spec_regex()? {
-                        Some(re) => run(Strat::HeaderMatch, url.to_string(), Some(re), None),
-                        None => return Err(Outside),
-                    });
+                    // Without a regex brew detects the
+                    // version from each header value
+                    // (`Version.parse` — the r408 port).
+                    return Ok(run(
+                        Strat::HeaderMatch,
+                        url.to_string(),
+                        spec_regex()?,
+                        None,
+                    ));
                 }
                 "sparkle" => {
                     if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -20046,10 +20497,82 @@ mod livecheck {
             }
             seen.push(original.clone());
             let mut plan = plan_url(spec, &fetch, &major_minor_of(own_version))?;
-            if let UrlPlan::Run(rp) = &mut plan
-                && rp.strat == Strat::ExtractPlist
-            {
-                rp.apps = apps.to_vec();
+            if let UrlPlan::Run(rp) = &mut plan {
+                if rp.strat == Strat::ExtractPlist {
+                    rp.apps = apps.to_vec();
+                }
+                // A reduced page block runs only on the
+                // PageMatch-backed arms that carry it,
+                // and its `match[0]` needs a capture.
+                if let Some(pb) = spec.and_then(|sp| sp.page_block.clone()) {
+                    let sub_ok = match &pb.shape {
+                        super::super::formula::PageShape::ScanSub(pat, flags, _) => {
+                            lc_regex(pat, flags).is_ok()
+                        }
+                        super::super::formula::PageShape::ScanSubBackref(pat, flags, tmpl)
+                        | super::super::formula::PageShape::ScanTrSubBackref(
+                            _,
+                            _,
+                            pat,
+                            flags,
+                            tmpl,
+                        ) => match lc_regex(pat, flags) {
+                            Ok(sub) => {
+                                let bytes = tmpl.as_bytes();
+                                let mut ok = true;
+                                let mut i = 0;
+                                while i < bytes.len() {
+                                    if bytes[i] == b'\\'
+                                        && let Some(d) = bytes
+                                            .get(i + 1)
+                                            .and_then(|b| char::from(*b).to_digit(10))
+                                    {
+                                        if d >= 2
+                                            && !sub
+                                                .extra_groups
+                                                .get(d as usize - 2)
+                                                .is_some_and(Option::is_some)
+                                        {
+                                            ok = false;
+                                        }
+                                        if d >= 1 && !sub.has_group {
+                                            ok = false;
+                                        }
+                                        i += 1;
+                                    }
+                                    i += 1;
+                                }
+                                ok
+                            }
+                            Err(_) => false,
+                        },
+                        super::super::formula::PageShape::DirWalk(w) => {
+                            [&w.stage1_regex, &w.stage2_regex]
+                                .into_iter()
+                                .flatten()
+                                .all(|(pat, flags)| lc_regex(pat, flags).is_ok())
+                        }
+                        super::super::formula::PageShape::ScanJoin(_) => rp
+                            .re
+                            .as_ref()
+                            .is_some_and(|re| re.extra_groups.iter().all(Option::is_some)),
+                        super::super::formula::PageShape::ScanCsvOpt => {
+                            rp.re.as_ref().is_some_and(|re| {
+                                re.group_count >= 2
+                                    && re.extra_groups.first().is_some_and(Option::is_some)
+                            })
+                        }
+                        _ => true,
+                    };
+                    match (
+                        matches!(rp.strat, Strat::PageMatch | Strat::Sourceforge),
+                        rp.re.as_ref().is_some_and(|re| re.has_group),
+                        sub_ok,
+                    ) {
+                        (true, true, true) => rp.page_block = Some(pb),
+                        _ => return Err(Outside),
+                    }
+                }
             }
             plans.push((original, plan));
         }
@@ -20289,6 +20812,40 @@ mod livecheck {
         dbg_label("Strategy:", strat_name(rp.strat));
     }
 
+    /// The closing debug lines for a URL whose check
+    /// ended in strategy messages (a failed fetch):
+    /// the oracle's match-data block still prints its
+    /// strategy URL and regex before the messages.
+    fn debug_failed_url_post(
+        rp: &RunPlan,
+        original_url: &str,
+        head_only: bool,
+        references: RefHops,
+        spec_has_regex: bool,
+    ) {
+        let meta = LcMeta {
+            head_only,
+            cached: false,
+            references,
+            symbol: None,
+            original: original_url.to_string(),
+            processed: (rp.url != original_url).then(|| rp.url.clone()),
+            strategy_url: rp.strategy_url.clone().filter(|u| *u != rp.url),
+            final_url: None,
+            strategy: strat_name(rp.strat),
+            strategies: rp.candidates.clone(),
+            regex_inspect: if rp.strat == Strat::Git && !spec_has_regex {
+                None
+            } else {
+                rp.re.as_ref().map(regex_inspect)
+            },
+            ua_option: rp.ua_option.clone(),
+            throttle: None,
+            throttle_days: None,
+        };
+        debug_url_post(&meta, spec_has_regex);
+    }
+
     /// The post-fetch lines of a winning URL's block.
     fn debug_url_post(meta: &LcMeta, spec_has_regex: bool) {
         if let Some(su) = &meta.strategy_url {
@@ -20420,12 +20977,17 @@ mod livecheck {
         match rp.strat {
             Strat::Git => git_versions(&rp.url, rp.re.as_ref().unwrap()),
             Strat::GithubLatest => github_latest_versions(&rp.url, rp.re.as_ref().unwrap()),
-            Strat::GithubReleases => github_releases_versions(&rp.url, rp.re.as_ref().unwrap()),
-            Strat::HeaderMatch => {
-                header_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ua.as_deref())
+            Strat::GithubReleases => {
+                github_releases_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ghrel_block.as_ref())
             }
+            Strat::HeaderMatch => header_versions(&rp.url, rp.re.as_ref(), rp.ua.as_deref()),
             Strat::Sparkle => sparkle_versions(&rp.url, rp.ua.as_deref()),
-            Strat::PageMatch => page_versions(&rp.url, rp.re.as_ref().unwrap(), rp.ua.as_deref()),
+            Strat::PageMatch => page_versions_block(
+                &rp.url,
+                rp.re.as_ref().unwrap(),
+                rp.ua.as_deref(),
+                rp.page_block.as_ref(),
+            ),
             Strat::Bitbucket => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
@@ -20450,11 +21012,13 @@ mod livecheck {
             Strat::Json => json_versions(rp),
             Strat::Xml => xml_versions(rp),
             Strat::Yaml => yaml_versions(rp),
+            Strat::ElectronBuilder => electron_builder_versions(rp),
             Strat::ExtractPlist => plist_versions(rp),
-            Strat::Sourceforge => page_versions(
+            Strat::Sourceforge => page_versions_block(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
                 rp.re.as_ref().unwrap(),
                 rp.ua.as_deref(),
+                rp.page_block.as_ref(),
             ),
             Strat::Hackage => page_versions(
                 rp.strategy_url.as_deref().unwrap_or(&rp.url),
@@ -20520,6 +21084,15 @@ mod livecheck {
             let (mut versions, final_url) = match run_strat(rp) {
                 Found::Versions(v, fin) => (v, fin),
                 Found::Messages(msgs) => {
+                    if debug {
+                        debug_failed_url_post(
+                            rp,
+                            original_url,
+                            false,
+                            res.references.clone(),
+                            res.spec_defined,
+                        );
+                    }
                     // Strategy messages go to stdout in text
                     // mode, as they do for packages.
                     if !json {
@@ -20658,6 +21231,15 @@ mod livecheck {
             let (mut versions, final_url) = match found {
                 Found::Versions(v, fin) => (v, fin),
                 Found::Messages(msgs) => {
+                    if debug {
+                        debug_failed_url_post(
+                            rp,
+                            original_url,
+                            pkg.head_only,
+                            Vec::new(),
+                            pkg.spec.as_ref().is_some_and(|s| s.regex.is_some()),
+                        );
+                    }
                     if !json {
                         for m in &msgs {
                             println!("{m}");
@@ -21133,6 +21715,438 @@ mod livecheck {
         }
     }
 
+    /// `page_versions` with a reduced strategy block:
+    /// Ruby's `page.scan(regex).map { … }` — first
+    /// captures in scan order, transformed, then
+    /// `handle_block_return`'s uniq.
+    fn page_versions_block(
+        url: &str,
+        re: &LcRegex,
+        ua: Option<&str>,
+        block: Option<&super::super::formula::PageBlock>,
+    ) -> Found {
+        let Some(block) = block else {
+            return page_versions(url, re, ua);
+        };
+        if let super::super::formula::PageShape::DirWalk(walk) = &block.shape {
+            return dirwalk_versions(url, re, ua, walk);
+        }
+        // A `sub` block's regex was compile-checked at
+        // plan time; rebuild it for the scan.
+        let sub_re = match &block.shape {
+            super::super::formula::PageShape::ScanSub(pat, flags, _)
+            | super::super::formula::PageShape::ScanSubBackref(pat, flags, _)
+            | super::super::formula::PageShape::ScanTrSubBackref(_, _, pat, flags, _) => {
+                match lc_regex(pat, flags) {
+                    Ok(re) => Some(re),
+                    Err(_) => return Found::Versions(Vec::new(), None),
+                }
+            }
+            _ => None,
+        };
+        match page_get(url, ua) {
+            Ok((content, fin)) => {
+                let mut out: Vec<String> = Vec::new();
+                for m in re.whole.find_iter(&content) {
+                    // Multi-capture shapes take the whole
+                    // scan array; the rest map capture 1.
+                    let multi = match &block.shape {
+                        super::super::formula::PageShape::ScanJoin(sep) => {
+                            let groups = extract_groups(re, m.as_str());
+                            let parts: Vec<&str> = groups
+                                .iter()
+                                .map(|g| g.as_deref().unwrap_or_default())
+                                .collect();
+                            Some(parts.join(sep))
+                        }
+                        super::super::formula::PageShape::ScanCsvOpt => {
+                            let groups = extract_groups(re, m.as_str());
+                            match (
+                                groups.first().cloned().flatten(),
+                                groups.get(1).cloned().flatten(),
+                            ) {
+                                (Some(g0), Some(g1)) => Some(format!("{g0},{g1}")),
+                                (Some(g0), None) => Some(g0),
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(v) = multi {
+                        if !out.contains(&v) {
+                            out.push(v);
+                        }
+                        continue;
+                    }
+                    if let Some(v) = extract_group(re, m.as_str()) {
+                        let v = match page_shape_apply(&block.shape, &v, sub_re.as_ref()) {
+                            Ok(Some(v)) => v,
+                            Ok(None) => continue,
+                            Err(msg) => return Found::Raised(msg),
+                        };
+                        if !out.contains(&v) {
+                            out.push(v);
+                        }
+                    }
+                }
+                Found::Versions(out, Some(fin))
+            }
+            Err(msgs) => Found::Messages(msgs),
+        }
+    }
+
+    /// Ruby `String#sub` with a backreference
+    /// template: the first match span replaced by
+    /// the template with `\1`..`\9` = captures,
+    /// `\0` = the whole match, `\\` = a backslash.
+    fn sub_backref_apply(v: &str, tmpl: &str, sub_re: Option<&LcRegex>) -> String {
+        let Some(re) = sub_re else {
+            return v.to_string();
+        };
+        let Some(m) = re.whole.find(v) else {
+            return v.to_string();
+        };
+        let groups = extract_groups(re, m.as_str());
+        let mut rendered = String::new();
+        let bytes = tmpl.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'\\' => rendered.push('\\'),
+                    b'0' => rendered.push_str(m.as_str()),
+                    d @ b'1'..=b'9' => {
+                        if let Some(g) = groups.get((d - b'1') as usize).cloned().flatten() {
+                            rendered.push_str(&g);
+                        }
+                    }
+                    _ => rendered.push(bytes[i + 1] as char),
+                }
+                i += 2;
+            } else {
+                // Copy one UTF-8 char.
+                let ch_len = tmpl[i..].chars().next().map_or(1, char::len_utf8);
+                rendered.push_str(&tmpl[i..i + ch_len]);
+                i += ch_len;
+            }
+        }
+        let mut out = String::with_capacity(v.len());
+        out.push_str(&v[..m.start()]);
+        out.push_str(&rendered);
+        out.push_str(&v[m.end()..]);
+        out
+    }
+
+    /// Ruby `URI.join` for the tap's relative forms:
+    /// an absolute-path reference replaces the path;
+    /// otherwise the reference replaces the base's
+    /// last path segment (a trailing-slash base keeps
+    /// it).
+    fn uri_join(base: &str, rel: &str) -> String {
+        if rel.contains("://") {
+            return rel.to_string();
+        }
+        let (scheme_host, path) = match base.split_once("://") {
+            Some((sch, rest)) => match rest.find('/') {
+                Some(i) => (format!("{sch}://{}", &rest[..i]), &rest[i..]),
+                None => (base.to_string(), "/"),
+            },
+            None => (String::new(), base),
+        };
+        if let Some(abs) = rel.strip_prefix('/') {
+            return format!("{scheme_host}/{abs}");
+        }
+        let dir = path
+            .rsplit_once('/')
+            .map_or("/", |(d, _)| if d.is_empty() { "/" } else { d });
+        format!("{scheme_host}{dir}/{rel}")
+    }
+
+    /// Brew's `Version#patch` as an integer (third
+    /// dot segment's leading integer; absent = 0).
+    fn version_patch_value(v: &str) -> u64 {
+        let seg = v.split('.').nth(2).unwrap_or_default();
+        seg.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    }
+
+    /// A reduced two-stage directory walk: scan the
+    /// first page for version directories, fetch the
+    /// newest (or last two) directory pages, scan
+    /// those for file versions.
+    fn dirwalk_versions(
+        url: &str,
+        re: &LcRegex,
+        ua: Option<&str>,
+        walk: &super::super::formula::DirWalk,
+    ) -> Found {
+        use super::super::formula::DirBlank;
+        let compile = |spec: &Option<(String, String)>| -> Option<LcRegex> {
+            match spec {
+                Some((pat, flags)) => lc_regex(pat, flags).ok(),
+                None => None,
+            }
+        };
+        let stage1_re = compile(&walk.stage1_regex);
+        let stage2_re = compile(&walk.stage2_regex);
+        if walk.stage1_regex.is_some() && stage1_re.is_none()
+            || walk.stage2_regex.is_some() && stage2_re.is_none()
+        {
+            return Found::Versions(Vec::new(), None);
+        }
+        let scan_first = |content: &str, sre: &LcRegex| -> Vec<String> {
+            let mut out: Vec<String> = Vec::new();
+            for m in sre.whole.find_iter(content) {
+                if let Some(v) = extract_group(sre, m.as_str()) {
+                    out.push(v);
+                }
+            }
+            out
+        };
+        let (content, fin) = match page_get(url, ua) {
+            Ok(ok) => ok,
+            Err(msgs) => return Found::Messages(msgs),
+        };
+        let re1 = stage1_re.as_ref().unwrap_or(re);
+        let mut stage1 = scan_first(&content, re1);
+        // Ruby: uniq keeps first occurrences.
+        let mut seen = std::collections::HashSet::new();
+        stage1.retain(|v| seen.insert(v.clone()));
+        if let Some((from, to)) = &walk.stage1_tr {
+            stage1 = stage1.iter().map(|v| ruby_tr(v, from, to)).collect();
+        }
+        if let Some(limit) = walk.reject_patch_ge {
+            stage1.retain(|v| version_patch_value(v) < limit);
+        }
+        stage1.sort_by(|a, b| super::super::formula::version_cmp(a, b));
+        if stage1.is_empty() {
+            return Found::Versions(Vec::new(), Some(fin));
+        }
+        let mut candidates: Vec<String> = if walk.last_two && stage1.len() > 1 {
+            vec![
+                stage1[stage1.len() - 1].clone(),
+                stage1[stage1.len() - 2].clone(),
+            ]
+        } else {
+            vec![stage1[stage1.len() - 1].clone()]
+        };
+        let re2 = stage2_re.as_ref().unwrap_or(re);
+        let mut dir_versions: Vec<String> = Vec::new();
+        for cand in candidates.drain(..) {
+            let dir_name = match &walk.dir_tr {
+                Some((from, to)) => ruby_tr(&cand, from, to),
+                None => cand.clone(),
+            };
+            let dir_url = uri_join(url, &format!("{}{dir_name}{}", walk.dir_pre, walk.dir_post));
+            let page = page_get(&dir_url, ua).ok().map(|(c, _)| c);
+            let Some(dir_content) = page.filter(|c| !c.trim().is_empty()) else {
+                match walk.blank {
+                    DirBlank::NextCandidate => continue,
+                    DirBlank::Stage1 => return Found::Versions(stage1, Some(fin)),
+                    DirBlank::Nothing => return Found::Versions(Vec::new(), Some(fin)),
+                }
+            };
+            dir_versions = scan_first(&dir_content, re2);
+            if !walk.last_two {
+                return Found::Versions(dir_versions, Some(fin));
+            }
+            if !dir_versions.is_empty() {
+                return Found::Versions(dir_versions, Some(fin));
+            }
+        }
+        if walk.empty_scan_stage1 && dir_versions.is_empty() {
+            return Found::Versions(stage1, Some(fin));
+        }
+        Found::Versions(dir_versions, Some(fin))
+    }
+
+    /// One mapped capture: `Ok(None)` is the block's
+    /// `nil` (compacted away); `Err` is a raised
+    /// exception's message.
+    fn page_shape_apply(
+        shape: &super::super::formula::PageShape,
+        v: &str,
+        sub_re: Option<&LcRegex>,
+    ) -> Result<Option<String>, String> {
+        use super::super::formula::PageShape;
+        match shape {
+            PageShape::ScanTr(from, to) => Ok(Some(ruby_tr(v, from, to))),
+            PageShape::ScanDateYmd => date_ymd(v)
+                .map(Some)
+                .ok_or_else(|| "invalid date".to_string()),
+            PageShape::ScanGsub(from, to) => Ok(Some(v.replace(from, to))),
+            PageShape::ScanSub(_, _, to) => {
+                let Some(re) = sub_re else {
+                    return Ok(Some(v.to_string()));
+                };
+                Ok(Some(match re.whole.find(v) {
+                    Some(m) => {
+                        let mut out = String::with_capacity(v.len());
+                        out.push_str(&v[..m.start()]);
+                        out.push_str(to);
+                        out.push_str(&v[m.end()..]);
+                        out
+                    }
+                    None => v.to_string(),
+                }))
+            }
+            PageShape::ScanRejectEq(lit) => Ok((v != lit.as_str()).then(|| v.to_string())),
+            PageShape::ScanSubBackref(_, _, tmpl) => Ok(Some(sub_backref_apply(v, tmpl, sub_re))),
+            PageShape::ScanTrSubBackref(from, to, _, _, tmpl) => {
+                Ok(Some(sub_backref_apply(&ruby_tr(v, from, to), tmpl, sub_re)))
+            }
+            PageShape::ScanChunks(n, sep) => {
+                // Ruby `scan(/\d{N}/)`: non-overlapping
+                // N-digit runs anywhere in the capture.
+                let digits: Vec<char> = v.chars().collect();
+                let mut parts: Vec<String> = Vec::new();
+                let mut i = 0;
+                while i + *n <= digits.len() {
+                    if digits[i..i + *n].iter().all(|c| c.is_ascii_digit()) {
+                        let num: String = digits[i..i + *n].iter().collect();
+                        parts.push(num.parse::<u64>().map_or(num, |x| x.to_string()));
+                        i += *n;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Ok((!parts.is_empty()).then(|| parts.join(sep)))
+            }
+            // Multi-capture shapes are applied in the
+            // scan loop, never per single capture.
+            PageShape::ScanJoin(_) | PageShape::ScanCsvOpt | PageShape::DirWalk(_) => {
+                Ok(Some(v.to_string()))
+            }
+        }
+    }
+
+    /// Ruby `Date.parse(s).strftime("%Y%m%d")` for the
+    /// month-name forms the tap regexes capture
+    /// (`09Mar2016`, `March 9, 2016`): tokens split on
+    /// separators and letter/digit boundaries; one
+    /// month name (3+ letter prefix), one 4-digit
+    /// year, one 1-2 digit day, calendar-validated.
+    /// Anything else is the oracle's `Date::Error`.
+    fn date_ymd(s: &str) -> Option<String> {
+        let mut toks: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut cur_digit = false;
+        for c in s.chars() {
+            if !c.is_ascii_alphanumeric() {
+                if !cur.is_empty() {
+                    toks.push(std::mem::take(&mut cur));
+                }
+                continue;
+            }
+            let d = c.is_ascii_digit();
+            if !cur.is_empty() && d != cur_digit {
+                toks.push(std::mem::take(&mut cur));
+            }
+            cur_digit = d;
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            toks.push(cur);
+        }
+        const MONTHS: &[&str] = &[
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "august",
+            "september",
+            "october",
+            "november",
+            "december",
+        ];
+        let (mut month, mut day, mut year) = (None, None, None);
+        for t in &toks {
+            if t.bytes().all(|b| b.is_ascii_alphabetic()) {
+                let lt = t.to_ascii_lowercase();
+                let m = MONTHS
+                    .iter()
+                    .position(|full| lt.len() >= 3 && full.starts_with(&lt))?;
+                if month.replace(m as u32 + 1).is_some() {
+                    return None;
+                }
+            } else if t.len() == 4 {
+                if year.replace(t.parse::<u32>().ok()?).is_some() {
+                    return None;
+                }
+            } else if t.len() <= 2 {
+                if day.replace(t.parse::<u32>().ok()?).is_some() {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+        let (y, m, d) = (year?, month?, day?);
+        let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+        let dim = match m {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => return None,
+        };
+        (d >= 1 && d <= dim).then(|| format!("{y:04}{m:02}{d:02}"))
+    }
+
+    /// One `String#tr` character set: literal chars
+    /// and `x-y` ranges (`-` is literal at either
+    /// end). The tap reduction rejects `\` and a
+    /// leading `^`.
+    fn tr_set(spec: &str) -> Vec<char> {
+        let chars: Vec<char> = spec.chars().collect();
+        let mut out: Vec<char> = Vec::new();
+        let mut i = 0;
+        while i < chars.len() {
+            if i + 2 < chars.len() && chars[i + 1] == '-' {
+                let (a, b) = (chars[i] as u32, chars[i + 2] as u32);
+                if a <= b {
+                    for u in a..=b {
+                        if let Some(c) = char::from_u32(u) {
+                            out.push(c);
+                        }
+                    }
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Ruby `String#tr`: each char in the from-set is
+    /// replaced by the to-set char at the same index
+    /// (a short to-set pads with its last char; an
+    /// empty to-set deletes).
+    fn ruby_tr(s: &str, from: &str, to: &str) -> String {
+        let from_set = tr_set(from);
+        let to_set = tr_set(to);
+        let mut out = String::with_capacity(s.len());
+        for c in s.chars() {
+            match from_set.iter().position(|&f| f == c) {
+                Some(idx) => {
+                    if let Some(&t) = to_set.get(idx).or_else(|| to_set.last()) {
+                        out.push(t);
+                    }
+                }
+                None => out.push(c),
+            }
+        }
+        out
+    }
+
     /// The PyPI JSON API's current version for the project
     /// (`info.version`); a spec regex captures from it.
     /// The Npm strategy: `version` at the top of the
@@ -21265,6 +22279,14 @@ mod livecheck {
                 JsonShape::Dig(path) => {
                     if let Some(v) = dig(&root, path).and_then(|v| scalar(v).transpose()) {
                         out.push(v?);
+                    }
+                }
+                JsonShape::DigSplitFirst(path, sep) => {
+                    if let Some(v) = dig(&root, path).and_then(|v| scalar(v).transpose()) {
+                        let v = v?;
+                        if !v.is_empty() {
+                            out.push(v.split(sep.as_str()).next().unwrap_or_default().to_string());
+                        }
                     }
                 }
                 JsonShape::DigDelete(path, chars) => {
@@ -21728,7 +22750,35 @@ mod livecheck {
         let Some((key, value)) = yaml_kv_split(line) else {
             return Err(format!("could not parse YAML line: {line}"));
         };
-        let node = if value.is_empty() {
+        // Block scalars (`>-`, `|`, …): following
+        // deeper-indented lines are the value — folded
+        // with spaces for `>`, newlines for `|`; clip
+        // chomping adds one trailing newline, `-`
+        // strips it. Content lines are the parser's
+        // trimmed lines, so inner leading space past
+        // the block indent is not preserved (the
+        // appcast values this serves are single-token).
+        let block_scalar = (value.starts_with('>') || value.starts_with('|'))
+            && value.split_whitespace().next().is_some_and(|h| {
+                h.len() <= 3 && h[1..].chars().all(|c| "+-0123456789".contains(c))
+            });
+        let node = if block_scalar {
+            let header = value.split_whitespace().next().unwrap_or_default();
+            let mut parts: Vec<&str> = Vec::new();
+            while *pos < lines.len() && lines[*pos].indent > indent {
+                parts.push(&lines[*pos].text);
+                *pos += 1;
+            }
+            let mut text = if header.starts_with('>') {
+                parts.join(" ")
+            } else {
+                parts.join("\n")
+            };
+            if !header.contains('-') && !parts.is_empty() {
+                text.push('\n');
+            }
+            YNode::Scalar(text, true)
+        } else if value.is_empty() {
             if *pos < lines.len() && lines[*pos].indent > indent {
                 yaml_block(lines, pos)?
             } else if *pos < lines.len()
@@ -21804,10 +22854,36 @@ mod livecheck {
     /// shapes: dig into the document, optionally with
     /// the regex's first capture applied.
     fn yaml_versions(rp: &RunPlan) -> Found {
+        match &rp.yaml {
+            Some(block) => yaml_versions_with(rp, block),
+            None => Found::Versions(Vec::new(), None),
+        }
+    }
+
+    /// Brew's ElectronBuilder strategy
+    /// (livecheck/strategy/electron_builder.rb): the
+    /// Yaml strategy with a default `yaml["version"]`
+    /// block; a regex without a `strategy` block is
+    /// the oracle's raised `ArgumentError`.
+    fn electron_builder_versions(rp: &RunPlan) -> Found {
+        use super::super::formula::{JsonKey, YamlBlock, YamlShape};
+        match &rp.yaml {
+            Some(block) => yaml_versions_with(rp, block),
+            None if rp.re.is_some() => Found::Raised(
+                "ElectronBuilder only supports a regex when using a `strategy` block".to_string(),
+            ),
+            None => yaml_versions_with(
+                rp,
+                &YamlBlock {
+                    has_regex: false,
+                    shape: YamlShape::Dig(vec![JsonKey::Key("version".to_string())]),
+                },
+            ),
+        }
+    }
+
+    fn yaml_versions_with(rp: &RunPlan, block: &super::super::formula::YamlBlock) -> Found {
         use super::super::formula::{JsonKey, YamlShape};
-        let Some(block) = &rp.yaml else {
-            return Found::Versions(Vec::new(), None);
-        };
         if block.has_regex && rp.re.is_none() {
             return Found::Raised(
                 "Two arguments found in `strategy` block but no regex provided.".to_string(),
@@ -21821,10 +22897,17 @@ mod livecheck {
             Ok(root) => root,
             Err(_) => return Found::Raised("Content could not be parsed as YAML.".to_string()),
         };
-        let (path, is_regex) = match &block.shape {
-            YamlShape::Dig(p) => (p, false),
-            YamlShape::DigRegex(p) => (p, true),
+        enum YApply<'a> {
+            Plain,
+            Regex,
+            SplitFirst(&'a str),
+        }
+        let (path, apply) = match &block.shape {
+            YamlShape::Dig(p) => (p, YApply::Plain),
+            YamlShape::DigRegex(p) => (p, YApply::Regex),
+            YamlShape::DigSplitFirst(p, sep) => (p, YApply::SplitFirst(sep)),
         };
+        let is_regex = matches!(apply, YApply::Regex);
         let mut cur = &root;
         for step in path {
             let next = match (step, cur) {
@@ -21875,6 +22958,16 @@ mod livecheck {
             YNode::Scalar(..) => return Found::Raised(NOT_STRING.to_string()),
             _ => return Found::Versions(Vec::new(), Some(fin)),
         };
+        if let YApply::SplitFirst(sep) = apply {
+            // Ruby `"".split(sep)` is `[]`, so `first`
+            // is nil and nothing is returned.
+            let out = if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![text.split(sep).next().unwrap_or_default().to_string()]
+            };
+            return Found::Versions(out, Some(fin));
+        }
         if !is_regex {
             return Found::Versions(vec![text], Some(fin));
         }
@@ -22363,8 +23456,12 @@ mod livecheck {
         }
     }
 
-    fn github_releases_versions(url: &str, re: &LcRegex) -> Found {
-        github_releases_versions_with(url, re, |slug| {
+    fn github_releases_versions(
+        url: &str,
+        re: &LcRegex,
+        block: Option<&super::super::formula::GhRelBlock>,
+    ) -> Found {
+        github_releases_versions_with(url, re, block, |slug| {
             let github = github_client()?;
             // Brew reads one default page of `/releases`.
             let opts = agh::page::ListOpts {
@@ -22380,6 +23477,7 @@ mod livecheck {
     fn github_releases_versions_with(
         url: &str,
         re: &LcRegex,
+        block: Option<&super::super::formula::GhRelBlock>,
         read: impl FnOnce(&agh::Slug) -> agh::Result<Vec<agh::model::ReleaseObject>>,
     ) -> Found {
         let Some((user, repo)) = github_repo(url) else {
@@ -22389,23 +23487,89 @@ mod livecheck {
             Ok(slug) => slug,
             Err(error) => return Found::Raised(github_api_error(&error)),
         };
+        // The oracle's no-block path is the block
+        // shape with both guards and a plain tag
+        // capture, so one loop serves both.
+        use super::super::formula::{GhRelSource, GhRelThen};
+        let default_block;
+        let block = match block {
+            Some(b) => b,
+            None => {
+                default_block = super::super::formula::GhRelBlock {
+                    skip_draft: true,
+                    skip_prerelease: true,
+                    name_skip: None,
+                    source: GhRelSource::TagName,
+                    then: GhRelThen::Identity,
+                };
+                &default_block
+            }
+        };
+        let name_re = match &block.name_skip {
+            Some((pat, flags)) => match lc_regex(pat, flags) {
+                Ok(re) => Some(re),
+                Err(_) => return Found::Versions(Vec::new(), None),
+            },
+            None => None,
+        };
         match read(&slug) {
             Ok(releases) => {
                 let mut versions: Vec<String> = Vec::new();
                 for release in &releases {
-                    if release.draft || release.prerelease {
+                    if (block.skip_draft && release.draft)
+                        || (block.skip_prerelease && release.prerelease)
+                    {
                         continue;
                     }
-                    if let Some(v) = search_group1(re, &release.tag_name)
-                        && !versions.contains(&v)
+                    if let Some(nre) = &name_re
+                        && release
+                            .name
+                            .as_deref()
+                            .is_some_and(|n| nre.whole.find(n).is_some())
                     {
-                        versions.push(v);
+                        continue;
+                    }
+                    let texts: Vec<&str> = match block.source {
+                        GhRelSource::TagName => vec![release.tag_name.as_str()],
+                        GhRelSource::AssetDownloadUrl => release
+                            .assets
+                            .iter()
+                            .map(|a| a.browser_download_url.as_str())
+                            .collect(),
+                    };
+                    for text in texts {
+                        let Some(cap) = search_group1(re, text) else {
+                            continue;
+                        };
+                        let v = match &block.then {
+                            GhRelThen::Identity => cap,
+                            GhRelThen::Tr(from, to) => ruby_tr(&cap, from, to),
+                            GhRelThen::NonZeroPatch => {
+                                if !version_patch_nonzero(&cap) {
+                                    continue;
+                                }
+                                cap
+                            }
+                        };
+                        if !versions.contains(&v) {
+                            versions.push(v);
+                        }
                     }
                 }
                 Found::Versions(versions, None)
             }
             Err(error) => Found::Raised(github_api_error(&error)),
         }
+    }
+
+    /// Brew's `Version#patch.to_i.nonzero?` for the
+    /// dotted captures the tap blocks see: the third
+    /// dot segment's leading integer (absent or
+    /// non-numeric reads as zero).
+    fn version_patch_nonzero(v: &str) -> bool {
+        let seg = v.split('.').nth(2).unwrap_or_default();
+        let digits: String = seg.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<u64>().is_ok_and(|n| n != 0)
     }
 
     /// The routed GitHub client brew-parity reads go
@@ -22424,13 +23588,18 @@ mod livecheck {
 
     /// Brew `HeaderMatch`: merge `location` /
     /// `content-disposition` across redirect responses (last
-    /// wins), run the regex over each wanted header.
-    fn header_versions(url: &str, re: &LcRegex, ua: Option<&str>) -> Found {
+    /// wins), run the regex over each wanted header —
+    /// or, without one, detect the version from the
+    /// header value (`Version.parse`).
+    fn header_versions(url: &str, re: Option<&LcRegex>, ua: Option<&str>) -> Found {
         let merged = page_headers(url, ua);
         let mut versions: Vec<String> = Vec::new();
         for name in ["content-disposition", "location"] {
             if let Some(value) = merged.get(name)
-                && let Some(v) = search_group1(re, value)
+                && let Some(v) = match re {
+                    Some(re) => search_group1(re, value),
+                    None => version_parse(value),
+                }
                 && !versions.contains(&v)
             {
                 versions.push(v);

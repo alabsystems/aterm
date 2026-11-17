@@ -1064,6 +1064,50 @@ fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<
     Ok(selected)
 }
 
+/// What a keeper of a read of the home [`observed_generation_until`] names stamps of its writer
+/// lineage ([`chain_homes`]).
+pub(crate) struct Chain {
+    /// Every home the walk passed, `paths` first and the home it stopped at last.
+    pub(crate) homes: Vec<Paths>,
+    /// The configuration each selection it read names, in the order read: the one whose policy
+    /// a read of that home's successor checks ([`Observation::observe_within`]).
+    pub(crate) configs: Vec<PathBuf>,
+}
+
+/// The walk of [`observed_generation_until`] with no deadline: every home it passes and every
+/// configuration a selection on the way names. A selection that cannot be read, or that holds no
+/// completion its claims seal, ends it at that home, as it ends that walk, which then either
+/// selects that home or refuses; so does a walk [`MAX_GENERATIONS`] long. It reads only the
+/// files that walk reads, writes nothing and waits for nothing.
+pub(crate) fn chain_homes(paths: &Paths) -> Chain {
+    let mut chain = Chain {
+        homes: vec![paths.clone()],
+        configs: Vec::new(),
+    };
+    let mut home = paths.clone();
+    for _ in 0..MAX_GENERATIONS {
+        let Ok(Some(selection)) = Selection::read(&home) else {
+            break;
+        };
+        chain.configs.push(selection.config.clone());
+        if !seal(&home).is_ok_and(|seal| selection.complete == Some(seal)) {
+            break;
+        }
+        home = candidate(&home);
+        chain.homes.push(home.clone());
+    }
+    chain
+}
+
+/// What a read of `home`'s writer succession lists and reads of its own files, for a keeper to
+/// stamp: the succession's folder (`commons/writer-generation`: the selection, the completion
+/// mark, the reservation, the statement and its refusal), the folder of a successor home inside
+/// it (left out of that folder's tree, as it is stamped as a home of its own), and the link to
+/// its predecessor in its vault folder ([`linked`]).
+pub(crate) fn succession_files(home: &Paths) -> (PathBuf, PathBuf, PathBuf) {
+    (root(home), candidate(home).home, home.dir.join(LINK))
+}
+
 /// This Mac's original home, whichever home of its writer lineage `paths` names: a successor's
 /// home sits inside its predecessor's vault folder ([`candidate`]), so the walk back reads no
 /// file. What is kept once per Mac rather than once per writer generation (the shared files'

@@ -388,7 +388,8 @@ fn the_check_panel_the_titles_and_the_type_words_name_a_machine() {
 
 /// Each header says what its column holds under its name, marks a key, and names the table a
 /// reference leads to by its rail title; columns stand in the display order compiled beside the
-/// collection, the naming column first.
+/// collection, the naming column first, within each group (an account's provider, login and
+/// status, set when it is added, lead SET WHEN ADDED).
 /// NEGATIVE CONTROL: with `cells_sheet` leaving the grid's columns in the order the schema
 /// declares them (its sort by `laid_out` removed), the machine's STORED columns read
 /// `["label", "aliases", "role", …]`: `` left: ["label", "aliases", …] right: ["label",
@@ -401,22 +402,27 @@ fn each_header_says_its_type_and_the_naming_column_leads() {
     spread(&mut app);
     {
         let tables = app.native_runtime.tables_mut().unwrap();
-        let names = |name: &str, n: usize| -> Vec<String> {
+        let names = |name: &str, group: Group, n: usize| -> Vec<String> {
             ordered(tables.sheet_named(name).unwrap())
                 .into_iter()
-                .filter(|c| c.group == Group::Stored)
+                .filter(|c| c.group == group)
                 .map(|c| c.name.clone())
                 .take(n)
                 .collect()
         };
         assert_eq!(
-            names("machine", 5),
+            names("machine", Group::Stored, 5),
             ["label", "nickname", "role", "location", "chip"]
         );
         assert_eq!(
-            names("account", 3),
-            ["label", "provider", "login"],
+            names("account", Group::Stored, 3),
+            ["label", "plan", "services"],
             "an account is named by its label"
+        );
+        // Account version 2's birth columns sit under SET WHEN ADDED, in the same order.
+        assert_eq!(
+            names("account", Group::Born, 3),
+            ["provider", "login", "status"]
         );
     }
     let ui = render(&app);
@@ -447,7 +453,8 @@ fn each_header_says_its_type_and_the_naming_column_leads() {
     for (column, says) in [
         ("services", services.as_str()),
         ("plan_since", "date"),
-        ("provider", "\u{2192} Providers"),
+        // Fixed at birth in account version 2: the key derives from the realm, which names it.
+        ("provider", "key \u{b7} \u{2192} Providers"),
         ("label", "text"),
     ] {
         assert_eq!(

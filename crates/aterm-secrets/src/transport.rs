@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) mod records_body;
 
 /// Where a vault is.
@@ -46,13 +46,13 @@ pub enum Fetched {
 /// A completed HTTP 204 response, distinct from a held request's synthetic no-news result.
 /// Its constructor stays at the actual response boundary; no URL or headers leave it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) struct NoContentReply {
     request: [u8; 32],
     responded_at_ms: u64,
 }
 
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 impl NoContentReply {
     pub(crate) const fn responded_at_ms(self) -> u64 {
         self.responded_at_ms
@@ -64,7 +64,7 @@ impl NoContentReply {
 }
 
 /// The exact URL and caller-supplied request context, without retaining their text.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn request_binding(url: &str, after: Option<u64>, subscriber: Option<&str>) -> [u8; 32] {
     let mut digest = aterm_digest::Sha256::new();
     digest.update(b"aterm vault HTTP204 request/1\0");
@@ -91,14 +91,14 @@ pub(crate) fn request_binding(url: &str, after: Option<u64>, subscriber: Option<
 #[derive(Debug)]
 pub(crate) struct ObservedFetch {
     pub(crate) fetched: Fetched,
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) http204: Option<NoContentReply>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ObservedAnswer {
     answer: Answer,
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     http204: Option<NoContentReply>,
 }
 
@@ -106,7 +106,7 @@ impl From<Answer> for ObservedAnswer {
     fn from(answer: Answer) -> Self {
         Self {
             answer,
-            #[cfg(any(unix, test))]
+            #[cfg(any(unix, windows, test))]
             http204: None,
         }
     }
@@ -117,7 +117,7 @@ impl ObservedAnswer {
         match self.answer {
             Answer::Fetched(fetched) => Ok(ObservedFetch {
                 fetched,
-                #[cfg(any(unix, test))]
+                #[cfg(any(unix, windows, test))]
                 http204: self.http204,
             }),
             Answer::Foreign(why) => Err(Error::new(why)),
@@ -137,11 +137,11 @@ pub const FETCH_MARGIN: Duration = aterm_spec::wait::MUST_HAPPEN.saturating_mul(
 /// [`FETCH_MARGIN`], or a test's hang detector where longer: the bound a test holds on this
 /// thread for the vault servers it started (`client::ServersAnswering`), which answer.
 fn fetch_margin() -> Duration {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         FETCH_MARGIN.max(crate::client::servers_within(FETCH_MARGIN))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         FETCH_MARGIN
     }
@@ -175,11 +175,11 @@ const VERDICT_EXCHANGE: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// [`VERDICT_EXCHANGE`], or a test's hang detector where longer: the bound a test holds on this
 /// thread for the vault servers it started (`client::ServersAnswering`), which answer.
 fn verdict_exchange() -> Duration {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         VERDICT_EXCHANGE.max(crate::client::servers_within(VERDICT_EXCHANGE))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         VERDICT_EXCHANGE
     }
@@ -238,6 +238,11 @@ pub fn parse_source(
         return Ok((Source::Path(home.join(rest)), pin));
     }
     if path.starts_with('/') {
+        return Ok((Source::Path(PathBuf::from(path)), pin));
+    }
+    // A Windows path is absolute with its drive (`C:\…`) or as a share (`\\host\share\…`).
+    #[cfg(windows)]
+    if std::path::Path::new(path).is_absolute() {
         return Ok((Source::Path(PathBuf::from(path)), pin));
     }
     let hint = if lower.contains("://") {
@@ -584,7 +589,7 @@ impl ReplyBound {
     }
 
     /// The bound the reply stated.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const fn stated(self) -> Option<crate::crossing::RecordsBound> {
         match self {
             Self::Stated(bound) => Some(bound),
@@ -593,7 +598,7 @@ impl ReplyBound {
     }
 
     /// Whether the reply stated that its server's log has crossed.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const fn crossed(self) -> bool {
         matches!(self, Self::Stated(bound) if bound.crossed)
     }
@@ -652,7 +657,7 @@ pub(crate) fn fetch_as_observed(
                 sent,
                 url,
                 after,
-                #[cfg(any(unix, test))]
+                #[cfg(any(unix, windows, test))]
                 subscriber,
             )
             .map_err(|unheard| unheard.why)
@@ -660,7 +665,7 @@ pub(crate) fn fetch_as_observed(
         }
         Source::Path(path) => read_path(path).map(|bytes| ObservedFetch {
             fetched: bytes.map_or(Fetched::Missing, Fetched::Body),
-            #[cfg(any(unix, test))]
+            #[cfg(any(unix, windows, test))]
             http204: None,
         }),
     }
@@ -746,7 +751,7 @@ pub(crate) fn observe_after_nowait(
 /// What a read of at most some bytes of a vault server's answer heard
 /// ([`observe_after_nowait_within`], [`get_within_as`], [`look_within`],
 /// [`fetch_records_within`]).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Pulled<A = Fetched> {
     /// The answer, read whole: what [`observe_after_nowait`] returns for it, for [`look_within`]
@@ -790,7 +795,7 @@ pub(crate) fn observe_after_nowait_within(
 /// `request`, a GET of the vault at `url` (asking after `after`, for `subscriber`), sent reading
 /// a body of at most `limit` bytes and never more than [`MAX_ENVELOPE`]: a longer one is
 /// [`Pulled::Larger`], and an answer no vault server gives is an error.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn pulled(
     request: aterm_http::RequestBuilder<'_>,
     url: &str,
@@ -807,7 +812,7 @@ fn pulled(
 
 /// [`pulled`], keeping an answer no vault server gives as the [`Answer::Foreign`] [`get`] makes of
 /// it.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 fn pulled_answer(
     request: aterm_http::RequestBuilder<'_>,
     url: &str,
@@ -922,7 +927,7 @@ pub fn get_within(url: &str, total: Duration) -> crate::Result<Answer> {
 /// answer no vault server gives ([`Answer::Foreign`], saying [`past_any_envelope`] of one past
 /// [`MAX_ENVELOPE`]). A join's probe of many servers at once reads each so, under a small limit
 /// first (`crate::client`'s `probes_within`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn look_within(
     url: &str,
     total: Duration,
@@ -948,7 +953,7 @@ pub(crate) fn look_within(
 /// What [`get_within`] says of `url`'s answer when its body is longer than [`MAX_ENVELOPE`]
 /// ([`Answer::Foreign`]): an answer a read of at most that much ([`look_within`]) takes for
 /// [`Pulled::Larger`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn past_any_envelope(url: &str) -> String {
     transport_error(
         "fetching",
@@ -966,7 +971,7 @@ pub(crate) fn past_any_envelope(url: &str) -> String {
 /// than [`MAX_ENVELOPE`]). A longer one is [`Pulled::Larger`], and an answer no vault server
 /// gives is an error. A client reading many servers' envelopes at once reads each so, under a
 /// small limit first (`crate::client`'s `fan_out::envelopes_within`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn get_within_as(
     url: &str,
     total: Duration,
@@ -1033,7 +1038,7 @@ fn get_via_purpose(
         sent,
         url,
         after,
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         subscriber,
     )
 }
@@ -1087,7 +1092,7 @@ fn classify_get_response(
     response: Result<aterm_http::Response, aterm_http::SendError>,
     url: &str,
     after: Option<u64>,
-    #[cfg(any(unix, test))] subscriber: Option<&str>,
+    #[cfg(any(unix, windows, test))] subscriber: Option<&str>,
 ) -> Result<ObservedAnswer, Unheard> {
     let response = match response {
         Ok(response) => response,
@@ -1106,7 +1111,7 @@ fn classify_get_response(
         }
     };
     // Sample only a completed response, never a request start, synthetic timeout or later read.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     let http204 = if response.status() == 204 {
         aterm_time::unix_millis()
             .filter(|at| *at > 0 && *at <= i64::MAX as u64)
@@ -1132,13 +1137,13 @@ fn classify_get_response(
     };
     Ok(ObservedAnswer {
         answer,
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         http204,
     })
 }
 
 /// Exercise the production classifier's failure branches without constructing reply tokens.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn test_classify_get_response(
     response: Result<aterm_http::Response, aterm_http::SendError>,
     url: &str,
@@ -1177,12 +1182,12 @@ const fn foreign_reply(error: &aterm_http::Error) -> bool {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn read_path(path: &std::path::Path) -> crate::Result<Option<Vec<u8>>> {
     crate::fsx::read_public(path, MAX_ENVELOPE)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn read_path(path: &std::path::Path) -> crate::Result<Option<Vec<u8>>> {
     Err(Error::new(format!(
         "{}: a vault at a path is read on Unix only",
@@ -1222,10 +1227,10 @@ pub fn fetch_records(
 
 /// What a server answered a records GET ([`fetch_records_sync`]).
 #[cfg_attr(
-    not(unix),
+    not(any(unix, windows)),
     expect(
         dead_code,
-        reason = "only the unix record transport reads `needs` and `boot`"
+        reason = "only the record transport of a unix or windows member reads `needs` and `boot`"
     )
 )]
 pub(crate) struct RecordsAnswer {
@@ -1258,7 +1263,7 @@ impl RecordsAnswer {
 }
 
 /// A completely received records response whose valid frames already own their wire bytes.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct ReceivedRecordsAnswer {
     pub(crate) received: crate::membership_log::untaken::ReceivedFrames,
     pub(crate) needs: bool,
@@ -1268,6 +1273,13 @@ pub(crate) struct ReceivedRecordsAnswer {
     /// The heads digest the server stated its records had as it answered
     /// ([`RECORDS_HEADS_HEADER`]): `None` from a server before it, one holding no genesis, or a
     /// reply that brought only a prefix ([`Self::more`]).
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the unix vault server reads a peer's heads digest"
+        )
+    )]
     pub(crate) heads: Option<[u8; 32]>,
     /// The records are a causally closed prefix of what the server holds past the pull's
     /// `have=`, and more follow ([`RECORDS_MORE_HEADER`]): the puller asks again past them. Only
@@ -1275,7 +1287,7 @@ pub(crate) struct ReceivedRecordsAnswer {
     pub(crate) more: bool,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl ReceivedRecordsAnswer {
     /// No answer: a long poll held past its deadline.
     fn none() -> Self {
@@ -1328,14 +1340,14 @@ fn completed_records<T>(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum RecordReception {
     Received(ReceivedRecordsAnswer),
     Other(aterm_http::Response),
     Refused(Error),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl RecordReception {
     fn read(
         exchange: aterm_http::Exchange,
@@ -1436,7 +1448,7 @@ pub(crate) fn fetch_records_sync(
 
 /// The ordinary client records pull, stating `bound` of the puller's records and staging frames
 /// while the response is read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn fetch_record_frames_sync(
     url: &str,
     have: &[crate::membership_log::RecordId],
@@ -1449,7 +1461,7 @@ pub(crate) fn fetch_record_frames_sync(
 }
 
 /// A records pull that can reuse exact immutable owners already held in memory.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn fetch_record_frames_with_known(
     url: &str,
     have: &[crate::membership_log::RecordId],
@@ -1480,7 +1492,7 @@ pub(crate) fn fetch_record_frames_with_known(
 /// one is [`Pulled::Larger`] (past [`crate::membership_log::MAX_RECORDS_STREAM`], where
 /// [`fetch_records_sync`] fails as [`past_any_records_stream`] says). A records pass reads its
 /// peers so, all at once under a small limit first (`crate::client`'s `fan_out::RECORDS`).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn fetch_records_within(
     url: &str,
     have: &[crate::membership_log::RecordId],
@@ -1514,7 +1526,7 @@ pub(crate) fn fetch_records_within(
 /// How [`fetch_records_sync`] fails at `url` when the records it answers are longer than
 /// [`crate::membership_log::MAX_RECORDS_STREAM`], which [`fetch_records_within`] takes for
 /// [`Pulled::Larger`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn past_any_records_stream(url: &str) -> Error {
     transport_error(
         "fetching records from",
@@ -1591,7 +1603,7 @@ fn records_answer(
 
 /// The digest a records reply's [`RECORDS_HEADS_HEADER`] states: none unless it is exactly 64
 /// lowercase hex digits.
-#[cfg(any(unix, test))] // read by the unix-only records reception
+#[cfg(any(unix, windows, test))] // read by the unix-only records reception
 fn records_heads(value: Option<&str>) -> Option<[u8; 32]> {
     let value = value.filter(|text| aterm_codec::hex::is_lower(text, 64))?;
     let mut digest = [0u8; 32];
@@ -1779,7 +1791,7 @@ pub(crate) fn post_records_answered_until(
 
 /// Post immutable selected records without collecting their wire stream, as
 /// [`post_records_answered_until`] posts a stream.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn post_record_selection_answered_until(
     url: &str,
     records: &[crate::membership_log::Record],
@@ -1918,7 +1930,7 @@ pub(crate) fn publish_until(
 /// version rules; its response still cannot prove global uniqueness. A failure
 /// that cannot have stored `bytes` is [`ErrorKind::Refused`](crate::ErrorKind::Refused):
 /// the server's 403 or 507, or a path that does not hold `bytes` afterwards.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn publish_initial(source: &Source, bytes: &[u8]) -> crate::Result<()> {
     if bytes.len() > MAX_ENVELOPE || crate::envelope::parse(bytes)?.seq != 1 {
         return Err(Error::new(
@@ -1952,7 +1964,7 @@ pub fn replace(source: &Source, envelope: &[u8], over: &[u8]) -> crate::Result<(
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn replace_path(path: &std::path::Path, envelope: &[u8], over: &[u8]) -> crate::Result<()> {
     let _held = PublishLock::take(path)?;
     if read_path(path)?.as_deref() == Some(over) {
@@ -1961,14 +1973,14 @@ fn replace_path(path: &std::path::Path, envelope: &[u8], over: &[u8]) -> crate::
     write_path_held(path, envelope)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn replace_path(path: &std::path::Path, envelope: &[u8], _over: &[u8]) -> crate::Result<()> {
     write_path(path, envelope)
 }
 
 /// A path keeps the server's rule (its 403 and 409, [`write_path_held`]), checked and renamed
 /// under [`PublishLock`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
     let _held = PublishLock::take(path)?;
     write_path_held(path, envelope)
@@ -1983,11 +1995,11 @@ fn write_path(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
 /// ([`PublishLock::take_clearing_dead`]); machines that share the mount and a host name are not
 /// told apart. Any other lock a killed publisher left refuses every publish until a person
 /// removes it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct PublishLock(std::path::PathBuf);
 
 /// Why [`PublishLock::take_clearing_dead`] did not take the lock.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) enum NotTaken {
     /// A lock the server did not clear: a publish that runs, or a holder it cannot tell is
     /// gone. `holder` is the line it holds, for a person (empty when unread).
@@ -1996,7 +2008,7 @@ pub(crate) enum NotTaken {
     Failed(Error),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl PublishLock {
     pub(crate) fn take(path: &std::path::Path) -> crate::Result<Self> {
         Self::taken(path, false).map_err(|refused| match refused {
@@ -2016,25 +2028,29 @@ impl PublishLock {
     /// [`take`](Self::take) for a server, which first clears a lock left by a holder on this
     /// machine that no longer runs. A server alone does, under its state lock, so no two
     /// clearers race to remove another's new lock, as long as one server serves the store.
+    #[cfg(unix)]
     pub(crate) fn take_clearing_dead(path: &std::path::Path) -> Result<Self, NotTaken> {
         Self::taken(path, true)
     }
 
     fn taken(path: &std::path::Path, clear_dead: bool) -> Result<Self, NotTaken> {
         use std::io::Write as _;
+        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
         let lock = PathBuf::from(name);
         let mut cleared = false;
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            // Off Unix a new file is never made through a link: `CREATE_NEW` fails on any name
+            // that is there, a link included, and the file takes its folder's access.
+            #[cfg(unix)]
+            options
                 .mode(0o644)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-                .open(&lock)
-            {
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+            match options.open(&lock) {
                 Ok(mut file) => {
                     let holder = aterm_uds::process::host_name().unwrap_or_default();
                     // Who holds it is for a person reading the file; the lock is the file.
@@ -2077,7 +2093,7 @@ impl PublishLock {
 }
 
 /// ` (<holder>)`, or nothing for a lock whose holder line was not read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn held_by(holder: &str) -> String {
     if holder.is_empty() {
         String::new()
@@ -2144,6 +2160,13 @@ fn remove_dead(lock: &std::path::Path) -> bool {
     removed
 }
 
+/// Off Unix no lock is judged dead: only a server clears one (`PublishLock::take_clearing_dead`,
+/// on Unix), and none serves here.
+#[cfg(not(unix))]
+const fn remove_dead(_lock: &std::path::Path) -> bool {
+    false
+}
+
 /// How far before this boot's start a file must have been written to be judged older than the
 /// boot ([`before_this_boot`]): room for a clock set forward after the boot (a network time
 /// fix), which makes the start computed now later than the clock read at the boot.
@@ -2163,14 +2186,14 @@ fn before_this_boot(written: std::time::SystemTime) -> bool {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for PublishLock {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
 }
 
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 thread_local! {
     /// The negative control of a path's compare-and-set (one-mesh P3, [`write_path_held`]): while
     /// set, the path judges a version of the vault it holds by its sequence and parents alone, as
@@ -2185,7 +2208,7 @@ thread_local! {
 
 /// Whether [`PATH_SEQUENCE_ONLY`] is on: set on this thread, or named for this process
 /// (`path-sequence-only`); never in a release build, which has neither switch.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn path_sequence_only() -> bool {
     #[cfg(any(test, debug_assertions))]
     {
@@ -2206,7 +2229,7 @@ fn path_sequence_only() -> bool {
 /// nothing was stored, and the version can never take the path over. One by sequence or parents is
 /// [`ErrorKind::NotStored`](crate::ErrorKind::NotStored), as a server's 409 is: another version
 /// holds the path. A path that holds no envelope, or another vault's, is written.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()> {
     use aterm_mesh_core::no_lost_edit::{Takeover, TakeoverFacts};
     if let (Ok(new), Some(held_bytes)) = (crate::envelope::parse(envelope), read_path(path)?)
@@ -2274,7 +2297,7 @@ fn write_path_held(path: &std::path::Path, envelope: &[u8]) -> crate::Result<()>
     crate::fsx::write_atomic(path, envelope, 0o644)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn write_path(path: &std::path::Path, _envelope: &[u8]) -> crate::Result<()> {
     Err(Error::new(format!(
         "{}: a vault at a path is written on Unix only",
@@ -2299,7 +2322,7 @@ pub(crate) fn post_join_pausing(
 }
 
 /// Post a join request and honor at most one short Retry-After, sharing `deadline` across both.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn post_join_until(
     url: &str,
     line: &str,
@@ -2411,7 +2434,7 @@ pub fn wait_joins_from(
 
 /// Read a join queue within the remaining shared deadline, including connection and response.
 /// A mirror's vault verification and its queue read share this same deadline.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn wait_joins_from_until(
     url: &str,
     after: Option<u64>,

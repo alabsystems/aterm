@@ -90,36 +90,29 @@ pub(crate) fn peer_check(stream: &CtlStream) -> Result<(), String> {
     }
 }
 
+/// The control folder's two postures over [`aterm_uds::acl`], which builds and writes their
+/// descriptors: the shared one (the token owner, SYSTEM and Administrators, each passed on) and
+/// the elevated one ([`ELEVATED_DIR_SDDL`]); and the peer's user.
 mod acl {
     #![allow(non_snake_case, reason = "Win32 API names are camel-case by contract")]
 
     use std::ffi::c_void;
     use std::fs::File;
     use std::io;
-    use std::iter::once;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle as _;
     use std::path::{Path, PathBuf};
     use std::ptr::null_mut;
     use std::sync::{Mutex, PoisonError};
 
+    pub(super) use aterm_uds::acl::Descriptor;
+    use aterm_uds::acl::{Grantee, Inherit, Parts, Sid, WellKnown};
+
     type Handle = isize;
 
-    const SE_FILE_OBJECT: u32 = 1;
-    const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
-    const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
-    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
     const TOKEN_QUERY: u32 = 0x0008;
-    const TOKEN_OWNER_CLASS: u32 = 4;
     const TOKEN_USER_CLASS: u32 = 1;
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
     const ERROR_ACCESS_DENIED: u32 = 5;
-    const ERROR_ALREADY_EXISTS: u32 = 183;
-    const SDDL_REVISION_1: u32 = 1;
-    const ERROR_SUCCESS: u32 = 0;
-    const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
-    const WIN_LOCAL_SYSTEM_SID: u32 = 22;
-    const WIN_BUILTIN_ADMINISTRATORS_SID: u32 = 26;
+    const ERROR_ALREADY_EXISTS: i32 = 183;
     const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
     const FILE_LIST_DIRECTORY: u32 = 0x0001;
@@ -140,79 +133,8 @@ mod acl {
     pub(super) const ELEVATED_FILE_SDDL: &str =
         "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;RC;;;OW)S:(ML;;NRNW;;;HI)";
 
-    /// Win32 `SECURITY_ATTRIBUTES`.
-    #[repr(C)]
-    struct SecurityAttributes {
-        nLength: u32,
-        lpSecurityDescriptor: *mut c_void,
-        bInheritHandle: i32,
-    }
-
     #[link(name = "advapi32")]
     unsafe extern "system" {
-        fn GetSecurityInfo(
-            handle: Handle,
-            ObjectType: u32,
-            SecurityInfo: u32,
-            ppsidOwner: *mut *mut c_void,
-            ppsidGroup: *mut *mut c_void,
-            ppDacl: *mut *mut c_void,
-            ppSacl: *mut *mut c_void,
-            ppSecurityDescriptor: *mut *mut c_void,
-        ) -> u32;
-        fn SetSecurityInfo(
-            handle: Handle,
-            ObjectType: u32,
-            SecurityInfo: u32,
-            psidOwner: *mut c_void,
-            psidGroup: *mut c_void,
-            pDacl: *mut c_void,
-            pSacl: *mut c_void,
-        ) -> u32;
-        fn GetSecurityDescriptorOwner(
-            pSecurityDescriptor: *mut c_void,
-            pOwner: *mut *mut c_void,
-            lpbOwnerDefaulted: *mut i32,
-        ) -> i32;
-        fn GetSecurityDescriptorSacl(
-            pSecurityDescriptor: *mut c_void,
-            lpbSaclPresent: *mut i32,
-            pSacl: *mut *mut c_void,
-            lpbSaclDefaulted: *mut i32,
-        ) -> i32;
-        fn IsWellKnownSid(pSid: *mut c_void, WellKnownSidType: u32) -> i32;
-        fn GetNamedSecurityInfoW(
-            pObjectName: *const u16,
-            ObjectType: u32,
-            SecurityInfo: u32,
-            ppsidOwner: *mut *mut c_void,
-            ppsidGroup: *mut *mut c_void,
-            ppDacl: *mut *mut c_void,
-            ppSacl: *mut *mut c_void,
-            ppSecurityDescriptor: *mut *mut c_void,
-        ) -> u32;
-        fn SetNamedSecurityInfoW(
-            pObjectName: *mut u16,
-            ObjectType: u32,
-            SecurityInfo: u32,
-            psidOwner: *mut c_void,
-            psidGroup: *mut c_void,
-            pDacl: *mut c_void,
-            pSacl: *mut c_void,
-        ) -> u32;
-        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            StringSecurityDescriptor: *const u16,
-            StringSDRevision: u32,
-            SecurityDescriptor: *mut *mut c_void,
-            SecurityDescriptorSize: *mut u32,
-        ) -> i32;
-        fn GetSecurityDescriptorDacl(
-            pSecurityDescriptor: *mut c_void,
-            lpbDaclPresent: *mut i32,
-            pDacl: *mut *mut c_void,
-            lpbDaclDefaulted: *mut i32,
-        ) -> i32;
-        fn ConvertSidToStringSidW(Sid: *mut c_void, StringSid: *mut *mut u16) -> i32;
         fn OpenProcessToken(
             ProcessHandle: Handle,
             DesiredAccess: u32,
@@ -230,38 +152,10 @@ mod acl {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        fn CreateDirectoryW(
-            lpPathName: *const u16,
-            lpSecurityAttributes: *mut SecurityAttributes,
-        ) -> i32;
         fn GetCurrentProcess() -> Handle;
         fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
         fn GetLastError() -> u32;
         fn CloseHandle(hObject: Handle) -> i32;
-        fn LocalFree(hMem: *mut c_void) -> *mut c_void;
-    }
-
-    fn to_wide(p: &Path) -> Vec<u16> {
-        p.as_os_str().encode_wide().chain(once(0)).collect()
-    }
-
-    /// Copy a LocalAlloc'd wide C string into an owned `String`.
-    /// # Safety
-    /// `p` is non-null and points at a NUL-terminated UTF-16 string.
-    unsafe fn wide_ptr_to_string(p: *const u16) -> String {
-        let mut len = 0isize;
-        // SAFETY: caller guarantees a NUL terminator within the allocation.
-        while unsafe { *p.offset(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: `len` u16s precede the NUL, all within the same allocation.
-        let slice = unsafe { std::slice::from_raw_parts(p, len as usize) };
-        String::from_utf16_lossy(slice)
-    }
-
-    fn current_token_owner_info() -> Option<Vec<u8>> {
-        // SAFETY: GetCurrentProcess returns a pseudo-handle, always valid.
-        token_info(unsafe { GetCurrentProcess() }, TOKEN_OWNER_CLASS)
     }
 
     /// What [`peer_user`] found out about a peer process.
@@ -351,43 +245,33 @@ mod acl {
 
     /// Refuse `dir` unless the current user owns it.
     pub(super) fn verify_owner_and_harden(dir: &Path) -> io::Result<()> {
-        let owner_buf = current_token_owner_info()
-            .ok_or_else(|| io::Error::other("cannot query process token owner SID"))?;
-        let self_owner_sid = sid_ptr(&owner_buf);
-        if self_owner_sid.is_null() {
-            return Err(io::Error::other("process token has no owner SID"));
-        }
-        verify_owner_and_harden_with(dir, self_owner_sid, &Descriptor::owner_of_path)
+        let token_owner = Sid::token_owner()
+            .map_err(|e| io::Error::other(format!("cannot query process token owner SID: {e}")))?;
+        verify_owner_and_harden_with(dir, &token_owner, &owner_of_path)
+    }
+
+    /// The owner part of the descriptor of the file or directory at `dir`, read by its name.
+    pub(super) fn owner_of_path(dir: &Path) -> io::Result<Descriptor> {
+        Descriptor::of_path(dir, Parts::OWNER)
     }
 
     /// [`verify_owner_and_harden`] with its two facts injected.
     pub(super) fn verify_owner_and_harden_with(
         dir: &Path,
-        token_owner: *mut c_void,
-        read_owner: &dyn Fn(&[u16]) -> io::Result<Descriptor>,
+        token_owner: &Sid,
+        read_owner: &dyn Fn(&Path) -> io::Result<Descriptor>,
     ) -> io::Result<()> {
-        let mut wide = to_wide(dir);
-        let owner = read_owner(&wide)?;
-        owner_verdict(owner.owner()?, token_owner)?;
-        harden_dacl(&mut wide, token_owner)
+        let owner = read_owner(dir)?.owner()?;
+        owner_verdict(owner.as_ref(), token_owner)?;
+        harden_dacl(dir, token_owner)
     }
 
     /// The owner check itself.
-    pub(super) fn owner_verdict(
-        dir_owner: *mut c_void,
-        token_owner: *mut c_void,
-    ) -> io::Result<()> {
-        // SAFETY: both are null or valid SIDs inside descriptors or token blobs the caller keeps
-        // alive for this call.
-        let owned_by_us = !dir_owner.is_null()
-            && !token_owner.is_null()
-            && unsafe { EqualSid(dir_owner, token_owner) } != 0;
-        if owned_by_us {
+    pub(super) fn owner_verdict(dir_owner: Option<&Sid>, token_owner: &Sid) -> io::Result<()> {
+        if dir_owner == Some(token_owner) {
             return Ok(());
         }
-        // SAFETY: as above.
-        let by_admins = !dir_owner.is_null()
-            && unsafe { IsWellKnownSid(dir_owner, WIN_BUILTIN_ADMINISTRATORS_SID) } != 0;
+        let by_admins = dir_owner.is_some_and(|owner| owner.is(WellKnown::Administrators));
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             if by_admins {
@@ -399,168 +283,18 @@ mod acl {
         ))
     }
 
-    fn harden_dacl(wide: &mut [u16], owner_sid: *mut c_void) -> io::Result<()> {
-        let mut sid_str: *mut u16 = null_mut();
-        // SAFETY: `owner_sid` is a valid SID from our own token blob.
-        if unsafe { ConvertSidToStringSidW(owner_sid, &mut sid_str) } == 0 || sid_str.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: on success `sid_str` is a NUL-terminated LocalAlloc'd wide string.
-        let owner_sid_str = unsafe { wide_ptr_to_string(sid_str) };
-        // SAFETY: `sid_str` was LocalAlloc'd by ConvertSidToStringSidW.
-        unsafe { LocalFree(sid_str.cast::<c_void>()) };
-
-        let sddl = format!("D:P(A;OICI;FA;;;{owner_sid_str})(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)");
-        let sddl_w: Vec<u16> = sddl.encode_utf16().chain(once(0)).collect();
-
-        let mut psd: *mut c_void = null_mut();
-        // SAFETY: `sddl_w` is a NUL-terminated SDDL string; we own `psd` on success.
-        if unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl_w.as_ptr(),
-                SDDL_REVISION_1,
-                &mut psd,
-                null_mut(),
-            )
-        } == 0
-            || psd.is_null()
-        {
-            return Err(io::Error::last_os_error());
-        }
-
-        let mut present: i32 = 0;
-        let mut dacl: *mut c_void = null_mut();
-        let mut defaulted: i32 = 0;
-        // SAFETY: `psd` is the descriptor we just built; out-params are owned locals.
-        let got =
-            unsafe { GetSecurityDescriptorDacl(psd, &mut present, &mut dacl, &mut defaulted) };
-        if got == 0 {
-            let e = io::Error::last_os_error();
-            // SAFETY: `psd` was LocalAlloc'd by the convert call above.
-            unsafe { LocalFree(psd) };
-            return Err(e);
-        }
-        // SAFETY: `wide` is a NUL-terminated path; `dacl` points into `psd`, live until the
-        // LocalFree below; we set only the (protected) DACL.
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
-                wide.as_mut_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                dacl,
-                null_mut(),
-            )
-        };
-        // SAFETY: `psd` was LocalAlloc'd by the convert call above.
-        unsafe { LocalFree(psd) };
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        Ok(())
-    }
-
-    /// A security descriptor.
-    pub(super) struct Descriptor(*mut c_void);
-
-    impl Descriptor {
-        /// `sddl` as a security descriptor.
-        pub(super) fn from_sddl(sddl: &str) -> io::Result<Self> {
-            let wide: Vec<u16> = sddl.encode_utf16().chain(once(0)).collect();
-            let mut psd: *mut c_void = null_mut();
-            // SAFETY: `wide` is a NUL-terminated SDDL string; we own `psd` on success.
-            let ok = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    wide.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut psd,
-                    null_mut(),
-                )
-            };
-            if ok == 0 || psd.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(Self(psd))
-        }
-
-        /// The owner part of the descriptor of the file or directory at `wide`.
-        pub(super) fn owner_of_path(wide: &[u16]) -> io::Result<Self> {
-            let mut owner: *mut c_void = null_mut();
-            let mut psd: *mut c_void = null_mut();
-            // SAFETY: `wide` is a NUL-terminated path; out-pointers we don't request
-            // (group/DACL/SACL) are null, matching the single OWNER info bit. On success the
-            // descriptor is LocalAlloc'd and owned by the result.
-            let rc = unsafe {
-                GetNamedSecurityInfoW(
-                    wide.as_ptr(),
-                    SE_FILE_OBJECT,
-                    OWNER_SECURITY_INFORMATION,
-                    &mut owner,
-                    null_mut(),
-                    null_mut(),
-                    null_mut(),
-                    &mut psd,
-                )
-            };
-            if rc != ERROR_SUCCESS {
-                return Err(io::Error::from_raw_os_error(rc as i32));
-            }
-            if psd.is_null() {
-                return Err(io::Error::other("no security descriptor"));
-            }
-            Ok(Self(psd))
-        }
-
-        /// The descriptor itself, live while `self` is.
-        pub(super) fn as_ptr(&self) -> *mut c_void {
-            self.0
-        }
-
-        /// Its owner SID, pointing into it.
-        pub(super) fn owner(&self) -> io::Result<*mut c_void> {
-            let mut owner: *mut c_void = null_mut();
-            let mut defaulted: i32 = 0;
-            // SAFETY: `self.0` is a live descriptor; out-params are owned locals.
-            if unsafe { GetSecurityDescriptorOwner(self.0, &mut owner, &mut defaulted) } == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(owner)
-        }
-
-        fn dacl(&self) -> io::Result<*mut c_void> {
-            let (mut present, mut defaulted): (i32, i32) = (0, 0);
-            let mut dacl: *mut c_void = null_mut();
-            // SAFETY: `self.0` is a live descriptor; out-params are owned locals.
-            let ok = unsafe {
-                GetSecurityDescriptorDacl(self.0, &mut present, &mut dacl, &mut defaulted)
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(dacl)
-        }
-
-        fn sacl(&self) -> io::Result<*mut c_void> {
-            let (mut present, mut defaulted): (i32, i32) = (0, 0);
-            let mut sacl: *mut c_void = null_mut();
-            // SAFETY: `self.0` is a live descriptor; out-params are owned locals.
-            let ok = unsafe {
-                GetSecurityDescriptorSacl(self.0, &mut present, &mut sacl, &mut defaulted)
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(sacl)
-        }
-    }
-
-    impl Drop for Descriptor {
-        fn drop(&mut self) {
-            // SAFETY: the convert call or GetNamedSecurityInfoW LocalAlloc'd the descriptor; freed
-            // once.
-            unsafe { LocalFree(self.0) };
-        }
+    /// The shared posture's protected list, by `dir`'s name: the token owner, SYSTEM and
+    /// Administrators, full access, each passed on to what is inside.
+    fn harden_dacl(dir: &Path, owner: &Sid) -> io::Result<()> {
+        let dacl = aterm_uds::acl::protected_dacl(
+            &[
+                Grantee::Sid(owner),
+                Grantee::WellKnown(WellKnown::LocalSystem),
+                Grantee::WellKnown(WellKnown::Administrators),
+            ],
+            Inherit::ToChildren,
+        );
+        Descriptor::from_sddl(&dacl)?.apply_to_path(dir, Parts::DACL | Parts::PROTECTED_DACL)
     }
 
     static PINNED: Mutex<Vec<(PathBuf, File)>> = Mutex::new(Vec::new());
@@ -574,13 +308,7 @@ mod acl {
         create_dir_with(dir, &sd)?;
         let handle = open_dir_nofollow(dir)?;
         verify_elevated_owner(&handle, dir)?;
-        apply(
-            &handle,
-            &sd,
-            DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION
-                | LABEL_SECURITY_INFORMATION,
-        )?;
+        sd.apply(&handle, Parts::DACL | Parts::PROTECTED_DACL | Parts::LABEL)?;
         if pin {
             let mut pinned = PINNED.lock().unwrap_or_else(PoisonError::into_inner);
             if !pinned.iter().any(|(path, _)| path == dir) {
@@ -600,13 +328,9 @@ mod acl {
             .share_mode(0)
             .open(path)?;
         let applied = Descriptor::from_sddl(ELEVATED_FILE_SDDL).and_then(|sd| {
-            apply(
+            sd.apply(
                 &file,
-                &sd,
-                OWNER_SECURITY_INFORMATION
-                    | DACL_SECURITY_INFORMATION
-                    | PROTECTED_DACL_SECURITY_INFORMATION
-                    | LABEL_SECURITY_INFORMATION,
+                Parts::OWNER | Parts::DACL | Parts::PROTECTED_DACL | Parts::LABEL,
             )
         });
         match applied {
@@ -619,23 +343,11 @@ mod acl {
         }
     }
 
+    /// `dir` made with `sd` from its creation; one already there is left as it is.
     fn create_dir_with(dir: &Path, sd: &Descriptor) -> io::Result<()> {
-        let wide = to_wide(dir);
-        let mut attributes = SecurityAttributes {
-            nLength: std::mem::size_of::<SecurityAttributes>() as u32,
-            lpSecurityDescriptor: sd.as_ptr(),
-            bInheritHandle: 0,
-        };
-        // SAFETY: `wide` is a NUL-terminated path; `attributes` and the descriptor it names outlive
-        // the call.
-        if unsafe { CreateDirectoryW(wide.as_ptr(), &mut attributes) } != 0 {
-            return Ok(());
-        }
-        let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(ERROR_ALREADY_EXISTS as i32) {
-            Ok(())
-        } else {
-            Err(e)
+        match aterm_uds::acl::create_dir(dir, sd) {
+            Err(e) if e.raw_os_error() != Some(ERROR_ALREADY_EXISTS) => Err(e),
+            _ => Ok(()),
         }
     }
 
@@ -661,38 +373,15 @@ mod acl {
     }
 
     fn verify_elevated_owner(handle: &File, dir: &Path) -> io::Result<()> {
-        let mut owner: *mut c_void = null_mut();
-        let mut psd: *mut c_void = null_mut();
-        // SAFETY: `handle` is a live handle opened with READ_CONTROL; only the owner is asked for,
-        // the other out-pointers are null.
-        let rc = unsafe {
-            GetSecurityInfo(
-                handle.as_raw_handle() as Handle,
-                SE_FILE_OBJECT,
-                OWNER_SECURITY_INFORMATION,
-                &mut owner,
-                null_mut(),
-                null_mut(),
-                null_mut(),
-                &mut psd,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        let _owned = (!psd.is_null()).then(|| Descriptor(psd));
-        elevated_owner_verdict(owner, dir)
+        let owner = Descriptor::of(handle, Parts::OWNER)?.owner()?;
+        elevated_owner_verdict(owner.as_ref(), dir)
     }
 
     /// The elevated owner check itself.
-    pub(super) fn elevated_owner_verdict(owner: *mut c_void, dir: &Path) -> io::Result<()> {
-        // SAFETY: `owner` is null or a valid SID inside a descriptor the caller keeps alive for
-        // this call.
-        let elevated_owner = !owner.is_null()
-            && unsafe {
-                IsWellKnownSid(owner, WIN_BUILTIN_ADMINISTRATORS_SID) != 0
-                    || IsWellKnownSid(owner, WIN_LOCAL_SYSTEM_SID) != 0
-            };
+    pub(super) fn elevated_owner_verdict(owner: Option<&Sid>, dir: &Path) -> io::Result<()> {
+        let elevated_owner = owner.is_some_and(|owner| {
+            owner.is(WellKnown::Administrators) || owner.is(WellKnown::LocalSystem)
+        });
         if elevated_owner {
             return Ok(());
         }
@@ -704,32 +393,6 @@ mod acl {
                 dir.display()
             ),
         ))
-    }
-
-    fn apply(handle: &File, sd: &Descriptor, info: u32) -> io::Result<()> {
-        let owner = if info & OWNER_SECURITY_INFORMATION != 0 {
-            sd.owner()?
-        } else {
-            null_mut()
-        };
-        let (dacl, sacl) = (sd.dacl()?, sd.sacl()?);
-        // SAFETY: `handle` is live with WRITE_DAC | WRITE_OWNER; the SID and the ACLs point into
-        // `sd`, which outlives the call.
-        let rc = unsafe {
-            SetSecurityInfo(
-                handle.as_raw_handle() as Handle,
-                SE_FILE_OBJECT,
-                info,
-                owner,
-                null_mut(),
-                dacl,
-                sacl,
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
-        }
-        Ok(())
     }
 }
 

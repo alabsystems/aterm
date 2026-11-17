@@ -6,6 +6,7 @@
 //! dependent write, and three code mutants the projection rejects.
 
 use super::*;
+use crate::tests::tempdir;
 use aterm_spec::interp::State;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -51,7 +52,7 @@ fn run(strict: bool, apart: bool, mutant: seam::Mutant) -> Option<Taken> {
     let _strict = strict.then(seam::serve_strict);
     let _apart = apart.then(seam::apart);
     let _mutant = seam::mutate(mutant);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = Log::open(dir.path(), "test", b"pinned", false, limits()).unwrap();
     log.finish_open().unwrap();
     if !strict && mutant != seam::Mutant::UnorderedRecord && !log.served_ordered() {
@@ -285,7 +286,7 @@ fn journal_append_matches_model_and_rejects_unordered_or_unflushed_checkpoints()
 /// (Ordered on an Apple boot volume), its records and checkpoint intact, and appends there.
 #[test]
 fn a_journal_written_strict_reopens_ordered() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     {
         let _strict = seam::serve_strict();
         let mut log = Log::open(dir.path(), "test", b"pinned", false, limits()).unwrap();
@@ -320,7 +321,7 @@ fn a_journal_keeps_its_log_identity_across_a_reboot() {
     const BOOT_B: [u8; 16] = [0x0B; 16];
     for mutant in [seam::Mutant::None, seam::Mutant::AcksAtPublish] {
         let _mutant = seam::mutate(mutant);
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let (before, ordered) = {
             let _boot = seam::boot(BOOT_A);
             let mut log = Log::open(dir.path(), "test", b"pinned", false, limits()).unwrap();

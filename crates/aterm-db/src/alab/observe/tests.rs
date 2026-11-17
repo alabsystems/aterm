@@ -104,7 +104,7 @@ fn of(plan: &Plan, collection: &str) -> usize {
 /// A login an account row already names gets this Mac's `account-obs` row and nothing else,
 /// keyed `<account>.<uuid>`, saying the account, CLI, state, tabs and source.
 /// NEGATIVE CONTROL: with `matched` reading only `identity`, bronto is born again:
-/// `` left: 7 right: 0 ``.
+/// `` left: 5 right: 0 ``.
 #[test]
 fn existing_row_marks_obs_only() {
     let held = cells(bronto_registry());
@@ -142,7 +142,7 @@ fn existing_row_marks_obs_only() {
 }
 
 /// THE LIVE BUG: unicorn has no address row and no account row. Its address is born, then its
-/// account (provider, realm, login, active, its default label, the service, live), every cell
+/// account (provider, realm, login, `pending`, live: its Birth columns alone), every cell
 /// automatic, then this Mac's row of it; the address text is only in `addr`.
 /// NEGATIVE CONTROL: with the address birth left out, the account's login names no row:
 /// `` assertion failed: addresses.rows[&login].live() ``.
@@ -184,8 +184,13 @@ fn unknown_address_births_address_and_account() {
         .unwrap()
         .to_owned();
     assert!(addresses.rows[&login].live());
-    assert_eq!(account.get("status"), Some(&json!("active")));
+    assert_eq!(account.get("status"), Some(&json!("pending")));
     assert_eq!(account.get("realm"), Some(&json!("claude")));
+    assert_eq!(
+        account.get("label"),
+        None,
+        "the label is the owner's verb's"
+    );
     assert!(account.live());
     // Bronto's row is untouched.
     assert_eq!(
@@ -194,11 +199,10 @@ fn unknown_address_births_address_and_account() {
     );
 }
 
-/// A Muse Code login no row names is born as a Meta account whose service is the registry's
-/// word for Muse Code, and its `account-obs` row says the CLI.
-/// NEGATIVE CONTROL: with `service` answering `muse` for Meta (no word of
-/// [`crate::alab::registry::SERVICES`]), the plan is refused whole: `` called `Result::unwrap()`
-/// on an `Err` value ``.
+/// A Muse Code login no row names is born as a Meta account, its provider the realm's, and its
+/// `account-obs` row says the CLI. The birth writes no service: that column is the owner's.
+/// NEGATIVE CONTROL: with `account_birth` taking every provider from the `claude` realm, the
+/// birth names Anthropic: `` left: Some(String("anthropic")) right: Some(String("meta")) ``.
 #[test]
 fn a_muse_login_is_born_as_a_meta_account() {
     let held = cells(bronto_registry());
@@ -223,7 +227,7 @@ fn a_muse_login_is_born_as_a_meta_account() {
     let account = &accounts.rows[&pk];
     assert_eq!(account.get("provider"), Some(&json!(keys::META)));
     assert_eq!(account.get("realm"), Some(&json!(keys::META)));
-    assert!(account.fields["services"].has_member("muse-code"));
+    assert!(!account.fields.contains_key("services"));
     assert!(account.live());
     let row = plan
         .changes
@@ -470,8 +474,9 @@ fn a_row_is_rewritten_only_beside_a_birth_or_a_first_row() {
 
 /// Two Macs that observe one unknown login birth the same address and account cells, so their
 /// records merge into one row with no conflicted cell; each writes only its own mark.
-/// NEGATIVE CONTROL: with the account's label made from the uuid, the label conflicts:
-/// `` assertion failed: !field.conflicted() ``.
+/// NEGATIVE CONTROL: with the birth's `status` taken from the sighting's state (`running` on one
+/// Mac, `idle` on the other, each as the word it is), the two births differ: `` assertion
+/// `left == right` failed ``.
 #[test]
 fn concurrent_births_converge() {
     let held = cells(bronto_registry());
@@ -516,7 +521,7 @@ fn concurrent_births_converge() {
     assert!(keys[0].ends_with(ME) && keys[1].ends_with(THEM), "{keys:?}");
 }
 
-/// An owner's concurrent `status` beats the birth's `active` by the column's rule, and a pass
+/// An owner's concurrent `status` beats the birth's `pending` by the column's rule, and a pass
 /// over a row the owner already wrote never writes its cells.
 /// NEGATIVE CONTROL: with `status` given no conflict rule, the field holds: `` left: None right:
 /// Some(String("paused")) ``.
@@ -563,11 +568,11 @@ fn owner_cell_beats_birth() {
 /// pass writes this Mac's first row of it and births nothing, and once that record lands after
 /// the owner's retire (it does: this Mac reads the row as retired only from that write), the row
 /// is still retired with the owner's status, and the next pass writes nothing. A birth there was
-/// appended after the retire, so its automatic `row=live` and `status=active` replaced the
-/// owner's cells and the account came back in use.
+/// appended after the retire, so its automatic `row=live` would replace the owner's word where no
+/// authority rule holds it inert, and the account would come back in use.
 ///
 /// NEGATIVE CONTROL: `matched` without its not-live arm plans the birth at the retired row's own
-/// key: the first `assert_eq!` reads its account cells (`left: 7 right: 0`).
+/// key: the first `assert_eq!` reads its account cells (`left: 5 right: 0`).
 #[test]
 fn a_login_of_a_retired_account_marks_it_and_never_revives_it() {
     let pk = account_pk(BRONTO);
@@ -876,22 +881,22 @@ fn observation_spends_at_most_its_share_and_a_reopened_tab_nothing() {
     );
 }
 
-/// An observed login is born where a live account already holds its default label (the owner
-/// gave another account that name, or two keys share their first 24 bits): the birth leaves its
-/// label empty, which reads as the default, so the pass is written, `check` finds no shared
-/// label, and the next pass is not refused either. Two births of one pass that would share a
-/// default label are handled alike: the second is born without one.
-/// NEGATIVE CONTROL: with `account_birth` writing the default label whatever `taken` holds, the
-/// rules every write passes refuse the whole pass (`Registry::observe_accounts`, `authored`):
-/// `` account.label: row ac-…: live row ac-… holds the same label; only one live row may ``.
+/// An observed login is born where a live account holds a label, through the pass's real
+/// write path, which every derived write's rules guard (`Compiled::rules`, `unique_clash`): the
+/// birth writes no label (version 2's `label` is the owner's verb's), so no live account's label
+/// refuses it, the pass is written, `check` finds no shared label, and the next pass is not
+/// refused either. Two births of one pass write no label between them.
+/// NEGATIVE CONTROL: with `account_birth` also writing an automatic `label` of `bronto`, the
+/// pass's rules refuse the whole pass (`Registry::observe_accounts`, `authored`): `` a birth
+/// beside a live account's label is written: Error("account.realm: row ac-…: live row ac-…
+/// holds the same realm, label; only one live row may") ``.
 #[test]
-fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
+fn an_observed_birth_writes_no_label_so_a_live_accounts_label_never_refuses_it() {
     use crate::{alab::Registry, table::tests::Lab, typed::check};
     use aterm_secrets::commons::roster::Role;
     let born = account_pk(UNICORN);
-    let label = keys::default_account_label("claude", &born).unwrap();
     let mut held = bronto_registry();
-    held.push(put(&ACCOUNT, &account_pk(BRONTO), "label", json!(label)));
+    held.push(put(&ACCOUNT, &account_pk(BRONTO), "label", json!("bronto")));
     let lab = Lab::new(&[Role::Writer]);
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
@@ -900,7 +905,7 @@ fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
     aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
     let observed = registry
         .observe_accounts(&config, &[sighting(UNICORN, "running", 1, NOW)], NOW)
-        .expect("a birth whose default label is taken is written");
+        .expect("a birth beside a live account's label is written");
     assert_eq!((observed.records, observed.born), (1, 1));
     let view = registry.view().unwrap();
     let accounts = cell::project(&ACCOUNT, &view.cells);
@@ -908,7 +913,7 @@ fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
     assert_eq!(
         accounts.rows[&born].get("label"),
         None,
-        "born without the label"
+        "born without a label"
     );
     let found = check::findings(
         &[&ACCOUNT],
@@ -927,22 +932,12 @@ fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
         .expect("the next pass is not refused");
     assert_eq!(again.born, 0);
 
-    // Two logins of one pass whose keys share their first 24 bits.
-    let mut by_label = std::collections::BTreeMap::new();
-    let (first, second) = (0..)
-        .find_map(|n: u32| {
-            let email = format!("u{n}@proton.example");
-            let label = keys::default_account_label("claude", &account_pk(&email)).unwrap();
-            by_label
-                .insert(label, email.clone())
-                .map(|earlier| (earlier, email))
-        })
-        .unwrap();
+    // Two logins of one pass.
     let plan = run(
         ME,
         &[
-            sighting(&first, "running", 1, NOW),
-            sighting(&second, "running", 1, NOW),
+            sighting("u0@proton.example", "running", 1, NOW),
+            sighting("u1@proton.example", "running", 1, NOW),
         ],
         &cells(bronto_registry()),
         &OwnedRead::default(),
@@ -954,7 +949,7 @@ fn an_observed_birth_leaves_out_a_label_a_live_account_holds() {
         .iter()
         .filter(|c| c.collection == ACCOUNT.name && c.key.ends_with(".label"))
         .count();
-    assert_eq!(labels, 1, "only the first birth takes the shared label");
+    assert_eq!(labels, 0, "no birth writes a label");
 }
 
 fn seen_by(cli: &str, realm: &str, email: &str, state: &str, src: &str, at: u64) -> Sighting {

@@ -16,7 +16,7 @@ fn legacy_recovery(bytes: &[u8]) -> Store {
     let mut records = Vec::new();
     let mut at = 0;
     while at < bytes.len() && records.len() < MAX_HELD_RECORDS {
-        let Ok(len) = Record::wire_len_prefix(&bytes[at..]) else {
+        let Ok(len) = Record::wire_len_prefix(&bytes[at..], Reading::ONE) else {
             break;
         };
         let Some(end) = at.checked_add(len).filter(|&end| end <= bytes.len()) else {
@@ -152,7 +152,7 @@ fn layout_reader_keeps_unknown_large_frames_without_relaxing_known_reader() {
 #[test]
 fn layout_reader_checks_remaining_budget_before_reading_the_frame_body() {
     let record = fixture().remove(0);
-    let header = Record::frame_header_len(record.bytes()).unwrap();
+    let header = Record::frame_header_len(record.bytes(), Reading::ONE).unwrap();
     let mut source = Chunks::new(record.bytes(), 7);
     source.fail_at = Some(header);
     let mut reader = FrameReader::new();
@@ -250,6 +250,7 @@ fn fragmented_recovery_preserves_exact_records_forks_and_waiting() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn late_undo_and_original_epoch_wraps_survive_framed_replay() {
     let (before, after, epoch) = crate::membership_log::tests::history_reader_fixture();
@@ -391,7 +392,7 @@ fn actual_read_errors_are_not_torn_tail_recovery() {
 fn oversized_frame_length_is_refused_before_body_allocation() {
     let records = fixture();
     let mut bytes = records[0].bytes().to_vec();
-    let header_len = Record::frame_header_len(&bytes).unwrap();
+    let header_len = Record::frame_header_len(&bytes, Reading::ONE).unwrap();
     bytes[header_len - 4..header_len].copy_from_slice(&u32::MAX.to_be_bytes());
     let mut input = Chunks::new(&bytes, 17);
     let actual = Store::with_compiled(None)

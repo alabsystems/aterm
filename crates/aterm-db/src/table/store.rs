@@ -6,7 +6,7 @@
 //! rollback of both custody and data needs an external witness to detect.
 
 use super::{
-    ReadBatch, Record, Scope, Session,
+    Envelope, ReadBatch, Record, Scope, Session,
     conflict::{Conflict, MAX_CONFLICT, ProofKey},
 };
 use crate::{
@@ -33,6 +33,7 @@ mod batch;
 mod batch_conformance_tests;
 #[cfg(test)]
 mod batch_tests;
+mod cold;
 mod contributor;
 pub mod custody;
 #[cfg(test)]
@@ -46,6 +47,7 @@ pub use cutoff::cut_removed_writer;
 mod directory;
 #[cfg(test)]
 mod enrollment_tests;
+mod floor;
 mod group;
 pub(crate) use directory::remove_claim_files;
 
@@ -263,10 +265,16 @@ pub(crate) const MAX_RECORDS: usize = 8192;
 pub(crate) const MAX_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONFLICTS: usize = aterm_secrets::commons::constraints::MAX_BINDINGS;
 const DISCARDED_OVERHEAD: usize = 5 + 32 + 4;
-const JOURNAL_RECORDS: usize = MAX_RECORDS * 2 + MAX_CONFLICTS;
-/// The causal index's bound ([`Store::index`]): the operations a store may hold, and as many
-/// discarded sources.
-const INDEX_CAPACITY: usize = MAX_RECORDS * 2;
+/// The fewest bytes a journal record takes: its subject, its receipt time and a byte of wire. A
+/// table's journal holds as many records as its bytes admit at this size (tracker LT-B10C2):
+/// no count of its own, since the quotas that admit each record, above the table's floor, and
+/// the floor's frontier, below it, already bound how many there are.
+const MIN_FRAME: usize = SUBJECT.len() + 8 + 1;
+/// The most records a table's journal (and so its receipt witness) may hold: [`MIN_FRAME`]
+/// into its byte limit.
+fn journal_records() -> usize {
+    Capacity::default().journal().records
+}
 
 #[derive(Clone, Copy)]
 struct Capacity {
@@ -293,12 +301,12 @@ impl Capacity {
         )
     )]
     fn journal(self) -> Limits {
+        let bytes = self.bytes * 2
+            + self.operations * (charge(SUBJECT, 0) + charge(CONFLICT_SUBJECT, DISCARDED_OVERHEAD))
+            + self.conflicts * charge(CONFLICT_SUBJECT, MAX_CONFLICT);
         Limits {
-            records: self.operations * 2 + self.conflicts,
-            bytes: self.bytes * 2
-                + self.operations
-                    * (charge(SUBJECT, 0) + charge(CONFLICT_SUBJECT, DISCARDED_OVERHEAD))
-                + self.conflicts * charge(CONFLICT_SUBJECT, MAX_CONFLICT),
+            records: bytes / MIN_FRAME,
+            bytes,
             record_bytes: MAX_CONFLICT + 8,
         }
     }
@@ -316,6 +324,14 @@ pub const fn operation_bytes_bound() -> u64 {
     MAX_BYTES as u64
 }
 pub(crate) const WRITER_RECORDS: usize = 4096;
+/// The room past a writer's quota its checkpoints may use (tracker LT-B10C1): a writer at
+/// [`Store::writer_records`] can still sign the checkpoint whose floor frees it, since that
+/// record is its own. A checkpoint may exceed the quota by the room and no more, and no other
+/// record may: no record passes a quota for being one.
+const WRITER_CHECKPOINT_ROOM: usize = 2;
+/// The room past the table's operation quota its checkpoints may use, as
+/// [`WRITER_CHECKPOINT_ROOM`].
+const TABLE_CHECKPOINT_ROOM: usize = 16;
 pub(crate) const WRITER_BYTES: usize = 8 * 1024 * 1024;
 const SUBJECT: &str = "commons/table/1";
 const CONFLICT_SUBJECT: &str = "commons/table-conflict/1";
@@ -557,6 +573,17 @@ impl StoredWire {
         }
     }
 
+    /// [`Self::authenticate`] of a record whose `payload` this Mac kept below its floor
+    /// ([`cold`]): the signature, grant and key are asked as for any record, a shared wire's
+    /// signature through the fact it keeps; only the opening is the kept payload.
+    fn authenticate_held(&self, batch: &ReadBatch<'_, '_>, payload: &[u8]) -> Result<Record> {
+        let envelope = match self {
+            Self::Owned(wire) => Envelope::parse(batch.scope, wire)?,
+            Self::Shared(wire) => Envelope::parse_identified(batch.scope, wire)?,
+        };
+        batch.authenticate_held(envelope, payload)
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Self::Owned(wire) => wire,
@@ -667,6 +694,12 @@ pub struct Store {
     /// combined view's primary, whose records move into the view with this count cleared
     /// (`Store::with_observed_primary`).
     writers: BTreeMap<Actor, WriterHeld>,
+    /// The table's floor, where this Mac recorded one ([`floor`]): what `records` and `writers`
+    /// hold at or below it is cold, and the quotas ([`Self::admit_records`]) count the rest.
+    floor: Option<floor::Floor>,
+    /// Whether checkpoints have room past the quotas ([`WRITER_CHECKPOINT_ROOM`]): everywhere but
+    /// the catalog, which never checkpoints.
+    checkpoint_room: bool,
     /// How many records one writer may have here: [`crate::catalog::RECORDS_PER_CREATOR`] in the
     /// catalog, [`WRITER_RECORDS`] elsewhere. The scope never changes.
     writer_records: usize,
@@ -681,7 +714,7 @@ pub struct Store {
 
 /// One writer's records in a [`Store`]: how many, and their wire bytes together.
 #[derive(Clone, Copy, Default)]
-struct WriterHeld {
+pub(super) struct WriterHeld {
     records: usize,
     bytes: usize,
 }
@@ -1520,6 +1553,13 @@ impl Store {
         // from pending to ready. No record can be authored in the pending state.
         claim[4] = b'1';
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
+        // The floor is read before replay, whose quota checks count from it, and confirmed
+        // after it.
+        let floor = if pending {
+            None
+        } else {
+            floor::read(&claim_dir, &claim_name, &claim)?.map(floor::Floor::new)
+        };
         // A writing open's pending group permit: whether one stood past the acknowledged witness
         // when replay read the log. An observer never acts on one.
         let (log, replay, permitted) = if read_only {
@@ -1574,6 +1614,8 @@ impl Store {
             index: OnceLock::new(),
             records: BTreeMap::new(),
             writers: BTreeMap::new(),
+            floor,
+            checkpoint_room: !catalog,
             writer_records: if catalog {
                 crate::catalog::RECORDS_PER_CREATOR
             } else {
@@ -1607,7 +1649,9 @@ impl Store {
             // Each header is admitted as the causal index would admit it, and the index is built
             // at first use (`Self::index`): an observer that never projects or ingests builds
             // none.
-            let mut causal = ReplayIndex::new(INDEX_CAPACITY);
+            // No count bounds the index: each record it admits was admitted under the quotas and
+            // the floor ([`Self::admit`]) and witnessed.
+            let mut causal = ReplayIndex::new(usize::MAX);
             sources.with_store_replay(scope, replay.entries.len(), |batch| {
                 for entry in replay.entries {
                     let receipt = entry.receipt();
@@ -1650,7 +1694,11 @@ impl Store {
                         {
                             classes.insert(class, batch.class_verdict(&class)?);
                         }
-                        store.admit(&stored.header, stored.wire.len())?;
+                        store.admit(
+                            &stored.header,
+                            stored.wire.len(),
+                            stored.checkpoint.is_some(),
+                        )?;
                         store.operation_bytes += stored.wire.len();
                         let slot = if stored.payload.awaiting_membership() {
                             match store.records.entry(receipt.id) {
@@ -1671,11 +1719,21 @@ impl Store {
                         };
                         #[cfg(test)]
                         replay_admitted(&stored.header);
-                        Self::hold_vacant(&mut store.writers, slot, stored);
+                        Self::hold_vacant(&mut store.writers, &mut store.floor, slot, stored);
                     }
                 }
                 Ok(())
             })?;
+        }
+        // The floor stands only on a checkpoint this Mac signed with exactly its body.
+        if let Some(floor) = &store.floor
+            && !store
+                .checkpoints()
+                .any(|(signer, body)| signer == store.actor && *body == floor.body)
+        {
+            return Err(Error::new(
+                "table floor names no checkpoint this Mac signed",
+            ));
         }
         store.finish_open(session, pending, acknowledged, &adopted, permitted)?;
         #[cfg(test)]
@@ -1870,22 +1928,85 @@ impl Store {
             "table custody changed or append is uncertain; reopen",
         ))
     }
-    fn admit(&self, header: &Header, bytes: usize) -> Result<()> {
-        self.admit_records(header.actor, 1, bytes)
+    /// Whether a record of `header` is at or below the table's floor: it is admitted as cold,
+    /// past every quota, since the floor's frontier bounds how many there can be.
+    fn is_cold(&self, header: &Header) -> bool {
+        self.floor
+            .as_ref()
+            .is_some_and(|floor| floor.covers(header))
     }
-    fn admit_records(&self, actor: Actor, records: usize, bytes: usize) -> Result<()> {
-        if self.records.len().saturating_add(records) > self.capacity.operations
-            || self.operation_bytes.saturating_add(bytes) > self.capacity.bytes
+    /// Admit a record of `header` and `bytes`; `checkpoint` where it signs a table checkpoint,
+    /// which may use the room past the quotas.
+    fn admit(&self, header: &Header, bytes: usize, checkpoint: bool) -> Result<()> {
+        if self.is_cold(header) {
+            return Ok(());
+        }
+        self.admit_records(header.actor, 1, bytes, checkpoint)
+    }
+    /// Admit `records` more records of `actor` above the floor, of `bytes` together: the table's
+    /// and the writer's quotas count only what is held above the floor. Where `checkpoint`, the
+    /// records may exceed each quota by its room for checkpoints.
+    fn admit_records(
+        &self,
+        actor: Actor,
+        records: usize,
+        bytes: usize,
+        checkpoint: bool,
+    ) -> Result<()> {
+        self.admit_table(records, bytes, checkpoint)?;
+        self.admit_writer(actor, records, bytes, checkpoint)
+    }
+    /// The room past a quota checkpoints may use: `room` where `checkpoint`, else none.
+    const fn room(&self, room: usize, checkpoint: bool) -> usize {
+        if checkpoint && self.checkpoint_room {
+            room
+        } else {
+            0
+        }
+    }
+    /// The table's quota on `records` more records above the floor, of `bytes` together.
+    fn admit_table(&self, records: usize, bytes: usize, checkpoint: bool) -> Result<()> {
+        let cold = self
+            .floor
+            .as_ref()
+            .map(|floor| floor.cold)
+            .unwrap_or_default();
+        let hot_records = self.records.len().saturating_sub(cold.records);
+        let hot_bytes = self.operation_bytes.saturating_sub(cold.bytes);
+        let quota = self
+            .capacity
+            .operations
+            .saturating_add(self.room(TABLE_CHECKPOINT_ROOM, checkpoint));
+        if hot_records.saturating_add(records) > quota
+            || hot_bytes.saturating_add(bytes) > self.capacity.bytes
         {
             return Err(Error::repair(
                 "table operation capacity exhausted; conflict space is reserved",
                 aterm_types::network_state::RepairCause::Quota,
             ));
         }
+        Ok(())
+    }
+    /// `actor`'s quota on `records` more of its records above the floor, of `bytes` together.
+    fn admit_writer(
+        &self,
+        actor: Actor,
+        records: usize,
+        bytes: usize,
+        checkpoint: bool,
+    ) -> Result<()> {
         let held = self.writers.get(&actor).copied().unwrap_or_default();
-        let count = records.saturating_add(held.records);
-        let size = bytes.saturating_add(held.bytes);
-        if count > self.writer_records || size > WRITER_BYTES {
+        let cold = self
+            .floor
+            .as_ref()
+            .map(|floor| floor.of(&actor))
+            .unwrap_or_default();
+        let count = records.saturating_add(held.records.saturating_sub(cold.records));
+        let size = bytes.saturating_add(held.bytes.saturating_sub(cold.bytes));
+        let quota = self
+            .writer_records
+            .saturating_add(self.room(WRITER_CHECKPOINT_ROOM, checkpoint));
+        if count > quota || size > WRITER_BYTES {
             return Err(Error::repair(
                 "table writer evidence quota exhausted",
                 aterm_types::network_state::RepairCause::Quota,
@@ -1899,7 +2020,7 @@ impl Store {
         let std::collections::btree_map::Entry::Vacant(entry) = self.records.entry(id) else {
             return false;
         };
-        Self::hold_vacant(&mut self.writers, entry, stored);
+        Self::hold_vacant(&mut self.writers, &mut self.floor, entry, stored);
         true
     }
 
@@ -1907,9 +2028,13 @@ impl Store {
     /// `writers` ([`Self::writers`]).
     fn hold_vacant(
         writers: &mut BTreeMap<Actor, WriterHeld>,
+        floor: &mut Option<floor::Floor>,
         entry: VacantEntry<'_, Digest, Stored>,
         stored: Stored,
     ) {
+        if let Some(floor) = floor {
+            floor.count(&stored.header, stored.wire.len());
+        }
         let held = writers.entry(stored.header.actor).or_default();
         held.records += 1;
         held.bytes = held.bytes.saturating_add(stored.wire.len());
@@ -1961,7 +2086,11 @@ impl Store {
         if self.conflicted().contains(&record.header().actor) {
             return Err(Error::new("table actor has restricted signed history"));
         }
-        self.admit(record.header(), wire.len())?;
+        self.admit(
+            record.header(),
+            wire.len(),
+            crate::checkpoint::decode(record.payload()).is_some(),
+        )?;
         self.index()?
             .check_insert(record.header())
             .map_err(|_| Error::new("table index refused header or capacity"))?;
@@ -2148,7 +2277,9 @@ impl Store {
         if let Some(index) = self.index.get() {
             return Ok(index);
         }
-        let mut index = Index::new(INDEX_CAPACITY);
+        // No count bounds the index: each header it admits passes the quotas above the floor or
+        // the floor's frontier below it first ([`Self::admit`]).
+        let mut index = Index::new(usize::MAX);
         for header in self.retained_headers() {
             index
                 .insert(header.clone())
@@ -2471,7 +2602,13 @@ impl Store {
             let record = session.authenticate(self.scope, &wire)?;
             operation_policy(self.scope, record.header(), record.payload().len())?;
             bytes = bytes.saturating_add(wire.len());
-            self.admit_records(self.actor, prepared.len() + 1, bytes)?;
+            // A checkpoint, and any merge it needs, may use the room past the quotas.
+            self.admit_records(
+                self.actor,
+                prepared.len() + 1,
+                bytes,
+                crate::checkpoint::decode(payload).is_some(),
+            )?;
             proposed
                 .insert(record.header().clone())
                 .map_err(|_| Error::new("table index refused header or capacity"))?;
@@ -3122,6 +3259,108 @@ impl Store {
         self.commit_own(session, &crate::checkpoint::encode(body))
     }
 
+    /// The body of this table's floor ([`floor`]), where it has one.
+    pub(crate) fn floor(&self) -> Option<&crate::checkpoint::Body> {
+        self.floor.as_ref().map(|floor| &floor.body)
+    }
+
+    /// Record `body` as this table's floor (docs/DESIGN-table-checkpoint-2026-11-15.md §5, tracker
+    /// LT-B10C1) and count from it: the checkpoint pass's, once it judged `body` final. The body
+    /// must be one this Mac signed here, and its cut must hold the present floor's.
+    ///
+    /// # Errors
+    /// The store is not this Mac's writer, this Mac signed no checkpoint with `body`, the body
+    /// does not hold the present floor, or the file cannot be written.
+    pub(crate) fn set_floor(
+        &mut self,
+        session: &Session<'_>,
+        body: &crate::checkpoint::Body,
+    ) -> Result<()> {
+        self.check(session)?;
+        if self.log.is_none() || self.is_recovery() {
+            return Err(Error::new("only this Mac's writer records a table floor"));
+        }
+        if !self
+            .checkpoints()
+            .any(|(signer, signed)| signer == self.actor && signed == body)
+        {
+            return Err(Error::new(
+                "a table floor must be a checkpoint this Mac signed",
+            ));
+        }
+        if let Some(present) = self.floor()
+            && !present.frontier.iter().all(|(actor, tip)| {
+                body.frontier
+                    .get(actor)
+                    .is_some_and(|at| at.sequence >= tip.sequence)
+            })
+        {
+            return Err(Error::new("a table floor never moves back"));
+        }
+        self.keep_cold(session, body)?;
+        floor::write(&self.claim_dir, &self.claim_name, &self.claim, body)?;
+        self.recount_floor(body.clone());
+        Ok(())
+    }
+
+    /// Open each held record `body` covers that the cold payloads ([`cold`]) do not yet keep,
+    /// once, and keep its payload there, before the floor that covers it is recorded: a read
+    /// then takes it from there ([`Self::metadata_from`]). A crash between the two leaves payloads
+    /// no floor covers yet, which no read takes.
+    fn keep_cold(&self, session: &Session<'_>, body: &crate::checkpoint::Body) -> Result<()> {
+        let key = session.cold_key(&self.scope)?;
+        let bound = self.capacity.journal().bytes;
+        let mut payloads = cold::read(&self.data_dir, &self.claim, &key, bound)?;
+        let floor = floor::Floor::new(body.clone());
+        let newly: Vec<&Stored> = self
+            .records
+            .values()
+            .filter(|stored| {
+                stored.payload.is_ready()
+                    && floor.covers(&stored.header)
+                    && !payloads.contains_key(&stored.header.id)
+            })
+            .collect();
+        if newly.is_empty() {
+            return Ok(());
+        }
+        session.with_read_batch(self.scope, |batch| {
+            for stored in newly {
+                let record = stored.wire.authenticate(batch)?;
+                payloads.insert(
+                    stored.header.id,
+                    zeroize::Zeroizing::new(record.payload().to_vec()),
+                );
+            }
+            Ok(())
+        })?;
+        cold::write(&self.data_dir, &self.claim, &key, &payloads)
+    }
+
+    /// The payloads kept below this store's floor ([`cold`]): none where it stands on no floor,
+    /// and none in a recovery view, whose custody is not the floor's.
+    fn cold_payloads(&self, session: &Session<'_>) -> Result<cold::Payloads> {
+        if self.floor.is_none() || self.is_recovery() {
+            return Ok(cold::Payloads::new());
+        }
+        let key = session.cold_key(&self.scope)?;
+        cold::read(
+            &self.data_dir,
+            &self.claim,
+            &key,
+            self.capacity.journal().bytes,
+        )
+    }
+
+    /// Stand on `body` and count what `records` holds at or below it.
+    fn recount_floor(&mut self, body: crate::checkpoint::Body) {
+        let mut floor = floor::Floor::new(body);
+        for stored in self.records.values() {
+            floor.count(&stored.header, stored.wire.len());
+        }
+        self.floor = Some(floor);
+    }
+
     fn catalog_projection(&self, session: &Session<'_>) -> Result<Projection> {
         self.check(session)?;
         self.projected(session)
@@ -3440,12 +3679,23 @@ impl Store {
     ) -> Result<Vec<MetadataEvidence>> {
         self.require_membership_evidence()?;
         let eligible: BTreeSet<_> = projection.ordered.into_iter().collect();
+        let cold = self.cold_payloads(session)?;
         let mut evidence = self
             .records
             .values()
             .map(|stored| {
                 let record = if stored.payload.is_ready() {
-                    Some(stored.wire.authenticate(batch)?)
+                    // A record at or below the floor whose payload this Mac kept is not opened
+                    // again (LT-B10C3); its grant and key are asked as any record's are.
+                    let kept = cold.get(&stored.header.id).filter(|_| {
+                        self.floor
+                            .as_ref()
+                            .is_some_and(|floor| floor.covers(&stored.header))
+                    });
+                    Some(match kept {
+                        Some(payload) => stored.wire.authenticate_held(batch, payload)?,
+                        None => stored.wire.authenticate(batch)?,
+                    })
                 } else {
                     None
                 };
@@ -3683,7 +3933,7 @@ impl Store {
         excluded
     }
     fn replication_index_with(&self, excluded: &BTreeSet<Digest>) -> Result<Index> {
-        let mut index = Index::new(MAX_RECORDS);
+        let mut index = Index::new(self.records.len());
         for (id, stored) in &self.records {
             if !excluded.contains(id) {
                 index
@@ -3841,7 +4091,7 @@ impl Store {
             .values()
             .any(|stored| stored.conflict.discarded().is_some())
         {
-            let mut positive = Index::new(MAX_RECORDS);
+            let mut positive = Index::new(self.records.len());
             for stored in self.records.values() {
                 positive
                     .insert(stored.header.clone())

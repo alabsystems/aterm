@@ -231,8 +231,11 @@ fn unwatched(timeout: Option<Duration>) -> Heard {
 /// directory made private first, as `aterm name` makes it, after it takes the nickname this Mac's
 /// own registry row was given from any Mac
 /// ([`aterm_agent::machine_name::follow_registry`]; a follow that fails is logged and leaves the
-/// name as it was), and whether this machine is in a fleet ([`InFleet::read`] over `state` and
-/// the vault at `vault`, where one is read).
+/// name as it was) and the number an owner wrote there, published as Rename This Mac… publishes
+/// a number ([`aterm_agent::machine_name::renumber_from_registry`]; a rename's number reaches the
+/// row from the rename itself, queued for this process's shared-files thread), and whether this
+/// machine is in a fleet ([`InFleet::read`] over `state` and the vault at `vault`, where one is
+/// read).
 fn read(
     state: &Path,
     vault: Option<&Paths>,
@@ -248,6 +251,9 @@ fn read(
             name
         }
     };
+    let name =
+        aterm_agent::machine_name::renumber_from_registry(state, Some(&MacSystemNames), now_ms)
+            .unwrap_or(name);
     Ok(MachineView {
         rev: name.rev,
         name: name.name(),
@@ -622,38 +628,6 @@ struct NameEdit {
     publication: Option<aterm_agent::machine_name::publish::Pending>,
 }
 
-/// Refuse, before anything changes, a nickname this Mac's lab registry row would refuse
-/// ([`aterm_agent::machine_name::registry::refusal`]), so the file and the row never part over
-/// it.
-fn registry_takes(
-    state: &Path,
-    nick: Option<&aterm_types::machine_name::Nickname>,
-) -> Result<(), String> {
-    match nick.and_then(|nick| aterm_agent::machine_name::registry::refusal(state, nick)) {
-        Some(why) => Err(format!("the lab registry refuses that nickname ({why})")),
-        None => Ok(()),
-    }
-}
-
-/// Write the nickname `name` holds to this Mac's lab registry row (where `state` is this
-/// account's live naming state) as a person's act, queued for this process's shared-files
-/// thread to publish rather than waited on, logging what became of it. A window names no aterm
-/// session as the act's: the one in its environment is the tab it was opened from, not the
-/// person's press.
-fn register(state: &Path, name: &aterm_agent::machine_name::file::MachineName) {
-    use aterm_net::fleet_member::name_record::ByKind;
-    let written = aterm_agent::machine_name::registry::write_nick(
-        state,
-        &name.nick,
-        ByKind::Person,
-        None,
-        std::time::Duration::ZERO,
-    );
-    if let Some(note) = written.note() {
-        aterm_log::info!("machine name: {note}");
-    }
-}
-
 fn change_number(
     state: &Path,
     config: &Path,
@@ -667,11 +641,10 @@ fn change_number(
     use aterm_net::fleet_member::name_record::ByKind;
     // Refuse naming holds and invalid configuration before changing the canonical name.
     let policy = publish::Policy::read(config, to.num)?;
-    registry_takes(state, to.nick.as_ref())?;
     let set = set_name(state, to, lab, ByKind::Person, roster, stamp, false)
         .map_err(|why| why.to_string())?;
+    offer_number(state, set.renumbered, set.queued.as_ref());
     let publication = publish::publish(state, config, &policy, Some(system)).err();
-    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,
@@ -710,16 +683,44 @@ fn change_undo(
         .transpose()?;
     let set = undo_last(state, Some(seen), lab, ByKind::Person, roster, stamp, false)
         .map_err(|why| why.to_string())?;
+    offer_number(state, set.renumbered, set.queued.as_ref());
     let publication = policy
         .as_ref()
         .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
-    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,
         shared: set.shared,
         publication,
     })
+}
+
+/// Publish the write a rename `queued` to this Mac's lab registry row, the nickname and number
+/// it changed as one ([`aterm_agent::machine_name::registry::offer`]), where it `renumbered` the
+/// Mac, before the vault signs that number, as `aterm name set` orders the two: registration,
+/// which writes the vault's number to the row as an automatic write, then finds the person's
+/// write there. Any other write a person's press queued is this process's shared-files thread's
+/// to publish at its next pass, as no press waits on the publisher. What became of it is
+/// journaled, and so is a write whose outbox folder's flush failed.
+fn offer_number(
+    state: &Path,
+    renumbered: bool,
+    queued: Option<&aterm_agent::machine_name::registry::Queued>,
+) {
+    let Some(write) = queued else {
+        return;
+    };
+    if renumbered {
+        if let Some(note) = aterm_agent::machine_name::registry::offer(state, write) {
+            aterm_log::info!("machine name: {note}");
+        }
+    } else if let Some(why) = &write.unflushed {
+        aterm_log::info!(
+            "machine name: lab registry: {} is in the outbox, but its folder's flush failed \
+             ({why}); a power loss before it is published may lose it",
+            write.id
+        );
+    }
 }
 
 /// Save a nickname and synchronize its generated OS targets without choosing a number again.
@@ -739,15 +740,11 @@ fn change_nickname(
         .and_then(chosen_number)
         .map(|number| publish::Policy::read(config, number))
         .transpose()?;
-    if let aterm_agent::machine_name::NickTo::Word(word) = to {
-        registry_takes(state, Some(word))?;
-    }
     let set =
         set_nick(state, to, ByKind::Person, roster, stamp, false).map_err(|why| why.to_string())?;
     let publication = policy
         .as_ref()
         .and_then(|policy| publish::publish(state, config, policy, Some(system)).err());
-    register(state, &set.name);
     Ok(NameEdit {
         name: set.name,
         changed: set.changed,

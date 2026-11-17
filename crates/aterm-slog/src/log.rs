@@ -228,6 +228,11 @@ pub enum Refused {
     Forgotten(Node),
     /// A `desc` mark whose `upto=` (held here) names a seq past the record it would become: a claim covers the log up to itself at most, never records that do not exist yet.
     UptoAhead(u64),
+    /// A `desc` mark the description rule does not admit ([`crate::fold::desc_admits`]): in-band
+    /// bytes stating anything but a title, aterm declaring `done`, a malformed `package`, a text
+    /// over its slot's bound or one the harness's readers read a head in, or a history line with no
+    /// text.
+    Claim(crate::fold::ClaimRefused),
 }
 
 impl From<FieldError> for Refused {
@@ -1422,7 +1427,7 @@ impl Log {
         self.fold.state()
     }
 
-    /// WHO THIS SESSION IS, for ranking its description claims ([`crate::fold::rank_of`]): its own sid and its creator's. No record carries it and no carry or journal does, so the host says it after every construction; the fold a fenced reader is shown learns it too, since it is a fact about the session and not a record past the fence. Every slot is settled again under it ([`crate::fold::Fold::set_desc_ident`]).
+    /// WHO THIS SESSION IS, for ranking its description claims ([`crate::fold::rank_of`]): its own sid and its creator's. No record, carry or journal holds it, so the host says it to every log that can hold a claim: to a carry as it is read ([`CarryAdopt::ident`]) and to a journal replay before its first record ([`Log::from_journal`]), so each ranks what it restores as the live log did, and here after every other construction and whenever it changes. A kept copy ([`Log::kept_within`]) keeps the log's; a closed summary holds no claim and is told none ([`Log::from_closed_summary`]). A tell that repeats the identity the log holds is a no-op. The fold a fenced reader is shown learns it too, since it is a fact about the session and not a record past the fence. Every slot is settled again under it ([`crate::fold::Fold::set_desc_ident`]).
     pub fn set_desc_ident(&mut self, own: Option<ShortId>, creator: Option<ShortId>) {
         self.fold.set_desc_ident(own, creator);
         if let Some(fence) = self.fence.as_mut() {
@@ -1741,9 +1746,14 @@ impl Log {
     /// when one is open ([`Log::open_decision_step`]), even with a tool open beside it (fix E3,
     /// finding E2E-3): the harness's escalate act lands on the box it escalated.
     /// A `desc` mark's `upto=` may name any seq up to the record itself (`last_seq + 1`, which is
-    /// what leaving it out means for the authors whose claim covers the log as they wrote it).
+    /// what leaving it out means for the authors whose claim covers the log as they wrote it), and
+    /// its fields must be what the description rule admits from its author, the rule the fold
+    /// applies again to every record it folds: a refused one is not appended, so neither the ring,
+    /// the journal nor the fold holds it.
     /// # Errors
-    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`], [`Refused::UptoAhead`] for a `desc` whose `upto=` is past the record it would become, or an encoding refusal.
+    /// [`Refused::KindDoesNotFit`] for a kind that is no mark's, [`Refused::SessionClosed`],
+    /// [`Refused::UptoAhead`] for a `desc` whose `upto=` is past the record it would become,
+    /// [`Refused::Claim`] for a `desc` the description rule does not admit, or an encoding refusal.
     pub fn mark(&mut self, m: Mark, at: Stamp) -> Result<u64, Refused> {
         if self.session_closed {
             return Err(Refused::SessionClosed);
@@ -1757,6 +1767,9 @@ impl Log {
             && upto > self.last_seq.saturating_add(1)
         {
             return Err(Refused::UptoAhead(upto));
+        }
+        if m.kind == Kind::Desc {
+            crate::fold::desc::admits_record(&m.f, m.by, m.src).map_err(Refused::Claim)?;
         }
         let node = match m.at {
             Some(n) if self.is_open(n) => n,

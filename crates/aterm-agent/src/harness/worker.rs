@@ -24,8 +24,8 @@ enum Launches {
     /// codex-alab: an image of ALab bytes ([`super::codex_alab::alab_bytes`]),
     /// typed as atpkg's managed twin where that twin execs ALab bytes too, else
     /// as itself. A vendor Codex image is no starter: the worker's line is then
-    /// [`WorkerCli::unstarted`]'s, and a `codex` that never claims its tab is
-    /// stalled `why=startup`.
+    /// [`WorkerCli::unstarted`]'s, and a `codex` that neither claims its tab
+    /// nor begins a turn by its own reports is stalled `why=startup`.
     Alab,
 }
 

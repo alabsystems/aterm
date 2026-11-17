@@ -295,6 +295,38 @@ fn an_owed_row_is_written_once_at_its_decision_or_as_its_wait_is_given_up() {
 }
 
 #[test]
+fn nested_captures_restore_the_outer_telemetry_writer_after_unwind() {
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::at(tmp.path().join("ledger"));
+    let need = || crate::Need::new("capture restoration").mem(crate::floor::GIB);
+    let ((), outer) = capture(ledger.clone(), || {
+        Owed::of(&ledger, &need()).stopped(Some(2));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture(ledger.clone(), || {
+                let _owed = Owed::of(&ledger, &need());
+                panic!("end the nested telemetry capture");
+            });
+        }));
+        assert!(panicked.is_err());
+        Owed::of(&ledger, &need()).stopped(Some(3));
+    });
+    assert_eq!(
+        outer.iter().map(|row| row.sig).collect::<Vec<_>>(),
+        [Some(2), Some(3)]
+    );
+    assert!(
+        outer
+            .iter()
+            .all(|row| row.kind == Kind::Admission && row.outcome == Outcome::Fail)
+    );
+    let ((), next) = capture(ledger.clone(), || {
+        Owed::of(&ledger, &need()).stopped(Some(15));
+    });
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].sig, Some(15));
+}
+
+#[test]
 fn only_this_users_ledger_writes_a_row() {
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
     let users = tmp.path().join("ledger");

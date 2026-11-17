@@ -5,7 +5,7 @@ use crate::documents::materialized::{Materialized, Read, materialize};
 use crate::{
     Error, Result,
     database::{Cell, Change, Command},
-    documents::Cells,
+    documents::{Cells, Unwritten},
     table::{
         Scope, Session,
         store::{Receipt, Store},
@@ -17,6 +17,14 @@ use std::sync::Mutex;
 
 /// Eligible causal-only merges as (writer, sequence) ([`Log::eligible_and_merges`]).
 pub(crate) type Merges = Vec<(Actor, u64)>;
+
+/// Whether `unwritten` names any change of `id`.
+fn touches(unwritten: &Unwritten, id: &Digest) -> bool {
+    unwritten
+        .range((*id, String::new(), String::new())..)
+        .next()
+        .is_some_and(|(operation, _, _)| operation == id)
+}
 
 /// A history clock derived from signed claims and causal edges, not an assertion of UTC time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,7 +163,8 @@ impl Log {
             retained: 0,
             append_bound,
             local_use: store.retained_use(session, session.actor())?,
-            index: Index::new(crate::database::MAX_RECORDS * 2),
+            // The held records, each counted once: no count of the log's own.
+            index: Index::new(metadata.len()),
             projection: Projection::default(),
             records: BTreeMap::new(),
             conflicts: BTreeSet::new(),
@@ -369,8 +378,14 @@ impl Log {
     pub(crate) fn operation(&self, id: &Digest) -> Option<&Operation> {
         self.records.get(id).map(|(operation, _)| operation)
     }
-    fn project_cells(&self, before: Option<Digest>, skip: &BTreeSet<Digest>) -> Cells {
+    fn project_cells(
+        &self,
+        before: Option<Digest>,
+        skip: &BTreeSet<Digest>,
+        unwritten: &Unwritten,
+    ) -> Cells {
         let mut cells = Cells::new();
+        let mut kept = Vec::new();
         for &id in &self.ordered {
             if before.is_some_and(|target| target == id || !self.observes(&target, &id))
                 || skip.contains(&id)
@@ -380,11 +395,30 @@ impl Log {
             if let Some(command) = &self.records[&id].1
                 && !matches!(command, Command::Merge { .. })
             {
+                let changes = command.changes().unwrap();
+                let changes = if touches(unwritten, &id) {
+                    kept.clear();
+                    kept.extend(
+                        changes
+                            .iter()
+                            .filter(|change| {
+                                !unwritten.contains(&(
+                                    id,
+                                    change.collection.clone(),
+                                    change.key.clone(),
+                                ))
+                            })
+                            .cloned(),
+                    );
+                    kept.as_slice()
+                } else {
+                    changes
+                };
                 crate::documents::apply(
                     &|later, earlier| self.observes(later, earlier),
                     &mut cells,
                     id,
-                    command.changes().unwrap(),
+                    changes,
                     true,
                 );
             }
@@ -469,26 +503,29 @@ impl Log {
         }
         cells.into_values().next()
     }
-    /// The cells without the operations in `skip`, as if they had never been applied: an
-    /// ATT/1 reader passes the automatic records past their writer's quota
-    /// (`typed::owned::quota`), which stay in history and dependencies but never project.
-    #[cfg(test)]
-    pub(crate) fn cells_without(&self, skip: &BTreeSet<Digest>) -> Cells {
-        self.project_cells(None, skip)
-    }
-    /// The cells without the operations in `skip`, as if they had never been applied (an ATT/1
-    /// reader passes the automatic records past their writer's quota, `typed::owned::quota`,
-    /// which stay in history and dependencies but never project), together with the retained
-    /// operation ids that are unavailable, withheld or refused and not in `awaited`
-    /// (`att::View::refused`), computed in one pass without building a full [`Snapshot`].
-    pub(crate) fn cells_and_refused(
+    /// The cells without the operations in `skip` and the single changes in `unwritten`, as if
+    /// they had never been applied: an ATT/1 reader passes the automatic records past their
+    /// writer's quota (`typed::owned::quota`) and the writes the authority rules hold inert
+    /// (`typed::authority`), which stay in history and dependencies but never project. Where
+    /// `before` names an operation, only what it observed, as it observed it. With no `before`
+    /// and nothing unwritten, the cells extend from this table's last read
+    /// ([`Self::materialized_cells`]); otherwise they are replayed in full.
+    pub(crate) fn cells_without(
         &self,
+        before: Option<Digest>,
         skip: &BTreeSet<Digest>,
-        awaited: &BTreeSet<Digest>,
-    ) -> (Cells, Vec<Digest>) {
-        let cells = self.materialized_cells(skip);
-        let refused = self
-            .records
+        unwritten: &Unwritten,
+    ) -> Cells {
+        if before.is_none() && unwritten.is_empty() {
+            self.materialized_cells(skip)
+        } else {
+            self.project_cells(before, skip, unwritten)
+        }
+    }
+    /// The retained operation ids that are unavailable, withheld or refused and not in
+    /// `awaited` (`att::View::refused`), without building a full [`Snapshot`].
+    pub(crate) fn refused(&self, awaited: &BTreeSet<Digest>) -> Vec<Digest> {
+        self.records
             .iter()
             .filter(|&(id, (op, _))| {
                 (!op.available
@@ -499,8 +536,7 @@ impl Log {
                     && !awaited.contains(id)
             })
             .map(|(id, _)| *id)
-            .collect();
-        (cells, refused)
+            .collect()
     }
     /// The cells without `skip`, extended from this table's last read in this process where
     /// [`materialize`] may reuse it, and kept for the next.
@@ -669,7 +705,7 @@ impl Log {
             .count()
     }
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let cells = self.project_cells(None, &BTreeSet::new());
+        let cells = self.project_cells(None, &BTreeSet::new(), &Unwritten::new());
         let operations = self
             .records
             .iter()
@@ -888,12 +924,18 @@ impl Log {
         Ok(None)
     }
     /// Compensate a target in the application's visible history. Excluded operations retain
-    /// their causal links but cannot supply the current value, the target or its preimage.
+    /// their causal links but cannot supply the current value, the target or its preimage, and
+    /// neither can an `unwritten` change, a write the reader holds inert: a revert never restores
+    /// one, and a target none of whose writes projected has nothing to revert. Every reader
+    /// refuses a revert that does not name each key of its target ([`Self::read_with`]), so a
+    /// key where the target's write is inert, which it never changed, is restated as it reads
+    /// now, while that register holds one value or none.
     pub(crate) fn compensate(
         &self,
         request: [u8; 16],
         target: Digest,
         excluded: &BTreeSet<Digest>,
+        unwritten: &Unwritten,
     ) -> Result<Command> {
         let command = self
             .records
@@ -907,11 +949,31 @@ impl Log {
         if !self.eligible.contains(&target) || excluded.contains(&target) {
             return Err(Error::new("target proposal is not eligible"));
         }
-        let current = self.project_cells(None, excluded);
+        let inert = |change: &Change| {
+            unwritten.contains(&(target, change.collection.clone(), change.key.clone()))
+        };
+        if changes.iter().all(inert) {
+            return Err(Error::new(
+                "every write of the target proposal is inert; it never projected",
+            ));
+        }
+        let mut current = self.project_cells(None, excluded, unwritten);
+        // Per key: the register it restores, read now where the target's write is inert.
         let mut keys = Vec::with_capacity(changes.len());
         for change in changes {
             let key = (change.collection.clone(), change.key.clone());
-            if !current.get(&key).is_some_and(|cell| {
+            let now = current.get(&key);
+            if inert(change) {
+                if now.is_some_and(|cell| cell.stopped || cell.candidates.len() > 1) {
+                    return Err(Error::new(
+                        "a key where the target proposal's write is inert is stopped or conflicted; resolve it explicitly",
+                    ));
+                }
+                let now = current.remove(&key);
+                keys.push((key, Some(now)));
+                continue;
+            }
+            if !now.is_some_and(|cell| {
                 !cell.stopped
                     && cell.candidates.len() == 1
                     && cell.candidates[0].operation == target
@@ -920,20 +982,26 @@ impl Log {
                     "an affected proposal changed; resolve it before reverting",
                 ));
             }
-            keys.push(key);
+            keys.push((key, None));
         }
-        let mut past = self.project_cells(Some(target), excluded);
+        let mut past = self.project_cells(Some(target), excluded, unwritten);
         let mut restored = Vec::with_capacity(keys.len());
-        for key in keys {
-            let old = past.remove(&key);
-            if old
-                .as_ref()
-                .is_some_and(|cell| cell.stopped || cell.candidates.len() > 1)
-            {
-                return Err(Error::new(
-                    "previous proposal is stopped or conflicted; resolve it explicitly",
-                ));
-            }
+        for (key, now) in keys {
+            let old = match now {
+                Some(now) => now,
+                None => {
+                    let old = past.remove(&key);
+                    if old
+                        .as_ref()
+                        .is_some_and(|cell| cell.stopped || cell.candidates.len() > 1)
+                    {
+                        return Err(Error::new(
+                            "previous proposal is stopped or conflicted; resolve it explicitly",
+                        ));
+                    }
+                    old
+                }
+            };
             restored.push(Change {
                 collection: key.0,
                 key: key.1,

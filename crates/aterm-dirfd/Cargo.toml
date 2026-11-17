@@ -8,11 +8,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Handle-relative directory operations for aterm's confined artifact paths and disk reclaim: fd-relative POSIX calls on unix, NT handle-relative opens on Windows"
+description = "Handle-relative directory operations for aterm's confined artifact paths, disk reclaim and private stores: fd-relative POSIX calls on unix; on Windows NT handle-relative opens, creates, renames and links, and the security descriptors that make an entry owner-only"
 
 [target.'cfg(unix)'.dependencies]
 # Already in the shipped graph, so this crate adds no package. The Windows half
-# is direct ntdll/kernel32 FFI (`src/windows/ffi.rs`) and needs nothing.
+# is direct ntdll/kernel32/advapi32 FFI (`src/windows/ffi.rs`) and needs nothing.
 libc = { workspace = true }
 
 [dev-dependencies]
@@ -22,8 +22,8 @@ aterm-tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 # The Windows tests' junctions: `cmd /C mklink /J`, spawned through
-# `aterm_uds::spawnfd::command` as every child is. A test-only edge; aterm-uds
-# is itself dependency-free on Windows.
+# `aterm_uds::spawnfd::command` as every child is. A test-only edge back:
+# aterm-uds depends on this crate (its `acl` is this crate's), never the other way.
 aterm-uds = { workspace = true }
 
 [lints]

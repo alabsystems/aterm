@@ -1488,6 +1488,15 @@ pub trait System: Sync {
         None
     }
 
+    /// Whether the file now at `path` is another file than the executable image this process
+    /// runs (an update replaced the app at the same path while this process ran, as it does a
+    /// Mac Setup tab's program carried across an update): `Some(true)` only on the kernel's
+    /// reading of this process's image, `None` where either cannot be read.
+    fn image_replaced(&self, path: &Path) -> Option<bool> {
+        let _ = path;
+        None
+    }
+
     /// The installed root LAN broker's checked protocol hello, with no direct
     /// fallback. This is an effect-boundary read, not the GUI's metadata probe.
     ///
@@ -3432,6 +3441,11 @@ impl System for Live {
             .map(Path::to_path_buf)
     }
 
+    fn image_replaced(&self, path: &Path) -> Option<bool> {
+        let pid = i32::try_from(std::process::id()).ok()?;
+        aterm_uds::process::image_matches_file(pid, path).map(|same| !same)
+    }
+
     fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {
         #[cfg(target_os = "macos")]
         return aterm_uds::lan::broker::installed_hello().map_err(|error| error.to_string());
@@ -3817,6 +3831,9 @@ mod fake {
         pub keyboard_services: Option<Result<Vec<u64>, String>>,
         /// What [`System::running_app`] answers: `None` unless a test names a bundle.
         pub running_app: Option<PathBuf>,
+        /// What [`System::image_replaced`] answers for every path: `None`, unread, unless a test
+        /// has an update replace this process's image.
+        pub image_replaced: Option<bool>,
         /// What [`System::volume`] answers for every path: `None`, unread, unless a test sets
         /// it.
         pub volume: Option<aterm_capacity::reading::Volume>,
@@ -5325,6 +5342,10 @@ mod fake {
 
         fn running_app(&self) -> Option<PathBuf> {
             self.running_app.clone()
+        }
+
+        fn image_replaced(&self, _path: &Path) -> Option<bool> {
+            self.image_replaced
         }
 
         fn installed_lan_broker(&self) -> Result<aterm_uds::lan::BrokerHello, String> {

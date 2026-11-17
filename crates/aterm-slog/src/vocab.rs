@@ -769,6 +769,7 @@ pub const OUT_WORDS: &[&str] = &[
     "wall:api-error",
     "wall:overloaded",
     "wall:memory",
+    "wall",
     "interrupted",
     "error",
     "approved",

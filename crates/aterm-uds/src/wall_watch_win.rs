@@ -166,6 +166,20 @@ impl Steps {
     }
 }
 
+/// Never made: a new time zone is announced to windows only here.
+#[derive(Debug)]
+pub(super) enum Zone {}
+
+impl Zone {
+    pub(super) fn start() -> Option<Self> {
+        None
+    }
+
+    pub(super) fn take(&self) -> bool {
+        match *self {}
+    }
+}
+
 /// The suspend and resume registration; it hears until dropped.
 pub(super) type Listening = aterm_sysprobe::power::windows::Listening;
 

@@ -1347,11 +1347,11 @@ fn a_frame_of_a_kind_this_build_does_not_know_still_frames() {
         "the stream is refused whole"
     );
     assert!(
-        Record::wire_len_prefix(&unread).is_err(),
+        Record::wire_len_prefix(&unread, Reading::ONE).is_err(),
         "the length prefix still refuses an unknown kind"
     );
     assert_eq!(
-        Record::wire_len_prefix(n0.bytes()).ok(),
+        Record::wire_len_prefix(n0.bytes(), Reading::ONE).ok(),
         Some(n0.bytes().len())
     );
 }

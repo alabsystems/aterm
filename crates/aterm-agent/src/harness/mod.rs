@@ -117,6 +117,8 @@ pub mod lights;
 pub mod login_adoption;
 pub mod login_drive;
 pub mod login_latch;
+/// What a footer read looked at before it read, for the resolver that watches its inputs.
+pub mod looks;
 pub mod mail_browser;
 pub mod mail_recovery;
 pub mod mailbox_needs;
@@ -183,6 +185,10 @@ pub mod stats;
 pub mod steps;
 pub mod switch_top;
 pub mod tap;
+/// The work a build with debug assertions counts per thread, for other crates' tests.
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub mod test_counters;
 /// The harness's clock: every bounded wait of the live upgrade and the relaunch, as one value ([`Timings`]).
 pub mod timings;
 /// The one judgment of whether a Claude Code launch starts on its vault token

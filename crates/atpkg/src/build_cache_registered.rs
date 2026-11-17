@@ -36,6 +36,10 @@ pub use retention::retain;
 #[path = "build_cache_gate.rs"]
 mod gate;
 
+#[cfg(unix)]
+#[path = "build_cache_receipt_stage.rs"]
+mod receipt_stage;
+
 /// The internal front-door call a managed compiler shim makes before it execs Cargo.
 pub const REGISTER_VERB: &str = "__build_cache_register";
 
@@ -196,6 +200,10 @@ fn clearance(
             records += 1;
             if records > MAX_ROOTS {
                 return Err("registered-cache index exceeds its bound".into());
+            }
+            #[cfg(unix)]
+            if receipt_stage::abandoned(&record) {
+                continue;
             }
             if record
                 .extension()
@@ -2356,8 +2364,10 @@ fn suppress_unresolved(home: &Path, target: &Path) -> std::io::Result<bool> {
         let mut receipt = read(&path)
             .filter(|receipt| receipt.root == root && same(home, receipt))
             .ok_or_else(stop)?;
-        receipt.owners_unknown = true;
-        write(&path, &receipt).ok_or_else(stop)?;
+        if !receipt.owners_unknown {
+            receipt.owners_unknown = true;
+            write(&path, &receipt).ok_or_else(stop)?;
+        }
         protected = true;
     }
     Ok(protected)
@@ -2394,8 +2404,10 @@ fn suppress_configured(home: &Path) -> std::io::Result<()> {
         let lock = gate::open(&gate_path(&path).ok_or_else(stop)?)?;
         let _held = gate::try_exclusive(lock).map_err(|_| stop())?;
         let mut receipt = read(&path).ok_or_else(stop)?;
-        receipt.owners_unknown = true;
-        write(&path, &receipt).ok_or_else(stop)?;
+        if !receipt.owners_unknown {
+            receipt.owners_unknown = true;
+            write(&path, &receipt).ok_or_else(stop)?;
+        }
     }
     Ok(())
 }

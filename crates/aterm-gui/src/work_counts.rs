@@ -114,7 +114,6 @@ thread_local! {
     static ON_SCREEN_ASKS: Cell<usize> = const { Cell::new(0) };
     static END_RESTAMPS: Cell<usize> = const { Cell::new(0) };
     static TIMER_RESOLVES: Cell<usize> = const { Cell::new(0) };
-    static ACCOUNT_STORE_READS: Cell<usize> = const { Cell::new(0) };
     static OUTLOOK_FILE_LOOKS: Cell<usize> = const { Cell::new(0) };
     static ACCOUNT_HISTORY_FOLDS: Cell<usize> = const { Cell::new(0) };
     static ACCOUNT_MACHINES_READS: Cell<usize> = const { Cell::new(0) };
@@ -128,17 +127,147 @@ fn take(counter: &'static std::thread::LocalKey<Cell<usize>>) -> usize {
     counter.with(|c| c.replace(0))
 }
 
-/// The accounts store read for the outlook's snapshot (`accounts_outlook::read_held`), on
-/// this thread.
-pub(crate) fn account_store_read() {
-    bump(&ACCOUNT_STORE_READS);
-}
-pub(crate) fn take_account_store_reads() -> usize {
-    take(&ACCOUNT_STORE_READS)
+/// What the Claude Code footer's resolver did on this thread since the last
+/// [`take_footer_work`], each count at the one site that does that work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FooterWork {
+    /// Runs of the footer's derive (`claude_footer::resolve_facts_at_with_cwd`): each read runs
+    /// it once, with its file reads inline.
+    pub(crate) derives: usize,
+    /// Decodes of a Claude Code profile's bytes (`aterm_agent::harness::profile`'s `decode`).
+    pub(crate) profile_decodes: usize,
+    /// Reads of an agent's exec image, its argv and environment (`claude_footer::exec_args`).
+    pub(crate) exec_arg_reads: usize,
+    /// Reads of a process's kernel start time (`claude_footer::birth_seconds`).
+    pub(crate) birth_reads: usize,
+    /// Loads of the accounts store's state (`footer_inputs::Stores::state`), which the footer's
+    /// own week, the roster's bindings and the accounts outlook share.
+    pub(crate) store_loads: usize,
+    /// Loads of the accounts roster the footer labels accounts by (`footer_inputs::Roster::at`,
+    /// or a test's `claude_footer::RosterAsks::Given`).
+    pub(crate) roster_loads: usize,
+    /// Reads of an agent's settings chain for its default permission mode
+    /// (`permission_click::note_default_of`).
+    pub(crate) settings_chain_reads: usize,
+    /// Reads of the vault token view (`token_lane::Here`'s read), booked on the thread that made
+    /// it: the token lane's, never the footer's. A unit test reads no vault.
+    pub(crate) token_view_reads: usize,
+    /// Asks of the token view's lane (`token_lane::want`): what the footer does in its place.
+    pub(crate) token_wants: usize,
+    /// Replays of the accounts outlook (`accounts_outlook::OutlookMemo::at`).
+    pub(crate) outlook_replays: usize,
+    /// Reads of a Claude Code build's model catalog (`claude_facts::note_catalog_under`).
+    pub(crate) catalog_reads: usize,
+    /// Gathers of each footer input, by [`aterm_agent::harness::looks::Input::index`]: a read
+    /// that read the input because it moved since the read before (the row, transcript,
+    /// subagents and git `HEAD` that `aterm-agent` counts, and the tap reading and the machine
+    /// memos counted here). A read of an input that stands gathers nothing of it.
+    pub(crate) gathers: Gathers,
 }
 
-/// A file the outlook's memo looked at on this thread: a `stat` of the store, the logins or a
-/// series, or a series' read (`accounts_outlook`).
+/// [`FooterWork::gathers`].
+pub(crate) type Gathers = [usize; aterm_agent::harness::looks::Input::ALL.len()];
+
+/// No gathers.
+pub(crate) const NO_GATHERS: Gathers = [0; aterm_agent::harness::looks::Input::ALL.len()];
+
+/// `gathers` with one gather of each of `inputs`.
+pub(crate) fn gathers_of(inputs: &[aterm_agent::harness::looks::Input]) -> Gathers {
+    let mut gathers = NO_GATHERS;
+    for input in inputs {
+        gathers[input.index()] += 1;
+    }
+    gathers
+}
+
+impl std::ops::AddAssign for FooterWork {
+    fn add_assign(&mut self, more: FooterWork) {
+        self.derives += more.derives;
+        self.profile_decodes += more.profile_decodes;
+        self.exec_arg_reads += more.exec_arg_reads;
+        self.birth_reads += more.birth_reads;
+        self.store_loads += more.store_loads;
+        self.roster_loads += more.roster_loads;
+        self.settings_chain_reads += more.settings_chain_reads;
+        self.token_view_reads += more.token_view_reads;
+        self.token_wants += more.token_wants;
+        self.outlook_replays += more.outlook_replays;
+        self.catalog_reads += more.catalog_reads;
+        for (held, more) in self.gathers.iter_mut().zip(more.gathers) {
+            *held += more;
+        }
+    }
+}
+
+thread_local! {
+    static FOOTER_WORK: Cell<FooterWork> = const { Cell::new(FooterWork {
+        derives: 0, profile_decodes: 0, exec_arg_reads: 0, birth_reads: 0, store_loads: 0,
+        roster_loads: 0, settings_chain_reads: 0, token_view_reads: 0, token_wants: 0,
+        outlook_replays: 0, catalog_reads: 0, gathers: NO_GATHERS,
+    }) };
+}
+
+fn footer_did(count: impl FnOnce(&mut FooterWork)) {
+    FOOTER_WORK.with(|c| {
+        let mut work = c.get();
+        count(&mut work);
+        c.set(work);
+    });
+}
+
+pub(crate) fn footer_derived() {
+    footer_did(|w| w.derives += 1);
+}
+pub(crate) fn exec_args_read() {
+    footer_did(|w| w.exec_arg_reads += 1);
+}
+pub(crate) fn birth_read() {
+    footer_did(|w| w.birth_reads += 1);
+}
+pub(crate) fn store_loaded() {
+    footer_did(|w| w.store_loads += 1);
+}
+pub(crate) fn roster_loaded() {
+    footer_did(|w| w.roster_loads += 1);
+}
+pub(crate) fn settings_chain_read() {
+    footer_did(|w| w.settings_chain_reads += 1);
+}
+pub(crate) fn token_view_read() {
+    footer_did(|w| w.token_view_reads += 1);
+}
+pub(crate) fn token_wanted() {
+    footer_did(|w| w.token_wants += 1);
+}
+pub(crate) fn outlook_replayed() {
+    footer_did(|w| w.outlook_replays += 1);
+}
+pub(crate) fn catalog_read() {
+    footer_did(|w| w.catalog_reads += 1);
+}
+pub(crate) fn gathered(input: aterm_agent::harness::looks::Input) {
+    footer_did(|w| w.gathers[input.index()] += 1);
+}
+
+/// This thread's [`FooterWork`] since the last take, zeroed: the profile decodes are the ones
+/// `aterm-agent` counts on this thread, and its gathers are added to those counted here.
+pub(crate) fn take_footer_work() -> FooterWork {
+    let mut work = FooterWork {
+        profile_decodes: aterm_agent::harness::test_counters::take_profile_decodes(),
+        ..FOOTER_WORK.with(|c| c.replace(FooterWork::default()))
+    };
+    for (held, more) in work
+        .gathers
+        .iter_mut()
+        .zip(aterm_agent::harness::test_counters::take_gathers())
+    {
+        *held += more;
+    }
+    work
+}
+
+/// A look of the outlook's memo on this thread: one look at the stamps of the store's and the
+/// logins' files, a `stat` of a series, or a series' read (`accounts_outlook`).
 pub(crate) fn outlook_file_look() {
     bump(&OUTLOOK_FILE_LOOKS);
 }

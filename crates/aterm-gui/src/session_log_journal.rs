@@ -453,7 +453,11 @@ impl Shared {
         let wake = Arc::new(Wake::default());
         let ring = Arc::clone(&wake);
         Arc::new(Shared {
-            notify: aterm_slog::Notify::new(move || ring.ring()),
+            // The one callback a log rings on every append rings aterm's default writer too.
+            notify: aterm_slog::Notify::new(move || {
+                ring.ring();
+                crate::describe::ring();
+            }),
             wake,
             req: AtomicU8::new(0),
             phase: AtomicU8::new(Phase::Armed as u8),
@@ -486,9 +490,13 @@ impl Shared {
 /// This process's lane, once a journal-keeping launch made one.
 static LANE: OnceLock<Arc<Shared>> = OnceLock::new();
 
-/// The wake a new session log installs ([`aterm_slog::Log::set_notify`]).
+/// The wake a new session log installs ([`aterm_slog::Log::set_notify`]): this lane's, which
+/// rings aterm's default writer too; where this launch keeps no journal, the default writer's
+/// alone ([`crate::describe::notify`]), once its lane is published.
 pub(crate) fn notify() -> Option<aterm_slog::Notify> {
-    LANE.get().map(|s| s.notify.clone())
+    LANE.get()
+        .map(|s| s.notify.clone())
+        .or_else(crate::describe::notify)
 }
 
 /// The successor's Commit landed.

@@ -59,6 +59,8 @@ fn this_macs_real_readings_make_a_row() {
         uuid: "11111111111111111111111111111111".into(),
         label: Some("m7".into()),
         chosen: None,
+        signed: None,
+        held: std::collections::BTreeSet::new(),
         hw_hint: "aaaaaaaaaaaaaaaa".into(),
         enrolled_ms: None,
         former: Vec::new(),

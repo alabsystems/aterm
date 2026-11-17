@@ -4,6 +4,8 @@
 //! Tests for the window's accounts outlook ([`super`]): what the memo costs, what the Accounts
 //! card maps from its snapshot, and what a forecast never does.
 
+use std::time::{Duration, Instant};
+
 use super::*;
 use crate::autopilot_menu::MenuRow;
 use crate::claude_footer::probe::{AT_REST, facts, glass_with, pass, publish};
@@ -20,12 +22,14 @@ const NOW: i64 = 1_792_956_600;
 const H: i64 = 3600;
 const D: i64 = 86_400;
 
-/// The window's reads on the test's thread ([`TEST_STATE_DIR`]) under a fixed policy and UTC.
+/// The window's reads on the test's thread ([`TEST_STATE_DIR`]) under a fixed policy and UTC,
+/// with no journal (as a process with no lab reads none).
 fn scratch_reads() -> Reads {
     Reads {
         state_dir: LIVE.state_dir,
         policy: || (Mode::Early, false),
         offset: |_| 0,
+        journal: || aterm_agent::harness::alab_seen::Journal::Off,
     }
 }
 
@@ -107,15 +111,20 @@ fn seeded() -> aterm_tempfile::TempDir {
 /// and rising 16 points a day for a day of series, its reset in three days; `alt1` read three
 /// hours ago at 96%; [`pool_roster`]'s `pool1` never read.
 fn seeded_stop() -> aterm_tempfile::TempDir {
+    seeded_me(580, NOW + 3 * D)
+}
+
+/// [`seeded_stop`] with `me` read ten minutes ago at `me_x10` tenths of a week resetting `week`,
+/// after 16 points of it in the day before.
+fn seeded_me(me_x10: u32, week: i64) -> aterm_tempfile::TempDir {
     let dir = scratch();
     let store = accounts::Store::at(dir.path());
     let (mut state, _) = store.load(NOW).expect("an empty store loads");
     state.active = Some("me".into());
-    let week = NOW + 3 * D;
     let _ = accounts::note_reading_held(
         &mut state,
         "me",
-        &tap(580, week, NOW - 600, true),
+        &tap(me_x10, week, NOW - 600, true),
         NOW,
         accounts::ReadingOwner::Unobserved,
     );
@@ -127,7 +136,12 @@ fn seeded_stop() -> aterm_tempfile::TempDir {
         accounts::ReadingOwner::Unobserved,
     );
     store.save(&state).expect("save");
-    for (hours, pct_x10) in [(24, 420), (16, 470), (8, 520), (0, 580)] {
+    for (hours, pct_x10) in [
+        (24, me_x10 - 160),
+        (16, me_x10 - 110),
+        (8, me_x10 - 60),
+        (0, me_x10),
+    ] {
         let at = NOW - 600 - hours * H;
         let fig = WindowFig {
             pct_x10,
@@ -160,14 +174,22 @@ fn files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     out
 }
 
-/// T21: THE OUTLOOK IS REPLAYED AT MOST ONCE A MINUTE, on the resolver's thread, and reads
-/// the store only when its stamps move. Ten minutes of reads every second (a busy resolver)
-/// replay it at most eleven times, read the store once, build the pane's quota view at most once
-/// a replay (a pass between replays is handed the one it built), its line D unit's words standing
-/// while the clock alone moves, and write nothing; the card's snapshot is posted and carries the
-/// replay. Negative control: a memo replayed on every read replays 600 times.
+/// T21: THE OUTLOOK REPLAYS ONLY FOR ITS CAUSES, on the resolver's thread, and reads the store
+/// only when its stamps move. Ten minutes of reads every second (a busy resolver) over a store no
+/// one writes replay it first, and after that only at a second the deadline the replay before
+/// computed had come ([`Outlook::changes_after`]); they read the store once, build the pane's
+/// quota view at most once a replay (a pass between replays is handed the one it built), its line
+/// D unit's words standing while the clock alone moves, and write nothing; the card's snapshot is
+/// posted and carries the replay. CONTROL: the store moves (a new reading saved): the next read
+/// loads it again, and the replay it owes runs once [`REPLAY_FLOOR_S`] has passed since the last
+/// replay, at the second [`OutlookMemo::changes_after`] names.
+///
+/// NEGATIVE CONTROL (run 2026-11-15): with `OutlookMemo::at`'s `due` true on every read, the test
+/// fails at "a replay at +1 before the deadline Some(60) the replay at Some(0) computed". With
+/// the minute put back in `due` (`|| floor` alone), it passes: the seeded outlook owes a replay
+/// each minute by its own deadline, so the minute cannot be told from it here.
 #[test]
-fn the_outlook_replays_at_most_once_a_minute() {
+fn the_outlook_replays_only_for_its_causes() {
     let dir = seeded();
     let before = files(dir.path());
     let roster = roster();
@@ -175,13 +197,20 @@ fn the_outlook_replays_at_most_once_a_minute() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    let start = Instant::now();
-    let _ = crate::work_counts::take_account_store_reads();
+    let _ = crate::work_counts::take_footer_work().store_loads;
     let own = Some(Figure::Exact(580));
     let mut views: Vec<QuotaView> = Vec::new();
     for s in 0..600i64 {
-        let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
-        let views_now = memo.quota((instant, NOW + s), Some(&roster), "me", own, true);
+        let (replays, deadline, last) = (memo.replays, memo.deadline, memo.replayed);
+        let views_now = memo.quota(NOW + s, Some(&roster), "me", own, true);
+        if replays > 0 && memo.replays > replays {
+            assert!(
+                deadline.is_some_and(|deadline| NOW + s >= deadline),
+                "a replay at +{s} before the deadline {:?} the replay at {:?} computed",
+                deadline.map(|d| d - NOW),
+                last.map(|(at, _)| at - NOW)
+            );
+        }
         let view = views_now
             .unwrap_or_else(|| panic!("second {s}: the pane's row has a view"))
             .view;
@@ -189,11 +218,7 @@ fn the_outlook_replays_at_most_once_a_minute() {
             views.push(view);
         }
     }
-    assert!(
-        (1..=11).contains(&memo.replays),
-        "at most once a minute: {} replays",
-        memo.replays
-    );
+    assert!(memo.replays >= 1, "the first read replays");
     assert!(
         (1..=memo.replays).contains(&views.len()),
         "at most one view a replay: {} views over {} replays",
@@ -207,7 +232,7 @@ fn the_outlook_replays_at_most_once_a_minute() {
         "the unit's words stand while only the clock moves"
     );
     assert_eq!(
-        crate::work_counts::take_account_store_reads(),
+        crate::work_counts::take_footer_work().store_loads,
         1,
         "the store is read once while its stamps stand"
     );
@@ -220,21 +245,19 @@ fn the_outlook_replays_at_most_once_a_minute() {
     );
     assert_eq!(before, files(dir.path()), "no file changed");
 
-    // CONTROL: the store moves (a new reading saved): the next look re-reads it, and the
-    // next replay is still a minute after the last.
     let store = accounts::Store::at(dir.path());
     let (mut state, _) = store.load(NOW).expect("load");
     state.active = Some("alt1".into());
     store.save(&state).expect("save");
     let replays = memo.replays;
-    let later = start + Duration::from_secs(600 + 11);
-    let _ = memo.quota((later, NOW + 611), Some(&roster), "me", own, true);
+    let (replayed, _) = memo.replayed.expect("a replay");
+    let moved = NOW + 600;
+    let _ = memo.quota(moved, Some(&roster), "me", own, true);
     assert_eq!(
-        crate::work_counts::take_account_store_reads(),
+        crate::work_counts::take_footer_work().store_loads,
         1,
         "CONTROL: a moved store is read again"
     );
-    assert!(memo.replays <= replays + 1);
     assert_eq!(
         memo.held
             .as_ref()
@@ -244,20 +267,34 @@ fn the_outlook_replays_at_most_once_a_minute() {
         Some("alt1"),
         "CONTROL: the memo holds the store as it now is"
     );
+    let owed = replayed + REPLAY_FLOOR_S;
+    if owed > moved {
+        assert_eq!(memo.replays, replays, "the moved store waits for the floor");
+        let due = memo.changes_after(moved).expect("a replay is owed");
+        assert!(due <= owed, "it is owed by the floor's end: {}", due - NOW);
+        let _ = memo.quota(owed, Some(&roster), "me", own, true);
+    }
+    assert_eq!(
+        memo.replays,
+        replays + 1,
+        "CONTROL: the moved store is replayed once the floor has passed"
+    );
     set_dir(None);
 }
 
-/// A FIRST READING IS DRAWN AT THE STORE'S NEXT MOVE, NOT AT THE MINUTE (2026-11-08, the glass
+/// A FIRST READING IS DRAWN AT THE STORE'S NEXT MOVE, NOT AT THE FLOOR (2026-11-08, the glass
 /// design's §7 step 4): the memo replays a store whose `me` was never read, so `me`'s pane is case
 /// (d). Five seconds later the harness folds `me`'s first reading (58%, its reset in three days)
-/// into the store, and the pane's footer holds it (`own`). Until the next stamp look the pane
-/// leads with 58% beside no refusal (the view's own rule); from that look, ten seconds after the
-/// first, its view is a replay that read the reading: the last past cell holds 58% and phrase 1
-/// says `me`'s reset. Only that replay runs early: at second 20 the store moves again (`alt1`
-/// made active) while the pane's reading is the replay's, and that move waits for the minute,
-/// so the minute's reads replay twice in all. NEGATIVE CONTROLS (each run once, restored): a
-/// memo that replays only at the minute draws nothing of the reading within the minute; one
-/// whose pane is behind whenever it holds a figure replays the second move too (3 replays).
+/// into the store, and the pane's footer holds it (`own`): the read the store's watch owes loads
+/// the store again and, the pane being behind, replays at once, so its view is a replay that read
+/// the reading: the last past cell holds 58% and phrase 1 says `me`'s reset. Only that replay runs
+/// early: at second 20 the store moves again (`alt1` made active) while the pane's reading is the
+/// replay's, and that move waits for the floor ([`REPLAY_FLOOR_S`] after second 5), so the
+/// minute's reads replay twice in all.
+///
+/// NEGATIVE CONTROL (run 2026-11-15, with `sign_in_moved` dropped too, which no sign-in here
+/// reaches): with `behind` dropped from `OutlookMemo::at`'s `due`, the test fails at "the early
+/// replay ran by second 20" with `left: 1 right: 2`: the reading waits for the floor.
 #[test]
 fn a_first_reading_is_drawn_at_the_stores_next_move() {
     let dir = scratch();
@@ -270,9 +307,8 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    let start = Instant::now();
     let first = memo
-        .quota((start, NOW), Some(&roster), "me", None, true)
+        .quota(NOW, Some(&roster), "me", None, true)
         .expect("a view")
         .view;
     assert!(first.waiting(), "case (d): me is unread");
@@ -298,9 +334,8 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
             store.save(&state).expect("save");
         }
         let own = (s >= 5).then_some(Figure::Exact(580));
-        let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
         let view = memo
-            .quota((instant, NOW + s), Some(&roster), "me", own, true)
+            .quota(NOW + s, Some(&roster), "me", own, true)
             .unwrap_or_else(|| panic!("second {s}: a view"))
             .view;
         if own.is_some() {
@@ -320,7 +355,7 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
             );
         }
     }
-    assert_eq!(drawn_at, Some(10), "drawn at the stamp look after the fold");
+    assert_eq!(drawn_at, Some(5), "drawn at the read after the fold");
     assert_eq!(
         memo.replays, 2,
         "one replay early, and no more within the minute: the store's second move waits"
@@ -337,15 +372,20 @@ fn a_first_reading_is_drawn_at_the_stores_next_move() {
     set_dir(None);
 }
 
-/// A SIGN-IN THAT STARTS OR ENDS IS SAID AT THE NEXT LOOK, NOT AT THE MINUTE: `alt1`'s login is
-/// on record as signed out, so the replay says `signed out` in its figure's place. A sign-in of it
-/// starts at second 3 (the record `accounts renew` and the ladder write) and ends at second 23.
-/// The look at second 10 replays and says `signing in`; the look at second 30 replays and says
-/// `signed out` again; nothing else within the minute replays, and `me`, which is read, keeps
-/// its figure throughout. NEGATIVE CONTROLS: with no sign-in the same minute replays once; a memo
-/// that replays only at the minute says `signed out` for the whole of it (run once, restored).
+/// A SIGN-IN THAT STARTS OR ENDS IS SAID AT THE NEXT READ: `alt1`'s login is on record as signed
+/// out, so the replay says `signed out` in its figure's place. A sign-in of it starts at second 3
+/// (the record `accounts renew` and the ladder write, whose file each read looks at,
+/// [`Input::SignIn`]) and ends at second 23. The read at second 3 replays and says `signing in`;
+/// the read at second 23 replays and says `signed out` again; nothing else within the minute
+/// replays, and `me`, which is read, keeps its figure throughout. CONTROL: with no sign-in the
+/// same minute replays once.
+///
+/// NEGATIVE CONTROL (run 2026-11-15, with `behind` dropped too, which a pane whose figure is the
+/// replay's never is): with `sign_in_moved` dropped from `OutlookMemo::at`'s `due`, the test
+/// fails at "each move is said at its read" with `left: ([(0, SignedOut)], 1)`: `alt1` says
+/// `signed out` for the whole minute and one replay runs.
 #[test]
-fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
+fn a_sign_in_that_starts_or_ends_is_said_at_the_next_read() {
     fn alt1(memo: &OutlookMemo, now: i64) -> (Figure, Figure) {
         let outlook = memo.outlook.as_deref().expect("a replay");
         let figure = |label: &str| {
@@ -369,7 +409,6 @@ fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
             reads: Some(scratch_reads()),
             ..OutlookMemo::default()
         };
-        let start = Instant::now();
         let own = Some(Figure::Exact(580));
         let mut said: Vec<(i64, Figure)> = Vec::new();
         let mut running = None;
@@ -381,8 +420,7 @@ fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
             if s == 23 {
                 running = None;
             }
-            let instant = start + Duration::from_secs(u64::try_from(s).expect("seconds"));
-            let _ = memo.quota((instant, NOW + s), Some(&roster), "me", own, true);
+            let _ = memo.quota(NOW + s, Some(&roster), "me", own, true);
             let (other, mine) = alt1(&memo, NOW + s);
             assert_eq!(mine, Figure::Exact(580), "second {s}: me keeps its figure");
             if said.last().map(|(_, f)| *f) != Some(other) {
@@ -398,12 +436,12 @@ fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
         (
             vec![
                 (0, Figure::SignedOut),
-                (10, Figure::SigningIn),
-                (30, Figure::SignedOut),
+                (3, Figure::SigningIn),
+                (23, Figure::SignedOut),
             ],
             3
         ),
-        "each move is said at its look, and replays once"
+        "each move is said at its read, and replays once"
     );
     assert_eq!(
         run(false),
@@ -412,6 +450,16 @@ fn a_sign_in_that_starts_or_ends_is_said_at_the_next_look() {
     );
 }
 
+/// A store that fails to load withdraws the forecast at its next read without spending a
+/// replay, and stays withdrawn while it stands; a repair moves the file's stamp (its change time,
+/// though its length and modification time are as before), so the next read loads it, and the
+/// replay it owes runs at the last actual replay's floor ([`REPLAY_FLOOR_S`]), which
+/// [`OutlookMemo::changes_after`] names while it waits.
+///
+/// NEGATIVE CONTROL (run 2026-11-14): with `footer_inputs::Stamp` taken as the file's length and
+/// its modification time's whole second, the test fails at "a repair at the same length and
+/// modification time still moves the stamp (its change time)": `left: Some((901, 1794720219))
+/// right: Some((901, 1794720219))`.
 #[test]
 fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
     let dir = seeded();
@@ -422,8 +470,7 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
         reads: Some(scratch_reads()),
         ..Default::default()
     };
-    let start = Instant::now();
-    assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
+    assert!(memo.at(NOW, Some(&roster), false).is_some());
     let original = memo.replayed;
     let rejected_modified = std::fs::metadata(store.state_file())
         .unwrap()
@@ -440,18 +487,9 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
             .unwrap();
     };
     set_modified();
-    let rejected_stamp = stamp(&store.state_file());
-    for (seconds, wall) in [(10, NOW + 10), (70, NOW + 70)] {
-        assert!(
-            memo.at(
-                start + Duration::from_secs(seconds),
-                wall,
-                Some(&roster),
-                true,
-                false
-            )
-            .is_none()
-        );
+    let rejected_stamp = crate::footer_inputs::stamp(&store.state_file());
+    for wall in [NOW + 10, NOW + 20] {
+        assert!(memo.at(wall, Some(&roster), false).is_none());
         assert!(memo.held.as_ref().unwrap().read.is_err());
         assert!(snapshot().unwrap().outlook.is_none());
         assert_eq!(memo.replays, 1);
@@ -459,39 +497,33 @@ fn a_failed_store_read_withdraws_the_forecast_without_spending_a_replay() {
     }
     std::fs::write(store.state_file(), source).unwrap();
     set_modified();
-    assert_eq!(stamp(&store.state_file()), rejected_stamp);
-    assert!(
-        memo.at(
-            start + Duration::from_secs(71),
-            NOW + 71,
-            Some(&roster),
-            false,
-            false
-        )
-        .is_none(),
-        "a failed read still observes the bounded look interval"
+    assert_ne!(
+        crate::footer_inputs::stamp(&store.state_file()),
+        rejected_stamp,
+        "a repair at the same length and modification time still moves the stamp (its change time)"
     );
     assert!(
-        memo.at(
-            start + Duration::from_secs(80),
-            NOW + 80,
-            Some(&roster),
-            false,
-            false
-        )
-        .is_some(),
-        "a failed read retries even when the repaired file has the same stamp"
+        memo.at(NOW + 30, Some(&roster), false).is_none(),
+        "the repaired store waits for the last actual replay's floor"
     );
+    assert!(memo.held.as_ref().unwrap().read.is_ok(), "and is read");
     assert_eq!(
-        memo.replays, 2,
-        "recovery uses the last actual replay's clock"
+        memo.changes_after(NOW + 30),
+        Some(NOW + REPLAY_FLOOR_S),
+        "the replay it owes is named"
     );
+    assert!(
+        memo.at(NOW + REPLAY_FLOOR_S, Some(&roster), false)
+            .is_some(),
+        "the repaired store is replayed at the floor"
+    );
+    assert_eq!(memo.replays, 2);
     assert!(snapshot().unwrap().outlook.is_some());
     set_dir(None);
 }
 
 #[test]
-fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() {
+fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_floor() {
     let roster = roster();
     for (input, store_present) in [
         (None, true),
@@ -509,21 +541,13 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
             reads: Some(scratch_reads()),
             ..Default::default()
         };
-        let start = Instant::now();
-        assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
+        assert!(memo.at(NOW, Some(&roster), false).is_some());
         let original = memo.replayed;
         if !store_present {
             set_dir(None);
         }
         assert!(
-            memo.at(
-                start + Duration::from_secs(10),
-                NOW + 10,
-                input.as_ref(),
-                true,
-                false
-            )
-            .is_none(),
+            memo.at(NOW + 10, input.as_ref(), false).is_none(),
             "input {input:?}, store present {store_present}"
         );
         assert!(memo.outlook.is_none(), "the payload itself is withdrawn");
@@ -532,33 +556,20 @@ fn losing_or_changing_the_roster_withdraws_without_resetting_the_replay_clock() 
         assert_eq!(memo.replayed, original);
         set_dir(Some(dir.path()));
         assert!(
-            memo.at(
-                start + Duration::from_secs(20),
-                NOW + 20,
-                Some(&roster),
-                true,
-                false
-            )
-            .is_none(),
-            "restoring input cannot revive or recompute before the slot"
+            memo.at(NOW + 20, Some(&roster), false).is_none(),
+            "restoring input cannot revive or recompute before the floor"
         );
         assert_eq!(memo.replays, 1);
-        assert!(
-            memo.at(
-                start + Duration::from_secs(60),
-                NOW + 60,
-                Some(&roster),
-                true,
-                false
-            )
-            .is_some()
-        );
+        assert!(memo.at(NOW + 60, Some(&roster), false).is_some());
         assert_eq!(memo.replays, 2);
         assert_eq!(memo.held.as_ref().unwrap().roster, roster);
         set_dir(None);
     }
 }
 
+/// A CHANGED POLICY IS REPLAYED AT ONCE: the forecast replayed under the policy before is
+/// withdrawn at the first read under the new one, which replays under it, whatever the floor;
+/// the policy restored is replayed at once again, and the old forecast is never shown again.
 #[test]
 fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
     let changes: [fn() -> (Mode, bool); 2] = [|| (Mode::Off, false), || (Mode::Early, true)];
@@ -569,50 +580,28 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
             reads: Some(scratch_reads()),
             ..Default::default()
         };
-        let start = Instant::now();
-        assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
-        let original = memo.replayed;
+        assert!(memo.at(NOW, Some(&roster), false).is_some());
+        let old = memo.outlook.clone().expect("a replay");
         memo.reads = Some(Reads {
             policy,
             ..scratch_reads()
         });
-        assert!(
-            memo.at(
-                start + Duration::from_secs(10),
-                NOW + 10,
-                Some(&roster),
-                false,
-                false
-            )
-            .is_none()
+        assert!(memo.at(NOW + 10, Some(&roster), false).is_some());
+        assert_eq!(memo.replays, 2, "the new policy is replayed at once");
+        assert_eq!(
+            memo.replayed.map(|(_, used)| used),
+            Some(policy()),
+            "under the new policy"
         );
-        assert!(snapshot().unwrap().outlook.is_none());
-        assert_eq!(memo.replays, 1);
-        assert_eq!(memo.replayed, original);
+        let fresh = snapshot().unwrap().outlook.clone().expect("a fresh replay");
+        assert!(!Arc::ptr_eq(&fresh, &old), "not the old forecast");
         memo.reads = Some(scratch_reads());
+        assert!(memo.at(NOW + 20, Some(&roster), false).is_some());
+        assert_eq!(memo.replays, 3, "the restored policy is replayed at once");
         assert!(
-            memo.at(
-                start + Duration::from_secs(20),
-                NOW + 20,
-                Some(&roster),
-                false,
-                false
-            )
-            .is_none(),
+            !Arc::ptr_eq(memo.outlook.as_ref().unwrap(), &old),
             "restoring policy does not restore the old forecast"
         );
-        assert_eq!(memo.replays, 1);
-        assert!(
-            memo.at(
-                start + Duration::from_secs(60),
-                NOW + 60,
-                Some(&roster),
-                false,
-                false
-            )
-            .is_some()
-        );
-        assert_eq!(memo.replays, 2);
         set_dir(None);
         drop(dir);
     }
@@ -620,7 +609,8 @@ fn a_changed_policy_withdraws_forecasts_until_a_fresh_replay() {
 
 /// THE TIER THE GATED READ NAMED IS ITS ROW'S PLAN (§4.2): `Max 20x` read for `me` is one `plan`
 /// row of its series, asked once however often the footer resolves; a new tier asks once more;
-/// the next replay counts `me` at that tier. Nothing is asked before the store was read.
+/// the next replay, which the series' moved file owes once the floor has passed
+/// ([`Input::Series`]), counts `me` at that tier. Nothing is asked before the store was read.
 /// Negative control: the memo's check removed asks on every resolve.
 #[test]
 fn a_gated_tier_is_one_plan_row() {
@@ -635,8 +625,7 @@ fn a_gated_tier_is_one_plan_row() {
         memo.plans_noted, 0,
         "nothing is asked before the store is read"
     );
-    let start = Instant::now();
-    assert!(memo.at(start, NOW, Some(&roster), false, false).is_some());
+    assert!(memo.at(NOW, Some(&roster), false).is_some());
     let (state, _) = accounts::Store::at(dir.path()).load(NOW).expect("loads");
     let plans = || -> Vec<account_series::PlanSaid> {
         account_series::read(dir.path(), "me", &state.machine)
@@ -662,16 +651,15 @@ fn a_gated_tier_is_one_plan_row() {
     memo.note_plan("me", "Max 5x", NOW + 31);
     assert_eq!(memo.plans_noted, 2, "a new tier is asked once more");
     assert_eq!(plans().len(), 2);
-    let later = start + Duration::from_secs(61);
-    let out = memo
-        .at(later, NOW + 61, Some(&roster), true, false)
-        .expect("replayed");
+    let replays = memo.replays;
+    let out = memo.at(NOW + 61, Some(&roster), false).expect("replayed");
     let me = out.rows.iter().find(|r| r.label == "me").expect("me");
     assert_eq!(
         (me.plan.m, me.plan.title().as_deref()),
         (5, Some("Max 5x")),
         "the replay counts the tier the read named"
     );
+    assert_eq!(memo.replays, replays + 1, "the series' move owed it");
     set_dir(None);
 }
 
@@ -683,21 +671,17 @@ fn no_store_no_outlook() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    let _ = crate::work_counts::take_account_store_reads();
+    let _ = crate::work_counts::take_footer_work().store_loads;
     let own = Some(Figure::Exact(580));
-    assert!(
-        memo.quota((Instant::now(), NOW), Some(&roster()), "me", own, true)
-            .is_none()
-    );
-    assert_eq!(crate::work_counts::take_account_store_reads(), 0);
+    assert!(memo.quota(NOW, Some(&roster()), "me", own, true).is_none());
+    assert_eq!(crate::work_counts::take_footer_work().store_loads, 0);
     assert!(snapshot().is_none());
     let dir = seeded();
     assert!(
-        memo.quota((Instant::now(), NOW), None, "me", own, true)
-            .is_none(),
+        memo.quota(NOW, None, "me", own, true).is_none(),
         "no roster, no view"
     );
-    assert_eq!(crate::work_counts::take_account_store_reads(), 0);
+    assert_eq!(crate::work_counts::take_footer_work().store_loads, 0);
     drop(dir);
     set_dir(None);
 }
@@ -748,7 +732,7 @@ fn a_walled_accounts_hover_says_out_once() {
         ..OutlookMemo::default()
     };
     let outlook = memo
-        .at(Instant::now(), NOW, Some(&roster), false, false)
+        .at(NOW, Some(&roster), false)
         .expect("an outlook")
         .clone();
     for own in [Some(Figure::Out), Some(Figure::Exact(970))] {
@@ -817,9 +801,7 @@ fn unavailable_outlook_gallery() {
             }),
             ..Default::default()
         };
-        let outlook = memo
-            .at(Instant::now(), NOW, Some(&roster), false, false)
-            .unwrap();
+        let outlook = memo.at(NOW, Some(&roster), false).unwrap();
         assert_eq!(outlook.verdict, Verdict::Refused(why));
         assert!(outlook.week.is_none() && outlook.working.is_none());
         let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
@@ -949,10 +931,7 @@ fn paused_outlook_gallery() {
         reads: Some(scratch_reads()),
         ..Default::default()
     };
-    let outlook = memo
-        .at(Instant::now(), NOW, Some(&roster), false, false)
-        .unwrap()
-        .clone();
+    let outlook = memo.at(NOW, Some(&roster), false).unwrap().clone();
     assert!(outlook.week.is_some());
     let own = Some(Figure::Exact(580));
     let view = outlook.quota("me", own, true);
@@ -1167,10 +1146,7 @@ fn watching_account_observations_gallery() {
         reads: Some(scratch_reads()),
         ..Default::default()
     };
-    let outlook = memo
-        .at(Instant::now(), now, Some(&roster), false, false)
-        .unwrap()
-        .clone();
+    let outlook = memo.at(now, Some(&roster), false).unwrap().clone();
     let (read, enrolled) = memo.held.as_ref().unwrap().read.clone().unwrap();
     let account = read.accounts.get("me").unwrap();
     assert_eq!(account.windows[accounts::WEEK_LIMIT].at, future_at);
@@ -1242,11 +1218,7 @@ fn watching_account_observations_gallery() {
         let mut facts = facts.clone();
         let result = if unavailable {
             std::fs::write(store.state_file(), b"not an account state").unwrap();
-            let instant = Instant::now() + Duration::from_secs(10);
-            assert!(
-                memo.at(instant, now + 10, Some(&roster), true, false)
-                    .is_none()
-            );
+            assert!(memo.at(now + 10, Some(&roster), false).is_none());
             let why = memo
                 .held
                 .as_ref()
@@ -1259,7 +1231,7 @@ fn watching_account_observations_gallery() {
                 &admitted, now,
             ));
             assert!(
-                memo.quota((instant, now + 10), Some(&roster), "me", own, true)
+                memo.quota(now + 10, Some(&roster), "me", own, true)
                     .is_none()
             );
             (facts.quota, facts.quota_observed) = (None, None);
@@ -1449,12 +1421,9 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
-    assert!(
-        memo.at(Instant::now(), NOW, Some(&roster), false, false)
-            .is_some()
-    );
+    assert!(memo.at(NOW, Some(&roster), false).is_some());
     assert_eq!(
-        crate::work_counts::take_account_store_reads(),
+        crate::work_counts::take_footer_work().store_loads,
         1,
         "the resolver read the store"
     );
@@ -1500,7 +1469,7 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
     app.on_claude_footer_changed(session);
     assert_eq!(
         (
-            crate::work_counts::take_account_store_reads(),
+            crate::work_counts::take_footer_work().store_loads,
             crate::work_counts::take_outlook_file_looks()
         ),
         (0, 0),
@@ -1521,7 +1490,7 @@ fn the_card_opens_on_the_snapshot_and_reads_nothing() {
         menu.rows
     );
     app.close_autopilot_menu();
-    assert_eq!(crate::work_counts::take_account_store_reads(), 0);
+    assert_eq!(crate::work_counts::take_footer_work().store_loads, 0);
     assert_eq!(crate::work_counts::take_outlook_file_looks(), 0);
     drop(dir);
     set_dir(None);
@@ -1537,13 +1506,25 @@ fn seeded_card(
     Vec<crate::fact_menu::AccountMenuRow>,
     aterm_agent::harness::account_card::AccountCard,
 ) {
-    let dir = seeded_stop();
+    seeded_card_of(roster, seeded_stop())
+}
+
+/// [`seeded_card`] over the store `dir` holds (the test's state directory already).
+fn seeded_card_of(
+    roster: &Roster,
+    dir: aterm_tempfile::TempDir,
+) -> (
+    aterm_tempfile::TempDir,
+    Arc<aterm_agent::harness::outlook::Outlook>,
+    Vec<crate::fact_menu::AccountMenuRow>,
+    aterm_agent::harness::account_card::AccountCard,
+) {
     let mut memo = OutlookMemo {
         reads: Some(scratch_reads()),
         ..OutlookMemo::default()
     };
     let outlook = Arc::new(
-        memo.at(Instant::now(), NOW, Some(roster), false, false)
+        memo.at(NOW, Some(roster), false)
             .expect("an outlook")
             .clone(),
     );
@@ -1689,46 +1670,107 @@ fn the_cards_rows_fit_speak_and_keep_roster_order() {
 
 /// THE CARD'S FORECAST IS THE SNAPSHOT'S PROJECTION OF THE TAB'S OWN WEEK, AND A TAB THE
 /// ROTATION CANNOT MOVE IS PROJECTED NOWHERE (§1.4, §2.2): the `Forecast` row says what the
-/// resolver's outlook projects for the account's week (that it lasts to its reset, or about
-/// when it runs out, in the warn ink, the instant said to its lead's grain as line E says its
-/// own, never to the minute a pace cannot place) with the pool's pace a day; with the footer's route off
+/// resolver's outlook projects for the account's week, each from a store the replay itself
+/// projects: that it lasts to its reset (`me` resetting in a day), about when it runs out (`me`
+/// alone, filling in under three days), in the warn ink, the instant said to its lead's grain
+/// as line E says its own, never to the minute a pace cannot place, each with the pool's pace a
+/// day; that it is out since about when it filled (`me` read full ten minutes ago), never
+/// `runs out` of a spent week; and where the outlook projects none because the work leans on a
+/// row it cannot read before the week resets (the seeded stop leans on `alt1`), the row and
+/// about when the forecast turns on it, as the CLI's week line says. With the footer's route off
 /// the account ([`crate::fact_menu::FactMenuFacts::movable`] false) it says the tab cannot be
-/// switched and no row says a stop. The card draws no projected line at all. Negative
-/// control: the same card for a movable tab says the seeded projection.
+/// switched and no row says a run-out or a stop, of a snapshot that projects one. The card draws
+/// no projected line at all.
+/// NEGATIVE CONTROLS (run): a card that says the projection whatever the tab's route (its
+/// `movable` arm dropped) says `runs out` of the tab that cannot be switched; one that reads the
+/// account's 5 hours in place of its week says `lasts to its reset` of `me` alone, which runs
+/// out.
 #[test]
 fn the_cards_forecast_is_the_snapshots_projection_and_follows_the_tabs_route() {
-    use aterm_agent::harness::outlook::{self, Window};
+    use aterm_agent::harness::outlook::{self, Outlook, Window};
+    let projection = |outlook: &Outlook| {
+        outlook
+            .rows
+            .iter()
+            .find(|row| row.label == "me")
+            .and_then(|row| row.window(Window::Week))
+            .and_then(|week| week.projection)
+    };
+    let pace = |outlook: &Outlook| {
+        outlook
+            .day_pct()
+            .map_or_else(String::new, |pct| format!(" at {pct}% of a week a day"))
+    };
+    let about = |outlook: &Outlook, t: i64| {
+        outlook::when(
+            outlook::round_down(t, outlook.as_of, &outlook.offsets),
+            NOW,
+            &outlook.offsets,
+        )
+    };
+    let me_alone = Roster {
+        rows: vec![row("me", Class::Preferred)],
+    };
+    // Lasts: 58% and 16 points a day, its reset in a day.
+    let (dir, lasts, accounts, card) = seeded_card_of(&pool_roster(), seeded_me(580, NOW + D));
+    let p = projection(&lasts).unwrap_or_else(|| panic!("me lasts:\n{}", lasts.text()));
+    assert_eq!(p.fills_at, None, "{}", lasts.text());
+    assert_eq!(
+        fact_of(&card_menu((&lasts, &accounts, &card), 60, true), "Forecast"),
+        Some(format!("lasts to its reset{}", pace(&lasts)))
+    );
+    drop(dir);
+    // Runs out: alone, it fills before its reset in three days.
+    let (dir, runs, accounts, card) = seeded_card_of(&me_alone, seeded_stop());
+    let at = projection(&runs)
+        .and_then(|p| p.fills_at)
+        .unwrap_or_else(|| panic!("me runs out:\n{}", runs.text()));
+    assert!(at > NOW && at < NOW + 3 * D, "{}", runs.text());
+    assert_eq!(
+        fact_of(&card_menu((&runs, &accounts, &card), 60, true), "Forecast"),
+        Some(format!("runs out ~{}{}", about(&runs, at), pace(&runs)))
+    );
+    drop(dir);
+    // Out already: read full ten minutes ago, out since that reading.
+    let (dir, spent, accounts, card) = seeded_card_of(&me_alone, seeded_me(1000, NOW + 3 * D));
+    let at = projection(&spent)
+        .and_then(|p| p.fills_at)
+        .unwrap_or_else(|| panic!("me is out:\n{}", spent.text()));
+    assert_eq!(at, NOW - 600, "{}", spent.text());
+    assert_eq!(
+        fact_of(&card_menu((&spent, &accounts, &card), 60, true), "Forecast"),
+        Some(format!("out since ~{}", about(&spent, at)))
+    );
+    drop(dir);
+    // The seeded stop leans on alt1, read three hours ago, before me's week resets, with me
+    // still short of out: what me holds at its reset turns on alt1, so the outlook projects none
+    // and the card says what it turns on and from when.
     let (dir, outlook, accounts, card) = seeded_card(&pool_roster());
-    let projection = outlook
+    assert_eq!(projection(&outlook), None, "{}", outlook.text());
+    let lean = outlook
+        .turns_on("me", Window::Week)
+        .unwrap_or_else(|| panic!("me's week turns on the lean:\n{}", outlook.text()));
+    assert_eq!(lean.row, "alt1");
+    let moved = card_menu((&outlook, &accounts, &card), 60, true);
+    assert_eq!(
+        fact_of(&moved, "Forecast"),
+        Some(format!(
+            "depends on alt1@example.test after ~{}{}",
+            about(&outlook, lean.at),
+            pace(&outlook)
+        ))
+    );
+    // An instant 30 hours and 7 minutes ahead is said to the hour. CONTROL: its own minute is
+    // another word, and the card does not say it.
+    let at = outlook.as_of + 30 * 3600 + 7 * 60;
+    let reset = outlook
         .rows
         .iter()
         .find(|row| row.label == "me")
         .and_then(|row| row.window(Window::Week))
-        .and_then(|week| week.projection);
-    let pace = outlook
-        .day_pct()
-        .map_or_else(String::new, |pct| format!(" at {pct}% of a week a day"));
-    let want = match projection {
-        Some(projection) => match projection.fills_at {
-            Some(at) => format!(
-                "runs out ~{}{pace}",
-                outlook::when(
-                    outlook::round_down(at, outlook.as_of, &outlook.offsets),
-                    NOW,
-                    &outlook.offsets
-                )
-            ),
-            None => format!("lasts to its reset{pace}"),
-        },
-        None => "not worked out yet".to_owned(),
-    };
-    assert!(projection.is_some(), "the seeded store projects me's week");
-    let moved = card_menu((&outlook, &accounts, &card), 60, true);
-    assert_eq!(fact_of(&moved, "Forecast").as_deref(), Some(want.as_str()));
-    // An instant 30 hours and 7 minutes ahead is said to the hour. CONTROL: its own minute is
-    // another word, and the card does not say it.
+        .and_then(|week| week.reset)
+        .expect("me's reset");
     let mut ahead = (*outlook).clone();
-    let at = ahead.as_of + 30 * 3600 + 7 * 60;
     for week in ahead
         .rows
         .iter_mut()
@@ -1736,29 +1778,24 @@ fn the_cards_forecast_is_the_snapshots_projection_and_follows_the_tabs_route() {
         .flat_map(|row| row.windows.iter_mut())
         .filter(|window| window.window == Window::Week)
     {
-        week.projection.as_mut().expect("a projection").fills_at = Some(at);
+        week.projection = Some(outlook::Proj {
+            at_reset_x10: 1000,
+            fills_at: Some(at),
+            reset,
+            pass: outlook::PassKind::Week,
+        });
     }
-    let (exact, hour) = (
-        outlook::when(at, NOW, &ahead.offsets),
-        outlook::when(
-            outlook::round_down(at, ahead.as_of, &ahead.offsets),
-            NOW,
-            &ahead.offsets,
-        ),
-    );
-    assert_ne!(exact, hour);
     let ahead = Arc::new(ahead);
+    let (exact, hour) = (outlook::when(at, NOW, &ahead.offsets), about(&ahead, at));
+    assert_ne!(exact, hour);
     let said =
         fact_of(&card_menu((&ahead, &accounts, &card), 60, true), "Forecast").expect("a forecast");
     assert!(
         said.starts_with(&format!("runs out ~{hour}")) && !said.contains(&exact),
         "{said}"
     );
-    let still = card_menu((&outlook, &accounts, &card), 60, false);
-    assert_eq!(
-        fact_of(&still, "Forecast").as_deref(),
-        Some("none: aterm cannot switch this tab")
-    );
+    // The same projected snapshot for a tab the rotation cannot move says no run-out anywhere.
+    let still = card_menu((&ahead, &accounts, &card), 60, false);
     assert!(
         !still.iter().any(|row| match row {
             MenuRow::Fact { value, .. } => value.contains("runs out"),
@@ -1766,6 +1803,10 @@ fn the_cards_forecast_is_the_snapshots_projection_and_follows_the_tabs_route() {
             _ => false,
         }),
         "{still:?}"
+    );
+    assert_eq!(
+        fact_of(&still, "Forecast").as_deref(),
+        Some("none: aterm cannot switch this tab")
     );
     // The Budget answer under the outlook is the snapshot's own figure of the row.
     let figure = outlook
@@ -1831,13 +1872,7 @@ fn a_forecast_interrupts_nobody() {
         ..OutlookMemo::default()
     };
     let view = memo
-        .quota(
-            (Instant::now(), NOW),
-            Some(&roster),
-            "me",
-            Some(Figure::Exact(580)),
-            true,
-        )
+        .quota(NOW, Some(&roster), "me", Some(Figure::Exact(580)), true)
         .expect("a view")
         .view;
     let verdict = view.tail.verdict.clone().expect("a verdict");
@@ -1850,8 +1885,7 @@ fn a_forecast_interrupts_nobody() {
         pass(&mut app, wid);
     }
     app.open_fact_menu(wid, session, Fact::Account, (0, 0), false);
-    let later = Instant::now() + Duration::from_secs(61);
-    let _ = memo.at(later, NOW + 61, Some(&roster), true, false);
+    let _ = memo.at(NOW + 61, Some(&roster), false);
     app.on_claude_footer_changed(session);
     for _ in 0..5 {
         pass(&mut app, wid);

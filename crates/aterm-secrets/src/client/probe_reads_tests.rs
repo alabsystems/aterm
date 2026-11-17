@@ -10,7 +10,7 @@ use super::fan_out::ENVELOPES;
 use super::fan_out::held::HeldReads;
 use super::*;
 use crate::discover::{DiscoveredVault, MAX_CANDIDATES};
-use crate::server::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE};
+use crate::pull_slots::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE};
 use crate::transport::{Answer, Pulled};
 use aterm_spec::wait::MUST_HAPPEN;
 

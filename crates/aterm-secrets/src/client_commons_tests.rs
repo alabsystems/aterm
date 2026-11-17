@@ -97,6 +97,7 @@ fn unavailable_control_observations_name_the_boundary_without_initializing() {
 /// with nothing failed, so its Commons control stays visible and a pass that applies the same
 /// version again reads the rest in place as any vault's. The refusal is reported on each pass
 /// that applies, in its own bucket.
+#[cfg(unix)]
 #[test]
 fn a_vault_holding_an_ai_clis_login_still_applies_and_keeps_its_commons_control() {
     use commons::Observation;
@@ -637,7 +638,11 @@ fn commons_cache_refuses_unbound_revoked_pending_and_changed_state() {
     assert!(commons::cached(&paths).unwrap().is_none());
     save_config(&paths, &config).unwrap();
     let key = std::fs::read(paths.identity_file()).unwrap();
+    #[cfg(unix)]
     let other = Identity::generate().unwrap().to_bech32();
+    // A Windows machine key is read only as this user's DPAPI sealed it.
+    #[cfg(windows)]
+    let other = crate::identity_file::stored_text(&Identity::generate().unwrap(), None, 0).unwrap();
     fsx::write_atomic(&paths.identity_file(), other.as_slice(), 0o600).unwrap();
     assert!(
         commons::cached(&paths).unwrap().is_none(),

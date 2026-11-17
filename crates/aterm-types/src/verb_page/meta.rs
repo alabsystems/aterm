@@ -104,7 +104,8 @@ pub(crate) const PAGE: Page = Page {
                     "title=",
                     "the title the terminal holds (the program's OSC title), empty with none; \
                      `user_title=` the stated title its claims settled (`help meta title`), \
-                     which the tab shows instead",
+                     which the tab shows instead. The OSC title is also a claim of its own, \
+                     ranked `inband` (`help described ranks`): it never settles `user_title=`",
                 ),
                 row("cwd=", "the folder the shell last reported"),
                 row(
@@ -161,6 +162,13 @@ pub(crate) const PAGE: Page = Page {
                      the program's OSC title.",
                 ),
                 para(
+                    "The title a program prints (OSC 0 or 2, or an OSC 7501 report's `title`) \
+                     is a claim too, `by=inband`, ranked below every author above: `described` \
+                     lists it, and it stands there only where no other title claim does. It \
+                     never sets `user_title=`, so a file that holds a title sequence, printed \
+                     with `cat`, changes no title the session or a person stated.",
+                ),
+                para(
                     "A person's claim stands over every other author's. A control client's \
                      `meta set title` under a person's rename is recorded and listed by \
                      `described`, answers `OK`, and does not change the title.",
@@ -168,7 +176,35 @@ pub(crate) const PAGE: Page = Page {
                 para(
                     "`meta unset title` withdraws the caller's own claim and nobody else's: it \
                      does not clear a title a person claimed, and where another author's claim \
-                     then stands, that one becomes the title.",
+                     then stands, that one becomes the title. A person is the exception: \
+                     emptying the rename field, where it opened holding a title, removes the \
+                     person's own title and every title a program, a control client or another \
+                     session put on the tab, so a person can always take a title off their own \
+                     tab. A rename field committed holding what it opened with, empty or not, \
+                     writes nothing, whatever another writer put on the tab while it was open.",
+                ),
+                para(
+                    "A rename or clear of the field is a person's only where no control client \
+                     opened the field or changed its text, whoever then commits it. One a \
+                     control client's `invoke` opened is that client's; one its keys or text \
+                     (`key`, `text`, `hwkey`) touched first is recorded with no author \
+                     (`by=-`): it is listed, never stands and clears no other author's title. \
+                     A client sets or clears a title with `meta set|unset title` (`help \
+                     described ranks`).",
+                ),
+                para(
+                    "WHO THE CALLER IS: aterm reads the process at the other end of the \
+                     control connection and its chain of parents (not the process group it \
+                     keeps). `aterm ctl` run inside the session it titles is that session's \
+                     own program; run inside the session its task names in `from=` (which a \
+                     client declares, at spawn or with `task mark … from=`), its creator; run \
+                     inside any other session it is listed and never stands; run outside every \
+                     tab it is a control client (`ctl`). A child the session's own program \
+                     detached from the session's process tree is such a client, ranked below \
+                     the program. aterm reads 32 processes of the chain below launchd, the \
+                     caller's first: a caller whose chain is longer, with no tab's shell among \
+                     those read, is listed with no author (`by=-`) wherever it runs (`help \
+                     described ranks`).",
                 ),
                 para(
                     "A title aterm put back has no author when it comes from a restart (aterm \
@@ -185,14 +221,15 @@ pub(crate) const PAGE: Page = Page {
                 ),
                 para(
                     "A title from another session, the bridge or another Mac's driver is \
-                     listed and never stands. Not on yet: a session's own sid and its \
-                     creator's rank as any other session's (`help described ranks`). A title \
-                     from anyone but a person is redacted before it is stored (what reads as a \
-                     credential becomes `[redacted]`), and one that is nothing but a credential \
-                     is refused. The cap is 120 bytes, and 256 once percent-encoded: a longer \
-                     title is refused, never cut. A title write spends its author's `mark` \
-                     tokens (`ERR busy retry_ms=<ms>`); a person's rename is never refused for \
-                     rate.",
+                     listed and never stands. A title from anyone but a person is redacted \
+                     before it is stored (what reads as a credential becomes `[redacted]`), and \
+                     one that is nothing but a credential is refused, as is one the harness \
+                     would read as a `NEEDS YOU:`, `Nothing left:` or `Could not finish:` line \
+                     or as `LANDED` (`ERR title reads as a protocol line`); a person's rename \
+                     of the same text is taken. The cap is 120 bytes, and 256 once \
+                     percent-encoded: a longer title is refused, never cut. A title \
+                     write spends its author's `mark` tokens (`ERR busy retry_ms=<ms>`); a \
+                     person's rename is never refused for rate.",
                 ),
             ],
         },

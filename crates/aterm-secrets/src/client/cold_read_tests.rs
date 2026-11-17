@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 pub(crate) fn cold_read_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -47,6 +48,7 @@ pub(crate) fn cold_read_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn cold_read_model_conforms_to_the_native_persistent_floor() {
     let model = aterm_models_swarm::cold_read_model();
@@ -69,6 +71,7 @@ fn cold_read_model_conforms_to_the_native_persistent_floor() {
     assert!(!model.successors("Read", &lost).contains(&stale));
 }
 
+#[cfg(unix)]
 fn visible_readers(paths: &Paths) -> [bool; 4] {
     let config = configured(paths).unwrap();
     [
@@ -87,6 +90,7 @@ fn visible_readers(paths: &Paths) -> [bool; 4] {
     ]
 }
 
+#[cfg(unix)]
 #[test]
 fn a_standby_server_waits_for_its_applied_records() {
     let _answering = ServersAnswering::set();
@@ -141,6 +145,7 @@ fn a_standby_server_waits_for_its_applied_records() {
 /// Off macOS an eligible member gets no member server: nothing finds one or feeds it there
 /// (`steward::MEMBER_SERVER_FOUND`), and the step had installed one advertising the member's label
 /// that held no vault for good. Its probe and apply idle, and say why.
+#[cfg(unix)]
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn off_macos_an_eligible_member_gets_no_member_server() {
@@ -170,6 +175,7 @@ fn off_macos_an_eligible_member_gets_no_member_server() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_cold_server_role_waits_for_its_applied_records() {
     let _answering = ServersAnswering::set();
@@ -222,6 +228,7 @@ fn a_cold_server_role_waits_for_its_applied_records() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_server_role_distinguishes_denial_from_unavailable_custody() {
     let _answering = ServersAnswering::set();
@@ -296,6 +303,7 @@ fn a_server_role_distinguishes_denial_from_unavailable_custody() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn cold_readers_withhold_stale_envelopes_until_applied_records_return() {
     let _answering = ServersAnswering::set();
@@ -356,6 +364,7 @@ fn cold_readers_withhold_stale_envelopes_until_applied_records_return() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_envelope_only_observation_cache_cannot_bypass_a_later_log_floor() {
     let _answering = ServersAnswering::set();
@@ -509,6 +518,7 @@ fn noncurrent_states(state: &State) -> Vec<State> {
     vec![pending, revoked, failed, unapplied, absent, plain]
 }
 
+#[cfg(unix)]
 pub(crate) fn caller_custody_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -558,6 +568,7 @@ pub(crate) fn caller_custody_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn caller_custody_model_conforms_to_native_head_coverage() {
     let model = aterm_models_swarm::caller_custody_model();
@@ -580,6 +591,7 @@ fn caller_custody_model_conforms_to_native_head_coverage() {
     assert!(!model.successors("Read", &noncurrent).contains(&stale));
 }
 
+#[cfg(unix)]
 #[test]
 fn noncurrent_callers_cannot_supply_a_log_behind_authenticated_custody() {
     let _answering = ServersAnswering::set();
@@ -687,6 +699,7 @@ fn an_unseeded_denial_probe_honors_record_sidecars() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_readable_caller_roster_reports_malformed_metadata() {
     let _answering = ServersAnswering::set();
@@ -705,6 +718,7 @@ fn a_readable_caller_roster_reports_malformed_metadata() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unstamped_cache_cannot_hide_a_readable_caller_denial() {
     let _answering = ServersAnswering::set();
@@ -757,6 +771,7 @@ fn an_unstamped_cache_cannot_hide_a_readable_caller_denial() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn noncurrent_peer_denials_retain_explicit_removals_behind_an_envelope() {
     let _answering = ServersAnswering::set();
@@ -823,6 +838,7 @@ fn noncurrent_peer_denials_retain_explicit_removals_behind_an_envelope() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_caller_log_cannot_bypass_lost_roster_denials() {
     let _answering = ServersAnswering::set();
@@ -858,6 +874,7 @@ fn a_caller_log_cannot_bypass_lost_roster_denials() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_endorsed_handoff_preserves_authenticated_record_custody() {
     let _answering = ServersAnswering::set();
@@ -905,6 +922,7 @@ fn an_endorsed_handoff_preserves_authenticated_record_custody() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_role_apply_cannot_hide_a_handoff_authenticated_removal() {
     let _answering = ServersAnswering::set();

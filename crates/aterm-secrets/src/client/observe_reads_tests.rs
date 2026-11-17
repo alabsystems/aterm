@@ -10,7 +10,10 @@
 //! each other decide, so the checkpoint is held to at most one read, not to exactly one.
 
 use super::*;
-use crate::commons::{Observation, Unavailable};
+use crate::commons::Observation;
+#[cfg(unix)]
+use crate::commons::Unavailable;
+#[cfg(unix)]
 use log_entries_tests::{TwoMacs, two_macs};
 use std::collections::BTreeMap;
 
@@ -42,6 +45,7 @@ fn is_visible(observed: &crate::Result<Observation>) -> bool {
     matches!(observed, Ok(Observation::Visible(_)))
 }
 
+#[cfg(unix)]
 fn is_unavailable(paths: &Paths, reason: Unavailable) -> bool {
     matches!(observe_commons(paths), Ok(Observation::Unavailable(found)) if found == reason)
 }
@@ -59,6 +63,7 @@ fn vault_files(paths: &Paths) -> Vec<PathBuf> {
 
 /// `lab` with an applied roster that denies a node, so that a denial check needs this Mac's device
 /// binding, and `m7` holding the version and its records.
+#[cfg(unix)]
 fn with_a_denied_node(lab: &TwoMacs) {
     let admin = admin_open(&lab.m22).unwrap();
     let mut doc = admin.doc.clone();
@@ -83,6 +88,7 @@ fn with_a_denied_node(lab: &TwoMacs) {
 /// branch's denial check, the second observation reads no `device.age` (`left: None, right:
 /// Some(1)`); with `selected` always going through `data_path`, the absent pin is opened (`left:
 /// Some(1), right: None`).
+#[cfg(unix)]
 #[test]
 fn an_observation_of_an_applied_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -109,6 +115,7 @@ fn an_observation_of_an_applied_vault_reads_each_file_once() {
 /// NEGATIVE CONTROLS (2026-11-05): with `data_path` back to `context.active()?`, the pin is `read
 /// more than once`; with the denial check given a second `Reads::new(paths)`, the data file opens
 /// four times (`left: Some(4), right: Some(2)`).
+#[cfg(unix)]
 #[test]
 fn an_observation_under_a_pinned_records_layout_opens_its_data_twice_and_the_rest_once() {
     let _answering = ServersAnswering::set();
@@ -133,6 +140,7 @@ fn an_observation_under_a_pinned_records_layout_opens_its_data_twice_and_the_res
 
 /// NEGATIVE CONTROL (2026-11-05): with the denial check given a second `Reads::new(paths)`, a file
 /// is `read more than once`.
+#[cfg(unix)]
 #[test]
 fn an_observation_of_a_log_only_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -176,6 +184,7 @@ fn an_observation_of_a_vault_with_no_log_reads_each_file_once() {
 }
 
 /// The read each caller of a roster makes, under the one lock it holds.
+#[cfg(unix)]
 fn roster_with_reads(
     paths: &Paths,
 ) -> (
@@ -190,6 +199,7 @@ fn roster_with_reads(
 ///
 /// NEGATIVE CONTROL (2026-11-05): with `swarm_roster_held` handing the overlay a second
 /// `Reads::new(paths)`, a file is `read more than once`.
+#[cfg(unix)]
 #[test]
 fn a_roster_read_of_an_applied_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -205,6 +215,7 @@ fn a_roster_read_of_an_applied_vault_reads_each_file_once() {
 
 /// NEGATIVE CONTROL (2026-11-05): with `swarm_roster_held` handing the overlay a second
 /// `Reads::new(paths)`, a file is `read more than once`.
+#[cfg(unix)]
 #[test]
 fn a_roster_read_of_a_log_only_vault_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -223,6 +234,7 @@ fn a_roster_read_of_a_log_only_vault_reads_each_file_once() {
 /// NEGATIVE CONTROLS (2026-11-05): with `commons_log_under`'s `reads.config()` back to
 /// `config(reads.paths())`, `source.toml` is `read more than once`; with `require_covers` handed
 /// `&Reads::new(reads.paths())`, `records.frontiers` is.
+#[cfg(unix)]
 #[test]
 fn a_commons_log_read_reads_each_file_once() {
     let _answering = ServersAnswering::set();
@@ -258,6 +270,7 @@ fn a_commons_log_read_reads_each_file_once() {
 ///
 /// NEGATIVE CONTROL (2026-11-05): with `Reads::vault` keeping no error, the vault file is read
 /// again (`left: Some(2), right: Some(1)`).
+#[cfg(unix)]
 #[test]
 fn a_failed_read_fails_the_observation_once() {
     let _answering = ServersAnswering::set();
@@ -281,6 +294,7 @@ fn a_failed_read_fails_the_observation_once() {
 /// `state`, `identity`, `vault`, `enrollment` and `acknowledged` each fire their own arm at the
 /// second ask (`… answers from its failure`), naming `source.toml`, `state.toml`, `identity`,
 /// `vault`, `records.frontiers` and `records`.
+#[cfg(unix)]
 #[test]
 fn a_failed_read_answers_every_later_ask_of_the_same_reads() {
     type Ask = fn(&Reads<'_>, &Config) -> bool;
@@ -335,6 +349,7 @@ fn an_unreadable_state_fails_a_denial_check_on_a_mac_with_no_configuration() {
 
 /// What a server's next poll decides ([`crate::cli::ServeRole::decide`]) on `paths`, its store at
 /// `store`.
+#[cfg(unix)]
 fn poll_server(
     paths: &Paths,
     store: &Path,
@@ -347,6 +362,7 @@ fn poll_server(
 }
 
 /// [`poll_server`] on `lab`'s `m7`.
+#[cfg(unix)]
 fn poll_role(
     lab: &TwoMacs,
     signer: Option<[u8; 32]>,
@@ -356,6 +372,7 @@ fn poll_role(
 }
 
 /// This thread's vault key is the ALab line, which a server role needs.
+#[cfg(unix)]
 fn on_the_alab_line(signer: Option<[u8; 32]>) {
     envelope::TEST_RETIRED.with(|cell| {
         *cell.borrow_mut() = Some(Retired {
@@ -365,11 +382,13 @@ fn on_the_alab_line(signer: Option<[u8; 32]>) {
     });
 }
 
+#[cfg(unix)]
 fn off_the_alab_line() {
     envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// The roster of `lab`'s next version says `roster`, and `m7` has applied that version.
+#[cfg(unix)]
 fn publish_roster(lab: &TwoMacs, roster: &[u8]) {
     let admin = admin_open(&lab.m22).unwrap();
     let mut doc = admin.doc.clone();
@@ -381,6 +400,7 @@ fn publish_roster(lab: &TwoMacs, roster: &[u8]) {
 }
 
 /// `m7` rotates with the vault, its `source.toml` naming the keys it followed.
+#[cfg(unix)]
 fn rotate(lab: &TwoMacs) {
     let opened = admin_open(&lab.m22).unwrap();
     admin_rotate(&lab.m22, &opened, &opened.doc.clone()).unwrap();
@@ -400,6 +420,7 @@ fn rotate(lab: &TwoMacs) {
 /// true, 2 failed`); with the writer's arm answering `unavailable()`, at once (`rotated false,
 /// contended true, 0 failed`); with a failed look read as a denial, a Mac still in loses its role
 /// (`left: None, right: Some("m7")`).
+#[cfg(unix)]
 #[test]
 fn a_failed_vault_read_hides_no_denial_from_a_server_holding_its_role() {
     let _answering = ServersAnswering::set();
@@ -478,6 +499,7 @@ fn a_failed_vault_read_hides_no_denial_from_a_server_holding_its_role() {
 ///
 /// NEGATIVE CONTROL (2026-11-05): with the writer's arm of `observe_alab_role_inner` answering
 /// `unavailable()`, the role reads `Unavailable` (`matches!(… Denied)`).
+#[cfg(unix)]
 #[test]
 fn a_mac_its_roster_denies_stays_denied_under_a_writer() {
     let _answering = ServersAnswering::set();
@@ -518,6 +540,7 @@ fn a_mac_its_roster_denies_stays_denied_under_a_writer() {
 ///
 /// NEGATIVE CONTROL (2026-11-05): with the writer's arm of `observe_alab_role_inner` answering
 /// `unavailable()`, the role reads `Unavailable` (`matches!(… Denied)`).
+#[cfg(unix)]
 #[test]
 fn a_removal_a_writer_made_durable_is_read_while_it_holds_the_lock() {
     let _answering = ServersAnswering::set();
@@ -574,6 +597,7 @@ fn a_removal_a_writer_made_durable_is_read_while_it_holds_the_lock() {
 /// the bound ends it`); with the envelope's denial read as clear while custody fails, the role
 /// stands (`denied true, the records file refused by its mode (writable by others): the
 /// envelope's denial ends it`).
+#[cfg(unix)]
 #[test]
 fn a_denial_check_that_keeps_failing_ends_a_held_role() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -702,6 +726,7 @@ fn a_denial_check_that_keeps_failing_ends_a_held_role() {
 }
 
 /// [`two_macs`] before its genesis: `m7` has applied a version of a vault that holds no log.
+#[cfg(unix)]
 fn macs_on_a_vault_with_no_log(root: &Path) -> (crate::server::Running, Paths, Paths) {
     let server = log_entries_tests::start_loopback_server(&root.join("s1"));
     let url = format!("http://{}/v1/alab", server.addr);
@@ -721,6 +746,7 @@ fn macs_on_a_vault_with_no_log(root: &Path) -> (crate::server::Running, Paths, P
 }
 
 /// `from`'s log and vault file on `m7`'s disk, through no apply.
+#[cfg(unix)]
 fn hold_unapplied(m7: &Paths, from: &Paths) {
     let records = load_records(from).unwrap();
     assert!(
@@ -740,6 +766,7 @@ fn hold_unapplied(m7: &Paths, from: &Paths) {
 /// custody takes the rotated key's log (the second arm's `reads.custody().unwrap().is_none()`). The
 /// other key's log needs that and `store.under(&reads.lineage(config))` gone from
 /// `records_store_selected`, because the store refuses its genesis first (the first arm's).
+#[cfg(unix)]
 #[test]
 fn custody_takes_no_log_on_the_word_of_a_vault_file_this_mac_did_not_apply() {
     let _answering = ServersAnswering::set();
@@ -798,6 +825,7 @@ fn custody_takes_no_log_on_the_word_of_a_vault_file_this_mac_did_not_apply() {
 /// NEGATIVE CONTROL (2026-11-05): with `cached_chain` and `Reads::config` answering the last chain
 /// of that file and pin when the read gives nothing, the moved file keeps its keys (`left:
 /// [[254, 87, …]], right: []`).
+#[cfg(unix)]
 #[test]
 fn a_chain_read_from_the_vault_file_goes_with_the_file_and_returns_with_it() {
     let _answering = ServersAnswering::set();
@@ -847,6 +875,7 @@ fn a_chain_read_from_the_vault_file_goes_with_the_file_and_returns_with_it() {
 /// device reported as a failed read, `no device: left: None, right: Some("m7")`; with the device's
 /// error returned ahead of the other denials, `a label denies it too: left: Some("m7"), right:
 /// None`.
+#[cfg(unix)]
 #[test]
 fn a_device_it_cannot_read_hides_no_node_denial_on_a_vault_with_no_log() {
     let _answering = ServersAnswering::set();
@@ -950,6 +979,7 @@ fn a_device_it_cannot_read_hides_no_node_denial_on_a_vault_with_no_log() {
 ///
 /// NEGATIVE CONTROL (2026-11-05): with `roster_denies_local` taking a failed read as no node, the
 /// new server gets the role (`left: Some("m7"), right: None`).
+#[cfg(unix)]
 #[test]
 fn a_device_it_cannot_read_gives_a_mac_still_in_no_new_authority() {
     let _answering = ServersAnswering::set();
@@ -985,6 +1015,7 @@ fn a_device_it_cannot_read_gives_a_mac_still_in_no_new_authority() {
 /// branch's denial check, the second observation reads no `device.age` (`left: None, right:
 /// Some(1)`); with that count off as well, the denied device reads as visible
 /// (`is_unavailable(&paths, Unavailable::Revoked)`).
+#[cfg(unix)]
 #[test]
 fn a_log_only_observation_judges_the_device_it_finds_behind_its_memo() {
     let _answering = ServersAnswering::set();
@@ -1039,6 +1070,7 @@ fn a_log_only_observation_judges_the_device_it_finds_behind_its_memo() {
 
 /// NEGATIVE CONTROL (2026-11-05): with `observe_commons` answering each home's last visible
 /// snapshot, its first change is missed (`is_unavailable(m7, Unavailable::MissingIdentity)`).
+#[cfg(unix)]
 #[test]
 fn a_change_on_disk_between_two_observations_is_seen_by_the_second() {
     let _answering = ServersAnswering::set();
@@ -1118,6 +1150,7 @@ fn a_change_on_disk_between_two_observations_is_seen_by_the_second() {
 /// NEGATIVE CONTROLS (2026-11-05): with the denial check gone from `observe_commons`'s applied
 /// branch, or `observe_commons` answering each home's last visible snapshot, the denied Mac reads as
 /// visible (`is_unavailable(&lab.m7, Unavailable::Revoked)`).
+#[cfg(unix)]
 #[test]
 fn a_roster_denial_applied_between_two_observations_is_seen_by_the_second() {
     let _answering = ServersAnswering::set();
@@ -1158,6 +1191,7 @@ fn a_roster_denial_applied_between_two_observations_is_seen_by_the_second() {
 /// `records.frontiers` (the journal's second ask, with no file of it moved, is answered by the
 /// history cache); with [`crate::records_storage::selected`] always through `data_path`, it names
 /// `records.layout`.
+#[cfg(unix)]
 #[test]
 fn a_state_lock_take_with_nothing_to_finish_reads_each_file_once() {
     let _answering = ServersAnswering::set();

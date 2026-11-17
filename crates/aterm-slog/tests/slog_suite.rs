@@ -12,6 +12,7 @@ mod support;
 
 mod agent_words;
 mod brief_budget;
+mod card;
 mod carry;
 mod claimed_boxes;
 mod claims;
@@ -44,6 +45,7 @@ mod mark_quota;
 mod mirror;
 mod node_log;
 mod program_share;
+mod protocol_line;
 mod record_mono;
 mod riders;
 mod ring_bounds;

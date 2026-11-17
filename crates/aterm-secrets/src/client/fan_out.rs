@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::crossing::RecordsBound;
-use crate::server::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE, PullSlots, RECORDS_PULLS_AT_ONCE};
+use crate::pull_slots::{ENVELOPE_PEEK, ENVELOPE_PULLS_AT_ONCE, PullSlots, RECORDS_PULLS_AT_ONCE};
 use crate::transport::Pulled;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicUsize, Ordering};

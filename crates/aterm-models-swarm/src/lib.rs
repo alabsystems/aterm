@@ -21,9 +21,13 @@
 //! records and migration, a machine's primary, succession, stripped and opaque entries, and the
 //! automatic pick), the fleet access lock
 //! (`docs/DESIGN-fleet-access-lock-2026-11-10.md` §8 `FleetAccessLock`: a per-machine ceiling
-//! over the drive grants that fails closed and keeps the reads), and a vault server's gated peer
+//! over the drive grants that fails closed and keeps the reads), a vault server's gated peer
 //! pulls (`VaultPeerGate`: a peer whose TXT names a newer version or records this server neither
-//! holds nor proved is pulled, and nothing a TXT shows held).
+//! holds nor proved is pulled, and nothing a TXT shows held), and the vault checkpoint
+//! (`docs/DESIGN-vault-log-2026-11-14.md` step 4 `VaultCheckpoint`: final only with a majority of
+//! its cut's recent seats, a seat's shares never shrink, the newest final checkpoint contains
+//! every final one and there is none where a split's two sides do not nest, and a prune keeps
+//! every share the newest does not contain).
 
 mod models_access_lock;
 mod models_cached_log;
@@ -51,6 +55,7 @@ mod models_records_capacity;
 mod models_records_file;
 mod models_retained_frontier;
 mod models_role;
+mod models_vault_checkpoint;
 
 pub use models_access_lock::fleet_access_lock_model;
 pub use models_cached_log::{
@@ -94,3 +99,4 @@ pub use models_retained_frontier::{
     retained_frontier_model, retained_replay_model,
 };
 pub use models_role::role_retention_model;
+pub use models_vault_checkpoint::vault_checkpoint_model;

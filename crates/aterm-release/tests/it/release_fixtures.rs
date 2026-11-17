@@ -1435,6 +1435,155 @@ fn incomplete_or_failed_prebuild_never_hides_the_preview_compile_red() {
 }
 
 #[test]
+fn main_reader_moves_to_a_submodule_pin_its_module_repository_never_fetched() {
+    let o = Origin::new();
+    let bus = o.dir.path().join("bus");
+    git(o.dir.path(), &["init", "-q", bus.to_str().unwrap()]);
+    identity(&bus);
+    fs::write(bus.join("body"), "first pin\n").unwrap();
+    git(&bus, &["add", "body"]);
+    git(&bus, &["commit", "-q", "-m", "first pin"]);
+    let first_pin = git(&bus, &["rev-parse", "HEAD"]);
+    git(
+        &o.work,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            bus.to_str().unwrap(),
+            "vendor/bus",
+        ],
+    );
+    git(&o.work, &["commit", "-q", "-m", "pin the first"]);
+    let first = git(&o.work, &["rev-parse", "HEAD"]);
+    let git_dir = git(&o.work, &["rev-parse", "--absolute-git-dir"]);
+    let tree = Path::new(git_dir.trim()).join(".ubd/main-reader.noindex/main");
+    // Seed a warm reader's own module repository. Only this fixture's local transport is
+    // allowed, at its point of use and in that module's configuration, never globally.
+    git(
+        &o.work,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            tree.to_str().unwrap(),
+            first.trim(),
+        ],
+    );
+    git(
+        &tree,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ],
+    );
+    let module = tree.join("vendor/bus");
+    git(&module, &["config", "protocol.file.allow", "always"]);
+    git(&o.work, &["config", "submodule.recurse", "true"]);
+    let compiler = targo();
+    let mut reader = fixtures::MainReader::new(&o.work).unwrap();
+    let mut compiles = 0;
+    reader
+        .prebuild(&compiler, first.trim(), &mut |cmd| {
+            compiles += 1;
+            assert!(cmd.get_args().any(|arg| arg == "--no-run"));
+            assert_eq!(cmd.get_current_dir(), Some(tree.as_path()));
+            assert_eq!(git(&module, &["rev-parse", "HEAD"]), first_pin);
+            assert_eq!(
+                fs::read_to_string(module.join("body")).unwrap(),
+                "first pin\n"
+            );
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+
+    // The new object must not exist when the reader's module is cloned or warmed.
+    fs::write(bus.join("body"), "second pin\n").unwrap();
+    git(&bus, &["commit", "-q", "-am", "second pin"]);
+    let second_pin = git(&bus, &["rev-parse", "HEAD"]);
+    let own_module = o.work.join("vendor/bus");
+    git(
+        &own_module,
+        &["-c", "protocol.file.allow=always", "fetch", "-q", "origin"],
+    );
+    git(&own_module, &["checkout", "-q", second_pin.trim()]);
+    git(&o.work, &["commit", "-q", "-am", "pin the second"]);
+    let second = git(&o.work, &["rev-parse", "HEAD"]);
+    let missing = crate::ledger::testing::git()
+        .current_dir(&module)
+        .args([
+            "cat-file",
+            "-e",
+            &format!("{}^{{commit}}", second_pin.trim()),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !missing.status.success(),
+        "the reader never fetched the new pin"
+    );
+    assert_eq!(
+        git(&tree, &["config", "--get", "submodule.recurse"]).trim(),
+        "true"
+    );
+    // NEGATIVE CONTROL: the former ordering fails before the explicit module update runs.
+    let recursive = crate::ledger::testing::git()
+        .current_dir(&tree)
+        .args(["checkout", "--force", "--detach", second.trim()])
+        .output()
+        .unwrap();
+    assert!(
+        !recursive.status.success(),
+        "unguarded checkout unexpectedly passed: {recursive:?}"
+    );
+    git(
+        &tree,
+        &[
+            "checkout",
+            "--force",
+            "--detach",
+            "--no-recurse-submodules",
+            first.trim(),
+        ],
+    );
+    assert_eq!(git(&module, &["rev-parse", "HEAD"]), first_pin);
+
+    reader
+        .prebuild(&compiler, second.trim(), &mut |cmd| {
+            compiles += 1;
+            assert!(cmd.get_args().any(|arg| arg == "--no-run"));
+            assert_eq!(cmd.get_current_dir(), Some(tree.as_path()));
+            assert_eq!(git(&tree, &["rev-parse", "HEAD"]), second);
+            assert_eq!(git(&module, &["rev-parse", "HEAD"]), second_pin);
+            assert_eq!(
+                fs::read_to_string(module.join("body")).unwrap(),
+                "second pin\n"
+            );
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+    assert_eq!(compiles, 2, "both aligned reader trees reached compilation");
+    assert_eq!(git(&o.work, &["rev-parse", "HEAD"]), second);
+    assert_eq!(
+        git(&tree, &["config", "--get", "submodule.recurse"]).trim(),
+        "true"
+    );
+}
+
+#[test]
 fn main_reader_reopens_warm_but_never_reuses_previous_answers_or_tree() {
     let o = Origin::new();
     let mut previous = None;

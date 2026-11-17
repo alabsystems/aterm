@@ -7,7 +7,7 @@
 use crate::database::{Candidate, Cell, Change};
 use astream_wire::sync::Digest;
 use aterm_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[cfg(unix)]
 pub(crate) mod application;
@@ -17,6 +17,11 @@ pub(crate) mod log;
 pub(crate) mod materialized;
 
 pub(crate) type Cells = BTreeMap<(String, String), Cell>;
+
+/// Single changes a reader projects as if they had never been written, each its operation,
+/// collection and key: the writes the authority rules hold inert (`typed::authority`). Their
+/// operations keep every other change they made, their place in history and their causal links.
+pub(crate) type Unwritten = BTreeSet<(Digest, String, String)>;
 
 /// A stop survives all later edits; a compensating absence remains a candidate
 /// so that an unseen concurrent value cannot disappear when it arrives later.

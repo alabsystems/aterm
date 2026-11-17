@@ -3,7 +3,7 @@
 
 //! macOS's own services' footprints, read without root into plain process observations.
 
-use aterm_process_facts::services::{Identity, Member, Reading, Service};
+use aterm_process_facts::services::{Identity, Reading, Service};
 
 /// What one look at a service's exact identity found ([`look`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,7 +93,7 @@ pub fn look(identity: Identity<'_>) -> Look {
 pub fn read(path_floor: fn(u64) -> u64) -> Option<Reading> {
     #[cfg(target_os = "macos")]
     {
-        use aterm_process_facts::services::{kernel_member, system_uid};
+        use aterm_process_facts::services::{Member, kernel_member, system_uid};
         use aterm_sysprobe::coalitions;
         let total = aterm_sysprobe::physical_memory_mib()?.saturating_mul(1 << 20);
         let read_paths_from = path_floor(total);

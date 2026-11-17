@@ -4002,8 +4002,8 @@ fn undriven(places: &Places, nodes: &[&str]) -> String {
     format!(
         "  holds      {noun} {} may drive this Mac no more: an aterm running here refuses {its} \
          next drive from now on, and cuts {its} open drives and lifts any hold {it} took here at \
-         its next read of [fleet] (each {} s), so a write here before then may still meet `ERR \
-         halted`\n",
+         its next read of [fleet] (within {} s of this write), so a write here before then may \
+         still meet `ERR halted`\n",
         named.join(", "),
         aterm_net::fleet::KEY_READ_EVERY.as_secs()
     )
@@ -4389,7 +4389,7 @@ fn own_place(table: &FleetTable) -> Option<SocketAddr> {
 }
 
 /// How long a verb that wrote the key waits for an aterm running here to serve it: its listener
-/// reads the key every [`aterm_net::fleet::KEY_READ_EVERY`], and a second more.
+/// reads the key again within [`aterm_net::fleet::KEY_READ_EVERY`] of a change, and a second more.
 const SERVES_NEW_KEY: Duration =
     aterm_net::fleet::KEY_READ_EVERY.saturating_add(Duration::from_secs(1));
 
@@ -4845,7 +4845,7 @@ fn refused_listen(places: &Places, why: &str, another: &str) -> String {
                 Err(e) => no_key(places, &e),
                 Ok(_) => format!(
                     "it reads no key it can use, though {} holds one: it has not read it yet (it \
-                     reads it every {} s), or it reads another state folder",
+                     reads it within {} s of a change), or it reads another state folder",
                     places.state.join(KEY_FILE).display(),
                     aterm_net::fleet::KEY_READ_EVERY.as_secs()
                 ),

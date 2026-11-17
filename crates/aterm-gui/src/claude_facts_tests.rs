@@ -496,6 +496,7 @@ fn every_recovery_phase_says_the_observation_then_the_rotation() {
                 wall: transcript_wall.then(|| Wall {
                     label: "7d",
                     resets: "Thu 09:00".into(),
+                    resets_at: 0,
                 }),
                 ..Default::default()
             }),
@@ -911,34 +912,49 @@ fn an_effort_pick_stands_until_it_has_settled() {
     assert!(!settling.stands(start + EFFORT_SETTLE));
 }
 
-/// The resolver's memo: one read per build, due again once it has stood ten seconds; a build
-/// no sweep has cached is held as read, with no catalog.
+/// The resolver's memo: one read per build while its `builds` folder stands, due again once the
+/// folder moves (a sweep caches a build's catalog there by a rename into it); a build no sweep
+/// has cached is held as read, with no catalog.
+///
+/// NEGATIVE CONTROL (run 2026-11-14): with `Catalogs::due` always true, the test fails at "a
+/// fresh read".
 #[test]
-fn a_build_s_catalog_is_read_once_and_again_after_ten_seconds() {
+fn a_build_s_catalog_is_read_once_and_again_when_its_folder_moves() {
     let newer = baked(&[("claude-opus-6", "Opus 6", true, ALL)]);
     let older = baked(&[("claude-opus-5", "Opus 5", false, &ALL[..3])]);
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-gui-catalogs-")
+        .tempdir()
+        .expect("temp dir");
+    let builds = || crate::footer_inputs::stamp(dir.path());
     let mut catalogs = Catalogs::default();
-    let start = std::time::Instant::now();
-    let later = |s| start + std::time::Duration::from_secs(s);
-    assert!(catalogs.due(Some("2.1.400"), start) && catalogs.get(Some("2.1.400")).is_none());
-    catalogs.hold(Some("2.1.400"), start, Some(newer.clone()));
-    assert!(!catalogs.due(Some("2.1.400"), later(9)), "a fresh read");
+    let first = builds();
+    assert!(first.is_some(), "the folder is there");
+    assert!(catalogs.due(Some("2.1.400"), first) && catalogs.get(Some("2.1.400")).is_none());
+    catalogs.hold(Some("2.1.400"), first, Some(newer.clone()));
+    assert!(!catalogs.due(Some("2.1.400"), builds()), "a fresh read");
     assert!(
-        catalogs.due(Some("2.1.300"), later(9)),
+        catalogs.due(Some("2.1.300"), builds()),
         "another build's is its own"
     );
-    catalogs.hold(Some("2.1.300"), later(9), Some(older.clone()));
+    catalogs.hold(Some("2.1.300"), first, Some(older.clone()));
     assert_eq!(catalogs.get(Some("2.1.400")).as_deref(), Some(&newer));
     assert_eq!(catalogs.get(Some("2.1.300")).as_deref(), Some(&older));
     assert!(catalogs.get(None).is_none(), "a build not read");
-    assert!(catalogs.due(Some("2.1.400"), later(10)));
-    catalogs.hold(Some("2.1.400"), later(10), None);
+
+    let part = dir.path().join("build.json.part");
+    std::fs::write(&part, "{}").unwrap();
+    std::fs::rename(&part, dir.path().join("build.json")).unwrap();
+    let moved = builds();
+    assert_ne!(moved, first, "a cache written moves the folder");
+    assert!(catalogs.due(Some("2.1.400"), moved));
+    catalogs.hold(Some("2.1.400"), moved, None);
     assert!(
         catalogs.get(Some("2.1.400")).is_none(),
         "a build no sweep cached"
     );
     assert!(
-        !catalogs.due(Some("2.1.400"), later(11)),
+        !catalogs.due(Some("2.1.400"), builds()),
         "and that is a read"
     );
 }

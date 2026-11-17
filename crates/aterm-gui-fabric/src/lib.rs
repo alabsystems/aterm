@@ -3707,7 +3707,7 @@ pub fn fabric_bridge_facts() -> (Option<u32>, Option<String>, u64) {
 }
 
 const LINK_USAGE: &str = "ERR usage: link up rtt=<ms> | link down reason=<token> [rtt=<ms>] | \
-                          link log <identity> [continues=<off> was=<identity>] | \
+                          link log <identity> [continues=<off> was=<identity> [proved=1]] | \
                           link bye <quit|handoff> | \
                           link mirror on|stopped|capped|budget|unretained [reason=<token>] | \
                           link set-aside files=<n> | \
@@ -3807,7 +3807,7 @@ pub fn cmd_link_waking(
         Some("down") => false,
         Some("log") => {
             let ident = toks.next();
-            let (mut fork, mut was) = (None, None);
+            let (mut fork, mut was, mut proved) = (None, None, false);
             for tok in toks {
                 if let Some(v) = kv(tok, "continues")
                     && fork.is_none()
@@ -3820,13 +3820,15 @@ pub fn cmd_link_waking(
                     && was.is_none()
                 {
                     was = Some(v);
+                } else if kv(tok, "proved") == Some("1") && !proved {
+                    proved = true;
                 } else {
                     return LINK_USAGE.to_string();
                 }
             }
             let continues = match (was, fork) {
-                (None, None) => None,
-                (Some(was), Some(fork)) => Some((was, fork)),
+                (None, None) if !proved => None,
+                (Some(was), Some(fork)) => Some((was, fork, proved)),
                 _ => return LINK_USAGE.to_string(),
             };
             return cmd_link_log(store, ident, continues, generation, on_forgot);
@@ -3879,19 +3881,27 @@ pub fn cmd_link_waking(
 fn cmd_link_log(
     store: &Store,
     ident: Option<&str>,
-    continues: Option<(&str, u64)>,
+    continues: Option<(&str, u64, bool)>,
     generation: Option<BridgeGeneration>,
     on_forgot: impl FnOnce(),
 ) -> String {
     // Both identities are read as astream reads them (`LogIdentity::parse`), and compared as
     // values: `<id>.01` is the clock `<id>.1`. A move is taken only from an earlier
-    // generation of the same log, the one pair a lineage can carry.
+    // generation of the same log, the one pair a lineage can carry, or, marked `proved=1`
+    // (`aterm_types::control_verbs::LINK_PROVED_LANE`), from another log the bridge proved this
+    // one holds below the fork by the records it told this endpoint.
     let Some(ident) = ident.and_then(LogIdentity::parse) else {
         return LINK_USAGE.to_string();
     };
     let continues = match continues {
         None => None,
-        Some((was, fork)) => match LogIdentity::parse(was).filter(|w| ident.continues_from(*w)) {
+        Some((was, fork, proved)) => match LogIdentity::parse(was).filter(|w| {
+            if proved {
+                w.id != ident.id
+            } else {
+                ident.continues_from(*w)
+            }
+        }) {
             Some(was) => Some((was, fork)),
             None => return LINK_USAGE.to_string(),
         },

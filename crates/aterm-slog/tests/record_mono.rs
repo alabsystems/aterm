@@ -4,8 +4,9 @@
 //! Tests that each record retains its monotonic process-clock reading in RAM without encoding it.
 
 use aterm_slog::{
-    Actor, Amend, CarryAdopt, CarryBudget, Close, Conf, Fields, GapWhy, JournalImage, Key, Kind,
-    Limits, Log, Mark, Node, Open, Out, Rec, RunOut, SessionOut, Src, Stamp, Tier, TurnOut, encode,
+    Actor, Amend, CarryAdopt, CarryBudget, Close, Conf, DescIdent, Fields, GapWhy, JournalImage,
+    Key, Kind, Limits, Log, Mark, Node, Open, Out, Rec, RunOut, SessionOut, Src, Stamp, Tier,
+    TurnOut, encode,
 };
 
 use crate::support::WALL0;
@@ -167,6 +168,7 @@ fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
             ids: log.id_counters(),
             limits: Limits::SESSION,
             at: now,
+            ident: aterm_slog::DescIdent::default(),
         },
     )
     .expect("the carry reads");
@@ -183,14 +185,17 @@ fn a_record_from_another_process_reads_its_wall_on_this_clock_or_nothing() {
     let mut log = Log::new(3);
     let _ = script(&mut log, 0);
     let recs: Vec<Rec> = log.window().cloned().collect();
-    let journal = Log::from_journal(&JournalImage {
-        ep: 3,
-        base: 3,
-        first: 1,
-        head: log.last_seq(),
-        recs,
-        holes: Vec::new(),
-    })
+    let journal = Log::from_journal(
+        &JournalImage {
+            ep: 3,
+            base: 3,
+            first: 1,
+            head: log.last_seq(),
+            recs,
+            holes: Vec::new(),
+        },
+        DescIdent::default(),
+    )
     .expect("the journal image reads");
     assert_eq!(journal.len(), log.len());
     assert!(journal.window_mono().all(|(_, m)| m == 0), "journal: none");

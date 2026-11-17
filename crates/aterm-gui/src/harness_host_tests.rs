@@ -121,6 +121,24 @@ fn account_usage_of(
     )
 }
 
+fn account_reply_of(
+    store: &accounts::Store,
+    roster: &accounts::Roster,
+    sid: &str,
+    read: &ReplyRead<'_>,
+    proof: &Proved<'_>,
+    now: i64,
+) -> &'static str {
+    super::account_reply_of(
+        (store, None),
+        &usage_fixture(store, roster, now),
+        sid,
+        read,
+        proof,
+        now,
+    )
+}
+
 #[path = "harness_host_agent_gate_tests.rs"]
 mod agent_gate_tests;
 
@@ -8653,6 +8671,7 @@ impl Acting {
                 account_wall: Arc::new(|_, _, _| ("inert", None)),
                 accounts_upkeep: AccountsUpkeep::Inert,
                 account_usage: Arc::new(|_, _, _, _, _| "inert"),
+                account_reply: Arc::new(|_, _, _, _, _| "inert"),
                 account_gone: Arc::new(move |sid| {
                     a17.accounts_gone.lock().unwrap().push(sid.to_string());
                 }),
@@ -8683,6 +8702,7 @@ impl Acting {
                 }),
                 startups: Arc::new(|_| Vec::new()),
                 startup_mark: Arc::new(|_, _| false),
+                startup_took_up: Acts::inert().startup_took_up,
                 agent_resumed: Acts::inert().agent_resumed,
                 own_worker: Acts::inert().own_worker,
                 claim_workers: Acts::inert().claim_workers,
@@ -11085,17 +11105,31 @@ impl Accts {
 
     fn transcript_row(&self, talk: &str, row: &str) {
         use std::io::Write as _;
-        let path = self
-            .tmp
-            .path()
-            .join("home/.claude/projects/proj")
-            .join(format!("{talk}.jsonl"));
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(path)
+            .open(self.transcript_path(talk))
             .unwrap();
         writeln!(file, "{row}").unwrap();
+    }
+
+    /// The transcript the conversation `talk` is written to: what [`Acts::transcript_tail`] reads.
+    fn transcript_path(&self, talk: &str) -> PathBuf {
+        self.tmp
+            .path()
+            .join("home/.claude/projects/proj")
+            .join(format!("{talk}.jsonl"))
+    }
+
+    /// The model's own reply to the conversation `talk`, written at `at`.
+    fn replied(&self, talk: &str, at: i64) {
+        let stamp = aterm_agent::harness::usage::rfc3339_utc(at).replace('Z', ".000Z");
+        self.transcript_row(
+            talk,
+            &format!(
+                r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"r","timestamp":"{stamp}","message":{{"id":"m","model":"claude-fable-5","role":"assistant","type":"message","content":[{{"type":"text","text":"Stage 3 landed."}}]}},"version":"2.1.323"}}"#
+            ),
+        );
     }
 
     fn exec(&self, sid: &str, talk: &str, login: Option<&str>, started: i64) -> Snapshot {
@@ -11174,12 +11208,14 @@ impl Accts {
             Arc::clone(self),
             Arc::clone(self),
         );
-        let (a6, a7, a8, a9) = (
+        let (a6, a7, a8, a9, a10) = (
+            Arc::clone(self),
             Arc::clone(self),
             Arc::clone(self),
             Arc::clone(self),
             Arc::clone(self),
         );
+        let a11 = Arc::clone(self);
         fn lock_word(store: &accounts::Store) -> &'static str {
             // A store nothing has made yet has no lock to hold.
             if !store.dir.exists() {
@@ -11234,6 +11270,20 @@ impl Accts {
                 };
                 account_wall_of(&a.store(), &a.roster(), sid, &read, a.clock())
             }),
+            account_reply: Arc::new(move |sid, agent, settled, proof, _| {
+                let a = &a11;
+                a.said.lock().unwrap().push(format!("reply:{sid}"));
+                if !a.listed.load(Ordering::SeqCst) {
+                    return "not-listed";
+                }
+                let env = a.procs.lock().unwrap().get(&agent.snap.pid).cloned();
+                let read = ReplyRead {
+                    env: env.as_deref().unwrap_or(&[]),
+                    started: process_started(&agent.snap.start),
+                    settled,
+                };
+                account_reply_of(&a.store(), &a.roster(), sid, &read, proof, a.clock())
+            }),
             snapshot: Arc::new(move |sid| {
                 a3.tabs.lock().unwrap().get(sid).cloned().ok_or(NO_AGENT)
             }),
@@ -11242,6 +11292,9 @@ impl Accts {
                 to.filter(|_| a4.ended.load(Ordering::SeqCst))
             }),
             background: Arc::new(move |_| a9.jobs.load(Ordering::SeqCst)),
+            transcript_tail: Arc::new(move |snap| {
+                std::fs::read_to_string(a10.transcript_path(snap.session.as_deref()?)).ok()
+            }),
             restart: restart_answering(move |sid, _, why, selected| {
                 let a = &a5;
                 let Restart::Account { to, .. } = why else {
@@ -13064,6 +13117,145 @@ fn a_lost_login_or_its_own_wall_strikes_the_account_moved_to() {
     assert!(state.account("work-2").walls.contains_key("five_hour"));
     assert_eq!(state.active, None, "put back");
     assert_eq!(moves(&idle.account(usage_wall())), Some("pool-a"));
+}
+
+/// Whether a rotation off `work-2` by a session on it is held now ([`accounts::Lost::Held`]):
+/// what an unproven `active` does to every move off it.
+fn off_work_2_held(a: &Accts, sid: &str) -> bool {
+    let roster = a.roster();
+    matches!(
+        accounts::begin_rotation(
+            &mut a.state(),
+            &roster,
+            &accounts::enrolled(&roster),
+            Some("work-2"),
+            accounts::Mover {
+                sid,
+                account: "work-2",
+            },
+            "pool-a",
+            a.clock(),
+        ),
+        Err(accounts::Lost::Held { .. })
+    )
+}
+
+/// m2, Claude Code 2.1.323, 2026-11-16, at the host: a limit on `main`, the relaunch under
+/// `work-2`, and the new process's start-up point drawing `main`'s limit again from the resumed
+/// transcript, which the wall recorder refuses as no limit of that process's (nothing struck);
+/// no answer of the move is told there, and every rotation off the unproven `work-2` is held. AN
+/// UNPROVEN `active` IS PROVEN BY A SERVED TURN OF A SESSION ON IT ([`WorkerIdle::turn_proof`]),
+/// dated by the model's newest reply its transcript holds since its process started: the move
+/// is answered with it and the rotations off `work-2` are held no more. The start-up point (no
+/// reply since the process started), a reply older than the rotation that chose `work-2` (a
+/// session already on it, read at a point after), and a relaunch onto `work-2` whose newest
+/// reply its process before served (on `main`) prove nothing. NEGATIVE CONTROL: a served turn of
+/// a session on another account takes no writer and proves nothing of `work-2`.
+#[test]
+fn a_served_turn_of_a_session_on_the_unproven_active_proves_it() {
+    const TALK_C: &str = "0badf00d-1111-2222-3333-444455558888";
+    const TALK_D: &str = "0badf00d-1111-2222-3333-444455559999";
+    let (a, idle) = moved_at_wall("s-acct-replayed");
+    let _ = idle.account(usage_wall());
+    let state = a.state();
+    assert_eq!(state.active.as_deref(), Some("work-2"), "nothing struck");
+    assert!(state.account("work-2").walls.is_empty(), "nothing struck");
+    assert!(!state.proven, "PRECONDITION: unproven");
+    assert_eq!(state.rotations, [ACCT_NOW], "PRECONDITION: chosen now");
+    assert!(off_work_2_held(&a, "s-acct-replayed"), "PRECONDITION: held");
+    a.spawn("s-acct-other", ACCT_TALK_B, "main");
+    let elsewhere = a.worker("s-acct-other", &on());
+    a.spawn("s-acct-two", TALK_C, "work-2");
+    let two = a.worker("s-acct-two", &on());
+    a.spawn("s-acct-three", TALK_D, "main");
+    a.replied(ACCT_TALK_A, ACCT_NOW - 20);
+    a.replied(ACCT_TALK_B, ACCT_NOW + 30);
+    a.replied(TALK_C, ACCT_NOW - 5);
+    a.replied(TALK_D, ACCT_NOW + 20);
+    a.exec(
+        "s-acct-three",
+        TALK_D,
+        Some(&a.login_dir("work-2")),
+        ACCT_NOW + 50,
+    );
+    let three = a.worker("s-acct-three", &on());
+    a.now.store(ACCT_NOW + 60, Ordering::SeqCst);
+    idle.login_seen(LoginSeen::Served);
+    assert!(!a.state().proven, "the start-up asked the model nothing");
+    let wrote = Arc::new(AtomicBool::new(false));
+    let w = Arc::clone(&wrote);
+    a.at_seat_read(2, move |_| w.store(true, Ordering::SeqCst));
+    elsewhere.login_seen(LoginSeen::Served);
+    *a.at_read.lock().unwrap() = None;
+    assert!(
+        !wrote.load(Ordering::SeqCst),
+        "CONTROL: a turn served on main takes no writer"
+    );
+    assert!(!a.state().proven, "CONTROL: a turn served on main");
+    two.login_seen(LoginSeen::Served);
+    assert!(!a.state().proven, "a reply from before the rotation");
+    three.login_seen(LoginSeen::Served);
+    assert!(!a.state().proven, "a reply its process before served");
+    assert!(off_work_2_held(&a, "s-acct-replayed"), "still held");
+    a.replied(ACCT_TALK_A, ACCT_NOW + 40);
+    idle.login_seen(LoginSeen::Served);
+    let state = a.state();
+    assert!(state.proven, "the served turn proves work-2");
+    assert_eq!(state.active.as_deref(), Some("work-2"));
+    assert_eq!(state.canary_since(), None, "the canary answered");
+    assert!(
+        idle.kept.lock().unwrap().account.moved.is_none(),
+        "the move is answered"
+    );
+    assert!(!off_work_2_held(&a, "s-acct-replayed"), "held no more");
+}
+
+/// A SERVED TURN A BREAK DATES PROVES THE UNPROVEN `active` BY ITS REPLY'S STAMP
+/// ([`IdleHost::login_served_at`], [`WorkerIdle::turn_proof`]): mid-turn, under a background
+/// wait, this is the only served turn a long turn tells, so a turn hours long on the account a
+/// move left unproven proves it before it ends. A reply stamped before the rotation that chose
+/// the account proves nothing of it, though read after.
+#[test]
+fn a_break_dated_since_the_rotation_proves_the_unproven_active() {
+    let (a, idle) = moved_at_wall("s-acct-break");
+    a.now.store(ACCT_NOW + 60, Ordering::SeqCst);
+    idle.login_served_at(ACCT_NOW - 5);
+    assert!(!a.state().proven, "a reply from before the rotation");
+    idle.login_served_at(ACCT_NOW + 30);
+    let state = a.state();
+    assert!(state.proven, "the break's reply proves work-2");
+    assert_eq!(state.canary_since(), None);
+}
+
+/// A STORED LOGIN ON RECORD SIGNED OUT PROVES ITS UNPROVEN `active` ONLY ONCE THE SAME SERVED TURN
+/// HAS LIFTED ITS STRIKE ([`WorkerIdle::turn_proof`] after [`WorkerIdle::claude_login_word`]): a
+/// reply stamped before the strike lifts nothing, so it proves nothing; one after it lifts the
+/// strike and then proves the account. NEGATIVE CONTROL: the proof refusing no signed-out login
+/// would prove `work-2` by the reply its strike came after, and signing it back in at once.
+#[test]
+fn a_struck_login_proves_its_unproven_active_once_its_strike_is_lifted() {
+    let (a, idle) = moved_at_wall("s-acct-struck");
+    auth_at(&a, "work-2", accounts::Auth::SignedOut, ACCT_NOW + 20);
+    let state = a.state();
+    assert_eq!(state.active.as_deref(), Some("work-2"), "PRECONDITION");
+    assert!(!state.proven, "PRECONDITION: unproven");
+    a.now.store(ACCT_NOW + 60, Ordering::SeqCst);
+    idle.login_served_at(ACCT_NOW + 10);
+    let state = a.state();
+    assert_eq!(
+        state.account("work-2").auth,
+        accounts::Auth::SignedOut,
+        "a reply before the strike lifts nothing"
+    );
+    assert!(!state.proven, "and proves nothing");
+    idle.login_served_at(ACCT_NOW + 30);
+    let state = a.state();
+    assert_ne!(
+        state.account("work-2").auth,
+        accounts::Auth::SignedOut,
+        "the strike lifted"
+    );
+    assert!(state.proven, "then the same turn proves work-2");
 }
 
 #[test]
@@ -14922,6 +15114,208 @@ fn the_host_reads_fables_week_from_the_accounts_record() {
             reset: Some(ACCT_NOW + 3600),
         })
     );
+}
+
+/// FL-116: AN ANSWERED TURN IS FILED WITH ITS ACCOUNT AND ITS MODEL, AND NO PROVIDER IS READ
+/// (`IdleHost::answered_by`, `IdleHost::fable_lift`). The account's record holds a 5-hour wall
+/// and Fable's weekly wall, both raised before the session's turn. An Opus turn the loop tells
+/// the host of is filed on the row the session's process runs on: the 5-hour wall is lifted as
+/// of the request's own time, Fable's wall stands (an Opus turn says nothing of Fable's limit)
+/// and the host reads the record as holding no lift of it. A Fable turn then lifts Fable's
+/// wall, and the host answers the lift's time to a loop that asks it. Neither call mints a
+/// provider read.
+///
+/// CONTROLS, each in a world of its own: a request dated before the session's process started
+/// is asked of the recorder and lifts nothing (another login's turn, carried in the
+/// conversation); a Codex worker asks the recorder nothing; with the roster off and the usage
+/// notes off the recorder is not asked; and a lift of Fable's wall another Mac made (its clock
+/// is not this one's) is read as no lift.
+///
+/// NEGATIVE CONTROL: with `WorkerIdle::answered_by` left as the trait's default no `reply:` is
+/// asked and no wall lifts; with `accounts::draws_on` true of every window the Opus turn lifts
+/// Fable's wall and `fable_lift` answers after it; with `accounts::record_served`'s
+/// process-start gate dropped the request from before the process lifts the 5-hour wall; with
+/// `Account::lifted_at` reading every Mac's lift, the peer's lift is answered.
+#[test]
+fn an_answered_turn_files_its_account_and_model_and_reads_no_provider() {
+    use aterm_agent::supervise::policy::turn_end::FableLift;
+    const OPUS: &str = "claude-opus-5-5";
+    const FABLE: &str = "claude-fable-5-2";
+    const RAISED: i64 = ACCT_NOW - 600;
+    let sid = "s-answered-by";
+    let session = accounts::SESSION_LIMIT;
+    let fable = accounts::week_bucket(aterm_phase::WeekModel::Fable);
+    let world = || {
+        let a = Accts::new();
+        a.spawn(sid, ACCT_TALK_A, "main");
+        edited(&a, |state| {
+            for window in [session, fable] {
+                let until = Some(ACCT_NOW + 3600);
+                accounts::note_wall(state, "main", window, until, RAISED, RAISED);
+            }
+        });
+        let walls = a.state().accounts["main"].walls.len();
+        assert_eq!(walls, 2, "the 5-hour wall and Fable's, both standing");
+        a
+    };
+    let lifted = |a: &Accts, window: &str| {
+        let state = a.state();
+        state.accounts["main"].lifted_at(window, &state.machine)
+    };
+
+    let a = world();
+    let idle = a.worker(sid, &on());
+    assert_eq!((lifted(&a, session), lifted(&a, fable)), (None, None));
+    assert_eq!(
+        idle.fable_lift(),
+        FableLift::Unlifted,
+        "Fable's wall stands"
+    );
+    let ((), reads) = provider_read::captured(|| idle.answered_by(OPUS, ACCT_NOW - 30));
+    assert!(reads.is_empty(), "no provider read: {reads:?}");
+    assert_eq!(
+        a.asked(&format!("reply:{sid}")),
+        1,
+        "asked once: {:?}",
+        a.said()
+    );
+    assert_eq!(
+        lifted(&a, session),
+        Some(ACCT_NOW - 30),
+        "the 5-hour wall, lifted as of the request"
+    );
+    assert_eq!(lifted(&a, fable), None, "Opus says nothing of Fable's");
+    assert_eq!(
+        idle.fable_lift(),
+        FableLift::Unlifted,
+        "no lift of Fable's limit yet"
+    );
+    let ((), reads) = provider_read::captured(|| idle.answered_by(FABLE, ACCT_NOW - 20));
+    assert!(reads.is_empty(), "no provider read: {reads:?}");
+    let (lift, reads) = provider_read::captured(|| idle.fable_lift());
+    assert_eq!(lift, FableLift::Lifted { at: ACCT_NOW - 20 });
+    assert!(reads.is_empty(), "no provider read: {reads:?}");
+
+    let a = world();
+    let idle = a.worker(sid, &on());
+    idle.answered_by(OPUS, ACCT_NOW - 101);
+    assert_eq!(a.asked("reply:"), 1, "asked of the recorder");
+    assert_eq!(
+        lifted(&a, session),
+        None,
+        "a request from before the process"
+    );
+
+    let a = world();
+    let codex = idle_host(sid, Program::Codex, switched(&on()), a.hooks());
+    codex.kept.lock().unwrap().snapshot = a.tabs.lock().unwrap().get(sid).cloned();
+    codex.answered_by(OPUS, ACCT_NOW - 30);
+    assert_eq!(a.asked("reply:"), 0, "a Codex worker files no served turn");
+
+    let a = world();
+    let mut off = on();
+    off.set("accounts", "off").unwrap();
+    let idle = a.worker(sid, &off);
+    idle.answered_by(OPUS, ACCT_NOW - 30);
+    assert_eq!(a.asked("reply:"), 0, "the roster and the notes both off");
+    assert_eq!(lifted(&a, session), None);
+
+    let a = world();
+    let idle = a.worker(sid, &on());
+    edited(&a, |state| {
+        let wall = state
+            .accounts
+            .get_mut("main")
+            .unwrap()
+            .walls
+            .get_mut(fable)
+            .unwrap();
+        (wall.cleared, wall.by, wall.seen) =
+            (true, "n-0123456789abcdef".to_string(), Some(ACCT_NOW));
+    });
+    assert_eq!(
+        idle.fable_lift(),
+        FableLift::Unlifted,
+        "another Mac's lift, dated by its clock"
+    );
+}
+
+/// FL-116: ONE `/usage` SAMPLE WHOSE FABLE ROW SHOWS ROOM RETURNS EVERY SESSION OF THE ACCOUNT
+/// MOVED OFF FABLE (`IdleHost::fable_room`, `IdleHost::fable_lift`). Two sessions run on one
+/// account whose record holds Fable's weekly wall, last seen standing ten minutes back. One of
+/// them tells its host its own sample showed room, asked for a minute back: the account's
+/// record lifts Fable's wall as of the read, with one `WALL_LIFTED` row, and both sessions'
+/// hosts answer the lift's time to their loops. No provider is read.
+/// CONTROLS: a wall seen standing again after the sample was asked for is not lifted by it (the
+/// read is older than that sighting), and a Codex worker files no sample.
+/// NEGATIVE CONTROL: with `WorkerIdle::fable_room` left as the trait's default the wall stands
+/// and both hosts read no lift; with `Account::room_lifts` judging the wall by its first
+/// sighting, the sample older than the newest sighting lifts it.
+#[test]
+fn a_samples_room_on_fables_row_lifts_fables_wall_for_every_session_of_the_account() {
+    use aterm_agent::supervise::policy::turn_end::FableLift;
+    const SIB: &str = "s-room-2";
+    let sid = "s-room";
+    let fable = accounts::week_bucket(aterm_phase::WeekModel::Fable);
+    let world = |seen_again: Option<i64>| {
+        let a = Accts::new();
+        a.spawn(sid, ACCT_TALK_A, "main");
+        a.spawn(SIB, ACCT_TALK_B, "main");
+        edited(&a, |state| {
+            let until = Some(ACCT_NOW + 86_400);
+            accounts::note_wall(state, "main", fable, until, ACCT_NOW - 600, ACCT_NOW - 600);
+            if let Some(again) = seen_again {
+                accounts::note_wall(state, "main", fable, until, again, again);
+            }
+        });
+        a
+    };
+
+    let a = world(None);
+    let (idle, sib) = (a.worker(sid, &on()), a.worker(SIB, &on()));
+    assert_eq!(
+        (idle.fable_lift(), sib.fable_lift()),
+        (FableLift::Unlifted, FableLift::Unlifted)
+    );
+    let ((), reads) = provider_read::captured(|| idle.fable_room(ACCT_NOW - 60));
+    assert!(reads.is_empty(), "no provider read: {reads:?}");
+    let lift = FableLift::Lifted { at: ACCT_NOW - 60 };
+    assert_eq!(idle.fable_lift(), lift, "the sampling session's");
+    assert_eq!(
+        sib.fable_lift(),
+        lift,
+        "and the other session's, on the one sample"
+    );
+    let rows: Vec<String> = a
+        .store()
+        .tail(200)
+        .expect("the ledger")
+        .into_iter()
+        .filter(|e| {
+            e.why
+                .starts_with(&format!("{fable}{}", accounts::WALL_LIFTED))
+        })
+        .map(|e| e.why)
+        .collect();
+    assert_eq!(
+        rows,
+        [format!("{fable}{}a read shows room", accounts::WALL_LIFTED)]
+    );
+
+    let a = world(Some(ACCT_NOW - 30));
+    let (idle, sib) = (a.worker(sid, &on()), a.worker(SIB, &on()));
+    idle.fable_room(ACCT_NOW - 60);
+    assert_eq!(
+        (idle.fable_lift(), sib.fable_lift()),
+        (FableLift::Unlifted, FableLift::Unlifted),
+        "a wall seen again after the read stands"
+    );
+
+    let a = world(None);
+    let codex = idle_host(sid, Program::Codex, switched(&on()), a.hooks());
+    codex.kept.lock().unwrap().snapshot = a.tabs.lock().unwrap().get(sid).cloned();
+    codex.fable_room(ACCT_NOW - 60);
+    assert_eq!(a.asked("reply:"), 0, "a Codex worker files no sample");
 }
 
 #[test]
@@ -37998,6 +38392,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
         state,
         record_rev: 0,
         since,
+        took_up: false,
         seen,
         held,
         standing: None,
@@ -38033,6 +38428,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
         state,
         record_rev: 0,
         since: Instant::now(),
+        took_up: false,
         seen: StartupSeen::Unread,
         held: Some(read),
         standing: None,
@@ -50522,4 +50918,33 @@ fn the_host_renews_each_idle_supervised_claude_agents_crash_witness_on_its_own_t
     assert!(witnesses.is_empty());
     crate::harness_host::publish_snapshot_for_test(claude, None);
     crate::harness_host::publish_snapshot_for_test(codex, None);
+}
+
+/// A HOST POLICY STORE SAYS WHETHER IT MOVED (the footer cause design's step C8): the window
+/// switches a footer read takes with no host at hand ([`HostPolicy`]) ring the footer's config
+/// bell from [`Switches::set`] only where its store moved one of them: the usage tap's switch,
+/// usage credits, the accounts mode or a bit beside it. Storing what it holds moves nothing.
+///
+/// NEGATIVE CONTROL (run 2026-11-16): with `HostPolicy::store` answering `false`, the test fails
+/// at "the tap's switch".
+#[test]
+fn a_host_policy_store_says_whether_it_moved() {
+    let policy = HostPolicy::new();
+    assert!(
+        !policy.store(false, false, ACCOUNTS_OFF),
+        "CONTROL: storing what it holds moves nothing"
+    );
+    assert!(policy.store(true, false, ACCOUNTS_OFF), "the tap's switch");
+    assert!(!policy.store(true, false, ACCOUNTS_OFF), "stored again");
+    assert!(policy.store(true, true, ACCOUNTS_OFF), "usage credits");
+    assert!(policy.store(true, true, ACCOUNTS_WALL), "the accounts mode");
+    assert!(
+        policy.store(true, true, ACCOUNTS_WALL | ACCOUNTS_SUPERVISED),
+        "supervision beside it"
+    );
+    assert!(!policy.store(true, true, ACCOUNTS_WALL | ACCOUNTS_SUPERVISED));
+    assert!(
+        policy.store(false, true, ACCOUNTS_WALL | ACCOUNTS_SUPERVISED),
+        "the tap off"
+    );
 }

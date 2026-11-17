@@ -360,7 +360,7 @@ fn explicitly_admitted_native_add_still_protects_source_outputs() {
         let result = accounts_add_admitted(
             Cli::Claude,
             &env,
-            &row,
+            (&row.label, &row),
             &|| true,
             &mut |_| {},
             Some(captured.native_guard().unwrap()),

@@ -34,6 +34,11 @@ pub enum Found {
 /// The probe [`CommandLineTools`] reads.
 pub type ProbeClt = Box<dyn Fn(&dyn System) -> Found + Send + Sync>;
 
+/// The hang detector of the installed build's read-only check
+/// ([`CommandLineTools::installed_build_done`]), which takes no lock and answers in well under a
+/// second.
+const INSTALLED_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The reader of generated OS names from the canonical number and nickname
 /// ([`CommandLineTools::with_name`]), `None` before admission: read as the root half is about to
 /// run, so that same naming choice rides the one password.
@@ -423,6 +428,12 @@ pub struct CommandLineTools {
     /// The window that opened the Mac Setup tab read developer mode off as the person's own
     /// choice ([`Self::leaving_developer_mode`]).
     developer_mode_theirs: bool,
+    /// This item reads as the Mac Setup tab's program does, with no tab to speak through
+    /// ([`Self::reading_as_tab`]).
+    tab_reading: bool,
+    /// A person's own run that applies or plans: it also excludes from Spotlight the folders
+    /// made in a home setup's password already scoped ([`Self::scoping_new_folders`]).
+    new_folders: bool,
     /// An explicit Finish setup press may extend existing administrator setup.
     explicit_tab: bool,
     /// The root work the last probe admitted ([`Self::read`]), which an apply re-reads within
@@ -473,6 +484,8 @@ impl CommandLineTools {
             owed: Box::new(|_| Vec::new()),
             asked: std::sync::atomic::AtomicBool::new(false),
             developer_mode_theirs: false,
+            tab_reading: false,
+            new_folders: false,
             explicit_tab: false,
             root_plan: Mutex::new(RootPlan::WithTools),
         }
@@ -499,13 +512,46 @@ impl CommandLineTools {
     /// person's choice ([`Self::leaving_developer_mode`]). A person's own typed `aterm init` sets
     /// it up whatever it reads: their run is their yes.
     fn leaves_developer_mode(&self, sys: &dyn System) -> bool {
-        let typed = self.tab.is_none() && self.unbidden.as_ref().is_none_or(|u| u.explicit);
-        !typed
+        !self.typed()
             && (self.developer_mode_theirs
                 || self
                     .unbidden
                     .as_ref()
                     .is_some_and(|unbidden| unbidden.finished(sys)))
+    }
+
+    /// Whether somebody typed this run: neither the Mac Setup tab's program, nor a reading made
+    /// for it ([`Self::reading_as_tab`]), nor a run aterm decided.
+    fn typed(&self) -> bool {
+        self.tab.is_none() && !self.tab_reading && self.unbidden.as_ref().is_none_or(|u| u.explicit)
+    }
+
+    /// This item reading as the Mac Setup tab's program reads, with no tab to speak through:
+    /// nobody typed it, and it leaves developer mode where that tab does (`leave`,
+    /// [`Self::leaving_developer_mode`]). It is how the installed build answers a tab program an
+    /// update replaced ([`Self::finished_in_place`]).
+    #[must_use]
+    pub fn reading_as_tab(self, leave: bool) -> Self {
+        Self {
+            tab_reading: true,
+            developer_mode_theirs: leave,
+            ..self
+        }
+    }
+
+    /// This item in a person's own run that applies or plans (`scopes`; never a `--check`): it
+    /// also owes Spotlight the folders made in a home setup's password already scoped
+    /// ([`crate::init_spotlight::scope_owed`]), as a tab the person's own press opened does
+    /// ([`Self::with_explicit_tab`]). A check says whether this Mac is set up, by the rule the
+    /// window and every automatic run read
+    /// ([`crate::init_spotlight::automatic_scope_owed`]), and a folder made since is work a
+    /// person's request does, not a Mac left unfinished.
+    #[must_use]
+    pub fn scoping_new_folders(self, scopes: bool) -> Self {
+        Self {
+            new_folders: scopes,
+            ..self
+        }
     }
 
     /// [`Self::command_for`] `plan`, telling the root half to leave developer mode where this
@@ -658,11 +704,44 @@ impl CommandLineTools {
 
     /// What the elevation still owes this Mac beside the tools ([`Self::with_owed`]), less
     /// developer mode where this run leaves it ([`Self::leaves_developer_mode`]). Only the
-    /// person's setup request may renew an old or unread naming permission; automatic runs
-    /// retain the original metadata inventory and durable episode policy.
+    /// person's setup request may renew an old or unread naming permission, and only their
+    /// press of Finish setup ([`Self::with_explicit_tab`]) or their run that applies or plans
+    /// ([`Self::scoping_new_folders`]) excludes from Spotlight a folder made in a home setup's
+    /// password already scoped; every other run owes Spotlight only a home never scoped
+    /// ([`crate::init_spotlight::automatic_scope_owed`]), a `--check` among them, and automatic
+    /// runs retain the original metadata inventory and durable episode policy.
+    ///
+    /// Where an update replaced this program's executable while it ran, the build now there
+    /// says whether anything is owed ([`Self::installed_build_done`]): it is the build the root
+    /// half ran, and this program's own rules are an older build's.
     fn owed_now(&self, sys: &dyn System) -> Vec<crate::root_steps::Owed> {
+        if self.installed_build_done(sys) == Some(true) {
+            return Vec::new();
+        }
+        self.own_owed(sys)
+    }
+
+    /// Whether this run asks the Mac password for `owed` ([`Self::owed_now`]): for any step of
+    /// it, except, in a run nobody asked for, a step a root apply already failed at for good
+    /// with the inputs it reads now ([`crate::root_steps::refused`]). Such a step still reads
+    /// owed, so the run does not read finished and its row names it; asked for by itself it
+    /// would bring the password back every time the person answered it. A person's own run
+    /// asks for it and tries it again, and a password asked for anything else carries it too.
+    fn asks(&self, sys: &dyn System, owed: &[crate::root_steps::Owed]) -> bool {
+        if self.is_explicit() {
+            return !owed.is_empty();
+        }
+        owed.iter()
+            .any(|step| !crate::root_steps::refused(sys, *step))
+    }
+
+    /// [`Self::owed_now`] by this program's own rules alone.
+    fn own_owed(&self, sys: &dyn System) -> Vec<crate::root_steps::Owed> {
         let mut owed = (self.owed)(sys);
-        if !self.is_explicit() && !crate::init_spotlight::automatic_scope_owed(sys) {
+        // A person's request alone takes up a folder made since: a run aterm decided that
+        // carried the flag would still owe only a home never scoped.
+        let extends = self.is_explicit() && (self.explicit_tab || self.new_folders);
+        if !extends && !crate::init_spotlight::automatic_scope_owed(sys) {
             owed.retain(|step| *step != crate::root_steps::Owed::Spotlight);
         }
         if self.leaves_developer_mode(sys) {
@@ -680,6 +759,73 @@ impl CommandLineTools {
             }
         }
         owed
+    }
+
+    /// Whether the build now at this program's executable path reads this run finished in
+    /// place ([`Self::finished_in_place`], by this run's own standing: its
+    /// [`Self::installed_check`] exits 0), asked only of a run nobody typed and only where an
+    /// update replaced this program's executable while it ran ([`System::image_replaced`]):
+    /// a Mac Setup tab carried across an update waits at its password prompt with an older
+    /// build's rules, while `sudo` runs the build at the path, so this program's own reading
+    /// would judge the newer build's work by rules that build retired and say Mac Setup did not
+    /// finish after a password that did all of it. `None` for a run somebody typed (which a
+    /// person runs again), where the image was not replaced, the account cannot be read, or
+    /// the check did not run; `Some(false)` where it ran and found something not in place,
+    /// which leaves this program's own reading to name it.
+    fn installed_build_done(&self, sys: &dyn System) -> Option<bool> {
+        if self.typed() || sys.image_replaced(&self.aterm) != Some(true) {
+            return None;
+        }
+        let identity = sys.identity().ok()?;
+        let ran = sys
+            .run(&self.installed_check(&identity.user, self.leaves_developer_mode(sys)))
+            .ok()?;
+        Some(ran.status == Some(0))
+    }
+
+    /// The installed build's read-only check ([`Self::installed_build_done`]) as `user` runs it,
+    /// by the Mac Setup tab's standing: the tab's own marker
+    /// ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB`]) on a `--check`, which that build
+    /// answers as its tab's program would read this Mac (`aterm init`'s tab check), leaving
+    /// developer mode where this run does (`leave`) and explicit where this tab is
+    /// ([`Self::with_explicit_tab`]). The environment is fixed, so it reads that account's own
+    /// home and state and nothing else of this program's.
+    fn installed_check(&self, user: &crate::model::User, leave: bool) -> Cmd {
+        let check = Cmd::new(&self.aterm)
+            .args(["init", "--check", "--no-wait", "--only", ID])
+            .env("HOME", &user.home)
+            .env("USER", &user.name)
+            .env("LOGNAME", &user.name)
+            .env(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB, "1")
+            .budget(INSTALLED_CHECK_BUDGET);
+        let check = if leave {
+            check.env(
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE,
+                "1",
+            )
+        } else {
+            check
+        };
+        if self.explicit_tab {
+            check.env(
+                aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_EXPLICIT,
+                "1",
+            )
+        } else {
+            check
+        }
+    }
+
+    /// Whether this Mac reads finished as this run stands: the tools present, nothing the
+    /// elevation owes ([`Self::owed_now`]) and the LAN broker answering
+    /// ([`crate::items::lan::ready`]). It is what turns a root half's unfinished exit into a
+    /// finished run ([`Self::ended`]), and what the installed build answers a tab program an
+    /// update replaced ([`Self::reading_as_tab`]: `aterm init`'s tab check).
+    #[must_use]
+    pub fn finished_in_place(&self, sys: &dyn System) -> bool {
+        matches!((self.found)(sys), Found::Present(_))
+            && self.owed_now(sys).is_empty()
+            && crate::items::lan::ready(sys).unwrap_or(false)
     }
 
     fn independent_plan(&self, owed: &[crate::root_steps::Owed]) -> Option<RootPlan> {
@@ -714,23 +860,27 @@ impl CommandLineTools {
             .then_some(RootPlan::NameRuleOnly));
         }
         if ceiling == RootPlan::StepsOnly {
-            return Ok(self.independent_plan(&self.owed_now(sys)));
+            return Ok(self.steps_plan(sys));
         }
         let (why, unfinished) = match (self.found)(sys) {
             Found::Missing(_) => return Ok(Some(RootPlan::WithTools)),
             Found::Present(_) => {
-                return Ok(self.independent_plan(&self.owed_now(sys)));
+                return Ok(self.steps_plan(sys));
             }
             Found::NotHere(_) => return Ok(None),
             Found::Refuses(why) => (why, Unfinished::Refuses),
             Found::Unknown(why) => (why, Unfinished::Unread),
         };
+        self.steps_plan(sys).map(Some).ok_or((why, unfinished))
+    }
+
+    /// The plan for the root steps alone: none where this run asks for none ([`Self::asks`]),
+    /// else the plan for every step owed, which the one password does.
+    fn steps_plan(&self, sys: &dyn System) -> Option<RootPlan> {
         let owed = self.owed_now(sys);
-        if owed.is_empty() {
-            Err((why, unfinished))
-        } else {
-            Ok(self.independent_plan(&owed))
-        }
+        self.asks(sys, &owed)
+            .then(|| self.independent_plan(&owed))
+            .flatten()
     }
 
     fn command_for(&self, plan: RootPlan) -> Cmd {
@@ -759,7 +909,10 @@ impl CommandLineTools {
     /// alone would read as a password macOS refused); else the root half's exit
     /// ([`Unfinished::after_root`]); and tools that arrived anyway are installed, whatever it
     /// said, where the elevation owes nothing else ([`Self::with_owed`]): on a Mac that had the
-    /// tools all along, a refused password is no success.
+    /// tools all along, a refused password is no success. Where an update replaced this
+    /// program while it ran, the build now at its path says whether the run finished in place
+    /// ([`Self::installed_build_done`], the broker's answer included); where that build finds
+    /// something short or does not answer, this program's own readings decide.
     fn ended(
         &self,
         sys: &dyn System,
@@ -774,9 +927,10 @@ impl CommandLineTools {
         match ended {
             Err(_)
                 if self.root_plan() != RootPlan::NameRuleOnly
-                    && matches!((self.found)(sys), Found::Present(_))
-                    && self.owed_now(sys).is_empty()
-                    && crate::items::lan::ready(sys).unwrap_or(false) =>
+                    && (self.installed_build_done(sys) == Some(true)
+                        || (matches!((self.found)(sys), Found::Present(_))
+                            && self.own_owed(sys).is_empty()
+                            && crate::items::lan::ready(sys).unwrap_or(false))) =>
             {
                 Ok(())
             }
@@ -1163,6 +1317,21 @@ impl Item for RootSteps<'_> {
             };
         }
         let from = format!("still owed: {steps}");
+        if !clt.asks(sys, &owed) {
+            // The tools' row read in place and asked nothing, so this row gives the tab its
+            // end: the step is still owed.
+            if let Some(tab) = &clt.tab
+                && tab.unfinished().is_none()
+            {
+                tab.note(Unfinished::StepsOwed);
+            }
+            return Probe::Deferred {
+                why: format!(
+                    "{from}; setup already tried this as root and it failed, so aterm does not ask the \
+                     Mac password for it again by itself; `aterm init` tries it again"
+                ),
+            };
+        }
         let why = match clt.held_back(sys, &from, false) {
             Some((Probe::Deferred { why } | Probe::Blocked { why }, _)) => why,
             Some(_) | None => format!("{from}; {ID}'s one Mac password does them"),
@@ -1411,7 +1580,9 @@ impl CommandLineTools {
     /// reading is `verdict`: the change for the elevation's other root steps where any is owed
     /// and this run may ask for the password now, else `verdict`. In the tab a run that may not
     /// ask says why ([`Self::held_back`]), as it would for the tools (Low Data Mode and an
-    /// install under way aside, which hold only a download); outside it the row says the tools'
+    /// install under way aside, which hold only a download); one that does not ask because
+    /// every step owed was already refused ([`Self::asks`]) says nothing here, and
+    /// [`RootSteps`]' row gives the tab its end; outside it the row says the tools'
     /// verdict alone, and [`RootSteps`]' row names what is left and who does it, so a step owed
     /// never reads in place. Once this run's root half ran, its read-back is `verdict`.
     fn read_owed(
@@ -1423,8 +1594,9 @@ impl CommandLineTools {
         if self.asked.load(std::sync::atomic::Ordering::Relaxed) {
             return verdict;
         }
+        // The one password does every step still owed, a refused one included.
         let owed = self.owed_now(sys);
-        if owed.is_empty() {
+        if !self.asks(sys, &owed) {
             return verdict;
         }
         let plan = self.independent_plan(&owed).expect("nonempty root work");
@@ -1525,7 +1697,7 @@ impl CommandLineTools {
         // With none definitely owed, do not ask merely to wait for Low Data Mode to end.
         if download
             && let Some(why) = crate::items::developer::low_data(sys)
-            && self.owed_now(sys).is_empty()
+            && !self.asks(sys, &self.owed_now(sys))
         {
             return Some((
                 Probe::Blocked {

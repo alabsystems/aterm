@@ -312,7 +312,7 @@ fn an_exited_workers_end_is_seen_by_a_look_and_by_going_to_it() {
         .entered;
     assert_eq!(app.task_exited.get(&second), Some(&entered));
     assert_eq!(seen_row(&app, second), None, "nobody looked");
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     app.switch_tab_in(wid, tabs - 1);
     assert_eq!(seen_row(&app, second), Some(entered), "a look");
 
@@ -358,7 +358,7 @@ fn a_task_done_where_nobody_looks_keeps_its_dot() {
     app.switch_tab_in(wid, tabs - 2);
     assert_eq!(dot(&app), ChipLevel::Done, "nobody looked");
     app.switch_tab_in(wid, tabs - 1);
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     app.switch_tab_in(wid, tabs - 2);
     assert_eq!(dot(&app), ChipLevel::Off, "seen once revealed");
 }

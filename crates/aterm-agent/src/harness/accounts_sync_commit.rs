@@ -1599,6 +1599,12 @@ impl Store {
         Ok(Some(receipt))
     }
 
+    /// The files [`Self::sync_read_receipt`] reads or looks at: the receipt, and its witness
+    /// where the receipt is absent.
+    pub(in crate::harness) fn sync_receipt_files(&self) -> [PathBuf; 2] {
+        [self.dir.join(RECEIPT), self.dir.join(WITNESS)]
+    }
+
     pub(in crate::harness) fn sync_read_receipt(&self) -> Result<Option<String>, String> {
         let receipt = self.receipt()?;
         if receipt.as_ref().is_some_and(|r| r.plan.is_some()) {

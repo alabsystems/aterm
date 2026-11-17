@@ -113,3 +113,52 @@ fn a_clone_refuses_an_occupied_name_and_a_non_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A kernel clone keeps the bytes, mode and time on an inode of its own, and refuses a name that
+/// is taken.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_kernel_clone_is_its_own_inode_with_the_sources_attributes() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = scratch("cow");
+    let src = dir.join("libLLVM.dylib");
+    std::fs::write(&src, vec![0x5a; 1 << 16]).unwrap();
+    std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let dst = dir.join("clone.dylib");
+    cow_clone_file(&src, &dst).unwrap();
+    let (s, d) = (
+        std::fs::metadata(&src).unwrap(),
+        std::fs::metadata(&dst).unwrap(),
+    );
+    assert_eq!(std::fs::read(&dst).unwrap(), vec![0x5a; 1 << 16]);
+    assert_eq!(
+        d.permissions().mode() & 0o7777,
+        0o444,
+        "a read-only file clones"
+    );
+    assert_eq!(d.modified().unwrap(), s.modified().unwrap());
+    assert_ne!(s.ino(), d.ino());
+    assert!(is_clone_of(&src, &dst));
+    assert_eq!(
+        cow_clone_file(&src, &dst).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A volume that cannot clone reads as `Unsupported`, which a caller refuses, never as a cue to
+/// copy; any other error stands as it is.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn a_volume_that_cannot_clone_is_unsupported() {
+    for code in [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV] {
+        assert_eq!(
+            unclonable(io::Error::from_raw_os_error(code)).kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+    assert_eq!(
+        unclonable(io::Error::from_raw_os_error(libc::ENOSPC)).raw_os_error(),
+        Some(libc::ENOSPC)
+    );
+}

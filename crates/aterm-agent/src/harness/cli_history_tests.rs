@@ -492,7 +492,7 @@ fn dates(text: &str) -> Vec<&str> {
 /// row), both five-hour windows ending at 12:00; A was then the row `now`, and B also used A's
 /// old label `before` on Saturday. `history now` (A) holds A's days from every file that carries
 /// its key, with the sign-in under Friday, and none of B's readings; `history work` (B) holds
-/// B's alone, without the sign-in it made, and no reset used where A's 80% gave way to B's 20%
+/// B's alone, without the sign-in it made, and no refill where A's 80% gave way to B's 20%
 /// under one reset. Negative control: keeping every line of a file that names the account
 /// (`judged` returning the lines as read) puts B's week of 10% in A's Friday, and the first
 /// assertion fails.
@@ -556,7 +556,7 @@ fn history_holds_only_the_accounts_own_readings() {
         "week 85% left",
         "week 90% left",
         "lowest 80% left",
-        "reset used",
+        "refilled or raised",
     ] {
         assert!(!theirs.contains(not_a), "{not_a}: {theirs}");
     }
@@ -567,7 +567,7 @@ fn history_holds_only_the_accounts_own_readings() {
         "week 50% left",
         "week 45% left",
         "lowest 20% left",
-        "reset used",
+        "refilled or raised",
         "another",
     ] {
         assert!(!mine.contains(not_b), "{not_b}: {mine}");
@@ -1163,5 +1163,132 @@ fn history_without_a_name_finds_a_forgotten_rows_key() {
             let named = history_of(&env, Some("now"), (false, false), |_| 0);
             assert_eq!(every, named, "the named history finds the same");
         },
+    );
+}
+
+/// A WEEK REFILLED OR RAISED IS SAID SO, NEVER A RESET USED. The week read 90% used and then, under
+/// the same reset, 30% with its barrier at that figure, as a tap's refill or raise is dated
+/// ([`accounts::WindowFig::epoch_at`]): the series cannot tell a limit reset spent from a refill
+/// or a raised allowance, so the day says `week refilled or raised` at the barrier's instant,
+/// once, and `--json` names it by the journal's word (`reset-used`) for the week. Negative
+/// control: the words before (`week reset used`) fail the first assertion.
+#[test]
+fn a_week_refilled_or_raised_is_said_so() {
+    let tmp = tmp_dir("history-refilled");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["work"], &[("work", a)]);
+    let week = now + 3 * D;
+    let refilled = now - 20 * H;
+    let mut after = keyed(refilled, None, Some((300, week)), a);
+    if let Said::Fig {
+        seven_day: Some(f), ..
+    } = &mut after.said
+    {
+        f.epoch = Some(refilled);
+    }
+    write_series(
+        &env,
+        "work",
+        &machine,
+        &[keyed(now - 30 * H, None, Some((900, week)), a), after],
+    );
+    let text = history_of(&env, Some("work"), (false, false), |_| 0);
+    let said = format!(
+        "week refilled or raised {}",
+        crate::harness::account_stats::hm(refilled, 0)
+    );
+    assert_eq!(text.matches(&said).count(), 1, "{said}: {text}");
+    assert!(!text.contains("reset used"), "{text}");
+    let doc: Value =
+        aterm_json::from_str(history_of(&env, Some("work"), (true, false), |_| 0).trim())
+            .expect("JSON");
+    let events: Vec<&Value> = doc["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .flat_map(|d| d["events"].as_array().into_iter().flatten())
+        .collect();
+    assert_eq!(events.len(), 1, "{doc:?}");
+    assert_eq!(events[0]["e"], Value::from("reset-used"));
+    assert_eq!(events[0]["w"], Value::from(accounts::WEEK_LIMIT));
+    assert_eq!(events[0]["t"], Value::from(refilled));
+}
+
+/// A FIVE-HOUR REFILL NAMES ITS WINDOW, AND A RESET THIS MAC'S aterm SPENT IS SAID `reset used`.
+/// The five-hour window read 90% used and then, under the same reset, 30% with its barrier at
+/// 23:00; the week did the same at 23:30, an instant this Mac's ledger holds a limit reset its
+/// aterm spent on the week at ([`accounts::Kind::ResetUsed`] naming the week). The day says `5h
+/// refilled or raised 23:00`, never a bare `refilled or raised` a reader takes for the week the
+/// day line names just before, and `week reset used 23:30`; `--json` names both by the journal's
+/// word. Negative controls: the five-hour words without their window fail the first assertion,
+/// and ignoring the ledger's spent reset (`week refilled or raised 23:30`) the second.
+#[test]
+fn a_five_hour_refill_names_its_window_and_a_spent_reset_says_so() {
+    let tmp = tmp_dir("history-five-refilled");
+    let env = env_at(&tmp);
+    let now = env.now;
+    let a = AccountKey::claude(UUID).expect("key");
+    let machine = pool(&tmp, &env, &["work"], &[("work", a)]);
+    let (five, week) = (now + 2 * H, now + 3 * D);
+    let (five_at, week_at) = (now - H, now - H / 2);
+    let mut rows = vec![
+        keyed(now - 2 * H, Some((900, five)), Some((900, week)), a),
+        keyed(five_at, Some((300, five)), Some((900, week)), a),
+        keyed(week_at, Some((300, five)), Some((300, week)), a),
+    ];
+    for (row, five_epoch, week_epoch) in
+        [(1, Some(five_at), None), (2, Some(five_at), Some(week_at))]
+    {
+        if let Said::Fig {
+            five_hour: Some(f),
+            seven_day: Some(w),
+            ..
+        } = &mut rows[row].said
+        {
+            f.epoch = five_epoch;
+            w.epoch = week_epoch;
+        }
+    }
+    write_series(&env, "work", &machine, &rows);
+    env.accounts_store()
+        .transact(env.now, &mut None, |_| {
+            Ok(vec![
+                accounts::Event::new(week_at, accounts::Kind::ResetUsed, "work")
+                    .refilling([accounts::WEEK_LIMIT]),
+            ])
+        })
+        .expect("the ledger row");
+    let text = history_of(&env, Some("work"), (false, false), |_| 0);
+    let at = |t| crate::harness::account_stats::hm(t, 0);
+    let five_words = format!("5h refilled or raised {}", at(five_at));
+    assert_eq!(text.matches(&five_words).count(), 1, "{five_words}: {text}");
+    let week_words = format!("week reset used {}", at(week_at));
+    assert_eq!(text.matches(&week_words).count(), 1, "{week_words}: {text}");
+    assert!(!text.contains("week refilled or raised"), "{text}");
+    let doc: Value =
+        aterm_json::from_str(history_of(&env, Some("work"), (true, false), |_| 0).trim())
+            .expect("JSON");
+    let events: Vec<(&Value, &Value)> = doc["days"]
+        .as_array()
+        .expect("days")
+        .iter()
+        .flat_map(|d| d["events"].as_array().into_iter().flatten())
+        .map(|e| (&e["e"], &e["w"]))
+        .collect();
+    assert_eq!(
+        events,
+        [
+            (
+                &Value::from("reset-used"),
+                &Value::from(accounts::SESSION_LIMIT)
+            ),
+            (
+                &Value::from("reset-used"),
+                &Value::from(accounts::WEEK_LIMIT)
+            ),
+        ],
+        "{doc:?}"
     );
 }

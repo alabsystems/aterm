@@ -1840,11 +1840,12 @@ fn since_view(five: u32, week: u32, rows: &[SeriesRow], span_s: i64) -> (View, S
     (v, shown, d)
 }
 
-/// SINCE SAYS THE RISE, A NEW WINDOW OR A RESET USED. Against a day of readings, the week rose
+/// SINCE SAYS THE RISE, A NEW WINDOW OR A REFILL. Against a day of readings, the week rose
 /// from 53% used a day ago to 71% now (`18 used since 24h`, not 31 from the older reading
 /// before it: a rise of use says `used`, beside the share left the row leads with), and the
 /// five-hour window a day ago is one that has since ended, so a new one began at its reset less
-/// five hours; a week that refilled says the reset used and when; a series younger than the
+/// five hours; a week that refilled says it was refilled or raised, and when (the series cannot
+/// tell a limit reset spent from a refill or a raised allowance, so never `reset used`); a series younger than the
 /// span says its own age, and one whose newest reading before the span's start is older than a
 /// reading heartbeat says the span it did compare (25h, 2d), never a rise over a longer gap put
 /// inside 24h; a figure that fell by less than a refill rose by nothing, never a negative
@@ -1853,7 +1854,7 @@ fn since_view(five: u32, week: u32, rows: &[SeriesRow], span_s: i64) -> (View, S
 /// in `since_of`, ignoring `now − span_s`) compares now with now, gives `0 used since 24h`, and the
 /// first assertion fails.
 #[test]
-fn since_says_the_rise_a_new_window_or_a_reset_used() {
+fn since_says_the_rise_a_new_window_or_a_refill() {
     let five_reset = NOW + 85 * MIN;
     let rows = [
         series_fig(
@@ -1930,12 +1931,12 @@ fn since_says_the_rise_a_new_window_or_a_reset_used() {
         win(&v, "seven_day").since,
         Some(Since {
             span_s: 25 * HOUR,
-            moved: Moved::ResetUsed(NOW - 10 * HOUR)
+            moved: Moved::Refilled(NOW - 10 * HOUR)
         }),
         "the baseline an hour before the span's start says the span it covers"
     );
     assert!(
-        shown.contains(" \u{b7} reset used since 06:40\n"),
+        shown.contains(" \u{b7} refilled or raised since 06:40\n"),
         "{shown}"
     );
     assert_eq!(
@@ -1965,6 +1966,53 @@ fn since_says_the_rise_a_new_window_or_a_reset_used() {
         })
     );
     assert!(shown.contains(" \u{b7} 0 used since 2d\n"), "{shown}");
+}
+
+/// A LIMIT RESET THIS MAC'S aterm SPENT IS SAID `reset used` SINCE, AS BEFORE A READING CAME. The
+/// week refilled ten hours ago, where the record's word says this Mac's aterm spent a limit reset
+/// then ([`accounts::reset_outcome`]'s mark: a word with neither figure nor reset): its row says
+/// `reset used since 06:40`, the words `reset used 06:40, no reading since` gave before a reading
+/// came, never `refilled or raised` for the same instant. A mark of another instant (a reset spent
+/// before the refill the series shows) leaves the refill `refilled or raised since 06:40`.
+/// Negative control: saying every refill `refilled or raised` fails the first assertion.
+#[test]
+fn since_says_a_reset_this_mac_spent_reset_used() {
+    let refilled = [
+        series_fig(NOW - 25 * HOUR, None, Some((900, WEEK_END))),
+        series_fig(NOW - 10 * HOUR, None, Some((100, WEEK_END))),
+    ];
+    let shown_with = |spent: i64| {
+        let mut state = tapped(380, 150, NOW - MIN);
+        state
+            .accounts
+            .get_mut("main")
+            .expect("the record")
+            .warned_week = Some(accounts::WindowSaid {
+            pct: None,
+            reset: None,
+            at: spent,
+        });
+        let p = profile(None);
+        let l = look(state.accounts.get("main"), &p, Tap::On);
+        let mut v = view(&l);
+        with_since(
+            &mut v,
+            (&refilled, account_series::Keys::default()),
+            DAY,
+            NOW,
+        );
+        text(&l, &v)
+    };
+    let shown = shown_with(NOW - 10 * HOUR);
+    assert!(
+        shown.contains(" \u{b7} reset used since 06:40\n"),
+        "{shown}"
+    );
+    let shown = shown_with(NOW - 12 * HOUR);
+    assert!(
+        shown.contains(" \u{b7} refilled or raised since 06:40\n"),
+        "{shown}"
+    );
 }
 
 /// Thursday, November 12, 2026, at the hour and minute of [`NOW`] (UTC).

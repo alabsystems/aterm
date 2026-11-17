@@ -16,9 +16,11 @@
 use crate::age::{Identity, Recipient};
 use crate::commons::binding::Request;
 use crate::membership_log::{
-    Body, Entrant, EpochAudience, LEGACY_RECORDS, Log, MemberId, NodeStanding, Record,
-    RecordBudgets, Store, decode_records,
+    Body, Entrant, EpochAudience, LEGACY_RECORDS, Log, MemberId, Record, RecordBudgets,
 };
+#[cfg(unix)]
+use crate::membership_log::{NodeStanding, Store, decode_records};
+#[cfg(unix)]
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
@@ -61,10 +63,24 @@ pub(crate) struct Batch {
     /// and A, in that order.
     pub(crate) removal: Vec<Record>,
     /// F, who removes C.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the unix vault server's crossing tests read it"
+        )
+    )]
     pub(crate) f: Founder,
     /// A, whose wrap is the batch's last record.
     pub(crate) a: Founder,
     /// B, wrapped before A.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the unix vault server's crossing tests read it"
+        )
+    )]
     pub(crate) b: Founder,
     /// C, whom the batch removes.
     pub(crate) c: Founder,
@@ -83,12 +99,14 @@ impl Batch {
     }
 
     /// The node keys a member that reads the whole log puts out: C's alone.
+    #[cfg(unix)]
     pub(crate) fn removed(&self) -> BTreeSet<[u8; 32]> {
         BTreeSet::from([self.c.node])
     }
 
     /// The node keys a member that reads the batch cut mid-Wraps puts out: C's, and A's and B's,
     /// whom its newest `[everyone]` epoch then leaves out.
+    #[cfg(unix)]
     pub(crate) fn cut_out(&self) -> BTreeSet<[u8; 32]> {
         BTreeSet::from([self.a.node, self.b.node, self.c.node])
     }
@@ -210,10 +228,12 @@ fn build() -> Batch {
 /// whole only where it holds at most [`LEGACY_RECORDS`] records, inserting what fits, and reads
 /// standing as those builds do (aterm-agent `fleet_log::log_member_keys`, and a Mac's own
 /// `Revoked` where its log removes it or its newest `[everyone]` epoch leaves it out).
+#[cfg(unix)]
 pub(crate) struct Legacy {
     store: Store,
 }
 
+#[cfg(unix)]
 impl Legacy {
     /// A member that holds `records`.
     pub(crate) fn holding(records: &[Record]) -> Self {

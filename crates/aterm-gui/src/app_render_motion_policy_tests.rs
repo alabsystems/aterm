@@ -1333,7 +1333,7 @@ fn an_unattended_window_applies_the_fades_end() {
     let attend = |app: &mut App, here: bool, at: Instant| {
         let rest = &mut app.windows.get_mut(&wid).expect("the headless window").rest;
         if here {
-            let _ = rest.touch(at);
+            let _ = rest.touch(at, true);
         } else {
             let _ = rest.settle_attended(at + ATTENTION, Some(ATTENTION));
         }

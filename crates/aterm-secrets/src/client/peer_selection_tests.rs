@@ -203,6 +203,7 @@ fn cached_materialization_model_conforms_and_rejects_conditional_repair() {
     assert!(!model.check_invariant("ConditionalQuiet", &bad));
 }
 
+#[cfg(unix)]
 #[test]
 fn cached_log_model_conforms_and_rejects_loss_as_progress() {
     let model = aterm_models_swarm::cached_log_model();
@@ -235,6 +236,7 @@ fn cached_log_model_conforms_and_rejects_loss_as_progress() {
     assert!(!model.check_invariant("KeepAppliedLog", &bad));
 }
 
+#[cfg(unix)]
 struct CachedLogView {
     config: Config,
     before: State,
@@ -244,6 +246,7 @@ struct CachedLogView {
     changed: Vec<u8>,
 }
 
+#[cfg(unix)]
 struct CachedLogFixture {
     active: CachedLogView,
     pending: CachedLogView,
@@ -252,6 +255,7 @@ struct CachedLogFixture {
     removed: Vec<u8>,
 }
 
+#[cfg(unix)]
 fn cached_log_fixture() -> &'static CachedLogFixture {
     static FIXTURE: std::sync::OnceLock<CachedLogFixture> = std::sync::OnceLock::new();
     FIXTURE.get_or_init(|| {
@@ -319,6 +323,7 @@ fn cached_log_fixture() -> &'static CachedLogFixture {
     })
 }
 
+#[cfg(unix)]
 #[test]
 fn cached_publication_model_keeps_denial_visible_and_blocks_publication() {
     let model = aterm_models_swarm::cached_publication_model();
@@ -345,6 +350,7 @@ fn cached_publication_model_keeps_denial_visible_and_blocks_publication() {
     assert!(!model.successors("Publish", &observed).contains(&published));
 }
 
+#[cfg(unix)]
 pub(crate) fn cached_publication_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -392,6 +398,7 @@ pub(crate) fn cached_publication_transition(
     next
 }
 
+#[cfg(unix)]
 pub(crate) fn cached_log_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -707,6 +714,7 @@ fn bodyless_conditional_repair_ignores_a_stale_pre_fetch_log_snapshot() {
     assert!(load_state(&f.paths).unwrap().held.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn losing_the_log_does_not_replay_an_older_cached_value() {
     let _answering = ServersAnswering::set();
@@ -825,6 +833,7 @@ fn an_exact_peer_remains_usable_when_the_local_log_cannot_support_publication() 
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_older_log_omission_cannot_block_publication_of_a_newer_admitted_envelope() {
     let _answering = ServersAnswering::set();
@@ -905,6 +914,7 @@ fn an_older_log_omission_cannot_block_publication_of_a_newer_admitted_envelope()
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_replacement_waiting_for_records_preserves_the_previous_state() {
     let _answering = ServersAnswering::set();
@@ -976,6 +986,7 @@ fn a_replacement_waiting_for_records_preserves_the_previous_state() {
     replacement.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_admitting_log_change_preserves_the_transport_error() {
     let _answering = ServersAnswering::set();
@@ -1010,6 +1021,7 @@ fn a_non_admitting_log_change_preserves_the_transport_error() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unbound_cache_cannot_select_a_local_log_change() {
     let _answering = ServersAnswering::set();
@@ -1027,6 +1039,7 @@ fn an_unbound_cache_cannot_select_a_local_log_change() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn unbounded_sync_applies_received_removal_before_putting_back_a_cache() {
     let _answering = ServersAnswering::set();
@@ -1052,6 +1065,7 @@ fn unbounded_sync_applies_received_removal_before_putting_back_a_cache() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_behind_log_cannot_swallow_the_transport_error() {
     let _answering = ServersAnswering::set();
@@ -1132,6 +1146,7 @@ fn missing_applied_records_do_not_commit_a_signer_rotation() {
     assert_eq!(std::fs::read(f.paths.cache_file()).unwrap(), f.base);
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_fetch_uses_the_current_locked_cache_for_local_log_progress() {
     let _answering = ServersAnswering::set();
@@ -1954,6 +1969,7 @@ fn a_no_change_primary_retains_a_verified_revoked_cache() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_bodyless_response_applies_log_admission_from_a_pending_cache() {
     let _answering = ServersAnswering::set();
@@ -2049,6 +2065,7 @@ fn descendant(base: &[u8], seed: &[u8; 32], advance: u64, parent: [u8; 32]) -> V
     .unwrap()
 }
 
+#[cfg(unix)]
 #[test]
 fn a_higher_unmerged_peer_does_not_mask_a_lower_descendant() {
     let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"retained")]);
@@ -2082,6 +2099,7 @@ fn a_higher_unmerged_peer_does_not_mask_a_lower_descendant() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_log_behind_head_does_not_mask_an_applicable_descendant() {
     let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);
@@ -2120,6 +2138,7 @@ fn a_log_behind_head_does_not_mask_an_applicable_descendant() {
     lab.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn ordinary_and_bounded_readers_apply_log_progress_without_an_envelope_server() {
     for bounded in [false, true] {
@@ -2164,6 +2183,7 @@ fn ordinary_and_bounded_readers_apply_log_progress_without_an_envelope_server() 
 /// NEGATIVE CONTROL (2026-11-11): with the apply storing the envelope by `fsx::write_atomic`
 /// whatever the state names, the cache after the apply is another file (`the cache is left as
 /// it is`).
+#[cfg(unix)]
 #[test]
 fn log_progress_under_the_held_envelope_leaves_the_cache_file_as_it_is() {
     let lab = log_entries_tests::two_macs(&[(Audience::Everyone, "shared", b"old")]);

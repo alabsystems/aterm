@@ -378,6 +378,37 @@ impl TaskWord {
             _ => return None,
         })
     }
+
+    /// Its word as the fleet tables and the session words read it.
+    pub(crate) const fn fleet(self) -> aterm_db::words::Task {
+        use aterm_db::words::Task;
+        match self {
+            Self::Working => Task::Working,
+            Self::Done => Task::Done,
+            Self::Failed => Task::Failed,
+            Self::Exited => Task::Exited,
+            Self::Stalled => Task::Stalled,
+        }
+    }
+}
+
+/// The glance word of an agent whose row says `agent` with its task `task`, and the kind of limit
+/// a walled one is at, as its row spelled it. A wait on a person and a limit say more than a
+/// stalled task, and a stalled task says more than an agent's `busy` or `idle`. The fleet tables'
+/// `state` and the session words' glance are both this, so the two cannot drift.
+pub(crate) fn glance_of(
+    agent: &AgentWord,
+    task: Option<TaskWord>,
+) -> (aterm_db::words::State, Option<&str>) {
+    use aterm_db::words::State;
+    match agent {
+        AgentWord::Waiting => (State::Waiting, None),
+        AgentWord::Walled(kind) => (State::Walled, Some(kind)),
+        _ if task == Some(TaskWord::Stalled) => (State::Stuck, None),
+        AgentWord::Busy => (State::Busy, None),
+        AgentWord::Idle => (State::Idle, None),
+        AgentWord::Unknown => (State::Unknown, None),
+    }
 }
 
 /// The most agent sessions one Mac's read keeps ([`FleetMac::agent_sessions`]).

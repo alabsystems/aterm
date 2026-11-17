@@ -53,6 +53,7 @@ pub fn admin_sign_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGene
 
 /// The CLI's configured realm: only an explicit private URL gains the private route. A default
 /// URL, any known ALab lineage or a live genesis retains the released-admin operation.
+#[cfg(unix)]
 pub(crate) fn configured_genesis(paths: &Paths, out: &Path) -> crate::Result<SignedGenesis> {
     let cfg = config(paths)?.ok_or_else(|| Error::new("no vault configured"))?;
     if matches!(cfg.source, Source::Url(_)) && private_realm(paths, &cfg)? {
@@ -361,5 +362,5 @@ fn sign_genesis_in_realm(
     Ok(SignedGenesis { digest, members })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

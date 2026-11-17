@@ -528,7 +528,6 @@ fn the_second_lab_sync_follows_the_native_default_after_the_actual_first_import(
     fs::remove_file(&world.roster).unwrap();
     let lab = Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         bound: Default::default(),
         accounts: [("a", A), ("b", B)]
             .into_iter()

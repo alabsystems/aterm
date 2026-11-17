@@ -16,6 +16,11 @@
 //! writer signed that this Mac computes identically, or proposes its own once the cut has grown
 //! by [`STRIDE`] records past every one it shared, so a table gains one checkpoint record per
 //! writer per [`STRIDE`] of its own.
+//!
+//! Each pass then records the table's floor (tracker LT-B10C1): the newest checkpoint this Mac
+//! signed that is final by the rule the vault log shares ([`finality`]): more than half of the
+//! members that signed a record of the table in the 30 days before the cut have signed its body,
+//! the cut's time being its newest frontier tip's. The store counts its quotas above that floor.
 
 use super::{Handle, Table, View, decode};
 use crate::{
@@ -118,7 +123,8 @@ impl Handle {
     /// Sign at most one checkpoint of this table (the module's pass): none while a current member
     /// holds the fence; else the newest share of another writer this Mac computes identically and
     /// has not signed, whose cut holds every one this Mac shared; else, at `now_ms`, its own,
-    /// once the cut holds [`STRIDE`] records more than every one it shared.
+    /// once the cut holds [`STRIDE`] records more than every one it shared. Then record the
+    /// table's floor: the newest final checkpoint this Mac signed.
     ///
     /// # Errors
     /// No Commons, the table's storage cannot be read or written, or the record cannot be signed.
@@ -162,55 +168,143 @@ impl Handle {
             self.descriptor(),
             |session, store, scope| {
                 let log = Log::read_with(session, store, scope, decode)?;
-                let me = session.actor();
-                let authored = |id: &Digest| log.authored_ms(id);
-                let state = |cut: &BTreeSet<Digest>| state(table, session, &log, cut);
-                let history = History {
-                    scope: scope.digest(),
-                    generation: scope.generation(),
-                    index: log.causal_index(),
-                    projection: log.projection(),
-                    authored: &authored,
-                    state: &state,
+                let pass = Pass {
+                    table,
+                    session,
+                    log: &log,
+                    scope,
+                    members: &members,
+                    held: &held,
+                    now_ms,
                 };
-                let shares: Vec<(Actor, Body)> = store
-                    .checkpoints()
-                    .map(|(signer, body)| (signer, body.clone()))
-                    .filter(|(_, body)| body.scope == history.scope)
-                    .collect();
-                let mine: Vec<&Body> = shares
-                    .iter()
-                    .filter(|(signer, _)| *signer == me)
-                    .map(|(_, body)| body)
-                    .collect();
-                let nests = |body: &Body| mine.iter().all(|earlier| contains(body, earlier));
-                let mut theirs: Vec<&Body> = shares
-                    .iter()
-                    .filter(|(signer, body)| *signer != me && !mine.contains(&body) && nests(body))
-                    .map(|(_, body)| body)
-                    .collect();
-                theirs.sort_by_key(|body| std::cmp::Reverse(body.below));
-                for body in theirs {
-                    if let Ok(computed) = checkpoint::second(&history, body) {
-                        store.sign_checkpoint(session, &computed, &held)?;
-                        return Ok(Signed::Seconded);
-                    }
-                }
-                let writers = current_writers(&log, &members, now_ms);
-                let Some(computed) =
-                    checkpoint::compute(&history, &writers, now_ms.saturating_sub(AGE_MS))
-                else {
-                    return Ok(Signed::Nothing);
-                };
-                let shared = mine.iter().map(|body| body.below).max().unwrap_or(0);
-                if !nests(computed.body()) || computed.body().below < shared.saturating_add(stride)
+                let signed = pass.sign(store, stride)?;
+                if let Some(body) = pass.final_floor(store)
+                    && store.floor() != Some(&body)
                 {
-                    return Ok(Signed::Nothing);
+                    store.set_floor(session, &body)?;
                 }
-                store.sign_checkpoint(session, &computed, &held)?;
-                Ok(Signed::Proposed)
+                Ok(signed)
             },
         )
+    }
+}
+
+/// One table's pass, over the log it read.
+struct Pass<'a> {
+    table: &'static Table,
+    session: &'a crate::table::Session<'a>,
+    log: &'a Log,
+    scope: crate::table::Scope,
+    members: &'a BTreeSet<Actor>,
+    /// The members holding the version fence back: none, or the pass signs nothing, and the
+    /// store refuses to sign over any ([`crate::table::store::Store::sign_checkpoint`]).
+    held: &'a [(Actor, hearing::Hold)],
+    now_ms: u64,
+}
+
+impl Pass<'_> {
+    /// Second the newest share this Mac computes identically, or propose its own once due.
+    fn sign(&self, store: &mut crate::table::store::Store, stride: u64) -> Result<Signed> {
+        let (session, log) = (self.session, self.log);
+        let me = session.actor();
+        let authored = |id: &Digest| log.authored_ms(id);
+        let state = |cut: &BTreeSet<Digest>| state(self.table, session, log, cut);
+        let history = History {
+            scope: self.scope.digest(),
+            generation: self.scope.generation(),
+            index: log.causal_index(),
+            projection: log.projection(),
+            authored: &authored,
+            state: &state,
+        };
+        let shares: Vec<(Actor, Body)> = store
+            .checkpoints()
+            .map(|(signer, body)| (signer, body.clone()))
+            .filter(|(_, body)| body.scope == history.scope)
+            .collect();
+        let mine: Vec<&Body> = shares
+            .iter()
+            .filter(|(signer, _)| *signer == me)
+            .map(|(_, body)| body)
+            .collect();
+        let nests = |body: &Body| mine.iter().all(|earlier| contains(body, earlier));
+        let mut theirs: Vec<&Body> = shares
+            .iter()
+            .filter(|(signer, body)| *signer != me && !mine.contains(&body) && nests(body))
+            .map(|(_, body)| body)
+            .collect();
+        theirs.sort_by_key(|body| std::cmp::Reverse(body.below));
+        for body in theirs {
+            if let Ok(computed) = checkpoint::second(&history, body) {
+                store.sign_checkpoint(session, &computed, self.held)?;
+                return Ok(Signed::Seconded);
+            }
+        }
+        let writers = current_writers(log, self.members, self.now_ms);
+        let Some(computed) =
+            checkpoint::compute(&history, &writers, self.now_ms.saturating_sub(AGE_MS))
+        else {
+            return Ok(Signed::Nothing);
+        };
+        let shared = mine.iter().map(|body| body.below).max().unwrap_or(0);
+        if !nests(computed.body()) || computed.body().below < shared.saturating_add(stride) {
+            return Ok(Signed::Nothing);
+        }
+        store.sign_checkpoint(session, &computed, self.held)?;
+        Ok(Signed::Proposed)
+    }
+
+    /// The newest checkpoint of this table this Mac signed that is final ([`finality`]), whose
+    /// cut holds the store's present floor; `None` where there is none.
+    fn final_floor(&self, store: &crate::table::store::Store) -> Option<Body> {
+        let me = self.session.actor();
+        // Each body, by its one encoding, with the members that signed it.
+        let mut signers: BTreeMap<Vec<u8>, (&Body, BTreeSet<Actor>)> = BTreeMap::new();
+        for (signer, body) in store.checkpoints() {
+            if body.scope == self.scope.digest() && body.generation == self.scope.generation() {
+                signers
+                    .entry(checkpoint::encode(body))
+                    .or_insert_with(|| (body, BTreeSet::new()))
+                    .1
+                    .insert(signer);
+            }
+        }
+        let floor = store.floor();
+        signers
+            .into_values()
+            .filter(|(body, signed)| {
+                signed.contains(&me)
+                    && floor.is_none_or(|floor| contains(body, floor))
+                    && self.cut_ms(body).is_some_and(|cut_ms| {
+                        let seats = finality::recent(self.members, cut_ms, |seat| {
+                            self.last_signed_ms(seat, cut_ms)
+                        });
+                        finality::is_final(&seats, signed)
+                    })
+            })
+            .max_by_key(|(body, _)| body.below)
+            .map(|(body, _)| (*body).clone())
+    }
+
+    /// The cut's time: its newest frontier tip's authored time. `None` where a tip is not here.
+    fn cut_ms(&self, body: &Body) -> Option<u64> {
+        body.frontier
+            .values()
+            .map(|tip| self.log.authored_ms(&tip.digest))
+            .try_fold(0, |newest, at| Some(newest.max(at?)))
+    }
+
+    /// `seat`'s newest record here authored at or before `cut_ms`.
+    fn last_signed_ms(&self, seat: &Actor, cut_ms: u64) -> Option<u64> {
+        let index = self.log.causal_index();
+        self.log
+            .projection()
+            .ordered
+            .iter()
+            .filter(|id| index.get(id).is_some_and(|header| header.actor == *seat))
+            .filter_map(|id| self.log.authored_ms(id))
+            .filter(|at| *at <= cut_ms)
+            .max()
     }
 }
 

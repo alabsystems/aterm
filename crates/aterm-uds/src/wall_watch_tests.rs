@@ -109,3 +109,29 @@ fn this_mac_announces_its_steps_and_wakes() {
     assert_eq!(watch.fds().len(), 2);
     assert!(!watch.take().any(), "nothing moved at start");
 }
+
+/// A ZONED WATCH HEARS THE TIME ZONE TOO ([`WallWatch::start_zoned`]): on macOS its
+/// `com.apple.system.timezone` registration is a third descriptor beside the doorbell and
+/// `clock_set` (the plumbing is [`a_libnotify_post_polls_ready_and_reads_as_a_step`]'s: posting
+/// the system's name would tell every process on the Mac its zone moved), nothing is read at
+/// start, and a told zone change polls ready and reads as `zoned` alone, once.
+///
+/// NEGATIVE CONTROL (run 2026-11-15): with `start_zoned` registering no zone (`start_with(None)`)
+/// the test fails at "the zone registered" (`left: 2 right: 3`).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_zoned_watch_hears_the_time_zone_too() {
+    let plain = WallWatch::start().expect("macOS announces both");
+    assert!(plain.zone.is_none(), "CONTROL: a plain watch hears no zone");
+    let watch = WallWatch::start_zoned().expect("macOS announces all three");
+    assert_eq!(watch.fds().len(), 3, "the zone registered");
+    assert!(!watch.take().any(), "nothing moved at start");
+    watch.tell(Moved {
+        zoned: true,
+        ..Moved::default()
+    });
+    assert!(ready(&watch));
+    let moved = watch.take();
+    assert!(moved.zoned && !moved.stepped && !moved.woke && moved.any());
+    assert!(!watch.take().any(), "taken once");
+}

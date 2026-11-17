@@ -712,6 +712,266 @@ fn tier_3_takes_an_unhashed_uplift_only_when_its_twin_is_the_same_artifact() {
     assert!(CARGO_LOCKS.iter().all(|l| debug.join(l).exists()));
 }
 
+/// One removal of each tier on the synthetic target `t` at `now` (`seen` its survey): 0 to 3 as
+/// [`ordinary_method`] names them (the idle reclaim, the pressure reclaim, the whole removal,
+/// tier 3), and 4 tier 0's, of the died build's metadata folder `debug/deps/rmetaAb12Cd`.
+fn windows_method(
+    method: usize,
+    t: &Path,
+    now: i64,
+    seen: i64,
+    hook: &mut dyn FnMut(Stage, &Path),
+) -> std::io::Result<Removed> {
+    if method < 4 {
+        return ordinary_method(method, t, now, seen, hook);
+    }
+    let debug = t.join("debug");
+    let piece = at(&debug, "deps/rmetaAb12Cd");
+    reclaim_died_with(t, &debug, &piece, &judge(now), seen, &mut || Ok(()), hook)
+}
+
+/// Lay the died build's metadata folder [`windows_method`]'s tier 0 takes, under `t`'s profile.
+fn lay_died_piece(t: &Path) -> PathBuf {
+    let piece = at(t, "debug/deps/rmetaAb12Cd");
+    std::fs::create_dir_all(&piece).expect("rmeta");
+    std::fs::write(piece.join("lib.rmeta"), vec![2u8; 8192]).expect("rmeta file");
+    piece
+}
+
+/// The exit test of DC-20w: on Windows each remover of the disk pass (tiers 0 to 4) takes what it
+/// removes under cargo's locks, moves it into a stage of its own, lets the locks go, and only
+/// then deletes the stage, so a build that starts in that profile meanwhile takes its lock at
+/// once. NTFS renames no folder while a file under it is open, and the pass holds each
+/// profile's locks open inside it, so the whole removal stages one level lower: the profile, its
+/// locks, and a build that took one stay, and the directory is not gone whole on that pass.
+///
+/// Negative controls: the probe at `Staged` finds the lock held, and a pass that deleted in
+/// place would come to its first removal with `debug/.cargo-lock` held, where `Build::holds`
+/// panics; the whole removal that went on to remove the profile its build holds would leave no
+/// `debug/.cargo-lock`.
+#[test]
+fn a_pass_on_windows_lets_go_of_the_cargo_locks_before_it_deletes() {
+    for method in 0..5 {
+        let tmp = Tmp::new("win-lets-go");
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        let piece = if method == 4 {
+            lay_died_piece(&t)
+        } else {
+            PathBuf::new()
+        };
+        let now = now_after_write(STALE + 1);
+        let seen = if method == 4 {
+            now
+        } else {
+            assessed(&t, now).profiles[0].last_used.unwrap()
+        };
+        let lock = debug.join(".cargo-lock");
+        let mut order = Vec::new();
+        let mut held_when_staged = None;
+        let mut free_at_first_removal = None;
+        let mut build: Option<Build> = None;
+        let done = windows_method(method, &t, now, seen, &mut |stage, _| {
+            if stage != Stage::Removing {
+                if stage == Stage::Staged && held_when_staged.is_none() {
+                    held_when_staged = Some(held(&lock));
+                }
+                order.push(stage);
+                return;
+            }
+            if build.is_none() {
+                free_at_first_removal = Some(!held(&lock));
+                build = Some(Build::holds(&lock));
+            }
+        })
+        .expect("reclaimed");
+        // The whole removal stages each pinned folder's entries, and deletes each stage.
+        order.dedup();
+        assert_eq!(order, STAGED_ORDER, "method {method}");
+        assert_eq!(held_when_staged, Some(true), "method {method}");
+        assert_eq!(free_at_first_removal, Some(true), "method {method}");
+        assert!(build.is_some(), "method {method}: a build took the lock");
+        assert!(done.bytes > 0, "method {method}: {done:?}");
+        assert!(stages_in(&t).is_empty(), "method {method}: stage left");
+        match method {
+            0 | 1 => assert!(!debug.join(INCREMENTAL).exists(), "method {method}"),
+            2 => {
+                assert!(t.join("CACHEDIR.TAG").exists(), "{done:?}");
+                assert!(lock.exists(), "the build's lock stays: {done:?}");
+                assert!(!debug.join("deps").exists(), "{done:?}");
+                assert!(done.units.is_empty(), "{done:?}");
+                assert!(
+                    done.trouble.iter().any(|w| w.contains("a build holds")),
+                    "{done:?}"
+                );
+            }
+            3 => {
+                for gone in ["deps", "build", ".fingerprint", INCREMENTAL] {
+                    assert!(!debug.join(gone).exists(), "{gone}: {done:?}");
+                }
+            }
+            _ => {
+                assert!(!piece.exists(), "{done:?}");
+                assert_eq!(done.units, vec![piece.clone()], "{done:?}");
+            }
+        }
+        drop(build);
+    }
+}
+
+/// On Windows an entry a handle holds open (here a test binary running from `deps/`: its file
+/// open under the folder) refuses its rename into the stage. It stays where it was, whole: never
+/// deleted in place under the locks instead. The reason is said, the build directory is not
+/// gone whole, and the next pass, the handle closed, takes it (tiers 1 and 3, the ones that
+/// take `deps/`).
+///
+/// Negative control: `deps/liblay.rlib`, beside the open file, survives the first pass; a pass
+/// that fell back to deleting the refused entry in place would remove it, and one that took the
+/// open file's siblings would leave `deps/` without it.
+#[test]
+fn a_pass_on_windows_keeps_an_entry_an_open_handle_holds_for_the_next_pass() {
+    for method in [2, 3] {
+        let tmp = Tmp::new("win-held-entry");
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        let running = at(&debug, "deps/lay-0123abcd.exe");
+        std::fs::write(&running, vec![1u8; 16 * 1024]).expect("a test binary");
+        let now = now_after_write(8);
+        // Shared for reading alone, as a loaded program image is.
+        let open = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&running)
+            .expect("running");
+        let done = windows_method(method, &t, now, now, &mut |_, _| {}).expect("the rest went");
+        assert!(running.exists(), "method {method}: {done:?}");
+        assert!(
+            at(&debug, "deps/liblay.rlib").exists(),
+            "method {method}: deps/ is kept whole: {done:?}"
+        );
+        assert!(
+            !debug.join(INCREMENTAL).exists(),
+            "method {method}: {done:?}"
+        );
+        assert!(
+            done.trouble.iter().any(|w| w.contains("deps")
+                && w.contains("a handle holds it open")
+                && w.contains("stays where it was")),
+            "method {method}: said: {done:?}"
+        );
+        assert!(!done.units.contains(&t), "method {method}: {done:?}");
+        assert!(t.exists(), "method {method}");
+        assert!(stages_in(&t).is_empty(), "method {method}: no stage left");
+        drop(open);
+
+        // The next pass, the whole removal, takes what stayed and the directory with it.
+        let again = windows_method(2, &t, now, now, &mut |_, _| {}).expect("the next pass");
+        assert_eq!(
+            again.units,
+            std::slice::from_ref(&t),
+            "method {method}: {again:?}"
+        );
+        assert!(!t.exists(), "method {method}");
+    }
+}
+
+/// On Windows a whole removal that can stage nothing more after an entry a handle held stayed
+/// (here a full disk at the rename after `deps/`'s) deletes the rest in place under the locks,
+/// as where no stage can be made, but never what the handle held: `deps/` stays whole and the
+/// reason is still said.
+///
+/// Negative control: `deps/liblay.rlib`, beside the open file, survives; the fallback that
+/// deleted the whole build directory in place would remove it and lose the handle's line.
+#[test]
+fn a_whole_removal_that_falls_back_in_place_keeps_what_a_handle_held() {
+    let tmp = Tmp::new("win-held-fallback");
+    let t = synthetic_target(&tmp, "target");
+    let debug = t.join("debug");
+    let running = at(&debug, "deps/lay-0123abcd.exe");
+    std::fs::write(&running, vec![1u8; 16 * 1024]).expect("a test binary");
+    let now = now_after_write(8);
+    let open = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(1)
+        .open(&running)
+        .expect("running");
+    // `.rustc_info.json`, `.fingerprint`, `build` and `deps` are tried in that order; the
+    // fifth rename (`incremental`) finds the disk full.
+    fd::inject_move_fault(Some((4, 112)));
+    let result = windows_method(2, &t, now, now, &mut |_, _| {});
+    fd::inject_move_fault(None);
+    let done = result.expect("the rest went");
+    assert!(running.exists(), "{done:?}");
+    assert!(at(&debug, "deps/liblay.rlib").exists(), "{done:?}");
+    for gone in [".fingerprint", "build", INCREMENTAL] {
+        assert!(!debug.join(gone).exists(), "{gone}: {done:?}");
+    }
+    assert!(
+        done.trouble
+            .iter()
+            .any(|w| w.contains("deps") && w.contains("a handle holds it open")),
+        "{done:?}"
+    );
+    assert!(done.units.is_empty(), "{done:?}");
+    assert!(t.exists());
+    assert!(stages_in(&t).is_empty(), "no stage left");
+    drop(open);
+}
+
+/// On Windows a pass killed once it staged and let go (here a panic at its first removal)
+/// leaves each stage it made tagged and let go, and the next pass, the directory's idle row,
+/// finishes every one and counts what it held, as on unix.
+///
+/// Negative control: the same pass without the panic leaves no stage.
+#[test]
+fn a_pass_on_windows_finishes_a_stage_a_killed_pass_left() {
+    for method in 0..5 {
+        for stop in [true, false] {
+            let tmp = Tmp::new("win-left-stage");
+            let t = synthetic_target(&tmp, "target");
+            if method == 4 {
+                lay_died_piece(&t);
+            }
+            let now = now_after_write(STALE + 1);
+            let seen = if method == 4 {
+                now
+            } else {
+                assessed(&t, now).profiles[0].last_used.unwrap()
+            };
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                windows_method(method, &t, now, seen, &mut |stage, _| {
+                    assert!(
+                        !(stop && stage == Stage::Removing),
+                        "the pass stops at its first removal"
+                    );
+                })
+            }));
+            let stages = stages_in(&t);
+            if !stop {
+                first.expect("no stop").expect("reclaimed");
+                assert!(stages.is_empty(), "method {method}: {stages:?}");
+                continue;
+            }
+            assert!(first.is_err(), "method {method}: the pass stopped");
+            // The whole removal stages the root's entries and the profile's, each in its own.
+            let made = if method == 2 { 2 } else { 1 };
+            assert_eq!(stages.len(), made, "method {method}: {stages:?}");
+            for stage in &stages {
+                assert!(stage.join(STAGE_TAG).exists(), "method {method}");
+                assert!(!held(&stage.join(STAGE_TAG)), "method {method}");
+            }
+            let td = assessed(&t, now);
+            assert_eq!(td.stages.len(), made, "method {method}: {td:?}");
+            let done = reclaim(&t, &judge(now)).expect("the next pass finishes it");
+            assert!(done.bytes > 0, "method {method}: {done:?}");
+            for stage in &stages {
+                assert!(done.units.contains(stage), "method {method}: {done:?}");
+            }
+            assert!(stages_in(&t).is_empty(), "method {method}");
+        }
+    }
+}
+
 #[test]
 #[ignore = "a measurement, run by hand"]
 fn reclaim_wall_time() {

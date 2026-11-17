@@ -2659,7 +2659,7 @@ pub const VERBS: &[VerbSpec] = &[
         Read,
         Lines,
         Session,
-        "described [--json]: each description slot's standing claim, its author, rank and the rest",
+        "described [history [n=<1-16>]] [--json]: the session's card: claims, history and derived facts",
         "",
     )
     .page(&crate::verb_page::described::PAGE)
@@ -2685,14 +2685,29 @@ pub const VERBS: &[VerbSpec] = &[
          state (`by=ctl|harness|bridge|<sid>|-`). Rate-limited to 1/s burst 20 (`ERR busy \
          retry_ms=<ms>`), capped at 1/4 of the log ring. DESC: `mark <-|r<n>> desc field=<slot> \
          [value=<pct>] [upto=<seq>] [ttl=<s>] [as=<name>] [re=<seq>]` claims one slot of a \
-         description (`help described`): the session's, or one of its agents'. `<slot>` is \
-         `title`, `description` or another word of lower-case `[a-z0-9.-]{1,24}`, refused when it \
-         is anything else, never rewritten. `value=` is one visible line, percent-encoded, of at \
-         most 256 encoded bytes: an empty, longer or multi-line one is refused, never cut. \
+         description (`help described`): the session's, or one of its agents'. `<slot>` is one of \
+         `title`, `matters`, `description`, `track`, `done` and `package`, or another word of \
+         lower-case `[a-z0-9.-]{1,24}`, refused when it is anything else, never rewritten. \
+         `field=history` claims no slot: it appends a line to the subject's history (one line a \
+         turn, a better rank replacing the turn's line, the newest 16 kept) and needs a `value=` \
+         (`ERR mark: a history line has a text`). `value=` is one visible line, percent-encoded, \
+         of at most 256 encoded bytes: an empty, longer or multi-line one is refused, never cut. \
+         A `package` is 1 to 4 tracker ids like `FL-04`, comma-separated, none repeated, at most \
+         103 bytes (`ERR mark: package is 1 to 4 tracker ids like FL-04, comma-separated`). A \
+         `done` from a writer aterm ran is refused (`ERR mark: done is declared by a person, the \
+         session's program, its creator or ctl`), and from every author but a person a value the \
+         harness would read as a `NEEDS YOU:`, `Nothing left:` or `Could not finish:` line or as \
+         `LANDED` (`ERR mark: value reads as a protocol line`). \
          `aterm ctl` reads the first line of stdin in place of a `value=-`; a value that is \
          itself `-` is `value=%2D`. No `value=` withdraws the caller's own claim of that slot and \
-         nobody else's. For `desc`, `-` is the session's open agent run, else the session, and a \
-         named node is an open agent run `r<n>` (`ERR mark: <node> is not an agent run`). \
+         nobody else's. A `desc`'s `by=` is where the calling process runs, read from its chain \
+         of parents: inside this session it is the session's ID and ranks `program`, inside the \
+         session this one's task names in `from=` `creator`, inside any other session it is \
+         listed and never stands, and outside every tab it is `ctl`; a child the session's own \
+         program detached from its process tree reads `ctl`, below `program`, though it keeps \
+         the shell's process group (`help described ranks`). For `desc`, `-` is the \
+         session's open agent run, else the session, and a named node is an open agent run \
+         `r<n>` (`ERR mark: <node> is not an agent run`). \
          `upto=<seq>` is the log position the writer had read, which `behind=` is counted from \
          (`ERR mark: upto=<n> is ahead of the log`); `ttl=<1..86400 s>` ends the claim's \
          standing after that many seconds. Text from every author but a person is redacted \
@@ -3774,7 +3789,9 @@ pub const VERBS: &[VerbSpec] = &[
          `resting=true|false` (whether that window rests: untouched and showing no new output \
          for `idle_rest_secs`, so it runs no blink and its deck draws still), \
          `attended=true|false` (whether a person touched that window within the last 40 s; \
-         past that its deck draws still at each reading until the next touch), \
+         past that its deck draws still at each reading until the next touch; always `true` \
+         in a `--headless` instance, under `motion = \"full\"` and for a window being \
+         recorded), \
          `sight=visible|covered|off-glass` (where that window's frames can be seen: `visible`, \
          some of it on screen; `covered`, fully covered, on another Space or on a sleeping \
          display, drawing at most a frame every 5 s; `off-glass`, minimised or its app hidden, \
@@ -4809,8 +4826,17 @@ pub fn json_verbs() -> impl Iterator<Item = &'static str> {
 
 /// The grammar generation each side states in `hello` (`lane=`) to identify its private protocol.
 /// Generation 10 removes compatibility notices; generation 9 is not reused for another grammar.
-/// Generation 11 adds `deliver … was=<n>` ([`LINK_MOVED_LANE`]).
-pub const BRIDGE_LANE: u32 = 11;
+/// Generation 11 adds `deliver … was=<n>` ([`LINK_MOVED_LANE`]); generation 12 adds
+/// `link log … proved=1` ([`LINK_PROVED_LANE`]).
+pub const BRIDGE_LANE: u32 = 12;
+
+/// The lane that added `proved=1` to `link log <id> continues=<f> was=<old>` (12 in
+/// [`BRIDGE_LANE`]'s list), for both sides: the bridge proved by the records it told the endpoint
+/// that `<id>`, another log than `<old>`, holds `<old>`'s records below `f` (astream gives a log
+/// whose identity sidecar does not read another id, keeping every record), so the endpoint keeps
+/// what it holds below `f` as it does across a move. Without it, a `continues=` names only an
+/// earlier generation of the same log, the one pair astream's lineage carries.
+pub const LINK_PROVED_LANE: u32 = 12;
 
 /// The lane that added `was=<n>` to `deliver` (11 in [`BRIDGE_LANE`]'s list), for both sides: the
 /// record was moved here across this Mac's own key rotation (§11 C3b), its mail first at offset

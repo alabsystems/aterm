@@ -108,6 +108,25 @@ impl Flush {
         )
     }
 
+    /// Flush the entries of this exact held directory, without reopening a pathname.
+    /// No unavailable flush is accepted. The requested durability or ordering strength is
+    /// the same as [`Self::file`], and the directory failure seam applies here too.
+    /// Native errors retain their errno for callers that classify unavailable directory flushes.
+    ///
+    /// # Errors
+    /// Reading its metadata fails, the descriptor is not a directory, or its flush fails.
+    pub fn dir_held(self, dir: &File) -> io::Result<()> {
+        if !dir.metadata()?.is_dir() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        #[cfg(any(test, debug_assertions, feature = "test-support"))]
+        if let Some(failed) = seam::dir_failure() {
+            seam::note(self);
+            return Err(failed);
+        }
+        self.file(dir)
+    }
+
     fn dir_using(
         self,
         dir: &Path,

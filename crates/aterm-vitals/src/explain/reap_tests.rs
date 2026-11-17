@@ -3,7 +3,7 @@
 
 //! The reap credit's ledger, step by step.
 
-use super::{ReapFault, ReapLedger, Scope, StepIn};
+use super::{HistoricalReported, ReapFault, ReapLedger, Scope, StepIn};
 use crate::explain::fixtures::tab;
 use crate::model::{NativeCpuCut, NativeCpuWindow, ProcSample, ProcState, TabRoot, attribute};
 
@@ -326,6 +326,12 @@ fn missed(r: &Run) -> u64 {
         .map_or(0, |t| t.missed)
 }
 
+fn historical(r: &Run) -> (u64, u64, bool) {
+    let h = r.ledger.historical_reported();
+    assert_eq!(h, r.ledger.totals().historical_reported);
+    (h.own_ns / MS, h.tabs_ns / MS, h.incomplete)
+}
+
 /// Tab `key`'s growth since `base`, ms, and whether a step between knowingly missed some of it.
 fn since(r: &Run, base: &super::ReapTotals, key: u64) -> (u64, bool) {
     let (ns, missed) = r.ledger.totals().since(base, key);
@@ -380,6 +386,7 @@ fn original_wait_finals_charge_short_siblings_once_and_leave_unrelated_reaps_own
     let now = [p(ATERM, 1, 0, 300), p(SHELL, ATERM, 0, 0)];
     r.step(&now);
     assert_eq!((r.tab(), r.all()), (300, 300));
+    assert_eq!(historical(&r), (0, 50, false));
     r.step(&now);
     assert_eq!(
         (r.tab(), r.all()),
@@ -393,6 +400,7 @@ fn original_wait_finals_charge_short_siblings_once_and_leave_unrelated_reaps_own
         (300, 400),
         "the daemon's other child remains its own work"
     );
+    assert_eq!(historical(&r), (0, 50, false));
 }
 
 #[test]
@@ -422,6 +430,7 @@ fn terminal_transport_custody_survives_truncated_and_missing_process_sweeps() {
             "a deferred whole sweep uses its actual broader adoption interval"
         );
         assert!(r.ledger.pending_terminals.is_empty());
+        assert_eq!(historical(&r), (0, 40, truncated));
     }
 }
 
@@ -555,6 +564,7 @@ fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_reported_baseline()
     let mut r = Run::new();
     r.step(&sweep(0, &[p(300, SHELL, 10, 0)]));
     r.step(&sweep(0, &[p(300, SHELL, 30, 0)]));
+    assert_eq!(historical(&r), (0, 20, false));
     r.step(&sweep(
         0,
         &[P {
@@ -576,6 +586,7 @@ fn an_own_cpu_counter_read_after_an_unread_step_starts_a_new_reported_baseline()
         r.ledger.totals().reported_since(&recovered, 1),
         (20 * MS, false)
     );
+    assert_eq!(historical(&r), (0, 40, true));
 }
 
 #[test]
@@ -604,6 +615,91 @@ fn a_decreasing_own_counter_preserves_its_maximum_until_a_new_baseline_is_read()
         110 * MS,
         "previously proved lifetime CPU is never counted twice"
     );
+    assert_eq!(historical(&r), (0, 110, true));
+}
+
+#[test]
+fn historical_credit_survives_duplicate_delegated_and_terminal_readings_once() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+    assert_eq!(historical(&r), (0, 100, false));
+    r.jobs.push(300);
+    r.step(&sweep(0, &[p(300, SHELL, 200, 0)]));
+    assert_eq!(historical(&r), (0, 100, false));
+    r.jobs.clear();
+    r.step(&sweep(0, &[p(300, SHELL, 250, 0)]));
+    assert_eq!(historical(&r), (0, 150, false));
+
+    r.native_terminals = vec![terminal(1, 300, 3000, 300, 700)];
+    // The process sweep preceded the final wait: its lower live counter cannot replace
+    // the accepted final counter, and the inherited child charge adds no published credit.
+    r.step(&sweep(0, &[p(300, SHELL, 250, 0)]));
+    assert_eq!(historical(&r), (0, 200, false));
+    r.step(&sweep(0, &[]));
+    r.step(&sweep(0, &[]));
+    assert_eq!(historical(&r), (0, 200, false));
+}
+
+#[test]
+fn historical_credit_marks_missing_identity_or_a_missing_final_counter_sticky() {
+    for absent in [false, true] {
+        let mut r = Run::new();
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+        r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+        assert_eq!(historical(&r), (0, 100, false));
+        if absent {
+            r.step(&sweep(0, &[]));
+        } else {
+            r.step(&sweep(0, &[p(300, SHELL, 140, 0).unread()]));
+        }
+        assert_eq!(historical(&r), (0, 100, true));
+        r.step(&sweep(0, &[p(300, SHELL, 150, 0)]));
+        r.step(&sweep(0, &[p(300, SHELL, 180, 0)]));
+        assert_eq!(historical(&r), (0, 130, true));
+    }
+}
+
+#[test]
+fn historical_credit_closes_a_zombie_without_inventing_a_missing_final_gap() {
+    let mut r = Run::new();
+    r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 100, 0)]));
+    r.step(&sweep(0, &[p(300, SHELL, 125, 0).zombie()]));
+    r.step(&sweep(0, &[]));
+    assert_eq!(historical(&r), (0, 125, false));
+    r.native_incomplete = true;
+    r.step(&sweep(0, &[]));
+    r.native_incomplete = false;
+    r.step(&sweep(0, &[]));
+    assert_eq!(historical(&r), (0, 125, true));
+}
+
+#[test]
+fn historical_credit_saturates_components_and_marks_an_overflowing_combined_total() {
+    let cpu_ms = u64::MAX / MS / 2 + 1;
+    let one = cpu_ms * MS;
+    assert!(one.checked_add(one).is_none());
+    for both_tabs in [false, true] {
+        let mut r = Run::new();
+        let parent = if both_tabs { SHELL } else { ATERM };
+        r.step(&sweep(0, &[p(300, SHELL, 0, 0), p(310, parent, 0, 0)]));
+        r.step(&sweep(
+            0,
+            &[p(300, SHELL, cpu_ms, 0), p(310, parent, cpu_ms, 0)],
+        ));
+        let h = r.ledger.historical_reported();
+        assert_eq!(h.own_ns, if both_tabs { 0 } else { one });
+        assert_eq!(h.tabs_ns, if both_tabs { u64::MAX } else { one });
+        assert!(h.incomplete);
+        assert_eq!(r.ledger.totals().historical_reported, h);
+        r.step(&sweep(
+            0,
+            &[p(300, SHELL, cpu_ms, 0), p(310, parent, cpu_ms, 0)],
+        ));
+        assert_eq!(r.ledger.historical_reported(), h);
+    }
 }
 
 #[test]
@@ -774,6 +870,14 @@ fn own_reported_keeps_panes_separate_and_retains_a_closed_panes_logical_remainde
         150 * MS,
         "the closed pane's orphan stays in its logical tab without becoming the surviving pane's own work"
     );
+    assert_eq!(
+        later.historical_reported,
+        HistoricalReported {
+            own_ns: 0,
+            tabs_ns: 900 * MS,
+            incomplete: false,
+        }
+    );
 }
 
 #[test]
@@ -828,6 +932,15 @@ fn coalition_reported_reuses_only_an_observed_unchanged_exec_version() {
     assert_eq!(totals.coalition_reported.get(&500), Some(&(50 * MS)));
     assert_eq!(totals.unmapped_reported, 100 * MS);
     assert_eq!(totals.all_reported, 300 * MS);
+    assert_eq!(
+        totals.historical_reported,
+        HistoricalReported {
+            own_ns: 0,
+            tabs_ns: 300 * MS,
+            incomplete: false,
+        },
+        "an observed exec preserves the process lifetime's own-counter continuity"
+    );
 }
 
 #[test]
@@ -1552,10 +1665,15 @@ fn a_closed_tabs_work_folds_into_aterms_own() {
     r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
     r.step(&sweep(0, &[p(300, SHELL, 300, 0)]));
     assert_eq!((r.tab(), r.all()), (300, 300));
+    assert_eq!(historical(&r), (0, 300, false));
     r.tabs.clear();
+    r.step(&sweep(0, &[p(300, SHELL, 300, 0)]));
+    assert_eq!((r.tab(), r.all()), (0, 300));
+    assert_eq!(historical(&r), (0, 300, false));
     r.step(&sweep(0, &[p(300, SHELL, 500, 0)]));
     assert_eq!((r.tab(), r.all()), (0, 500));
     assert_eq!(r.ledger.row(300).map(|v| v.scope), Some(Scope::Own));
+    assert_eq!(historical(&r), (200, 300, false));
 }
 
 /// A process aterm started before its tab was read (the shell, first seen as aterm's own)
@@ -1567,9 +1685,11 @@ fn a_tabs_shell_first_seen_as_aterms_moves_to_its_tab() {
     r.step(&sweep(0, &[]));
     r.step(&sweep(40, &[]));
     assert_eq!((r.tab(), r.all()), (0, 80));
+    assert_eq!(historical(&r), (80, 0, false));
     r.tabs = vec![tab(1, SHELL)];
     r.step(&sweep(100, &[]));
     assert_eq!((r.tab(), r.all()), (60, 200));
+    assert_eq!(historical(&r), (140, 60, false));
 }
 
 /// A cut sweep is skipped: a member it missed may be alive, so nothing goes pending and the
@@ -1579,12 +1699,15 @@ fn a_cut_sweep_is_skipped() {
     let mut r = Run::new();
     r.step(&sweep(0, &[p(300, SHELL, 0, 0)]));
     r.step(&sweep(0, &[p(300, SHELL, 0, 0), p(310, 300, 100, 0)]));
+    assert_eq!(historical(&r), (0, 100, false));
     r.step_cut(&sweep(0, &[p(300, SHELL, 0, 0)]), true);
+    assert_eq!(historical(&r), (0, 100, true));
     assert_eq!(r.ledger.row(310).map(|v| v.cpu_ns), Some(100 * MS));
     assert_eq!(
         r.step(&sweep(0, &[p(300, SHELL, 0, 0), p(310, 300, 160, 0)])),
         160
     );
+    assert_eq!(historical(&r), (0, 160, true));
 }
 
 /// THE NAIVE Δ(LIVE + REAPED) DIPS: each counter its members' `cpu + child` now loses a

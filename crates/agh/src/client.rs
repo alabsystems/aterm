@@ -1451,6 +1451,25 @@ impl Github {
                 .fingerprint()
                 .to_string()
         };
+        self.refs(&run.slug)
+            .reconcile_dead_writer(permit, intents, true)?;
+        let refs = match &run.op {
+            crate::git::GitOp::PushRefs { batch, .. } => batch.updates().to_vec(),
+            crate::git::GitOp::PushControl { transaction, .. } => transaction
+                .changes()
+                .iter()
+                .map(|change| crate::github::refs::RefUpdate {
+                    reference: change.reference.clone(),
+                    before: change.before.clone().unwrap_or_else(|| "0".repeat(40)),
+                    after: change.after.clone().unwrap_or_else(|| "0".repeat(40)),
+                })
+                .collect(),
+            _ => {
+                return Err(Error::usage(
+                    "a journaled native push needs an exact ref batch",
+                ));
+            }
+        };
         let canonical = canon::git_request(run);
         let latest = intents.latest(WriteOp::RefUpdateAtomic, crate::github::refs::ATOMIC_KEY)?;
         if let Some(view) = latest.as_ref().filter(|view| view.open) {
@@ -1473,17 +1492,25 @@ impl Github {
             crate::github::refs::ATOMIC_KEY,
         )
         .with_request(canon::request_digest(&canonical))
+        .with_refs(refs)
         .with_body_digest(Some(crate::model::Sha256Digest::of(&canonical).to_string()))
         .with_after(latest.map(|view| view.intent.id));
-        let mut id = None;
+        let id = std::cell::RefCell::new(None);
         let mut admit = || {
-            id = Some(intents.begin(&draft)?);
+            *id.borrow_mut() = Some(intents.begin(&draft)?);
             Ok(())
         };
-        // Retain the original draft and credential across preparation. The runner
-        // calls this once, immediately before its first receive-capable child.
-        let result = crate::git::run_with_credential(self, run, decided.cred.clone(), &mut admit);
-        let Some(id) = id else {
+        let record = |pid| {
+            let held = id.borrow();
+            let id = held
+                .as_ref()
+                .ok_or_else(|| Error::local("native child has no durable intent"))?;
+            intents.writer_child(id, pid)
+        };
+        // Prepare first; then admit once and bind the actual child before execution.
+        let result =
+            crate::git::run_with_credential(self, run, decided.cred.clone(), &mut admit, &record);
+        let Some(id) = id.into_inner() else {
             return Err(before_the_write(result.err().unwrap_or_else(|| {
                 Error::local("the native write returned without journal admission")
             })));

@@ -2963,13 +2963,12 @@ pub fn build_machine_roster(
 }
 
 /// The row the default login (address `de`) takes under the lab's `fleet` where none of this
-/// Mac's preferred accounts is it: the label `kept`, the existing row of that account, gives it
-/// (after the native sync projects approved legacy renames), else the lab's label for the
-/// account ([`FleetRoster::known`]); none where the lab does not know the account and no row
-/// names it, or another account's row or fleet row holds that label, since the lab is what names
-/// an account here and a label is never taken from the row that holds it. Never a label with a
-/// machine in it, and never a slot read from an address ([`local_account`] is the sheet path's
-/// alone).
+/// Mac's preferred accounts is it: the label `kept`, the existing row of that account, gives it,
+/// else the lab's label for the account ([`FleetRoster::known`]); none where the lab does not
+/// know the account and no row names it, or another account's row or fleet row holds that label,
+/// since the lab is what names an account here and a label is never taken from the row that
+/// holds it. Never a label with a machine in it, and never a slot read from an address
+/// ([`local_account`] is the sheet path's alone).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -6178,7 +6177,7 @@ fn persist_accounts_sync(
     aterm_spec_anchor::refines(
         machine = "AccountIdentityCompletion",
         action = "Complete",
-        project = "aterm_agent::harness::accounts_sync::alab_tests::native_migration_tests::completion::completion_transition"
+        project = "aterm_agent::harness::accounts_sync::alab_tests::native_identity_tests::completion::completion_transition"
     )
 )]
 #[cfg_attr(
@@ -6186,7 +6185,7 @@ fn persist_accounts_sync(
     aterm_spec_anchor::refines(
         machine = "AccountIdentityCompletion",
         action = "Repeat",
-        project = "aterm_agent::harness::accounts_sync::alab_tests::native_migration_tests::completion::completion_transition"
+        project = "aterm_agent::harness::accounts_sync::alab_tests::native_identity_tests::completion::completion_transition"
     )
 )]
 #[cfg_attr(
@@ -6259,21 +6258,12 @@ fn persist_accounts_sync_with_pool(
         )
     })?;
     let lab = fleet.lab_snapshot.as_deref();
-    // Native label migration is part of this publication, not an earlier write. Project
-    // its roster and bindings in memory, then derive the final rows from the same lab.
     let mut projected_existing = original_existing.clone();
-    let (mut retained_state, _) = store.load(now)?;
-    let (original_logins, _) = store.load_logins(now)?;
-    let mut projected_logins = original_logins.clone();
-    let mut native_moves = Vec::new();
+    let (retained_state, _) = store.load(now)?;
+    let (logins, _) = store.load_logins(now)?;
+    // Under the lab every row keeps its label (no sync renames one), and the final rows are
+    // derived from the same lab as the roster this sync compares them with.
     let native_fleet = if let Some(lab) = lab {
-        if lab.settled {
-            native_moves =
-                super::alab_roster::renames(lab, Cli::Claude, &original_existing, |label| {
-                    accounts::label_is_retained(&retained_state, &projected_logins, label)
-                })
-                .moved;
-        }
         for row in &mut projected_existing.rows {
             // Retention compares provider identities. Complete a missing alias expectation
             // from the same unique native account before that comparison; the original
@@ -6283,15 +6273,7 @@ fn persist_accounts_sync_with_pool(
                     .account_of(Cli::Claude, row)
                     .and_then(|account| account.identity.clone());
             }
-            if let Some((_, to)) = native_moves.iter().find(|(from, _)| *from == row.label) {
-                row.label.clone_from(to);
-            }
         }
-        let pairs: Vec<(&str, &str)> = native_moves
-            .iter()
-            .map(|(from, to)| (from.as_str(), to.as_str()))
-            .collect();
-        accounts::move_accounts(&mut retained_state, &mut projected_logins, &pairs)?;
         super::alab_roster::fleet_for(lab, Cli::Claude, Some(&projected_existing))
     } else {
         None
@@ -6303,16 +6285,11 @@ fn persist_accounts_sync_with_pool(
         (store, &projected_existing),
         pool_ctx,
         lab,
-        &projected_logins,
+        &logins,
     )?;
-    // A pinned shared row must be compared to its original label and configuration.
-    // A scratch rename cannot grant permission to rewrite that shared authority.
-    retain_shared_rows(
-        &mut roster,
-        &original_existing,
-        &original_logins,
-        lab.is_some(),
-    )?;
+    // A pinned shared row must be compared to its original configuration: an identity
+    // completed in memory grants no permission to rewrite that shared authority.
+    retain_shared_rows(&mut roster, &original_existing, &logins, lab.is_some())?;
     let existing = projected_existing;
     // Under the lab a default login neither the lab nor a row of this Mac names gets no row
     // (`alab_default_account`): nothing is lost, since the roster never listed it.
@@ -6378,7 +6355,6 @@ fn persist_accounts_sync_with_pool(
     let chain = default_relocation(&existing, &roster)?;
     let mut moves = relabel_moves(&existing, &roster, &chain);
     let retained = retained_state;
-    let logins = projected_logins;
     let returns = returned::find(store, &existing, &roster, &retained, &logins, &moves)?;
     moves.extend(
         returns
@@ -6404,9 +6380,9 @@ fn persist_accounts_sync_with_pool(
     // It reads the bindings under the lock this sync holds through publication, as the
     // transaction below reads the ones it edits, whose directory check still refuses a row given
     // a directory another binding retains.
-    // The post-migration roster already carries each relabel's exact directory. Only
-    // genuinely new or repointed rows need directory discovery; a relabel must not turn
-    // an opaque but retained login into a different, empty directory.
+    // Only a row new here or repointed needs directory discovery (`rows_to_choose`): a label
+    // its account still holds keeps that row's directory (`label_dir_kept`), so an opaque but
+    // retained login is never traded for a different, empty one.
     let mut choose = rows_to_choose(&existing, &roster, &chain);
     for found in &returns {
         choose.retain(|label| label != &found.to);
@@ -6575,9 +6551,6 @@ fn persist_accounts_sync_with_pool(
             }
             validate_fleet_snapshots(protection.home.as_deref(), fleet_snapshots)?;
             let before = (state.clone(), logins.clone());
-            let native_pairs: Vec<(&str, &str)> = native_moves.iter()
-                .map(|(from, to)| (from.as_str(), to.as_str())).collect();
-            accounts::move_accounts(state, logins, &native_pairs)?;
             for found in &returns {
                 found.recheck(state, &roster)?;
                 found.restore(logins, &found.from);
@@ -6768,12 +6741,9 @@ fn persist_accounts_sync_with_pool(
                 events.extend(note_wrong_account_logins(&roster, logins, now));
             }
             for (wall_label, wall) in standing_walls {
-                let wall_label = native_moves.iter()
-                    .find(|(from, _)| from == wall_label)
-                    .map_or(wall_label.as_str(), |(_, to)| to.as_str());
                 let wall_label = moves.iter()
                     .find(|(from, _)| from == wall_label)
-                    .map_or(wall_label, |(_, to)| to.as_str());
+                    .map_or(wall_label.as_str(), |(_, to)| to.as_str());
                 if roster.row(wall_label).is_none() {
                     continue;
                 }
@@ -9563,19 +9533,11 @@ pub fn accounts_sync_off(config: Option<&Path>) -> bool {
 }
 
 /// Whether a sync of `cli` from the lab would change the roster at `roster_path`
-/// ([`super::alab_roster::sync_due`]), a rename judged against the records `store` keeps under
-/// each label, as the migration judges it; an unreadable store asks for the sync, which says why.
-fn lab_sync_due(cli: Cli, store: &accounts::Store, roster_path: &Path, now: i64) -> bool {
-    if cli == Cli::Claude && !store.source_policy().is_ok_and(|policy| policy.retired()) {
-        return true;
-    }
-    let records = store.load(now).ok().zip(store.load_logins(now).ok());
-    let Some(((state, _), (logins, _))) = records else {
-        return true;
-    };
-    super::alab_roster::sync_due(cli, roster_path, |label| {
-        accounts::label_is_retained(&state, &logins, label)
-    })
+/// ([`super::alab_roster::sync_due`]), or Claude Code's `store` has not retired its legacy
+/// source yet.
+fn lab_sync_due(cli: Cli, store: &accounts::Store, roster_path: &Path) -> bool {
+    (cli == Cli::Claude && !store.source_policy().is_ok_and(|policy| policy.retired()))
+        || super::alab_roster::sync_due(cli, roster_path)
 }
 
 /// THE ONE RULE OF WHEN A PERIODIC CALLER SYNCS a roster that stands (a window's upkeep, the
@@ -9626,19 +9588,15 @@ fn sync_called_for_recording(
         Err(_) => return true,
     };
     if selected {
-        return lab_sync_due(
-            Cli::Claude,
-            &accounts::Store::at(state_dir),
-            roster_path,
-            now,
-        ) || default_login_unlisted(
-            home,
-            state_dir,
-            (roster_path, config),
-            now,
-            rediscovery,
-            Some(claim),
-        );
+        return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path)
+            || default_login_unlisted(
+                home,
+                state_dir,
+                (roster_path, config),
+                now,
+                rediscovery,
+                Some(claim),
+            );
     }
     let configured = configured_source(Some(config), Some(roster_path));
     // A mode change invalidates this process's observation. Returning to the same path
@@ -10140,12 +10098,7 @@ fn init_sync_needed(
         Err(_) => return true,
     };
     if selected {
-        return lab_sync_due(
-            Cli::Claude,
-            &accounts::Store::at(state_dir),
-            roster_path,
-            now,
-        );
+        return lab_sync_due(Cli::Claude, &accounts::Store::at(state_dir), roster_path);
     }
     let config_path = config_beside(roster_path);
     let Ok(selected) = source_selection::select_for(
@@ -11745,7 +11698,7 @@ fn sync_cli_in_env(
     }
     let store = accounts::Store::at_for(state_dir, cli, home);
     let mut recovered_commit = store.recover_sync_within(ladder, &roster_path)?;
-    let mut captured = ProviderSource::capture(
+    let captured = ProviderSource::capture(
         cli,
         env,
         &store,
@@ -11803,7 +11756,6 @@ fn sync_cli_in_env(
         captured.validate(cli, env)?;
         let (write_to, keep_mode) = super::cli::roster_target(&roster_path)?;
         captured.protect(env, &write_to)?;
-        recovered_commit |= captured.migrate(cli, env, &store, &lock, &roster_path)?;
         let Some((fleet, pool_ctx, machine)) = captured.load(cli, &roster_path)? else {
             drop(lock);
             return sync_without_source(cli, (env, &store), &roster_path, ladder, now)

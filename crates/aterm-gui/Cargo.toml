@@ -226,6 +226,15 @@ name = "trail_dump"
 path = "examples/trail_dump.rs"
 required-features = ["bench-support"]
 
+# The comprehension marks' offscreen specimen, which `targo --unverified lab
+# comprehension-gallery` photographs (debug builds only). An example, so a build of this
+# crate and verify's `--tests` and `--lib` test runs leave it out; a plain `targo test` of the
+# crate builds and links it, as it does every example here, to check that it compiles. By hand:
+# `targo --unverified build -p aterm-gui --example comprehension_specimen`.
+[[example]]
+name = "comprehension_specimen"
+path = "examples/comprehension_specimen.rs"
+
 [features]
 # Accessibility delivery is native and unconditional on supported platforms:
 # macOS NSAccessibility, Linux AT-SPI and Windows UIA use one semantic tree.

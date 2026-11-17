@@ -39,6 +39,7 @@ fn covered(login: LoginHalf) -> Covered {
         label: Some("work".to_owned()),
         logged_in: true,
         login: LoginHere::Half(login),
+        login_turns: None,
     }
 }
 
@@ -1360,5 +1361,305 @@ fn an_offer_with_no_token_in_use_asks_the_lab_and_one_in_use_asks_nothing() {
         asked(account(away, &Lookup::Absent, None, Some(false), NOW)),
         (TokenState::None, false, Vec::new()),
         "no session here is logged into it"
+    );
+}
+
+/// What the surfaces say of the account a read at `now` finds: the state's words and word, the
+/// login half's word, the state line's phrase, the offer's pair and step and the Lab page's line.
+fn shown_at(account: &AccountToken, now: i64) -> String {
+    format!(
+        "{} | {} | {} | {:?} | {:?} | {:?}",
+        account.state.word(),
+        account.state.words(),
+        account.login.word(),
+        account.phrase(now),
+        account
+            .offer
+            .as_ref()
+            .map(|offer| (offer.pair.clone(), offer.step.to_string())),
+        account.offer_line(),
+    )
+}
+
+/// The law's sweep over one account whose read at `t` is `read(t)`, from `from` to `to`, every
+/// `step` seconds and at each second a read named and the one before it: wherever two
+/// consecutive instants show the account otherwise, the earlier one's read named a second no
+/// later than the later one ([`AccountToken::changes_after`]). Returns how many changes it saw.
+fn sweep(
+    name: &str,
+    (from, to): (i64, i64),
+    step: i64,
+    read: impl Fn(i64) -> AccountToken,
+) -> usize {
+    let mut at: std::collections::BTreeSet<i64> = (from..to).step_by(step as usize).collect();
+    for t in at.clone() {
+        if let Some(due) = read(t).changes_after(t).filter(|due| *due < to) {
+            at.extend([due - 1, due]);
+        }
+    }
+    let at: Vec<i64> = at.into_iter().filter(|t| (from..to).contains(t)).collect();
+    let mut changes = 0;
+    for pair in at.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let (was, then) = (read(a), read(b));
+        if shown_at(&was, a) != shown_at(&then, b) {
+            changes += 1;
+            let due = was.changes_after(a);
+            assert!(
+                due.is_some_and(|due| due <= b),
+                "{name}: read at {a} named {due:?}, but at {b} it shows {:?} where it showed {:?}",
+                shown_at(&then, b),
+                shown_at(&was, a),
+            );
+        }
+    }
+    changes
+}
+
+/// A TOKEN VIEW'S DEADLINE COMES NO LATER THAN THE FIRST CHANGE THE CLOCK ALONE MAKES
+/// ([`AccountToken::changes_after`], the token lane's computed deadline): over a month of a
+/// verified token (`active`, `soon` 30 days before its end, `ended` at it), ten days of an ending
+/// login on no token (the offer pair's half `ok`, then `ending` with the state line counting the
+/// days down, then `ended`), and an unverified token whose basis's week ends (`no reading yet`,
+/// then `awaiting a stored-login reading`), every change of what the surfaces say comes at or
+/// after the second the read before it named, each read made as a read then would make it.
+///
+/// NEGATIVE CONTROLS (run 2026-11-14): with the `soon` term left out of `changes_after`, the
+/// verified token's sweep fails where `active` turns `soon` (`a verified token: read at …
+/// named Some(<the end>)`); with the state line's days left out, the ending login's fails where
+/// `login ends in 6 days` turns 5 (`an ending login: read at … named Some(<the end>)`).
+#[test]
+fn the_views_deadline_is_no_later_than_its_first_change() {
+    let day = i64::try_from(DAY).unwrap();
+    let now = i64::try_from(NOW).unwrap();
+    let end = NOW + 31 * DAY;
+    let verified = Lookup::Found(standing(end, &[]));
+    let read = |t: i64| {
+        account(
+            covered(LoginHalf::Ok),
+            &verified,
+            None,
+            Some(false),
+            u64::try_from(t).unwrap(),
+        )
+    };
+    assert_eq!(
+        sweep("a verified token", (now, now + 32 * day), 3_600, read),
+        2,
+        "active, soon, ended"
+    );
+
+    let login_end = now + 10 * day;
+    let read = |t: i64| {
+        let covered = Covered {
+            login: LoginHere::Half(LoginHalf::of_forecast(Some(login_end), t)),
+            login_turns: LoginHalf::forecast_turns(Some(login_end), t),
+            ..covered(LoginHalf::Ok)
+        };
+        account(
+            covered,
+            &Lookup::Absent,
+            None,
+            Some(false),
+            u64::try_from(t).unwrap(),
+        )
+    };
+    assert!(
+        read(now).offer.is_some(),
+        "an offer stands for a login on no token"
+    );
+    assert_eq!(
+        sweep("an ending login", (now, now + 11 * day), 3_600, read),
+        8,
+        "ok, ending in 6 days to today, ended"
+    );
+
+    let mut unverified = standing(NOW + 300 * DAY, &[]);
+    if let Some(meta) = unverified.meta.as_mut() {
+        meta.verified = None;
+    }
+    unverified.minted_here = true;
+    let minted_at = unverified.meta.as_ref().map(|meta| meta.minted_at);
+    let week = now + 2 * day;
+    let kept = TokenRow {
+        minted_at,
+        verified: None,
+        verification: Verification {
+            basis: Some((
+                NOW - DAY,
+                crate::harness::accounts_tokens::Windows {
+                    week_reset: Some(week),
+                    session_reset: None,
+                },
+            )),
+            reading: None,
+            verdict: None,
+            shared_with: std::collections::BTreeSet::new(),
+        },
+        ..row()
+    };
+    let found = Lookup::Found(unverified);
+    let read = |t: i64| {
+        account(
+            covered(LoginHalf::Ok),
+            &found,
+            Some(kept.clone()),
+            Some(false),
+            u64::try_from(t).unwrap(),
+        )
+    };
+    assert!(
+        matches!(
+            read(now).state,
+            TokenState::Unverified {
+                why: tokens::Unverified::NoReadingYet,
+                ..
+            }
+        ),
+        "{:?}",
+        read(now).state
+    );
+    assert_eq!(
+        sweep(
+            "an unverified token's basis",
+            (now, now + 3 * day),
+            3_600,
+            read
+        ),
+        1,
+        "no reading yet, awaiting a stored-login reading"
+    );
+}
+
+/// A READ SET NAMES THE FILES THE VIEW OPENS, AND ITS STAMP MOVES ONLY WITH THEM
+/// ([`read_set_here`], [`ReadSet::stamp`]): the accounts store's state, the table, the steps and
+/// the upkeep's tried gaps ([`held_steps`] reads both), the roster, the default login's record
+/// and the vault's source are among its files; stamped twice with nothing written between, it
+/// stands; a table written in place of the one stamped moves it, and so does a vault configured
+/// under the home after it was stamped.
+///
+/// NEGATIVE CONTROLS: with the table left out of `read_set_here`'s files (run 2026-11-14), the
+/// test fails at `…/accounts/tokens.json not in [`; with the tried gaps left out (run
+/// 2026-11-16), at `…/accounts/tokens-tried.json not in [`.
+#[test]
+fn a_read_set_names_the_views_files_and_its_stamp_moves_with_them() {
+    let (dir, store) = scratch();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = dir.path().join("config").join("aterm.toml");
+    let roster = accounts::roster_beside_for(&config, Cli::Claude).expect("a roster beside");
+    let now = i64::try_from(NOW).unwrap();
+    let set = read_set_here(dir.path(), Some(&config), Some(&home), now);
+    let paths = set.paths();
+    for want in [
+        store.state_file(),
+        store.shared_dir().join(tokens::TABLE_FILE),
+        store.shared_dir().join(token_steps::STEPS_FILE),
+        store.shared_dir().join(token_steps::TRIED_FILE),
+        roster.clone(),
+        crate::harness::profile::login_record_path(&home, None).expect("the default login's"),
+        aterm_secrets::client::Paths::locate_for_home(&home)
+            .dir
+            .join("source.toml"),
+    ] {
+        assert!(
+            paths.contains(&want),
+            "{} not in {paths:#?}",
+            want.display()
+        );
+    }
+    let before = set.stamp();
+    assert!(set.stamp() == before, "nothing written, the stamp stands");
+    tokens::update_table(&store, |table| {
+        table.rows.insert(KEY.to_owned(), row());
+    })
+    .expect("the table is written");
+    assert!(set.stamp() != before, "a table write moves the stamp");
+    let written = set.stamp();
+    let vault = aterm_secrets::client::Paths::locate_for_home(&home);
+    std::fs::create_dir_all(&vault.dir).unwrap();
+    std::fs::write(vault.dir.join("source.toml"), "fixture = true\n").unwrap();
+    assert!(set.stamp() != written, "a vault made later moves the stamp");
+}
+
+/// A HELD CODE PAGE'S READ SET NAMES THE MAILBOX CONFIGURATIONS ITS JUDGE READS
+/// ([`read_set_here`], [`token_steps::mailbox_paths`]): with no step waiting on a mailbox the set
+/// names no `aterm.toml` under the home; with a code page's stop held
+/// ([`token_steps::Stopped::waits_on_a_mailbox`]) it names the home's `aterm.toml` and
+/// `mailbox.toml`, another agent's roster, the fleet roster and the default mail folder there,
+/// and a mailbox written into that `aterm.toml`, the write that lets the stop through
+/// ([`held_steps`], the CONTROL that the file is one its judge reads), moves the set's stamp.
+///
+/// NEGATIVE CONTROL (run 2026-11-16, restored): with `read_set_here` naming no
+/// [`token_steps::mailbox_paths`], the test fails at `…/home/.config/aterm/aterm.toml not in [`.
+#[test]
+fn a_held_code_pages_read_set_names_the_mailbox_configurations_its_judge_reads() {
+    use crate::harness::open_url::MetWord;
+    let (dir, store) = scratch();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = dir.path().join("config").join("aterm.toml");
+    let now = i64::try_from(NOW).unwrap();
+    let config_dir = home.join(".config/aterm");
+    let aterm_toml = config_dir.join("aterm.toml");
+    let unheld = read_set_here(dir.path(), Some(&config), Some(&home), now).paths();
+    assert!(
+        !unheld.contains(&aterm_toml),
+        "no step waits on a mailbox, and no aterm.toml is named: {unheld:#?}"
+    );
+    let stop = Stopped::new(MetWord::WindowCodeNoMailbox, NOW, "2.1.318", "").expect("a record");
+    token_steps::put(&store, KEY, Some(&stop)).unwrap();
+    let set = read_set_here(dir.path(), Some(&config), Some(&home), now);
+    let paths = set.paths();
+    for want in [
+        aterm_toml.clone(),
+        config_dir.join(crate::harness::headless_oauth::MAILBOX_TOML_FILE),
+        config_dir.join(Cli::Codex.accounts().roster_file),
+        config_dir.join(crate::harness::accounts_sync::FLEET_ROSTER_FILE),
+        config_dir.join(crate::harness::open_url::DEFAULT_MAILBOX_DIR),
+    ] {
+        assert!(
+            paths.contains(&want),
+            "{} not in {paths:#?}",
+            want.display()
+        );
+    }
+    let none = account(
+        covered(LoginHalf::Ok),
+        &Lookup::Absent,
+        None,
+        Some(false),
+        NOW,
+    );
+    let held = || {
+        held_steps(
+            &store,
+            std::slice::from_ref(&none),
+            (Some(&home), &|_| None),
+            || Some("2.1.318".to_owned()),
+        )
+        .stopped
+    };
+    assert!(
+        held().contains_key(KEY),
+        "CONTROL: no mailbox is read, and the code page's stop holds"
+    );
+    let before = set.stamp();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        &aterm_toml,
+        format!(
+            "[mailbox]\nimap_url = \"imaps://imap.example.test/INBOX\"\nuser = \"{EMAIL}\"\n\
+             password = \"a fixture's word\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(
+        held().is_empty(),
+        "CONTROL: the window reads the mailbox aterm.toml configures, and the stop is let through"
+    );
+    assert!(
+        set.stamp() != before,
+        "a mailbox written into aterm.toml moves the stamp"
     );
 }

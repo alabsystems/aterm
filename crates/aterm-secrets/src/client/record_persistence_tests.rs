@@ -79,6 +79,10 @@ fn commons_retention_fixture(
     (paths, *root)
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn expanded_custody_refuses_an_older_local_file_reader_and_writer() {
     use crate::crossing::fixture::Batch;
@@ -183,6 +187,10 @@ fn crossed_commons_retention_rechecks_after_a_writer_interleaves() {
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn bounded_commons_marks_new_complete_records_but_not_duplicates_or_waiting() {
     use crate::crossing::{RecordsBound, fixture::Batch};
@@ -341,6 +349,10 @@ fn bounded_commons_mark_failure_or_interruption_precedes_record_custody() {
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn bounded_commons_reconnect_completes_a_previously_unretained_child() {
     use crate::crossing::{RecordsBound, fixture::Batch};
@@ -427,6 +439,10 @@ fn bounded_commons_rejects_bad_capacity_and_oversized_batches_before_decoding() 
 ///
 /// CONTROL (MUTANT `Faults::mark_after_take`): the file holds the 4,097th record with no mark,
 /// where the mark then cannot be stored.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_mac_stores_its_mark_before_its_records_file_holds_its_4097th_record() {
     use crate::crossing::fixture::{self, Batch, VAULT};
@@ -712,6 +728,10 @@ fn mac_budgets(model: &aterm_spec::derive::Model) -> crate::membership_log::Reco
 /// total a pull that dies between them leaves the file holding what a crossed log's server sent
 /// with no mark, and at the activation's a write whose mark cannot be stored leaves the file
 /// past the bound with none. Each is no successor of its action and breaks `CrossedBeforeHeld`.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_macs_records_file_conforms_to_the_capacity_model() {
     let name = aterm_models_swarm::records_capacity_model().name;

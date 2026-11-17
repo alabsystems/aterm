@@ -679,6 +679,7 @@ fn account_progress_gallery() {
                         "tomorrow"
                     }
                     .into(),
+                    resets_at: 0,
                 });
         }
         if name.contains("unobserved-recovery") {

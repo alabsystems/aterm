@@ -584,10 +584,28 @@ impl AiSigninDoc {
     }
 }
 
+/// The `ai-signin.toml` files [`load_local_ai_signin_into`] reads, in its order: the one in
+/// `store_dir`, the one in `~/.config/aterm` under `home` and the one beside `config_path`
+/// (the vault's entry, read between the first two, is no file).
+#[must_use]
+pub fn local_ai_signin_files(
+    home: Option<&Path>,
+    store_dir: Option<&Path>,
+    config_path: Option<&Path>,
+) -> [Option<std::path::PathBuf>; 3] {
+    [
+        store_dir.map(|store| store.join(AI_SIGNIN_FILE)),
+        home.map(|h| h.join(".config/aterm").join(AI_SIGNIN_FILE)),
+        config_path
+            .and_then(Path::parent)
+            .map(|parent| parent.join(AI_SIGNIN_FILE)),
+    ]
+}
+
 /// Discover and apply `ai-signin.toml` into `out`, in order: a file in `store_dir`, the vault's
 /// entry in `home`'s store ([`crate::vault_entry`]), a file in `~/.config/aterm` and one beside
-/// the config, decrypting warm per-email credentials with this Mac's local age identity when
-/// present.
+/// the config ([`local_ai_signin_files`]), decrypting warm per-email credentials with this Mac's
+/// local age identity when present.
 pub fn load_local_ai_signin_into(
     home: Option<&Path>,
     store_dir: Option<&Path>,
@@ -595,31 +613,24 @@ pub fn load_local_ai_signin_into(
     out: &mut MailboxConfig,
 ) {
     const MAX_SIGNIN_BYTES: usize = 4 * 1024 * 1024;
-    let file = |path: std::path::PathBuf| {
-        if !path.is_file() {
-            return None;
-        }
+    let file = |path: Option<std::path::PathBuf>| {
+        let path = path.filter(|path| path.is_file())?;
         super::accounts::read_bounded(&path, MAX_SIGNIN_BYTES as u64)
             .ok()
             .flatten()
     };
-    let mut candidates: Vec<Option<String>> = Vec::new();
-    if let Some(store) = store_dir {
-        candidates.push(file(store.join(AI_SIGNIN_FILE)));
-    }
+    let [in_store, in_config_dir, beside_config] =
+        local_ai_signin_files(home, store_dir, config_path);
+    let mut candidates: Vec<Option<String>> = vec![file(in_store)];
     if let Some(h) = home {
         candidates.push(
             crate::vault_entry::read_text(h, AI_SIGNIN_FILE, MAX_SIGNIN_BYTES)
                 .text()
                 .map(str::to_owned),
         );
-        candidates.push(file(h.join(".config/aterm").join(AI_SIGNIN_FILE)));
     }
-    if let Some(cfg_file) = config_path
-        && let Some(parent) = cfg_file.parent()
-    {
-        candidates.push(file(parent.join(AI_SIGNIN_FILE)));
-    }
+    candidates.push(file(in_config_dir));
+    candidates.push(file(beside_config));
 
     #[cfg(unix)]
     let local_identity = home.and_then(|h| {

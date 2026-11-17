@@ -10,6 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aterm_json::Value;
 use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
+use aterm_uds::file_watch::FileStamp;
+
+use super::looks::{self, Heed, Input, Look};
 
 /// How much of a transcript's end one read window takes.
 pub const TAIL_BYTES: u64 = 512 * 1024;
@@ -1436,6 +1439,35 @@ pub struct FooterCache {
     /// The goal store read of an agent that keeps its goal in one (Muse Code,
     /// [`super::goal::StoreGoal`]): no transcript fold holds it.
     store_goal: super::goal::StoreGoal,
+    /// The process's registry row as the last read read it ([`read_pid`]): read again only
+    /// where its stamp, the pid or the kernel start moved.
+    row: Option<RowHeld>,
+    /// The git `HEAD` read of the last read's directory ([`held_git_head`]).
+    git: Option<GitHeld>,
+    /// The transcript the last read looked at, with its stamp then.
+    transcript_seen: Option<(PathBuf, Option<FileStamp>)>,
+    /// The subagent files and directories the last read followed, with their stamps as it read
+    /// them ([`read_pid`]'s subagent looks).
+    subagents_seen: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+/// A registry row as one read read it: its stamp just before, what it was read for, and what it
+/// gave.
+#[derive(Debug)]
+struct RowHeld {
+    stamp: Option<FileStamp>,
+    pid: u32,
+    started: Option<u64>,
+    entry: Option<SessionEntry>,
+}
+
+/// A git `HEAD` read of one directory, with the looks it took before each file it read
+/// ([`read_git_head_in`]).
+#[derive(Debug)]
+struct GitHeld {
+    cwd: PathBuf,
+    looks: Vec<Look>,
+    read: GitHeadRead,
 }
 
 impl Default for FooterCache {
@@ -1450,6 +1482,10 @@ impl Default for FooterCache {
             dirs: None,
             dropped: 0,
             store_goal: super::goal::StoreGoal::default(),
+            row: None,
+            git: None,
+            transcript_seen: None,
+            subagents_seen: Vec::new(),
         }
     }
 }
@@ -1644,10 +1680,143 @@ impl FooterCache {
         &mut self.store_goal
     }
 
+    /// Whether the usage fold's last refresh stopped at [`FOLD_BUDGET`] with more to read
+    /// ([`super::session_usage::SessionUsage::behind`]): until a read folds the rest, the tokens,
+    /// models, runtime and goal are not shown and the limit wall is the last caught-up read's, so
+    /// the next read is owed by the fold itself, with no file moved.
+    #[must_use]
+    pub fn behind(&self) -> bool {
+        self.usage
+            .as_ref()
+            .is_some_and(super::session_usage::SessionUsage::behind)
+    }
+
+    /// A cache whose reads fold at most `budget` transcript bytes each, for a test of another
+    /// crate that cuts a fold short without writing [`FOLD_BUDGET`] of transcript.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn with_budget(budget: u64) -> Self {
+        Self {
+            budget,
+            ..Self::default()
+        }
+    }
+
     fn caught_up_usage(&self) -> Option<&super::session_usage::SessionUsage> {
         self.refreshed
             .filter(|refresh| refresh.caught_up)
             .and(self.usage.as_ref())
+    }
+
+    /// The registry row of process `pid` (kernel start `started`) under `claude_dir`
+    /// ([`session_of_pid`]), looked at first ([`Input::Row`]) and read only where its stamp,
+    /// `pid` or `started` moved since the last read of it.
+    fn row_of(
+        &mut self,
+        claude_dir: &Path,
+        pid: u32,
+        started: Option<u64>,
+    ) -> Option<SessionEntry> {
+        let path = claude_dir.join("sessions").join(format!("{pid}.json"));
+        let stamp = looks::note(Input::Row, &path, Heed::All);
+        if let Some(held) = self.row.as_ref()
+            && held.stamp == stamp
+            && held.pid == pid
+            && held.started == started
+        {
+            return held.entry.clone();
+        }
+        #[cfg(any(test, debug_assertions))]
+        if stamp.is_some() {
+            super::test_counters::count_gather(Input::Row);
+        }
+        let entry = session_of_pid(claude_dir, pid, started);
+        self.row = Some(RowHeld {
+            stamp,
+            pid,
+            started,
+            entry: entry.clone(),
+        });
+        entry
+    }
+
+    /// Look at the transcript a read is about to read ([`Input::Transcript`]): the one
+    /// [`transcript_lookup`] `found`, or, where it found none, the file the session's own project
+    /// would hold and the projects directory the lookup listed. A gather of it is counted where
+    /// its stamp moved since the last read's look: the tail and the fold read its appended bytes
+    /// only then.
+    fn look_at_transcript(
+        &mut self,
+        claude_dir: &Path,
+        entry: &SessionEntry,
+        found: Option<&Path>,
+    ) {
+        let projects = claude_dir.join("projects");
+        let seen = match found {
+            Some(path) => (
+                path.to_path_buf(),
+                looks::note(Input::Transcript, path, Heed::Contents),
+            ),
+            None => {
+                let direct = projects
+                    .join(project_slug(&entry.cwd))
+                    .join(format!("{}.jsonl", entry.session_id));
+                looks::note(Input::Transcript, &projects, Heed::All);
+                let stamp = looks::note(Input::Transcript, &direct, Heed::Contents);
+                (direct, stamp)
+            }
+        };
+        #[cfg(any(test, debug_assertions))]
+        if seen.1.is_some() && self.transcript_seen.as_ref() != Some(&seen) {
+            super::test_counters::count_gather(Input::Transcript);
+        }
+        self.transcript_seen = Some(seen);
+    }
+
+    /// Each subagent file and directory the fold follows ([`SessionUsage::followed`]), with its
+    /// stamp now: what the read about to refresh the fold looks at before it does.
+    fn subagent_stamps(&self) -> Vec<(PathBuf, Option<FileStamp>)> {
+        self.usage
+            .as_ref()
+            .map(|usage| {
+                usage
+                    .followed()
+                    .into_iter()
+                    .map(|path| {
+                        let stamp = FileStamp::of(&path);
+                        (path, stamp)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Note the subagent looks of the read that just refreshed the fold ([`Input::Subagents`]):
+    /// each path followed before it with its stamp then (`before`), and each it followed first
+    /// with none, since the refresh met it before any look; a gather is counted where any of
+    /// them stands otherwise than at the last read.
+    fn look_at_subagents(&mut self, before: Vec<(PathBuf, Option<FileStamp>)>) {
+        let after = self
+            .usage
+            .as_ref()
+            .map(super::session_usage::SessionUsage::followed)
+            .unwrap_or_default();
+        for (path, stamp) in &before {
+            looks::note_stamped(Input::Subagents, path, Heed::All, *stamp);
+        }
+        let mut seen = before;
+        for path in after {
+            if !seen.iter().any(|(held, _)| *held == path) {
+                looks::note_stamped(Input::Subagents, &path, Heed::All, None);
+                let stamp = FileStamp::of(&path);
+                seen.push((path, stamp));
+            }
+        }
+        #[cfg(any(test, debug_assertions))]
+        if seen.iter().any(|seen| !self.subagents_seen.contains(seen)) {
+            super::test_counters::count_gather(Input::Subagents);
+        }
+        self.subagents_seen = seen;
     }
 
     fn forget(&mut self) {
@@ -2376,10 +2545,57 @@ pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bo
 
 /// [`git_head`], saying why there is no answer when the kernel refused a read.
 pub fn read_git_head(cwd: &Path) -> GitHeadRead {
-    read_git_head_in(aterm_types::dirs::home_dir().as_deref(), cwd)
+    read_git_head_in(aterm_types::dirs::home_dir().as_deref(), cwd, None)
 }
 
-fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
+/// [`read_git_head`] of `cwd` as the last read of it gave it (`held`), where none of the files
+/// that read looked at moved since; else read again, and held where it was no refusal. Each
+/// look the answer stands on is noted for the read this runs in ([`looks::record`]): the `HEAD`
+/// read and a worktree's `.git` file, or, where no repository was found, `cwd`'s own `.git`.
+fn held_git_head(held: &mut Option<GitHeld>, cwd: &Path) -> GitHeadRead {
+    if let Some(memo) = held.as_ref()
+        && memo.cwd == cwd
+        && !memo.looks.iter().any(Look::moved)
+    {
+        for look in &memo.looks {
+            looks::note_stamped(look.input, &look.path, look.heed, look.stamp);
+        }
+        return memo.read.clone();
+    }
+    let mut seen = Vec::new();
+    let read = read_git_head_in(
+        aterm_types::dirs::home_dir().as_deref(),
+        cwd,
+        Some(&mut seen),
+    );
+    #[cfg(any(test, debug_assertions))]
+    if seen.iter().any(|look| look.stamp.is_some()) {
+        super::test_counters::count_gather(Input::Git);
+    }
+    for look in &seen {
+        looks::note_stamped(look.input, &look.path, look.heed, look.stamp);
+    }
+    *held = (read != GitHeadRead::Denied).then(|| GitHeld {
+        cwd: cwd.to_path_buf(),
+        looks: seen,
+        read: read.clone(),
+    });
+    read
+}
+
+/// [`read_git_head`] with `home` as the user's home; where `looks` is given, each file the climb
+/// reads is looked at just before it is read (a worktree's `.git` file, then `HEAD`), and a climb
+/// that found no repository looks at `cwd`'s own `.git`, where one would appear.
+fn read_git_head_in(
+    home: Option<&Path>,
+    cwd: &Path,
+    mut looks: Option<&mut Vec<Look>>,
+) -> GitHeadRead {
+    let mut look = |path: &Path| {
+        if let Some(looks) = looks.as_deref_mut() {
+            looks.push(Look::now(Input::Git, path, Heed::All));
+        }
+    };
     if under_file_provider_domain(home, cwd) {
         return GitHeadRead::Absent;
     }
@@ -2390,13 +2606,18 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
             Err(error) if is_eperm(&error) => return GitHeadRead::Denied,
             Err(_) => {}
             Ok(meta) => {
+                if !meta.is_dir() {
+                    look(&dot_git);
+                }
                 let Some(git_dir) = resolve_git_dir_of(&dot_git, &meta) else {
                     return GitHeadRead::Absent;
                 };
                 if under_file_provider_domain(home, &git_dir) {
                     return GitHeadRead::Absent;
                 }
-                return match read_head(&git_dir.join("HEAD")) {
+                let head = git_dir.join("HEAD");
+                look(&head);
+                return match read_head(&head) {
                     Err(()) => GitHeadRead::Denied,
                     Ok(Some(head)) => branch_of_head(&head).map_or(GitHeadRead::Absent, |branch| {
                         GitHeadRead::Found(branch, dir.to_path_buf())
@@ -2406,10 +2627,12 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
             }
         }
         let Some(parent) = dir.parent() else {
+            look(&cwd.join(".git"));
             return GitHeadRead::Absent;
         };
         dir = parent;
     }
+    look(&cwd.join(".git"));
     GitHeadRead::Absent
 }
 
@@ -2479,14 +2702,15 @@ pub fn facts_for_entry_at(
         transcript.as_deref(),
         launch,
         cache,
-        read_at,
+        (read_at, &mut read_git_head),
     )
     .0
 }
 
 /// [`facts_for_entry_at`] over the caller's transcript lookup
 /// ([`transcript_path`]), shared with the usage fold so both read one file,
-/// and the directories beside the facts ([`FactDirs`]).
+/// and its git `HEAD` read (`git`: [`read_git_head`], or the read's held one), and the
+/// directories beside the facts ([`FactDirs`]).
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -2504,7 +2728,7 @@ fn facts_for_entry_from(
     transcript: Option<&Path>,
     launch: &LaunchFacts,
     cache: &mut TailCache,
-    read_at: SystemTime,
+    (read_at, git): (SystemTime, &mut dyn FnMut(&Path) -> GitHeadRead),
 ) -> (FooterFacts, FactDirs) {
     let floor = floor_of(started, entry);
     let path = floor.and(transcript);
@@ -2564,7 +2788,7 @@ fn facts_for_entry_from(
         ),
         None => read.facts,
     };
-    let (branch, repo_read_denied, repo_root) = match read_git_head(&dir) {
+    let (branch, repo_read_denied, repo_root) = match git(&dir) {
         GitHeadRead::Found(branch, root) => (Some(branch), None, Some(root)),
         GitHeadRead::Absent => (None, None, None),
         GitHeadRead::Denied => (None, Some(dir.clone()), None),
@@ -2756,12 +2980,17 @@ pub fn read_pid(
     clock: &ReadClock<'_>,
     user_home: Option<&Path>,
 ) -> Option<FooterFacts> {
-    let Some(entry) = session_of_pid(claude_dir, pid, started) else {
+    let Some(entry) = fold.row_of(claude_dir, pid, started) else {
         tail.clear();
         return None;
     };
     let (launch, argv) = launch(&entry);
     let found = transcript_lookup(claude_dir, &entry);
+    fold.look_at_transcript(
+        claude_dir,
+        &entry,
+        found.as_ref().map(|(path, _)| path.as_path()),
+    );
     fold.note_entry(
         floor_of(started, &entry).map(|s| s.saturating_mul(1000)),
         &entry.session_id,
@@ -2770,6 +2999,7 @@ pub fn read_pid(
             .map(|(path, certain)| (path.as_path(), *certain)),
     );
     let transcript = found.map(|(path, _)| path);
+    let mut git = fold.git.take();
     let (mut facts, dirs) = facts_for_entry_from(
         claude_dir,
         pid,
@@ -2778,10 +3008,15 @@ pub fn read_pid(
         transcript.as_deref(),
         &launch,
         tail,
-        clock.read_at,
+        (clock.read_at, &mut |cwd: &Path| {
+            held_git_head(&mut git, cwd)
+        }),
     );
+    fold.git = git;
     fold.dirs = Some(dirs);
+    let before = fold.subagent_stamps();
     facts.usage = fold.usage(transcript, clock.now, clock.offset_at);
+    fold.look_at_subagents(before);
     facts.goal = fold.goal();
     let home = user_home.map_or_else(Vec::new, |user_home| {
         super::resume::home_env(user_home, launch.config.as_deref(), Some(claude_dir))

@@ -1181,6 +1181,9 @@ mod macos {
                     let _ = ivars.proxy.send_event(Wake::BeginSessionRename {
                         window: ivars.window,
                         tab: self.tab_id(),
+                        marks: crate::app_take_over::GestureMarks::of(
+                            crate::tab_spawn::native_post_origin(),
+                        ),
                     });
                     return;
                 }
@@ -3020,9 +3023,23 @@ mod macos {
             type Ivars = RenameIvars;
             protocols: [NSObject, NSTextFieldDelegate];
 
-            /// Sanitize and clamp the edited text as the user types.
+            /// Sanitize and clamp the edited text as the user types, and report a change a key
+            /// an `hwkey` burst posted made, so the edit is that control client's
+            /// ([`crate::App::native_rename_edited`]).
             @sel(controlTextDidChange:)
             fn control_text_did_change(&self, notification: Id) {
+                // The notification comes inside the key's dispatch, so the event AppKit handles
+                // now is the key that changed the text. A key another process relayed stays a
+                // person's (ATERM-KI-1115-284 (d)), so only a burst's is reported.
+                let origin = crate::tab_spawn::native_post_origin();
+                if origin == aterm_window::event::InputOrigin::Posted {
+                    let ivars = self.ivars();
+                    let _ = ivars.proxy.send_event(Wake::NativeRenameEdited {
+                        window: ivars.window,
+                        session: ivars.session,
+                        marks: crate::app_take_over::GestureMarks::of(origin),
+                    });
+                }
                 // SAFETY: `-object` on the live NSNotification is the edited NSControl;
                 // `-stringValue` / `-setStringValue:` are its main-thread accessors.
                 unsafe {
@@ -3094,6 +3111,9 @@ mod macos {
                     window: ivars.window,
                     session: ivars.session,
                     text,
+                    marks: crate::app_take_over::GestureMarks::of(
+                        crate::tab_spawn::native_post_origin(),
+                    ),
                 });
             }
         }

@@ -3,12 +3,14 @@
 
 use super::*;
 
+#[cfg(unix)]
 struct FailingServer {
     address: std::net::SocketAddr,
     stop: std::sync::Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<Vec<String>>>,
 }
 
+#[cfg(unix)]
 impl FailingServer {
     fn start() -> Self {
         use std::io::{Read as _, Write as _};
@@ -57,6 +59,7 @@ impl FailingServer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for FailingServer {
     fn drop(&mut self) {
         if self.worker.is_some() {
@@ -83,6 +86,14 @@ fn fixture() -> (aterm_tempfile::TempDir, Paths, Config) {
     (root, paths, config)
 }
 
+/// The refresh receipt one [`observe_receipts`] gives, where nothing holds the state lock.
+fn read_refresh(paths: &Paths, config: &Config) -> Option<VaultNetworkRefresh> {
+    match observe_receipts(paths, config).unwrap() {
+        Observed::Read(receipts) => receipts.refresh,
+        other => panic!("{other:?}: the fixture's state lock is there and free"),
+    }
+}
+
 fn failure(paths: &Paths, config: &Config) -> Attempt {
     let attempt = Attempt::start(paths, config).unwrap();
     retain(
@@ -93,15 +104,13 @@ fn failure(paths: &Paths, config: &Config) -> Attempt {
         1_000,
     );
     assert_eq!(
-        observe_network_refresh(paths, config)
-            .unwrap()
-            .unwrap()
-            .completed_at_ms(),
+        read_refresh(paths, config).unwrap().completed_at_ms(),
         1_000
     );
     attempt
 }
 
+#[cfg(unix)]
 #[test]
 fn cli_and_subscriber_share_the_actual_failed_refresh_boundary() {
     for subscriber in [false, true] {
@@ -122,7 +131,7 @@ fn cli_and_subscriber_share_the_actual_failed_refresh_boundary() {
                 .any(|head| head.starts_with("GET /v1/team ") || head.starts_with("GET /v1/team?")),
             "an actual configured envelope request was answered503"
         );
-        let observed = observe_network_refresh(&paths, &config).unwrap().unwrap();
+        let observed = read_refresh(&paths, &config).unwrap();
         assert_eq!(observed.outcome(), VaultNetworkRefreshOutcome::Failed);
         assert!(observed.completed_at_ms() > 0);
         let state = load_state(&paths).unwrap();
@@ -137,9 +146,9 @@ fn metadata_reload_preserves_time_and_changed_context_neither_reads_nor_overwrit
     let (_root, paths, config) = fixture();
     let attempt = failure(&paths, &config);
     let before = std::fs::read(paths.state_file()).unwrap();
-    let observed = observe_network_refresh(&paths, &config).unwrap();
+    let observed = read_refresh(&paths, &config);
     for _ in 0..2 {
-        assert_eq!(observe_network_refresh(&paths, &config).unwrap(), observed);
+        assert_eq!(read_refresh(&paths, &config), observed);
         assert_eq!(std::fs::read(paths.state_file()).unwrap(), before);
     }
     for changed in [
@@ -161,7 +170,7 @@ fn metadata_reload_preserves_time_and_changed_context_neither_reads_nor_overwrit
         },
     ] {
         save_config(&paths, &changed).unwrap();
-        assert_eq!(observe_network_refresh(&paths, &changed).unwrap(), None);
+        assert_eq!(read_refresh(&paths, &changed), None);
         retain(
             &paths,
             &config,
@@ -173,15 +182,14 @@ fn metadata_reload_preserves_time_and_changed_context_neither_reads_nor_overwrit
     }
     save_config(&paths, &config).unwrap();
     let identity = std::fs::read(paths.identity_file()).unwrap();
-    fsx::write_atomic(
-        &paths.identity_file(),
-        Identity::from_secret_bytes([117; 32])
-            .to_bech32()
-            .as_slice(),
-        0o600,
-    )
-    .unwrap();
-    assert_eq!(observe_network_refresh(&paths, &config).unwrap(), None);
+    #[cfg(unix)]
+    let other = Identity::from_secret_bytes([117; 32]).to_bech32();
+    // A Windows machine key is read only as this user's DPAPI sealed it.
+    #[cfg(windows)]
+    let other = crate::identity_file::stored_text(&Identity::from_secret_bytes([117; 32]), None, 0)
+        .unwrap();
+    fsx::write_atomic(&paths.identity_file(), other.as_slice(), 0o600).unwrap();
+    assert_eq!(read_refresh(&paths, &config), None);
     retain(
         &paths,
         &config,
@@ -191,21 +199,24 @@ fn metadata_reload_preserves_time_and_changed_context_neither_reads_nor_overwrit
     );
     assert_eq!(std::fs::read(paths.state_file()).unwrap(), before);
     fsx::write_atomic(&paths.identity_file(), &identity, 0o600).unwrap();
-    assert_eq!(observe_network_refresh(&paths, &config).unwrap(), observed);
+    assert_eq!(read_refresh(&paths, &config), observed);
 }
 
 #[test]
 fn busy_history_is_unavailable_then_the_same_retained_failure_is_readable_again() {
     let (root, paths, config) = fixture();
     failure(&paths, &config);
-    let original = observe_network_refresh(&paths, &config).unwrap().unwrap();
+    let original = read_refresh(&paths, &config).unwrap();
     let bytes = std::fs::read(paths.state_file()).unwrap();
     let absent = Paths::for_home(&root.path().join("absent"));
     assert!(matches!(
         StateLock::observe_classified(&absent).unwrap(),
         StateObservation::Absent
     ));
-    assert_eq!(observe_network_refresh(&absent, &config).unwrap(), None);
+    assert_eq!(
+        observe_receipts(&absent, &config).unwrap(),
+        Observed::Absent
+    );
     assert!(!absent.dir.exists(), "a missing observation is not created");
     {
         let writer = StateLock::take(&paths).unwrap();
@@ -217,7 +228,7 @@ fn busy_history_is_unavailable_then_the_same_retained_failure_is_readable_again(
             StateLock::observe(&paths).unwrap().is_none(),
             "legacy readers retain their contract"
         );
-        assert!(observe_network_refresh(&paths, &config).is_err());
+        assert_eq!(observe_receipts(&paths, &config).unwrap(), Observed::Busy);
         assert_eq!(std::fs::read(paths.state_file()).unwrap(), bytes);
         drop(writer);
     }
@@ -225,13 +236,11 @@ fn busy_history_is_unavailable_then_the_same_retained_failure_is_readable_again(
         StateLock::observe_classified(&paths).unwrap(),
         StateObservation::Held(_)
     ));
-    assert_eq!(
-        observe_network_refresh(&paths, &config).unwrap(),
-        Some(original)
-    );
+    assert_eq!(read_refresh(&paths, &config), Some(original));
     assert_eq!(std::fs::read(paths.state_file()).unwrap(), bytes);
 }
 
+#[cfg(unix)]
 #[test]
 fn busy_or_unsafe_optional_state_cannot_change_sync_result_or_follow_a_link() {
     use std::os::unix::fs::symlink;
@@ -257,7 +266,7 @@ fn busy_or_unsafe_optional_state_cannot_change_sync_result_or_follow_a_link() {
         2_000,
     );
     assert_eq!(std::fs::read(&kept).unwrap(), before);
-    assert!(observe_network_refresh(&paths, &config).is_err());
+    assert!(observe_receipts(&paths, &config).is_err());
     std::fs::remove_file(paths.state_file()).unwrap();
     std::fs::rename(kept, paths.state_file()).unwrap();
     let result = run(&paths, &config, |refresh| {
@@ -272,6 +281,7 @@ fn busy_or_unsafe_optional_state_cannot_change_sync_result_or_follow_a_link() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_transport_followed_by_real_local_cache_apply_remains_a_failed_refresh() {
     // Every server it reads is its own on loopback, which answers.
@@ -327,20 +337,17 @@ fn failed_transport_followed_by_real_local_cache_apply_remains_a_failed_refresh(
         )
     })
     .unwrap();
-    let failed = observe_network_refresh(&paths, &config).unwrap().unwrap();
+    let failed = read_refresh(&paths, &config).unwrap();
     assert_eq!(failed.outcome(), VaultNetworkRefreshOutcome::Failed);
     assert_eq!(materialization(), Some(receipt));
     // Raw caller/cache bytes do not enter the network-refresh recorder at all.
     sync_with(&paths, cached.as_slice().to_vec()).unwrap();
-    assert_eq!(
-        observe_network_refresh(&paths, &config).unwrap(),
-        Some(failed)
-    );
+    assert_eq!(read_refresh(&paths, &config), Some(failed));
     assert_eq!(materialization(), Some(receipt));
     let state = std::fs::read_to_string(paths.state_file()).unwrap();
     let malformed = state.replace("outcome = \"failed\"", "outcome = 7");
     fsx::write_atomic(&paths.state_file(), malformed.as_bytes(), 0o600).unwrap();
-    assert_eq!(observe_network_refresh(&paths, &config).unwrap(), None);
+    assert_eq!(read_refresh(&paths, &config), None);
     assert_eq!(
         materialization(),
         Some(receipt),
@@ -372,10 +379,7 @@ fn failed_transport_followed_by_real_local_cache_apply_remains_a_failed_refresh(
         Some(load_state(&paths).unwrap().seq)
     );
     assert_eq!(
-        observe_network_refresh(&paths, &config)
-            .unwrap()
-            .unwrap()
-            .outcome(),
+        read_refresh(&paths, &config).unwrap().outcome(),
         VaultNetworkRefreshOutcome::Succeeded
     );
     assert_eq!(materialization(), Some(receipt));
@@ -385,7 +389,7 @@ fn failed_transport_followed_by_real_local_cache_apply_remains_a_failed_refresh(
 #[test]
 fn absent_and_malformed_optional_history_is_not_a_success_or_failure() {
     let (_root, paths, config) = fixture();
-    assert_eq!(observe_network_refresh(&paths, &config).unwrap(), None);
+    assert_eq!(read_refresh(&paths, &config), None);
     failure(&paths, &config);
     let before = std::fs::read_to_string(paths.state_file()).unwrap();
     for text in [
@@ -394,7 +398,7 @@ fn absent_and_malformed_optional_history_is_not_a_success_or_failure() {
         before.replace("version = 1", "version = 2"),
     ] {
         fsx::write_atomic(&paths.state_file(), text.as_bytes(), 0o600).unwrap();
-        assert_eq!(observe_network_refresh(&paths, &config).unwrap(), None);
+        assert_eq!(read_refresh(&paths, &config), None);
         assert_eq!(std::fs::read_to_string(paths.state_file()).unwrap(), text);
     }
 }
@@ -442,7 +446,7 @@ fn a_repeated_outcome_within_a_minute_keeps_the_retained_receipt_and_the_state_f
     let (_root, paths, config) = fixture();
     let attempt = failure(&paths, &config);
     let observed = || {
-        let refresh = observe_network_refresh(&paths, &config).unwrap().unwrap();
+        let refresh = read_refresh(&paths, &config).unwrap();
         (refresh.outcome(), refresh.completed_at_ms())
     };
     let file = || fsx::stamp(&paths.state_file()).unwrap();

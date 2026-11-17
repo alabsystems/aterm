@@ -5716,6 +5716,48 @@ impl App {
         true
     }
 
+    /// A press at `at` on window `wid`'s strip band where no segment lies (the header's bare
+    /// band, or the side inset beside it, `App::side_inset_band_at`): a second within the
+    /// multi-click interval maximizes or restores the window, else the press arms a move (Windows
+    /// drags at once; a Linux client-side header once the pointer moves).
+    pub(crate) fn press_strip_band(&mut self, wid: WindowId, at: std::time::Instant) {
+        let band_repeat = self.windows.get(&wid).is_some_and(|ws| {
+            ws.strip_band_press.is_some_and(|last| {
+                at.saturating_duration_since(last).as_millis() <= crate::multi_click_ms()
+            })
+        });
+        self.clear_strip_press(wid);
+        self.settle_rename_edit(wid);
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            ws.strip_band_press = (!band_repeat).then_some(at);
+        }
+        #[cfg(windows)]
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            if band_repeat {
+                w.set_maximized(!w.is_maximized());
+            } else {
+                let _ = w.drag_window();
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            if let Some(frame) = ws.client_frame.filter(|frame| frame.header) {
+                if band_repeat {
+                    ws.caption_move = None;
+                    if frame.maximize
+                        && let Some(w) = &ws.os_window
+                    {
+                        w.set_maximized(!frame.maximized);
+                    }
+                } else if ws.pointer_position_known {
+                    ws.caption_move = Some(ws.last_cursor_px);
+                }
+            }
+        }
+    }
+
     /// A click in window `wid`'s tab strip at column `col`, pressed at `at`.
     pub(crate) fn handle_tab_strip_click(
         &mut self,
@@ -5727,41 +5769,7 @@ impl App {
             return;
         };
         let Some(hit) = tab_bar::hit_test(&segs, col) else {
-            let band_repeat = self.windows.get(&wid).is_some_and(|ws| {
-                ws.strip_band_press.is_some_and(|last| {
-                    at.saturating_duration_since(last).as_millis() <= crate::multi_click_ms()
-                })
-            });
-            self.clear_strip_press(wid);
-            self.settle_rename_edit(wid);
-            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-                let ws = &mut **route_guard_ws;
-                ws.strip_band_press = (!band_repeat).then_some(at);
-            }
-            #[cfg(windows)]
-            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-                if band_repeat {
-                    w.set_maximized(!w.is_maximized());
-                } else {
-                    let _ = w.drag_window();
-                }
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-                let ws = &mut **route_guard_ws;
-                if let Some(frame) = ws.client_frame.filter(|frame| frame.header) {
-                    if band_repeat {
-                        ws.caption_move = None;
-                        if frame.maximize
-                            && let Some(w) = &ws.os_window
-                        {
-                            w.set_maximized(!frame.maximized);
-                        }
-                    } else if ws.pointer_position_known {
-                        ws.caption_move = Some(ws.last_cursor_px);
-                    }
-                }
-            }
+            self.press_strip_band(wid, at);
             return;
         };
         match hit {
@@ -6656,7 +6664,7 @@ impl App {
     ) {
         self.restored_workers.remove(&id);
         #[cfg(target_os = "macos")]
-        self.withdraw_askpass_session(id);
+        self.withdraw_askpass_session(id, std::time::Instant::now());
         let (reason, by) = session_store::current_close_attribution();
         let (closing, instance) = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());

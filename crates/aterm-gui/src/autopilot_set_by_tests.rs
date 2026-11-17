@@ -665,7 +665,9 @@ fn a_later_wake_never_replaces_the_fires_record() {
 #[test]
 fn a_fleet_setter_is_named_by_its_mac() {
     let node = "87be5228aaaaaaaaaaaaaaaaaaaaaaaa";
-    let sid = "t0123456789";
+    // An ID whose shown prefix no other test's ID shares: `tab_ids` holds every ID this
+    // process has known, and shows one longer where two share their first five characters.
+    let sid = "t7k2m9w4q8r";
     let words = |actor: Actor, name: Option<&str>| {
         SetByWords::of(
             Some(AutopilotSetBy {
@@ -685,7 +687,7 @@ fn a_fleet_setter_is_named_by_its_mac() {
     };
     assert_eq!(
         words(Actor::fleet_drive(node, Some(sid)), Some("m9")),
-        "over the fleet from m9 (session t0123)"
+        "over the fleet from m9 (session t7k2m)"
     );
     assert_eq!(
         words(Actor::fleet_drive(node, None), Some("m9")),
@@ -693,7 +695,7 @@ fn a_fleet_setter_is_named_by_its_mac() {
     );
     assert_eq!(
         words(Actor::fleet_drive(node, Some(sid)), None),
-        "over the fleet from node 87be5228 (session t0123)",
+        "over the fleet from node 87be5228 (session t7k2m)",
         "CONTROL"
     );
     assert_eq!(

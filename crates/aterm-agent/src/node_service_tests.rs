@@ -2118,3 +2118,89 @@ fn launchd_reads_the_node_jobs_switch_from_print_disabled() {
     );
     assert!(ask(Ok((false, "Could not find domain".to_owned()))).is_err());
 }
+
+/// The node's take of `node-port.lock` (and a window's of `window-port.lock`) moves the file's
+/// stamp, which a file watch hears; a shared probe moves nothing, so probes are never heard; and
+/// a waiter on a held lock returns only once its holder lets go. Files only, in a scratch state
+/// folder.
+/// NEGATIVE CONTROLS: the stamp after a probe equals the one before it, and the probe says held
+/// while the holder holds. Remove `mark_taken` from `try_acquire_marked`: the take's stamp
+/// equals the file's stamp before it (the file is made by the first take, so the second take
+/// is the one compared; its modification time is first put at the epoch, so the take's write
+/// moves it on a volume whose times are as coarse as a kernel tick, where two writes of the
+/// same bytes microseconds apart leave every field of the stamp equal).
+#[cfg(unix)]
+#[test]
+fn a_port_take_is_heard_a_probe_is_not_and_a_waiter_returns_on_release() {
+    use aterm_uds::file_watch::FileStamp;
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let state = scratch.path().join("state");
+    for (name, take) in [
+        (
+            NODE_PORT_LOCK,
+            NodeJobLock::try_acquire_port as fn(&Path) -> std::io::Result<Option<NodeJobLock>>,
+        ),
+        (WINDOW_PORT_LOCK, NodeJobLock::try_acquire_window_port),
+    ] {
+        let path = state.join(name);
+        drop(take(&state).unwrap().expect("a first take"));
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| {
+                file.set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1))
+            })
+            .expect("the first take's time put back");
+        let before = FileStamp::of(&path).expect("the first take made the file");
+        let held = take(&state).unwrap().expect("the lock is free again");
+        let taken = FileStamp::of(&path).expect("the file stands");
+        assert_ne!(
+            before, taken,
+            "{name}: a take moves the stamp a watch hears"
+        );
+
+        assert!(
+            holds_lock_at(&state, name),
+            "{name}: the probe says held while it is held"
+        );
+        assert_eq!(
+            FileStamp::of(&path),
+            Some(taken),
+            "{name}: CONTROL: a probe moves nothing a watch hears"
+        );
+
+        let released = Arc::new(AtomicBool::new(false));
+        let (done, returned) = std::sync::mpsc::channel();
+        let (entering, entered) = std::sync::mpsc::channel();
+        let waiter = {
+            let state = state.clone();
+            let released = Arc::clone(&released);
+            std::thread::spawn(move || {
+                PORT_WAITER_ENTERING.with(|slot| *slot.borrow_mut() = Some(entering));
+                let result = wait_port_released(&state, name);
+                let _ = done.send(released.load(Ordering::Acquire));
+                result
+            })
+        };
+        entered
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .expect("the waiter reaches its wait");
+        released.store(true, Ordering::Release);
+        drop(held);
+        assert!(
+            returned
+                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                .expect("the waiter returns once the holder lets go"),
+            "{name}: the waiter returned only after the release"
+        );
+        waiter.join().unwrap().expect("the wait succeeded");
+        assert!(
+            !holds_lock_at(&state, name),
+            "{name}: the waiter let its share go"
+        );
+    }
+    assert!(
+        wait_port_released(&scratch.path().join("none"), NODE_PORT_LOCK).is_ok(),
+        "a lock file that is not there is held by no one"
+    );
+}

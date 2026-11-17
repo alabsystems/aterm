@@ -35,6 +35,13 @@ impl RouteRefresh {
         self.worker.is_none() && now >= self.next
     }
 
+    /// When the next refresh is due: a period after the last one started, or now before the
+    /// first. A worker still out then (it ends within [`WITHIN`], well inside the period) leaves
+    /// it not due until it ends; a waiter that wakes for this deadline then keeps its old pace.
+    pub(super) fn next_due(&self) -> Instant {
+        self.next
+    }
+
     pub(super) fn start(&mut self, now: Instant, work: impl FnOnce() + Send + 'static) -> bool {
         if !self.due(now) {
             return false;

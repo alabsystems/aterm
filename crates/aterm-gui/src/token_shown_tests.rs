@@ -209,6 +209,7 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
         pending: Some(false),
         logged_in: true,
         login: LoginHere::Half(LoginHalf::Ok),
+        login_turns: None,
         offer: Some(Offer {
             pair: "none:-/ok:-".into(),
             step: Step::Token {
@@ -287,6 +288,7 @@ fn a_held_token_step_is_in_the_accounts_fact() {
         pending: Some(false),
         logged_in: true,
         login: LoginHere::Half(LoginHalf::Ok),
+        login_turns: None,
         offer: None,
     };
     let other = "ac-0123456789abcdef";
@@ -349,6 +351,7 @@ fn a_fact_keeps_the_views_typed_fields() {
         pending: Some(false),
         logged_in: false,
         login: LoginHere::Half(LoginHalf::Ending { end: 7_000 }),
+        login_turns: None,
         offer: None,
     };
     let read = facts_of_view(
@@ -423,10 +426,21 @@ fn a_fact_keeps_the_views_typed_fields() {
     );
 }
 
+/// A POST OF THE FACTS SHOWN MOVES NOTHING, AND ONE OF OTHER FACTS REPLACES THEM ([`post`], the
+/// token lane's): a read that found what the last found leaves the card asleep, so a read its own
+/// writes caused wakes nothing.
+///
+/// NEGATIVE CONTROL (run 2026-11-14): with `post` counting every post as a move, the test fails at
+/// "the same facts again move nothing".
 #[test]
-fn a_read_is_due_once_a_minute() {
-    assert!(due(None, 100));
-    assert!(!due(Some(100), 100 + READ_EVERY_S - 1));
-    assert!(due(Some(100), 100 + READ_EVERY_S));
-    assert!(due(Some(100), 99), "a clock that stepped back");
+fn a_post_of_the_facts_shown_moves_nothing() {
+    show(None);
+    let active = Tokens::read(vec![fact(TokenState::Active, None)]);
+    assert!(post(active.clone()), "the first post moves the facts");
+    assert_eq!(shown().as_deref(), Some(&active));
+    assert!(!post(active.clone()), "the same facts again move nothing");
+    let soon = Tokens::read(vec![fact(TokenState::Soon, None)]);
+    assert!(post(soon.clone()), "other facts move");
+    assert_eq!(shown().as_deref(), Some(&soon));
+    show(None);
 }

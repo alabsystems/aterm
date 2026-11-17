@@ -27,10 +27,12 @@ pub(crate) const FILE_LIST_DIRECTORY: u32 = 0x0001;
 pub(crate) const FILE_TRAVERSE: u32 = 0x0020;
 /// `FILE_READ_ATTRIBUTES`: every by-handle query here needs it.
 pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-/// `DELETE`: the one right a disposition needs.
+/// `DELETE`: the one right a disposition, and a rename of the entry, needs.
 pub(crate) const DELETE: u32 = 0x0001_0000;
 /// `READ_CONTROL`: read the security descriptor (its owner, here).
 pub(crate) const READ_CONTROL: u32 = 0x0002_0000;
+/// `WRITE_DAC`: write the access list (an object's owner holds it whatever the list says).
+pub(crate) const WRITE_DAC: u32 = 0x0004_0000;
 /// `SYNCHRONIZE`: required with `FILE_SYNCHRONOUS_IO_NONALERT`.
 pub(crate) const SYNCHRONIZE: u32 = 0x0010_0000;
 /// `FILE_GENERIC_READ`: `STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE`.
@@ -101,6 +103,23 @@ pub(crate) const FileIdExtdDirectoryInfo: i32 = 19;
 pub(crate) const FileIdExtdDirectoryRestartInfo: i32 = 20;
 pub(crate) const FileDispositionInfoEx: i32 = 21;
 
+/// `FILE_INFORMATION_CLASS::FileRenameInformation` (`NtSetInformationFile`; `FILE_RENAME_INFORMATION`
+/// with its first field read as the `ReplaceIfExists` `BOOLEAN`).
+pub(crate) const FileRenameInformation: i32 = 10;
+/// `FILE_INFORMATION_CLASS::FileLinkInformation` (`FILE_LINK_INFORMATION`, the same layout).
+pub(crate) const FileLinkInformation: i32 = 11;
+/// `FILE_INFORMATION_CLASS::FileRenameInformationEx` (Windows 10 1607 on): the first field is
+/// `Flags`.
+pub(crate) const FileRenameInformationEx: i32 = 65;
+
+/// `FILE_RENAME_INFORMATION.Flags`: replace an entry already at the new name.
+pub(crate) const FILE_RENAME_REPLACE_IF_EXISTS: u32 = 0x0001;
+/// `FILE_RENAME_INFORMATION.Flags`: replace the entry even while it is open (each handle on it,
+/// opened sharing deletion, keeps reading and writing the file it had), as `rename(2)` does.
+pub(crate) const FILE_RENAME_POSIX_SEMANTICS: u32 = 0x0002;
+/// `FILE_RENAME_INFORMATION.Flags`: replace a read-only entry too (Windows 10 1809 on).
+pub(crate) const FILE_RENAME_IGNORE_READONLY_ATTRIBUTE: u32 = 0x0040;
+
 /// `FILE_DISPOSITION_INFO_EX.Flags`: delete.
 pub(crate) const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x0001;
 /// `FILE_DISPOSITION_INFO_EX.Flags`: unlink immediately with POSIX semantics while handles remain.
@@ -128,6 +147,7 @@ pub(crate) const ERROR_INVALID_FUNCTION: i32 = 1;
 pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
 pub(crate) const ERROR_PATH_NOT_FOUND: i32 = 3;
 pub(crate) const ERROR_ACCESS_DENIED: i32 = 5;
+pub(crate) const ERROR_NOT_SAME_DEVICE: i32 = 17;
 pub(crate) const ERROR_INVALID_DATA: i32 = 13;
 pub(crate) const ERROR_NO_MORE_FILES: i32 = 18;
 pub(crate) const ERROR_SHARING_VIOLATION: i32 = 32;
@@ -135,8 +155,10 @@ pub(crate) const ERROR_NOT_SUPPORTED: i32 = 50;
 pub(crate) const ERROR_INVALID_PARAMETER: i32 = 87;
 pub(crate) const ERROR_INSUFFICIENT_BUFFER: i32 = 122;
 pub(crate) const ERROR_INVALID_NAME: i32 = 123;
+pub(crate) const ERROR_CALL_NOT_IMPLEMENTED: i32 = 120;
 pub(crate) const ERROR_INVALID_LEVEL: i32 = 124;
 pub(crate) const ERROR_DIR_NOT_EMPTY: i32 = 145;
+pub(crate) const ERROR_ALREADY_EXISTS: i32 = 183;
 pub(crate) const ERROR_MORE_DATA: i32 = 234;
 pub(crate) const ERROR_DIRECTORY: i32 = 267;
 pub(crate) const ERROR_DELETE_PENDING: i32 = 303;
@@ -278,6 +300,17 @@ pub(crate) struct TOKEN_USER {
     pub User: SID_AND_ATTRIBUTES,
 }
 
+/// `FILE_RENAME_INFORMATION` and `FILE_LINK_INFORMATION` (one layout): the flags (in the legacy
+/// classes a `BOOLEAN` `ReplaceIfExists` in their first byte), the directory the new name is
+/// relative to, and the name (`FileNameLength` bytes, not NUL-terminated) from `FileName` on.
+#[repr(C)]
+pub(crate) struct FILE_RENAME_INFORMATION {
+    pub Flags: u32,
+    pub RootDirectory: HANDLE,
+    pub FileNameLength: u32,
+    pub FileName: [u16; 1],
+}
+
 /// Pointer-width-dependent sizes: (64-bit, 32-bit).
 const fn by_width(wide: usize, narrow: usize) -> usize {
     if size_of::<usize>() == 8 {
@@ -327,6 +360,10 @@ const _: () = {
     assert!(size_of::<SID_AND_ATTRIBUTES>() == by_width(16, 8));
     assert!(offset_of!(SID_AND_ATTRIBUTES, Attributes) == by_width(8, 4));
     assert!(size_of::<TOKEN_USER>() == by_width(16, 8));
+    assert!(offset_of!(FILE_RENAME_INFORMATION, RootDirectory) == by_width(8, 4));
+    assert!(offset_of!(FILE_RENAME_INFORMATION, FileNameLength) == by_width(16, 8));
+    assert!(offset_of!(FILE_RENAME_INFORMATION, FileName) == by_width(20, 12));
+    assert!(size_of::<FILE_RENAME_INFORMATION>() == by_width(24, 16));
 };
 
 #[link(name = "kernel32")]
@@ -374,6 +411,13 @@ unsafe extern "system" {
     pub(crate) fn GetCurrentProcess() -> HANDLE;
     /// Frees what `GetSecurityInfo` allocated; returns NULL on success.
     pub(crate) fn LocalFree(hMem: *mut c_void) -> *mut c_void;
+    /// A folder made with the descriptor `lpSecurityAttributes` names (`acl::create_dir`).
+    pub(crate) fn CreateDirectoryW(
+        lpPathName: *const u16,
+        lpSecurityAttributes: *const c_void,
+    ) -> i32;
+    /// `BY_HANDLE_FILE_INFORMATION`, thirteen `DWORD`s, into `lpFileInformation`.
+    pub(crate) fn GetFileInformationByHandle(hFile: HANDLE, lpFileInformation: *mut u32) -> i32;
 }
 
 #[link(name = "advapi32")]
@@ -407,6 +451,86 @@ unsafe extern "system" {
     pub(crate) fn IsValidSid(pSid: *const c_void) -> i32;
     /// The length in bytes of the valid SID at `pSid`.
     pub(crate) fn GetLengthSid(pSid: *const c_void) -> u32;
+    /// Whether the SID at `pSid` is the well-known account `WellKnownSidType`.
+    pub(crate) fn IsWellKnownSid(pSid: *mut c_void, WellKnownSidType: u32) -> i32;
+    /// The SID's text (`S-1-5-…`), LocalAlloc'd.
+    pub(crate) fn ConvertSidToStringSidW(Sid: *mut c_void, StringSid: *mut *mut u16) -> i32;
+    /// The SID a text spells, LocalAlloc'd.
+    pub(crate) fn ConvertStringSidToSidW(StringSid: *const u16, Sid: *mut *mut c_void) -> i32;
+    /// Writes `SecurityInfo` parts of `handle`'s security descriptor.
+    pub(crate) fn SetSecurityInfo(
+        handle: HANDLE,
+        ObjectType: u32,
+        SecurityInfo: u32,
+        psidOwner: *mut c_void,
+        psidGroup: *mut c_void,
+        pDacl: *mut c_void,
+        pSacl: *mut c_void,
+    ) -> u32;
+    /// Reads `SecurityInfo` parts of the descriptor of the object at `pObjectName`.
+    pub(crate) fn GetNamedSecurityInfoW(
+        pObjectName: *const u16,
+        ObjectType: u32,
+        SecurityInfo: u32,
+        ppsidOwner: *mut *mut c_void,
+        ppsidGroup: *mut *mut c_void,
+        ppDacl: *mut *mut c_void,
+        ppSacl: *mut *mut c_void,
+        ppSecurityDescriptor: *mut *mut c_void,
+    ) -> u32;
+    /// Writes `SecurityInfo` parts of the descriptor of the object at `pObjectName`.
+    pub(crate) fn SetNamedSecurityInfoW(
+        pObjectName: *mut u16,
+        ObjectType: u32,
+        SecurityInfo: u32,
+        psidOwner: *mut c_void,
+        psidGroup: *mut c_void,
+        pDacl: *mut c_void,
+        pSacl: *mut c_void,
+    ) -> u32;
+    pub(crate) fn GetSecurityDescriptorOwner(
+        pSecurityDescriptor: *mut c_void,
+        pOwner: *mut *mut c_void,
+        lpbOwnerDefaulted: *mut i32,
+    ) -> i32;
+    pub(crate) fn GetSecurityDescriptorDacl(
+        pSecurityDescriptor: *mut c_void,
+        lpbDaclPresent: *mut i32,
+        pDacl: *mut *mut c_void,
+        lpbDaclDefaulted: *mut i32,
+    ) -> i32;
+    pub(crate) fn GetSecurityDescriptorSacl(
+        pSecurityDescriptor: *mut c_void,
+        lpbSaclPresent: *mut i32,
+        pSacl: *mut *mut c_void,
+        lpbSaclDefaulted: *mut i32,
+    ) -> i32;
+    pub(crate) fn GetSecurityDescriptorControl(
+        pSecurityDescriptor: *mut c_void,
+        pControl: *mut u16,
+        lpdwRevision: *mut u32,
+    ) -> i32;
+    /// `ACL_SIZE_INFORMATION` (three `DWORD`s) for `AclSizeInformation`.
+    pub(crate) fn GetAclInformation(
+        pAcl: *mut c_void,
+        pAclInformation: *mut c_void,
+        nAclInformationLength: u32,
+        dwAclInformationClass: u32,
+    ) -> i32;
+    pub(crate) fn GetAce(pAcl: *mut c_void, dwAceIndex: u32, pAce: *mut *mut c_void) -> i32;
+    pub(crate) fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        SecurityDescriptor: *mut c_void,
+        RequestedStringSDRevision: u32,
+        SecurityInformation: u32,
+        StringSecurityDescriptor: *mut *mut u16,
+        StringSecurityDescriptorLen: *mut u32,
+    ) -> i32;
+    pub(crate) fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        StringSecurityDescriptor: *const u16,
+        StringSDRevision: u32,
+        SecurityDescriptor: *mut *mut c_void,
+        SecurityDescriptorSize: *mut u32,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -424,6 +548,16 @@ unsafe extern "system" {
         CreateOptions: u32,
         EaBuffer: *const c_void,
         EaLength: u32,
+    ) -> NTSTATUS;
+    /// Sets one class of facts on an open handle: here, a new name for its entry
+    /// (`FileRenameInformation[Ex]`) or a second name (`FileLinkInformation`), relative to the
+    /// directory handle the information names.
+    pub(crate) fn NtSetInformationFile(
+        FileHandle: HANDLE,
+        IoStatusBlock: *mut IO_STATUS_BLOCK,
+        FileInformation: *const c_void,
+        Length: u32,
+        FileInformationClass: i32,
     ) -> NTSTATUS;
     /// The Win32 error code an NTSTATUS maps to.
     pub(crate) fn RtlNtStatusToDosError(Status: NTSTATUS) -> u32;

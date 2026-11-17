@@ -53,21 +53,21 @@ impl SourceRepo {
         {
             cmd.env_remove(key);
         }
-        cmd.args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-C",
-        ])
-        .arg(&self.root)
-        .args(args)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_NO_REPLACE_OBJECTS", "1")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        // The words agh's own children carry in a repository it only reads objects from, so the
+        // keys its admission let the repository set (a hook path, an fsmonitor command, an ssh
+        // command) stay inert here too.
+        for word in agh::git::OBJECT_SOURCE_WORDS {
+            cmd.arg("-c").arg(format!("{}={}", word.key, word.value));
+        }
+        cmd.arg("-C")
+            .arg(&self.root)
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_NO_REPLACE_OBJECTS", "1")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0");
         let out = output_within(&mut cmd, LOCAL_GIT_BOUND)
             .map_err(|e| Error::cannot_run(format!("read immutable source object: {e}")))?;
         if !out.status.success() {

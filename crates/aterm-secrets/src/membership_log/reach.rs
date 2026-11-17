@@ -173,7 +173,7 @@ const fn full_words(c: usize) -> usize {
 }
 
 /// The bytes the rows of `n` records take: the sum over `i < n` of `ceil(i / 64) * 8`.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(super) const fn bytes_for(n: usize) -> usize {
     let (full, rest) = (n / ROWS, n % ROWS);
     let mut words = ROWS * (full * full.saturating_sub(1) / 2) + (ROWS - 1) * full;
@@ -185,7 +185,7 @@ pub(super) const fn bytes_for(n: usize) -> usize {
 
 /// The most bytes the rows of a log of at most `n` records allocate: each chunk reserves all 64
 /// of its rows when it starts, so a partial last chunk takes what a full one does.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(super) const fn reserved_for(n: usize) -> usize {
     bytes_for(n.div_ceil(ROWS) * ROWS)
 }

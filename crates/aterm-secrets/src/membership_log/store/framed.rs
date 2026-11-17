@@ -4,9 +4,10 @@
 //! Bounded frame acquisition shared by records transport and local-file recovery.
 //! Callers retain their own count, verification and recovery policies.
 
-use super::{MAX_RECORDS_STREAM, Record, Store};
+use super::{MAX_RECORDS_STREAM, Reading, Record, Store};
 use crate::membership_log::{FRAME_PREFIX_LEN, RecordId};
 use crate::{Error, Result};
+#[cfg(any(unix, test))]
 use std::collections::BTreeSet;
 use std::io::{self, Read};
 use zeroize::Zeroizing;
@@ -14,12 +15,23 @@ use zeroize::Zeroizing;
 /// A transport read failure differs from an invalid or incomplete frame.
 pub(crate) enum FrameReadError {
     Read(io::Error),
-    Invalid(Error),
+    Invalid(
+        #[cfg_attr(
+            not(unix),
+            expect(
+                dead_code,
+                reason = "only the unix vault server answers with the reason"
+            )
+        )]
+        Error,
+    ),
 }
 
 /// Read one bounded frame at a time. Callers choose count, verification and recovery policy.
 pub(crate) struct FrameReader {
     header: Zeroizing<Vec<u8>>,
+    /// The layouts it frames ([`Reading`]).
+    reading: Reading,
 }
 
 /// A complete layout frame, with unverified parent identities from its header.
@@ -34,9 +46,16 @@ struct FrameWith<T> {
 }
 
 impl FrameReader {
+    /// A reader of the layouts a format-1 node reads ([`Reading::ONE`]).
     pub(crate) fn new() -> Self {
+        Self::at(Reading::ONE)
+    }
+
+    /// A reader of the layouts `reading` reads.
+    pub(crate) fn at(reading: Reading) -> Self {
         Self {
             header: Zeroizing::new(vec![0; FRAME_PREFIX_LEN]),
+            reading,
         }
     }
 
@@ -44,8 +63,9 @@ impl FrameReader {
         &mut self,
         reader: &mut R,
     ) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, FrameReadError> {
+        let reading = self.reading;
         self.read_with(reader, |header| {
-            Record::known_frame_header(header).map(|len| (len, ()))
+            Record::known_frame_header(header, reading).map(|len| (len, ()))
         })
         .map(|frame| frame.map(|frame| frame.wire))
     }
@@ -56,8 +76,9 @@ impl FrameReader {
         reader: &mut R,
         remaining: usize,
     ) -> std::result::Result<Option<LayoutFrame>, FrameReadError> {
+        let reading = self.reading;
         self.read_with(reader, |header| {
-            let (len, parents) = Record::frame_header(header)?;
+            let (len, parents) = Record::frame_header(header, reading)?;
             if len > remaining {
                 return Err(Error::new("membership record stream is too large"));
             }
@@ -85,7 +106,8 @@ impl FrameReader {
         if read != self.header.len() {
             return Err(invalid());
         }
-        let header_len = Record::frame_header_len(&self.header).map_err(FrameReadError::Invalid)?;
+        let header_len = Record::frame_header_len(&self.header, self.reading)
+            .map_err(FrameReadError::Invalid)?;
         self.header.resize(header_len, 0);
         if fill(reader, &mut self.header[FRAME_PREFIX_LEN..]).map_err(FrameReadError::Read)?
             != header_len - FRAME_PREFIX_LEN
@@ -108,10 +130,18 @@ impl FrameReader {
 pub(crate) struct DecodedRecords {
     records: Vec<Record>,
     strict: bool,
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "only the unix vault server reads how much it read"
+        )
+    )]
     bytes_read: usize,
 }
 
 impl DecodedRecords {
+    #[cfg(any(unix, test))]
     pub(crate) const fn bytes_read(&self) -> usize {
         self.bytes_read
     }
@@ -123,6 +153,7 @@ impl DecodedRecords {
     /// An unrooted server keeps new records only if they establish a genesis.
     /// While no genesis lands, insertion can only add unrooted IDs, never replace them.
     /// Retain the original IDs on that outcome without cloning their Store or bytes.
+    #[cfg(any(unix, test))]
     pub(crate) fn apply_rooted(self, store: Store) -> Store {
         let original: Option<BTreeSet<_>> = store
             .log
@@ -144,20 +175,26 @@ impl Store {
     /// store's held budget of verified frames. Every byte of the capped prefix is consumed,
     /// including after recovery stops, for its complete digest.
     pub(crate) fn recovering_read(self, reader: impl Read) -> Result<Self> {
-        Ok(Self::read_records_bounded(reader, self.budgets.held)?.apply(self))
+        let reading = self.reading;
+        Ok(Self::read_records_bounded(reader, self.budgets.held, reading)?.apply(self))
     }
 
     /// Read capped recovery input at the receiving store's explicit record limit. A server
     /// finishes its whole-file length and descriptor checks before applying this batch.
+    #[cfg(any(unix, test))]
     pub(crate) fn read_records(reader: impl Read, record_limit: usize) -> Result<DecodedRecords> {
-        Self::read_records_bounded(reader, record_limit)
+        Self::read_records_bounded(reader, record_limit, Reading::ONE)
     }
 
-    fn read_records_bounded(reader: impl Read, record_limit: usize) -> Result<DecodedRecords> {
+    fn read_records_bounded(
+        reader: impl Read,
+        record_limit: usize,
+        reading: Reading,
+    ) -> Result<DecodedRecords> {
         let mut reader = reader.take(MAX_RECORDS_STREAM as u64);
         let mut records = Vec::new();
         let mut strict = true;
-        let mut frames = FrameReader::new();
+        let mut frames = FrameReader::at(reading);
         while records.len() < record_limit {
             let frame = match frames.read(&mut reader) {
                 Ok(None) => {
@@ -174,7 +211,7 @@ impl Store {
                     break;
                 }
             };
-            match Record::decode(&frame) {
+            match Record::decode_in(&frame, reading) {
                 Ok(record) => records.push(record),
                 Err(_) => strict = false,
             }

@@ -581,6 +581,24 @@ pub struct StoreBuild {
     pub bytes_partial: bool,
 }
 
+/// One keyed build tree in the package store that `aterm pkg gc` would evict
+/// ([`atpkg::keyed_tree::evictable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleTree {
+    /// The keyed-tree program.
+    pub program: String,
+    /// The tree's key.
+    pub key: String,
+    /// The key of the program's most recently used tree on its target, which stays.
+    pub newest: String,
+    /// Absolute path of the tree.
+    pub path: PathBuf,
+    /// Size in bytes, as far as the walk got.
+    pub bytes: u64,
+    /// `true` when the walk hit [`MAX_WALK_ENTRIES`] and stopped.
+    pub bytes_partial: bool,
+}
+
 /// What made the host re-measure: the owner's verb, or the window's harness host on its tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
@@ -630,6 +648,8 @@ pub struct Survey {
     pub live_unnamed: Option<String>,
     /// Builds in the package store.
     pub store: Vec<StoreBuild>,
+    /// Keyed build trees in the package store that `aterm pkg gc` would evict.
+    pub idle_trees: Vec<IdleTree>,
     /// The live build of each program in the store.
     pub live_builds: BTreeMap<String, String>,
     /// Where transcripts live.
@@ -670,6 +690,7 @@ impl Survey {
             live_copy: None,
             live_unnamed: None,
             store: Vec::new(),
+            idle_trees: Vec::new(),
             live_builds: BTreeMap::new(),
             transcripts_root: None,
             purge_available: false,
@@ -793,6 +814,12 @@ pub enum Witness {
         program: String,
         live: String,
     },
+    /// A keyed build tree `aterm pkg gc` evicts: unused for `atpkg::keyed_tree::KEEP`, and not
+    /// the most recently used tree of its program, `newest`, which stays.
+    IdleTree {
+        program: String,
+        newest: String,
+    },
     VendorReports {
         command: &'static str,
     },
@@ -894,6 +921,11 @@ impl Witness {
             Witness::Superseded { program, live } => {
                 format!("superseded: {program} live build is {live}")
             }
+            Witness::IdleTree { program, newest } => format!(
+                "a {program} tree no worktree took for {} days; {program} keeps its most \
+                 recently used tree {newest}",
+                atpkg::keyed_tree::KEEP.as_secs() / 86_400
+            ),
             Witness::VendorReports { command } => format!("surfaced by `{command}`"),
         }
     }
@@ -910,6 +942,7 @@ impl Witness {
             Witness::NotLinkTarget { .. } => "not-link-target",
             Witness::NotLauncherCopy { .. } => "not-launcher-copy",
             Witness::Superseded { .. } => "superseded",
+            Witness::IdleTree { .. } => "idle-tree",
             Witness::VendorReports { .. } => "vendor-reports",
         }
     }
@@ -1374,6 +1407,20 @@ pub fn report(survey: &Survey, config: Config) -> Report {
     let mut notes: Vec<String> = Vec::new();
 
     let d = Delegate::AtermPkgGc;
+    for t in survey.idle_trees.iter().take(MAX_ROWS_PER_CLASS) {
+        rows.push(Row {
+            class: Class::AtpkgGc,
+            path: t.path.clone(),
+            bytes: t.bytes,
+            bytes_partial: t.bytes_partial,
+            witness: Witness::IdleTree {
+                program: t.program.clone(),
+                newest: t.newest.clone(),
+            },
+            removable: false,
+            blocked: Some(format!("run `{}` — {}", d.command(), d.because())),
+        });
+    }
     for b in survey.store.iter().take(MAX_ROWS_PER_CLASS) {
         let Some(live) = survey.live_builds.get(&b.program) else {
             notes.push(format!(
@@ -2019,6 +2066,7 @@ pub fn hogs_left(
                 Witness::NotLinkTarget { .. }
                 | Witness::NotLauncherCopy { .. }
                 | Witness::Superseded { .. }
+                | Witness::IdleTree { .. }
                 | Witness::VendorReports { .. } => false,
             })
             .map(|(row, removed)| {
@@ -4728,6 +4776,7 @@ pub fn scan_with(
     s.live_unnamed = read.unnamed;
     if let Some(store) = &roots.store_dir {
         scan_store(store, &mut s);
+        scan_trees(store, &mut s);
     }
     s.home = roots.home.clone();
     s.notes = roots.found_notes.clone();
@@ -4902,8 +4951,23 @@ fn observe_registered_holders(survey: &mut Survey) {
         });
         aterm_uds::progress::tick();
     }
+    let tree_stores = atpkg::keyed_tree::roots(home);
     for store in atpkg::build_cache::shared_units::roots(home) {
-        observe_shared_store(survey, store, deadline);
+        observe_shared_store(
+            survey,
+            store,
+            deadline,
+            "Trust's shared dependency store; aterm's cache sweep evicts its units by last use",
+        );
+    }
+    for store in tree_stores {
+        observe_shared_store(
+            survey,
+            store,
+            deadline,
+            "aterm's keyed build trees (LLVM, stage 0); `aterm pkg gc` evicts a tree no \
+             worktree took for 14 days",
+        );
     }
 }
 
@@ -4911,7 +4975,12 @@ fn observe_registered_holders(survey: &mut Survey) {
 /// rebuildable bytes beside the registered caches: no build directory the survey finds reaches
 /// `<cargo home>/trust/native-dependencies-v1`, so without it the rebuildable total
 /// ([`seen_rebuildable`]) would leave the store out.
-fn observe_shared_store(survey: &mut Survey, store: PathBuf, deadline: std::time::Instant) {
+fn observe_shared_store(
+    survey: &mut Survey,
+    store: PathBuf,
+    deadline: std::time::Instant,
+    why: &str,
+) {
     if !std::fs::symlink_metadata(&store).is_ok_and(|meta| meta.is_dir())
         || survey
             .volume_device
@@ -4926,8 +4995,7 @@ fn observe_shared_store(survey: &mut Survey, store: PathBuf, deadline: std::time
         path: store,
         bytes,
         bytes_partial,
-        why: "Trust's shared dependency store; aterm's cache sweep evicts its units by last use"
-            .into(),
+        why: why.into(),
         serves: None,
         built_s_ago: None,
     });
@@ -4988,6 +5056,30 @@ fn assess_idle_whole(
         if let (Err(why), Some(t)) = (clear, s.targets.get_mut(*i)) {
             t.idle = Some(Err(why));
         }
+    }
+}
+
+/// The keyed trees beside `store` (`<prefix>/trees.noindex`) that `aterm pkg gc` would evict.
+fn scan_trees(store: &Path, s: &mut Survey) {
+    let Some(prefix) = store.parent() else {
+        return;
+    };
+    let layout = atpkg::store::Layout {
+        prefix: prefix.to_path_buf(),
+    };
+    for e in atpkg::keyed_tree::evictable(&layout, std::time::SystemTime::now())
+        .into_iter()
+        .take(MAX_ROWS_PER_CLASS)
+    {
+        let (bytes, bytes_partial) = dir_bytes(&e.tree.at);
+        s.idle_trees.push(IdleTree {
+            program: e.tree.program.name.to_owned(),
+            key: e.tree.key.to_string(),
+            newest: e.newest.to_string(),
+            path: e.tree.at,
+            bytes,
+            bytes_partial,
+        });
     }
 }
 

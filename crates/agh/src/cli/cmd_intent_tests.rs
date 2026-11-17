@@ -66,6 +66,8 @@ fn begin(journal: &Journal, slug: &str, key: &str) -> IntentId {
             body_digest: None,
             grant: None,
             after,
+            writer: None,
+            refs: Vec::new(),
         })
         .expect("begin")
 }
@@ -83,8 +85,8 @@ fn created(id: u64) -> Settled {
     }
 }
 
-/// The document's fourteen keys, sorted.
-const KEYS: [&str; 14] = [
+/// The document's fifteen keys, sorted.
+const KEYS: [&str; 15] = [
     "at_secs",
     "closable",
     "grant",
@@ -99,6 +101,7 @@ const KEYS: [&str; 14] = [
     "retracted",
     "settled",
     "target_commitish",
+    "writer",
 ];
 
 #[test]

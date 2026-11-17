@@ -447,6 +447,12 @@ pub trait Machine {
     fn release_run(&self) -> bool {
         false
     }
+    /// Whether a PERSON asks for this admission ([`crate::Need::person`]): a command typed at a
+    /// terminal's prompt, not an agent's call ([`person_at`]). Injected machines are inert, so
+    /// a test of an isolated ledger never inherits the terminal it runs from.
+    fn person(&self) -> bool {
+        false
+    }
     /// The machine now, its volume the one holding `path` (`None`: no volume).
     fn read(&self, path: Option<&Path>) -> Reading;
 
@@ -636,6 +642,48 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// THE TERMINAL RULE: whether a process of the group `group` asks as a PERSON
+/// ([`crate::Need::person`]). It does where its group is `foreground`, the foreground group of
+/// its controlling terminal (`None`: no terminal, or none read), `var` reads none of
+/// [`aterm_types::domain::AGENT_MARKERS`], and it names no spawned worker's task file
+/// ([`aterm_types::domain::ENV_TASK_FILE`]): a command typed at a tab's prompt. An agent's
+/// tool call carries a marker; a tab `aterm ctl spawn` started for a worker (a program worker
+/// such as `verify land --tab`'s, one another Mac's fleet drive started) carries its task file,
+/// which every other tab strips; a detached child or a landing's judgment runs in a group of its
+/// own with no terminal; and a job sent to the background is not its terminal's foreground.
+#[must_use]
+pub fn person_at(
+    foreground: Option<i32>,
+    group: i32,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> bool {
+    group > 0
+        && foreground == Some(group)
+        && aterm_types::domain::agent_marker(var).is_none()
+        && var(aterm_types::domain::ENV_TASK_FILE).is_none_or(|v| v.is_empty())
+}
+
+/// The foreground process group of this process's controlling terminal, read through
+/// `/dev/tty` opened as `atpkg`'s build front opens it (no new controlling terminal, never
+/// blocking, kept out of every child and closed at once after the read); `None` where it has
+/// none.
+#[cfg(unix)]
+fn terminal_foreground() -> Option<i32> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let tty = aterm_uds::kept_out(|| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/dev/tty")
+    })
+    .ok()?;
+    // SAFETY: an integer call on a descriptor `tty` owns for the call's length; one that is no
+    // terminal answers -1.
+    let group = unsafe { libc::tcgetpgrp(tty.as_raw_fd()) };
+    (group > 0).then_some(group)
+}
+
 /// The live machine, through aterm-sysprobe.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Live;
@@ -643,6 +691,19 @@ pub struct Live;
 impl Machine for Live {
     fn release_run(&self) -> bool {
         std::env::var_os(crate::RELEASE_RUN_ENV).is_some_and(|v| !v.is_empty())
+    }
+    fn person(&self) -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: getpgrp has no arguments and cannot fail.
+            let group = unsafe { libc::getpgrp() };
+            // A value that is not UTF-8 is still set.
+            person_at(terminal_foreground(), group, &|k| {
+                std::env::var_os(k).map(|v| v.to_string_lossy().into_owned())
+            })
+        }
+        #[cfg(not(unix))]
+        false
     }
     fn cpu_point(&self) -> Option<crate::CpuPoint> {
         let ticks = aterm_sysprobe::Probe::new().core_ticks()?;

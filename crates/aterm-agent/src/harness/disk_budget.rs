@@ -69,7 +69,8 @@ pub fn due(began: Option<i64>, now: i64) -> bool {
 }
 
 /// The rebuildable bytes the volume holds now: each registered build cache under `roots`'s
-/// home, its shared dependency stores (`atpkg::build_cache::shared_units::roots`) and each build directory a search from `roots` finds (under `search`), those
+/// home, its shared dependency stores (`atpkg::build_cache::shared_units::roots`), its keyed
+/// build trees (`atpkg::keyed_tree::roots`) and each build directory a search from `roots` finds (under `search`), those
 /// `same_volume` places on the volume, sized by [`size`] before `deadline`, a registered cache
 /// counted only where its registration is still current once it was sized (as the report's
 /// holders are). The figure is a floor (`partial`) where the search was cut short, too.
@@ -87,7 +88,14 @@ pub fn rebuildable(
     let found = discover::discover(roots, discover::Budget { wall, ..search });
     let home = roots.home.as_deref();
     let registered = home.map_or_else(Vec::new, atpkg::build_cache::registered::roots);
-    let stores = home.map_or_else(Vec::new, atpkg::build_cache::shared_units::roots);
+    // Targo's shared dependency store and atpkg's keyed build trees: rebuildable or refetchable
+    // bytes no build directory the search finds holds.
+    let stores: Vec<PathBuf> = home.map_or_else(Vec::new, |home| {
+        atpkg::build_cache::shared_units::roots(home)
+            .into_iter()
+            .chain(atpkg::keyed_tree::roots(home))
+            .collect()
+    });
     let caches: Vec<PathBuf> = home.map_or_else(Vec::new, |home| {
         registered
             .iter()

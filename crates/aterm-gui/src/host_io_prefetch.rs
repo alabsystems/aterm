@@ -5,7 +5,7 @@
 //! ([`Prefetch::reads`], [`Flags`], [`take_clipboard_query`], [`take_kitty_medium`],
 //! [`READ_BUDGET`], [`Burst::covered`]).
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 
 use aterm_core::terminal::kitty_graphics::{KittyAction, KittyMedium, parse_kitty_control};
 use aterm_core::terminal::{ClipboardSelection, Terminal};
@@ -64,10 +64,10 @@ struct Fetched {
 }
 
 thread_local! {
-    // Boxed: inline it was 120 bytes of every thread's thread-local template
-    // (`tests/thread_local_template.rs`). The pointer is read once as a slice begins, once as its
-    // burst drops and once for each request taken, never inside the scan.
-    static FETCHED: Box<RefCell<Fetched>> = Box::new(RefCell::new(Fetched::default()));
+    // The lazy owner stays pointer-sized in the thread-local template. A reader that admits
+    // no host I/O never creates the boxed state; an initialized reader keeps its carried
+    // request and same-slice cleanup across bursts.
+    static FETCHED: OnceCell<Box<RefCell<Fetched>>> = const { OnceCell::new() };
 }
 
 /// A PTY reader's side of the prefetch.
@@ -94,7 +94,7 @@ impl Prefetch {
 /// The reads one slice asked for, held until it has been fed.
 pub(crate) struct Burst {
     covered: usize,
-    consume: fn(KittyMedium, &str, bool),
+    consume: Option<fn(KittyMedium, &str, bool)>,
 }
 
 impl Burst {
@@ -117,7 +117,16 @@ impl Burst {
         mut medium: impl FnMut(KittyMedium, &str) -> Option<Vec<u8>>,
         consume: fn(KittyMedium, &str, bool),
     ) -> Self {
-        let covered = FETCHED.with(|cell| {
+        let mut cleanup = false;
+        let covered = FETCHED.with(|slot| {
+            let cell = match slot.get() {
+                Some(cell) => cell,
+                None if flags.any() => {
+                    slot.get_or_init(|| Box::new(RefCell::new(Fetched::default())))
+                }
+                None => return slice.len(),
+            };
+            cleanup = true;
             let Ok(mut fetched) = cell.try_borrow_mut() else {
                 return slice.len();
             };
@@ -174,7 +183,10 @@ impl Burst {
                 }
             }
         });
-        Self { covered, consume }
+        Self {
+            covered,
+            consume: cleanup.then_some(consume),
+        }
     }
 
     /// Prefix length of the slice covered by its reads ([`READ_BUDGET`]).
@@ -185,7 +197,13 @@ impl Burst {
 
 impl Drop for Burst {
     fn drop(&mut self) {
-        let taken = FETCHED.with(|cell| {
+        let Some(consume) = self.consume else {
+            return;
+        };
+        let taken = FETCHED.with(|slot| {
+            let Some(cell) = slot.get() else {
+                return Vec::new();
+            };
             let Ok(mut fetched) = cell.try_borrow_mut() else {
                 return Vec::new();
             };
@@ -195,7 +213,7 @@ impl Drop for Burst {
             std::mem::take(&mut fetched.taken)
         });
         for (medium, name, read) in taken {
-            (self.consume)(medium, &name, read);
+            consume(medium, &name, read);
         }
     }
 }
@@ -203,8 +221,8 @@ impl Drop for Burst {
 /// The OSC 52 query callback's answer.
 #[cfg(any(not(target_os = "linux"), test))]
 pub(crate) fn take_clipboard_query() -> Option<String> {
-    FETCHED.with(|cell| {
-        let mut fetched = cell.try_borrow_mut().ok()?;
+    FETCHED.with(|slot| {
+        let mut fetched = slot.get()?.try_borrow_mut().ok()?;
         fetched.queries = fetched.queries.checked_sub(1)?;
         if fetched.queries == 0 {
             fetched.clipboard.take()
@@ -216,8 +234,8 @@ pub(crate) fn take_clipboard_query() -> Option<String> {
 
 /// Take the prefetched Kitty medium `(medium, name)` for the slice being fed ([`Burst`]).
 pub(crate) fn take_kitty_medium(medium: KittyMedium, name: &str) -> Option<Vec<u8>> {
-    FETCHED.with(|cell| {
-        let mut fetched = cell.try_borrow_mut().ok()?;
+    FETCHED.with(|slot| {
+        let mut fetched = slot.get()?.try_borrow_mut().ok()?;
         let at = fetched
             .kitty
             .iter()
@@ -346,3 +364,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "host_io_prefetch_measure_tests.rs"]
 mod measure_tests;
+
+#[cfg(test)]
+#[path = "host_io_prefetch_default_measure_tests.rs"]
+mod default_measure_tests;

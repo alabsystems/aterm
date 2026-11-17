@@ -104,10 +104,7 @@ fn supported_retention_revokes_ordinary_paths_and_keeps_unretained_siblings_elig
 
 #[test]
 fn a_late_registered_marker_revokes_each_ordinary_removal_path() {
-    #[cfg(unix)]
     let whens = [Stage::Locked, Stage::Staging, Stage::Staged];
-    #[cfg(windows)]
-    let whens = [Stage::Locked, Stage::Staging];
     for method in 0..4 {
         for when in whens {
             let tmp = Tmp::new("late-managed-target");
@@ -1321,10 +1318,10 @@ fn a_build_holding_any_lock_keeps_its_profile() {
 }
 
 /// Every lock is held from before anything is taken until what was taken is staged, and let go
-/// before the stage is deleted (Windows, which stages nothing: until after the delete).
+/// before the stage is deleted, on unix and on Windows alike (DC-20, DC-20w).
 ///
-/// Negative control: a pass that deleted in place on unix would show `incremental/` still in its
-/// place at `Deleting` with every lock held.
+/// Negative control: a pass that deleted in place would show `incremental/` still in its place
+/// at `Deleting` with every lock held.
 #[test]
 fn every_lock_is_held_until_what_it_took_is_staged() {
     let tmp = Tmp::new("locks");
@@ -1341,20 +1338,12 @@ fn every_lock_is_held_until_what_it_took_is_staged() {
         seen.push((stage, all, inc));
     })
     .expect("reclaimed");
-    #[cfg(unix)]
     let expected = vec![
         (Stage::Locked, true, true),
         (Stage::Staging, true, true),
         (Stage::Staged, true, false),
         (Stage::Released, false, false),
         (Stage::Deleting, false, false),
-    ];
-    #[cfg(windows)]
-    let expected = vec![
-        (Stage::Locked, true, true),
-        (Stage::Staging, true, true),
-        (Stage::Deleting, true, true),
-        (Stage::Released, false, false),
     ];
     assert_eq!(seen, expected, "(stage, locks held, in place)");
     assert!(!debug.join(INCREMENTAL).exists());
@@ -1751,6 +1740,9 @@ fn the_bytes_counted_are_the_blocks_the_unlinks_released() {
 
 /// An undeletable entry is reported and uncounted while its siblings are still removed, and it
 /// ends where it was: what the delete of a stage leaves goes back, and its line names it there.
+/// On Windows the stuck file's open handle refuses the rename of `incremental/`, which is then
+/// kept whole (`a_pass_on_windows_keeps_an_entry_an_open_handle_holds_for_the_next_pass`):
+/// there a pass that can make no stage deletes in place, and this holds of that delete.
 ///
 /// Negative control (unix): without the move back the stuck folder would sit in the pass's
 /// stage, where `ro` names nothing and a stage stands.
@@ -1768,7 +1760,12 @@ fn an_undeletable_entry_is_reported_and_its_siblings_still_go() {
         counted += blocks(&f);
     }
 
-    let done = reclaim(&t, &judge(now_after_write(STALE + 1))).expect("partly reclaimed");
+    #[cfg(windows)]
+    fd::inject_stage_fault(Some(112));
+    let done = reclaim(&t, &judge(now_after_write(STALE + 1)));
+    #[cfg(windows)]
+    fd::inject_stage_fault(None);
+    let done = done.expect("partly reclaimed");
     drop(stuck);
     assert!(ro.join("file").exists(), "the stuck file stays");
     let left: Vec<String> = std::fs::read_dir(&inc)
@@ -1813,10 +1810,12 @@ fn a_directory_holding_source_is_never_a_candidate() {
 /// too: a full disk makes no stage) deleted it in place.
 #[test]
 fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
+    // On Windows the stuck file's open handle keeps `incremental/` whole where a stage can be
+    // made: only the delete in place leaves a partial delete there.
     #[cfg(unix)]
-    let ways = [false, true];
+    let (ways, full) = ([false, true], libc::ENOSPC);
     #[cfg(windows)]
-    let ways = [false];
+    let (ways, full) = ([true], 112);
     for in_place in ways {
         let tmp = Tmp::new(["cut-short", "cut-short-in-place"][usize::from(in_place)]);
         let t = synthetic_target(&tmp, "target");
@@ -1837,10 +1836,8 @@ fn a_reclaim_cut_short_leaves_the_profile_idle_for_the_next() {
         }
         assert!(target_witness(&assessed(&t, now), now, STALE).is_ok());
 
-        #[cfg(unix)]
-        fd::inject_stage_fault(in_place.then_some(libc::ENOSPC));
+        fd::inject_stage_fault(in_place.then_some(full));
         let done = reclaim(&t, &judge(now));
-        #[cfg(unix)]
         fd::inject_stage_fault(None);
         let done = done.expect("partly reclaimed");
         assert!(done.units.is_empty(), "{done:?}");
@@ -1989,20 +1986,12 @@ fn reclaim_lru_takes_only_the_named_profile_under_every_lock() {
         done.skipped.is_empty() && done.trouble.is_empty(),
         "{done:?}"
     );
-    #[cfg(unix)]
     let expected = vec![
         (Stage::Locked, true),
         (Stage::Staging, true),
         (Stage::Staged, true),
         (Stage::Released, false),
         (Stage::Deleting, false),
-    ];
-    #[cfg(windows)]
-    let expected = vec![
-        (Stage::Locked, true),
-        (Stage::Staging, true),
-        (Stage::Deleting, true),
-        (Stage::Released, false),
     ];
     assert_eq!(seen, expected);
     assert!(!debug.join(INCREMENTAL).exists());
@@ -2334,7 +2323,6 @@ fn a_stage_is_never_walked_as_a_profile_nor_kept_by_a_bound() {
 
 /// The hook order of a pass that stages: what it takes is staged under the locks and deleted
 /// once they are let go.
-#[cfg(unix)]
 const STAGED_ORDER: [Stage; 5] = [
     Stage::Locked,
     Stage::Staging,
@@ -2353,7 +2341,6 @@ const IN_PLACE_ORDER: [Stage; 4] = [
 ];
 
 /// Every folder under `root` named as a stage ([`STAGE`]): none where `root` itself is gone.
-#[cfg(unix)]
 fn stages_in(root: &Path) -> Vec<PathBuf> {
     if !root.exists() {
         return Vec::new();
@@ -3300,8 +3287,10 @@ fn a_died_build_is_read_by_age_and_lock_and_a_held_session_is_waited_for() {
 }
 
 /// TIER 0's remover takes a died build's piece under the profile's locks and the session's own,
-/// and puts its folder's times back, so the profile's clock reads what it read before: a held
-/// session lock keeps the session; let go, the session goes and its lock file stays.
+/// stages it in the profile and lets the locks go before it deletes it (DC-20w), and puts its
+/// folder's times back before it lets them go, so the profile's clock reads what it read
+/// before: a held session lock keeps the session; let go, the session goes and its lock file
+/// stays.
 /// NEGATIVE CONTROL: a remover that skipped the session lock removes the held session (the
 /// first `expect_err` fails), and one that did not put the times back leaves `deps/` dated
 /// the removal (the `modified` line fails).
@@ -3359,11 +3348,8 @@ fn a_died_builds_piece_goes_under_its_locks_and_its_folders_times_stay() {
         .map(|(s, _)| *s)
         .filter(|s| *s != Stage::Removing)
         .collect();
-    assert_eq!(
-        told,
-        [Stage::Locked, Stage::Deleting, Stage::Released],
-        "{stages:?}"
-    );
+    assert_eq!(told, STAGED_ORDER, "{stages:?}");
+    assert!(stages_in(&target).is_empty(), "no stage left");
     assert_eq!(
         modified(&profile.join("deps")),
         deps_at,
@@ -3500,6 +3486,81 @@ fn what_a_stage_finish_leaves_goes_back_or_stops_being_a_stage() {
                 assert!(assessed(&t, now).stages.is_empty(), "{case}: {text}");
             }
         }
+    }
+}
+
+/// A died build's piece is staged in its profile, where a walk finds a stage a killed pass
+/// left, and the stage's tag names the folder the piece came from: what a later pass's delete
+/// of that stage leaves goes back there (`deps/`), not to the profile's root, where nothing
+/// names it again.
+///
+/// Negative control: the same stage with a tag that names no folder puts what its delete left
+/// back beside itself, in the profile's root.
+#[cfg(unix)]
+#[test]
+fn what_a_finish_leaves_of_a_died_piece_goes_back_to_its_own_folder() {
+    use std::os::unix::fs::PermissionsExt as _;
+    for named in [true, false] {
+        let tmp = Tmp::new("died-settle");
+        let t = synthetic_target(&tmp, "target");
+        let debug = t.join("debug");
+        let piece = at(&debug, "deps/rmetaAb12Cd");
+        std::fs::create_dir_all(&piece).expect("rmeta");
+        std::fs::write(piece.join("lib.rmeta"), vec![2u8; 8192]).expect("rmeta file");
+        let now = now_after_write(STALE + 1);
+        let killed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            reclaim_died_with(
+                &t,
+                &debug,
+                &piece,
+                &judge(now),
+                now,
+                &mut || Ok(()),
+                &mut |stage, _| {
+                    assert_ne!(
+                        stage,
+                        Stage::Removing,
+                        "the pass stops at its first removal"
+                    );
+                },
+            )
+        }));
+        assert!(killed.is_err(), "named {named}: the pass stopped");
+        let stages = stages_in(&t);
+        assert_eq!(stages.len(), 1, "named {named}: {stages:?}");
+        let stage = &stages[0];
+        assert_eq!(stage.parent(), Some(debug.as_path()), "in the profile");
+        let tag = stage.join(STAGE_TAG);
+        assert_eq!(
+            std::fs::read(&tag).expect("tag"),
+            b"deps\n",
+            "it names deps/"
+        );
+        if !named {
+            std::fs::write(&tag, b"").expect("a tag that names no folder");
+        }
+        let stuck = Stuck::at(&stage.join("rmetaAb12Cd").join("stuck"));
+        let result = reclaim(&t, &judge(now));
+        drop(stuck);
+        let home = if named {
+            piece.clone()
+        } else {
+            debug.join("rmetaAb12Cd")
+        };
+        let back = home.join("stuck");
+        let _ = std::fs::set_permissions(&back, std::fs::Permissions::from_mode(0o755));
+        let text = match &result {
+            Ok(done) => format!("{done:?}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(back.join("file").exists(), "named {named}: {text}");
+        let other = if named {
+            debug.join("rmetaAb12Cd")
+        } else {
+            piece.clone()
+        };
+        assert!(!other.exists(), "named {named}: {text}");
+        assert!(stages_in(&t).is_empty(), "named {named}: {text}");
     }
 }
 

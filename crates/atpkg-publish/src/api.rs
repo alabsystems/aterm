@@ -244,6 +244,9 @@ pub struct Delta {
     pub triple_drops: Vec<TripleDrop>,
     /// A new freshness horizon (RFC3339 UTC).
     pub valid_until: Option<String>,
+    /// Keyed trees to list (`program -> key -> build`, `--tree`): each published key maps to
+    /// the build whose signed pack carries it, never pinned (`atpkg::keyed_tree`).
+    pub trees: BTreeMap<String, BTreeMap<String, Build>>,
 }
 
 /// What the index is built over.

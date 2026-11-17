@@ -1360,24 +1360,47 @@ fn log_state_digest(
     ] {
         if let Some(meta) = crate::fsx::lstat_in(glance, &extra)? {
             hash.update([1]);
-            hash.update(meta.len().to_le_bytes());
             #[cfg(unix)]
             {
-                use std::os::unix::fs::MetadataExt as _;
-                hash.update(meta.dev().to_le_bytes());
-                hash.update(meta.ino().to_le_bytes());
-                hash.update(meta.mode().to_le_bytes());
-                hash.update(meta.uid().to_le_bytes());
-                hash.update(meta.gid().to_le_bytes());
-                hash.update(meta.nlink().to_le_bytes());
-                hash.update(meta.ctime().to_le_bytes());
-                hash.update(meta.ctime_nsec().to_le_bytes());
+                hash.update(meta.len().to_le_bytes());
+                {
+                    use std::os::unix::fs::MetadataExt as _;
+                    hash.update(meta.dev().to_le_bytes());
+                    hash.update(meta.ino().to_le_bytes());
+                    hash.update(meta.mode().to_le_bytes());
+                    hash.update(meta.uid().to_le_bytes());
+                    hash.update(meta.gid().to_le_bytes());
+                    hash.update(meta.nlink().to_le_bytes());
+                    hash.update(meta.ctime().to_le_bytes());
+                    hash.update(meta.ctime_nsec().to_le_bytes());
+                }
+                let dur = meta.modified().and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map_err(std::io::Error::other)
+                })?;
+                hash.update(dur.as_nanos().to_le_bytes());
             }
-            let dur = meta.modified().and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH)
-                    .map_err(std::io::Error::other)
-            })?;
-            hash.update(dur.as_nanos().to_le_bytes());
+            // The same facts as a handle shows them: the length, the volume and file id, the
+            // attributes and reparse tag (the kind), the link count, the change and last-write
+            // times, and the owner and access list in place of the mode and owner ids.
+            #[cfg(windows)]
+            {
+                hash.update(meta.size.to_le_bytes());
+                hash.update(meta.st_dev.to_le_bytes());
+                hash.update(meta.st_ino.to_le_bytes());
+                hash.update(meta.attributes.to_le_bytes());
+                hash.update(meta.reparse_tag.to_le_bytes());
+                hash.update(meta.st_nlink.to_le_bytes());
+                hash.update(meta.change_time.to_le_bytes());
+                hash.update(meta.last_write.to_le_bytes());
+                match crate::fsx::access_digest(&extra) {
+                    Ok(access) => {
+                        hash.update([1]);
+                        hash.update(access);
+                    }
+                    Err(_) => hash.update([0]),
+                }
+            }
         } else {
             hash.update([0]);
         }

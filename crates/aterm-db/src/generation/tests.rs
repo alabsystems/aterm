@@ -135,6 +135,16 @@ fn reserved(lab: &Lab) -> Selection {
     reserve(&lab.paths[0], &config, &bootstrap).unwrap()
 }
 
+/// Take the original home of a lab of two writers through a completed succession: reserved,
+/// its successor the second writer's admitted custody, its records imported. The configuration
+/// its selection names is returned.
+pub(crate) fn succeed(lab: &mut Lab) -> PathBuf {
+    let mut selection = reserved(lab);
+    move_admitted_candidate(lab);
+    import(&mut selection).unwrap();
+    selection.config
+}
+
 fn move_admitted_candidate(lab: &mut Lab) -> Paths {
     let next = candidate(&lab.paths[0]);
     move_admitted_to(lab, 1, next)
@@ -640,14 +650,14 @@ fn account_service_observation_never_repairs_a_selected_generations_ancestor() {
         move_admitted_candidate(&mut lab);
         import(&mut selection).unwrap();
         assert_eq!(
-            crate::service_state::accounts(&original, &selection.config, 1000).availability,
+            crate::service_state::tests::accounts(&original, &selection.config, 1000).availability,
             ServiceAvailability::Cached
         );
         let path = original.dir.join(name);
         std::fs::rename(&path, path.with_extension("preserved")).unwrap();
         let before = files(lab._home.path());
 
-        let observed = crate::service_state::accounts(&original, &selection.config, 2000);
+        let observed = crate::service_state::tests::accounts(&original, &selection.config, 2000);
         assert!(
             files(lab._home.path()) == before,
             "account observation repaired ancestor {name}"
@@ -707,6 +717,7 @@ fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
                 &Instant::now,
                 hang_detector(),
             )
+            .0
         });
         assert!(!waited.get(), "{lock}: waited past a spent wait");
         assert_eq!(read, control_busy(1000), "{lock}");
@@ -719,7 +730,8 @@ fn a_held_predecessor_is_busy_when_the_wait_ends_not_when_the_read_does() {
         2000,
         &Instant::now,
         hang_detector(),
-    );
+    )
+    .0;
     assert_eq!(read.availability, ServiceAvailability::Cached, "{read:?}");
 }
 
@@ -2280,7 +2292,8 @@ fn a_successor_homes_readers_observe_their_predecessor_once() {
                     1000,
                     &Instant::now,
                     hang_detector(),
-                );
+                )
+                .0;
                 (
                     read.availability == ServiceAvailability::Cached,
                     format!("{read:?}"),
@@ -2441,7 +2454,8 @@ fn a_stale_account_read_keeps_its_finding_beside_a_predecessor_holder() {
         1000,
         &Instant::now,
         Instant::now() + aterm_spec::wait::MUST_HAPPEN,
-    );
+    )
+    .0;
     assert!(holder.borrow_mut().take().is_some(), "never held");
     assert_ne!(
         read,

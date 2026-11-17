@@ -10,11 +10,7 @@ use std::process::Output;
 use std::time::Instant;
 
 const PRODUCT: &[u8] = b"crates/aterm/Cargo.toml";
-const IDENTITY: [&[u8]; 3] = [
-    b"crates/aterm/build.rs",
-    b"crates/aterm-stamp/src/lib.rs",
-    b"crates/aterm-census/src/guards/identity_read.rs",
-];
+const IDENTITY: [&[u8]; 2] = [b"crates/aterm/build.rs", b"crates/aterm-stamp/src/lib.rs"];
 /// The four trees [`independent_lock`] reads, in its argument order, as a refusal names them.
 const ENDPOINTS: [&str; 4] = ["the base", "new main", "the checked tree", "the merge"];
 

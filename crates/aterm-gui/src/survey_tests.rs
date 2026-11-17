@@ -42,6 +42,7 @@ fn prompt(text: &str) -> Prompt {
     Prompt {
         text: text.to_owned(),
         key: excerpt::prompt_key(text),
+        shell: false,
     }
 }
 

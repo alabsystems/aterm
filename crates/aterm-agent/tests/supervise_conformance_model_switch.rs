@@ -6,8 +6,9 @@
 //! `acted` and `restarted`) driven along every reachable state of the model, so the
 //! answer to Fable's own limit (the move onto Opus asked for until the host can make
 //! it, the continuation first at the reset, a return to the launch's own model only at
-//! a named reset that was ahead when the move was made or as a `/usage` sample of Fable's
-//! week reads it where the notice named none, and nothing at all for a launch that names
+//! a named reset that was ahead when the move was made, as a `/usage` sample of Fable's
+//! week reads it where the notice named none, or once a turn Fable served on the account
+//! after the move lifted its limit there, and nothing at all for a launch that names
 //! another model) is the model's, state for state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -15,10 +16,11 @@ use std::time::{Duration, Instant};
 
 use alab_policy::config::TurnEndTiming;
 use alab_policy::vocab::{Phase, WallKind};
+use aterm_agent::harness::accounts;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::policy::turn_end::{
-    BackBy, Composer, FABLE_FALLBACK, LaunchModel, ModelSwitch, RULE_LIMIT_RESUME, Restart,
-    Sampled, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end, fable_rung,
+    BackBy, Composer, FABLE_FALLBACK, LaunchModel, LiftTold, ModelSwitch, RULE_LIMIT_RESUME,
+    Restart, Sampled, TurnEndAction, TurnEndReading, TurnEndState, decide_turn_end, fable_rung,
 };
 use aterm_models_harness::supervisor_model_switch_model;
 use aterm_spec::derive::Model;
@@ -28,6 +30,7 @@ use crate::common::cnst;
 type State = BTreeMap<&'static str, i64>;
 
 const MIN: Duration = Duration::from_secs(60);
+const SEC: Duration = Duration::from_secs(1);
 const REAL_WORK: Duration = Duration::from_secs(30 * 60);
 const WALL: &str =
     "You've reached your Fable limit. Run /usage-credits to continue or switch models with /model.";
@@ -237,7 +240,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
             Verdict::Other
         }
     } else if st["on"] == 1
-        && ((st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt")) || st["back"] == 2)
+        && ((st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt"))
+            || st["back"] == 2
+            || st["back"] == 4)
     {
         Verdict::Return
     } else {
@@ -368,6 +373,36 @@ fn mirror(
                 real.now = real.now.max(last + fable_rung(u32::MAX));
             }
         }
+        // A turn served on the account a second after this point, told the real switch as the
+        // loop tells it: the lift of Fable's limit the account's record holds, which only a reply
+        // by a Fable model leaves there ([`accounts::draws_on`]). `FableServes` is the launch's
+        // own Fable; the `Buggy = 3` model's `OtherModelLifts` is a turn the fallback served,
+        // which lifts nothing, so the walk judges the real answer, not the model's wish. The
+        // wall's clock moves with the second, so a reset it names stays the same ticks ahead. In
+        // the strict walk the real switch must take the lift: the return is due by now (at once,
+        // or where an earlier reading already timed it), timed by the lift.
+        "FableServes" | "OtherModelLifts" => {
+            real.appeared += SEC;
+            real.now += SEC;
+            let served_by = if action == "FableServes" {
+                FABLE_ID
+            } else {
+                FABLE_FALLBACK
+            };
+            let fables = accounts::week_bucket(aterm_phase::WeekModel::Fable);
+            let lift = accounts::draws_on(served_by, fables).then_some(real.now);
+            let got = real.st.fable_lifted(lift, real.now);
+            let timed = real.st.model_switch().and_then(|m| m.back_by);
+            let taken = matches!(got, Some(LiftTold::Due { at }) if at <= real.now)
+                && timed == Some(BackBy::Lifted);
+            if action == "FableServes" && !taken {
+                assert!(
+                    !real.strict,
+                    "{action} at {before:?}: {got:?} timed by {timed:?}, not a lift due by now"
+                );
+                return false;
+            }
+        }
         "GuessedReturn" | "GivesUp" | "ReturnBlocks" | "MovesAnother" => {}
         other => panic!("an action this bind does not mirror: {other}"),
     }
@@ -433,7 +468,9 @@ fn tier1_the_real_decider_switches_and_returns_exactly_where_the_model_allows() 
 /// scheduled one for) and the `Buggy = 2` one (a return made on a row with room left inside the
 /// rung since the last such return, which a row misread while the bucket stands turns into a
 /// `NoPingPong`) are not the real decider, the latter judged by what the real switch answers that
-/// row; and
+/// row; the `Buggy = 3` model (a turn another model served taken for Fable's, so a return made
+/// with the bucket at its limit) is not either, judged by what the real switch answers a lift no
+/// Fable turn left; and
 /// a switch seeded with a guessed half hour's `back_at` makes the real decider return where
 /// the committed switch owes none until a sample times it.
 #[test]
@@ -459,6 +496,20 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         "no disagreement at a return owed inside its rung: {} states",
         off.len()
     );
+    let other_model = aterm_spec::interp::with_buggy(&m, 3);
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&other_model),
+        std::collections::BTreeSet::from(["NoPingPong", "NoReturnWithoutAReset"]),
+        "a return on another model's turn is made with the bucket at its limit, and is one more \
+         relaunch pair between two turns Fable served"
+    );
+    let (_, off) = walk(&other_model, false, false);
+    assert!(
+        off.iter()
+            .any(|st| st["on"] == 1 && st["back"] == 4 && st["bucket"] == 1),
+        "no disagreement at a return owed on another model's turn: {} states",
+        off.len()
+    );
     let (_, mislabelled) = walk(&m, false, true);
     assert!(
         mislabelled
@@ -475,8 +526,10 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         launch: None,
         from: Some("fable".to_string()),
         to: FABLE_FALLBACK.to_string(),
+        since: t,
         back_at: Some(t + 30 * MIN),
         back_by: Some(BackBy::Notice),
+        lifted_over: None,
         sample_at: None,
         samples: 0,
         proc: None,

@@ -132,6 +132,7 @@ fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
             .jobs
             .as_deref()
             .map(|_| (snap.jobs_age_ms, window_ms(snap))),
+        View::Boot => Some((0, None)),
         _ => None,
     };
     let (older, window) = carried.unwrap_or((0, window_ms(snap)));
@@ -913,13 +914,16 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     if let Some(s) = ctx.snap {
         lines.extend(stalled_lines(s));
     }
-    let events: Vec<Line> = ctx.snap.map_or_else(Vec::new, |s| {
-        ctx.events
-            .iter()
-            .filter(|e| event_shown(ctx, e))
-            .map(|e| event_line(ctx, s, e))
-            .collect()
-    });
+    let events: Vec<Line> = ctx
+        .snap
+        .filter(|_| q.view != View::Boot)
+        .map_or_else(Vec::new, |s| {
+            ctx.events
+                .iter()
+                .filter(|e| event_shown(ctx, e))
+                .map(|e| event_line(ctx, s, e))
+                .collect()
+        });
     let mut hw_notes: Vec<Line> = match (ctx.snap, q.view) {
         (Some(s), View::Cores | View::Why) => super::hardware::lines(s)
             .into_iter()
@@ -971,6 +975,7 @@ pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
                         .map(|s| note("report", s)),
                 );
             }
+            View::Boot => lines.extend(super::boot::text(s.boot_cost.as_deref(), q.top)),
         },
     }
     if let Some(s) = ctx.snap
@@ -3125,6 +3130,25 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
 }
 
 fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
+    if view == View::Boot {
+        return Jv::obj([
+            (
+                "unix_ms_decimal",
+                ctx.snap.map_or_else(
+                    || Jv::why("warming"),
+                    |_| Jv::s(ctx.as_of_unix_ms.to_string()),
+                ),
+            ),
+            (
+                "age_ms_decimal",
+                ctx.snap
+                    .map_or_else(|| Jv::why("warming"), |_| Jv::s(ctx.age_ms.to_string())),
+            ),
+            ("window_ms", Jv::why("unavailable:execution_window_unknown")),
+            ("cursor", Jv::s(ctx.cursor().to_string())),
+            ("state", Jv::s(ctx.state.word())),
+        ]);
+    }
     let (unix, age, window) = match as_of(view, ctx) {
         Some((unix, age, window)) => (
             Jv::u(unix),
@@ -4029,7 +4053,12 @@ pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
         }
         View::Why => why::why_json(q, ctx, s, &mut o),
         View::Report => o.set("report", super::hardware::report_json(s)),
+        View::Boot => o.set("boot", super::boot::json(s.boot_cost.as_deref())),
         View::Left => super::left::left_json(q, ctx, s, &mut o),
+    }
+    if q.view == View::Boot {
+        o.set("events", Jv::Arr(Vec::new()));
+        return o;
     }
     if matches!(q.view, View::Cores | View::Procs) {
         o.set("scheduling_context", scheduling_context_json(ctx, s));

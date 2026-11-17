@@ -13,8 +13,11 @@
 //! session's agent (its restart, its usage limit, its upgrade), whose shell would otherwise own
 //! it. The worker runs `targo --unverified verify land` with the landing's other words and
 //! `--at <commit>`, the HEAD the ask saw, at the checkout's root, so it lands that commit or
-//! nothing. Its exit status concludes its task (`aterm ctl await task @<sid> since=0`), and its
-//! output tail, which ends with the landing's verdict, is its result (`aterm ctl @<sid> result`).
+//! nothing. Its exit status concludes its task (`aterm ctl await task @<sid> since=0`), which a
+//! landing that landed reaches only once its records' append to the journal ends (its checkout
+//! may land again meanwhile), and its output tail is its result (`aterm ctl @<sid> result`): the
+//! landing's verdict, then the lines that say where its records went (the journal, or the
+//! clone's spool for its next landing that lands), so the verdict is not the tail's last line.
 //! Where no aterm harness would run it (a shell in no aterm session, no `aterm` to ask, or an
 //! aterm that answers `ERR unsupervised:`), nothing starts and the landing runs in place, as
 //! without the flag. Any other answer (another refusal, none, or one naming no sid) lands

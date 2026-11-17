@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use crate::tests::{Step, clear_append_hook, on_append};
+use crate::tests::{Step, clear_append_hook, on_append, tempdir};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -30,24 +30,30 @@ fn records(count: usize) -> Vec<(&'static str, Vec<u8>)> {
 fn group_commit_uses_one_checkpoint_and_one_witness_for_256_records() {
     for strict in [false, true] {
         let _strict = strict.then(seam::serve_strict);
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let mut log = open(dir.path(), false);
         let steps = Rc::new(RefCell::new(Vec::new()));
         let seen = Rc::clone(&steps);
+        #[cfg(unix)]
         let path = dir.path().to_path_buf();
         on_append(move |step, _| {
             // The checkpoint exposes either the previous prefix or the entire group,
             // including to a lock-free reader between individual record publications.
-            let Committed::Rebuilt {
-                records: committed, ..
-            } = read_committed(&path, "group", b"pinned", bounds(), None).unwrap()
-            else {
-                panic!("a reader without a prefix rebuilds the journal");
-            };
-            assert_eq!(
-                committed.len(),
-                if step == Step::Published { 0 } else { 256 }
-            );
+            // Unix only: on Windows astream's lock refuses a read beside the live writer
+            // (ATERM-KI-1116-48213); the steps and the one witness are judged there too.
+            #[cfg(unix)]
+            {
+                let Committed::Rebuilt {
+                    records: committed, ..
+                } = read_committed(&path, "group", b"pinned", bounds(), None).unwrap()
+                else {
+                    panic!("a reader without a prefix rebuilds the journal");
+                };
+                assert_eq!(
+                    committed.len(),
+                    if step == Step::Published { 0 } else { 256 }
+                );
+            }
             seen.borrow_mut().push(step);
         });
         let mut writes = 0;
@@ -82,7 +88,7 @@ fn group_commit_uses_one_checkpoint_and_one_witness_for_256_records() {
 
 #[test]
 fn group_preflight_rejects_the_whole_input_without_publication() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path(), false);
     for _ in 0..2 {
         assert_eq!(log.check_append_many(&records(2)).unwrap(), Offset::ZERO);
@@ -129,7 +135,7 @@ fn group_preflight_rejects_the_whole_input_without_publication() {
 
 #[test]
 fn group_dependent_failure_fences_reads_and_writes_but_preserves_the_committed_group() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path(), false);
     assert!(
         log.append_many_then(records(8), dir.path(), |_, _| {
@@ -152,7 +158,7 @@ fn group_dependent_failure_fences_reads_and_writes_but_preserves_the_committed_g
 
 #[test]
 fn group_refuses_a_retained_producer_key_in_a_later_record() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let mut log = open(dir.path(), false);
     // Replayed broker producer metadata can name a future sequence even when the
     // application receipt chain is intact. A local deduplication hit is not a new
@@ -220,9 +226,17 @@ fn group_crash_cuts_keep_whole_checkpointed_groups() {
         .unwrap();
         panic!("crash cut was not reached");
     }
-    use std::os::unix::process::ExitStatusExt as _;
+    #[cfg(unix)]
+    let killed = |status: std::process::ExitStatus| {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal() == Some(libc::SIGKILL)
+    };
+    // `kill_self_now` aborts there: `__fastfail`'s `STATUS_STACK_BUFFER_OVERRUN`.
+    #[cfg(windows)]
+    let killed =
+        |status: std::process::ExitStatus| status.code() == Some(0xC000_0409_u32.cast_signed());
     for cut in [1, 4, 8, 9, 10, 11] {
-        let dir = aterm_tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
         cmd.args([
             "--exact",
@@ -233,11 +247,7 @@ fn group_crash_cuts_keep_whole_checkpointed_groups() {
         let output =
             aterm_uds::deadline::output_within(&mut cmd, std::time::Duration::from_secs(60))
                 .unwrap();
-        assert_eq!(
-            output.status.signal(),
-            Some(libc::SIGKILL),
-            "cut {cut}: {output:?}"
-        );
+        assert!(killed(output.status), "cut {cut}: {output:?}");
         let kept = if cut <= 8 { 3 } else { 11 };
         assert_eq!(
             open(dir.path(), true)

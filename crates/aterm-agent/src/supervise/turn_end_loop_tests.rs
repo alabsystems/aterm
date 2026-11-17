@@ -25,6 +25,9 @@ mod remembered_limit;
 #[path = "walls_tests.rs"]
 mod walls;
 
+#[path = "wall_read_tests.rs"]
+mod wall_read;
+
 #[path = "relaunch_carry_loop_tests.rs"]
 mod relaunch_carry;
 
@@ -7149,6 +7152,11 @@ struct ReachHost {
     answered: std::sync::atomic::AtomicUsize,
     /// How long before each answered turn was told the API answered it.
     answered_ago: std::sync::Mutex<Vec<Duration>>,
+    /// The model and the reply's time (unix seconds) of each served turn the loop told
+    /// ([`IdleHost::answered_by`]), in order.
+    answered_by: std::sync::Mutex<Vec<(String, i64)>>,
+    /// The time (unix seconds) the transcript's last rows were dated ([`Self::said`]), once read.
+    said_at: std::sync::Mutex<Option<i64>>,
     /// What the session's transcript ends on ([`IdleHost::transcript_tail`]), dated that long
     /// before the wall clock; `None`, no transcript.
     said: std::sync::Mutex<Option<(Said, Duration)>>,
@@ -7162,25 +7170,58 @@ struct ReachHost {
 enum Said {
     /// The model's reply.
     Reply,
+    /// The model's reply, its row naming the model that served it (`message.model`).
+    ReplyBy(&'static str),
     /// An API error's notice (`isApiErrorMessage`): the API never answered.
     Notice,
 }
 
+/// How long before its reply the request a [`Said::ReplyBy`] reply answered was made.
+const ASKED_BEFORE_S: u64 = 90;
+
 /// A transcript's last rows: a prompt, then the model's reply or an API error's notice, each
-/// dated `at` (RFC 3339).
-fn said_jsonl(said: Said, at: &str) -> String {
+/// dated `at` (unix seconds). A reply that names its model ([`Said::ReplyBy`]) answers a prompt
+/// made [`ASKED_BEFORE_S`] before it, after an earlier response of the same model, each response
+/// under its own `message.id`: the tail of a conversation whose last request was served.
+fn said_jsonl(said: Said, at: u64) -> String {
+    let at_s = aterm_types::rfc3339::format_rfc3339(at);
     let prompt = format!(
-        r#"{{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"c1","timestamp":"{at}","message":{{"role":"user","content":"Go on."}}}}"#
+        r#"{{"type":"user","uuid":"u1","parentUuid":null,"sessionId":"c1","timestamp":"{at_s}","message":{{"role":"user","content":"Go on."}}}}"#
     );
     let last = match said {
         Said::Reply => format!(
-            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"c1","timestamp":"{at}","message":{{"role":"assistant","content":[{{"type":"text","text":"Stage done."}}]}}}}"#
+            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"c1","timestamp":"{at_s}","message":{{"role":"assistant","content":[{{"type":"text","text":"Stage done."}}]}}}}"#
         ),
+        Said::ReplyBy(model) => return replied_by(model, at),
         Said::Notice => format!(
-            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"c1","timestamp":"{at}","isApiErrorMessage":true,"apiErrorStatus":529,"message":{{"role":"assistant","content":[{{"type":"text","text":"API Error: 529 Overloaded"}}]}}}}"#
+            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"c1","timestamp":"{at_s}","isApiErrorMessage":true,"apiErrorStatus":529,"message":{{"role":"assistant","content":[{{"type":"text","text":"API Error: 529 Overloaded"}}]}}}}"#
         ),
     };
     format!("{prompt}\n{last}\n")
+}
+
+/// [`said_jsonl`]'s [`Said::ReplyBy`]: an earlier response of `model`, a prompt made
+/// [`ASKED_BEFORE_S`] before `at`, and `model`'s reply to it at `at`.
+fn replied_by(model: &str, at: u64) -> String {
+    let stamp = aterm_types::rfc3339::format_rfc3339;
+    let (before, asked, at) = (
+        stamp(at.saturating_sub(ASKED_BEFORE_S + 30)),
+        stamp(at.saturating_sub(ASKED_BEFORE_S)),
+        stamp(at),
+    );
+    [
+        format!(
+            r#"{{"type":"assistant","uuid":"a0","parentUuid":null,"sessionId":"c1","timestamp":"{before}","message":{{"id":"msg_0","role":"assistant","model":"{model}","content":[{{"type":"text","text":"Stage one done."}}]}}}}"#
+        ),
+        format!(
+            r#"{{"type":"user","uuid":"u1","parentUuid":"a0","sessionId":"c1","timestamp":"{asked}","message":{{"role":"user","content":"Go on."}}}}"#
+        ),
+        format!(
+            r#"{{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"c1","timestamp":"{at}","message":{{"id":"msg_1","role":"assistant","model":"{model}","content":[{{"type":"text","text":"Stage done."}}]}}}}"#
+        ),
+    ]
+    .map(|row| row + "\n")
+    .concat()
 }
 
 /// A measure that lands at `at` on the run's clock: an ask from then on answers `lands`.
@@ -7304,6 +7345,12 @@ impl IdleHost for ReachHost {
             .unwrap()
             .push(Duration::from_millis(ago_ms));
     }
+    fn answered_by(&self, model: &str, at: i64) {
+        self.answered_by
+            .lock()
+            .unwrap()
+            .push((model.to_string(), at));
+    }
     fn transcript_tail(&self) -> Option<String> {
         let (said, ago) = (*self.said.lock().unwrap())?;
         if self.said_once_witnessed.load(Ordering::SeqCst)
@@ -7325,7 +7372,8 @@ impl IdleHost for ReachHost {
         let at = u64::try_from(secs)
             .unwrap_or(0)
             .saturating_sub(ago.as_secs());
-        Some(said_jsonl(said, &aterm_types::rfc3339::format_rfc3339(at)))
+        *self.said_at.lock().unwrap() = i64::try_from(at).ok();
+        Some(said_jsonl(said, at))
     }
     fn witness(&self) -> Option<Instant> {
         self.witness_asks.fetch_add(1, Ordering::SeqCst);
@@ -7755,8 +7803,8 @@ fn awaits_before_turn(m: &Mock) -> usize {
 /// time; the same screen whose transcript ends on an API error's notice, or with no transcript,
 /// books none, and so do a turn the person interrupted, a turn whose wall the transcript refused
 /// (its words may still be the outage's), and agy's or Muse Code's reply that reads as an error;
-/// their plain replies book one. NEGATIVE CONTROLS (run): with `Session::answered_ago` asking only
-/// the turn's shape (`answered_turn`, as the slice first built it), the notice, the missing
+/// their plain replies book one. NEGATIVE CONTROLS (run): with `Session::answered_reply` asking
+/// only the turn's shape (`answered_turn`, as the slice first built it), the notice, the missing
 /// transcript, the refused wall and both error replies book one and the test fails; with the
 /// refused-wall check alone dropped, the refused wall books one.
 #[test]
@@ -15678,9 +15726,83 @@ struct AccountHost {
     late_agent: std::sync::Mutex<Option<(u32, i64, Option<&'static str>)>>,
     /// What the loop told of the session's own login ([`IdleHost::login_seen`]), in order.
     login_facts: std::sync::Mutex<Vec<crate::supervise::policy::turn_end::LoginSeen>>,
+    /// A sibling session of the same account whose served turn its own host files while this
+    /// one's loop waits ([`Sibling`]); `None`: no sibling.
+    sibling: std::sync::Mutex<Option<Sibling>>,
 }
 
+/// A SIBLING SESSION'S SERVED TURN, FILED UNDER A WAITING LOOP: the account's record as the
+/// window's hosts share it, and the turn another session of the account ends on the model's
+/// reply. Its host files that turn (`harness::accounts::note_served`, the store's own lift) at
+/// the first read of the accounts' stamp at or after [`Self::files_at`] on the loop's clock, and
+/// that read still answers the stamp from before it: the filing lands just after a step's read,
+/// the latest a step can leave it. The stamp moves only where a row the filing wrote wakes
+/// (`Event::wakes`), as the store's marker does.
+#[derive(Debug)]
+struct Sibling {
+    files_at: Instant,
+    state: crate::harness::accounts::State,
+    /// When the waiting session's wall was written on the record (unix seconds).
+    wall_at: i64,
+    /// The model that served the sibling's reply, and the reply's own time (unix seconds).
+    served: (&'static str, i64),
+    /// When, on the loop's clock, the turn was filed; `None` until it is.
+    filed_at: Option<Instant>,
+}
+
+/// The roster row the waiting session and its [`Sibling`] both run on.
+const SIBLING_ROW: &str = "work-1";
+
 impl AccountHost {
+    /// File the sibling's served turn once the loop's clock reached its time ([`Sibling`]).
+    fn sibling_files(&self) {
+        let mut sibling = self.sibling.lock().unwrap();
+        let Some(sib) = sibling.as_mut() else {
+            return;
+        };
+        let Some(clock) = self.clock.lock().unwrap().clone() else {
+            return;
+        };
+        if sib.filed_at.is_some() || clock.mono() < sib.files_at {
+            return;
+        }
+        sib.filed_at = Some(clock.mono());
+        let served = crate::harness::accounts::ServedTurn {
+            model: sib.served.0,
+            at: sib.served.1,
+        };
+        let now = clock.peek_wall_ms().div_euclid(1000);
+        let events =
+            crate::harness::accounts::note_served(&mut sib.state, SIBLING_ROW, &served, now);
+        if events.iter().any(crate::harness::accounts::Event::wakes) {
+            self.stamp.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// When, on the loop's clock, the sibling's turn was filed ([`Self::sibling_files`]).
+    fn sibling_filed(&self) -> Option<Instant> {
+        self.sibling.lock().unwrap().as_ref()?.filed_at
+    }
+
+    /// When the record says the 5-hour wall was lifted (`Account::lifted_at`), if it was.
+    fn sibling_lifted(&self) -> Option<i64> {
+        let sibling = self.sibling.lock().unwrap();
+        let state = &sibling.as_ref()?.state;
+        let record = state.accounts.get(SIBLING_ROW)?;
+        record.lifted_at(crate::harness::accounts::SESSION_LIMIT, &state.machine)
+    }
+
+    /// When the record says the waiting session's wall was cleared after it was written, as the
+    /// roster's advice at a wall reads it (`harness::accounts::advise`'s `Advice::Resume`).
+    fn sibling_cleared(&self) -> Option<i64> {
+        let sibling = self.sibling.lock().unwrap();
+        let sib = sibling.as_ref()?;
+        let clock = self.clock.lock().unwrap().clone()?;
+        let now = clock.peek_wall_ms().div_euclid(1000);
+        let record = sib.state.accounts.get(SIBLING_ROW)?;
+        record.cleared_since(crate::harness::accounts::SESSION_LIMIT, sib.wall_at, now)
+    }
+
     /// Stamp each restart asked on the clock of the loop `s` (from the run's setup), as the
     /// shipped host and loop share the system's.
     fn stamps_on<C: Ctl>(&self, s: &mut Session<'_, C>) {
@@ -15884,6 +16006,11 @@ impl IdleHost for AccountHost {
             AccountPoint::TurnEnd => "account:turn-end".to_string(),
         };
         self.said.lock().unwrap().push(at);
+        if point.at_wall()
+            && let Some(cleared_at) = self.sibling_cleared()
+        {
+            return Some(AccountAdvice::Resume { cleared_at });
+        }
         let mut last = self.advised.lock().unwrap();
         if let Some(next) = self.advice.lock().unwrap().pop_front() {
             *last = next;
@@ -15894,7 +16021,9 @@ impl IdleHost for AccountHost {
         last.clone()
     }
     fn account_stamp(&self) -> u64 {
-        self.stamp.load(Ordering::SeqCst)
+        let stamp = self.stamp.load(Ordering::SeqCst);
+        self.sibling_files();
+        stamp
     }
     fn login_label(&self) -> Option<String> {
         self.login_label.lock().unwrap().clone()
@@ -24703,6 +24832,209 @@ fn the_owners_clearing_continues_a_session_at_its_wall_once() {
     assert_eq!((attempts, turns), (Some(0), 0));
 }
 
+/// FL-116: A TURN SERVED ON AN ACCOUNT RESUMES THAT ACCOUNT'S IDLE SESSIONS, with no provider
+/// read. Two halves, the two sessions of one account.
+///
+/// THE SIBLING tells its host who served its turn: a Claude Code turn whose transcript ends on
+/// the model's reply to a request the tail shows served tells `IdleHost::answered_by` that model
+/// and the time the request was made (ninety seconds before the reply, itself ten minutes back
+/// here: neither the reply's time nor the read's), once, beside `IdleHost::answered`.
+/// CONTROLS: a reply row that names no model, one Claude Code wrote itself (`<synthetic>`) and
+/// an API error's notice tell no model (the last tells no answer either), and a reply served
+/// while usage credits carry the session tells the answer and no model.
+///
+/// THE WAITER stands at its 5-hour wall, the roster advising nothing, its wait set. The
+/// sibling's host files the served turn on the account's record with the store's own
+/// `accounts::note_served`, just after one step's read of the accounts' stamp
+/// ([`Sibling`]): the lift's row wakes, the stamp moves, the next step's read is news
+/// (`Session::account_edge`), the wall is decided again, the record's clearing is the roster's
+/// resume, and `usage-resume@v1` is typed once, no later than one wait step (`WAIT_STEP`, 20 s)
+/// after the filing. The whole run mints no provider read and types no `/usage`.
+/// CONTROLS: with no sibling, and with a sibling whose reply predates the wall (which lifts
+/// nothing, so no row wakes), nothing is typed two wait steps past the filing's time.
+///
+/// NEGATIVE CONTROL: with the loop telling no `answered_by` (the call in
+/// `Session::turn_end_at_point` removed) the sibling half tells no model; dated by the reply's
+/// row (`transcript_ends_on`'s `at`) it tells the reply's time; with `note_served`
+/// lifting nothing, or with a lifted wall's row no longer waking (`Event::wakes`), the stamp
+/// never moves and the waiter types nothing; with `account_edge` not reading the stamp under a
+/// wall's wait, the same.
+#[test]
+fn an_idle_walled_session_resumes_within_one_wait_step_of_a_siblings_served_turn() {
+    use crate::harness::accounts;
+    use crate::supervise::policy::turn_end::RULE_LIMIT_RESUME;
+    const OPUS: &str = "claude-opus-5-5";
+    // When the waiter's wall was written on the account's record: ten minutes back.
+    const WALL_AT: i64 = ACCOUNT_NOW - 600;
+    // How far into the waiter's wait the sibling's turn is filed.
+    const FILES_IN: Duration = Duration::from_secs(30);
+    let step = crate::supervise::run::WAIT_STEP;
+
+    // The sibling: what its loop tells its host of the turn it ended.
+    let told = |mut m: Mock, said: Said| {
+        let host = ReachHost::scripted(&[]);
+        *host.said.lock().unwrap() = Some((said, Duration::from_secs(600)));
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(30)
+        };
+        {
+            let mut s = session(&mut m, None);
+            let screen = s.screen().expect("the point");
+            let point = s.turn_of(screen);
+            s.turn_end_at_point(&point, Some(Duration::from_secs(90)), &opts)
+                .unwrap_or_else(|e| panic!("{e:?}"));
+        }
+        let by = host.answered_by.lock().unwrap().clone();
+        let dated = *host.said_at.lock().unwrap();
+        (host.answered.load(Ordering::SeqCst), by, dated)
+    };
+    let claude = || Mock::new(vec![ended("Stage done.")]);
+    let on_credits = || {
+        let mut r = ended("Stage done.");
+        let at = r.len() - 1;
+        r[at] = format!("{:<95}Now using usage credits", r[at]);
+        Mock::new(vec![r])
+    };
+    let before = crate::supervise::limit::unix_now_ms().div_euclid(1000);
+    let (answers, by, dated) = told(claude(), Said::ReplyBy(OPUS));
+    let dated = dated.expect("the transcript was read");
+    assert_eq!(answers, 1, "the turn is told answered");
+    let asked = dated - i64::try_from(ASKED_BEFORE_S).unwrap();
+    assert_eq!(
+        by,
+        [(OPUS.to_string(), asked)],
+        "its model, at the time of the request it answered, not the reply's"
+    );
+    assert!(
+        dated <= before - 500,
+        "the reply's own time, ten minutes back, not the read's: {dated} {before}"
+    );
+    for (what, m, said, answered) in [
+        ("a reply that names no model", claude(), Said::Reply, 1),
+        (
+            "a row Claude Code wrote itself",
+            claude(),
+            Said::ReplyBy(accounts::SYNTHETIC_MODEL),
+            1,
+        ),
+        ("an API error's notice", claude(), Said::Notice, 0),
+        (
+            "a reply served on usage credits",
+            on_credits(),
+            Said::ReplyBy(OPUS),
+            1,
+        ),
+    ] {
+        let (answers, by, _) = told(m, said);
+        assert_eq!(answers, answered, "{what}");
+        assert_eq!(by, [], "{what}");
+    }
+
+    // The waiter: its wall written ten minutes back, the sibling's turn filed half a minute
+    // into the wait.
+    let waits = |served: Option<(&'static str, i64)>| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![limited_screen()]);
+        let lag = {
+            let (mut s, wall) = account_session(&mut m);
+            // Both clocks stand before anything is read on them: the wall clock at ACCOUNT_NOW
+            // (`account_session`), the loop's own moved by this test's steps alone.
+            let clock = s.fx.scripted_handle().expect("the session's test clock");
+            clock.stand_mono();
+            host.stamps_on(&mut s);
+            let mut state = accounts::State::default();
+            let until = Some(WALL_AT + 3600);
+            accounts::note_wall(
+                &mut state,
+                SIBLING_ROW,
+                accounts::SESSION_LIMIT,
+                until,
+                WALL_AT,
+                WALL_AT,
+            );
+            let walled = state
+                .accounts
+                .get(SIBLING_ROW)
+                .is_some_and(|record| record.limited_until(ACCOUNT_NOW).is_some());
+            assert!(walled, "the record holds the waiter's wall");
+            if let Some(served) = served {
+                *host.sibling.lock().unwrap() = Some(Sibling {
+                    files_at: clock.mono() + FILES_IN,
+                    state,
+                    wall_at: WALL_AT,
+                    served,
+                    filed_at: None,
+                });
+            }
+            let first = s
+                .turn_end_at_point(&wall, Some(Duration::from_secs(180)), &opts)
+                .expect("a decision");
+            assert!(
+                matches!(first, TurnEndAction::WaitUntil { .. }),
+                "the wall is waited at: {first:?}"
+            );
+            s.turn_end_execute(&wall, first, &opts, &[], &mut Alone)
+                .expect("the wait is set");
+            // The wait's steps, each a wait step on: the read the wait loop makes at each one.
+            let mut typed_at = None;
+            for _ in 0..4 {
+                clock.skip(step);
+                if !s.account_edge(&opts) {
+                    continue;
+                }
+                let again = s.turn_end_at_point(&wall, None, &opts).expect("a decision");
+                assert_eq!(
+                    again,
+                    TurnEndAction::Type {
+                        text: CLEARED.to_string(),
+                        rule_id: RULE_LIMIT_RESUME,
+                    }
+                );
+                s.turn_end_execute(&wall, again, &opts, &[], &mut Alone)
+                    .expect("carried out");
+                typed_at = Some(clock.mono());
+                break;
+            }
+            typed_at
+                .zip(host.sibling_filed())
+                .map(|(typed, filed)| typed.saturating_duration_since(filed))
+        };
+        let lifted = host.sibling_lifted();
+        let typed = m.requests.iter().filter(|r| r.contains(CLEARED)).count();
+        let probed = m
+            .requests
+            .iter()
+            .any(|r| r.contains(crate::harness::usage::USAGE_COMMAND));
+        (lag, typed, lifted, probed, host.all())
+    };
+    let served_at = ACCOUNT_NOW - 30;
+    let ((lag, typed, lifted, probed, said), reads) =
+        crate::harness::provider_read::captured(|| waits(Some((OPUS, served_at))));
+    assert_eq!(typed, 1, "the resume, typed once: {said:?}");
+    let lag = lag.expect("typed after the filing");
+    assert!(lag <= step, "within one wait step of the filing: {lag:?}");
+    assert_eq!(lifted, Some(served_at), "lifted as of the reply");
+    assert!(reads.is_empty(), "no provider read: {reads:?}");
+    assert!(!probed, "no /usage typed: {said:?}");
+    assert_eq!(
+        said,
+        ["account:wall:usage-session", "account:wall:usage-session"],
+        "asked at the wall and at the news, and nothing else"
+    );
+    for (what, served) in [
+        ("no sibling", None),
+        (
+            "a sibling's reply from before the wall",
+            Some((OPUS, WALL_AT - 10)),
+        ),
+    ] {
+        let (lag, typed, lifted, _, said) = waits(served);
+        assert_eq!((lag, typed, lifted), (None, 0, None), "{what}: {said:?}");
+    }
+}
+
 #[test]
 fn the_stamp_a_loop_first_reads_is_no_news_to_its_latch() {
     let host = AccountHost::moving("work-2", "refused:line");
@@ -25258,9 +25590,12 @@ fn usage_fable_spent() -> String {
 /// A SWITCH ONTO OPUS THAT NO READING HAS TIMED IS SAMPLED BY THE PROBE'S OWN `/usage` AT A QUIET
 /// TURN END, with no account advising a probe and none claimed: a `Current week (Fable)` row with
 /// room left makes the return due at once, and the same point asks it (`restart:model-back`); the
-/// sample and what it scheduled are a journal record. A row at its limit times the return at the
-/// reset it names, and nothing returns now. NEGATIVE CONTROL: a switch the notice timed is never
-/// sampled (no `/usage` is typed).
+/// sample and what it scheduled are a journal record. The room is told the host once
+/// (`IdleHost::fable_room`, FL-116), dated no later than the `/usage` was typed, before the
+/// return is asked, so the account's record lifts Fable's wall for every session moved off it. A
+/// row at its limit times the return at the reset it names, nothing returns now and nothing is
+/// told the host. NEGATIVE CONTROL: a switch the notice timed is never sampled (no `/usage` is
+/// typed); with `Session::fable_sampled` telling the host nothing, no `fable-room:` is said.
 #[test]
 fn a_switch_no_reading_timed_is_sampled_by_usage_and_its_fable_row_times_the_return() {
     let run = |tag: &str, frame: &str, back_at_unix: Option<i64>| {
@@ -25282,6 +25617,20 @@ fn a_switch_no_reading_timed_is_sampled_by_usage_and_its_fable_row_times_the_ret
 
     let (writes, lines, journal, said) = run("fable-room", panel_fx::USAGE_SETTLED, None);
     assert_eq!(writes[..3], ["text:/usage", "enter", "esc"], "{writes:?}");
+    let told: Vec<i64> = said
+        .iter()
+        .filter_map(|w| w.strip_prefix("fable-room:")?.parse().ok())
+        .collect();
+    assert_eq!(told.len(), 1, "the room told the host once: {said:?}");
+    assert!(
+        told[0] <= PROBE_NOW + 60,
+        "no later than the /usage was typed: {told:?}"
+    );
+    let at = |word: &str| said.iter().position(|w| w.starts_with(word));
+    assert!(
+        at("fable-room:") < at("restart:model-back"),
+        "told before the return is asked: {said:?}"
+    );
     assert!(
         !said
             .iter()
@@ -25309,6 +25658,10 @@ fn a_switch_no_reading_timed_is_sampled_by_usage_and_its_fable_row_times_the_ret
     let (writes, _, journal, said) = run("fable-spent", &spent, None);
     assert_eq!(writes[..3], ["text:/usage", "enter", "esc"], "{writes:?}");
     assert!(!said.iter().any(|w| w == "restart:model-back"), "{said:?}");
+    assert!(
+        !said.iter().any(|w| w.starts_with("fable-room:")),
+        "a row at its limit lifts nothing: {said:?}"
+    );
     let note = journal
         .iter()
         .find(|l| l.contains(" rule=model-restore@v1 /usage "))

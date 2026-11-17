@@ -121,7 +121,7 @@ fn undo_evaluate(model: &aterm_spec::derive::Model, lose_undo: bool, lose_contex
     parents.sort_unstable();
     let withdrawn = operation(50, ROWS[0], "label", "m8", &parents, &mut index);
     let mut restored = operation(5, ROWS[0], "label", "m7", &[50], &mut index);
-    restored.revert = !lose_undo;
+    restored.revert = (!lose_undo).then_some(withdrawn.id);
     restored.changes[0].value = Some(beforeimage);
     raw.extend(cells(&[&restored]));
     operations.extend([withdrawn, restored]);
@@ -351,6 +351,7 @@ fn evaluate(input: &State, drop_provenance: bool) -> State {
         ops: operations.clone(),
         quota: Default::default(),
         cells: raw.clone(),
+        inert: Default::default(),
         owned: Default::default(),
         complete: mode != 5,
         awaiting: if mode == 5 {

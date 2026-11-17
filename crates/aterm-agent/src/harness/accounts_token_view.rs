@@ -35,10 +35,10 @@ use super::accounts_tokens::{
 };
 use super::token_steps::{self, Since, Stopped, Tried};
 use aterm_json::{Map, Value};
-use aterm_secrets::claude_token::{Key, Lookup, Standing};
+use aterm_secrets::claude_token::{Key, Lookup, SOON_SECS, Standing};
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// An account the surfaces cover.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +53,9 @@ pub struct Covered {
     pub logged_in: bool,
     /// Its stored login here.
     pub login: LoginHere,
+    /// The first second after the read at which [`Self::login`] turns by the clock alone, as its
+    /// records stand ([`LoginHalf::turns_after`]), where one is ahead.
+    pub login_turns: Option<i64>,
 }
 
 /// The offer standing for an account (§5.9).
@@ -89,6 +92,8 @@ pub struct AccountToken {
     /// The offer pair's login half: [`Covered::login`], or [`LoginHalf::InUse`] while a token is
     /// in use.
     pub login: LoginHere,
+    /// [`Covered::login_turns`]: when the stored login's half turns by the clock alone.
+    pub login_turns: Option<i64>,
     /// The offer, where one stands.
     pub offer: Option<Offer>,
 }
@@ -234,6 +239,38 @@ impl AccountToken {
             }
             Some(LoginHalf::InUse | LoginHalf::Ok) | None => token,
         })
+    }
+
+    /// The first second after `now` at which what the surfaces say of the account can differ by
+    /// the clock alone, its files unchanged: its token's state at `now` ([`TokenState::of`]: the
+    /// token turns `soon` [`SOON_SECS`] before its end and `ended` at it, and an unverified token
+    /// awaits a stored-login reading once its basis's week ends,
+    /// [`tokens::Verification::current_basis`]), its stored login's half
+    /// ([`Self::login_turns`]), and the state line's days while the login is ending and an offer
+    /// stands ([`Self::phrase`]). It is never later than the first such change; it may be
+    /// earlier, which costs a reader one read that finds nothing new. `None` where no such second
+    /// is ahead.
+    #[must_use]
+    pub fn changes_after(&self, now: i64) -> Option<i64> {
+        let end = self.expires_at().and_then(|at| i64::try_from(at).ok());
+        let soon = end.and_then(|end| end.checked_sub(i64::try_from(SOON_SECS).ok()?));
+        let basis = self
+            .row
+            .as_ref()
+            .and_then(|row| row.verification.basis.as_ref())
+            .and_then(|(_, basis)| basis.week_reset);
+        let days = match (self.offer.as_ref(), self.login.half()) {
+            (Some(_), Some(LoginHalf::Ending { end })) => {
+                let days = (end - now).max(0) / 86_400;
+                (days > 0).then(|| end - days * 86_400 + 1)
+            }
+            _ => None,
+        };
+        [soon, end, basis, self.login_turns, days]
+            .into_iter()
+            .flatten()
+            .filter(|at| *at > now)
+            .min()
     }
 
     /// The Lab page's one quiet line while an offer stands (§5.9); the Account card says the
@@ -454,6 +491,7 @@ pub fn account(
         pending,
         logged_in: covered.logged_in,
         login,
+        login_turns: covered.login_turns,
         offer,
     }
 }
@@ -535,6 +573,13 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
                     half,
                     holds || (here && matches!(half, LoginHalf::SignedOut { .. })),
                 ),
+                login_turns: LoginHalf::turns_after(
+                    row,
+                    &records.logins,
+                    &records.state,
+                    here || logged_in,
+                    places.now,
+                ),
             });
         }
     }
@@ -553,6 +598,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             label: None,
             logged_in: logged_in(&login.email),
             login: LoginHere::Half(LoginHalf::Ok),
+            login_turns: None,
         });
     }
     out
@@ -583,6 +629,7 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
             label: row.label.clone(),
             logged_in: false,
             login: LoginHere::Unread,
+            login_turns: None,
         });
     }
     let listed = vault.listed().unwrap_or(Lookup::Unknown);
@@ -724,13 +771,6 @@ pub fn note_posted(
     vault: &dyn TokenVault,
     now: u64,
 ) -> io::Result<usize> {
-    let signed_here = |account: &AccountToken| {
-        account.standing.is_some()
-            && account
-                .row
-                .as_ref()
-                .is_some_and(|row| row.vault == InVault::SignedHere)
-    };
     if !accounts.iter().any(signed_here) {
         return Ok(0);
     }
@@ -778,6 +818,35 @@ pub fn note_posted(
         }
     }
     Ok(turned)
+}
+
+/// Whether `account`'s token was signed into this Mac's log and no server took it yet, while the log
+/// holds it: a row whose post [`note_posted`] retries.
+fn signed_here(account: &AccountToken) -> bool {
+    account.standing.is_some()
+        && account
+            .row
+            .as_ref()
+            .is_some_and(|row| row.vault == InVault::SignedHere)
+}
+
+/// The first second after `now` at which a read of the token view is owed by the clock alone,
+/// `accounts` being what a read at `now` found: the earliest [`AccountToken::changes_after`], and
+/// while a `signed here` row waits for a server, its next post, [`POST_EVERY_S`] after this
+/// read's ([`note_posted`]). `None` where none is ahead: only a file the view reads moving
+/// changes what it says.
+#[must_use]
+pub fn view_changes_after(accounts: &[AccountToken], now: i64) -> Option<i64> {
+    let post = accounts
+        .iter()
+        .any(signed_here)
+        .then(|| now.checked_add(i64::try_from(POST_EVERY_S).ok()?))
+        .flatten();
+    accounts
+        .iter()
+        .filter_map(|account| account.changes_after(now))
+        .chain(post)
+        .min()
 }
 
 /// Which peers use each token, from one fleet read (§5.10).
@@ -1293,6 +1362,162 @@ pub fn view_here(
         u64::try_from(now).unwrap_or(0),
     );
     Some(accounts)
+}
+
+/// The files one read of this Mac's token view opens ([`view_here`], [`steps_here`] and
+/// [`note_offers`]), as its inputs name them now: the accounts store's state, logins, token
+/// reading, table, checks, steps and the upkeep's tried gaps ([`token_steps::TRIED_FILE`], which
+/// [`held_steps`] reads beside the steps); the roster; the login record of each login a session
+/// here runs on ([`tokens::session_login_dirs`]); the files a held step's route is judged by for
+/// each account the roster, those records and the table name ([`token_steps::route_paths`]); the
+/// managed Claude Code twin a held step is judged by; and the vault's own
+/// ([`aterm_secrets::client::token_view_files`]), configured or not, so a vault made here later is
+/// heard. A surface that watches them and stamps them before each read ([`ReadSet::stamp`]) hears
+/// each write a read did not see. Which logins and accounts it names comes from the store, the
+/// roster, the records and the table, all of which it names, so a change of that set moves a
+/// stamp too.
+///
+/// Where a step the store holds waits on a mailbox ([`token_steps::Stopped::waits_on_a_mailbox`]:
+/// a code page's stop, which [`held_steps`] judges by whether aterm's window reads the account's
+/// mailbox now, [`token_steps::mailbox_read`]), it also names every file and folder that read
+/// reads ([`token_steps::mailbox_paths`], with this process's environment): the mailbox
+/// configurations and rosters, `aterm.toml`, the other agents' and the fleet's rosters, the local
+/// `ai-signin.toml` files and the default mail folders. Not named, being no files of their own:
+/// the vault's mailbox entries (read from the vault's files, which the set names), the lab
+/// registry's mailboxes and the environment; nor a secret file a configuration names by a
+/// `*_file` key: a mailbox configured by one of those alone is seen at the view's next read for
+/// another cause.
+#[must_use]
+pub fn read_set_here(
+    harness: &Path,
+    config: Option<&Path>,
+    home: Option<&Path>,
+    now: i64,
+) -> ReadSet {
+    let store = Store::at(harness);
+    let shared = store.shared_dir();
+    let roster_path = config.and_then(|config| accounts::roster_beside_for(config, Cli::Claude));
+    let mut files = vec![
+        store.state_file(),
+        store.logins_file(),
+        store.dir.join(accounts::TOKENS_HERE_FILE),
+        shared.join(tokens::TABLE_FILE),
+        shared.join(tokens::CHECK_FILE),
+        shared.join(token_steps::STEPS_FILE),
+        shared.join(token_steps::TRIED_FILE),
+    ];
+    files.extend(roster_path.clone());
+    let mut emails: Vec<String> = Vec::new();
+    if let Some(home) = home {
+        for dir in tokens::session_login_dirs(Some(&store), roster_path.as_deref(), now) {
+            files.extend(super::profile::login_record_path(home, dir.as_deref()));
+        }
+        emails.extend(
+            tokens::session_logins_at(Some(&store), roster_path.as_deref(), Some(home), now)
+                .into_iter()
+                .map(|login| login.email),
+        );
+    }
+    if let Some(roster) = roster_path
+        .as_deref()
+        .and_then(|path| accounts::Roster::load_for(Cli::Claude, path).ok())
+    {
+        emails.extend(
+            roster
+                .rows
+                .iter()
+                .filter_map(|row| row.expected_identity_email().map(str::to_owned)),
+        );
+    }
+    if let Ok(read) = tokens::read_parts(&store) {
+        emails.extend(read.table.rows.values().map(|row| row.email.clone()));
+    }
+    emails.sort();
+    emails.dedup();
+    for email in &emails {
+        files.extend(token_steps::route_paths(&store, home, email));
+    }
+    if token_steps::read(&store)
+        .is_ok_and(|steps| steps.values().any(token_steps::Stopped::waits_on_a_mailbox))
+    {
+        files.extend(token_steps::mailbox_paths(
+            &store,
+            (home, &|name| std::env::var_os(name)),
+        ));
+    }
+    files.extend(super::upgrade_drive::managed_agent_twin("claude"));
+    files.sort();
+    files.dedup();
+    ReadSet {
+        files,
+        vault: home.map(aterm_secrets::client::Paths::locate_for_home),
+    }
+}
+
+/// The files a read of the token view opens ([`read_set_here`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadSet {
+    /// Each file outside the vault folder, by path, sorted.
+    pub files: Vec<PathBuf>,
+    /// The vault's paths under this Mac's home, where a home is known.
+    pub vault: Option<aterm_secrets::client::Paths>,
+}
+
+impl ReadSet {
+    /// Every path to watch: [`Self::files`] and the vault's ([`aterm_secrets::client::token_view_files`]).
+    #[must_use]
+    pub fn paths(&self) -> Vec<PathBuf> {
+        let mut paths = self.files.clone();
+        if let Some(vault) = &self.vault {
+            paths.extend(aterm_secrets::client::token_view_files(vault));
+        }
+        paths
+    }
+
+    /// The set's files as they stand now: each outside the vault by its stamp
+    /// ([`aterm_uds::file_watch::FileStamp`]: device, inode, length, modification and change
+    /// times), and the vault's by [`aterm_secrets::client::token_view_inputs`], which stamps its
+    /// `state.toml` by what it holds but when the vault last heard this Mac; where those cannot
+    /// be read, the vault's files by their stamps.
+    #[must_use]
+    pub fn stamp(&self) -> SetStamp {
+        let of = |paths: &[PathBuf]| -> Vec<Option<aterm_uds::file_watch::FileStamp>> {
+            paths
+                .iter()
+                .map(|path| aterm_uds::file_watch::FileStamp::of(path))
+                .collect()
+        };
+        SetStamp {
+            files: of(&self.files),
+            vault: self
+                .vault
+                .as_ref()
+                .map(
+                    |vault| match aterm_secrets::client::token_view_inputs(vault) {
+                        Some(inputs) => VaultStamp::Inputs(inputs),
+                        None => {
+                            VaultStamp::Files(of(&aterm_secrets::client::token_view_files(vault)))
+                        }
+                    },
+                ),
+        }
+    }
+}
+
+/// What [`ReadSet::stamp`] found: equal only for the same files unchanged.
+#[derive(PartialEq, Eq)]
+pub struct SetStamp {
+    files: Vec<Option<aterm_uds::file_watch::FileStamp>>,
+    vault: Option<VaultStamp>,
+}
+
+/// The vault's share of a [`SetStamp`].
+#[derive(PartialEq, Eq)]
+enum VaultStamp {
+    /// Its inputs as the vault stamps them.
+    Inputs(aterm_secrets::client::TokenViewInputs),
+    /// Its files by their stamps, where the vault's own could not be taken.
+    Files(Vec<Option<aterm_uds::file_watch::FileStamp>>),
 }
 
 /// [`ask_lab`] for a surface that has no host, through the vault configured under `home`

@@ -152,9 +152,11 @@ fn group_of(collection: &Collection, name: &str, face: Face) -> (Group, ColumnKi
     let Some(schema) = collection.column(name) else {
         return (face_group(face), ColumnKind::Text, false);
     };
-    let owners = schema.writer == Writer::Owner;
+    // A verb column is the owner's too: the page's save is an owner's write, which the
+    // authority rules take there.
+    let owners = matches!(schema.writer, Writer::Owner | Writer::Verb);
     let group = match (face, schema.writer) {
-        (Face::Owner, Writer::Owner) => Group::Stored,
+        (Face::Owner, Writer::Owner | Writer::Verb) => Group::Stored,
         (Face::Owner, Writer::Birth) => Group::Born,
         (Face::Owner, Writer::Mine | Writer::Seed) => Group::SetByAterm,
         (face, _) => face_group(face),
@@ -274,138 +276,16 @@ fn shown_value(
     }
 }
 
-/// One seat of this Mac's membership log: the Commons actor it is keyed by, the machine its
-/// binding names, and its label (`m73`).
+/// What the page calls a writer: the machine row its Mac's facts bind, by that row's name
+/// ([`aterm_db::att::Mac::name`]); where none binds, no label, and the start of its Commons
+/// machine id (of its actor where the roster binds no machine) for the page to show dimmed.
 #[cfg(unix)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Seat {
-    pub(crate) actor: [u8; 48],
-    pub(crate) machine: [u8; 16],
-    pub(crate) label: String,
-}
-
-/// Every seat this Mac's membership log holds, removed ones included: a removed Mac's signed rows
-/// are still its own. None where the vault holds no log here.
-#[cfg(unix)]
-fn seats(paths: &Paths) -> Vec<Seat> {
-    let Ok(read) = aterm_secrets::client::load_acknowledged_and_ahead(paths) else {
-        return Vec::new();
-    };
-    let Some(log) = read.acknowledged.log() else {
-        return Vec::new();
-    };
-    aterm_secrets::client::seats_ever(log)
-        .into_iter()
-        .map(|(actor, machine, label)| Seat {
-            actor,
-            machine,
-            label,
-        })
-        .collect()
-}
-
-/// Each writer's label, from what aterm already holds: an operation's actor names a seat, the
-/// seat a Commons machine, and the machine a label. Nothing here makes a name up: a writer none
-/// of these name has no label.
-#[cfg(unix)]
-#[derive(Debug, Default)]
-pub(crate) struct Writers {
-    by_actor: BTreeMap<[u8; 48], String>,
-    by_machine: BTreeMap<[u8; 16], String>,
-}
-
-#[cfg(unix)]
-impl Writers {
-    /// The labels `machines` (the registry's machine rows), `facts` (each Mac's own statement,
-    /// keyed by its Commons machine) and `seats` (this Mac's membership log) give.
-    ///
-    /// A machine's label is, first, the registry's: the unconflicted `label` of the machine row
-    /// its facts row binds (`merged_into` where it states one). Then the label its facts row
-    /// states, then its seat's. A facts row's `predecessor` is the same Mac before writer
-    /// succession, so that machine's operations take the successor's label.
-    pub(crate) fn new(
-        machines: &aterm_db::typed::cell::Projection,
-        facts: &aterm_db::typed::owned::OwnedRead,
-        seats: &[Seat],
-    ) -> Self {
-        let text = |value: &aterm_json::Value, column: &str| {
-            value
-                .get(column)
-                .and_then(aterm_json::Value::as_str)
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned)
-        };
-        let registry = |mac: &str| {
-            let row = machines.rows.get(mac)?;
-            if row.raw.contains("label") || row.fields.get("label")?.conflicted() {
-                return None;
-            }
-            row.get("label")
-                .and_then(aterm_json::Value::as_str)
-                .filter(|t| !t.is_empty())
-                .map(str::to_owned)
-        };
-        let mut by_machine: BTreeMap<[u8; 16], String> = BTreeMap::new();
-        for row in facts.rows.values() {
-            let mac = text(&row.value, "merged_into").or_else(|| text(&row.value, "mac"));
-            if let Some(label) = mac
-                .as_deref()
-                .and_then(registry)
-                .or_else(|| text(&row.value, "label"))
-            {
-                by_machine.insert(row.machine, label);
-            }
-        }
-        let mut by_actor = BTreeMap::new();
-        for seat in seats {
-            by_actor.insert(seat.actor, seat.label.clone());
-            by_machine
-                .entry(seat.machine)
-                .or_insert_with(|| seat.label.clone());
-        }
-        // Each pass carries a label one predecessor back; a chain is no longer than the rows.
-        for _ in 0..facts.rows.len() {
-            let mut carried = false;
-            for row in facts.rows.values() {
-                let Some(before) = text(&row.value, "predecessor")
-                    .and_then(|p| aterm_db::typed::keys::parse_uuid32(&p))
-                else {
-                    continue;
-                };
-                if by_machine.contains_key(&before) {
-                    continue;
-                }
-                if let Some(label) = by_machine.get(&row.machine).cloned() {
-                    by_machine.insert(before, label);
-                    carried = true;
-                }
-            }
-            if !carried {
-                break;
-            }
-        }
-        Self {
-            by_actor,
-            by_machine,
-        }
-    }
-
-    /// The label of the Mac that signed as `actor` from Commons machine `machine`, where any is
-    /// known.
-    pub(crate) fn label(&self, actor: &[u8; 48], machine: Option<&[u8; 16]>) -> Option<String> {
-        machine
-            .and_then(|m| self.by_machine.get(m))
-            .or_else(|| self.by_actor.get(actor))
-            .cloned()
-    }
-}
-
-/// What names a writer no label names: the start of its Commons machine id, else of its actor.
-#[cfg(unix)]
-pub(crate) fn short_id(actor: &[u8; 48], machine: Option<&[u8; 16]>) -> String {
-    match machine {
-        Some(machine) => aterm_codec::hex::encode_lower(&machine[..4]),
-        None => aterm_codec::hex::encode_lower(&actor[..4]),
+fn named(mac: &aterm_db::att::Mac) -> (Option<String>, String) {
+    use aterm_db::att::Mac;
+    match mac {
+        Mac::Row { key, .. } => (Some(mac.name()), key.clone()),
+        Mac::Machine(machine) => (None, aterm_codec::hex::encode_lower(&machine[..4])),
+        Mac::Actor(actor) => (None, aterm_codec::hex::encode_lower(&actor[..4])),
     }
 }
 
@@ -517,25 +397,21 @@ pub(crate) fn read(
         }
         None => Vec::new(),
     };
-    let empty = aterm_db::typed::owned::OwnedRead::default();
-    // A writer is named as the registry names its Mac now, in a past table too: history runs
-    // past the point, and a Mac labelled since is still that Mac.
-    let names_view = &head;
-    let writers = Writers::new(
-        &names_view.project(&aterm_db::alab::registry::MACHINE),
-        names_view.owned.get("machine-facts").unwrap_or(&empty),
-        &seats(paths),
-    );
-    let names = aterm_db::alab::registry::Names::of(table, names_view);
+    // A writer is named as history names its Mac now (`Entry::mac`), in a past table too:
+    // history runs past the point, and a Mac labelled since is still that Mac. An owned row
+    // whose record history does not list is named by the same join, read from the head.
+    let macs = aterm_db::att::Macs::of(&head);
+    let names = aterm_db::alab::registry::Names::of(table, &head);
     let author = |entry: &aterm_db::att::Entry| -> Author {
+        let (label, id) = named(&entry.mac);
         Author {
             kind: match entry.kind {
                 aterm_db::att::EntryKind::Aterm => AuthorKind::Aterm,
                 aterm_db::att::EntryKind::Import => AuthorKind::Import,
                 aterm_db::att::EntryKind::Explicit => AuthorKind::Explicit,
             },
-            label: writers.label(&entry.actor, entry.machine.as_ref()),
-            id: short_id(&entry.actor, entry.machine.as_ref()),
+            label,
+            id,
             at_ms: entry.authored_ms,
             hlc: (entry.hlc.ms, entry.hlc.counter),
         }
@@ -556,7 +432,7 @@ pub(crate) fn read(
         now: past.as_ref().map(|_| &head),
         history: &history,
         by_operation: &by_operation,
-        writers: &writers,
+        macs: &macs,
         names: &names,
         listed: &listed,
         since: &since,
@@ -749,7 +625,7 @@ struct Read<'a> {
     now: Option<&'a aterm_db::typed::View>,
     history: &'a [aterm_db::att::Entry],
     by_operation: &'a BTreeMap<[u8; 32], Author>,
-    writers: &'a Writers,
+    macs: &'a aterm_db::att::Macs,
     names: &'a aterm_db::alab::registry::Names,
     listed: &'a [Listed],
     since: &'a [aterm_db::att::CellDiff],
@@ -771,12 +647,15 @@ impl Read<'_> {
             .by_operation
             .get(&row.operation)
             .cloned()
-            .unwrap_or_else(|| Author {
-                kind: AuthorKind::Aterm,
-                label: self.writers.label(&row.actor, Some(&row.machine)),
-                id: short_id(&row.actor, Some(&row.machine)),
-                at_ms: 0,
-                hlc: (0, 0),
+            .unwrap_or_else(|| {
+                let (label, id) = named(&self.macs.name(&row.actor, Some(&row.machine)));
+                Author {
+                    kind: AuthorKind::Aterm,
+                    label,
+                    id,
+                    at_ms: 0,
+                    hlc: (0, 0),
+                }
             });
         by.kind = AuthorKind::Aterm;
         by
@@ -1687,14 +1566,13 @@ pub(crate) fn live() -> Result<Paths, String> {
 }
 
 /// What a read of the registry rests on, read without opening a payload: the table's revision
-/// (`aterm_db::att::Handle::revision`) and the seats that name its writers. Two reads at one
-/// point under one mark show the same page, so the page's reader reads again only once the mark
-/// moves.
+/// (`aterm_db::att::Handle::revision`), which covers the facts and machine rows that name its
+/// writers. Two reads at one point under one mark show the same page, so the page's reader
+/// reads again only once the mark moves.
 #[cfg(unix)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Mark {
     revision: aterm_db::att::Revision,
-    seats: Vec<Seat>,
 }
 
 /// [`Mark`] of the registry at `paths`.
@@ -1707,10 +1585,7 @@ pub(crate) fn mark(paths: &Paths) -> Result<Mark, String> {
     let revision = Handle::at(paths.clone(), &REGISTRY)
         .revision()
         .map_err(|e| e.to_string())?;
-    Ok(Mark {
-        revision,
-        seats: seats(paths),
-    })
+    Ok(Mark { revision })
 }
 
 #[cfg(not(unix))]

@@ -5,6 +5,7 @@
 
 use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
+use crate::identity_file::IDENTITY_MAX;
 pub use crate::membership_log::Author;
 use crate::pass_counts::{self, Count, Phase};
 use crate::text::{self, Audience, Document, Entry};
@@ -31,7 +32,7 @@ mod admission;
 mod admit;
 mod bounded;
 mod chain_cache;
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 mod commons_excluded;
 mod continuity;
 mod control_recovery;
@@ -61,29 +62,38 @@ mod log_entries;
 mod log_fill;
 mod materialization_selection;
 mod member_authority;
+#[cfg(unix)]
 mod member_routes;
 mod mirrors;
 mod network_observation;
 mod network_refresh;
+#[cfg(unix)]
 mod open_migration;
 mod own_head;
 mod peer_candidates;
+#[cfg(unix)]
 mod projection;
+#[cfg(unix)]
 pub use projection::{
     ConvergenceInputs, ConvergenceRole, ConvergenceSnapshot, ConvergenceWake, IdentityDebt,
     convergence_inputs, on_convergence_inputs,
 };
 mod readmit;
 mod reads;
+mod receipts;
 mod records_cache;
+#[cfg(unix)]
 pub mod release;
+#[cfg(unix)]
 mod release_migration;
 mod removal_plan;
 mod remove;
 mod retirement;
 mod roster;
 mod seat_ask;
+pub mod service_reading;
 mod steward;
+#[cfg(unix)]
 mod subscriber;
 mod successor;
 mod toml_cache;
@@ -101,7 +111,7 @@ pub(crate) use admit::{
     with_proof_admission,
 };
 pub use bounded::{join_if_unchanged_until, sync_reader_until};
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 pub use commons_excluded::{CommonsExcluded, test_commons_excluded};
 pub use continuity::{Split, SplitBy, seat_splits, splits};
 pub use control_recovery::{
@@ -131,6 +141,7 @@ pub use foundation::{
     CommonsInit, Foundable, NotFounded, admin_commons_found_by_default, admin_commons_init,
     commons_foundable,
 };
+#[cfg(unix)]
 pub(crate) use genesis::configured_genesis;
 pub use genesis::{SignedGenesis, admin_sign_genesis, seed_vault_genesis};
 #[cfg(any(test, debug_assertions))]
@@ -139,8 +150,8 @@ pub use handover::{
     HANDOVER_LOCK_WAIT, HandoverHold, ask_allowed, handover_bundle, holds_allowed, post_allowed,
     take_handover_hold, write_from_bundle,
 };
-pub use http204_observation::{VaultHttp204Response, observe_http204_response};
-#[cfg(test)]
+pub use http204_observation::VaultHttp204Response;
+#[cfg(all(test, unix))]
 pub(crate) use inspection::newest_everyone;
 pub(crate) use inspection::newest_everyone_until;
 pub use inspection::{
@@ -175,9 +186,7 @@ pub use mirrors::{
     MAX_MIRRORS, MirrorProbe, mirror_notes, mirror_typed, probe_mirror, set_mirrors,
 };
 pub use network_observation::{VaultNetworkMaterialization, VaultNetworkSource};
-pub use network_refresh::{
-    VaultNetworkRefresh, VaultNetworkRefreshOutcome, observe_network_refresh,
-};
+pub use network_refresh::{VaultNetworkRefresh, VaultNetworkRefreshOutcome};
 use peer_candidates::{PeerDiscovery, PeerUse};
 pub use readmit::{
     AUTOMATIC_PER_HOUR, Book, How as ReadmitHow, KeptSeat, MAX_READMISSIONS,
@@ -185,14 +194,17 @@ pub use readmit::{
     prove_at, prove_at_ms, refuses_before_possession, refuses_before_possession_at_ms,
 };
 use reads::{HeldLog, Reads};
+pub use receipts::{Observed, Receipts, observe_receipts};
 pub use remove::{
-    CutPass, ListedMac, MemberRemoval, NodePass, NodePassHost, NodePassPace, NodePassReceipt,
-    NodePassSaid, RemovedNote, RemovedNotes, TableCuts, UndoOffer, UndoShare, cut_own_removals,
+    CutPass, ListedMac, MemberRemoval, NodePass, NodePassPace, NodePassReceipt, NodePassSaid,
+    RemovedNote, RemovedNotes, TableCuts, UndoOffer, UndoShare, cut_own_removals,
     epoch_convergence_environment, gap_heal_environment, member_list, node_pass_receipt,
     on_table_cuts, read_after_cutoff_lines, remove_member, remove_seat, removed_notes,
-    removes_by_log, reseal_waits, revoke_by_log, run_node_pass, seats_ever, tend_epochs,
-    tend_epochs_at, undo_offers, undo_removals, vault_admin_named, vault_pass_at,
+    removes_by_log, reseal_waits, revoke_by_log, seats_ever, tend_epochs, tend_epochs_at,
+    undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
+#[cfg(unix)]
+pub use remove::{NodePassHost, run_node_pass};
 pub(crate) use remove::{recipient_label, seat_label};
 #[cfg(any(test, debug_assertions))]
 pub use remove::{test_put_everyone, test_put_everyone_draft, test_remove_unposted};
@@ -221,18 +233,26 @@ pub use seat_ask::{
 pub(crate) use steward::local_recipient_denial_held;
 #[cfg(any(test, debug_assertions))]
 pub use steward::test_alab_standing;
+#[cfg(unix)]
 pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role};
 pub use steward::{
-    StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
-    local_recipient_denial_observed, local_recipient_denied_in_roster, no_admin_key,
-    retire_stale_member_server, stale_member_server, steward_alab_policy_role,
-    steward_ensure_lease, steward_ensure_standby_server, steward_finish_revokes,
-    steward_lease_check, steward_revoke_check, steward_standby_server_check, stewardship,
+    StewardLease, StewardRevoke, Stewardship, local_recipient_denial_observed,
+    local_recipient_denied_in_roster, no_admin_key, steward_alab_policy_role, steward_ensure_lease,
+    steward_finish_revokes, steward_lease_check, steward_revoke_check, stewardship,
 };
+#[cfg(unix)]
+pub use steward::{
+    StewardStandbyServer, retire_stale_member_server, stale_member_server,
+    steward_ensure_standby_server, steward_standby_server_check,
+};
+#[cfg(unix)]
 pub use subscriber::mend_subscriber;
 #[cfg(any(test, debug_assertions))]
 pub use successor::SecondSuccessor;
 pub use successor::{Succeeding, Succession, admit_successor};
+#[cfg(any(test, debug_assertions))]
+#[doc(hidden)]
+pub use vault_memo::desk_stamped_files;
 pub(crate) use vault_memo::{
     Currency, Moment, Under, local_recipient_denied_under, observe_commons_now,
     observe_commons_quiet, state_standing_in, trusted_commons_log_under,
@@ -243,34 +263,36 @@ pub use vault_memo::{
     Derivations, LookDerivations, test_logs_read, test_look_derivations, test_looks_observed,
 };
 pub use vault_memo::{
-    DeskInputs, VaultLook, acknowledged_commons_log_now, config_now, desk_inputs,
-    desk_inputs_quiet, local_swarm_roster_for_log_now, records_now, swarm_denial_snapshot_now,
-    swarm_denied_nodes_now, swarm_member_heard_now, swarm_roster_now_until,
-    trusted_commons_log_now,
+    DeskInputs, RecordBounds, TokenViewInputs, VaultLook, acknowledged_commons_log_now, config_now,
+    desk_inputs, desk_inputs_quiet, local_swarm_roster_for_log_now, record_bounds, records_now,
+    swarm_denial_snapshot_now, swarm_denied_nodes_now, swarm_member_heard_now,
+    swarm_roster_now_until, token_view_files, token_view_inputs, trusted_commons_log_now,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod approver_queue_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use approver_queue_tests::{
     mirror_vault as mirrored_vault_for_test, request as queued_identity_for_test,
 };
 #[cfg(test)]
 mod birth_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod desk_node_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod join_elsewhere_tests;
 #[cfg(test)]
 mod join_tests;
 #[cfg(test)]
 mod log_entries_tests;
+#[cfg(unix)]
 #[cfg(test)]
 pub(crate) use log_entries_tests::two_macs as two_log_macs_for_test;
+#[cfg(unix)]
 #[cfg(test)]
 pub(crate) use log_entries_tests::two_macs_with as two_log_macs_with_for_test;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod own_head_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod parent_history_tests;
 #[cfg(test)]
 mod pass_counts_tests;
@@ -282,7 +304,7 @@ mod peer_selection_tests;
 
 #[cfg(test)]
 mod cold_read_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod entry_class_tests;
 #[cfg(test)]
 mod envelope_denial_tests;
@@ -290,20 +312,24 @@ mod envelope_denial_tests;
 mod idle_reads_tests;
 #[cfg(test)]
 mod lab_start_over_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod log_only_tests;
 #[cfg(test)]
 mod observe_reads_tests;
 #[cfg(test)]
 mod probe_reads_tests;
 #[cfg(test)]
+mod receipts_tests;
+#[cfg(test)]
 mod received_records_tests;
 #[cfg(test)]
 mod records_push_tests;
 #[cfg(test)]
 mod records_sync_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod selection_pass_tests;
+#[cfg(all(test, unix))]
+mod service_reading_tests;
 
 /// Where a machine keeps its vault state, under one home.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -445,6 +471,7 @@ impl Paths {
         self.dir.join("answered-approved")
     }
 
+    #[cfg(unix)]
     fn stuck_file(&self, pid: u32) -> PathBuf {
         self.dir.join(format!("{STUCK_PREFIX}{pid}"))
     }
@@ -492,6 +519,37 @@ impl Paths {
     #[must_use]
     pub fn acknowledged_history_files(&self) -> [PathBuf; 4] {
         retained_history::files(self)
+    }
+
+    /// The files whose change can move what a fleet listener judges of this Mac and of the
+    /// peers it serves (its standing, tenure and deny list, and this Mac's own denial):
+    /// [`Self::standing_files`] and every file the vault's memos re-read on a change but the
+    /// state lock (`vault_memo::watched_inputs`). A listener that judges again whenever one of
+    /// them changes, rather than on a clock, watches these. Like [`Self::standing_files`] it
+    /// names the records' entry and a layout's header and data file whatever the entry is now,
+    /// so a watcher takes it once and re-resolves nothing.
+    #[must_use]
+    pub fn fleet_judgment_files(&self) -> Vec<PathBuf> {
+        let mut files = self.standing_files();
+        for file in vault_memo::watched_inputs(self) {
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+        files
+    }
+
+    /// Whether a writer holds this vault's state lock now: one nonblocking observation, which
+    /// takes a shared one and lets it go where no writer holds it. A memo read under a writer is
+    /// read again at its next call, and the writer's release of the lock changes none of
+    /// [`Self::fleet_judgment_files`], so a listener that judges again on their events keeps a
+    /// clock while this holds. A missing lock, or one that cannot be observed, is no writer's.
+    #[must_use]
+    pub fn writer_holds_state(&self) -> bool {
+        matches!(
+            StateLock::observe_classified(self),
+            Ok(StateObservation::Busy)
+        )
     }
 }
 
@@ -765,6 +823,13 @@ enum ExpectedConfig<'a> {
         &'a (dyn Fn() -> crate::Result<()> + Sync),
     ),
     /// A background join over the source read, held whenever sharing is off.
+    #[cfg_attr(
+        all(not(unix), not(test)),
+        expect(
+            dead_code,
+            reason = "only the unix subscriber's background join holds it"
+        )
+    )]
     WhileSharing(Option<&'a Config>),
 }
 
@@ -955,7 +1020,7 @@ pub(crate) struct StateLock {
     shared: bool,
     /// The device and inode of the lock file an observation's descriptor (opened read-only)
     /// goes back to [`IDLE_LOCKS`] as once it is unlocked. A writer's take has none.
-    idle_as: Option<(u64, u64)>,
+    idle_as: Option<(u64, fsx::Ino)>,
 }
 
 /// Descriptors of vault state lock files that shared observations opened and that hold no lock,
@@ -984,7 +1049,7 @@ const IDLE_LOCKS_KEPT: usize = 8;
 /// One idle descriptor: its lock file's device and inode, which name that file while the
 /// descriptor holds it open (an open file's inode is not given to another), and when it came back.
 struct IdleLock {
-    id: (u64, u64),
+    id: (u64, fsx::Ino),
     file: std::fs::File,
     returned: u64,
 }
@@ -1006,7 +1071,7 @@ impl IdleLocks {
     }
 
     /// An idle descriptor of the file `id` names, taken out.
-    fn take(&mut self, id: (u64, u64)) -> Option<std::fs::File> {
+    fn take(&mut self, id: (u64, fsx::Ino)) -> Option<std::fs::File> {
         self.slots
             .iter_mut()
             .find(|slot| slot.as_ref().is_some_and(|idle| idle.id == id))?
@@ -1016,7 +1081,7 @@ impl IdleLocks {
 
     /// Keep `file`, an unlocked descriptor of the file `id` names, in an empty slot or in place of
     /// the one that came back longest ago, which closes.
-    fn keep(&mut self, id: (u64, u64), file: std::fs::File) {
+    fn keep(&mut self, id: (u64, fsx::Ino), file: std::fs::File) {
         let returned = self.returns;
         self.returns = self.returns.wrapping_add(1);
         if let Some(slot) = self
@@ -1030,7 +1095,7 @@ impl IdleLocks {
 }
 
 /// An idle descriptor of the lock file `id` names, taken out of [`IDLE_LOCKS`].
-fn idle_lock(id: (u64, u64)) -> Option<std::fs::File> {
+fn idle_lock(id: (u64, fsx::Ino)) -> Option<std::fs::File> {
     #[cfg(not(test))]
     return IDLE_LOCKS
         .lock()
@@ -1044,7 +1109,7 @@ fn idle_lock(id: (u64, u64)) -> Option<std::fs::File> {
 }
 
 /// Put `file`, an unlocked descriptor of the lock file `id` names, back into [`IDLE_LOCKS`].
-fn keep_idle_lock(id: (u64, u64), file: std::fs::File) {
+fn keep_idle_lock(id: (u64, fsx::Ino), file: std::fs::File) {
     #[cfg(not(test))]
     IDLE_LOCKS
         .lock()
@@ -1217,19 +1282,18 @@ impl StateLock {
     /// judged found, and otherwise its own `fstat`: an open descriptor's device and inode never
     /// change.
     fn guards_in(&self, path: &Path, glance: Option<&fsx::Glance>) -> bool {
-        use std::os::unix::fs::MetadataExt as _;
         let Some(file) = &self.file else {
             return false;
         };
         let held = self
             .idle_as
-            .or_else(|| file.metadata().ok().map(|held| (held.dev(), held.ino())));
+            .or_else(|| fsx::meta_of(file).ok().map(|held| fsx::id_of(&held)));
         let at = match glance {
             Some(glance) => glance
                 .symlink_metadata(path)
                 .ok()
                 .flatten()
-                .map(|at| (at.dev(), at.ino())),
+                .map(|at| fsx::id_of(&at)),
             None => {
                 #[cfg(test)]
                 count_lock_use(LockUse::Judged, path);
@@ -1290,17 +1354,33 @@ impl StateLock {
 
     /// Try an existing private lock without creating files or repairing their permissions.
     fn try_take_existing(paths: &Paths) -> crate::Result<Option<StateLock>> {
-        use std::os::unix::fs::MetadataExt as _;
         #[cfg(debug_assertions)]
         Self::not_under_own_observation(&paths.lock_file());
         let Some((file, metadata)) = Self::open_existing(paths, true)? else {
             return Ok(None);
         };
-        let dir =
-            std::fs::symlink_metadata(&paths.dir).map_err(|error| Error::new(error.to_string()))?;
-        if dir.uid() != fsx::euid() || dir.mode() & 0o7777 != 0o700 || metadata.mode() & 0o7077 != 0
+        #[cfg(unix)]
         {
-            return Ok(None);
+            use std::os::unix::fs::MetadataExt as _;
+            let dir = std::fs::symlink_metadata(&paths.dir)
+                .map_err(|error| Error::new(error.to_string()))?;
+            if dir.uid() != fsx::euid()
+                || dir.mode() & 0o7777 != 0o700
+                || metadata.mode() & 0o7077 != 0
+            {
+                return Ok(None);
+            }
+        }
+        // The folder owner-only and the lock owner-only, as the Unix folder of mode 0700 and the
+        // lock with no group, other, setuid or setgid bit are.
+        #[cfg(windows)]
+        {
+            let _ = metadata;
+            if fsx::private_dir_settled(&paths.dir).is_err()
+                || fsx::lock_wide(&file, &paths.lock_file())?.is_some()
+            {
+                return Ok(None);
+            }
         }
         #[expect(
             clippy::disallowed_methods,
@@ -1406,16 +1486,25 @@ impl StateLock {
     /// another file, which is opened. The kernel's access check of an open is not made again: a
     /// lock its owner made unreadable is still observed through a descriptor opened before, as it
     /// was while one observation held it, since only its `flock` is used, never its bytes.
-    fn open_observed(paths: &Paths) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    fn open_observed(paths: &Paths) -> crate::Result<Option<(std::fs::File, fsx::Meta)>> {
         if !Self::folder_present(paths)? {
             return Ok(None);
         }
         let path = paths.lock_file();
+        #[cfg(unix)]
         if let Some(id) = fsx::file_id(&path)
             && let Some(file) = idle_lock(id)
             && let Ok(metadata) = file.metadata()
         {
             return Ok(Some((file, fsx::judge_lock(metadata, &path)?)));
+        }
+        // The idle handle is judged as a lock just opened is, its owner read from its descriptor.
+        #[cfg(windows)]
+        if let Some(id) = fsx::file_id(&path)
+            && let Some(file) = idle_lock(id)
+        {
+            let metadata = fsx::lock_metadata(&file, &path)?;
+            return Ok(Some((file, metadata)));
         }
         Self::open_present(paths, false)
     }
@@ -1423,7 +1512,7 @@ impl StateLock {
     fn open_existing(
         paths: &Paths,
         writable: bool,
-    ) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
+    ) -> crate::Result<Option<(std::fs::File, fsx::Meta)>> {
         if !Self::folder_present(paths)? {
             return Ok(None);
         }
@@ -1434,19 +1523,23 @@ impl StateLock {
     fn open_present(
         paths: &Paths,
         writable: bool,
-    ) -> crate::Result<Option<(std::fs::File, std::fs::Metadata)>> {
-        use std::os::unix::fs::OpenOptionsExt;
+    ) -> crate::Result<Option<(std::fs::File, fsx::Meta)>> {
         let path = paths.lock_file();
         #[cfg(test)]
         count_lock_use(LockUse::Opened, &path);
         fsx::look_afresh();
-        let file = match aterm_uds::kept_out(|| {
+        #[cfg(unix)]
+        let opened = aterm_uds::kept_out(|| {
+            use std::os::unix::fs::OpenOptionsExt;
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(writable)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
                 .open(&path)
-        }) {
+        });
+        #[cfg(windows)]
+        let opened = fsx::open_lock_existing(&path, writable);
+        let file = match opened {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(Error::new(format!("{}: {error}", path.display()))),
@@ -1479,6 +1572,7 @@ impl StateLock {
 
     /// [`Self::narrow_owned`], running `before_narrowing` between its checks and its `fchmod`: a
     /// test's stand-in for whatever renames the lock in that moment.
+    #[cfg(unix)]
     fn narrow_owned_then(paths: &Paths, before_narrowing: impl FnOnce()) -> crate::Result<bool> {
         use std::os::unix::fs::MetadataExt as _;
         let Ok(Some((file, metadata))) = Self::open_existing(paths, false) else {
@@ -1503,6 +1597,31 @@ impl StateLock {
         Ok(true)
     }
 
+    /// [`Self::narrow_owned_then`] on Windows: a lock of this user's (one link, no reparse point,
+    /// [`fsx::lock_metadata`]) whose list is not owner-only, which a writer can open read-write,
+    /// in a folder of this user's that no other account may change ([`fsx::dir_owned_unshared`]),
+    /// is made owner-only through its handle.
+    #[cfg(windows)]
+    fn narrow_owned_then(paths: &Paths, before_narrowing: impl FnOnce()) -> crate::Result<bool> {
+        let Ok(Some((file, _metadata))) = Self::open_existing(paths, false) else {
+            return Ok(false);
+        };
+        if fsx::lock_wide(&file, &paths.lock_file())?.is_none() {
+            return Ok(false);
+        }
+        // A writer opens it read-write, which its list must already let this user do.
+        if fsx::open_lock_existing(&paths.lock_file(), true).is_err() {
+            return Ok(false);
+        }
+        if !fsx::dir_owned_unshared(&paths.dir) {
+            return Ok(false);
+        }
+        before_narrowing();
+        fsx::narrow_lock(&file, &paths.lock_file())?;
+        Ok(true)
+    }
+
+    #[cfg(unix)]
     fn permissions_need_repair(paths: &Paths) -> crate::Result<bool> {
         use std::os::unix::fs::MetadataExt as _;
         let Some((_file, metadata)) = Self::open_existing(paths, true)? else {
@@ -1519,6 +1638,21 @@ impl StateLock {
         // open_lock needs owner read/write before it can narrow the mode. Opening without
         // create or truncate above also refuses a read-only filesystem or denied write access.
         Ok(mode & 0o600 == 0o600 && (mode & 0o077 != 0 || mode & 0o6000 != 0))
+    }
+
+    /// [`Self::permissions_need_repair`] on Windows: the lock, opened read-write as it is, has a
+    /// list that is not owner-only, in a folder of this user's.
+    #[cfg(windows)]
+    fn permissions_need_repair(paths: &Paths) -> crate::Result<bool> {
+        let Some((file, _metadata)) = Self::open_existing(paths, true)? else {
+            return Ok(false);
+        };
+        if aterm_uds::private_file::check_owned_dir(&paths.dir).is_err() {
+            return Err(Error::new(
+                "the vault state directory is not this user's directory",
+            ));
+        }
+        Ok(fsx::lock_wide(&file, &paths.lock_file())?.is_some())
     }
 
     fn observe(paths: &Paths) -> crate::Result<Option<StateLock>> {
@@ -1538,12 +1672,20 @@ impl StateLock {
     /// [`Self::narrow_owned`] and then [`Self::observe_classified`], on one open of the lock
     /// unless it needs narrowing.
     fn observe_narrowed(paths: &Paths) -> crate::Result<StateObservation> {
-        use std::os::unix::fs::MetadataExt as _;
         let opened = Self::open_observed(paths)?;
-        if opened
-            .as_ref()
-            .is_some_and(|(_, metadata)| metadata.mode() & 0o6077 != 0)
-        {
+        #[cfg(unix)]
+        let wide = {
+            use std::os::unix::fs::MetadataExt as _;
+            opened
+                .as_ref()
+                .is_some_and(|(_, metadata)| metadata.mode() & 0o6077 != 0)
+        };
+        #[cfg(windows)]
+        let wide = match &opened {
+            Some((file, _)) => fsx::lock_wide(file, &paths.lock_file())?.is_some(),
+            None => false,
+        };
+        if wide {
             drop(opened);
             Self::narrow_owned(paths)?;
             return Self::observe_classified(paths);
@@ -1553,9 +1695,8 @@ impl StateLock {
 
     fn classify(
         paths: &Paths,
-        opened: Option<(std::fs::File, std::fs::Metadata)>,
+        opened: Option<(std::fs::File, fsx::Meta)>,
     ) -> crate::Result<StateObservation> {
-        use std::os::unix::fs::MetadataExt as _;
         let Some((file, metadata)) = opened else {
             return Ok(StateObservation::Absent);
         };
@@ -1563,11 +1704,22 @@ impl StateLock {
         let path = paths.lock_file();
         #[cfg(test)]
         count_lock_use(LockUse::Observed, &path);
-        if metadata.mode() & 0o077 != 0 || metadata.mode() & 0o6000 != 0 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.mode() & 0o077 != 0 || metadata.mode() & 0o6000 != 0 {
+                return Err(Error::new(format!(
+                    "{}: mode {:o} lets other users read it; run chmod 600 on it",
+                    path.display(),
+                    metadata.mode() & 0o7777
+                )));
+            }
+        }
+        #[cfg(windows)]
+        if let Some(why) = fsx::lock_wide(&file, &path)? {
             return Err(Error::new(format!(
-                "{}: mode {:o} lets other users read it; run chmod 600 on it",
-                path.display(),
-                metadata.mode() & 0o7777
+                "{}: {why}; a vault writer makes it owner-only again",
+                path.display()
             )));
         }
         #[expect(
@@ -1579,7 +1731,7 @@ impl StateLock {
                 let lock = StateLock {
                     file: Some(file),
                     shared: true,
-                    idle_as: Some((metadata.dev(), metadata.ino())),
+                    idle_as: Some(fsx::id_of(&metadata)),
                 };
                 // A lock file renamed away since it was opened guards nothing here: busy, and a
                 // wait opens the one at the path again.
@@ -1706,7 +1858,7 @@ std::thread_local! {
 
 /// Run `take` with `blocked` as this thread's action on each blocked try of a waiting exclusive
 /// take ([`TAKE_BLOCKED`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn while_take_blocked<T>(blocked: impl FnMut() + 'static, take: impl FnOnce() -> T) -> T {
     struct Restore(Option<Box<dyn FnMut()>>);
     impl Drop for Restore {
@@ -1798,6 +1950,8 @@ pub fn default_host_name() -> String {
     if let Some(name) = aterm_uds::process::lan_host_name() {
         candidates.push(name);
     }
+    // Windows keeps no /etc/hostname: its computer name is the host name above.
+    #[cfg(unix)]
     if let Some(name) = read_etc_hostname() {
         candidates.push(name);
     }
@@ -1819,6 +1973,7 @@ fn host_name_hint(candidates: &[String]) -> String {
     "machine".to_string()
 }
 
+#[cfg(unix)]
 fn read_etc_hostname() -> Option<String> {
     use std::io::Read as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -1865,24 +2020,14 @@ pub(crate) fn read_identity(paths: &Paths) -> crate::Result<Option<Identity>> {
     Ok(read_identity_marked(paths)?.map(|(identity, _)| identity))
 }
 
-/// The comment line that marks a lab identity in its file ([`crate::LabMark`]), followed by the
-/// mark's word. A comment, so every build reads the key past it as before (the key is the last
-/// line that is not one).
-const LAB_LINE: &str = "# aterm lab identity: ";
-
-/// The most bytes an identity file holds that a read of it takes.
-const IDENTITY_MAX: usize = 16 << 10;
-
 /// This machine's age identity and its lab mark, read together from one read of
-/// `~/.config/aterm/secrets/identity`: the mark is a line starting [`LAB_LINE`], written when the
-/// identity was made ([`install_identity`]).
+/// `~/.config/aterm/secrets/identity` ([`crate::identity_file::read_marked`]): the mark is a line
+/// starting [`crate::identity_file::LAB_LINE`], written when the identity was made
+/// ([`crate::identity_file::install`]).
 pub(crate) fn read_identity_marked(
     paths: &Paths,
 ) -> crate::Result<Option<(Identity, Option<crate::LabMark>)>> {
-    let Some(bytes) = fsx::read_private(&paths.identity_file(), IDENTITY_MAX)? else {
-        return Ok(None);
-    };
-    identity_marked_in(paths, &bytes).map(Some)
+    crate::identity_file::read_marked(&paths.identity_file())
 }
 
 /// The recipient of this machine's age identity ([`read_identity`]), `None` where there is none,
@@ -1918,7 +2063,10 @@ pub(crate) fn identity_recipient(
         let Some(bytes) = fsx::read_private(&path, IDENTITY_MAX)? else {
             return Ok(None);
         };
-        let recipient = identity_marked_in(paths, &bytes)?.0.recipient();
+        let Some((identity, _)) = crate::identity_file::marked_in(&path, &bytes)? else {
+            return Ok(None);
+        };
+        let recipient = identity.recipient();
         let parsed = aterm_digest::Sha256::digest(bytes.as_slice());
         if let Ok(mut kept) = kept.lock() {
             kept.retain(|(of, _)| *of != parsed);
@@ -1935,32 +2083,6 @@ pub(crate) fn identity_recipient(
     }
     #[cfg(test)]
     THREAD_RECIPIENTS.with(recipient_in)
-}
-
-/// The identity and lab mark `bytes`, the identity file's, hold ([`read_identity_marked`]).
-fn identity_marked_in(
-    paths: &Paths,
-    bytes: &SecretBytes,
-) -> crate::Result<(Identity, Option<crate::LabMark>)> {
-    let text = bytes
-        .as_str()
-        .ok_or_else(|| Error::new("identity: not UTF-8"))?;
-    let line = text
-        .lines()
-        .map(str::trim)
-        .rfind(|line| !line.is_empty() && !line.starts_with('#'))
-        .ok_or_else(|| Error::new("identity: no key in the file"))?;
-    let mark = text.lines().map(str::trim).find_map(|line| {
-        line.strip_prefix(LAB_LINE)
-            .map(|rest| crate::LabMark::of_word(rest.split_whitespace().next().unwrap_or("")))
-    });
-    let identity = Identity::parse(line).map_err(|_| {
-        Error::new(format!(
-            "{}: not an age identity",
-            paths.identity_file().display()
-        ))
-    })?;
-    Ok((identity, mark))
 }
 
 /// Read this machine's age identity from `~/.config/aterm/secrets/identity` without creating one.
@@ -1985,45 +2107,25 @@ pub fn machine_identity_as(paths: &Paths, making: crate::Making) -> crate::Resul
 }
 
 fn machine_identity_making(paths: &Paths, making: crate::Making) -> crate::Result<Identity> {
-    if let Some(identity) = read_identity(paths)? {
-        return Ok(identity);
-    }
-    fsx::ensure_private_dir(&paths.dir)?;
-    install_identity(paths, Identity::generate()?, crate::lab_identity(making))
+    crate::identity_file::machine_identity(
+        &paths.dir,
+        &paths.identity_file(),
+        crate::lab_identity(making),
+        now(),
+    )
 }
 
 /// Write `identity` as this machine's key with its lab mark, `mark` (A12): written with the key,
 /// in one new file, so no identity is ever without the mark it was made with, and none gains one
-/// later. Where another process wrote the file first, its key and mark win.
+/// later. Where another process wrote the file first, its key and mark win
+/// ([`crate::identity_file::install`], which [`machine_identity`] makes through): the tests' seam.
+#[cfg(test)]
 fn install_identity(
     paths: &Paths,
     identity: Identity,
     mark: Option<crate::LabMark>,
 ) -> crate::Result<Identity> {
-    let secret = identity.to_bech32();
-    let mut file = format!(
-        "# aterm secrets machine key: created {} (unix), never copied off this machine.\n# public key: {}\n",
-        now(),
-        identity.recipient().to_bech32()
-    )
-    .into_bytes();
-    if let Some(mark) = mark {
-        file.extend_from_slice(
-            format!(
-                "{LAB_LINE}{} (it founds its own lab and never joins the live ALab)\n",
-                mark.word()
-            )
-            .as_bytes(),
-        );
-    }
-    file.extend_from_slice(secret.as_slice());
-    file.push(b'\n');
-    let file = SecretBytes::new(file);
-    if fsx::write_new(&paths.identity_file(), file.as_slice(), 0o600)? {
-        return Ok(identity);
-    }
-    read_identity(paths)?
-        .ok_or_else(|| Error::new("the machine key changed while it was being created; try again"))
+    crate::identity_file::install(&paths.identity_file(), identity, mark, now())
 }
 
 /// The record a lab identity's set-aside leaves in the new vault folder ([`start_over_as`]): one
@@ -2190,8 +2292,8 @@ fn start_over_then(
         before_identity();
         machine_identity_making(paths, making)?;
         // A process that makes lab identities (a debug build's) may have made one in the new
-        // folder first; its key wins the write ([`install_identity`]), so say so rather than
-        // report a new Mac. The next start sets that one aside too.
+        // folder first; its key wins the write ([`crate::identity_file::install`]), so say so
+        // rather than report a new Mac. The next start sets that one aside too.
         if let Some((_, Some(again))) = read_identity_marked(paths)? {
             return Err(Error::new(format!(
                 "another process made a lab identity ({}) in the new vault folder first",
@@ -2287,73 +2389,6 @@ pub fn start_over_lab_identity_as(
     now_secs: u64,
 ) -> crate::Result<Option<LabSetAside>> {
     start_over_as(paths, making, now_secs)
-}
-
-impl crate::Making {
-    /// What this process is, read now ([`crate::lab_identity`]): a test binary by its executable's
-    /// name (`aterm_uds::test_binary::is_test_binary`), a build with debug assertions on, a
-    /// process a lab lane marked ([`Self::lab_lane_of`]: `ATERM_LAB_MEMBER_SERVICE` or
-    /// `ATERM_LAB_VAULT_SERVICE` set, whatever its value),
-    /// whether it runs inside a virtual machine (macOS's `kern.hv_vmm_present`,
-    /// [`aterm_sysprobe::hv_vmm_present`]), and whether its home is a folder other than its
-    /// login's account home ([`Self::foreign_home_now`]), as [`Self::reading`] reads them.
-    #[must_use]
-    pub fn now() -> Self {
-        Self::reading(
-            std::env::current_exe().is_ok_and(|exe| aterm_uds::test_binary::is_test_binary(&exe)),
-            aterm_sysprobe::hv_vmm_present,
-            Self::foreign_home_now,
-        )
-    }
-
-    /// Whether this process's home (`HOME`, as [`aterm_types::dirs::home_dir`] reads it) is a
-    /// folder other than the one the account database names for its user: the process was handed
-    /// a scratch `HOME`. `None` off Unix, and where either home is unresolved.
-    fn foreign_home_now() -> Option<bool> {
-        #[cfg(unix)]
-        let account = aterm_uds::account::home();
-        #[cfg(not(unix))]
-        let account = None;
-        Self::foreign_home_of(aterm_types::dirs::home_dir().as_deref(), account.as_deref())
-    }
-
-    /// [`Self::foreign_home_now`] for a process whose home is `home` and whose account home is
-    /// `account`: whether they are two folders ([`crate::service::one_folder`], so a symlinked or
-    /// differently spelled home is the login's own), or `None` where either is unresolved.
-    pub(crate) fn foreign_home_of(home: Option<&Path>, account: Option<&Path>) -> Option<bool> {
-        Some(!crate::service::one_folder(home?, account?))
-    }
-
-    /// Whether a lab lane marked a process whose environment has each variable `set` says it
-    /// has: [`crate::discover::LAB_MEMBER_SERVICE_ENV`] or
-    /// [`crate::discover::LAB_VAULT_SERVICE_ENV`], whatever its value (one this build cannot take
-    /// browses for nothing, and still marks the process a lab's).
-    pub(crate) fn lab_lane_of(set: impl Fn(&str) -> bool) -> bool {
-        set(crate::discover::LAB_MEMBER_SERVICE_ENV) || set(crate::discover::LAB_VAULT_SERVICE_ENV)
-    }
-
-    /// [`Self::now`] for a process that is a test binary or not (`test_binary`), its
-    /// virtual-machine fact read through `virtual_machine` and its home fact through
-    /// `foreign_home`. A test binary, in any crate, reads no
-    /// probe: a test states the fact through [`crate::Making`], so no test's outcome hangs on the
-    /// host it runs on, a macOS VM included, and every identity a test binary makes is marked
-    /// [`crate::LabMark::TestBinary`] first anyway. A probe that does not answer (off macOS, a
-    /// kernel with no such name; an account home the database does not name) is no virtual machine
-    /// and no foreign home, so a Mac's own hardware never makes a lab
-    /// identity because a probe failed.
-    pub(crate) fn reading(
-        test_binary: bool,
-        virtual_machine: fn() -> Option<bool>,
-        foreign_home: fn() -> Option<bool>,
-    ) -> Self {
-        Self {
-            test_binary,
-            debug_build: cfg!(debug_assertions),
-            lab_lane: Self::lab_lane_of(|knob| std::env::var_os(knob).is_some()),
-            virtual_machine: !test_binary && virtual_machine() == Some(true),
-            foreign_home: !test_binary && foreign_home() == Some(true),
-        }
-    }
 }
 
 /// The lab mark a joiner's lines carry (`members::wire::lab_field`) for an identity whose file
@@ -3067,22 +3102,38 @@ fn log_only_source_bound(config: &Config, state: &State) -> bool {
         && state.records_digest.is_some()
 }
 
+/// Whether a vault held by its log alone (no envelope copy) is intact: the log the source binds
+/// admits this Mac at the records digest `state` applied.
 fn log_only_intact(paths: &Paths, config: &Config, state: &State) -> bool {
+    log_only_judged(paths, config, state, &mut Judgement::default())
+}
+
+/// [`log_only_intact`], noting in `judgement` each read that failed (the held copy's `lstat`, the
+/// identity, the log) and that it answered `false` for.
+fn log_only_judged(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+    judgement: &mut Judgement,
+) -> bool {
     if state.membership != Stored::In
         || !log_only_source_bound(config, state)
         || pin_gives_way(config)
-        || fsx::kind(&paths.cache_file()).ok() != Some(fsx::Kind::Missing)
+        || judgement.ok(fsx::kind(&paths.cache_file())) != Some(fsx::Kind::Missing)
     {
         return false;
     }
-    let Ok(Some(identity)) = read_identity(paths) else {
+    let Some(Some(identity)) = judgement.ok(read_identity(paths)) else {
         return false;
     };
-    let Ok(Some(configured)) = log_entries::trusted_configured_log(paths, config) else {
+    let Some(Some(configured)) = judgement.ok(log_entries::trusted_configured_log(paths, config))
+    else {
         return false;
     };
     Some(log_entries::records_heads_digest(&configured.log)) == state.records_digest
-        && log_entries::log_alone_admits(&configured.log, &identity).unwrap_or(false)
+        && judgement
+            .ok(log_entries::log_alone_admits(&configured.log, &identity))
+            .unwrap_or(false)
 }
 
 fn prepare_materialization(paths: &Paths, state: &mut State) -> crate::Result<()> {
@@ -3492,6 +3543,9 @@ pub struct Materialized<T> {
 #[cfg(test)]
 #[path = "client/materialization_scope_tests.rs"]
 mod materialization_scope_tests;
+#[cfg(test)]
+#[path = "client/readiness_judgement_tests.rs"]
+mod readiness_judgement_tests;
 
 /// Why one guarded local materialization observation could not read its inputs.
 /// These reasons reveal no entry names, credentials, paths or source payloads.
@@ -3650,10 +3704,11 @@ impl MaterializationSnapshot {
         match with_ready_state_reusing(
             paths,
             Some(&self.config),
-            local_intact,
+            local_judged,
             None,
             Some(&self.selection),
             OnWriter::Wait,
+            &mut Judgement::default(),
             |now| {
                 if now.seq != self.seq
                     || now.digest != self.digest
@@ -3694,10 +3749,11 @@ impl MaterializationSnapshot {
             match with_ready_state_reusing(
                 paths,
                 Some(&self.config),
-                local_intact,
+                local_judged,
                 None,
                 Some(&self.selection),
                 OnWriter::Wait,
+                &mut Judgement::default(),
                 |_| Ok(()),
             )? {
                 MaterializationObservation::Ready(current) => {
@@ -3764,7 +3820,7 @@ pub fn with_materialization_ready<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_intact,
+        local_judged,
         None,
         OnWriter::Wait,
         |_| read(),
@@ -3796,7 +3852,7 @@ pub fn with_materialization_ready_for_entries<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_intact,
+        local_judged,
         Some(entries),
         OnWriter::Wait,
         |_| read(),
@@ -3820,7 +3876,7 @@ pub fn observe_materialization<T>(
     with_ready_state(
         paths,
         Some(expected),
-        local_intact,
+        local_judged,
         None,
         OnWriter::Answer,
         |_| read(),
@@ -3833,7 +3889,14 @@ fn materialization_ready_with(
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
     Ok(matches!(
-        with_ready_state(paths, expected, intact, None, OnWriter::Wait, |_| Ok(()))?,
+        with_ready_state(
+            paths,
+            expected,
+            |paths, state, _| intact(paths, state),
+            None,
+            OnWriter::Wait,
+            |_| Ok(())
+        )?,
         MaterializationObservation::Ready(_)
     ))
 }
@@ -3856,6 +3919,27 @@ enum OnWriter {
     /// A reader that gates work waits it out ([`StateLock::observe_judging`]) and errs where it
     /// outlasts the wait ([`writer_outlasted_wait`]).
     Wait,
+}
+
+/// Whether a readiness read ([`with_ready_state_reusing`]) folded a fault of the moment into its
+/// answer, which it gives as it always has: a read that failed (a file that could not be opened,
+/// read or parsed, the configuration, the identity, the held envelope and the log among them; the
+/// held copy's metadata read in the log-only check, failed other than NotFound), or a selection
+/// whose observation or inputs moved while it was read. So a denial check that could not read its
+/// evidence still denies, a dropped judgement that could not read the log still reads the Mac
+/// revoked, and a store that could not be read is still not intact. The callers that gate work
+/// pass a scratch one and ignore it; a keeper of the answer ([`service_reading`]) learns from it
+/// that the answer came from the moment, not from the files.
+#[derive(Default)]
+pub(crate) struct Judgement {
+    pub(crate) faulted: bool,
+}
+
+impl Judgement {
+    /// [`Result::ok`] of `read`, noting a failure.
+    pub(crate) fn ok<T, E>(&mut self, read: Result<T, E>) -> Option<T> {
+        read.inspect_err(|_| self.faulted = true).ok()
+    }
 }
 
 /// The common recorded source checks, with the caller holding the state lock.
@@ -3899,14 +3983,27 @@ fn materialization_source_state(
 fn with_ready_state<T>(
     paths: &Paths,
     expected: Option<&Config>,
-    intact: impl FnOnce(&Paths, &State) -> bool,
+    intact: impl FnOnce(&Paths, &State, &mut Judgement) -> bool,
     entries: Option<&[&str]>,
     on_writer: OnWriter,
     read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state_reusing(paths, expected, intact, entries, None, on_writer, read)
+    with_ready_state_reusing(
+        paths,
+        expected,
+        intact,
+        entries,
+        None,
+        on_writer,
+        &mut Judgement::default(),
+        read,
+    )
 }
 
+/// One readiness read under one shared observation of the state lock, which [`with_ready_state`],
+/// [`MaterializationSnapshot::is_current`] and [`MaterializationSnapshot::at_current_version`]
+/// make: the recorded source, the denial check, `intact`, and the selection `state` says was
+/// applied. `judgement` learns of each fault the read folds into its answer ([`Judgement`]).
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -3923,13 +4020,19 @@ fn with_ready_state<T>(
         project = "aterm_secrets::client::network_observation::conformance_tests::projection_transition"
     )
 )]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the source expected, the files and entries judged, the prior selection, the writer \
+              policy and the judgement a keeper reads"
+)]
 fn with_ready_state_reusing<T>(
     paths: &Paths,
     expected: Option<&Config>,
-    intact: impl FnOnce(&Paths, &State) -> bool,
+    intact: impl FnOnce(&Paths, &State, &mut Judgement) -> bool,
     entries: Option<&[&str]>,
     prior: Option<&std::sync::Arc<materialization_selection::Fact>>,
     on_writer: OnWriter,
+    judgement: &mut Judgement,
     read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
@@ -3946,26 +4049,32 @@ fn with_ready_state_reusing<T>(
     };
     let (config, state) = match materialization_source_state(paths, expected, &observation)? {
         Ok(ready) => ready,
-        Err(Blocker::Revoked) if dropped(paths) => return blocked(Blocker::Dropped),
+        Err(Blocker::Revoked)
+            if judgement
+                .ok(seat_ask::dropped_judged(paths))
+                .unwrap_or(false) =>
+        {
+            return blocked(Blocker::Dropped);
+        }
         Err(why) => return blocked(why),
     };
     if state.membership == Stored::In
         && config.signer.is_some()
-        && steward::local_recipient_denied_in_roster_held(paths, &observation)
+        && judgement
+            .ok(steward::local_recipient_denial_held(paths, &observation))
+            .unwrap_or(true)
     {
         return blocked(Blocker::Revoked);
     }
-    if !intact(paths, &state) {
+    if !intact(paths, &state, judgement) {
         return blocked(Blocker::ApplyIncomplete);
     }
     let Some(applied) = state.materialization_selection else {
         return blocked(Blocker::ApplyIncomplete);
     };
-    let Some(selection) =
-        materialization_selection::observe(paths, &config, &state, &observation, prior)
-            .ok()
-            .flatten()
-    else {
+    let observed =
+        materialization_selection::observe(paths, &config, &state, &observation, prior, judgement);
+    let Some(selection) = judgement.ok(observed).flatten() else {
         return blocked(Blocker::ApplyIncomplete);
     };
     if selection.meaning != applied {
@@ -4258,6 +4367,22 @@ pub struct CommonsSourceRead {
 /// The existing lock cannot be opened safely or its shared lock fails.
 pub fn try_commons_source_read(paths: &Paths) -> crate::Result<Option<CommonsSourceRead>> {
     Ok(StateLock::observe(paths)?.map(|lock| CommonsSourceRead { lock }))
+}
+
+/// [`try_commons_source_read`], telling a lock a writer holds from a vault folder or lock that is
+/// not there: [`Observed::Read`] holds the shared observation, [`Observed::Busy`] met a writer
+/// and [`Observed::Absent`] found no lock to observe. A keeper of a local read beside the vault
+/// holds it across that read, and keeps what it read only where it settled (held, or no lock
+/// there) and the stamps it keeps that read under did not move. It never waits or creates state.
+///
+/// # Errors
+/// As [`try_commons_source_read`].
+pub fn observe_commons_source_read(paths: &Paths) -> crate::Result<Observed<CommonsSourceRead>> {
+    Ok(match StateLock::observe_classified(paths)? {
+        StateObservation::Held(lock) => Observed::Read(CommonsSourceRead { lock }),
+        StateObservation::Busy => Observed::Busy,
+        StateObservation::Absent => Observed::Absent,
+    })
 }
 
 impl CommonsSourceRead {
@@ -4793,13 +4918,21 @@ fn needs_broker(url: &str) -> bool {
     if !cfg!(target_os = "macos") {
         return false;
     }
-    let Some(uri) = aterm_http::Uri::parse(url) else {
-        return false;
-    };
-    let host = uri.host().trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<std::net::IpAddr>() {
-        Ok(ip) => aterm_uds::lan::is_local_network(&ip),
-        Err(_) => aterm_uds::lan::is_local_name(host),
+    #[cfg(not(unix))]
+    {
+        let _ = url;
+        false
+    }
+    #[cfg(unix)]
+    {
+        let Some(uri) = aterm_http::Uri::parse(url) else {
+            return false;
+        };
+        let host = uri.host().trim_start_matches('[').trim_end_matches(']');
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => aterm_uds::lan::is_local_network(&ip),
+            Err(_) => aterm_uds::lan::is_local_name(host),
+        }
     }
 }
 
@@ -4808,6 +4941,10 @@ impl Tries for LiveTries {
         if !needs_broker(url) {
             return Ok(());
         }
+        // Only macOS has the LAN broker, and `needs_broker` names none elsewhere.
+        #[cfg(not(unix))]
+        return Ok(());
+        #[cfg(unix)]
         match aterm_uds::lan::broker::hello() {
             Err(aterm_uds::lan::LanError::Unavailable(why)) => Err(why.to_string()),
             // A broker that answered, or an exchange that failed otherwise: the try says what
@@ -4915,7 +5052,6 @@ pub fn keep_config_if_unchanged(
 }
 
 fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) -> crate::Result<()> {
-    use std::os::unix::fs::DirBuilderExt as _;
     let files = match StateLock::observe(paths)? {
         Some(_lock) => {
             expected.check(paths)?;
@@ -4941,9 +5077,7 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
             ));
         }
     };
-    std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(into)
+    fsx::create_private_dir_new(into)
         .map_err(|error| Error::new(format!("{}: {error}", into.display())))?;
     for (name, bytes) in files {
         fsx::write_atomic(&into.join(name), bytes.as_slice(), 0o600)?;
@@ -5069,12 +5203,17 @@ fn applied_intact(paths: &Paths, state: &State) -> bool {
 /// The apply finished and the store it reads in place is whole: the verified cache, or a Mac
 /// that holds its vault as a log alone, its trusted log. Apart from the current selected meaning.
 fn local_intact(paths: &Paths, state: &State) -> bool {
+    local_judged(paths, state, &mut Judgement::default())
+}
+
+/// [`local_intact`], noting in `judgement` each fault it folds into its answer.
+fn local_judged(paths: &Paths, state: &State, judgement: &mut Judgement) -> bool {
     !state.failed
-        && (cache_intact(paths, state)
-            || config(paths)
-                .ok()
+        && (cache_intact_judged(paths, state, judgement)
+            || judgement
+                .ok(config(paths))
                 .flatten()
-                .is_some_and(|config| log_only_intact(paths, &config, state)))
+                .is_some_and(|config| log_only_judged(paths, &config, state, judgement)))
 }
 
 fn materialization_selection_current(paths: &Paths, state: &State) -> bool {
@@ -5085,15 +5224,33 @@ fn materialization_selection_current(paths: &Paths, state: &State) -> bool {
 }
 
 fn cache_intact(paths: &Paths, state: &State) -> bool {
-    config(paths).ok().flatten().is_some_and(|config| {
-        config.signer.is_none()
-            || (state.membership == Stored::In
-                && verified_cached_envelope(paths, &config, state).is_some_and(|bytes| {
-                    envelope::parse(&bytes).is_ok_and(|envelope| {
-                        log_entries::trusted_seeded_log(paths, &config, &envelope).is_ok()
-                    })
-                }))
-    })
+    cache_intact_judged(paths, state, &mut Judgement::default())
+}
+
+/// [`cache_intact`], noting in `judgement` each read that failed (the configuration, the held
+/// envelope, its parse, the log it seeds) and that it answered `false` for.
+fn cache_intact_judged(paths: &Paths, state: &State, judgement: &mut Judgement) -> bool {
+    let Some(config) = judgement.ok(config(paths)).flatten() else {
+        return false;
+    };
+    if config.signer.is_none() {
+        return true;
+    }
+    if state.membership != Stored::In {
+        return false;
+    }
+    let Some(bytes) = judgement
+        .ok(read_verified_cached_envelope(paths, &config, state))
+        .flatten()
+    else {
+        return false;
+    };
+    let Some(envelope) = judgement.ok(envelope::parse(&bytes)) else {
+        return false;
+    };
+    judgement
+        .ok(log_entries::trusted_seeded_log(paths, &config, &envelope))
+        .is_some()
 }
 
 fn place(source: &Source) -> String {
@@ -5197,6 +5354,7 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
 /// [`sync`] of a subscriber's pass: a source that fails or holds nothing newer gives way to the
 /// highest verified seq among the vault servers `found` (`docs/DESIGN-fluid-swarm-2026-10-28.md`
 /// F5), the source still its first choice. It keeps in `said` what the source itself said.
+#[cfg(unix)]
 fn sync_found(
     paths: &Paths,
     wait: Option<Duration>,
@@ -5654,14 +5812,14 @@ mod mesh_records_tests;
 #[cfg(test)]
 #[path = "client/record_persistence_tests.rs"]
 mod record_persistence_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "client/records_append_tests.rs"]
 mod records_append_tests;
 #[cfg(test)]
 #[path = "client/state_writes_tests.rs"]
 mod state_writes_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "client/retained_history_tests.rs"]
 mod retained_history_tests;
 
@@ -8515,6 +8673,7 @@ fn apply_configured_log(
 /// The subscriber counts its passes and says them in `log` as its 1st, 2nd, 4th ... 256th pass
 /// ends and then as each 256th does ([`crate::pass_counts`]): on a running Mac,
 /// `grep 'pass counts' ~/.config/aterm/secrets/systems.alab.aterm-secrets.log`.
+#[cfg(unix)]
 pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     beside_the_approver(
         |stop| approver_loop(paths, log, stop),
@@ -8525,6 +8684,7 @@ pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
 /// Run `subscriber` beside `approver`, on a thread of its own, and set the stop `approver` is given
 /// however `subscriber` ends, a panic included: the scope joins the approver before it returns or
 /// re-raises, so a stop left unset would hold `watch` for good.
+#[cfg(unix)]
 fn beside_the_approver<R>(
     approver: impl FnOnce(&aterm_uds::stop::Stop) + Send,
     subscriber: impl FnOnce() -> R,
@@ -8546,6 +8706,7 @@ fn beside_the_approver<R>(
 
 /// Sleep `total`, ending at once when `stop` is set, or early once `moved` says so (looked at
 /// every `look`).
+#[cfg(unix)]
 fn nap_unless(
     stop: &aterm_uds::stop::Stop,
     total: Duration,
@@ -8563,6 +8724,7 @@ fn nap_unless(
 
 /// How often a subscriber, or the approver beside it, that `[swarm] enabled = false` holds looks
 /// at `aterm.toml` again: one `stat` ([`crate::swarm::Switch`]).
+#[cfg(unix)]
 const SWARM_LOOK: Duration = Duration::from_secs(1);
 
 /// Whether `[swarm] enabled` lets `who` (this subscriber, the approver beside it) work now
@@ -8571,6 +8733,7 @@ const SWARM_LOOK: Duration = Duration::from_secs(1);
 /// cannot be read, as it holds all automatic vault work (`aterm init`'s Secrets stage, the
 /// subscriber's mend). Each hold, and its end, is said once in `log` (`held` keeps whether one
 /// stands).
+#[cfg(unix)]
 fn swarm_lets(
     switch: &mut crate::swarm::Switch,
     held: &mut bool,
@@ -8606,8 +8769,10 @@ fn swarm_lets(
 
 /// How often an approver's wait for a version this Mac applies looks at its seq
 /// ([`approver_nap`]).
+#[cfg(unix)]
 const NAP_LOOK: Duration = Duration::from_millis(100);
 /// The longest approver nap that watches this Mac's seq ([`approver_nap`]).
+#[cfg(unix)]
 const WATCHED_NAP: Duration = Duration::from_secs(2);
 
 /// An approver's nap of `pause`. A short one, the wait for this Mac's subscriber to apply a
@@ -8616,6 +8781,7 @@ const WATCHED_NAP: Duration = Duration::from_secs(2);
 /// resting (this Mac is no admin, the usual case on every member Mac, or a pass failed): it reads
 /// nothing and sleeps on `stop` in one wait, which its setting ends at once (it once woke each
 /// second to look at a flag set only when the subscriber ends).
+#[cfg(unix)]
 fn approver_nap(stop: &aterm_uds::stop::Stop, pause: Duration, seq: &dyn Fn() -> Option<u64>) {
     if pause > WATCHED_NAP {
         stop.sleep(pause);
@@ -8625,16 +8791,21 @@ fn approver_nap(stop: &aterm_uds::stop::Stop, pause: Duration, seq: &dyn Fn() ->
     nap_unless(stop, pause, NAP_LOOK, &|| seq() != held);
 }
 
+#[cfg(unix)]
 const FIRST_RETRY: Duration = Duration::from_secs(5);
+#[cfg(unix)]
 const LONGEST_RETRY: Duration = Duration::from_secs(300);
 
+#[cfg(unix)]
 const LONGEST_ERROR_RETRY: Duration = Duration::from_secs(60);
 /// How often a wait looks at the network where the kernel tells it of no change
 /// ([`crate::network::RouteChanges`]).
+#[cfg(unix)]
 const MOVED_STEP: Duration = Duration::from_secs(5);
 
 /// Wait `total` unless the network moves first (`moved`, looked at after each `wait`, which
 /// waits at most the time it is given and says how long it took): whether it moved.
+#[cfg(unix)]
 fn nap_unless_moved(
     total: Duration,
     moved: &mut dyn FnMut() -> bool,
@@ -8653,6 +8824,7 @@ fn nap_unless_moved(
 /// [`nap_unless_moved`]'s wait on `hearing`'s bell: until a source rings it, the kernel's word of
 /// a change to the routes, addresses or links included where `hearing` hears them (else a look
 /// every [`MOVED_STEP`]). It keeps in `woke` a ring that ended it, and says how long it took.
+#[cfg(unix)]
 fn wait_for_a_ring(
     hearing: &Hearing<'_>,
     woke: &std::cell::Cell<Option<crate::wake::Wake>>,
@@ -8674,11 +8846,13 @@ fn wait_for_a_ring(
 /// How long a subscriber away from the ALab LAN waits after a pass that failed: the vault's
 /// source and its servers answer on the ALab LAN, so asking every minute only spends dials; a
 /// new network or a vault server heard ends the wait at once ([`nap_after_failing`]).
+#[cfg(unix)]
 const AWAY_ERROR_RETRY: Duration = Duration::from_secs(15 * 60);
 
 /// The wait after a pass that failed, from the last (`backoff`): 5 s once this Mac's network
 /// `moved`; [`AWAY_ERROR_RETRY`] while `away` from the ALab LAN (`aterm_netplace::routes::paced`);
 /// else twice the last, up to [`LONGEST_ERROR_RETRY`].
+#[cfg(unix)]
 fn retry_after(backoff: Duration, moved: bool, away: bool) -> Duration {
     if moved {
         Duration::from_secs(5)
@@ -8690,6 +8864,7 @@ fn retry_after(backoff: Duration, moved: bool, away: bool) -> Duration {
 }
 
 /// The subscriber's words for a pass that failed with `text`, `away` from the ALab LAN or not.
+#[cfg(unix)]
 fn failed_line(text: &str, away: bool) -> String {
     if away {
         format!(
@@ -8705,6 +8880,7 @@ fn failed_line(text: &str, away: bool) -> String {
 }
 
 /// How one subscriber pass went, beyond its outcome ([`pause_after`]).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Pass {
     /// What its source itself said.
@@ -8745,6 +8921,7 @@ const HELD: Duration = Duration::from_secs(1);
 /// servers found held nothing new (F5's failover while the source is away). It is asked again on
 /// the error backoff, a vault server heard or a route change ending the wait early, not at once
 /// and not every few seconds.
+#[cfg(unix)]
 fn failed_over_idle(pass: Pass) -> bool {
     pass.source == SourceSaid::Nothing && !pass.moved
 }
@@ -8753,6 +8930,7 @@ fn failed_over_idle(pass: Pass) -> bool {
 /// Keep its recovery trigger for the first pass that actually hears the source.
 /// `owed` is a pass another apply left owed ([`converge_inputs::take_owed`]): it starts a runner
 /// as a version this pass applied does, whatever `outcome` is.
+#[cfg(unix)]
 fn converge_after_pass(
     due: &mut crate::converge::Due,
     outcome: &SyncOutcome,
@@ -8778,6 +8956,7 @@ fn converge_after_pass(
 /// something changes. Only one answered at once with nothing new pauses, so a source that
 /// holds nothing is not asked in a loop; one whose source said nothing is paced as a failing
 /// pass besides ([`failed_over_idle`]).
+#[cfg(unix)]
 fn pause_after(
     source: &Source,
     outcome: &SyncOutcome,
@@ -8802,6 +8981,7 @@ fn pause_after(
 
 /// The entries a pass refused, named after its count ([`Report::refused`]); empty where it
 /// refused none.
+#[cfg(unix)]
 fn refused_words(report: &Report) -> String {
     if report.refused.is_empty() {
         return String::new();
@@ -8817,6 +8997,7 @@ fn refused_words(report: &Report) -> String {
     )
 }
 
+#[cfg(unix)]
 fn pass_line(
     paths: &Paths,
     config: &Config,
@@ -8891,6 +9072,7 @@ type Repaired = Option<([u8; 32], u64)>;
 /// run that migrates installed services too (`cli::repair`), so a caller that wants only the
 /// services lowers this Mac's floor where the digest differs; the texts that name the verb say
 /// so (`cli`'s usage, [`log_entries::legacy_refusal`], SPECS `CL-FRONTIER-REPAIR`).
+#[cfg(unix)]
 pub(crate) fn repair_legacy_frontier(paths: &Paths, deadline: Instant) -> crate::Result<bool> {
     let Some(config) = config(paths)? else {
         return Ok(false);
@@ -8972,7 +9154,7 @@ fn put_back_due(version: ([u8; 32], u64), repaired: &mut Repaired) -> bool {
 /// subscriber`) without waiting for it: the pass runs `aterm fleet sync`'s work among its items,
 /// and a dial of the fleet's issuer must never hold up this long-poll (or, on an admin Mac, the
 /// approver beside it).
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 fn start_converge(
     exe: &Path,
     request: crate::converge::RepositoryRequest,
@@ -8985,7 +9167,7 @@ fn start_converge(
 
 /// A test build's live subscriber starts no runner: the test binary is no aterm. A test hands
 /// [`subscriber_loop_until`] a [`Converging`] of its own.
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn start_converge(
     _exe: &Path,
     _request: crate::converge::RepositoryRequest,
@@ -8997,6 +9179,7 @@ fn start_converge(
 /// How the subscriber's loop starts the converge pass's runner, and reads the routes its due
 /// check compares ([`crate::converge::Due`]): [`start_converge`] and
 /// [`crate::server::route_sources`], or a test's own.
+#[cfg(unix)]
 struct Converging<'a> {
     /// Start the runner of the program at this path, without waiting for it.
     start: &'a (
@@ -9012,6 +9195,7 @@ struct Converging<'a> {
 /// source fails or holds nothing newer reads ([`sync_found`]), and the bell its nap after an
 /// error waits on, which this process's route changes and that browse ring ([`crate::wake`]).
 /// [`subscriber_loop`]'s are this Mac's; a test hands its own to `subscriber_loop_until`.
+#[cfg(unix)]
 struct Hearing<'a> {
     found: Found<'a>,
     bell: &'a crate::wake::Bell,
@@ -9035,10 +9219,12 @@ struct Hearing<'a> {
 
 /// How a waiting Mac asks ALab's members on the LAN to show its request (F10's `ask`): how many
 /// heard it.
+#[cfg(unix)]
 type AskMembers<'a> = &'a dyn Fn(&Paths) -> crate::Result<usize>;
 
 /// A passive, owned native readiness source. Packets only wake an ordinary member
 /// ask; this source provides no peer identity, proof or admission authority.
+#[cfg(unix)]
 pub trait MemberArrivals: Send {
     /// Refresh attachments after activation, a route change or a broker arrival.
     /// A healthy source is not refreshed on the observer's periodic looks.
@@ -9053,18 +9239,21 @@ pub trait MemberArrivals: Send {
     fn poll(&mut self) -> std::io::Result<bool>;
 }
 
+#[cfg(unix)]
 struct MemberCallbacks {
     ask: fn(&Paths) -> crate::Result<usize>,
     arrivals: fn(&Paths) -> std::io::Result<Box<dyn MemberArrivals>>,
 }
 
 /// The ask and its passive native readiness source share one registration.
+#[cfg(unix)]
 static ASK_MEMBERS: std::sync::OnceLock<MemberCallbacks> = std::sync::OnceLock::new();
 
 /// Ask ALab's members on the LAN with `ask` (`aterm members join`'s, over the fleet port's
 /// `ask` op, which aterm-secrets cannot dial itself) while this Mac waits to be let into the
 /// ALab vault ([`ask_members_if_due`]). Its owned passive source is retained only after
 /// ordinary asking established that wait. The first call wins.
+#[cfg(unix)]
 pub fn on_ask_members(
     ask: fn(&Paths) -> crate::Result<usize>,
     arrivals: fn(&Paths) -> std::io::Result<Box<dyn MemberArrivals>>,
@@ -9081,6 +9270,7 @@ pub fn on_ask_members(
 /// the Mac in on its first ask (`client::readmit`); a member busy with a vault pass, or a
 /// connection its listener's watchdog cut, can answer the next. A member keeps one row per
 /// asking Mac (`members::desk`), so an ask again shows nothing new there.
+#[cfg(unix)]
 fn ask_members_pause(asks: u32) -> Duration {
     const SECONDS: [u64; 6] = [20, 60, 120, 240, 480, 900];
     let at = usize::try_from(asks.saturating_sub(1))
@@ -9090,6 +9280,7 @@ fn ask_members_pause(asks: u32) -> Duration {
 
 /// When the subscriber last asked ALab's members, how many times in a row, on what, and what it
 /// last said of it.
+#[cfg(unix)]
 struct MembersAsked {
     at: Option<Instant>,
     said: String,
@@ -9111,6 +9302,7 @@ struct MembersAsked {
     rung: Option<std::sync::Arc<aterm_uds::ready::Doorbell>>,
 }
 
+#[cfg(unix)]
 impl Default for MembersAsked {
     fn default() -> Self {
         Self {
@@ -9125,6 +9317,7 @@ impl Default for MembersAsked {
     }
 }
 
+#[cfg(unix)]
 impl MembersAsked {
     /// Whether an ask went out that the wait still stands on (the readiness worker's asking
     /// begins here).
@@ -9199,6 +9392,7 @@ impl MembersAsked {
     }
 }
 
+#[cfg(unix)]
 fn member_waiting_inputs(paths: &Paths) -> Option<vault_memo::InputStamps> {
     vault_memo::stamp_inputs(paths, |paths| {
         let mut inputs = vault_memo::inputs(paths)?;
@@ -9210,12 +9404,14 @@ fn member_waiting_inputs(paths: &Paths) -> Option<vault_memo::InputStamps> {
     })
 }
 
+#[cfg(unix)]
 struct MemberWaiting {
     requested: u64,
     bootstrap: bool,
 }
 
 /// The one eligibility predicate for ordinary asking and its passive native hints.
+#[cfg(unix)]
 fn member_waiting(paths: &Paths) -> Option<MemberWaiting> {
     let config = self::config(paths)
         .ok()
@@ -9253,6 +9449,7 @@ fn member_waiting(paths: &Paths) -> Option<MemberWaiting> {
 /// nobody, while its vault has no membership log, so a member's Allow ends the asking; once it
 /// holds a trusted one (F12b), any member can let it in by the log (F15), so it asks the members
 /// again rather than wait on an approver that may never run.
+#[cfg(unix)]
 fn ask_members_if_due(
     paths: &Paths,
     asked: &mut MembersAsked,
@@ -9262,6 +9459,7 @@ fn ask_members_if_due(
     ask_members_if_due_with_native(paths, asked, ask, &alab_join::background_native, log);
 }
 
+#[cfg(unix)]
 fn ask_members_if_due_with_native(
     paths: &Paths,
     asked: &mut MembersAsked,
@@ -9325,6 +9523,7 @@ fn ask_members_if_due_with_native(
 }
 
 /// The subscriber's projection as its readiness worker serves it.
+#[cfg(unix)]
 struct Projecting<'a> {
     projection: &'a projection::Projection<'a>,
     bell: &'a crate::wake::Bell,
@@ -9334,6 +9533,7 @@ struct Projecting<'a> {
     unheard: bool,
 }
 
+#[cfg(unix)]
 impl member_routes::Projected for Projecting<'_> {
     fn event(&self, event: member_routes::ProjectionEvent) {
         match event {
@@ -9373,6 +9573,7 @@ impl member_routes::Projected for Projecting<'_> {
     }
 }
 
+#[cfg(unix)]
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let start = |exe: &Path, request| start_converge(exe, request, log);
     // Without a doorbell (this process is out of descriptors) the worker looks at its own pace.
@@ -9409,10 +9610,10 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     };
     let hold = || standing.stop();
     let away = || {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         return aterm_types::dirs::state_dir()
             .is_some_and(|state| aterm_netplace::routes::paced_now(&state));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         false
     };
     let hearing = Hearing {
@@ -9463,11 +9664,13 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
 /// first time a pass of the ALab vault asks ([`browsed`]), dropped while
 /// `[swarm] enabled` holds the rounds ([`Hearing::hold`]), and started afresh by the first pass
 /// once sharing is on again.
+#[cfg(unix)]
 #[derive(Default)]
 struct StandingBrowse {
     watch: std::sync::Mutex<Option<std::sync::Arc<crate::discover::Watch>>>,
 }
 
+#[cfg(unix)]
 impl StandingBrowse {
     /// The browse running now, `start`ed where none does.
     fn watch_or_start(
@@ -9506,6 +9709,7 @@ impl StandingBrowse {
 /// the first time a pass of the ALab vault asks (and again after `[swarm]` held the rounds) and
 /// then rings `bell` ([`Hearing`]); none for another vault. While it has heard none yet (it has
 /// just started, or this Mac is alone), a bounded browse's.
+#[cfg(unix)]
 fn browsed(
     config: &Config,
     bell: &std::sync::Arc<crate::wake::Bell>,
@@ -9528,6 +9732,7 @@ fn browsed(
 /// through `converging`, its passes reading the vault servers `hearing` found, and its naps
 /// after an error ended by what `hearing` hears.
 #[cfg(test)]
+#[cfg(unix)]
 fn subscriber_loop_until(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
@@ -9544,6 +9749,7 @@ fn subscriber_loop_until(
     })
 }
 
+#[cfg(unix)]
 fn subscriber_loop_projecting(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
@@ -9708,6 +9914,7 @@ fn subscriber_loop_projecting(
 
 /// Keep healthy batching's original deadline, while an ended readiness owner can
 /// request upkeep immediately. Other queued hints neither end nor renew this pause.
+#[cfg(unix)]
 fn pause_on_bell(bell: &crate::wake::Bell, pause: Duration) -> crate::wake::Wake {
     let deadline = Instant::now() + pause;
     loop {
@@ -9727,6 +9934,7 @@ fn pause_on_bell(bell: &crate::wake::Bell, pause: Duration) -> crate::wake::Wake
 /// A subscriber's nap of `backoff` after a pass that failed, or read only the servers found: a
 /// broker arrival or vault server the browse heard ends it, and so does a route change once this Mac's routes
 /// moved from `routes`, where they were as the pass began. Whether one ended it, said in `log`.
+#[cfg(unix)]
 fn nap_after_failing(
     hearing: &Hearing<'_>,
     routes: [Option<std::net::IpAddr>; 3],
@@ -9741,6 +9949,7 @@ fn nap_after_failing(
     )
 }
 
+#[cfg(unix)]
 fn nap_after_failing_with(
     hearing: &Hearing<'_>,
     backoff: Duration,
@@ -9771,6 +9980,7 @@ fn nap_after_failing_with(
 
 /// Read an admin Mac's verdict on this waiting machine's join password when one is due
 /// ([`verdict_due`]), and say a refusal once.
+#[cfg(unix)]
 fn heed_verdict(paths: &Paths, log: &dyn Fn(&str)) {
     if verdict_due(paths) && read_verdict(paths).unwrap_or(false) {
         log(
@@ -9781,6 +9991,7 @@ fn heed_verdict(paths: &Paths, log: &dyn Fn(&str)) {
 
 /// Whether this machine waits with a proof of the join password that no verdict refused yet
 /// ([`read_verdict`]).
+#[cfg(unix)]
 fn verdict_due(paths: &Paths) -> bool {
     load_state(paths).is_ok_and(|state| {
         state.membership == Stored::Pending && state.proof.is_some() && !refused_now(&state)
@@ -9789,6 +10000,7 @@ fn verdict_due(paths: &Paths) -> bool {
 
 /// [`subscriber_pass_saying`], where what the source said is not wanted.
 #[cfg(test)]
+#[cfg(unix)]
 fn subscriber_pass(
     paths: &Paths,
     repaired: &mut Repaired,
@@ -9805,6 +10017,7 @@ fn subscriber_pass(
 /// One subscriber pass: a long-poll of the source (a read every minute of a vault at a path),
 /// which gives way to the vault servers `found` where the source fails or holds nothing newer
 /// ([`sync_found`]). It keeps in `said` what a source at a URL itself said.
+#[cfg(unix)]
 fn subscriber_pass_saying(
     paths: &Paths,
     repaired: &mut Repaired,
@@ -9851,6 +10064,7 @@ fn subscriber_pass_saying(
 /// How long a subscriber's long-poll waits for the server's answer, before the margin
 /// [`sync`] adds: as long as a server holds one by default, so a request a sleeping Mac lost
 /// ends within about that long of its waking.
+#[cfg(unix)]
 const LONG_POLL: Duration = crate::server::DEFAULT_HOLD;
 
 /// How often a machine still waiting asks again ([`ask_again_if_due`]).
@@ -9867,6 +10081,7 @@ fn in_flight() -> u64 {
     now().saturating_sub(REASK - JOIN_GRACE)
 }
 
+#[cfg(unix)]
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
     let due = || -> crate::Result<Option<(Config, Option<String>)>> {
         let _lock = StateLock::take(paths)?;
@@ -10067,6 +10282,7 @@ fn admin_removed_in_log_with_lock(
 /// is a release older than the first that reads the locker's format. An approver from before
 /// [`approver_stuck`]'s record existed says nothing of itself; `None` where it reads the locker,
 /// this Mac is no admin, or nothing can be told.
+#[cfg(unix)]
 pub fn approver_cannot_read(paths: &Paths, pid: u32) -> Option<String> {
     let _lock = StateLock::observe(paths).ok()??;
     let config = config(paths).ok()??;
@@ -10198,6 +10414,7 @@ fn admin_locker_here(paths: &Paths) -> AdminLocker {
 }
 
 /// What the window's mend did with a vault job held on another aterm ([`mend_held`]).
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeldMend {
     /// Nothing is held: the job is absent, runs this aterm, is switched off, or is in a shape
@@ -10216,6 +10433,7 @@ pub enum HeldMend {
 }
 
 /// Why a vault job runs this aterm now ([`HeldMend::Moved`]).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeldMoved {
     /// An ALab server older than [`steward::FLUID_SERVER_MIN_RELEASE`], whose store holds the ALab
@@ -10238,6 +10456,7 @@ pub enum HeldMoved {
     Scheduling,
 }
 
+#[cfg(unix)]
 impl HeldMoved {
     /// Why the job runs this aterm now, as a clause for the window's log.
     #[must_use]
@@ -10262,6 +10481,7 @@ impl HeldMoved {
 }
 
 /// Why a held job stays where it is ([`HeldMend::Kept`]).
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HeldKept {
     /// A person pinned it there on purpose (`agent on --program`, `server on --program`,
@@ -10308,6 +10528,7 @@ pub enum HeldKept {
 /// job (a build, a copy that goes away), the job did not start on it, or the job's decision
 /// lock, the subscriber's off record or the system LaunchDaemon's state (for the server) could
 /// not be read.
+#[cfg(unix)]
 pub fn mend_held(paths: &Paths, job: crate::service::Job) -> crate::Result<HeldMend> {
     let program = crate::service::program_for_service();
     let Some(held) = crate::service::held(&paths.home, job, program.as_deref().ok()) else {
@@ -10338,12 +10559,15 @@ pub fn mend_held(paths: &Paths, job: crate::service::Job) -> crate::Result<HeldM
 /// The first release whose approver admits only a request that carries a member's `Allowed`
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F10): it reads ` allowed=` lines and admits nothing
 /// by `open`.
+#[cfg(unix)]
 const ALLOWED_APPROVER_MIN_RELEASE: locker_skew::Version = (0, 146, 0);
 
 /// The release that keeps managed ALab jobs on the installed release, so an old but
 /// healthy server or approver cannot keep behavior the installed release dropped.
+#[cfg(unix)]
 const ALAB_MANAGED_JOB_RELEASE: locker_skew::Version = (0, 147, 0);
 
+#[cfg(unix)]
 fn held_alab_release_due(own: &locker_skew::Own, held: locker_skew::Version) -> bool {
     // Build metadata is not an ordering: adopt this installed release even from a held
     // copy of the same core version. Once moved, `service::held` sees the same path and
@@ -10355,6 +10579,7 @@ fn held_alab_release_due(own: &locker_skew::Own, held: locker_skew::Version) -> 
 /// and `move_it` moving the job onto this aterm (`None`: a person changed the job meanwhile,
 /// [`crate::service::move_held`]); it is given the URL a held ALab server must be seen serving
 /// the ALab vault at before the move counts, or `None` for a move that waits on no answer.
+#[cfg(unix)]
 fn mend_held_with(
     paths: &Paths,
     own: &locker_skew::Own,
@@ -10467,6 +10692,7 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
         .map(|(_, _, approval)| approval))
 }
 
+#[cfg(unix)]
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &aterm_uds::stop::Stop) {
     approver_loop_napping(paths, log, stop, &mut |pause| {
         approver_nap(stop, pause, &|| {
@@ -10476,6 +10702,7 @@ fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &aterm_uds::s
 }
 
 /// [`approver_loop`], each pause between two passes taken by `nap`.
+#[cfg(unix)]
 fn approver_loop_napping(
     paths: &Paths,
     log: &(dyn Fn(&str) + Sync),
@@ -10503,6 +10730,7 @@ fn approver_loop_napping(
 
 /// How long an approver's long-poll of the join queue waits for the server's answer, past
 /// [`transport::FETCH_MARGIN`]: as long as the server holds one by default.
+#[cfg(unix)]
 const JOINS_WAIT: Duration = crate::server::DEFAULT_HOLD;
 
 /// The join queue as an approver last heard it: where, the version the server named (`None`:
@@ -10519,6 +10747,7 @@ struct Heard {
 /// A fair selection from the configured queue and verified policy mirrors. A version only
 /// continues a long-poll at the URL and server address that supplied it; a fresh listing is
 /// reported as moved. Empty queues keep their current listing to continue long-polling.
+#[cfg(unix)]
 fn hear_joins(
     paths: &Paths,
     config: &Config,
@@ -10529,6 +10758,7 @@ fn hear_joins(
 
 /// What a judged approver pass read: the vault version, the requests, and those of them the
 /// vault answered as they stand ([`still_answered`]).
+#[cfg(unix)]
 type Listed = (
     u64,
     std::collections::BTreeSet<Judged>,
@@ -10539,6 +10769,7 @@ type Listed = (
 /// server moved (a Mac let go that asks again as it asked before) drops out, which starts one
 /// pass; a request judged anew stays out, so its hourly re-asks start none, and neither do two
 /// requests under one key and name.
+#[cfg(unix)]
 fn still_answered(
     pending: &[Request],
     answered: &std::collections::BTreeSet<Answered>,
@@ -10566,6 +10797,7 @@ fn still_answered(
 /// restart. A Mac let go that asks again, with the renewed join password, before this approver
 /// reads the version that let it go is held so too, and let in once its time moves: a proof alone
 /// never says when it was made, since an admin may set an earlier password again.
+#[cfg(unix)]
 fn code_only_standing(
     named: &std::collections::BTreeSet<String>,
     known: &std::collections::BTreeSet<String>,
@@ -10604,6 +10836,7 @@ fn code_only_standing(
 /// request is taken for answered until the server moves its time, which a Mac still asking has
 /// it do within an hour or two. A note only ever takes a request for answered, so none lets a
 /// Mac in.
+#[cfg(unix)]
 fn stayed_named(
     doc: &Document,
     seq: u64,
@@ -10630,6 +10863,7 @@ fn stayed_named(
 }
 
 /// What the approver keeps from one pass to the next.
+#[cfg(unix)]
 #[derive(Default)]
 struct Approver {
     settled: Settled,
@@ -10688,6 +10922,7 @@ struct Approver {
 /// `step` and `pause` must not wait on a worker or network request. The implementation owns
 /// any background work and cancels and joins it in `Drop`, before the watch can finish,
 /// including when its subscriber or approver unwinds.
+#[cfg(unix)]
 pub trait AccountUpkeep: Send {
     /// Offer work or drain an owned result under freshly opened local admin authority.
     /// The deadline bounds this callback, not an independently owned fetch.
@@ -10699,16 +10934,20 @@ pub trait AccountUpkeep: Send {
     fn pause(&mut self) {}
 }
 
+#[cfg(unix)]
 type MakeAccountUpkeep = fn() -> Box<dyn AccountUpkeep>;
+#[cfg(unix)]
 static ACCOUNT_UPKEEP: std::sync::OnceLock<MakeAccountUpkeep> = std::sync::OnceLock::new();
 
 /// Install the executable's account application maintenance. The normal
 /// approver constructs it once per watch and invokes it only after opening current local
 /// root authority. A member retains no application authority by constructing the object.
+#[cfg(unix)]
 pub fn on_account_upkeep(make: MakeAccountUpkeep) {
     let _ = ACCOUNT_UPKEEP.set(make);
 }
 
+#[cfg(unix)]
 fn account_upkeep(
     paths: &Paths,
     config: &Config,
@@ -10720,7 +10959,7 @@ fn account_upkeep(
     let Some(upkeep) = upkeep.as_mut() else {
         return;
     };
-    if crate::service::subscriber_turned_off(&paths.home) {
+    if crate::off_record::subscriber_turned_off(&paths.home) {
         upkeep.pause();
         *at = None;
         return;
@@ -10736,7 +10975,7 @@ fn account_upkeep(
             .ok_or_else(|| Error::new("account upkeep authority changed"))
     });
     let result = match opened {
-        Ok(admin) if !crate::service::subscriber_turned_off(&paths.home) => {
+        Ok(admin) if !crate::off_record::subscriber_turned_off(&paths.home) => {
             upkeep.step(paths, &admin, deadline)
         }
         Ok(_) => {
@@ -10781,6 +11020,7 @@ impl JoinKeys {
     }
 }
 
+#[cfg(unix)]
 impl Approver {
     /// An approver that knows the join requests its earlier runs found answered.
     fn resumed(paths: &Paths) -> Approver {
@@ -10926,13 +11166,16 @@ impl Approver {
 /// The approver records' names: `approver-stuck.<pid>`, one per process, so an approver writes
 /// only its own and removes no live approver's (its own, and at its start those of processes
 /// that are gone, [`clear_dead_stuck`]), and `status` reads the one of the subscriber it names.
+#[cfg(unix)]
 const STUCK_PREFIX: &str = "approver-stuck.";
 
 /// The longest failure text the approver's record keeps.
+#[cfg(unix)]
 const STUCK_MOST: usize = 512;
 
 /// Record `stuck`, why this process's approver stopped approving, where `status` reads it
 /// ([`approver_stuck`]); the record gone when `stuck` is `None`.
+#[cfg(unix)]
 fn write_stuck(paths: &Paths, stuck: Option<&str>) -> crate::Result<()> {
     let path = paths.stuck_file(std::process::id());
     let Some(text) = stuck else {
@@ -10947,6 +11190,7 @@ fn write_stuck(paths: &Paths, stuck: Option<&str>) -> crate::Result<()> {
     fsx::write_atomic(&path, format!("{text}\n").as_bytes(), 0o600)
 }
 
+#[cfg(unix)]
 fn remove_stuck(path: &Path) -> crate::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -10956,6 +11200,7 @@ fn remove_stuck(path: &Path) -> crate::Result<()> {
 }
 
 /// Remove the records of approvers that are gone, and one an earlier process with this pid left.
+#[cfg(unix)]
 fn clear_dead_stuck(paths: &Paths) -> crate::Result<()> {
     match fsx::kind(&paths.dir)? {
         fsx::Kind::Missing => return Ok(()),
@@ -10997,6 +11242,7 @@ fn clear_dead_stuck(paths: &Paths) -> crate::Result<()> {
 
 /// Why the approver in process `pid` last said it stopped approving: from the local record
 /// alone, `None` where it reported nothing or approves again.
+#[cfg(unix)]
 pub fn approver_stuck(paths: &Paths, pid: u32) -> Option<String> {
     let bytes = fsx::read_private(&paths.stuck_file(pid), 4 << 10).ok()??;
     let text = String::from_utf8_lossy(bytes.as_slice());
@@ -11004,6 +11250,7 @@ pub fn approver_stuck(paths: &Paths, pid: u32) -> Option<String> {
     (!why.is_empty()).then(|| why.to_owned())
 }
 
+#[cfg(unix)]
 fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> Duration {
     let (config, seq, approval) = match admin_check(paths, &mut approver.checked) {
         Ok(Some(held)) => {
@@ -11243,10 +11490,12 @@ impl Settled {
 }
 
 /// How the approver's log names a machine a member's Allow let in.
+#[cfg(unix)]
 const ALLOWED_BY: &str = "by a member's Allow";
 
 /// The approver's log lines for the machines `done` added: those a member's Allow let in apart
 /// from the rest, which `by` names (the join password).
+#[cfg(unix)]
 fn approved_lines(done: &AutoApproved, by: &str) -> Vec<String> {
     let (allowed, rest): (Vec<&str>, Vec<&str>) = done
         .approved
@@ -11262,6 +11511,7 @@ fn approved_lines(done: &AutoApproved, by: &str) -> Vec<String> {
 
 /// The approver's log lines for each new machine `done` let in under the `m<N>` label of a
 /// standing seat (`client::continuity`): a new seat beside that one, on the record.
+#[cfg(unix)]
 fn seat_lines(done: &AutoApproved) -> Vec<String> {
     done.beside
         .iter()
@@ -11658,6 +11908,7 @@ const ANSWERED_BEGUN: &str = "#\tbegun\t";
 
 /// The join queue an approver judges, as its record of answered requests names it: the vault's
 /// name and where it is served, so a new signing key or host name is the same queue.
+#[cfg(unix)]
 fn queue_of(config: &Config) -> String {
     let source = match &config.source {
         Source::Url(url) => url.clone(),
@@ -11856,6 +12107,7 @@ fn remove_record(path: &Path) -> crate::Result<()> {
 /// between the two leaves the new requests beside the keys named before, whose standing requests
 /// the next pass only seeds again; the other way round, a key named but its request missing would
 /// read as an ask.
+#[cfg(unix)]
 fn write_answered(
     paths: &Paths,
     answered: &std::collections::BTreeSet<Answered>,
@@ -11943,7 +12195,7 @@ pub(crate) fn record_approved(
 }
 
 /// The recipients of the requests this Mac's approvals by code recorded ([`record_approved`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn approved_recipients(paths: &Paths) -> Vec<String> {
     read_approved(paths)
         .into_iter()
@@ -11958,6 +12210,7 @@ pub(crate) fn approved_recipients(paths: &Paths) -> Vec<String> {
 const ASKING_BY: &str = "# approver ";
 
 /// This process as the head of the record of those asking to join names it ([`ASKING_BY`]).
+#[cfg(unix)]
 fn approver_named() -> String {
     let pid = std::process::id();
     match i32::try_from(pid)
@@ -11997,6 +12250,7 @@ fn approver_runs(named: &str) -> bool {
 /// Write `asking`, the machines an admin Mac's approver left for a person to approve, where this
 /// Mac's aterm reads them ([`asking`]): a head line naming this process ([`ASKING_BY`]), then one
 /// `code<TAB>key<TAB>name` line each, the record gone when none ask.
+#[cfg(unix)]
 fn write_asking(paths: &Paths, asking: &[Asking]) -> crate::Result<()> {
     let path = paths.asking_file();
     if asking.is_empty() {
@@ -12555,6 +12809,7 @@ fn request_join_until_admitted(
     posted.and(recorded).map(|()| code)
 }
 
+#[cfg(unix)]
 fn change_request(
     paths: &Paths,
     config: &Config,
@@ -12563,6 +12818,7 @@ fn change_request(
     change_request_until(paths, config, None, change)
 }
 
+#[cfg(unix)]
 fn change_request_until(
     paths: &Paths,
     config: &Config,
@@ -14448,7 +14704,7 @@ pub fn admin_publish_with_candidates(
     publish_as_with(paths, admin, doc, false, &[], false, extra_urls, None, None)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn admin_publish_found(
     paths: &Paths,
     admin: &Admin,
@@ -15575,6 +15831,7 @@ pub fn test_create_with_password(
 }
 
 /// An explicitly requested remote creation still needs background recovery.
+#[cfg(unix)]
 pub(crate) fn creation_pending(paths: &Paths) -> crate::Result<bool> {
     creation::pending_remote(paths)
 }
@@ -15961,6 +16218,7 @@ pub(crate) fn requests_for_approval(
 /// authorized queues. Bulk approval cannot promise every pending machine when a
 /// queue was unavailable. Keep admitted identities here for answered bookkeeping;
 /// the caller separately selects which pending identities to offer.
+#[cfg(unix)]
 pub(crate) fn all_requests_for_approval(admin: &Admin) -> crate::Result<ApprovalRequests> {
     let (requests, incomplete) = approval_requests(&admin.config, &admin.published_doc)?;
     if incomplete {
@@ -15977,6 +16235,7 @@ pub(crate) fn all_requests_for_approval(admin: &Admin) -> crate::Result<Approval
 
 /// Opening holds every already-waiting identity. A partial observation cannot
 /// establish that hold, so unlike a found manual approval it refuses to publish.
+#[cfg(unix)]
 pub(crate) fn requests_before_opening(
     admin: &Admin,
     doc: &Document,
@@ -16345,6 +16604,30 @@ impl Drop for HeldLock {
     }
 }
 
+/// A new owner-only edit folder in `dir`, `edit-<16 hex>` of a fresh random name, made with its
+/// list at its creation ([`fsx::create_private_dir_new`], never narrowed after): a taken name is
+/// passed over, at most five times, as aterm-tempfile passes one on Unix.
+///
+/// # Errors
+/// No random name could be drawn, five names were taken, or the folder could not be made.
+#[cfg(windows)]
+fn new_edit_dir(dir: &Path) -> crate::Result<PathBuf> {
+    for _ in 0..5 {
+        let mut name = [0u8; 8];
+        aterm_uds::rand::fill(&mut name)?;
+        let path = dir.join(format!("edit-{}", aterm_codec::hex::encode_lower(&name)));
+        match fsx::create_private_dir_new(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::new(format!("{}: {error}", path.display()))),
+        }
+    }
+    Err(Error::new(format!(
+        "{}: five edit directory names were taken",
+        dir.display()
+    )))
+}
+
 /// An exclusively created `0700` edit directory, locked while it lives.
 pub struct Scratch {
     dir: PathBuf,
@@ -16355,11 +16638,14 @@ impl Scratch {
     /// Create a new edit directory. Existing directories are never adopted or swept.
     pub fn new(paths: &Paths) -> crate::Result<Scratch> {
         fsx::ensure_private_dir(&paths.dir)?;
+        #[cfg(unix)]
         let dir = aterm_tempfile::Builder::new()
             .prefix("edit-")
             .tempdir_in(&paths.dir)
             .map_err(|error| Error::new(format!("{}: {error}", paths.dir.display())))?
             .keep();
+        #[cfg(windows)]
+        let dir = new_edit_dir(&paths.dir)?;
         let lock = HeldLock::try_take(&dir.join(".lock"))?
             .ok_or_else(|| Error::new("a fresh edit directory is already locked"))?;
         Ok(Scratch { dir, _lock: lock })

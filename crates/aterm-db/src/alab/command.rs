@@ -7,14 +7,15 @@
 //! `signins`, `add`, `retire`, `relabel`, `edit`). Every report names keys, columns, counts
 //! and source coordinates, never a secret; a secret cell names its secret-store entry or holds
 //! a sealed token, never its value in the clear, and addresses and phone numbers are ordinary
-//! data. A sheet's note crosses into its row's `note` only past the note guard. The import's
-//! review (`--review`: a private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and
-//! removed once the owner closes it) is the only place a withheld note's text or a losing value
-//! is shown, and only on this Mac; a cell shaped like a credential, or one that names a secret, is
-//! never shown even there.
+//! data. Every verb that takes an account resolves it as [`account_row`] does. A sheet's note
+//! crosses into its row's `note` only past the note guard. The import's review (`--review`: a
+//! private `$TMPDIR/.ubd/alab-import-*.noindex/` folder opened in amacs and removed once the
+//! owner closes it) is the only place a withheld note's text or a losing value is shown, and
+//! only on this Mac; a cell shaped like a credential, or one that names a secret, is never shown
+//! even there.
 
 use super::{
-    Registry, checks,
+    Registry, account_names, checks,
     import::{self, Coord, Finding, Input, KnownMac, Mode, Plan, Sheet, SheetKind, Step, Vendors},
     registry::{self, ACCOUNT, MACHINE, PHONE, PREFERENCE},
 };
@@ -115,13 +116,16 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     edited the old generation before it heard the seal, it carries those edits\n\
   unprefer <machine> <account>\n\
                     end that preference; nobody is signed out. A machine is its label, an alias\n\
-                    or its key; an account its label, legacy label or key, never its address\n\
+                    or its key. An <account> is its slug, its key, its provider word and its\n\
+                    address (`oai ada@x.example` or `oai:ada@x.example`), or an address that\n\
+                    names one account\n\
   export [--dry-run|--apply]\n\
                     the files older Macs still read, rendered from the lab and its place rows,\n\
                     compared with the vault's and (--apply) published in one admin write\n\
   machines | accounts | preferences | mail | phones\n\
-                    the registry's rows by key and label; mail shows each address by key, the\n\
-                    mailbox its codes arrive in (key and label) and how, never an address;\n\
+                    the registry's rows by key and label, each account by its key, its slug and\n\
+                    its name (its provider word and address); mail shows each address by key,\n\
+                    the mailbox its codes arrive in (key and label) and how, never an address;\n\
                     phones shows each phone row by key, last4, carrier, line type and device\n\
   machines <machine>\n\
                     what runs on it: its facts and model, its preferences by rank with each\n\
@@ -712,6 +716,7 @@ pub fn checked(
     let duplicates = duplicate_numbers(&view.project(phone), &numbers);
     let table = handle.compiled().table;
     let (mut lab, generic) = checks::lab(table, &view.cells);
+    lab.extend(checks::inert(&view.inert));
     lab.extend(checks::facts(
         view.owned
             .get(registry::MACHINE_FACTS.name)
@@ -2205,16 +2210,35 @@ fn merge(paths: &Paths, args: &Args) -> Result<Value> {
     Ok(report)
 }
 
-/// The one row of `rows` whose text `matches`, by key first. `require_live` (`prefer`) refuses a
-/// retired or conflicted row even when named by key, while `!require_live` (`unprefer`) tries live
-/// rows first and falls back to retired rows so a lingering preference on a retired machine or
-/// account can be ended by label or key.
+/// The account row `word` names in `view` (docs/DESIGN-shared-files-2026-11-11.md §3): its slug,
+/// its key, its provider word and address (`oai ada@x.example` or `oai:ada@x.example`), or an
+/// address that names one account, live accounts tried first ([`account_names::one`]). A word
+/// that names none or several says so in the resolver's words. `require_live` (`prefer`) refuses
+/// an account that is not live however it is named; without it (`unprefer`, `retire`, `set`) a
+/// retired account is named for its history.
+pub(super) fn account_row(view: &att::View, word: &str, require_live: bool) -> Result<String> {
+    let names = account_names::of(view);
+    let pk = account_names::one(&names, word).map_err(|why| Error::new(&why))?;
+    if require_live && !names[pk].live {
+        return Err(Error::new(&format!(
+            "the account {} is not live: bring it back in `aterm db alab edit accounts` first",
+            names[pk].shown()
+        )));
+    }
+    Ok(pk.to_owned())
+}
+
+/// The one machine or phone row of `rows` that `matches`, by key first. `require_live` (`prefer`,
+/// `relabel`) refuses a retired or conflicted row even when named by key, while `!require_live`
+/// (`unprefer`, `retire`, the views) tries live rows first and falls back to retired rows, so a
+/// lingering preference on a retired machine can be ended by its label or key. Accounts are named
+/// by [`account_row`].
 fn named_row(
     what: &str,
     rows: &Projection,
     name: &str,
     require_live: bool,
-    matches: impl Fn(&str, &cell::Row) -> bool,
+    matches: impl Fn(&cell::Row) -> bool,
 ) -> Result<String> {
     if let Some(row) = rows.rows.get(name) {
         if require_live && !row.live() {
@@ -2225,14 +2249,14 @@ fn named_row(
     let mut found: Vec<&String> = rows
         .rows
         .iter()
-        .filter(|(pk, row)| (!require_live || row.live()) && matches(pk, row))
+        .filter(|(_, row)| (!require_live || row.live()) && matches(row))
         .map(|(pk, _)| pk)
         .collect();
     if found.is_empty() && !require_live {
         found = rows
             .rows
             .iter()
-            .filter(|(pk, row)| !row.live() && matches(pk, row))
+            .filter(|(_, row)| !row.live() && matches(row))
             .map(|(pk, _)| pk)
             .collect();
     }
@@ -2255,15 +2279,10 @@ fn prefer(paths: &Paths, args: &Args, on: bool, now_ms: u64) -> Result<Value> {
     let [machine, account] = args.operands.as_slice() else {
         return Err(Error::new("name a machine and an account"));
     };
-    if account.contains('@') || machine.contains('@') {
-        return Err(Error::new(
-            "an account is named by its label, legacy label or key, never its address",
-        ));
-    }
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     let (report, applied) = handle.commit_derived(false, |view| {
         let wanted = Label::parse(machine).ok().map(|label| label.canonical());
-        let machine = named_row("machine", &view.project(&MACHINE), machine, on, |_, row| {
+        let machine = named_row("machine", &view.project(&MACHINE), machine, on, |row| {
             wanted.as_deref().is_some_and(|label| {
                 row.get("label").and_then(Value::as_str) == Some(label)
                     || row
@@ -2272,16 +2291,7 @@ fn prefer(paths: &Paths, args: &Args, on: bool, now_ms: u64) -> Result<Value> {
                         .is_some_and(|field| field.has_member(label))
             })
         })?;
-        let account = named_row(
-            "account",
-            &view.project(&ACCOUNT),
-            account,
-            on,
-            |pk, row| {
-                registry::account_label(pk, row).as_deref() == Some(account)
-                    || row.get("legacy_label").and_then(Value::as_str) == Some(account)
-            },
-        )?;
+        let account = account_row(view, account, on)?;
         let pk = keys::preference_pk(&machine, &account)?;
         let projected = view.project(&PREFERENCE);
         let current = projected.rows.get(&pk);

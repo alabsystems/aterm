@@ -8,12 +8,14 @@
 
 use super::roster::RESTORED_DERIVED;
 use super::*;
+#[cfg(unix)]
 use crate::commons;
 use crate::membership_log::{
     Body, CLOSURE_RECORDS, Draft, Entrant, Evidence, Founder, Log, MEMBERSHIP_CLONES, MemberId,
     Record, RecordId, Root,
 };
 use crate::swarm_roster::{SwarmMember, SwarmRoster};
+#[cfg(unix)]
 use std::collections::BTreeMap;
 
 struct Mac {
@@ -240,6 +242,7 @@ fn an_overlay_of_an_unchanged_log_derives_its_restored_macs_once() {
     assert_eq!(overlay_cost(&log, &roster), (overlaid, [0, 0, 0]));
 }
 
+#[cfg(unix)]
 fn verdict(observed: &crate::Result<crate::commons::Observation>) -> String {
     match observed {
         Ok(crate::commons::Observation::Visible(_)) => "visible".to_owned(),
@@ -249,6 +252,7 @@ fn verdict(observed: &crate::Result<crate::commons::Observation>) -> String {
 }
 
 /// The files under `paths`' home that `read` opened, with how many times.
+#[cfg(unix)]
 fn reads_during<T>(paths: &Paths, read: impl FnOnce() -> T) -> (T, BTreeMap<PathBuf, usize>) {
     let before = fsx::reads_under(&paths.home);
     let answer = read();
@@ -267,6 +271,7 @@ fn reads_during<T>(paths: &Paths, read: impl FnOnce() -> T) -> (T, BTreeMap<Path
 /// NEGATIVE CONTROL (2026-11-08): with `standing`'s plain records file judged by
 /// `records_storage::data_path`, the second observation opens the missing pin (`a settled
 /// observation of unchanged files`).
+#[cfg(unix)]
 fn settles(paths: &Paths, expected: &str) {
     let (fresh, read) = reads_during(paths, || observe_commons(paths));
     assert_eq!(verdict(&fresh), expected);
@@ -281,6 +286,7 @@ fn settles(paths: &Paths, expected: &str) {
     assert_eq!(read, vec![], "a settled observation of unchanged files");
 }
 
+#[cfg(unix)]
 fn with_a_denied_node(m22: &Paths, m7: &Paths) {
     let admin = admin_open(m22).unwrap();
     let mut doc = admin.doc.clone();
@@ -299,6 +305,7 @@ fn with_a_denied_node(m22: &Paths, m7: &Paths) {
     sync(m7, None).unwrap();
 }
 
+#[cfg(unix)]
 fn narrow_commons_to_m22(m22: &Paths) {
     let admin = admin_open(m22).unwrap();
     let mut doc = admin.doc.clone();
@@ -331,6 +338,7 @@ fn narrow_commons_to_m22(m22: &Paths) {
 /// [(".../commons/device.age", 1), (".../commons/device.claim", 1), ..., (".../vault", 1)],
 /// right: []`); with `observation_inputs` left at the deny list's, the device files are read but
 /// not stamped (`read but not stamped: [".../commons/device.age", ".../commons/device.claim"]`).
+#[cfg(unix)]
 #[test]
 fn a_settled_observation_of_unchanged_files_reads_none_of_them() {
     let _answering = ServersAnswering::set();
@@ -370,6 +378,7 @@ fn a_settled_observation_of_unchanged_files_reads_none_of_them() {
 /// [`undo_offers`] and, for no member, whether it left: the Commons observation and
 /// [`member_by_log`]) finds a member or not as `member` says, and every file it reads is among
 /// those [`desk_inputs`] stamps; reading them moves no stamp.
+#[cfg(unix)]
 fn desk_reads_only_stamped_files(paths: &Paths, member: bool) {
     let before = desk_inputs(paths).expect("the desk's inputs stamp");
     let ((local, offers), read) = reads_during(paths, || {
@@ -405,6 +414,7 @@ fn desk_reads_only_stamped_files(paths: &Paths, member: bool) {
 /// claims the member's desk is read from are read but not stamped (`read but not stamped:
 /// [".../commons/control/control.anchor", ".../commons/default.pin", ".../commons.claim",
 /// ".../creation.claim"]`).
+#[cfg(unix)]
 #[test]
 fn the_desk_reads_only_files_its_inputs_stamp() {
     let _answering = ServersAnswering::set();
@@ -429,6 +439,7 @@ fn the_desk_reads_only_files_its_inputs_stamp() {
 }
 
 /// The trust a Commons peer check of `paths`' log is made under: its genesis root.
+#[cfg(unix)]
 fn trust_of(paths: &Paths) -> crate::commons::journal::Trust {
     let store = load_acknowledged_records(paths).unwrap();
     let crate::membership_log::Body::Genesis { root, .. } = store.log().unwrap().genesis().body()
@@ -442,6 +453,7 @@ fn trust_of(paths: &Paths) -> crate::commons::journal::Trust {
     }
 }
 
+#[cfg(unix)]
 fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
     roster
         .as_ref()
@@ -450,6 +462,7 @@ fn denies(roster: &crate::Result<Option<SwarmRoster>>, label: &str) -> bool {
 
 /// Whether `paths`' own denial check, as a table session's access asks it under `lock`
 /// (`Bootstrap::access_in_observed`), finds this Mac denied, with the files it read.
+#[cfg(unix)]
 fn denial(paths: &Paths, lock: &StateLock) -> (bool, BTreeMap<PathBuf, usize>) {
     let (denied, read) = reads_during(paths, || {
         local_recipient_denied_under(
@@ -461,6 +474,7 @@ fn denial(paths: &Paths, lock: &StateLock) -> (bool, BTreeMap<PathBuf, usize>) {
 }
 
 /// A shared observation of `paths`' state lock, as a table session's access holds one.
+#[cfg(unix)]
 fn observation(paths: &Paths) -> StateLock {
     StateLock::observe(paths)
         .unwrap()
@@ -480,6 +494,7 @@ fn observation(paths: &Paths) -> StateLock {
 /// observation kept from before it (`left: "visible", right: "vault-busy"`); with
 /// `local_recipient_denied_under`'s not quiet, the writer's own check reads nothing
 /// (`a writer's denial check reads afresh`).
+#[cfg(unix)]
 #[test]
 fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     let _answering = ServersAnswering::set();
@@ -559,6 +574,7 @@ fn a_custody_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer()
 }
 
 /// The vault's held files: the envelope, the records entry and its data.
+#[cfg(unix)]
 fn vault_files(paths: &Paths) -> Vec<PathBuf> {
     vec![
         paths.cache_file(),
@@ -578,6 +594,7 @@ fn vault_files(paths: &Paths) -> Vec<PathBuf> {
 /// the kept custody check opens the vault (`a custody check of unchanged files`); with
 /// `Bootstrap::access_in_observed` back on `local_recipient_denial_held`, the kept access does
 /// (`an access of unchanged files`).
+#[cfg(unix)]
 #[test]
 fn a_table_sessions_custody_and_access_keep_their_reads_until_a_file_moves() {
     let _answering = ServersAnswering::set();
@@ -648,6 +665,7 @@ fn a_table_sessions_custody_and_access_keep_their_reads_until_a_file_moves() {
 /// `deny_labels: ["m99"]` against `["m98"]`). (2026-11-08): with `records_storage::standing`'s
 /// plain records file judged by `records_storage::data_path`, the kept reads open the missing pin
 /// (`kept reads of unchanged files`).
+#[cfg(unix)]
 #[test]
 fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
     let _answering = ServersAnswering::set();
@@ -748,6 +766,7 @@ fn a_peer_checks_reads_are_kept_until_a_file_moves_and_never_under_a_writer() {
 }
 
 /// When the vault last heard `paths`' Mac, as its status says.
+#[cfg(unix)]
 fn heard(paths: &Paths) -> u64 {
     match status(paths).unwrap().membership {
         Membership::In { heard, .. } => heard,
@@ -771,6 +790,7 @@ fn heard(paths: &Paths) -> u64 {
 /// given the answer kept from before it (`a writer holding the vault meets the read`); keyed by
 /// nothing (`&false` for the registration), the registration is not read (`a registration after a
 /// first read`).
+#[cfg(unix)]
 #[test]
 fn the_lan_presence_reads_the_vault_again_only_when_a_file_moved() {
     let _answering = ServersAnswering::set();
@@ -867,6 +887,7 @@ fn the_lan_presence_reads_the_vault_again_only_when_a_file_moved() {
 /// writer holding the vault meets a fresh read`); with the memo reading `config` (which takes a
 /// failed envelope read as no chain) in place of `config_whole`, that answer is kept past the
 /// fault (`a failed read is not kept`).
+#[cfg(unix)]
 #[test]
 fn the_configuration_is_read_again_only_when_its_files_move() {
     let _answering = ServersAnswering::set();
@@ -944,6 +965,7 @@ fn the_configuration_is_read_again_only_when_its_files_move() {
 /// by their metadata, the round moves them (`a round moves none of the desk's inputs`); with
 /// `desk_inputs` stamping no file and no state, the membership change moves none (`a change of
 /// the state moves them`).
+#[cfg(unix)]
 #[test]
 fn the_desk_inputs_stand_over_a_round_and_move_with_the_state() {
     use std::os::unix::fs::MetadataExt as _;
@@ -987,6 +1009,7 @@ fn the_desk_inputs_stand_over_a_round_and_move_with_the_state() {
 /// NEGATIVE CONTROL (2026-11-09): with `stamp_memo_inputs_in` stamping `state.toml` by its
 /// metadata (as `stamp_inputs_in`), the round reads the vault again (`a round reads state.toml
 /// alone`).
+#[cfg(unix)]
 #[test]
 fn a_round_that_moves_only_heard_reads_no_memo_again() {
     let _answering = ServersAnswering::set();
@@ -1034,6 +1057,7 @@ fn a_round_that_moves_only_heard_reads_no_memo_again() {
 /// failure, as the genesis's and the configuration's do, meets the fault again): the member each
 /// gives, where it gives one, is whole only where it reads as the one read with no fault. How
 /// many faults left a member marked, and how many left none.
+#[cfg(unix)]
 fn fault_sweep(paths: &Paths, shape: &str) -> (usize, usize) {
     use crate::members::desk::Local;
     let (fresh, read) = reads_during(paths, || Local::of(paths));
@@ -1092,6 +1116,7 @@ fn fault_sweep(paths: &Paths, shape: &str) -> (usize, usize) {
 /// kept seats' (`a lab's: … at …/records read 3 (1 failed)`).
 ///
 /// [`Local::whole`]: crate::members::desk::Local::whole
+#[cfg(unix)]
 #[test]
 fn a_member_read_through_a_fault_is_whole_only_as_read() {
     let _answering = ServersAnswering::set();

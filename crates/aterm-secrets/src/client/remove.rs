@@ -46,7 +46,9 @@ use crate::membership_log::{
     Body, EpochAudience, Evidence, Kind, Log, MemberId, Record, RecordId, RekeyDue, Store, Turn,
     Undo, audience_tag, entries::OpenedAudienceEntries,
 };
+#[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(unix)]
 use std::sync::Arc;
 
 /// What [`remove_member`] or [`remove_seat`] did.
@@ -2204,6 +2206,7 @@ pub enum NodePassSaid {
 }
 
 impl NodePassSaid {
+    #[cfg(unix)]
     const fn word(self) -> &'static str {
         match self {
             Self::Done => "done",
@@ -2236,6 +2239,7 @@ pub struct NodePassReceipt {
 }
 
 impl NodePassReceipt {
+    #[cfg(unix)]
     fn encode(&self) -> String {
         let applied = self
             .applied
@@ -2459,6 +2463,7 @@ fn said_of(error: &Error) -> NodePassSaid {
 
 /// What tells one records file's contents from another's: every writer renames a new file over it
 /// or appends to it ([`fsx::FileStamp`]). `None` with no readable file.
+#[cfg(unix)]
 fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(paths.records_data_file().ok()?).ok()?;
@@ -2474,6 +2479,7 @@ fn records_stamp(paths: &Paths) -> Option<fsx::FileStamp> {
 
 /// When the next node pass is due: at once for a records file not seen before (a record arrived,
 /// by whichever path), otherwise when its time comes, or at once where the clock was set back.
+#[cfg(unix)]
 #[derive(Debug, Default)]
 struct NodePassDue {
     stamp: Option<fsx::FileStamp>,
@@ -2481,6 +2487,7 @@ struct NodePassDue {
     wait_ms: u64,
 }
 
+#[cfg(unix)]
 impl NodePassDue {
     fn due(&self, stamp: Option<fsx::FileStamp>, now_ms: u64) -> bool {
         let Some(ran_ms) = self.ran_ms else {
@@ -2514,6 +2521,7 @@ impl NodePassDue {
 }
 
 /// What a node service gives [`run_node_pass`].
+#[cfg(unix)]
 pub struct NodePassHost<'a> {
     /// This Mac's vault.
     pub paths: &'a Paths,
@@ -2554,7 +2562,7 @@ pub struct NodePassHost<'a> {
 /// every new log record, by whichever path it came (the relay's ingest, a pull, another process's
 /// write, this pass's own), and one every [`NodePassPace::every`]. It runs until `stop`, each
 /// pass's end kept where `aterm secrets status` reads it. A person's `aterm secrets agent off`
-/// holds it too ([`crate::service::subscriber_turned_off`]), as it holds all automatic vault work.
+/// holds it too ([`crate::off_record::subscriber_turned_off`]), as it holds all automatic vault work.
 ///
 /// Between looks it waits on what owes the next one ([`NodeHeard`]): a ring of
 /// [`NodePassHost::rung`] (a new records file, a switch, an input the observer reads), its
@@ -2565,6 +2573,7 @@ pub struct NodePassHost<'a> {
 /// tells a change against the last state it told, so a switch flipped and flipped back inside
 /// its settle, read midway by a look, is told by none. With no bell it looks every
 /// [`NodePassPace::look`].
+#[cfg(unix)]
 pub fn run_node_pass(host: &NodePassHost<'_>) {
     run_node_pass_hearing(host, super::member_routes::NativeChanges::new, |_| {});
 }
@@ -2572,6 +2581,7 @@ pub fn run_node_pass(host: &NodePassHost<'_>) {
 /// [`run_node_pass`], hearing changes of network through what `changes` makes once a bell rings
 /// the loop, and telling `told` each key its own watch tells ([`RECORDS_WATCH`], …) just before
 /// that tell rings it.
+#[cfg(unix)]
 fn run_node_pass_hearing<C: super::member_routes::Changes>(
     host: &NodePassHost<'_>,
     changes: impl FnOnce() -> C,
@@ -2599,7 +2609,7 @@ fn run_node_pass_hearing<C: super::member_routes::Changes>(
         if let Some(heard) = &heard {
             heard.rung.clear();
         }
-        let open = !(host.held)() && !crate::service::subscriber_turned_off(&host.paths.home);
+        let open = !(host.held)() && !crate::off_record::subscriber_turned_off(&host.paths.home);
         let next = if open {
             let inputs = inputs.get_or_insert_with(host.make_inputs);
             let stamp = records_stamp(host.paths);
@@ -2656,13 +2666,18 @@ fn run_node_pass_hearing<C: super::member_routes::Changes>(
 /// [`NodeHeard`]'s keys in its watch: the records ([`Records`]: the data file, or the entry while
 /// its layout names none), the subscriber's off switch, and, while the layout names no data file,
 /// its readiness pin and its preparation intent.
+#[cfg(unix)]
 const RECORDS_WATCH: u64 = 0;
+#[cfg(unix)]
 const OFF_WATCH: u64 = 1;
+#[cfg(unix)]
 const PIN_WATCH: u64 = 2;
+#[cfg(unix)]
 const INTENT_WATCH: u64 = 3;
 
 /// What a node's loop watches of its records.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(unix)]
 enum Records {
     /// The data file the layout names.
     Data(std::path::PathBuf),
@@ -2674,6 +2689,7 @@ enum Records {
 }
 
 /// What wakes a node's loop between looks where a bell rings it ([`NodePassHost::rung`]).
+#[cfg(unix)]
 struct NodeHeard<C> {
     rung: Arc<aterm_uds::ready::Doorbell>,
     /// The loop's own watch over what it reads: the records and the subscriber's off switch.
@@ -2688,6 +2704,7 @@ struct NodeHeard<C> {
     broker_error: Option<String>,
 }
 
+#[cfg(unix)]
 impl<C: super::member_routes::Changes> NodeHeard<C> {
     /// `None` where the watch cannot start; the loop then looks at its pace. It watches before
     /// the first look reads, so each file's first look, which always tells, comes once, together.
@@ -2707,7 +2724,10 @@ impl<C: super::member_routes::Changes> NodeHeard<C> {
             }),
         )
         .ok()?;
-        watch.watch(OFF_WATCH, crate::service::subscriber_off_path(&paths.home));
+        watch.watch(
+            OFF_WATCH,
+            crate::off_record::subscriber_off_path(&paths.home),
+        );
         let mut heard = Self {
             rung: Arc::clone(rung),
             watch,
@@ -2860,6 +2880,7 @@ impl<C: super::member_routes::Changes> NodeHeard<C> {
 
 /// The wait after a pass, `unfinished` of them in a row busy or failed: [`NodePassPace::every`]
 /// after one that finished, otherwise [`NodePassPace::again`], doubling up to `every`.
+#[cfg(unix)]
 fn node_pass_wait(pace: &NodePassPace, unfinished: u32) -> Duration {
     if unfinished == 0 {
         return pace.every;
@@ -2873,6 +2894,7 @@ fn node_pass_wait(pace: &NodePassPace, unfinished: u32) -> Duration {
 /// materialization and source observations progress while HTTP stands unchanged; a start
 /// waits until the LAN is admitted. Pacing uses elapsed time, independently of the vault clock.
 #[derive(Default)]
+#[cfg(unix)]
 struct NodeConverge {
     due: crate::converge::Due,
     runner: Option<aterm_uds::spawnfd::Child>,
@@ -2885,6 +2907,7 @@ struct NodeConverge {
     clock: Option<Instant>,
 }
 
+#[cfg(unix)]
 impl NodeConverge {
     fn tend(&mut self, host: &NodePassHost<'_>, inputs: &mut super::ConvergenceInputs) {
         let clock = self.clock.get_or_insert_with(Instant::now);
@@ -2960,6 +2983,7 @@ impl NodeConverge {
     }
 }
 
+#[cfg(unix)]
 fn keep_node_pass_end(
     host: &NodePassHost<'_>,
     receipt: &NodePassReceipt,

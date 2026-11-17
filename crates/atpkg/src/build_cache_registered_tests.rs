@@ -2109,6 +2109,79 @@ fn explicit_retirement_rechecks_its_captured_snapshot_against_the_locked_fresh_r
 }
 
 #[test]
+fn ordinary_clearance_sets_aside_only_abandoned_private_receipt_stages() {
+    let world = World::new();
+    world.build();
+    let index = world.home.join(INDEX);
+    let unrelated = world.home.join("unrelated.noindex");
+    let mut child = aterm_uds::spawnfd::command("/bin/sh")
+        .args([
+            "-c",
+            r#"set -eu
+stage="$1/cache-receipt-$$_0000000000000000_0"
+/bin/mkdir -m 700 "$stage"
+printf '{partial' > "$stage/receipt"
+chmod 600 "$stage/receipt"
+printf 'ready\n'
+read token
+"#,
+            "receipt-writer",
+        ])
+        .arg(&index)
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .unwrap();
+    aterm_uds::deadline::prints(&mut child, "ready", Duration::from_secs(60));
+    let stage = index.join(format!("cache-receipt-{}_0000000000000000_0", child.id()));
+    let live_refused = ordinary_clearance(&world.home, &unrelated).is_err();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(live_refused);
+    assert!(
+        ordinary_clearance(&world.home, &unrelated)
+            .unwrap()
+            .current()
+    );
+    assert!(ordinary_clearance(&world.home, &world.target).is_err());
+    assert_eq!(std::fs::read(stage.join("receipt")).unwrap(), b"{partial");
+
+    std::fs::write(stage.join("receipt"), vec![0; MAX_RECORD + 1]).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    std::fs::remove_file(stage.join("receipt")).unwrap();
+    std::fs::hard_link(world.path(), stage.join("receipt")).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    std::fs::remove_file(stage.join("receipt")).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_ok());
+    std::fs::write(stage.join("foreign"), b"keep").unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    std::fs::remove_file(stage.join("foreign")).unwrap();
+    std::os::unix::fs::symlink(world.path(), stage.join("receipt")).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    std::fs::remove_file(stage.join("receipt")).unwrap();
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    std::fs::set_permissions(&stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for name in [
+        "cache-receipt-0_0000000000000000_0".to_owned(),
+        format!("cache-receipt-0{}_0000000000000000_0", child.id()),
+        format!("cache-receipt-{}_A000000000000000_0", child.id()),
+        format!("cache-receipt-{}_0000000000000000_00", child.id()),
+        format!("cache-receipt-{}_0000000000000000_0_extra", child.id()),
+    ] {
+        let moved = index.join(name);
+        std::fs::rename(&stage, &moved).unwrap();
+        assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+        std::fs::rename(&moved, &stage).unwrap();
+    }
+    let outside = world.home.join("saved-stage");
+    std::fs::rename(&stage, &outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &stage).unwrap();
+    assert!(ordinary_clearance(&world.home, &unrelated).is_err());
+    assert!(outside.is_dir());
+}
+
+#[test]
 fn ordinary_clearance_includes_partial_stages_and_refuses_unknown_index_state() {
     let world = World::new();
     world.build();
@@ -11627,6 +11700,44 @@ fn a_real_metadata_into_a_tagged_folder_leaves_nothing_adoptable() {
                 "{at}: what the cache keeps stands"
             );
         }
+    }
+}
+
+#[test]
+fn repeated_unknown_owners_preserve_the_published_receipt() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    for configured in [false, true] {
+        let world = World::new();
+        world.build();
+        let suppress = || {
+            if configured {
+                suppress_configured(&world.home)
+            } else {
+                suppress_unresolved(&world.home, &world.target).map(|protected| {
+                    assert!(protected);
+                })
+            }
+        };
+        assert!(!read(&world.path()).unwrap().owners_unknown);
+        suppress().unwrap();
+        assert!(read(&world.path()).unwrap().owners_unknown);
+        // Keep the inode open: replacement cannot accidentally reuse its number.
+        let published = std::fs::File::open(world.path()).unwrap();
+        let before = published.metadata().unwrap();
+        let bytes = std::fs::read(world.path()).unwrap();
+        suppress().unwrap();
+        let after = std::fs::metadata(world.path()).unwrap();
+        assert_eq!(std::fs::read(world.path()).unwrap(), bytes);
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+
+        let gate = gate::open(&gate_path(&world.path()).unwrap()).unwrap();
+        let _held = gate::try_exclusive(gate).unwrap();
+        assert!(
+            suppress().is_err(),
+            "known suppression still honors the root gate"
+        );
     }
 }
 

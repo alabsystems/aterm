@@ -8,9 +8,9 @@
 //! that log, a plain local file; its **face** is the TSV a person opens. This crate is the
 //! snapshot's side: the name grammar ([`Name`]), where the parts live ([`Root`]), the snapshot
 //! and status codecs ([`Snapshot`], [`State`]), the state word every answer carries
-//! ([`Word`], [`Why`]), the read ([`File::read`]), the outbox of this Mac's unsigned writes
-//! ([`outbox`], [`File::write`]) and the verbs of `aterm file` that need no typed table
-//! ([`cli`]).
+//! ([`Word`], [`Why`]), the read ([`File::read`]), the one resolver every row and account name
+//! passes ([`resolve`]), the outbox of this Mac's unsigned writes ([`outbox`], [`File::write`])
+//! and the verbs of `aterm file` that need no typed table ([`cli`]).
 //!
 //! It does not depend on aterm-db, aterm-secrets or the transport, so no session, vault or
 //! writer-generation code can reach a read: a read answers from local files in every custody
@@ -36,7 +36,10 @@ pub mod status;
 
 #[cfg(any(unix, windows))]
 pub use file::Look;
-pub use file::{File, Opened, Pass, Projected, Projection, Read, Recorded};
+pub use file::{
+    ACCOUNT_HANDLES, File, Named, Opened, Pass, Projected, Projection, Read, Recorded, Resolved,
+    many_accounts, no_account, resolve,
+};
 pub use frontier::Frontier;
 pub use layout::Root;
 pub use name::{Name, NotAName};

@@ -4,8 +4,11 @@
 //! One bounded peer plan across configured URLs and unresolved LAN names.
 
 use super::*;
-use crate::discover::{DiscoveredVault, MAX_CANDIDATES, Watch};
+#[cfg(unix)]
+use crate::discover::Watch;
+use crate::discover::{DiscoveredVault, MAX_CANDIDATES};
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -43,6 +46,8 @@ enum DiscoverySource<'a> {
     Empty,
     #[cfg(test)]
     Supplied(&'a (dyn Fn(&Config) -> Vec<DiscoveredVault> + Sync)),
+    // The subscriber's standing browse, which only its Unix loop keeps.
+    #[cfg(unix)]
     Watching {
         bell: &'a Arc<crate::wake::Bell>,
         standing: &'a StandingBrowse,
@@ -74,6 +79,7 @@ impl<'a> PeerDiscovery<'a> {
         Self::new(DiscoverySource::Supplied(found))
     }
 
+    #[cfg(unix)]
     pub(super) fn watching(bell: &'a Arc<crate::wake::Bell>, standing: &'a StandingBrowse) -> Self {
         Self::new(DiscoverySource::Watching { bell, standing })
     }
@@ -111,6 +117,7 @@ impl<'a> PeerDiscovery<'a> {
             DiscoverySource::Empty => Vec::new(),
             #[cfg(test)]
             DiscoverySource::Supplied(found) => found(config),
+            #[cfg(unix)]
             DiscoverySource::Watching { bell, standing } => super::browsed(config, bell, standing),
             DiscoverySource::Direct(_) if !cfg!(test) && alab_vault(config) => {
                 crate::discover::browse_alab(self.budget()).unwrap_or_default()
@@ -143,6 +150,7 @@ impl<'a> PeerDiscovery<'a> {
         match &self.source {
             #[cfg(test)]
             DiscoverySource::Supplied(found) => Pool::Ready(found(config)),
+            #[cfg(unix)]
             DiscoverySource::Watching { bell, standing } if alab_vault(config) => {
                 let watch = standing.watch_or_start(|| Watch::start_look(bell, &[]));
                 let heard = watch.heard();

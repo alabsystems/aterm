@@ -1018,6 +1018,57 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     assert_eq!(catalog.get("refs/tags/v1"), Some(&token));
     assert_eq!(catalog.get("refs/tags/v1^{}"), Some(&commit));
     assert_eq!(catalog.get("refs/tags/alias^{}"), Some(&commit));
+    // Residency alone grants no reuse: another Remote has no completed-import custody.
+    let uncached = Remote::new(remote.client.clone(), remote.slug.clone(), &target).unwrap();
+    let first = effects.children_run().len();
+    let imported_at = std::time::Instant::now();
+    assert_eq!(uncached.tag_commit("v1").unwrap(), Some(commit.clone()));
+    let children = effects.children_run();
+    let imports = children[first..]
+        .iter()
+        .filter(|child| child.args.iter().any(|arg| arg == "fetch"))
+        .count();
+    assert_eq!(imports, 1, "an uncached exact tag read must import");
+    eprintln!(
+        "uncached-exact-tag: {imports} fetch, {:?} elapsed",
+        imported_at.elapsed(),
+    );
+    // The handoff policy asks for the predecessor again after catalog gates imported it.
+    // NEGATIVE CONTROL: an unconditional fetch here repeats the completed import.
+    let first = effects.children_run().len();
+    let reused_at = std::time::Instant::now();
+    assert_eq!(remote.tag_commit("v1").unwrap(), Some(commit.clone()));
+    assert!(
+        !imported_since(first),
+        "an exact tag read reuses its catalog's complete import"
+    );
+    let children = effects.children_run();
+    eprintln!(
+        "catalog-to-exact-tag: {} fetches, {} fresh advertisements, {:?} elapsed",
+        children[first..]
+            .iter()
+            .filter(|child| child.args.iter().any(|arg| arg == "fetch"))
+            .count(),
+        children[first..]
+            .iter()
+            .filter(|child| child.args.iter().any(|arg| arg == "ls-remote"))
+            .count(),
+        reused_at.elapsed(),
+    );
+    assert_eq!(
+        children[first..]
+            .iter()
+            .filter(|child| child.args.iter().any(|arg| arg == "ls-remote"))
+            .count(),
+        1,
+        "a reused import still needs a fresh exact advertisement"
+    );
+    assert!(
+        children[first..]
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "--git-common-dir")),
+        "a reused tag import still admits its source"
+    );
     let first = effects.children_run().len();
     assert_eq!(parse_tags(&remote.tag_catalog().unwrap()).unwrap(), catalog);
     let children = effects.children_run();
@@ -1057,6 +1108,12 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     git(&bare, &["update-ref", "refs/tags/v1", &replacement]);
     git(&bare, &["update-ref", "-d", "refs/tags/replacement"]);
     let first = effects.children_run().len();
+    assert_eq!(remote.tag_commit("v1").unwrap(), Some(commit.clone()));
+    assert!(
+        imported_since(first),
+        "a changed raw tag is imported even when its peeled commit is unchanged"
+    );
+    let first = effects.children_run().len();
     let moved = parse_tags(&remote.tag_catalog().unwrap()).unwrap();
     assert_eq!(moved.get("refs/tags/v1"), Some(&replacement));
     assert_eq!(moved.get("refs/tags/v1^{}"), Some(&commit));
@@ -1091,10 +1148,16 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     };
     remove_object(&old_blob);
     let first = effects.children_run().len();
-    assert_eq!(parse_tags(&remote.tag_catalog().unwrap()).unwrap(), moved);
+    assert_eq!(remote.tag_commit("v1").unwrap(), Some(commit.clone()));
     assert!(
         imported_since(first),
-        "missing historical content must be imported again"
+        "an exact tag read repairs missing historical content"
+    );
+    let first = effects.children_run().len();
+    assert_eq!(parse_tags(&remote.tag_catalog().unwrap()).unwrap(), moved);
+    assert!(
+        !imported_since(first),
+        "the repaired closure also serves the catalog"
     );
     assert_eq!(
         git(&target, &["show", &format!("{older}:line.toml")]),
@@ -1125,8 +1188,10 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
             "local history cutoffs cannot prove residency"
         );
         let first = effects.children_run().len();
+        let repaired_tag = remote.tag_commit("v1");
         let repaired = remote.tag_catalog();
         std::fs::remove_file(cutoff).unwrap();
+        assert_eq!(repaired_tag.unwrap(), Some(commit.clone()));
         assert_eq!(parse_tags(&repaired.unwrap()).unwrap(), moved);
         assert!(
             imported_since(first),
@@ -1137,6 +1202,33 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
             "earlier release"
         );
     }
+    remove_object(&older);
+    let replacement_ref = format!("refs/replace/{older}");
+    git(&target, &["update-ref", &replacement_ref, &head]);
+    let masked = GitCli::new(&target)
+        .git(&[
+            "-c",
+            "core.commitGraph=false",
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--missing=print",
+            &commit,
+            "--",
+        ])
+        .unwrap();
+    assert!(
+        masked.success() && masked.stdout_utf8().is_empty(),
+        "the replacement must hide the missing parent from an ordinary walk"
+    );
+    let first = effects.children_run().len();
+    let repaired = remote.tag_commit("v1");
+    git(&target, &["update-ref", "-d", &replacement_ref]);
+    assert_eq!(repaired.unwrap(), Some(commit.clone()));
+    assert!(
+        imported_since(first),
+        "a replacement cannot conceal a missing raw parent from tag reuse"
+    );
     assert_eq!(remote.tag_commit("v1").unwrap(), Some(commit));
     assert_eq!(remote.tag_commit("absent").unwrap(), None);
     assert!(remote.tag_commit("tree-only").is_err());
@@ -1159,6 +1251,10 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
         remote.tag_catalog().is_err(),
         "a cached catalog cannot bypass source configuration"
     );
+    assert!(
+        remote.tag_commit("v1").is_err(),
+        "a cached tag import cannot bypass source configuration"
+    );
     assert!(effects.children_run()[first..].iter().all(|child| {
         !child
             .args
@@ -1171,6 +1267,7 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     let offline = root.path().join("offline.git");
     std::fs::rename(&bare, &offline).unwrap();
     let cached_unavailable = remote.tag_catalog();
+    let cached_tag_unavailable = remote.tag_commit("v1");
     let unavailable = retry.tag_catalog();
     std::fs::rename(&offline, &bare).unwrap();
     assert!(
@@ -1178,6 +1275,10 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
         "a cached catalog is no current advertisement"
     );
     assert!(unavailable.is_err());
+    assert!(
+        cached_tag_unavailable.is_err(),
+        "a cached tag import is no current advertisement"
+    );
     let first = effects.children_run().len();
     assert_eq!(parse_tags(&retry.tag_catalog().unwrap()).unwrap(), moved);
     assert!(
@@ -1195,6 +1296,10 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     assert!(
         remote.tag_catalog().is_err(),
         "a captured source cannot silently retarget"
+    );
+    assert!(
+        remote.tag_commit("v1").is_err(),
+        "a cached tag's captured source cannot silently retarget"
     );
 }
 

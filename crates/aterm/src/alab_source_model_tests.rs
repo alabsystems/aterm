@@ -65,7 +65,6 @@ pub(crate) fn project(state: &State, action: &str) -> State {
     let cache = Cache {
         paths: Paths::for_home(root.path()),
         config,
-        settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),

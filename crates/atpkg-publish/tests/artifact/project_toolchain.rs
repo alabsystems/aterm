@@ -373,7 +373,11 @@ fn replacement_refs_cannot_change_source_authority_and_fsmonitor_never_runs() {
             &format!("!touch {}", marker.display()),
         ],
     );
-    assert!(Authority::committed(repo, &original).is_err());
+    // RL-30: a source that names an fsmonitor command is read, and the command never runs:
+    // every git child carries `core.fsmonitor=false`.
+    assert!(
+        matches!(Authority::committed(repo, &original).expect("a source with fsmonitor set"), Authority::Committed { lock: Some(lock), .. } if lock == w.lock)
+    );
     assert!(
         !marker.exists(),
         "source hooks/fsmonitor are never executed"

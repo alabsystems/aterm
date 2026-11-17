@@ -63,7 +63,15 @@ fn stand_in(
             _ => None,
         };
         for frame in &frames {
-            wire::send(&stream, frame).unwrap();
+            if let Err(error) = wire::send(&stream, frame) {
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                panic!("the stand-in could not send its event: {error}");
+            }
         }
         // The client's close ends the browse, as it ends the broker's.
         let _ = reader.frame(&stream, deadline);

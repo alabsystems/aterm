@@ -14,7 +14,7 @@ use aterm_window::window::CursorIcon;
 
 use aterm_core::terminal::{CustodyTransition, Terminal};
 
-use crate::app_render::{pixel_to_term_cell, strip_col_for_pixel};
+use crate::app_render::{pixel_to_term_cell, strip_band_holds_row, strip_col_for_pixel};
 use crate::input::{InputEvent, Source};
 use crate::{
     App, GestureOrigin, WindowId, control, is_safe_url, multi_click_ms, pane, plain_url_at,
@@ -3267,6 +3267,26 @@ impl App {
         )
     }
 
+    /// Whether window pixel `(x, y)` lies in the side inset beside the strip's band
+    /// ([`strip_band_holds_row`]), the Deck's rows excepted: the header's band is drawn across
+    /// the dock's column, above the dock, so a press there is a press on its bare band
+    /// ([`Self::press_strip_band`]), as one on the strip where no segment lies is.
+    pub(crate) fn side_inset_band_at(&self, wid: WindowId, x: f64, y: f64) -> bool {
+        if !self.tab_strip_enabled() || !self.in_side_inset(wid, x) {
+            return false;
+        }
+        let geom = self.pointer_geometry(wid);
+        let (_, y) = self.window_to_frame_with(wid, geom, x, y);
+        if y >= 0.0
+            && self
+                .deck_rows_px(wid)
+                .is_some_and(|rows| rows.contains(&(y as usize)))
+        {
+            return false;
+        }
+        strip_band_holds_row(y, geom.cell.1, self.tab_strip_rows, geom.pad_top, geom.head)
+    }
+
     /// Window pixel `(x, y)` as a frame cell `(row, col)`.
     pub(crate) fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
         let geom = self.pointer_geometry(wid);
@@ -6100,6 +6120,14 @@ impl App {
                 .is_some_and(|ws| self.in_side_inset(wid, ws.last_cursor_px.0))
             && self.dock_under_pointer(wid).is_none()
         {
+            // Above the dock the inset is the header's: a left press there is one on its bare
+            // band, so a client-side header is dragged and double-pressed by its whole width.
+            if button == WinitMouseButton::Left
+                && let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px)
+                && self.side_inset_band_at(wid, x, y)
+            {
+                self.press_strip_band(wid, at);
+            }
             return None;
         }
         let mods_state = self.windows.get(&wid).map(|ws| ws.mods)?;

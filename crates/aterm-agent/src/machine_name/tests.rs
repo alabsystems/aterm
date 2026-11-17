@@ -540,6 +540,549 @@ fn a_dry_run_leaves_the_file_as_it_is() {
     assert_eq!(file::read(root.path()).expect("reads"), Some(mirror));
 }
 
+/// What a read of this Mac's row does to the name kept in `root` while its label shows the
+/// owner's number `label` (`None`: none to take; `pending`: a write of this Mac's own on its
+/// way, or a held one the row does not show the rival of yet), with the vault's labels `lab`
+/// reads.
+fn renumber_with(
+    root: &aterm_tempfile::TempDir,
+    label: Option<&str>,
+    pending: bool,
+    lab: impl FnOnce() -> io::Result<LabLabels>,
+    at: u64,
+) -> io::Result<Option<MachineName>> {
+    let config = root.path().join("aterm.toml");
+    registry::with_label(label, pending, || {
+        follow_number(root.path(), &config, lab, at)
+    })
+    .map(|got| got.map(|(name, _)| name))
+}
+
+/// [`renumber_with`] with no vault labels and no write of this Mac's own on its way.
+fn renumber(root: &aterm_tempfile::TempDir, label: Option<&str>, at: u64) -> Option<MachineName> {
+    renumber_with(root, label, false, no_labels, at).expect("a read of the row")
+}
+
+/// The name a first read made from the bound row nicknamed `MissBunny` (seeded m86), its number
+/// then chosen here.
+fn chosen(root: &aterm_tempfile::TempDir) -> MachineName {
+    mirrored(root);
+    file::replace(root.path(), |name| {
+        name.class = Class::Chosen;
+        Ok(())
+    })
+    .expect("a chosen number")
+}
+
+/// `set_name` of `to` as a person asks for it, with the row's write queued through a door that
+/// answers `door`: the rename's outcome and the writes it queued, each as its cells.
+fn renamed_with(
+    root: &aterm_tempfile::TempDir,
+    to: &str,
+    door: registry::Written,
+    dry_run: bool,
+    at: u64,
+) -> (io::Result<NameSet>, Vec<Vec<String>>) {
+    let to = NameTo {
+        num: Number::parse(to).expect("a number"),
+        nick: None,
+    };
+    registry::with_door(door, || {
+        registry::with_label(None, false, || {
+            set_name(
+                root.path(),
+                &to,
+                no_labels,
+                ByKind::Person,
+                unread,
+                at,
+                dry_run,
+            )
+        })
+    })
+}
+
+/// What a person's rename through a door that queues it answers.
+fn queued() -> registry::Written {
+    registry::Written::Queued(registry::Queued {
+        id: "wi-1".to_owned(),
+        unflushed: None,
+    })
+}
+
+/// The id of the write an edit queued.
+fn queued_id(queued: Option<&registry::Queued>) -> Option<&str> {
+    queued.map(|write| write.id.as_str())
+}
+
+/// The cells of one write to the row, as the door seam records them.
+fn cells(cells: &[&str]) -> Vec<Vec<String>> {
+    vec![cells.iter().map(|cell| (*cell).to_owned()).collect()]
+}
+
+/// The registry row's number is the Mac's: an owner's number other than the chosen one renumbers
+/// it as chosen, by no author here (the registry keeps who wrote it), and a read again changes
+/// nothing.
+#[test]
+fn an_owner_write_of_the_row_label_renumbers_this_mac() {
+    let root = state();
+    let before = chosen(&root);
+    let name = renumber(&root, Some("m87"), NOW + 1).expect("the row renumbers the Mac");
+    assert_eq!(name.title(), "m87 MissBunny");
+    assert_eq!(
+        (name.class, name.rev, name.by),
+        (Class::Chosen, before.rev + 1, None),
+        "a chosen number, by no author here: the registry keeps who wrote it"
+    );
+    assert_eq!(
+        (
+            name.history[0].why,
+            name.history[0].from,
+            name.history[0].to
+        ),
+        (Why::Registry, Some(num(86)), Some(num(87)))
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(name));
+    assert_eq!(
+        renumber(&root, Some("m87"), NOW + 2),
+        None,
+        "a row read again changes nothing"
+    );
+}
+
+/// A follow of the row's number saves the renumbered name only under the admission of the
+/// source the decision read, the name lock held through it: a source that no longer admits
+/// local writes (a held, off or revoked registry) renumbers nothing and leaves the file as it
+/// was, and the same row is taken once the source admits it.
+///
+/// NEGATIVE CONTROL, observed: with `edit_name` writing a follow's file outside the admission
+/// (`LabelWrite::Follows(_) => write()`), the refused source renumbers the Mac: `a refused
+/// source renumbers nothing: Ok(Some(…m87…))`.
+#[test]
+fn a_followed_number_is_saved_only_under_the_sources_admission() {
+    use crate::harness::{
+        account_sync_error::SyncError,
+        alab_roster::{ReceiptGuard, SourceGuard},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct Admission(Arc<AtomicBool>);
+    impl SourceGuard for Admission {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn same_source(&self, other: &dyn SourceGuard) -> bool {
+            other
+                .as_any()
+                .downcast_ref::<Self>()
+                .is_some_and(|other| Arc::ptr_eq(&self.0, &other.0))
+        }
+        fn with_admitted(
+            &self,
+            save: Box<dyn FnOnce() -> Result<(), SyncError> + '_>,
+        ) -> Result<(), SyncError> {
+            if !self.0.load(Ordering::Acquire) {
+                return Err("the retained source no longer admits local writes".into());
+            }
+            save()
+        }
+    }
+
+    let root = state();
+    let before = chosen(&root);
+    let allowed = Arc::new(AtomicBool::new(false));
+    let seam = || registry::Seam {
+        label: Some(Some(num(87))),
+        admission: Some(ReceiptGuard::new(Admission(allowed.clone()))),
+        ..registry::Seam::default()
+    };
+    let config = root.path().join("aterm.toml");
+    let follow = |at: u64| {
+        registry::with_seam(seam(), || {
+            follow_number(root.path(), &config, no_labels, at)
+        })
+        .map(|got| got.map(|(name, _)| name))
+    };
+    let refused = follow(NOW + 1);
+    assert!(
+        refused.is_err(),
+        "a refused source renumbers nothing: {refused:?}"
+    );
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(before),
+        "neither the number nor History moved"
+    );
+    allowed.store(true, Ordering::Release);
+    let name = follow(NOW + 2)
+        .expect("an admitted source")
+        .expect("the row renumbers the Mac");
+    assert_eq!(name.title(), "m87 MissBunny");
+    assert_eq!(file::read(root.path()).expect("reads"), Some(name));
+}
+
+/// An owner's number replaces one nobody chose here (seeded from the registry, as this one is,
+/// or automatic), and the number the row shows becomes chosen where it is the Mac's own: the
+/// owner chose it.
+#[test]
+fn an_owner_number_replaces_a_seeded_one_and_makes_its_own_chosen() {
+    let root = state();
+    let mirror = mirrored(&root);
+    assert_eq!(mirror.class, Class::Seeded);
+    let name = renumber(&root, Some("m87"), NOW + 1).expect("renumbered");
+    assert_eq!(
+        (name.title(), name.class),
+        ("m87 MissBunny".to_owned(), Class::Chosen)
+    );
+    let root = state();
+    mirrored(&root);
+    let name = renumber(&root, Some("m86"), NOW + 1).expect("the seeded number becomes chosen");
+    assert_eq!(
+        (name.title(), name.class),
+        ("m86 MissBunny".to_owned(), Class::Chosen)
+    );
+    assert_eq!(
+        renumber(&root, Some("m86"), NOW + 2),
+        None,
+        "and stays as it is"
+    );
+}
+
+/// A label this Mac's own write is still changing (or a held one waits on the row to show what
+/// it met), and one with no owner's number to take (empty, an automatic write's or an import's, another row's by the claim rule),
+/// renumber nothing and leave the file as it is; the owner's number read later is taken.
+#[test]
+fn a_pending_or_untakeable_label_renumbers_nothing() {
+    let root = state();
+    let before = chosen(&root);
+    assert_eq!(
+        renumber_with(&root, Some("m87"), true, no_labels, NOW + 1).expect("reads"),
+        None
+    );
+    assert_eq!(renumber(&root, None, NOW + 2), None);
+    assert_eq!(
+        file::read(root.path()).expect("reads"),
+        Some(before),
+        "nothing is marked or written"
+    );
+    assert_eq!(
+        renumber(&root, Some("m87"), NOW + 3).map(|name| name.title()),
+        Some("m87 MissBunny".to_owned())
+    );
+}
+
+/// A person's renumber here queues the number it moves to as the row's label before the file
+/// holds it, so the row never shows the number it replaced with nothing of this Mac's on its
+/// way; the rename answers the write's id for its command to publish. The nickname it leaves as
+/// it was is no part of the write, so a nickname the row would not take (one chosen while no row
+/// was this Mac's) refuses no renumber. A nickname rename queues its nickname alone; a dry run
+/// and a follow queue nothing.
+///
+/// NEGATIVE CONTROLS, observed: with `edit_name` queueing nothing, the rename's door is never
+/// asked: `left: [] right: [["label=m88"]]`; with it queueing the nickname the edit left as it
+/// was: `left: [["label=m88", "nickname=MissBunny"]] right: [["label=m88"]]`.
+#[test]
+fn a_renumber_here_queues_its_number_to_the_row() {
+    let root = state();
+    chosen(&root);
+    let (set, asked) = renamed_with(&root, "m88", queued(), false, NOW + 1);
+    let set = set.expect("a renumber here");
+    assert_eq!(asked, cells(&["label=m88"]));
+    assert!(set.renumbered);
+    assert_eq!(queued_id(set.queued.as_ref()), Some("wi-1"));
+    assert_eq!(set.name.title(), "m88 MissBunny");
+    let (set, asked) = renamed_with(&root, "m89", queued(), true, NOW + 2);
+    let set = set.expect("a preview");
+    assert_eq!(set.name.title(), "m89 MissBunny");
+    assert!(asked.is_empty(), "a dry run queues nothing");
+    assert_eq!(set.queued, None);
+    let to = NickTo::Word(Nickname::parse("Otter").expect("a nickname"));
+    let (set, asked) = registry::with_door(queued(), || {
+        registry::with_row(None, || {
+            set_nick(root.path(), &to, ByKind::Person, unread, NOW + 3, false)
+        })
+    });
+    let set = set.expect("a nickname rename");
+    assert_eq!(set.name.title(), "m88 Otter");
+    assert_eq!(
+        asked,
+        cells(&["nickname=Otter"]),
+        "a nickname rename queues no number"
+    );
+    assert_eq!(queued_id(set.queued.as_ref()), Some("wi-1"));
+    let config = root.path().join("aterm.toml");
+    let (taken, asked) = registry::with_door(queued(), || {
+        registry::with_label(Some("m90"), false, || {
+            follow_number(root.path(), &config, no_labels, NOW + 4)
+        })
+    });
+    let taken = taken.expect("a read of the row").expect("renumbered").0;
+    assert_eq!(taken.title(), "m90 Otter");
+    assert!(asked.is_empty(), "a follow's number is the row's already");
+}
+
+/// FL-194's exit: a rename of the number and the nickname together, asked in an aterm session, is
+/// one write of the row, so one operation holds it and an undo of the row's newest rename can
+/// take back both.
+///
+/// NEGATIVE CONTROL, observed: with the nickname queued as a write of its own after the number
+/// (`edit_name` calling the door once per cell), the rename asks for two writes:
+/// `left: [["label=m88"], ["nickname=Otter"]] right: [["label=m88", "nickname=Otter"]]`.
+#[test]
+fn a_rename_queues_its_number_and_nickname_as_one_row_write() {
+    let root = state();
+    chosen(&root);
+    let to = NameTo {
+        num: num(88),
+        nick: Some(Nickname::parse("Otter").expect("a nickname")),
+    };
+    let asker = crate::machine_name::Asker {
+        kind: ByKind::Person,
+        session: Some("s-rename"),
+    };
+    let (set, asked) = registry::with_door(queued(), || {
+        registry::with_label(None, false, || {
+            set_name(root.path(), &to, no_labels, asker, unread, NOW, false)
+        })
+    });
+    let set = set.expect("a rename");
+    assert_eq!(set.name.title(), "m88 Otter");
+    assert_eq!(asked, cells(&["label=m88", "nickname=Otter"]));
+    assert_eq!(queued_id(set.queued.as_ref()), Some("wi-1"));
+}
+
+/// A dry run asks the row's rules as the real run's write would be judged, queueing nothing: a
+/// rename the row would refuse is refused in its preview too, with the same cause.
+///
+/// NEGATIVE CONTROL, observed: with `edit_name` asking nothing of the row for a dry run, the
+/// preview passes: `a refused preview: NameSet { name: MachineName { num: Some(Number(88)), … }, … }`.
+#[test]
+fn a_dry_run_is_refused_as_its_real_run_would_be() {
+    let root = state();
+    let before = chosen(&root);
+    let door = registry::Written::Refused("a value the column refuses".to_owned());
+    let (set, asked) = renamed_with(&root, "m88", door, true, NOW + 1);
+    let why = set.expect_err("a refused preview");
+    assert!(asked.is_empty(), "a dry run queues nothing: {asked:?}");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Registry),
+        "{why}"
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(before));
+    let (set, _) = renamed_with(&root, "m88", queued(), true, NOW + 2);
+    assert_eq!(set.expect("a preview").name.title(), "m88 MissBunny");
+}
+
+/// A rename's write that gives way, whole, to another writer's value of the row leaves the row's
+/// nickname there, and the next read follows it: the file counts the nickname it queued as what
+/// the row will show, so the row showing another is a change to follow, never the rename's own.
+///
+/// NEGATIVE CONTROL, observed: with the queued rename leaving the file's `row` as the base saw
+/// it (`Saw(MissBunny)`), the row's MissBunny reads as seen and the Mac keeps the nickname the
+/// row never took: `left: "m12 Otter" right: "m12 MissBunny"`.
+#[test]
+fn a_rename_that_gave_way_follows_the_rows_nickname() {
+    let root = state();
+    chosen(&root);
+    let to = NameTo {
+        num: num(12),
+        nick: Some(Nickname::parse("Otter").expect("a nickname")),
+    };
+    let (set, asked) = registry::with_door(queued(), || {
+        registry::with_label(None, false, || {
+            set_name(
+                root.path(),
+                &to,
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW + 1,
+                false,
+            )
+        })
+    });
+    assert_eq!(set.expect("a rename").name.title(), "m12 Otter");
+    assert_eq!(asked, cells(&["label=m12", "nickname=Otter"]));
+    let name = follow(&root, Some("MissBunny"), NOW + 2);
+    assert_eq!(name.title(), "m12 MissBunny");
+    assert_eq!(follow(&root, Some("MissBunny"), NOW + 3), name);
+}
+
+/// A rename to the number the name already holds, asked for while the row shows another number
+/// an owner wrote that no read followed yet, queues the number asked for: the request is the
+/// newer of the two, and the row's older number does not replace it at the next read. An undo
+/// that moves no number queues none.
+///
+/// NEGATIVE CONTROL, observed: with `LabelWrite::asked_over_row` answering `false`, the rename
+/// changes nothing and queues nothing: `left: [] right: ["m86"]`.
+#[test]
+fn a_number_asked_for_again_is_queued_over_an_unfollowed_row_number() {
+    let root = state();
+    chosen(&root);
+    let to = NameTo {
+        num: num(86),
+        nick: None,
+    };
+    let (set, asked) = registry::with_door(queued(), || {
+        registry::with_label(Some("m9"), false, || {
+            set_name(
+                root.path(),
+                &to,
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW + 1,
+                false,
+            )
+        })
+    });
+    let set = set.expect("a rename to the number held");
+    assert_eq!(asked, cells(&["label=m86"]));
+    assert!(set.renumbered && !set.changed);
+    assert_eq!(set.name.title(), "m86 MissBunny");
+    let (_, asked) = registry::with_door(queued(), || {
+        registry::with_label(Some("m86"), false, || {
+            set_name(
+                root.path(),
+                &to,
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW + 2,
+                false,
+            )
+        })
+    });
+    assert!(
+        asked.is_empty(),
+        "the row shows the number asked for: {asked:?}"
+    );
+    let nick = NickTo::Word(Nickname::parse("Otter").expect("a nickname"));
+    registry::with_door(queued(), || {
+        registry::with_row(None, || {
+            set_nick(root.path(), &nick, ByKind::Person, unread, NOW + 3, false)
+        })
+    })
+    .0
+    .expect("a nickname rename");
+    let (undone, asked) = registry::with_door(queued(), || {
+        registry::with_label(Some("m9"), false, || {
+            undo_last(
+                root.path(),
+                None,
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW + 4,
+                false,
+            )
+        })
+    });
+    assert_eq!(
+        undone.expect("a nickname undo").name.title(),
+        "m86 MissBunny"
+    );
+    assert_eq!(
+        asked,
+        cells(&["nickname=MissBunny"]),
+        "an undo that moves no number queues none"
+    );
+}
+
+/// A row that would not take the number refuses the rename, which leaves the file as it was.
+#[test]
+fn a_number_the_row_refuses_renames_nothing() {
+    let root = state();
+    let before = chosen(&root);
+    let door = registry::Written::Refused("a value the column refuses".to_owned());
+    let (set, asked) = renamed_with(&root, "m88", door, false, NOW + 1);
+    let why = set.expect_err("refused");
+    assert_eq!(asked, cells(&["label=m88"]));
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Registry),
+        "{why}"
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(before));
+}
+
+/// An owner who writes back the number a rename here replaced is followed: the row's number is
+/// the Mac's, with nothing remembered of what it showed before.
+#[test]
+fn an_owner_revert_to_the_number_a_rename_here_replaced_is_followed() {
+    let root = state();
+    chosen(&root);
+    let (set, _) = renamed_with(&root, "m88", queued(), false, NOW + 1);
+    assert_eq!(set.expect("a renumber here").name.title(), "m88 MissBunny");
+    assert_eq!(
+        renumber(&root, Some("m88"), NOW + 2),
+        None,
+        "the rename's own write"
+    );
+    assert_eq!(
+        renumber(&root, Some("m86"), NOW + 3).map(|name| name.title()),
+        Some("m86 MissBunny".to_owned())
+    );
+}
+
+/// A number the vault gives another Mac is refused as any rename's is, leaving the file as it
+/// was, so a later read judges it again and takes it once nothing holds it.
+#[test]
+fn a_label_the_vault_gives_another_mac_is_refused_and_judged_again() {
+    let root = state();
+    let before = chosen(&root);
+    let lab = LabLabels {
+        held: BTreeMap::from([(num(87), LabelHold::Label)]),
+        ..LabLabels::default()
+    };
+    let why = renumber_with(&root, Some("m87"), false, || Ok(lab), NOW + 1)
+        .expect_err("another Mac's number");
+    assert_eq!(
+        Refused::of(&why).map(|refused| &refused.cause),
+        Some(&Cause::Vault(LabelHold::Label)),
+        "{why}"
+    );
+    assert_eq!(file::read(root.path()).expect("reads"), Some(before));
+    assert_eq!(
+        renumber(&root, Some("m87"), NOW + 2).map(|name| name.title()),
+        Some("m87 MissBunny".to_owned())
+    );
+}
+
+/// Undo takes a followed number back and queues the number it restores to the row, which then
+/// shows it, so the undone number is not taken again.
+#[test]
+fn an_undo_of_a_followed_number_queues_the_number_it_restores() {
+    let root = state();
+    chosen(&root);
+    let name = renumber(&root, Some("m87"), NOW + 1).expect("renumbered");
+    let (undone, asked) = registry::with_door(queued(), || {
+        registry::with_label(Some("m87"), false, || {
+            undo_last(
+                root.path(),
+                name.history.first(),
+                no_labels,
+                ByKind::Person,
+                unread,
+                NOW + 2,
+                false,
+            )
+        })
+    });
+    let undone = undone.expect("an undo").name;
+    assert_eq!(undone.title(), "m86 MissBunny");
+    assert_eq!(asked, cells(&["label=m86"]));
+    assert_eq!(
+        renumber_with(&root, Some("m87"), true, no_labels, NOW + 3).expect("reads"),
+        None
+    );
+    assert_eq!(renumber(&root, Some("m86"), NOW + 4), None);
+}
+
 #[test]
 fn pending_or_invalid_bound_registry_names_refuse_first_creation_without_fallback() {
     for source in [

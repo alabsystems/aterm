@@ -12,6 +12,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use aterm_dirfd::acl::{self, Descriptor, NotOwnerOnly, Parts, Sid};
 use aterm_dirfd::{AtFlags, Dir, Errno, FileId, Mode, OFlags, OwnedFd};
 
 /// A scratch directory on the temp volume (NTFS on every machine this runs on).
@@ -1370,6 +1371,7 @@ fn errors_keep_gone_apart_from_everything_else() {
         Errno::NOT_VOLUME_ROOT,
         Errno::MOUNT_POINT,
         Errno::PLACEHOLDERS_HIDDEN,
+        Errno::NOT_OWNER,
     ] {
         let e = std::io::Error::from(own);
         assert_eq!(
@@ -1391,11 +1393,598 @@ fn errors_keep_gone_apart_from_everything_else() {
         Errno::NOT_VOLUME_ROOT,
         Errno::MOUNT_POINT,
         Errno::PLACEHOLDERS_HIDDEN,
+        Errno::NOT_OWNER,
+        Errno::EXIST,
+        Errno::NOSYS,
     ];
     let mut unique = codes.to_vec();
     unique.sort();
     unique.dedup();
     assert_eq!(unique.len(), codes.len());
+    assert_eq!(
+        std::io::Error::from(Errno::EXIST).kind(),
+        ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        std::io::Error::from(Errno::NOSYS).kind(),
+        ErrorKind::Unsupported
+    );
+    assert_eq!(
+        std::io::Error::from(Errno::NOT_OWNER).kind(),
+        ErrorKind::PermissionDenied
+    );
+}
+
+/// This token's user.
+fn me() -> Sid {
+    Sid::token_user().expect("this token's user")
+}
+
+/// The owner-only descriptor's text for `me`: a file's, or a folder's (its entries passed on).
+fn owner_only_text(me: &Sid, folder: bool) -> String {
+    let passed = if folder { "OICI" } else { "" };
+    format!("O:{me}D:P(A;{passed};FA;;;{me})(A;{passed};FA;;;SY)")
+}
+
+/// The descriptor of `name` under `dir`, read off a facts-only open of it.
+fn descriptor_of(dir: &OwnedFd, name: &str) -> Descriptor {
+    let facts = aterm_dirfd::openat(dir, name, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty())
+        .expect("a facts-only open");
+    Descriptor::of(&facts, Parts::OWNER | Parts::DACL).expect("its descriptor")
+}
+
+/// `name`'s owner and access list as descriptor text.
+fn text_of(dir: &OwnedFd, name: &str) -> String {
+    descriptor_of(dir, name)
+        .to_sddl(Parts::OWNER | Parts::DACL)
+        .expect("as text")
+}
+
+/// The owner-only rule's verdict on `name`.
+fn verdict(dir: &OwnedFd, name: &str) -> Result<(), NotOwnerOnly> {
+    let facts = aterm_dirfd::openat(dir, name, OFlags::PATH | OFlags::NOFOLLOW, Mode::empty())
+        .expect("a facts-only open");
+    acl::owner_only(&facts, &me()).expect("its descriptor reads")
+}
+
+/// Whether `name`'s access list is its folder's alone: not protected, and every entry inherited.
+fn takes_folders_entries(dir: &OwnedFd, name: &str) -> bool {
+    let descriptor = descriptor_of(dir, name);
+    !descriptor.dacl_protected().expect("its control bits")
+        && descriptor
+            .entries()
+            .expect("its entries")
+            .is_some_and(|entries| {
+                !entries.is_empty() && entries.iter().all(|e| e.flags & acl::INHERITED != 0)
+            })
+}
+
+/// Whether `name` is owned by `me` under a protected list of exactly two entries, `me`'s and
+/// SYSTEM's, each allowing everything (a folder's passed on to what is made inside, `OICI`), read
+/// entry by entry: a list written in place carries the auto-inherited bit (`D:PAI`) a list made
+/// at creation does not, and the rule reads no control bit but protection.
+fn exactly_owner_only(dir: &OwnedFd, name: &str, me: &Sid, folder: bool) -> bool {
+    const OBJECT_AND_CONTAINER_INHERIT: u8 = 0x3;
+    let descriptor = descriptor_of(dir, name);
+    let flags = if folder {
+        OBJECT_AND_CONTAINER_INHERIT
+    } else {
+        0
+    };
+    let allow = |sid: Sid| acl::Entry {
+        kind: acl::ACCESS_ALLOWED,
+        flags,
+        mask: acl::FILE_ALL_ACCESS,
+        sid: Some(sid),
+    };
+    descriptor.owner().expect("its owner").as_ref() == Some(me)
+        && descriptor.dacl_protected().expect("its control bits")
+        && descriptor.entries().expect("its entries")
+            == Some(vec![
+                allow(me.clone()),
+                allow(Sid::parse("SY").expect("SYSTEM")),
+            ])
+}
+
+/// A file `openat` makes and a folder `mkdirat` makes with a private mode (no group or other bit)
+/// are owner-only from their making: owned by this user under a protected list of exactly the
+/// user and SYSTEM (a folder's passed on, `OICI`), with no entry from their folder, a private file
+/// inside a private folder too. With any other mode each takes its folder's entries, and a file
+/// that exists, opened with `CREATE` and a private mode, keeps its own.
+#[test]
+fn a_private_mode_makes_owner_only_and_another_takes_the_folders_entries() {
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let me = me();
+    let create = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
+    for (name, mode) in [
+        ("rw", Mode::RUSR | Mode::WUSR),
+        ("ro", Mode::RUSR),
+        ("none", Mode::empty()),
+    ] {
+        drop(aterm_dirfd::openat(&pinned, name, create, mode).expect("made"));
+        assert_eq!(
+            text_of(&pinned, name),
+            owner_only_text(&me, false),
+            "{name}"
+        );
+        assert_eq!(verdict(&pinned, name), Ok(()), "{name}");
+    }
+    aterm_dirfd::mkdirat(&pinned, "vault", Mode::RWXU).expect("made");
+    assert_eq!(text_of(&pinned, "vault"), owner_only_text(&me, true));
+    assert_eq!(verdict(&pinned, "vault"), Ok(()));
+    for (name, mode) in [
+        ("group", Mode::RUSR | Mode::WUSR | Mode::RGRP),
+        ("other", Mode::RUSR | Mode::WUSR | Mode::WOTH),
+        ("exec", Mode::RWXU | Mode::XOTH),
+    ] {
+        drop(aterm_dirfd::openat(&pinned, name, create, mode).expect("made"));
+        assert!(takes_folders_entries(&pinned, name), "{name}");
+    }
+    let shared = Mode::RWXU | Mode::RGRP | Mode::XGRP | Mode::ROTH | Mode::XOTH;
+    aterm_dirfd::mkdirat(&pinned, "shared", shared).expect("made");
+    assert!(takes_folders_entries(&pinned, "shared"));
+    let flags = OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW;
+    drop(aterm_dirfd::openat(&pinned, "group", flags, Mode::RUSR | Mode::WUSR).expect("opened"));
+    assert!(takes_folders_entries(&pinned, "group"));
+    let vault = aterm_dirfd::openat(&pinned, "vault", dir_flags(), Mode::empty()).expect("vault");
+    drop(aterm_dirfd::openat(&vault, "key", create, Mode::RUSR | Mode::WUSR).expect("made"));
+    assert_eq!(text_of(&vault, "key"), owner_only_text(&me, false));
+    aterm_dirfd::mkdirat(&vault, "inner", Mode::RWXU).expect("made");
+    assert_eq!(text_of(&vault, "inner"), owner_only_text(&me, true));
+    drop(aterm_dirfd::openat(&vault, "loose", create, Mode::RUSR | Mode::RGRP).expect("made"));
+    assert!(takes_folders_entries(&vault, "loose"));
+    assert_eq!(verdict(&vault, "loose"), Err(NotOwnerOnly::Unprotected));
+}
+
+/// `mkdirat`, `fstatat` and `linkat` agree with each other and with the handles: a folder made is
+/// there as a folder with the identity its open reads; a second name of a file, in another folder,
+/// is the same file (one identity, two links, one content); a taken name is refused (`EXIST`) and
+/// kept. `fstatat` reads `.` as the directory itself and a junction as itself, and refuses
+/// `REMOVEDIR`, as `linkat` does.
+#[test]
+fn mkdirat_linkat_and_fstatat_round_trip() {
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let none = AtFlags::empty();
+
+    aterm_dirfd::mkdirat(&pinned, "sub", Mode::RWXU).expect("made");
+    assert!(root.join("sub").is_dir());
+    let sub = aterm_dirfd::openat(&pinned, "sub", dir_flags(), Mode::empty()).expect("sub");
+    let made = aterm_dirfd::fstatat(&pinned, "sub", AtFlags::SYMLINK_NOFOLLOW).expect("stat");
+    assert!(made.file_type().is_dir());
+    assert_eq!(made.id(), aterm_dirfd::file_id(&sub).expect("its identity"));
+    assert_eq!(
+        aterm_dirfd::mkdirat(&pinned, "sub", Mode::RWXU),
+        Err(Errno::EXIST)
+    );
+    write(&root.join("plain"), "x");
+    assert_eq!(
+        aterm_dirfd::mkdirat(&pinned, "plain", Mode::RWXU),
+        Err(Errno::EXIST)
+    );
+    assert_eq!(
+        aterm_dirfd::mkdirat(&pinned, ".", Mode::RWXU),
+        Err(Errno::INVAL)
+    );
+
+    write(&root.join("a"), "hello");
+    let a = aterm_dirfd::openat(
+        &pinned,
+        "a",
+        OFlags::RDONLY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .expect("a");
+    let by_name = aterm_dirfd::fstatat(&pinned, "a", none).expect("stat");
+    assert_eq!(by_name.id(), aterm_dirfd::fstat(&a).expect("fstat").id());
+    assert!(by_name.file_type().is_file());
+    assert_eq!((by_name.size, by_name.st_nlink), (5, 1));
+    assert_eq!(
+        aterm_dirfd::fstatat(&pinned, ".", none)
+            .expect("itself")
+            .id(),
+        aterm_dirfd::file_id(&pinned).expect("its identity")
+    );
+    assert_eq!(
+        aterm_dirfd::fstatat(&pinned, "missing", none).err(),
+        Some(Errno::NOENT)
+    );
+    assert_eq!(
+        aterm_dirfd::fstatat(&pinned, "a", AtFlags::REMOVEDIR).err(),
+        Some(Errno::INVAL)
+    );
+
+    aterm_dirfd::linkat(&pinned, "a", &sub, "b", none).expect("linked");
+    let b = aterm_dirfd::fstatat(&sub, "b", none).expect("stat");
+    assert_eq!(b.id(), by_name.id());
+    assert_eq!(b.st_nlink, 2);
+    assert_eq!(aterm_dirfd::fstat(&a).expect("fstat").st_nlink, 2);
+    assert_eq!(read(&root.join("sub").join("b")), "hello");
+    write(&root.join("sub").join("b"), "world");
+    assert_eq!(read(&root.join("a")), "world");
+    write(&root.join("taken"), "kept");
+    assert_eq!(
+        aterm_dirfd::linkat(&pinned, "a", &pinned, "taken", none),
+        Err(Errno::EXIST)
+    );
+    assert_eq!(read(&root.join("taken")), "kept");
+    assert_eq!(
+        aterm_dirfd::linkat(&pinned, "a", &sub, "b", none),
+        Err(Errno::EXIST)
+    );
+    assert_eq!(
+        aterm_dirfd::linkat(&pinned, "missing", &pinned, "c", none),
+        Err(Errno::NOENT)
+    );
+    assert_eq!(
+        aterm_dirfd::linkat(&pinned, "a", &pinned, "c", AtFlags::REMOVEDIR),
+        Err(Errno::INVAL)
+    );
+    assert_eq!(
+        aterm_dirfd::linkat(&pinned, "sub", &pinned, "sub2", none),
+        Err(Errno::ISDIR)
+    );
+    assert!(gone(&root.join("sub2")) && gone(&root.join("c")));
+    assert_eq!(aterm_dirfd::fstat(&a).expect("fstat").st_nlink, 2);
+
+    std::fs::create_dir(root.join("target")).expect("target");
+    junction(&root.join("j"), &root.join("target"));
+    let j = aterm_dirfd::fstatat(&pinned, "j", none).expect("stat");
+    assert!(j.file_type().is_link(), "{j:?}");
+    assert_ne!(
+        j.id(),
+        aterm_dirfd::fstatat(&pinned, "target", none)
+            .expect("stat")
+            .id()
+    );
+}
+
+/// A `NOREPLACE` rename refuses a name a file, a folder or a junction takes, with `EXIST` (std's
+/// `AlreadyExists`), and leaves both entries as they were, the junction's target untouched; into
+/// a free name, in its own folder or another, it moves the entry, its identity kept, a folder too.
+#[test]
+fn a_noreplace_rename_refuses_a_taken_name_and_takes_a_free_one() {
+    use aterm_dirfd::RenameFlags;
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let none = AtFlags::empty();
+    write(&root.join("from"), "mine");
+    write(&root.join("file"), "theirs");
+    std::fs::create_dir(root.join("folder")).expect("folder");
+    std::fs::create_dir(root.join("target")).expect("target");
+    write(&root.join("target").join("inside"), "inside");
+    junction(&root.join("junction"), &root.join("target"));
+    let from = aterm_dirfd::fstatat(&pinned, "from", none)
+        .expect("stat")
+        .id();
+    for taken in ["file", "folder", "junction"] {
+        let refused =
+            aterm_dirfd::renameat_with(&pinned, "from", &pinned, taken, RenameFlags::NOREPLACE);
+        assert_eq!(refused, Err(Errno::EXIST), "{taken}");
+        assert_eq!(
+            std::io::Error::from(refused.unwrap_err()).kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(read(&root.join("from")), "mine", "{taken}");
+    }
+    assert_eq!(read(&root.join("file")), "theirs");
+    assert!(root.join("folder").is_dir());
+    assert!(
+        aterm_dirfd::fstatat(&pinned, "junction", none)
+            .expect("stat")
+            .file_type()
+            .is_link()
+    );
+    assert_eq!(read(&root.join("target").join("inside")), "inside");
+    assert!(!root.join("target").join("from").exists());
+
+    aterm_dirfd::renameat_with(&pinned, "from", &pinned, "moved", RenameFlags::NOREPLACE)
+        .expect("moved");
+    assert!(gone(&root.join("from")));
+    assert_eq!(read(&root.join("moved")), "mine");
+    assert_eq!(
+        aterm_dirfd::fstatat(&pinned, "moved", none)
+            .expect("stat")
+            .id(),
+        from
+    );
+    std::fs::create_dir(root.join("other")).expect("other");
+    let other = aterm_dirfd::openat(&pinned, "other", dir_flags(), Mode::empty()).expect("other");
+    aterm_dirfd::renameat_with(&pinned, "moved", &other, "there", RenameFlags::NOREPLACE)
+        .expect("moved across");
+    assert!(gone(&root.join("moved")));
+    assert_eq!(read(&root.join("other").join("there")), "mine");
+    assert_eq!(
+        aterm_dirfd::fstatat(&other, "there", none)
+            .expect("stat")
+            .id(),
+        from
+    );
+    aterm_dirfd::renameat_with(&pinned, "folder", &other, "folder", RenameFlags::NOREPLACE)
+        .expect("a folder moved");
+    assert!(gone(&root.join("folder")) && root.join("other").join("folder").is_dir());
+    assert_eq!(
+        aterm_dirfd::renameat_with(&pinned, "missing", &pinned, "x", RenameFlags::NOREPLACE),
+        Err(Errno::NOENT)
+    );
+    assert_eq!(
+        aterm_dirfd::renameat_with(&pinned, ".", &pinned, "x", RenameFlags::NOREPLACE),
+        Err(Errno::INVAL)
+    );
+    assert!(gone(&root.join("x")));
+}
+
+/// A rename over a name replaces the entry there even while a reader holds it open, as
+/// `rename(2)` does (POSIX semantics): the reader reads the old file's bytes on to their end and
+/// again from the start, its file now nameless; the name opens the new file, its identity the
+/// moved one's, and the old name is gone. With no flags `renameat_with` is the same rename, and a
+/// read-only entry is replaced too. An entry held open without delete sharing, at either name, is
+/// not moved or replaced (`SHARING_VIOLATION`); a folder is not replaced (`ISDIR`); a folder with
+/// a file open inside is not moved (`ACCESS_DENIED`) until it closes; each refusal leaves both
+/// names as they were.
+#[test]
+fn a_rename_replaces_an_open_file_whose_reader_reads_the_old_bytes_on() {
+    use std::io::Seek as _;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let none = AtFlags::empty();
+    write(&root.join("old"), "old bytes, all of them");
+    write(&root.join("new"), "new bytes");
+    let new = aterm_dirfd::fstatat(&pinned, "new", none)
+        .expect("stat")
+        .id();
+    let mut reader = std::fs::File::open(root.join("old")).expect("a reader");
+    let mut head = [0u8; 4];
+    reader.read_exact(&mut head).expect("read");
+    assert_eq!(&head, b"old ");
+
+    aterm_dirfd::renameat(&pinned, "new", &pinned, "old").expect("replaced while open");
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).expect("read on");
+    assert_eq!(rest, "bytes, all of them");
+    reader.rewind().expect("rewound");
+    let mut whole = String::new();
+    reader.read_to_string(&mut whole).expect("read again");
+    assert_eq!(whole, "old bytes, all of them");
+    assert_eq!(aterm_dirfd::fstat(&reader).expect("fstat").st_nlink, 0);
+    assert_eq!(read(&root.join("old")), "new bytes");
+    assert!(gone(&root.join("new")));
+    assert_eq!(
+        aterm_dirfd::fstatat(&pinned, "old", none)
+            .expect("stat")
+            .id(),
+        new
+    );
+
+    write(&root.join("next"), "next");
+    aterm_dirfd::renameat_with(
+        &pinned,
+        "next",
+        &pinned,
+        "old",
+        aterm_dirfd::RenameFlags::empty(),
+    )
+    .expect("replaced");
+    assert_eq!(read(&root.join("old")), "next");
+    assert!(gone(&root.join("next")));
+
+    write(&root.join("ro"), "read-only");
+    let mut permissions = std::fs::metadata(root.join("ro"))
+        .expect("metadata")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(root.join("ro"), permissions).expect("read-only");
+    write(&root.join("src"), "over it");
+    aterm_dirfd::renameat(&pinned, "src", &pinned, "ro").expect("a read-only entry replaced");
+    assert_eq!(read(&root.join("ro")), "over it");
+
+    const FILE_SHARE_READ: u32 = 0x1;
+    write(&root.join("held"), "held");
+    write(&root.join("onto"), "onto");
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(root.join("held"))
+        .expect("held without delete sharing");
+    assert_eq!(
+        aterm_dirfd::renameat(&pinned, "onto", &pinned, "held"),
+        Err(Errno::SHARING_VIOLATION)
+    );
+    assert_eq!(
+        aterm_dirfd::renameat(&pinned, "held", &pinned, "elsewhere"),
+        Err(Errno::SHARING_VIOLATION)
+    );
+    assert!(gone(&root.join("elsewhere")));
+    drop(holder);
+    assert_eq!(read(&root.join("held")), "held");
+    assert_eq!(read(&root.join("onto")), "onto");
+
+    std::fs::create_dir(root.join("empty")).expect("a folder");
+    assert_eq!(
+        aterm_dirfd::renameat(&pinned, "onto", &pinned, "empty"),
+        Err(Errno::ISDIR)
+    );
+    assert!(root.join("empty").is_dir());
+    std::fs::create_dir(root.join("busy")).expect("a folder");
+    write(&root.join("busy").join("open"), "open");
+    let inside = std::fs::File::open(root.join("busy").join("open")).expect("open inside");
+    assert_eq!(
+        aterm_dirfd::renameat(&pinned, "busy", &pinned, "moved"),
+        Err(Errno::ACCESS_DENIED)
+    );
+    drop(inside);
+    assert!(root.join("busy").is_dir() && gone(&root.join("moved")));
+    aterm_dirfd::renameat(&pinned, "busy", &pinned, "moved").expect("moved once nothing is open");
+    assert_eq!(read(&root.join("moved").join("open")), "open");
+}
+
+/// NTFS has no atomic exchange of two names: `EXCHANGE`, alone or with `NOREPLACE`, is refused
+/// (`NOSYS`, std's `Unsupported`) and both entries stay as they were.
+#[test]
+fn an_exchange_is_refused_and_moves_nothing() {
+    use aterm_dirfd::RenameFlags;
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    write(&root.join("one"), "one");
+    write(&root.join("two"), "two");
+    for flags in [
+        RenameFlags::EXCHANGE,
+        RenameFlags::EXCHANGE | RenameFlags::NOREPLACE,
+    ] {
+        assert_eq!(
+            aterm_dirfd::renameat_with(&pinned, "one", &pinned, "two", flags),
+            Err(Errno::NOSYS),
+            "{flags:?}"
+        );
+    }
+    assert_eq!(read(&root.join("one")), "one");
+    assert_eq!(read(&root.join("two")), "two");
+}
+
+/// `fchmod` to a private mode makes what the handle is open on owner-only in place, through the
+/// handle and no name: a file, whose handle still writes after, and a folder, whose entries are
+/// then passed on. A mode that grants the group or others anything is refused (`NOSYS`) and
+/// changes nothing.
+#[test]
+fn fchmod_to_a_private_mode_makes_a_file_and_a_folder_owner_only_in_place() {
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let me = me();
+    let create = OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW;
+    let public = Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH;
+
+    let file = aterm_dirfd::openat(&pinned, "file", create, public).expect("made");
+    assert!(takes_folders_entries(&pinned, "file"));
+    aterm_dirfd::fchmod(&file, Mode::RUSR | Mode::WUSR).expect("narrowed");
+    assert!(exactly_owner_only(&pinned, "file", &me, false));
+    assert_eq!(verdict(&pinned, "file"), Ok(()));
+    std::fs::File::from(file)
+        .write_all(b"still writes")
+        .expect("written");
+    assert_eq!(read(&root.join("file")), "still writes");
+
+    aterm_dirfd::mkdirat(&pinned, "folder", Mode::RWXU | Mode::RGRP | Mode::XGRP).expect("made");
+    assert!(takes_folders_entries(&pinned, "folder"));
+    let folder = aterm_dirfd::openat(&pinned, "folder", dir_flags(), Mode::empty()).expect("open");
+    drop(aterm_dirfd::openat(&folder, "loose", create, public).expect("made"));
+    drop(aterm_dirfd::openat(&folder, "own", create, Mode::RUSR | Mode::WUSR).expect("made"));
+    aterm_dirfd::fchmod(&folder, Mode::RWXU).expect("narrowed");
+    assert!(exactly_owner_only(&pinned, "folder", &me, true));
+    assert_eq!(verdict(&pinned, "folder"), Ok(()));
+    let system = Sid::parse("SY").expect("SYSTEM");
+    let loose = descriptor_of(&folder, "loose")
+        .entries()
+        .expect("its entries")
+        .expect("a list");
+    assert!(takes_folders_entries(&folder, "loose"));
+    assert!(
+        loose
+            .iter()
+            .all(|e| e.sid.as_ref() == Some(&me) || e.sid.as_ref() == Some(&system)),
+        "{loose:?}"
+    );
+    assert_eq!(text_of(&folder, "own"), owner_only_text(&me, false));
+
+    let left = aterm_dirfd::openat(&pinned, "left", create, public).expect("made");
+    for mode in [public, Mode::RUSR | Mode::WUSR | Mode::XOTH] {
+        assert_eq!(
+            aterm_dirfd::fchmod(&left, mode),
+            Err(Errno::NOSYS),
+            "{mode:?}"
+        );
+    }
+    assert!(takes_folders_entries(&pinned, "left"));
+}
+
+/// `fchmod` of what another account owns is refused (`NOT_OWNER`, read as `PermissionDenied`, as
+/// unix's `EPERM` for a chmod by anyone but the owner) and changes nothing, never taking it over:
+/// Windows' own program and folder, which `TrustedInstaller` owns (this unelevated user can give
+/// nothing another owner, so the system's own stand in for a planted file), keep their owner and
+/// list.
+/// NEGATIVE CONTROL (2026-11-16): `fchmod` writing a file another account owns as it did before
+/// (reopened with `WRITE_OWNER` to give it to the user): `cmd.exe: Err(Errno(5))` (the reopen's
+/// `ERROR_ACCESS_DENIED`, the takeover tried), not `NOT_OWNER`.
+#[test]
+fn fchmod_of_what_another_account_owns_is_refused_and_changes_nothing() {
+    use std::os::windows::io::{AsHandle as _, BorrowedHandle};
+    let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"));
+    let me = me();
+    let program = std::fs::File::open(windows.join("System32").join("cmd.exe")).expect("cmd.exe");
+    let folder = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&windows)
+            .expect("Windows' folder")
+    };
+    let parts = Parts::OWNER | Parts::DACL;
+    let text = |fd: BorrowedHandle<'_>| {
+        Descriptor::of(fd, parts)
+            .and_then(|descriptor| descriptor.to_sddl(parts))
+            .expect("its descriptor")
+    };
+    for (what, fd, mode) in [
+        ("cmd.exe", program.as_handle(), Mode::RUSR | Mode::WUSR),
+        ("Windows' folder", folder.as_handle(), Mode::RWXU),
+    ] {
+        let owner = Descriptor::of(fd, Parts::OWNER)
+            .and_then(|descriptor| descriptor.owner())
+            .expect("its owner")
+            .expect("an owner");
+        assert_ne!(owner, me, "the control: {what} is {owner}'s");
+        let before = text(fd);
+        let refused = aterm_dirfd::fchmod(fd, mode);
+        assert_eq!(refused, Err(Errno::NOT_OWNER), "{what}: {refused:?}");
+        assert_eq!(text(fd), before, "{what} is left as it was");
+    }
+}
+
+/// Where the file system has no POSIX rename (the legacy class, forced on this thread), a
+/// `NOREPLACE` rename still refuses a taken name with `EXIST`, and a rename still replaces a name
+/// nothing holds open; one a reader holds open is not replaced, and both names stay.
+#[test]
+fn the_legacy_rename_class_refuses_a_taken_name_and_replaces_a_closed_one() {
+    use aterm_dirfd::RenameFlags;
+    struct Legacy;
+    impl Drop for Legacy {
+        fn drop(&mut self) {
+            aterm_dirfd::seam::legacy_classes(false);
+        }
+    }
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    write(&root.join("from"), "from");
+    write(&root.join("to"), "to");
+    aterm_dirfd::seam::legacy_classes(true);
+    let _legacy = Legacy;
+    assert_eq!(
+        aterm_dirfd::renameat_with(&pinned, "from", &pinned, "to", RenameFlags::NOREPLACE),
+        Err(Errno::EXIST)
+    );
+    assert_eq!(read(&root.join("to")), "to");
+    let reader = std::fs::File::open(root.join("to")).expect("a reader");
+    assert_eq!(
+        aterm_dirfd::renameat(&pinned, "from", &pinned, "to"),
+        Err(Errno::ACCESS_DENIED)
+    );
+    assert_eq!(read(&root.join("from")), "from");
+    drop(reader);
+    aterm_dirfd::renameat(&pinned, "from", &pinned, "to").expect("replaced");
+    assert_eq!(read(&root.join("to")), "from");
+    assert!(gone(&root.join("from")));
 }
 
 /// A third-party reparse tag set on a file: a stand-in for a cloud placeholder
@@ -1444,4 +2033,209 @@ mod mount_point {
             .expect("opened for the reparse point");
         aterm_dirfd::seam::set_mount_point(&dir, target).expect("FSCTL_SET_REPARSE_POINT");
     }
+}
+
+/// The identity of the entry `name` under `fd`, as its folder lists it.
+fn listed_id(fd: &OwnedFd, name: &str) -> FileId {
+    FileId {
+        dev: aterm_dirfd::file_id(fd).expect("the folder's id").dev,
+        ino: entry(fd, name).ino(),
+    }
+}
+
+/// `renameat_judged` moves an entry (a file, or a folder and all it holds) through a handle open
+/// on it relative to its folder, to a name relative to another folder's handle that `mkdirat`
+/// made, and never over an entry there; a name that no longer carries the identity judged, or
+/// any flag word but `NOREPLACE` alone, moves nothing.
+///
+/// Negative controls: the taken destination (`EXIST`), the swapped name (`CHANGED`) and the
+/// refused flag words (`INVAL`) each leave both entries as they were; a rename that replaced
+/// would leave `stage/b.txt` reading "from".
+#[test]
+fn renameat_moves_an_entry_by_handle_and_never_over_another() {
+    use aterm_dirfd::RenameFlags;
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let from = root.join("from");
+    std::fs::create_dir_all(from.join("sub")).expect("from/sub");
+    write(&from.join("a.txt"), "a");
+    write(&from.join("sub").join("inner.txt"), "inner");
+    write(&from.join("b.txt"), "from");
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    let from_fd = aterm_dirfd::openat(&pinned, "from", dir_flags(), Mode::empty()).expect("from");
+
+    aterm_dirfd::mkdirat(&pinned, "stage", Mode::RWXU).expect("made");
+    assert_eq!(
+        aterm_dirfd::mkdirat(&pinned, "stage", Mode::RWXU),
+        Err(Errno::EXIST),
+        "a taken name is never made again"
+    );
+    assert_eq!(
+        aterm_dirfd::mkdirat(&pinned, ".", Mode::RWXU),
+        Err(Errno::INVAL)
+    );
+    let stage = aterm_dirfd::openat(&pinned, "stage", dir_flags(), Mode::empty()).expect("stage");
+    write(&root.join("stage").join("b.txt"), "theirs");
+
+    let a = listed_id(&from_fd, "a.txt");
+    aterm_dirfd::renameat_judged(
+        &from_fd,
+        "a.txt",
+        &stage,
+        "a.txt",
+        RenameFlags::NOREPLACE,
+        a,
+    )
+    .expect("a file moves");
+    assert!(gone(&from.join("a.txt")));
+    assert_eq!(read(&root.join("stage").join("a.txt")), "a");
+    assert_eq!(listed_id(&stage, "a.txt"), a, "the same file, renamed");
+
+    let sub = listed_id(&from_fd, "sub");
+    aterm_dirfd::renameat_judged(&from_fd, "sub", &stage, "sub", RenameFlags::NOREPLACE, sub)
+        .expect("a folder moves whole");
+    assert!(gone(&from.join("sub")));
+    assert_eq!(
+        read(&root.join("stage").join("sub").join("inner.txt")),
+        "inner"
+    );
+
+    let b = listed_id(&from_fd, "b.txt");
+    assert_eq!(
+        aterm_dirfd::renameat_judged(
+            &from_fd,
+            "b.txt",
+            &stage,
+            "b.txt",
+            RenameFlags::NOREPLACE,
+            b
+        ),
+        Err(Errno::EXIST)
+    );
+    assert_eq!(read(&from.join("b.txt")), "from");
+    assert_eq!(read(&root.join("stage").join("b.txt")), "theirs");
+
+    assert_eq!(
+        aterm_dirfd::renameat_judged(
+            &from_fd,
+            "b.txt",
+            &stage,
+            "c.txt",
+            RenameFlags::NOREPLACE,
+            a
+        ),
+        Err(Errno::CHANGED),
+        "b.txt is not the file judged"
+    );
+    for flags in [
+        RenameFlags::empty(),
+        RenameFlags::EXCHANGE,
+        RenameFlags::NOREPLACE | RenameFlags::EXCHANGE,
+    ] {
+        assert_eq!(
+            aterm_dirfd::renameat_judged(&from_fd, "b.txt", &stage, "c.txt", flags, b),
+            Err(Errno::INVAL),
+            "{flags:?}"
+        );
+    }
+    assert_eq!(read(&from.join("b.txt")), "from");
+    assert!(gone(&root.join("stage").join("c.txt")));
+    aterm_dirfd::renameat_judged(
+        &from_fd,
+        "b.txt",
+        &stage,
+        "c.txt",
+        RenameFlags::NOREPLACE,
+        b,
+    )
+    .expect("a free name takes it");
+    assert_eq!(read(&root.join("stage").join("c.txt")), "from");
+}
+
+/// NTFS refuses to rename a folder while a file under it is open, even one opened with every
+/// sharing right and locked as cargo locks a profile's `.cargo-lock`: the premise that keeps a
+/// whole removal on Windows from staging a profile whose locks the pass holds. Once the handle
+/// closes, the same rename goes. A folder mounted on a volume is never renamed either.
+///
+/// Negative control: the rename after the handle closed succeeds, so the refusal is the open
+/// handle's.
+#[test]
+fn renameat_of_a_folder_with_a_file_open_under_it_is_refused() {
+    use aterm_dirfd::RenameFlags;
+    let tmp = scratch();
+    let root = canon(tmp.path());
+    let profile = root.join("debug");
+    std::fs::create_dir_all(profile.join("deps")).expect("debug/deps");
+    write(&profile.join(".cargo-lock"), "");
+    write(&profile.join("deps").join("lay.rlib"), "rlib");
+    let pinned = aterm_dirfd::pin(&root).expect("pinned");
+    aterm_dirfd::mkdirat(&pinned, "stage", Mode::RWXU).expect("made");
+    let stage = aterm_dirfd::openat(&pinned, "stage", dir_flags(), Mode::empty()).expect("stage");
+    let id = listed_id(&pinned, "debug");
+
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(profile.join(".cargo-lock"))
+        .expect("the lock");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test's build: released by unlock before its handle closes"
+    )]
+    let taken = lock.try_lock();
+    taken.expect("uncontended");
+    let refused = aterm_dirfd::renameat_judged(
+        &pinned,
+        "debug",
+        &stage,
+        "debug",
+        RenameFlags::NOREPLACE,
+        id,
+    )
+    .expect_err("a file open under it keeps the folder where it is");
+    assert!(
+        [Errno::ACCESS_DENIED, Errno::SHARING_VIOLATION].contains(&refused),
+        "{refused:?}"
+    );
+    assert_eq!(read(&profile.join("deps").join("lay.rlib")), "rlib");
+    assert!(gone(&root.join("stage").join("debug")));
+    let _ = lock.unlock();
+    drop(lock);
+
+    aterm_dirfd::renameat_judged(
+        &pinned,
+        "debug",
+        &stage,
+        "debug",
+        RenameFlags::NOREPLACE,
+        id,
+    )
+    .expect("let go, it moves");
+    assert!(gone(&profile));
+    assert_eq!(
+        read(
+            &root
+                .join("stage")
+                .join("debug")
+                .join("deps")
+                .join("lay.rlib")
+        ),
+        "rlib"
+    );
+
+    let mounted = root.join("mounted");
+    mount_point::make(&mounted, mount_point::NO_VOLUME);
+    let id = listed_id(&pinned, "mounted");
+    assert_eq!(
+        aterm_dirfd::renameat_judged(
+            &pinned,
+            "mounted",
+            &stage,
+            "mounted",
+            RenameFlags::NOREPLACE,
+            id
+        ),
+        Err(Errno::MOUNT_POINT)
+    );
+    assert!(std::fs::symlink_metadata(&mounted).is_ok());
 }

@@ -37,19 +37,26 @@ use strip::StripStore;
 #[path = "vitals_assessment.rs"]
 mod assessment;
 
+#[path = "vitals_boot_capture.rs"]
+pub(crate) mod boot_capture;
+
+#[path = "vitals_boot_cost.rs"]
+pub(crate) mod boot_cost;
+
 #[path = "vitals_ownership.rs"]
 mod ownership;
 
 #[path = "vitals_self_cpu.rs"]
 mod self_cpu;
 
-/// A reading a second while a focused window shows the Deck and neither rests nor has gone
-/// unattended, and while aterm has a focused window and a Tab Control or Allocation page on
-/// screen ([`Audience::Shown`]; an open stats lens reads on its own cadence either way).
+/// A reading a second while the bars are in view, aterm has a focused window, and either the
+/// focused window or another window on screen neither rests nor has gone unattended
+/// ([`attends_readings`]) or a Tab Control or Allocation page is on screen
+/// ([`Audience::Shown`]; an open stats lens reads on its own cadence either way).
 pub(crate) const FOCUSED_PERIOD: Duration = Duration::from_secs(1);
-/// One every five seconds while the bars are in view and aterm is in the background, or its
-/// focused window rests or nobody has touched it for [`crate::window_rest::ATTENTION`], with no
-/// such page on screen ([`Audience::Background`]).
+/// One every five seconds while the bars are in view and aterm is in the background, or the
+/// focused window and every other window on screen rest or have gone untouched for
+/// [`crate::window_rest::ATTENTION`], with no such page on screen ([`Audience::Background`]).
 pub(crate) const BACKGROUND_PERIOD: Duration = Duration::from_secs(5);
 /// The machine counters every ten seconds while every window that draws the bars is hidden.
 pub(crate) const HIDDEN_PERIOD: Duration = Duration::from_secs(10);
@@ -377,6 +384,15 @@ impl Audience {
             Self::Background => Some((BACKGROUND_PERIOD, false)),
         }
     }
+}
+
+/// Whether window `ws` gives the readings a person's audience while aterm has a focused window
+/// (`App::vitals_audience`): it neither rests nor is unattended ([`crate::window_rest::Rest`]),
+/// and it is focused, focused by the event at hand (`focusing`), or not occluded. So a person
+/// who scrolls or points at a window beside the focused one keeps the focused cadence after the
+/// focused window's attention lapsed.
+pub(crate) fn attends_readings(ws: &crate::WindowState, focusing: bool) -> bool {
+    (focusing || ws.focused || !ws.occluded) && !ws.rest.resting() && ws.rest.attended()
 }
 
 /// When the next reading at cadence `period` is due at `now`, `wall_ms` on the wall clock: at
@@ -824,6 +840,7 @@ pub(crate) enum Msg {
     Facts(Box<Request>),
     Pull,
     AssessmentReady,
+    BootReady,
     CpuPolicy(aterm_vitals::sys::json::Jv),
     Name(Box<crate::sys_naming::Request>),
     /// The host's tellings at once, as the next request would carry them ([`Request::left_told`]).
@@ -1389,6 +1406,10 @@ trait Source: Sized {
         true
     }
     fn install_assessment_wake(&mut self, _wake: std::sync::Weak<SyncSender<Msg>>) {}
+    /// A remaining boot target; no deadline once both observations are recorded.
+    fn boot_after(&mut self) -> Option<Duration> {
+        None
+    }
     fn assessment_work(&self) -> assessment::Work {
         assessment::Work::None
     }
@@ -1518,7 +1539,16 @@ impl Source for Reader {
     }
 
     fn install_assessment_wake(&mut self, wake: std::sync::Weak<SyncSender<Msg>>) {
+        let boot_wake = wake.clone();
+        self.boot.set_wake(Arc::new(move || {
+            if let Some(tx) = boot_wake.upgrade() {
+                let _ = tx.try_send(Msg::BootReady);
+            }
+        }));
         self.assessment.install_wake(wake);
+    }
+    fn boot_after(&mut self) -> Option<Duration> {
+        self.boot.after()
     }
     fn assessment_work(&self) -> assessment::Work {
         self.assessment.work()
@@ -1581,6 +1611,7 @@ impl Asked {
             }
             Msg::Pull => self.pull = true,
             Msg::AssessmentReady => self.assessment_ready = true,
+            Msg::BootReady => {}
             Msg::CpuPolicy(report) => {
                 self.cpu_policy = Some(report);
                 self.read = true;
@@ -1733,9 +1764,25 @@ fn run(
     let no_machine = Machine::default();
     let mut req = Request::default();
     let mut last_whole: Option<Instant> = None;
-    while let Ok(first) = rx.recv() {
+    loop {
+        // Initial layout facts precede the first scheduled capture. Completion notices wake
+        // this worker after restore; no polling timer or UI event is needed for persistence.
+        let first = match (req.self_pid != 0).then(|| source.boot_after()).flatten() {
+            Some(after) => match rx.recv_timeout(after) {
+                Ok(message) => Some(message),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            },
+            None => match rx.recv() {
+                Ok(message) => Some(message),
+                Err(_) => break,
+            },
+        };
+        let checkpoint = first.is_none();
         let mut asked = Asked::default();
-        asked.take(first, &mut req);
+        if let Some(first) = first {
+            asked.take(first, &mut req);
+        }
         while let Ok(more) = rx.try_recv() {
             asked.take(more, &mut req);
         }
@@ -1761,7 +1808,7 @@ fn run(
         {
             sys.set_facts(req.layout.clone());
         }
-        if !(asked.read || asked.pull) {
+        if !(asked.read || asked.pull || checkpoint) {
             continue;
         }
         if req.self_pid == 0 {
@@ -1772,6 +1819,11 @@ fn run(
         req.assessment_only = assessment_only;
         let mut snap = if asked.pull {
             pull(&mut source, &mut req, last_whole, !asked.names.is_empty())
+        } else if checkpoint {
+            let mut checkpoint_req = req.clone();
+            checkpoint_req.machine_only = false;
+            checkpoint_req.assessment_only = false;
+            source.reading(&checkpoint_req)
         } else {
             source.reading(&req)
         };
@@ -1852,7 +1904,11 @@ fn run(
                 match msg {
                     Msg::Told(told) => req.left_told = told,
                     Msg::Read(r) | Msg::Facts(r) => req.left_told = r.left_told,
-                    Msg::Pull | Msg::AssessmentReady | Msg::CpuPolicy(_) | Msg::Name(_) => {}
+                    Msg::Pull
+                    | Msg::AssessmentReady
+                    | Msg::BootReady
+                    | Msg::CpuPolicy(_)
+                    | Msg::Name(_) => {}
                 }
             }
             break;
@@ -3225,6 +3281,7 @@ impl WhyFixture {
 
 /// The readers and the model: one per thread.
 pub(crate) struct Reader {
+    boot: crate::vitals_host::boot_capture::BootCapture,
     probe: aterm_sysprobe::Probe,
     ownership: ownership::Images,
     hardware: aterm_sysprobe::cpu_hardware::Probe,
@@ -3419,6 +3476,11 @@ impl Reader {
             &SPLIT_ARMED,
         );
         let mut reader = Self {
+            boot: if cfg!(test) || fixture.as_ref().is_some_and(WhyFixture::is_recorded) {
+                crate::vitals_host::boot_capture::BootCapture::inert()
+            } else {
+                crate::vitals_host::boot_capture::BootCapture::native()
+            },
             probe: aterm_sysprobe::Probe::new(),
             ownership: if cfg!(test) {
                 ownership::Images::INERT
@@ -3680,6 +3742,7 @@ impl Reader {
 
     /// Takes one full reading (machine counters, process sweep, split set if due, and jobs pass).
     pub(crate) fn read(&mut self, req: &Request) -> Snapshot {
+        let boot_before = self.boot.begin();
         let reads = req.tab_reads(self.epoch, self.clock);
         self.machine_observed_at = Some(reads.observed_at);
         let now = Instant::now();
@@ -3809,6 +3872,13 @@ impl Reader {
         }
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
         if scene.is_none() {
+            snap.boot_cost = Some(self.boot.finish(
+                &sample,
+                self.vitals.historical_reported(),
+                boot_before,
+            ));
+        }
+        if scene.is_none() {
             crate::resource_jobs::publish_origins(self.vitals.process_origins(), &req.session_ids);
             if sample.procs.is_some() {
                 crate::resource_jobs::native_model_pending(self.vitals.has_pending_native());
@@ -3910,6 +3980,9 @@ impl Reader {
             .filter(|fixture| fixture.is_recorded())
             .map(|fixture| fixture.reading(&sample, false));
         let mut snap = self.vitals.absorb(scene.as_ref().unwrap_or(&sample));
+        if scene.is_none() {
+            snap.boot_cost = Some(self.boot.report());
+        }
         self.set_occupancy_facts(&mut snap);
         snap.place = place;
         let events_before = snap.strip_events.len();
@@ -5739,22 +5812,41 @@ impl crate::App {
         let in_view = page
             || self.deck_in_view()
             || (self.tabs_page_shown() && self.windows.values().any(|ws| !ws.occluded));
-        // The rest and the lapse of a person's attention slow the one shared stream only while no
-        // page reads it ([`crate::window_rest`]): a focused window that rests, or that nobody
-        // has touched within its attention, reads as one in the background unless a page on
-        // screen reads the stream, which keeps the cadence a focused window gives it. An open
-        // stats lens keeps its own cadence either way ([`Audience::cadence`]).
-        let focused = self
-            .windows
-            .values()
-            .any(|ws| ws.focused && (page || (!ws.rest.resting() && ws.rest.attended())));
+        // With a focused window, the rest and a lapsed attention slow the one shared stream only
+        // while no page reads it and no window gives it a person's audience
+        // ([`attends_readings`], [`crate::window_rest`]): aterm in front reads as in the
+        // background once neither its focused window nor any other window on screen is awake
+        // and attended, unless a page on screen reads the stream, which keeps the cadence a
+        // focused window gives it. An open stats lens keeps its own cadence either way
+        // ([`Audience::cadence`]).
+        let front = self.windows.values().any(|ws| ws.focused);
+        let focused =
+            front && (page || self.windows.values().any(|ws| attends_readings(ws, false)));
         Audience::of(in_view, bars && drawing().next().is_some(), focused)
     }
 
-    /// A window woke from rest at `now`, or a person touched it after its attention lapsed:
-    /// while a window shows the bars, the next reading is due at once, or at the focused
-    /// cadence's next half-slot after the last one asked if that is later ([`due_on_phase`]), so
-    /// the deck is live again from the next reading rather than the background cadence's next.
+    /// An event at `now` can have made a window give the readings a person's audience
+    /// ([`attends_readings`]): a wake of an attended window that is focused or on screen
+    /// (`App::stir_rest`, output's wake in `App::admit_content_redraws`), a touch that ended a
+    /// lapse of an awake window that is focused, focused by the event or on screen, or the focus
+    /// coming to an awake, attended window (`App::touch_rest`), or the uncover of an awake,
+    /// attended window (`App::on_occlusion_changed`). Where aterm has a focused window, or
+    /// `focusing` says the event focuses one, that can turn the audience [`Audience::Shown`],
+    /// and the next reading is brought forward ([`Self::vitals_ask_now`]). With no focused
+    /// window the audience stays what it was, and a reading brought forward would be one more
+    /// for nothing.
+    pub(crate) fn vitals_ask_for_attention(&mut self, now: Instant, focusing: bool) {
+        if focusing || self.windows.values().any(|ws| ws.focused) {
+            self.vitals_ask_now(now);
+        }
+    }
+
+    /// An event at `now` can have given the readings a person's audience
+    /// ([`Self::vitals_ask_for_attention`]): while a window in view shows the bars, the next
+    /// reading is due at once, or at the focused cadence's next half-slot after the last one
+    /// asked if that is later ([`due_on_phase`]; a focused period after it where the wall clock
+    /// does not read), so the deck is live again from the next reading rather than the
+    /// background cadence's next.
     pub(crate) fn vitals_ask_now(&mut self, now: Instant) {
         if !self.vitals.windowed {
             return;
@@ -6749,6 +6841,10 @@ mod strip;
 #[cfg(test)]
 #[path = "vitals_host_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "vitals_boot_schedule_tests.rs"]
+mod boot_schedule_tests;
 
 #[cfg(test)]
 #[path = "vitals_host_split_tests.rs"]

@@ -3,6 +3,7 @@
 
 use super::super::tests::Fixture;
 use super::*;
+#[cfg(unix)]
 use aterm_spec::interp::State as ModelState;
 
 fn snapshot(paths: &Paths) -> EntrySnapshot {
@@ -18,6 +19,7 @@ fn named_snapshot(paths: &Paths, name: &str) -> EntrySnapshot {
 
 /// A real healed split with readable current values but a retained keyed
 /// epoch this recipient cannot open. Reuse the vault protocol's split fixture.
+#[cfg(unix)]
 fn incomplete_audience() -> (EntrySnapshot, EntrySnapshot) {
     let _answering = ServersAnswering::set();
     let split = crate::client::remove::tests::keyed_split(false);
@@ -63,6 +65,7 @@ fn log_fixture() -> Fixture {
     fixture
 }
 
+#[cfg(unix)]
 fn legacy_envelope(fixture: &Fixture) {
     let admin = admin_open(&fixture.paths).unwrap();
     let mut state = load_state(&fixture.paths).unwrap();
@@ -83,6 +86,7 @@ fn legacy_envelope(fixture: &Fixture) {
     save_state(&fixture.paths, &state).unwrap();
 }
 
+#[cfg(unix)]
 fn register(snapshot: &EntrySnapshot) -> (&Log, &Register) {
     let Source::Log {
         history,
@@ -96,6 +100,7 @@ fn register(snapshot: &EntrySnapshot) -> (&Log, &Register) {
 
 /// Independently signed sibling writes, admitted and materialized through the
 /// real client. Equal-valued siblings have no value conflict but are concurrent.
+#[cfg(unix)]
 fn concurrent(equal: bool) -> (EntrySnapshot, EntrySnapshot) {
     use crate::commons::bootstrap::Bootstrap;
     use crate::membership_log::EpochAudience;
@@ -155,6 +160,7 @@ fn concurrent(equal: bool) -> (EntrySnapshot, EntrySnapshot) {
     (previous, current)
 }
 
+#[cfg(unix)]
 fn carry() -> (EntrySnapshot, EntrySnapshot) {
     let _answering = ServersAnswering::set();
     let lab =
@@ -169,6 +175,7 @@ fn carry() -> (EntrySnapshot, EntrySnapshot) {
     (previous, current)
 }
 
+#[cfg(unix)]
 fn cross_epoch_round_trip() -> (EntrySnapshot, EntrySnapshot) {
     let _answering = ServersAnswering::set();
     let lab =
@@ -191,6 +198,7 @@ fn cross_epoch_round_trip() -> (EntrySnapshot, EntrySnapshot) {
 
 /// Overlapping host registers can arrive independently through the log even
 /// though a single document correctly refuses to author that overlap.
+#[cfg(unix)]
 fn host_overlap(follow_on: bool) -> (EntrySnapshot, EntrySnapshot) {
     use crate::commons::bootstrap::Bootstrap;
     let _answering = ServersAnswering::set();
@@ -296,6 +304,7 @@ fn host_overlap(follow_on: bool) -> (EntrySnapshot, EntrySnapshot) {
     (previous, current)
 }
 
+#[cfg(unix)]
 fn observations(case: i64) -> (EntrySnapshot, EntrySnapshot) {
     if case == 15 {
         return cross_epoch_round_trip();
@@ -385,6 +394,7 @@ fn observations(case: i64) -> (EntrySnapshot, EntrySnapshot) {
     }
 }
 
+#[cfg(unix)]
 pub(crate) fn transition(state: &ModelState, action: &str) -> ModelState {
     let mut next = state.clone();
     if action == "Case" {
@@ -399,6 +409,7 @@ pub(crate) fn transition(state: &ModelState, action: &str) -> ModelState {
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn semantic_provenance_requires_actual_selection_and_causal_revision() {
     let model = aterm_models_db::entry_provenance_model();

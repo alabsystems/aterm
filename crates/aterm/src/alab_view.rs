@@ -10,8 +10,9 @@
 //! that answer in every custody state, so the lab is served across a restart while the registry
 //! refuses every strict reader (a pending writer succession, ATERM-KI-1109-1), and a held
 //! snapshot is served as it is. A read opens no custody, takes no vault and calls no provider;
-//! each caller reads the snapshots' status files, and the snapshots themselves only once a pass
-//! moved them. No thread looks at the registry on a timer: the materializer
+//! each caller reads the snapshots' status files and this Mac's outbox beside each, and the
+//! snapshots themselves only once a pass moved them or a write of this Mac's own moved what a
+//! read lays over them. No thread looks at the registry on a timer: the materializer
 //! (`aterm_db::file::materialize`) moves the snapshots after the registry grows. With no
 //! snapshot here the source is absent only on an installation that never configured a Commons,
 //! and pending otherwise, so neither naming nor account discovery reads uncertainty as an
@@ -24,10 +25,9 @@
 //!
 //! What no shared file carries is still read from the registry, strictly, as a sign-in's
 //! mailbox always was (§10): the mail metadata (mailboxes, where an address's codes arrive, the
-//! alias links), whose collections hold `Secret` columns (LT-04), and the registry table a
-//! peer's round settled here. It is read when the snapshots' records move, and again 15
-//! seconds after a refusal; a refusal leaves the mail routes empty and the lab unsettled, and
-//! never withholds the lab. Writers stay strict: a receipt decided from the served lab is saved
+//! alias links), whose collections hold `Secret` columns (LT-04). It is read when the snapshots'
+//! records move, and again 15 seconds after a refusal; a refusal leaves the mail routes empty
+//! and never withholds the lab. Writers stay strict: a receipt decided from the served lab is saved
 //! only under the registry's admitted projection, and only where that projection makes the same
 //! lab (`NativeReceiptGuard`). Reveals read the registry as they always did.
 //!
@@ -37,12 +37,6 @@
 //! reads this Mac's registry. Every getter admits current local policy before exposing a held
 //! projection. Unavailable policy hides the projection and blocks automatic fallback without
 //! erasing its history.
-//!
-//! [`round`] records, per registry table, that an authenticated peer reported exactly this Mac's
-//! retained registry operations in a round that completed (`RepairRound::matching_inventory`, the
-//! one gate that admits a witness): `Lab::settled`, which lets migration rename rows. It stays
-//! set for that table: it says this Mac's history is no partial one, which later operations
-//! extend and cannot undo.
 //!
 //! The cached lab carries no `place` rows (`Lab::places` stays empty): no sync, pool or outlook
 //! reads them, so no process decodes the journal window for them; the exports read their own
@@ -57,7 +51,7 @@ use aterm_agent::{
         accounts::{Cli, Vendor},
         alab_roster::{
             self, Lab, LabAccount, LabMailbox, MachineKey, MachineRef, Part, Placements,
-            SourceSnapshot,
+            SourceSnapshot, Standing,
         },
     },
     machine_name::RegistryName,
@@ -134,69 +128,6 @@ fn roster_policy_value(table: &aterm_toml::Value) -> LocalRosterPolicy {
         Some(aterm_toml::Value::Boolean(false)) => LocalRosterPolicy::Disabled,
         Some(_) => LocalRosterPolicy::Unavailable,
     }
-}
-
-/// The private directory recording which registry table's inventory a peer matched.
-fn settled_dir() -> Option<PathBuf> {
-    Some(aterm_types::dirs::state_dir()?.join("alab"))
-}
-
-/// Whether `alab_dir` holds an owner-private `settled` witness for `table`.
-fn settled_in(alab_dir: &Path, table: &[u8; 32]) -> bool {
-    let Ok(bytes) = aterm_uds::private_file::read_private(alab_dir, "settled", 256) else {
-        return false;
-    };
-    let trimmed = bytes.trim_ascii();
-    let mut decoded = [0u8; 32];
-    !trimmed.iter().any(u8::is_ascii_uppercase)
-        && aterm_codec::hex::decode_into(trimmed, &mut decoded)
-        && &decoded == table
-}
-
-/// One completed repair round: where it showed an authenticated peer holding exactly this Mac's
-/// retained registry operations, record that table, once.
-pub(crate) fn round(paths: &Paths, report: &aterm_db::runtime::RepairRound) {
-    if !holds() {
-        return;
-    }
-    let Some(dir) = settled_dir() else {
-        return;
-    };
-    // Only the round's completion gate admits a witness: a cancelled, interrupted, deferred or
-    // failed round, or one whose witness names another peer, table or inventory, settles nothing.
-    let Some(table) = witness_table(
-        report
-            .matching_inventory()
-            .map(|witness| (witness.inventory().count, witness.scope())),
-        |table| settled_in(&dir, table),
-        || Registry::at(paths.clone()).table().ok().flatten(),
-    ) else {
-        return;
-    };
-    let hex = aterm_codec::hex::encode_lower(&table);
-    if aterm_types::fs_restricted::ensure_private_dir(&dir).is_ok() {
-        let _ = aterm_agent::harness::atomic_write::write_atomic_mode(
-            &dir.join("settled"),
-            &hex,
-            Some(0o600),
-        );
-    }
-}
-
-/// The registry table a completed round's witness (`witness`: the operations it counts and its
-/// table's scope) settles: its table where it counts at least one operation, is one of the
-/// registry's generations ([`Registry::is_generation`]), is not `settled` already, and is the
-/// table the registry holds now (`held`, a read of custody and the catalog, made only where all
-/// the rest hold), else none.
-fn witness_table(
-    witness: Option<(usize, aterm_db::table::Scope)>,
-    settled: impl FnOnce(&[u8; 32]) -> bool,
-    held: impl FnOnce() -> Option<[u8; 32]>,
-) -> Option<[u8; 32]> {
-    let (_, scope) =
-        witness.filter(|(count, scope)| *count > 0 && Registry::is_generation(*scope))?;
-    let table = scope.digest();
-    (!settled(&table) && held() == Some(table)).then_some(table)
 }
 
 /// Each mailbox key a login of `ai-mailbox.toml` (`logins`) names, to that login lower-cased:
@@ -298,13 +229,13 @@ pub(crate) fn placements(view: &LabView, places: &Places) -> Placements {
 
 /// `view` as the harness reads it, each address the lab places in a mailbox `logins` names
 /// given that mailbox's login ([`Lab::mailboxes`]).
-pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<String, String>) -> Lab {
+pub(crate) fn harness_lab(view: &LabView, logins: &BTreeMap<String, String>) -> Lab {
     let placed = if logins.is_empty() {
         BTreeMap::new()
     } else {
         view.mailboxes()
     };
-    harness_lab_with_placed(view, &placed, settled, logins)
+    harness_lab_with_placed(view, &placed, logins)
 }
 
 #[cfg_attr(
@@ -318,14 +249,11 @@ pub(crate) fn harness_lab(view: &LabView, settled: bool, logins: &BTreeMap<Strin
 fn harness_lab_with_placed(
     view: &LabView,
     placed: &BTreeMap<String, String>,
-    settled: bool,
     logins: &BTreeMap<String, String>,
 ) -> Lab {
     let mut accounts = Vec::with_capacity(view.accounts.len());
     for account in view.accounts.values() {
-        let (Some(realm), Some(label), Some(email)) =
-            (account.realm.as_deref(), &account.label, &account.login)
-        else {
+        let (Some(realm), Some(email)) = (account.realm.as_deref(), &account.login) else {
             continue;
         };
         let (cli, region) = match realm {
@@ -357,7 +285,13 @@ fn harness_lab_with_placed(
                 region,
                 flow: account.flow.as_deref().and_then(Flow::parse),
             },
-            label: label.clone(),
+            // A roster row is a local key a sync never renames (its login directory, its vault
+            // snapshot, its sessions' `ATERM_ACCOUNT_LABEL`), so a row this Mac adds is named by
+            // the account's reserved slug, `<word>-<16 hex of its key>`, which no other account
+            // ever takes, never by its slug, which moves when the owner relabels it, when it
+            // retires or when a second account derives its handle, and may then name another
+            // account (SF-10 re-keys every row by its account key).
+            label: aterm_db::typed::keys::reserved_slug(realm, &account.pk),
             legacy_label: account.legacy_label.clone(),
             email: email.clone(),
             identity: account.identity.clone(),
@@ -372,7 +306,6 @@ fn harness_lab_with_placed(
             .my_machine()
             .map(|machine| MachineRef::from_registry(machine.pk.clone(), machine.label.clone())),
         machine_name: registry_name(view),
-        settled,
         bound: view
             .bound
             .iter()
@@ -461,9 +394,13 @@ fn look<S>(held: &mut Held<S>, read: Result<Option<Projected<S>>, String>) {
 /// The least time between two reads of the registry's mail metadata after one was refused.
 const RETRY_MAIL: Duration = Duration::from_secs(15);
 
-/// What one shared file's status says of its snapshot: its frontier's fingerprint, its revision
-/// and the last pass's word. Equal marks mean the same snapshot of the same records.
-type Mark = Option<(String, u64, Option<Word>)>;
+/// What a read of one shared file answers from: what its status says of its snapshot (its
+/// frontier's fingerprint, its revision and the last pass's word), and the ids of this Mac's
+/// own writes a read lays over that snapshot or marks on it (queued, held, and published ones
+/// no pass marked seen). Equal marks mean the same snapshot of the same records under the same
+/// writes: a write queued, held, dropped or settled moves no status, and moves what a read
+/// shows.
+type Mark = (Option<(String, u64, Option<Word>)>, Vec<String>);
 
 /// What a held lab was read from: the marks of `ai/accounts`, `ai/links` and `lab/machines`,
 /// and the registry read its mail metadata came from, where one answered.
@@ -483,7 +420,6 @@ const FILES: [&aterm_db::file::Type; 3] = [
 struct Cache<S = Seen> {
     paths: Paths,
     config: PathBuf,
-    settled: Option<PathBuf>,
     held: Mutex<Held<S>>,
     /// Keep an older in-flight read from replacing a newer projection.
     refreshing: Mutex<()>,
@@ -634,19 +570,12 @@ fn decided(lab: &Lab) -> Lab {
 }
 
 impl Cache {
-    /// Whether `table` is the registry table a peer's completed round settled here.
-    fn settled_for(&self, table: &[u8; 32]) -> bool {
-        self.settled
-            .as_ref()
-            .is_some_and(|dir| settled_in(dir, table))
-    }
-
     /// The lab the shared files' `view` and the registry's mail metadata (`mail`, where a read
     /// answered) say: accounts, machines, links and this Mac's binding from the snapshot, and the
-    /// mail routes and the settled witness, which no shared file carries, from the registry.
+    /// mail routes, which no shared file carries, from the registry.
     fn lab_of(&self, view: &LabView, mail: Option<&SourceRead>) -> Lab {
         let Some(source) = mail else {
-            return harness_lab_with_placed(view, &BTreeMap::new(), false, &BTreeMap::new());
+            return harness_lab_with_placed(view, &BTreeMap::new(), &BTreeMap::new());
         };
         let held = lab_mail(source.mailboxes());
         let toml = mailbox_logins(source.addresses(), &mailbox_names(&self.paths));
@@ -656,20 +585,15 @@ impl Cache {
         } else {
             source.view().mailboxes()
         };
-        let mut lab =
-            harness_lab_with_placed(view, &placed, self.settled_for(&source.table()), &logins);
+        let mut lab = harness_lab_with_placed(view, &placed, &logins);
         lab.aliases = source.view().aliases();
         lab
     }
 
     /// The lab as the registry projects it now (`source`): what a receipt's admission compares
     /// the captured lab with.
-    fn lab_for_source(&self, source: &SourceRead) -> Lab {
-        harness_lab(
-            source.view(),
-            self.settled_for(&source.table()),
-            &BTreeMap::new(),
-        )
+    fn lab_for_source(source: &SourceRead) -> Lab {
+        harness_lab(source.view(), &BTreeMap::new())
     }
 
     /// Whether a read of the registry's mail metadata is due though the snapshot did not move:
@@ -710,12 +634,28 @@ impl Cache {
         let root = aterm_db::file::root(&self.paths);
         let files = FILES.map(|file| File::at(&root, &file.file()));
         let marks: [Mark; 3] = files.each_ref().map(|file| {
-            file.state()
-                .map(|state| (state.fingerprint, state.rev, state.word))
+            // The outbox first, as a read takes it: a write that moves after is one more read.
+            let outbox = file.outbox();
+            let own = outbox
+                .waiting()
+                .chain(outbox.held.iter().map(|held| &held.intent))
+                .chain(
+                    outbox
+                        .done
+                        .iter()
+                        .filter(|done| !done.seen && done.op.is_some())
+                        .map(|done| &done.intent),
+                )
+                .map(|intent| intent.id.clone())
+                .collect();
+            let state = file
+                .state()
+                .map(|state| (state.fingerprint, state.rev, state.word));
+            (state, own)
         });
         if marks
             .iter()
-            .flatten()
+            .filter_map(|(state, _)| state.as_ref())
             .any(|(_, _, word)| *word == Some(Word::Off))
         {
             return Err("[commons] keeps the registry's shared files off on this Mac".into());
@@ -727,16 +667,8 @@ impl Cache {
             .projected
             .clone()
             .filter(|held| held.source.files == marks);
-        // A settlement recorded since the lab was read rebuilds it from the same reads.
-        let settled_moved = |held: &Projected<Seen>| {
-            held.source
-                .mail
-                .as_ref()
-                .is_some_and(|mail| self.settled_for(&mail.source().table()) != held.lab.settled)
-        };
         // Nothing moved: the held lab stands, unless its mail metadata is still to be read.
         if let Some(held) = &held
-            && !settled_moved(held)
             && (held.source.mail.is_some() || !self.mail_due())
         {
             return Ok(Some(held.clone()));
@@ -827,7 +759,7 @@ impl alab_roster::SourceGuard for NativeReceiptGuard {
                     || caller.as_ref().ok() != Some(&self.caller_image)
                     || !caller_permitted
                     || !permitted
-                    || decided(&self.cache.lab_for_source(current)) != decided(&self.lab)
+                    || decided(&Cache::lab_for_source(current)) != decided(&self.lab)
                 {
                     return Ok(Err(SyncError::retry(Retry::Changed, "native account source or local policy changed before receipt admission")));
                 }
@@ -972,6 +904,38 @@ impl alab_roster::Source for &'static Cache {
             ),
         }
     }
+
+    fn usable(&self, mailbox: &str, part: Part) -> Result<Standing, &'static str> {
+        if self.snapshot().lab().is_none() {
+            return Err("no lab registry is held here");
+        }
+        // A reveal needs its journal: where that is no private file of this user every reveal
+        // fails, and the look says so. An append that fails on a full volume shows only then.
+        Journal::local()
+            .and_then(|journal| journal.ready())
+            .map_err(|_| "the local reveal journal is unavailable")?;
+        let which = match part {
+            Part::Password => mail::Credential::Password,
+            Part::MailboxPassword => mail::Credential::MailboxPassword,
+            Part::Totp => mail::Credential::Totp,
+        };
+        let ask = mail::Ask {
+            mailbox,
+            which,
+            when_ms: aterm_time::unix_millis().unwrap_or(0),
+        };
+        match mail::usable(
+            &Registry::at(self.paths.clone()),
+            &secret::store(&self.paths),
+            ask,
+        ) {
+            Ok(Ok(mail::Standing::Usable)) => Ok(Standing::Usable),
+            Ok(Ok(mail::Standing::Blank)) => Ok(Standing::Blank),
+            Ok(Ok(mail::Standing::Empty)) => Ok(Standing::Empty),
+            Ok(Err(withheld)) => Err(withheld.words()),
+            Err(_) => Err("the registry's cell or the secret store is unavailable here"),
+        }
+    }
 }
 
 static CACHE: OnceLock<Cache> = OnceLock::new();
@@ -992,7 +956,6 @@ pub(crate) fn install() {
     let cache = CACHE.get_or_init(|| Cache {
         paths: Paths::for_home(&home),
         config,
-        settled: settled_dir(),
         held: Mutex::new(Held {
             projected: None,
             pending: true,

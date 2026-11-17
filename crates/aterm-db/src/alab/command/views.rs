@@ -42,7 +42,7 @@
 //!   coordinates and the token written, and an empty value clears the cell. A phone's number is
 //!   given either way, held to a number's shape, and sealed where the generation holds it so.
 
-use super::{named_row, verbs};
+use super::{account_row, named_row, verbs};
 use crate::{
     Error, Result,
     alab::{
@@ -751,7 +751,8 @@ fn trim_piped_line(bytes: &mut Vec<u8>) {
 /// The row `name` names in `noun`'s collection: its key, or an address (`emails`: the row whose
 /// `addr` says it now, [`registry::AddressIndex`], so a renamed row goes by its new address and
 /// never by the one it was born with), a machine label (`computers`), a phone's label, or an
-/// account's label. A refusal never quotes the address.
+/// account as every account verb names it (`ai-accounts`, [`account_row`]). An email row's
+/// refusal never quotes the address.
 fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
     let collection = noun.collection();
     let projection = view.project(collection);
@@ -794,11 +795,12 @@ fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
             verbs::machine_named(&lab, name)
                 .ok_or_else(|| Error::new("no one machine goes by that name: name it by its key"))
         }
-        Noun::Phones | Noun::AiAccounts => {
-            named_row(collection.name, &projection, name, false, |_, row| {
-                row.get("label").and_then(Value::as_str) == Some(name)
-            })
-        }
+        // An account as every account verb names it: its slug, its key, its provider word and
+        // address, or an address that names one account.
+        Noun::AiAccounts => account_row(view, name, false),
+        Noun::Phones => named_row(collection.name, &projection, name, false, |row| {
+            row.get("label").and_then(Value::as_str) == Some(name)
+        }),
     }
 }
 

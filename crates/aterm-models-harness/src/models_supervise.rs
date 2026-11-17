@@ -3912,7 +3912,16 @@ pub fn supervisor_credits_hold_liveness() -> Liveness {
 /// the longest rung) starts the count over. `NoPingPong` bounds the relaunches between two passes
 /// of a rung and between two turns Fable served (`Works`): five at most, a move, one return on
 /// room left and the move after it, a return at the reset a spent row names and the move after
-/// it. `launch` is what the session's launch names: none (1), Fable (2), or another model (3),
+/// it. A turn Fable served on the account after the move (`FableServes`, a sibling session's
+/// request a Fable model answered, filed as the lift of Fable's limit on the account's record
+/// and dated by the request, never by its later reply, so the request was made while the
+/// bucket had room) is a reset in these terms: it fires only with the bucket lifted (`bucket`
+/// 0), which the bucket stays while the switch stands (it is hit only off the switch), so the
+/// return it makes due (`back` 4) is never one made with the bucket at its limit, and it counts
+/// as a turn Fable served for `NoPingPong`. `Buggy = 3` takes another model's turn for Fable's
+/// (`OtherModelLifts`): the return is made with the bucket at its limit, which
+/// `NoReturnWithoutAReset` forbids, and the relaunch pair it adds breaks `NoPingPong` too.
+/// `launch` is what the session's launch names: none (1), Fable (2), or another model (3),
 /// which is never moved.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -4019,7 +4028,16 @@ pub fn supervisor_model_switch_model() -> Model {
                 named = 1;
                 back = 1;
             }
-            action Return when (on == 1 && jobs == 0 && ((back == 1 && ResetAt <= clock) || back == 2)) {
+            // A turn Fable served on the account after the move: Fable serves again, so the
+            // return is due at once, whatever had timed it, and it is a turn Fable served.
+            action FableServes when (on == 1 && bucket == 0 && back <= 3) {
+                back = 4;
+                flips = 0;
+            }
+            action Return when (
+                on == 1 && jobs == 0 && ((back == 1 && ResetAt <= clock) || back == 2 || back == 4)
+            ) {
+                badret = if back == 4 && bucket == 1 { 1 } else { badret };
                 roomed = if back == 2 { if roomed <= 2 { roomed + 1 } else { roomed } } else { roomed };
                 paced = if back == 2 { 0 } else { paced };
                 on = 0;
@@ -4048,6 +4066,12 @@ pub fn supervisor_model_switch_model() -> Model {
                 Buggy == 2 && on == 1 && back == 0 && named == 0 && jobs == 0 && 1 <= roomed && paced == 0
             ) {
                 back = 2;
+            }
+            // `Buggy = 3`: a turn another model served (or one usage credits carried) taken for
+            // Fable's: the return is made with the bucket at its limit.
+            action OtherModelLifts when (Buggy == 3 && on == 1 && bucket == 1 && back <= 3) {
+                back = 4;
+                flips = 0;
             }
 
             invariant NoReturnWithoutAReset: badret == 0;

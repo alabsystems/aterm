@@ -37,6 +37,46 @@ fn every_view_word_parses_with_its_options() {
 }
 
 #[test]
+fn boot_reads_bounded_saved_aggregates_without_scope_or_instance_escalation() {
+    let query = SysQuery::parse("boot top=3 fresh=0 since=7f3a.2 caller=s-origin --json").unwrap();
+    assert_eq!(query.view, View::Boot);
+    assert_eq!(query.effective_scope(), None);
+    assert!(query.target_rows_only());
+    assert!(query.top_set && query.top == 3 && query.json);
+    assert_eq!(query.fresh_ms, Some(0));
+    assert_eq!(
+        query.since,
+        Some(Cursor {
+            epoch: 0x7f3a,
+            seq: 2
+        })
+    );
+    assert_eq!(query.caller.as_deref(), Some("s-origin"));
+    for option in [
+        "scope=pane",
+        "scope=tab",
+        "scope=window",
+        "scope=request",
+        "scope=aterm",
+        "scope=global",
+        "instances=all",
+        "depth=1",
+        "top=0",
+        "top=65",
+        "pid=1",
+        "report",
+        "boot",
+    ] {
+        assert_eq!(
+            SysQuery::parse(&format!("boot {option}")),
+            Err(USAGE),
+            "{option}"
+        );
+    }
+    assert_eq!(SysQuery::parse("scope=aterm boot"), Err(USAGE));
+}
+
+#[test]
 fn refusals_answer_the_usage_line() {
     for bad in [
         "bogus",

@@ -3201,6 +3201,12 @@ fn emit_pty_census(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
     s.count("pty_kits", kits as u64);
 }
 
+/// Lifetime delivered proxy events from the UI census, excluding control-listener requests.
+/// These counts describe this process's UI events, never machine-wide wakeups.
+pub(crate) fn lifetime_wakes() -> (Vec<(&'static str, u64)>, bool) {
+    wakes::WAKES.lifetime()
+}
+
 pub(crate) fn reset() {
     #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
     crate::restore_measurement::reset();

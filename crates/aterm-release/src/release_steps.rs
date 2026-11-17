@@ -9674,15 +9674,34 @@ impl Backend for Real {
                 "restore a clean release clone and retry",
             )
         })?;
-        if dirty.is_empty() {
-            Ok(())
-        } else {
-            Err(Refusal::new(
+        if !dirty.is_empty() {
+            return Err(Refusal::new(
                 "the release clone is not clean",
                 "commit or remove the listed changes before selecting a candidate",
             )
-            .detail(dirty.into_iter().take(5)))
+            .detail(dirty.into_iter().take(5)));
         }
+        if !self.scratch_logs && self.branch_is_main() {
+            let journal = self.release.join("bump-claim.json");
+            let pending = crate::bump_claim::recorded_at_head(&self.git(), &journal)
+                .map_err(|why| cut_refusal("owned bump custody", &why))?;
+            if pending {
+                // The launcher must reach its candidate's cutter before normal fetch(), but
+                // an exact local bump can make move_to() refuse before that handover. Observe
+                // origin first, then let the canonical custody proof recover only our bump.
+                // This reads no engine, gate, release journal or candidate toolchain.
+                self.prefetch_source()?;
+                let tip = self
+                    .prefetched_origin
+                    .as_ref()
+                    .expect("source prefetch retained its observation")
+                    .main
+                    .clone();
+                crate::bump_claim::recover_for_selection(&self.git(), &journal, &tip)
+                    .map_err(|why| cut_refusal("owned bump recovery", &why))?;
+            }
+        }
+        Ok(())
     }
 
     fn head(&mut self) -> String {
@@ -12812,6 +12831,10 @@ mod public_reads_http_tests;
 #[cfg(test)]
 #[path = "release_steps_engine_tests.rs"]
 mod engine_tests;
+
+#[cfg(test)]
+#[path = "release_steps_recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 #[path = "release_fix_tests.rs"]

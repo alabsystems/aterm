@@ -24,3 +24,4 @@ mod sign;
 mod tarwrite;
 mod toolchain;
 mod tools;
+mod tree;

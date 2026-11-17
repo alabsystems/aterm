@@ -265,6 +265,7 @@ fn index_naming(programs: &[&str]) -> crate::manifest::Index {
             })
             .collect(),
         channels: vec![],
+        trees: Default::default(),
     }
 }
 

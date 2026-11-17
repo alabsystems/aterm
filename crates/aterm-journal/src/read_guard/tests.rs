@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::tests::{Exposed, tempdir};
 use aterm_spec::interp::State;
-use std::{collections::BTreeMap, io::Write, os::unix::fs::PermissionsExt};
+use std::{collections::BTreeMap, io::Write};
 
 thread_local! {
     pub(super) static MUTANT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
@@ -21,7 +22,62 @@ fn replace(guard: &ReadGuard) {
     write_private_durable(&guard.dir, &guard.name, b"").unwrap();
 }
 
-fn snapshot(dir: &Path) -> BTreeMap<String, (u32, Vec<u8>)> {
+/// Who may do what with a name: its mode on Unix (the link's own for an entry, the folder's
+/// for `.`).
+#[cfg(unix)]
+type Access = u32;
+/// On Windows the text of its access list, read through any link, or the read's error code.
+#[cfg(windows)]
+type Access = Result<String, Option<i32>>;
+
+/// What a name holds: its bytes, read through any link. On Windows a read can be refused (a
+/// live writer's mandatory lock, a junction that leads to no folder), and the refusal's code
+/// stands for them: nothing but that writer can change bytes its lock refuses.
+#[cfg(unix)]
+type Bytes = Vec<u8>;
+#[cfg(windows)]
+type Bytes = Result<Vec<u8>, Option<i32>>;
+
+#[cfg(unix)]
+fn access(path: &Path, link: bool) -> Access {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = if link {
+        std::fs::symlink_metadata(path)
+    } else {
+        std::fs::metadata(path)
+    };
+    metadata.unwrap().permissions().mode()
+}
+
+#[cfg(windows)]
+fn access(path: &Path, _link: bool) -> Access {
+    use aterm_uds::acl::{Descriptor, Parts};
+    Descriptor::of_path(path, Parts::DACL)
+        .and_then(|descriptor| descriptor.to_sddl(Parts::DACL))
+        .map_err(|error| error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn bytes(path: &Path) -> Bytes {
+    std::fs::read(path).unwrap()
+}
+
+#[cfg(windows)]
+fn bytes(path: &Path) -> Bytes {
+    std::fs::read(path).map_err(|error| error.raw_os_error())
+}
+
+#[cfg(unix)]
+fn no_bytes() -> Bytes {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn no_bytes() -> Bytes {
+    Ok(Vec::new())
+}
+
+fn snapshot(dir: &Path) -> BTreeMap<String, (Access, Bytes)> {
     if !dir.exists() {
         return BTreeMap::new();
     }
@@ -31,23 +87,11 @@ fn snapshot(dir: &Path) -> BTreeMap<String, (u32, Vec<u8>)> {
             let path = entry.unwrap().path();
             (
                 path.file_name().unwrap().to_str().unwrap().to_owned(),
-                (
-                    std::fs::symlink_metadata(&path)
-                        .unwrap()
-                        .permissions()
-                        .mode(),
-                    std::fs::read(&path).unwrap(),
-                ),
+                (access(&path, true), bytes(&path)),
             )
         })
         .collect();
-    files.insert(
-        ".".into(),
-        (
-            std::fs::metadata(dir).unwrap().permissions().mode(),
-            Vec::new(),
-        ),
-    );
+    files.insert(".".into(), (access(dir, false), no_bytes()));
     files
 }
 
@@ -69,8 +113,29 @@ fn locked(dir: &Path) -> bool {
     }
 }
 
+/// A link at `path` to the file `target`: a symbolic link on Unix; on Windows a junction
+/// (`mklink /J`, which needs no privilege a symbolic link would), a reparse point the guard
+/// must refuse the same way.
+fn link(path: &Path, target: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target.file_name().unwrap(), path).unwrap();
+    #[cfg(windows)]
+    {
+        let status = aterm_uds::spawnfd::command("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(path)
+            .arg(target)
+            .stdin(aterm_uds::spawnfd::Stdio::null())
+            .stdout(aterm_uds::spawnfd::Stdio::null())
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "mklink /J {path:?} {target:?}");
+    }
+}
+
 fn check(scenario: i64, mutant: u8) -> State {
-    let root = aterm_tempfile::tempdir().unwrap();
+    let root = tempdir();
     let dir = root.path().join("journal");
     let mut owner = if scenario == 4 {
         None
@@ -80,17 +145,15 @@ fn check(scenario: i64, mutant: u8) -> State {
     if scenario != 2 {
         drop(owner.take());
     }
+    // What scenarios 6 and 11 open to others, taken back when this returns.
+    let mut _exposed = None;
     match scenario {
         1 => std::fs::remove_file(dir.join("test.lock")).unwrap(),
         5 => {
             std::fs::rename(dir.join("test.lock"), dir.join("link-target")).unwrap();
-            std::os::unix::fs::symlink("link-target", dir.join("test.lock")).unwrap();
+            link(&dir.join("test.lock"), &dir.join("link-target"));
         }
-        6 => std::fs::set_permissions(
-            dir.join("test.lock"),
-            std::fs::Permissions::from_mode(0o644),
-        )
-        .unwrap(),
+        6 => _exposed = Some(Exposed::new(&dir.join("test.lock"))),
         9 => {
             let mut file = OpenOptions::new()
                 .append(true)
@@ -99,7 +162,7 @@ fn check(scenario: i64, mutant: u8) -> State {
             file.write_all(b"unacknowledged tail").unwrap();
         }
         10 => std::fs::hard_link(dir.join("test.lock"), dir.join("another-link")).unwrap(),
-        11 => std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap(),
+        11 => _exposed = Some(Exposed::new(&dir)),
         _ => {}
     }
     let mut before = snapshot(&dir);
@@ -208,7 +271,7 @@ fn retained_read_guard_refines_writer_exclusion_without_source_mutation() {
 
 #[test]
 fn mutable_open_is_not_a_non_mutating_read_guard() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     drop(super::super::tests::open(dir.path()));
     let mut file = OpenOptions::new()
         .append(true)
@@ -218,8 +281,22 @@ fn mutable_open_is_not_a_non_mutating_read_guard() {
     drop(file);
     let before = snapshot(dir.path());
     let guard = ReadGuard::take(dir.path(), "test", Instant::now()).unwrap();
+    #[cfg(unix)]
     assert_eq!(snapshot(dir.path()), before);
+    // On Windows the guard's lock, mandatory there, refuses a read of the lock file's bytes while
+    // it is held (`ERROR_LOCK_VIOLATION`): every other name's bytes, and every access list, the
+    // lock file's included, are compared while it is held, and the lock file's bytes once it
+    // drops.
+    #[cfg(windows)]
+    {
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        let mut held = before.clone();
+        held.get_mut("test.lock").expect("the lock file").1 = Err(Some(ERROR_LOCK_VIOLATION));
+        assert_eq!(snapshot(dir.path()), held);
+    }
     drop(guard);
+    #[cfg(windows)]
+    assert_eq!(snapshot(dir.path()), before);
     drop(super::super::tests::open(dir.path()));
     let mut actual = check(9, 0);
     actual.insert("unchanged", i64::from(snapshot(dir.path()) == before));
@@ -231,7 +308,7 @@ fn mutable_open_is_not_a_non_mutating_read_guard() {
 
 #[test]
 fn replaced_guard_is_refused_without_reacquisition() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     drop(super::super::tests::open(dir.path()));
     let guard = ReadGuard::take(dir.path(), "test", Instant::now()).unwrap();
     replace(&guard);
@@ -242,7 +319,7 @@ fn replaced_guard_is_refused_without_reacquisition() {
 
 #[test]
 fn real_journal_writer_waits_until_the_read_guard_drops() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     drop(super::super::tests::open(dir.path()));
     let guard = ReadGuard::take(dir.path(), "test", Instant::now()).unwrap();
     let blocked = Log::open(
@@ -262,7 +339,7 @@ fn real_journal_writer_waits_until_the_read_guard_drops() {
 
 #[test]
 fn invalid_names_do_not_touch_the_directory() {
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = tempdir();
     let before = snapshot(dir.path());
     for name in ["", ".", "..", "a/b", "name.lock", "🦀"] {
         assert!(ReadGuard::take(dir.path(), name, Instant::now()).is_err());

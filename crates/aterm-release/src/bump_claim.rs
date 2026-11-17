@@ -77,6 +77,65 @@ struct Owned {
     paths: Vec<String>,
 }
 
+fn load(journal: &Path) -> Result<Option<Owned>, String> {
+    let bytes = match crate::durable::read_text(journal) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    aterm_json::from_str(&bytes)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Whether this clone is still at the commit its bump journal names. This is only an
+/// observation hint: [`recover`] must prove the full custody record against fresh origin
+/// before changing anything. Foreign children, absent journals and other heads do not need
+/// an early origin read.
+pub(crate) fn recorded_at_head(git: &dyn GitRunner, journal: &Path) -> Result<bool, String> {
+    let Some(owned) = load(journal)? else {
+        return Ok(false);
+    };
+    Ok(text(git, &["rev-parse", "HEAD"])? == owned.commit)
+}
+
+/// Recover before candidate selection, using freshly observed main as authority but placing
+/// the clone at the bump's parent. The ordinary candidate movement then fast-forwards and
+/// aligns that candidate's submodules. The unpublished bump changes no input of that parent
+/// except its recorded edits, and no unobserved or foreign parent can be discarded.
+pub(crate) fn recover_for_selection(
+    git: &dyn GitRunner,
+    journal: &Path,
+    observed_main: &str,
+) -> Result<(), String> {
+    let Some(owned) = load(journal)? else {
+        return Ok(());
+    };
+    if original_ancestor(git, &owned.parent, observed_main)?
+        && !original_ancestor(git, &owned.commit, observed_main)?
+    {
+        recover(git, journal, &owned.parent, false)?;
+    }
+    Ok(())
+}
+
+fn original_ancestor(git: &dyn GitRunner, before: &str, after: &str) -> Result<bool, String> {
+    if !agh::path::is_sha(before) || !agh::path::is_sha(after) {
+        return Err("owned bump ancestry requires exact commit identities".into());
+    }
+    let out = git
+        .git_original(&["merge-base", "--is-ancestor", before, after])
+        .map_err(|e| e.to_string())?;
+    match out.status {
+        0 => Ok(true),
+        1 => Ok(false),
+        status => Err(format!(
+            "original bump ancestry could not be read (exit {status}): {}",
+            out.stderr_utf8().trim()
+        )),
+    }
+}
+
 fn text(git: &dyn GitRunner, args: &[&str]) -> Result<String, String> {
     git_ok(git, args)
         .map(|out| out.stdout_utf8().trim().to_owned())
@@ -152,12 +211,9 @@ pub(crate) fn recover(
     tip: &str,
     compose: bool,
 ) -> Result<Option<String>, String> {
-    let bytes = match crate::durable::read_text(journal) {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
+    let Some(owned) = load(journal)? else {
+        return Ok(None);
     };
-    let owned: Owned = aterm_json::from_str(&bytes).map_err(|e| e.to_string())?;
     let head = text(git, &["rev-parse", "HEAD"])?;
     if head != owned.commit || head == tip {
         return Ok(None);
@@ -177,7 +233,7 @@ pub(crate) fn recover(
     let disjoint = touched(git, &owned.parent, tip)?
         .iter()
         .all(|p| !owned.paths.contains(p));
-    text(git, &["reset", "--keep", tip])?;
+    text(git, &["reset", "--keep", "--no-recurse-submodules", tip])?;
     if compose && disjoint {
         if let Err(why) = text(git, &["cherry-pick", &owned.commit]) {
             text(git, &["cherry-pick", "--abort"])?;

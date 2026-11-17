@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use super::{ConfigClass, ConfigVerdict, SCREEN_MAX, project_config_names};
+use super::{ConfigAccess, ConfigClass, ConfigVerdict, SCREEN_MAX, project_config_names};
 
 #[derive(Default)]
 struct Filter {
@@ -54,7 +54,7 @@ pub(super) fn project(listed: &[u8]) -> Vec<u8> {
         .unwrap_or_default();
     }
     if listed.is_empty() {
-        return project_config_names(listed, true);
+        return project_config_names(listed, ConfigAccess::Read);
     }
     let Some(entries) = listed.strip_suffix(&[0]) else {
         return refused(ConfigClass::Unknown);
@@ -103,7 +103,7 @@ pub(super) fn project(listed: &[u8]) -> Vec<u8> {
     {
         return refused(ConfigClass::Remote);
     }
-    let ordinary = project_config_names(&names, true);
+    let ordinary = project_config_names(&names, ConfigAccess::Read);
     match aterm_json::from_slice::<ConfigVerdict>(&ordinary) {
         Ok(ConfigVerdict::Allowed { .. }) => {
             aterm_json::to_vec(&ConfigVerdict::Allowed { keys }).unwrap_or_default()

@@ -571,12 +571,24 @@ impl Remote {
         if !agh::path::ref_name_ok(&name) {
             return Err("a release tag must name one exact Git ref".into());
         }
+        self.run(GitRun::check_local(&self.slug, &self.repo))?;
         let Some(oid) = self.get(&name)? else {
             return Ok(None);
         };
-        self.fetch_exact(&oid)?;
+        // A catalog imported this exact raw tag already. Keep the ref observation fresh,
+        // and prove its complete raw closure still resides here before reusing that import.
+        let imported = self
+            .catalog
+            .lock()
+            .map_err(|_| "tag catalog cache lock is poisoned")?
+            .as_ref()
+            .is_some_and(|catalog| catalog.inventory.get(&name) == Some(&oid));
+        if !imported || !self.catalog_present(&BTreeMap::from([(name, oid.clone())])) {
+            self.fetch_exact(&oid)?;
+        }
         let target = self.peel_tag(&oid)?.unwrap_or(oid);
         self.ensure_origin()?;
+        self.run(GitRun::check_local(&self.slug, &self.repo))?;
         Ok(Some(target))
     }
 

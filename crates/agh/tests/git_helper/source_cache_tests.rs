@@ -380,3 +380,158 @@ fn source_and_checkout_scopes_require_exact_refs_and_cannot_mix() {
     assert!(world.fake.seen().is_empty());
     assert!(!world.dirs.grants().exists());
 }
+
+/// RL-30: a repository agh only reads objects from (`repo check-local`, a
+/// `--source-object-cache`) may set a hook path, an ssh command and an fsmonitor
+/// command, as Trust's and Clean's hook installers write them: each is admitted and none
+/// runs, because every git child carries the word that overrides it. A clone agh fetches
+/// into is still refused for the same keys. CONTROL: the host's own git, with no such
+/// words, runs each of the three in that repository.
+#[test]
+fn a_read_only_source_that_sets_a_hook_path_an_ssh_command_and_fsmonitor_is_admitted_and_runs_none()
+{
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let world = World::canonical("helper-source-hook-keys");
+    let root = world.root.path();
+    let bare = crate::git_runner::bare_repo(root, "hooked");
+    let source = root.join("hooked-work");
+    std::fs::write(source.join("file"), b"source bytes\n").unwrap();
+    crate::git_runner::host_git(&source, &["add", "."]);
+    crate::git_runner::host_git(&source, &["commit", "-qm", "two"]);
+    crate::git_runner::host_git(
+        &source,
+        &["push", "-q", bare.to_str().unwrap(), "HEAD:main"],
+    );
+    crate::git_runner::host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+    crate::git_runner::host_git(&bare, &["config", "uploadpack.allowAnySHA1InWant", "true"]);
+    let target = crate::git_runner::host_git(&source, &["rev-parse", "HEAD"]);
+
+    // Each planted command leaves a file named for it in `ran` when it runs.
+    let ran = root.join("ran");
+    std::fs::create_dir(&ran).unwrap();
+    let script = |path: &Path, name: &str| {
+        let body = format!("#!/bin/sh\n: > '{}'\nexit 1\n", ran.join(name).display());
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let hooks = root.join("hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    for hook in [
+        "reference-transaction",
+        "post-checkout",
+        "post-index-change",
+        "pre-auto-gc",
+    ] {
+        script(&hooks.join(hook), hook);
+    }
+    let fsmonitor = root.join("fsmonitor");
+    script(&fsmonitor, "fsmonitor");
+    let ssh = root.join("ssh");
+    script(&ssh, "ssh");
+    for (key, value) in [
+        ("core.hooksPath", &hooks),
+        ("core.fsmonitor", &fsmonitor),
+        ("core.sshCommand", &ssh),
+    ] {
+        crate::git_runner::host_git(
+            &source,
+            &["config", "--local", key, value.to_str().unwrap()],
+        );
+    }
+    let ran_nothing = || std::fs::read_dir(&ran).unwrap().next().is_none();
+
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("alabsystems/aterm", &bare);
+    let exit = common::run_cli(
+        &mut ctx,
+        &[
+            "repo",
+            "check-local",
+            "alabsystems/aterm",
+            source.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(exit, 0, "check-local: {}", captured.stderr_text());
+
+    let receiver = root.join("receiver.git");
+    crate::git_runner::host_git(root, &["init", "-q", "--bare", receiver.to_str().unwrap()]);
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("alabsystems/aterm", &bare);
+    let exit = common::run_cli(
+        &mut ctx,
+        &[
+            "repo",
+            "fetch",
+            "alabsystems/aterm",
+            receiver.to_str().unwrap(),
+            "--ref",
+            &target,
+            "--into",
+            "refs/agh/full-source",
+            "--source-object-cache",
+            source.to_str().unwrap(),
+            "--anonymous",
+        ],
+    );
+    assert_eq!(exit, 0, "source-object-cache: {}", captured.stderr_text());
+    assert_eq!(
+        crate::git_runner::host_git(&receiver, &["rev-parse", "refs/agh/full-source"]),
+        target
+    );
+    assert!(
+        ran_nothing(),
+        "a planted command ran: {:?}",
+        std::fs::read_dir(&ran).unwrap().collect::<Vec<_>>()
+    );
+
+    // A clone agh fetches into is screened as before: the hook path is refused there.
+    let (ctx, captured) = world.ctx(crate::git_runner::git_env());
+    let mut ctx = ctx
+        .with_git_helper(common::helper())
+        .with_git_remote("alabsystems/aterm", &bare);
+    let exit = common::run_cli(
+        &mut ctx,
+        &[
+            "repo",
+            "fetch",
+            "alabsystems/aterm",
+            source.to_str().unwrap(),
+            "--ref",
+            &target,
+            "--into",
+            "refs/agh/fetched",
+            "--anonymous",
+        ],
+    );
+    assert_ne!(exit, 0, "a fetch into the hooked clone was admitted");
+    assert!(
+        captured
+            .stderr_text()
+            .contains("outside agh's transport security policy: core.*"),
+        "{}",
+        captured.stderr_text()
+    );
+    assert!(ran_nothing());
+
+    // The control: the host's git, carrying none of agh's words, runs all three.
+    let control = |args: &[&str]| {
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+        cmd.args(args)
+            .current_dir(&source)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        aterm_uds::deadline::output_until(&mut cmd, std::time::Instant::now() + common::HANG)
+            .unwrap_or_else(|e| panic!("git {args:?}: {e:?}"));
+    };
+    control(&["update-ref", "refs/heads/control", &target]);
+    control(&["status", "--porcelain"]);
+    control(&["ls-remote", "ssh://example.invalid/x"]);
+    for name in ["reference-transaction", "fsmonitor", "ssh"] {
+        assert!(ran.join(name).is_file(), "the control's git ran no {name}");
+    }
+}

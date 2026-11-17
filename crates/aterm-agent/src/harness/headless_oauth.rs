@@ -206,13 +206,20 @@ pub struct MailboxConfig {
 
 /// The registry values one discovery revealed, each `(mailbox key, part)` once: a memo every
 /// clone and routed view shares, never configuration (two are always equal), dropped with the
-/// discovery and zeroized then.
+/// discovery and zeroized then. It also keeps what the discovery learned of a value without
+/// revealing it ([`Revealed::standing`]).
 #[derive(Clone, Default)]
 pub struct Revealed(std::sync::Arc<std::sync::Mutex<RevealedParts>>);
 
-/// Each `(mailbox key, part)` a discovery asked for, and what it revealed (`None`: withheld).
-type RevealedParts =
-    BTreeMap<(String, super::alab_roster::Part), Option<zeroize::Zeroizing<String>>>;
+/// What a discovery asked of each `(mailbox key, part)`.
+#[derive(Default)]
+struct RevealedParts {
+    /// What it revealed (`None`: withheld, or an empty value).
+    values: BTreeMap<(String, super::alab_roster::Part), Option<zeroize::Zeroizing<String>>>,
+    /// What it learned with nothing revealed: whether a reveal would hand a value over, and
+    /// whether that value holds a character other than whitespace.
+    standing: BTreeMap<(String, super::alab_roster::Part), Option<bool>>,
+}
 
 impl PartialEq for Revealed {
     fn eq(&self, _: &Self) -> bool {
@@ -230,7 +237,8 @@ impl Revealed {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.entry((mailbox.to_owned(), part))
+        held.values
+            .entry((mailbox.to_owned(), part))
             .or_insert_with(|| match super::alab_roster::reveal(mailbox, part) {
                 Ok(value) if !value.is_empty() => Some(value),
                 Ok(_) => None,
@@ -241,6 +249,36 @@ impl Revealed {
             })
             .as_ref()
             .map(|value| String::clone(value))
+    }
+
+    /// What [`Self::value`] would answer, with nothing revealed and nothing journalled: `None`
+    /// where it would hand over no value, else whether that value holds a character other than
+    /// whitespace. Read from what this discovery already revealed, else asked of the registry
+    /// once per discovery ([`super::alab_roster::usable`]), which cannot see a reveal whose
+    /// journal append would fail, nor a cell that changes before the reveal.
+    fn standing(&self, mailbox: &str, part: super::alab_roster::Part) -> Option<bool> {
+        use super::alab_roster::Standing;
+        let mut held = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (mailbox.to_owned(), part);
+        if let Some(revealed) = held.values.get(&key) {
+            return revealed
+                .as_ref()
+                .map(|value| Standing::of(value) == Standing::Usable);
+        }
+        *held.standing.entry(key).or_insert_with(|| {
+            match super::alab_roster::usable(mailbox, part) {
+                Ok(Standing::Usable) => Some(true),
+                Ok(Standing::Blank) => Some(false),
+                Ok(Standing::Empty) => None,
+                Err(why) => {
+                    aterm_log::debug!("mailbox credential in the lab registry: {why}");
+                    None
+                }
+            }
+        })
     }
 }
 
@@ -292,6 +330,48 @@ impl MailboxConfig {
             .as_ref()
             .filter(|r| self.routed && self.unready.is_none() && r.holds(part))?;
         self.revealed.value(&registered.mailbox, part)
+    }
+
+    /// What [`Self::password_for`] would answer for `target_email`, with nothing revealed:
+    /// `None` where it would return no password, else whether that password holds a character
+    /// other than whitespace. It walks the same sources in the same order (a route's own value
+    /// then the registry's, or the configuration's, the routed registry's, then the default
+    /// component), asking the registry what its value holds ([`Revealed::standing`]) where
+    /// the getter would reveal it. A caller that only decides whether a sign-in can start
+    /// (`native_mail::plan`) asks this; the sign-in that types the password asks the getter.
+    #[must_use]
+    pub(super) fn password_standing(&self, target_email: Option<&str>) -> Option<bool> {
+        use super::alab_roster::{Part, Standing};
+        let usable = |value: &str| Standing::of(value) == Standing::Usable;
+        if let Some(route) = self.route_for(target_email) {
+            if !route.ready() {
+                return None;
+            }
+            if let Some(own) = route.password.as_deref().filter(|v| !v.is_empty()) {
+                return Some(usable(own));
+            }
+            let registered = route
+                .registry
+                .as_ref()
+                .filter(|r| r.holds(Part::Password))?;
+            return self.revealed.standing(&registered.mailbox, Part::Password);
+        }
+        self.credential_for(&self.passwords, self.password.as_ref(), target_email)
+            .map(|own| usable(&own))
+            .or_else(|| {
+                let registered = self
+                    .registry
+                    .as_ref()
+                    .filter(|r| self.routed && self.unready.is_none() && r.holds(Part::Password))?;
+                self.revealed.standing(&registered.mailbox, Part::Password)
+            })
+            .or_else(|| {
+                super::mailbox_needs::default_component(
+                    self,
+                    aterm_secrets::mailbox_component::Part::Password,
+                )
+                .map(|own| usable(&own))
+            })
     }
 
     /// Whether `target_email`'s sign-in holds `part` here: as the value getters answer, but
@@ -1868,10 +1948,10 @@ fn mailbox_aliases(
         }
     }
     // Where the lab names this Mac it names every label: each account's lab label, and the
-    // legacy label a renamed row's secrets still name (`alab_roster::renames`). No sheet or
-    // fleet file is read then (§0: the sheet is the importer's input alone), nor while the lab
-    // may name this Mac and could not be read yet (`alab_roster::pending`): the rosters above
-    // still name their rows, and a stale sheet's label-to-address map routes nothing.
+    // legacy label a row may still have and its secrets name. No sheet or fleet file is read
+    // then (§0: the sheet is the importer's input alone), nor while the lab may name this Mac
+    // and could not be read yet (`alab_roster::pending`): the rosters above still name their
+    // rows, and a stale sheet's label-to-address map routes nothing.
     let labels = super::alab_roster::mailbox_labels();
     if !super::accounts_sync::sheet_read_here() {
         for (cli, label, email) in labels {
@@ -1949,6 +2029,93 @@ fn discover_mailbox_config_files_raw(
     cfg
 }
 
+/// The files a mailbox configuration discovery under `home`, `store_dir` and `config_path` reads
+/// ([`discover_mailbox_config_sources`]), in the order it reads them in. The vault's entries are
+/// read beside them, from the vault's own files, and the lab registry's mailboxes and labels from
+/// the process's registry.
+struct SourceFiles {
+    /// The store's `mailbox.toml`: the first configuration read, before the vault's two mailbox
+    /// entries.
+    store: Option<PathBuf>,
+    /// The configurations read after those entries, in order: `~/.config/aterm`'s
+    /// `mailbox.toml`, `aterm.toml` and `accounts.toml`, then beside `config_path` its
+    /// `mailbox.toml` and `accounts.toml`, then `config_path` itself.
+    configs: Vec<PathBuf>,
+    /// The Claude Code rosters whose rows alias mailbox labels: `~/.config/aterm`'s and the one
+    /// beside `config_path`.
+    rosters: Vec<PathBuf>,
+    /// The other agents' rosters, in the same two folders.
+    cli_rosters: Vec<(super::accounts::Cli, PathBuf)>,
+    /// The fleet roster in `~/.config/aterm`, read before the vault's.
+    fleet_home: Option<PathBuf>,
+    /// The fleet roster beside `config_path`, read after the vault's.
+    fleet_config: Option<PathBuf>,
+    /// The mail folders taken where no configuration names one: the first of them that is a
+    /// folder, the store's before `~/.config/aterm`'s.
+    default_dirs: Vec<PathBuf>,
+}
+
+impl SourceFiles {
+    fn of(home: Option<&Path>, store_dir: Option<&Path>, config_path: Option<&Path>) -> Self {
+        let config_dir = home.map(|h| h.join(".config/aterm"));
+        let beside = config_path.and_then(Path::parent);
+        let other_rosters = |dir: &Path| {
+            super::accounts::Cli::ALL
+                .into_iter()
+                .filter(|cli| *cli != super::accounts::Cli::Claude)
+                .map(|cli| (cli, dir.join(cli.accounts().roster_file)))
+                .collect::<Vec<_>>()
+        };
+        let mut files = Self {
+            store: store_dir.map(|store| store.join(MAILBOX_TOML_FILE)),
+            configs: Vec::new(),
+            rosters: Vec::new(),
+            cli_rosters: Vec::new(),
+            fleet_home: config_dir
+                .as_ref()
+                .map(|dir| dir.join(super::accounts_sync::FLEET_ROSTER_FILE)),
+            fleet_config: beside.map(|dir| dir.join(super::accounts_sync::FLEET_ROSTER_FILE)),
+            default_dirs: store_dir
+                .map(|store| store.join(DEFAULT_MAILBOX_DIR))
+                .into_iter()
+                .chain(config_dir.as_ref().map(|dir| dir.join(DEFAULT_MAILBOX_DIR)))
+                .collect(),
+        };
+        if let Some(dir) = &config_dir {
+            files.configs.extend([
+                dir.join(MAILBOX_TOML_FILE),
+                dir.join("aterm.toml"),
+                dir.join("accounts.toml"),
+            ]);
+            files.rosters.push(dir.join("accounts.toml"));
+            files.cli_rosters.extend(other_rosters(dir));
+        }
+        if let Some(dir) = beside {
+            files
+                .configs
+                .extend([dir.join(MAILBOX_TOML_FILE), dir.join("accounts.toml")]);
+            files.rosters.push(dir.join("accounts.toml"));
+            files.cli_rosters.extend(other_rosters(dir));
+        }
+        files.configs.extend(config_path.map(Path::to_path_buf));
+        files
+    }
+
+    /// Every path named.
+    // Read only by the unix-only [`mailbox_config_files_with_env`].
+    #[cfg(unix)]
+    fn paths(self) -> impl Iterator<Item = PathBuf> {
+        self.store
+            .into_iter()
+            .chain(self.configs)
+            .chain(self.rosters)
+            .chain(self.cli_rosters.into_iter().map(|(_, path)| path))
+            .chain(self.fleet_home)
+            .chain(self.fleet_config)
+            .chain(self.default_dirs)
+    }
+}
+
 /// Capture source configuration and associations together; callers apply roster aliases
 /// after merging any overrides so conflict checks and aliasing share the same observations.
 fn discover_mailbox_config_sources(
@@ -1962,12 +2129,11 @@ fn discover_mailbox_config_sources(
         File(PathBuf),
         Entry(Option<String>),
     }
+    let files = SourceFiles::of(home, store_dir, config_path);
     let mut cfg = MailboxConfig::default();
-    let mut toml_candidates = Vec::new();
+    let mut toml_candidates: Vec<Candidate> =
+        files.store.iter().cloned().map(Candidate::File).collect();
     let mut vault_fleet = None;
-    if let Some(store) = store_dir {
-        toml_candidates.push(Candidate::File(store.join(MAILBOX_TOML_FILE)));
-    }
     if let Some(h) = home {
         // The vault's two mailbox entries and its fleet roster, from one version of the vault.
         let [routes, mailbox, fleet] = <[_; 3]>::try_from(crate::vault_entry::read_set(
@@ -1984,59 +2150,23 @@ fn discover_mailbox_config_sources(
         });
         toml_candidates.push(Candidate::Entry(routes.text().map(str::to_owned)));
         toml_candidates.push(Candidate::Entry(mailbox.text().map(str::to_owned)));
-        toml_candidates.push(Candidate::File(
-            h.join(".config/aterm").join(MAILBOX_TOML_FILE),
-        ));
-        toml_candidates.push(Candidate::File(h.join(".config/aterm/aterm.toml")));
         vault_fleet = fleet.text().map(str::to_owned);
     }
-    let mut roster_candidates = Vec::new();
-    let mut cli_roster_candidates = Vec::new();
-    let mut fleet_roster_candidates = Vec::new();
-    let fleet_file = |path: PathBuf| {
-        super::accounts::read_bounded(&path, 256 * 1024)
+    toml_candidates.extend(files.configs.iter().cloned().map(Candidate::File));
+    let fleet_file = |path: &PathBuf| {
+        super::accounts::read_bounded(path, 256 * 1024)
             .ok()
             .flatten()
     };
-    if let Some(h) = home {
-        let roster_path = h.join(".config/aterm/accounts.toml");
-        toml_candidates.push(Candidate::File(roster_path.clone()));
-        roster_candidates.push(roster_path);
-        for cli in super::accounts::Cli::ALL {
-            if cli != super::accounts::Cli::Claude {
-                cli_roster_candidates.push((
-                    cli,
-                    h.join(".config/aterm").join(cli.accounts().roster_file),
-                ));
-            }
-        }
-        fleet_roster_candidates.push(fleet_file(
-            h.join(".config/aterm")
-                .join(super::accounts_sync::FLEET_ROSTER_FILE),
-        ));
-        fleet_roster_candidates.push(vault_fleet.take());
-    }
-    if let Some(cfg_file) = config_path {
-        if let Some(parent) = cfg_file.parent() {
-            toml_candidates.push(Candidate::File(parent.join(MAILBOX_TOML_FILE)));
-            let sibling_roster = parent.join("accounts.toml");
-            toml_candidates.push(Candidate::File(sibling_roster.clone()));
-            roster_candidates.push(sibling_roster);
-            for cli in super::accounts::Cli::ALL {
-                if cli != super::accounts::Cli::Claude {
-                    cli_roster_candidates.push((cli, parent.join(cli.accounts().roster_file)));
-                }
-            }
-            fleet_roster_candidates.push(fleet_file(
-                parent.join(super::accounts_sync::FLEET_ROSTER_FILE),
-            ));
-        }
-        toml_candidates.push(Candidate::File(cfg_file.to_path_buf()));
-    }
+    let fleet_roster_candidates = [
+        files.fleet_home.as_ref().and_then(fleet_file),
+        vault_fleet,
+        files.fleet_config.as_ref().and_then(fleet_file),
+    ];
     let aliases = mailbox_aliases(
         home,
-        &roster_candidates,
-        &cli_roster_candidates,
+        &files.rosters,
+        &files.cli_rosters,
         &fleet_roster_candidates,
     );
     cfg.contested_labels = contested_labels(&aliases);
@@ -2068,20 +2198,7 @@ fn discover_mailbox_config_sources(
         merge_vault_mailbox_secrets(h, &mut cfg);
     }
     if cfg.dir.is_none() {
-        if let Some(store) = store_dir {
-            let store_mb = store.join(DEFAULT_MAILBOX_DIR);
-            if store_mb.is_dir() {
-                cfg.dir = Some(store_mb);
-            }
-        }
-        if cfg.dir.is_none()
-            && let Some(h) = home
-        {
-            let config_mb = h.join(".config/aterm").join(DEFAULT_MAILBOX_DIR);
-            if config_mb.is_dir() {
-                cfg.dir = Some(config_mb);
-            }
-        }
+        cfg.dir = files.default_dirs.into_iter().find(|dir| dir.is_dir());
     }
     if cfg.seen_file.is_none() {
         cfg.seen_file = store_dir
@@ -2393,6 +2510,22 @@ pub fn discover_mailbox_config_files(
     cfg.is_configured().then_some(cfg)
 }
 
+/// The trimmed URL a mailbox override `value` gives (`imap://`, `imaps://`, `http://` or
+/// `https://`), `None` where it gives a path or nothing.
+fn override_url(value: &OsStr) -> Option<&str> {
+    value.to_str().map(str::trim).filter(|url| {
+        ["imap://", "imaps://", "http://", "https://"]
+            .iter()
+            .any(|scheme| url.starts_with(scheme))
+    })
+}
+
+/// The path a mailbox override `value` names ([`mailbox_config_from_override`]): a `.toml`
+/// configuration it reads, or a mail folder; `None` where it is empty or a URL.
+fn override_path(value: &OsStr) -> Option<PathBuf> {
+    (!value.is_empty() && override_url(value).is_none()).then(|| PathBuf::from(value))
+}
+
 /// Interpret an explicit mailbox override without changing local path bytes.
 #[must_use]
 pub(super) fn mailbox_config_from_override(
@@ -2404,24 +2537,19 @@ pub(super) fn mailbox_config_from_override(
         contested_labels: contested.clone(),
         ..MailboxConfig::default()
     };
-    if value.is_empty() {
-        return cfg;
-    }
-    if let Some(url) = value.to_str().map(str::trim) {
+    if let Some(url) = override_url(value) {
         if url.starts_with("imap://") || url.starts_with("imaps://") {
             cfg.imap_url = Some(url.to_owned());
-            return cfg;
+        } else if is_webmail_ui_url(url) {
+            cfg.webmail_url = Some(url.to_owned());
+        } else {
+            cfg.http_url = Some(url.to_owned());
         }
-        if url.starts_with("http://") || url.starts_with("https://") {
-            if is_webmail_ui_url(url) {
-                cfg.webmail_url = Some(url.to_owned());
-            } else {
-                cfg.http_url = Some(url.to_owned());
-            }
-            return cfg;
-        }
+        return cfg;
     }
-    let path = PathBuf::from(value);
+    let Some(path) = override_path(value) else {
+        return cfg;
+    };
     if path
         .extension()
         .and_then(OsStr::to_str)
@@ -2446,15 +2574,50 @@ pub fn discover_mailbox_config(
     discover_mailbox_config_with_env(home, store_dir, |name| std::env::var_os(name))
 }
 
+/// The `aterm.toml` under `$XDG_CONFIG_HOME`, as `env` reads it, beside which a discovery reads
+/// configurations too ([`discover_mailbox_config_with_env`]).
+fn xdg_config_of(env: &impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<PathBuf> {
+    env("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(|v| PathBuf::from(v).join("aterm/aterm.toml"))
+}
+
+/// Every file and folder [`discover_mailbox_config_with_env`] may read under `home` and
+/// `store_dir`, `env` read as it reads it: the configuration and roster files
+/// ([`SourceFiles`]: the store's, `~/.config/aterm`'s, those beside `$XDG_CONFIG_HOME`'s
+/// `aterm.toml` and that file), the default mail folders whose presence it checks, the local
+/// `ai-signin.toml` files ([`super::ai_signin::local_ai_signin_files`], on unix), and the path the
+/// mailbox override variable names. Not named, being no files of their own: the vault's entries
+/// (read from the vault's own files), the lab registry's mailboxes and labels, and the
+/// environment; nor a secret file a configuration names by a `*_file` key.
+// Read only by the unix-only `token_steps::mailbox_paths`.
+#[cfg(unix)]
+pub(super) fn mailbox_config_files_with_env(
+    home: Option<&Path>,
+    store_dir: Option<&Path>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<PathBuf> {
+    let config_path = xdg_config_of(&env);
+    let mut files: Vec<PathBuf> = SourceFiles::of(home, store_dir, config_path.as_deref())
+        .paths()
+        .collect();
+    #[cfg(unix)]
+    files.extend(
+        super::ai_signin::local_ai_signin_files(home, store_dir, config_path.as_deref())
+            .into_iter()
+            .flatten(),
+    );
+    files.extend(env(MAILBOX_ENV).as_deref().and_then(override_path));
+    files
+}
+
 /// [`discover_mailbox_config`] reading `env` in place of the process's environment.
 pub(super) fn discover_mailbox_config_with_env(
     home: Option<&Path>,
     store_dir: Option<&Path>,
     env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<MailboxConfig> {
-    let xdg_config = env("XDG_CONFIG_HOME")
-        .filter(|v| !v.is_empty())
-        .map(|v| PathBuf::from(v).join("aterm/aterm.toml"));
+    let xdg_config = xdg_config_of(&env);
     let (files, aliases) = discover_mailbox_config_sources(home, store_dir, xdg_config.as_deref());
     let mut cfg = MailboxConfig::default();
 

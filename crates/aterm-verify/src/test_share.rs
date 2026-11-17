@@ -44,7 +44,7 @@
 //! cover, so the stacks its binaries boot rise and fall with the binaries it runs.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,10 @@ pub(crate) struct Asker {
     pub(crate) ancestors: Vec<u32>,
     /// The rank its binaries claim at.
     pub(crate) rank: Rank,
+    /// Whether its binaries' claims are a person's ([`aterm_capacity::Need::person`]): as the
+    /// ledger marks a claim on the same machine, then its place's mark ([`Live::placed`]), which
+    /// each binary entered at the place takes.
+    pub(crate) person: bool,
     /// The dispatch's stamp, unix ms: a waiter that arrived later is behind it. When the
     /// dispatch began, then its place in the ledger's queue ([`Live::placed`]).
     pub(crate) since_ms: u64,
@@ -101,8 +105,15 @@ impl Asker {
                 .map(|procs| procs.ancestors(pid))
                 .unwrap_or_default(),
             rank,
+            person: rank == Rank::Ordinary && machine.person(),
             since_ms: unix_ms(),
         }
+    }
+
+    /// Its priority among the ledger's waiters, as its binaries' claims stand
+    /// ([`aterm_capacity::Need::priority`]).
+    const fn priority(&self) -> (Rank, bool) {
+        (self.rank, !self.person)
     }
 }
 
@@ -143,7 +154,9 @@ impl Others {
                     others.in_load +=
                         f64::from(held.cores) * (1.0 - (-age.as_secs_f64() / tau).exp());
                 }
-                None if (r.need.rank, r.order()) < (asker.rank, (asker.since_ms, asker.pid, 0)) => {
+                None if (r.need.priority(), r.order())
+                    < (asker.priority(), (asker.since_ms, asker.pid, 0)) =>
+                {
                     others.waiting = others.waiting.saturating_add(1);
                     if r.need.mem == 0
                         && r.need.margin == 0
@@ -268,6 +281,8 @@ pub(crate) struct Live {
     state: Mutex<State>,
     /// The dispatch's stamp ([`Asker::since_ms`]), which a look on the ledger reads.
     since: Arc<AtomicU64>,
+    /// The dispatch's mark ([`Asker::person`]), which a look on the ledger reads.
+    person: Arc<AtomicBool>,
 }
 
 impl Live {
@@ -285,18 +300,20 @@ impl Live {
             look,
             slots,
             Arc::new(AtomicU64::new(unix_ms())),
+            Arc::new(AtomicBool::new(false)),
         )
     }
 
     /// A dispatch that asked `asked` cores and whose recording pass was granted `granted`,
     /// looking through `look`, its subprocess pool `slots` held to the share from now on, its
-    /// look reading the dispatch's stamp from `since`.
+    /// look reading the dispatch's stamp from `since` and its mark from `person`.
     fn since(
         asked: u32,
         granted: u32,
         look: Box<dyn Fn() -> Option<Look> + Send + Sync>,
         slots: Option<Slots>,
         since: Arc<AtomicU64>,
+        person: Arc<AtomicBool>,
     ) -> Live {
         let live = Live {
             asked: asked.max(1),
@@ -309,6 +326,7 @@ impl Live {
                 range: None,
             }),
             since,
+            person,
         };
         if let Some(slots) = &live.slots {
             slots.follow(live.granted);
@@ -325,7 +343,8 @@ impl Live {
     ) -> Live {
         let asker = Asker::live(&aterm_capacity::Live, rank);
         let since = Arc::new(AtomicU64::new(asker.since_ms));
-        let placed = Arc::clone(&since);
+        let person = Arc::new(AtomicBool::new(asker.person));
+        let (placed, marked) = (Arc::clone(&since), Arc::clone(&person));
         Live::since(
             asked,
             granted,
@@ -338,6 +357,7 @@ impl Live {
                 let records = ledger.list().ok()?;
                 let asker = Asker {
                     since_ms: placed.load(Ordering::Relaxed),
+                    person: marked.load(Ordering::Relaxed),
                     ..asker.clone()
                 };
                 Some(Look {
@@ -347,15 +367,18 @@ impl Live {
             }),
             slots,
             since,
+            person,
         )
     }
 
-    /// The dispatch's place in the ledger's memory queue is `ms` (unix ms; `None`: it has none
-    /// yet, or none stands): the stamp its share places it by from the next look, so a waiter
-    /// is ahead of the dispatch's cores exactly where it is ahead of its memory.
-    pub(crate) fn placed(&self, ms: Option<u64>) {
-        if let Some(ms) = ms {
+    /// The dispatch's place in the ledger's memory queue is `ms` (unix ms) with the mark `person`
+    /// ([`aterm_capacity::admit::Place::standing`]; `None`: it has none yet, or none stands): the
+    /// stamp and mark its share places it by from the next look, so a waiter is ahead of the
+    /// dispatch's cores exactly where it is ahead of its memory.
+    pub(crate) fn placed(&self, place: Option<(u64, bool)>) {
+        if let Some((ms, person)) = place {
             self.since.store(ms, Ordering::Relaxed);
+            self.person.store(person, Ordering::Relaxed);
         }
     }
 

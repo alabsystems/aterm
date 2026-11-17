@@ -3,6 +3,7 @@
 
 use super::super::tests::Fixture;
 use super::*;
+#[cfg(unix)]
 use aterm_spec::interp::State as ModelState;
 
 pub(super) fn fixture() -> Fixture {
@@ -25,6 +26,7 @@ pub(super) fn update(f: &Fixture, value: &[u8]) {
     });
 }
 
+#[cfg(unix)]
 pub(super) fn envelope_fallback(f: &Fixture) {
     let admin = admin_open(&f.paths).unwrap();
     let mut state = load_state(&f.paths).unwrap();
@@ -44,6 +46,7 @@ pub(super) fn envelope_fallback(f: &Fixture) {
     save_state(&f.paths, &state).unwrap();
 }
 
+#[cfg(unix)]
 pub(crate) fn transition(state: &ModelState, action: &str) -> ModelState {
     let mut next = state.clone();
     if action == "Case" {
@@ -338,6 +341,7 @@ fn entry_claim_authority_checks_are_independent_of_recipient_and_selection() {
     );
 }
 
+#[cfg(unix)]
 pub(super) fn historical_roster_denial_checks() -> (EntryClaimRelation, bool) {
     let _answering = ServersAnswering::set();
     let lab = crate::client::log_entries_tests::two_macs_with(
@@ -437,6 +441,7 @@ pub(super) fn historical_roster_denial_checks() -> (EntryClaimRelation, bool) {
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn durable_entry_claims_verify_the_old_selection() {
     let model = aterm_models_db::entry_claim_model();

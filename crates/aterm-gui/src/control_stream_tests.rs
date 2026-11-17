@@ -55,13 +55,15 @@ fn other() -> Proven {
 }
 
 /// Place a claim on `handle`'s session, bound to connection `conn`: contract 2 is codex-alab's
-/// proven self-claim, 3 and 4 a registered harness's scoped claim of `duties` proven as `proven`.
+/// proven self-claim, 3 and 4 a registered harness's scoped claim of `duties` proven as `proven`,
+/// under the registry row `row`.
 fn place(
     handle: &SessionHandle,
     contract_no: u32,
     duties: &[Duty],
     conn: u64,
     proven: Proven,
+    row: &str,
 ) -> Result<(), String> {
     let now = crate::metrics::now_us();
     if contract_no == 2 {
@@ -77,7 +79,7 @@ fn place(
         )
         .map(drop);
     }
-    let holder = format!("claude-code-alab@{}", proven.pid);
+    let holder = format!("{row}@{}", proven.pid);
     let contract::Words::Scoped(mut claim) =
         contract::read(&holder, &["contract=3", "scope=upgrade"])
     else {
@@ -134,7 +136,9 @@ impl Service {
             .contains(&id)
     }
 
-    /// `claim <sid> <contract> <duty,…|-> [other]`, on the connection that sent it.
+    /// `claim <sid> <contract> <duty,…|-> [other] [<row id>]`, on the connection that sent it:
+    /// `other` proves another claimant, and a row id claims under that registry row and not
+    /// claude-code-alab's.
     fn claim(&self, line: &str) -> String {
         let words: Vec<&str> = line.split(' ').collect();
         let handle = self.handle(words[1]);
@@ -144,14 +148,20 @@ impl Service {
             .filter(|word| *word != "-")
             .map(|word| Duty::from_word(word).expect("a scope word"))
             .collect();
-        let proven = if words.get(4) == Some(&"other") {
+        let rest = words.get(4..).unwrap_or_default();
+        let proven = if rest.contains(&"other") {
             other()
         } else {
             running()
         };
+        let row = rest
+            .iter()
+            .find(|word| **word != "other")
+            .copied()
+            .unwrap_or("claude-code-alab");
         let conn = super::super::serving_connection().expect("serving a connection");
         super::super::note_connection_claim();
-        match place(&handle, contract_no, &duties, conn, proven) {
+        match place(&handle, contract_no, &duties, conn, proven, row) {
             Ok(()) => "OK claim".to_string(),
             Err(refusal) => format!("ERR {}", refusal.trim_end()),
         }
@@ -811,7 +821,15 @@ fn bytes_with_no_newline_do_not_put_off_the_look_at_the_claim() {
 
     // The claim leaves for another connection while the drip goes on.
     let handle = rig.service.handle(ONE);
-    place(&handle, 4, &[Duty::State], u64::MAX - 9, running()).expect("a claim placed elsewhere");
+    place(
+        &handle,
+        4,
+        &[Duty::State],
+        u64::MAX - 9,
+        running(),
+        "claude-code-alab",
+    )
+    .expect("a claim placed elsewhere");
     let deadline = Instant::now() + SETTLE;
     while !rig.service.released(id) {
         assert!(
@@ -1023,11 +1041,27 @@ fn a_seq_gap_or_a_claim_on_another_connection_closes_the_stream() {
     assert_eq!(moved.open(ONE).acked, 6);
     // A renewal in place, on the stream's own connection, changes nothing.
     let handle = rig.service.handle(ONE);
-    place(&handle, 4, &[Duty::State], id, running()).expect("a renewal in place");
+    place(
+        &handle,
+        4,
+        &[Duty::State],
+        id,
+        running(),
+        "claude-code-alab",
+    )
+    .expect("a renewal in place");
     assert_eq!(moved.record(7, goal()), (7, None));
     // The claim placed on another connection: the stream ends at its next look.
     let elsewhere = u64::MAX - 7;
-    place(&handle, 4, &[Duty::State], elsewhere, running()).expect("a claim placed elsewhere");
+    place(
+        &handle,
+        4,
+        &[Duty::State],
+        elsewhere,
+        running(),
+        "claude-code-alab",
+    )
+    .expect("a claim placed elsewhere");
     assert_eq!(moved.line(), "<EOF>");
     rig.ended(id);
     let now = crate::metrics::now_us();

@@ -79,18 +79,21 @@ fn a_capacity_refusal_names_the_mac_whose_aterm_is_short() {
     assert_eq!(source_refusal(larger_crossed, Some(larger_crossed)), None);
 }
 
+#[cfg(unix)]
 const TRUST: Trust = Trust {
     network: [1; 16],
     authority: [2; 32],
     genesis: [3; 32],
 };
 
+#[cfg(unix)]
 fn device(root: &std::path::Path, name: &str) -> Device {
     let paths = client::Paths::for_home(&root.join(name));
     client::machine_identity(&paths).unwrap();
     Device::open(&paths).unwrap().unwrap()
 }
 
+#[cfg(unix)]
 fn ask(desk: &mut Desk, device: &Device, name: &str, from: IpAddr, now: Instant) -> Request {
     let request = device.request(TRUST.network, TRUST.authority).unwrap();
     let node = [7; 32];
@@ -129,6 +132,7 @@ fn ask(desk: &mut Desk, device: &Device, name: &str, from: IpAddr, now: Instant)
 /// member has a home (an IPv4 or IPv4-mapped private address, in place of `home.holds`): the
 /// VM bridge's `192.168.64.3` reads as home. Taking any source while the member has none
 /// (`self.home.is_none_or(…)`): "no home: 192.168.64.3" fails.
+#[cfg(unix)]
 #[test]
 fn only_a_host_on_the_members_home_lan_is_from_the_home_lan() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -160,6 +164,7 @@ fn only_a_host_on_the_members_home_lan_is_from_the_home_lan() {
 
 /// A plain ask, even from this member's home ALab LAN on the pinned ALab vault, is a row that
 /// waits for a person's Allow: nothing lets a Mac in by its asking alone.
+#[cfg(unix)]
 #[test]
 fn a_plain_ask_from_the_home_lan_waits_for_a_person() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -181,6 +186,7 @@ fn a_plain_ask_from_the_home_lan_waits_for_a_person() {
     assert_eq!(rows[0].state, RowState::Asking);
 }
 
+#[cfg(unix)]
 #[test]
 fn confirmed_admission_closes_existing_and_repeated_approval_rows() {
     let root = aterm_tempfile::tempdir().unwrap();

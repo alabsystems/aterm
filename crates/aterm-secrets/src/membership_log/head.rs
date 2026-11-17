@@ -392,6 +392,10 @@ impl<'a> Fields<'a> {
     fn i128(&mut self) -> Option<i128> {
         Some(i128::from_be_bytes(self.array()?))
     }
+    /// A file number: Unix's 8-byte inode, Windows's 16-byte file id ([`fsx::Ino`]).
+    fn ino(&mut self) -> Option<fsx::Ino> {
+        Some(fsx::Ino::from_be_bytes(self.array()?))
+    }
 }
 
 /// The head at `head` beside the records file opened as `file`, which stood as `stamp` when it
@@ -429,7 +433,7 @@ pub(crate) fn open(
     }
     let named = fsx::FileStamp {
         dev: fields.u64()?,
-        ino: fields.u64()?,
+        ino: fields.ino()?,
         len: fields.u64()?,
         mtime_ns: fields.i128()?,
         ctime_ns: fields.i128()?,
@@ -440,6 +444,9 @@ pub(crate) fn open(
         return None;
     }
     let source = Arc::new(Source::new(file.try_clone().ok()?, stamp.len));
+    // A record is read under the format the store reads its file at, as a full open would read
+    // it: a head never holds a record the file's own read would refuse.
+    let reading = store.reading();
     let count = fields.len()?;
     let mut records = Vec::with_capacity(count.min(super::MAX_HELD_RECORDS));
     let mut covered = 0u64;
@@ -453,11 +460,12 @@ pub(crate) fn open(
         }
         covered = covered.checked_add(u64::try_from(len).ok()?)?;
         records.push(match form {
-            WHOLE => Record::vouched(fields.take(len)?).ok()?,
+            WHOLE => Record::vouched(fields.take(len)?, reading).ok()?,
             SHELVED => {
                 let id = fields.array::<32>()?;
                 let frame_len = fields.len()?;
-                Record::shelved(id, len, fields.take(frame_len)?, at, Arc::clone(&source)).ok()?
+                let frame = fields.take(frame_len)?;
+                Record::shelved(id, len, frame, at, Arc::clone(&source), reading).ok()?
             }
             _ => return None,
         });
@@ -484,7 +492,10 @@ pub(crate) fn open(
     let read = store.read_through_head(records, ops, origin)?;
     if named != stamp
         && fsx::stamp_settled(&stamp, began)
-        && file.metadata().ok().map(|meta| fsx::FileStamp::of(&meta)) == Some(stamp)
+        && fsx::meta_of(file)
+            .ok()
+            .map(|meta| fsx::FileStamp::of(&meta))
+            == Some(stamp)
     {
         // The file's bytes under another stamp (a rename of the same bytes over it, a change of
         // its mode), settled before it was hashed and unchanged since: the head names the new
@@ -500,6 +511,9 @@ pub(crate) fn open(
 /// build's rules) reads none of the rest. A `false` only sends the open to a full one; a `true` is
 /// checked again on the bytes the MAC authenticates.
 fn names(reader: &mut fsx::OwnedReader, len: u64, context: [u8; 32], identity: &Identity) -> bool {
+    #[cfg(windows)]
+    use crate::fsx::FileAt as _;
+    #[cfg(unix)]
     use std::os::unix::fs::FileExt as _;
     let mut fixed = [0u8; FIXED_LEN];
     if reader.len() < FIXED_LEN as u64 || reader.file().read_exact_at(&mut fixed, 0).is_err() {
@@ -513,13 +527,13 @@ fn names(reader: &mut fsx::OwnedReader, len: u64, context: [u8; 32], identity: &
         && fields.array::<32>() == Some(identity.recipient().0)
         && fields.array::<32>() == Some(context)
         && fields.u64().is_some()
-        && fields.u64().is_some()
+        && fields.ino().is_some()
         && fields.u64() == Some(len)
 }
 
 /// The bytes before a head's records that [`names`] reads: its magic, recipient, context and the
 /// stamp's device, inode and length.
-const FIXED_LEN: usize = MAGIC.len() + 32 + 32 + 8 + 8 + 8;
+const FIXED_LEN: usize = MAGIC.len() + 32 + 32 + 8 + size_of::<fsx::Ino>() + 8;
 
 /// Write `signed`, a head's bytes before its MAC that the open just checked, again naming
 /// `stamp`, sealed under `identity`. Best effort: a head not written is hashed against the file
@@ -544,10 +558,13 @@ fn restamped(head: &Path, signed: &[u8], stamp: &fsx::FileStamp, identity: &Iden
 }
 
 /// The bytes a stamp takes in a head ([`put_stamp`]).
-const STAMP_LEN: usize = 8 + 8 + 8 + 16 + 16;
+const STAMP_LEN: usize = 8 + size_of::<fsx::Ino>() + 8 + 16 + 16;
 
 /// SHA-256 of the first `len` bytes of `file`, which must hold that many.
 fn file_sha256(file: &std::fs::File, len: u64) -> Option<[u8; 32]> {
+    #[cfg(windows)]
+    use crate::fsx::FileAt as _;
+    #[cfg(unix)]
     use std::os::unix::fs::FileExt as _;
     #[cfg(test)]
     HASHES.with(|hashes| hashes.set(hashes.get() + 1));
@@ -569,8 +586,13 @@ fn file_sha256(file: &std::fs::File, len: u64) -> Option<[u8; 32]> {
 }
 
 impl Record {
-    /// Its bytes before its payload, for a `Put`, `Delete` or `Wrap`: what shelving it keeps.
+    /// Its bytes before its payload, for a `Put`, `Delete` or `Wrap`: what shelving it keeps. A
+    /// version-1 record's payload ends its body, before the signature; a version-2 record's
+    /// ciphertext follows its signature, and a shed one has none to shelve.
     pub(crate) fn frame(&self) -> Option<&[u8]> {
+        if self.is_shed() {
+            return None;
+        }
         let payload = match self.body() {
             super::Body::Put { ciphertext, .. } | super::Body::Delete { ciphertext, .. } => {
                 ciphertext.len()
@@ -578,7 +600,11 @@ impl Record {
             super::Body::Wrap { capsule, .. } => capsule.len(),
             _ => return None,
         };
-        let frame = self.wire_len().checked_sub(payload)?.checked_sub(64)?;
+        let signature = if self.version() == 1 { 64 } else { 0 };
+        let frame = self
+            .wire_len()
+            .checked_sub(payload)?
+            .checked_sub(signature)?;
         match &self.wire {
             payload::Wire::Shelved(shelved) => {
                 (shelved.frame.len() == frame).then_some(&shelved.frame[..])

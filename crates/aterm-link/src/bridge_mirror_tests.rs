@@ -365,6 +365,7 @@ impl World {
                 ids: old.id_counters(),
                 limits: limits(),
                 at,
+                ident: aterm_slog::DescIdent::default(),
             },
         )
         .expect("the successor reads the carry");

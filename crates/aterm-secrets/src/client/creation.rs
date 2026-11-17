@@ -8,6 +8,7 @@
 use super::*;
 use astream_wire::Offset;
 use aterm_journal::{Limits, Log, create_private_dir_durable, write_private_durable};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 const CLAIM: &str = "creation.claim";
@@ -21,13 +22,16 @@ impl Lease {
     fn take(paths: &Paths) -> crate::Result<Self> {
         fsx::ensure_private_dir(&paths.dir)?;
         let path = paths.dir.join("creation.lock");
-        match std::fs::OpenOptions::new()
+        #[cfg(unix)]
+        let created = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(&path)
-        {
+            .open(&path);
+        #[cfg(windows)]
+        let created = fsx::create_private_file_new(&path);
+        match created {
             Ok(file) => {
                 aterm_durable::durable(&file)?;
                 aterm_durable::durable_dir(&paths.dir)?;
@@ -46,7 +50,15 @@ impl Lease {
         file.try_lock()
             .map_err(|_| Error::new("another local vault creation is active"))?;
         let lease = Self(file);
-        if fsx::file_id(&path) != Some((metadata.dev(), metadata.ino())) {
+        #[cfg(unix)]
+        let held = (metadata.dev(), metadata.ino());
+        // Windows's `std::fs::Metadata` names no file id: the lease's handle does.
+        #[cfg(windows)]
+        let held = {
+            let _ = metadata;
+            fsx::id_of(&fsx::meta_of(&lease.0)?)
+        };
+        if fsx::file_id(&path) != Some(held) {
             return Err(Error::new("creation lease changed while acquiring it"));
         }
         Ok(lease)
@@ -685,6 +697,7 @@ fn ensure_absent(source: &Source) -> crate::Result<()> {
         project = "aterm_secrets::client::creation::tests::creation_transition"
     )
 )]
+#[cfg(unix)]
 pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
     let Some(claim) = live(paths)? else {
         return Ok(());
@@ -729,6 +742,7 @@ pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) fn pending_remote(paths: &Paths) -> crate::Result<bool> {
     let Some(claim) = live(paths)? else {
         return Ok(false);
@@ -1034,7 +1048,18 @@ pub(super) fn enroll_founder(
     let scratch = aterm_tempfile::Builder::new()
         .prefix("creation-control-")
         .tempdir_in(&paths.dir)?;
-    let mut journal = Journal::open(scratch.path(), trust)?;
+    #[cfg(unix)]
+    let journal_dir = scratch.path().to_path_buf();
+    // A Windows folder takes the entries its parent hands down, and the journal's writer admits
+    // only a folder of the user's alone: its folder is made private from its creation, inside
+    // the scratch folder, which goes with it.
+    #[cfg(windows)]
+    let journal_dir = {
+        let dir = scratch.path().join("journal");
+        fsx::create_private_dir_new(&dir)?;
+        dir
+    };
+    let mut journal = Journal::open(&journal_dir, trust)?;
     journal.ingest(Node::foundation(trust.authority)?.bytes())?;
     let device =
         Device::open(paths)?.ok_or_else(|| Error::new("founder has no device identity"))?;

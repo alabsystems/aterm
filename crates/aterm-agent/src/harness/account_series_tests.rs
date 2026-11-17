@@ -2462,7 +2462,7 @@ fn since_never_crosses_a_reading_of_another_account() {
     assert!(
         matches!(
             since(Keys::default()).map(|s| s.moved),
-            Some(Moved::ResetUsed(_))
+            Some(Moved::Refilled(_))
         ),
         "a reader that knows no key cannot tell them"
     );

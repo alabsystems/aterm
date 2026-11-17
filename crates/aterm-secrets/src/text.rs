@@ -605,7 +605,7 @@ impl Document {
     }
 
     /// Explicit Commons eligibility without copying the secret entry values.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn commons_audience(&self) -> Option<&Audience> {
         self.model
             .entries

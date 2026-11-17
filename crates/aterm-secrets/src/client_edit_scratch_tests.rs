@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use super::{Paths, Scratch, host_name_hint};
+use super::host_name_hint;
+#[cfg(unix)]
+use super::{Paths, Scratch};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
 #[test]
 fn an_unpublished_edit_and_unclaimed_files_survive_later_edits() {
     let home = aterm_tempfile::tempdir().expect("owned home");
@@ -83,6 +87,7 @@ fn an_unpublished_edit_and_unclaimed_files_survive_later_edits() {
         b"unpublished changes"
     );
 }
+#[cfg(unix)]
 #[test]
 fn a_broadly_readable_completed_draft_is_refused_and_preserved() {
     let home = aterm_tempfile::tempdir().expect("owned home");

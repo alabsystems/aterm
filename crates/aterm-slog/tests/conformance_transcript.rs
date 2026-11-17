@@ -758,7 +758,7 @@ pub fn apply(m: &Model, j: &mut Join, step: Step) -> Result<Option<Vec<&'static 
         }
         Step::Refute | Step::Confirm => {
             let kind = match j.tracker.view(j.now).step {
-                Some((_, ScreenStep::Wall(k), _)) => k,
+                Some((_, ScreenStep::Wall(Some(k)), _)) => k,
                 _ => WallKind::UsageSession,
             };
             let (judge, a) = if step == Step::Refute {

@@ -44,6 +44,7 @@ mod sealed {
     impl LaunchDoor for super::super::codex_login_rotation::LaunchUse {}
     impl LaunchDoor for super::super::codex_rotation::LaunchUse {}
     pub trait WallDoor {}
+    impl WallDoor for super::super::accounts::WallUse {}
     impl WallDoor for super::super::agy_quota_store::WallUse {}
     impl WallDoor for super::super::codex_login_rotation::WallUse {}
     impl WallDoor for super::super::codex_rotation::WallUse {}
@@ -163,7 +164,9 @@ impl Use {
         }
     }
 
-    /// The account held by a running session's screen-wall door.
+    /// The account held by a running session's wall door: agy's and Codex's screen walls, and
+    /// the rung of a Claude Code account's wall ladder its holder claimed
+    /// ([`super::accounts::WallClaim::read_use`]).
     pub(super) fn wall_read_use(wall: impl WallDoor) -> Self {
         Self {
             account: wall.account(),

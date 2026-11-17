@@ -144,6 +144,14 @@ pub struct LivecheckSpec {
     /// data shape (see `PlistBlock`); other blocks stay
     /// `None`.
     pub plist_block: Option<PlistBlock>,
+    /// A `:page_match`-family strategy block reduced to
+    /// a data shape (see `PageShape`); other blocks stay
+    /// `None`.
+    pub page_block: Option<PageBlock>,
+    /// A `:github_releases` strategy block reduced to
+    /// a data shape (see `GhRelBlock`); other blocks
+    /// stay `None`.
+    pub ghrel_block: Option<GhRelBlock>,
     /// `skip` was declared; the string is its optional message.
     pub skip: Option<String>,
     /// `throttle <versions>` / `throttle days: <days>`.
@@ -179,6 +187,9 @@ pub enum JsonShape {
     Dig(Vec<JsonKey>),
     /// `….delete("v")` — value with chars removed.
     DigDelete(Vec<JsonKey>, String),
+    /// `….split("-")&.first` — value up to the first
+    /// separator.
+    DigSplitFirst(Vec<JsonKey>, String),
     /// `….[](regex, 1)` / `….match(regex)` first capture.
     DigRegex(Vec<JsonKey>),
     /// `….map { |item| item["k"] }` (item key `None` =
@@ -255,6 +266,129 @@ pub struct YamlBlock {
     pub shape: YamlShape,
 }
 
+/// A `:page_match`-family strategy block reduced to data:
+/// `page.scan(regex).map { … }` with an enumerable
+/// per-match transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageBlock {
+    pub shape: PageShape,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageShape {
+    /// `match[0].tr("from", "to")` (also written
+    /// `match.first.tr(…)`): Ruby `String#tr` of the
+    /// regex's first capture.
+    ScanTr(String, String),
+    /// `Date.parse(match.first)&.strftime("%Y%m%d")`:
+    /// the capture parsed as a date, rendered basic
+    /// ISO (`YYYYMMDD`).
+    ScanDateYmd,
+    /// `match[0].gsub("from", "to")`: literal
+    /// replace-all (no backslash escapes in either
+    /// argument).
+    ScanGsub(String, String),
+    /// `match.first.sub(/pat/flags, "to")`: first
+    /// regex match replaced by a literal (no
+    /// backreferences — the replacement is
+    /// backslash-free).
+    ScanSub(String, String, String),
+    /// `((v = match.first) == "x") ? nil : v`: the
+    /// named version is dropped (`nil`, compacted
+    /// away by `handle_block_return`).
+    ScanRejectEq(String),
+    /// `match.join(".")`: all captures joined
+    /// (nil renders empty, as Ruby's `join`).
+    ScanJoin(String),
+    /// `match[1] ? "#{match[0]},#{match[1]}" : match[0]`.
+    ScanCsvOpt,
+    /// `match.first.sub(/pat/flags, '\1.\2')`: first
+    /// regex match replaced by a backreference
+    /// template (`\1`..`\9`, `\0` whole, `\\`).
+    ScanSubBackref(String, String, String),
+    /// `match[0].tr(a, b).sub(/pat/flags, '-\1')`:
+    /// the two transforms chained.
+    ScanTrSubBackref(String, String, String, String, String),
+    /// `match[0].scan(/\d{N}/).map(&:to_i).join(sep)`:
+    /// N-digit chunks read as integers, joined.
+    ScanChunks(usize, String),
+    /// Two-stage directory walk: scan version
+    /// directories on the first page, fetch the
+    /// newest directory's page, scan it for files.
+    DirWalk(Box<DirWalk>),
+}
+
+/// A two-stage directory-walk page block reduced
+/// to data (gnu-getopt, texlive, singular).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirWalk {
+    /// Stage-1 scan regex (source, flags); `None` =
+    /// the block's `regex`.
+    pub stage1_regex: Option<(String, String)>,
+    /// `Version.new(v.tr(a, b))` on stage-1 captures.
+    pub stage1_tr: Option<(String, String)>,
+    /// `.reject { |v| v.patch >= N }`.
+    pub reject_patch_ge: Option<u64>,
+    /// Try the last two directories (gnu-getopt)
+    /// instead of only the newest.
+    pub last_two: bool,
+    /// Directory URL template around the (possibly
+    /// `tr`-ed) stage-1 version: pre + version + post,
+    /// joined onto the livecheck URL.
+    pub dir_pre: String,
+    pub dir_tr: Option<(String, String)>,
+    pub dir_post: String,
+    /// Stage-2 scan regex; `None` = the block's.
+    pub stage2_regex: Option<(String, String)>,
+    /// A blank directory page: try the next
+    /// candidate, return stage 1, or return nothing.
+    pub blank: DirBlank,
+    /// An empty stage-2 scan falls back to the
+    /// stage-1 versions (`dir_versions.presence`).
+    pub empty_scan_stage1: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirBlank {
+    NextCandidate,
+    Stage1,
+    Nothing,
+}
+
+/// A `:github_releases` strategy block reduced to
+/// data: per-release guards, the text the regex
+/// captures from, and what the map returns per match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhRelBlock {
+    pub skip_draft: bool,
+    pub skip_prerelease: bool,
+    /// Skip when the release `name` matches this
+    /// regex (source, flags), searched.
+    pub name_skip: Option<(String, String)>,
+    pub source: GhRelSource,
+    pub then: GhRelThen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GhRelSource {
+    /// `release["tag_name"]`
+    TagName,
+    /// Each asset's `browser_download_url`
+    /// (the block flattens).
+    AssetDownloadUrl,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GhRelThen {
+    /// `match[1]`
+    Identity,
+    /// `match[1]&.tr("from", "to")`
+    Tr(String, String),
+    /// `Version.new(match[1])`, skipped when its
+    /// patch token is zero/absent.
+    NonZeroPatch,
+}
+
 /// An `:extract_plist` strategy block reduced to data:
 /// one bundle-identifier lookup of one version property,
 /// optionally with the regex's first capture applied.
@@ -283,6 +417,9 @@ pub enum PlistProp {
 pub enum YamlShape {
     Dig(Vec<JsonKey>),
     DigRegex(Vec<JsonKey>),
+    /// `….split("-")&.first` — value up to the first
+    /// separator.
+    DigSplitFirst(Vec<JsonKey>, String),
 }
 
 /// A livecheck `url` argument.

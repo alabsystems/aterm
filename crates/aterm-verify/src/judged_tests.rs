@@ -1718,6 +1718,12 @@ fn journal_timeout_head_retains_an_already_exhausted_deadline() {
     }
 }
 
+/// A GitHub journal push goes through agh's write runner alone, keeps the refusal's evidence,
+/// never makes an unknown outcome again, and counts only a rejection (exit 9) as a lost race,
+/// whose pause comes before the readback. NEGATIVE CONTROL, run once against a broken copy of
+/// `judged.rs` (restored with cp, then touch), which made this test fail: `push_journal` reading
+/// the journal before `lost()`: `assertion `left == right` failed: only a rejected push is a
+/// lost race` (left: 0, right: 1).
 #[test]
 fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retries() {
     use crate::remote::Tool;
@@ -1771,6 +1777,7 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
             );
             Ok(output(code, b"", b"original push refusal"))
         };
+        let lost = Cell::new(0);
         let result = push_journal(
             dir.path(),
             "origin",
@@ -1778,8 +1785,17 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
             sha,
             &read,
             crate::remote::WriteRunner(&write),
+            &|| {
+                assert_eq!(reads.get(), 0, "a lost race pauses before its readback");
+                lost.set(lost.get() + 1);
+            },
         );
         assert_eq!(pushes.get(), 1);
+        assert_eq!(
+            lost.get(),
+            usize::from(code == 9),
+            "only a rejected push is a lost race"
+        );
         if let Err(why) = &result {
             assert!(why.contains(&format!("journal_ref={REF}")), "{why}");
             assert!(why.contains(&format!("journal_before={parent}")), "{why}");
@@ -1803,6 +1819,82 @@ fn github_journal_push_uses_agh_and_keeps_refusal_evidence_without_unknown_retri
                 assert_eq!(reads.get(), 0, "unknown sends are never retried or raced");
             }
             _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn rejected_journal_push_distinguishes_published_unchanged_and_competing_heads() {
+    use crate::remote::Tool;
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let parent = "1111111111111111111111111111111111111111";
+    let sha = "2222222222222222222222222222222222222222";
+    let rival = "3333333333333333333333333333333333333333";
+    for observed in [Some(sha), Some(parent), Some(rival), None] {
+        let pushes = Cell::new(0);
+        let output = |code: i32, stdout: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: b"controlled rejection".to_vec(),
+        };
+        let read = |tool, args: &[std::ffi::OsString]| {
+            let words: Vec<_> = args.iter().map(|arg| arg.to_str().unwrap()).collect();
+            match (tool, words.as_slice()) {
+                (Tool::Git, ["remote", "get-url", "--all", "origin"])
+                | (Tool::Git, ["remote", "get-url", "--all", "--push", "origin"]) => {
+                    Ok(output(0, b"https://github.com/fixture/repo.git\n"))
+                }
+                (Tool::Agh, ["repo", "refs", "fixture/repo", "--ref", reference]) => {
+                    assert_eq!(*reference, REF);
+                    let rows: Vec<_> = observed
+                        .into_iter()
+                        .map(|oid| aterm_json::json!({"ref":REF,"oid":oid}))
+                        .collect();
+                    Ok(output(0, aterm_json::json!(rows).to_string().as_bytes()))
+                }
+                (Tool::Agh, ["repo", "fetch", "fixture/repo", _, "--objects", input]) => {
+                    let objects: aterm_json::Value =
+                        aterm_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
+                    assert_eq!(objects, aterm_json::json!([observed.unwrap()]));
+                    Ok(output(0, b""))
+                }
+                (Tool::Git, ["cat-file", "-t", oid]) => {
+                    assert_eq!(Some(*oid), observed);
+                    Ok(output(0, b"commit\n"))
+                }
+                _ => panic!("unexpected read: {tool:?} {words:?}"),
+            }
+        };
+        let write = |tool, _: &[std::ffi::OsString]| {
+            assert_eq!(tool, Tool::Agh);
+            pushes.set(pushes.get() + 1);
+            Ok(output(9, b""))
+        };
+        let paused = Cell::new(0);
+        let result = push_journal(
+            dir.path(),
+            "origin",
+            Some(parent),
+            sha,
+            &read,
+            crate::remote::WriteRunner(&write),
+            &|| paused.set(paused.get() + 1),
+        );
+        assert_eq!(pushes.get(), 1);
+        assert_eq!(
+            paused.get(),
+            1,
+            "a rejected push is a lost race, paused once"
+        );
+        match observed {
+            Some(id) if id == sha => assert_eq!(result, Ok(Appended::Holds(sha.to_owned()))),
+            Some(id) if id == parent => {
+                assert!(result.unwrap_err().contains("controlled rejection"));
+            }
+            _ => assert_eq!(result, Ok(Appended::Raced(observed.map(str::to_owned)))),
         }
     }
 }
@@ -1906,7 +1998,10 @@ fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
                 std::slice::from_ref(&mine),
                 NOW,
                 &budget,
-                &mut blob,
+                &mut AppendObjects {
+                    blob: &mut blob,
+                    list: &mut |id| ls_tree(&root, id, budget.deadline()),
+                },
             )
         },
     )
@@ -1926,6 +2021,288 @@ fn a_journal_race_reuses_written_blobs_but_rebuilds_over_the_moved_head() {
         writes.get(),
         2,
         "only different bytes require another write"
+    );
+}
+
+/// A LOST RACE WAITS BEFORE IT READS THE JOURNAL AGAIN, AND EACH RACE'S CEILING DOUBLES: over a
+/// scratch origin, the journal moves before this append's first push, again during that race's
+/// pause, and again once its second attempt has read the head it pushes over. The append makes
+/// three attempts and waits out two pauses: the first between half of [`RACE_PAUSE`] and all of
+/// it, the second between [`RACE_PAUSE`] and twice it; the head it holds keeps every record.
+/// The pause is injected and recorded, never slept.
+///
+/// NEGATIVE CONTROLS, each run once against a broken copy of `judged.rs` (restored with cp,
+/// then touch), which made this test fail:
+/// - `push_journal` reading the journal before `lost()` (the pause after the readback):
+///   `assertion `left == right` failed: the second attempt pushes over the head read after the
+///   pause` (left: 4, right: 3);
+/// - `AppendBudget::lost` not counting the race (every pause a first race's): `the second race's
+///   ceiling doubled: 1.766s`;
+/// - `publish` passing a `lost` that never pauses: `assertion `left == right` failed: the second
+///   attempt pushes over the head read after the pause` (left: 2, right: 3).
+#[test]
+fn a_lost_race_pauses_before_it_reads_the_journal_again() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, NOW, T, T2, record, signer};
+    use std::cell::{Cell, RefCell};
+    use std::time::Duration;
+    let (_tmp, root) = scratch(&["origin"]);
+    let signed = |check, tree| {
+        record(check, Word::Ok, tree, BASE, NOW)
+            .sign(Some(&signer(7)))
+            .unwrap()
+    };
+    let initial = signed(Check::Lint, T);
+    let before_push = signed(Check::Test, T);
+    let in_pause = signed(Check::Cells, T);
+    let after_read = signed(Check::Lint, T2);
+    let mine = signed(Check::Fmt, T);
+    let base = append_land(&root, "origin", &[initial.clone()], NOW, deadline())
+        .unwrap()
+        .unwrap();
+    append_land(&root, "origin", &[before_push.clone()], NOW, deadline()).unwrap();
+    let pauses = RefCell::new(Vec::<Duration>::new());
+    // The head the journal moved to during the first pause: the next attempt reads and lists it.
+    let moved = RefCell::new(None::<String>);
+    let pause = |pause: Duration| {
+        pauses.borrow_mut().push(pause);
+        if pauses.borrow().len() == 1 {
+            *moved.borrow_mut() =
+                append_land(&root, "origin", &[in_pause.clone()], NOW, deadline()).unwrap();
+        }
+    };
+    let budget = AppendBudget::pausing(deadline(), &pause);
+    let mut blob = cached_blobs(|bytes| write_blob(&root, bytes, budget.deadline()));
+    let moved_again = Cell::new(false);
+    let mut list = |id: &str| {
+        if !moved_again.get() && moved.borrow().as_deref() == Some(id) {
+            moved_again.set(true);
+            append_land(&root, "origin", &[after_read.clone()], NOW, deadline()).unwrap();
+        }
+        ls_tree(&root, id, budget.deadline())
+    };
+    let mut objects = AppendObjects {
+        blob: &mut blob,
+        list: &mut list,
+    };
+    let mut attempts = 0;
+    let head = append_land_through(
+        false,
+        || Ok(Some(base.clone())),
+        |parent| {
+            attempts += 1;
+            land_append_with(
+                &root,
+                "origin",
+                parent,
+                std::slice::from_ref(&mine),
+                NOW,
+                &budget,
+                &mut objects,
+            )
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        attempts, 3,
+        "the second attempt pushes over the head read after the pause"
+    );
+    let pauses = pauses.borrow().clone();
+    assert_eq!(pauses.len(), 2, "one pause per lost race: {pauses:?}");
+    assert!(
+        (RACE_PAUSE / 2..=RACE_PAUSE).contains(&pauses[0]),
+        "the first race's pause: {:?}",
+        pauses[0]
+    );
+    assert!(
+        (RACE_PAUSE..=RACE_PAUSE * 2).contains(&pauses[1]),
+        "the second race's ceiling doubled: {:?}",
+        pauses[1]
+    );
+    for record in [&initial, &before_push, &in_pause, &after_read, &mine] {
+        assert_eq!(bytes_at(&root, &head, &record.path), record.bytes);
+    }
+}
+
+/// A lost race's pause ([`race_pause`]) is at least half its ceiling and at most all of it, the
+/// ceiling [`RACE_PAUSE`] doubled each race and held at [`RACE_PAUSE_MAX`], however many races
+/// and whatever the draw: never zero, so a loser never pushes, reads and pushes back to back.
+///
+/// NEGATIVE CONTROL, run once against a broken copy of `judged.rs` (restored with cp, then
+/// touch), which made this test fail: `race_pause` without `.min(RACE_PAUSE_MAX)`: `race 6:
+/// 16s..=32s, drew 32.001s`.
+#[test]
+fn a_lost_race_pauses_at_least_half_a_ceiling_that_doubles_to_its_bound() {
+    use std::time::Duration;
+    for race in [0, 1, 2, 3, 4, 5, 6, 7, 17, 64, u32::MAX] {
+        let ceiling = match race {
+            0 | 1 => RACE_PAUSE,
+            2 => RACE_PAUSE * 2,
+            3 => RACE_PAUSE * 4,
+            4 => RACE_PAUSE * 8,
+            _ => RACE_PAUSE_MAX,
+        };
+        let mut drawn = std::collections::BTreeSet::new();
+        for draw in [0, 1, 999, 1_000, 12_345_678_901, u64::MAX - 1, u64::MAX] {
+            let pause = race_pause(race, draw);
+            assert!(
+                (ceiling / 2..=ceiling).contains(&pause),
+                "race {race}: {:?}..={ceiling:?}, drew {pause:?}",
+                ceiling / 2
+            );
+            drawn.insert(pause);
+        }
+        assert_eq!(race_pause(race, 0), ceiling / 2, "race {race}");
+        assert!(drawn.len() > 1, "race {race}: the draw spreads the pause");
+        assert!(race_pause(race, 0) > Duration::ZERO);
+    }
+}
+
+/// A competing append changes the root and another tree bucket. Read the unchanged target
+/// bucket once, but retain the rival's new bucket when the rejected append is rebuilt.
+#[test]
+fn a_journal_race_reuses_immutable_tree_reads_without_reusing_the_old_parent() {
+    use crate::checks::Check;
+    use crate::land_record::Word;
+    use crate::land_record::tests::{BASE, DAY, NOW, T, T2, record, signer};
+    use std::cell::RefCell;
+    let (_tmp, root) = scratch(&["origin"]);
+    let signed = |check, tree| {
+        record(check, Word::Ok, tree, BASE, NOW)
+            .sign(Some(&signer(7)))
+            .unwrap()
+    };
+    let initial = signed(Check::Lint, T);
+    let rival = signed(Check::Lint, T2);
+    let mine = signed(Check::Fmt, T);
+    let base = append_land(&root, "origin", &[initial.clone()], NOW, deadline())
+        .unwrap()
+        .unwrap();
+    let bucket = rev(&root, &format!("{base}:land/{DAY}/{T}"));
+    let moved = append_land(&root, "origin", &[rival.clone()], NOW, deadline())
+        .unwrap()
+        .unwrap();
+    let budget = AppendBudget::new(deadline());
+    let reads = RefCell::new(std::collections::BTreeMap::<String, usize>::new());
+    let mut list = cached_trees(|id| {
+        *reads.borrow_mut().entry(id.into()).or_default() += 1;
+        ls_tree(&root, id, budget.deadline())
+    });
+    let mut blob = cached_blobs(|bytes| write_blob(&root, bytes, budget.deadline()));
+    let mut objects = AppendObjects {
+        blob: &mut blob,
+        list: &mut list,
+    };
+    let mut attempts = 0;
+    let head = append_land_through(
+        false,
+        || Ok(Some(base.clone())),
+        |parent| {
+            attempts += 1;
+            land_append_with(
+                &root,
+                "origin",
+                parent,
+                std::slice::from_ref(&mine),
+                NOW,
+                &budget,
+                &mut objects,
+            )
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(attempts, 2);
+    for record in [initial, rival, mine] {
+        assert_eq!(bytes_at(&root, &head, &record.path), record.bytes);
+    }
+    let reads = reads.borrow();
+    assert_eq!(
+        reads.get(&bucket),
+        Some(&1),
+        "the same immutable bucket is read once"
+    );
+    assert_eq!(reads.get(&base), Some(&1));
+    assert_eq!(
+        reads.get(&moved),
+        Some(&1),
+        "the new parent is read separately"
+    );
+}
+
+/// A failed read is not a fact about the object, and editing one returned directory must
+/// not change a later read of the same immutable tree.
+#[test]
+fn cached_tree_reads_do_not_keep_errors_or_caller_edits() {
+    let (_tmp, root) = scratch(&[]);
+    git(
+        &root,
+        &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+    )
+    .unwrap();
+    let parent = with_blobs(
+        &root,
+        &rev(&root, "HEAD"),
+        &[("record".into(), b"kept".to_vec())],
+    );
+    let calls = std::cell::Cell::new(0);
+    let mut list = cached_trees(|id| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            return Err("controlled read failure".into());
+        }
+        ls_tree(&root, id, deadline())
+    });
+    assert_eq!(list(&parent), Err("controlled read failure".into()));
+    let mut entries = list(&parent).unwrap();
+    assert!(entries.remove("record").is_some());
+    assert!(list(&parent).unwrap().contains_key("record"));
+    assert_eq!(calls.get(), 2);
+}
+
+/// Once the cache fills, new and oversized listings remain readable without displacing
+/// a cached object or retaining an unbounded stream of distinct journal parents.
+#[test]
+fn tree_cache_capacity_does_not_limit_reads_or_evict_a_cached_tree() {
+    use std::cell::RefCell;
+    let (_tmp, root) = scratch(&[]);
+    git(
+        &root,
+        &["commit", "--quiet", "--allow-empty", "-m", "empty"],
+    )
+    .unwrap();
+    let empty = rev(&root, "HEAD");
+    let first = with_blobs(&root, &empty, &[("a".repeat(128), b"one".to_vec())]);
+    let second = with_blobs(&root, &empty, &[("b".repeat(128), b"two".to_vec())]);
+    let oversized = with_blobs(&root, &empty, &[("c".repeat(1024), b"large".to_vec())]);
+    let reads = RefCell::new(std::collections::BTreeMap::<String, usize>::new());
+    let mut list = cached_trees_with_budget(
+        |id| {
+            *reads.borrow_mut().entry(id.into()).or_default() += 1;
+            ls_tree(&root, id, deadline())
+        },
+        512,
+    );
+    let kept = list(&first).unwrap();
+    for id in [&second, &oversized] {
+        let expected = ls_tree(&root, id, deadline()).unwrap();
+        assert_eq!(list(id).unwrap(), expected);
+        assert_eq!(list(id).unwrap(), expected);
+    }
+    assert_eq!(list(&first).unwrap(), kept);
+    let reads = reads.borrow();
+    assert_eq!(reads.get(&first), Some(&1));
+    assert_eq!(
+        reads.get(&second),
+        Some(&2),
+        "a full cache must not retain another listing"
+    );
+    assert_eq!(
+        reads.get(&oversized),
+        Some(&2),
+        "an oversized listing is never cached"
     );
 }
 

@@ -19,6 +19,7 @@ use super::read::{
     Access, AccountWord, AgentSeen, Answer, Answered, Harness, Latest, Limits, Load, Look,
     MachineSeen, OutSrc, Pressure, Read, State, Tally, Task, TurnFacts, WaitTally, Work, WorkTally,
 };
+use crate::alab::account_names::Names;
 use crate::alab::journal::event::{Event, SIGNIN_ENDED, SIGNIN_IN};
 use crate::alab::journal::seen::{Claimed, Seen, SignedIn};
 use crate::alab::sighted::{Obs, ObsState};
@@ -107,11 +108,11 @@ fn uuid_of(label: &str) -> [u8; 16] {
     uuid
 }
 
-/// One fixture account: its key, its realm, its label and the address its sessions name.
+/// One fixture account: its key, its realm, its slug and the address its sessions name.
 struct Pooled {
     pk: String,
     realm: &'static str,
-    label: String,
+    slug: String,
     address: String,
 }
 
@@ -227,6 +228,49 @@ fn look_of(b: u64, now_ms: u64) -> Look {
     }
 }
 
+/// Each account of `lab`, a view built by hand, named as `alab::account_names` names a registry
+/// row whose label the owner never wrote: its slug from its realm and login address, and its
+/// provider word and address.
+pub fn name_accounts(lab: &mut LabView) {
+    let rows: Vec<keys::Slugged<'_>> = lab
+        .accounts
+        .values()
+        .map(|account| keys::Slugged {
+            pk: &account.pk,
+            realm: account.realm.as_deref().unwrap_or_default(),
+            handle: None,
+            claims_email: account.identity.as_deref().or(account.login.as_deref()),
+            live: account.live,
+        })
+        .collect();
+    let mut slugs = keys::account_slugs(&rows);
+    lab.names = lab
+        .accounts
+        .values()
+        .map(|account| {
+            let email = account.identity.clone().or_else(|| account.login.clone());
+            let names = Names {
+                slug: slugs.remove(&account.pk).unwrap_or_default(),
+                name: account
+                    .realm
+                    .as_deref()
+                    .zip(email.as_deref())
+                    .and_then(|(realm, email)| keys::account_name(realm, email)),
+                email,
+                login: account.login.clone(),
+                live: account.live,
+            };
+            (account.pk.clone(), names)
+        })
+        .collect();
+    for account in lab.accounts.values_mut() {
+        if let Some(names) = lab.names.get(&account.pk) {
+            account.slug.clone_from(&names.slug);
+            account.name.clone_from(&names.name);
+        }
+    }
+}
+
 /// The fixture's inputs as of `now_ms` (Unix milliseconds).
 pub fn inputs(now_ms: u64) -> Inputs {
     let now_s = now_ms / 1_000;
@@ -293,7 +337,6 @@ pub fn inputs(now_ms: u64) -> Inputs {
         let Ok(pk) = keys::account_pk(realm, &address) else {
             continue;
         };
-        let label = keys::default_account_label(realm, &pk).unwrap_or_else(|_| format!("pool-{i}"));
         let status = if spread(i, ACCOUNTS_ACTIVE, ACCOUNTS) {
             read.push(i);
             in_use.push(i);
@@ -315,7 +358,8 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 pk: pk.clone(),
                 provider: keys::provider_of_realm(realm).map(str::to_owned),
                 realm: Some(realm.to_owned()),
-                label: Some(label.clone()),
+                slug: String::new(),
+                name: None,
                 legacy_label: None,
                 login: Some(address.clone()),
                 identity: None,
@@ -337,9 +381,13 @@ pub fn inputs(now_ms: u64) -> Inputs {
         pool.push(Pooled {
             pk,
             realm,
-            label,
+            slug: String::new(),
             address,
         });
+    }
+    name_accounts(&mut lab);
+    for pooled in &mut pool {
+        pooled.slug = lab.slug(&pooled.pk).unwrap_or_default().to_owned();
     }
 
     // Preferences: the accounts with readings, spread over the bound machines.
@@ -589,7 +637,7 @@ pub fn inputs(now_ms: u64) -> Inputs {
                 } else if g % 25 == 7 {
                     AccountWord::new(&format!("stranger{g}@fixture.example"))
                 } else if g % 3 == 0 {
-                    AccountWord::new(&account.label)
+                    AccountWord::new(&account.slug)
                 } else {
                     AccountWord::new(&account.address)
                 },

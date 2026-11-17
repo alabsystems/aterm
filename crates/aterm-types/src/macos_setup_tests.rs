@@ -248,6 +248,9 @@ fn accessibility_is_needed_only_while_a_sign_out_is_managed() {
     assert!(Access::FullDiskAccess.needed_for(selection));
     selection.set(Setting::FaceTime, true);
     assert!(Access::Accessibility.needed_for(selection));
+    assert!(!Access::LocalNetwork.needed_for(selection));
+    assert!(!Access::LocalNetwork.needed_for(Selection::all()));
+    assert!(Access::NetworkHelper.needed_for(selection));
 }
 
 #[test]
@@ -258,7 +261,6 @@ fn init_requires_confirmation_of_network_and_administrator_setup() {
             .filter(|access| access.requires_confirmation())
             .collect::<Vec<_>>(),
         [
-            Access::LocalNetwork,
             Access::NameRule,
             Access::SpotlightScope,
             Access::NetworkAuth,

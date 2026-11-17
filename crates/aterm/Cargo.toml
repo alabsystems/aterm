@@ -99,6 +99,12 @@ aterm-update = { path = "../aterm-update" }
 # atpkg's `<prefix>/status.toml`) and the `[update]` settings.
 aterm-update-core = { path = "../aterm-update-core" }
 aterm-log = { path = "../aterm-log" }    # the log facade (the update verb records to aterm.log)
+# `aterm secrets` — one credentials file for every machine
+# (docs/DESIGN-secrets-2026-10-20.md): the vault's client, its keyless long-poll server and the
+# launchd/systemd services on Unix; on Windows the client alone, owner-only under a protected
+# access list, where a member joins, syncs and reads its entries in place and runs no service
+# (`aterm_secrets::cli`'s Windows verbs). Already in the graph through aterm-agent and aterm-gui.
+aterm-secrets = { workspace = true }
 # `aterm_uds::spawnfd::command` and `spawn::set_gui_image_flags` for the windowed front door's
 # launch. Every live-headless test arms its instance with this crate's lifeline
 # (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its instances with
@@ -122,13 +128,6 @@ aterm-vitals = { workspace = true }
 aterm-capacity = { workspace = true }
 aterm-toolchain = { path = "../aterm-toolchain" }
 aterm-link = { path = "../aterm-link" }
-# `aterm secrets` — one credentials file for every machine
-# (docs/DESIGN-secrets-2026-10-20.md): the vault's client, its keyless
-# long-poll server and the launchd/systemd services. UNIX ONLY: the secrets
-# are kept private by POSIX file modes (0600 files in a 0700 ~/.secrets),
-# which Windows has none of, so there the verb stays on the roster and
-# refuses by name (`secrets_unavailable` in src/main.rs).
-aterm-secrets = { workspace = true }
 # `aterm lan serve | status` (hidden): the root LAN broker the LaunchDaemon runs, and its
 # reader for `aterm doctor` and the lab lane (docs/DESIGN-lan-broker-2026-11-05.md); on macOS
 # also the allowed direct path every aterm process is given at start (§5).
@@ -256,6 +255,11 @@ aterm-stamp = { workspace = true }
 
 [lints]
 workspace = true
+
+# The complete application includes CLI TLS absent from the GUI-only main entry.
+[[test]]
+name = "native_thread_local_template"
+path = "tests/native_thread_local_template.rs"
 
 [[test]]
 name = "aterm_suite"

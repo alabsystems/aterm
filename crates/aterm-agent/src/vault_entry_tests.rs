@@ -15,7 +15,7 @@ fn no_vault_reads_every_entry_absent() {
     assert!(names(root.path()).is_empty());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn a_file_under_the_home_never_stands_for_an_entry() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -31,7 +31,7 @@ fn a_file_under_the_home_never_stands_for_an_entry() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn an_unusable_entry_holds_its_place() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -57,7 +57,7 @@ fn an_unusable_entry_holds_its_place() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn the_digest_moves_with_a_value_and_hides_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -77,7 +77,7 @@ fn the_digest_moves_with_a_value_and_hides_it() {
 
 /// An entry that joins the names a reader watches is a change, not a first read. NEGATIVE
 /// CONTROL: another reader of the same home starts from its own first read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn an_entry_that_joins_the_watched_names_is_a_change() {
     let root = aterm_tempfile::tempdir().unwrap();

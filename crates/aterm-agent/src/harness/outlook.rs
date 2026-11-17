@@ -577,13 +577,22 @@ pub struct Demand {
     pub week_working: Option<i64>,
 }
 
-/// A row's projection of one window: what the replay spends of it by its reset.
+/// A row's projection of one window: what the replay spends of it by its reset. It is a figure
+/// of the window the row was read holding, which the replay knows exactly: never of a week it
+/// cannot read, of a window it opens (a 5-hour window at first use), or of a lean's assumption
+/// about one ([`Pass::proj`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Proj {
     /// Its tenths used at its reset (at most 1000).
     pub at_reset_x10: u32,
-    /// When it fills before its reset, where it does.
+    /// When it filled or fills, where it does: the instant its figure reached full, which is
+    /// before the outlook's instant for a window read full (its reading's) or walled (its wall's
+    /// first sighting); never past [`Self::reset`], and set exactly where
+    /// [`Self::at_reset_x10`] is 1000.
     pub fills_at: Option<i64>,
+    /// The reset it is at: the one read of the window ([`WindowOutlook::reset`]); in a lean's
+    /// best case on a peer's bound ([`Assumed::Peer`]), that bound's end.
+    pub reset: i64,
     /// The pass that made it.
     pub pass: PassKind,
 }
@@ -605,7 +614,10 @@ pub struct WindowOutlook {
     pub at: Option<i64>,
     /// Its class.
     pub fresh: Fresh,
-    /// The replay's projection, where the chain uses it.
+    /// The replay's projection of it, where the chain uses it and knows it exactly, as it was
+    /// read holding it; none of a window the replay opens (a 5-hour window at first use), and
+    /// none where what it holds at its reset turns on a lean ([`Pass::proj`],
+    /// [`Outlook::turns_on`]).
     pub projection: Option<Proj>,
     /// Where it was read.
     pub source: Option<Source>,
@@ -720,8 +732,9 @@ pub struct Read {
     pub x10: u16,
     /// Its window's vendor reset: a new reset is a new window.
     pub reset: i64,
-    /// The used limit reset its window restarted at, where one did: a new epoch is a new window
-    /// too, empty from that instant.
+    /// Its window's refill barrier, where one is held ([`super::accounts::WindowFig::epoch_at`]):
+    /// a limit reset spent, a refill or a raised allowance. A new epoch is a new window too, from
+    /// that instant.
     pub epoch: Option<i64>,
 }
 
@@ -1033,7 +1046,8 @@ pub struct Lean {
     pub at: i64,
     /// The row.
     pub row: String,
-    /// Its class.
+    /// Its class at [`Self::at`]: a week read before a reset that passed by then is
+    /// [`Fresh::ResetUnread`] there, whatever it was read as now (a wall, a bound).
     pub why: Fresh,
     /// It holds nothing.
     pub worst: Pass,
@@ -1085,7 +1099,10 @@ pub struct Pass {
     pub cut_at: Option<i64>,
     /// The events it took.
     pub events: usize,
-    /// Each used row window's projection: its first window's, at its reset.
+    /// Each used row window's projection: of the window it was read holding, at its reset
+    /// (`Sim::capture`). Past a lean only what both of its cases hold (`Sim::fork`): a window
+    /// still filling there has none, since what it holds at its reset turns on the row the
+    /// replay cannot read ([`Outlook::turns_on`]).
     pub proj: BTreeMap<(String, Window), Proj>,
     /// Each row's fill through the pass, up to its horizon (or its fork), oldest first: a knot
     /// wherever it changes course (the carrier's after each step, a reset's drop, a move, the
@@ -1095,18 +1112,6 @@ pub struct Pass {
 }
 
 impl Pass {
-    /// The projections a bar shows: this pass's, and past its lean the worst case's.
-    #[must_use]
-    pub fn projections(&self) -> BTreeMap<(String, Window), Proj> {
-        let mut out = self.proj.clone();
-        if let Some(lean) = &self.lean {
-            for (key, proj) in lean.worst.projections() {
-                out.entry(key).or_insert(proj);
-            }
-        }
-        out
-    }
-
     /// The first reported stop of this pass's own chain (not its lean's).
     #[must_use]
     pub fn first_stop(&self) -> Option<&Stop> {
@@ -1513,17 +1518,7 @@ fn fresh_of(
     let fresh = match cond {
         Condition::NotEnrolled => Fresh::NotEnrolled,
         Condition::SignedOut => Fresh::SignedOut,
-        // A wall walls its own window; a wall that names no window, or another week's (a
-        // model's), walls the week. A 5-hour wall never does: the week keeps its figure.
-        Condition::Limited { .. }
-            if acct.is_some_and(|a| {
-                a.walls.iter().any(|(id, wall)| {
-                    let walls_w = id == w.id()
-                        || (w == Window::Week && id.as_str() != accounts::SESSION_LIMIT);
-                    walls_w && wall.stands_until().is_some_and(|end| now < end)
-                })
-            }) =>
-        {
+        Condition::Limited { .. } if acct.and_then(|a| walled_from(a, w, now)).is_some() => {
             Fresh::Walled
         }
         _ => match seen {
@@ -1550,6 +1545,21 @@ fn fresh_of(
         },
     };
     (fresh, seen)
+}
+
+/// The first sighting of the earliest wall that walls `acct`'s window `w` and stands at `now`,
+/// where one does. A wall walls its own window; a wall that names no window, or another week's (a
+/// model's), walls the week. A 5-hour wall never does: the week keeps its figure.
+fn walled_from(acct: &accounts::Account, w: Window, now: i64) -> Option<i64> {
+    acct.walls
+        .iter()
+        .filter(|(id, wall)| {
+            let walls_w =
+                *id == w.id() || (w == Window::Week && id.as_str() != accounts::SESSION_LIMIT);
+            walls_w && wall.stands_until().is_some_and(|end| now < end)
+        })
+        .map(|(_, wall)| wall.at)
+        .min()
 }
 
 /// The next reset after `now` of a window that reset at `passed`, a whole number of windows on.
@@ -1704,7 +1714,13 @@ struct Win {
     reset: Option<i64>,
     known: Known,
     low_fired: bool,
+    /// When it filled, where it is full: the instant its figure reached full (a reading of it
+    /// full, a wall's first sighting, the advance or the spend that crossed full), never later.
     fills_at: Option<i64>,
+    /// It is the window the row was read holding, to the reset read of it
+    /// ([`WindowOutlook::reset`]): a window the replay opens (at first use, at a reset, or a
+    /// lean's fresh week) is not, and only a held window is projected ([`Sim::capture`]).
+    held: bool,
 }
 
 impl Win {
@@ -1716,6 +1732,19 @@ impl Win {
             known,
             low_fired: false,
             fills_at: None,
+            held: false,
+        }
+    }
+
+    /// The window a figure of `pct_x10` tenths, read at `at` to `reset`, says the row holds
+    /// ([`Self::held`]), in `scale` units, known as `known`: full from `at` where it is full.
+    fn read(pct_x10: u32, scale: i128, reset: i64, at: i64, known: Known) -> Win {
+        Win {
+            acc: i128::from(pct_x10) * scale,
+            reset: Some(reset),
+            fills_at: (i64::from(pct_x10) >= FULL_X10).then_some(at),
+            held: true,
+            ..Win::empty(known)
         }
     }
 }
@@ -1727,8 +1756,10 @@ struct SimRow {
     seen: bool,
     week: Win,
     five: Win,
+    /// Its week's class at the replay's instant: as read, and [`Fresh::ResetUnread`] from the
+    /// reset of a week it read and does not follow ([`Sim::on_resets`]).
     fresh_week: Fresh,
-    /// The read figure a best case counts ([`Known::Lower`]).
+    /// The read figure a best case counts ([`Known::Lower`]), until its window resets.
     read_week: Option<Seen>,
     /// A peer's bound of the week a best case counts where no figure was read here
     /// ([`WindowOutlook::lab`]).
@@ -2010,20 +2041,30 @@ impl<'a> Sim<'a> {
         }
     }
 
+    /// Row `i`'s projection of `w` ([`Pass::proj`]), its first window's: only of the window the
+    /// row was read holding ([`Win::held`]), which the replay knows exactly, at the reset read of
+    /// it. A window it does not know (a week unread, or the worst case's assumption of one,
+    /// [`Self::assume_worst`]) has none, nor one it opens (a 5-hour window at first use, the
+    /// week after a reset).
     fn capture(&mut self, i: usize, w: Window) {
         let row = &self.rows[i];
         let key = (row.label.clone(), w);
-        if row.seen && !self.proj.contains_key(&key) {
-            let win = row.win(w);
-            self.proj.insert(
-                key,
-                Proj {
-                    at_reset_x10: row.used_x10(win),
-                    fills_at: win.fills_at,
-                    pass: self.ctx.kind,
-                },
-            );
+        let win = row.win(w);
+        if !row.seen || !win.held || win.known != Known::Exact || self.proj.contains_key(&key) {
+            return;
         }
+        let Some(reset) = win.reset else {
+            return;
+        };
+        self.proj.insert(
+            key,
+            Proj {
+                at_reset_x10: row.used_x10(win),
+                fills_at: win.fills_at,
+                reset,
+                pass: self.ctx.kind,
+            },
+        );
     }
 
     /// The earliest event after `t` (R4): at most the horizon, or while a stop is open, the
@@ -2134,9 +2175,17 @@ impl<'a> Sim<'a> {
                 // Only the carrier's own window is followed past a reset: any other Mac may
                 // have used any other row's.
                 let keeps = row.seen;
+                if !keeps && w == Window::Week && row.fresh_week.known() != Known::Unknown {
+                    // From here its week is one this Mac has not read since its reset: the
+                    // class a lean onto it says ([`Lean::why`]), whatever it was read as.
+                    row.fresh_week = Fresh::ResetUnread;
+                    row.read_week = None;
+                }
                 let win = row.win_mut(w);
                 win.fills_at = None;
                 win.low_fired = false;
+                // The window from here is one the replay opens, not the one read.
+                win.held = false;
                 if !keeps {
                     win.known = Known::Unknown;
                     win.reset = None;
@@ -2410,7 +2459,8 @@ impl<'a> Sim<'a> {
     /// its wall's end (the bound plus the reset grace) lie at or past the bound, which no event
     /// reaches ([`Self::next_event`]): the invention is never an event and never ends a stop,
     /// by construction. Its fill is an assumption, not a figure: the week is
-    /// [`Known::Unknown`], so [`Pass::fills`] never draws it full (never an inferred 100%).
+    /// [`Known::Unknown`], so [`Pass::fills`] never draws it full (never an inferred 100%) and
+    /// [`Pass::proj`] never holds it ([`Self::capture`]).
     fn assume_worst(&mut self, b: usize) {
         let label = self.rows[b].label.clone();
         let bound = self.ctx.resume_bound;
@@ -2459,17 +2509,17 @@ impl<'a> Sim<'a> {
         row.seen = true;
         let assumed = match (row.week.known, row.read_week, row.lab_week.clone()) {
             (Known::Lower, Some(seen), _) => {
-                row.week.known = Known::Exact;
-                row.week.acc = i128::from(seen.pct_x10) * row.scale();
-                row.week.reset = Some(seen.reset);
+                row.week = Win::read(seen.pct_x10, row.scale(), seen.reset, seen.at, Known::Exact);
                 Assumed::Read
             }
             (_, None, Some(bound)) if bound.until() > t => {
-                row.week = Win {
-                    acc: i128::from(bound.used_x10().min(1000)) * row.scale(),
-                    reset: Some(bound.until()),
-                    ..Win::empty(Known::Exact)
-                };
+                row.week = Win::read(
+                    u32::from(bound.used_x10().min(1000)),
+                    row.scale(),
+                    bound.until(),
+                    bound.read(),
+                    Known::Exact,
+                );
                 Assumed::Peer(bound)
             }
             _ => {
@@ -2507,12 +2557,21 @@ impl<'a> Sim<'a> {
         best.seed_fills();
         let assumed = best.assume_best(b);
         let at = self.t;
+        let (worst, best) = (worst.run(), best.run());
+        // Past the lean this pass keeps a row's projection only where both cases make the same
+        // one (a window already out stays out to its reset whatever the unread row holds); one
+        // they part on turns on that row, and each case says its own under its words.
+        for (key, proj) in &worst.proj {
+            if best.proj.get(key) == Some(proj) {
+                self.proj.entry(key.clone()).or_insert(*proj);
+            }
+        }
         self.lean = Some(Box::new(Lean {
             at,
             row: label,
             why,
-            worst: worst.run(),
-            best: best.run(),
+            worst,
+            best,
             assumed,
         }));
     }
@@ -2770,7 +2829,17 @@ fn carrier_of<'a>(inputs: &Inputs<'a>) -> Result<&'a accounts::Row, Refusal> {
         })
 }
 
-fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win {
+/// Row's window `w` as the replay starts it at `now`, from what was read of it (`seen`, its class
+/// `fresh`, its plan multiple `m`); a walled one full from `walled_from`, its wall's first
+/// sighting ([`walled_from`]), at the latest now.
+fn win_of(
+    seen: Option<Seen>,
+    fresh: Fresh,
+    walled_from: Option<i64>,
+    m: u32,
+    now: i64,
+    w: Window,
+) -> Win {
     let scale = i128::from(m.max(1)) * i128::from(DAY);
     let known = fresh.known();
     let admitted = seen.filter(|s| super::profile::usage_read_age(s.at, now).is_some());
@@ -2780,14 +2849,11 @@ fn win_of(seen: Option<Seen>, fresh: Fresh, m: u32, now: i64, w: Window) -> Win 
             acc: i128::from(FULL_X10) * scale,
             reset: s.map(|s| s.reset),
             low_fired: true,
-            fills_at: Some(now),
+            fills_at: Some(walled_from.unwrap_or(now).min(now)),
+            held: s.is_some(),
             ..Win::empty(Known::Exact)
         },
-        (_, Some(s)) => Win {
-            acc: i128::from(s.pct_x10) * scale,
-            reset: Some(s.reset),
-            ..Win::empty(known)
-        },
+        (_, Some(s)) => Win::read(s.pct_x10, scale, s.reset, s.at, known),
         (_, None) if w == Window::Five && admitted.is_some() => Win::empty(Known::Exact),
         (_, None) => Win::empty(Known::Unknown),
     }
@@ -3126,7 +3192,11 @@ fn build(
         // work on it, as R7 follows a row once taken); every other row read before now is a
         // bound, since any Mac may run any account.
         let start = |seen, fresh, w| {
-            let mut win = win_of(seen, fresh, plan.m, now, w);
+            let walled = state
+                .accounts
+                .get(&row.label)
+                .and_then(|a| walled_from(a, w, now));
+            let mut win = win_of(seen, fresh, walled, plan.m, now, w);
             if is_carrier && win.known == Known::Lower {
                 win.known = Known::Exact;
             }
@@ -3223,11 +3293,18 @@ fn build(
             ) else {
                 continue;
             };
+            let full = i128::from(FULL_X10) * row.scale();
             let win = row.win_mut(w);
             if win.known == Known::Exact && win.reset.is_some_and(|r| r > now) {
-                let full = i128::from(FULL_X10) * i128::from(row.m.max(1)) * i128::from(DAY);
-                let win = row.win_mut(w);
-                win.acc = (win.acc + i128::from(rate) * i128::from((now - at).max(0))).min(full);
+                let rate = i128::from(rate);
+                let acc = (win.acc + rate * i128::from((now - at).max(0))).min(full);
+                // Full by now: from the instant the advance crossed full, as the spend marks
+                // its own crossing (a figure read full keeps its reading's instant).
+                if acc >= full && win.fills_at.is_none() && rate > 0 {
+                    let dt = (full - win.acc + rate - 1) / rate;
+                    win.fills_at = Some(at.saturating_add(i64::try_from(dt).unwrap_or(0)).min(now));
+                }
+                win.acc = acc;
             }
         }
     }
@@ -3282,16 +3359,14 @@ fn build(
     if let Some(working) = &working {
         working.used(&mut used);
     }
-    let week_proj = week.projections();
-    let working_proj = working.as_ref().map(Pass::projections).unwrap_or_default();
+    // The week's projection is the week pass's, the 5 hours' the working pass's.
     for row in &mut out.rows {
         for win in &mut row.windows {
             let key = (row.label.clone(), win.window);
             win.projection = match win.window {
-                Window::Week => week_proj.get(&key).copied(),
-                Window::Five => working_proj.get(&key).copied(),
-            }
-            .filter(|_| win.fresh != Fresh::ClockInvalid);
+                Window::Week => week.proj.get(&key).copied(),
+                Window::Five => working.as_ref().and_then(|p| p.proj.get(&key).copied()),
+            };
         }
     }
     out.not_needed = out
@@ -3787,7 +3862,90 @@ fn ahead(x10: u32) -> String {
     }
 }
 
+/// The grain the outlook's words keep while a pace stands ([`Outlook::changes_after`]).
+pub const DRIFT_S: i64 = 60;
+
 impl Outlook {
+    /// The earliest wall second after [`Self::as_of`] at which a replay of `inputs` (the inputs
+    /// this outlook was replayed of, nothing read since) can say otherwise:
+    ///
+    /// - while a pace stands, or a refusal says a span that grows with the clock (`TooEarly`),
+    ///   [`DRIFT_S`] on: a pace's span ends at the clock, so its forecasts move with it at seconds
+    ///   no reading names, and they are said again each minute; a `Stale` refusal's age at its
+    ///   next whole minute;
+    /// - each window's reading where it comes within the skew, stops being current and stops
+    ///   being shown ([`super::profile::reading_terms`]), its reset, and a reset class's next
+    ///   reset;
+    /// - each wall's end and each wall's reset the glass says, and each forecast instant's lead
+    ///   where it turns a finer [`grain`] ([`NEAR_LEAD_S`], [`DAY_LEAD_S`]);
+    /// - each row's low window's end, each vault token's end and where its reading stops being
+    ///   fresh ([`accounts::on_token_here`]);
+    /// - each reading where it leaves [`READ_SPAN_S`];
+    /// - the next local midnight, where [`when`] says a day otherwise, and the next offset change.
+    ///
+    /// `None` where none is ahead.
+    #[must_use]
+    pub fn changes_after(&self, inputs: &Inputs<'_>) -> Option<i64> {
+        let now = self.as_of;
+        let mut terms: Vec<i64> = Vec::new();
+        let drifts =
+            |pace: &Result<Pace, Refusal>| matches!(pace, Ok(_) | Err(Refusal::TooEarly { .. }));
+        if drifts(&self.demand.week)
+            || drifts(&self.demand.five)
+            || self.demand.week_working.is_some()
+        {
+            terms.push(now.saturating_add(DRIFT_S));
+        }
+        for refusal in [self.demand.week, self.demand.five] {
+            if let Err(Refusal::Stale { age_s }) = refusal {
+                terms.push(now.saturating_add(DRIFT_S - age_s.rem_euclid(DRIFT_S)));
+            }
+        }
+        let lead = |t: i64| [t - DAY_LEAD_S, t - NEAR_LEAD_S, t];
+        for row in &self.rows {
+            for w in &row.windows {
+                if let Some(at) = w.at {
+                    terms.extend(super::profile::reading_terms(at));
+                }
+                if let Some(reset) = w.reset {
+                    terms.push(if reset > now {
+                        reset
+                    } else {
+                        next_reset(reset, w.window.len_s(), now)
+                    });
+                }
+            }
+            if let Condition::Limited { until } = row.condition {
+                terms.push(until);
+            }
+            if let Some(walled) = &row.walled {
+                terms.extend(walled.until.into_iter().flat_map(lead));
+                terms.extend(walled.reset);
+            }
+            terms.extend(row.read.iter().map(|read| read.t + READ_SPAN_S + 1));
+        }
+        for pass in [&self.week, &self.working].into_iter().flatten() {
+            terms.extend(pass.stops.iter().flat_map(|stop| lead(stop.from)));
+        }
+        for row in &inputs.roster.rows {
+            if let Some(acct) = inputs.state.accounts.get(&row.label) {
+                terms.extend(acct.walls.values().filter_map(accounts::Wall::stands_until));
+                terms.extend(acct.low_until(now));
+            }
+            terms.extend(accounts::on_token_here(row, inputs.state, now));
+        }
+        if let Some(read) = inputs.state.tokens_here.as_ref() {
+            terms.extend([
+                read.read_at,
+                read.read_at + accounts::TOKENS_HERE_FRESH_S + 1,
+            ]);
+        }
+        let offset = self.offsets.at(now);
+        terms.push(now + DAY - (now + offset).rem_euclid(DAY));
+        terms.extend(self.offsets.change_after(now));
+        terms.into_iter().filter(|t| *t > now).min()
+    }
+
     /// A pane-local observation view, retaining the pool's raw snapshot unchanged.
     /// No service chain, proposed target or future-use projection survives the given refusal.
     #[must_use]
@@ -3822,6 +3980,24 @@ impl Outlook {
 
     fn row(&self, label: &str) -> Option<&RowOutlook> {
         self.rows.iter().find(|r| r.label == label)
+    }
+
+    /// The lean that what row `label`'s window `w` holds at its reset turns on, where one does:
+    /// the window's pass (the week's, or the working pass's for the 5 hours) leans on another
+    /// row, one the replay cannot read, and the lean's cases part on the window (one projects
+    /// it, the other does not or not alike), so the row has no projection ([`Pass::proj`]). The
+    /// CLI's window line and the Account card's `Forecast` say it in a projection's place. The
+    /// lean's own row has none: what it holds turns on its own figure, which its row says.
+    #[must_use]
+    pub fn turns_on(&self, label: &str, w: Window) -> Option<&Lean> {
+        let pass = match w {
+            Window::Week => self.week.as_ref(),
+            Window::Five => self.working.as_ref(),
+        }?;
+        let lean = pass.lean.as_deref().filter(|lean| lean.row != label)?;
+        let key = (label.to_owned(), w);
+        let parted = lean.worst.proj.contains_key(&key) || lean.best.proj.contains_key(&key);
+        (parted && self.row(label)?.window(w)?.projection.is_none()).then_some(lean)
     }
 
     /// What the glass names the row `label` by ([`RowOutlook::name`]): its email, else the label
@@ -4138,16 +4314,28 @@ impl Outlook {
             (Some(why), _) if row.carrier && why != Refusal::Idle => {
                 out.push_str(&format!(" \u{b7} not projected: {}", why.words()));
             }
-            (None, Some(p)) if p.fills_at.is_some() || p.at_reset_x10 >= 1000 => {
+            (
+                None,
+                Some(Proj {
+                    fills_at: Some(at), ..
+                }),
+            ) => {
                 out.push_str(&format!(
                     " \u{b7} out ~{} before reset",
-                    p.fills_at.map_or_else(String::new, |t| {
-                        self.cli_when(round_down(t, self.as_of, &self.offsets))
-                    })
+                    self.cli_when(round_down(at, self.as_of, &self.offsets))
                 ));
             }
             (None, Some(p)) => {
                 out.push_str(&format!(" \u{b7} {} at reset", ahead(p.at_reset_x10)));
+            }
+            (None, None) => {
+                if let Some(lean) = self.turns_on(&row.label, w.window) {
+                    out.push_str(&format!(
+                        " \u{b7} depends on {} after ~{}",
+                        lean.row,
+                        self.cli_when(round_down(lean.at, self.as_of, &self.offsets))
+                    ));
+                }
             }
             _ => {}
         }
@@ -4361,15 +4549,17 @@ impl Outlook {
                 }),
                 Ends::Walls => "walls".into(),
                 Ends::Horizon => {
-                    let row = self.row(&link.label).and_then(|r| r.window(Window::Week));
-                    let reset_inside = row
-                        .and_then(|w| w.reset)
-                        .filter(|r| *r > link.from && *r <= link.to);
-                    match (pass.kind, row.and_then(|w| w.projection), reset_inside) {
-                        (PassKind::Week, Some(p), Some(r)) => format!(
+                    // This pass's own projection (a lean's case says its own under its words),
+                    // never the row's, which holds no case's.
+                    let inside = pass
+                        .proj
+                        .get(&(link.label.clone(), Window::Week))
+                        .filter(|p| p.reset > link.from && p.reset <= link.to);
+                    match (pass.kind, inside) {
+                        (PassKind::Week, Some(p)) => format!(
                             "{} at its reset {}",
                             ahead(p.at_reset_x10),
-                            long_when(r, &self.offsets)
+                            long_when(p.reset, &self.offsets)
                         ),
                         _ => link.left_at_x10.map_or_else(String::new, |x| {
                             format!("{}{of} at the horizon", ahead(x))
@@ -4646,6 +4836,7 @@ fn proj_json(p: Proj) -> Value {
         "fills_at".into(),
         p.fills_at.map_or(Value::Null, Value::from),
     );
+    o.insert("reset".into(), Value::from(p.reset));
     o.insert("pass".into(), Value::from(p.pass.word()));
     Value::Object(o)
 }

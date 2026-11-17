@@ -937,6 +937,7 @@ fn a_selected_reserved_read_distinguishes_a_conditional_host_winner_from_absence
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_log_backed_denied_admin_can_read_the_roster_but_has_no_admin_privilege() {
     for deny_node in [false, true] {
@@ -1035,6 +1036,7 @@ fn a_log_backed_denied_admin_can_read_the_roster_but_has_no_admin_privilege() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_log_removed_admin_cannot_reuse_its_cached_admin_locker() {
     let macs = crate::client::log_entries_tests::two_macs_with(
@@ -1478,6 +1480,7 @@ fn signing_material_reads_in_place_and_claims_nothing() {
     }
 }
 
+#[cfg(unix)]
 fn publication_fixture(name: &str) -> Fixture {
     let f = Fixture::new();
     plant(&f.paths.home, name, b"inert-publication-token");
@@ -1488,6 +1491,7 @@ fn publication_fixture(name: &str) -> Fixture {
     f
 }
 
+#[cfg(unix)]
 #[test]
 fn publication_reader_reads_the_two_token_names_in_place_and_claims_nothing() {
     for name in ["gh_access_token", "gh_access_token_alabsystems"] {
@@ -1531,6 +1535,7 @@ fn publication_reader_reads_the_two_token_names_in_place_and_claims_nothing() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn publication_token_and_snapshot_refuse_stale_foreign_or_revoked_material() {
     let name = "gh_access_token";
@@ -1577,6 +1582,7 @@ fn publication_token_and_snapshot_refuse_stale_foreign_or_revoked_material() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn signing_material_reader_keeps_current_authority_whatever_the_file_holds() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1664,6 +1670,7 @@ fn signing_material_reader_keeps_current_authority_whatever_the_file_holds() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_anchored_signing_key_reads_only_with_its_anchor_chain_in_the_same_view() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1862,6 +1869,7 @@ fn unsigned_and_unconfigured_reads_create_nothing() {
     assert!(!paths.home.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn stale_apply_context_never_supplies_authenticated_bytes_and_unsafe_files_change_nothing() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1927,12 +1935,14 @@ fn stale_apply_context_never_supplies_authenticated_bytes_and_unsafe_files_chang
 }
 
 /// The fixture token of the class scenarios: inert, in the setup-token grammar.
+#[cfg(unix)]
 const CLASS_TOKEN: &[u8] = concat!("sk-ant-", "oat01-inert-conformance_fixture").as_bytes();
 
 /// The class scenarios of [`entry_transition`] (DESIGN-claude-setup-token §4.2): on a seated
 /// member (m7) of a log vault, `claude_token::write` stores a token, and the typed read
 /// (`ClaudeToken`, [`Reading::ClaudeToken`]) or an ordinary read
 /// (`ClaudeTokenOrdinary`, [`read_verified_entry`]) of its entry is made.
+#[cfg(unix)]
 fn claude_token_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -2002,6 +2012,7 @@ fn claude_token_transition(
     next
 }
 
+#[cfg(unix)]
 pub(crate) fn entry_transition(
     state: &aterm_spec::interp::State,
     action: &str,
@@ -2176,6 +2187,7 @@ pub(crate) fn entry_transition(
     next
 }
 
+#[cfg(unix)]
 #[test]
 fn verified_entry_reads_conform_in_place_and_rolled_back_pins_are_caught() {
     let model = aterm_models_db::verified_entry_model();

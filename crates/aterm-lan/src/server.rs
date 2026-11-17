@@ -3,7 +3,7 @@
 
 //! The broker's socket, its admission of each client, and its one request per connection.
 
-use std::io::{self, Write as _};
+use std::io;
 use std::net::IpAddr;
 use std::os::fd::AsFd as _;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
@@ -50,9 +50,9 @@ pub struct Opts {
     pub socket: PathBuf,
 }
 
-/// One line to the broker's log (its stderr, which launchd sends to [`aterm_uds::lan::LOG_PATH`]).
+/// One line to the broker's bounded log on launchd's existing stderr inode.
 pub(crate) fn log(line: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stderr(), "aterm-lan: {line}");
+    crate::log::line(line);
 }
 
 /// Who a connection must be to be served.
@@ -217,8 +217,13 @@ pub(crate) fn team_requirement(team: &str) -> io::Result<String> {
 ///
 /// # Errors
 /// Not root (outside a test binary), off macOS, the socket's folder or the socket that cannot be
-/// made, or the admission requirement that cannot be read.
+/// made, or the admission requirement that cannot be read. Failures are reported through the
+/// broker's bounded log.
 pub fn serve(opts: Opts) -> io::Result<()> {
+    serve_inner(opts).inspect_err(|error| log(format_args!("serve: {error}")))
+}
+
+fn serve_inner(opts: Opts) -> io::Result<()> {
     if aterm_uds::test_binary::scratch_root().is_none() && aterm_uds::peer::our_uid() != 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -239,6 +244,10 @@ pub fn serve(opts: Opts) -> io::Result<()> {
     server.run()
 }
 
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod tests;
+
 /// A bound broker socket and what serving it needs.
 pub(crate) struct Server {
     listener: aterm_uds::CtlListener,
@@ -253,6 +262,9 @@ pub(crate) struct Shared {
     /// Where a connection's lines go: the broker's [`log`], or nowhere when the one client is
     /// this process (the direct path), which hears each failure itself as a frame.
     log: fn(std::fmt::Arguments<'_>),
+    peers: crate::peers::Peers,
+    /// The monotonic retry clock; separate from socket hang detectors.
+    clock: fn() -> Instant,
     pub(crate) live: AtomicUsize,
     /// What this server counts of its connections ([`crate::counts`]). Only a served socket's
     /// accept loop writes them to a file; the direct path's are counted and read by nobody.
@@ -273,6 +285,8 @@ impl Shared {
             admission,
             bonjour,
             log,
+            peers: crate::peers::Peers::default(),
+            clock: Instant::now,
             live: AtomicUsize::new(0),
             counts: Counts::new(),
             #[cfg(any(test, debug_assertions))]
@@ -554,10 +568,15 @@ fn served(
         Request::Query { .. } => Count::Query,
         Request::Register(_) => Count::Register,
     });
+    let connecting = matches!(&request, Request::Connect { .. });
     match answer(shared, stream, request, spent) {
         Ok(()) => Count::Answered,
         Err((code, words)) => {
-            (shared.log)(format_args!("pid {pid}: {words}"));
+            // Connect's destination state owns its diagnostic: another local caller's
+            // retry is the same outage, not another log line.
+            if !connecting {
+                (shared.log)(format_args!("pid {pid}: {words}"));
+            }
             let _ = wire::send(stream, &Frame::Error { code, words });
             Count::Failed
         }
@@ -623,19 +642,16 @@ fn answer(
                 source,
                 hop_limit,
             };
-            let (connected, reached) = match target {
+            let key = crate::peers::Key::new(target.clone(), port, options);
+            // Local-network policy is checked before consulting scheduling memory, and
+            // names are resolved afresh so an eligible probe sees their current addresses.
+            let addrs = match target {
                 Target::Addr(mut addr) => {
                     addr.set_port(port);
                     if !aterm_uds::lan::is_local_network(&addr.ip()) {
                         return Err(not_local(addr));
                     }
-                    here::dial_any_while_open(
-                        std::slice::from_ref(&addr),
-                        deadline,
-                        options,
-                        stream.as_fd(),
-                    )
-                    .map_err(|e| failure(&e))?
+                    vec![addr]
                 }
                 Target::Host(name) => {
                     let mut addrs =
@@ -648,10 +664,18 @@ fn answer(
                         return Err(not_local(format_args!("{name} ({addrs:?})")));
                     }
                     addrs.retain(|addr| aterm_uds::lan::is_local_network(&addr.ip()));
-                    here::dial_any_while_open(&addrs, deadline, options, stream.as_fd())
-                        .map_err(|e| failure(&e))?
+                    addrs
                 }
             };
+            let (connected, reached) = shared.peers.connect(
+                key,
+                shared.clock,
+                || {
+                    here::dial_any_while_open(&addrs, deadline, options, stream.as_fd())
+                        .map_err(|e| failure(&e))
+                },
+                shared.log,
+            )?;
             pass_socket(
                 stream,
                 &Frame::Socket {

@@ -1304,6 +1304,139 @@ fn an_app_word_past_the_bound_drops_the_report() {
     );
 }
 
+/// A PROGRAM'S TITLE IS KEPT FROM ANY PROGRAM'S ROOT RECORD: Grok Build's `title=` (base64,
+/// with or without padding) and another program's (`app=kimi-code`) are each decoded and kept
+/// ([`ProgramStateReport::title`]), cleaned of the controls an OSC title is cleaned of, and
+/// `title_seq` moves with each change and not with a re-send.
+/// NEGATIVE CONTROL: a codex report that names no title leaves none.
+#[test]
+fn a_title_is_taken_from_a_known_program_and_another() {
+    use crate::terminal::Terminal;
+    let mut term = Terminal::new(24, 80);
+    term.process(b"\x1b]7501;state=working:app=codex\x1b\\");
+    assert_eq!(
+        term.program_state().title(),
+        None,
+        "CONTROL: no title named"
+    );
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=Rml4IHRoZSBwYXJzZXI\x1b\\");
+    let report = term.program_state();
+    assert_eq!(report.title(), Some("Fix the parser"), "unpadded");
+    assert_eq!(report.title_seq, 1);
+    term.process(b"\x1b]7501;state=done:app=grok-build:title=Rml4IHRoZSBwYXJzZXI=\x1b\\");
+    let report = term.program_state();
+    assert_eq!(report.title(), Some("Fix the parser"), "padded");
+    assert_eq!(report.title_seq, 1, "the same title moves nothing");
+    term.process(b"\x1b]7501;state=working:app=kimi-code:title=UmV2aWV3IHRoZSBmb2xk\x1b\\");
+    let report = term.program_state();
+    assert!(report.other.state.is_some(), "another program's report");
+    assert_eq!(
+        report.title(),
+        Some("Review the fold"),
+        "another program's title"
+    );
+    assert_eq!(report.title_seq, 2);
+    term.process(b"\x1b]7501;state=working:app=kimi-code:title=YmVsbAdoZXJlG1szMW0=\x1b\\");
+    assert_eq!(
+        term.program_state().title(),
+        Some("bellhere[31m"),
+        "the controls an OSC title loses are dropped"
+    );
+}
+
+/// A CHILD RECORD NEVER TITLES THE SESSION, AND `msg` IS NEVER READ: a subagent's record
+/// (`id=`) with a `title=` leaves the root's title as it stood, and a root record whose only text
+/// is a `msg=` leaves it too. A record that names no `title` keeps the title, an empty `title=`
+/// takes it away, and a `clear` and a full reset take it away.
+/// NEGATIVE CONTROL: the child's title named by the root record itself is taken.
+#[test]
+fn a_child_record_never_sets_the_title_and_msg_is_never_read() {
+    use crate::terminal::Terminal;
+    let mut term = Terminal::new(24, 80);
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=Rml4IHRoZSBwYXJzZXI\x1b\\");
+    let root = term.program_state();
+    term.process(b"\x1b]7501;state=working:app=grok-build:id=sub_1:title=cmVhZA\x1b\\");
+    assert_eq!(term.program_state(), root, "a child record's title");
+    term.process(b"\x1b]7501;state=working:app=grok-build:msg=Tm9wZQ==\x1b\\");
+    let report = term.program_state();
+    assert_eq!(
+        (report.title(), report.title_seq),
+        (Some("Fix the parser"), root.title_seq),
+        "a msg is no title, and a record naming none keeps it"
+    );
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=cmVhZA\x1b\\");
+    assert_eq!(term.program_state().title(), Some("read"), "CONTROL");
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=\x1b\\");
+    assert_eq!(term.program_state().title(), None, "an empty title");
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=cmVhZA\x1b\\");
+    term.process(b"\x1b]7501;state=clear\x1b\\");
+    assert_eq!(term.program_state().title(), None, "a clear");
+    term.process(b"\x1b]7501;state=working:app=kimi-code:title=cmVhZA\x1b\\");
+    term.process(b"\x1bc");
+    assert_eq!(term.program_state().title(), None, "a full reset");
+}
+
+/// A TITLE PAST THE PROTOCOL'S CAP IS NOT TAKEN: 256 base64 bytes (192 decoded) are taken, one
+/// more leaves the title as it stood, as do two `title` keys and one that is not base64. A
+/// checkpoint carries no title: the body it carries names none.
+/// NEGATIVE CONTROL: the title at the cap is taken whole.
+#[test]
+fn a_title_past_its_cap_is_not_taken_and_no_checkpoint_carries_one() {
+    let at_cap = "eHh4".repeat(64);
+    let mut report = ProgramStateRecord::default();
+    assert!(report.accept(&format!("state=working:app=grok-build:title={at_cap}")));
+    assert_eq!(report.title(), Some("x".repeat(192).as_str()), "CONTROL");
+    let seq = report.title_seq;
+    for body in [
+        format!("state=working:app=grok-build:title={at_cap}eA"),
+        "state=working:app=grok-build:title=cmVhZA:title=Tm9wZQ".to_string(),
+        "state=working:app=grok-build:title=not*base64".to_string(),
+    ] {
+        assert!(report.accept(&body), "the report is taken: {body}");
+        assert_eq!(report.title_seq, seq, "the title is not: {body}");
+    }
+    assert_eq!(
+        report.carried().as_deref(),
+        Some("state=working:app=grok-build")
+    );
+    let mut restored = ProgramStateRecord::default();
+    restored.restore(report.carried().as_deref(), None);
+    assert_eq!((restored.title(), restored.title_seq), (None, 0));
+}
+
+/// THE TITLE EPOCH MOVES WITH A PROGRAM'S TITLE: a 7501 report whose title differs from the one
+/// kept moves the engine's title epoch, as an OSC 2 title does, and so does a full reset that
+/// takes it away; a re-send of the same title, a report naming none and another program's state
+/// move with no title leave the epoch.
+/// NEGATIVE CONTROL: the window title is unchanged throughout, so only the program's title
+/// moved it.
+#[test]
+fn the_title_epoch_moves_only_when_a_programs_title_changes() {
+    use crate::terminal::Terminal;
+    let mut term = Terminal::new(24, 80);
+    let epoch = term.title_epoch();
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=cmVhZA\x1b\\");
+    assert_eq!(term.title_epoch(), epoch + 1, "a new title");
+    for same in [
+        &b"\x1b]7501;state=blocked:app=grok-build:title=cmVhZA==\x1b\\"[..],
+        b"\x1b]7501;state=working:app=grok-build\x1b\\",
+        b"\x1b]7501;state=idle:app=kimi-code\x1b\\",
+    ] {
+        term.process(same);
+        assert_eq!(
+            term.title_epoch(),
+            epoch + 1,
+            "{}",
+            String::from_utf8_lossy(same)
+        );
+    }
+    term.process(b"\x1b]7501;state=working:app=grok-build:title=Tm9wZQ==\x1b\\");
+    assert_eq!(term.title_epoch(), epoch + 2, "another title");
+    term.process(b"\x1bc");
+    assert_eq!(term.title_epoch(), epoch + 3, "a reset took it away");
+    assert_eq!(term.title(), "", "CONTROL: no window title was ever set");
+}
+
 #[test]
 fn an_unknown_report_and_prompt_preserve_the_numbered_turn_cursor() {
     let mut record = ProgramStateRecord::default();

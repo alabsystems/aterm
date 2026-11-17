@@ -249,6 +249,8 @@ pub enum StoodAside {
     Absent(String),
     /// Another actor must finish a prerequisite, such as an admin approval or background pass.
     Waiting(String),
+    /// The cause stands until an input changes; a clock retry cannot finish this work.
+    Inputs(String),
     /// The account has not granted permission the change needs (exit 77).
     Permission(String),
 }
@@ -263,6 +265,7 @@ impl StoodAside {
             | Self::Offline(why)
             | Self::Absent(why)
             | Self::Waiting(why)
+            | Self::Inputs(why)
             | Self::Permission(why) => why,
         }
     }
@@ -275,6 +278,7 @@ impl StoodAside {
             Self::Lock(_) | Self::Waiting(_) => 75,
             Self::Offline(_) | Self::Absent(_) => 69,
             Self::Permission(_) => 77,
+            Self::Inputs(_) => 78,
         }
     }
 }

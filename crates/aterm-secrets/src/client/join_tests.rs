@@ -5,9 +5,12 @@
 //! password, and the subscriber's starts of the converge pass, against a server on loopback.
 
 use super::*;
+#[cfg(unix)]
 use std::cell::RefCell;
+#[cfg(unix)]
 use std::sync::mpsc;
 
+#[cfg(unix)]
 const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
 #[test]
@@ -41,6 +44,7 @@ fn a_path_vault_has_no_join_queues_even_with_irrelevant_policy() {
     }
 }
 
+#[cfg(unix)]
 fn serve_holding(store: &Path, hold: Duration) -> crate::server::Running {
     crate::server::start_with_join_change_gap(
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
@@ -57,8 +61,10 @@ fn serve_holding(store: &Path, hold: Duration) -> crate::server::Running {
     .expect("server starts")
 }
 
+#[cfg(unix)]
 struct EndServer(Option<crate::server::Running>);
 
+#[cfg(unix)]
 impl Drop for EndServer {
     fn drop(&mut self) {
         if let Some(server) = self.0.take() {
@@ -68,6 +74,7 @@ impl Drop for EndServer {
 }
 
 /// The team vault `ma` makes at `server`: its admin, its pinned URL and its join password.
+#[cfg(unix)]
 fn team(root: &Path, server: &crate::server::Running) -> (Paths, String, SecretBytes) {
     let admin = Paths::for_home(&root.join("ma"));
     let url = format!("http://{}/v1/team", server.addr);
@@ -99,6 +106,7 @@ fn options<'a>(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn admitted_http_joins_recheck_after_fetch_before_creating_identity_source_or_requests() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,6 +168,7 @@ fn admitted_http_joins_recheck_after_fetch_before_creating_identity_source_or_re
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn admitted_http_join_rechecks_under_the_apply_lock_after_its_own_source_publication() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -228,6 +237,7 @@ fn admitted_http_join_rechecks_under_the_apply_lock_after_its_own_source_publica
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn admitted_http_join_withdrawn_at_the_password_boundary_posts_and_records_nothing_further() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,6 +272,7 @@ fn admitted_http_join_withdrawn_at_the_password_boundary_posts_and_records_nothi
 }
 
 /// Remove the admin Mac's approver record, as on a Mac whose approver never kept one.
+#[cfg(unix)]
 fn forget_record(admin: &Paths) {
     std::fs::remove_file(admin.answered_file()).expect("CONTROL: the approver kept a record");
     for path in [admin.answered_queue_file(), admin.answered_approved_file()] {
@@ -274,6 +285,7 @@ fn forget_record(admin: &Paths) {
 
 /// Let `key` in as `host` by its code as another admin Mac does: the version names it, and that
 /// Mac records the request it let in on itself, not on this one.
+#[cfg(unix)]
 fn let_in_by_another_admin(admin: &Paths, host: &str, key: &str) {
     let opened = admin_open(admin).expect("admin opens");
     let mut doc = opened.doc.clone();
@@ -286,6 +298,7 @@ fn let_in_by_another_admin(admin: &Paths, host: &str, key: &str) {
 }
 
 /// Wait, at most the hang detector, until `ready`.
+#[cfg(unix)]
 fn until(what: &str, ready: impl Fn() -> bool) {
     let deadline = Instant::now() + HANG_DETECTOR;
     while !ready() {
@@ -294,6 +307,7 @@ fn until(what: &str, ready: impl Fn() -> bool) {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_fetches_the_vault_once_and_a_probed_one_not_again() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -367,6 +381,7 @@ fn a_join_that_reaches_no_vault_leaves_no_machine_key() {
     assert!(config(&mb).expect("readable").is_none(), "no source saved");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_mistyped_join_password_is_asked_again_as_soon_as_the_approver_refuses_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -456,6 +471,7 @@ fn a_mistyped_join_password_is_asked_again_as_soon_as_the_approver_refuses_it() 
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_forged_verdict_only_asks_for_the_password_again() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -501,6 +517,7 @@ fn a_forged_verdict_only_asks_for_the_password_again() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_admin_mac_records_each_mac_left_to_a_person_and_approves_exactly_the_one_named() {
     // Every server it reads is its own on loopback, which answers.
@@ -593,6 +610,7 @@ fn an_admin_mac_records_each_mac_left_to_a_person_and_approves_exactly_the_one_n
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn failed_approval_refresh_withdraws_actions_until_a_fresh_judgment() {
     // Every server it reads is its own on loopback, which answers.
@@ -630,6 +648,7 @@ fn failed_approval_refresh_withdraws_actions_until_a_fresh_judgment() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_vault_approved_only_by_code_records_every_asking_mac_until_it_is_in() {
     // Every server it reads is its own on loopback, which answers.
@@ -695,6 +714,7 @@ fn a_vault_approved_only_by_code_records_every_asking_mac_until_it_is_in() {
 /// (the subscriber turned off, stopped or killed), nobody is shown asking, as nothing keeps the
 /// record current. A record that names no process (an approver before the head line) is read
 /// as it stands.
+#[cfg(unix)]
 #[test]
 fn a_record_of_macs_asking_ends_with_the_approver_that_wrote_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -748,6 +768,7 @@ fn a_record_of_macs_asking_ends_with_the_approver_that_wrote_it() {
     assert!(!paths.asking_file().exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_mac_let_go_is_no_mac_asking_to_join_until_it_asks_again() {
     #[derive(Debug, Clone, Copy)]
@@ -878,6 +899,7 @@ fn a_mac_let_go_is_no_mac_asking_to_join_until_it_asks_again() {
 /// one started on a build before its record of answered requests) takes the request of a key an
 /// open vault let go, still queued, for no ask: the `code-only` line says a version let it go.
 /// Once the Mac asks again and the server moves its request's time, a person is asked.
+#[cfg(unix)]
 #[test]
 fn a_fresh_approver_shows_no_mac_let_go_from_an_open_vault_until_it_asks_again() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -959,6 +981,7 @@ fn a_fresh_approver_shows_no_mac_let_go_from_an_open_vault_until_it_asks_again()
 /// approve by code, and stays shown across restarts: the approver showed it as the line appeared,
 /// and its record keeps the keys it knew on such lines, so it never takes the request for
 /// answered.
+#[cfg(unix)]
 #[test]
 fn a_mac_held_as_the_vault_opens_stays_shown_after_the_approver_restarts() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1014,6 +1037,7 @@ fn a_mac_held_as_the_vault_opens_stays_shown_after_the_approver_restarts() {
 /// An admin Mac whose approver did not read the vault while a Mac came and went (off, asleep, or
 /// no admin then) shows no ghost when it reads the vault again: the key is new on a `code-only`
 /// line to its record, so the request that let the Mac in is taken for answered.
+#[cfg(unix)]
 #[test]
 fn an_approver_away_while_a_mac_came_and_went_shows_no_ghost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1067,6 +1091,7 @@ fn an_approver_away_while_a_mac_came_and_went_shows_no_ghost() {
 /// An approver that showed a Mac as asking, then read nothing (asleep, or off the LAN) while
 /// another admin let it in by code and let it go, shows no ghost when it reads the vault again:
 /// what it showed at a version before the one just before says nothing of that Mac now.
+#[cfg(unix)]
 #[test]
 fn an_approver_that_showed_a_mac_then_slept_through_its_stay_shows_no_ghost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1117,6 +1142,7 @@ fn an_approver_that_showed_a_mac_then_slept_through_its_stay_shows_no_ghost() {
 /// A vault with a join password names a Mac it lets go on a `code-only` line too, so an approver
 /// with no record of it shows no ghost, and opening the vault later lets the key in only by its
 /// code. Its person is told of the new password, not of an open vault's line.
+#[cfg(unix)]
 #[test]
 fn a_mac_let_go_from_a_closed_vault_is_named_code_only() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1170,6 +1196,7 @@ fn a_mac_let_go_from_a_closed_vault_is_named_code_only() {
 /// A Mac let go that asks again with the renewed join password before the approver reads the
 /// version that let it go is held as the request it had standing then, and let in once the
 /// server moves its time, within the hour: never shown as asking, never left out for good.
+#[cfg(unix)]
 #[test]
 fn a_mac_let_go_that_proves_the_renewed_password_is_let_in_within_the_hour() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1274,6 +1301,7 @@ fn a_mac_let_go_that_proves_the_renewed_password_is_let_in_within_the_hour() {
 
 /// A request a Mac joined with stays held once the vault lets the Mac go, even after an admin
 /// sets the password it proved again: a proof says nothing of when it was made.
+#[cfg(unix)]
 #[test]
 fn a_mac_let_go_is_not_let_back_in_when_its_old_password_is_set_again() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1332,6 +1360,7 @@ fn a_mac_let_go_is_not_let_back_in_when_its_old_password_is_set_again() {
 /// read no version while it was in (the subscriber off, or stuck) shows no ghost once another
 /// version lets it go, even for a key a `code-only` line named before: it took the request it
 /// let in for answered.
+#[cfg(unix)]
 #[test]
 fn a_mac_let_in_by_code_while_the_approver_was_away_is_no_ghost_once_let_go() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1413,6 +1442,7 @@ fn a_mac_let_in_by_code_while_the_approver_was_away_is_no_ghost_once_let_go() {
 }
 
 /// A server on loopback whose clock is `clock`.
+#[cfg(unix)]
 fn serve_with_clock(store: &Path, clock: fn() -> u64) -> crate::server::Running {
     crate::server::start_with_clock(
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind"),
@@ -1430,6 +1460,7 @@ fn serve_with_clock(store: &Path, clock: fn() -> u64) -> crate::server::Running 
 }
 
 /// The keys of the Macs the approver last showed as asking.
+#[cfg(unix)]
 fn shown_keys(admin: &Paths) -> Vec<String> {
     asking(admin).into_iter().map(|a| a.recipient).collect()
 }
@@ -1437,6 +1468,7 @@ fn shown_keys(admin: &Paths) -> Vec<String> {
 /// Publish `edit` of the vault as an admin Mac on an aterm before `[join]`'s notes does: the
 /// text as edited, its notes as they were, and a `code-only` line for each key it lets go, as
 /// builds since 2026-10-26 write.
+#[cfg(unix)]
 fn publish_before_notes(paths: &Paths, edit: impl FnOnce(&mut Document)) {
     let admin = admin_open(paths).expect("admin opens");
     let mut doc = admin.doc.clone();
@@ -1465,6 +1497,7 @@ fn publish_before_notes(paths: &Paths, edit: impl FnOnce(&mut Document)) {
 
 /// The team vault at `server`, where `mb` asked with no proof and the approver showed it as
 /// asking: the vault's admin, its source, `mb`'s key and the approver.
+#[cfg(unix)]
 fn asking_with_no_proof(
     root: &Path,
     server: &crate::server::Running,
@@ -1497,6 +1530,7 @@ fn asking_with_no_proof(
 /// [`asking_with_no_proof`], then a version of this aterm opens the vault, which holds `mb` on
 /// a `code-only` line noted at its own version, and the approver still shows it: the vault's
 /// admin, its source, `mb`'s key, the approver and the version it judged.
+#[cfg(unix)]
 fn held_as_the_vault_opened(
     root: &Path,
     server: &crate::server::Running,
@@ -1523,6 +1557,7 @@ fn held_as_the_vault_opened(
 /// shown at once: its key is on a `code-only` line the approver knew at its last judged pass,
 /// and the request it asks with now is none the approver read while it was in. The vault's
 /// admin, `mb`'s key, the line it asks with, and the approver.
+#[cfg(unix)]
 fn shown_on_a_line_it_knew(
     root: &Path,
     server: &crate::server::Running,
@@ -1561,6 +1596,7 @@ fn shown_on_a_line_it_knew(
 /// reads nothing, is no ghost, even for a key a `code-only` line named at its last pass: the
 /// version that let it go named the key anew, and the request it asked with is taken for
 /// answered. A Mac that asks again after it is shown.
+#[cfg(unix)]
 #[test]
 fn a_mac_another_admin_lets_in_by_code_and_lets_go_while_the_approver_is_away_is_no_ghost() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1601,6 +1637,7 @@ fn a_mac_another_admin_lets_in_by_code_and_lets_go_while_the_approver_is_away_is
 /// A Mac held as the vault opened, and shown, that another admin Mac lets in by its code and a
 /// version lets go while this approver reads nothing, is no ghost: the version that let it go
 /// named its key anew, so the request it was held on is taken for answered.
+#[cfg(unix)]
 #[test]
 fn a_mac_held_as_the_vault_opens_then_let_in_and_gone_by_another_admin_is_no_ghost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1626,6 +1663,7 @@ fn a_mac_held_as_the_vault_opens_then_let_in_and_gone_by_another_admin_is_no_gho
 /// named at its last pass: the version that let it go named the key anew, so the request that
 /// proved the password then is taken for answered, not checked against the password renewed
 /// since, and no verdict asks its person for the password again.
+#[cfg(unix)]
 #[test]
 fn a_mac_another_approver_lets_in_by_the_password_and_lets_go_is_neither_shown_nor_refused() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1728,6 +1766,7 @@ fn a_mac_another_approver_lets_in_by_the_password_and_lets_go_is_neither_shown_n
 /// while this approver reads nothing leave the notes as they were and the run short of the
 /// version this approver reads: no key it knew counts as named still, and the request the Mac
 /// asked with is taken for answered.
+#[cfg(unix)]
 #[test]
 fn a_mac_admins_before_notes_let_in_and_let_go_is_no_ghost() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1776,6 +1815,7 @@ fn a_mac_admins_before_notes_let_in_and_let_go_is_no_ghost() {
 /// A Mac held on a `code-only` line as the vault opened, and shown, stays shown to an approver
 /// that read nothing while another admin Mac let another Mac in by its code and let it go and
 /// published again: the notes say its key stayed named, while the key let go is named anew.
+#[cfg(unix)]
 #[test]
 fn a_mac_held_on_a_code_only_line_stays_shown_while_other_macs_come_and_go() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1838,6 +1878,7 @@ fn a_mac_held_on_a_code_only_line_stays_shown_while_other_macs_come_and_go() {
 /// all while this approver reads nothing, is no ghost: the run begins three versions after the
 /// one the approver read, so two versions it does not cover could have let the key in and let it
 /// go, and the key, on its line again with no note, is named anew.
+#[cfg(unix)]
 #[test]
 fn a_mac_an_admin_before_notes_lets_go_between_versions_that_note_is_no_ghost() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1887,6 +1928,7 @@ fn a_mac_an_admin_before_notes_lets_go_between_versions_that_note_is_no_ghost() 
 /// which no note covers, and to one that read nothing while versions of this aterm followed: each
 /// carried the key on its line with no note, and a key with none was on its line since before
 /// their run began.
+#[cfg(unix)]
 #[test]
 fn a_mac_held_on_a_line_an_aterm_before_notes_wrote_stays_shown_as_versions_note() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1965,6 +2007,7 @@ fn a_mac_held_on_a_line_an_aterm_before_notes_wrote_stays_shown_as_versions_note
 /// went back) vouches for no key: each it knew on a `code-only` line is named anew
 /// ([`stayed_named`]). Negative control: without the check of the version judged against the one
 /// read, a key it knew stays named.
+#[cfg(unix)]
 #[test]
 fn a_record_judged_above_the_version_read_keeps_no_key_named() {
     let key = Identity::generate().expect("a key").recipient().to_bech32();
@@ -1990,6 +2033,7 @@ fn a_record_judged_above_the_version_read_keeps_no_key_named() {
 /// person's edit that deletes the notes gets them back. A vault with no such line gets none.
 /// After a version an aterm before the notes published, the run begins again. A key let in by
 /// hand with its line left is named anew once it is let go.
+#[cfg(unix)]
 #[test]
 fn a_version_notes_each_key_it_names_anew_and_carries_the_rest() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2218,6 +2262,7 @@ fn answered_proof_indices_do_not_rebind_after_request_lines_change() {
 /// and a build before the version's line reads the queue and the keys alone. A queue file
 /// without that line, and a record of 2026-10-26, with the queue and key lines at the head of
 /// `answered`, still read, with no version; the next write moves them.
+#[cfg(unix)]
 #[test]
 fn an_approver_record_keeps_its_requests_and_judged_version_where_a_build_before_reads_them() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2303,6 +2348,7 @@ fn an_approver_record_keeps_its_requests_and_judged_version_where_a_build_before
     assert_eq!(read_answered(&admin), record);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approver_rests_once_a_member_has_two_requests_under_one_name() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2392,6 +2438,7 @@ fn an_approver_rests_once_a_member_has_two_requests_under_one_name() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approver_rests_while_a_mac_let_go_asks_again_under_another_proof() {
     static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2479,6 +2526,7 @@ fn an_approver_rests_while_a_mac_let_go_asks_again_under_another_proof() {
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approver_that_stays_stuck_says_why_once_and_says_when_it_approves_again() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2522,6 +2570,7 @@ fn an_approver_that_stays_stuck_says_why_once_and_says_when_it_approves_again() 
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_stuck_approver_reports_again_only_for_a_failure_that_differs_in_more_than_numbers() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2567,6 +2616,7 @@ fn a_stuck_approver_reports_again_only_for_a_failure_that_differs_in_more_than_n
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approver_record_is_its_own_process_s_and_a_failed_removal_is_tried_again() {
     use std::os::unix::fs::PermissionsExt;
@@ -2634,6 +2684,7 @@ fn an_approver_record_is_its_own_process_s_and_a_failed_removal_is_tried_again()
     assert_eq!(approver_stuck(&paths, live), Some("stuck".to_string()));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_approval_publish_is_reported_on_its_first_pass_unless_the_vault_kept_nothing() {
     use std::os::unix::fs::PermissionsExt;
@@ -2775,6 +2826,7 @@ fn a_failed_approval_publish_is_reported_on_its_first_pass_unless_the_vault_kept
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_member_s_failures_to_read_are_not_an_approver_s_and_one_that_stops_being_admin_says_so() {
     use std::sync::Arc;
@@ -2832,6 +2884,7 @@ fn a_member_s_failures_to_read_are_not_an_approver_s_and_one_that_stops_being_ad
     server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_approver_starting_clears_its_own_pid_s_old_record_and_gone_ones() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2848,6 +2901,7 @@ fn an_approver_starting_clears_its_own_pid_s_old_record_and_gone_ones() {
     assert_eq!(approver_stuck(&paths, 999_999_999), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_record_that_failed_to_be_written_is_written_on_a_later_failing_pass() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2887,6 +2941,7 @@ fn a_record_that_failed_to_be_written_is_written_on_a_later_failing_pass() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_whose_request_is_not_heard_keeps_its_proof_for_the_next_ask() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2921,6 +2976,7 @@ fn a_join_whose_request_is_not_heard_keeps_its_proof_for_the_next_ask() {
     assert_eq!(state.membership, Stored::Pending);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_verdict_kept_before_the_subscribers_long_poll_is_read_before_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2984,6 +3040,7 @@ fn a_verdict_kept_before_the_subscribers_long_poll_is_read_before_it() {
     assert_eq!(refusals, 1, "said once");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_join_keeps_its_new_proof_before_its_request_is_answered() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3047,6 +3104,7 @@ fn a_join_keeps_its_new_proof_before_its_request_is_answered() {
 /// the approver long-polls the join queue, so a request ends its wait at once and nothing naps
 /// between them. Negative control: an approver that polls (a server that names no queue
 /// version) naps 2 s between passes, so the request waits out a nap.
+#[cfg(unix)]
 #[test]
 fn a_typed_join_password_is_let_in_with_no_nap_between() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3087,6 +3145,7 @@ fn a_typed_join_password_is_let_in_with_no_nap_between() {
 /// An idle admin Mac's approver costs one request per hold of the server's, each a long-poll
 /// the server holds: 3600 / 25 = 144 an hour at the default hold, where polling every 2 s cost
 /// 1800. Negative control: a pass that pauses (a polling approver) fails the zero pauses.
+#[cfg(unix)]
 #[test]
 fn an_idle_approver_asks_once_per_hold() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3111,6 +3170,7 @@ fn an_idle_approver_asks_once_per_hold() {
 /// asking to join, and stretches the join password once for all of them while it stays: three
 /// passes judging three listings stretch it once. Negative control: a key stretched in each
 /// judging pass is stretched three times.
+#[cfg(unix)]
 #[test]
 fn an_approver_stretches_the_join_password_once_while_it_stays() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3145,9 +3205,11 @@ fn an_approver_stretches_the_join_password_once_while_it_stays() {
 }
 
 /// The bell of a subscriber loop that hears nothing: nothing rings it.
+#[cfg(unix)]
 static NOBODY: crate::wake::Bell = crate::wake::Bell::new();
 
 /// What a subscriber loop hears in a test that hears nothing of the network.
+#[cfg(unix)]
 fn deaf() -> Hearing<'static> {
     Hearing {
         found: &FOUND_NONE,
@@ -3162,6 +3224,7 @@ fn deaf() -> Hearing<'static> {
 
 /// A route hint that moved no address cannot discard the later verified broker
 /// arrival. That cause ends the actual error nap and starts its retry afresh.
+#[cfg(unix)]
 #[test]
 fn broker_readiness_ends_a_failed_round_after_an_unrelated_route_hint() {
     let bell = crate::wake::Bell::new();
@@ -3191,9 +3254,11 @@ fn broker_readiness_ends_a_failed_round_after_an_unrelated_route_hint() {
 }
 
 /// A test loop's round `[swarm]` holds: it has no standing browse to drop.
+#[cfg(unix)]
 fn hold_nothing() {}
 
 /// A subscriber's ask of ALab's members that reaches none.
+#[cfg(unix)]
 fn ask_nobody(_: &Paths) -> crate::Result<usize> {
     Ok(0)
 }
@@ -3201,6 +3266,7 @@ fn ask_nobody(_: &Paths) -> crate::Result<usize> {
 /// `mb`, waiting to be let into the vault `ma` makes at `server` (no join password, so only
 /// an approval lets it in), and the vault read as ALab's from this thread on: its signer the
 /// key this build names.
+#[cfg(unix)]
 fn waiting_for_alab(
     root: &Path,
     server: &crate::server::Running,
@@ -3235,6 +3301,7 @@ fn waiting_for_alab(
 /// LAN to let it in from its subscriber, and says how many answered.
 /// NEGATIVE CONTROL: a subscriber loop that never calls `ask_members_if_due` (main before this
 /// fix) asks no member, and the hang detector fails the test.
+#[cfg(unix)]
 #[test]
 fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3294,8 +3361,10 @@ fn a_mac_waiting_for_alab_asks_its_members_from_its_subscriber() {
 /// is owed at every turn, as a lane whose inputs no watch covers owes one
 /// ([`member_routes::Projected::next_look`]). The worker then looks once a [`member_routes`]
 /// `LOOK`, which these tests take as their boundary between rounds.
+#[cfg(unix)]
 struct Paced<F>(F);
 
+#[cfg(unix)]
 impl<F: Fn(member_routes::ProjectionEvent) + Sync> member_routes::Projected for Paced<F> {
     fn event(&self, event: member_routes::ProjectionEvent) {
         (self.0)(event);
@@ -3308,6 +3377,7 @@ impl<F: Fn(member_routes::ProjectionEvent) + Sync> member_routes::Projected for 
 
 /// A route event reaches members while the vault's actual long poll remains held,
 /// even after the ordinary member requests backed off to fifteen minutes.
+#[cfg(unix)]
 #[test]
 fn a_route_asks_pending_members_without_waiting_for_the_vault_long_poll() {
     use crate::members::{desk, join, joiner};
@@ -3746,6 +3816,7 @@ fn a_broker_arrival_asks_pending_members_without_a_route_change() {
     assert!(observed.1, "the arriving broker answered a real hello");
 }
 
+#[cfg(unix)]
 #[test]
 fn member_route_wakes_preserve_sharing_holds_and_revocation() {
     for off in [true, false] {
@@ -4367,6 +4438,7 @@ fn a_failed_readiness_round_recovers_local_inputs_while_http_is_held() {
 /// NEGATIVE CONTROLS: a fixed minute's cadence asks within each longer pause; an
 /// `ask_members_if_due` without its `holds_allowed` check asks again after a run let this Mac in;
 /// one without its ALab check asks ALab's members for a team vault.
+#[cfg(unix)]
 #[test]
 fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4534,6 +4606,7 @@ fn a_waiting_mac_asks_alabs_members_less_often_until_a_member_allows_it() {
 /// switch is off, says so once, drops its standing browse at each round the switch holds
 /// ([`Hearing::hold`]), and asks again once a person turns it on.
 /// NEGATIVE CONTROL: a subscriber loop that reads no switch asks ALab's members at once.
+#[cfg(unix)]
 #[test]
 fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4637,6 +4710,7 @@ fn swarm_off_asks_no_alab_member_from_a_waiting_subscriber() {
 /// a fresh one starts with the first pass of the ALab vault after sharing comes back on: no
 /// browse runs while sharing is off. (A test build's `Watch::start_look` runs no browse.)
 /// NEGATIVE CONTROL: make `StandingBrowse::stop` keep the watch: it still runs while held.
+#[cfg(unix)]
 #[test]
 fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
     let bell = std::sync::Arc::new(crate::wake::Bell::default());
@@ -4662,6 +4736,7 @@ fn the_standing_browse_ends_while_sharing_is_off_and_starts_afresh() {
 }
 
 /// `mb`, let into `admin`'s vault at `source` and holding its version.
+#[cfg(unix)]
 fn member_in(root: &Path, admin: &Paths, source: &str) -> Paths {
     // The server it reads is its own on loopback, which answers.
     let _answering = ServersAnswering::set();
@@ -4686,8 +4761,10 @@ fn member_in(root: &Path, admin: &Paths, source: &str) -> Paths {
 
 /// Sets its flag as it drops, a failed check's unwinding included: the subscriber loop that
 /// flag stops ends, so the scope that runs it ends and the failure is reported.
+#[cfg(unix)]
 struct StopsOnDrop<'a>(&'a AtomicBool);
 
+#[cfg(unix)]
 impl Drop for StopsOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(true, Ordering::SeqCst);
@@ -4699,6 +4776,7 @@ impl Drop for StopsOnDrop<'_> {
 /// and one once this Mac's routes moved; the loop's long-polls go on beside each start.
 /// NEGATIVE CONTROL: a loop that starts no runner after an applied version (or none as it
 /// starts) never reaches the count.
+#[cfg(unix)]
 #[test]
 fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_on_moved_routes() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -4795,6 +4873,7 @@ fn the_subscriber_starts_the_converge_pass_as_it_starts_per_applied_version_and_
 /// watch that hears one add, ringing the bell the loop naps on.
 /// NEGATIVE CONTROL: a nap that waits on no bell runs to its timer and the next, and the hang
 /// detector fires.
+#[cfg(unix)]
 #[test]
 fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4860,6 +4939,7 @@ fn a_failing_subscriber_ends_its_nap_on_a_browse_add() {
 /// nothing and the routes stayed: the vault came back, or this Mac came back to it.
 /// NEGATIVE CONTROL: drop the streak rule (`Due::after_pass` forgetting the failed passes) and
 /// no runner starts after the one at start: the hang detector fires.
+#[cfg(unix)]
 #[test]
 fn a_pass_healthy_after_errors_starts_a_runner() {
     use std::net::{IpAddr, Ipv4Addr};
@@ -4948,6 +5028,7 @@ fn a_pass_healthy_after_errors_starts_a_runner() {
 /// NEGATIVE CONTROL: a pass that reads its source only (no browsed server) never applies it,
 /// and the hang detector fires; a nap that waits on no bell runs to its timer, and the log never
 /// says the browse woke it.
+#[cfg(unix)]
 #[test]
 fn a_server_that_vanishes_and_returns_at_a_new_address_is_applied() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5102,6 +5183,7 @@ fn a_runner_that_ended_while_the_vault_cannot_be_reached_is_reaped() {
 
 /// A Mac at `home` that asks `source` to join as `host` with no password, carrying the Allow
 /// `member` handed it, and its key.
+#[cfg(unix)]
 fn ask_as(root: &Path, home: &str, host: &str, source: &str, member: &Paths) -> (Paths, String) {
     let paths = Paths::for_home(&root.join(home));
     super::handover::test_hand_allowed(member, &paths, host);
@@ -5132,6 +5214,7 @@ fn ask_as(root: &Path, home: &str, host: &str, source: &str, member: &Paths) -> 
 /// gets the next free one.
 /// NEGATIVE CONTROL: an approver that holds a new key asking under a let-go name for its code
 /// (the let-go record tried and dropped on 2026-10-27) leaves the new Mac waiting.
+#[cfg(unix)]
 #[test]
 fn a_new_mac_allowed_under_the_name_of_a_mac_let_go_is_let_in() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5197,6 +5280,7 @@ fn a_new_mac_allowed_under_the_name_of_a_mac_let_go_is_let_in() {
 /// NEGATIVE CONTROLS: a mend that moves any program older than this build moves the 0.142
 /// snapshot, which reads the locker; one that ignores the pin moves the pinned job; an
 /// [`admin_locker_here`] that reads a held state lock as no vault keeps the job as a member's.
+#[cfg(unix)]
 #[test]
 fn a_held_approver_moves_only_once_it_cannot_read_the_vaults_admin_locker() {
     use crate::service::{Held, Job};
@@ -5297,6 +5381,7 @@ fn a_held_approver_moves_only_once_it_cannot_read_the_vaults_admin_locker() {
 /// 0.146, and one on another vault.
 /// NEGATIVE CONTROL: the mend before this fix (a held approver moves only once it cannot read
 /// the locker) keeps the ALab admin's 0.145 approver as `Kept(Reads)`.
+#[cfg(unix)]
 #[test]
 fn the_alab_admins_held_approver_older_than_0_146_moves_onto_this_release() {
     use crate::envelope::{Retired, TEST_RETIRED};
@@ -5384,6 +5469,7 @@ fn the_alab_admins_held_approver_older_than_0_146_moves_onto_this_release() {
     assert_eq!(moves.get(), 1);
 }
 
+#[cfg(unix)]
 #[test]
 fn managed_alab_subscribers_follow_installed_releases_without_admin_or_downgrade() {
     use crate::envelope::{Retired, TEST_RETIRED};
@@ -5535,6 +5621,7 @@ fn managed_alab_subscribers_follow_installed_releases_without_admin_or_downgrade
 /// the join password, in the same pass.
 /// NEGATIVE CONTROL: one line naming every Mac by the vault's own policy (the old log) says the
 /// allowed Mac came in by the join password, and the first assertion fails.
+#[cfg(unix)]
 #[test]
 fn the_approver_says_how_each_mac_it_let_in_got_in() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5603,6 +5690,7 @@ fn the_approver_says_how_each_mac_it_let_in_got_in() {
 /// start over at a minute after every wake. Another network still starts them over.
 /// NEGATIVE CONTROL: storing the read as it came (`None`, or a `-` part) reads the rejoined Wi-Fi
 /// as another network.
+#[cfg(unix)]
 #[test]
 fn a_wake_on_the_same_network_does_not_start_the_asks_over() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5715,6 +5803,7 @@ fn the_projection_rings_as_what_its_worker_awaits_moves() {
 /// does not read rings nothing.
 /// NEGATIVE CONTROL: telling only as asking begins or ends leaves an ask that moved the next one
 /// unheard, and the worker waits out the earlier pause.
+#[cfg(unix)]
 #[test]
 fn the_members_asking_rings_as_what_its_worker_reads_moves() {
     let bell = std::sync::Arc::new(aterm_uds::ready::Doorbell::new().unwrap());

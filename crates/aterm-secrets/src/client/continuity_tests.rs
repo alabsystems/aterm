@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(unix)]
 use super::super::log_entries_tests::{TwoMacs, newcomer, two_macs};
 use super::super::readmit::{Decision, decide};
 use super::*;
@@ -575,6 +576,7 @@ fn a_members_listed_facts_are_the_logs() {
 }
 
 /// A Mac that asks as `m7` and proves `node_key` from another host on the member's home ALab LAN.
+#[cfg(unix)]
 fn asked_on_lan(request: &DeviceRequest, node_key: [u8; 32]) -> Proven<'_> {
     Proven {
         reader: crate::members::bundle::Reader::BoundedLog(
@@ -593,6 +595,7 @@ fn asked_on_lan(request: &DeviceRequest, node_key: [u8; 32]) -> Proven<'_> {
 /// A vault with m22 (the admin) and m7, whose own `Node` record binds `node(7)`, on real vault
 /// folders (synthetic keys, a loopback server), and a clock a day past that record, by which a
 /// proof of `node(7)` would move seat m7.
+#[cfg(unix)]
 fn m7_published() -> (TwoMacs, u64) {
     // The server it reads is its own on loopback, which answers.
     let _answering = ServersAnswering::set();
@@ -614,6 +617,7 @@ fn m7_published() -> (TwoMacs, u64) {
 
 /// The request the Mac at `paths` queues under `host`, with the join password `password` of the
 /// vault `vault` proved.
+#[cfg(unix)]
 fn ask_with_password(paths: &Paths, host: &str, vault: &str, password: &[u8]) -> Request {
     let recipient = machine_identity(paths).unwrap().recipient().to_bech32();
     let proof = join::Key::derive(vault, password).prove(vault, &recipient, host);
@@ -637,6 +641,7 @@ fn ask_with_password(paths: &Paths, host: &str, vault: &str, password: &[u8]) ->
 /// NEGATIVE CONTROL: `auto_approve_listed` without its `seat_named` look (`named` always `None`):
 /// the approver's admission beside m22 is not on the record and the `beside` assert fails
 /// (`left: []`).
+#[cfg(unix)]
 #[test]
 fn a_proof_keeps_a_returning_macs_seat_and_a_new_seat_beside_one_is_on_the_record() {
     let (macs, dark) = m7_published();

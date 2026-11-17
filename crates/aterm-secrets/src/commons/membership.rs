@@ -13,11 +13,11 @@ pub const CERTIFICATE_LEN: usize = 4 + BINDING_LEN + 32 + 64;
 
 /// Public eligibility metadata captured from a verified vault on open. Never
 /// consult the caller's mutable edit document while issuing certificates.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct Eligibility {
     recipients: std::collections::BTreeMap<String, crate::age::Recipient>,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Eligibility {
     pub(crate) fn from_document(document: &crate::text::Document) -> Self {
         let mut recipients = std::collections::BTreeMap::new();
@@ -98,7 +98,7 @@ impl Certificate {
 
 /// Explicit authority approval. Automatic enrollment must first establish its
 /// own durable eligibility evidence; a vault machine-list entry alone is not it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -170,7 +170,7 @@ pub(crate) fn approve(
 
 /// Read-only policy check. Only `approve` consumes joint possession and signs a
 /// certificate; success here grants no membership or reusable permission.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn check_candidate(
     seed: &[u8; 32],
     journal: &super::journal::Journal,
@@ -199,5 +199,5 @@ pub(crate) fn check_candidate(
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;

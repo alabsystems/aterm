@@ -1,14 +1,87 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Admitted file reads (`O_NOFOLLOW | O_NONBLOCK`) and atomic 0600 writes.
+//! Admitted file reads (`O_NOFOLLOW | O_NONBLOCK`) and atomic 0600 writes; on Windows the same
+//! reads and writes under an access list in place of a mode (`fsx_win.rs`).
 
 use crate::{Error, SecretBytes};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
+#[cfg(windows)]
+#[path = "fsx_win.rs"]
+mod win;
+#[cfg(windows)]
+pub(crate) use win::FileAt;
+#[cfg(windows)]
+use win::MetaLen as _;
+#[cfg(windows)]
+pub(crate) use win::{
+    access_digest, create_private_dir_new, create_private_file_new, dir_owned_unshared, id_of,
+    lock_metadata, lock_wide, meta_of, narrow_lock, open_lock, open_lock_existing,
+    owned_unshared_dir_id, owner_only, private_dir_settled, private_file_settled,
+};
+#[cfg(windows)]
+pub use win::{ensure_private_dir, has_private_nonempty};
+#[cfg(windows)]
+use win::{gone, kind_of, open_admitted, seen_of, write_all_at};
+
+/// What one look at a path, or at the file a read opened, shows: Unix's `lstat` or `fstat`
+/// (`std::fs::Metadata`); on Windows the handle's own facts ([`aterm_dirfd::Stat`]), the name
+/// opened as itself.
+#[cfg(unix)]
+pub(crate) type Meta = std::fs::Metadata;
+/// What one look at a path, or at the file a read opened, shows: Unix's `lstat` or `fstat`
+/// (`std::fs::Metadata`); on Windows the handle's own facts ([`aterm_dirfd::Stat`]), the name
+/// opened as itself.
+#[cfg(windows)]
+pub(crate) type Meta = aterm_dirfd::Stat;
+
+/// A file's number on its device ([`FileStamp::ino`]): Unix's inode; on Windows the 128-bit file
+/// id (`FILE_ID_INFO`, which ReFS fills past 64 bits).
+#[cfg(unix)]
+pub type Ino = u64;
+/// A file's number on its device ([`FileStamp::ino`]): Unix's inode; on Windows the 128-bit file
+/// id (`FILE_ID_INFO`, which ReFS fills past 64 bits).
+#[cfg(windows)]
+pub type Ino = u128;
+
+/// What the handle `file` is open on is (`fstat`).
+#[cfg(unix)]
+pub(crate) fn meta_of(file: &File) -> io::Result<Meta> {
+    file.metadata()
+}
+
+/// Whether the file `meta` shows has lost its last link since it was opened.
+#[cfg(unix)]
+fn gone(meta: &Meta) -> bool {
+    meta.nlink() == 0
+}
+
+/// The device and inode `meta` shows.
+#[cfg(unix)]
+pub(crate) fn id_of(meta: &Meta) -> (u64, Ino) {
+    (meta.dev(), meta.ino())
+}
+
+/// The look at `path` that follows no final link (`lstat`).
+#[cfg(unix)]
+fn look_at(path: &Path) -> io::Result<Meta> {
+    std::fs::symlink_metadata(path)
+}
+
+/// The look at `path` that follows no final link: the name opened as itself.
+#[cfg(windows)]
+fn look_at(path: &Path) -> io::Result<Meta> {
+    win::lstat(path)
+}
+
+#[cfg(unix)]
 fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
     check_access_list(dir_fd, true).map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
     let meta = dir_fd
@@ -24,6 +97,7 @@ fn check_and_narrow_dir_fd(dir: &Path, dir_fd: &File) -> crate::Result<()> {
 
 /// Whether the folder `meta` describes is `0700` (any other mode [`ensure_private_dir`] makes
 /// `0700`), refused where it is no folder or another user's, as [`ensure_private_dir`] refuses it.
+#[cfg(unix)]
 fn owned_dir(dir: &Path, meta: &std::fs::Metadata) -> crate::Result<bool> {
     if !meta.is_dir() {
         return Err(Error::new(format!("{}: not a directory", dir.display())));
@@ -44,6 +118,7 @@ fn owned_dir(dir: &Path, meta: &std::fs::Metadata) -> crate::Result<bool> {
 /// # Errors
 /// `dir` is missing, a link or no folder, another user's, or of another mode, which
 /// [`ensure_private_dir`] would make `0700`.
+#[cfg(unix)]
 pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
     aterm_uds::private_file::check_private_dir(dir)
         .map_err(|e| Error::new(format!("{}: {e}", dir.display())))?;
@@ -65,7 +140,18 @@ pub(crate) fn private_dir_settled(dir: &Path) -> crate::Result<()> {
     Ok(())
 }
 
+/// Makes `dir`, a new `0700` directory (`mkdir`): a taken name is `AlreadyExists`. On Windows a new
+/// folder of the user's under a protected list of the user and SYSTEM alone from its creation.
+///
+/// # Errors
+/// The creation's.
+#[cfg(unix)]
+pub(crate) fn create_private_dir_new(dir: &Path) -> io::Result<()> {
+    std::fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
 /// Ensures `dir` exists as a 0700 directory owned by this user, refusing symlinks.
+#[cfg(unix)]
 pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
     let open_dir = || {
         OpenOptions::new()
@@ -121,6 +207,7 @@ pub fn ensure_private_dir(dir: &Path) -> crate::Result<()> {
 
 /// Mode repair cannot remove an extended ACL. Judge the retained descriptor
 /// before reads or writes; the caller supplies its own mode and owner policy.
+#[cfg(unix)]
 fn check_access_list(file: &File, directory: bool) -> io::Result<()> {
     match access_list_refusal(file, directory)? {
         Some(why) => Err(io::Error::new(io::ErrorKind::PermissionDenied, why)),
@@ -132,6 +219,7 @@ fn check_access_list(file: &File, directory: bool) -> io::Result<()> {
 /// list refuses it, `None` where it does not. An error is the look failing (an `fstat`, or the
 /// list's read, which can fail for memory), not a verdict on the file: looked at again, it may
 /// pass.
+#[cfg(unix)]
 fn access_list_refusal(file: &File, directory: bool) -> io::Result<Option<&'static str>> {
     let verdict = if directory {
         astream_sys::owner_private_dir(file)?
@@ -271,6 +359,7 @@ fn read_bounded(
     Ok(bytes)
 }
 
+#[cfg(unix)]
 fn open_admitted(
     path: &Path,
     admit: Admit,
@@ -394,19 +483,25 @@ impl OwnedReader {
     /// when its link count drops (measured on APFS, 2026-11-06: `mv` over a file held open moved
     /// its `st_ctime` and left its inode, length and `st_mtime`), so it is taken when every other
     /// field is unchanged. An append, a write in place and a file still linked whose change time
-    /// moved (renamed aside, say) are refused.
+    /// moved (renamed aside, say) are refused. On Windows a file renamed over or removed while
+    /// open shows no link left or a delete pending ([`aterm_dirfd::Stat`]), taken the same way.
     pub(crate) fn check_unchanged_classified(&self) -> Result<(), Unread> {
-        let metadata = self
-            .file
-            .metadata()
+        let metadata = meta_of(&self.file)
             .map_err(|e| Unread::Failed(Error::new(format!("{}: {e}", self.path.display()))))?;
         let now = FileStamp::of(&metadata);
-        let unlinked = metadata.nlink() == 0
+        let unlinked = gone(&metadata)
             && FileStamp {
                 ctime_ns: self.stamp.ctime_ns,
                 ..now
             } == self.stamp;
-        if now != self.stamp && !unlinked {
+        // NTFS leaves a file's stamp as it was through a rename (measured 2026-11-16: a file
+        // renamed aside while it was read kept its change time), so on Windows a file still
+        // linked must still be the one at its path.
+        #[cfg(windows)]
+        let moved = !unlinked && file_id(&self.path) != Some(id_of(&metadata));
+        #[cfg(unix)]
+        let moved = false;
+        if (now != self.stamp && !unlinked) || moved {
             return Err(Unread::Failed(Error::new(format!(
                 "{}: changed while reading membership records",
                 self.path.display()
@@ -455,6 +550,7 @@ pub(crate) fn read_buffer(len: u64, max: usize) -> Vec<u8> {
 
 /// Metadata-only check whether `path` is a non-empty regular file [`read_private`] admits
 /// (not a symlink, owned by this user, no group/other or setuid/setgid bits, at most `max` bytes).
+#[cfg(unix)]
 #[must_use]
 pub fn has_private_nonempty(path: &Path, max: usize) -> bool {
     let limit = u64::try_from(max).unwrap_or(u64::MAX);
@@ -529,8 +625,11 @@ pub fn write_atomic_with(
             parent.display()
         )));
     }
-    aterm_uds::atomic_file::write_with(path, mode, produce)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))
+    #[cfg(unix)]
+    let written = aterm_uds::atomic_file::write_with(path, mode, produce);
+    #[cfg(windows)]
+    let written = win::write_with(path, mode, produce);
+    written.map_err(|e| Error::new(format!("{}: {e}", path.display())))
 }
 
 /// [`write_atomic`], unless `path` already holds exactly `bytes`: a regular file of this user's
@@ -560,25 +659,9 @@ pub fn write_atomic_if_changed(path: &Path, bytes: &[u8], mode: u32) -> crate::R
 /// through) is `false`. The opened file is examined and read, so a file renamed over the path
 /// meanwhile is not the one judged, and the bytes read are wiped.
 fn holds_exactly(path: &Path, bytes: &[u8], mode: u32) -> bool {
-    let Ok(mut file) = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-    else {
+    let Some(mut file) = opened_as(path, bytes, mode) else {
         return false;
     };
-    let Ok(meta) = file.metadata() else {
-        return false;
-    };
-    if !meta.file_type().is_file()
-        || meta.uid() != euid()
-        || meta.nlink() != 1
-        || meta.mode() & 0o7777 != mode & 0o7777
-        || u64::try_from(bytes.len()).ok() != Some(meta.len())
-        || check_access_list(&file, false).is_err()
-    {
-        return false;
-    }
     let mut held = zeroize::Zeroizing::new([0u8; 64 * 1024]);
     let mut rest = bytes;
     loop {
@@ -592,9 +675,43 @@ fn holds_exactly(path: &Path, bytes: &[u8], mode: u32) -> bool {
     }
 }
 
+/// The file at `path` opened to read ([`holds_exactly`]), where it is a regular file of this
+/// user's with one link, `bytes`' length, permissions exactly `mode` and no access list that
+/// widens it; `None` where it is not, or cannot be opened or examined.
+#[cfg(unix)]
+fn opened_as(path: &Path, bytes: &[u8], mode: u32) -> Option<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file()
+        || meta.uid() != euid()
+        || meta.nlink() != 1
+        || meta.mode() & 0o7777 != mode & 0o7777
+        || u64::try_from(bytes.len()).ok() != Some(meta.len())
+        || check_access_list(&file, false).is_err()
+    {
+        return None;
+    }
+    Some(file)
+}
+
+/// The file at `path` opened as itself to read ([`holds_exactly`]), where it is a regular file
+/// of one link and `bytes`' length whose access list is of `mode`'s class (owner-only for a
+/// private mode, else this user's but not owner-only); `None` where it is not, or cannot be
+/// opened or examined.
+#[cfg(windows)]
+fn opened_as(path: &Path, bytes: &[u8], mode: u32) -> Option<File> {
+    let file = win::open_read(path).ok()?;
+    win::holds_as(&file, u64::try_from(bytes.len()).ok()?, mode).then_some(file)
+}
+
 /// Opens or creates a `0600` regular lock file at `path` (`O_NOFOLLOW | O_NONBLOCK`), verifying
 /// ownership and a single hard link, narrowing its permissions to `0600`, and keeping its
 /// descriptor out of child processes.
+#[cfg(unix)]
 pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
     let file = aterm_uds::kept_out(|| {
         OpenOptions::new()
@@ -620,6 +737,7 @@ pub(crate) fn open_lock(path: &Path) -> crate::Result<File> {
 ///
 /// # Errors
 /// The file cannot be examined, or it fails one of those checks.
+#[cfg(unix)]
 pub(crate) fn lock_metadata(file: &File, path: &Path) -> crate::Result<std::fs::Metadata> {
     check_access_list(file, false).map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     let metadata = file
@@ -632,6 +750,7 @@ pub(crate) fn lock_metadata(file: &File, path: &Path) -> crate::Result<std::fs::
 ///
 /// # Errors
 /// It fails one of [`lock_metadata`]'s checks.
+#[cfg(unix)]
 pub(crate) fn judge_lock(
     metadata: std::fs::Metadata,
     path: &Path,
@@ -665,6 +784,7 @@ pub(crate) fn judge_lock(
 ///
 /// # Errors
 /// The `fchmod` fails (a read-only filesystem, say).
+#[cfg(unix)]
 pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
     file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .map_err(|e| Error::new(format!("{}: {e}", path.display())))
@@ -676,13 +796,16 @@ pub(crate) fn narrow_lock(file: &File, path: &Path) -> crate::Result<()> {
 /// rewrite in place of the same length within the clock's granularity keeps it, which no
 /// writer of these files does (each writes a new file and renames it, or appends). A `chmod`,
 /// `chown` or `link` moves its inode-change time alone, which a filesystem whose clock ticks
-/// coarsely keeps within one tick: [`Seen`] holds what those change.
+/// coarsely keeps within one tick: [`Seen`] holds what those change. On Windows the device is the
+/// volume's serial number and the inode the file's 128-bit id; its change time moves at a write,
+/// a rename, a new link and a change of its access list (measured on NTFS, 2026-11-16: `icacls`
+/// moved it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileStamp {
     /// The device it is on.
     pub dev: u64,
-    /// Its inode.
-    pub ino: u64,
+    /// Its inode ([`Ino`]).
+    pub ino: Ino,
     /// Its length in bytes.
     pub len: u64,
     /// When its contents last changed.
@@ -691,6 +814,7 @@ pub struct FileStamp {
     pub ctime_ns: i128,
 }
 
+#[cfg(unix)]
 impl FileStamp {
     pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
         let ns = |secs: i64, nsec: i64| i128::from(secs) * 1_000_000_000 + i128::from(nsec);
@@ -719,14 +843,23 @@ pub(crate) fn stamp_if_present(path: &Path) -> crate::Result<Option<FileStamp>> 
 }
 
 /// What one `lstat` of a path shows ([`seen_if_present`]): its [`Kind`] and [`FileStamp`], and the
-/// owner, mode and link count that a stamp shows only through its inode-change time.
+/// owner, mode and link count that a stamp shows only through its inode-change time; on Windows
+/// the link count and the attributes, its owner and access list showing in the change time (NTFS
+/// moves it on a change to the security descriptor, measured 2026-11-16, though not within one
+/// tick of the system clock, about 16 ms, of its last move).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Seen {
     pub(crate) kind: Kind,
     pub(crate) stamp: FileStamp,
+    #[cfg(unix)]
     pub(crate) uid: u32,
+    #[cfg(unix)]
     pub(crate) mode: u32,
     pub(crate) nlink: u64,
+    /// The `FILE_ATTRIBUTE_*` bits: an attribute change within a clock tick of the file's last
+    /// change leaves its change time where it was.
+    #[cfg(windows)]
+    pub(crate) attributes: u32,
 }
 
 /// [`kind_and_stamp_if_present`], with the owner, mode and link count the same `lstat` found.
@@ -754,6 +887,7 @@ pub(crate) fn seen_if_present_in(
 }
 
 /// What the `lstat` `meta` shows ([`Seen`]).
+#[cfg(unix)]
 fn seen_of(meta: &std::fs::Metadata) -> Seen {
     Seen {
         kind: kind_of(meta),
@@ -764,16 +898,227 @@ fn seen_of(meta: &std::fs::Metadata) -> Seen {
     }
 }
 
+/// How [`seen_set`] looks at one path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Look {
+    /// Its kind, its [`FileStamp`] (device, inode, length, both change times), owner, group,
+    /// mode and link count. For a file a reader reads, and for a directory whose entries are among
+    /// what it reads: making, removing or renaming an entry moves the directory's change times.
+    Whole,
+    /// Its kind, device, inode, owner, group and mode, without its length, change times or link
+    /// count: for a directory a reader only passes through, whose own entries may come and go
+    /// without moving what that reader finds. On Windows its kind, volume, file id and
+    /// attributes: its owner and access list show only in its change time there.
+    Identity,
+    /// What an identity look takes, and the directory's verdict under the owner-only rule
+    /// ([`aterm_uds::private_file::judge_private_dir`]: missing, private, open by these mode bits,
+    /// or refused): for a directory a reader holds to that rule before it reads a file in it,
+    /// whose entries may come and go. That reader refuses an access-list grant, which no mode bit
+    /// shows, and whose change time, the only time that moves with it, moves for each entry made
+    /// or removed as well.
+    Private,
+}
+
+/// A directory's verdict under the owner-only rule, as a [`Look::Private`] takes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Nothing there when it was judged.
+    Missing,
+    /// This user's, `0700`, no access-list grant.
+    Private,
+    /// This user's and no access-list grant, open to others by these mode bits.
+    Open(u32),
+    /// Refused: an access-list grant, another user's, a symlink or no directory.
+    Refused,
+}
+
+impl Verdict {
+    /// `dir`'s verdict now; `None` where it could not be judged.
+    fn of(dir: &Path) -> Option<Self> {
+        use aterm_uds::private_file::PrivateDir;
+        match aterm_uds::private_file::judge_private_dir(dir) {
+            Ok(PrivateDir::Missing) => Some(Self::Missing),
+            Ok(PrivateDir::Private) => Some(Self::Private),
+            Ok(PrivateDir::Open(mode)) => Some(Self::Open(mode)),
+            Err(refused) if refused.kind() == io::ErrorKind::PermissionDenied => {
+                Some(Self::Refused)
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+/// What one [`Look`] of a path found ([`seen_set`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeenAs {
+    /// A [`Look::Whole`]: the [`Seen`] of its `lstat`, and the group it holds, which an
+    /// identity look holds too. On Windows the [`Seen`] alone: a file's owner and access list
+    /// show in its change time there, which it holds.
+    Whole {
+        seen: Seen,
+        #[cfg(unix)]
+        gid: u32,
+    },
+    /// A [`Look::Identity`].
+    Identity(Identified),
+    /// A [`Look::Private`]: what an identity look takes, and the verdict.
+    Private {
+        identity: Identified,
+        verdict: Verdict,
+    },
+}
+
+/// What an identity look takes of one `lstat` ([`Look::Identity`]): its kind, device and inode,
+/// and its owner, group and mode. On Windows its kind, volume, file id and attributes: its owner
+/// and access list show only in its change time there, which an identity look leaves out, and a
+/// [`Look::Private`] judges them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Identified {
+    kind: Kind,
+    dev: u64,
+    ino: Ino,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(windows)]
+    attributes: u32,
+}
+
+impl Identified {
+    /// What an identity look takes of the `lstat` `meta`.
+    fn of(meta: &Meta) -> Self {
+        let (dev, ino) = id_of(meta);
+        Self {
+            kind: kind_of(meta),
+            dev,
+            ino,
+            #[cfg(unix)]
+            uid: meta.uid(),
+            #[cfg(unix)]
+            gid: meta.gid(),
+            #[cfg(unix)]
+            mode: meta.mode(),
+            #[cfg(windows)]
+            attributes: meta.attributes,
+        }
+    }
+}
+
+impl SeenAs {
+    /// What `look` takes of the `lstat` `meta` of `path`; `None` where a private look's verdict
+    /// could not be judged.
+    fn of(path: &Path, meta: &Meta, look: Look) -> Option<Self> {
+        Some(match look {
+            Look::Whole => Self::Whole {
+                seen: seen_of(meta),
+                #[cfg(unix)]
+                gid: meta.gid(),
+            },
+            Look::Identity => Self::Identity(Identified::of(meta)),
+            Look::Private => Self::Private {
+                identity: Identified::of(meta),
+                verdict: Verdict::of(path)?,
+            },
+        })
+    }
+}
+
+/// What one `lstat` each of a list of paths showed, in the list's order, each as its [`Look`]
+/// takes it, and `None` for a path where nothing was ([`seen_set`]). Equal to a set taken of the
+/// same list only where each path showed the same: a file renamed over, written, appended to,
+/// linked, removed or made, a `chmod` or `chown`, an entry made in or removed from a directory
+/// looked at whole, and an access-list grant given or taken on a directory looked at privately
+/// each move it, and a read moves none of it. Of a file's times, a `chmod`, `chown`
+/// or link moves only its inode-change time, which a filesystem whose clock ticks coarsely can
+/// keep within one tick, so the set holds the owner, group, mode and link count they change. What
+/// it cannot tell is what a [`FileStamp`] cannot: a change within one tick of such a clock that
+/// moves only the times, a rewrite in place at the same length, or an entry made in a directory
+/// whose length does not count its entries. A set compares with one taken of the same list only:
+/// it holds no path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeenSet(Vec<(Look, Option<SeenAs>)>);
+
+/// One `lstat` of each of `paths` (never through a final symlink), each taken as its [`Look`]
+/// says, and a [`Look::Private`] of what is there judged as well; `None` where an `lstat` fails
+/// other than for a missing path, or a verdict cannot be judged, which is read again then. Each
+/// `lstat` is a fresh look ([`fresh_looks`]). Nothing is listed, and nothing is opened but a
+/// directory a private look judges where its attributes cannot decide its verdict (off macOS
+/// arm64, or where it carries an access list).
+#[must_use]
+pub fn seen_set(paths: &[(std::path::PathBuf, Look)]) -> Option<SeenSet> {
+    paths
+        .iter()
+        .map(|(path, look)| {
+            let seen = match lstat_in(None, path).ok()? {
+                Some(meta) => Some(SeenAs::of(path, &meta, *look)?),
+                None => None,
+            };
+            Some((*look, seen))
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(SeenSet)
+}
+
+/// `root` and every directory, file, symlink and other entry under it, never through a symlink,
+/// sorted (a directory before what it holds), leaving out each entry `stop` names and all it
+/// holds (a successor home inside the tree, which is stamped as a home of its own). Taken
+/// [`Look::Whole`] by [`seen_set`], the list moves with every change to what the tree holds
+/// without being listed again: an entry made, removed or renamed moves its directory's change
+/// times, and one removed shows nothing where it was. A missing `root`, or one that is a file or
+/// any other entry but a directory or a symlink, lists `root` alone. `None` where `root` is a
+/// symlink, which a reader of the tree may follow where this walk does not, or where `root` or
+/// an entry cannot be examined or a directory cannot be listed. Each listing, and the `lstat` of
+/// `root`, is a fresh look
+/// ([`fresh_looks`]); a directory gone between its listing and its own (`NotFound`) is in the
+/// list as an entry of its parent and lists nothing.
+#[must_use]
+pub fn tree_paths(root: &Path, stop: &[std::path::PathBuf]) -> Option<Vec<std::path::PathBuf>> {
+    let mut paths = vec![root.to_path_buf()];
+    match lstat_in(None, root) {
+        Ok(Some(meta)) => match kind_of(&meta) {
+            Kind::Symlink => return None,
+            Kind::Dir => {}
+            _ => return Some(paths),
+        },
+        Ok(None) => return Some(paths),
+        Err(_) => return None,
+    }
+    let mut folders = vec![root.to_path_buf()];
+    while let Some(folder) = folders.pop() {
+        look_afresh();
+        let entries = match std::fs::read_dir(&folder) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        for entry in entries {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if stop.contains(&path) {
+                continue;
+            }
+            // The entry's own type (`lstat`'s, or the directory's record of it): a symlink to a
+            // directory is an entry, never walked.
+            if entry.file_type().ok()?.is_dir() {
+                folders.push(path.clone());
+            }
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Some(paths)
+}
+
 /// The `lstat` of `path`, `None` where nothing is there: `glance`'s where the caller looks
 /// through one ([`Glance::symlink_metadata`]), a fresh one where it does not, which moves this
 /// thread's count of fresh looks ([`fresh_looks`]).
 ///
 /// # Errors
 /// The `lstat`'s, other than a missing path.
-pub(crate) fn lstat_in(
-    glance: Option<&Glance>,
-    path: &Path,
-) -> io::Result<Option<std::fs::Metadata>> {
+pub(crate) fn lstat_in(glance: Option<&Glance>, path: &Path) -> io::Result<Option<Meta>> {
     if let Some(glance) = glance {
         return glance.symlink_metadata(path);
     }
@@ -786,10 +1131,10 @@ pub(crate) fn lstat_in(
 ///
 /// # Errors
 /// The `lstat`'s, other than a missing path.
-fn lstat_now(path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+fn lstat_now(path: &Path) -> io::Result<Option<Meta>> {
     #[cfg(test)]
     count_look(path);
-    match std::fs::symlink_metadata(path) {
+    match look_at(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -802,13 +1147,14 @@ std::thread_local! {
 }
 
 /// How many times this thread looked at the disk afresh, since it began. These looks move it: each
-/// `lstat` no glance keeps ([`lstat_in`] on its own call, [`kind`], [`kind_and_id`], [`file_id`],
-/// [`kind_and_stamp_if_present`], a glance's `lstat` that failed, which it does not keep, and the
-/// `lstat` a glance confirms its first look at a file by, which it does not keep either
-/// ([`Glance::first_stands`])), each open of a file through `open_admitted` (the one [`read_private`], [`read_public`],
-/// [`read_owned`] and the digests [`digest_while_seen`] reads go through), the state lock's own
-/// open (`client::StateLock::open_present`), each listing of the control journal
-/// (`client::vault_memo::desk_files`), a memo's miss under a look
+/// `lstat` no glance keeps ([`lstat_in`] on its own call, [`seen_set`]'s and [`tree_paths`]' among
+/// them, [`kind`], [`kind_and_id`], [`file_id`], [`kind_and_stamp_if_present`], a glance's `lstat`
+/// that failed, which it does not keep, and the `lstat` a glance confirms its first look at a file
+/// by, which it does not keep either ([`Glance::first_stands`])), each open of a file through
+/// `open_admitted` (the one [`read_private`], [`read_public`], [`read_owned`] and the digests
+/// [`digest_while_seen`] reads go through), the state lock's own open
+/// (`client::StateLock::open_present`), each listing of a directory by [`tree_paths`] (the control
+/// journal's, `client::vault_memo::desk_files`), a memo's miss under a look
 /// (`client::vault_memo::Memo::read_under`), and each other mark of a reader that reads past these
 /// ([`look_afresh`]). A glance's first `lstat` of a path, which the glance keeps and gives for the
 /// rest of its life ([`Glance::symlink_metadata`]), does not move it. Nor do some other looks a
@@ -859,7 +1205,7 @@ pub(crate) fn look_afresh() {
 pub(crate) struct Glance {
     /// When this look began, before any `lstat` it took ([`asked_now`]).
     began: std::time::SystemTime,
-    seen: std::cell::RefCell<Vec<(std::path::PathBuf, Option<std::fs::Metadata>)>>,
+    seen: std::cell::RefCell<Vec<(std::path::PathBuf, Option<Meta>)>>,
 }
 
 impl Glance {
@@ -882,13 +1228,20 @@ impl Glance {
     ///
     /// # Errors
     /// The `lstat`'s, other than a missing path.
-    pub(crate) fn symlink_metadata(&self, path: &Path) -> io::Result<Option<std::fs::Metadata>> {
+    pub(crate) fn symlink_metadata(&self, path: &Path) -> io::Result<Option<Meta>> {
         if let Some(meta) = self.first(path) {
             return Ok(meta);
         }
         // The one look at the disk that is no fresh look ([`fresh_looks`]): what it finds is
         // this glance's for the rest of its life. One that fails is not kept, and is.
         let meta = lstat_now(path).inspect_err(|_| look_afresh())?;
+        #[cfg_attr(
+            windows,
+            expect(
+                clippy::clone_on_copy,
+                reason = "Unix's Metadata is no Copy; Windows' Stat is"
+            )
+        )]
         self.seen
             .borrow_mut()
             .push((path.to_path_buf(), meta.clone()));
@@ -897,7 +1250,7 @@ impl Glance {
 
     /// The `lstat` of `path` this look took first, `Some(None)` where nothing was there; `None`
     /// where it took none. It looks at nothing.
-    fn first(&self, path: &Path) -> Option<Option<std::fs::Metadata>> {
+    fn first(&self, path: &Path) -> Option<Option<Meta>> {
         let bytes = path.as_os_str().as_encoded_bytes();
         // The paths one check names share their folder: they differ at their ends.
         let same = |at: &std::path::PathBuf| {
@@ -908,7 +1261,8 @@ impl Glance {
             .borrow()
             .iter()
             .find(|(at, _)| same(at))
-            .map(|(_, meta)| meta.clone())
+            .map(|(_, meta)| meta)
+            .cloned()
     }
 
     /// What this look's first `lstat` of `path` showed, where it showed a regular file that had
@@ -1244,7 +1598,7 @@ fn digest_while_seen_in(
 /// As [`stamp_if_present`].
 pub(crate) fn kind_and_stamp_if_present(path: &Path) -> crate::Result<Option<(Kind, FileStamp)>> {
     look_afresh();
-    match std::fs::symlink_metadata(path) {
+    match look_at(path) {
         Ok(meta) => Ok(Some((kind_of(&meta), FileStamp::of(&meta)))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(Error::new(format!("{}: {error}", path.display()))),
@@ -1293,36 +1647,55 @@ pub fn append_at_with(
             parent.display()
         )));
     }
-    let appended = OpenOptions::new()
+    let appended = open_append(path, expected).and_then(|mut file| {
+        {
+            let mut exact = ExactWriter {
+                writer: &mut file,
+                remaining: length,
+            };
+            produce(&mut exact)?;
+            exact.finish()?;
+        }
+        aterm_durable::durable_data(&file)?;
+        meta_of(&file).map(|after| FileStamp::of(&after))
+    });
+    appended.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+/// [`append_at_with`]'s open: `path` opened to append (never through a symlink), where it is
+/// still the private regular file of one link `expected` stamped (its device, inode and length).
+///
+/// # Errors
+/// The open, its access list or `fstat` fails, or the file is not that one.
+#[cfg(unix)]
+fn open_append(path: &Path, expected: &FileStamp) -> io::Result<File> {
+    let file = OpenOptions::new()
         .append(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
-        .and_then(|mut file| {
-            check_access_list(&file, false)?;
-            let metadata = file.metadata()?;
-            if !metadata.file_type().is_file()
-                || metadata.uid() != euid()
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o077 != 0
-                || metadata.mode() & 0o6000 != 0
-                || metadata.dev() != expected.dev
-                || metadata.ino() != expected.ino
-                || metadata.len() != expected.len
-            {
-                return Err(io::Error::other("not the file this writer last left"));
-            }
-            {
-                let mut exact = ExactWriter {
-                    writer: &mut file,
-                    remaining: length,
-                };
-                produce(&mut exact)?;
-                exact.finish()?;
-            }
-            aterm_durable::durable_data(&file)?;
-            file.metadata().map(|after| FileStamp::of(&after))
-        });
-    appended.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+        .open(path)?;
+    check_access_list(&file, false)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != euid()
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o6000 != 0
+        || metadata.dev() != expected.dev
+        || metadata.ino() != expected.ino
+        || metadata.len() != expected.len
+    {
+        return Err(io::Error::other("not the file this writer last left"));
+    }
+    Ok(file)
+}
+
+/// [`append_at_with`]'s open on Windows ([`win::open_append`]).
+///
+/// # Errors
+/// The open, its access list or its facts fail, or the file is not that one.
+#[cfg(windows)]
+fn open_append(path: &Path, expected: &FileStamp) -> io::Result<File> {
+    win::open_append(path, expected)
 }
 
 struct ExactWriter<'a> {
@@ -1405,10 +1778,14 @@ fn write_atomic_stamped_after(
             parent.display()
         )));
     }
+    #[cfg(unix)]
     let written = aterm_uds::atomic_file::write_with_metadata(path, mode, produce)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
+        .map(|written| (written.dev(), written.ino()));
+    #[cfg(windows)]
+    let written = win::write_with_id(path, mode, produce);
+    let written = written.map_err(|e| Error::new(format!("{}: {e}", path.display())))?;
     after();
-    Ok(stamp(path).filter(|placed| placed.dev == written.dev() && placed.ino == written.ino()))
+    Ok(stamp(path).filter(|placed| (placed.dev, placed.ino) == written))
 }
 
 #[cfg(test)]
@@ -1419,6 +1796,10 @@ mod stream_tests;
 #[path = "fsx_acl_tests.rs"]
 mod acl_tests;
 
+#[cfg(all(test, unix))]
+#[path = "fsx_seen_tests.rs"]
+mod seen_tests;
+
 /// [`write_atomic`] for one of many files a pass writes: the temporary file's bytes ordered
 /// before its rename ([`aterm_durable::ordered`]) and no flush of the directory, which the
 /// pass flushes once for all its files, so `path` holds `bytes` or what it held, never a part.
@@ -1426,7 +1807,7 @@ pub fn write_ordered(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<()> 
     let (tmp, mut file) = temp_beside(path, mode)?;
     let placed = file
         .write_all(bytes)
-        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| set_mode(&file, mode))
         .and_then(|()| aterm_durable::ordered(&file))
         .and_then(|()| {
             drop(file);
@@ -1448,8 +1829,23 @@ fn temp_beside(path: &Path, mode: u32) -> crate::Result<(std::path::PathBuf, Fil
             parent.display()
         )));
     }
-    aterm_uds::atomic_file::create_temp_beside(path, mode)
-        .map_err(|e| Error::new(format!("{}: {e}", path.display())))
+    #[cfg(unix)]
+    let made = aterm_uds::atomic_file::create_temp_beside(path, mode);
+    #[cfg(windows)]
+    let made = win::create_temp(path, mode);
+    made.map_err(|e| Error::new(format!("{}: {e}", path.display())))
+}
+
+/// Set the temporary `file` [`temp_beside`] made to `mode` (`fchmod`), past the umask.
+#[cfg(unix)]
+fn set_mode(file: &File, mode: u32) -> io::Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(mode))
+}
+
+/// Nothing on Windows: [`temp_beside`] made the temporary in `mode`'s class from its creation.
+#[cfg(windows)]
+const fn set_mode(_file: &File, _mode: u32) -> io::Result<()> {
+    Ok(())
 }
 
 /// Writes `bytes` to `path` at `mode` only if `path` does not exist.
@@ -1458,7 +1854,35 @@ fn temp_beside(path: &Path, mode: u32) -> crate::Result<(std::path::PathBuf, Fil
 /// [`write_atomic`]'s: once the link has made `path`, an error would tell the caller nothing
 /// was placed while its next try answers "taken", a claim no caller owns.
 pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
-    let placed = write_new_flushed(path, bytes, mode, sync)?;
+    write_new_durable(path, bytes, mode, || Ok(()))
+}
+
+/// [`write_new`] that runs `staged` once the bytes are written whole and made durable beside
+/// `path`, just before the link that places them: what `staged` does (the Windows machine key's
+/// making sets aside the file DPAPI no longer opens) happens only once nothing but that link is
+/// left to fail. Where `staged` fails, the temporary file is removed and nothing is placed.
+///
+/// # Errors
+/// As [`write_new`], or `staged`'s.
+#[cfg(windows)]
+pub(crate) fn write_new_staged(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    staged: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<bool> {
+    write_new_durable(path, bytes, mode, staged)
+}
+
+/// [`write_new`] with `staged` run before its link ([`write_new_staged`]), the folder flushed
+/// (best-effort) after a link that placed it.
+fn write_new_durable(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    staged: impl FnOnce() -> crate::Result<()>,
+) -> crate::Result<bool> {
+    let placed = write_new_flushed(path, bytes, mode, sync, staged)?;
     if placed {
         let dir = match path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir,
@@ -1472,29 +1896,34 @@ pub fn write_new(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
 /// [`write_new`] for one of many files a pass writes, as [`write_ordered`]: the bytes ordered
 /// before the link, and no flush of the directory.
 pub fn write_new_ordered(path: &Path, bytes: &[u8], mode: u32) -> crate::Result<bool> {
-    write_new_flushed(path, bytes, mode, aterm_durable::ordered)
+    write_new_flushed(path, bytes, mode, aterm_durable::ordered, || Ok(()))
 }
 
-/// [`write_new`]'s link, the temporary file's bytes finished by `flush` before it.
+/// [`write_new`]'s link, the temporary file's bytes finished by `flush` before it and `staged` run
+/// between the two.
 fn write_new_flushed(
     path: &Path,
     bytes: &[u8],
     mode: u32,
     flush: fn(&File) -> io::Result<()>,
+    staged: impl FnOnce() -> crate::Result<()>,
 ) -> crate::Result<bool> {
     let (tmp, mut file) = temp_beside(path, mode)?;
     let written = file
         .write_all(bytes)
-        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| set_mode(&file, mode))
         .and_then(|()| flush(&file));
     drop(file);
     let placed = match written {
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
-        Ok(()) => match link_then_unlink(&tmp, path) {
-            Ok(()) => Ok(true),
-            Err(Moved::NotLinked(e)) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(Moved::NotLinked(e)) => Err(Error::new(format!("{}: {e}", path.display()))),
-            Err(Moved::NotUnlinked(e)) => Err(Error::new(format!("{}: {e}", tmp.display()))),
+        Ok(()) => match staged() {
+            Err(e) => Err(e),
+            Ok(()) => match link_then_unlink(&tmp, path) {
+                Ok(()) => Ok(true),
+                Err(Moved::NotLinked(e)) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                Err(Moved::NotLinked(e)) => Err(Error::new(format!("{}: {e}", path.display()))),
+                Err(Moved::NotUnlinked(e)) => Err(Error::new(format!("{}: {e}", tmp.display()))),
+            },
         },
     };
     if !matches!(placed, Ok(true)) {
@@ -1524,15 +1953,16 @@ pub fn kind(path: &Path) -> crate::Result<Kind> {
 }
 
 /// What is at `path` (`lstat`), together with its `(device, inode)` when present.
-pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, u64)>)> {
+pub fn kind_and_id(path: &Path) -> crate::Result<(Kind, Option<(u64, Ino)>)> {
     look_afresh();
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) => Ok((kind_of(&meta), Some((meta.dev(), meta.ino())))),
+    match look_at(path) {
+        Ok(meta) => Ok((kind_of(&meta), Some(id_of(&meta)))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok((Kind::Missing, None)),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
 }
 
+#[cfg(unix)]
 fn kind_of(meta: &std::fs::Metadata) -> Kind {
     let kind = meta.file_type();
     if kind.is_symlink() {
@@ -1547,11 +1977,9 @@ fn kind_of(meta: &std::fs::Metadata) -> Kind {
 }
 
 /// Returns `(device, inode)` of `path` via `lstat`, or `None` if missing.
-pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+pub fn file_id(path: &Path) -> Option<(u64, Ino)> {
     look_afresh();
-    std::fs::symlink_metadata(path)
-        .ok()
-        .map(|meta| (meta.dev(), meta.ino()))
+    look_at(path).ok().map(|meta| id_of(&meta))
 }
 
 /// Renames `from` to `to` without replacing an existing `to`.
@@ -1568,10 +1996,18 @@ enum Moved {
     /// The link failed (`AlreadyExists` when `to` was taken): nothing changed.
     NotLinked(io::Error),
     /// The removal of `from` failed; the link was undone.
+    #[cfg_attr(
+        windows,
+        expect(
+            dead_code,
+            reason = "a Windows move is one rename that replaces nothing, with no removal to fail"
+        )
+    )]
     NotUnlinked(io::Error),
 }
 
 /// [`rename_noreplace`]'s steps, with the step that failed and its OS error.
+#[cfg(unix)]
 fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     std::fs::hard_link(from, to).map_err(Moved::NotLinked)?;
     let Err(e) = std::fs::remove_file(from) else {
@@ -1586,13 +2022,24 @@ fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
     Err(Moved::NotUnlinked(e))
 }
 
+/// [`rename_noreplace`] on Windows: one rename that refuses a taken name in the same step
+/// ([`win::rename_noreplace`]), so nothing is ever linked twice and no removal can fail apart.
+#[cfg(windows)]
+fn link_then_unlink(from: &Path, to: &Path) -> Result<(), Moved> {
+    win::rename_noreplace(from, to)
+}
+
 /// Zeroes and removes a regular file at `path` (one this user cannot read stays), or unlinks a
 /// symlink without following it.
 pub fn wipe_and_remove(path: &Path) -> crate::Result<()> {
     if kind(path)? == Kind::File {
         return wipe(path, |_, _| Ok(true)).map(drop);
     }
-    match std::fs::remove_file(path) {
+    #[cfg(unix)]
+    let removed = std::fs::remove_file(path);
+    #[cfg(windows)]
+    let removed = win::remove_link(path);
+    match removed {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
@@ -1619,9 +2066,10 @@ pub fn wipe_if(path: &Path, max: usize, ours: impl FnOnce(&[u8]) -> bool) -> cra
 /// [`wipe_if`]'s steps, with `judge` reading the file it opened.
 fn wipe(
     path: &Path,
-    judge: impl FnOnce(&mut File, &std::fs::Metadata) -> io::Result<bool>,
+    judge: impl FnOnce(&mut File, &Meta) -> io::Result<bool>,
 ) -> crate::Result<bool> {
     let at = |e: io::Error| Error::new(format!("{}: {e}", path.display()));
+    #[cfg(unix)]
     let open = |write: bool| {
         OpenOptions::new()
             .read(true)
@@ -1629,6 +2077,8 @@ fn wipe(
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(path)
     };
+    #[cfg(windows)]
+    let open = |write: bool| win::open_wipe(path, write);
     let opened = match open(true) {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied => open(false),
         opened => opened,
@@ -1639,16 +2089,16 @@ fn wipe(
             if matches!(
                 e.kind(),
                 io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
-            ) || e.raw_os_error() == Some(libc::ELOOP) =>
+            ) || refused_link(&e) =>
         {
             return Ok(false);
         }
         Err(e) => return Err(at(e)),
     };
-    let meta = file.metadata().map_err(at)?;
+    let meta = meta_of(&file).map_err(at)?;
     if !meta.file_type().is_file()
         || !judge(&mut file, &meta).map_err(at)?
-        || file_id(path) != Some((meta.dev(), meta.ino()))
+        || file_id(path) != Some(id_of(&meta))
     {
         return Ok(false);
     }
@@ -1661,7 +2111,7 @@ fn wipe(
     let mut done = 0;
     while done < meta.len() {
         let n = usize::try_from((meta.len() - done).min(4096)).unwrap_or(4096);
-        if file.write_all_at(&zeros[..n], done).is_err() {
+        if write_all_at(&file, &zeros[..n], done).is_err() {
             break;
         }
         done += n as u64;
@@ -1670,11 +2120,30 @@ fn wipe(
     Ok(true)
 }
 
+/// Whether an open's error is its refusal of a symlink at the name (`O_NOFOLLOW`'s `ELOOP`).
+#[cfg(unix)]
+fn refused_link(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// Never on Windows: a reparse point at the name opens as itself, and is judged no regular file.
+#[cfg(windows)]
+const fn refused_link(_: &io::Error) -> bool {
+    false
+}
+
+/// Write all of `bytes` to `file` at `offset` (`pwrite`).
+#[cfg(unix)]
+fn write_all_at(file: &File, bytes: &[u8], offset: u64) -> io::Result<()> {
+    file.write_all_at(bytes, offset)
+}
+
 fn sync(file: &File) -> io::Result<()> {
     aterm_durable::durable_data(file)
 }
 
 /// This process's effective uid.
+#[cfg(unix)]
 pub fn euid() -> u32 {
     #[cfg(test)]
     if let Some(uid) = EUID_SEAM.with(std::cell::Cell::get) {
@@ -1832,10 +2301,11 @@ pub(crate) fn reads_under(dir: &Path) -> std::collections::BTreeMap<std::path::P
 pub(crate) fn write_owned_in_place(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) {
     let path = path.as_ref();
     std::fs::write(path, bytes).unwrap();
+    #[cfg(unix)]
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     /// The uid [`euid`] answers on this thread while [`as_another_user`] runs.
     static EUID_SEAM: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
@@ -1843,7 +2313,7 @@ thread_local! {
 
 /// Run `f` with [`euid`] answering a uid other than this process's on this thread: every file this
 /// user made is then another user's to the checks inside it, as a lock another account left is.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn as_another_user<T>(f: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {

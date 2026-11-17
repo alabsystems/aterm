@@ -1491,7 +1491,8 @@ pub struct Ask<'a> {
     pub length_s: i64,
     /// Its reset, from a current reading; `None` sums a rolling span ending now, with no capacity.
     pub resets_at: Option<i64>,
-    /// A reset used inside the window: the vendor refilled it there.
+    /// The window's refill barrier ([`super::accounts::WindowFig::epoch_at`]): a limit reset spent,
+    /// a refill or a raised allowance inside it.
     pub epoch_at: Option<i64>,
     /// Only the models of this family (`fable`, the Fable bucket).
     pub family: Option<&'a str>,
@@ -1548,7 +1549,7 @@ pub struct Figure {
     pub left: Result<Left, Why>,
 }
 
-/// One window's dollars: spent so far (from the window's start, or from a reset used inside it), and with a reading in it, its capacity, with its error bar, and what is left, with `u_now`'s age, or the word that says why each is empty.
+/// One window's dollars: spent so far (from the window's start, or from its refill barrier), and with a reading in it, its capacity, with its error bar, and what is left, with `u_now`'s age, or the word that says why each is empty.
 #[must_use]
 pub fn figure(spend: &Spend, ask: &Ask<'_>) -> Figure {
     let (from, to, rolling) = match ask.resets_at {

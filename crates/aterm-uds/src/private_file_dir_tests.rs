@@ -158,3 +158,75 @@ fn admission_is_rechecked_and_children_refuse_links_and_nonregular_files() {
     assert!(root.lock("new-lock", Duration::ZERO, "busy").is_err());
     assert!(PrivateDirectory::open(&path).is_err());
 }
+
+fn child_names(view: &DirectoryView<'_>) -> Vec<std::ffi::OsString> {
+    view.names()
+        .unwrap()
+        .collect::<io::Result<Vec<_>>>()
+        .unwrap()
+        .into_iter()
+        .filter(|name| name != "." && name != "..")
+        .collect()
+}
+
+#[test]
+fn strict_held_entry_write_preserves_preparation_and_directory_failure_stages() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = PrivateDirectory::open(scratch.path()).unwrap();
+    let view = root.view().unwrap();
+    view.write_entry_landed("row", b"before", || Ok(()))
+        .unwrap()
+        .unwrap();
+    let recording = aterm_durable::seam::Recording::start();
+    let refused = view.write_entry_landed("row", b"not published", || {
+        Err(io::Error::from(io::ErrorKind::StorageFull))
+    });
+    assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::StorageFull);
+    assert_eq!(view.read("row", 100).unwrap(), b"before");
+    assert_eq!(recording.take(), [aterm_durable::Flush::Durable]);
+    for errno in [aterm_durable::seam::ENOTSUP, aterm_durable::seam::EIO] {
+        let bytes = format!("published {errno}");
+        let failure = aterm_durable::seam::FailingDirs::with(errno);
+        let landed = view
+            .write_entry_landed("row", bytes.as_bytes(), || Ok(()))
+            .expect("temporary preparation and rename succeed");
+        drop(failure);
+        assert_eq!(landed.unwrap_err().raw_os_error(), Some(errno));
+        assert_eq!(view.read("row", 100).unwrap(), bytes.as_bytes());
+        assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
+    }
+    let unavailable = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::ENOTSUP);
+    view.write("row", b"best effort caller").unwrap();
+    drop(unavailable);
+    assert_eq!(view.read("row", 100).unwrap(), b"best effort caller");
+    assert_eq!(recording.take(), [aterm_durable::Flush::Durable; 2]);
+    assert_eq!(child_names(&view), ["row"], "no failed temporary remains");
+}
+
+#[test]
+fn strict_publication_and_flush_stay_on_the_held_directory_after_commit_check() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let path = scratch.path().join("current");
+    let retired = scratch.path().join("retired");
+    let other = scratch.path().join("other");
+    crate::private_file::create_private_dir(&path).unwrap();
+    crate::private_file::create_private_dir(&other).unwrap();
+    let root = PrivateDirectory::open(&path).unwrap();
+    let view = root.view().unwrap();
+    view.write("row", b"before").unwrap();
+    crate::private_file::write_private(&other, "row", b"unrelated").unwrap();
+    let outcome = view
+        .write_entry_landed("row", b"after", || {
+            std::fs::rename(&path, &retired)?;
+            symlink(&other, &path)?;
+            Ok(())
+        })
+        .unwrap();
+    outcome.unwrap();
+    assert_eq!(view.read("row", 100).unwrap(), b"after");
+    assert_eq!(
+        crate::private_file::read_private(&other, "row", 100).unwrap(),
+        b"unrelated"
+    );
+    assert_eq!(child_names(&view), ["row"]);
+}

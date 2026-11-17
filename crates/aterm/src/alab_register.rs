@@ -51,10 +51,9 @@ fn log_pass(pass: &aterm_db::Result<Registered>) {
 /// The repair-round hook for one Commons runtime: inert where this process does not publish.
 pub(crate) fn reports(paths: Paths, config: PathBuf) -> impl Fn(RepairRound) + Send + 'static {
     let registrar = super::alab_view::holds()
-        .then(|| Registrar::start(paths.clone(), config, probe, log_pass).ok())
+        .then(|| Registrar::start(paths, config, probe, log_pass).ok())
         .flatten();
     move |round: RepairRound| {
-        super::alab_view::round(&paths, &round);
         if let Some(registrar) = &registrar {
             registrar.round(&round);
         }

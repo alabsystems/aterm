@@ -4534,6 +4534,12 @@ fn dispatch_hold_verb(
     let reply = cmd_hold_waking(store, rest, issuer, &|sid| {
         wake_sid_watchers(store, sid);
     });
+    // A remote hold is an input of the fleet listener's lift, which has no file event: its
+    // apply rings the listener, after the hold is in place.
+    #[cfg(unix)]
+    if issuer == HoldIssuer::Remote && reply.starts_with("OK") {
+        crate::fleet_listen::remote_hold_moved();
+    }
     if reply == HOLD_DENIED {
         log_denial(
             AUDIT_SUBSYSTEM,
@@ -4634,6 +4640,23 @@ fn serve_meta_with_barrier(
     before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
     on_change: impl FnOnce(bool),
 ) -> String {
+    serve_meta_as(
+        request,
+        before_act,
+        || crate::typed_by::Who::client(serving_peer_pid()),
+        on_change,
+    )
+}
+
+/// [`serve_meta_with_barrier`], `client` naming the owner-token connection's process: the
+/// connection's peer, or a test's process and lineage. It is read for a title write alone,
+/// whose author is who that process was observed to be ([`control_session::desc_author_as`]).
+fn serve_meta_as(
+    request: MetaRequest<'_>,
+    before_act: impl FnOnce(&SessionCtx) -> crate::act_barrier::Passage,
+    client: impl FnOnce() -> crate::typed_by::Who,
+    on_change: impl FnOnce(bool),
+) -> String {
     let MetaRequest {
         rest,
         term,
@@ -4700,7 +4723,13 @@ fn serve_meta_with_barrier(
     })
     .or_else(|| control_session::meta_questions_denied(scope, rest))
     .unwrap_or_else(|| {
-        let by = control_session::log_actor(scope, ctx);
+        // A title is a description claim: its author is who the connection was observed to be,
+        // read here, before `cmd_meta_by` takes the session's metadata lock.
+        let by = if control_session::meta_writes_title(rest) {
+            control_session::desc_author_as(scope, ctx, store, client)
+        } else {
+            control_session::log_actor(scope, ctx)
+        };
         control_session::cmd_meta_by(term, store, session, ctx, rest, by)
     });
     if changed {
@@ -5915,7 +5944,11 @@ fn earlier_log_reply(
     let (Some(reader), Some(short)) = (reader, aterm_slog::ShortId::new(sid)) else {
         return NO_EARLIER_LOG.to_string();
     };
-    match reader.view_picked(&short, aterm_slog::journal::Pick::Before { below, back }) {
+    match reader.view_picked(
+        &short,
+        journal_ident(sid, store),
+        aterm_slog::journal::Pick::Before { below, back },
+    ) {
         JournalRead::View(view) => journal_view_reply(&view, sid, verb, rest, store),
         JournalRead::Absent => NO_EARLIER_LOG.to_string(),
         JournalRead::Cut => JOURNAL_CUT.to_string(),
@@ -6001,7 +6034,7 @@ fn journal_session_reply_with(
     }
     let short = aterm_slog::ShortId::new(sid.as_str())?;
     use crate::session_log_journal::read::{self as journal_read, JournalRead};
-    let view = match reader.view(&short) {
+    let view = match reader.view(&short, journal_ident(sid.as_str(), store)) {
         JournalRead::View(view) => view,
         JournalRead::Absent => return None,
         JournalRead::Cut => return Some(journal_read::JOURNAL_CUT.to_string()),
@@ -6019,6 +6052,44 @@ fn journal_session_reply_with(
         ),
         Err(()) => prev_usage(verb).to_string(),
     })
+}
+
+/// WHO SESSION `sid` IS, for a journal replay of its log ([`aterm_slog::Log::from_journal`]): its
+/// own sid, and the creator its task record names where this host still holds the session or the
+/// row its end left in the machine's session table ([`crate::session_table`]), each read as the
+/// live log is told them ([`crate::session_log::sid_ident`]).
+fn journal_ident(sid: &str, store: &Store) -> aterm_slog::DescIdent {
+    // A sid that does not read as a session's names none here, and so no creator.
+    let id = SessionId::parse(sid);
+    let (live, table) = {
+        let guard = store.read().unwrap_or_else(|p| p.into_inner());
+        (
+            id.as_ref()
+                .and_then(|id| guard.by_sid(id))
+                .map(|h| Arc::clone(&h.ctx)),
+            guard.table(),
+        )
+    };
+    // The row may be read from its file: after the store's lock is let go, as `ended_record` does.
+    let ended = || {
+        id.as_ref()
+            .and_then(|id| table.row(id))
+            .and_then(|row| row.task)
+            .map(|task| task.from)
+    };
+    let creator = live
+        .and_then(|ctx| {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .task()
+                .map(|task| task.from.clone())
+        })
+        .or_else(ended);
+    aterm_slog::DescIdent {
+        own: crate::session_log::sid_ident(sid),
+        creator: creator.as_deref().and_then(crate::session_log::sid_ident),
+    }
 }
 
 /// `log` (any other verb: `brief`) over a journal read's `view` of session `sid`, its cursor
@@ -8268,8 +8339,8 @@ fn drive_spawn(
     let usage = || {
         format!(
             "a drive's worker form is spawn agent=<{}> [model=<m>] [effort=<level>] [autopilot=<land|cruise>] \
-             [cwd=<absolute>|~/<path>] [from=<sid>] [why=<one line>] [req=<id>] [raise=false] \
-             - < task",
+             [cwd=<absolute>|~/<path>] [from=<sid>] [why=<one line>] [req=<id>] [package=<ids>] \
+             [raise=false] - < task",
             aterm_agent::harness::worker::started_words()
         )
     };
@@ -8383,6 +8454,13 @@ fn drive_spawn(
             "req" => {
                 aterm_types::control_verbs::request_id(value)
                     .map_err(|bad| drive_refused(&format!("{}: its req= {bad}", usage()), token))?;
+            }
+            // The `package` slot's one rule, as on this Mac (`parse_spawn_args` holds a repeat).
+            "package" => {
+                aterm_slog::desc_text("package", value).map_err(|_| {
+                    let rule = "is 1 to 4 tracker ids joined by `,`, none repeated";
+                    drive_refused(&format!("{}: its package= {rule}", usage()), token)
+                })?;
             }
             "raise" if value == "false" => raise = true,
             "raise" => return Err(drive_refused("a drive's worker opens raise=false", token)),
@@ -9692,10 +9770,38 @@ fn run_feed_bin<W: Write>(
     )
 }
 
+/// [`dispatch_mark_as`] for a test whose connection has no peer process, so its client lives in
+/// no tab (and the store it is looked for in holds none): a `desc`'s author is then what
+/// [`control_session::desc_author_as`] names an owner-token client outside every tab, `ctl`,
+/// and every other connection as [`control_session::log_actor`] does.
+#[cfg(test)]
 fn dispatch_mark(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
+    let no_tabs = crate::session_store::new_store();
+    dispatch_mark_as(ctx, scope, rest, &no_tabs, || {
+        crate::typed_by::Who::client(None)
+    })
+}
+
+/// THE `mark` VERB on `scope`, `client` naming the owner-token connection's process (the
+/// connection's peer, or a test's process and lineage): every kind is written by the
+/// connection's [`control_session::log_actor`] but a `desc`, a description claim, whose author
+/// is who the connection was observed to be ([`control_session::desc_author_as`], over the
+/// sessions `store` registers). That one reads the store and the client's process lineage, so
+/// it is asked for a `desc` alone and before `cmd_mark` takes the session's timeline lock.
+fn dispatch_mark_as(
+    ctx: &SessionCtx,
+    scope: Scope,
+    rest: &str,
+    store: &Store,
+    client: impl FnOnce() -> crate::typed_by::Who,
+) -> String {
     let reads = scope.is_owner_class() || cross_session_authorized(scope, "text", ctx);
-    let (reply, owed) =
-        crate::session_log::cmd_mark(ctx, control_session::log_actor(scope, ctx), reads, rest);
+    let by = if crate::session_log::mark_is_desc(rest) {
+        control_session::desc_author_as(scope, ctx, store, client)
+    } else {
+        control_session::log_actor(scope, ctx)
+    };
+    let (reply, owed) = crate::session_log::cmd_mark(ctx, by, reads, rest);
     if owed {
         ctx.watchers.ring_watchers();
     }
@@ -12043,7 +12149,9 @@ fn serve_session_verb(
                 .map(|h| h.sid.as_str().to_string());
             crate::occupancy_host::cmd_occupancy(sid.as_deref(), rest)
         }
-        "mark" => dispatch_mark(ctx, scope, rest),
+        "mark" => dispatch_mark_as(ctx, scope, rest, store, || {
+            crate::typed_by::Who::client(serving_peer_pid())
+        }),
         "pin" | "unpin" => {
             let (reply, moved) = crate::session_pin::cmd(
                 ctx,
@@ -12283,6 +12391,10 @@ fn typing_momentum_reading(
 #[cfg(test)]
 #[path = "control_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "control_desc_author_tests.rs"]
+mod desc_author_tests;
 
 #[cfg(test)]
 #[path = "control_ended_row_tests.rs"]

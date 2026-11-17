@@ -590,7 +590,7 @@ fn an_idle_or_covered_dock_reads_and_publishes_nothing() {
         paint
     );
     assert_eq!(app.dock_fall_due(), None);
-    app.on_occlusion_changed(WID, true);
+    app.on_occlusion_changed(WID, true, std::time::Instant::now());
     app.navigator_mark_row(session);
     app.navigator_mark_words(session);
     app.publish_navigators(now + Duration::from_secs(61));
@@ -604,7 +604,7 @@ fn an_idle_or_covered_dock_reads_and_publishes_nothing() {
         app.windows[&WID].leaf_render_cache[&view].native_paint_serial,
         paint
     );
-    app.on_occlusion_changed(WID, false);
+    app.on_occlusion_changed(WID, false, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(62));
     assert!(
         app.navigator_wake().is_some(),

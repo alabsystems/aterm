@@ -72,6 +72,10 @@ pub struct ResourceProbe {
     /// What every look reads of every claim the probe read, and of the probe's own need as the
     /// claim its look would read ([`Ledgerwide`]).
     wide: Ledgerwide,
+    /// Whether a need it judges is a person's ([`Need::person`]), as admission would mark it on
+    /// the machine the probe read: a person's waiting claim is ahead of the agents' of its rank,
+    /// so judged unmarked it would be rejected behind waiters it goes before.
+    person: bool,
 }
 
 impl ResourceProbe {
@@ -99,6 +103,7 @@ impl ResourceProbe {
         if machine.release_run() || ledger.cohort_aware()? {
             return Ok(Capture::Unsupported);
         }
+        let person = machine.person();
         let _turn = match ledger.try_turn()? {
             Ok(turn) => turn,
             Err(holder) => return Ok(Capture::Turn(holder)),
@@ -190,6 +195,7 @@ impl ResourceProbe {
             records,
             used,
             wide,
+            person,
         })))
     }
 
@@ -229,10 +235,12 @@ impl ResourceProbe {
     }
 
     /// [`Self::rejection_at`] for a need its caller would enter at `place`
-    /// ([`Waiter::enter_at`]): judged behind the claims ahead of that place where a record of
-    /// this process still stands at it in the ledger this probe read, else as one laid now. A
-    /// need judged as laid now would be rejected behind every large waiter laid since the
-    /// place, which an entry at the place is ahead of.
+    /// ([`Waiter::enter_at`]): judged behind the claims ahead of that place, with the place's
+    /// mark ([`Place::standing`]), where a record of this process still stands at it in the
+    /// ledger this probe read, else as one laid now, marked as the machine the probe read marks
+    /// a new claim ([`Machine::person`]). A need judged as laid now would be rejected behind
+    /// every large waiter laid since the place, which an entry at the place is ahead of; one
+    /// judged unmarked, behind every agent's waiter a person's claim goes before.
     #[must_use]
     pub fn rejection_placed(
         &self,
@@ -261,11 +269,18 @@ impl ResourceProbe {
             &self.used.lines,
             &self.wide,
         );
-        let placed = place
+        let (placed, person) = place
             .and_then(|place| place.standing_in(&self.dir))
             .filter(|stood| stood.pid == self.pid)
-            .map_or(self.now, |stood| stood.ms.min(self.now));
+            .map_or((self.now, self.person), |stood| {
+                (stood.ms.min(self.now), stood.person)
+            });
         let mine = (placed, self.pid, u64::MAX);
+        // The envelope is an Ordinary claim that leads nothing, so admission would mark it.
+        let need = &Need {
+            person,
+            ..need.clone()
+        };
         decide(need, mine, &self.reading, &others, self.now)
             .err()
             .map(ProbeRejection::Waiting)

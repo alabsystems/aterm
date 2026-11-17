@@ -1713,7 +1713,9 @@ pub struct Beside {
     /// Its process's API time grew since that reading: it made calls since then, where a
     /// reading [`Fresh::admit`] took for its windows alone made none.
     pub served: bool,
-    /// Per window (five-hour, week), the figure the vendor refilled it to.
+    /// Per window (five-hour, week), the figure it fell from where the process now reads it at
+    /// least [`accounts::REFILL_MIN_X10`] less used under the same reset: refilled or its
+    /// allowance raised ([`accounts::WindowRead::refilled`]).
     pub refilled: [Option<u32>; 2],
 }
 

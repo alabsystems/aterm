@@ -165,7 +165,7 @@ version = "0.2.2"
 
 [[package]]
 name = "aterm"
-version = "0.205.0"
+version = "0.206.0"
 dependencies = [
  "agh",
  "alab-policy",
@@ -447,6 +447,7 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-models-capacity",
+ "aterm-pty",
  "aterm-serde",
  "aterm-spec",
  "aterm-spec-anchor",
@@ -1125,6 +1126,7 @@ dependencies = [
  "astream-wire",
  "aterm-codec",
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-durable",
  "aterm-models-swarm",
  "aterm-spec",

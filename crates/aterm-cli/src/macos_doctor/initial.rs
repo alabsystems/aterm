@@ -3924,7 +3924,7 @@ pub(super) fn init_grants(
         Access::Accessibility,
     ]
     .into_iter()
-    .filter(|access| sign_out || *access != Access::Accessibility)
+    .filter(|access| access.needed_for(selection))
     .map(|access| {
         let row = access::observation(access, &grants, selection);
         // Developer mode whose password is not coming by itself says so, and the person's

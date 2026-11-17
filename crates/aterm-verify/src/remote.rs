@@ -650,8 +650,8 @@ impl<'a> Remote<'a> {
     }
 
     /// Observe only the exact foreign journal entry which refused our pre-send attempt, until
-    /// it is closed or agh's next atomic write would close it (`closable`: its writer can send
-    /// nothing more and its window is over), when the push is made again. The caller owns the
+    /// it is closed or its dead writer can be reconciled by the next atomic write
+    /// (`closable`), when the push is made again. The caller owns the
     /// deadline; neither journal reads nor superseding writers extend it.
     #[cfg(unix)]
     pub(crate) fn wait_for_intent(
@@ -673,7 +673,7 @@ impl<'a> Remote<'a> {
                 op: String,
                 key: String,
                 open: bool,
-                /// agh's next atomic write closes it (`agh::Journal::closable`).
+                /// agh's next atomic write can reconcile it from origin (`agh::Journal::closable`).
                 #[serde(default)]
                 closable: bool,
             }

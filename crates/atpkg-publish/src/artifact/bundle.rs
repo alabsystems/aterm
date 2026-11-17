@@ -400,10 +400,28 @@ pub fn admit<'a>(
 /// An I/O failure, or a special file.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     let mut seen: BTreeMap<u64, (u64, PathBuf)> = BTreeMap::new();
-    copy_into(src, dst, &mut seen)
+    copy_into(src, dst, &mut seen, crate::identity::copy_regular_file)
 }
 
-fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<u64, (u64, PathBuf)>) -> Result<()> {
+/// [`copy_tree`], each regular file a copy-on-write clone where the volume makes one
+/// ([`crate::identity::clone_regular_file`]): a snapshot of a build tree of gigabytes costs no
+/// bytes on the volume it shares.
+/// # Errors
+/// As [`copy_tree`].
+pub fn clone_tree(src: &Path, dst: &Path) -> Result<()> {
+    let mut seen: BTreeMap<u64, (u64, PathBuf)> = BTreeMap::new();
+    copy_into(src, dst, &mut seen, crate::identity::clone_regular_file)
+}
+
+/// How one regular file is laid: its source's metadata, or the failure.
+type LayFile = fn(&Path, &Path) -> std::io::Result<std::fs::Metadata>;
+
+fn copy_into(
+    src: &Path,
+    dst: &Path,
+    seen: &mut BTreeMap<u64, (u64, PathBuf)>,
+    lay: LayFile,
+) -> Result<()> {
     std::fs::create_dir_all(dst).map_err(|e| Error::io(format!("mkdir {}", dst.display()), &e))?;
     let mut entries: Vec<_> = std::fs::read_dir(src)
         .map_err(|e| Error::io(format!("read {}", src.display()), &e))?
@@ -420,7 +438,7 @@ fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<u64, (u64, PathBuf)>) -
                 .map_err(|err| Error::io(format!("readlink {}", from.display()), &err))?;
             symlink(&target, &to)?;
         } else if ft.is_dir() {
-            copy_into(&from, &to, seen)?;
+            copy_into(&from, &to, seen, lay)?;
         } else if ft.is_file() {
             if let Some(ino) = entry_ino(&e)
                 && let Some((seen_dev, first)) = seen.get(&ino)
@@ -434,7 +452,7 @@ fn copy_into(src: &Path, dst: &Path, seen: &mut BTreeMap<u64, (u64, PathBuf)>) -
                     continue;
                 }
             }
-            let meta = crate::identity::copy_regular_file(&from, &to)
+            let meta = lay(&from, &to)
                 .map_err(|err| Error::io(format!("copy {}", from.display()), &err))?;
             if let Some((dev, ino)) = inode(&meta) {
                 seen.entry(ino).or_insert((dev, to));

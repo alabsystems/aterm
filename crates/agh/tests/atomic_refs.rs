@@ -4,8 +4,6 @@
 
 //! Atomic ref updates across the real client, journal and loopback service.
 
-use std::time::Duration;
-
 use agh::github::refs::{AtomicRefBatch, RefUpdate};
 use agh::journal::IntentStore as _;
 use agh::policy::{RouteRequest, RouteTarget};
@@ -241,11 +239,8 @@ fn graphql_errors_override_even_the_matching_acknowledgement_and_never_leak_thei
 }
 
 #[test]
-/// An unanswered batch is never retried, and its intent stops every atomic batch, its own
-/// resend included, for agh's window: the time it is given to land late. Then the next batch
-/// begins and closes it (`Journal::closable`): each batch is a compare-and-swap on its refs'
-/// exact old ids.
-fn an_unacknowledged_mutation_is_unknown_never_retried_and_stops_batches_for_its_window() {
+/// An unanswered batch remains held while its recorded writer lives.
+fn an_unacknowledged_mutation_is_unknown_never_retried_and_blocks_other_batches() {
     for (label, fault) in [
         ("lost", Fault::LandThenClose),
         (
@@ -306,26 +301,9 @@ fn an_unacknowledged_mutation_is_unknown_never_retried_and_stops_batches_for_its
             AtomicRefBatch::new(vec![update("refs/attest/another", ZERO, NEXT)]).expect("batch");
         let error = w
             .run(&other)
-            .expect_err("inside its window the open intent stops another batch");
+            .expect_err("the live writer stops another batch");
         assert_eq!(error.kind, Kind::OutcomeUnknown, "{label}");
         assert_eq!(w.posts(), 1, "{label}");
-        w.gh.fx()
-            .sleep(agh::git::GRANT_MAX)
-            .expect("the simulated clock");
-        let error = w
-            .run(&other)
-            .expect_err("the whole-second retirement fence never shortens the window");
-        assert_eq!(error.kind, Kind::OutcomeUnknown, "{label}");
-        assert_eq!(w.posts(), 1, "{label}");
-        w.gh.fx()
-            .sleep(Duration::from_secs(1))
-            .expect("the simulated clock");
-        assert!(
-            matches!(w.run(&other).expect("outcome"), Outcome::Done(_)),
-            "past its window another batch begins: {label}"
-        );
-        assert_eq!(w.posts(), 2, "{label}");
-        assert!(w.journal.open().expect("journal").is_empty(), "{label}");
     }
 }
 
@@ -453,6 +431,334 @@ fn a_bare_replay_cannot_read_an_input_file_named_by_a_tape() {
         captured
             .stderr_text()
             .contains("a bare --replay reads no file")
+    );
+    assert_eq!(w.posts(), 0);
+}
+
+fn abandoned(
+    w: &World,
+    batch: &AtomicRefBatch,
+    writer: Option<agh::journal::IntentWriter>,
+) -> agh::journal::IntentId {
+    let permit = common::permit(
+        &w.gh,
+        &RouteRequest::write(RouteTarget::Repo(common::slug(APP))),
+    );
+    let mut draft = agh::journal::IntentDraft::new(
+        agh::write::WriteOp::RefUpdateAtomic,
+        &common::slug(APP),
+        &permit,
+        "fixture-fingerprint",
+        "atomic refs",
+    )
+    .with_request(format!("sha256:{} 1", "0".repeat(64)))
+    .with_refs(batch.updates().to_vec())
+    .with_after(
+        w.journal
+            .latest(agh::write::WriteOp::RefUpdateAtomic, "atomic refs")
+            .unwrap()
+            .map(|v| v.intent.id),
+    );
+    draft.writer = writer;
+    w.journal.begin(&draft).expect("durable old writer")
+}
+
+/// Register a child after the reader's open-intent snapshot. This reproduces
+/// frontend death between listing the intent and judging its process identity.
+struct ChildAfterSnapshot<'a> {
+    journal: &'a Journal,
+    child: agh::journal::WriterProcess,
+    registered: std::sync::atomic::AtomicBool,
+}
+
+impl agh::journal::IntentStore for ChildAfterSnapshot<'_> {
+    fn begin(&self, draft: &agh::journal::IntentDraft) -> agh::Result<agh::journal::IntentId> {
+        self.journal.begin(draft)
+    }
+    fn settle(
+        &self,
+        id: &agh::journal::IntentId,
+        outcome: &agh::journal::Settled,
+    ) -> agh::Result<()> {
+        self.journal.settle(id, outcome)
+    }
+    fn observe(&self, id: &agh::journal::IntentId, found: Option<u64>) -> agh::Result<()> {
+        self.journal.observe(id, found)
+    }
+    fn retract(&self, id: &agh::journal::IntentId) -> agh::Result<()> {
+        self.journal.retract(id)
+    }
+    fn latest(
+        &self,
+        op: agh::write::WriteOp,
+        key: &str,
+    ) -> agh::Result<Option<agh::journal::IntentView>> {
+        self.journal.latest(op, key)
+    }
+    fn open(&self) -> agh::Result<Vec<agh::journal::Intent>> {
+        let snapshot = self.journal.open()?;
+        if !self
+            .registered
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.journal
+                .append(&agh::journal::JournalRecord::WriterChild {
+                    intent: snapshot[0].id.clone(),
+                    child: self.child,
+                    at_secs: 1,
+                })?;
+        }
+        Ok(snapshot)
+    }
+}
+
+fn dead_writer() -> agh::journal::IntentWriter {
+    let mut writer = agh::journal::IntentWriter::current().unwrap();
+    // Same PID, different kernel start: exercise reuse, never kill a bystander.
+    let agh::journal::IntentWriter::Tracked { agh, .. } = &mut writer else {
+        panic!("current writer must track native child custody");
+    };
+    agh.start ^= 1;
+    writer
+}
+
+fn another_batch() -> AtomicRefBatch {
+    AtomicRefBatch::new(vec![update("refs/attest/next-writer", ZERO, NEXT)]).unwrap()
+}
+
+#[test]
+fn a_dead_writers_open_intent_is_settled_from_origin_by_the_next_writer() {
+    // Entirely BEFORE, including a genuinely missing ref: retract, then write once.
+    let w = world("dead-before");
+    let old = abandoned(&w, &batch(), Some(dead_writer()));
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    let view = w.journal.view(&old).unwrap().unwrap();
+    assert!(!view.open);
+    assert!(view.retracted.is_some());
+    assert_eq!(w.posts(), 1);
+
+    // The journal retains the complete maximum-size batch, not only its digest.
+    let w = world("large-ref-batch");
+    let updates: Vec<_> = (0..128)
+        .map(|i| {
+            let prefix = format!("refs/attest/{i:03}/");
+            update(
+                &format!("{prefix}{}", "a".repeat(1024 - prefix.len())),
+                ZERO,
+                NEXT,
+            )
+        })
+        .collect();
+    let large = AtomicRefBatch::new(updates).unwrap();
+    let old = abandoned(&w, &large, Some(dead_writer()));
+    assert_eq!(
+        w.journal.view(&old).unwrap().unwrap().intent.refs,
+        large.updates()
+    );
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    assert!(!w.journal.view(&old).unwrap().unwrap().open);
+
+    // Entirely AFTER: observe, without resending the abandoned request.
+    let w = world("dead-after");
+    assert!(matches!(w.run(&batch()).unwrap(), Outcome::Done(_)));
+    let old = abandoned(&w, &batch(), Some(dead_writer()));
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    let view = w.journal.view(&old).unwrap().unwrap();
+    assert!(!view.open);
+    assert!(view.retracted.is_none());
+    assert_eq!(view.observed.len(), 1);
+    assert_eq!(w.posts(), 2);
+
+    // A prior Unknown does not prevent the read-only closure.
+    let w = world("dead-unknown");
+    let old = abandoned(&w, &batch(), Some(dead_writer()));
+    w.journal
+        .settle(&old, &agh::journal::Settled::Unknown { why: "lost".into() })
+        .unwrap();
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    assert!(!w.journal.view(&old).unwrap().unwrap().open);
+
+    // Mixed and unreadable are held with the exact dead identity and recovery command.
+    for unreadable in [false, true] {
+        let w = world("dead-unresolved");
+        if !unreadable {
+            let only_main =
+                AtomicRefBatch::new(vec![update("refs/heads/main", common::MAIN_SHA, NEXT)])
+                    .unwrap();
+            w.run(&only_main).unwrap();
+        }
+        let old = abandoned(&w, &batch(), Some(dead_writer()));
+        if unreadable {
+            w.fake.fault(
+                Match::api("/repos/fixture-dev/app/git/ref/heads/main"),
+                Fault::Status {
+                    status: 403,
+                    body: "{}".into(),
+                    headers: Vec::new(),
+                },
+            );
+        }
+        let posts = w.posts();
+        let error = w
+            .run(&another_batch())
+            .expect_err("unresolved origin holds");
+        assert_eq!(error.kind, Kind::OutcomeUnknown);
+        assert!(error.why.contains("pid="));
+        assert!(error.why.contains("start="));
+        assert!(error.next.contains("agh intent retract"));
+        assert!(w.journal.view(&old).unwrap().unwrap().open);
+        assert_eq!(w.posts(), posts);
+    }
+
+    // Repository-level invisibility is unreadable, not proof that creates
+    // were absent. A per-ref 404 is usable only after the writer repo guard.
+    for status in [403, 404] {
+        let w = world("dead-hidden-repository");
+        let create = AtomicRefBatch::new(vec![update(RECORD, ZERO, NEXT)]).unwrap();
+        let old = abandoned(&w, &create, Some(dead_writer()));
+        w.fake.fault(
+            Match::api("/repos/fixture-dev/app"),
+            Fault::Status {
+                status,
+                body: "{}".into(),
+                headers: Vec::new(),
+            },
+        );
+        assert_eq!(
+            w.run(&another_batch()).unwrap_err().kind,
+            Kind::OutcomeUnknown
+        );
+        assert!(w.journal.view(&old).unwrap().unwrap().open);
+        assert_eq!(w.posts(), 0);
+    }
+
+    // A v1 record from an older installation has no writer and remains held.
+    let template = world("legacy-template");
+    let id = abandoned(&template, &batch(), Some(dead_writer()));
+    let mut intent = template.journal.view(&id).unwrap().unwrap().intent;
+    intent.writer = None;
+    let w = world("legacy-writer");
+    w.journal
+        .append(&agh::journal::JournalRecord::Intent(Box::new(intent)))
+        .unwrap();
+    assert_eq!(
+        w.run(&another_batch()).unwrap_err().kind,
+        Kind::OutcomeUnknown
+    );
+    assert_eq!(w.posts(), 0);
+
+    // A different boot is conclusive even if its PID/start equals this process.
+    let w = world("dead-boot");
+    let mut writer = agh::journal::IntentWriter::current().unwrap();
+    let agh::journal::IntentWriter::Tracked { boot, .. } = &mut writer else {
+        panic!("current writer must track native child custody");
+    };
+    *boot = "previous-boot".into();
+    let old = abandoned(&w, &batch(), Some(writer));
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    assert!(!w.journal.view(&old).unwrap().unwrap().open);
+}
+
+#[test]
+fn a_live_writers_open_intent_still_refuses_the_next_writer() {
+    let w = world("live-writer");
+    let old = abandoned(
+        &w,
+        &batch(),
+        Some(agh::journal::IntentWriter::current().unwrap()),
+    );
+    let error = w.run(&another_batch()).expect_err("live owner holds");
+    assert_eq!(error.kind, Kind::OutcomeUnknown);
+    assert!(w.journal.view(&old).unwrap().unwrap().open);
+    assert_eq!(w.posts(), 0);
+}
+
+#[test]
+fn a_dead_writer_whose_git_child_lives_still_refuses_the_next_writer() {
+    let w = world("live-native-child");
+    let mut child = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut writer = dead_writer();
+    let agh::journal::IntentWriter::Tracked { git, .. } = &mut writer else {
+        panic!("current writer must track native child custody");
+    };
+    *git = Some(agh::journal::WriterProcess::read(child.id()).unwrap());
+    let old = abandoned(&w, &batch(), Some(writer));
+    let result = w.run(&another_batch());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(result.expect_err("child holds").kind, Kind::OutcomeUnknown);
+    assert!(w.journal.view(&old).unwrap().unwrap().open);
+    assert_eq!(w.posts(), 0);
+    assert!(matches!(w.run(&another_batch()).unwrap(), Outcome::Done(_)));
+    assert!(!w.journal.view(&old).unwrap().unwrap().open);
+
+    // The live child must also be protected when its durable registration
+    // appeared after open() returned the reader's stale no-child snapshot.
+    let w = world("native-child-after-snapshot");
+    let mut child = aterm_uds::spawnfd::command("/bin/cat")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .unwrap();
+    let old = abandoned(&w, &batch(), Some(dead_writer()));
+    let store = ChildAfterSnapshot {
+        journal: &w.journal,
+        child: agh::journal::WriterProcess::read(child.id()).unwrap(),
+        registered: std::sync::atomic::AtomicBool::new(false),
+    };
+    let permit = common::permit(
+        &w.gh,
+        &RouteRequest::write(RouteTarget::Repo(common::slug(APP))),
+    );
+    let result =
+        w.gh.refs(&common::slug(APP))
+            .update_atomic(&permit, &another_batch(), &store);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        result.expect_err("refreshed child holds").kind,
+        Kind::OutcomeUnknown
+    );
+    assert!(w.journal.view(&old).unwrap().unwrap().open);
+    assert_eq!(w.posts(), 0);
+}
+
+#[test]
+fn an_atomic_writer_cannot_reconcile_another_repositorys_journal() {
+    let w = world("foreign-atomic-journal");
+    let foreign = common::slug("fixture-dev/other");
+    let journal = w.gh.journal(&foreign).unwrap();
+    let foreign_permit = common::permit(
+        &w.gh,
+        &RouteRequest::write(RouteTarget::Repo(foreign.clone())),
+    );
+    let mut draft = agh::journal::IntentDraft::new(
+        agh::write::WriteOp::RefUpdateAtomic,
+        &foreign,
+        &foreign_permit,
+        "fixture-fingerprint",
+        "atomic refs",
+    )
+    .with_request(format!("sha256:{} 1", "0".repeat(64)))
+    .with_refs(vec![update(RECORD, ZERO, NEXT)]);
+    draft.writer = Some(dead_writer());
+    let old = journal.begin(&draft).unwrap();
+    let permit = common::permit(
+        &w.gh,
+        &RouteRequest::write(RouteTarget::Repo(common::slug(APP))),
+    );
+    let error =
+        w.gh.refs(&common::slug(APP))
+            .update_atomic(&permit, &another_batch(), &journal)
+            .expect_err("the write's repository differs from the journal's");
+    assert_eq!(error.kind, Kind::Usage);
+    assert!(
+        journal.view(&old).unwrap().unwrap().open,
+        "another repository's absent ref cannot retract this intent"
     );
     assert_eq!(w.posts(), 0);
 }

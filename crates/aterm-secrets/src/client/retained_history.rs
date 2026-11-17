@@ -884,7 +884,7 @@ fn eligible(config: &Config) -> bool {
 }
 
 /// Fill this Mac's acknowledged history with other vaults' contexts, to [`MAX_CONTEXTS`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn fill_contexts(paths: &Paths) {
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, true, limits()).unwrap();
     journal.finish_open().unwrap();
@@ -913,7 +913,7 @@ pub(super) fn fill_contexts(paths: &Paths) {
 /// Leave the vault folder as a first enrollment cut after its pending claim and before its
 /// receipt leaves it ([`acknowledge_selected`]): the journal open, the claim pending, nothing
 /// appended.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn cut_first_enrollment(paths: &Paths) {
     let mut journal = aterm_journal::Log::open(&paths.dir, NAME, ANCHOR, false, limits()).unwrap();
     journal.finish_open().unwrap();
@@ -1173,6 +1173,6 @@ pub(super) fn resolve_version_reference(
 #[path = "retained_history_read_tests.rs"]
 mod read_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "retained_history_own_tests.rs"]
 mod tests;

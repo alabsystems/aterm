@@ -35,7 +35,6 @@ fn lab_account(cli: Cli, local: &str, label: &str, here: bool) -> LabAccount {
 fn lab(accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         bound: Default::default(),
         accounts,
         aliases: BTreeMap::new(),
@@ -242,15 +241,13 @@ fn native_sync_preserves_rank_for_existing_and_new_rows_with_an_opaque_key() {
     };
     lab.accounts[0].preferred[0].1 = Some(0);
     alab_roster::with_lab(lab.clone(), || {
-        assert!(alab_roster::sync_due(cli, &bed.roster_path(cli), |_| false));
+        assert!(alab_roster::sync_due(cli, &bed.roster_path(cli)));
         assert!(!due().is_empty());
     });
     bed.sync(cli, &lab);
     assert_eq!(labels(), ["alpha", "zeta", "middle"]);
     alab_roster::with_lab(lab.clone(), || {
-        assert!(!alab_roster::sync_due(cli, &bed.roster_path(cli), |_| {
-            false
-        }));
+        assert!(!alab_roster::sync_due(cli, &bed.roster_path(cli)));
         assert!(due().is_empty());
     });
     let before = fs::read(bed.roster_path(cli)).unwrap();

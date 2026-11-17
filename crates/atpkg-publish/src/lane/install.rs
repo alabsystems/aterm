@@ -601,6 +601,20 @@ pub fn install_with(
     let arm = machine.services.arm(kind, &out.armed);
     let stamped = stamp_at_bootout(&ctx.state_dir);
     let arm = arm?;
+    match kind {
+        // Arming the alab lane retires the tip lane's jobs (`Launchd::arm_with`).
+        LaneKind::Alab
+            if rendered_dir
+                .join(format!("{}.plist", units::TIP_LABEL))
+                .is_file() =>
+        {
+            record_tip_stopped(ctx, "lane install alab");
+        }
+        LaneKind::Tip => {
+            let _ = std::fs::remove_file(stopped_path(&ctx.state_dir));
+        }
+        _ => {}
+    }
     if flags.host == HostChoice::Gh {
         // The armed unit reads no agh.toml, so a config need an earlier `--host agh*` unit
         // raised under the unit's directories says something no longer true. Best effort: it
@@ -744,6 +758,9 @@ pub fn disarm(ctx: &Ctx, kind: LaneKind, machine: &Machine) -> Result<()> {
     let stopped = machine.services.disarm(kind);
     stamp_at_bootout(&ctx.state_dir);
     stopped?;
+    if kind == LaneKind::Tip {
+        record_tip_stopped(ctx, "lane disarm tip");
+    }
     let dir = machine.unit_dir(kind);
     let names: Vec<String> = match kind {
         LaneKind::Alab => vec![
@@ -1295,6 +1312,90 @@ fn bootout_or_absent(
             .ok()
             .and_then(|s| listed_label(s, label))
             == Some(false)
+}
+
+/// Whether launchd lists `label` in this user's gui domain: `launchctl list` read as
+/// [`bootout_or_absent`] reads it, under the same Aqua-manager rule.
+/// # Errors
+/// Why launchd's job list could not be read as this user's.
+pub(crate) fn launchd_loaded(label: &str) -> std::result::Result<bool, String> {
+    let uid = uid().map_err(|e| e.to_string())?;
+    let mut run = |args: &[&str]| run_tool(aterm_uds::os_path!("launchctl"), args);
+    if uid == "0"
+        || query_text(&mut run, &["manageruid"]).as_deref() != Some(uid.as_str())
+        || query_text(&mut run, &["managername"]).as_deref() != Some("Aqua")
+    {
+        return Err(format!(
+            "this process does not run under uid {uid}'s Aqua launchd manager, whose job list \
+             it would read"
+        ));
+    }
+    let out = run(&["list"]).map_err(|e| e.to_string())?;
+    if !out.status.success() || !out.stderr.is_empty() {
+        return Err(format!(
+            "`launchctl list` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    std::str::from_utf8(&out.stdout)
+        .ok()
+        .and_then(|text| listed_label(text, label))
+        .ok_or_else(|| "`launchctl list` printed no job table this check reads".to_string())
+}
+
+/// The file in the tip lane's directory that records the last time aterm stopped its jobs.
+pub(crate) const TIP_STOPPED: &str = "stopped.toml";
+
+/// When, how and by whom aterm last stopped the tip lane's jobs: written by `lane disarm tip`
+/// and by an install of another lane that retires them, removed when tip is armed again.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Stopped {
+    /// Seconds since the epoch.
+    pub(crate) unix: i64,
+    /// The verb that stopped them (`lane disarm tip`, `lane install alab`).
+    pub(crate) verb: String,
+    /// Who ran it: the aterm session, else the parent process.
+    pub(crate) caller: String,
+}
+
+fn stopped_path(state_dir: &Path) -> PathBuf {
+    LaneState::of(LaneKind::Tip, state_dir)
+        .dir
+        .join(TIP_STOPPED)
+}
+
+/// Record that `verb` stopped the tip lane's jobs now. A failure is printed, never fatal: the
+/// jobs are stopped either way.
+pub(crate) fn record_tip_stopped(ctx: &Ctx, verb: &str) {
+    let caller = std::env::var("ATERM_SESSION_ID")
+        .ok()
+        .filter(|sid| !sid.is_empty())
+        .map_or_else(
+            || format!("pid {}", std::os::unix::process::parent_id()),
+            |sid| format!("aterm session {sid}"),
+        );
+    let stopped = Stopped {
+        unix: ctx.now_unix,
+        verb: verb.to_string(),
+        caller,
+    };
+    let wrote = LaneState::of(LaneKind::Tip, &ctx.state_dir)
+        .ensure()
+        .and_then(|()| {
+            let text =
+                aterm_toml::to_string(&stopped).map_err(|e| Error::refused(e.to_string()))?;
+            super::report::write_atomic(&stopped_path(&ctx.state_dir), &text)
+        });
+    if let Err(e) = wrote {
+        eprintln!("atpkg-publish: cannot record that `{verb}` stopped the tip lane: {e}");
+    }
+}
+
+/// What [`record_tip_stopped`] last wrote under `state_dir`, if it is there and readable.
+pub(crate) fn tip_stopped(state_dir: &Path) -> Option<Stopped> {
+    let text = std::fs::read_to_string(stopped_path(state_dir)).ok()?;
+    aterm_toml::from_str(&text).ok()
 }
 
 fn query_text(

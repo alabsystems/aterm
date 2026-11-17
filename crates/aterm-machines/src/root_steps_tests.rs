@@ -62,6 +62,18 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
         b"/Users//alice/Developer\n/Users//alice/Downloads\n/Users//alice/My Projects\n",
     );
     assert_eq!(owed(&account), Vec::<Owed>::new());
+    // A folder the home gains once it is scoped is named as work again; whether a password is
+    // asked for it is the setup item's (`init_spotlight::automatic_scope_owed`).
+    let worktree = "/Users//alice/codex-worktree";
+    account.file(worktree, b"").stat_of(
+        worktree,
+        Stat {
+            dir: true,
+            ..rule_stat(501, 0o755)
+        },
+    );
+    assert!(!crate::init_spotlight::automatic_scope_owed(&account));
+    assert_eq!(owed(&account), vec![Owed::Spotlight]);
 
     let unread = Fake::root();
     unread
@@ -1070,6 +1082,202 @@ fn the_rule_goes_live_only_once_visudo_passes_it() {
     }
 }
 
+/// A developer mode root could not set is recorded with the reading it failed for, so a run
+/// nobody asked for does not ask the Mac password for it again ([`refused`]); the apply that
+/// succeeds removes the record. The key names the half that failed: a membership refused once
+/// the mode turned on is recorded as the membership's, not the mode's. NEGATIVE CONTROLS:
+/// nothing is recorded before any apply, for an apply that could not read the mode, for a tool
+/// that gave no answer in its budget or was killed, or for another step; the record of a mode
+/// that would not turn on does not stand for a missing membership, nor one account's missing
+/// membership for another's; a record root does not own stands for nothing.
+#[test]
+fn a_developer_mode_root_could_not_set_is_recorded_until_an_apply_succeeds() {
+    use aterm_types::macos_setup::refused::{DEVELOPER_MODE, LAN_BROKER};
+    const OFF: &str = "Developer mode is currently disabled.\n";
+    const ON: &str = "Developer mode is currently enabled.\n";
+    let admin = "/usr/sbin/dseditgroup -o checkmember -m alice admin";
+    let checkmember = "/usr/sbin/dseditgroup -o checkmember -m alice _developer";
+    let enable = "/usr/sbin/DevToolsSecurity -enable";
+    let add = "/usr/sbin/dseditgroup -o edit -a alice -t user _developer";
+    let not_member = |group: &str| Ran {
+        status: Some(67),
+        stdout: format!("no alice is NOT a member of {group}\n").into_bytes(),
+        stderr: Vec::new(),
+    };
+    let ctx = console();
+    // What an account reads once root's record holds `record`.
+    let account = |uid: u32, status: &str, record: Option<&[u8]>| {
+        let mut sys = Fake::root();
+        sys.euid = uid;
+        sys.logged_in(&user("alice", uid))
+            .on(STATUS, Ran::ok(status));
+        if let Some(record) = record {
+            sys.file(DEVELOPER_MODE, record);
+        }
+        sys
+    };
+    assert!(!refused(&account(501, OFF, None), Owed::Debugger));
+
+    // `-enable` fails, and `-enable` exits 0 on a Mac that keeps the mode off: each is recorded.
+    for (why, enabled) in [
+        (
+            "the tool failed",
+            Ran {
+                status: Some(1),
+                stdout: Vec::new(),
+                stderr: b"denied".to_vec(),
+            },
+        ),
+        ("the mode stayed off", Ran::ok("")),
+    ] {
+        let sys = Fake::root();
+        sys.on(STATUS, Ran::ok(OFF))
+            .on(admin, Ran::ok("yes alice is a member of admin\n"))
+            .on(enable, enabled);
+        assert!(DeveloperMode.apply(&sys, &ctx).is_err(), "{why}");
+        assert_eq!(
+            sys.written(DEVELOPER_MODE).as_deref(),
+            Some(&b"off\n"[..]),
+            "{why}"
+        );
+        // A second failure adds nothing.
+        assert!(DeveloperMode.apply(&sys, &ctx).is_err(), "{why}");
+        assert_eq!(
+            sys.written(DEVELOPER_MODE).as_deref(),
+            Some(&b"off\n"[..]),
+            "{why}"
+        );
+    }
+    assert!(refused(&account(501, OFF, Some(b"off\n")), Owed::Debugger));
+    assert!(refused(&account(502, OFF, Some(b"off\n")), Owed::Debugger));
+    for (why, sys, step) in [
+        (
+            "the mode is on, the membership missing",
+            account(501, ON, Some(b"off\n")),
+            Owed::Debugger,
+        ),
+        (
+            "the mode cannot be read",
+            account(501, "what?\n", Some(b"off\n")),
+            Owed::Debugger,
+        ),
+        (
+            "another step",
+            account(501, OFF, Some(b"off\n")),
+            Owed::NameRule,
+        ),
+        (
+            "another step's record",
+            {
+                let sys = account(501, OFF, None);
+                sys.file(LAN_BROKER, b"off\n");
+                sys
+            },
+            Owed::Debugger,
+        ),
+        (
+            "not root's file",
+            {
+                let sys = account(501, OFF, Some(b"off\n"));
+                sys.stat_of(DEVELOPER_MODE, rule_stat(501, 0o644));
+                sys
+            },
+            Owed::Debugger,
+        ),
+    ] {
+        assert!(!refused(&sys, step), "{why}");
+    }
+
+    // A membership the directory refuses is recorded for that account alone, beside the
+    // mode's own key; the apply that succeeds removes the record.
+    let sys = Fake::root();
+    sys.file(DEVELOPER_MODE, b"off\n")
+        .on(STATUS, Ran::ok(ON))
+        .on(admin, not_member("admin"))
+        .on(checkmember, not_member("_developer"))
+        .on(
+            add,
+            Ran {
+                status: Some(1),
+                stdout: Vec::new(),
+                stderr: b"denied".to_vec(),
+            },
+        )
+        .on(add, Ran::ok(""));
+    assert!(DeveloperMode.apply(&sys, &ctx).is_err());
+    let record = sys.written(DEVELOPER_MODE).unwrap();
+    assert_eq!(record, b"member 501\noff\n");
+    assert!(refused(&account(501, ON, Some(&record)), Owed::Debugger));
+    assert!(!refused(&account(502, ON, Some(&record)), Owed::Debugger));
+    assert!(DeveloperMode.apply(&sys, &ctx).is_ok());
+    assert!(sys.written(DEVELOPER_MODE).is_none());
+
+    // The mode turns on and the membership is then refused: the record names the membership,
+    // which is what the next reading finds, and not a mode this Mac did turn on.
+    let half = Fake::root();
+    half.on(STATUS, Ran::ok(OFF))
+        .on(STATUS, Ran::ok(ON))
+        .on(admin, not_member("admin"))
+        .on(checkmember, not_member("_developer"))
+        .on(enable, Ran::ok(""))
+        .on(
+            add,
+            Ran {
+                status: Some(1),
+                stdout: Vec::new(),
+                stderr: b"denied".to_vec(),
+            },
+        );
+    assert!(DeveloperMode.apply(&half, &ctx).is_err());
+    let record = half.written(DEVELOPER_MODE).unwrap();
+    assert_eq!(record, b"member 501\n");
+    assert!(refused(&account(501, ON, Some(&record)), Owed::Debugger));
+    assert!(!refused(&account(501, OFF, Some(&record)), Owed::Debugger));
+
+    // A tool that gave no answer in its budget, or that a signal killed, says nothing of this
+    // Mac: the step is asked for again.
+    let slow = Fake::root();
+    slow.on(STATUS, Ran::ok(OFF))
+        .on(admin, Ran::ok("yes alice is a member of admin\n"))
+        .time_out(enable);
+    assert!(DeveloperMode.apply(&slow, &ctx).is_err());
+    assert!(slow.written(DEVELOPER_MODE).is_none());
+    let killed = Fake::root();
+    killed
+        .on(STATUS, Ran::ok(ON))
+        .on(admin, not_member("admin"))
+        .on(checkmember, not_member("_developer"))
+        .on(
+            add,
+            Ran {
+                status: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        );
+    assert!(DeveloperMode.apply(&killed, &ctx).is_err());
+    assert!(killed.written(DEVELOPER_MODE).is_none());
+
+    // An apply that could not read the mode says nothing of the step.
+    let unread = Fake::root();
+    unread.on(STATUS, Ran::ok("what?\n"));
+    assert!(DeveloperMode.apply(&unread, &ctx).is_err());
+    assert!(unread.written(DEVELOPER_MODE).is_none());
+
+    // A record that holds its bound stands for every reading, and gains no more keys.
+    let keys: String = (0..aterm_types::macos_setup::refused::KEYS)
+        .map(|n| format!("member {}\n", 600 + n))
+        .collect();
+    assert!(refused(
+        &account(501, OFF, Some(keys.as_bytes())),
+        Owed::Debugger
+    ));
+    let full = Fake::root();
+    full.file(DEVELOPER_MODE, keys.as_bytes());
+    record_refusal(&full, DEVELOPER_MODE, "off");
+    assert_eq!(full.written(DEVELOPER_MODE).unwrap(), keys.as_bytes());
+}
+
 /// Developer mode turns on with a non-admin console account added to `_developer`, each only where
 /// it is not so already. NEGATIVE CONTROL: with both in place the probe reads in place and
 /// the apply runs neither change.
@@ -1080,7 +1288,10 @@ fn developer_mode_turns_on_with_the_account_in_the_developer_group() {
     let enable = "/usr/sbin/DevToolsSecurity -enable";
     let add = "/usr/sbin/dseditgroup -o edit -a alice -t user _developer";
     let sys = Fake::root();
+    // Off for the probe and for the apply's own reading, on once `-enable` ran.
     sys.on(STATUS, Ran::ok("Developer mode is currently disabled.\n"))
+        .on(STATUS, Ran::ok("Developer mode is currently disabled.\n"))
+        .on(STATUS, Ran::ok("Developer mode is currently enabled.\n"))
         .on(admin, Ran::ok("no alice is NOT a member of admin\n"))
         .on(
             checkmember,

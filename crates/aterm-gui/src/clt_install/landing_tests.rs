@@ -196,7 +196,7 @@ fn automatic_install_lands_up_front_with_no_focus_condition() {
         if on_terminal {
             app.switch_tab_in(wid, 0);
         }
-        app.on_occlusion_changed(wid, occluded);
+        app.on_occlusion_changed(wid, occluded, std::time::Instant::now());
         app.windows.get_mut(&wid).unwrap().focused = focused;
         assert!(app.developer_tools_install_due(false));
         let (window, ask, then) = app
@@ -3113,6 +3113,11 @@ fn the_tab_closes_itself_once_it_installed_them_but_never_ends_its_window() {
         1,
         "CONTROL: a window's last tab stays"
     );
+    let next = alone.next_session_id;
+    alone.push_stub_tab(wid, crate::stub_session(next));
+    alone.tick_workstation_setup(std::time::Instant::now());
+    assert_eq!(alone.windows[&wid].tab_set.len(), 1);
+    assert!(alone.workstation_setup.developer_tools_session.is_empty());
 }
 
 /// A package pass that says `c-toolchain: missing` while aterm's own Mac Setup tab

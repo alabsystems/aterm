@@ -246,6 +246,16 @@ impl RunOut {
 pub trait GitRunner {
     fn git(&self, args: &[&str]) -> Result<RunOut>;
 
+    /// A complete local read of the original object graph: no replacement objects, grafts,
+    /// shallow cutoffs, commit-graph acceleration, ambient Git routing or lazy network fetch.
+    /// A runner that cannot supply that authority refuses instead of using an ordinary read.
+    fn git_original(&self, args: &[&str]) -> Result<RunOut> {
+        Err(Error::new(format!(
+            "git {}: this runner supplies no original-history read",
+            args.join(" ")
+        )))
+    }
+
     /// A complete local history listing, bounded in the production runner, which fetches
     /// nothing a partial clone lacks (`--no-lazy-fetch` where git takes it and
     /// `GIT_NO_LAZY_FETCH=1`, on a git seen to keep a read local, and a refusal on one that does
@@ -471,6 +481,25 @@ impl GitCli {
 impl GitRunner for GitCli {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
         self.git_env(args, &[])
+    }
+
+    fn git_original(&self, args: &[&str]) -> Result<RunOut> {
+        let mut cmd = object_git(&self.repo)?;
+        cmd.env("GIT_GRAFT_FILE", "/dev/null")
+            .env("GIT_SHALLOW_FILE", "/dev/null")
+            .args(["-c", "core.commitGraph=false", "-c", "protocol.allow=never"])
+            .args(args);
+        let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(
+            &mut cmd,
+            std::time::Duration::from_secs(60),
+            "original Git history",
+        )
+        .map_err(|e| Error::new(format!("git {}: {e}", args.join(" "))))?;
+        Ok(RunOut {
+            status: out.status.code().unwrap_or(-1),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        })
     }
 
     fn git_read(&self, args: &[&str]) -> Result<RunOut> {

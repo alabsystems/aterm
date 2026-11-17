@@ -49,13 +49,19 @@
 //! What the person's account can read of each step without root ([`owed`]) decides whether the
 //! independent root work is owed, including when the compiler refuses or cannot be read:
 //! an unreadable root step is not owed, so no password is asked for want of a reading.
+//!
+//! A step whose apply fails for good leaves root's record of it, so a run nobody asked for does
+//! not ask the password for that step again by itself: the naming rule its own ([`REFUSED_RULE`])
+//! and Spotlight's scope its own (`spotlight_scope::REFUSED`), which [`owed`] reads, and developer
+//! mode and the broker the keyed records of `aterm_types::macos_setup::refused`, which
+//! [`refused`] reads where the password is decided. A step so recorded still reads owed.
 
 use crate::items::{Ctx, Item};
 use crate::model::{Probe, Read};
 use crate::port::{Cmd, Ran, System};
 use aterm_containment::consent::{ADMIN_GROUP, DebuggerMember, classify_membership};
 use aterm_types::machine_name::{GeneratedNames, OsSlot};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub use aterm_types::macos_setup::ADMITTED_NAME_RULE;
 
@@ -127,8 +133,11 @@ pub enum Owed {
     /// is known stopped; never a job launchd lists switched off, which stays the person's
     /// ([`aterm_uds::lan::install::Reading::owed_with_job`]).
     LanBroker,
-    /// Spotlight still indexes a folder of this account's home that setup has never excluded
-    /// nor failed to ([`crate::init_spotlight::scope_owed`]).
+    /// Spotlight still indexes a folder of this account's home that setup has neither excluded
+    /// nor failed to ([`crate::init_spotlight::scope_owed`]). Only a home setup's password never
+    /// scoped is asked for by itself ([`crate::init_spotlight::automatic_scope_owed`]); a folder
+    /// made since is the person's explicit request to exclude
+    /// ([`crate::init_clt::CommandLineTools::scoping_new_folders`]).
     Spotlight,
 }
 
@@ -463,8 +472,62 @@ pub fn name_by_rule(
     Ok(set)
 }
 
+/// Root's note that a step's apply failed for good with the inputs `key` names
+/// (`aterm_types::macos_setup::refused`): the key joins the step's record at `file`, which a run
+/// nobody asked for reads before it asks the Mac password for the step ([`refused`]). Best
+/// effort, as root: a record that cannot be written leaves the step asked for again, as it was
+/// before any record.
+pub(crate) fn record_refusal(sys: &dyn System, file: &str, key: &str) {
+    use aterm_types::macos_setup::refused::KEYS;
+    let mut keys = crate::init_spotlight::listed(sys, file).unwrap_or_default();
+    if keys.len() >= KEYS || !keys.insert(PathBuf::from(key)) {
+        return;
+    }
+    if let Err(why) = crate::init_spotlight::list(sys, file, &keys) {
+        aterm_log::warn!("setup: a refused root step was not recorded: {why}");
+    }
+}
+
+/// Remove a step's record at `file`: its apply succeeded.
+pub(crate) fn clear_refusal(sys: &dyn System, file: &str) {
+    let file = Path::new(file);
+    if sys.stat(file).is_ok()
+        && let Err(error) = sys.remove(file)
+    {
+        aterm_log::warn!("setup: {} was not removed: {error}", file.display());
+    }
+}
+
+/// Whether a root apply already failed for good at `step` with the inputs it reads now, so a
+/// run nobody asked for does not ask the Mac password for it again
+/// (`aterm_types::macos_setup::refused`). The step still reads owed ([`owed`]): a person's own
+/// run asks for it, and every root run that carries it tries it. `false` for the naming rule
+/// and Spotlight's scope, whose own records [`owed`] already reads, and wherever the step's
+/// inputs or record cannot be read.
+#[must_use]
+pub fn refused(sys: &dyn System, step: Owed) -> bool {
+    use aterm_types::macos_setup::refused::{
+        DEVELOPER_MODE, LAN_BROKER, developer_mode_key, stands,
+    };
+    let reads = crate::init_spotlight::Port(sys);
+    match step {
+        Owed::Debugger => stands(&reads, DEVELOPER_MODE, || match developer_mode_now(sys)? {
+            false => Some(developer_mode_key(false, 0)),
+            true => sys
+                .identity()
+                .ok()
+                .map(|identity| developer_mode_key(true, identity.user.uid)),
+        }),
+        Owed::LanBroker => stands(&reads, LAN_BROKER, || crate::items::lan::refusal_key(sys)),
+        Owed::NameRule | Owed::Spotlight => false,
+    }
+}
+
 /// `[developer] debugger = true`: developer mode on, and the console account authorized as an
-/// admin or in [`DEVELOPER_GROUP`]. Applied as root, by the elevation's root half.
+/// admin or in [`DEVELOPER_GROUP`]. Applied as root, by the elevation's root half. An apply
+/// one of Apple's tools answered with a failure, or that left the mode off, leaves the reading
+/// that failure leaves in root's record, and one that succeeds removes the record
+/// (`aterm_types::macos_setup::refused::DEVELOPER_MODE`).
 pub struct DeveloperMode;
 
 impl DeveloperMode {
@@ -533,28 +596,73 @@ impl Item for DeveloperMode {
     }
 
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
+        use aterm_types::macos_setup::refused::{DEVELOPER_MODE, developer_mode_key};
         let (mode, user) = Self::read(sys, ctx);
         let mode = mode.ok_or_else(|| format!("{} did not say", status_cmd().display()))?;
-        if !mode {
-            run_ok(sys, &Cmd::new(DEVTOOLS_SECURITY).arg("-enable"))?;
+        let missing = user
+            .filter(|(_, member)| *member == DebuggerMember::NotMember)
+            .map(|(name, _)| name);
+        // A half that failed, with the key of the reading it leaves (the one a later ask reads)
+        // where the tool itself answered. One that could not be started, gave no answer in
+        // its budget or was killed says nothing of this Mac, and is asked for again.
+        type Failed = (String, Option<String>);
+        let run = |cmd: &Cmd, key: Option<String>| -> Result<(), Failed> {
+            match sys.run(cmd) {
+                Ok(ran) if ran.success() => Ok(()),
+                Ok(ran) => Err((
+                    format!("{}: {}", cmd.display(), ran.describe()),
+                    key.filter(|_| ran.status.is_some()),
+                )),
+                Err(error) => Err((format!("{}: {error}", cmd.display()), None)),
+            }
+        };
+        let set = || -> Result<(), Failed> {
+            if !mode {
+                let off = developer_mode_key(false, 0);
+                run(
+                    &Cmd::new(DEVTOOLS_SECURITY).arg("-enable"),
+                    Some(off.clone()),
+                )?;
+                // The tool's exit alone does not say the mode is on.
+                if developer_mode_now(sys) == Some(false) {
+                    return Err((
+                        format!(
+                            "{DEVTOOLS_SECURITY} -enable ran and developer mode still reads off"
+                        ),
+                        Some(off),
+                    ));
+                }
+            }
+            if let Some(name) = &missing {
+                run(
+                    &Cmd::new(DSEDITGROUP).args([
+                        "-o",
+                        "edit",
+                        "-a",
+                        name.as_str(),
+                        "-t",
+                        "user",
+                        DEVELOPER_GROUP,
+                    ]),
+                    ctx.console
+                        .as_ref()
+                        .map(|user| developer_mode_key(true, user.uid)),
+                )?;
+            }
+            Ok(())
+        };
+        match set() {
+            Ok(()) => {
+                clear_refusal(sys, DEVELOPER_MODE);
+                Ok(())
+            }
+            Err((why, key)) => {
+                if let Some(key) = key {
+                    record_refusal(sys, DEVELOPER_MODE, &key);
+                }
+                Err(why)
+            }
         }
-        if let Some((name, member)) = user
-            && member == DebuggerMember::NotMember
-        {
-            run_ok(
-                sys,
-                &Cmd::new(DSEDITGROUP).args([
-                    "-o",
-                    "edit",
-                    "-a",
-                    name.as_str(),
-                    "-t",
-                    "user",
-                    DEVELOPER_GROUP,
-                ]),
-            )?;
-        }
-        Ok(())
     }
 
     fn revert(&self) -> Option<String> {

@@ -48,10 +48,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use super::checkout::{self, Placing};
-use super::retired::{Answer, Git, history};
+use super::retired::{Answer, Git, history, read_until};
 
 /// The config every git run that writes a pin is given: no file system monitor or untracked
 /// cache answers for a file git did not read itself, no hook runs (a reference-transaction hook
@@ -93,9 +92,6 @@ const MAX_FILES: usize = 65_536;
 
 /// The most commits one entry's refs and reflogs may name.
 const MAX_ROOTS: usize = 65_536;
-
-/// How long one history read may take.
-const READ_FOR: Duration = Duration::from_secs(30);
 
 /// A worktree registration of a checkout.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -658,12 +654,6 @@ impl Named {
         named.under_way(entry)?;
         Ok(named)
     }
-}
-
-/// When a history read that starts now must end: [`READ_FOR`] on, or the git's own end first.
-fn read_until(git: &dyn Git) -> Instant {
-    let bound = Instant::now() + READ_FOR;
-    git.until().map_or(bound, |until| until.min(bound))
 }
 
 /// The commit HEAD names in the git directory `prefix` selects (none: the checkout's), through

@@ -15,12 +15,12 @@
 #[cfg(unix)]
 use super::journal::place::{Places, Why};
 use super::{
+    account_names::{self, Found, Names},
     mail,
     registry::{self, ACCOUNT, ADDRESS, AddressIndex, MACHINE, PREFERENCE},
 };
 use crate::typed::{
     cell::{self, Cells, Projection},
-    keys,
     owned::OwnedRead,
 };
 use aterm_json::Value;
@@ -58,6 +58,48 @@ impl MachineNickname {
     }
 }
 
+/// The registry label's value, provenance and claim, as a `lab/machines` snapshot row shows
+/// them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum MachineLabel {
+    /// The cell is missing or explicitly null.
+    #[default]
+    Unset,
+    /// One value: its spelling, whether an automatic path or an import wrote it rather than an
+    /// owner (`label_auto`), and the label the column's claim rule gives this row
+    /// (`label_claim`): the label itself where the row holds it, a clash label where another row
+    /// won it, `None` while the claim is undecided or the snapshot is from a build before the
+    /// column.
+    Named {
+        label: String,
+        automatic: bool,
+        claim: Option<String>,
+    },
+    /// Concurrent values conflict, or the cell shows a refusal in the value's place.
+    Conflict,
+}
+
+impl MachineLabel {
+    /// The label a `lab/machines` snapshot row holds, read as [`MachineNickname::of_file_row`]
+    /// reads the nickname.
+    #[must_use]
+    pub fn of_file_row(row: &aterm_file::Row) -> Self {
+        if row.cell("label").is_empty() {
+            return Self::Unset;
+        }
+        match row.values.get("label").and_then(Value::as_str) {
+            Some(label) if row.cell("label") == label => Self::Named {
+                label: label.to_owned(),
+                automatic: row.cell("label_auto") == "yes",
+                claim: Some(row.cell("label_claim"))
+                    .filter(|claim| !claim.is_empty())
+                    .map(str::to_owned),
+            },
+            _ => Self::Conflict,
+        }
+    }
+}
+
 /// A machine row, by its key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Machine {
@@ -86,9 +128,12 @@ pub struct Account {
     pub provider: Option<String>,
     /// The canonical realm (`claude`, `codex`, `kimi:global`, …).
     pub realm: Option<String>,
-    /// What the row is called: the owner's or the import's label, else its default
-    /// ([`registry::account_label`]). It names no machine.
-    pub label: Option<String>,
+    /// Its slug (`claude-fb-alpha`), unique across the lab ([`account_names`]): what a surface
+    /// and a new roster row call it. Empty only where its realm reads as no one value.
+    pub slug: String,
+    /// Its provider word and claims address (`claude ada.fb@alpha.example`), where its address
+    /// resolves ([`account_names`]).
+    pub name: Option<String>,
     /// What a Mac called the row before labels named no machine (`m8-2`, `kimi-m16`).
     pub legacy_label: Option<String>,
     /// The login address, local to this process: this view never prints it.
@@ -146,6 +191,9 @@ pub struct LabView {
     pub bound: BTreeMap<String, String>,
     pub machines: BTreeMap<String, Machine>,
     pub accounts: BTreeMap<String, Account>,
+    /// Each account's slug and name, by key ([`account_names`]): how a surface shows it and
+    /// what a command names it by.
+    pub names: BTreeMap<String, Names>,
     /// Live preferences on live machines, by machine key then rank.
     pub preferences: Vec<Preference>,
     /// Every Mac's `account-obs` rows: which accounts its login files name, and when it last
@@ -219,8 +267,14 @@ impl LabView {
         obs: &OwnedRead,
         me_uuid: Option<&str>,
     ) -> Self {
-        let mut lab =
-            Self::read_projected(&view.cells, &view.project(&MACHINE), facts, obs, me_uuid);
+        let mut lab = Self::read_projected(
+            &view.cells,
+            &view.project(&MACHINE),
+            account_names::of(view),
+            facts,
+            obs,
+            me_uuid,
+        );
         if let Some(rows) = view.owned.get(registry::ACCOUNT_OBS.name) {
             lab.account_obs = super::sighted::obs_rows(rows);
         }
@@ -236,7 +290,15 @@ impl LabView {
         obs: &OwnedRead,
         me_uuid: Option<&str>,
     ) -> Self {
-        Self::read_projected(cells, &cell::project(&MACHINE, cells), facts, obs, me_uuid)
+        let names = account_names::of_cells(cells);
+        Self::read_projected(
+            cells,
+            &cell::project(&MACHINE, cells),
+            names,
+            facts,
+            obs,
+            me_uuid,
+        )
     }
 
     /// What [`Self::read_view`] reads but the `account-obs` rows (left empty), with MACHINE's
@@ -245,6 +307,7 @@ impl LabView {
     pub(crate) fn read_projected(
         cells: &Cells,
         machines: &Projection,
+        names: BTreeMap<String, Names>,
         facts: &OwnedRead,
         obs: &OwnedRead,
         me_uuid: Option<&str>,
@@ -284,8 +347,10 @@ impl LabView {
             .rows
             .into_iter()
             .map(|(pk, row)| {
+                let names = names.get(&pk);
                 let account = Account {
-                    label: registry::account_label(&pk, &row),
+                    slug: names.map(|names| names.slug.clone()).unwrap_or_default(),
+                    name: names.and_then(|names| names.name.clone()),
                     provider: text(&row, "provider"),
                     realm: text(&row, "realm"),
                     legacy_label: text(&row, "legacy_label"),
@@ -337,6 +402,7 @@ impl LabView {
             bound,
             machines,
             accounts,
+            names,
             preferences,
             account_obs: Vec::new(),
             addresses,
@@ -349,7 +415,8 @@ impl LabView {
     /// (docs/DESIGN-shared-files-2026-11-11.md §4, SF-04): what [`Self::read`] projects from the
     /// registry, read from this Mac's snapshots, which answer in every custody state. This Mac is
     /// the live machine the snapshot marks `=here` (the one its own facts row binds when the pass
-    /// ran), and each seat of `=seats` is bound as [`Self::bound`] says. A label or nickname whose
+    /// ran), and each seat of `=seats` is bound as [`Self::bound`] says. Each account's names are
+    /// the pass's: `=slug`, `=name`, `=email` and `=login_email`. A label or nickname whose
     /// cell is a conflict, or one the guards refused, is read as [`Self::read`] reads a conflicted
     /// register. The snapshots carry no address rows: [`Self::mailbox`], [`Self::mailboxes`] and
     /// [`Self::aliases`] answer nothing here, and mail metadata is read from the registry.
@@ -424,8 +491,8 @@ impl LabView {
                 let pk = row.pk.clone();
                 let realm = value(row, "realm");
                 let account = Account {
-                    label: value(row, "label")
-                        .or_else(|| keys::default_account_label(realm.as_deref()?, &pk).ok()),
+                    slug: row.cell("slug").to_owned(),
+                    name: shown(row, "name"),
                     legacy_label: value(row, "legacy_label"),
                     provider: value(row, "provider"),
                     plan: value(row, "plan"),
@@ -445,6 +512,20 @@ impl LabView {
                     pk: pk.clone(),
                 };
                 (pk, account)
+            })
+            .collect();
+        let names: BTreeMap<String, Names> = accounts
+            .rows()
+            .iter()
+            .map(|row| {
+                let names = Names {
+                    slug: row.cell("slug").to_owned(),
+                    name: shown(row, "name"),
+                    email: shown(row, "email"),
+                    login: shown(row, "login_email"),
+                    live: row.live,
+                };
+                (row.pk.clone(), names)
             })
             .collect();
         let mut preferences: Vec<Preference> = links
@@ -467,9 +548,28 @@ impl LabView {
             bound,
             machines: machine_rows,
             accounts: account_rows,
+            names,
             preferences,
             ..Self::default()
         }
+    }
+
+    /// The slug of account `pk` ([`account_names`]).
+    pub fn slug(&self, pk: &str) -> Option<&str> {
+        Some(self.names.get(pk)?.slug.as_str()).filter(|slug| !slug.is_empty())
+    }
+
+    /// The name of account `pk`: its provider word and its address (`claude
+    /// ada.fb@alpha.example`).
+    pub fn name(&self, pk: &str) -> Option<&str> {
+        self.names.get(pk)?.name.as_deref()
+    }
+
+    /// The accounts `word` names ([`account_names::named`]): its slug, its key, its provider word
+    /// and address (`oai ada@x.example` or `oai:ada@x.example`), or an address, live accounts
+    /// tried first. A roster label and a legacy label name none.
+    pub fn account_named(&self, word: &str) -> Found<'_> {
+        account_names::named(&self.names, word)
     }
 
     /// The label of machine `pk`.

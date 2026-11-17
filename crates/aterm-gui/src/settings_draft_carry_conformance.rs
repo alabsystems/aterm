@@ -400,6 +400,8 @@ fn tab_only_layout(manifest: &RestoreManifest, restore_tag: &str) -> crate::rest
         .clone();
     crate::restore::WindowLayout {
         dock: None,
+        dock_by_default: false,
+        scale: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

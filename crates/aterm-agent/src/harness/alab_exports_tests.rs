@@ -73,7 +73,6 @@ fn lab() -> Lab {
     by_account.insert(bob.pk.clone(), vec![("m3".to_owned(), "fill".to_owned())]);
     Lab {
         me: Some(test_machine("m3")),
-        settled: true,
         bound: Default::default(),
         accounts: vec![ann, bob, cy, dee],
         aliases: BTreeMap::new(),

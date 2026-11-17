@@ -136,7 +136,10 @@ fn resolve_with_origin(state: &State, action: &str, promote: bool) -> State {
         0 => SourceSnapshot::Present(initial.clone()),
         1 => SourceSnapshot::Present(Arc::new((*initial).clone())),
         2 => SourceSnapshot::Present(Arc::new(Lab {
-            settled: true,
+            aliases: std::collections::BTreeMap::from([(
+                "alias@example.test".to_owned(),
+                vec!["mailbox@example.test".to_owned()],
+            )]),
             ..(*initial).clone()
         })),
         3 => SourceSnapshot::Pending,

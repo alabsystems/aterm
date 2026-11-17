@@ -3200,6 +3200,8 @@ impl Wake {
             #[cfg(target_os = "macos")]
             Wake::BeginSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
+            Wake::NativeRenameEdited { .. } => None,
+            #[cfg(target_os = "macos")]
             Wake::CommitSessionRename { .. } => None,
             #[cfg(target_os = "macos")]
             Wake::CancelSessionRename { .. } => None,
@@ -3222,7 +3224,7 @@ impl Wake {
             | Wake::InitialSetupReadings(_)
             | Wake::InitialSetupApplyResolved
             | Wake::InitialSetupPhraseJoined
-            | Wake::KittyBaked
+            | Wake::LockupBaked
             | Wake::AgentsDiscoveryReady
             | Wake::RestoreDocumentReady
             | Wake::AccountMenuRead(_) => None,

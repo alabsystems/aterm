@@ -276,11 +276,15 @@ impl Access {
         }
     }
 
-    /// Whether this grant is needed for `selection`. Accessibility is needed only
-    /// while an account sign-out is managed; otherwise its row reads Not needed.
+    /// Whether this grant is needed for `selection`. Accessibility is needed only while an
+    /// account sign-out is managed. App-level Local Network consent is diagnostic: aterm's own
+    /// LAN traffic requires the separately confirmed root helper.
     #[must_use]
     pub const fn needed_for(self, selection: Selection) -> bool {
         match self {
+            // aterm's own LAN traffic requires the authenticated root helper, not this
+            // application's macOS consent. Keep the app grant as an explicit diagnostic.
+            Self::LocalNetwork => false,
             Self::Accessibility => {
                 selection.contains(Setting::Messages) || selection.contains(Setting::FaceTime)
             }
@@ -294,14 +298,12 @@ impl Access {
     #[must_use]
     pub const fn requires_confirmation(self) -> bool {
         match self {
-            Self::LocalNetwork
-            | Self::NameRule
-            | Self::SpotlightScope
-            | Self::NetworkAuth
-            | Self::NetworkHelper => true,
-            Self::FullDiskAccess | Self::DeveloperTools | Self::Debugger | Self::Accessibility => {
-                false
-            }
+            Self::NameRule | Self::SpotlightScope | Self::NetworkAuth | Self::NetworkHelper => true,
+            Self::FullDiskAccess
+            | Self::DeveloperTools
+            | Self::Debugger
+            | Self::Accessibility
+            | Self::LocalNetwork => false,
         }
     }
 }
@@ -668,6 +670,7 @@ pub const ADMITTED_NAME_RULE: &str = "/private/etc/sudoers.d/aterm-admitted-name
 /// later launch ask for the password again.
 pub const ADMITTED_NAME_RULE_REFUSED: &str = "/private/etc/sudoers.d/.aterm-admitted-name.refused";
 
+pub mod refused;
 pub mod spotlight_scope;
 
 /// The environment variable System State's Mac Setup tab runs `aterm init --only

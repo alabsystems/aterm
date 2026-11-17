@@ -21,6 +21,7 @@ pub mod sign;
 pub mod tarwrite;
 pub mod toolchain;
 pub mod tools;
+pub mod tree;
 pub mod upload;
 
 #[cfg(all(test, unix))]

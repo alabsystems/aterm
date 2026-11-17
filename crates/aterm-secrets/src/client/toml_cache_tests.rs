@@ -3,7 +3,9 @@
 
 use super::*;
 use crate::{client, envelope};
-use std::{os::unix::fs::PermissionsExt, sync::atomic::Ordering};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::Ordering;
 
 fn value(table: &aterm_toml::Table) -> i64 {
     table.get("value").unwrap().as_integer().unwrap()
@@ -28,6 +30,7 @@ fn identical_bytes_share_a_tree_and_edits_are_parsed_afresh() {
     assert_eq!(cache.parses.load(Ordering::Relaxed), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_warm_reader_still_checks_the_file_bytes_permissions_and_size() {
     let home = aterm_tempfile::tempdir().unwrap();

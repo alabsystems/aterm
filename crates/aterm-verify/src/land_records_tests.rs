@@ -119,6 +119,7 @@ impl Mac {
             run: crate::land_run::tests::run(),
             interrupt: Box::new(|| None),
             tally: records::Tally::default(),
+            lock: None,
         }
     }
 
@@ -166,6 +167,23 @@ fn filed(root: &Path, tree: &str) -> Vec<String> {
     names
 }
 
+/// Append what a landing that pushed nothing left in `mac`'s spool, as the clone's next landing
+/// appends it ([`Records::publish`]), once the journal is shown to hold none of `tree`'s
+/// records: the run deferred them ([`records::finish`]).
+fn append_kept(world: &World, mac: &Mac, tree: &str) {
+    assert_eq!(
+        filed(&world.work, tree),
+        Vec::<String>::new(),
+        "a run that pushed nothing appends none of its records"
+    );
+    let mut said = Vec::new();
+    mac.records()
+        .publish(&world.work, &mut |line| said.push(line.to_owned()))
+        .expect("the next landing appends what the spool kept");
+    assert!(said.is_empty(), "{said:#?}");
+    assert!(mac.spooled().is_empty(), "the append held them");
+}
+
 /// What a scripted landing did: its exit, what it said, and each judgment's base and tree.
 struct Landed {
     code: i32,
@@ -180,11 +198,26 @@ fn land_on(
     records: Records<'_>,
     judge: impl FnMut(&str, &str, Poll<'_>) -> Ran,
 ) -> Landed {
+    land_heard(root, records, judge, &|_| {})
+}
+
+/// [`land_on`], each line the landing says also told to `heard` as it is said.
+fn land_heard(
+    root: &Path,
+    records: Records<'_>,
+    judge: impl FnMut(&str, &str, Poll<'_>) -> Ran,
+    heard: &dyn Fn(&str),
+) -> Landed {
     let branch = crates(&["a"]);
     let reach = whole_reach(&branch);
-    land_rounds(root, records, &reach, judge, |_, _| {
-        panic!("no round was expected")
-    })
+    land_rounds_heard(
+        root,
+        records,
+        &reach,
+        judge,
+        |_, _| panic!("no round was expected"),
+        heard,
+    )
 }
 
 /// [`land_on`] whose shared paths reach what `reach` says (its argument the paths, or `None` for
@@ -194,8 +227,20 @@ fn land_rounds(
     root: &Path,
     records: Records<'_>,
     reach: &dyn Fn(Option<&[String]>) -> Reach,
+    judge: impl FnMut(&str, &str, Poll<'_>) -> Ran,
+    round: impl FnMut(&str, &str) -> Judged,
+) -> Landed {
+    land_rounds_heard(root, records, reach, judge, round, &|_| {})
+}
+
+/// [`land_rounds`], each line the landing says also told to `heard` as it is said.
+fn land_rounds_heard(
+    root: &Path,
+    records: Records<'_>,
+    reach: &dyn Fn(Option<&[String]>) -> Reach,
     mut judge: impl FnMut(&str, &str, Poll<'_>) -> Ran,
     mut round: impl FnMut(&str, &str) -> Judged,
+    heard: &dyn Fn(&str),
 ) -> Landed {
     let said = RefCell::new(Vec::new());
     let judged = RefCell::new(Vec::new());
@@ -217,7 +262,10 @@ fn land_rounds(
                 round(base, &git(at, &["rev-parse", "HEAD^{tree}"]))
             },
             hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
-            say: &mut |line: &str| said.borrow_mut().push(line.to_owned()),
+            say: &mut |line: &str| {
+                heard(line);
+                said.borrow_mut().push(line.to_owned());
+            },
             remote: &remote_step,
             pause: &no_retry,
         },
@@ -299,7 +347,9 @@ fn judging<'w>(
 /// the tree it judged and the main commit it merged, each reading back with its run and its key
 /// the plan's, and `verify land records` lists them; the landing lands as without them. A run
 /// whose record is not whole (no `run-finished`) records its FAIL alone: its passes name a run
-/// that did not end as its rows say. NEGATIVE CONTROL, run as a mutant that made this test fail:
+/// that did not end as its rows say; it pushed nothing, so its record waits in the clone's spool
+/// for the next landing's append ([`append_kept`]). NEGATIVE CONTROL, run as a mutant that made
+/// this test fail:
 /// `end` writing every row whatever the run's record (the not-whole run filed `fmt.ok`).
 #[test]
 fn a_whole_run_records_every_check_and_one_not_whole_its_fails_alone() {
@@ -360,6 +410,8 @@ fn a_whole_run_records_every_check_and_one_not_whole_its_fails_alone() {
     });
     assert_eq!(landing.code, exit::FAILED, "{:#?}", landing.said);
     let (_, tree) = &landing.judged[0];
+    assert_eq!(mac.spooled(), ["lint.FAIL"]);
+    append_kept(&world, &mac, tree);
     assert_eq!(filed(&world.work, tree), ["lint.FAIL"]);
     let record = journal(&world.work, tree)
         .remove(0)
@@ -425,9 +477,10 @@ fn an_interrupted_or_moved_run_writes_nothing() {
 /// reach holds one of the branch's crates and not the other, is answered by a round once the
 /// judgment passed, and the round's verdicts are recorded under the merge's tree and main's
 /// tip, as the merge's own run: its FAIL with its passes, beside the judgment's own records of
-/// the tree it judged. The landing exits as the round's red says. NEGATIVE CONTROL: the judgment's records of its own
-/// tree. Mutant run: `recheck` without its `records::record` filed nothing under the merge's
-/// tree.
+/// the tree it judged. The landing exits as the round's red says, and its records reach the
+/// journal with the clone's next landing ([`append_kept`]). NEGATIVE CONTROL: the judgment's
+/// records of its own tree. Mutant run: `recheck` without its `records::record` filed nothing
+/// under the merge's tree.
 #[test]
 fn a_rounds_verdicts_are_recorded_under_the_merges_tree() {
     let world = world_of();
@@ -466,6 +519,7 @@ fn a_rounds_verdicts_are_recorded_under_the_merges_tree() {
         panic!("one judgment: {:#?}", landing.said);
     };
     assert_ne!(merge, judged);
+    append_kept(&world, &mac, merge);
     assert_eq!(
         filed(&world.work, judged),
         ["cells.ok", "fmt.ok", "lint.ok", "test.ok"],
@@ -635,6 +689,225 @@ fn a_conflict_keeps_its_records_for_the_next_landing_without_appending() {
     assert!(remaining.unreadable.is_empty());
 }
 
+/// A RED LANDING KEEPS ITS RECORDS IN THE CLONE AND LEAVES THE CHECKOUT FREE AT ITS VERDICT: a
+/// run that pushed nothing (here a FAIL) starts no append; its signed records, its end
+/// included, stay in the clone's spool, said after its verdict, and the checkout's landing lock
+/// it held is free by the time it says so, while the run still lives, so the fix lands at once.
+/// That landing says its verdict, then lets its lock go, then appends: its one append carries
+/// the red run's records beside its own, and the spool is empty again.
+///
+/// NEGATIVE CONTROLS, each run once against a broken copy of `land_records.rs` or `land.rs`
+/// (restored with cp, then touch), which made this test fail:
+/// - `finish` returning `Delivery::Publish(None)` for every run that took no interrupt (the
+///   append of every exit, as before): `a run that pushed nothing starts no append`;
+/// - `deliver` letting the lock go only after its append: `the landing let its lock go before
+///   it appends: Err("another landing runs in …: it holds …/.git/aterm-land.lock until it ends
+///   …")`;
+/// - `deliver` letting the lock go only in its `Delivery::Publish` arm, so a kept run holds it
+///   through its delivery: `the red run let its lock go before it said where its records went`,
+///   `left: Some(Err("another landing runs in …"))`;
+/// - `concluded` delivering before `say_verdict`: `assertion `left == right` failed` on the
+///   line after the red run's verdict (the records' line came before it).
+#[test]
+fn a_red_landing_keeps_its_records_and_leaves_the_checkout_free_for_the_next_land() {
+    let world = world_of();
+    commit(&world.work, "a/x.txt", "a2\n");
+    let mac = Mac::new(&world, Some(1));
+    let checkout = Git {
+        root: &world.work,
+        make: &git_cmd,
+    };
+    let mut red = mac.records();
+    red.run.id = "fa11".repeat(8);
+    red.append = Box::new(|_, _, _| panic!("a run that pushed nothing starts no append"));
+    red.lock = Some(checkout.hold().expect("the checkout's landing lock"));
+    // The checkout's landing as the red run's records line is said, while the run (and the
+    // records that held its lock) still lives.
+    let free_at_kept = RefCell::new(None);
+    let landing = land_heard(
+        &world.work,
+        red,
+        judging("fa110001", &[(Check::Lint, Word::Fail)]),
+        &|line| {
+            if line.starts_with("verify land: this run's records are kept in this clone") {
+                *free_at_kept.borrow_mut() = Some(checkout.hold().map(drop));
+            }
+        },
+    );
+    assert_eq!(landing.code, exit::FAILED, "{:#?}", landing.said);
+    assert_eq!(
+        free_at_kept.into_inner(),
+        Some(Ok(())),
+        "the red run let its lock go before it said where its records went: {:#?}",
+        landing.said
+    );
+    let (_, red_tree) = landing.judged[0].clone();
+    let verdict = landing
+        .said
+        .iter()
+        .position(|line| line.starts_with("verify land: VERDICT — NOT LANDED"))
+        .expect("the verdict");
+    assert_eq!(
+        landing.said[verdict + 1..].last().map(String::as_str),
+        Some(
+            format!(
+                "verify land: this run's records are kept in this clone; {}",
+                records::WHO_APPENDS
+            )
+            .as_str()
+        ),
+        "{:#?}",
+        landing.said
+    );
+    assert_eq!(
+        mac.spooled(),
+        ["cells.ok", "fmt.ok", "lint.FAIL", "test.ok"]
+    );
+    let red_end = mac
+        .dir()
+        .pending()
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|signed| {
+            crate::land_run::Filed::parse(&signed.path).is_ok_and(|filed| {
+                filed.kind == crate::land_run::Kind::End && signed.path.contains(&"fa11".repeat(8))
+            })
+        })
+        .expect("the red run's end is kept");
+    assert!(
+        crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+            .unwrap()
+            .is_none(),
+        "nothing reached the journal"
+    );
+
+    let held = checkout
+        .hold()
+        .expect("the red run left the checkout's landing free");
+    commit(&world.work, "a/x.txt", "a3\n");
+    let said = RefCell::new(Vec::<String>::new());
+    let mut fixed = mac.records();
+    fixed.run.id = "f1fe".repeat(8);
+    fixed.lock = Some(held);
+    let mut append = fixed.append;
+    let (heard, free) = (&said, &checkout);
+    fixed.append = Box::new(move |root, signed, at| {
+        assert!(
+            heard
+                .borrow()
+                .iter()
+                .any(|line| line.starts_with("verify land: VERDICT — LANDED")),
+            "the verdict is said before the append: {:#?}",
+            heard.borrow()
+        );
+        let free = free.hold().map(drop);
+        assert!(
+            free.is_ok(),
+            "the landing let its lock go before it appends: {free:?}"
+        );
+        append(root, signed, at)
+    });
+    let landed = land_heard(&world.work, fixed, judging("f1fe0001", &[]), &|line| {
+        said.borrow_mut().push(line.to_owned())
+    });
+    assert_eq!(landed.code, exit::PASS, "{:#?}", landed.said);
+    let (_, fixed_tree) = &landed.judged[0];
+    assert_ne!(fixed_tree, &red_tree);
+    for tree in [&red_tree, fixed_tree] {
+        let want: &[&str] = if *tree == red_tree {
+            &["cells.ok", "fmt.ok", "lint.FAIL", "test.ok"]
+        } else {
+            &["cells.ok", "fmt.ok", "lint.ok", "test.ok"]
+        };
+        assert_eq!(filed(&world.work, tree), want, "{tree}");
+    }
+    let head = crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+        .unwrap()
+        .expect("the journal");
+    let output = git_cmd(&world.work)
+        .args(["show", &format!("{head}:{}", red_end.path)])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "the red run's end is appended");
+    assert_eq!(output.stdout, red_end.bytes);
+    assert!(mac.dir().pending().unwrap().records.is_empty());
+}
+
+/// A RUN AN INTERRUPT TOOK LETS THE CHECKOUT GO BEFORE IT SAYS ITS RECORDS ARE KEPT: its end
+/// records the signal and stays in the clone's spool, no append starts, and the checkout's
+/// landing lock the run held is free by the time the line that says so is said, while the run
+/// (and its records) still lives.
+///
+/// NEGATIVE CONTROL, run once against a broken copy of `land_records.rs` (restored with cp, then
+/// touch), which made this test fail: `deliver` letting the lock go only in its
+/// `Delivery::Publish` arm, so a kept or interrupted run holds it through its delivery: `the run
+/// let its lock go before it said where its records went`, `left: Some(Err("another landing runs
+/// in …"))`.
+#[test]
+fn an_interrupted_run_lets_the_checkout_go_before_it_says_its_records_are_kept() {
+    let world = world_of();
+    let mac = Mac::new(&world, Some(1));
+    let checkout = Git {
+        root: &world.work,
+        make: &git_cmd,
+    };
+    let mut records = mac.records();
+    records.append = Box::new(|_, _, _| panic!("a run an interrupt took starts no append"));
+    records.interrupt = Box::new(|| Some(15));
+    records.lock = Some(checkout.hold().expect("the checkout's landing lock"));
+    let mut said = Vec::new();
+    let delivery = records::finish(
+        &checkout,
+        &mut records,
+        &mut |line| said.push(line.to_owned()),
+        exit::COULD_NOT_RUN,
+    );
+    assert_eq!(delivery, records::Delivery::Interrupted(15), "{said:#?}");
+    let mut free = None;
+    records::deliver(
+        &world.work,
+        &mut records,
+        &mut |line| {
+            if line
+                .starts_with("verify land: interrupted by signal 15: this run's records are kept")
+            {
+                free = Some(checkout.hold().map(drop));
+            }
+            said.push(line.to_owned());
+        },
+        delivery,
+    );
+    assert_eq!(
+        free,
+        Some(Ok(())),
+        "the run let its lock go before it said where its records went: {said:#?}"
+    );
+    let end = mac
+        .dir()
+        .pending()
+        .unwrap()
+        .records
+        .into_iter()
+        .find(|signed| {
+            crate::land_run::Filed::parse(&signed.path)
+                .is_ok_and(|filed| filed.kind == crate::land_run::Kind::End)
+        })
+        .expect("the interrupted run's end is kept");
+    let entry = crate::land_run::Entry::read(&end.path, &end.bytes, Origin::Spool);
+    assert_eq!(
+        entry.body.expect("the end reads").record.signal,
+        Some(15),
+        "the end records the signal"
+    );
+    assert!(
+        crate::judged::head(&world.work, REMOTE, crate::judged::deadline())
+            .unwrap()
+            .is_none(),
+        "nothing reached the journal"
+    );
+}
+
 /// Deferral cannot discard records when the end cannot be saved or durable custody cannot be
 /// confirmed: publication rescues them and preserves the conflict exit. An end record that
 /// cannot be formed must not produce a vacuous assurance that the run was kept.
@@ -723,7 +996,7 @@ fn a_conflict_rescues_records_when_local_custody_is_not_confirmed() {
             absent.run.id = "not-a-run-id".into();
             absent.signer = None;
             let mut said = Vec::new();
-            records::finish(
+            let delivery = records::finish(
                 &Git {
                     root: &world.work,
                     make: &git_cmd,
@@ -731,7 +1004,12 @@ fn a_conflict_rescues_records_when_local_custody_is_not_confirmed() {
                 &mut absent,
                 &mut |line| said.push(line.to_owned()),
                 exit::CONFLICT,
-                records::Delivery::DeferIfKept,
+            );
+            records::deliver(
+                &world.work,
+                &mut absent,
+                &mut |line| said.push(line.to_owned()),
+                delivery,
             );
             assert!(
                 said.iter()
@@ -739,9 +1017,7 @@ fn a_conflict_rescues_records_when_local_custody_is_not_confirmed() {
                 "{said:#?}"
             );
             assert!(
-                !said
-                    .iter()
-                    .any(|line| line.contains("its next land appends them")),
+                !said.iter().any(|line| line.contains(records::WHO_APPENDS)),
                 "{said:#?}"
             );
         }
@@ -749,7 +1025,8 @@ fn a_conflict_rescues_records_when_local_custody_is_not_confirmed() {
 }
 
 /// A verifier older than `run-planned` (its rows carry no key) has its FAIL rows recorded
-/// unkeyed, under the controller's key, and no pass. NEGATIVE CONTROL: the same run with
+/// unkeyed, under the controller's key, and no pass, read from the journal once the clone's next
+/// landing appended them ([`append_kept`]). NEGATIVE CONTROL: the same run with
 /// `run-planned` records every row keyed, as a whole run's are. Mutant run: dropping `end`'s
 /// keyed filter wrote the old run's passes.
 #[test]
@@ -779,6 +1056,7 @@ fn an_older_verifier_without_run_planned_writes_unkeyed_fails_only() {
         });
         assert_eq!(landing.code, exit::FAILED, "{:#?}", landing.said);
         let (_, tree) = &landing.judged[0];
+        append_kept(&world, &mac, tree);
         let entries = journal(&world.work, tree);
         let mut names: Vec<String> = entries.iter().map(|entry| named(&entry.path)).collect();
         names.sort();
@@ -963,6 +1241,7 @@ fn a_publish_appends_only_what_reads_and_forgets_only_what_it_held() {
         run: crate::land_run::tests::run(),
         interrupt: Box::new(|| None),
         tally: records::Tally::default(),
+        lock: None,
     };
     records.run_record(
         crate::land_run::Kind::End,

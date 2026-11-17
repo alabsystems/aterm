@@ -102,7 +102,7 @@ pub fn lock_exclusive_until_with(
 ///
 /// # Errors
 /// The lock's own error, or [`takes_nothing`]'s refusal on a thread inside it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn lock_exclusive_blocking(file: &std::fs::File) -> io::Result<()> {
     refused_here()?;
     crate::keep_out_of_children(file)?;

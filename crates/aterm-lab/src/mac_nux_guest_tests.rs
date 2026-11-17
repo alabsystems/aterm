@@ -661,7 +661,9 @@ fn the_wait_stops_a_minute_after_setup_last_moved_and_never_before() {
 
 /// A press aterm could have made is a row that waited on one (`;needs:`) while nobody asked
 /// for anything; once a person asked for macOS's batch, the grants only a person gives are
-/// theirs. Grants on offer are no press. Negative control: a run whose readings name none.
+/// theirs. Required external authorization stays pending in both modes; setup's own naming,
+/// helper and Spotlight work remains avoidable. Grants on offer are no press. Negative
+/// control: a run whose readings name none.
 #[test]
 fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
     assert_eq!(
@@ -693,6 +695,28 @@ fn presses_are_the_rows_that_waited_on_one_and_offers_are_not() {
     // no press at all (the LAN broker), so a `lan` card that waited fails the row.
     assert_eq!(presses.avoidable(true), ["repos", "lan"]);
     assert!(presses.local_network_step());
+    let mut authority = Presses::default();
+    authority
+        .see("pending:local-network,network-auth,vault,repos;needs:local-network,network-auth");
+    assert_eq!(authority.needs, ["local-network", "network-auth"]);
+    assert_eq!(
+        authority.named,
+        ["local-network", "network-auth", "vault", "repos"]
+    );
+    assert!(authority.offered.is_empty());
+    assert!(!authority.local_network_step());
+    for person in [false, true] {
+        assert!(authority.avoidable(person).is_empty());
+    }
+    authority.see(
+        "pending:name-rule,network-helper,spotlight-scope;needs:name-rule,network-helper,spotlight-scope",
+    );
+    for person in [false, true] {
+        assert_eq!(
+            authority.avoidable(person),
+            ["name-rule", "network-helper", "spotlight-scope"]
+        );
+    }
     let mut unread = Presses::default();
     unread.see("pending:repos;unread:dock");
     unread.see("unread:dock,spotlight;offered:fda");

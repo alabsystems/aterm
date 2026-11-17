@@ -1900,6 +1900,7 @@ fn index_of(programs: &[(&str, Option<&str>)]) -> crate::manifest::Index {
             })
             .collect(),
         channels: vec![],
+        trees: Default::default(),
     }
 }
 

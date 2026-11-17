@@ -159,7 +159,7 @@ impl Look {
         }
     }
 
-    const fn light(self) -> bool {
+    pub(crate) const fn light(self) -> bool {
         matches!(self, Look::Light | Look::HcLight | Look::RtLight)
     }
 
@@ -173,7 +173,7 @@ impl Look {
     }
 
     /// The `ATERM_DEV_ACCESSIBILITY` word it turns on.
-    const fn accessibility(self) -> Option<&'static str> {
+    pub(crate) const fn accessibility(self) -> Option<&'static str> {
         match self {
             Look::HcDark | Look::HcLight => Some("high-contrast"),
             Look::RtDark | Look::RtLight => Some("reduce-transparency"),
@@ -963,21 +963,38 @@ pub fn system_state_view(tabs: &str) -> Option<u64> {
     })
 }
 
-/// The layout's shape: its node and fit lines, which a painter that moves (the village walking)
-/// leaves as they are, though it changes the compiled UI's fingerprint every tick.
+/// The layout's shape: its node and fit lines, and what its lockup draws, which a painter that
+/// moves (the village walking) leaves as they are, though it changes the compiled UI's
+/// fingerprint every tick.
 #[must_use]
 pub fn layout_shape(audit: &str) -> String {
     audit
         .lines()
-        .filter(|l| l.starts_with("paint-node ") || l.starts_with("paint-text "))
+        .filter(|l| {
+            l.starts_with("paint-node ")
+                || l.starts_with("paint-text ")
+                || l.starts_with("paint-lockup ")
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
+/// Whether the audit's lockup still waits on its images (`paint-lockup … pending=true`): its
+/// bakes land off the paint thread and change no rect, so a page whose layout has settled may
+/// still be drawing the moment before.
+#[must_use]
+pub fn lockup_pending(audit: &str) -> bool {
+    audit.lines().any(|l| {
+        l.starts_with("paint-lockup ") && l.split_whitespace().any(|w| w == "pending=true")
+    })
+}
+
 /// The page's frame once it has settled: two reads of its layout [`SETTLE_GAP`] apart with the
-/// same shape, then a frame, then a read with that shape still, so the layout kept beside the
-/// frame is the one it was painted from (a moving painter's tick between them changes no rect).
-/// A frame is rendered before each read: a headless page paints only when asked.
+/// same shape and no lockup image baking ([`lockup_pending`]), then a frame, then a read with
+/// that shape still, so the layout kept beside the frame is the one it was painted from (a moving
+/// painter's tick between them changes no rect). A frame is rendered before each read: a
+/// headless page paints only when asked. The wait is a hang detector ([`SETTLE_LIMIT`]): a bake
+/// is tens of milliseconds, a loaded Mac's many times that.
 fn settled_frame(inst: &Instance, view: u64) -> Result<(Vec<u8>, String, String), Miss> {
     let mut wire = inst.connect().ok();
     let mut request = |words: &[&str], shape: ReplyShape| -> Reply {
@@ -1004,7 +1021,10 @@ fn settled_frame(inst: &Instance, view: u64) -> Result<(Vec<u8>, String, String)
             )));
         }
         let mut shape = layout_shape(&audit.stdout);
-        if !shape.is_empty() && last.as_deref() == Some(shape.as_str()) {
+        if !shape.is_empty()
+            && last.as_deref() == Some(shape.as_str())
+            && !lockup_pending(&audit.stdout)
+        {
             let shot = request(&["image", "--meta", "--bytes"], ReplyShape::Counted);
             if shot.code != 0 {
                 return Err(Miss::Failed(format!(
@@ -1016,14 +1036,15 @@ fn settled_frame(inst: &Instance, view: u64) -> Result<(Vec<u8>, String, String)
             let meta = meta.to_string();
             let after = request(&audit_words, ReplyShape::Counted);
             let held = layout_shape(&after.stdout);
-            if after.code == 0 && held == shape {
+            if after.code == 0 && held == shape && !lockup_pending(&after.stdout) {
                 return Ok((png, meta, after.stdout));
             }
             shape = held;
         }
         if Instant::now() >= end {
             return Err(Miss::Failed(format!(
-                "the page never settled in {} s (its layout kept changing)",
+                "the page never settled in {} s (its layout kept changing, or its lockup's \
+                 images never landed)",
                 SETTLE_LIMIT.as_secs()
             )));
         }

@@ -1127,3 +1127,35 @@ fn without_a_broker_a_local_name_fails_with_the_brokers_words() {
     get_within(&url, HANG_DETECTOR).expect("by address");
     server.join().expect("stub");
 }
+
+/// A Windows path is absolute with its drive or as a share, pinned or not; one relative to a
+/// drive's current folder is no source.
+///
+/// NEGATIVE CONTROL (2026-11-16): without `parse_source`'s Windows arm, `C:\vaults\alab.vault`
+/// is refused ("a URL starts with http:// or https://"), and so is every vault at a path a
+/// Windows member is given.
+#[cfg(windows)]
+#[test]
+fn a_windows_path_parses_with_its_drive_or_as_a_share() {
+    let pinned = format!(
+        r"C:\vaults\alab.vault#{}",
+        crate::b64::encode_padded(&key())
+    );
+    assert_eq!(
+        parse_source(&pinned, home()).expect("pinned drive path"),
+        (
+            Source::Path(PathBuf::from(r"C:\vaults\alab.vault")),
+            Some(key())
+        )
+    );
+    assert_eq!(
+        parse_source(r"\\host\share\alab.vault", home()).expect("share"),
+        (
+            Source::Path(PathBuf::from(r"\\host\share\alab.vault")),
+            None
+        )
+    );
+    for text in [r"C:alab.vault", r"vaults\alab.vault"] {
+        assert!(parse_source(text, home()).is_err(), "{text:?}");
+    }
+}

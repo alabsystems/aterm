@@ -839,6 +839,8 @@ pub struct StateDir {
     #[cfg(test)]
     heads_at_the_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    rewitness_keeps_the_head: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     keep_acked_across_its_replace: std::sync::atomic::AtomicBool,
@@ -1171,8 +1173,10 @@ pub(crate) struct InFlight {
     pub body: Vec<u8>,
     /// The log this body was prepared on, the only one where a `re=` in it points.
     pub log: Option<astream_broker::LogIdentity>,
-    /// The log's head as the bridge knew it when it journaled the entry, on `log`: every
-    /// attempt's record lands at or above it. Where a replay reads its record back from
+    /// The log's head as the bridge knew it when it journaled the entry, on `log`, or, for a
+    /// reply a move re-witnessed onto `log` (`StateDir::forget_log_offsets`), the lower of that
+    /// head and the fork where `log` continues the one it was journaled on: every attempt's
+    /// record lands at or above it. Where a replay reads its record back from
     /// before it publishes again (`Bridge::landed_since`), since astream's dedup reaches
     /// only the records at or above the base retention leaves. Kept as [`PublishPin::at`] is:
     /// never in the text form.
@@ -1841,6 +1845,8 @@ impl StateDir {
             #[cfg(test)]
             heads_at_the_attach: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            rewitness_keeps_the_head: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
@@ -1955,6 +1961,15 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn heads_at_the_attach(&self, on: bool) {
         self.heads_at_the_attach
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a reply re-witnessed onto a moved log, which keeps the head it had
+    /// on the log before, as every build before ATERM-KI-1116-2615 kept it, not brought down to
+    /// the fork ([`crate::sim::world::Mutant::RewitnessKeepsTheOldHead`]).
+    #[cfg(test)]
+    pub(crate) fn rewitness_keeps_the_head(&self, on: bool) {
+        self.rewitness_keeps_the_head
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -5871,7 +5886,7 @@ impl StateDir {
         }
     }
 
-    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. A post pin's head ([`PublishPin::at`]) goes where it stands on this log ([`StateDir::publication_offset_resets`]); a record in flight's and a receipt's stay with the log they name, which the read back maps (`Bridge::read_back_from`).
+    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. A post pin's head ([`PublishPin::at`]) goes where it stands on this log ([`StateDir::publication_offset_resets`]); a record in flight's and a receipt's stay with the log they name, which the read back maps (`Bridge::read_back_from`), but a reply in flight this re-witnesses onto `log`, its `re=` below its fork, takes its head down to that fork here (`Head::min`): on its new log the read back reads it from its own head (ATERM-KI-1116-2615).
     pub fn forget_log_offsets(
         &self,
         head: u64,
@@ -6017,10 +6032,22 @@ impl StateDir {
                 None => keep_below,
             };
             moved = true;
-            if re.is_some_and(|off| fork.is_some_and(|f| off < f)) {
+            // A REPLY RE-WITNESSED ONTO THE NEW LOG takes its head down to the fork, as a
+            // continuing read of an entry kept on the old log does (`Bridge::read_back_from`,
+            // the aterm-link B05 review): past the fork the new log's offsets name records
+            // published since, a copy the replay published there among them, which a read from
+            // the old head would miss (ATERM-KI-1116-2615).
+            if let Some(f) = fork.filter(|&f| re.is_some_and(|off| off < f)) {
+                #[cfg(test)]
+                let keeps = self
+                    .rewitness_keeps_the_head
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let keeps = false;
+                let at = entry.at.map(|at| if keeps { at } else { at.min(f) });
                 self.append_post_frame(
                     &mut posts,
-                    journal::Frame::InFlight(InFlight { log, ..entry }),
+                    journal::Frame::InFlight(InFlight { log, at, ..entry }),
                 )?;
                 continue;
             }

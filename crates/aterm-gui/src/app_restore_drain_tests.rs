@@ -47,6 +47,8 @@ fn leaf(title: &str) -> restore::RestoredSplitTree {
 fn window(titles: &[&str], front: usize) -> restore::WindowLayout {
     restore::WindowLayout {
         dock: None,
+        dock_by_default: false,
+        scale: None,
         rows: 24,
         cols: 80,
         active_tab: 0,
@@ -266,7 +268,7 @@ fn a_held_window_owes_its_dock_until_the_sliced_drain_finishes() {
         let mut ws = app.windows.get_mut(&wid).expect("the window");
         (ws.rows, ws.cols) = (27, 140);
     }
-    app.take_dock_record(wid, wl.dock, crate::app_window::DockBirth::of_row(&wl));
+    app.take_dock_record(wid, crate::app_window::DockRow::of(&wl));
     app.config.navigator = Some(crate::app_config::NavigatorConfig { dock: Some(true) });
     // The seat a windowed launch makes at its attach; the drain itself runs headless here.
     app.headless = false;

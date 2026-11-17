@@ -6,7 +6,7 @@
 //! `docs/DESIGN-alab-swarm-2026-10-27.md` §9).
 
 use crate::{Error, Result};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::Path;
 
 /// What a converge or setup row says where `[swarm] enabled = false` turns swarm participation off.
@@ -64,7 +64,7 @@ pub fn enabled_in_toml(text: &str) -> Result<bool> {
 /// # Errors
 /// `path` (or the file a symlink there names) is not a regular file this user or root owns and
 /// others cannot write, is not UTF-8 or valid TOML, or `[swarm]` fails [`enabled_in_table`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn enabled_at(path: &Path) -> Result<bool> {
     let bytes = crate::fsx::read_aterm_config(path, 1024 * 1024)?;
     let Some(bytes) = bytes else {
@@ -89,7 +89,7 @@ pub fn unreadable(why: &impl std::fmt::Display) -> String {
 ///
 /// # Errors
 /// The resolved `aterm.toml` fails [`enabled_at`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn enabled_in_home(home: &Path) -> Result<bool> {
     match config_in_home(home) {
         Some(path) => enabled_at(&path),
@@ -99,7 +99,7 @@ pub fn enabled_in_home(home: &Path) -> Result<bool> {
 
 /// The `aterm.toml` [`enabled_in_home`] reads for `home`: this process's `XDG_CONFIG_HOME` or
 /// `APPDATA` only where `home` is the live home or holds it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[must_use]
 pub fn config_in_home(home: &Path) -> Option<std::path::PathBuf> {
     let matches_live_home = aterm_types::dirs::home_dir().as_deref() == Some(home);
@@ -120,6 +120,12 @@ pub fn config_in_home(home: &Path) -> Option<std::path::PathBuf> {
 #[cfg(unix)]
 type Stamp = (u64, u64, u64, i64, i64, i64, i64);
 
+/// What a file's metadata says of its contents without reading them, on Windows as its handle
+/// shows it: its volume and file id, its length, and its last-write and change times in 100 ns
+/// ticks, so an edit in place and an atomic replace each move it.
+#[cfg(windows)]
+type Stamp = (u64, crate::fsx::Ino, u64, i64, i64);
+
 /// The [`Stamp`] of the file `path` resolves to, a symlink followed as [`enabled_at`] follows it:
 /// an edit of the file a dotfiles link names moves it.
 #[cfg(unix)]
@@ -137,12 +143,27 @@ fn stamp_of(path: &Path) -> Option<Stamp> {
     ))
 }
 
+/// The [`Stamp`] of the file `path` resolves to, a symlink followed as [`enabled_at`] follows it:
+/// an edit of the file a dotfiles link names moves it.
+#[cfg(windows)]
+fn stamp_of(path: &Path) -> Option<Stamp> {
+    let file = std::fs::File::open(path).ok()?;
+    let meta = crate::fsx::meta_of(&file).ok()?;
+    Some((
+        meta.st_dev,
+        meta.st_ino,
+        meta.size,
+        meta.last_write,
+        meta.change_time,
+    ))
+}
+
 /// `home`'s `[swarm] enabled` for a loop that asks it every turn (a running subscriber, the
 /// approver beside it): [`enabled_in_home`]'s answer, with its `aterm.toml` read and parsed again
 /// only once the metadata of the file it resolves to moved ([`Stamp`]: an edit, a replace, the
 /// file or its symlink's target coming or going) or the path it resolves to did, so a turn costs
 /// one `stat`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct Switch {
     home: std::path::PathBuf,
@@ -150,7 +171,7 @@ pub struct Switch {
     read: Option<(Option<std::path::PathBuf>, Option<Stamp>, Result<bool>)>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Switch {
     /// The switch of `home`'s `aterm.toml`, not read yet.
     #[must_use]
@@ -205,7 +226,7 @@ impl Switch {
 ///
 /// # Errors
 /// The resolved `aterm.toml` fails [`enabled_at`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn enabled_live() -> Result<bool> {
     let Some(path) = aterm_types::dirs::aterm_config_path() else {
         return Ok(true);

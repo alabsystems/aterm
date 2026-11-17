@@ -4,7 +4,7 @@
 //! Per-session instance survey (`survey` control verb).
 
 use std::fmt::Write as _;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use aterm_agent::harness::accounts::Cli;
 use aterm_agent::harness::excerpt::{self, Excerpts};
@@ -94,11 +94,21 @@ const SHELL_ROWS: usize = 3;
 
 /// Read, fold, and cap the worker task prompt from [`TASK_FILE_ENV`] in `env`.
 pub(crate) fn task_prompt_of_env(env: &[String]) -> Option<String> {
-    let path = env
-        .iter()
+    task_prompt_of_file(&task_file_of_env(env)?)
+}
+
+/// The task file [`TASK_FILE_ENV`] names in `env`, its last setting: what
+/// [`task_prompt_of_env`] reads.
+pub(crate) fn task_file_of_env(env: &[String]) -> Option<PathBuf> {
+    env.iter()
         .rev()
-        .find_map(|kv| kv.strip_prefix(TASK_FILE_ENV)?.strip_prefix('='))?;
-    task_prompt_at(Path::new(path), &crate::task_record::tasks_dir()?)
+        .find_map(|kv| kv.strip_prefix(TASK_FILE_ENV)?.strip_prefix('='))
+        .map(PathBuf::from)
+}
+
+/// [`task_prompt_of_env`] of the task file `path` it names.
+pub(crate) fn task_prompt_of_file(path: &Path) -> Option<String> {
+    task_prompt_at(path, &crate::task_record::tasks_dir()?)
 }
 
 fn task_prompt_at(path: &Path, tasks: &Path) -> Option<String> {
@@ -407,15 +417,20 @@ pub(crate) fn step_of(
 ) -> Option<String> {
     let posted = topic
         .filter(|post| words.as_ref().is_none_or(|(_, at)| post.at_ms > *at))
-        .and_then(|post| excerpt_plain(Some(&excerpt::fold(&post.text))));
+        .and_then(topic_words);
     posted.or_else(|| words.map(|(words, _)| words))
 }
 
+/// The words of a topic post as a surface may show them: one line, redacted and capped as a
+/// `survey` row's are; `None` where it says nothing.
+pub(crate) fn topic_words(post: &crate::fabric::TopicPost) -> Option<String> {
+    excerpt_plain(Some(&excerpt::fold(&post.text)))
+}
+
 /// The last words of the session behind `h` on its screen, read here in the process and redacted
-/// and capped as a `survey` row's are, with when they were written: what its agent said (at the
-/// end, once `finished`, as `said=` does), as of the row its transcript or rollout stamped it
-/// with, else as of the read that first saw those words; else what it is doing, as of that read;
-/// else a shell's bottom rows, as of the feed that last moved the screen.
+/// and capped as a `survey` row's are, with when they were written: its agent's
+/// ([`excerpt_last_words`]), else a shell's bottom rows, as of the feed that last moved the
+/// screen.
 fn screen_words(h: &SessionHandle, finished: bool) -> Result<Option<(String, u64)>, ScreenBusy> {
     let (excerpts, read) = {
         let timeline = h.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -427,32 +442,47 @@ fn screen_words(h: &SessionHandle, finished: bool) -> Result<Option<(String, u64
             timeline.words_read(),
         )
     };
-    if let Some(excerpts) = &excerpts {
-        let said = if finished {
-            (excerpts.said_end.as_deref(), Word::SaidEnd)
-        } else {
-            (excerpts.said.as_deref(), Word::Said)
-        };
-        let written = |word: Word| match word {
-            Word::Said | Word::SaidEnd => excerpts
-                .said_at_ms
-                .and_then(|at| u64::try_from(at).ok())
-                .unwrap_or_else(|| read.at(word)),
-            Word::Doing => read.at(word),
-        };
-        let (words, word) = match said {
-            (Some(said), word) => (Some(said), word),
-            (None, _) => (excerpts.doing.as_deref(), Word::Doing),
-        };
-        if let Some(words) = excerpt_plain(words) {
-            return Ok(Some((words, written(word))));
-        }
+    if let Some(words) = excerpts
+        .as_ref()
+        .and_then(|excerpts| excerpt_last_words(excerpts, read, finished))
+    {
+        return Ok(Some(words));
     }
     let engine = engine_read(h, true);
     if engine.busy {
         return Err(ScreenBusy);
     }
     Ok(excerpt_plain(engine.rows.as_deref()).map(|rows| (rows, h.ctx.screen_moves.moved_ms())))
+}
+
+/// THE LAST WORDS OF AN AGENT'S EXCERPTS, redacted and capped as a `survey` row's are, with when
+/// they were written: what it said (at the end, once `finished`, as `said=` does), as of the row
+/// its transcript or rollout stamped it with, else as of the read that first saw those words
+/// (`read`); else what it is doing, as of that read. What [`screen_words`] reads before the
+/// screen's rows, and all aterm's default writer reads ([`crate::describe`]), which never takes
+/// a screen row.
+pub(crate) fn excerpt_last_words(
+    excerpts: &Excerpts,
+    read: WordsRead,
+    finished: bool,
+) -> Option<(String, u64)> {
+    let said = if finished {
+        (excerpts.said_end.as_deref(), Word::SaidEnd)
+    } else {
+        (excerpts.said.as_deref(), Word::Said)
+    };
+    let written = |word: Word| match word {
+        Word::Said | Word::SaidEnd => excerpts
+            .said_at_ms
+            .and_then(|at| u64::try_from(at).ok())
+            .unwrap_or_else(|| read.at(word)),
+        Word::Doing => read.at(word),
+    };
+    let (words, word) = match said {
+        (Some(said), word) => (Some(said), word),
+        (None, _) => (excerpts.doing.as_deref(), Word::Doing),
+    };
+    excerpt_plain(words).map(|words| (words, written(word)))
 }
 
 fn branch_token(text: Option<&str>) -> String {
@@ -605,8 +635,9 @@ pub(crate) enum Taking {
     /// A peer's survey answer: the look as it is at this reply.
     Look,
     /// This Mac's own reads on their timers, which no reader of a look waits on: the window's
-    /// 3-minute facts push, and the node job's facts push and 60 s count of agents, which ask
-    /// the window a survey that names no peer (`node_serve::relayed_survey`). No look.
+    /// 3-minute facts push, and the node job's facts push, its 60 s count of agents and its
+    /// checkouts clock (`node_serve::read_checkouts_when_due`), which ask the window a survey that
+    /// names no peer (`node_serve::relayed_survey`). No look.
     NoLook,
 }
 
@@ -985,12 +1016,12 @@ const fn agents_step(kind: aterm_slog::Kind) -> bool {
 }
 
 /// A conversation's whole token counters ([`whole_tokens`]).
-struct Whole {
+pub(crate) struct Whole {
     /// The conversation they count, in the process that counts it: the key of
     /// [`crate::session_timeline::SessionTimeline::token_epoch`].
     conversation: String,
-    tok_in: Option<u64>,
-    tok_out: Option<u64>,
+    pub(crate) tok_in: Option<u64>,
+    pub(crate) tok_out: Option<u64>,
 }
 
 /// THE TOKEN COUNTERS A ROW MAY SEND, only where they are the whole conversation's: Claude Code's
@@ -998,7 +1029,7 @@ struct Whole {
 /// included ([`aterm_agent::harness::session_usage::UsageFacts::complete`], no file unread, no
 /// walk cut short), and codex-alab's rollout's own running total; none for any other program.
 /// A prefix of the totals sent as counts would book a restart's catch-up as one minute's burst.
-fn whole_tokens(
+pub(crate) fn whole_tokens(
     reader: Option<aterm_phase::Program>,
     pgid: i32,
     claude: Option<(
@@ -1293,14 +1324,7 @@ fn session_row(
         )
     };
     let is_agent = agent.reader.is_some();
-    // A reader that names no state (codex's) leaves the word to what the program says itself.
-    let (agent_word, agent_ms) = match shown.filter(|_| agent.word == "unknown") {
-        Some(shown) => (
-            crate::program_state::survey_word(shown.state),
-            shown.age_ms(),
-        ),
-        None => (agent.word, agent.age_ms()),
-    };
+    let (agent_word, agent_ms) = row_agent_word(&agent, shown);
     let codex_facts = codex.as_ref().map(|c| &c.facts);
     // The account it runs on, by its address where one is known: Claude Code's as its footer
     // judges its login against the roster, another pooled CLI's as its pool last read the
@@ -1582,6 +1606,48 @@ fn work_fields(work: &aterm_agent::harness::work_record::WorkRecord, now_unix_ms
         },
         now_unix_ms.saturating_sub(work.read_ms),
     )
+}
+
+/// THE AGENT WORD A SESSION'S ROW SENDS, `agent=`, and its age, `agent_ms=`: the reader's word,
+/// except where a reader that names no state (codex's) says `unknown` and the program in front
+/// reports one, which then speaks for itself.
+pub(crate) fn row_agent_word(
+    agent: &crate::session_timeline::AgentPublication,
+    shown: Option<crate::session_timeline::ShownProgram>,
+) -> (&'static str, u64) {
+    match shown.filter(|_| agent.word == "unknown") {
+        Some(shown) => (
+            crate::program_state::survey_word(shown.state),
+            shown.age_ms(),
+        ),
+        None => (agent.word, agent.age_ms()),
+    }
+}
+
+/// What `timeline`'s session row says of what it is doing, each in the word [`session_row`]
+/// prints: `program_kind=`, `agent=` ([`row_agent_word`]), `needs=` (`-` where the row read its
+/// needs and found none), `task=` and `task_conclusion=` (`None` where it has no task, or no
+/// conclusion). `state=` is the registry's lifecycle word, which no timeline holds: `None`. The
+/// words a reader of the row reads the session by, so this Mac reads its own session as a peer
+/// reads its row ([`crate::comprehension_words::seen_of_row`]).
+pub(crate) fn row_words(
+    timeline: &crate::session_timeline::SessionTimeline,
+) -> crate::comprehension_words::RowWords<'static> {
+    let agent = timeline.agent();
+    let task = timeline.task();
+    crate::comprehension_words::RowWords {
+        state: None,
+        program_kind: Some(program_kind(
+            agent.reader.is_some(),
+            agent.program.as_deref(),
+        )),
+        agent: Some(row_agent_word(agent, timeline.program_shown()).0),
+        needs: Some(timeline.need().needs_word()),
+        task: task.map(|t| t.state.as_str()),
+        task_conclusion: task
+            .and_then(crate::task_record::TaskRecord::conclusion)
+            .map(crate::task_record::Conclusion::word),
+    }
 }
 
 fn program_kind(is_agent: bool, program: Option<&str>) -> &'static str {

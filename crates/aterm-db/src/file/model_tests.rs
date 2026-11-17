@@ -2,12 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 //! `SharedFile` conformance (docs/DESIGN-shared-files-2026-11-11.md §8): the reading and the
-//! writing walks of the model, taken on a stand-in lab's real stores. Each step runs the code
-//! its anchor names (`aterm_file::File::read`, the accept inside `File::write`,
-//! [`super::materialize::pass`], [`super::publish::pass`]) in an evidence window of its own, and
-//! the state measured from the stores after it must be a successor the model has for that
-//! action from the state measured before it. The environment's steps (a peer's record, a
-//! record arriving, the fence) are made through the registry and writer succession's own seam.
+//! writing walks of the model, taken on a stand-in lab's real stores (a registry of machines
+//! alone, so no read there enters the authority judgment), and the authority walk,
+//! taken on a causal history of a collection that opts into the authority rules. Each step runs
+//! the code its anchor names (`aterm_file::File::read`, the accept inside `File::write`,
+//! [`super::materialize::pass`], [`super::publish::pass`], [`crate::typed::authority::read`]) in
+//! an evidence window of its own, and the state measured after it must be a successor the model
+//! has for that action from the state measured before it. The environment's steps (a peer's
+//! record, a record arriving, the fence) are made through the registry and writer succession's
+//! own seam.
 //!
 //! What a walk measures, never assumes: the outbox, held list and done markers on disk; the
 //! table's records and the register's candidates; the table files' bytes under a fence, where
@@ -24,12 +27,19 @@ use super::{
 use crate::{
     alab::{Registry, registry::MACHINE},
     att, generation,
-    typed::grid::tests::put,
+    typed::{
+        authority::{
+            seam::{self as rules, Control},
+            tests::{self as ruled, History},
+        },
+        cell::CellValue,
+        grid::tests::put,
+    },
 };
 use astream_wire::sync::Digest;
 use aterm_file::{Why, Word, outbox};
 use aterm_json::json;
-use aterm_spec::{interp::State, xref::StepEvidence};
+use aterm_spec::{derive::Model, interp::State, xref::StepEvidence};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -106,7 +116,7 @@ const THERE: &str = "0000000000000000000000000000000b";
 impl Walk {
     fn new() -> Self {
         Self {
-            stand: Stand::new(),
+            stand: Stand::machines_only(),
             evidence: StepEvidence::new("SharedFile"),
             area: 0,
             accepted: 0,
@@ -215,7 +225,7 @@ impl Walk {
             "Accept" => {
                 let text = format!("the owner's note {}", self.accepted + 1);
                 let draft =
-                    write::draft_set(stand.paths(), MACHINES.name, "m7", "note", Some(&text))
+                    write::draft_set(stand.paths(), MACHINES.name, "m7", &[("note", Some(&text))])
                         .unwrap()
                         .expect("the cell does not say that yet");
                 // What the author saw: an operation, or the record of an earlier intent of
@@ -413,10 +423,140 @@ impl Walk {
     }
 }
 
-/// Run `path` on a fresh stand-in lab, each step held to the model: the stores' state after it
-/// is a successor the model has for that action. Returns the walk and its last state.
-fn run(model: &aterm_spec::derive::Model, path: &[&'static str]) -> (Walk, State) {
-    let mut walk = Walk::new();
+/// What a walk does: take one of the model's steps on the code, and measure the model's state.
+trait Steps {
+    fn apply(&mut self, action: &'static str);
+    /// The model's state as the code says it now, `before` supplying what the walk's area does
+    /// not touch.
+    fn state(&self, before: &State) -> State;
+}
+
+impl Steps for Walk {
+    fn apply(&mut self, action: &'static str) {
+        Walk::apply(self, action);
+    }
+    fn state(&self, before: &State) -> State {
+        Walk::state(self, before)
+    }
+}
+
+/// The authority walk: one row of `typed::authority`'s scratch collection, written by the owner
+/// (writer 0), by a peer that births the row before it hears the owner (writer 1), and by a
+/// Mac whose automatic paths and importer hear everything (writer 2), and read as every read of
+/// a collection that opts in reads it. The note is an Owner column, the status a Birth column
+/// the owner may set, the realm a fixed one and the label one only an owner's verb writes.
+struct AuthorityWalk {
+    history: History,
+    evidence: StepEvidence,
+    area: i64,
+    /// Names the importer and the automatic paths wrote, so they take turns.
+    names: usize,
+}
+
+impl AuthorityWalk {
+    fn new() -> Self {
+        Self {
+            history: History::new(),
+            evidence: StepEvidence::new("SharedFile"),
+            area: 0,
+            names: 0,
+        }
+    }
+
+    /// Each candidate of `column`'s register, as the read admits it.
+    fn candidates(cells: &crate::typed::cell::Cells, column: &str) -> Vec<CellValue> {
+        ruled::field(cells, column).map_or_else(Vec::new, |field| {
+            field.candidates().iter().map(|c| c.value.clone()).collect()
+        })
+    }
+}
+
+impl Steps for AuthorityWalk {
+    fn apply(&mut self, action: &'static str) {
+        let all = self.history.all();
+        let (writer, seen, changes) = match action {
+            "ChooseAuthority" => {
+                self.area = 3;
+                return;
+            }
+            "OwnerWrites" => (0, all, vec![ruled::owner("note", json!("the owner's"))]),
+            "AutomaticWrites" => (
+                2,
+                all,
+                vec![ruled::automatic(2, "note", json!("automatic"))],
+            ),
+            // The peer has heard nothing: its birth is concurrent with what the owner wrote.
+            "Birth" => (1, Vec::new(), ruled::birth(ruled::automatic2)),
+            "OwnerSets" => (0, all, vec![ruled::owner("status", json!("active"))]),
+            "Rewrite" => (0, all, vec![ruled::owner("realm", json!("codex"))]),
+            "OwnerNames" => (0, all, vec![ruled::owner("label", json!("work"))]),
+            // An import's name, then an older peer's default one, written at version 1.
+            "ImportNames" => {
+                self.names += 1;
+                let name = if self.names % 2 == 1 {
+                    ruled::imported("label", json!("imported"))
+                } else {
+                    ruled::automatic(1, "label", json!("claude-1a2b3c"))
+                };
+                (2, all, vec![name])
+            }
+            other => panic!("the authority walk has no step {other}"),
+        };
+        let history = &mut self.history;
+        self.evidence.step(action, || {
+            history.write(writer, &seen, changes);
+            history.read(&ruled::TABLE)
+        });
+    }
+
+    fn state(&self, before: &State) -> State {
+        let mut state = before.clone();
+        state.insert("area", self.area);
+        if self.area != 3 {
+            return state;
+        }
+        let (cells, _) = self.history.read(&ruled::TABLE);
+        let owners = |values: &[CellValue]| values.iter().any(|v| !v.a && v.s.is_none());
+        let automatic = |values: &[CellValue]| values.iter().any(|v| v.a || v.s.is_some());
+        let note = Self::candidates(&cells, "note");
+        state.insert("oc", i64::from(owners(&note)));
+        state.insert(
+            "proj",
+            if automatic(&note) {
+                2
+            } else {
+                i64::from(!note.is_empty())
+            },
+        );
+        let status = Self::candidates(&cells, "status");
+        state.insert("birth", i64::from(ruled::field(&cells, "row").is_some()));
+        state.insert("own", i64::from(owners(&status)));
+        state.insert("bshown", i64::from(status.iter().any(|v| v.a)));
+        state.insert(
+            "ident",
+            match ruled::shown(&cells, "realm") {
+                None => 0,
+                Some(realm) if realm == json!("claude") => 1,
+                Some(_) => 2,
+            },
+        );
+        let label = Self::candidates(&cells, "label");
+        state.insert("named", i64::from(owners(&label)));
+        state.insert(
+            "vlabel",
+            if automatic(&label) {
+                2
+            } else {
+                i64::from(!label.is_empty())
+            },
+        );
+        state
+    }
+}
+
+/// Run `path` on `walk`, each step held to the model: the state measured after it is a
+/// successor the model has for that action. Returns the walk and its last state.
+fn run<W: Steps>(model: &Model, mut walk: W, path: &[&'static str]) -> (W, State) {
     let mut state = walk.state(&model.init_state());
     assert_eq!(
         state,
@@ -439,7 +579,7 @@ fn run(model: &aterm_spec::derive::Model, path: &[&'static str]) -> (Walk, State
 /// what the anchors on the accept and on the publisher name.
 pub(crate) fn write_transition(path: &[&'static str], action: &'static str) -> State {
     let model = aterm_models_db::shared_file_model();
-    let (mut walk, state) = run(&model, path);
+    let (mut walk, state) = run(&model, Walk::new(), path);
     walk.apply(action);
     walk.state(&state)
 }
@@ -456,11 +596,54 @@ pub(crate) fn rotation_transition(path: &[&'static str], action: &'static str) -
     write_transition(path, action)
 }
 
-/// The shared files' code refines its model along the reading and the writing walks: a read
-/// before anything is materialized, after a pass, after a record arrived, and under a fence; a
-/// write accepted, signed and done, twice over; a write whose register a peer moved, held; and
-/// a write accepted under a fence, which no pass signs. Every anchored action is driven in a
-/// window that enters its own function.
+/// The `SharedFile` projection of `action` from the state `path` reaches, in the authority area:
+/// what the anchors on `typed::authority`'s judgment name.
+pub(crate) fn authority_transition(path: &[&'static str], action: &'static str) -> State {
+    let model = aterm_models_db::shared_file_model();
+    let (mut walk, state) = run(&model, AuthorityWalk::new(), path);
+    walk.apply(action);
+    walk.state(&state)
+}
+
+/// The authority walks: an automatic note before and after the owner's; a birth the owner then
+/// sets and rewrites, and the same birth arriving after the owner set the row's status; and
+/// names an import and an older peer write, before and after the owner's.
+const AUTHORITY_PATHS: [&[&str]; 4] = [
+    &[
+        "ChooseAuthority",
+        "AutomaticWrites",
+        "OwnerWrites",
+        "AutomaticWrites",
+    ],
+    &["ChooseAuthority", "Birth", "OwnerSets", "Rewrite"],
+    &["ChooseAuthority", "OwnerSets", "Birth", "Rewrite"],
+    &[
+        "ChooseAuthority",
+        "ImportNames",
+        "ImportNames",
+        "OwnerNames",
+        "ImportNames",
+    ],
+];
+
+/// Every law of `model` holds in the state `path` ended in.
+fn holds_every_law(model: &Model, path: &[&str], state: &State) {
+    for law in &model.invariants {
+        assert!(
+            model.check_invariant(law.name, state),
+            "{path:?} ends in a state that breaks {}",
+            law.name
+        );
+    }
+}
+
+/// The shared files' code refines its model along the reading, the writing, the rotation and
+/// the authority walks: a read before anything is materialized, after a pass, after a record
+/// arrived, and under a fence; a write accepted, signed and done, twice over; a write whose
+/// register a peer moved, held; a write accepted under a fence, which no pass signs; two Macs'
+/// readings of one account's week, in each order, folded; and the authority walks
+/// ([`AUTHORITY_PATHS`]). Every anchored action is driven in a window that enters its own
+/// function.
 ///
 /// NEGATIVE CONTROL: with the publisher ignoring what the intent's author saw
 /// (`publish::seam::ignore_expected`), the pass signs over the peer's candidate. The stores
@@ -468,7 +651,11 @@ pub(crate) fn rotation_transition(path: &[&'static str], action: &'static str) -
 /// not enabled while a peer's candidate stands) and that breaks `PublishObservedOnly`. With the
 /// fold taking the reading whose Mac's clock read last (`limits::seam::fold_by_clock`, the
 /// model's `ClockOrdersReadings`), this Mac's old week wins over the peer's new one on both
-/// Macs: `fr1 == fr2 == 1`, a state the model has no `Fold` step to.
+/// Macs: `fr1 == fr2 == 1`, a state the model has no `Fold` step to. With
+/// `typed::authority::read` judging every read of a table one of whose collections opts in (its
+/// return where no write names one removed), the reading and writing walks' passes enter the
+/// judgment the authority steps are anchored on: `` stray: {"judge": {"Done", "Hold",
+/// "Materialize", "Sign"}} ``.
 #[test]
 fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
     let model = aterm_models_db::shared_file_model();
@@ -496,7 +683,7 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
     ];
     let mut evidence = StepEvidence::new("SharedFile");
     for path in paths {
-        let (walk, state) = run(&model, path);
+        let (walk, state) = run(&model, Walk::new(), path);
         if path == ["ChooseWrite", "Fence", "Accept"] {
             // A pass under the fence is no step: the intent stays, and nothing is signed.
             let outcomes = publish_pass(walk.stand.paths(), &walk.stand.config);
@@ -512,13 +699,12 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
             assert_eq!(walk.state(&state), state, "a fenced pass changes nothing");
             assert_eq!((state["q"], state["fsig"]), (1, 0));
         }
-        for law in &model.invariants {
-            assert!(
-                model.check_invariant(law.name, &state),
-                "{path:?} ends in a state that breaks {}",
-                law.name
-            );
-        }
+        holds_every_law(&model, path, &state);
+        evidence.absorb(walk.evidence);
+    }
+    for path in AUTHORITY_PATHS {
+        let (walk, state) = run(&model, AuthorityWalk::new(), path);
+        holds_every_law(&model, path, &state);
         evidence.absorb(walk.evidence);
     }
     let audit = evidence.audit();
@@ -527,16 +713,23 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
         audit.actions.iter().copied().collect::<Vec<_>>(),
         [
             "Accept",
+            "AutomaticWrites",
+            "Birth",
             "Done",
             "Fold",
             "Hold",
+            "ImportNames",
             "Materialize",
+            "OwnerNames",
+            "OwnerSets",
+            "OwnerWrites",
             "Read",
+            "Rewrite",
             "Sign"
         ]
     );
 
-    let (mut walk, state) = run(&model, &["ChooseWrite", "Accept", "PeerWrite"]);
+    let (mut walk, state) = run(&model, Walk::new(), &["ChooseWrite", "Accept", "PeerWrite"]);
     let blind = {
         let _blind = publish::seam::ignore_expected();
         walk.apply("Sign");
@@ -556,7 +749,11 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
         (fold["fr1"], fold["fp1"], fold["fr2"], fold["fp2"]),
         (2, 2, 2, 2)
     );
-    let (mut walk, state) = run(&model, &["ChooseRotation", "HereOldWeek", "PeerNewWeek"]);
+    let (mut walk, state) = run(
+        &model,
+        Walk::new(),
+        &["ChooseRotation", "HereOldWeek", "PeerNewWeek"],
+    );
     let by_clock = {
         let _clock = limits::seam::fold_by_clock();
         walk.apply("Fold");
@@ -577,4 +774,58 @@ fn shared_file_conforms_and_a_publish_that_ignores_expected_is_detected() {
         (read["answered"], read["opens"], read["authored"]),
         (1, 0, 0)
     );
+}
+
+/// Each law of the authority area holds because the read leaves out what the column's writer
+/// would not write: walked under a read that admits every write, each walk ends in the state
+/// its law forbids, one the model has no step to.
+/// NEGATIVE CONTROL: this test is the control. With `typed::authority` judging nothing
+/// (`Control::AdmitAll`), the automatic note projects (`proj == 2`), the birth's status shows
+/// beside the owner's (`own == 1 && bshown == 1`), the rewrite takes (`ident == 2`) and the
+/// import's name projects (`vlabel == 2`).
+#[test]
+fn a_read_that_admits_every_write_breaks_each_authority_law() {
+    let model = aterm_models_db::shared_file_model();
+    for (path, law, measured) in [
+        (
+            &["ChooseAuthority", "AutomaticWrites"][..],
+            "OwnerOverAutomatic",
+            ("proj", 2),
+        ),
+        (
+            &["ChooseAuthority", "OwnerSets", "Birth"][..],
+            "OwnerOverBirth",
+            ("bshown", 1),
+        ),
+        (
+            &["ChooseAuthority", "Birth", "Rewrite"][..],
+            "FixedIdentity",
+            ("ident", 2),
+        ),
+        (
+            &["ChooseAuthority", "ImportNames"][..],
+            "OwnerVerbOnly",
+            ("vlabel", 2),
+        ),
+    ] {
+        let (before, last) = path.split_at(path.len() - 1);
+        let (mut walk, state) = run(&model, AuthorityWalk::new(), before);
+        let admitted = {
+            let _all = rules::control(Control::AdmitAll);
+            walk.apply(last[0]);
+            walk.state(&state)
+        };
+        assert_eq!(admitted[measured.0], measured.1, "{path:?}");
+        assert!(
+            !model.successors(last[0], &state).contains(&admitted),
+            "{path:?}"
+        );
+        assert!(
+            !model.check_invariant(law, &admitted),
+            "{path:?} keeps {law}"
+        );
+        // The same step judged holds the law.
+        let judged = authority_transition(before, last[0]);
+        assert!(model.check_invariant(law, &judged), "{path:?}");
+    }
 }

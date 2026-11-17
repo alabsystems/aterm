@@ -85,6 +85,11 @@ impl Lane {
     pub const fn slotted(self) -> Lane {
         Lane {
             bell: match self.bell {
+                // Off Unix a bell lane is its slice alone, so the new one takes nothing of it.
+                #[cfg_attr(
+                    not(unix),
+                    expect(unused_variables, reason = "off Unix the slice is all a lane holds")
+                )]
                 Some(bell) => Some(BellLane {
                     slice: unsliced,
                     ..bell

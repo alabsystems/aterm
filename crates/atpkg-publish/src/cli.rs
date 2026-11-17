@@ -51,6 +51,11 @@ pub const VERBS: &[Verb] = &[
         synopsis: artifact::package::SYNOPSIS,
         does: "pack, gate and sign a prebuilt package tree (codex, built in codex-alab)",
     },
+    Verb {
+        name: "pack-tree",
+        synopsis: artifact::tree::SYNOPSIS,
+        does: "pack and sign a build tree whole under the key that names what it was built from (llvm-tree, trust-stage0)",
+    },
     #[cfg(unix)]
     Verb {
         name: "publish-package",
@@ -115,7 +120,7 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "hosts",
-        synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless] [--lane alab|linux]",
+        synopsis: "hosts check [--host agh-staging|agh] [--unit-env] [--keyless] [--lane alab|linux|tip]",
         does: "whether this builder's agh.toml is ready for --host agh-staging or agh (reads files, sends nothing)",
     },
     Verb {
@@ -366,7 +371,7 @@ fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
         "publish-group" => rest
             .iter()
             .any(|arg| matches!(arg.as_str(), "--stage-upload" | "--publish-staged")),
-        "pack" | "pack-bundle" | "pack-package" | "pack-bottle" | "index" => {
+        "pack" | "pack-bundle" | "pack-package" | "pack-bottle" | "pack-tree" | "index" => {
             rest.iter().any(|arg| arg == "--upload")
         }
         "lane" => rest.first().is_some_and(|arg| arg == "run"),
@@ -386,6 +391,7 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),
         "pack-package" => artifact::package::run(ctx, rest),
+        "pack-tree" => artifact::tree::run(ctx, rest),
         #[cfg(unix)]
         "publish-package" => crate::package_campaign::run(ctx, rest),
         "pack-bottle" => artifact::bottle::run(ctx, rest),

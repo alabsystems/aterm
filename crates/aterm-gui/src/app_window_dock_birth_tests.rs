@@ -5,9 +5,11 @@
 //! a headless window, a default dock wider than its screen, the origin slide and a failed attach.
 
 use super::{
-    BirthDock, DOCK_CELLS, DockBirth, MonitorRectPx, birth_dock, docked_origin_x, docks_by_default,
+    BirthDock, BirthScreens, DOCK_CELLS, DesktopPlane, DockBirth, DockRow, MonitorRectPx,
+    WorkAreaPts, birth_dock, docked_origin_x, docks_by_default, frame_is_placed, monitor_holding,
 };
 use crate::{App, WindowId};
+use aterm_window::dpi::{PhysicalPosition, Position};
 
 const WID: WindowId = WindowId(0);
 
@@ -49,6 +51,15 @@ fn resize_sites(app: &App, id: u64) -> Vec<String> {
         .collect()
 }
 
+/// A row's record `pref` as its person left it (or never decided), with the birth `birth`.
+const fn person(pref: Option<u16>, birth: DockBirth) -> DockRow {
+    DockRow {
+        pref,
+        by_default: false,
+        birth,
+    }
+}
+
 /// The frame window `wid` attaches at for its own grid with no carried frame.
 fn own_frame(app: &App, wid: WindowId) -> aterm_window::dpi::PhysicalSize<u32> {
     let ws = &app.windows[&wid];
@@ -58,29 +69,38 @@ fn own_frame(app: &App, wid: WindowId) -> aterm_window::dpi::PhysicalSize<u32> {
 #[test]
 fn birth_dock_is_its_table() {
     use BirthDock::{Hidden, Inside, Shown};
-    let rows: [(Option<u16>, bool, bool, bool, BirthDock); 11] = [
-        // Off: no window is born docked, whatever its record says.
-        (Some(30), false, false, true, Hidden),
-        (None, false, false, true, Hidden),
+    // (record, the default wrote it, setting on, held, room, born).
+    let rows: [(Option<u16>, bool, bool, bool, bool, BirthDock); 17] = [
+        // Off: what the default decides is undocked, an undecided window and one the default
+        // docked alike.
+        (Some(30), true, false, false, true, Hidden),
+        (Some(30), true, false, true, false, Hidden),
+        (None, false, false, false, true, Hidden),
+        // A person's Show is theirs, whatever the setting says, held or not.
+        (Some(30), false, false, false, true, Shown(30)),
+        (Some(30), false, false, true, false, Shown(30)),
         // A person's Hide is kept.
-        (Some(0), true, false, true, Hidden),
+        (Some(0), false, true, false, true, Hidden),
+        (Some(0), false, false, false, true, Hidden),
         // A record of a shown dock is born with it, held or not.
-        (Some(30), true, false, true, Shown(30)),
-        (Some(30), true, true, false, Shown(30)),
+        (Some(30), false, true, false, true, Shown(30)),
+        (Some(30), false, true, true, false, Shown(30)),
+        (Some(30), true, true, false, true, Shown(30)),
+        (Some(30), true, true, true, false, Shown(30)),
         // At this build's width, whatever width the row carries: none is born a screen wide.
-        (Some(2000), true, false, true, Shown(DOCK_CELLS)),
-        (Some(7), true, false, true, Shown(DOCK_CELLS)),
+        (Some(2000), false, true, false, true, Shown(DOCK_CELLS)),
+        (Some(7), false, false, false, true, Shown(DOCK_CELLS)),
         // Never decided: born wider where it can be, else owed inside.
-        (None, true, false, true, Shown(DOCK_CELLS)),
-        (None, true, true, true, Inside(DOCK_CELLS)),
-        (None, true, false, false, Inside(DOCK_CELLS)),
-        (None, true, true, false, Inside(DOCK_CELLS)),
+        (None, false, true, false, true, Shown(DOCK_CELLS)),
+        (None, false, true, true, true, Inside(DOCK_CELLS)),
+        (None, false, true, false, false, Inside(DOCK_CELLS)),
+        (None, false, true, true, false, Inside(DOCK_CELLS)),
     ];
-    for (pref, on, held, room, want) in rows {
+    for (pref, by_default, on, held, room, want) in rows {
         assert_eq!(
-            birth_dock(pref, on, held, room),
+            birth_dock(pref, by_default, on, held, room),
             want,
-            "pref={pref:?} on={on} held={held} room={room}"
+            "pref={pref:?} by_default={by_default} on={on} held={held} room={room}"
         );
     }
 }
@@ -117,7 +137,7 @@ fn a_headless_window_starts_with_the_dock_hidden() {
         restored: true,
         ..DockBirth::default()
     };
-    app.take_dock_record(WID, Some(30), birth);
+    app.take_dock_record(WID, person(Some(30), birth));
     assert!(!app.seat_birth_dock(WID));
     let ws = &app.windows[&WID];
     assert_eq!(ws.dock.cells, 0);
@@ -132,7 +152,7 @@ fn a_headless_window_starts_with_the_dock_hidden() {
     // CONTROL: the same app not headless is born with it.
     let mut app = App::headless_for_test();
     dock_setting(&mut app, Some(true));
-    app.take_dock_record(WID, Some(30), birth);
+    app.take_dock_record(WID, person(Some(30), birth));
     app.headless = false;
     assert!(app.seat_birth_dock(WID));
     assert_eq!(app.windows[&WID].dock.cells, 30);
@@ -227,11 +247,13 @@ fn a_default_dock_wider_than_its_screen_is_not_born() {
         let mut app = docking_app();
         app.take_dock_record(
             WID,
-            None,
-            DockBirth {
-                restored,
-                ..DockBirth::default()
-            },
+            person(
+                None,
+                DockBirth {
+                    restored,
+                    ..DockBirth::default()
+                },
+            ),
         );
         let bare = own_frame(&app, WID);
         assert!(app.seat_birth_dock(WID));
@@ -240,10 +262,10 @@ fn a_default_dock_wider_than_its_screen_is_not_born() {
         let docked_pts = f64::from(own_frame(&app, WID).width) / scale;
 
         // CONTROL: a screen that holds the docked frame keeps it.
-        assert!(!app.fit_birth_dock_to(WID, docked_pts, Some(docked_pts)));
+        assert!(!app.fit_birth_dock_to(WID, docked_pts, Some(docked_pts), false));
         assert_eq!(app.windows[&WID].dock.cells, 30);
 
-        assert!(app.fit_birth_dock_to(WID, docked_pts, Some(docked_pts - 1.0)));
+        assert!(app.fit_birth_dock_to(WID, docked_pts, Some(docked_pts - 1.0), false));
         let ws = &app.windows[&WID];
         assert_eq!(ws.dock.cells, 0);
         assert!(ws.dock.view.is_none());
@@ -257,9 +279,13 @@ fn a_default_dock_wider_than_its_screen_is_not_born() {
 
         // A dock its record asked for is not fitted away.
         let mut app = docking_app();
-        app.take_dock_record(WID, Some(30), DockBirth::default());
+        app.take_dock_record(WID, person(Some(30), DockBirth::default()));
         assert!(app.seat_birth_dock(WID));
-        assert!(!app.fit_birth_dock_to(WID, 2000.0, Some(100.0)));
+        assert!(!app.fit_birth_dock_to(WID, 2000.0, Some(100.0), false));
+        assert!(
+            !app.fit_birth_dock_to(WID, 2000.0, Some(100.0), true),
+            "nor placed in a tile"
+        );
         assert_eq!(app.windows[&WID].dock.cells, 30);
     }
 }
@@ -279,6 +305,395 @@ fn a_docked_origin_slides_left_only_by_what_the_dock_pushed_past_the_screen() {
     assert_eq!(docked_origin_x(50, 2100, 300, screen), 0);
     // A screen right of the origin's: its own left edge and width.
     assert_eq!(docked_origin_x(2600, 1500, 300, (2000, 2000)), 2500);
+}
+
+/// Two displays side by side as macOS reports them, the left at scale 2 (1440 x 900 pt) and the
+/// right at scale 1 (1920 x 1080 pt): each rectangle's px are its points times its own scale,
+/// so the two px rectangles overlap from 1440 to 2880.
+const MIXED_SCALE_DESK: [MonitorRectPx; 2] = [
+    MonitorRectPx {
+        x: 0.0,
+        y: 0.0,
+        w: 2880.0,
+        h: 1800.0,
+        scale: 2.0,
+    },
+    MonitorRectPx {
+        x: 1440.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+        scale: 1.0,
+    },
+];
+
+/// A windowed app whose window was born with a default dock from a row read at scale `scale`.
+fn born_default_from_row_at(scale: Option<f64>) -> App {
+    let mut app = docking_app();
+    let birth = DockBirth {
+        restored: true,
+        scale,
+        ..DockBirth::default()
+    };
+    app.take_dock_record(WID, person(None, birth));
+    assert!(app.seat_birth_dock(WID), "PRECONDITION: a default dock");
+    app
+}
+
+/// Where a window of scale `window_scale` lands, in points, when it is put at `place`: macOS's
+/// `set_outer_position` reads a place in px at the window's scale when it is moved.
+fn lands_at(place: Position, window_scale: f64) -> (f64, f64) {
+    let at = place.to_logical::<f64>(window_scale);
+    (at.x, at.y)
+}
+
+/// MIXED-SCALE DISPLAYS. A restored window born with a default dock is slid onto the display
+/// its saved origin lies on, judged in one unit: on macOS's plane of points each display's
+/// rectangle at its own scale and the origin at the scale its row read it at, whatever order
+/// the displays are listed in; the slide is made in the row's px, and the window lands at the
+/// point those px stand for, whatever scale it has when it is moved. CONTROL: on a plane of px
+/// (Windows, X11) the px rectangles are the plane and the slide is the px slide.
+#[test]
+fn a_docked_window_on_displays_of_different_scale_is_slid_on_its_own_display() {
+    let [left, right] = MIXED_SCALE_DESK;
+    for monitors in [[left, right], [right, left]] {
+        // On the right display at 2800 pt (2800 px at scale 1), inside the left's px too.
+        assert_eq!(
+            monitor_holding(DesktopPlane::Points, &monitors, (2800, 100), 1.0),
+            Some(right),
+            "{monitors:?}"
+        );
+        // On the left display at 1000 pt (2000 px at scale 2), inside the right's px too.
+        assert_eq!(
+            monitor_holding(DesktopPlane::Points, &monitors, (2000, 100), 2.0),
+            Some(left),
+            "{monitors:?}"
+        );
+
+        // The right display's window: a 600 pt docked frame at 2800 pt crosses its 3360 pt edge
+        // by 40 pt, and undocked (300 pt less) fitted: slid 40 pt.
+        let app = born_default_from_row_at(Some(1.0));
+        let place = app.restored_origin_among(
+            WID,
+            DesktopPlane::Points,
+            &monitors,
+            (600, 1.0),
+            (2800, 100),
+            300,
+        );
+        assert_eq!(lands_at(place, 1.0), (2760.0, 100.0), "{monitors:?}");
+        // The same row while the window stands on the scale-2 display, its frame and dock read
+        // there: the same place, where it lands at that scale.
+        let place = app.restored_origin_among(
+            WID,
+            DesktopPlane::Points,
+            &monitors,
+            (1200, 2.0),
+            (2800, 100),
+            600,
+        );
+        assert_eq!(
+            lands_at(place, 2.0),
+            (2760.0, 100.0),
+            "{monitors:?}: frame read at another scale"
+        );
+        // The left display's window: at 1000 pt a 600 pt docked frame crosses its 1440 pt edge
+        // by 160 pt: slid 160 pt, 320 of the row's px.
+        let app = born_default_from_row_at(Some(2.0));
+        let place = app.restored_origin_among(
+            WID,
+            DesktopPlane::Points,
+            &monitors,
+            (1200, 2.0),
+            (2000, 100),
+            600,
+        );
+        assert_eq!(lands_at(place, 2.0), (840.0, 50.0), "{monitors:?}");
+    }
+
+    // The row carries the scale its px were read at; one without it reads none.
+    let mut wl = crate::restore::RestoreManifest::one_terminal_for_test(None).windows[0].clone();
+    (wl.outer_x, wl.outer_y, wl.scale) = (Some(2000), Some(100), Some(2.0));
+    let text = crate::restore::RestoreManifest::new(vec![wl.clone()])
+        .to_toml()
+        .expect("serialize");
+    let back = crate::restore::RestoreManifest::from_toml(&text).expect("parse");
+    assert_eq!(back.windows[0].scale, Some(2.0), "{text}");
+    assert_eq!(DockBirth::of_row(&back.windows[0]).scale, Some(2.0));
+    wl.scale = None;
+    let text = crate::restore::RestoreManifest::new(vec![wl])
+        .to_toml()
+        .expect("serialize");
+    assert!(!text.contains("\nscale ="), "{text}");
+    let back = crate::restore::RestoreManifest::from_toml(&text).expect("parse");
+    assert_eq!(DockBirth::of_row(&back.windows[0]).scale, None);
+
+    // CONTROL: a plane of px, the right display laid at the left's px edge.
+    let right_px = MonitorRectPx { x: 2880.0, ..right };
+    let px_desk = [left, right_px];
+    assert_eq!(
+        monitor_holding(DesktopPlane::Pixels, &px_desk, (3000, 100), 1.0),
+        Some(right_px)
+    );
+    assert_eq!(
+        monitor_holding(DesktopPlane::Pixels, &px_desk, (2000, 100), 2.0),
+        Some(left)
+    );
+    let app = born_default_from_row_at(Some(1.0));
+    assert_eq!(
+        app.restored_origin_among(
+            WID,
+            DesktopPlane::Pixels,
+            &px_desk,
+            (600, 1.0),
+            (4300, 100),
+            300
+        ),
+        Position::Physical(PhysicalPosition::new(4200, 100)),
+        "CONTROL: the px slide"
+    );
+}
+
+/// A RESTORED WINDOW LANDS ON THE DISPLAY ITS ROW WAS READ ON. macOS makes a restored window on
+/// the main display, at that display's scale, and only then moves it: the place it is moved to
+/// is the point its row's px stand for at the row's scale, docked or not, so on displays of
+/// different scale it lands on the display it was saved on. The desk: [`MIXED_SCALE_DESK`], the
+/// main display the left one at scale 2, the row read on the right one at scale 1. CONTROL: a
+/// row from before the scale was written is read at the window's scale, as before; on a plane
+/// of px the place is the row's px.
+#[test]
+fn a_restored_window_lands_where_its_row_was_read_whatever_scale_it_is_born_at() {
+    let [left, right] = MIXED_SCALE_DESK;
+    for monitors in [[left, right], [right, left]] {
+        // Docked by default, saved at 1500 pt on the right display: the 840 pt docked frame
+        // (1680 px at the window's scale 2, its dock 480) fits that display's 3360 pt edge, so
+        // it is not slid, and lands on the right display, not at 750 pt on the left one.
+        let app = born_default_from_row_at(Some(1.0));
+        let place = app.restored_origin_among(
+            WID,
+            DesktopPlane::Points,
+            &monitors,
+            (1680, 2.0),
+            (1500, 100),
+            480,
+        );
+        let (x, _) = lands_at(place, 2.0);
+        assert_eq!(lands_at(place, 2.0), (1500.0, 100.0), "{monitors:?}");
+        assert!(
+            (right.x..right.x + right.w).contains(&x) && x + 840.0 <= right.x + right.w,
+            "{monitors:?}: on the display it was saved on, whole"
+        );
+    }
+
+    // Undocked, the row read on the right display at 2800 pt (2800 px at scale 1).
+    let mut app = docking_app();
+    let birth = |scale| DockBirth {
+        restored: true,
+        origin: Some((2800, 100)),
+        scale,
+        ..DockBirth::default()
+    };
+    app.take_dock_record(WID, person(Some(0), birth(Some(1.0))));
+    assert!(
+        !app.seat_birth_dock(WID),
+        "PRECONDITION: no dock, so no slide"
+    );
+    let place = app.restored_origin_among(
+        WID,
+        DesktopPlane::Points,
+        &MIXED_SCALE_DESK,
+        (1200, 2.0),
+        (2800, 100),
+        0,
+    );
+    assert_eq!(lands_at(place, 2.0), (2800.0, 100.0), "undocked");
+    // CONTROL: a row with no scale is read at the window's.
+    app.take_dock_record(WID, person(Some(0), birth(None)));
+    let place = app.restored_origin_among(
+        WID,
+        DesktopPlane::Points,
+        &MIXED_SCALE_DESK,
+        (1200, 2.0),
+        (2800, 100),
+        0,
+    );
+    assert_eq!(lands_at(place, 2.0), (1400.0, 50.0), "CONTROL: no scale");
+    // CONTROL: a plane of px places the row's px.
+    app.take_dock_record(WID, person(Some(0), birth(Some(1.0))));
+    assert_eq!(
+        app.restored_origin_among(
+            WID,
+            DesktopPlane::Pixels,
+            &MIXED_SCALE_DESK,
+            (1200, 2.0),
+            (2800, 100),
+            0,
+        ),
+        Position::Physical(PhysicalPosition::new(2800, 100)),
+        "CONTROL: a plane of px"
+    );
+}
+
+/// A rectangle in points.
+const fn pts(x: f64, y: f64, w: f64, h: f64) -> WorkAreaPts {
+    WorkAreaPts { x, y, w, h }
+}
+
+/// THE PLACED-FRAME RULE: a frame that meets a side of its screen's visible frame and spans a
+/// tile row (the whole visible height, or its top or bottom half) stands in a tile; a frame
+/// that floats, however large, does not.
+#[test]
+fn a_frame_in_a_tile_of_its_screen_is_placed_and_a_floating_one_is_not() {
+    // A 1440 x 900 pt screen less a 25 pt menu bar.
+    let visible = pts(0.0, 25.0, 1440.0, 875.0);
+    let rows: [(&str, WorkAreaPts, bool); 14] = [
+        ("left half", pts(0.0, 25.0, 720.0, 875.0), true),
+        ("right half", pts(720.0, 25.0, 720.0, 875.0), true),
+        ("left half with margins", pts(8.0, 33.0, 708.0, 859.0), true),
+        (
+            "right half with margins",
+            pts(724.0, 33.0, 708.0, 859.0),
+            true,
+        ),
+        ("top-left quarter", pts(0.0, 25.0, 720.0, 437.5), true),
+        (
+            "bottom-right quarter",
+            pts(720.0, 462.5, 720.0, 437.5),
+            true,
+        ),
+        ("fill", pts(0.0, 25.0, 1440.0, 875.0), true),
+        ("a third at the left", pts(0.0, 25.0, 480.0, 875.0), true),
+        // CONTROL: floating.
+        ("floating", pts(200.0, 150.0, 800.0, 600.0), false),
+        (
+            "full height, touching no side",
+            pts(300.0, 25.0, 800.0, 875.0),
+            false,
+        ),
+        (
+            "at the left edge, not a row",
+            pts(0.0, 100.0, 800.0, 600.0),
+            false,
+        ),
+        (
+            "in the top-left corner, not a row",
+            pts(0.0, 25.0, 800.0, 600.0),
+            false,
+        ),
+        ("one edge 17 pt off", pts(17.0, 25.0, 700.0, 875.0), false),
+        ("no area", pts(0.0, 25.0, 0.0, 875.0), false),
+    ];
+    for (name, frame, placed) in rows {
+        assert_eq!(frame_is_placed(frame, visible), placed, "{name}");
+    }
+    // A screen right of the main one: its own visible frame.
+    let right = pts(1440.0, 0.0, 1920.0, 1055.0);
+    assert!(frame_is_placed(pts(2400.0, 0.0, 960.0, 1055.0), right));
+    assert!(!frame_is_placed(pts(2400.0, 0.0, 960.0, 1055.0), visible));
+}
+
+/// The birth fit reads the screen its saved origin lies on, judged on its own display: a
+/// 1600 pt docked frame saved on the 1920 pt scale-1 display of [`MIXED_SCALE_DESK`] is kept,
+/// though its px also lie on the 1440 pt scale-2 display, which could not hold it.
+#[test]
+fn the_birth_fit_reads_the_display_the_saved_origin_is_on() {
+    for monitors in [MIXED_SCALE_DESK, [MIXED_SCALE_DESK[1], MIXED_SCALE_DESK[0]]] {
+        let mut app = docking_app();
+        let birth = DockBirth {
+            restored: true,
+            origin: Some((1500, 100)),
+            scale: Some(1.0),
+            ..DockBirth::default()
+        };
+        app.take_dock_record(WID, person(None, birth));
+        assert!(app.seat_birth_dock(WID));
+        let screens = BirthScreens {
+            plane: DesktopPlane::Points,
+            monitors: &monitors,
+            visible: &[],
+            current: None,
+            scale: 1.0,
+        };
+        assert!(
+            !app.fit_birth_dock_on(WID, &screens, 1600.0, None),
+            "{monitors:?}"
+        );
+        assert_eq!(app.windows[&WID].dock.cells, 30);
+        // CONTROL: wider than that display too.
+        assert!(
+            app.fit_birth_dock_on(WID, &screens, 2000.0, None),
+            "{monitors:?}"
+        );
+        assert_eq!(app.windows[&WID].dock.cells, 0);
+    }
+}
+
+/// A TILE IS JUDGED ONLY AGAINST THE SCREENS THE WINDOW SYSTEM NAMES. macOS names each screen's
+/// visible frame; Windows and Linux name none, and there no saved frame is judged placed. The
+/// screen the window stands on now is no stand-in: the Windows early reveal fits the dock before
+/// it moves the window to its saved place and the attach fits it again after, so the two would
+/// read different screens, and the window, shown docked, would be narrowed on glass at its
+/// attach. The desk: two 1920 x 1080 px displays side by side, the saved frame the right half
+/// of the second one's work area. CONTROL: the same frame among named visible frames stands in
+/// a tile, and its dock goes inside.
+#[test]
+fn a_tile_is_judged_against_named_screens_never_the_one_the_window_stands_on() {
+    let monitor = |x| MonitorRectPx {
+        x,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+        scale: 1.0,
+    };
+    let monitors = [monitor(0.0), monitor(1920.0)];
+    let (first, second) = (
+        pts(0.0, 0.0, 1920.0, 1040.0),
+        pts(1920.0, 0.0, 1920.0, 1040.0),
+    );
+    let born = || {
+        let mut app = docking_app();
+        let birth = DockBirth {
+            restored: true,
+            origin: Some((2880, 0)),
+            scale: Some(1.0),
+            ..DockBirth::default()
+        };
+        app.take_dock_record(WID, person(None, birth));
+        assert!(app.seat_birth_dock(WID), "PRECONDITION: a default dock");
+        app
+    };
+    // The saved half is 960 x 1040 px; docked, 1200 pt, which either screen holds.
+    let saved = Some((960.0, 1040.0));
+    let mut app = born();
+    for (at, current) in [("the early reveal", first), ("the attach", second)] {
+        let screens = BirthScreens {
+            plane: DesktopPlane::Pixels,
+            monitors: &monitors,
+            visible: &[],
+            current: Some(current),
+            scale: 1.0,
+        };
+        assert!(
+            !app.fit_birth_dock_on(WID, &screens, 1200.0, saved),
+            "{at}: no screen named, no tile judged"
+        );
+        assert_eq!(app.windows[&WID].dock.cells, 30, "{at}: born beside it");
+    }
+
+    // CONTROL: the screens named, the half stands in a tile of the second one's.
+    let mut app = born();
+    let screens = BirthScreens {
+        plane: DesktopPlane::Pixels,
+        monitors: &monitors,
+        visible: &[first, second],
+        current: Some(first),
+        scale: 1.0,
+    };
+    assert!(
+        app.fit_birth_dock_on(WID, &screens, 1200.0, saved),
+        "CONTROL"
+    );
+    assert_eq!(app.windows[&WID].dock.cells, 0, "CONTROL: owed inside");
 }
 
 #[test]
@@ -378,7 +793,7 @@ fn a_window_landed_off_the_loop_takes_the_record_of_the_window_it_was_opened_fro
 #[test]
 fn the_early_reveal_places_a_default_dock_without_the_renderer() {
     let mut app = docking_app();
-    app.take_dock_record(WID, None, DockBirth::default());
+    app.take_dock_record(WID, person(None, DockBirth::default()));
     assert!(app.seat_birth_dock(WID), "PRECONDITION: a default dock");
     let screen = MonitorRectPx {
         x: 0.0,
@@ -389,12 +804,19 @@ fn the_early_reveal_places_a_default_dock_without_the_renderer() {
     };
     let ready = std::mem::replace(&mut app.backend, crate::BackendSlot::Pending(None));
     let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        app.restored_origin_among(WID, &[screen], 1500, (600, 100), 300)
+        app.restored_origin_among(
+            WID,
+            DesktopPlane::NATIVE,
+            &[screen],
+            (1500, 1.0),
+            (600, 100),
+            300,
+        )
     }));
     app.backend = ready;
     assert_eq!(
-        placed.ok(),
-        Some((500, 100)),
+        placed.ok().map(|place| lands_at(place, 1.0)),
+        Some((500.0, 100.0)),
         "slid by what the dock pushed past the edge, reading no renderer metric"
     );
 }
@@ -419,7 +841,7 @@ fn a_default_dock_the_os_refuses_the_wider_frame_for_goes_inside() {
         let shells = app.window_terminal_sessions(WID);
         assert_eq!(shells.len(), 3, "PRECONDITION: three programs");
         let tile = own_frame(&app, WID);
-        app.take_dock_record(WID, None, DockBirth::default());
+        app.take_dock_record(WID, person(None, DockBirth::default()));
         assert!(
             app.seat_birth_dock(WID),
             "PRECONDITION: born wider by default"
@@ -482,7 +904,7 @@ fn a_default_dock_the_os_refuses_the_wider_frame_for_goes_inside() {
     let mut app = docking_app();
     let (rows, cols) = (app.windows[&WID].rows, app.windows[&WID].cols);
     let tile = own_frame(&app, WID);
-    app.take_dock_record(WID, None, DockBirth::default());
+    app.take_dock_record(WID, person(None, DockBirth::default()));
     assert!(app.seat_birth_dock(WID));
     let docked = own_frame(&app, WID);
     app.windows.get_mut(&WID).unwrap().win_px = Some(docked);

@@ -29,10 +29,23 @@ pub(crate) struct TabRenameEdit {
     pub surface: RenameSurface,
     /// The metadata field the commit writes: the title pin (Rename Session…, the double-click) or the role (Window ▸ Set Role…).
     pub field: MetaField,
+    /// The text the field opened holding: the stored value, empty when unset. A commit of it
+    /// (trimmed) states nothing, whoever touched or settles the edit and whatever another
+    /// writer pinned while it was open ([`App::commit_session_rename`]).
+    pub seed: String,
     /// The in-grid field's text: seeded from the stored value (empty when unset), changed only through [`crate::app_search::apply_field_edit`], the find bar's reducer.
     pub text: String,
     /// Caret position in [`Self::text`], a byte offset on a char boundary.
     pub cursor: usize,
+    /// The first control client that opened the field or changed its text
+    /// ([`App::rename_controller`]), `None` while only a person has: recorded at begin, at
+    /// each change of the in-grid field's text ([`App::rename_field_edit`]), and at each
+    /// change a key an `hwkey` burst posted made to the macOS field's text
+    /// (`App::native_rename_edited`, which the field's delegate posts). The commit is that
+    /// client's, else a person's, whichever gesture settles the edit (Enter, a person's click
+    /// elsewhere, a controller's `invoke` of another action, a burst's Return): its author is
+    /// who touched the field, not who ended it.
+    pub controller: Option<aterm_slog::Actor>,
 }
 
 impl App {
@@ -114,6 +127,9 @@ impl App {
             .get(&window)
             .and_then(|ws| ws.rename_edit.as_ref())
             .map(|edit| (edit.session, edit.tab, edit.field));
+        // A reopen of the edit already open changes nothing in it: it keeps the text it opened
+        // holding ([`TabRenameEdit::seed`]), and a controller's records no controller nor a
+        // person's takes one back ([`TabRenameEdit::controller`]).
         if live == Some((session, tab, field)) {
             return true;
         }
@@ -163,6 +179,7 @@ impl App {
             return false;
         };
         let cursor = seed.len();
+        let controller = self.rename_controller();
         if let Some(mut route_guard_ws) = self.windows.get_mut(&window) {
             let ws = &mut **route_guard_ws;
             ws.routing.set_rename(Some(TabRenameEdit {
@@ -170,8 +187,10 @@ impl App {
                 tab,
                 surface,
                 field,
+                seed: seed.clone(),
                 text: seed,
                 cursor,
+                controller,
             }));
         } else {
             return false;
@@ -256,8 +275,13 @@ impl App {
         }
     }
 
-    /// Apply one field edit to `window`'s in-grid rename field and repaint.
+    /// Apply one field edit to `window`'s in-grid rename field and repaint. An edit that changes
+    /// the text in a control client's gesture makes the edit that client's
+    /// ([`TabRenameEdit::controller`]) where no client had touched it before; a caret move
+    /// changes nothing. The macOS field, whose text AppKit edits, is recorded the same way by
+    /// `Self::native_rename_edited`.
     pub(crate) fn rename_field_edit(&mut self, window: WindowId, edit: SearchEdit) -> bool {
+        let touching = self.rename_controller();
         let Some(mut route_guard_ws) = self.windows.get_mut(&window) else {
             return false;
         };
@@ -270,7 +294,9 @@ impl App {
             return false;
         };
         let state = &mut *rename_scope;
-        apply_field_edit(&mut state.text, &mut state.cursor, edit);
+        if apply_field_edit(&mut state.text, &mut state.cursor, edit) {
+            state.controller = state.controller.or(touching);
+        }
         let canonical =
             crate::session_timeline::sanitize_presentation_line(&state.text, state.field.cap());
         if state.text.trim() != canonical {
@@ -284,6 +310,30 @@ impl App {
         drop(route_guard_ws);
         self.request_rename_repaint(window);
         true
+    }
+
+    /// The macOS field over `session` in `window` changed its text (`controlTextDidChange:`),
+    /// run under the marks of the key that changed it: where that key was a control client's
+    /// (one an `hwkey` burst posted), the edit becomes that client's
+    /// ([`TabRenameEdit::controller`]) where no client had touched it before, as
+    /// [`Self::rename_field_edit`] records the in-grid field. The field's delegate posts this
+    /// only for such a key, while AppKit dispatches it; the wake runs before the commit the
+    /// field posts after it, since wakes run in the order they were sent.
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn native_rename_edited(&mut self, window: WindowId, session: u64) {
+        let touching = self.rename_controller();
+        let Some(mut route_guard_ws) = self.windows.get_mut(&window) else {
+            return;
+        };
+        let ws = &mut **route_guard_ws;
+        if let Some(mut rename_scope) = ws
+            .routing
+            .rename_mut()
+            .filter(|state| state.session == session && state.surface == RenameSurface::Native)
+        {
+            let state = &mut *rename_scope;
+            state.controller = state.controller.or(touching);
+        }
     }
 
     /// Paste the clipboard into `window`'s in-grid rename field (one line; the reducer strips control characters). A control client's gesture reads no clipboard ([`Self::refuse_clipboard_gesture`]).
@@ -309,19 +359,34 @@ impl App {
         self.end_session_rename_editor(window);
     }
 
-    /// Commit the live edit: tear the editor down, then write the pin.
+    /// Commit the live edit: tear the editor down, then write the pin as the edit's author, the
+    /// control client that touched the field ([`TabRenameEdit::controller`]), else a person,
+    /// whoever's gesture commits it. A field committed holding what it opened with
+    /// ([`TabRenameEdit::seed`], trimmed) writes nothing, whoever touched or settles it: what
+    /// another writer pinned while it was open is not the person's or the client's to undo, and
+    /// the text they did not change states nothing. The field still counts as written by a
+    /// driver, as after any write ([`crate::session_timeline::note_unstated_meta_write`]).
     pub(crate) fn commit_session_rename(&mut self, window: WindowId, session: u64, text: &str) {
         if self.rename_edit_session(window) != Some(session) {
             aterm_log::info!("rename commit dropped: session {session} is no longer being edited");
             return;
         }
-        let field = self
+        let (field, controller, opened) = self
             .windows
             .get(&window)
             .and_then(|ws| ws.rename_edit.as_ref())
-            .map_or(MetaField::Title, |edit| edit.field);
+            .map_or((MetaField::Title, None, String::new()), |edit| {
+                (edit.field, edit.controller, edit.seed.clone())
+            });
         self.end_session_rename_editor(window);
-        match self.write_session_meta_field(session, field, text) {
+        if text.trim() == opened.trim() {
+            if let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) {
+                crate::session_timeline::note_unstated_meta_write(&ctx, field);
+            }
+            return;
+        }
+        let by = controller.unwrap_or(aterm_slog::Actor::Human);
+        match self.write_session_meta_field(session, field, text, by) {
             Ok(_) => {}
             Err(error) => {
                 aterm_log::info!("rename refused for session {session}: {error:?}");
@@ -329,22 +394,50 @@ impl App {
         }
     }
 
-    /// Write one session's title pin (empty clears it) and refresh what it invalidates.
+    /// Write one session's title pin (empty clears it) as a person's rename, and refresh what it
+    /// invalidates.
     #[cfg(test)]
     pub(crate) fn write_session_title_pin(
         &mut self,
         session: u64,
         text: &str,
     ) -> Result<bool, MetaWriteError> {
-        self.write_session_meta_field(session, MetaField::Title, text)
+        self.write_session_meta_field(session, MetaField::Title, text, aterm_slog::Actor::Human)
     }
 
-    /// `Self::write_session_title_pin` for any presentation field.
+    /// THE CONTROL CLIENT WHOSE GESTURE IS SERVED NOW, `None` for a person's: what
+    /// [`TabRenameEdit::controller`] records as a control client opens the field or changes its
+    /// text. The gesture is a control client's where [`Self::person_gesture_refused`] says so
+    /// (an `invoke`, or keys or text a controller sent into the field: `key`, `text`, and an
+    /// `hwkey` burst's keys, which the macOS field's delegate reports by their origin,
+    /// `Self::native_rename_edited`). The client is then the actor the `invoke` was attributed
+    /// to, where one is open on this thread ([`crate::session_store::open_close_attribution`];
+    /// a person there is nobody), and nobody otherwise: the wake that carries a controller's
+    /// input does not say which session sent it, and calling it `ctl` would let another
+    /// session's client stand as a control client from no session. So a title a controller
+    /// touched is never a person's claim, and cannot clear one. An assistive or relayed gesture
+    /// may be a person's and stays one.
+    fn rename_controller(&self) -> Option<aterm_slog::Actor> {
+        use aterm_slog::Actor;
+        if !self.person_gesture_refused() {
+            return None;
+        }
+        Some(match crate::session_store::open_close_attribution() {
+            Some((_, by)) => match crate::session_log::exit_actor(&by) {
+                Actor::Human => Actor::Nobody,
+                by => by,
+            },
+            None => Actor::Nobody,
+        })
+    }
+
+    /// `Self::write_session_title_pin` for any presentation field, written as `by`'s.
     pub(crate) fn write_session_meta_field(
         &mut self,
         session: u64,
         field: MetaField,
         text: &str,
+        by: aterm_slog::Actor,
     ) -> Result<bool, MetaWriteError> {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
             return Ok(false);
@@ -354,7 +447,7 @@ impl App {
         } else {
             MetaEdit::Set(text)
         };
-        let changed = write_session_meta(&ctx, field, edit, aterm_slog::Actor::Human)?;
+        let changed = write_session_meta(&ctx, field, edit, by)?;
         if changed {
             self.refresh_meta_dependent_chrome(session);
             self.rebuild_teams();

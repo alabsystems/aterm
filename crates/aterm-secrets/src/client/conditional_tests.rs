@@ -94,6 +94,7 @@ fn a_higher_sequence_does_not_license_a_stale_conditional_parent() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn http_store_rejects_a_sibling_and_a_parentless_downgrade() {
     // Every server it reads is its own on loopback, which answers.

@@ -2797,6 +2797,8 @@ impl Unread {
 /// Everything at one moment. Immutable once made; the host shares it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Snapshot {
+    /// Bounded boot observations and separate persistence status, supplied by the host.
+    pub boot_cost: Option<Arc<crate::sys::boot::BootReport>>,
     /// This process's CPU bounds by observed thread name, separate from app and tab charges.
     pub self_cpu: crate::self_cpu::OwnCpuView,
     /// Original native waits observed on this sample, including known aggregate CPU where a
@@ -4018,6 +4020,12 @@ pub struct StripLine {
 }
 
 impl Vitals {
+    /// Published growth by its original observed assignment, including closed tabs.
+    #[must_use]
+    pub fn historical_reported(&self) -> crate::explain::HistoricalReported {
+        self.why.historical_reported()
+    }
+
     /// Whether native completion evidence needs another complete process reading before its
     /// delivered journal cursor can be considered adopted by the model.
     #[must_use]
@@ -4891,6 +4899,7 @@ impl Vitals {
         };
 
         let mut snap = Snapshot {
+            boot_cost: None,
             self_cpu,
             native_terminals: s.native_terminals.clone(),
             cpu_counter_sample: s.cores.clone(),

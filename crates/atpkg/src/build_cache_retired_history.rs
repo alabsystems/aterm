@@ -13,13 +13,12 @@ use std::ffi::OsStr;
 use std::fs::{self, Metadata};
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 const FILE_BYTES: usize = 16 << 20;
 const METADATA_BYTES: usize = 64 << 20;
 const ROOTS: usize = 65_536;
 const WITNESS_ROOTS: usize = 1_024;
-const ELAPSED: Duration = Duration::from_secs(30);
 
 #[derive(Clone, PartialEq, Eq)]
 struct Stamp {
@@ -81,6 +80,7 @@ impl Snapshot {
             files: BTreeMap::new(),
         };
         let mut bytes = 0;
+        budget.begin_walk();
         snapshot.walk(directory, Path::new(""), objects, 0, budget, &mut bytes)?;
         let named = Directory::root(&directory.path)?
             .ok_or_else(|| io::Error::other("private Git store disappeared"))?;
@@ -167,7 +167,6 @@ impl Snapshot {
 struct Read<'a> {
     git: &'a dyn Git,
     checkout: &'a Path,
-    deadline: Instant,
 }
 
 impl Read<'_> {
@@ -188,7 +187,10 @@ impl Read<'_> {
         input: &[u8],
         objects: Option<&Path>,
     ) -> Result<super::Answer, String> {
-        if Instant::now() >= self.deadline {
+        // Each run's own bound ([`super::READ_FOR`]), and a caller's end refuses a run before
+        // it starts.
+        let deadline = super::read_until(self.git);
+        if Instant::now() >= deadline {
             return Err("private Git history reached its time bound".to_owned());
         }
         let store = super::git_path(store)
@@ -203,7 +205,7 @@ impl Read<'_> {
         all.extend_from_slice(args);
         Ok(self
             .git
-            .read_history(self.checkout, &all, input, objects, self.deadline))
+            .read_history(self.checkout, &all, input, objects, deadline))
     }
 
     /// Each ref of `store` and its object, one `<name>NUL<object>` row each, as
@@ -622,11 +624,7 @@ fn check(git: &dyn Git, checkout: &Path, wt: &Path, admin: Option<&Path>) -> Res
         return Ok(());
     }
     let mut budget = Budget::new();
-    let read = Read {
-        git,
-        checkout,
-        deadline: Instant::now() + ELAPSED,
-    };
+    let read = Read { git, checkout };
     let mut cuts = vec![location(wt)?];
     if let Some(admin) = admin {
         cuts.push(location(admin)?);
@@ -795,11 +793,7 @@ pub(in crate::build_cache) fn unrooted(
 ) -> Result<Vec<Unrooted>, String> {
     let private = registry::clear(wt, Some(admin))?;
     let mut budget = Budget::new();
-    let read = Read {
-        git,
-        checkout,
-        deadline: Instant::now() + ELAPSED,
-    };
+    let read = Read { git, checkout };
     let cuts = vec![location(wt)?, location(admin)?];
     let mut out = Vec::new();
     for directory in &private {
@@ -874,3 +868,7 @@ pub(in crate::build_cache) fn clear(
 #[cfg(test)]
 #[path = "build_cache_retired_history_format_tests.rs"]
 mod format_tests;
+
+#[cfg(test)]
+#[path = "build_cache_retired_history_bound_tests.rs"]
+mod bound_tests;

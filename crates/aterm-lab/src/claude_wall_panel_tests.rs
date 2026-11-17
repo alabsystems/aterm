@@ -551,3 +551,17 @@ fn the_measured_frames_read_as_the_run_judged_them() {
     );
     assert_ne!(standing(&wall), standing(&week));
 }
+
+#[test]
+fn a_passing_run_writes_a_frame_only_for_a_new_build_or_when_recording() {
+    assert!(
+        writes_frame(false, false),
+        "a build's first capture is written"
+    );
+    assert!(
+        !writes_frame(true, false),
+        "a re-run leaves the committed frame"
+    );
+    assert!(writes_frame(true, true), "--record rewrites it");
+    assert!(writes_frame(false, true));
+}

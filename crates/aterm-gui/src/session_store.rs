@@ -1318,6 +1318,15 @@ impl SessionStore {
             #[cfg(not(test))]
             crate::fabric::watch_direct_mail(&handle.ctx);
         }
+        // The log ranks a description claim by whose session this is: said on every register,
+        // since a handle that replaces one may bring another context and so another log.
+        handle
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .slog_mut()
+            .set_desc_own(handle.sid.as_str());
         let journal = first.then(|| (handle.sid.as_str().to_string(), handle.local_id));
         // A replace journals nothing, but `bridge_roster` emits these two, so a bridge holding
         // the count must learn of it: the count alone moves, and leaves a hole in the journal's

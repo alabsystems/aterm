@@ -315,7 +315,7 @@ fn unreadable_name_candidates_never_become_an_unset_or_authoritative_value() {
 /// This Mac is the machine its own facts row binds, its `merged_into` when it names one; its
 /// preferences come in rank order with an unranked one last; the Macs preferring an account sort
 /// by rank, then by label number (`m3` before `m22`); an ended preference, or one on a retired
-/// machine, is no preference; an account reads its default label, which names no machine.
+/// machine, is no preference; an account reads its slug and name as `account_names` gives them.
 /// NEGATIVE CONTROL: with `read` taking `mac` before `merged_into`, `me` is m22's row, not m3's:
 /// `` left: Some("mc-…") right: Some("mc-…") ``; with the preference sort's `rank.is_none()` key
 /// removed, the unranked account comes first.
@@ -363,9 +363,10 @@ fn a_mac_reads_its_preferences_from_its_facts_binding() {
         view.preferring(&bob).iter().all(|p| p.machine == m3),
         "ended"
     );
-    let label = view.accounts[&ann].label.clone().unwrap();
-    assert_eq!(label, keys::default_account_label("claude", &ann).unwrap());
-    assert!(!label.contains("m3") && !label.contains("ann"));
+    let account = &view.accounts[&ann];
+    assert_eq!(account.slug, "claude-ann-example");
+    assert_eq!(account.name.as_deref(), Some("claude ann@example.test"));
+    assert_eq!(view.slug(&ann), Some(account.slug.as_str()));
 
     let unbound = LabView::read(
         &cells,

@@ -30,6 +30,8 @@ pub(super) fn artifact(sha256: &str, tree_root: &str) -> Artifact {
         vendor: String::new(),
         protocol: "github-release".into(),
         provenance: None,
+        key: String::new(),
+        key_inputs: String::new(),
     }
 }
 

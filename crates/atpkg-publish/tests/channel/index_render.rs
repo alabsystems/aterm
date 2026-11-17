@@ -74,6 +74,11 @@ fn plan(rig: &Rig) -> Plan {
         added: Vec::new(),
         carried: Vec::new(),
         retired: Vec::new(),
+        trees: BTreeMap::from([(
+            "llvm-tree".to_string(),
+            BTreeMap::from([("a".repeat(64), 3)]),
+        )]),
+        added_trees: Vec::new(),
     }
 }
 
@@ -88,6 +93,8 @@ fn the_rendered_index_reads_back_through_the_client_field_for_field() {
     let index = &q.index;
     assert_eq!(index.schema, 2);
     assert_eq!(index.index_build, 42);
+    assert_eq!(index.trees, p.trees, "the keyed trees read back");
+    assert_eq!(index.tree_build("llvm-tree", &"a".repeat(64)), Some(3));
     assert_eq!(index.valid_until, p.valid_until);
     assert_eq!(index.attribution().machine_id, p.machine_id);
     assert_eq!(index.roster_seq(), p.roster_seq);

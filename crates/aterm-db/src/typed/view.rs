@@ -5,6 +5,7 @@
 
 use super::{
     self as typed, Collection, Table,
+    authority::Inert,
     cell::{self, Cells, Projection},
     grid,
     owned::{self, Op, OwnedRead, Quota, SchemaState},
@@ -29,8 +30,12 @@ pub struct View {
     /// Each writer's automatic records, and the ones past the table's `self_quota`, which never
     /// project.
     pub quota: Quota,
-    /// The projected cells without the past-quota records.
+    /// The projected cells without the past-quota records and without the writes the authority
+    /// rules hold inert ([`typed::authority`]).
     pub cells: Cells,
+    /// The writes the authority rules hold inert in the collections that opt into them: left out
+    /// of `cells`, kept in `ops` and in history.
+    pub inert: Inert,
     /// The owned collections' rows, past-quota records left out, each at its signer's own key.
     pub owned: BTreeMap<&'static str, OwnedRead>,
     /// No retained operation could still become visible here (`Log::awaited`: none waits on a
@@ -84,6 +89,7 @@ impl View {
             ops: Vec::new(),
             quota: Quota::default(),
             cells: Cells::new(),
+            inert: Inert::default(),
             owned: BTreeMap::new(),
             complete: true,
             awaiting: Awaiting::NONE,

@@ -343,7 +343,7 @@ fn through_word_at(text: &str, at: usize, most: usize) -> &str {
 }
 
 /// `text` cut at whole graphemes to `max` percent-encoded bytes, its trailing blanks trimmed.
-fn cut_to_encoded(text: &str, max: usize) -> String {
+pub(crate) fn cut_to_encoded(text: &str, max: usize) -> String {
     use aterm_grapheme::GraphemeClusters as _;
     let mut kept = text.len();
     if aterm_codec::pct::encoded_len(text) > max {
@@ -450,6 +450,14 @@ pub(crate) struct TaskRecord {
     pub(crate) started_unix_ms: u64,
     /// Monotonic instant when the task began.
     pub(crate) started: Instant,
+    /// THE STARTUP DEADLINE JUDGED THIS RECORD'S WORKER STARTED: by its screen, a proven claim, or
+    /// its program's own reports (`harness_host::look_at_startups`, [`note_task_took_up`]). It
+    /// rides the seamless-update carry row (`took_up=1`) so a successor, whose startup books start
+    /// empty and whose restored codex report keeps no turn at rest, judges only the held deadline
+    /// on it; a restore's row ([`restore_row`]) is that row and holds it too. A fact, not a mark: setting it moves no [`Self::rev`] and wakes no `await task`
+    /// waiter, and a mark keeps it ([`TaskMark::apply`]), as the deadline's own books keep a
+    /// started worker while its session stands.
+    pub(crate) took_up: bool,
     /// Revision at which the current state was entered.
     pub(crate) entered: u64,
     /// The `entered` this record arrived with from an earlier process ([`seed_carried`]), never
@@ -608,6 +616,9 @@ impl TaskRecord {
         if self.unfinished_exit {
             out.push_str(" unfinished_exit=1");
         }
+        if self.took_up {
+            out.push_str(" took_up=1");
+        }
         let ms = |stood: std::time::Duration| u64::try_from(stood.as_millis()).unwrap_or(u64::MAX);
         if self.started_unix_ms != self.since_unix_ms {
             out.push_str(&format!(" started={}", self.started_unix_ms));
@@ -659,7 +670,10 @@ impl TaskRecord {
     /// The words of carry row `row` ([`Self::carry_row`]) that a seamless update's claims fence
     /// compares between the park and the Commit ([`crate::session_store::CarriedClaims`]): all
     /// but its ages (`age_ms=`, `ran_ms=`), which grow while the record stands still. A mark
-    /// still moves the face, by its `rev=` at least.
+    /// still moves the face, by its `rev=` at least, and so does a fact that moves no rev but the
+    /// successor reads (`block=`, `took_up=1`): rightly, since one noted after the park would not
+    /// cross, and a successor without `took_up=1` judges its worker's start again
+    /// ([`TaskRecord::took_up`]). The fence refuses that Commit, and the next attempt carries it.
     #[must_use]
     pub(crate) fn carry_face(row: &str) -> String {
         row.split_whitespace()
@@ -750,6 +764,8 @@ impl TaskRecord {
             },
             finished: field("finished") == Some("1"),
             unfinished_exit: field("unfinished_exit") == Some("1"),
+            // An older predecessor's row has no `took_up=`: its successor judges the start again.
+            took_up: field("took_up") == Some("1"),
             result_bytes: parse_u64(field("result_bytes")?)?,
             result_path: match field("result_path") {
                 Some(path) => Some(result_path(path, tasks)?),
@@ -1117,6 +1133,7 @@ impl TaskMark {
                 since: now,
                 started_unix_ms: now_unix_ms,
                 started: now,
+                took_up: false,
                 entered: 1,
                 carried_entered: None,
                 agent: None,
@@ -1634,6 +1651,30 @@ pub(crate) fn mark_session_task_fact_if(
     outcome
 }
 
+/// Notes on `ctx`'s task record that the startup deadline judged its worker started
+/// ([`TaskRecord::took_up`]), where the record is still the one the deadline's look read (at
+/// revision `rev`) and still open (`working`, or `stalled`), under the lock a mark takes and the
+/// fence a committing update holds (waiting at most `fence_wait`), so a seamless update carries
+/// it or its claims fence sees it ([`TaskRecord::carry_face`]). A fact, not a mark: it moves no
+/// rev, changes no state, `why=` or attention, records no `task-change` and posts no wake, so no
+/// `await task` waiter wakes on it. Returns whether that record carries it now: false where the
+/// record moved, closed or went, or the fence held past `fence_wait`, and the deadline's next
+/// look writes it again.
+pub(crate) fn note_task_took_up(
+    ctx: &SessionCtx,
+    rev: u64,
+    fence_wait: std::time::Duration,
+) -> bool {
+    ctx.fabric
+        .run_unfenced(fence_wait, |_| {
+            ctx.timeline
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .note_task_took_up(rev)
+        })
+        .unwrap_or(false)
+}
+
 /// What [`TaskRecord`] the fact edit `word` makes of `current`, and the outcome: `None` for no
 /// move ([`mark_session_task_fact_if`]'s rules).
 pub(crate) fn fact_edit(
@@ -1943,8 +1984,9 @@ pub(crate) fn row_carried(row: &str) -> Vec<PathBuf> {
 /// already says it ran (a `why=`), reads `working why=restored`, which no startup or held deadline
 /// reads as one just spawned. One neither says of, in a shell a keeper handed back (`kept`), may
 /// never have had its line typed, and the launcher that would have typed it ended with the process:
-/// it reads `working` from now, so the startup deadline judges what its screen shows. Otherwise, where its agent is not coming
-/// back, it reads `exited why=exit`: gone (a plain quit forgets it, and no keeper handed its shell
+/// it reads `working` from now, so the startup deadline judges what its screen shows, unless its
+/// record carries a start a deadline judged before ([`TaskRecord::took_up`]), which only the held
+/// deadline then judges. Otherwise, where its agent is not coming back, it reads `exited why=exit`: gone (a plain quit forgets it, and no keeper handed its shell
 /// back), or a disposable worker whose shell did not come back running. A disk worker an earlier
 /// build left is disposable: nothing starts one now, so a cold restart never relaunches it
 /// ([`disposable_worker`]). Returns whether this is such a worker, whose agent the restore leaves
@@ -2107,6 +2149,14 @@ pub(crate) fn note_program_block(
                 .note_program_block(block)
         })
         .unwrap_or(false)
+}
+
+/// THE CREATOR A CARRIED TASK ROW NAMES (its `from=`), read as [`seed_carried`] reads the row,
+/// so it is the creator the seed will tell the session's log ([`TaskRecord::from_carry_row`]):
+/// `None` where there is no row or it does not read, as the seed then sets no record.
+pub(crate) fn carried_creator(row: Option<&str>) -> Option<String> {
+    TaskRecord::from_carry_row(row?, tasks_dir().as_deref(), Instant::now(), unix_ms_now())
+        .map(|record| record.from)
 }
 
 /// Restores a carried task record onto `ctx` during seamless-update adoption, with the asks the

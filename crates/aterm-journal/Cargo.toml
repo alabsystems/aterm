@@ -9,7 +9,6 @@ repository.workspace = true
 authors.workspace = true
 description = "Private astream journal acknowledged at a durable prefix checkpoint, with acknowledged-prefix recovery"
 [dependencies]
-libc.workspace = true
 aterm-codec.workspace = true
 aterm-digest.workspace = true
 aterm-durable.workspace = true
@@ -17,6 +16,13 @@ aterm-uds.workspace = true
 aterm-spec-anchor.workspace = true
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 astream-wire = { path = "../../vendor/astream/crates/astream-wire" }
+[target.'cfg(unix)'.dependencies]
+# Recovery's O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC open of the log.
+libc.workspace = true
+[target.'cfg(windows)'.dependencies]
+# A file's identity (volume serial and 128-bit file id) and link count, read from its handle:
+# a Windows `Metadata` carries neither. Already in the Windows graph under aterm-uds.
+aterm-dirfd.workspace = true
 [dev-dependencies]
 aterm-tempfile.workspace = true
 # The process-wide flush tally `tests/flushes.rs` reads.

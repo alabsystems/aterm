@@ -375,6 +375,9 @@ pub struct Row {
     pub plan: Vec<String>,
     /// What became of a candidate in a real run.
     pub fate: Option<Fate>,
+    /// A candidate's committed bound: the summed `within-secs` of its qualify list, read before
+    /// any step of the pass runs; `None` where no list was read.
+    pub bound: Option<u64>,
 }
 
 impl Row {
@@ -726,6 +729,7 @@ impl Bench<'_> {
             decision: Decision::Unpinned,
             plan: Vec::new(),
             fate: None,
+            bound: None,
         };
         // A refused or unpinned program's repository is never even read.
         if let (None, Some(pin)) = (&facts.refusal, facts.pin) {
@@ -829,6 +833,22 @@ fn pass(
         .filter(|def| def.is_plain())
         .map(|def| bench.gather(def, &registry, &view, &pins))
         .collect();
+    let candidates: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| row.decision == Decision::Qualify)
+        .map(|(i, _)| i)
+        .collect();
+    // Every candidate's list is read before any step runs, so the cheapest goes first and no
+    // program waits behind a list longer than its own.
+    for &i in &candidates {
+        rows[i].bound = bench
+            .list(&rows[i])
+            .ok()
+            .flatten()
+            .map(|plan| plan.steps().iter().map(|step| step.within.as_secs()).sum());
+    }
+    let candidates = cheapest_first(&candidates, &rows);
     say_table(tx, n, &rows);
 
     outcome.head = Some(n);
@@ -843,12 +863,6 @@ fn pass(
             _ => {}
         }
     }
-    let candidates: Vec<usize> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.decision == Decision::Qualify)
-        .map(|(i, _)| i)
-        .collect();
 
     if opts.dry_run {
         let mut unlisted = Vec::new();
@@ -989,6 +1003,29 @@ fn raise_floors(
     }
 }
 
+/// `candidates` in the order a pass qualifies them: those whose list was read by ascending
+/// committed bound ([`Row::bound`]), the program's name breaking a tie, in the places such
+/// candidates held; a candidate with no list read keeps its own place (and its red).
+fn cheapest_first(candidates: &[usize], rows: &[Row]) -> Vec<usize> {
+    let mut listed: Vec<usize> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| rows[i].bound.is_some())
+        .collect();
+    listed.sort_by_key(|&i| (rows[i].bound, rows[i].program.name));
+    let mut listed = listed.into_iter();
+    candidates
+        .iter()
+        .map(|&i| {
+            if rows[i].bound.is_some() {
+                listed.next().unwrap_or(i)
+            } else {
+                i
+            }
+        })
+        .collect()
+}
+
 fn say_table(tx: &Transcript, n: u64, rows: &[Row]) {
     tx.say(format!(
         "decision table for atpkg-index-{n} (each program's dev main, frozen once):"
@@ -998,6 +1035,7 @@ fn say_table(tx: &Transcript, n: u64, rows: &[Row]) {
         "PINNED".into(),
         "MAIN".into(),
         "MAIN-BUILD".into(),
+        "BOUND".into(),
         "DECISION".into(),
     ]];
     for r in rows {
@@ -1010,6 +1048,7 @@ fn say_table(tx: &Transcript, n: u64, rows: &[Row]) {
             r.frozen
                 .as_ref()
                 .map_or_else(|| "—".into(), |f| f.build.to_string()),
+            r.bound.map_or_else(|| "—".into(), |b| format!("{b} s")),
             r.render(n),
         ]);
     }
@@ -1091,7 +1130,7 @@ impl Bench<'_> {
     fn plan(&mut self, row: &Row) -> (Vec<String>, bool) {
         let def = row.program;
         let name = def.name;
-        let (Some(frozen), Ok((dir, _))) = (&row.frozen, self.freeze(def)) else {
+        let (Some(frozen), Ok(_)) = (&row.frozen, self.freeze(def)) else {
             return (vec![format!("[{name}] no frozen main to plan from")], false);
         };
         let mut lines = vec![format!(
@@ -1101,26 +1140,7 @@ impl Bench<'_> {
             frozen.build,
             row.pin.unwrap_or(0)
         )];
-        let src = self.work.join("src").join(def.repo);
-        let listed = (|| {
-            if !may_declare_list(&dir, frozen).map_err(Error::refused)? {
-                return Ok(None);
-            }
-            if !src.is_dir() {
-                crate::git::run(
-                    &dir,
-                    &[
-                        "worktree",
-                        "add",
-                        "--quiet",
-                        "--detach",
-                        &src.display().to_string(),
-                        &frozen.sha,
-                    ],
-                )?;
-            }
-            qualify::parse(&self.deps.backend.metadata(self.ctx, &src)?, name)
-        })();
+        let listed = self.list(row);
         let qualified = matches!(listed, Ok(Some(_)));
         match listed {
             Ok(Some(plan)) => {
@@ -1148,6 +1168,34 @@ impl Bench<'_> {
             )),
         }
         (lines, qualified)
+    }
+
+    /// A candidate's qualify list, read from its frozen commit in the run's scratch checkout
+    /// (`Ok(None)`: its repository declares none at that commit).
+    fn list(&mut self, row: &Row) -> Result<Option<qualify::Plan>> {
+        let def = row.program;
+        let Some(frozen) = &row.frozen else {
+            return Ok(None);
+        };
+        let (dir, _) = self.freeze(def).map_err(Error::refused)?;
+        if !may_declare_list(&dir, frozen).map_err(Error::refused)? {
+            return Ok(None);
+        }
+        let src = self.work.join("src").join(def.repo);
+        if !src.is_dir() {
+            crate::git::run(
+                &dir,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    &src.display().to_string(),
+                    &frozen.sha,
+                ],
+            )?;
+        }
+        qualify::parse(&self.deps.backend.metadata(self.ctx, &src)?, def.name)
     }
 
     /// Hold one frozen candidate to its repository's list, pack it, run its packed controls,

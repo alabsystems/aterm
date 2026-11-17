@@ -197,17 +197,23 @@ fn repair_commons_with(
                 incoming.join().unwrap().unwrap();
             });
             if require_complete {
-                for repair in [&*left, &*right] {
-                    assert!(
-                        repair.membership_error().is_none()
-                            && repair.application_error().is_none()
-                            && repair.application().is_some(),
-                        "Commons application round did not complete: membership={:?}, application={:?}, phase={:?}",
-                        repair.membership_error(),
-                        repair.application_error(),
-                        repair.phase()
-                    );
-                }
+                // Each side's errors, the responder's too: an initiator often sees only that its
+                // peer hung up, and the peer's report says why.
+                let complete = |repair: &Repair| {
+                    repair.membership_error().is_none()
+                        && repair.application_error().is_none()
+                        && repair.application().is_some()
+                };
+                assert!(
+                    complete(left) && complete(right),
+                    "Commons application round did not complete: initiator membership={:?}, application={:?}, phase={:?}; responder (Mac {peer}) membership={:?}, application={:?}, phase={:?}",
+                    left.membership_error(),
+                    left.application_error(),
+                    left.phase(),
+                    right.membership_error(),
+                    right.application_error(),
+                    right.phase()
+                );
             }
             reports[0].extend(left.application());
             reports[peer].extend(right.application());

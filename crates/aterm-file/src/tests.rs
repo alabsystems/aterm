@@ -2052,6 +2052,110 @@ fn an_intent_leaves_the_outbox_only_marked_or_held_and_a_held_one_is_shown_not_a
     );
 }
 
+/// A read made while a pass writes, after its frontier and before the snapshot that frontier is
+/// for, lays this Mac's published write over the older snapshot, which does not hold it, and
+/// names its cell among the pending ones; a settle made then marks nothing seen. Only the status,
+/// which a pass writes last, says which frontier the snapshot it names was projected from, so the
+/// write stays laid over a snapshot the pass wrote before its status until the pass records
+/// (tracker package FL-170). A held write is marked and pending.
+///
+/// NEGATIVE CONTROLS, each observed: with `File::vouched` answering the frontier file whatever
+/// fingerprint the status records, the read in the pass's window shows the older snapshot's empty
+/// label: `left: "" right: "mine"`; with it not comparing the snapshot's revision and content
+/// with the status's, a snapshot the status does not name is vouched for: `assertion failed:
+/// file.projected_from().is_none()`.
+#[test]
+fn a_read_while_a_pass_writes_still_shows_this_macs_published_write() {
+    let scratch = scratch();
+    let accounts_file = name("ai/accounts");
+    let file = File::at(&scratch.root, &accounts_file);
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1]), Some(accounts(vec![ada()]))),
+        10,
+    )
+    .expect("recorded");
+    let pk = ada().pk;
+    let theirs = ada().cell("label").to_owned();
+    let intent = file
+        .write(
+            &person(),
+            draft(vec![edit(&pk, "label", "mine", &[&op(1)])]),
+            20,
+        )
+        .expect("accepted");
+    assert!(mark_done(&file, &intent.id, &mark(Some(op(2))), 30));
+    assert!(dequeue(&file, &intent.id));
+    let shown = |file: &File| {
+        file.read()
+            .rows()
+            .iter()
+            .find(|row| row.pk == pk)
+            .map(|row| row.cell("label").to_owned())
+            .unwrap_or_default()
+    };
+    let pending = |file: &File| file.published_pending().1;
+    let cell = (pk.clone(), "label".to_owned());
+    // The pass that projects the operation has written its frontier and nothing else yet.
+    let projecting = frontier(0, &[1, 2]);
+    std::fs::write(scratch.root.frontier(&accounts_file), projecting.encode())
+        .expect("the frontier");
+    assert_eq!(shown(&file), "mine");
+    assert!(pending(&file).contains(&cell));
+    assert_eq!(file.published_pending().0.rows()[0].cell("label"), theirs);
+    file.settle_done().expect("settled");
+    assert!(!file.outbox().done[0].seen, "the snapshot does not hold it");
+    // Then its snapshot, and not yet the status that says which frontier it was projected
+    // from: nothing vouches for the pair yet, and the write stays laid over it.
+    let mut snapshot = accounts(vec![ada()]);
+    snapshot.rev = 2;
+    std::fs::write(scratch.root.snapshot(&accounts_file), snapshot.encode()).expect("the snapshot");
+    assert_eq!(shown(&file), "mine");
+    assert!(pending(&file).contains(&cell));
+    file.settle_done().expect("settled");
+    assert!(!file.outbox().done[0].seen, "no status vouches for it");
+    // The pass records.
+    file.record(
+        file.look().expect("a look"),
+        opened(true, frontier(0, &[1, 2]), Some(accounts(vec![ada()]))),
+        40,
+    )
+    .expect("recorded");
+    // The status names that frontier for the snapshot it recorded, and for no other beside
+    // it: one at another revision, or of other content at that revision (put back from a
+    // copy, written by another hand).
+    let path = scratch.root.snapshot(&accounts_file);
+    let recorded = std::fs::read(&path).expect("the recorded snapshot");
+    let rev = file.state().expect("a status").rev;
+    for (rows, rev) in [(vec![ada()], rev + 1), (vec![ada(), ada_at_oai()], rev)] {
+        let mut other = accounts(rows);
+        other.rev = rev;
+        std::fs::write(&path, other.encode()).expect("another snapshot");
+        assert!(file.projected_from().is_none());
+        assert_eq!(shown(&file), "mine");
+        assert!(pending(&file).contains(&cell));
+        file.settle_done().expect("settled");
+        assert!(!file.outbox().done[0].seen, "not the snapshot it names");
+    }
+    std::fs::write(&path, &recorded).expect("the recorded snapshot");
+    assert_eq!(shown(&file), theirs);
+    assert!(pending(&file).is_empty());
+    file.settle_done().expect("settled");
+    assert!(file.outbox().done[0].seen);
+    // A held write is marked, and pending.
+    let held = file
+        .write(
+            &person(),
+            draft(vec![edit(&pk, "label", "mine again", &[&op(1)])]),
+            50,
+        )
+        .expect("accepted");
+    assert!(pending(&file).contains(&cell), "queued, it is pending");
+    assert!(hold(&file, &held.id, "changed since it was written", 60));
+    assert_eq!(shown(&file), format!("⚠ mine again ‖ {theirs}"));
+    assert!(pending(&file).contains(&cell), "held, it is pending");
+}
+
 /// An outbox write whose rename landed and whose folder's flush then failed is accepted: the
 /// intent is queued and the answer says the flush failed, never a refusal that would have the
 /// person write it a second time.

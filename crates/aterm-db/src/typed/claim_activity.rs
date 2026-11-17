@@ -197,7 +197,7 @@ impl Activity {
                 }
                 rows.entry(key.pk.into())
                     .or_default()
-                    .insert(operation.id, (value, operation.revert));
+                    .insert(operation.id, (value, operation.revert.is_some()));
             }
         }
         let ordered = index.project().ordered;

@@ -1188,6 +1188,24 @@ pub(crate) fn seed_adopted_rows(
     }
 }
 
+/// SAY WHO AN ADOPTED SESSION IS BEFORE ITS CARRIED LOG IS READ ([`mark_handoff_gap`]): its own
+/// sid `sid`, as its registration will say it, and the creator its carried task row `task` names,
+/// as the task seed will say it ([`crate::task_record::carried_creator`]). The carry's claims are
+/// then ranked and keyed for the card under that identity as they are read
+/// ([`aterm_slog::CarryAdopt::ident`]), and the later tells repeat it, so none of them moves the
+/// card's revision.
+pub(crate) fn tell_adopted_ident(
+    timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
+    sid: &str,
+    task: Option<&str>,
+) {
+    let creator = crate::task_record::carried_creator(task);
+    let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let slog = tl.slog_mut();
+    slog.set_desc_own(sid);
+    slog.set_desc_creator(creator.as_deref());
+}
+
 /// Mark an adopted session's timeline, cast and temporal recorder as starting at the handoff
 /// ([`crate::session_timeline::HandoffGap`]), since none of them crosses the update.
 pub(crate) fn mark_handoff_gap(
@@ -1206,6 +1224,8 @@ pub(crate) fn mark_handoff_gap(
         tl.continue_ids(timeline_id);
         let at = tl.slog().now();
         tl.slog_mut().adopt(log, keeper, from_build, at);
+        // After the adoption, whose newest seq bounds the claims the update carried.
+        tl.note_unread_after_update();
         tl.record("handoff");
     }
     cast.lock()
@@ -1331,19 +1351,27 @@ pub(crate) fn adopted_log(
     }
 }
 
-/// The adopted log meets its engine.
+/// The adopted log meets its engine, and the timeline takes the folder the engine reports
+/// ([`crate::session_timeline::SessionTimeline::seed_adopted_cwd`]): called before the session is
+/// registered, so aterm's default writer's first read of it already holds that folder.
 pub(crate) fn fit_adopted_log(
     term: &Mutex<Terminal>,
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
 ) {
-    let (next_block, started) = {
+    use crate::cwd_native::ReportedCwd as _;
+    let (next_block, started, cwd) = {
         let engine = term_lock(term);
-        (engine.next_block_id(), engine.started_command_seq())
+        (
+            engine.next_block_id(),
+            engine.started_command_seq(),
+            engine
+                .native_working_directory()
+                .map(std::borrow::Cow::into_owned),
+        )
     };
-    timeline
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .slog_fit_engine(next_block, started);
+    let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
+    tl.slog_fit_engine(next_block, started);
+    tl.seed_adopted_cwd(cwd.as_deref());
 }
 
 /// Install an adopted session's carried archive ([`hydrate_adopted_engine`]), logging rows it
@@ -1914,6 +1942,7 @@ pub(crate) fn spawn_session(
     }
     let adopt_log = adopted_log(&adopt_log, adopt_control.as_mut());
     if adopted {
+        tell_adopted_ident(&ctx.timeline, ctx.self_id.as_str(), adopt_task.as_deref());
         mark_handoff_gap(
             &ctx.timeline,
             &ctx.cast,

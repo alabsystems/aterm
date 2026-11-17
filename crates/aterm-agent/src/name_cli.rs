@@ -317,11 +317,9 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
             for note in notes {
                 eprintln!("aterm name: {}", note.text(&state));
             }
-            #[cfg(target_os = "macos")]
-            let system: Option<&dyn publish::SystemNames> = Some(&SystemNaming);
-            #[cfg(not(target_os = "macos"))]
-            let system: Option<&dyn publish::SystemNames> = None;
-            if !dry_run && let Err(pending) = publish::publish(&state, &config, &policy, system) {
+            if !dry_run
+                && let Err(pending) = publish::publish(&state, &config, &policy, system_naming())
+            {
                 eprintln!(
                     "aterm name: {} was requested; publication pending: {}; inspect the current name before retrying",
                     to.num,
@@ -346,6 +344,18 @@ fn set(to: &Name, dry_run: bool, json: bool) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// The port a rename publishes macOS's names through: [`SystemNaming`].
+#[cfg(target_os = "macos")]
+fn system_naming() -> Option<&'static dyn crate::machine_name::publish::SystemNames> {
+    Some(&SystemNaming)
+}
+
+/// The port a rename publishes macOS's names through: none, off macOS.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn system_naming() -> Option<&'static dyn crate::machine_name::publish::SystemNames> {
+    None
 }
 
 /// CLI and menu publication share the application's existing noninteractive rule.
@@ -666,9 +676,7 @@ mod unix {
     use std::io;
     use std::path::Path;
 
-    use aterm_net::fleet_member::name_record::ByKind;
     use aterm_net::fleet_member::read_node_identity;
-    use aterm_types::machine_name::Nickname;
 
     use aterm_secrets::client::Paths;
 
@@ -691,6 +699,18 @@ mod unix {
         }
     }
 
+    /// [`followed`], then the number an owner wrote to this Mac's own registry row, published as
+    /// `aterm name set` publishes a number ([`crate::machine_name::renumber_from_registry`]), as
+    /// a read that shows the name takes both. An undo's own read runs only [`followed`], so the
+    /// undo never renumbers the Mac on its way; the change it takes back, History's newest as
+    /// that read showed it, may be one an earlier read followed from the row
+    /// ([`crate::machine_name::file::Why::Registry`]), which it reverts as it reverts any rename.
+    fn shown_name(state: &Path, name: MachineName, now_ms: u64) -> MachineName {
+        let name = followed(state, name, now_ms);
+        crate::machine_name::renumber_from_registry(state, super::system_naming(), now_ms)
+            .unwrap_or(name)
+    }
+
     /// The report of this machine's name in `state`, made first where no file is there
     /// ([`ensure_in_view`], whose first-name sources are the registry, roster and legacy name;
     /// a read of a name already made opens no naming source but this Mac's own registry row,
@@ -711,7 +731,7 @@ mod unix {
         let narrowed =
             aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
         let (name, origin) = ensure_in_view(state, roster, now_ms).map_err(|e| e.to_string())?;
-        let name = followed(state, name, now_ms);
+        let name = shown_name(state, name, now_ms);
         let me = report_node(state);
         let shown = Shown {
             name: &name,
@@ -752,8 +772,8 @@ mod unix {
         DryRun,
         /// A rename preview changed nothing.
         NameDryRun,
-        /// What became of the nickname's write to this Mac's lab registry row
-        /// ([`crate::machine_name::registry::Written::note`]).
+        /// What became of a rename's write to this Mac's lab registry row, the nickname and the
+        /// number it changed as one intent ([`crate::machine_name::registry::offer`]).
         Registry(String),
     }
 
@@ -817,11 +837,13 @@ mod unix {
     ) -> io::Result<(String, Vec<Note>)> {
         let NameAsk { to, kind, dry_run } = *ask;
         let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
-        if let Some(word) = &to.nick {
-            refused_by_registry(state, word)?;
-        }
         let lab = || crate::machine_name::lab_labels(vault);
-        let set = crate::machine_name::set_name(state, to, lab, kind, roster, now_ms, dry_run)?;
+        let session = session();
+        let asker = crate::machine_name::Asker {
+            kind,
+            session: session.as_deref(),
+        };
+        let set = crate::machine_name::set_name(state, to, lab, asker, roster, now_ms, dry_run)?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
         if !set.changed {
@@ -833,7 +855,7 @@ mod unix {
         if dry_run {
             notes.push(Note::NameDryRun);
         }
-        registered(state, &set.name, kind, dry_run, &mut notes);
+        registered(state, set.queued.as_ref(), &mut notes);
         let shown = Shown {
             name: &set.name,
             origin: set.origin,
@@ -843,39 +865,25 @@ mod unix {
         Ok((if json { shown.json() } else { shown.line() }, notes))
     }
 
-    /// Refuse, before anything changes, a nickname this Mac's lab registry row would refuse
-    /// ([`crate::machine_name::registry::refusal`]), so the file and the row never part over it.
-    fn refused_by_registry(state: &Path, word: &Nickname) -> io::Result<()> {
-        match crate::machine_name::registry::refusal(state, word) {
-            Some(why) => Err(io::Error::other(format!(
-                "the lab registry refuses that nickname ({why}); no name changed"
-            ))),
-            None => Ok(()),
-        }
+    /// The aterm session this command runs in, which a rename's registry write names.
+    fn session() -> Option<String> {
+        std::env::var("ATERM_SESSION_ID")
+            .ok()
+            .filter(|session| !session.is_empty())
     }
 
-    /// Once a change is made (not a dry run), write the nickname `name` holds to this Mac's lab
-    /// registry row, where `state` is this account's live naming state, saying what became of
-    /// it among `notes`.
+    /// Publish the write a change `queued` to this Mac's lab registry row, the nickname it
+    /// changed and a number it moved to as one (none for a dry run, a row that says it already,
+    /// or no row of this Mac's), where `state` is this account's live naming state, saying what
+    /// became of it among `notes` ([`crate::machine_name::registry::offer`]).
     fn registered(
         state: &Path,
-        name: &MachineName,
-        kind: ByKind,
-        dry_run: bool,
+        queued: Option<&crate::machine_name::registry::Queued>,
         notes: &mut Vec<Note>,
     ) {
-        if dry_run {
-            return;
-        }
-        let session = std::env::var("ATERM_SESSION_ID").ok();
-        let written = crate::machine_name::registry::write_nick(
-            state,
-            &name.nick,
-            kind,
-            session.as_deref().filter(|session| !session.is_empty()),
-            crate::machine_name::registry::INLINE,
-        );
-        if let Some(note) = written.note() {
+        if let Some(note) =
+            queued.and_then(|write| crate::machine_name::registry::offer(state, write))
+        {
             notes.push(Note::Registry(note));
         }
     }
@@ -897,10 +905,12 @@ mod unix {
     ) -> io::Result<(String, Vec<Note>)> {
         let NickAsk { to, kind, dry_run } = *ask;
         let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
-        if let crate::machine_name::NickTo::Word(word) = to {
-            refused_by_registry(state, word)?;
-        }
-        let set = crate::machine_name::set_nick(state, to, kind, roster, now_ms, dry_run)?;
+        let session = session();
+        let asker = crate::machine_name::Asker {
+            kind,
+            session: session.as_deref(),
+        };
+        let set = crate::machine_name::set_nick(state, to, asker, roster, now_ms, dry_run)?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
         let nick = set.name.display_nick();
@@ -913,7 +923,7 @@ mod unix {
         if dry_run {
             notes.push(Note::DryRun);
         }
-        registered(state, &set.name, kind, dry_run, &mut notes);
+        registered(state, set.queued.as_ref(), &mut notes);
         let shown = Shown {
             name: &set.name,
             origin: set.origin,
@@ -945,7 +955,12 @@ mod unix {
         } = *ask;
         let narrowed = aterm_uds::private_file::ensure_private_dir(state)?;
         let lab = || crate::machine_name::lab_labels(vault);
-        let set = crate::machine_name::undo_last(state, seen, lab, kind, roster, now_ms, dry_run)?;
+        let session = session();
+        let asker = crate::machine_name::Asker {
+            kind,
+            session: session.as_deref(),
+        };
+        let set = crate::machine_name::undo_last(state, seen, lab, asker, roster, now_ms, dry_run)?;
         let me = report_node(state);
         let mut notes: Vec<Note> = narrowed.into_iter().map(Note::Narrowed).collect();
         if set.shared {
@@ -954,7 +969,7 @@ mod unix {
         if dry_run {
             notes.push(Note::NameDryRun);
         }
-        registered(state, &set.name, kind, dry_run, &mut notes);
+        registered(state, set.queued.as_ref(), &mut notes);
         let shown = Shown {
             name: &set.name,
             origin: set.origin,
@@ -980,7 +995,7 @@ mod unix {
         let narrowed =
             aterm_uds::private_file::ensure_private_dir(state).map_err(|e| e.to_string())?;
         let (name, _) = ensure_in_view(state, roster, now_ms).map_err(|e| e.to_string())?;
-        let name = followed(state, name, now_ms);
+        let name = shown_name(state, name, now_ms);
         let text = if json {
             let changes = name.history.iter().map(change_json).collect();
             let mut text =

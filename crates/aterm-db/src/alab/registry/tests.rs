@@ -327,6 +327,388 @@ fn an_account_is_live_only_under_the_key_its_rows_derive() {
     passes(&mut [vec![put(&ACCOUNT, &stale, "status", json!("paused"))]]);
 }
 
+/// Live accounts `claude ann`, `claude bob`, `grok ann` and `codex ann`, each born as `add
+/// account` births one, over live address rows; `ann`'s Claude account labelled `desk` by the
+/// owner where `desk`.
+fn accounts(desk: bool) -> (Cells, [String; 4]) {
+    let mut book = Book::new();
+    let (ann, bob) = (pk("ann"), pk("bob"));
+    let mut changes = row(&ann, &at("ann"));
+    changes.extend(row(&bob, &at("bob")));
+    let keys = [
+        ("claude", "ann", &ann),
+        ("claude", "bob", &bob),
+        ("grok", "ann", &ann),
+        ("codex", "ann", &ann),
+    ]
+    .map(|(realm, local, login)| {
+        let key = keys::account_pk(realm, &at(local)).unwrap();
+        changes.extend([
+            put(&ACCOUNT, &key, "realm", json!(realm)),
+            put(&ACCOUNT, &key, "login", json!(login)),
+            put(&ACCOUNT, &key, "row", json!("live")),
+        ]);
+        key
+    });
+    if desk {
+        changes.push(put(&ACCOUNT, &keys[0], "label", json!("desk")));
+    }
+    book.write(1, &[], changes);
+    (book.cells(), keys)
+}
+
+/// An account's `realm` holds the realm's own word: a write of another spelling of it (`oai`,
+/// `openai`, `Claude`, `xai`) is refused naming the word to write, though the key it derives is
+/// the row's own, and so is a word no realm goes by, never quoting what was typed; a new grid row
+/// is refused alike, before any key is made from it. The canonical word passes.
+/// NEGATIVE CONTROL: with the `realm` arm of `guard`'s first pass removed, `oai` on the Codex
+/// account passes, the key it derives being the row's: `` panicked … refused: oai ``.
+#[test]
+fn an_accounts_realm_holds_the_realms_own_word() {
+    let (cells, [claude, _, grok, codex]) = accounts(false);
+    let write = |realm: &str, key: &str| {
+        guard(
+            &mut [vec![put(&ACCOUNT, key, "realm", json!(realm))]],
+            &cells,
+        )
+        .unwrap()
+    };
+    let refused = |realm: &str, key: &str| {
+        let refusal = write(realm, key).unwrap_or_else(|| panic!("refused: {realm}"));
+        assert_eq!(
+            (refusal.pk.as_str(), refusal.column.as_str()),
+            (key, "realm")
+        );
+        refusal.rule
+    };
+    for (word, key, canonical) in [
+        ("oai", &codex, "codex"),
+        ("openai", &codex, "codex"),
+        ("Claude", &claude, "claude"),
+        ("xai", &grok, "grok"),
+    ] {
+        let rule = refused(word, key);
+        assert!(rule.contains(&format!("`{canonical}`")), "{word}: {rule}");
+    }
+    let unknown = refused("nowhere", &claude);
+    assert!(
+        unknown.contains("codex") && !unknown.contains("nowhere"),
+        "{unknown}"
+    );
+    assert_eq!(write("codex", &codex), None);
+    assert_eq!(write("claude", &claude), None);
+    let born = |realm: &str| {
+        birth(
+            &ACCOUNT,
+            &BTreeMap::from([
+                ("realm".to_owned(), json!(realm)),
+                ("login".to_owned(), json!(pk("bob"))),
+            ]),
+            &cells,
+        )
+    };
+    let oai = born("oai").unwrap_err().to_string();
+    assert!(oai.contains("`codex`"), "{oai}");
+    assert_eq!(
+        born("codex").unwrap(),
+        keys::account_pk("codex", &at("bob")).unwrap()
+    );
+}
+
+/// An owner's label names its account by the slug it makes, so a label is refused where it makes
+/// none (an xAI handle of 20 bytes, an xAI key's shape; the label's type, a handle, admits no
+/// other) and where its slug is one another account goes by now (its derived slug, the owner's
+/// label of another account, its 16-hex slug) or another label of the same save makes. A label
+/// whose slug is free, or is the account's own already, passes, as does an xAI handle of 19
+/// bytes. The refusals name keys, never an address.
+/// NEGATIVE CONTROLS: with `label_refusal` returning `None`, `ann-example` on bob's account
+/// passes and moves ann's slug: `` held: derived ``; with `making` left out, two labels of one
+/// slug in one save pass: `` held: one save ``.
+#[test]
+fn an_owners_label_never_takes_a_slug_another_account_goes_by() {
+    let (cells, [ann, bob, grok, _]) = accounts(false);
+    let label = |key: &str, text: &str| put(&ACCOUNT, key, "label", json!(text));
+    let refused = |case: &str, cells: &Cells, rows: &mut [Vec<Change>]| {
+        let refusal = guard(rows, cells).unwrap().expect(case);
+        assert_eq!(refusal.column, "label", "{case}");
+        let text = Error::from(refusal.clone()).to_string();
+        assert!(!text.contains('@'), "{case}: {text}");
+        refusal
+    };
+    let passes = |cells: &Cells, rows: &mut [Vec<Change>]| {
+        assert_eq!(guard(rows, cells).unwrap(), None);
+    };
+    // Its derived slug: `claude-ann-example`.
+    let derived = refused(
+        "held: derived",
+        &cells,
+        &mut [vec![label(&bob, "ann-example")]],
+    );
+    assert_eq!(derived.pk, bob);
+    assert!(
+        derived.rule.contains(&ann) && derived.rule.contains("`claude-ann-example`"),
+        "{derived:?}"
+    );
+    passes(&cells, &mut [vec![label(&bob, "bob")]]);
+    passes(&cells, &mut [vec![label(&bob, "bob-example")]]);
+    passes(&cells, &mut [vec![label(&grok, "ann-example")]]);
+    let one_save = refused(
+        "held: one save",
+        &cells,
+        &mut [vec![label(&ann, "desk")], vec![label(&bob, "desk")]],
+    );
+    assert!(one_save.rule.contains("`claude-desk`"), "{one_save:?}");
+    // Another account's owner label, and its 16-hex slug.
+    let (named, _) = accounts(true);
+    let owner = refused("held: owner", &named, &mut [vec![label(&bob, "desk")]]);
+    assert!(owner.rule.contains(&ann), "{owner:?}");
+    passes(&named, &mut [vec![label(&ann, "desk")]]);
+    let reserved = refused(
+        "held: reserved",
+        &cells,
+        &mut [vec![label(&bob, &ann[3..])]],
+    );
+    assert!(reserved.rule.contains(&ann), "{reserved:?}");
+    // No slug.
+    let none = refused(
+        "no slug",
+        &cells,
+        &mut [vec![label(&grok, "andrew-yates-research")]],
+    );
+    assert!(none.rule.contains("names no account"), "{none:?}");
+    passes(&cells, &mut [vec![label(&grok, "yates-research-lab1")]]);
+}
+
+/// An owner's label never makes a slug spelled like a label a Mac's roster row of another account
+/// carries, which the fleet fold resolves to that account: its legacy label (`kimi-m16`, the
+/// `<cli>-<machine>` shape the importer kept) or the default an earlier build gave rows
+/// (`claude-<6 hex>`). The label `m16` on another Kimi account is refused naming the account
+/// whose row it is, as is the 6 hex of Ann's key on Bob's Claude account; either passes on the
+/// account whose row it is, and on an account of another provider word.
+/// NEGATIVE CONTROL: with `label_refusal` holding slugs alone (its legacy and earlier-label loop
+/// removed), `m16` on the second Kimi account passes: `` panicked … held: legacy ``.
+#[test]
+fn an_owners_label_never_spells_another_accounts_row_label() {
+    let mut book = Book::new();
+    let (ann, bob) = (pk("ann"), pk("bob"));
+    let mut changes = row(&ann, &at("ann"));
+    changes.extend(row(&bob, &at("bob")));
+    let keys = [
+        ("kimi:global", "ann", &ann),
+        ("kimi:global", "bob", &bob),
+        ("claude", "ann", &ann),
+        ("claude", "bob", &bob),
+    ]
+    .map(|(realm, local, login)| {
+        let key = keys::account_pk(realm, &at(local)).unwrap();
+        changes.extend([
+            put(&ACCOUNT, &key, "realm", json!(realm)),
+            put(&ACCOUNT, &key, "login", json!(login)),
+            put(&ACCOUNT, &key, "row", json!("live")),
+        ]);
+        key
+    });
+    let [kimi_ann, kimi_bob, claude_ann, claude_bob] = &keys;
+    changes.push(put(&ACCOUNT, kimi_ann, "legacy_label", json!("kimi-m16")));
+    book.write(1, &[], changes);
+    let cells = book.cells();
+    let label = |key: &str, text: &str| put(&ACCOUNT, key, "label", json!(text));
+    let refused = |case: &str, rows: &mut [Vec<Change>]| {
+        let refusal = guard(rows, &cells).unwrap().expect(case);
+        assert_eq!(refusal.column, "label", "{case}");
+        let text = Error::from(refusal.clone()).to_string();
+        assert!(!text.contains('@'), "{case}: {text}");
+        refusal
+    };
+    let passes = |rows: &mut [Vec<Change>]| assert_eq!(guard(rows, &cells).unwrap(), None);
+    let legacy = refused("held: legacy", &mut [vec![label(kimi_bob, "m16")]]);
+    assert_eq!(legacy.pk, *kimi_bob);
+    assert!(
+        legacy.rule.contains(kimi_ann.as_str()) && legacy.rule.contains("`kimi-m16`"),
+        "{legacy:?}"
+    );
+    passes(&mut [vec![label(kimi_ann, "m16")]]);
+    passes(&mut [vec![label(claude_bob, "m16")]]);
+    let earlier = keys::earlier_row_label("claude", claude_ann).unwrap();
+    let hex = earlier.strip_prefix("claude-").unwrap();
+    let held = refused("held: earlier", &mut [vec![label(claude_bob, hex)]]);
+    assert!(held.rule.contains(claude_ann.as_str()), "{held:?}");
+    passes(&mut [vec![label(claude_ann, hex)]]);
+}
+
+/// An account's provider is its realm's: a birth or a write whose `provider` is another
+/// provider's key is refused on `provider`, naming the one to write, and the realm's own passes.
+/// NEGATIVE CONTROL: with the provider check after `guard`'s keyed checks removed, `openai` on the
+/// Claude account passes: `` panicked … refused: openai ``.
+#[test]
+fn an_accounts_provider_is_its_realms() {
+    let (cells, [claude, _, grok, _]) = accounts(false);
+    let write = |key: &str, provider: &str| {
+        guard(
+            &mut [vec![put(&ACCOUNT, key, "provider", json!(provider))]],
+            &cells,
+        )
+        .unwrap()
+    };
+    for (key, provider, own) in [
+        (&claude, "openai", "anthropic"),
+        (&grok, "anthropic", "xai"),
+    ] {
+        let refusal = write(key, provider).unwrap_or_else(|| panic!("refused: {provider}"));
+        assert_eq!(
+            (refusal.pk.as_str(), refusal.column.as_str()),
+            (key.as_str(), "provider")
+        );
+        assert!(refusal.rule.contains(&format!("`{own}`")), "{refusal:?}");
+    }
+    assert_eq!(write(&claude, "anthropic"), None);
+    assert_eq!(write(&grok, "xai"), None);
+}
+
+/// An account's provider and realm are written once, at its birth (`typed::check::
+/// fixed_after_birth`, which `att::Compiled::rules` runs before the table's own guard): a write
+/// to either on a row already born is refused on that column, while a birth that writes them
+/// with its lifecycle, a column that is not fixed, a write that restates the one value the cell
+/// holds (what a revert of an inert write there restores) and a revert that restores a fixed
+/// cell's absence pass; a row a revert returned to unborn may be born again.
+/// NEGATIVE CONTROL: with `fixed_after_birth` reading no row as born (`born` false), the
+/// provider written on the Claude account passes: `` panicked … refused: provider ``.
+#[test]
+fn an_accounts_provider_and_realm_are_written_once_at_its_birth() {
+    let (cells, [claude, ..]) = accounts(false);
+    let rules = |rows: &[Vec<Change>], cells: &Cells| {
+        crate::typed::check::fixed_after_birth(&REGISTRY_3, rows, cells)
+    };
+    for (column, value) in [("provider", "anthropic"), ("realm", "codex")] {
+        let refusal = rules(
+            &[vec![put(&ACCOUNT, &claude, column, json!(value))]],
+            &cells,
+        )
+        .unwrap_or_else(|| panic!("refused: {column}"));
+        assert_eq!(
+            (
+                refusal.collection,
+                refusal.pk.as_str(),
+                refusal.column.as_str()
+            ),
+            (ACCOUNT.name, claude.as_str(), column)
+        );
+        assert!(refusal.rule.contains("written once"), "{refusal:?}");
+    }
+    assert_eq!(
+        rules(
+            &[vec![put(&ACCOUNT, &claude, "status", json!("paused"))]],
+            &cells
+        ),
+        None
+    );
+    assert_eq!(
+        rules(
+            &[vec![put(&ACCOUNT, &claude, "realm", json!("claude"))]],
+            &cells
+        ),
+        None,
+        "a restatement"
+    );
+    let restored = Change {
+        collection: ACCOUNT.name.to_owned(),
+        key: format!("{claude}.provider"),
+        value: None,
+    };
+    assert_eq!(rules(&[vec![restored]], &cells), None);
+    let new = keys::account_pk("claude", &at("cy")).unwrap();
+    let birth = vec![
+        put(&ACCOUNT, &new, "provider", json!("anthropic")),
+        put(&ACCOUNT, &new, "realm", json!("claude")),
+        put(&ACCOUNT, &new, "login", json!(pk("cy"))),
+        put(&ACCOUNT, &new, "row", json!("live")),
+    ];
+    assert_eq!(rules(std::slice::from_ref(&birth), &cells), None);
+    // The row's lifecycle restored to its absence: unborn, and born again.
+    let mut book = Book::new();
+    let born = book.write(1, &[], birth.clone());
+    book.write(
+        1,
+        &[born],
+        vec![Change {
+            collection: ACCOUNT.name.to_owned(),
+            key: format!("{new}.row"),
+            value: None,
+        }],
+    );
+    assert_eq!(rules(&[birth], &book.cells()), None);
+}
+
+/// Preference version 2 reads under the authority rules (`typed::authority`), over two writers:
+/// an automatic cell of a preference never projects, every column being the owner's (rule 2);
+/// the owner's write to its fixed `machine` after its birth never projects (rule 4); and two
+/// concurrent owner ranks, 3 from one Mac and 1 from the other, read as the smaller, tried first
+/// (`OnConflict::Min`), the rank the earlier record wrote being 3. The read counts the two
+/// records that hold an inert write.
+/// NEGATIVE CONTROLS: with `PREFERENCE.authority` `None`, the automatic note shows: `` left:
+/// Some(String("seen on m7")) right: None ``; with `rank`'s `.on_conflict(OnConflict::Min)`
+/// removed, the rank reads as the first candidate's: `` left: Some(Number(Number(Unsigned(3))))
+/// right: Some(Number(Number(Unsigned(1)))) ``.
+#[test]
+fn a_preference_reads_under_the_authority_rules_and_its_rank_settles_to_the_smaller() {
+    use crate::typed::authority::tests::History;
+    let machine = keys::machine_pk("m7");
+    let account = keys::account_pk("claude", &at("ann")).unwrap();
+    let pf = keys::preference_pk(&machine, &account).unwrap();
+    let write = |col: &str, value: CellValue| {
+        cell::change(
+            &PREFERENCE,
+            CellKey {
+                pk: &pf,
+                col,
+                elem: None,
+            },
+            &value,
+        )
+        .unwrap()
+    };
+    let owner = |col: &str, x: Value| write(col, CellValue::owner(PREFERENCE.version, x));
+    let mut history = History::new();
+    let birth = history.write(
+        0,
+        &[],
+        vec![
+            owner("machine", json!(machine)),
+            owner("account", json!(account)),
+            owner("why", json!("owner")),
+            owner("row", json!("live")),
+        ],
+    );
+    history.write(1, &[birth], vec![owner("rank", json!(3))]);
+    history.write(0, &[birth], vec![owner("rank", json!(1))]);
+    let noted = history.write(
+        1,
+        &history.all(),
+        vec![write(
+            "note",
+            CellValue::automatic(PREFERENCE.version, json!("seen on m7")),
+        )],
+    );
+    let moved = history.write(
+        0,
+        &history.all(),
+        vec![owner("machine", json!(keys::machine_pk("m8")))],
+    );
+    let (cells, inert) = history.read(&REGISTRY);
+    let rows = cell::project(&PREFERENCE, &cells).rows;
+    let row = &rows[&pf];
+    assert_eq!(row.get("note"), None);
+    assert_eq!(row.get("machine"), Some(&json!(machine)));
+    assert!(row.fields["rank"].conflicted());
+    assert_eq!(row.get("rank"), Some(&json!(1)));
+    let at = |operation, col: &str| (operation, PREFERENCE.name.to_owned(), format!("{pf}.{col}"));
+    assert_eq!(
+        inert.changes,
+        std::collections::BTreeSet::from([at(noted, "note"), at(moved, "machine")])
+    );
+    assert_eq!(inert.records.get(PREFERENCE.name), Some(&2));
+}
+
 /// An account reads as its provider word and its login's address, one read of the view naming
 /// it; with no address it reads as the provider and its label; with no provider, as its address.
 /// NEGATIVE CONTROL: with `Names::of` naming an account by its address alone (its first arm

@@ -3,6 +3,7 @@
 
 //! The agent interface: `aterm ctl sys` and `await sys`.
 
+pub mod boot;
 pub mod delta;
 pub mod disk;
 pub mod hardware;

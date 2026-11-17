@@ -329,3 +329,70 @@ fn a_harness_clear_lifts_only_harness_needs_and_ranks_below_exact_and_strong() {
         "CONTROL: the same author's consumer clear lifts its consumer need and no harness need"
     );
 }
+
+/// ONE WORD, TWO SOURCES: the session's own `mark need help` and its harness's `help` over the
+/// stream are both `by=<sid>` at the session, and they are two needs. Neither raise replaces
+/// the other, in either order, so the harness's `clear` lifts the one its stream raised and
+/// leaves the consumer's, and the consumer's clear the reverse. NEGATIVE CONTROLS: a second
+/// raise of the same word from the same source is still one need (the newer), and with only
+/// the consumer's need standing a harness clear lifts nothing.
+#[test]
+fn a_harness_need_and_the_sessions_own_mark_of_one_word_stand_apart() {
+    let consumer = ("help", Src::Mark, own());
+    let stream = ("help", Src::Harness, own());
+    for harness_first in [false, true] {
+        let build = || {
+            let mut log = Log::new(0);
+            session(&mut log);
+            let order = if harness_first {
+                [Src::Harness, Src::Mark]
+            } else {
+                [Src::Mark, Src::Harness]
+            };
+            for (i, src) in order.into_iter().enumerate() {
+                need(&mut log, src, own(), "help", 2 + i as u64);
+            }
+            log
+        };
+        let mut log = build();
+        assert_eq!(
+            needs(&log),
+            [stream, consumer],
+            "both stand, the harness's first (harness first: {harness_first})"
+        );
+        clear(&mut log, Src::Harness, own(), 20);
+        assert_eq!(
+            needs(&log),
+            [consumer],
+            "the harness's clear lifts its own and leaves the consumer's"
+        );
+        clear(&mut log, Src::Harness, own(), 21);
+        assert_eq!(
+            needs(&log),
+            [consumer],
+            "CONTROL: a harness clear lifts no consumer need"
+        );
+
+        let mut log = build();
+        clear(&mut log, Src::Mark, own(), 20);
+        assert_eq!(
+            needs(&log),
+            [stream],
+            "the consumer's clear lifts its own and leaves the harness's"
+        );
+        clear(&mut log, Src::Harness, own(), 21);
+        assert!(
+            needs(&log).is_empty(),
+            "which the harness's clear then lifts"
+        );
+    }
+
+    // NEGATIVE CONTROL: the same word from the same source is one need.
+    let mut log = Log::new(0);
+    session(&mut log);
+    need(&mut log, Src::Harness, own(), "help", 2);
+    need(&mut log, Src::Harness, own(), "help", 3);
+    need(&mut log, Src::Mark, own(), "help", 4);
+    need(&mut log, Src::Mark, own(), "help", 5);
+    assert_eq!(needs(&log), [stream, consumer]);
+}

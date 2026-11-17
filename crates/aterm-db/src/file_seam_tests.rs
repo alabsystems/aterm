@@ -159,5 +159,5 @@ pub(crate) fn draft_set(
     column: &str,
     value: Option<&str>,
 ) -> Option<aterm_file::Draft> {
-    super::write::draft_set(paths, name, key, column, value).expect("a draft")
+    super::write::draft_set(paths, name, key, &[(column, value)]).expect("a draft")
 }

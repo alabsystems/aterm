@@ -244,6 +244,7 @@ const INTENT: &[&str] = &[
     "request",
     "observed",
     "retracted",
+    "writer",
 ];
 /// Credential's fields, every one of them derived: what the git helper would answer.
 const CREDENTIAL: &[&str] = &["repo", "tier", "answer", "profile", "grant", "why"];

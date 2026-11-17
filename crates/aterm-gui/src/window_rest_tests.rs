@@ -97,6 +97,15 @@ pub(crate) fn key() -> WindowEvent {
     }
 }
 
+/// A line of scroll, a touch that reaches a window whether or not it is focused.
+pub(crate) fn scroll() -> WindowEvent {
+    WindowEvent::MouseWheel {
+        device_id: DeviceId::dummy(),
+        delta: MouseScrollDelta::LineDelta(0.0, -1.0),
+        phase: TouchPhase::Moved,
+    }
+}
+
 /// Every person's event stirs the window; a frame, an occlusion change, the focus leaving and
 /// a theme change never do, so the window's own drawing cannot keep it awake.
 #[test]
@@ -171,9 +180,9 @@ fn a_window_is_attended_for_its_attention_after_a_touch_and_output_attends_nothi
     assert!(rest.settle_attended(t0 + ATTENTION * 2, Some(ATTENTION)));
 
     let touched = t0 + ATTENTION * 3;
-    assert!(rest.touch(touched), "the touch ends the lapse");
+    assert!(rest.touch(touched, true), "the touch ends the lapse");
     assert!(rest.attended(), "at once, before any settle");
-    assert!(!rest.touch(touched), "a second touch ends none");
+    assert!(!rest.touch(touched, true), "a second touch ends none");
     assert!(
         !rest.settle_attended(
             touched + ATTENTION - Duration::from_millis(1),
@@ -203,7 +212,13 @@ fn only_the_resize_aterm_asked_for_is_its_own() {
 }
 
 /// An unattended window's deck holds still whatever reading lands; after the touch that
-/// attends it again it holds until a reading lands after that touch.
+/// attends a focused window again it holds until a reading lands after that touch. The touch
+/// that attends an unfocused window again says it ended the lapse and holds nothing: a reading
+/// that landed before it moves the deck once the window is focused.
+///
+/// Negative control, run once by hand and restored by copy: `Rest::touch` holding the deck on
+/// every touch that ends a lapse, focused or not (`if lapsed` in place of `if lapsed &&
+/// focused` before it sets `woke_at`), fails "an unfocused window's touch holds nothing".
 #[test]
 fn an_unattended_window_holds_its_deck_until_a_reading_lands_after_the_next_touch() {
     use super::ATTENTION;
@@ -224,15 +239,28 @@ fn an_unattended_window_holds_its_deck_until_a_reading_lands_after_the_next_touc
         "output brings no motion back"
     );
     let touched = t0 + ATTENTION * 2;
-    assert!(rest.touch(touched));
+    assert!(rest.touch(touched, true));
     assert!(!rest.deck_moves(Some(touched)), "the touch's own frame");
     assert!(
         rest.deck_moves(Some(touched + Duration::from_millis(300))),
         "the reading after the touch"
     );
-    assert!(!rest.touch(touched + Duration::from_secs(1)));
+    assert!(!rest.touch(touched + Duration::from_secs(1), true));
     assert!(
         rest.deck_moves(Some(touched + Duration::from_millis(300))),
         "a touch of an attended window holds nothing"
+    );
+
+    let read = touched + Duration::from_millis(300);
+    assert!(rest.settle_attended(touched + ATTENTION * 2, Some(ATTENTION)));
+    let scrolled = touched + ATTENTION * 2;
+    assert!(
+        rest.touch(scrolled, false),
+        "an unfocused window's touch ends the lapse"
+    );
+    assert!(rest.attended());
+    assert!(
+        rest.deck_moves(Some(read)),
+        "an unfocused window's touch holds nothing"
     );
 }

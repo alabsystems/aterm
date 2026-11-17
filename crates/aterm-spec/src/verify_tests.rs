@@ -539,7 +539,7 @@ fn ty_capabilities_are_the_json_list_and_an_older_ty_has_none() {
     );
 }
 
-/// A probe that exceeds its timeout is killed and returns `None`.
+/// A probe that makes no progress for its window is killed and returns `None`.
 #[cfg(unix)]
 #[test]
 fn a_wedged_probe_is_killed_at_its_bound() {

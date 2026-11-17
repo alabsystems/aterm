@@ -855,10 +855,10 @@ fn a_covered_window_owes_no_wake_and_an_uncovered_one_does() {
         app.navigator_wake().is_some() && app.navigator_reads_words(first),
         "PRECONDITION: the ages' minute is armed and the row is read"
     );
-    app.on_occlusion_changed(WID, true);
+    app.on_occlusion_changed(WID, true, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(1));
     assert_eq!(app.navigator_wake(), None, "a covered list owes no wake");
-    app.on_occlusion_changed(WID, false);
+    app.on_occlusion_changed(WID, false, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(2));
     assert!(app.navigator_wake().is_some());
     assert!(app.navigator_reads_words(first));
@@ -2408,10 +2408,10 @@ fn a_view_uncovered_beside_one_in_sight_is_drawn_with_the_ages_of_now() {
             .map_or(0, |cache| cache.native_paint_serial)
     };
 
-    app.on_occlusion_changed(other, true);
+    app.on_occlusion_changed(other, true, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(1));
     let (shown, painted) = (presentation_revision(&app, covered), asked(&app));
-    app.on_occlusion_changed(other, false);
+    app.on_occlusion_changed(other, false, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(2));
     assert_eq!(
         (presentation_revision(&app, covered), asked(&app)),
@@ -2419,14 +2419,14 @@ fn a_view_uncovered_beside_one_in_sight_is_drawn_with_the_ages_of_now() {
         "NEGATIVE CONTROL: no minute passed, and the view keeps its frame"
     );
 
-    app.on_occlusion_changed(other, true);
+    app.on_occlusion_changed(other, true, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(3));
     assert!(
         app.navigator_wake().is_some(),
         "PRECONDITION: the view in sight keeps the ages' minute armed"
     );
     app.publish_navigators(now + Duration::from_secs(70));
-    app.on_occlusion_changed(other, false);
+    app.on_occlusion_changed(other, false, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(71));
     assert_ne!(
         presentation_revision(&app, covered),
@@ -2454,7 +2454,7 @@ fn a_covered_view_that_drew_a_frame_reads_each_later_change() {
     app.publish_navigators(now);
     let view = view_in(&app, WID);
     paint(&mut app);
-    app.on_occlusion_changed(WID, true);
+    app.on_occlusion_changed(WID, true, std::time::Instant::now());
     app.publish_navigators(now + Duration::from_secs(1));
     let says = |app: &mut App, title: &str| {
         inspect_text(app, view)

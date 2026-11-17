@@ -9,12 +9,12 @@ use super::super::policy::sleeps::InTurn;
 use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
     ANSWERS_OFF, AccountAnswer, AccountAt, BackBy, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD,
-    Composer, ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK,
-    ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LOGIN, RULE_MODEL_RESTORE, RULE_USAGE_PROBE,
-    RecordTurn, Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo, Sampled,
-    TRY_ANSWER_SLACK, account_hold, act_turn_work, budget_frees, conversation_mark,
-    decide_turn_end, decide_turn_end_traced, done_row_work, grace_for, is_wait_resume, outage_of,
-    reads_conversation,
+    Composer, ComposerRead, Conversation, CreditsCarry, FableLift, GoAheadVerdict,
+    LOGIN_SHARED_LOOK, LiftTold, ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LOGIN,
+    RULE_MODEL_RESTORE, RULE_USAGE_PROBE, RecordTurn, Restart, RestartAnswer, RestartAsk,
+    RestartClaim, RouteTo, Sampled, TRY_ANSWER_SLACK, account_hold, act_turn_work, budget_frees,
+    conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work, grace_for,
+    is_wait_resume, outage_of, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -858,14 +858,29 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// A PAST EVENT'S `unix` (epoch seconds) ON THE LOOP'S CLOCK, OR NOTHING: `now` for a time at
+    /// or ahead of the loop's wall clock (a skewed stamp is no later than this read), and `None`
+    /// for one the monotonic clock cannot name. [`Self::instant_of`] reads such a time as `now`,
+    /// which would date an event older than the clock's origin after everything the loop saw.
+    fn past_instant_of(&self, unix: i64, now: Instant) -> Option<Instant> {
+        let now_ms = self.now_unix_ms();
+        let delta = unix.saturating_mul(1000).saturating_sub(now_ms);
+        if delta >= 0 {
+            return Some(now);
+        }
+        now.checked_sub(Duration::from_millis(delta.unsigned_abs()))
+    }
+
     /// The model switch an earlier loop left open.
     pub(super) fn carried_model_switch(&self, open: approvals::OpenSwitch) -> ModelSwitch {
         ModelSwitch {
             from: open.from,
             to: open.to,
             launch: open.launch,
+            since: self.instant_of(open.made_unix),
             back_at: open.back_at_unix.map(|unix| self.instant_of(unix)),
             back_by: open.back_at_unix.map(|_| BackBy::Notice),
+            lifted_over: None,
             sample_at: None,
             samples: 0,
             proc: open.proc,
@@ -2297,6 +2312,9 @@ impl<C: Ctl> Session<'_, C> {
     /// Clear cached account advice before starting a new decision round.
     fn account_round(&mut self) {
         self.account_seen = None;
+        // A wall rung is asked again at each decision: a Claude Code wall screen draws nothing
+        // new while it waits, and the rung its ask came for stands on that same screen.
+        self.wall_rung = None;
         self.roster_seen = None;
         self.nothing_decided = false;
     }
@@ -3470,6 +3488,7 @@ impl<C: Ctl> Session<'_, C> {
         opts: &SuperviseOpts,
         review: &mut dyn Review,
     ) -> Result<TurnEndAction, Fail> {
+        self.fable_lift_look(point.screen.seq, opts, review);
         self.probe_seed_claims(&point.screen, review);
         self.custody_look(point, review)?;
         let at = super::occupancy_loop::LookAt::Point;
@@ -3575,10 +3594,19 @@ impl<C: Ctl> Session<'_, C> {
         let record = self.task_ahead(opts)?;
         let mut r = self.turn_end_reading(&point.screen, worked, opts);
         if !self.fx.replay_lacks_host_door("host.answered")
-            && let Some(ago) = self.answered_ago(&r, point.screen.seq, opts)
+            && let Some((ago, by)) = self.answered_reply(&r, point.screen.seq, opts)
             && let Some(host) = opts.idle_host.as_ref()
         {
             host.answered(u64::try_from(ago.as_millis()).unwrap_or(u64::MAX));
+            // The model that served the reply, filed with the account the session runs on
+            // (`IdleHost::answered_by`): never while usage credits carry the session, whose
+            // served turn says nothing of the plan's limits.
+            if let Some((model, at)) = by
+                && r.credits.is_none()
+                && !self.fx.replay_lacks_host_door("host.answered_by")
+            {
+                host.answered_by(&model, at);
+            }
         }
         self.host_held = r.upgrading || host_withholds(opts);
         let now = self.policy_now();
@@ -3597,7 +3625,22 @@ impl<C: Ctl> Session<'_, C> {
     /// dated by this read (zero), as their screens date nothing. `None` books no witness: no
     /// transcript, one ending on an error's notice, a prompt or a tool's result, a reply that
     /// reads as an error, or a program whose route is not read.
-    fn answered_ago(&self, r: &TurnEndReading, seq: u64, opts: &SuperviseOpts) -> Option<Duration> {
+    ///
+    /// BESIDE THE AGE, WHO SERVED IT AND WHEN IT WAS ASKED: the model the first answer to the
+    /// tail's last served request names, and when the prompt or tool result that began that
+    /// request was written, in unix seconds (`harness::login_adoption::served_request`), for the
+    /// host to file with the session's account (`IdleHost::answered_by`). Dated by the request,
+    /// never by the reply: a reply streamed for a minute proves room only as of the request, and a
+    /// limit another session met in that minute is not one it speaks against. `None` where the
+    /// tail shows no such request (a row of the response in flight at it, no assistant row read
+    /// before it, an answer that names no model), and for agy and Muse Code, whose screens name
+    /// no served model. The same one read of the transcript's tail gives both.
+    fn answered_reply(
+        &self,
+        r: &TurnEndReading,
+        seq: u64,
+        opts: &SuperviseOpts,
+    ) -> Option<(Duration, Option<(String, i64)>)> {
         if !answered_turn(r) || self.wall_refused_at(seq) {
             return None;
         }
@@ -3605,17 +3648,66 @@ impl<C: Ctl> Session<'_, C> {
             Program::Claude => {
                 let tail = opts.idle_host.as_ref()?.transcript_tail()?;
                 let end = super::wall_confirm::transcript_ends_on(&tail);
-                (end.last == super::wall_confirm::Entry::Reply)
+                let ago = (end.last == super::wall_confirm::Entry::Reply)
                     .then(|| answered_age(self.now_unix_ms(), end.at))
-                    .flatten()
+                    .flatten()?;
+                let by = crate::harness::login_adoption::served_request(&tail)
+                    .map(|served| (served.model, served.asked));
+                Some((ago, by))
             }
             Program::Agy | Program::Muse => r
                 .said_tail
                 .as_deref()
                 .filter(|said| !aterm_phase::answered::reads_as_error(said))
-                .map(|_| Duration::ZERO),
+                .map(|_| (Duration::ZERO, None)),
             Program::Codex | Program::Grok | Program::Kimi | Program::Generic => None,
         }
+    }
+
+    /// WHAT THE ACCOUNT'S RECORD SAYS OF FABLE'S LIMIT WHILE THE SESSION RUNS ON ANOTHER MODEL
+    /// (`IdleHost::fable_lift`), told to the switch ([`TurnEndState::fable_lifted`]). A lift after
+    /// the switch was made (a request Fable served there, a sample that showed room) is the
+    /// evidence that Fable serves again, so the switch's return is due now and not at the reset
+    /// its notice named. Where a record read holds that lift no longer before the return is made
+    /// (a session of the account met Fable's limit again, so the record holds the wall and no
+    /// lift), the return is timed as it was before it: the session is never returned into a
+    /// limit the record holds standing. A record the host could not read says nothing, and the
+    /// switch keeps its timing. Asked at each point the loop decides while a switch stands,
+    /// which costs a session on its launch's model nothing. Journaled where it moved the return:
+    /// a record, never an alert.
+    fn fable_lift_look(&mut self, seq: u64, opts: &SuperviseOpts, review: &mut dyn Review) {
+        if self.turn_end.model_switch().is_none() {
+            return;
+        }
+        let lift = opts
+            .idle_host
+            .as_ref()
+            .map_or(FableLift::Unread, |h| h.fable_lift());
+        let now = self.fx.mono();
+        let at = match lift {
+            FableLift::Unread => return,
+            FableLift::Unlifted => None,
+            FableLift::Lifted { at } => self.past_instant_of(at, now),
+        };
+        let note = match self.turn_end.fable_lifted(at, now) {
+            None => return,
+            Some(LiftTold::Due { .. }) => {
+                let unix = match lift {
+                    FableLift::Lifted { at } => u64::try_from(at).unwrap_or(0),
+                    FableLift::Unread | FableLift::Unlifted => 0,
+                };
+                format!(
+                    "Fable's limit lifted on the account at {}: evidence this Mac took that \
+                     Fable serves; the return to the launch's model is due at the next quiet \
+                     moment",
+                    utc_stamp(unix)
+                )
+            }
+            Some(LiftTold::Withdrawn) => "Fable's limit stands on the account's record again: \
+                 the return its lift made due waits as it was timed before the lift"
+                .to_string(),
+        };
+        review.note(&format!("NOTE seq={seq} rule={RULE_MODEL_RESTORE} {note}"));
     }
 
     /// Infer turn work from a Claude Code done row when no intermediate busy read was seen
@@ -4015,6 +4107,7 @@ impl<C: Ctl> Session<'_, C> {
         allow: &[String],
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
+        self.fable_lift_look(seen.screen.seq, opts, review);
         self.stall_withheld = false;
         self.edge_moved = false;
         let standing = self.turn_end_due.take();
@@ -4057,6 +4150,15 @@ impl<C: Ctl> Session<'_, C> {
             self.escalate_point(&turn, Some(reason), review)?;
             if self.memory_wall {
                 self.mark_memory_badge();
+            }
+        }
+        // A WALL RUNG FALLS ON A POINT DECIDED AGAIN (FL-118b): the session waits at its wall,
+        // and its holder's read is due at the ask the rung brought (`AskAgain::WallRead`).
+        if review.unattended() && self.wall_rung_held(&turn, opts) {
+            match self.usage_probe(&turn, &action, opts, review)? {
+                Probed::No => {}
+                Probed::Done => return self.after_probe(&turn, opts, allow, review),
+                Probed::Again | Probed::Open => return Ok(()),
             }
         }
         self.turn_end_execute(&turn, action, opts, allow, review)
@@ -6956,7 +7058,7 @@ impl<C: Ctl> Session<'_, C> {
         let Some(host) = opts.idle_host.clone() else {
             return Ok(Probed::No);
         };
-        let advised = self.probe_advised(&point.screen);
+        let advised = self.probe_advised(&point.screen) || self.wall_rung_held(point, opts);
         if !self.probe_due(&point.screen) {
             return Ok(Probed::No);
         }
@@ -6964,8 +7066,9 @@ impl<C: Ctl> Session<'_, C> {
             self.probe_shut(point, gate, None, review)?;
             return Ok(Probed::No);
         }
-        // The accounts probe claims its account's one read; a sample of Fable's week for a
-        // switch's return is the session's own and claims nothing.
+        // The accounts probe claims its account's one read, and so does a wall rung's holder
+        // (its claim is the rung's); a sample of Fable's week for a switch's return is the
+        // session's own and claims nothing.
         let use_token = if advised {
             match host.account_probe() {
                 Ok(token) => Some(token),
@@ -6985,9 +7088,11 @@ impl<C: Ctl> Session<'_, C> {
             use_token,
         };
         self.probe_fable = None;
+        // No later than the panel's read: what it shows of Fable's week was true then.
+        let asked = self.now_unix();
         let done = self.probe_step(point, &mut tell, opts, review);
         if let Some(read) = self.probe_fable.take() {
-            self.fable_sampled(point.screen.seq, read, review);
+            self.fable_sampled(point.screen.seq, read, (asked, host.as_ref()), review);
         }
         if !tell.told {
             tell.tell(Err(ProbeMiss::Lost));
@@ -7003,17 +7108,71 @@ impl<C: Ctl> Session<'_, C> {
     /// Whether a `/usage` probe is due at `screen`: the host advised one, or a model switch waits
     /// on a sample of Fable's week ([`TurnEndState::model_sample_due`]).
     fn probe_due(&self, screen: &Screen) -> bool {
-        self.probe_advised(screen) || self.turn_end.model_sample_due(self.fx.mono())
+        self.probe_advised(screen)
+            || self.wall_rung == Some((screen.seq, true))
+            || self.turn_end.model_sample_due(self.fx.mono())
+    }
+
+    /// THE WALL DOOR at `point` ([`IdleHost::wall_read`], FL-118b), asked once a decision (each
+    /// round clears it, [`Self::account_round`]) and only where a Claude Code session stands at a
+    /// wall it shows or the loop remembers: whether this session holds its account's due wall
+    /// rung, on a build whose panel was measured over a wall. Its `/usage` is then the rung's one
+    /// read ([`Self::usage_probe`]). A person who typed in the tab within their grace (their keys,
+    /// never a scroll or a click: [`Self::key_ago`]) is told, so the ladder starts again at its
+    /// first rung.
+    pub(super) fn wall_rung_held(&mut self, point: &Turn, opts: &SuperviseOpts) -> bool {
+        let seq = point.screen.seq;
+        if let Some((at, held)) = self.wall_rung
+            && at == seq
+        {
+            return held;
+        }
+        let held = self.wall_rung_ask(point, opts);
+        self.wall_rung = Some((seq, held));
+        held
+    }
+
+    /// [`Self::wall_rung_held`]'s ask of the host.
+    fn wall_rung_ask(&mut self, point: &Turn, opts: &SuperviseOpts) -> bool {
+        let Some(host) = opts.idle_host.clone() else {
+            return false;
+        };
+        // Only Claude Code's panel was measured over a wall (`lab claude-wall-panel`).
+        let claude = match self.reader(&point.screen.rows).program() {
+            Program::Claude => true,
+            Program::Codex
+            | Program::Grok
+            | Program::Kimi
+            | Program::Agy
+            | Program::Muse
+            | Program::Generic => false,
+        };
+        let walled = matches!(point.phase, Phase::Limited { .. }) || self.turn_end.wall_standing();
+        if !walled || !claude || self.fx.replay_lacks_host_door("host.wall_read") {
+            return false;
+        }
+        let grace = Duration::from_secs(u64::from(opts.policy.human_grace_s));
+        let person = self
+            .key_ago(self.fx.mono(), &point.screen)
+            .is_some_and(|ago| ago < grace);
+        host.wall_read(person)
     }
 
     /// WHAT A `/usage` SAMPLE READ OF FABLE'S WEEK (`read`: the `Current week (Fable)` row's
     /// percent and reset, unix seconds; `None`: no row, or no panel read once the `/usage` was
     /// entered), told the switch that waited on it ([`TurnEndState::model_sampled`]) and
-    /// journaled with its evidence and what it scheduled: a record, never an alert.
+    /// journaled with its evidence and what it scheduled: a record, never an alert. Where it
+    /// makes the switch's own return due at once on room left, the host is told too
+    /// (`IdleHost::fable_room`, with `asked`, when the panel was asked for), so the account's
+    /// record lifts Fable's wall and every session of the account moved off Fable returns on the
+    /// one sample. A room the session's rung on such returns still holds back is told nobody:
+    /// a row that reads room while Fable is spent then costs the account's other sessions no
+    /// relaunch either.
     fn fable_sampled(
         &mut self,
         seq: u64,
         read: Option<(u32, Option<i64>)>,
+        (asked, host): (i64, &dyn IdleHost),
         review: &mut dyn Review,
     ) {
         let now = self.fx.mono();
@@ -7021,6 +7180,11 @@ impl<C: Ctl> Session<'_, C> {
         let Some(said) = self.turn_end.model_sampled(placed, now) else {
             return;
         };
+        if matches!(said, Sampled::Room { at } if at <= now)
+            && !self.fx.replay_lacks_host_door("host.fable_room")
+        {
+            host.fable_room(asked);
+        }
         let row = match placed {
             Some((pct, Some(reset))) => {
                 format!(
@@ -7112,7 +7276,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.probe != UsageProbe::Idle {
             return Ok(Some(ProbeGate::PanelOwed));
         }
-        if !self.turn_live {
+        // A wall rung is read where the session waits: the point stands, no turn makes it live.
+        let rung = self.wall_rung == Some((point.screen.seq, true));
+        if !self.turn_live && !rung {
             return Ok(Some(ProbeGate::NotLive));
         }
         if matches!(decided, TurnEndAction::Escalate { .. }) {
@@ -7154,10 +7320,13 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         let reading = self.turn_end_reread(screen, opts);
-        if let Some(gate) = self
-            .turn_end
-            .probe_gate(&reading, &opts.policy, self.fx.mono())
-        {
+        let now = self.fx.mono();
+        let gate = if rung {
+            self.turn_end.wall_probe_gate(&reading, &opts.policy, now)
+        } else {
+            self.turn_end.probe_gate(&reading, &opts.policy, now)
+        };
+        if let Some(gate) = gate {
             return Ok(Some(gate));
         }
         Ok((!self.alt_screen()?).then_some(ProbeGate::NotFullscreen))

@@ -89,16 +89,14 @@ pub(crate) fn opened_for_test(
     opened_why_for_test((fleet, node, host, by), made, sid, Ok("a test's request"))
 }
 
-/// [`opened_for_test`] for asker `(fleet, node, host, by)`, the request's why `why`: `Ok` the
-/// requester's own line, `Err` a brief its fallback why is taken from (the content tier).
+/// The asker `(fleet, node, host, by)` whose tab's goal and asked lines are `(goal, asked)`: what
+/// a local request's fallback why is taken from ([`aterm_requests::why_of`]).
 #[cfg(test)]
-pub(crate) fn opened_why_for_test(
+pub(crate) fn asker_for_test(
     (fleet, node, host, by): (bool, &str, &str, &str),
-    made: Made,
-    sid: &str,
-    why: Result<&str, &str>,
-) -> String {
-    let asker = Asker {
+    (goal, asked): (Option<&str>, Option<&str>),
+) -> Asker {
+    Asker {
         fleet,
         from: From {
             node: node.to_owned(),
@@ -108,9 +106,21 @@ pub(crate) fn opened_why_for_test(
             model: None,
             account: None,
         },
-        goal: None,
-        asked: None,
-    };
+        goal: goal.map(str::to_owned),
+        asked: asked.map(str::to_owned),
+    }
+}
+
+/// [`opened_for_test`] for asker `(fleet, node, host, by)`, the request's why `why`: `Ok` the
+/// requester's own line, `Err` a brief its fallback why is taken from (the content tier).
+#[cfg(test)]
+pub(crate) fn opened_why_for_test(
+    asker: (bool, &str, &str, &str),
+    made: Made,
+    sid: &str,
+    why: Result<&str, &str>,
+) -> String {
+    let asker = asker_for_test(asker, (None, None));
     let (given, brief) = match why {
         Ok(given) => (Some(given), None),
         Err(brief) => (None, Some(brief.as_bytes())),
@@ -599,12 +609,25 @@ pub(crate) struct Begun {
     by: String,
     /// Named by `req=` ([`aterm_requests::Store::join`]), not opened by this spawn.
     joined: bool,
+    /// The joined request's given why ([`Self::joined_why`]).
+    joined_why: Option<String>,
+}
+
+impl Begun {
+    /// The why of the request this spawn joined (`req=`) where its requester gave one
+    /// (`why_src=given`): the reason the session the spawn opens is born with where the spawn
+    /// gives no `why=` of its own ([`crate::session_log::Birth::joining`]). `None` for a request
+    /// this spawn opened (its own `why=` is that), and for one whose why was guessed (a brief, a
+    /// goal, an asked line) or none.
+    pub(crate) fn joined_why(&self) -> Option<&str> {
+        self.joined_why.as_deref()
+    }
 }
 
 /// Write what `prepared` decided: the request's `open` (before the spawn reaches the main
 /// thread, so nothing runs on another's behalf without one), or the check that `req=` names an
 /// open request of the same requester that came in as this spawn does, which holds it open until
-/// the spawn settles.
+/// the spawn settles, and the read of that request's given why ([`Begun::joined_why`]).
 /// # Errors
 /// The spawn's refusal: the store could not record the request, or the join is refused.
 pub(crate) fn begin(prepared: Option<Prepared>) -> Result<Option<Begun>, String> {
@@ -619,6 +642,7 @@ pub(crate) fn begin(prepared: Option<Prepared>) -> Result<Option<Begun>, String>
                 id,
                 by,
                 joined: false,
+                joined_why: None,
             }))
         }
         Some(Prepared::Join {
@@ -628,14 +652,24 @@ pub(crate) fn begin(prepared: Option<Prepared>) -> Result<Option<Begun>, String>
             by,
             via,
         }) => {
-            let joined = with_store(&dir, |store| Ok(store.join(&id, &node, &by, via)))
-                .map_err(|error| format!("ERR request store: {error}\n"))?;
-            joined.map_err(|why| format!("ERR spawn req={id}: {why}\n"))?;
+            let joined = with_store(&dir, |store| {
+                Ok(store.join(&id, &node, &by, via).map(|()| {
+                    // The fold alone: a given why is held on the request, so the content tier
+                    // is never opened.
+                    store
+                        .get(&id)
+                        .filter(|request| request.open.why_src == WhySrc::Given)
+                        .and_then(|request| request.why.clone())
+                }))
+            })
+            .map_err(|error| format!("ERR request store: {error}\n"))?;
+            let joined_why = joined.map_err(|why| format!("ERR spawn req={id}: {why}\n"))?;
             Ok(Some(Begun {
                 dir,
                 id,
                 by,
                 joined: true,
+                joined_why,
             }))
         }
     }
@@ -678,6 +712,7 @@ pub(crate) fn hand(begun: Option<Begun>, cwd: Option<&str>) -> (Option<Pending>,
         id,
         by,
         joined,
+        joined_why: _,
     }) = begun
     else {
         return (None, None);

@@ -697,13 +697,36 @@ impl DefaultReads {
     }
 }
 
+#[cfg(not(test))]
 static DEFAULT_READS: Mutex<DefaultReads> = Mutex::new(DefaultReads(Vec::new()));
 
+#[cfg(test)]
+thread_local! {
+    /// A test's own reads: tests run side by side, each with its own resolver stand-in.
+    static DEFAULT_READS: std::cell::RefCell<DefaultReads> =
+        const { std::cell::RefCell::new(DefaultReads(Vec::new())) };
+}
+
+/// `f` over the defaults the resolver last read, held for no longer than `f` runs.
+fn with_reads<T>(f: impl FnOnce(&mut DefaultReads) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut DEFAULT_READS.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        DEFAULT_READS.with(|reads| f(&mut reads.borrow_mut()))
+    }
+}
+
 /// Read the settings' default of the agent `pid`, off the window thread (the footer's resolver,
-/// after it read the session's facts) and at most every [`DEFAULT_RECHECK`]: the settings chain
+/// on the window's ask, [`crate::claude_footer::request_default`], and on no footer read) and
+/// at most every [`DEFAULT_RECHECK`]: the settings chain
 /// of the agent the host's relaunch snapshot names, read under that agent's own environment,
 /// line and directory ([`crate::harness_netprobe::permission_default_of_agent`]). An agent no
-/// snapshot names (one started under Off) is not read. No lock is held over the read.
+/// snapshot names (one started under Off) is not read. A unit test reads nothing here: a test's
+/// ask is captured ([`crate::claude_footer::request_default`]), and a rig reads through
+/// [`note_default_of`].
 pub(crate) fn note_default(pid: u32, now: Instant) {
     if cfg!(test) {
         return;
@@ -711,28 +734,32 @@ pub(crate) fn note_default(pid: u32, now: Instant) {
     let Some(snap) = crate::harness_host::published_snapshot_of_pid(pid) else {
         return;
     };
-    let due = DEFAULT_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .due(&snap.tab, snap.pid, now);
-    if !due {
+    note_default_of(&snap.tab, snap.pid, now, || {
+        crate::harness_netprobe::permission_default_of_agent(snap.pid, &snap.argv, &snap.cwd)
+    });
+}
+
+/// Hold agent `pid` of tab `tab`'s settings default as `read` reads its chain, where the last
+/// read is due at `now` ([`DefaultReads::due`]). No lock is held over the read.
+pub(crate) fn note_default_of(
+    tab: &str,
+    pid: u32,
+    now: Instant,
+    read: impl FnOnce() -> PermissionDefault,
+) {
+    if !with_reads(|reads| reads.due(tab, pid, now)) {
         return;
     }
-    let default =
-        crate::harness_netprobe::permission_default_of_agent(snap.pid, &snap.argv, &snap.cwd);
-    DEFAULT_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .hold(&snap.tab, snap.pid, now, default);
+    #[cfg(test)]
+    crate::work_counts::settings_chain_read();
+    let default = read();
+    with_reads(|reads| reads.hold(tab, pid, now, default));
 }
 
 /// Hold `default` for agent `pid` of tab `tab` as the resolver's read, as a test scripts it.
 #[cfg(all(test, unix))]
 pub(crate) fn hold_default_for_test(tab: &str, pid: u32, default: PermissionDefault) {
-    DEFAULT_READS
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .hold(tab, pid, Instant::now(), default);
+    with_reads(|reads| reads.hold(tab, pid, Instant::now(), default));
 }
 
 /// Why a tab's default is not told before the resolver's first read of its agent.
@@ -751,10 +778,7 @@ pub(crate) fn live_defaults() -> Defaults {
                 bypass_disabled: None,
             });
         };
-        DEFAULT_READS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(tab, pid)
+        with_reads(|reads| reads.get(tab, pid))
     })
 }
 
@@ -838,7 +862,8 @@ impl App {
     }
 
     /// Ask the footer's resolver to read `session`'s settings default again where the read held
-    /// for its tab is due and none was asked for lately ([`DefaultReads::ask`]). It is asked on
+    /// for its tab is due and none was asked for lately ([`DefaultReads::ask`]): that read
+    /// alone, no footer read with it ([`crate::claude_footer::request_default`]). It is asked on
     /// each frame the permission chip's title shows and by a click made before the first read;
     /// a click uses the last read held, which a pointer resting on the chip with nothing
     /// repainting does not renew.
@@ -849,12 +874,9 @@ impl App {
         let Some(pid) = crate::harness_host::published_pid(&tab) else {
             return;
         };
-        let ask = DEFAULT_READS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .ask(&tab, pid, Instant::now());
+        let ask = with_reads(|reads| reads.ask(&tab, pid, Instant::now()));
         if ask {
-            self.request_account_read(session);
+            crate::claude_footer::request_default(pid);
         }
     }
 

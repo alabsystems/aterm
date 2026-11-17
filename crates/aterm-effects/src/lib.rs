@@ -103,6 +103,9 @@ pub mod pane;
 pub mod pipeline;
 /// Rainbow kitty ([`rainbow_kitty::Engine`]).
 pub mod rainbow_kitty;
+/// The setup screen's hero: the rainbow road and the cat on it ([`rainbow_road::RoadArt`],
+/// [`rainbow_road::CatArt`]).
+pub mod rainbow_road;
 /// Glint wave field for Claude Code's mascot ripple.
 pub mod ripple;
 /// Sound-cue policy.

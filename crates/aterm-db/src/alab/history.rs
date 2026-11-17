@@ -669,11 +669,9 @@ pub fn carried(
     let mut trusted = super::roll::rollers(view, &resolve);
     trusted.extend(also);
     let mut out = Carried::default();
-    for op in view
-        .ops
-        .iter()
-        .filter(|op| !op.revert && !view.quota.over.contains(&op.id) && trusted.contains(&op.actor))
-    {
+    for op in view.ops.iter().filter(|op| {
+        op.revert.is_none() && !view.quota.over.contains(&op.id) && trusted.contains(&op.actor)
+    }) {
         let writer = resolve(&op.roster, &op.actor).map(|machine| keys::uuid32(&machine));
         for change in op
             .changes

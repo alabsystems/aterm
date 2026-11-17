@@ -8,11 +8,13 @@ use super::{Allowed, Bundle};
 use crate::client::{self, Paths};
 use crate::commons::bootstrap::Device;
 use crate::commons::journal::Trust;
+#[cfg(unix)]
 use crate::phrase::Phrase;
 use crate::text::{self, Audience, Entry};
 use crate::{Result, SecretBytes};
 use aterm_time::Instant;
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::Mutex;
@@ -78,6 +80,7 @@ fn bundle_of(value: &str) -> impl Fn(&Handing<'_>) -> Result<Handout> + '_ {
 
 /// One connection: the member serves it while `joiner` speaks, each end with a one-minute hang
 /// detector.
+#[cfg(unix)]
 fn exchange<T>(
     desk: &Mutex<Desk>,
     from: IpAddr,
@@ -108,6 +111,7 @@ fn joining<'a>(device: &'a Device, node: [u8; 32], name: &str) -> Joining<'a> {
     }
 }
 
+#[cfg(unix)]
 fn ask(desk: &Mutex<Desk>, from: IpAddr, joining: &Joining<'_>) -> Answer {
     exchange(desk, from, "", |stream| {
         let greeting = joiner::greeting(stream)?;
@@ -167,6 +171,7 @@ fn an_admitted_ask_rechecks_after_the_real_member_greeting() {
     }
 }
 
+#[cfg(unix)]
 fn run(
     desk: &Mutex<Desk>,
     from: IpAddr,
@@ -181,6 +186,7 @@ fn run(
     })
 }
 
+#[cfg(unix)]
 fn done(desk: &Mutex<Desk>, from: IpAddr, joining: &Joining<'_>) {
     exchange(desk, from, "", |stream| {
         let greeting = joiner::greeting(stream)?;
@@ -191,6 +197,7 @@ fn done(desk: &Mutex<Desk>, from: IpAddr, joining: &Joining<'_>) {
 }
 
 /// Allow the only asking row on `desk`, and the words its sheet would draw.
+#[cfg(unix)]
 fn allow(desk: &Mutex<Desk>) -> String {
     let mut desk = desk.lock().unwrap();
     let now = Instant::now();
@@ -342,6 +349,7 @@ fn bounded_log_bundle_refuses_malformed_missing_or_downgraded_bounds() {
     assert!(bundle.encode().is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_request_seen_by_three_members_shows_on_three_and_the_first_allow_closes_the_rest() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -435,6 +443,7 @@ fn a_request_seen_by_three_members_shows_on_three_and_the_first_allow_closes_the
 ///
 /// NEGATIVE CONTROL: answer a closed row as before (`hear` returning `answer` for a found row
 /// without reopening it): the ask answers Closed and the Allow is refused.
+#[cfg(unix)]
 #[test]
 fn a_mac_whose_bundle_never_landed_asks_again_and_the_member_that_let_it_in_shows_it_again() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -463,6 +472,7 @@ fn a_mac_whose_bundle_never_landed_asks_again_and_the_member_that_let_it_in_show
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_phrase_typed_into_another_mac_admits_nothing() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -500,6 +510,7 @@ fn a_phrase_typed_into_another_mac_admits_nothing() {
     assert!(served.unwrap().is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_run_by_a_mac_without_the_requests_keys_gets_no_bundle() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -544,6 +555,7 @@ fn ask_signature(
 /// allowed off the desk: its phrase stays live, and the Mac it was shown for still gets in.
 /// NEGATIVE CONTROL: the eviction this desk had (the oldest row, once no ignored or let-in one
 /// is left) drops the allowed row, and that Mac's run is refused ("no join phrase is shown").
+#[cfg(unix)]
 #[test]
 fn a_flood_of_requests_never_takes_a_row_a_person_allowed() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -588,6 +600,7 @@ fn a_flood_of_requests_never_takes_a_row_a_person_allowed() {
 /// keys churns only its own rows, so another Mac's row stays for a person to allow.
 /// NEGATIVE CONTROL: a desk with no per-source bound drops K's row, the oldest asking one,
 /// under the flood.
+#[cfg(unix)]
 #[test]
 fn one_sources_flood_of_requests_churns_only_its_own_rows() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -624,6 +637,7 @@ fn one_sources_flood_of_requests_churns_only_its_own_rows() {
 /// is left.
 /// NEGATIVE CONTROL: the eviction this desk had (the oldest asking row, once no settled one is
 /// left) drops the flood's first rows and then K's ("K's row stays").
+#[cfg(unix)]
 #[test]
 fn a_flood_from_many_addresses_never_takes_a_row_that_asked_again() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -889,6 +903,7 @@ fn a_row_closes_once_the_commons_roster_binds_its_mac() {
 /// rather than closing at once as a member's would, and it closes once the log seats it.
 /// NEGATIVE CONTROL: `Local::knows_recipient` reading the roster alone closes S's first ask and
 /// the first assert fails.
+#[cfg(unix)]
 #[test]
 fn a_seatless_recipient_the_roster_names_shows_a_row_until_the_log_seats_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -930,6 +945,7 @@ fn a_seatless_recipient_the_roster_names_shows_a_row_until_the_log_seats_it() {
 /// allows is bound to the node key the real Mac runs with, under the name it asked for.
 /// NEGATIVE CONTROL: a `hear` that skips the ask's signature shows the copy as J's row under
 /// node `[9; 32]`, and J's run under its own node key is then refused.
+#[cfg(unix)]
 #[test]
 fn a_copied_request_shows_only_as_the_mac_that_signed_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1046,6 +1062,7 @@ fn joiner_greeting(desk: &Mutex<Desk>) -> joiner::Greeting {
     }
 }
 
+#[cfg(unix)]
 fn phrase_of(desk: &Mutex<Desk>) -> crate::pake::PhraseId {
     match states(desk)[0] {
         RowState::Allowed(phrase) => phrase,
@@ -1055,6 +1072,7 @@ fn phrase_of(desk: &Mutex<Desk>) -> crate::pake::PhraseId {
 
 /// J's side of a run, by a Mac that holds the phrase and J's public request, signs the run with
 /// `signer`'s writer key, and answers the possession challenge with `device`.
+#[cfg(unix)]
 fn stolen_run(
     stream: &mut UnixStream,
     greeting: &joiner::Greeting,
@@ -1118,6 +1136,7 @@ fn stolen_run(
 /// One connection from `from` that sends `run` for J's copied `request` and node `[7; 32]`,
 /// signed as `sign` says over the challenge this connection's greeting carries (no `sig` field
 /// when it says `None`), then hangs up after the member's first answer: that answer.
+#[cfg(unix)]
 fn copied_run(
     desk: &Mutex<Desk>,
     from: IpAddr,
@@ -1151,6 +1170,7 @@ fn copied_run(
 /// are each refused before the phrase is touched, and J's run then gets its bundle.
 /// NEGATIVE CONTROL: a `Desk::begin` that skips the run's signature check lets the copy's run
 /// take the phrase, and its hang-up burns it, so J's run is refused.
+#[cfg(unix)]
 #[test]
 fn a_mac_that_copied_the_request_cannot_spend_the_phrase_allowed_for_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1198,6 +1218,7 @@ fn a_mac_that_copied_the_request_cannot_spend_the_phrase_allowed_for_it() {
     assert!(served.unwrap().is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fourth_run_from_one_address_in_a_minute_is_refused() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1257,6 +1278,7 @@ fn a_fourth_run_from_one_address_in_a_minute_is_refused() {
     assert!(err.contains("no model"), "{err}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_member_with_no_roster_binding_shows_the_row_and_cannot_allow() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1272,6 +1294,7 @@ fn a_member_with_no_roster_binding_shows_the_row_and_cannot_allow() {
     assert!(desk.invite(Instant::now()).is_err());
 }
 
+#[cfg(unix)]
 #[test]
 fn refreshing_without_a_roster_binding_or_on_a_new_network_cancels_live_phrases() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1321,6 +1344,7 @@ fn refreshing_without_a_roster_binding_or_on_a_new_network_cancels_live_phrases(
 /// NEGATIVE CONTROL: `relay` returning after the bundle without passing the acknowledgement on
 /// (`if acks && false`): `left: Unacknowledged("the other Mac closed the join exchange")`,
 /// `right: Acknowledged`.
+#[cfg(unix)]
 #[test]
 fn a_run_relayed_between_the_node_job_and_the_window_gets_its_bundle() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1366,6 +1390,7 @@ fn a_run_relayed_between_the_node_job_and_the_window_gets_its_bundle() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_removed_mac_cannot_burn_a_live_invite_phrase_and_refresh_cancels_newly_removed_allows() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1462,6 +1487,7 @@ fn a_removed_mac_cannot_burn_a_live_invite_phrase_and_refresh_cancels_newly_remo
 
 /// A node key's record signature of a proof, as `NodeIdentity::sign_record(PROVE_RECORD, ..)`
 /// makes it.
+#[cfg(unix)]
 fn node_signer(seed: u8) -> (impl Fn(&[u8]) -> [u8; 64] + Sync, [u8; 32]) {
     use ring::signature::{Ed25519KeyPair, KeyPair as _};
     let pair = Ed25519KeyPair::from_seed_unchecked(&[seed; 32]).expect("node key");
@@ -1478,6 +1504,7 @@ fn node_signer(seed: u8) -> (impl Fn(&[u8]) -> [u8; 64] + Sync, [u8; 32]) {
 
 /// One `prove` connection: the member serves it with `proof` (its `decide` hands
 /// [`files_bundle`] signed by `signer`, the member's own device) while `joiner` speaks.
+#[cfg(unix)]
 fn proving<T>(
     desk: &Mutex<Desk>,
     fleet: Option<desk::Fleet>,
@@ -1488,6 +1515,7 @@ fn proving<T>(
 }
 
 /// [`proving`] from `from`, the member's check before possession `refuses`.
+#[cfg(unix)]
 fn proving_checked<T>(
     desk: &Mutex<Desk>,
     (fleet, from): (Option<desk::Fleet>, IpAddr),
@@ -1524,6 +1552,7 @@ fn proving_checked<T>(
 
 /// The member's `decide` for these tests: [`files_bundle`] holding `value`, its `Allowed`
 /// signed by the member's device at `paths`.
+#[cfg(unix)]
 fn hands(paths: &Paths, value: &str) -> impl Fn(&desk::Proving<'_>) -> Result<SecretBytes> + Sync {
     let paths = paths.clone();
     let value = value.to_owned();
@@ -1536,18 +1565,21 @@ fn hands(paths: &Paths, value: &str) -> impl Fn(&desk::Proving<'_>) -> Result<Se
 }
 
 /// Deliver the possession line, then lose the flush result after the member decided it.
+#[cfg(unix)]
 struct FailsPossessionFlush {
     inner: UnixStream,
     possessing: bool,
     decided: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(unix)]
 impl std::io::Read for FailsPossessionFlush {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         std::io::Read::read(&mut self.inner, bytes)
     }
 }
 
+#[cfg(unix)]
 impl std::io::Write for FailsPossessionFlush {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.possessing |= bytes.starts_with(b"possess ");
@@ -1569,6 +1601,7 @@ impl std::io::Write for FailsPossessionFlush {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_failed_possession_flush_cannot_send_the_mac_to_a_second_member() {
     use super::join::{self, Stream};
@@ -1647,6 +1680,7 @@ fn a_failed_possession_flush_cannot_send_the_mac_to_a_second_member() {
 /// NEGATIVE CONTROL: `prove` holding the desk's lock across `(proof.decide)(..)` (taken just
 /// before it, dropped just after): the hook's `try_lock` fails and the "the desk's lock is free
 /// while decide runs" assert fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_that_proves_its_node_key_gets_the_bundle_sealed_to_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1697,6 +1731,7 @@ fn a_mac_that_proves_its_node_key_gets_the_bundle_sealed_to_it() {
 /// `10.0.0.9` reaches `decide` marked and the "off the home subnet" assert fails. It taking any
 /// source while the member has no home (`self.home.is_none_or(…)`): the "no home ALab LAN"
 /// assert fails for `192.168.1.40`.
+#[cfg(unix)]
 #[test]
 fn a_proof_from_the_home_lan_reaches_decide_marked_lan() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1760,6 +1795,7 @@ fn a_proof_from_the_home_lan_reaches_decide_marked_lan() {
 ///
 /// NEGATIVE CONTROL: `prove` handing `decide` a fresh `Cell` of its own in place of the one
 /// `refuses` saw: the decision reads `false` and the first assert fails.
+#[cfg(unix)]
 #[test]
 fn the_check_before_possession_hands_its_read_to_the_decision() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1805,6 +1841,7 @@ fn the_check_before_possession_hands_its_read_to_the_decision() {
 /// member answers `OK challenge=`, so the "refused at the prove line" assert fails. The node
 /// key's signature check cut from `begin_proof`: the borrowing Mac answers its own possession
 /// challenge and takes a bundle, and the "a borrowed node key" assert fails.
+#[cfg(unix)]
 #[test]
 fn a_replayed_or_borrowed_proof_proves_nothing() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1865,6 +1902,7 @@ fn a_replayed_or_borrowed_proof_proves_nothing() {
 ///
 /// NEGATIVE CONTROL: `Desk::begin_proof` checking the node key's signature through ring's
 /// `UnparsedPublicKey`: the desk serves the proof to its end, refusing nothing.
+#[cfg(unix)]
 #[test]
 fn a_small_order_node_key_proves_nothing_at_the_desk() {
     use crate::ed25519::{FORGED, SMALL_ORDER_KEY};
@@ -1894,6 +1932,7 @@ fn a_small_order_node_key_proves_nothing_at_the_desk() {
 ///
 /// NEGATIVE CONTROL: `joiner::ask_checked` through ring's `UnparsedPublicKey`: the forged answer
 /// is heard as `Signed::Verified`.
+#[cfg(unix)]
 #[test]
 fn a_small_order_greeting_key_signs_no_answer() {
     use super::wire;
@@ -1938,6 +1977,7 @@ fn a_small_order_greeting_key_signs_no_answer() {
 ///
 /// NEGATIVE CONTROL: the `fleet.is_some_and(..)` check cut from `begin_proof`: the proof of
 /// another node key than the channel's goes through and the first assert fails.
+#[cfg(unix)]
 #[test]
 fn a_proof_over_the_fleet_names_the_node_key_its_channel_proved() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -2019,17 +2059,20 @@ fn a_proof_over_the_fleet_names_the_node_key_its_channel_proved() {
 }
 
 /// A stream that keeps the first line written through it.
+#[cfg(unix)]
 struct Tee<'a, S: ?Sized> {
     inner: &'a mut S,
     first: &'a Mutex<String>,
 }
 
+#[cfg(unix)]
 impl<S: std::io::Read + ?Sized> std::io::Read for Tee<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf)
     }
 }
 
+#[cfg(unix)]
 impl<S: std::io::Write + ?Sized> std::io::Write for Tee<'_, S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut first = self.first.lock().unwrap();
@@ -2045,17 +2088,20 @@ impl<S: std::io::Write + ?Sized> std::io::Write for Tee<'_, S> {
 
 /// A stream that loses everything the joiner writes from its acknowledgement on: the link went
 /// down just after the bundle arrived.
+#[cfg(unix)]
 struct LosesTheAck<'a> {
     inner: &'a mut UnixStream,
     lost: bool,
 }
 
+#[cfg(unix)]
 impl std::io::Read for LosesTheAck<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         std::io::Read::read(self.inner, buf)
     }
 }
 
+#[cfg(unix)]
 impl std::io::Write for LosesTheAck<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.lost |= buf.starts_with(b"ack ");
@@ -2078,6 +2124,7 @@ impl std::io::Write for LosesTheAck<'_> {
 /// NEGATIVE CONTROL: `steps` closing the row before it reads the acknowledgement (the
 /// `desk.close(..)` moved above the `acknowledged` read): the row is closed at once,
 /// `left: [Closed]`, `right: [Allowed(PhraseId(..))]`.
+#[cfg(unix)]
 #[test]
 fn a_bundle_the_new_mac_never_acknowledged_leaves_its_row_open_for_allow_again() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -2162,11 +2209,13 @@ fn a_bundle_the_new_mac_never_acknowledged_leaves_its_row_open_for_allow_again()
 }
 
 /// A stream that keeps every byte read through it.
+#[cfg(unix)]
 struct Recording<'a, S: ?Sized> {
     inner: &'a mut S,
     read: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl<S: std::io::Read + ?Sized> std::io::Read for Recording<'_, S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
@@ -2175,6 +2224,7 @@ impl<S: std::io::Read + ?Sized> std::io::Read for Recording<'_, S> {
     }
 }
 
+#[cfg(unix)]
 impl<S: std::io::Write + ?Sized> std::io::Write for Recording<'_, S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.inner.write(buf)
@@ -2194,6 +2244,7 @@ impl<S: std::io::Write + ?Sized> std::io::Write for Recording<'_, S> {
 /// `an answer m5 signed for another connection proves nothing: []`. `pick` skipping `outranked`:
 /// `one candidate: Error("3 members show a phrase (m5 at 10.0.0.67:7100, m5 at 10.0.0.5:7100,
 /// m5 at [fd00::5]:7100): ...`.
+#[cfg(unix)]
 #[test]
 fn a_host_that_copies_a_members_greeting_is_no_candidate_beside_it() {
     use super::join;
@@ -2384,6 +2435,7 @@ fn an_old_member_and_a_new_one_that_both_show_a_phrase_are_both_named() {
 
 /// A Mac whose machine key a release build made on a Mac's own hardware: unmarked, whatever binary
 /// opens it later (A12).
+#[cfg(unix)]
 fn release_mac(root: &Path, name: &str) -> (Paths, Device) {
     let paths = Paths::for_home(&root.join(name));
     client::machine_identity_as(&paths, crate::Making::default()).expect("identity");
@@ -2392,17 +2444,20 @@ fn release_mac(root: &Path, name: &str) -> (Paths, Device) {
 }
 
 /// A joiner's end that keeps every byte it writes, so a test reads the lines it sent.
+#[cfg(unix)]
 struct Tap<'a> {
     stream: &'a mut UnixStream,
     sent: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl std::io::Read for Tap<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         std::io::Read::read(self.stream, bytes)
     }
 }
 
+#[cfg(unix)]
 impl std::io::Write for Tap<'_> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         let wrote = std::io::Write::write(self.stream, bytes)?;
@@ -2418,6 +2473,7 @@ impl std::io::Write for Tap<'_> {
 /// A12: an identity this test binary made is a lab identity, its Commons device says so, and its
 /// `ask` line carries `lab=1`; an identity a release build made carries nothing, opened by the same
 /// binary.
+#[cfg(unix)]
 #[test]
 fn a_test_binarys_ask_carries_the_lab_mark_and_a_release_identitys_does_not() {
     let root = aterm_tempfile::tempdir().expect("temp");
@@ -2446,6 +2502,7 @@ fn a_test_binarys_ask_carries_the_lab_mark_and_a_release_identitys_does_not() {
 /// A12: a member on the live ALab genesis refuses a lab identity's ask once its signature checks,
 /// showing no row; a member on another genesis (a lab's) admits the same ask, and the live member
 /// admits a release identity's. The pair shows the refusal bites and keys on the mark alone.
+#[cfg(unix)]
 #[test]
 fn a_member_on_the_live_genesis_refuses_a_lab_identitys_ask_and_one_on_another_admits_it() {
     let root = aterm_tempfile::tempdir().expect("temp");
@@ -2486,6 +2543,7 @@ fn a_member_on_the_live_genesis_refuses_a_lab_identitys_ask_and_one_on_another_a
 
 /// A12: a lab identity's run with an invite on the live genesis is refused before the phrase is
 /// touched, so the invite stays live, and a release identity's run with the same words is let in.
+#[cfg(unix)]
 #[test]
 fn a_lab_identitys_run_on_the_live_genesis_spends_no_phrase() {
     let root = aterm_tempfile::tempdir().expect("temp");
@@ -2533,6 +2591,7 @@ fn a_lab_identitys_run_on_the_live_genesis_spends_no_phrase() {
 ///
 /// NEGATIVE CONTROL: `Desk::kept_seat` reading only `self.local.kept.get(&heard.node)` (the seat
 /// filter cut): the seat's own Mac reads as moving its own seat and the `own` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_rebuilt_macs_row_names_the_seat_it_takes_back_and_when_it_last_signed() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -2605,6 +2664,7 @@ fn a_rebuilt_macs_row_names_the_seat_it_takes_back_and_when_it_last_signed() {
 ///
 /// NEGATIVE CONTROL: `Desk::begin_proof` not recording the proven node (its `self.proven.push`
 /// cut): the rebuilt Mac's row shows no move and the `moves` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_refused_proof_of_a_kept_node_key_lets_the_ask_that_follows_show_the_move() {
     let root = aterm_tempfile::tempdir().unwrap();

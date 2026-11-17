@@ -245,6 +245,33 @@ pub struct TabTotal {
     pub ambiguous: u64,
 }
 
+/// Accepted nondelegated published own-counter growth, by its scope when accepted.
+///
+/// Closing or renaming a tab never moves its historical credit into `own_ns`. These counters
+/// start with the collector: `incomplete == false` proves neither pre-collector history nor
+/// when the observed work executed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoricalReported {
+    /// Growth accepted in aterm's own scope, nanoseconds.
+    pub own_ns: u64,
+    /// Growth accepted in any tab's scope, including closed tabs, nanoseconds.
+    pub tabs_ns: u64,
+    /// An observed owned-counter or identity gap, truncated sweep, or saturation occurred.
+    pub incomplete: bool,
+}
+
+impl HistoricalReported {
+    fn credit(&mut self, scope: Scope, delta: u64) {
+        let total = match scope {
+            Scope::Own => &mut self.own_ns,
+            Scope::Tab(_) => &mut self.tabs_ns,
+        };
+        self.incomplete |= total.checked_add(delta).is_none();
+        *total = total.saturating_add(delta);
+        self.incomplete |= self.own_ns.checked_add(self.tabs_ns).is_none();
+    }
+}
+
 /// The ledger's counters at one reading: where a window starts or ends.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReapTotals {
@@ -257,6 +284,8 @@ pub struct ReapTotals {
     pub missed: u64,
     /// Every scope's published own-counter growth, including closed tabs, nanoseconds.
     pub all_reported: u64,
+    /// Published growth retained in the scope that accepted it, independent of open tabs.
+    pub historical_reported: HistoricalReported,
     /// Last ambiguous inherited charge in any scope.
     pub ambiguous: u64,
     /// Last ambiguous inherited charge in aterm's own scope.
@@ -425,6 +454,7 @@ pub struct ReapLedger {
     pane_reported: IdMap<u64, u64>,
     unmapped_reported: u64,
     own_reported: u64,
+    historical_reported: HistoricalReported,
     ambiguity: u64,
     own_ambiguity: u64,
     terminal_totals: IdMap<crate::delegated::ProcessKey, Option<u64>>,
@@ -484,6 +514,8 @@ struct OwnReported {
     coalition: Option<u64>,
     version: Option<i32>,
     pane: Option<u64>,
+    /// A terminal or zombie read supplied this generation's final own counter.
+    final_read: bool,
 }
 
 impl ReapLedger {
@@ -530,8 +562,19 @@ impl ReapLedger {
 
     fn observe_own_reported(&mut self, i: &StepIn) {
         self.name_tabs(i.tabs);
+        let owned_pids: IdSet<_> = self
+            .reported_rows
+            .iter()
+            .filter(|(_, row)| !row.delegated)
+            .map(|(key, _)| key.pid)
+            .collect();
         for ((p, member), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
             let (Some(start), Some(cpu)) = (p.start, p.cpu_ns) else {
+                if !*delegated
+                    && (member.aterm || member.tab.is_some() || owned_pids.contains(&p.pid))
+                {
+                    self.historical_reported.incomplete = true;
+                }
                 let scope = member
                     .tab
                     .and_then(|index| i.tabs.get(index))
@@ -582,6 +625,8 @@ impl ReapLedger {
                 });
             let born = self.born_in_window(p, i);
             let regressed = previous.is_some_and(|before| cpu < before.cpu);
+            let final_read = p.state == ProcState::Zombie
+                || previous.is_some_and(|before| before.final_read && cpu <= before.cpu);
             let consecutive = !regressed
                 && previous.is_some_and(|before| self.reported_is_consecutive(&before, i.at_ns));
             let delta = if consecutive {
@@ -591,6 +636,16 @@ impl ReapLedger {
             } else {
                 0
             };
+            if !*delegated
+                && !previous.is_some_and(|before| before.final_read && cpu <= before.cpu)
+                && (regressed
+                    || (self.whole_at_ns.is_some()
+                        && !consecutive
+                        && (previous.is_some() || !born)
+                        && cpu > 0))
+            {
+                self.historical_reported.incomplete = true;
+            }
             if !*delegated
                 && self.whole_at_ns.is_some()
                 && !consecutive
@@ -630,9 +685,11 @@ impl ReapLedger {
                         .version
                         .or_else(|| previous.and_then(|before| before.version)),
                     pane,
+                    final_read,
                 },
             );
             if !*delegated {
+                self.historical_reported.credit(scope, delta);
                 if let Some(pane) = pane {
                     let total = self.pane_reported.entry(pane).or_default();
                     *total = total.saturating_add(delta);
@@ -674,6 +731,7 @@ impl ReapLedger {
         incomplete: bool,
     ) {
         self.pending_native_incomplete |= incomplete;
+        self.historical_reported.incomplete |= incomplete;
         for record in terminals {
             if record.seq
                 <= self
@@ -698,6 +756,7 @@ impl ReapLedger {
                 self.pending_terminals.remove(&key);
             }
             self.pending_native_incomplete = true;
+            self.historical_reported.incomplete = true;
         }
     }
 
@@ -714,6 +773,7 @@ impl ReapLedger {
     ) {
         self.ingest_terminals(terminals, incomplete);
         if i.truncated {
+            self.historical_reported.incomplete = true;
             return;
         }
         let terminals: Vec<_> = std::mem::take(&mut self.pending_terminals)
@@ -993,6 +1053,7 @@ impl ReapLedger {
             }
         }
         for tab in invalid {
+            self.historical_reported.incomplete = true;
             let scope = tab
                 .and_then(|key| {
                     self.keys
@@ -1043,6 +1104,7 @@ impl ReapLedger {
             all_reported: self.tabs.values().fold(self.own_reported, |sum, c| {
                 sum.saturating_add(c.reported_ns)
             }),
+            historical_reported: self.historical_reported,
             ambiguous: self.ambiguity,
             own_ambiguous: self.own_ambiguity,
             coalition_reported: self.coalition_reported.clone(),
@@ -1054,6 +1116,16 @@ impl ReapLedger {
                 .fold(self.own, |sum, c| sum.saturating_add(c.ns)),
             tabs,
         }
+    }
+
+    /// Accepted published growth by its original scope, without cloning current-scope maps.
+    #[must_use]
+    pub fn historical_reported(&self) -> HistoricalReported {
+        self.historical_reported
+    }
+
+    pub(super) fn mark_historical_incomplete(&mut self) {
+        self.historical_reported.incomplete = true;
     }
 
     /// Whether process `pid` started at `start` is a member whose work from step `since` to the
@@ -1172,6 +1244,7 @@ impl ReapLedger {
 
     fn step_observed(&mut self, i: &StepIn, whole: bool) {
         if i.truncated {
+            self.historical_reported.incomplete = true;
             return;
         }
         self.observe_own_reported(i);
@@ -1326,6 +1399,22 @@ impl ReapLedger {
     }
 
     fn accept_whole_cut(&mut self, i: &StepIn) {
+        let present: IdSet<_> = i
+            .procs
+            .iter()
+            .filter_map(|p| {
+                Some(crate::delegated::ProcessKey {
+                    pid: p.pid,
+                    start: p.start?,
+                })
+            })
+            .collect();
+        // A listed live member that vanished has no final counter. A native terminal or
+        // zombie read closes that gap before this real sweep, without moving its credit.
+        self.historical_reported.incomplete |= self
+            .reported_rows
+            .iter()
+            .any(|(key, row)| !row.delegated && !row.final_read && !present.contains(key));
         self.whole_at_ns = Some(i.at_ns);
         self.whole_wall_ms = Some(i.at_unix_ms);
         self.whole_cpu_cut = i.cpu_cut;

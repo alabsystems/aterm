@@ -46,8 +46,16 @@ fn rules_digest() {
             if test_only.iter().any(|excluded| path.starts_with(excluded)) {
                 continue;
             }
-            let relative = path.strip_prefix(root).unwrap_or(&path);
-            files.push((format!("{label}:{}", relative.display()), path.clone()));
+            // Named with `/` between its folders on every host, so a Windows build's rules name
+            // each input as a Unix build's do.
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            files.push((format!("{label}:{relative}"), path.clone()));
         }
     }
     files.sort();

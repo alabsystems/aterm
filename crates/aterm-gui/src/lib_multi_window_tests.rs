@@ -3073,7 +3073,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     };
     assert_eq!(app.present_latency_ns(wid), 0, "nothing armed yet");
 
-    app.on_occlusion_changed(wid, true);
+    app.on_occlusion_changed(wid, true, std::time::Instant::now());
     arm(&app, 2_000_000);
     let dt = app.present_latency_ns(wid);
     assert!(
@@ -3082,7 +3082,7 @@ fn an_occlusion_reveal_discards_the_stale_output_stamp_not_books_it() {
     );
 
     arm(&app, 1_000_000_000);
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     assert_eq!(
         app.present_latency_ns(wid),
         0,

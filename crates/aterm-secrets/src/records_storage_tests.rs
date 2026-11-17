@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 fn fixture() -> (aterm_tempfile::TempDir, PathBuf) {
@@ -44,6 +45,7 @@ fn budget(held: usize) -> crate::membership_log::RecordBudgets {
 /// after its growth, and without the capacity after the smaller one. APFS moves a file's
 /// inode-change time at each `chmod`, so no change here shows a mode the stamp kept, which
 /// [`fsx::Seen`] holds for a coarser clock.
+#[cfg(unix)]
 #[test]
 fn a_reader_resolves_an_unchanged_layout_once_and_a_changed_one_again() {
     /// A change to a judged layout, the capacity its reader then holds, and what makes it.
@@ -115,6 +117,10 @@ fn a_reader_resolves_an_unchanged_layout_once_and_a_changed_one_again() {
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_stale_snapshot_never_prepares_or_raises_the_layout() {
     for fenced in [false, true] {
@@ -149,6 +155,10 @@ fn an_absent_snapshot_refuses_a_new_file_before_preparing_a_layout() {
     assert!(!intent_path(&entry).unwrap().exists());
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_larger_writer_fences_format_aware_smaller_readers_before_changing_data() {
     let (_root, entry) = fixture();
@@ -169,6 +179,10 @@ fn a_larger_writer_fences_format_aware_smaller_readers_before_changing_data() {
     });
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_smaller_writer_cannot_finish_a_larger_pending_layout() {
     for cut in [Step::Intent, Step::Exchanged] {
@@ -190,6 +204,10 @@ fn a_smaller_writer_cannot_finish_a_larger_pending_layout() {
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn the_write_target_keeps_a_process_shared_lock_until_the_write_finishes() {
     let (_root, entry) = fixture();
@@ -216,6 +234,10 @@ fn the_write_target_keeps_a_process_shared_lock_until_the_write_finishes() {
     drop(inherited);
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn layout_preserves_the_original_and_selects_later_writes() {
     let (root, entry) = fixture();
@@ -237,6 +259,10 @@ fn layout_preserves_the_original_and_selects_later_writes() {
     assert!(fsx::write_atomic(&entry, b"old writer", 0o600).is_err());
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn interruption_keeps_custody_and_only_a_writer_finishes_a_pending_transition() {
     for cut in [
@@ -262,6 +288,10 @@ fn interruption_keeps_custody_and_only_a_writer_finishes_a_pending_transition() 
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn preparation_retries_reuse_one_declared_generation() {
     let (root, entry) = fixture();
@@ -295,6 +325,10 @@ fn preparation_retries_reuse_one_declared_generation() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_interrupted_derived_copy_resumes_from_its_existing_intent() {
     let (_root, entry) = fixture();
@@ -312,6 +346,10 @@ fn an_interrupted_derived_copy_resumes_from_its_existing_intent() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_interrupted_pin_write_resumes_without_moving_the_prepared_files() {
     let (_root, entry) = fixture();
@@ -335,6 +373,10 @@ fn an_interrupted_pin_write_resumes_without_moving_the_prepared_files() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_intent_does_not_turn_a_missing_original_into_empty_custody() {
     let (root, entry) = fixture();
@@ -347,6 +389,10 @@ fn an_intent_does_not_turn_a_missing_original_into_empty_custody() {
     assert_eq!(std::fs::read(saved).unwrap(), b"original history");
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_active_pin_never_falls_back_after_current_or_layout_is_lost() {
     let (root, entry) = fixture();
@@ -366,6 +412,10 @@ fn an_active_pin_never_falls_back_after_current_or_layout_is_lost() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_changed_predecessor_refuses_pending_recovery_without_losing_either_copy() {
     let (root, entry) = fixture();
@@ -388,6 +438,10 @@ fn a_changed_predecessor_refuses_pending_recovery_without_losing_either_copy() {
 /// `selection_witnesses`, the entry's arm confirms the replaced entry
 /// (`the selection still stood`); with the intent's stamp replaced the same way, the intent's
 /// arm does.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_selection_resolves_again_once_its_entry_or_its_intent_moved() {
     let refusal = |held: &Selected| {
@@ -429,6 +483,7 @@ fn a_selection_resolves_again_once_its_entry_or_its_intent_moved() {
 /// at the entry, the symlink selects the entry (`a symlink`, `left: Ok(entry), right: Err(..)`);
 /// with `Dir` or `Other` admitted alone, the directory or the FIFO does; with the intent's slot
 /// `_`, the missing original does; with the pin's slot `_`, the pin beside a file does.
+#[cfg(unix)]
 #[test]
 fn a_selection_from_its_witnesses_answers_as_data_path_does() {
     let answer = |path: Result<PathBuf>| path.map_err(|error| error.to_string());
@@ -500,6 +555,7 @@ fn a_selection_from_its_witnesses_answers_as_data_path_does() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn symlinks_hard_links_and_public_layout_files_are_refused() {
     for slot in [DATA, HEADER, "pin"] {
@@ -559,6 +615,10 @@ fn a_fresh_layout_has_no_invented_predecessor() {
     );
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_old_open_descriptor_can_only_change_the_preserved_predecessor() {
     let (_root, entry) = fixture();
@@ -573,4 +633,30 @@ fn an_old_open_descriptor_can_only_change_the_preserved_predecessor() {
         b"original history"
     );
     assert_eq!(std::fs::read(data).unwrap(), b"original history");
+}
+
+/// Windows has no atomic exchange of two names (ATERM-KI-1116-52817), so a records file kept
+/// whole is refused as a layout before any preparation is declared: the file stays as it was, and
+/// no intent, pin or preserved folder is left beside it. A fresh layout, which exchanges nothing,
+/// is made there as on Unix ([`a_fresh_layout_has_no_invented_predecessor`]).
+///
+/// NEGATIVE CONTROL (2026-11-16): without `prepare`'s Windows refusal the preparation is declared
+/// and copied, and its exchange is refused only at the end (os error 120, aterm-dirfd's
+/// `Errno::NOSYS`): the test fails on that refusal.
+#[cfg(windows)]
+#[test]
+fn a_records_file_kept_whole_is_refused_as_a_layout_and_stays_as_it_was() {
+    let (root, entry) = fixture();
+    let error = write_path(&entry, true).err().expect("refused");
+    assert!(error.to_string().contains("no atomic exchange"), "{error}");
+    assert_eq!(std::fs::read(&entry).unwrap(), b"original history");
+    assert!(!intent_path(&entry).unwrap().exists(), "an intent was left");
+    assert!(!pin_path(&entry).unwrap().exists(), "a pin was left");
+    for name in std::fs::read_dir(root.path()).unwrap() {
+        let name = name.unwrap().file_name();
+        assert!(
+            !name.to_string_lossy().starts_with(".aterm-records-"),
+            "{name:?} was left"
+        );
+    }
 }

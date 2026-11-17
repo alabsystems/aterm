@@ -207,8 +207,9 @@ pub fn apple_devtools_dialogs(dialogs: &[Dialog]) -> Vec<&Dialog> {
         .collect()
 }
 
-/// The `setup=` rows only a person can settle: a privacy switch in System Settings (Full Disk
-/// Access, Developer Tools, Accessibility), which aterm offers (`;offered:`), never answers, and
+/// The legacy `setup=` grants offered until a person asks for the batch: a privacy switch in
+/// System Settings (Full Disk Access, Developer Tools, Accessibility), which aterm offers
+/// (`;offered:`), never answers, and
 /// waits on only once a person asked for the batch; and the debugger's developer mode on an
 /// account that may not turn it on, which needs an administrator. An admin account's debugger row
 /// is neither offered nor waited on: it reads Waiting until setup's one Mac password (the Mac
@@ -271,16 +272,20 @@ impl Presses {
         self.named.iter().any(|row| row == LOCAL_NETWORK_ROW)
     }
 
-    /// The presses aterm could have made itself: every row that waited on a press while nobody
-    /// asked for anything (`person` false: a grant macOS requires is offered then, never waited
-    /// on), or, once a person at the console asked for the batch, each such row but the grants
-    /// only a person gives ([`MACOS_PERSON_ROWS`]).
+    /// The presses aterm could have made itself. The required `local-network` and `network-auth`
+    /// observations need macOS's app authorization and authenticated ALab admission, respectively;
+    /// neither authority is a press aterm can make. They remain pending in both person modes.
+    /// Other rows that waited on a press are avoidable, except the legacy grants only a person
+    /// gives ([`MACOS_PERSON_ROWS`]) once someone at the console asked for their batch.
     #[must_use]
     pub fn avoidable(&self, person: bool) -> Vec<&str> {
         self.needs
             .iter()
             .map(String::as_str)
-            .filter(|row| !person || !MACOS_PERSON_ROWS.contains(row))
+            .filter(|row| {
+                !matches!(*row, "local-network" | "network-auth")
+                    && (!person || !MACOS_PERSON_ROWS.contains(row))
+            })
             .collect()
     }
 }

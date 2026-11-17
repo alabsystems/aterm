@@ -19,6 +19,7 @@ fn intent(paths: &Paths) -> crate::Result<Option<bool>> {
         .transpose()
 }
 
+#[cfg(unix)]
 pub(super) fn pending(paths: &Paths) -> bool {
     matches!(config(paths), Ok(None)) && intent(paths).is_ok_and(|intent| intent.is_some())
 }
@@ -55,7 +56,7 @@ pub fn on_bootstrap_allowed(allowed: BootstrapAllowed) {
 /// # Errors
 /// Setup was stopped, disabled, replaced, or could not be read.
 pub fn check_bootstrap_allowed(paths: &Paths) -> crate::Result<()> {
-    if crate::service::subscriber_turned_off(&paths.home) {
+    if crate::off_record::subscriber_turned_off(&paths.home) {
         return Err(Error::new(
             "the vault subscriber was turned off; bootstrap is held",
         ));
@@ -71,6 +72,7 @@ pub fn check_bootstrap_allowed(paths: &Paths) -> crate::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 pub(super) fn background_native(paths: &Paths) -> crate::Result<NativeAdmission> {
     native_bootstrap(paths, &|| {
         check_bootstrap_allowed(paths)?;
@@ -134,9 +136,9 @@ fn remember_native(paths: &Paths, outcome: NativeAdmission) -> crate::Result<Nat
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type Attempt = Box<dyn Fn(&Paths, ExpectedConfig<'static>) -> crate::Result<()>>;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static ATTEMPT: std::cell::RefCell<Option<Attempt>> = const { std::cell::RefCell::new(None) };
 }
@@ -161,6 +163,7 @@ pub fn prepare_alab_join_retry(paths: &Paths) -> crate::Result<()> {
     fsx::write_atomic(&paths.dir.join(FILE), INTENT, 0o600)
 }
 
+#[cfg(unix)]
 pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
     #[cfg(test)]
     if let Some(result) = ATTEMPT.with(|attempt| {
@@ -191,6 +194,7 @@ pub(super) fn resume(paths: &Paths) -> crate::Result<()> {
     })
 }
 
+#[cfg(any(unix, test))]
 fn resume_with(
     paths: &Paths,
     join: impl FnOnce(&Paths, ExpectedConfig<'static>) -> crate::Result<()>,
@@ -214,6 +218,7 @@ fn resume_with(
 ///
 /// # Errors
 /// The intent cannot be read, the gate holds a pending bootstrap, or the bootstrap failed.
+#[cfg(any(unix, test))]
 fn resume_attempt(
     paths: &Paths,
     join: impl FnOnce(&Paths, ExpectedConfig<'static>) -> crate::Result<()>,

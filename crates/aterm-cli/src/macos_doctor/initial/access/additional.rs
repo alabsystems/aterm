@@ -29,14 +29,80 @@ fn row(access: Access, result: Result<(Standing, String, Option<String>), String
 }
 
 pub(super) fn read() -> [Option<Observation>; 5] {
-    [
-        Access::LocalNetwork,
-        Access::NameRule,
-        Access::SpotlightScope,
-        Access::NetworkAuth,
+    #[cfg(target_os = "macos")]
+    let local_network = local_network(aterm_lan::grant::authorization_here());
+    #[cfg(not(target_os = "macos"))]
+    let local_network = local_network(Ok(None));
+    #[cfg(target_os = "macos")]
+    let network_helper = network_helper(aterm_uds::lan::broker::installed_hello(), || {
+        aterm_uds::lan::install::owed_here(
+            || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
+            || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
+        )
+    });
+    #[cfg(not(target_os = "macos"))]
+    let network_helper = row(
         Access::NetworkHelper,
+        Ok((Standing::InPlace, "No helper required".into(), None)),
+    );
+    [
+        Some(local_network),
+        Some(row(Access::NameRule, read_one(Access::NameRule))),
+        Some(row(
+            Access::SpotlightScope,
+            read_one(Access::SpotlightScope),
+        )),
+        Some(row(Access::NetworkAuth, read_one(Access::NetworkAuth))),
+        Some(network_helper),
     ]
-    .map(|access| Some(row(access, read_one(access))))
+}
+
+/// App-level consent is diagnostic: all of aterm's own LAN traffic requires the separately
+/// confirmed root helper, with no fallback that asks macOS for this app's permission.
+pub(super) fn local_network(permission: Result<Option<bool>, String>) -> Observation {
+    let (now, error) = match permission {
+        Ok(Some(true)) => ("Allowed", None),
+        Ok(Some(false)) => ("Denied", None),
+        Ok(None) => ("Not answered", None),
+        Err(why) => ("Not read", Some(why)),
+    };
+    let mut seen = Observation::unknown(Subject::Access(Access::LocalNetwork));
+    seen.standing = Standing::NotNeeded;
+    seen.now = Some(now.into());
+    let mut detail = format!(
+        "Not required for aterm's own LAN traffic; the network helper is checked separately. macOS app permission: {now}."
+    );
+    if let Some(error) = error {
+        detail.push(' ');
+        detail.push_str(&error);
+    }
+    seen.note = Some(detail.clone());
+    seen.detail = Some(detail);
+    seen
+}
+
+/// One current installed-root hello owns the helper requirement. A missing or refused proof
+/// remains incomplete; app-level consent never supplies root custody.
+#[cfg(target_os = "macos")]
+pub(super) fn network_helper(
+    hello: Result<aterm_uds::lan::BrokerHello, aterm_uds::lan::LanError>,
+    repair: impl FnOnce() -> bool,
+) -> Observation {
+    let result = match hello {
+        Ok(hello) if hello.direct.is_none() => {
+            Ok((Standing::InPlace, "Installed and authorized".into(), None))
+        }
+        Ok(_) => Err("The installed helper did not establish root custody".into()),
+        Err(_) if repair() => Ok((
+            Standing::NeedsYou,
+            "Setup incomplete".into(),
+            Some(
+                "Your Mac password is required to finish the local-network helper's setup.".into(),
+            ),
+        )),
+        Err(why) => Err(format!("Network helper not confirmed: {why}")),
+    };
+    row(Access::NetworkHelper, result)
 }
 
 fn read_one(access: Access) -> Result<(Standing, String, Option<String>), String> {
@@ -45,52 +111,6 @@ fn read_one(access: Access) -> Result<(Standing, String, Option<String>), String
     let ready = |word: &str| Ok((Standing::InPlace, word.to_owned(), None));
     let needs = |word: &str, why: String| Ok((Standing::NeedsYou, word.to_owned(), Some(why)));
     match access {
-        Access::LocalNetwork => {
-            #[cfg(target_os = "macos")]
-            {
-                match aterm_lan::grant::authorization_here()? {
-                    Some(true) => ready("Allowed by macOS"),
-                    Some(false) => needs(
-                        "Denied",
-                        "Allow aterm in System Settings > Privacy & Security > Local Network."
-                            .into(),
-                    ),
-                    None => needs(
-                        "Not authorized",
-                        "Allow aterm in System Settings > Privacy & Security > Local Network."
-                            .into(),
-                    ),
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                ready("No macOS grant required")
-            }
-        }
-        Access::NetworkHelper => {
-            #[cfg(target_os = "macos")]
-            {
-                match aterm_uds::lan::broker::installed_hello() {
-                    Ok(hello) if hello.direct.is_none() => ready("Installed and authorized"),
-                    Ok(_) => Err("The installed helper did not establish root custody".into()),
-                    Err(why) => {
-                        let repair = aterm_uds::lan::install::owed_here(
-                            || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
-                            || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
-                        );
-                        if repair {
-                            needs("Setup incomplete", "Your Mac password is required to finish the local-network helper's setup.".into())
-                        } else {
-                            Err(format!("Network helper not confirmed: {why}"))
-                        }
-                    }
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                ready("No helper required")
-            }
-        }
         Access::NameRule => {
             if !cfg!(target_os = "macos") {
                 return Ok((Standing::NotNeeded, "macOS only".into(), None));

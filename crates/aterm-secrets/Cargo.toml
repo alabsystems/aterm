@@ -32,7 +32,7 @@ aterm-uds = { workspace = true }
 # `dirs::home_dir`, `fs_restricted` (0700 directories).
 aterm-stamp = { workspace = true }
 aterm-types = { workspace = true }
-# `hv_vmm_present`: an identity made in a virtual machine is a lab identity (`LabMark`).
+# `vm_guest`: an identity made in a virtual machine is a lab identity (`LabMark`).
 aterm-sysprobe = { workspace = true }
 # Shared release-ring authority is verified with the updater's pinned master-roster chain.
 aterm-update-core = { workspace = true }
@@ -75,6 +75,17 @@ libc = { workspace = true }
 aterm-tempfile = { workspace = true }
 astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
 
+[target.'cfg(windows)'.dependencies]
+# fsx's Windows arm (`fsx_win.rs`): its looks read a handle's facts and its folder-relative
+# renames refuse a taken name in one step; the journal fsx stamps for its readers.
+aterm-dirfd.workspace = true
+aterm-journal.workspace = true
+# Exclusive scratch folders (a founding's control journal); the client's edit folders are made
+# owner-only by fsx on Windows instead.
+aterm-tempfile = { workspace = true }
+# Commons' control journal's records (`commons::journal`).
+astream-broker = { path = "../../vendor/astream/crates/astream-broker" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Network.framework's path monitor (`home_lan`: a cellular or hotspot path is never the home ALab
 # LAN). Zero dependencies of its own; it opens the framework only at a monitor's first start.
@@ -92,7 +103,7 @@ aterm-models-db.workspace = true
 aterm-models-swarm.workspace = true
 aterm-spec.workspace = true
 # The CCTV vectors are found from the package directory when the tests run
-# (`aterm_tempfile::manifest_dir`), off Unix too, where it is no normal dependency.
+# (`aterm_tempfile::manifest_dir`), on a target where it is no normal dependency too.
 aterm-tempfile.workspace = true
 
 [[example]]

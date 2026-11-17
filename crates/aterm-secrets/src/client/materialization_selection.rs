@@ -213,15 +213,20 @@ pub(super) fn current(paths: &Paths, state: &State) -> crate::Result<Option<Curr
 
 /// A prior fact is reused only under a current shared state observation and identical source,
 /// recipient-file, history and record-budget inputs. Every caller still reads actual local files
-/// and denial policy. A stamp miss reads the current selector; no plaintext is cached.
+/// and denial policy. A stamp miss reads the current selector; no plaintext is cached. `None` for
+/// a moment, an observation that no longer guards the state lock or selection inputs that moved
+/// while they were read, is noted in `judgement` ([`Judgement::faulted`]); a read that fails is
+/// the caller's `Err` to note.
 pub(super) fn observe(
     paths: &Paths,
     config: &Config,
     state: &State,
     observation: &StateLock,
     prior: Option<&Arc<Fact>>,
+    judgement: &mut Judgement,
 ) -> crate::Result<Option<Arc<Fact>>> {
     if !observation.observes(paths) {
+        judgement.faulted = true;
         return Ok(None);
     }
     let inputs = config
@@ -257,6 +262,7 @@ pub(super) fn observe(
         .as_ref()
         .is_some_and(|before| after.as_ref() != Some(before))
     {
+        judgement.faulted = true;
         return Ok(None);
     }
     let inputs = inputs.filter(|before| after.as_ref() == Some(before));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `claude-wall-panel [--keep]`: MEASURE CLAUDE CODE'S OWN `/usage` PANEL OVER A STANDING USAGE
+//! `claude-wall-panel [--keep] [--record]`: MEASURE CLAUDE CODE'S OWN `/usage` PANEL OVER A STANDING USAGE
 //! WALL, and record what it found in `ai::connector::CLAUDE_ACCOUNTS.wall_panel_measured_on`.
 //!
 //! The accounts probe types `/usage` only at a quiet turn end: `ProbeGate::Wall` shuts it wherever
@@ -33,7 +33,8 @@
 //!    as before (`upgrade::transcript_standing_wall`, what `upgrade_drive::named_standing_wall`
 //!    reads), and that Escape left the wall, Claude Code's own continuation and its dialog as they
 //!    were;
-//! 5. on a PASS, the frames written to aterm-phase's fixtures (`claude-<build>-wall-panel-*.txt`,
+//! 5. on a PASS, the frames this build has none of yet (all of them with `--record`) written to
+//!    aterm-phase's fixtures (`claude-<build>-wall-panel-*.txt`,
 //!    the lab's project folder spelled `/private/tmp/at.lab0`) and the connector's field written to
 //!    what the run found ([`record_field`]): the build where the panel opened at every wall it
 //!    was typed at, else `None`; on a FAIL, the frames and logs kept in a world of their own and
@@ -1179,13 +1180,23 @@ fn session(build: &str, keep: bool) -> Result<(Lab, Vec<(WallAt, Evidence)>), Fa
     Ok((lab, out))
 }
 
+/// Whether a passing run writes its capture of a frame: where this build has no
+/// committed frame of that name, or where the run was asked to (`--record`). Claude
+/// Code's screen differs between runs of one build beyond when they were taken (its
+/// spinner word, an effort row, the status line's hints, the order rows settle in),
+/// so a committed frame is a build's first capture, kept until someone records again:
+/// a re-run judges its own fresh frames and leaves the checkout as it was.
+pub(crate) fn writes_frame(committed: bool, record: bool) -> bool {
+    record || !committed
+}
+
 /// Write `text` to `path`.
 fn write(path: &Path, text: &str) -> Result<(), Fail> {
     crate::util::atomic_write(path, text.as_bytes())
         .map_err(|e| Fail::die(format!("{}: {e}", path.display())))
 }
 
-/// `claude-wall-panel [--keep]`.
+/// `claude-wall-panel [--keep] [--record]`.
 /// # Errors
 /// Usage; the run's interrupt; NOT RUN where the managed Claude Code or the lab is missing; a
 /// FAIL where a step that must happen did not.
@@ -1193,6 +1204,7 @@ pub fn cmd_claude_wall_panel(args: &[String]) -> Res {
     crate::stop::install();
     let mut a = args.to_vec();
     let keep = take_flag(&mut a, "--keep");
+    let record = take_flag(&mut a, "--record");
     if let Some(extra) = a.first() {
         return Err(Fail::usage(format!(
             "{VERB}: unexpected '{extra}' ({LAB} help)"
@@ -1271,7 +1283,10 @@ pub fn cmd_claude_wall_panel(args: &[String]) -> Res {
     }
     let fixtures = repo.join(FIXTURES);
     for (name, text) in &frames {
-        write(&fixtures.join(name), text)?;
+        let path = fixtures.join(name);
+        if writes_frame(path.exists(), record) {
+            write(&path, text)?;
+        }
     }
     let connector = repo.join(CONNECTOR);
     let source = crate::util::read_regular_text(&connector)

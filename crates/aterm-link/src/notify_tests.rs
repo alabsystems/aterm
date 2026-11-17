@@ -5127,10 +5127,12 @@ fn need_selectors_take_the_needs_a_fold_raises_and_refuse_any_other() {
             "{f}: a family names some word"
         );
         for w in &words {
+            // `wall` is a word too: a wall whose kind nothing names. `need:wall` takes it
+            // with every `wall:<kind>`.
             assert_eq!(
                 sel.selects(w),
-                w.split_once(':').is_some_and(|(family, _)| family == *f),
-                "need:{f} selects {w} exactly when it is of the family"
+                w == f || w.split_once(':').is_some_and(|(family, _)| family == *f),
+                "need:{f} selects {w} exactly when it is of the family, or is its bare word"
             );
         }
     }

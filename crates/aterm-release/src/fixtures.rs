@@ -927,7 +927,18 @@ impl MainReader {
         let git = crate::ledger::GitCli::new(&self.repo);
         let local = crate::ledger::GitCli::new(&tree);
         if tree.join(".git").exists() {
-            git_ok(&local, &["checkout", "--force", "--detach", revision])?;
+            // Move the superproject first: its module repositories may not hold the new pins
+            // yet. The explicit update below fetches and checks out those pins next.
+            git_ok(
+                &local,
+                &[
+                    "checkout",
+                    "--force",
+                    "--detach",
+                    "--no-recurse-submodules",
+                    revision,
+                ],
+            )?;
             git_ok(&local, &["clean", "-ffdx"])?;
         } else {
             git_ok(

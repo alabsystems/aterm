@@ -4,9 +4,12 @@
 //! Copy-on-write clones of a build's files for the rustup view ([`crate::seam`])
 //! and per-build exec roots ([`crate::compat`]).
 //!
-//! Uses `std::fs::copy` within a single volume on Unix (`fclonefileat` on APFS,
-//! `copy_file_range` on Linux) and verifies clone identity by matching length,
-//! permissions, and mtime on a distinct inode.
+//! [`clone_file`] uses `std::fs::copy` within a single volume on Unix (`fclonefileat` on APFS,
+//! `copy_file_range` on Linux), which falls back to a byte copy where the filesystem cannot
+//! clone (HFS+, exFAT, ext4). [`cow_clone_file`] never does: it asks the kernel for a
+//! copy-on-write clone (`clonefile` on macOS, `FICLONE` on Linux) and refuses where none can be
+//! made. [`is_clone_of`] verifies clone identity by matching length, permissions, and mtime on a
+//! distinct inode.
 
 use std::io;
 use std::path::Path;
@@ -15,12 +18,34 @@ use std::path::Path;
 type VolumeId = u64;
 
 /// Clones regular file `src` to `dst` on the same volume, preserving permissions and mtime.
+/// Where the volume cannot clone, `std::fs::copy` lays a byte copy instead; a caller that must
+/// never byte-copy uses [`cow_clone_file`].
 ///
 /// # Errors
 /// `src` is not a regular file, `dst` exists, `dst`'s directory is on another device than
-/// `src` (a toolchain is never byte-copied in a clone's place), or the copy fails. Off Unix
-/// it always refuses with [`io::ErrorKind::Unsupported`].
+/// `src` (a toolchain is never copied across volumes in a clone's place), or the copy fails.
+/// Off Unix it always refuses with [`io::ErrorKind::Unsupported`].
 pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+    lay(src, dst, |src, dst| std::fs::copy(src, dst).map(drop))
+}
+
+/// Clones regular file `src` to `dst` as a copy-on-write clone the kernel makes (`clonefile` on
+/// macOS, `FICLONE` on Linux), preserving permissions and mtime: `dst` shares `src`'s blocks
+/// until one of them is written, and no byte is ever copied.
+///
+/// # Errors
+/// As [`clone_file`]; and [`io::ErrorKind::Unsupported`] where the volume cannot clone (HFS+,
+/// exFAT, ext4, any other OS), with nothing left at `dst`.
+pub(crate) fn cow_clone_file(src: &Path, dst: &Path) -> io::Result<()> {
+    lay(src, dst, kernel_clone)
+}
+
+/// [`clone_file`]'s steps around `copy`, the one that lays `dst`'s bytes.
+fn lay(
+    src: &Path,
+    dst: &Path,
+    copy: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let meta = std::fs::symlink_metadata(src)?;
     if !meta.is_file() {
         return Err(io::Error::new(
@@ -41,15 +66,17 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
         ));
     }
     same_device(src, &meta, dst)?;
-    std::fs::copy(src, dst).map_err(|e| {
+    copy(src, dst).map_err(|e| {
         io::Error::new(
             e.kind(),
             format!("cannot clone {} to {} ({e})", src.display(), dst.display()),
         )
     })?;
     let modified = meta.modified()?;
+    // Read-only: the owner sets a file's time and mode through any descriptor, and a clone of a
+    // read-only file opens for writing to nobody.
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
+    opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -68,6 +95,96 @@ pub(crate) fn clone_file(src: &Path, dst: &Path) -> io::Result<()> {
         file.set_permissions(meta.permissions())?;
     }
     Ok(())
+}
+
+/// Ask the kernel for a copy-on-write clone of `src` at the free name `dst`
+/// (`clonefile(2)`, `CLONE_NOFOLLOW`): no byte copy where the volume cannot clone.
+#[cfg(target_os = "macos")]
+fn kernel_clone(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    /// `<sys/clonefile.h>`: do not follow a symbolic link at `src`.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+
+    unsafe extern "C" {
+        /// `<sys/clonefile.h>`: `int clonefile(const char *src, const char *dst, uint32_t flags)`.
+        fn clonefile(src: *const libc::c_char, dst: *const libc::c_char, flags: u32)
+        -> libc::c_int;
+    }
+
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    };
+    let (from, to) = (c(src)?, c(dst)?);
+    // SAFETY: both arguments are NUL-terminated paths alive across the call; `clonefile` reads
+    // them and writes no memory of ours.
+    let rc = unsafe { clonefile(from.as_ptr(), to.as_ptr(), CLONE_NOFOLLOW) };
+    if rc == 0 {
+        return Ok(());
+    }
+    Err(unclonable(io::Error::last_os_error()))
+}
+
+/// Ask the kernel for a copy-on-write clone of `src` at the free name `dst` (`FICLONE`): no
+/// byte copy where the volume cannot clone, and nothing left at `dst` after a refusal.
+#[cfg(target_os = "linux")]
+fn kernel_clone(src: &Path, dst: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    /// `<linux/fs.h>`: `FICLONE = _IOW(0x94, 9, int)`.
+    const FICLONE: libc::c_ulong = 0x4004_9409;
+
+    let from = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(src)?;
+    let to = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(dst)?;
+    // SAFETY: both descriptors are open for the call; `FICLONE` takes the source descriptor as
+    // its argument and writes no memory of ours.
+    let rc = unsafe { libc::ioctl(to.as_raw_fd(), FICLONE, from.as_raw_fd()) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let e = io::Error::last_os_error();
+    drop(to);
+    let _ = std::fs::remove_file(dst);
+    Err(unclonable(e))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn kernel_clone(src: &Path, _dst: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "{}: atpkg makes a copy-on-write clone only on macOS and Linux",
+            src.display()
+        ),
+    ))
+}
+
+/// A volume that cannot clone reads as [`io::ErrorKind::Unsupported`]; any other error stands.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unclonable(e: io::Error) -> io::Error {
+    // `ENOTSUP` and `EOPNOTSUPP` are one number on Linux and two on macOS.
+    let cannot = e.raw_os_error().is_some_and(|code| {
+        [libc::ENOTSUP, libc::EOPNOTSUPP, libc::EXDEV, libc::EINVAL].contains(&code)
+    });
+    if cannot {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "the volume cannot make a copy-on-write clone ({e}), and atpkg never byte-copies one"
+            ),
+        )
+    } else {
+        e
+    }
 }
 
 /// Refuse when `dst`'s parent directory is not on `src`'s device.

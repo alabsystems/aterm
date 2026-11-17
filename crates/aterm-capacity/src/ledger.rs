@@ -33,6 +33,9 @@ mod heavy_tests;
 #[cfg(test)]
 #[path = "legacy_claim_tests.rs"]
 mod legacy_claim_tests;
+#[cfg(test)]
+#[path = "ledger_person_tests.rs"]
+mod person_tests;
 
 /// Saved identity of the original claim guard. These numbers are observations, not a
 /// descriptor, writer, spawn receipt or permission to release a reservation.
@@ -297,6 +300,9 @@ impl Record {
         if self.need.leads {
             o.insert("leads".to_owned(), Value::from(true));
         }
+        if self.need.person {
+            o.insert("person".to_owned(), Value::from(true));
+        }
         if self.need.critical {
             o.insert("critical".to_owned(), Value::from(true));
         }
@@ -517,6 +523,7 @@ impl Record {
             covers: head.get("covers").and_then(Value::as_bool) == Some(true),
             scratch: head.get("scratch").and_then(Value::as_bool) == Some(true),
             leads: head.get("leads").and_then(Value::as_bool) == Some(true),
+            person: head.get("person").and_then(Value::as_bool) == Some(true),
             critical: head.get("critical").and_then(Value::as_bool) == Some(true),
             lead_reservation: None,
             run_mem: None,
@@ -594,6 +601,7 @@ impl Record {
         // as any other, no longer alone: its reservation is counted beside the other claims'.
         let mut need = need;
         need.leads &= need.rank != crate::Rank::Background;
+        need.person &= need.rank == crate::Rank::Ordinary && !need.leads;
         need.run_mem = num(&head, "run_mem").filter(|run| *run < need.mem);
         need.stepped = stepped.filter(|_| held);
         let valid_detached_need = match marker {
@@ -1639,6 +1647,8 @@ impl Ledger {
         // written by this ledger's waiter, never authority a caller can carry into a new claim.
         need.critical &= need.leads && need.rank == crate::Rank::Release;
         need.lead_reservation = None;
+        // Only an Ordinary claim that does not lead is a person's ([`Need::person`]).
+        need.person &= need.rank == crate::Rank::Ordinary && !need.leads;
         let record = Record {
             accounting,
             pid,

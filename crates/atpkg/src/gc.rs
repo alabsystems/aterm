@@ -481,6 +481,9 @@ pub struct GcReport {
     /// `(program, builds ascending)` moved out of Spotlight's index into `<build>.noindex`
     /// ([`lay_aside_unused`]).
     pub laid_aside: Vec<(String, Vec<u64>)>,
+    /// The keyed trees evicted for idleness and what interrupted installs of them left
+    /// ([`crate::keyed_tree::sweep_idle`]).
+    pub swept_trees: crate::keyed_tree::Sweep,
 }
 
 /// Reclaim superseded builds per program, keeping the live build and one rollback.
@@ -658,7 +661,13 @@ fn run_in(
     for sidecar in debris.orphan_sidecars {
         let _ = std::fs::remove_file(sidecar);
     }
-    // A discarded build's kept unit went with it; its `units/` link goes now too.
+    let swept_trees = crate::keyed_tree::sweep_idle(
+        layout,
+        std::time::SystemTime::now(),
+        crate::keyed_tree::KEEP,
+        &in_scope,
+    );
+    // A discarded build's or tree's kept unit went with it; its `units/` link goes now too.
     crate::peers::sweep_kept(layout);
     let mut swept_scratch: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (program, name, path) in debris.scratch {
@@ -745,6 +754,7 @@ fn run_in(
         leased,
         held_staging,
         laid_aside,
+        swept_trees,
     }
 }
 

@@ -407,7 +407,9 @@ fn git_child_observation_preserves_config_input_exits_and_errors() {
         base.clone().arg("--version"),
         query(
             b"[user]\nname = private-config-marker\n",
-            ConfigQuery::Names { read_only: false },
+            ConfigQuery::Names {
+                access: crate::git::ConfigAccess::Write,
+            },
         ),
         query(
             b"[core]\nrepositoryformatversion = 0\n",
@@ -415,7 +417,9 @@ fn git_child_observation_preserves_config_input_exits_and_errors() {
         ),
         query(
             b"[broken\nprivate-config-marker\n",
-            ConfigQuery::Names { read_only: false },
+            ConfigQuery::Names {
+                access: crate::git::ConfigAccess::Write,
+            },
         ),
     ];
     let spans = Arc::new(Mutex::new(Vec::new()));

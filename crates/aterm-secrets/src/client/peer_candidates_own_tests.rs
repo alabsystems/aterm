@@ -3,6 +3,8 @@
 
 use super::*;
 
+use std::sync::Arc;
+
 #[test]
 fn reordered_browse_events_do_not_hide_later_peers() {
     const DEFAULT: &str = "http://default.local:7484/v1/alab";

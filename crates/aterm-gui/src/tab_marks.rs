@@ -34,6 +34,9 @@ pub(crate) struct Acting {
     /// Who on another Mac asked, for a fleet drive's act: a tab it opens records the requester's
     /// program, model and account (`agent=`, `model=`, `account=`).
     pub(crate) requester: Option<Arc<aterm_types::control_verbs::Requester>>,
+    /// What a spawn said of the session it opens: the first open under the act takes it
+    /// ([`take_birth`]) and writes its birth claims.
+    pub(crate) birth: Option<Arc<crate::session_log::Birth>>,
     /// The act closes a tab (`unstarted`): its `why=` is the close's, never an open's.
     closes: bool,
 }
@@ -53,23 +56,32 @@ impl ActScope {
     /// An act by `by` that places tabs, for `why`.
     #[must_use = "the act lasts exactly as long as this guard lives"]
     pub(crate) fn enter(by: ExitActor, why: &'static str) -> Self {
-        Self::asking(by, why, None, None)
+        Self::resume(Some(Acting {
+            by,
+            why: Some(why),
+            asked: None,
+            requester: None,
+            birth: None,
+            closes: false,
+        }))
     }
 
-    /// [`Self::enter`] for a request that said what it is for in `asked` (`spawn why=`), from
-    /// `requester` on another Mac where a fleet drive asked it.
+    /// [`Self::enter`] for a spawn that said what it opens in `birth` (its `why=`, which a tab it
+    /// opens records as `why_text=`, its task's line, `package=` and `from=`), from `requester`
+    /// on another Mac where a fleet drive asked it.
     #[must_use = "the act lasts exactly as long as this guard lives"]
     pub(crate) fn asking(
         by: ExitActor,
         why: &'static str,
-        asked: Option<&str>,
+        birth: crate::session_log::Birth,
         requester: Option<aterm_types::control_verbs::Requester>,
     ) -> Self {
         Self::resume(Some(Acting {
             by,
             why: Some(why),
-            asked: asked.map(Arc::from),
+            asked: birth.matters.as_deref().map(Arc::from),
             requester: requester.map(Arc::new),
+            birth: Some(Arc::new(birth)),
             closes: false,
         }))
     }
@@ -96,6 +108,7 @@ impl ActScope {
             why: Some(why),
             asked: None,
             requester: None,
+            birth: None,
             closes: true,
         }))
     }
@@ -135,8 +148,21 @@ pub(crate) fn acting() -> Option<Acting> {
             why: None,
             asked: None,
             requester: None,
+            birth: None,
             closes: false,
         })
+    })
+}
+
+/// TAKE THE BIRTH of the act under way on this thread: the first open under the act takes it, and
+/// a later open under the same act gets none, since a birth is one session's. An async spawn's
+/// booked copy of the act ([`acting`]) carries its own birth to the land, whose open takes it.
+pub(crate) fn take_birth() -> Option<Arc<crate::session_log::Birth>> {
+    ACTING.with(|slot| {
+        slot.borrow_mut()
+            .as_mut()
+            .filter(|acting| !acting.closes)
+            .and_then(|acting| acting.birth.take())
     })
 }
 
@@ -304,7 +330,13 @@ impl crate::App {
         else {
             return;
         };
+        let birth = take_birth();
         let (by, why, asked) = open_by(place_why);
+        // Resolved before the new session's timeline is locked: the store's lock and the
+        // creator's timeline lock are each taken alone.
+        let born = birth
+            .as_ref()
+            .map(|birth| self.birth_of(birth, &by, asked.requester.is_some()));
         let mut tl = ctx
             .timeline
             .lock()
@@ -318,6 +350,46 @@ impl crate::App {
         };
         let by = crate::session_log::exit_actor(&by);
         tl.slog_mut().open_tab(place, why, &asked, by, at);
+        if let (Some(birth), Some(born)) = (birth.as_deref(), born.as_ref()) {
+            let _ = tl.slog_mut().claim_birth(&born.claims(birth), at);
+        }
+    }
+
+    /// WHAT AN OPEN MAKES OF `birth`, its act by `by` (asked over a fleet drive where `fleet`):
+    /// the creator its `from=` names as the store resolves it ([`Self::resolved_from`]), who its
+    /// claims are by ([`crate::session_log::BirthAuthor::of`]), and, where it gave no `why=`,
+    /// joined no request whose why was given and no fleet drive asked, the creator's standing
+    /// reason copied once, under the creator's timeline lock alone (so the creator's timeline is
+    /// never locked for a reason that would not be written). A later change of the creator's
+    /// reason is the creator's to state.
+    pub(crate) fn birth_of(
+        &self,
+        birth: &crate::session_log::Birth,
+        by: &ExitActor,
+        fleet: bool,
+    ) -> crate::session_log::Born {
+        let resolved = birth.from.as_ref().map(|from| self.resolved_from(from));
+        let creator = resolved
+            .as_ref()
+            .and_then(|r| crate::session_log::sid_ident(&r.sid));
+        let author = crate::session_log::BirthAuthor::of(by, creator, fleet);
+        let copied = match resolved.as_ref().and_then(|r| r.ctx.as_ref()) {
+            Some(ctx) if birth.matters.is_none() && birth.request_why.is_none() && !fleet => {
+                let tl = ctx
+                    .timeline
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let now_wall = tl.slog().now().wall_ms;
+                aterm_slog::shown(tl.slog().log().state(), "matters", now_wall)
+                    .map(|s| s.claim.value.clone())
+            }
+            _ => None,
+        };
+        crate::session_log::Born {
+            author,
+            creator: resolved.map(|r| r.sid),
+            copied,
+        }
     }
 
     /// The launch's first tab (session 0 of window 0, built before the App was): opened by

@@ -68,7 +68,19 @@ pub trait SealProbe {
 
     /// The lineage receipt switch, read from `trust_repo`'s live origin main.
     fn lineage_switch(&self, ctx: &Ctx, trust_repo: &Path) -> Switch;
+
+    /// Whether `checkout`'s whole dependency graph resolves as its pack will build it: the
+    /// seal's `targo metadata --locked --offline --format-version 1`, `RUSTC` the seal's
+    /// `trustc`, with this process's Cargo home (the one the pack inherits). Nothing is
+    /// downloaded: a dependency the Cargo home lacks fails as that.
+    ///
+    /// # Errors
+    /// cargo's last lines, or why it did not run.
+    fn resolves(&self, seal: &Path, checkout: &Path) -> std::result::Result<(), String>;
 }
+
+/// How many of cargo's last stderr lines a refusal quotes.
+const CARGO_TAIL: usize = 5;
 
 /// The seal run for real, and the switch the packers read.
 #[derive(Clone, Copy, Debug, Default)]
@@ -92,6 +104,23 @@ impl SealProbe for RealProbe {
 
     fn lineage_switch(&self, ctx: &Ctx, trust_repo: &Path) -> Switch {
         lineage_switch::read(ctx, trust_repo).unwrap_or_else(|e| Switch::Unknown(e.to_string()))
+    }
+
+    fn resolves(&self, seal: &Path, checkout: &Path) -> std::result::Result<(), String> {
+        let mut cmd = aterm_uds::spawnfd::command(seal.join("bin/targo"));
+        cmd.args(["metadata", "--locked", "--offline", "--format-version", "1"])
+            .current_dir(checkout)
+            .env("RUSTC", seal.join("bin/trustc"));
+        match aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(300))
+        {
+            Ok(o) if o.status.success() => Ok(()),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                let lines: Vec<&str> = stderr.trim_end().lines().collect();
+                Err(lines[lines.len().saturating_sub(CARGO_TAIL)..].join("\n"))
+            }
+            Err(e) => Err(format!("`targo metadata` did not run: {e:?}")),
+        }
     }
 }
 
@@ -624,6 +653,17 @@ pub fn preflight(ctx: &Ctx, req: &GroupRequest, parts: &Parts<'_>) -> Preflight 
             pf.problems.push(format!(
                 "{program}: the checkout at {} is dirty — a dirty tree cannot carry its \
                  commit's build number",
+                ctx.shown(&dir)
+            ));
+        }
+        // A graph that does not resolve (a [patch] path holding no such package, a lock that
+        // does not match, a dependency the Cargo home lacks) fails the pack only after the
+        // bundle and the siblings before it are staged.
+        if let Err(why) = parts.probe.resolves(seal, &dir) {
+            pf.problems.push(format!(
+                "{program}: its dependencies do not resolve in {} with the seal's targo and \
+                 this Cargo home (`targo metadata --locked --offline`), so its pack would fail \
+                 after the bundle is staged:\n{why}",
                 ctx.shown(&dir)
             ));
         }

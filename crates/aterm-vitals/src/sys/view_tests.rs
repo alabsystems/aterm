@@ -656,7 +656,8 @@ fn every_view_answers_in_both_shapes_and_the_json_keeps_the_contract() {
                 assert_eq!(j.get("schema"), Some(&Jv::Int(schema)), "{view:?}");
                 assert_eq!(j.get("kind"), Some(&Jv::s(format!("sys.{}", view.word()))));
                 assert!(j.get("as_of").is_some());
-                assert!(matches!(j.get("events"), Some(Jv::Arr(e)) if e.len() == 1));
+                let event_count = if view == View::Boot { 0 } else { 1 };
+                assert!(matches!(j.get("events"), Some(Jv::Arr(e)) if e.len() == event_count));
                 let header = reply.header(&c, false);
                 assert!(
                     header.starts_with(&format!(
@@ -666,9 +667,10 @@ fn every_view_answers_in_both_shapes_and_the_json_keeps_the_contract() {
                     )),
                     "{header}"
                 );
-                assert!(
-                    header.contains(" as_of=21:21:37.412 age_ms=120 window_ms=1000 next=7f3a.")
-                );
+                let window = if view == View::Boot { "-" } else { "1000" };
+                assert!(header.contains(&format!(
+                    " as_of=21:21:37.412 age_ms=120 window_ms={window} next=7f3a."
+                )));
             }
         }
     }

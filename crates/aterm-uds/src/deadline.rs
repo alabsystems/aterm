@@ -997,6 +997,63 @@ pub fn output_until_from_unless(
     )
 }
 
+/// Run a native writer only after its actual child identity has been made durable.
+/// The entry barrier retains the child before exec; failure or owner death cannot
+/// release an unrecorded writer. Output and retirement use the ordinary collector.
+/// # Errors
+/// Birth, persistence, release, cancellation or collection failed.
+#[cfg(unix)]
+pub fn output_from_journaled(
+    cmd: &mut Command,
+    stdin: Stdio,
+    deadline: Instant,
+    progress: Option<Duration>,
+    stopped: &mut dyn FnMut() -> bool,
+    record: &dyn Fn(u32) -> io::Result<()>,
+) -> Result<Output, RunError> {
+    fn failed(failure: crate::spawnfd::SpawnFailure) -> RunError {
+        match failure {
+            crate::spawnfd::SpawnFailure::NotSpawned(proof) => RunError::Spawn(proof.into_error()),
+            crate::spawnfd::SpawnFailure::Refused(error) => RunError::Spawn(error),
+            crate::spawnfd::SpawnFailure::Unbound { spawned, error } => {
+                let mut child = spawned.into_child();
+                settle_child(&mut child);
+                RunError::Capture(error)
+            }
+        }
+    }
+    cmd.stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let attempt = crate::spawnfd::BirthAttempt::new().map_err(RunError::Spawn)?;
+    let mut held = cmd.prepare_cohort(attempt).map_err(failed)?;
+    record(held.id()).map_err(RunError::Spawn)?;
+    let mut child = held.release().map_err(failed)?.into_child();
+    let pipes = (child.stdout.take(), child.stderr.take());
+    let group = Some(child.id());
+    let mut probe = ProcessProgressProbe::default();
+    let mut clock = deadline_now;
+    let mut work = |pid| probe.read(pid);
+    let mut window;
+    let mut wall = |_: Option<u32>, _: u64| deadline.saturating_duration_since(deadline_now());
+    let left: &mut dyn FnMut(Option<u32>, u64) -> Duration = if let Some(progress) = progress {
+        window = ProgressWindow::collector(progress, &mut clock, &mut work);
+        &mut window
+    } else {
+        &mut wall
+    };
+    drained_owned(
+        child,
+        pipes,
+        group,
+        left,
+        &mut settle_child,
+        true,
+        Some(stopped),
+    )?
+    .map_err(|_| RunError::TimedOut)
+}
+
 /// How often [`output_until_from_unless`] and [`outputs_until_unless`] read their stop while a
 /// child runs.
 pub const STOP_TICK: Duration = Duration::from_millis(100);

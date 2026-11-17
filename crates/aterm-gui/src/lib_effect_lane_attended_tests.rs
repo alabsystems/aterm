@@ -335,7 +335,7 @@ fn the_pet_offer_is_admitted_while_a_person_is_here_or_an_event_plays() {
             for (attended, resting) in [(true, false), (false, false), (true, true), (false, true)]
             {
                 if attended {
-                    let _ = ws.rest.touch(now);
+                    let _ = ws.rest.touch(now, true);
                 } else {
                     lapse(&mut ws, now + ATTENTION);
                 }
@@ -388,7 +388,7 @@ fn an_unattended_windows_settled_pet_plans_no_offer() {
         .get_mut(&WindowId(0))
         .expect("the headless window");
     let now = settled_pet(&mut ws, start);
-    let _ = ws.rest.touch(now);
+    let _ = ws.rest.touch(now, true);
     assert!(
         !ws.fx.companion().needs_frames(),
         "fixture: off the frame train"
@@ -414,7 +414,7 @@ fn an_unattended_windows_settled_pet_plans_no_offer() {
     );
     assert_eq!(ws.next_trail_tick, None, "…and arms no slot");
 
-    let _ = ws.rest.touch(now);
+    let _ = ws.rest.touch(now, true);
     assert_eq!(
         plan_pet(&mut ws, now),
         Some(offer),

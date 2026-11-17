@@ -305,7 +305,14 @@ impl Kept {
                 if store.records.contains_key(&receipt.id) {
                     return Err(Error::new("duplicate physical table record"));
                 }
-                store.admit(&stored.header, stored.wire.len())?;
+                // The kept store's floor is the one its open read; a floor only moves up, so an
+                // older one counts more records against the quotas and covers fewer kept
+                // payloads, never fewer and more (LT-B10C1, LT-B10C3).
+                store.admit(
+                    &stored.header,
+                    stored.wire.len(),
+                    stored.checkpoint.is_some(),
+                )?;
                 if !stored.payload.awaiting_membership() {
                     store
                         .index()?

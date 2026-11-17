@@ -135,6 +135,7 @@ fn adopt_at(log: &Log, ms: u64) -> CarryAdopt {
         ids: log.id_counters(),
         limits: Limits::SESSION,
         at: at(ms),
+        ident: aterm_slog::DescIdent::default(),
     }
 }
 
@@ -795,6 +796,7 @@ fn a_tracker_carried_mid_sequence_writes_what_an_uncarried_one_would() {
                     ids: log.id_counters(),
                     limits: Limits::SESSION,
                     at: now,
+                    ident: aterm_slog::DescIdent::default(),
                 };
                 let (new, host, _) = Log::from_carry(&out.lines, a).expect("reads");
                 log = new;

@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+pub mod desc;
+
 use aterm_slog::{
     Actor, Close, Conf, Fields, Key, Kind, Log, Lvl, Mark, Node, Open, Out, RunOut, Src, Stamp,
     TurnOut,

@@ -241,11 +241,12 @@ impl SessionLog {
         }
         if let Some(a) = &self.agent {
             out.push(format!(
-                "agent pgid={} node={} who={} by_screen={}",
+                "agent pgid={} node={} who={} by_screen={}{}",
                 a.pgid,
                 a.node,
                 a.who.name(),
-                u8::from(a.by_screen)
+                u8::from(a.by_screen),
+                if a.kept_prompt { " kept=1" } else { "" }
             ));
             out.push(a.tracker.carry_line(now));
         }
@@ -300,6 +301,12 @@ impl SessionLog {
             ids: ids.ids,
             limits: super::ring_limits(),
             at,
+            // Who the session is, as this host knows it now: the carried claims are ranked and
+            // keyed for the card under it as they are read, so `replace_log`'s tell moves nothing.
+            ident: aterm_slog::DescIdent {
+                own: self.desc_own,
+                creator: self.desc_creator,
+            },
         };
         let (log, host, stats) = Log::from_carry_built(lines, a, build)?;
         self.epochs.note(log.ep());
@@ -437,6 +444,12 @@ impl SessionLog {
                             by_screen,
                             tracker: TurnTracker::new(node),
                             pairs: super::transcript::HarnessPairs::default(),
+                            // The text is never carried (it may hold a credential): aterm's
+                            // default writer reads it again from its own title claim
+                            // (`as=prompt`), which the carry holds, and `kept=` carries the fact
+                            // that the run kept one, which no claim may hold.
+                            first_prompt: None,
+                            kept_prompt: kv(line, "kept") == Some("1"),
                         });
                         self.note_agent_cmd(node);
                     }

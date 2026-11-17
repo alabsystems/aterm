@@ -2651,6 +2651,9 @@ pub struct Session<'a, C: Ctl> {
     /// read (`Session::fable_sampled`).
     probe_fable: Option<Option<(u32, Option<i64>)>>,
     probe_off: bool,
+    /// THE WALL DOOR's answer at a point (`Session::wall_rung_held`): the point's screen seq and
+    /// whether this session holds its account's due wall rung there (FL-118b).
+    wall_rung: Option<(u64, bool)>,
     turn_live: bool,
     probe_said: Option<String>,
     probe_hold: Option<Instant>,
@@ -2986,6 +2989,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             probe_fold: None,
             probe_fable: None,
             probe_off: false,
+            wall_rung: None,
             turn_live: false,
             probe_said: None,
             probe_hold: None,
@@ -9151,6 +9155,8 @@ pub use task_mark::{
 mod turn_end_loop;
 #[path = "wall_confirm.rs"]
 pub(crate) mod wall_confirm;
+/// The model's newest reply to the agent since a time ([`wall_confirm::served_since`]).
+pub use wall_confirm::served_since;
 pub(super) use wall_confirm::words_kind;
 #[path = "wall_memory.rs"]
 mod wall_memory;

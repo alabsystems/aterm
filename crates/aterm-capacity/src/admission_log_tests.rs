@@ -431,6 +431,48 @@ fn a_scratch_ledger_writes_no_admission_log() {
     assert!(rows.is_empty(), "{rows:?}");
 }
 
+/// A nested capture takes its own rows; returning or unwinding restores the outer writer.
+#[test]
+fn nested_captures_restore_the_outer_admission_writer_after_unwind() {
+    let (_dir, ledger) = scratch("capture-restore");
+    let write = |kind| {
+        assert!(
+            super::user()
+                .expect("this thread's capture writer")
+                .write(&Row::new(kind, 1_000))
+        );
+    };
+    let ((), outer) = capture(ledger.clone(), || {
+        write("outer-before");
+        let (value, inner) = capture(ledger.clone(), || {
+            write("inner-return");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(
+            inner.iter().map(Row::kind).collect::<Vec<_>>(),
+            ["inner-return"]
+        );
+        write("outer-after-return");
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture(ledger.clone(), || {
+                write("inner-unwind");
+                panic!("end the nested admission capture");
+            });
+        }));
+        assert!(panicked.is_err());
+        write("outer-after-unwind");
+    });
+    assert_eq!(
+        outer.iter().map(Row::kind).collect::<Vec<_>>(),
+        ["outer-before", "outer-after-return", "outer-after-unwind"]
+    );
+    assert!(
+        super::user().is_none(),
+        "the outer capture restored no writer"
+    );
+}
+
 /// The one rule of who writes, production's and a capture's alike: another ledger than the
 /// account's writes no row, and asks for no writer; the account's own ledger, named by another
 /// value of the same folder, gets the log's writer.

@@ -4243,7 +4243,8 @@ pub(crate) fn cmd_meta(
     cmd_meta_by(term, store, session, ctx, rest, aterm_slog::Actor::Ctl)
 }
 
-/// `cmd_meta`, each write's session log mark by `by` (the wire's [`log_actor`]).
+/// `cmd_meta`, each write's session log mark by `by`: the wire's [`log_actor`], and for a title
+/// write, which is a description claim, its [`desc_author_as`].
 pub(crate) fn cmd_meta_by(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -4376,6 +4377,10 @@ fn meta_write_reply(field: MetaField, result: Result<bool, MetaWriteError>) -> (
         ),
         Err(MetaWriteError::Credential) => (
             format!("ERR {} reads as a credential\n", field.wire_name()),
+            false,
+        ),
+        Err(MetaWriteError::ProtocolLine) => (
+            format!("ERR {} reads as a protocol line\n", field.wire_name()),
             false,
         ),
         Err(MetaWriteError::Busy { retry_ms }) => {
@@ -4542,6 +4547,9 @@ fn attention_owned_reply(
         )) => (format!("ERR attention too long (max {cap} bytes)\n"), false),
         Err(AttentionWriteError::Meta(MetaWriteError::Credential)) => {
             ("ERR attention reads as a credential\n".to_string(), false)
+        }
+        Err(AttentionWriteError::Meta(MetaWriteError::ProtocolLine)) => {
+            ("ERR attention reads as a protocol line\n".to_string(), false)
         }
         Err(AttentionWriteError::Meta(MetaWriteError::Busy { retry_ms })) => {
             (format!("ERR busy retry_ms={retry_ms}\n"), false)
@@ -6558,12 +6566,16 @@ pub(crate) fn caller_actor_as(
 }
 
 /// The sid of the live session whose shell is `who`'s process or an ancestor of it
-/// (`crate::typed_by::tab_session_of`), over the sessions `store` registers now.
+/// (`crate::typed_by::tab_session_of`), over the sessions `store` registers now whose shell has
+/// not exited: a tab kept open after its shell exited (a hold, a shell that failed at start, the
+/// Developer Tools tab) holds no process, and since aterm reaped its shell that pid may name any
+/// other process.
 pub(crate) fn owner_tab_sid(who: &crate::typed_by::Who, store: &Store) -> Option<String> {
     let shells: Vec<(u64, i32, String)> = store
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .live_handles()
+        .filter(|h| h.state != SessionState::Exited)
         .map(|h| (h.local_id, h.shell_identity.pid, h.sid.as_str().to_string()))
         .collect();
     let pids: Vec<(u64, i32)> = shells
@@ -6711,6 +6723,56 @@ pub(crate) fn log_actor(scope: Scope, target: &SessionCtx) -> aterm_slog::Actor 
         #[cfg(any(unix, test))]
         Scope::Fleet { .. } => Actor::Nobody,
     }
+}
+
+/// THE AUTHOR OF A DESCRIPTION written on `scope` against `target` (a `mark … desc`, a `meta
+/// set|unset title`), `client` naming the owner-token connection's process (read only for such
+/// a connection: the connection's peer, or a test's process and lineage): who aterm observed
+/// the connection to be ([`caller_actor_as`]), never a name the request gives (`as=` is
+/// listed, and is not the author). It is [`log_actor`] but for an owner-token client, which
+/// that names `ctl` wherever it runs: here a client whose process lives inside a tab (its own
+/// or an ancestor's process is that tab's shell) is that tab's session, and only one that lives
+/// in no tab is `ctl`. The session's log ranks the sid: the described session's own is its
+/// program, its creator's the creator, any other session's is listed and never stands.
+///
+/// Only the client's chain of parents places it in a tab: its lineage is read with every
+/// process group dropped ([`crate::typed_by::Who::parent_chain`]), where the exits ledger and
+/// the typing credit ([`caller_actor_of`]) also count a process in the group of a tab's shell.
+/// A process that leaves its tab's process tree (a double fork, a launchd job) is then `ctl`,
+/// below the session's own program, though it keeps the shell's process group: leaving the
+/// tree never raises a rank. A chain longer than aterm reads
+/// ([`crate::typed_by::Who::lineage_cut`]) with no tab's shell in what was read places the
+/// client nowhere: a shell may be above it, so it is nobody (`by=-`, listed), never `ctl`, which
+/// would let another session's process stand. A parent that could not be read (another user's,
+/// such as a root `login` or `sudo`) ends the walk as launchd does, and keeps `ctl`.
+///
+/// It reads the store and the client's process lineage, so it is called before the request
+/// takes the session's metadata or timeline lock (the store registers a session under its own
+/// lock, then the timeline's), once a request, and for no other mark or metadata field.
+pub(crate) fn desc_author_as(
+    scope: Scope,
+    target: &SessionCtx,
+    store: &Store,
+    client: impl FnOnce() -> crate::typed_by::Who,
+) -> aterm_slog::Actor {
+    let mut cut = false;
+    let parents = || {
+        let who = client().parent_chain();
+        cut = who.lineage_cut();
+        who
+    };
+    match caller_actor_as(scope, Some(target), store, parents) {
+        ExitActor::Ctl if cut => aterm_slog::Actor::Nobody,
+        actor => crate::session_log::exit_actor(&actor),
+    }
+}
+
+/// Whether `rest` (a `meta` request's arguments) writes the session's title: `set title …` or
+/// `unset title`, the one metadata write whose author is [`desc_author_as`]'s.
+pub(crate) fn meta_writes_title(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    matches!(words.next(), Some("set" | "unset"))
+        && words.next().and_then(MetaField::parse) == Some(MetaField::Title)
 }
 
 /// `whoami` -> this session's fabric id and nonce and the connection's effective scope against the session active now.

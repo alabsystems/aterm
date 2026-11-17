@@ -7,11 +7,13 @@
 
 //! aterm's models of search, scrollback and the other families.
 
+mod models_boot_cost;
 mod models_diskwalk;
 mod models_misc;
 mod models_vitals;
 mod models_vz;
 
+pub use models_boot_cost::*;
 pub use models_diskwalk::*;
 pub use models_misc::*;
 pub use models_vitals::*;

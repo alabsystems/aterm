@@ -1342,6 +1342,68 @@ fn the_window_reads_the_services_only_while_their_cells_are_drawn_or_inspected()
     assert_eq!(read(&mut app, second), [Network], "past a minute");
 }
 
+/// The band asks for the services only while a person is at a window that draws it: once
+/// that window's attention lapses the poll reads the network alone, so the services' observer
+/// is asked for no sample, and the first poll after a touch asks again. The lens asks with
+/// nobody there, as before.
+/// NEGATIVE CONTROL: with the read asking wherever the band is drawn (`band` for `watched` in
+/// `service_network_state`), "nobody is at the band's window" failed (left [WithServices],
+/// right [Network]).
+#[test]
+fn the_band_reads_the_services_only_while_a_person_is_at_its_window() {
+    use crate::NetworkRead::{Network, WithServices};
+    let _bars = crate::stats_deck::tests::attach_stats();
+    let mut app = crate::App::headless_for_test();
+    let wid = *app.windows.keys().next().expect("window");
+    // Attention is for a window on screen: a headless instance's never lapses. Rest stays off.
+    app.headless = false;
+    app.config.idle_rest_secs = Some(0.0);
+    let snapshot = inactive_snapshot();
+    let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reads = std::sync::Arc::clone(&asked);
+    app.network_source = Some(std::sync::Arc::new(move |read| {
+        reads.lock().unwrap().push(read);
+        Some(snapshot.clone())
+    }));
+    let now = std::cell::Cell::new(std::time::Instant::now());
+    let read = |app: &mut crate::App, after: std::time::Duration| {
+        now.set(now.get() + after);
+        app.settle_rest(now.get());
+        app.service_network_state(now.get());
+        std::mem::take(&mut *asked.lock().unwrap())
+    };
+    let second = std::time::Duration::from_secs(1);
+    assert!(app.network_band_drawn(), "PRECONDITION: the band is drawn");
+    assert!(app.windows[&wid].person_here(), "PRECONDITION");
+    assert_eq!(
+        read(&mut app, second),
+        [WithServices],
+        "a person is at the band's window"
+    );
+    assert_eq!(
+        read(&mut app, crate::window_rest::ATTENTION),
+        [Network],
+        "nobody is at the band's window"
+    );
+    assert!(app.network_band_drawn(), "the band is still drawn");
+    assert_eq!(read(&mut app, second), [Network], "still nobody");
+    assert!(app.open_network_lens());
+    assert_eq!(
+        read(&mut app, second),
+        [WithServices],
+        "the lens draws them with nobody there"
+    );
+    app.close_stats_lens(wid);
+    assert!(!app.windows[&wid].person_here(), "the lens was no touch");
+    assert_eq!(read(&mut app, second), [Network], "the lens closed");
+    app.note_rest_event(wid, &crate::window_rest::tests::key(), now.get());
+    assert_eq!(
+        read(&mut app, second),
+        [WithServices],
+        "the first poll after a touch"
+    );
+}
+
 /// An inspection owes the window a read each second for a minute, drawn or not: the next
 /// turn's at once, then the ordinary poll's; one within that minute leaves the poll alone.
 /// NEGATIVE CONTROLS: a deadline that leaves out the inspection is `None` with nothing drawn;
@@ -1757,6 +1819,261 @@ fn explicit_network_closeup_keeps_hidden_deck_and_terminal_geometry() {
         ),
         before
     );
+}
+
+/// What a Deck window's band asks of a services read: of the two windows, `deck` draws the
+/// Deck's band and `lens` draws it with the Network State lens open over it. The read serves
+/// what `served` holds; the lab's rows and the Fleet Field never move, since the test's lab feed
+/// is not live and no fleet is read.
+struct BandWindows {
+    app: crate::App,
+    deck: crate::WindowId,
+    lens: crate::WindowId,
+    served: std::sync::Arc<std::sync::Mutex<std::sync::Arc<NetworkStateSnapshot>>>,
+    now: std::time::Instant,
+    _attached: crate::stats_deck::tests::Attached,
+}
+
+impl BandWindows {
+    fn new() -> Self {
+        let attached = crate::stats_deck::tests::attach_stats();
+        let mut app = crate::App::headless_for_test();
+        app.config
+            .sys
+            .get_or_insert_with(Default::default)
+            .stats_bars = Some("deck".into());
+        let deck = *app.windows.keys().next().expect("window");
+        let lens = crate::WindowId(9);
+        app.install_window_state(lens, crate::stub_session(99), 38, 132);
+        assert!(
+            app.open_network_lens_in(lens),
+            "PRECONDITION: the lens opens"
+        );
+        let served = std::sync::Arc::new(std::sync::Mutex::new(std::sync::Arc::new(
+            NetworkStateSnapshot::default(),
+        )));
+        let source = std::sync::Arc::clone(&served);
+        app.network_source = Some(std::sync::Arc::new(move |_| {
+            Some(source.lock().expect("served").clone())
+        }));
+        Self {
+            app,
+            deck,
+            lens,
+            served,
+            now: std::time::Instant::now(),
+            _attached: attached,
+        }
+    }
+
+    /// One poll a second on, at wall `wall_ms`, of `snapshot` (or of what was served before):
+    /// the frames it asked of (`deck`, `lens`).
+    fn poll(&mut self, snapshot: Option<NetworkStateSnapshot>, wall_ms: u64) -> (u32, u32) {
+        if let Some(snapshot) = snapshot {
+            *self.served.lock().expect("served") = std::sync::Arc::new(snapshot);
+        }
+        self.now += std::time::Duration::from_secs(1);
+        let asked = |app: &crate::App| {
+            (
+                app.windows[&self.deck].redraw_requests_for_test.get(),
+                app.windows[&self.lens].redraw_requests_for_test.get(),
+            )
+        };
+        let before = asked(&self.app);
+        self.app.service_network_state_at(self.now, Some(wall_ms));
+        let after = asked(&self.app);
+        (after.0 - before.0, after.1 - before.1)
+    }
+}
+
+/// A services read asks a Deck window whose lens does not show Network State for a frame only
+/// where the band's face of the services moved ([`band_face`]: each one's availability and
+/// `refresh_failed`), never for a read that moved only a service's check or success time,
+/// detail, revision or a receipt; a window whose lens shows Network State, which draws those, is
+/// asked at each change, whether or not it draws the band. Each change is read
+/// in, then out again, of each service in turn, with the composed revision moving at each read
+/// as the composition moves it.
+/// The Deck's own key (`stats_deck`'s `deck_input_key`) still hashes the composed revision and
+/// the services whole, so the card is laid out again on its next frame; that half is
+/// ATERM-KI-1114-921's Left, not held here.
+/// NEGATIVE CONTROLS, each run on this code: (a) a Deck window asked at every change (`changed`
+/// in place of `band_moved` in the redraw's test) fails each of the 28 time, detail, revision
+/// and receipt reads, in and out, of both services, "accounts checked in: asked (deck, lens)
+/// (1, 1), want (0, 1)" first; (b) `band_face` left out of `band_moved` fails each of the 16
+/// availability and `refresh_failed` reads, "accounts unavailable in: asked (deck, lens) (0, 1),
+/// want (1, 1)" first, and fails `an_expired_service_flips_the_band_and_redraws_the_deck` at
+/// t0 + 61 s and t0 + 91 s.
+#[test]
+fn the_deck_redraws_with_the_band_face_and_nothing_else_of_the_services() {
+    use aterm_types::network_state::{
+        VaultHttp204Response, VaultNetworkMaterialization, VaultNetworkRefresh,
+        VaultNetworkRefreshOutcome, VaultNetworkSource,
+    };
+    const WALL: u64 = 1_800_000_000_000;
+    let mut band = BandWindows::new();
+    let mut base = NetworkStateSnapshot::default();
+    // No network claim to age: only the services move.
+    base.network.visibility = Visibility::Unavailable;
+    for service in [&mut base.services.accounts, &mut base.services.secrets] {
+        service.availability = ServiceAvailability::Cached;
+        service.observed_at_ms = WALL;
+        service.last_success_ms = Some(WALL);
+        service.revision = Some("vault 7".into());
+        service.detail = "Local cache is usable".into();
+    }
+    let secrets = &mut base.services.secrets;
+    secrets.network_materialization = Some(VaultNetworkMaterialization {
+        source: VaultNetworkSource::ConfiguredUrl,
+        sequence: 7,
+        sampled_at_ms: WALL - 20_000,
+    });
+    secrets.http204_response = Some(VaultHttp204Response {
+        source: VaultNetworkSource::ConfiguredUrl,
+        responded_at_ms: WALL - 21_000,
+    });
+    secrets.network_refresh = Some(VaultNetworkRefresh {
+        completed_at_ms: WALL - 22_000,
+        outcome: VaultNetworkRefreshOutcome::Succeeded,
+    });
+    let mut revision = 0;
+    let mut serve = |band: &mut BandWindows, mut snapshot: NetworkStateSnapshot| {
+        revision += 1;
+        snapshot.revision = revision;
+        band.poll(Some(snapshot), WALL)
+    };
+    assert_eq!(
+        serve(&mut band, base.clone()),
+        (1, 1),
+        "PRECONDITION: the first read turns both cells Cached"
+    );
+    type Change = fn(&mut ServiceState);
+    let changes: [(&str, bool, Change); 11] = [
+        ("checked", false, |s| s.observed_at_ms -= 5_000),
+        ("last success", false, |s| {
+            s.last_success_ms = Some(WALL - 9_000)
+        }),
+        ("detail", false, |s| s.detail.push_str("; read again")),
+        ("revision", false, |s| s.revision = Some("vault 8".into())),
+        ("materialization receipt", false, |s| {
+            s.network_materialization = Some(VaultNetworkMaterialization {
+                source: VaultNetworkSource::PeerUrl,
+                sequence: 8,
+                sampled_at_ms: WALL - 2_000,
+            });
+        }),
+        ("204 receipt", false, |s| {
+            s.http204_response = Some(VaultHttp204Response {
+                source: VaultNetworkSource::PeerUrl,
+                responded_at_ms: WALL - 3_000,
+            });
+        }),
+        ("refresh receipt", false, |s| {
+            s.network_refresh = Some(VaultNetworkRefresh {
+                completed_at_ms: WALL - 4_000,
+                outcome: VaultNetworkRefreshOutcome::Failed,
+            });
+        }),
+        ("unavailable", true, |s| {
+            s.availability = ServiceAvailability::Unavailable;
+        }),
+        ("current", true, |s| {
+            s.availability = ServiceAvailability::Current
+        }),
+        ("unknown", true, |s| {
+            s.availability = ServiceAvailability::Unknown
+        }),
+        ("refresh failed", true, |s| s.refresh_failed = true),
+    ];
+    let mut wrong = Vec::new();
+    for which in ["accounts", "secrets"] {
+        for (name, drawn, change) in changes {
+            let mut moved = base.clone();
+            change(if which == "accounts" {
+                &mut moved.services.accounts
+            } else {
+                &mut moved.services.secrets
+            });
+            if (band_face(&moved.services) != band_face(&base.services)) != drawn {
+                wrong.push(format!("{which} {name}: band_face moved is {}", !drawn));
+            }
+            let want = (u32::from(drawn), 1);
+            let into = serve(&mut band, moved.clone());
+            if band.app.network_snapshot.services != moved.services {
+                wrong.push(format!(
+                    "PRECONDITION {which} {name}: the read was not taken"
+                ));
+            }
+            if into != want {
+                wrong.push(format!(
+                    "{which} {name} in: asked (deck, lens) {into:?}, want {want:?}"
+                ));
+            }
+            let out = serve(&mut band, base.clone());
+            if out != want {
+                wrong.push(format!(
+                    "{which} {name} out: asked (deck, lens) {out:?}, want {want:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A service's lease runs out with no sample after it: the first poll past its 60 s asks each
+/// Deck window for a frame, since its cell turns `Unknown` ([`band_face`] of the snapshot as
+/// [`fresh_snapshot`] aged it at that poll's wall), and the polls before it, and those after it
+/// while nothing else runs out, ask none. The secrets were observed at t0 and the accounts at
+/// t0 + 30 s, so each runs out on its own poll.
+/// NEGATIVE CONTROL, run on this code: the band face of the read taken before
+/// [`snapshot_after_read`] aged it (`band_face` of the source's own snapshot) fails at the first
+/// lease's end, "t0 + 61 s: asked 0 with [(Cached, false), (Unknown, false)], want 1 with
+/// [(Cached, false), (Unknown, false)]"; at t0 + 91 s that face still differs from the held one,
+/// whose secrets cell had turned Unknown at t0 + 61 s.
+#[test]
+fn an_expired_service_flips_the_band_and_redraws_the_deck() {
+    use ServiceAvailability::{Cached, Unknown};
+    const T0: u64 = 1_800_000_000_000;
+    let mut band = BandWindows::new();
+    assert!(
+        band.app.close_stats_lens(band.lens),
+        "PRECONDITION: the lens closes"
+    );
+    let mut snapshot = NetworkStateSnapshot {
+        revision: 1,
+        ..Default::default()
+    };
+    snapshot.network.visibility = Visibility::Unavailable;
+    snapshot.services.secrets = ServiceState {
+        availability: Cached,
+        observed_at_ms: T0,
+        ..Default::default()
+    };
+    snapshot.services.accounts = ServiceState {
+        availability: Cached,
+        observed_at_ms: T0 + 30_000,
+        ..Default::default()
+    };
+    let mut served = Some(snapshot);
+    let mut wrong = Vec::new();
+    for (after_s, asked, face) in [
+        (30, 1, [(Cached, false), (Cached, false)]),
+        (59, 0, [(Cached, false), (Cached, false)]),
+        (60, 0, [(Cached, false), (Cached, false)]),
+        (61, 1, [(Cached, false), (Unknown, false)]),
+        (62, 0, [(Cached, false), (Unknown, false)]),
+        (90, 0, [(Cached, false), (Unknown, false)]),
+        (91, 1, [(Unknown, false), (Unknown, false)]),
+        (92, 0, [(Unknown, false), (Unknown, false)]),
+    ] {
+        let (deck, _) = band.poll(served.take(), T0 + after_s * 1000);
+        let drawn = band_face(&band.app.network_snapshot.services);
+        if (deck, drawn) != (asked, face) {
+            wrong.push(format!(
+                "t0 + {after_s} s: asked {deck} with {drawn:?}, want {asked} with {face:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// The Network State band is part of the System Resources band, so it is drawn only where a

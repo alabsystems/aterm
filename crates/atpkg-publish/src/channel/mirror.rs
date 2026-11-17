@@ -59,16 +59,51 @@ fn release_assets(pkg: &atpkg::PkgManifest) -> Vec<(String, String)> {
         .collect()
 }
 
-fn bind(pkg: &atpkg::PkgManifest, program: &str, build: u64, which: &str, tag: &str) -> Result<()> {
-    if pkg.program == program && pkg.build_number == build {
-        Ok(())
-    } else {
-        Err(Error::refused(format!(
+fn bind(
+    quad: &VerifiedQuad,
+    pkg: &atpkg::PkgManifest,
+    (program, build): (&str, u64),
+    which: &str,
+    tag: &str,
+) -> Result<()> {
+    if pkg.program != program || pkg.build_number != build {
+        return Err(Error::refused(format!(
             "{which} {tag} manifest binds program={} build={}, the index pins {program}/{build} \
              — refusing",
             pkg.program, pkg.build_number
-        )))
+        )));
     }
+    // A keyed tree's pack carries every key the index lists at its build, each signed.
+    for (key, _) in quad
+        .index
+        .trees
+        .get(program)
+        .into_iter()
+        .flatten()
+        .filter(|(_, b)| **b == build)
+    {
+        let signed = pkg
+            .artifacts
+            .iter()
+            .any(|a| a.kind == atpkg::keyed_tree::KIND && &a.key == key);
+        if !signed {
+            return Err(Error::refused(format!(
+                "{which} {tag} manifest signs no keyed-tree row of key {key}, which the index \
+                 lists at {program}@{build} — refusing"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The repository `program`'s packs are released on: its `[programs.*]` block's, or a keyed
+/// tree's (`atpkg::keyed_tree::TREES`, which no channel pins).
+fn repo_of(quad: &VerifiedQuad, program: &str) -> Option<String> {
+    quad.index
+        .programs
+        .get(program)
+        .map(|p| p.repo.clone())
+        .or_else(|| atpkg::keyed_tree::program(program).map(|t| t.repo.to_string()))
 }
 
 /// Checks the asset list and hashes of the staged release in `dir`.
@@ -99,7 +134,7 @@ pub fn check_staged(
         )));
     };
     let pkg = quad.verify_pkg(&bytes, &sig_bytes)?;
-    bind(&pkg, program, build, "the staging", &tag)?;
+    bind(quad, &pkg, (program, build), "the staging", &tag)?;
     if pkg.artifacts.is_empty() {
         return Err(Error::refused(format!("{tag} manifest names no artifacts")));
     }
@@ -206,16 +241,27 @@ pub fn mirror(
     result
 }
 
-/// The public repositories a mirror of `quad` can write to, each once: the `[programs.*] repo`
-/// of every program a channel pins. A pin whose program names no repo is left to the walk,
-/// which refuses it.
+/// The public repositories a mirror of `quad` can write to, each once: the repo of every
+/// program a channel pins and every keyed tree the index lists ([`repo_of`]). A pin whose
+/// program names no repo is left to the walk, which refuses it.
 fn public_repos(quad: &VerifiedQuad) -> BTreeSet<String> {
-    quad.index
-        .channels
-        .iter()
-        .flat_map(crate::pins::union)
-        .filter_map(|(program, _)| quad.index.programs.get(&program).map(|p| p.repo.clone()))
+    work_list(quad)
+        .into_iter()
+        .filter_map(|(program, _)| repo_of(quad, &program))
         .collect()
+}
+
+/// Every `(program, build)` whose pack a mirror of `quad` makes public: each channel's pins and
+/// every build the index lists a keyed tree at.
+fn work_list(quad: &VerifiedQuad) -> BTreeSet<(String, u64)> {
+    let mut work: BTreeSet<(String, u64)> = BTreeSet::new();
+    for c in &quad.index.channels {
+        work.extend(crate::pins::union(c));
+    }
+    for (program, keys) in &quad.index.trees {
+        work.extend(keys.values().map(|&b| (program.clone(), b)));
+    }
+    work
 }
 
 fn mirror_in(
@@ -225,10 +271,9 @@ fn mirror_in(
     log: &mut Log,
     work: &Path,
 ) -> Result<MirrorReport> {
-    let mut work_list: BTreeSet<(String, u64)> = BTreeSet::new();
+    let work_list = self::work_list(quad);
     let mut triples: BTreeSet<&str> = BTreeSet::new();
     for c in &quad.index.channels {
-        work_list.extend(crate::pins::union(c));
         triples.extend(c.pin_by_target.keys().map(String::as_str));
     }
     if !triples.is_empty() {
@@ -256,11 +301,7 @@ fn mirror_in(
                     std::thread::Builder::new()
                         .name("atpkg-public-pack-read".into())
                         .spawn_scoped(scope, move || -> Result<_> {
-                            let repo = quad
-                                .index
-                                .programs
-                                .get(program)
-                                .map(|p| p.repo.clone())
+                            let repo = repo_of(quad, program)
                                 .ok_or_else(|| {
                                     Error::refused(format!(
                                         "pinned program {program} has no [programs.{program}] repo in the index"
@@ -375,7 +416,7 @@ fn read_public(
                  SELF-CHECK FAILED: {e}"
             ))
         })?;
-        bind(&pkg, program, build, "the public", &tag)?;
+        bind(quad, &pkg, (program, build), "the public", &tag)?;
         let mut complete = true;
         for artifact in pkg
             .artifacts

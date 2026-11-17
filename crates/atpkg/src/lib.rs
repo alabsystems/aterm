@@ -131,6 +131,9 @@ mod native_defaults;
 pub fn native_launcher_for_test(path: &std::path::Path) -> bool {
     native_defaults::Launcher::of_current_image(Some(path)).is_some()
 }
+/// Keyed trees: a build tree installed whole under the key that names what it was built from
+/// and handed out as copy-on-write clones.
+pub mod keyed_tree;
 pub mod net;
 /// Where atpkg's unasked notices go.
 pub mod notice;

@@ -15,7 +15,7 @@ use aterm_slog::journal::{
     decode_line, is_end_line, line_subject, parse_segment_name, segment_version,
 };
 use aterm_slog::journal::{Pick, View};
-use aterm_slog::{Cursor, ShortId};
+use aterm_slog::{Cursor, DescIdent, ShortId};
 
 #[cfg(unix)]
 use super::fs::{JournalFs, Meta, list};
@@ -115,14 +115,15 @@ impl Reader {
         }
     }
 
-    /// What the journal answers for `sid`'s newest log (no directory: [`JournalRead::Absent`]).
-    pub(crate) fn view(&self, sid: &ShortId) -> JournalRead {
-        self.view_picked(sid, Pick::Newest)
+    /// What the journal answers for `sid`'s newest log, the session being `ident` (no directory:
+    /// [`JournalRead::Absent`]).
+    pub(crate) fn view(&self, sid: &ShortId, ident: DescIdent) -> JournalRead {
+        self.view_picked(sid, ident, Pick::Newest)
     }
 
-    /// What the journal answers for the log of `sid` that `pick` names (no directory:
-    /// [`JournalRead::Absent`]).
-    pub(crate) fn view_picked(&self, sid: &ShortId, pick: Pick) -> JournalRead {
+    /// What the journal answers for the log of `sid` that `pick` names, its records replayed as
+    /// the session `ident` names ([`journal::view_picked`]; no directory: [`JournalRead::Absent`]).
+    pub(crate) fn view_picked(&self, sid: &ShortId, ident: DescIdent, pick: Pick) -> JournalRead {
         let _one = self.flight.lock().unwrap_or_else(|p| p.into_inner());
         #[cfg(unix)]
         {
@@ -134,11 +135,11 @@ impl Reader {
                     return JournalRead::Cut;
                 }
             };
-            view_picked(&dir, &self.index, sid, pick, Budgets::READER)
+            view_picked(&dir, &self.index, sid, ident, pick, Budgets::READER)
         }
         #[cfg(not(unix))]
         {
-            let _ = (&self.logs, &self.index, sid, pick);
+            let _ = (&self.logs, &self.index, sid, ident, pick);
             JournalRead::Absent
         }
     }
@@ -201,16 +202,17 @@ pub(crate) struct ReadCost {
     pub(crate) decoded: u64,
 }
 
-/// Read the log of `sid` that `pick` names from `fs` within `b`.
+/// Read the log of `sid` that `pick` names from `fs` within `b`, the session being `ident`.
 #[cfg(unix)]
 pub(crate) fn view_picked(
     fs: &dyn JournalFs,
     index: &Mutex<Index>,
     sid: &ShortId,
+    ident: DescIdent,
     pick: Pick,
     b: Budgets,
 ) -> JournalRead {
-    view_costed(fs, index, sid, pick, b, &mut ReadCost::default())
+    view_costed(fs, index, sid, ident, pick, b, &mut ReadCost::default())
 }
 
 /// [`view_picked`], adding what it spent to `cost`.
@@ -219,6 +221,7 @@ pub(crate) fn view_costed(
     fs: &dyn JournalFs,
     index: &Mutex<Index>,
     sid: &ShortId,
+    ident: DescIdent,
     pick: Pick,
     b: Budgets,
     cost: &mut ReadCost,
@@ -399,7 +402,7 @@ pub(crate) fn view_costed(
             }
         })
         .collect();
-    match journal::view_picked(sid, &chains, unread, ViewRules::READER, pick) {
+    match journal::view_picked(sid, ident, &chains, unread, ViewRules::READER, pick) {
         Some(view) => JournalRead::View(Box::new(view)),
         None if unread => JournalRead::Cut,
         None => JournalRead::Absent,

@@ -396,7 +396,11 @@ pub(super) fn record(
     true
 }
 
-/// Called inside the existing successful readiness observation, under its shared guard.
+/// The receipt `state` retains, where it was recorded for `config` and for `recipient` (this
+/// Mac's identity as its caller read it; `None`, no identity, matches none) and its sequence,
+/// envelope and records are still the ones `state` holds. Its callers outside tests hold a
+/// shared guard of the state lock: a successful readiness observation (through [`project`]) and
+/// [`observe_receipts`].
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -533,9 +537,9 @@ pub(super) fn record(
         project = "aterm_secrets::client::network_observation::conformance_tests::projection_transition"
     )
 )]
-pub(super) fn project(
-    paths: &Paths,
+pub(super) fn project_for(
     config: &Config,
+    recipient: Option<[u8; 32]>,
     state: &State,
 ) -> Option<VaultNetworkMaterialization> {
     let receipt = state.network_materialization.as_ref()?;
@@ -546,12 +550,22 @@ pub(super) fn project(
         && receipt.sequence == state.seq
         && state.digest == Some(receipt.digest)
         && receipt.records_digest == state.records_digest
-        && read_identity(paths)
-            .ok()
-            .flatten()
-            .map(|key| key.recipient().0)
-            == Some(receipt.recipient))
+        && recipient == Some(receipt.recipient))
     .then_some(receipt.observation)
+}
+
+/// [`project_for`] this Mac's identity as `paths` holds it now; an identity that is missing or
+/// cannot be read matches no receipt.
+pub(super) fn project(
+    paths: &Paths,
+    config: &Config,
+    state: &State,
+) -> Option<VaultNetworkMaterialization> {
+    let recipient = read_identity(paths)
+        .ok()
+        .flatten()
+        .map(|key| key.recipient().0);
+    project_for(config, recipient, state)
 }
 
 impl Receipt {
@@ -622,7 +636,7 @@ impl Receipt {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod conformance_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

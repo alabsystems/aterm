@@ -12141,6 +12141,168 @@ fn an_entry_a_replay_published_on_a_moved_generation_is_read_back_from_the_fork(
     }
 }
 
+/// **A REPLY RE-WITNESSED ONTO A MOVED GENERATION IS READ BACK FROM THE FORK BY THE NEXT REPLAY**
+/// (ATERM-KI-1116-2615, `StateDir::forget_log_offsets`). A reply to offset 1 was journaled at
+/// head 10 of a log that a power loss cut back to 4 records, and the broker reopens it as a
+/// moved generation that continues it at 4. The first bridge's attach re-witnesses the reply,
+/// which lies below the fork, onto the new generation. Its replay publishes the reply at the new
+/// head, below 10, and the bridge is killed before anything ends the entry. A cut past the copy
+/// carries it and drops its key. A successor's replay reads the entry on its own log from its
+/// head, now the fork, finds that copy and publishes nothing: the reply is on the bus once.
+/// NEGATIVE CONTROL (`Mutant::RewitnessKeepsTheOldHead`): the re-witness keeps head 10, and the
+/// successor misses the copy below it and publishes a second.
+#[cfg(unix)]
+#[test]
+fn a_reply_re_witnessed_onto_a_moved_generation_is_read_back_from_the_fork() {
+    use crate::durability::{self, Durability};
+    const SID: &str = "tkept000000";
+    for control in [false, true] {
+        let case = format!("control={control}");
+        let (lane, mut first) = FakeVerbLane::bridge(&[(1, SID)]);
+        *lane.outbox.lock().unwrap() = Some(String::new());
+        lane.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
+        first.introduce();
+        assert!(first.refresh_sessions().is_ok());
+        let state = first.state.root().to_path_buf();
+        let log = lane.dir.path().join("moved.log");
+        let socket = lane.dir.path().join("moved.sock");
+        first.cfg.broker = socket.to_string_lossy().into_owned();
+        let subject = format!("/f/f/in/{0}/{SID}/{0}/ack", first.node);
+        let body = b"v=1 t=1 re=1 verdict=handled".to_vec();
+        let (cut, old) = {
+            let opened = durability::open(
+                &log,
+                None,
+                Durability::Relaxed,
+                Some(durability::test_boot(1)),
+            )
+            .unwrap();
+            opened.broker.arm_unclean_stop();
+            let mut server = opened.broker.serve(&socket).unwrap();
+            let (mut writer, _) = first.connect().unwrap();
+            for seq in 1..=4 {
+                writer.publish(81, seq, "/f/f/x/history", b"v=1").unwrap();
+            }
+            let cut = std::fs::metadata(&log).unwrap().len();
+            for seq in 5..=10 {
+                writer.publish(81, seq, "/f/f/x/history", b"v=1").unwrap();
+            }
+            drop(writer);
+            server.shutdown();
+            (cut, opened.broker.log_identity())
+        };
+        let pin = plain_pin(first.next_seq().unwrap(), &subject, &body);
+        first
+            .state
+            .set_in_flight(&InFlight {
+                pin,
+                subject: subject.clone(),
+                body: body.clone(),
+                log: Some(old),
+                at: Some(Head::From(10)),
+            })
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap()
+            .set_len(cut)
+            .unwrap();
+        let reopened = durability::open(
+            &log,
+            None,
+            Durability::Relaxed,
+            Some(durability::test_boot(2)),
+        )
+        .unwrap();
+        assert_eq!(reopened.broker.head(), 4, "{case}: the moved generation");
+        let _server = reopened.broker.serve(&socket).unwrap();
+        let copies = |bridge: &Bridge| -> Vec<u64> {
+            let (mut reader, _) = bridge.connect().unwrap();
+            let ((rows, _), _) = transport::fetch_told_kept(&mut reader, 0, &subject, 64).unwrap();
+            rows.into_iter()
+                .filter(|(_, _, b)| b.as_slice() == body.as_slice())
+                .map(|(off, _, _)| off)
+                .collect()
+        };
+        // The first attach's re-witness and replay alone, on the moved generation's Hello, as a
+        // bridge killed right after them leaves them.
+        first.conn = Some(first.connect().unwrap().0.into());
+        first
+            .conn
+            .as_mut()
+            .unwrap()
+            .ready()
+            .unwrap()
+            .hello()
+            .unwrap();
+        let conn = first.conn.as_ref().unwrap();
+        let now = conn
+            .seen_log_identity()
+            .expect("the moved generation's identity");
+        let lineage = conn
+            .log_lineage()
+            .cloned()
+            .expect("the moved generation's lineage");
+        let fork = now.continues(old, &lineage);
+        assert_eq!(fork, Some(4), "{case}: the fork");
+        if control {
+            first.fx =
+                crate::fx::Fx::os_without(crate::sim::world::Mutant::RewitnessKeepsTheOldHead);
+        }
+        first
+            .forget_log_offsets(4, Some(now), fork, Some(&lineage))
+            .unwrap();
+        let rewitnessed = first.state.in_flight().unwrap();
+        assert_eq!(
+            rewitnessed
+                .iter()
+                .map(|(_, entry)| (entry.log, entry.at))
+                .collect::<Vec<_>>(),
+            vec![(Some(now), Some(Head::From(if control { 10 } else { 4 })))],
+            "{case}: the reply to offset 1, below the fork, re-witnessed onto the moved generation"
+        );
+        assert!(first.replay_in_flight(), "{case}: the first replay");
+        let replayed = copies(&first);
+        assert!(
+            replayed.len() == 1 && replayed[0] < 10,
+            "{case}: the first replay's copy, below the entry's old head: {replayed:?}"
+        );
+        assert_eq!(
+            first.state.in_flight().unwrap().len(),
+            1,
+            "{case}: the entry stands"
+        );
+        first.close_subscriptions();
+        drop(first);
+        // A cut past the copy carries it, the mail kept, and drops its key, as retention may
+        // before the next replay: only a read back finds it then.
+        reopened
+            .broker
+            .set_retention(lanes_whole_from_the_base(false))
+            .unwrap();
+        reopened
+            .broker
+            .retain_before_carrying_state(reopened.broker.head())
+            .unwrap();
+
+        let (second, mut bridge) = FakeVerbLane::bridge_with_state(&[(1, SID)], Some(&state));
+        *second.outbox.lock().unwrap() = Some(String::new());
+        second.answer_hello_with(&format!("OK lane={LINK_LOG_LANE} build=test\n"));
+        bridge.introduce();
+        assert!(bridge.refresh_sessions().is_ok());
+        bridge.cfg.broker = socket.to_string_lossy().into_owned();
+        let _ = bridge.attach_broker();
+        let on_bus = copies(&bridge);
+        assert_eq!(
+            on_bus.len(),
+            1 + usize::from(control),
+            "{case}: the reply on the bus once, or twice (the control): {on_bus:?}"
+        );
+        bridge.close_subscriptions();
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn a_moved_generation_is_told_to_a_lane_3_endpoint_with_its_fork() {

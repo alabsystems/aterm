@@ -2,7 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! The write verbs of `aterm file` (docs/DESIGN-shared-files-2026-11-11.md §3, §4):
-//! `set <name> <row> <column> [<value> | --stdin]`, `add`, `rm`, `revert` and `resolve`. Each
+//! `set <name> <row> <column> [<value> | --stdin]` (or several cells of one row as one write,
+//! `set <name> <row> <column>=<value>…`), `add`, `rm`, `revert` and `resolve`. Each
 //! reads the owner's words against what this Mac's last snapshot showed (its baseline: every
 //! cell's candidates), queues one intent (`aterm_file::File::write`, which opens no custody),
 //! gives the publisher two seconds ([`publish::INLINE`]) and answers `published <operation>`,
@@ -43,7 +44,8 @@ pub struct Env<'a> {
     pub session: Option<&'a str>,
     /// This Mac's clock, Unix milliseconds.
     pub now_ms: u64,
-    /// The publisher's bound.
+    /// The publisher's bound; zero queues the write for a later pass and runs no publisher, so
+    /// a write made under another lock takes no custody.
     pub attempt: Duration,
     /// Answer as one JSON object (`--json`).
     pub json: bool,
@@ -76,6 +78,13 @@ struct Target {
     collection: &'static Collection,
     held: File,
     name: Name,
+    /// This Mac's intents, read before [`Self::rev`]: an intent a marker here calls seen is in
+    /// the snapshot a pass recorded before that read, so in the baseline at any later revision.
+    outbox: Outbox,
+    /// The revision the status recorded when this target was made: the one whose baseline a
+    /// write is read against ([`Self::baseline`]) and whose frontier says which of this Mac's
+    /// published writes that baseline holds ([`follow`]).
+    rev: u64,
 }
 
 impl Target {
@@ -95,17 +104,22 @@ impl Target {
             }));
         };
         let root = super::root(&generation::original(paths));
+        let held = File::at(&root, &name);
+        let outbox = held.outbox();
+        let rev = held.published().status.rev();
         Ok(Self {
             file,
             collection,
-            held: File::at(&root, &name),
+            held,
             name,
+            outbox,
+            rev,
         })
     }
 
     /// The baseline of the snapshot here, and the collection it was laid out at.
     fn baseline(&self) -> Result<(Base, &'static Collection), Refusal> {
-        let rev = self.held.published().status.rev();
+        let rev = self.rev;
         let stale = || {
             problem(format!(
                 "{}: nothing is materialized here to write against; run `aterm file refresh {}`",
@@ -124,21 +138,15 @@ impl Target {
         Ok((base, collection))
     }
 
-    /// The key of the one published row `word` names: its key, or a handle.
+    /// The key of the one published row `word` names (`aterm_file::Read::one`): its key, or a
+    /// name. A word that names none or several is a usage refusal, the several listed.
     fn row(&self, base: &Base, word: &str) -> Result<String, Refusal> {
         let read = self.held.read();
-        let rows = read.named(word);
-        let pk = match rows.as_slice() {
-            [row] => row.pk.clone(),
-            [] => return Err(problem(format!("{}: no row {word}", self.name))),
-            many => {
-                return Err(problem(format!(
-                    "{}: {word} names {} rows; name one by its key",
-                    self.name,
-                    many.len()
-                )));
-            }
-        };
+        let pk = read
+            .one(word)
+            .map_err(|why| usage(format!("{}: {why}", self.name)))?
+            .pk
+            .clone();
         if !base.rows.iter().any(|(row, _)| *row == pk) {
             return Err(problem(format!(
                 "{}: row {word} is not published yet; it is written once its own write is",
@@ -153,6 +161,37 @@ impl Target {
 fn from_stdin(text: &str) -> &str {
     let text = text.strip_suffix('\n').unwrap_or(text);
     text.strip_suffix('\r').unwrap_or(text)
+}
+
+/// The cells `set <name> <row> …` names after its row: `<column> [<value> | --stdin]`, no value
+/// clearing the cell, or several `<column>=<value>`, an empty value clearing its cell, each column
+/// once.
+fn set_cells<'w>(
+    words: &'w [String],
+    stdin: Option<&'w str>,
+    what: &str,
+) -> Result<Vec<(&'w str, Option<&'w str>)>, Refusal> {
+    match words {
+        [first, ..] if first.contains('=') => {
+            let mut cells: Vec<(&str, Option<&str>)> = Vec::with_capacity(words.len());
+            for word in words {
+                let (column, value) = assignment(word)?;
+                if cells.iter().any(|(named, _)| *named == column) {
+                    return Err(usage(format!("{column} is named twice")));
+                }
+                cells.push((column, Some(value)));
+            }
+            Ok(cells)
+        }
+        [column] => Ok(vec![(column.as_str(), None)]),
+        [column, stdin_word] if stdin_word == "--stdin" => {
+            let text =
+                stdin.ok_or_else(|| problem("--stdin: nothing was read from standard input"))?;
+            Ok(vec![(column.as_str(), Some(from_stdin(text)))])
+        }
+        [column, value] => Ok(vec![(column.as_str(), Some(value.as_str()))]),
+        _ => Err(usage(what)),
+    }
 }
 
 fn assignment(word: &str) -> Result<(&str, &str), Refusal> {
@@ -204,12 +243,40 @@ fn kept(column: &Column, edit: grid::Edit, born: bool) -> Edit {
     }
 }
 
-/// What each edit's author saw where this Mac's own earlier writes are ahead of the snapshot:
-/// the latest intent of this Mac on the same register that still waits, or that was published
-/// and is not in the snapshot yet (`intent:<id>`). The publisher compares the edit with what
-/// that intent left in the register.
-fn follow(held: &File, outbox: &Outbox, edits: &mut [Edit]) {
-    let frontier = held.frontier();
+/// The candidates the baseline at revision `rev` of `held` holds in the row `pk`'s `column`,
+/// lower-case hex in order: what a write of that cell read against the snapshot at that revision
+/// expects. `None` where no baseline reads there.
+pub(super) fn candidates_at(held: &File, rev: u64, edit: &Edit) -> Option<Vec<String>> {
+    let bytes = held.baseline(rev)?;
+    let value: Value = aterm_json::from_slice(&bytes).ok()?;
+    let base = Base::from_json(&value).ok()?;
+    let mut now = base
+        .rows
+        .iter()
+        .find(|(row, _)| *row == edit.key)
+        .and_then(|(_, seen)| seen.get(&edit.column))
+        .map(|seen| match &edit.elem {
+            Some(elem) => seen
+                .elements
+                .get(elem)
+                .map(|ops| hex(ops))
+                .unwrap_or_default(),
+            None => hex(&seen.candidates),
+        })
+        .unwrap_or_default();
+    now.sort_unstable();
+    Some(now)
+}
+
+/// What each edit's author saw where this Mac's own earlier writes are ahead of the baseline the
+/// edit was read against ([`Target::baseline`]): the latest intent of this Mac on the same
+/// register that still waits, or that was published and is not in that baseline yet
+/// (`intent:<id>`). The publisher compares the edit with what that intent left in the register.
+fn follow(target: &Target, edits: &mut [Edit]) {
+    // Only the frontier the snapshot at the baseline's revision was projected from says what
+    // that baseline holds: a snapshot a pass wrote before its status is a later one.
+    let frontier = target.held.projected_at(target.rev);
+    let outbox = &target.outbox;
     let same = |a: &Edit, b: &Edit| a.key == b.key && a.column == b.column && a.elem == b.elem;
     for edit in edits {
         let waiting = outbox
@@ -416,7 +483,7 @@ fn again(target: &Target, held: &aterm_file::Intent) -> Result<Draft, Refusal> {
         }
         .unwrap_or_default();
     }
-    follow(&target.held, &target.held.outbox(), &mut edits);
+    follow(target, &mut edits);
     Ok(Draft {
         born: false,
         revert: None,
@@ -434,15 +501,63 @@ enum Said {
     Dropped { id: String },
 }
 
+/// What a write verb did: the text or JSON `aterm file` prints for it with its exit code, and
+/// the intent it queued, published, held or dropped, by id (`None` where it changed nothing).
+#[derive(Debug)]
+pub struct Wrote {
+    text: String,
+    code: u8,
+    id: Option<String>,
+    unflushed: Option<String>,
+}
+
+impl Wrote {
+    /// The text or JSON to print, and the exit code.
+    #[must_use]
+    pub fn printed(self) -> (String, u8) {
+        (self.text, self.code)
+    }
+
+    /// The intent the verb queued, published, held or dropped; `None` where the file already
+    /// said what it asked.
+    #[must_use]
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    /// Why the outbox folder's flush failed after the intent was written, where it did.
+    #[must_use]
+    pub fn unflushed(&self) -> Option<&str> {
+        self.unflushed.as_deref()
+    }
+}
+
 /// `said` for `name`, with `unflushed` (the outbox holds the intent, but its folder's flush
 /// failed): the text or JSON to print and the exit code. A held intent is a conflict recorded.
-fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> (String, u8) {
+fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> Wrote {
+    let wrote = |(text, code)| Wrote {
+        text,
+        code,
+        id: match &said {
+            Said::Published { id, .. }
+            | Said::Queued { id, .. }
+            | Said::Held { id, .. }
+            | Said::Dropped { id } => Some(id.clone()),
+            Said::Unchanged => None,
+        },
+        unflushed: unflushed.map(str::to_owned),
+    };
+    wrote(printed(name, &said, unflushed, json))
+}
+
+/// [`answer`]'s text or JSON and exit code.
+fn printed(name: &Name, said: &Said, unflushed: Option<&str>, json: bool) -> (String, u8) {
     let code = if matches!(said, Said::Held { .. }) {
         exit::CONFLICT
     } else {
         exit::OK
     };
-    let (state, id, op, why) = match &said {
+    let (state, id, op, why) = match said {
         Said::Published { id, op } => ("published", Some(id), op.as_ref(), None),
         Said::Queued { id, why } => ("queued", Some(id), None, Some(why)),
         Said::Held { id, why } => ("held", Some(id), None, Some(why)),
@@ -459,7 +574,7 @@ fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> (Stri
         object.insert("unflushed".to_owned(), Value::from(unflushed));
         return (format!("{}\n", Value::Object(object)), code);
     }
-    let mut text = match &said {
+    let mut text = match said {
         Said::Published { op: Some(op), .. } => format!("published {op}\n"),
         Said::Published { id, op: None } => {
             format!("published: the table already says what {id} writes\n")
@@ -480,59 +595,131 @@ fn answer(name: &Name, said: Said, unflushed: Option<&str>, json: bool) -> (Stri
 
 /// Give the publisher its bound for the intent `id`, and say what became of it.
 fn attempt(paths: &Paths, config: &Path, target: &Target, id: &str, env: &Env<'_>) -> Said {
-    let outcomes = publish::pass(
-        paths,
-        config,
-        Some(&target.name),
-        &publish::Pass {
-            by: std::time::Instant::now() + env.attempt,
-            now_ms: env.now_ms,
-        },
+    let id = id.to_owned();
+    if env.attempt.is_zero() {
+        return Said::Queued {
+            id,
+            why: "a later pass publishes it".to_owned(),
+        };
+    }
+    said_of(
+        &target.held,
+        &offer(paths, config, &target.name, env.attempt, env.now_ms),
+        id,
+    )
+}
+
+/// Offer what this Mac queued for `name` to the publisher for `attempt` ([`offer`]), and say
+/// what became of the intent `id`, whose outbox folder's flush failed as `unflushed` says where
+/// it did, in a write verb's words (`published <op>`, `queued <id>: <why>` or `held <id>:
+/// <why>`, and the flush note).
+pub(super) fn offered(
+    paths: &Paths,
+    config: &Path,
+    name: &Name,
+    (id, unflushed): (&str, Option<&str>),
+    attempt: Duration,
+    now_ms: u64,
+) -> String {
+    let held = File::at(&super::root(&generation::original(paths)), name);
+    let said = said_of(
+        &held,
+        &offer(paths, config, name, attempt, now_ms),
+        id.to_owned(),
     );
+    printed(name, &said, unflushed, false).0
+}
+
+/// What `outcomes`, a publisher pass's, say became of the intent `id` of `held`: where they say
+/// nothing of it, what its outbox says, since another pass may have settled it first.
+fn said_of(held: &File, outcomes: &[publish::Outcome], id: String) -> Said {
     let answer = outcomes
         .iter()
-        .find_map(|outcome| outcome.answer(id).cloned());
-    let id = id.to_owned();
+        .find_map(|outcome| outcome.answer(&id).cloned());
     match answer {
-        Some(Answer::Published { op }) => {
-            // The snapshot takes the record up now rather than at the next pass; a pass that
-            // cannot leaves the read laying this write over the old snapshot.
-            let _ = materialize::pass(
-                paths,
-                config,
-                Some(&target.name),
-                &materialize::Pass {
-                    now_ms: env.now_ms,
-                    ..materialize::Pass::now()
-                },
-            );
-            Said::Published { id, op }
-        }
+        Some(Answer::Published { op }) => Said::Published { id, op },
         Some(Answer::Held { why }) => Said::Held { id, why },
         Some(Answer::Queued { why }) => Said::Queued { id, why },
-        None => Said::Queued {
-            id,
-            why: "the publisher has not reached it".to_owned(),
-        },
+        None => {
+            let outbox = held.outbox();
+            if let Some(done) = outbox.done.iter().find(|done| done.intent.id == id) {
+                Said::Published {
+                    op: done.op.clone(),
+                    id,
+                }
+            } else if let Some(stopped) = outbox.held.iter().find(|held| held.intent.id == id) {
+                Said::Held {
+                    why: stopped.why.clone(),
+                    id,
+                }
+            } else {
+                Said::Queued {
+                    id,
+                    why: "the publisher has not reached it".to_owned(),
+                }
+            }
+        }
     }
 }
 
-/// What `set <name> <row> <column> [<value>]` queues, read against this Mac's last snapshot:
-/// `None` where the cell already says the value (no value: the cell is empty). The conformance
-/// test accepts it itself, so its accept is a step of its own.
+/// Offer what this Mac queued for `name` to the publisher for `attempt`, and where it signed any
+/// of it, project the file again now rather than at the next pass (a pass that cannot leaves a
+/// read laying those writes over the old snapshot). Each intent's answer is in the outcomes.
+pub(super) fn offer(
+    paths: &Paths,
+    config: &Path,
+    name: &Name,
+    attempt: Duration,
+    now_ms: u64,
+) -> Vec<publish::Outcome> {
+    let outcomes = publish::pass(
+        paths,
+        config,
+        Some(name),
+        &publish::Pass {
+            by: std::time::Instant::now() + attempt,
+            now_ms,
+        },
+    );
+    let signed = outcomes.iter().any(|outcome| {
+        outcome
+            .intents
+            .iter()
+            .any(|(_, answer)| matches!(answer, Answer::Published { .. }))
+    });
+    if signed {
+        let _ = materialize::pass(
+            paths,
+            config,
+            Some(name),
+            &materialize::Pass {
+                now_ms,
+                ..materialize::Pass::now()
+            },
+        );
+    }
+    outcomes
+}
+
+/// What `set <name> <row> <column> [<value>]`, or `set <name> <row> <column>=<value>…` with
+/// each cell of `cells`, queues as one intent, read against this Mac's last snapshot:
+/// `None` where every cell already says its value (no value: the cell is empty). The
+/// conformance test accepts it itself, so its accept is a step of its own.
 pub(crate) fn draft_set(
     paths: &Paths,
     name: &str,
     key: &str,
-    column: &str,
-    value: Option<&str>,
+    cells: &[(&str, Option<&str>)],
 ) -> Result<Option<Draft>, Refusal> {
     let target = Target::of(paths, name)?;
-    let mut edits = set(&target, key, column, value)?;
+    let mut edits = Vec::new();
+    for (column, value) in cells {
+        edits.extend(set(&target, key, column, *value)?);
+    }
     if edits.is_empty() {
         return Ok(None);
     }
-    follow(&target.held, &target.held.outbox(), &mut edits);
+    follow(&target, &mut edits);
     Ok(Some(Draft {
         born: false,
         revert: None,
@@ -546,7 +733,7 @@ pub fn is_verb(word: &str) -> bool {
     matches!(word, "set" | "add" | "rm" | "revert" | "resolve")
 }
 
-/// One write verb over `paths`, and what to print with its exit code.
+/// One write verb over `paths`, and what it did ([`Wrote`]).
 ///
 /// # Errors
 /// Nothing was queued: the words are not the verb's, or the write cannot be made here now.
@@ -555,11 +742,11 @@ pub fn verb(
     config: &Path,
     words: &[String],
     env: &Env<'_>,
-) -> Result<(String, u8), Refusal> {
+) -> Result<Wrote, Refusal> {
     #[expect(
         clippy::disallowed_methods,
         reason = "the explicit `aterm file` verb: set, add, rm, revert and resolve (this fn's \
-                  own clippy.toml row lets only `aterm file`'s entry and `rename_nick` run it)"
+                  own clippy.toml row lets only `aterm file`'s entry and `rename` run it)"
     )]
     let act = OwnerAct::verb(env.by, env.session)
         .ok_or_else(|| usage("--by takes one word [a-z][a-z0-9-]{0,19}"))?;
@@ -567,7 +754,7 @@ pub fn verb(
         words.get(at).map(String::as_str).ok_or_else(|| usage(what))
     };
     let verb = word(0, "set|add|rm|revert|resolve <name> ...")?;
-    let queued = |target: &Target, draft: Draft| -> Result<(String, u8), Refusal> {
+    let queued = |target: &Target, draft: Draft| -> Result<Wrote, Refusal> {
         let accepted = target
             .held
             .write(&act, draft, env.now_ms)
@@ -585,7 +772,7 @@ pub fn verb(
             return Ok(answer(&target.name, Said::Unchanged, None, env.json));
         }
         if !born {
-            follow(&target.held, &target.held.outbox(), &mut edits);
+            follow(target, &mut edits);
         }
         queued(
             target,
@@ -598,20 +785,12 @@ pub fn verb(
     };
     match verb {
         "set" => {
-            let what = "set <name> <row> <column> [<value> | --stdin]";
+            let what = "set <name> <row> <column> [<value> | --stdin] | set <name> <row> \
+                        <column>=<value>...";
             let target = Target::of(paths, word(1, what)?)?;
-            let (key, column) = (word(2, what)?, word(3, what)?);
-            let value = match &words[4..] {
-                [] => None,
-                [stdin] if stdin == "--stdin" => {
-                    Some(from_stdin(env.stdin.ok_or_else(|| {
-                        problem("--stdin: nothing was read from standard input")
-                    })?))
-                }
-                [value] => Some(value.as_str()),
-                _ => return Err(usage(what)),
-            };
-            match draft_set(paths, target.file.name, key, column, value)? {
+            let key = word(2, what)?;
+            let cells = set_cells(&words[3..], env.stdin, what)?;
+            match draft_set(paths, target.file.name, key, &cells)? {
                 Some(draft) => queued(&target, draft),
                 None => Ok(answer(&target.name, Said::Unchanged, None, env.json)),
             }

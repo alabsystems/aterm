@@ -65,6 +65,6 @@ pub fn newest_until(
         .map(|(epoch, key)| EveryoneKey { epoch, key }))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "everyone_key_tests.rs"]
 mod tests;

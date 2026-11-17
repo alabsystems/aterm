@@ -28,7 +28,7 @@
 //!
 //! Its readers write nothing: `accounts stats` and the accounts report say how far each window
 //! moved over a span ([`since_of`]), and `accounts history` an account's days ([`day_summaries`]
-//! over the rows with the closes derived in memory, [`resets_used`]).
+//! over the rows with the closes derived in memory, [`refills`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom, Write as _};
@@ -89,15 +89,15 @@ pub const COMPACT_EVERY_S: i64 = 86_400;
 /// A window anchor is closed this long after its reset, where no newer anchor came first.
 pub const CLOSE_SLACK_S: i64 = 600;
 
-/// The most limit resets used one `close` row names.
+/// The most refill barriers one `close` row names ([`Close::epochs`]).
 pub const EPOCHS_MAX: usize = 4;
 
 /// The most bytes one row may take.
 pub const ROW_MAX: usize = 512;
 
 /// The most five-hour windows one stored `day` row names by anchor ([`DayFive::anchors`]): one
-/// window ends at most every five hours where no limit reset was used and no other login took
-/// the home, so a day holds five, and six name one to spare. A row names the oldest of them
+/// window ends at most every five hours where it was not refilled or raised and no other login
+/// took the home, so a day holds five, and six name one to spare. A row names the oldest of them
 /// that fit its line under [`ROW_MAX`] ([`SeriesRow::line`]): six fit a row of every count and
 /// figure at its widest and ten-digit instants.
 pub const DAY_ANCHORS_MAX: usize = 6;
@@ -132,7 +132,8 @@ pub struct Fig {
     pub at: i64,
     /// Where it came from ([`accounts::SOURCE_TAP`], [`accounts::SOURCE_SAMPLE`]).
     pub src: String,
-    /// A limit reset used inside the window ([`WindowFig::epoch_at`]).
+    /// The window's refill barrier ([`WindowFig::epoch_at`]): a limit reset spent, or a refill or
+    /// a raised allowance a tap read, inside the window.
     pub epoch: Option<i64>,
 }
 
@@ -201,8 +202,9 @@ pub struct Close {
     pub n: u32,
     /// Its peak read full (`peak` ≥ 1000).
     pub walled: bool,
-    /// The limit resets used inside it, at most [`EPOCHS_MAX`], oldest first: each figure's
-    /// `epoch` and each refill drop of at least [`accounts::REFILL_MIN_X10`].
+    /// Each instant it was refilled or raised inside it (a limit reset spent among them), at most
+    /// [`EPOCHS_MAX`], oldest first: each figure's `epoch` and each drop of at least
+    /// [`accounts::REFILL_MIN_X10`].
     pub epochs: Vec<i64>,
     /// A newer anchor's first figure came before this reset.
     pub early: bool,
@@ -1455,7 +1457,7 @@ pub fn outlook_view(rows: Vec<SeriesRow>, now: i64) -> Vec<SeriesRow> {
 pub enum Began {
     /// A window's first run: empty at `reset − W`.
     Window,
-    /// After a limit reset used inside the window, or a refill or raised allowance read on the
+    /// After a limit reset spent inside the window, or a refill or raised allowance read on the
     /// run's first row: empty at the epoch when the epoch precedes that row, else at that row
     /// (the epoch then says only that the change came before it).
     Epoch(i64),
@@ -1835,12 +1837,14 @@ pub fn day_summaries(
         .collect()
 }
 
-/// The limit resets used inside `window`'s anchors in `rows` by `now`, oldest first and each
-/// once: every `close` row's `epochs`, a stored one's or one [`derive_closes`] gives an anchor
-/// that ended, and for an anchor no close holds yet, its figures' `epoch` inside it and each run
-/// an epoch or a refill began ([`runs`]), as its close will name them.
+/// Each instant `window` was refilled or raised inside one of its anchors in `rows` by `now` (a
+/// limit reset spent, a refill or a raised allowance, which the series does not tell apart),
+/// oldest first and each once: every `close` row's `epochs`, a stored one's or one
+/// [`derive_closes`] gives an anchor that ended, and for an anchor no close holds yet, its
+/// figures' `epoch` inside it and each run an epoch or a refill began ([`runs`]), as its close
+/// will name them.
 #[must_use]
-pub fn resets_used(rows: &[SeriesRow], window: &str, now: i64) -> Vec<i64> {
+pub fn refills(rows: &[SeriesRow], window: &str, now: i64) -> Vec<i64> {
     let derived = derive_closes(rows, now);
     let closes: Vec<&Close> = rows
         .iter()
@@ -1891,9 +1895,9 @@ pub enum Moved {
     /// The window its figure is of began at this instant (`reset − length`), after the
     /// baseline.
     NewWindow(i64),
-    /// A limit reset was used, or the window refilled or raised with no session seeing it, at this
-    /// instant, after the baseline: the figure counts from there.
-    ResetUsed(i64),
+    /// The window was refilled or raised (a limit reset spent among them) at this instant, after
+    /// the baseline: the figure counts from there.
+    Refilled(i64),
 }
 
 /// How far one window moved over a span ([`since_of`]).
@@ -1985,8 +1989,8 @@ pub fn taken_over<'a>(
 /// unless it was served within [`accounts::READING_HEARTBEAT_S`] of the span's start; it is
 /// taken only after the newest row that parts two accounts ([`after_parting`]), so it never
 /// compares two accounts. Where the baseline's reset is not `current`'s, a new window began
-/// (`current.reset − length`); else, where a limit reset was used after it (`current`'s epoch, a
-/// later row's, or a refill drop, [`runs`]), that instant, the newest; else the rise in whole
+/// (`current.reset − length`); else, where it was refilled or raised after it (`current`'s epoch,
+/// a later row's, or a drop, [`runs`]), that instant, the newest; else the rise in whole
 /// points, never negative. `None` where `current` is `None` (no figure, a void or cut one, or
 /// another account's record) or no `fig` row of the window comes after that parting.
 #[must_use]
@@ -2039,7 +2043,7 @@ pub fn since_of(
                 Began::Window => None,
             });
         match epochs.chain(refills).filter(|at| *at <= now).max() {
-            Some(at) => Moved::ResetUsed(at),
+            Some(at) => Moved::Refilled(at),
             None => Moved::Rose(current.whole().saturating_sub(base.whole())),
         }
     };

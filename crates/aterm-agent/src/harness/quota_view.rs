@@ -58,7 +58,8 @@ pub const NOW_MARK: char = '\u{2595}';
 pub const GAP_MARK: char = '\u{2573}';
 /// `→`: the work moves to another account.
 pub const HANDOFF_MARK: char = '\u{2192}';
-/// `↺` (U+21BA): a vendor reset.
+/// `↺` (U+21BA): a vendor reset, or, in the measured past, a refill or a raised allowance inside
+/// the week ([`Read::epoch`]).
 pub const RESET_MARK: char = '\u{21ba}';
 /// `$`: the work spends usage credits.
 pub const CREDITS_MARK: char = '$';
@@ -214,7 +215,7 @@ pub enum Cell {
     Gap,
     /// `→`, a hand-off.
     Handoff,
-    /// `↺`, a vendor reset.
+    /// `↺`, a vendor reset, or a past refill or raise ([`RESET_MARK`]).
     Reset,
     /// `$`, usage credits.
     Credits,
@@ -961,13 +962,17 @@ impl Chart {
         }
     }
 
+    /// Whether a week of the measured past ended, or began at its vendor reset, in `[a, b)`: a
+    /// cell's `↺` is then a reset, and otherwise a refill barrier ([`Read::epoch`]).
+    fn turned(&self, a: i64, b: i64) -> bool {
+        self.past.iter().any(|r| {
+            (a..b).contains(&r.reset) || (r.epoch.is_none() && (a..b).contains(&(r.reset - WEEK)))
+        })
+    }
+
     fn past_cell(&self, a: i64, b: i64) -> Cell {
         let starts = |r: &Read| r.epoch.unwrap_or(r.reset - WEEK);
-        if self
-            .past
-            .iter()
-            .any(|r| (a..b).contains(&r.reset) || (a..b).contains(&starts(r)))
-        {
+        if self.turned(a, b) || self.past.iter().any(|r| (a..b).contains(&starts(r))) {
             return Cell::Reset;
         }
         let i = self.past.partition_point(|r| r.t <= b);
@@ -2384,7 +2389,9 @@ impl QuotaView {
     /// where a wall lifts at a named account's reset said
     /// at that reset exactly, `Sat 10:00 · the work moves to main`), and a name after it the
     /// same; a `╳` its stop (`~Sat 05:00–Sat 10:00 · every account out until main's reset`); a
-    /// `$` its span on credits; a `↺` the reset; `┄` that nothing is projected there. `None` for
+    /// `$` its span on credits; a `↺` the week's reset, or in the measured past, where no reset
+    /// falls in the cell, its refill barrier (`main's week refilled or raised`, [`Read::epoch`]);
+    /// `┄` that nothing is projected there. `None` for
     /// the now cell, which holds no time, and past the chart's end: the row's own title stands.
     #[must_use]
     pub fn column_title(&self, per_day: u8, cell: usize, offsets: &Offsets) -> Option<String> {
@@ -2411,7 +2418,12 @@ impl QuotaView {
                         super::left::words(u32::from(r.x10))
                     )
                 }
-                Cell::Reset => format!("{span}{SEP}{}'s week reset", whole(tab)),
+                // A past `↺` is the week's reset, or its refill barrier (`Read::epoch`): a limit
+                // reset spent, a refill or a raised allowance, which no reading tells apart.
+                Cell::Reset if chart.turned(a, b) => {
+                    format!("{span}{SEP}{}'s week reset", whole(tab))
+                }
+                Cell::Reset => format!("{span}{SEP}{}'s week refilled or raised", whole(tab)),
                 _ => format!("{span}{SEP}no reading on this Mac"),
             });
         }

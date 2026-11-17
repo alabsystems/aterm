@@ -6,30 +6,48 @@
 //! them, the compiled reference rows, and a chip the owner stated that its Mac sees otherwise.
 //! It opens the page, takes a frame, opens the Columns list and takes a frame, selects a Mac's
 //! status (STORED's folded stub, the columns no row fills, stands before it) and takes a frame,
-//! unfolds STORED with a press on its stub and takes a frame, stages an edit through `act`, takes
-//! a frame, opens a Mac's
-//! role (an enum) on its list of words and takes a frame, stages a word that is none of them
-//! and takes a frame of its refusal, asks `act` to write them (which `act` refuses: only a
-//! person's own press writes) and discards them, turns the fold off from the Columns list,
-//! selects a Mac's linked count (the cell bar says the count, the line under the grid which
-//! rows name the Mac), takes a frame, selects the grid's last column, takes a frame,
-//! sorts the rows by a header, takes a frame, selects the stated chip (the line under the grid says both what is stated and what the Mac sees), takes
-//! a frame, in a narrow window opens the table picker and takes a frame, opens the Macs' own
-//! facts and selects a cell, takes a frame, opens the providers and takes a frame, opens the
-//! CLIs and selects one's key, takes a frame, opens the machine models (the rail's last table)
-//! and takes a frame, opens the plans (each one's limits in words) and the imports (each one's
-//! time a date) and takes a frame of each, opens Check and takes a frame, selects its first
-//! finding and takes a frame,
-//! goes back to the machines, selects a cell and finds another row (the cell bar names the
-//! selected cell as not among the rows found), takes a frame and clears the find; then opens the
-//! links, adds one and opens its machine on the list of the machines (two under one label, each
-//! saying which it is) and takes a frame, chooses one and opens its account on its list and
-//! takes a frame, discards them and selects a written link, whose cells read as the rows they
-//! name and whose pane offers each, and takes a frame (docs/PLAN.md LT-30); then selects the
-//! machine that link names, whose Retire waits on the link, and takes a frame, ends the link from
-//! there and takes a frame of the machine's Retire freed, discards that, steps the lifecycle
-//! filter to retired rows and takes a frame, and adds an email, whose pane names the verb that
-//! sets its password, and takes a frame (docs/PLAN.md LT-24); the frames go to the folder named.
+//! unfolds STORED with a press on its stub and takes a frame, stages an edit through `act`, takes a
+//! frame, opens a Mac's role (an enum) on its list of words and takes a frame, stages a word that
+//! is none of them and takes a frame of its refusal, asks `act` to write them (which `act` refuses:
+//! only a person's own press writes) and discards them, turns the fold off from the Columns list,
+//! selects a Mac's linked count (the cell bar says the count, the line under the grid which rows
+//! name the Mac), takes a frame, selects the grid's last column, takes a frame, sorts the rows by a
+//! header, takes a frame, selects the stated chip (the line under the grid says both what is stated
+//! and what the Mac sees), takes a frame, in a narrow window opens the table picker and takes a
+//! frame, opens the Macs' own facts and selects a cell, takes a frame, opens the providers and
+//! takes a frame, opens the CLIs and selects one's key, takes a frame, opens the machine models
+//! (the rail's last table) and takes a frame, opens the plans (each one's limits in words) and the
+//! imports (each one's time a date) and takes a frame of each, opens Check and takes a frame,
+//! selects its first finding and takes a frame, goes back to the machines, opens the status's list
+//! of values from the mark at its header's end and takes a frame, keeps the active machines in the
+//! office or in rack a (two chips under the tools) and takes a frame, adds a filter no row passes
+//! (the grid says so, with Clear filters) and takes a frame, and clears them (docs/PLAN.md LT-41);
+//! then selects a cell and finds another row (the cell bar names the selected cell as not among
+//! the rows found), takes a frame,
+//! selects the cell the two Macs wrote apart (its row is the one found, and the find stays) and
+//! opens the history drawer under the grid on the whole table, takes a frame, narrows it to that
+//! cell, takes a frame, opens the Columns list over the drawer (the grid and the drawer stay where
+//! they stand) and takes a frame, hides that cell's column from it (the selection, and the drawer's
+//! cell with it, move to the next column drawn) and takes a frame, shows it again (docs/PLAN.md
+//! LT-39, LT-40), opens the location's list of values over the drawer and takes a frame, keeps the
+//! office's machines, which leaves the found row out (its chip under the tools, the drawer under
+//! the grid still listing that row's records), narrows the drawer to that row and takes a frame
+//! where the chip's line leaves the drawer room, takes the filter off (LT-41 with LT-39; a drawer
+//! line's key runs past the 64 bytes `act` takes for an action, so the lane presses no line),
+//! closes the drawer and clears the find; then opens the links, adds one and opens its machine on
+//! the list of the machines (two under one label, each saying which it is) and takes a frame,
+//! chooses one and opens its account on its list and takes a frame, discards them and selects a
+//! written link, whose cells read as the rows they name and
+//! whose pane offers each, and takes a frame (docs/PLAN.md LT-30); then selects the machine that
+//! link names, whose Retire waits on the link, and takes a frame, ends the link from there and
+//! takes a frame of the machine's Retire freed, stages that retire, opens the history drawer on the
+//! machine's row (the retire first, not written) and takes a frame, closes it, discards them, steps
+//! the lifecycle filter to retired rows and takes a frame, and adds an email, whose pane names the
+//! verb that sets its password, and takes a frame, opens the drawer on the new row (its birth, not
+//! written) and takes a frame, and closes it (docs/PLAN.md LT-24, LT-39); the frames go to the
+//! folder named. A window too short for the drawer (judged, as the cell bar is, from the window and
+//! the filters' chips alone) has no drawer, and the lane takes none of its frames there; it asks
+//! again once the location's chip stands, which can take the drawer away.
 //! `--lines N` sets the window's height (56 lines by default), so a short one shows the rail
 //! scrolled; `--columns N` its width (200 by default), so a narrow one (under 900 px) shows the
 //! table picker and the pane below the grid. No live vault, fleet or Commons is reached, and every
@@ -373,6 +391,16 @@ fn open_list(inst: &Instance, view: &str, key: &str) -> Result<(), Fail> {
 /// The rail's line that opens Check.
 const CHECK: &str = "tables/view/check";
 
+/// Whether the history drawer stands, closed (its Show history) or open (its Hide history): a
+/// window too short for its line over three lines of grid, judged from the window and the
+/// filters' chips alone, has none.
+fn drawer_stands(inst: &Instance, view: &str) -> bool {
+    let shown = inst.ctl(&["inspect", "app/v1", "view", view, "text"]);
+    shown.code == 0
+        && (shown.stdout.contains("tables/history/show")
+            || shown.stdout.contains("tables/history/hide"))
+}
+
 fn drive(
     inst: &mut Instance,
     out: &Path,
@@ -554,15 +582,130 @@ fn drive(
         text.contains("tables/check/row/0/0")
     })?;
     shots.push(frame(inst, out, "tables-13-finding.png")?);
-    // Back on the machines, a find that leaves the selected row out: the line under the grid
-    // still tells of the cell, and the cell bar names it as not among the rows found.
+    // Back on the machines: a column's filters (docs/PLAN.md LT-41), then a find that leaves
+    // the selected row out: the line under the grid still tells of the cell, and the cell bar
+    // names it as not among the rows found.
     choose(inst, &view, "tables/sheet/machine", narrow)?;
+    // A column's filter: the mark at its header's end opens the list of the values its rows
+    // hold, each with how many rows hold it.
+    act(inst, &view, "tables/mark/status", None)?;
+    until(inst, &view, "the status's values", |text| {
+        text.contains("tables/filter/value/active")
+    })?;
+    shots.push(frame(inst, out, "tables-13a-filter-list.png")?);
+    // Two filters, each a chip in words under the tools: the active machines in the office or
+    // in rack a.
+    act(inst, &view, "tables/filter/value/active", None)?;
+    act(inst, &view, "tables/mark/location", None)?;
+    act(inst, &view, "tables/filter/value/office", None)?;
+    act(inst, &view, "tables/filter/value/rack%20a", None)?;
+    act(inst, &view, "tables/mark/location", None)?;
+    until(inst, &view, "two chips", |text| {
+        text.contains("tables/chips/chip/status") && text.contains("tables/chips/chip/location")
+    })?;
+    shots.push(frame(inst, out, "tables-13b-filtered.png")?);
+    // A third filter no row passes: the grid says so, with Clear filters.
+    act(inst, &view, "tables/mark/nickname", None)?;
+    act(inst, &view, "tables/filter/empty", None)?;
+    act(inst, &view, "tables/mark/nickname", None)?;
+    until(inst, &view, "no row passing", |text| {
+        text.contains("No row passes these filters")
+    })?;
+    shots.push(frame(inst, out, "tables-13c-none-pass.png")?);
+    act(inst, &view, "tables/none/clear", None)?;
+    until(inst, &view, "the filters cleared", |text| {
+        !text.contains("tables/chips/")
+    })?;
     act(inst, &view, "tables/cell/mc-000000000000000c/chip", None)?;
     act(inst, &view, "tables/find", Some("mc-000000000000000a"))?;
     until(inst, &view, "the selected cell, its row left out", |text| {
         text.contains("not among the rows found")
     })?;
     shots.push(frame(inst, out, "tables-14-found.png")?);
+    // The history drawer, open under the grid at Table scope on the row found: every cell a
+    // record set in the table, whatever the find shows, the newest line of the selected cell
+    // (the one the two Macs wrote apart) in the grid's ring.
+    act(
+        inst,
+        &view,
+        "tables/cell/mc-000000000000000a/nickname",
+        None,
+    )?;
+    // A window too short for the drawer's line over three lines of grid, judged from the
+    // window and the filters' chips (none stands yet), has no drawer.
+    let drawer = drawer_stands(inst, &view);
+    if drawer {
+        act(inst, &view, "tables/history/show", None)?;
+        until(inst, &view, "the history drawer's list", |text| {
+            text.contains("tables/history/hide")
+        })?;
+        shots.push(frame(inst, out, "tables-14a-history.png")?);
+        // Cell scope on that cell: every value written to it, both of the conflict.
+        act(inst, &view, "tables/history/scope/cell", None)?;
+        shots.push(frame(inst, out, "tables-14b-history-cell.png")?);
+        // The Columns list over the open drawer: laid over the grid and the drawer's list,
+        // neither of which moves for it.
+        act(inst, &view, "tables/columns", None)?;
+        until(inst, &view, "the list of columns over the drawer", |text| {
+            text.contains("tables/columns/fold")
+        })?;
+        shots.push(frame(inst, out, "tables-14c-history-columns.png")?);
+        // The selected cell's column hidden from the list: the selection moves to the next
+        // column drawn, and the drawer's Cell scope with it.
+        act(inst, &view, "tables/columns/column/nickname", None)?;
+        act(inst, &view, "tables/columns", None)?;
+        // The key whole, in its quotes: `nickname_aliases` is another column.
+        let nickname = "\"tables/head/nickname\"";
+        until(inst, &view, "the nickname hidden", |text| {
+            !text.contains(nickname)
+        })?;
+        shots.push(frame(inst, out, "tables-14d-history-hidden.png")?);
+        act(inst, &view, "tables/columns", None)?;
+        act(inst, &view, "tables/columns/column/nickname", None)?;
+        act(inst, &view, "tables/columns", None)?;
+        until(inst, &view, "the nickname shown again", |text| {
+            text.contains(nickname)
+        })?;
+        // A column's list of values over the open drawer (docs/PLAN.md LT-41 with LT-39): laid
+        // over the grid and the drawer, neither of which moves for it.
+        act(inst, &view, "tables/mark/location", None)?;
+        until(
+            inst,
+            &view,
+            "the list of locations over the drawer",
+            |text| text.contains("tables/filter/value/office"),
+        )?;
+        shots.push(frame(inst, out, "tables-14e-history-filter-list.png")?);
+        // The office's machines alone, which leaves the found row out: the chip stands under
+        // the tools, and the drawer still lists the row's records.
+        act(inst, &view, "tables/filter/value/office", None)?;
+        act(inst, &view, "tables/mark/location", None)?;
+        until(inst, &view, "the location's chip", |text| {
+            text.contains("tables/chips/chip/location")
+        })?;
+        // The chip's line counts in the window's judgment of the drawer, so a window that
+        // only just held the drawer holds it no longer: no frame of it there.
+        if drawer_stands(inst, &view) {
+            act(inst, &view, "tables/history/scope/row", None)?;
+            shots.push(frame(inst, out, "tables-14f-history-filtered.png")?);
+        } else {
+            println!(
+                "tables-page: the filter's chip leaves this window too short for the history \
+                 drawer; no frame of it filtered"
+            );
+        }
+        // The filter taken off again. A press on one of the drawer's lines would clear it too
+        // (docs/PLAN.md LT-41 with LT-39), but a line's key, which names its record by the
+        // record's whole digest, is longer than the 64 bytes `act` takes for an action, so the
+        // lane presses no line: the page's tests press them.
+        act(inst, &view, "tables/chips/remove/location", None)?;
+        until(inst, &view, "the location's chip taken off", |text| {
+            !text.contains("tables/chips/")
+        })?;
+        act(inst, &view, "tables/history/hide", None)?;
+    } else {
+        println!("tables-page: this window is too short for the history drawer; no frame of it");
+    }
     act(inst, &view, "tables/find", Some(""))?;
     // A link's machine is chosen from the machines' rows, each read by its words; two under one
     // label say each one's key ending, status and whether a Mac holds it.
@@ -606,6 +749,19 @@ fn drive(
         text.contains("Retire this machine") && !text.contains("1 live row names it")
     })?;
     shots.push(frame(inst, out, "tables-19-retire-freed.png")?);
+    // The machine's retire, staged from its pane, is the drawer's too: the first line of its
+    // row's history, not written, with the Undo its pane offers under the fields.
+    if drawer {
+        act(inst, &view, "tables/pane/row/retire", None)?;
+        let staged = format!("tables/history/staged/{MACHINE}/row");
+        act(inst, &view, "tables/history/show", None)?;
+        act(inst, &view, "tables/history/scope/row", None)?;
+        until(inst, &view, "the staged retire in the drawer", |text| {
+            text.contains(&staged)
+        })?;
+        shots.push(frame(inst, out, "tables-19a-history-retire.png")?);
+        act(inst, &view, "tables/history/hide", None)?;
+    }
     act(inst, &view, "tables/discard", None)?;
     // The lifecycle filter's next step: the retired rows.
     act(inst, &view, "tables/rows/filter", None)?;
@@ -620,6 +776,15 @@ fn drive(
         text.contains("tables/pane/row/set/password")
     })?;
     shots.push(frame(inst, out, "tables-21-new-email.png")?);
+    // The new row is the drawer's first line not written, though no cell of it is staged yet.
+    if drawer {
+        act(inst, &view, "tables/history/show", None)?;
+        until(inst, &view, "the new row in the drawer", |text| {
+            text.contains("tables/history/staged/+new-")
+        })?;
+        shots.push(frame(inst, out, "tables-21a-history-new.png")?);
+        act(inst, &view, "tables/history/hide", None)?;
+    }
     // Nothing of it is staged, so its pane's Remove takes it back.
     act(inst, &view, "tables/pane/row/drop", None)?;
     Ok(shots)

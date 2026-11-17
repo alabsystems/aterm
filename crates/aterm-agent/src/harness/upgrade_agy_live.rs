@@ -327,7 +327,7 @@ pub fn prompts_since(text: &str, from_s: u64) -> Vec<String> {
             if typed_words(request).starts_with(HARNESS_MARK) {
                 Some(typed_words(request).to_owned())
             } else {
-                clean_prompt_words(request)
+                clean_prompt_words(request).map(|cleaned| cleaned.words)
             }
         })
         .collect()

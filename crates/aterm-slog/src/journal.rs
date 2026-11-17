@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 
 use crate::Close;
 use crate::field::Tier;
+use crate::fold::DescIdent;
 use crate::line::{DecodeError, decode, encode};
 use crate::log::{GapWhy, JournalImage, Log};
 use crate::rec::{Rec, Stamp};
@@ -902,21 +903,26 @@ pub enum Pick {
     },
 }
 
-/// The view of session `sid`'s newest log over the chains a read gathered.
+/// The view of session `sid`'s newest log over the chains a read gathered, the session being
+/// `ident` ([`view_picked`]).
 #[must_use]
 pub fn view_of(
     sid: &ShortId,
+    ident: DescIdent,
     chains: &[ChainRead],
     unread: bool,
     rules: ViewRules,
 ) -> Option<View> {
-    view_picked(sid, chains, unread, rules, Pick::Newest)
+    view_picked(sid, ident, chains, unread, rules, Pick::Newest)
 }
 
-/// The view of the log of session `sid` that `pick` names, over the chains a read gathered.
+/// The view of the log of session `sid` that `pick` names, over the chains a read gathered, its
+/// records replayed as the session `ident` names ([`Log::from_journal`]): the host says who the
+/// session is, since no record does.
 #[must_use]
 pub fn view_picked(
     sid: &ShortId,
+    ident: DescIdent,
     chains: &[ChainRead],
     unread: bool,
     rules: ViewRules,
@@ -1041,7 +1047,7 @@ pub fn view_picked(
         }
     }
     let ((base, _), sp) = picked(spaces, pick)?;
-    build(base, sp, chains, &handed, unread, rules)
+    build(base, sp, chains, &handed, unread, rules, ident)
 }
 
 /// The space `pick` names among `spaces`, keyed `(base, number)` and so ordered oldest first.
@@ -1068,6 +1074,7 @@ fn build(
     handed: &BTreeMap<usize, bool>,
     unread: bool,
     rules: ViewRules,
+    ident: DescIdent,
 ) -> Option<View> {
     let last_chain = sp.chains.iter().next_back().map(|(.., ci)| *ci)?;
     let chain = chains.get(last_chain)?;
@@ -1171,7 +1178,7 @@ fn build(
         recs,
         holes: merged,
     };
-    let mut log = Log::from_journal(&img).ok()?;
+    let mut log = Log::from_journal(&img, ident).ok()?;
     let journal_head = log.last_seq();
     let victims = unknown_victims(&log, &sp, &img);
     let crash = rules.crash_closes && dead && log.is_open(Node::SESSION);

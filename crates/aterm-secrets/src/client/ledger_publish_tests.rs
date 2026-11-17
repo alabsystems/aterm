@@ -2,12 +2,15 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+#[cfg(unix)]
 use crate::client::log_entries_tests::join_host;
+#[cfg(unix)]
 use crate::server::{AlabNameInput, AlabNameWatcher, Options as ServerOptions};
-use crate::swarm_roster::{
-    LEASE_CLOCK_MARGIN_SECS, LEASE_TTL_SECS, StewardPolicy, SwarmLease, SwarmPolicy,
-};
+#[cfg(unix)]
+use crate::swarm_roster::LEASE_TTL_SECS;
+use crate::swarm_roster::{LEASE_CLOCK_MARGIN_SECS, StewardPolicy, SwarmLease, SwarmPolicy};
 
+#[cfg(unix)]
 fn start_loopback_server(store: &Path) -> crate::server::Running {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     crate::server::start(
@@ -242,6 +245,7 @@ fn ledger_publish_model_conforms_across_reachable_transitions_and_catches_mutant
     assert!(!model.check_invariant("RevocationsGrowOnly", &buggy_merge));
 }
 
+#[cfg(unix)]
 #[test]
 fn approver_read_back_gates_admission_retirement_and_negative_control_drops_it() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -275,6 +279,7 @@ fn approver_read_back_gates_admission_retirement_and_negative_control_drops_it()
     srv.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn steward_lease_cas_prevents_split_brain_epoch_holders() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -405,6 +410,7 @@ fn steward_lease_cas_prevents_split_brain_epoch_holders() {
     srv.stop();
 }
 
+#[cfg(unix)]
 fn alab_holder_hint(seq: u64, label: &str) -> crate::discover::DiscoveredVault {
     crate::discover::DiscoveredVault {
         url: format!("http://alab-secrets.local:{}/v1/alab", crate::DEFAULT_PORT),
@@ -422,6 +428,7 @@ fn alab_holder_hint(seq: u64, label: &str) -> crate::discover::DiscoveredVault {
 /// With no lease published anywhere, once `alab-secrets.local` goes silent for 90 continuous
 /// seconds, a server takes the name (`docs/DESIGN-fluid-swarm-2026-10-28.md` F7).
 /// NEGATIVE CONTROL: the retired lease-required rule advertises nothing when `lease` is `None`.
+#[cfg(unix)]
 #[test]
 fn with_no_lease_one_server_takes_the_name_after_the_holder_goes_silent() {
     let start = Instant::now();
@@ -484,6 +491,7 @@ fn with_no_lease_one_server_takes_the_name_after_the_holder_goes_silent() {
 /// verified ALab envelope, even when the returning server has a lower label rank (`m3 < m19`).
 /// NEGATIVE CONTROL: removing the holder-answers gate causes the returning lower-label server to
 /// grab the name immediately and flap it.
+#[cfg(unix)]
 #[test]
 fn a_returning_server_leaves_the_name_to_a_holder_that_answers() {
     let start = Instant::now();
@@ -544,6 +552,7 @@ fn a_returning_server_leaves_the_name_to_a_holder_that_answers() {
 /// ordering (then natural label order `m3 < m5 < m19 < m22`) settles on exactly one
 /// holder (`docs/DESIGN-fluid-swarm-2026-10-28.md` F7).
 /// NEGATIVE CONTROL: without the tie-break, symmetric holders either both keep or both drop.
+#[cfg(unix)]
 #[test]
 fn two_holders_at_a_heal_settle_on_one() {
     let start = Instant::now();
@@ -641,6 +650,7 @@ fn two_holders_at_a_heal_settle_on_one() {
     assert_eq!(no_tiebreak_keep_if_gt(7, 7), (false, false));
 }
 
+#[cfg(unix)]
 #[test]
 fn holder_txt_cannot_substitute_for_a_current_verified_envelope() {
     let start = Instant::now();
@@ -714,6 +724,7 @@ fn holder_txt_cannot_substitute_for_a_current_verified_envelope() {
 /// A `>= 0.146` server yields `alab-secrets` to a `0.145` holder (`txt: None`, no watcher) that
 /// answers with a verified ALab envelope at least as new as its own, both before claiming the name
 /// and when already holding it as `m22` returns (`docs/DESIGN-fluid-swarm-2026-10-28.md` F7).
+#[cfg(unix)]
 #[test]
 fn a_new_server_yields_the_name_to_a_0_145_holder_that_answers() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -858,6 +869,7 @@ fn a_new_server_yields_the_name_to_a_0_145_holder_that_answers() {
     srv_new.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn admin_publish_replicates_to_policy_secondary_servers_immediately() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -934,6 +946,7 @@ fn admin_publish_replicates_to_policy_secondary_servers_immediately() {
     s3.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_higher_seq() {
     // Every server it reads is its own on loopback, which answers or, stopped, refuses at once.
@@ -1055,6 +1068,7 @@ fn sync_with_candidates_escapes_frozen_or_offline_primary_and_rejects_forged_hig
 /// A member `m9` of `team` at seq 2 (`shared-key` = `v1`) whose source, `s_primary`, has gone,
 /// and the servers its standing browse may have found: `s_fresh`, where another admin published
 /// seq 3 (`v2`), and `s_rogue`, holding a `team` vault an attacker's key signed at seq 5.
+#[cfg(unix)]
 struct DeadSource {
     _root: aterm_tempfile::TempDir,
     member: Paths,
@@ -1064,6 +1078,7 @@ struct DeadSource {
     servers: Vec<crate::server::Running>,
 }
 
+#[cfg(unix)]
 fn dead_source() -> DeadSource {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s_primary = start_loopback_server(&root.path().join("s_primary"));
@@ -1144,6 +1159,7 @@ fn dead_source() -> DeadSource {
 /// Something that answers at a gone source's address (`url`'s host and port): each request it
 /// reads gets `reply` (an HTTP response) after `delay`, or, with none, is dropped after it. It
 /// stops when dropped.
+#[cfg(unix)]
 struct StandIn {
     addr: std::net::SocketAddr,
     stop: std::sync::Arc<AtomicBool>,
@@ -1152,6 +1168,7 @@ struct StandIn {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+#[cfg(unix)]
 impl StandIn {
     fn at(url: &str, delay: Duration, reply: Option<Vec<u8>>) -> Self {
         use std::io::{Read as _, Write as _};
@@ -1220,6 +1237,7 @@ impl StandIn {
     }
 }
 
+#[cfg(unix)]
 impl Drop for StandIn {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -1231,6 +1249,7 @@ impl Drop for StandIn {
 }
 
 /// An HTTP `200` carrying `body`.
+#[cfg(unix)]
 fn ok_with(body: &[u8]) -> Vec<u8> {
     let mut reply = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1242,6 +1261,7 @@ fn ok_with(body: &[u8]) -> Vec<u8> {
 }
 
 /// The envelope the server at `url` serves.
+#[cfg(unix)]
 fn served(url: &str) -> Vec<u8> {
     match transport::fetch(
         &Source::Url(url.to_owned()),
@@ -1253,6 +1273,7 @@ fn served(url: &str) -> Vec<u8> {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn unused_peer_selection_does_not_skip_envelope_failover() {
     let _answering = ServersAnswering::set();
@@ -1287,6 +1308,7 @@ fn unused_peer_selection_does_not_skip_envelope_failover() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn an_exact_peer_recovers_a_damaged_cache_after_a_bodyless_primary_response() {
     let _answering = ServersAnswering::set();
@@ -1348,6 +1370,7 @@ fn an_exact_peer_recovers_a_damaged_cache_after_a_bodyless_primary_response() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_intact_cache_repairs_an_unrecorded_apply_after_a_bodyless_primary_response() {
     let _answering = ServersAnswering::set();
@@ -1434,6 +1457,7 @@ fn an_intact_cache_repairs_an_unrecorded_apply_after_a_bodyless_primary_response
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_log_only_readers_recover_before_contacting_an_endpoint() {
     let _answering = ServersAnswering::set();
@@ -1503,6 +1527,7 @@ fn bounded_log_only_readers_recover_before_contacting_an_endpoint() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
     let _answering = ServersAnswering::set();
@@ -1645,6 +1670,7 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_readers_apply_local_admission_or_continue_to_the_network() {
     let _answering = ServersAnswering::set();
@@ -1713,6 +1739,7 @@ fn pending_readers_apply_local_admission_or_continue_to_the_network() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_intact_cache_repairs_an_unrecorded_apply_when_every_endpoint_fails() {
     let _answering = ServersAnswering::set();
@@ -1873,6 +1900,7 @@ fn an_intact_cache_repairs_an_unrecorded_apply_when_every_endpoint_fails() {
 
 /// Make the state at `paths` one an older aterm wrote: no apply of this build recorded what it
 /// reads ([`State::held`]), so a subscriber's pass applies the version it holds again, once.
+#[cfg(unix)]
 fn unrecord_apply(paths: &Paths) {
     let mut state = load_state(paths).unwrap();
     state.held = None;
@@ -1885,6 +1913,7 @@ fn unrecord_apply(paths: &Paths) {
 /// NEGATIVE CONTROL: a pass that takes the source's seq unverified (`envelope::parse` in place
 /// of `verify_for_reader`) as news probes no browsed server and errs on the forged signature,
 /// leaving seq 2.
+#[cfg(unix)]
 #[test]
 fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
     // Every server it reads is its own on loopback, which answers; so does the stand-in at its
@@ -1927,6 +1956,7 @@ fn a_forged_newer_seq_at_the_source_does_not_stop_the_failover() {
 /// loop for as long as the source is away.
 /// NEGATIVE CONTROL: taking a source that failed after [`HELD`] or more as one that held the
 /// long-poll (the old reading of a pass's whole time) gives a zero pause.
+#[cfg(unix)]
 #[test]
 fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
     // Every server it reads is its own on loopback, which answers; its gone source refuses at
@@ -1971,6 +2001,7 @@ fn a_failover_pass_with_nothing_new_is_not_followed_at_once() {
 /// source, its first choice.
 /// NEGATIVE CONTROL: a pass that reads `config.source` only (`sync` in place of `sync_found`)
 /// errs here.
+#[cfg(unix)]
 #[test]
 fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
     // Every server it reads is its own on loopback, which answers; its gone source refuses at
@@ -2007,6 +2038,7 @@ fn a_dead_source_fails_over_to_a_browsed_server_with_a_newer_seq() {
 /// forger alone it errs and leaves this Mac as it was.
 /// NEGATIVE CONTROL: a pass that takes a browsed envelope unverified (`probe_sync_peer` parsing
 /// in place of `verify_for_reader`) picks the forger's seq 5 and errs.
+#[cfg(unix)]
 #[test]
 fn a_forged_higher_seq_on_a_browsed_server_is_ignored() {
     // Every server it reads is its own on loopback, which answers; its gone source refuses at
@@ -2077,6 +2109,7 @@ fn a_merge_keeps_a_policy_only_another_branch_set_and_its_own_over_another() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_steady() {
     // Every server it reads is its own on loopback, which answers, but the silent primary below.
@@ -2337,6 +2370,7 @@ fn sync_auto_reconciles_diverged_policy_servers_for_admin_and_keeps_member_stead
 /// After `signer:` and optional `previous-signer:`/`endorsement:` pairs, `v0.145.0` immediately
 /// parses `locker: ` blocks and `signature: `; any `parent: ` line fails on line 6 with the
 /// expected locker or signature error.
+#[cfg(unix)]
 fn parse_v0_145_envelope_grammar(bytes: &[u8]) -> Result<(String, u64, usize), String> {
     if bytes.len() > envelope::MAX_ENVELOPE {
         return Err(format!(
@@ -2459,6 +2493,7 @@ fn parse_v0_145_envelope_grammar(bytes: &[u8]) -> Result<(String, u64, usize), S
     Ok((name.to_owned(), seq, locker_count))
 }
 
+#[cfg(unix)]
 #[test]
 fn ordinary_unparented_publication_keeps_legacy_format_and_explicit_parents_are_signed() {
     let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -2514,6 +2549,7 @@ fn ordinary_unparented_publication_keeps_legacy_format_and_explicit_parents_are_
     srv.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn the_header_a_c7_build_writes_parses_with_the_v0_145_grammar() {
     // Frozen v0.145.0 header fixture check first.
@@ -2594,6 +2630,7 @@ fn the_header_a_c7_build_writes_parses_with_the_v0_145_grammar() {
     srv.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn with_policy_published_and_no_lease_some_server_advertises_alab_secrets() {
     let alab_name = crate::alab_advertised().to_owned();
@@ -2676,6 +2713,7 @@ fn with_policy_published_and_no_lease_some_server_advertises_alab_secrets() {
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6).
 /// NEGATIVE CONTROL: without peer pull, a lagging server stays on its old `seq`; without the ALab
 /// pin, an empty server refuses to adopt an unheld `alab` vault from a peer.
+#[cfg(unix)]
 #[test]
 fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2791,6 +2829,7 @@ fn a_server_pulls_a_newer_head_from_a_browsed_peer() {
 /// candidate servers even when `config.source` itself is offline (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6).
 /// NEGATIVE CONTROL: publishing to `config.source` alone leaves peer servers stale and fails when
 /// `config.source` is down.
+#[cfg(unix)]
 #[test]
 fn a_publish_reaches_every_candidate_server() {
     // Every server it reads is its own on loopback, which answers.
@@ -2897,6 +2936,7 @@ fn a_publish_reaches_every_candidate_server() {
 /// A listener on loopback that takes connections and answers none: a browsed server that
 /// accepts a PUT and never replies. It sends its index on `heard` for each connection it takes
 /// and holds them all until `release`, then closes them and the next one it takes, and ends.
+#[cfg(unix)]
 fn silent_server(
     index: usize,
     heard: std::sync::mpsc::Sender<usize>,
@@ -2931,6 +2971,7 @@ fn silent_server(
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6, from the review).
 /// NEGATIVE CONTROL: PUT one after another, the second silent server hears nothing until the
 /// first one's 120 s deadline ends, past this test's hang detector.
+#[cfg(unix)]
 #[test]
 fn a_publish_puts_to_every_server_at_once() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3009,6 +3050,7 @@ fn a_publish_puts_to_every_server_at_once() {
 /// NEGATIVE CONTROL: holding `configured_admin`'s lock across the PUTs (main before this fix)
 /// keeps the state lock from the other command until the silent server is let go, and the test
 /// fails "never: the state lock while a PUT waits on a silent server".
+#[cfg(unix)]
 #[test]
 fn a_publish_leaves_the_state_lock_while_a_silent_server_holds_its_put() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3081,6 +3123,7 @@ fn a_publish_leaves_the_state_lock_while_a_silent_server_holds_its_put() {
 /// A server never stores an envelope that its pinned signer (or held key lineage) refuses, whether
 /// pushed directly by HTTP `PUT` or pulled from a browsed peer (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6).
 /// NEGATIVE CONTROL: skipping pin verification accepts the higher-`seq` forged envelope.
+#[cfg(unix)]
 #[test]
 fn a_server_never_stores_an_envelope_the_pin_refuses() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3172,6 +3215,7 @@ fn a_server_never_stores_an_envelope_the_pin_refuses() {
 /// build fails to start or serves nothing (`docs/DESIGN-fluid-swarm-2026-10-28.md` F6 & §4.3
 /// step 1), and leaves a job whose store holds no ALab vault this build verifies where it is.
 /// NEGATIVE CONTROL: `service::repair_server_with` alone keeps the job on the `0.145.0` snapshot.
+#[cfg(unix)]
 #[test]
 fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3599,6 +3643,7 @@ fn a_held_0_145_server_job_moves_once_the_new_build_serves_its_store() {
 /// Its looks are probes: the server's heard history books none of them as a plain read.
 /// NEGATIVE CONTROL: look with a plain `transport::fetch_within`: the history's anonymous read
 /// is the server's start time.
+#[cfg(unix)]
 #[test]
 fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3679,6 +3724,7 @@ fn a_moved_server_serves_only_once_it_answers_with_the_alab_vault() {
 /// A look for a vault, `look`'s and `probe`'s alike: the server answers it and its heard history
 /// books no plain read, which would keep F20's mirror on for 14 days. NEGATIVE
 /// CONTROL: either look as a plain GET again: `left: Some(1840000000)`, the server's start time.
+#[cfg(unix)]
 #[test]
 fn a_look_for_a_vault_books_no_plain_read() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -3759,6 +3805,7 @@ fn a_look_for_a_vault_books_no_plain_read() {
 /// fails the 0.146-install assertion (`left: Moved("moved", ManagedRelease)`, `right:
 /// Moved("moved", FluidServer)`), and one that asks the managed-release rule first fails the
 /// 0.145-under-0.147 case the same way.
+#[cfg(unix)]
 #[test]
 fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
     use crate::service::{Held, Job};
@@ -3944,6 +3991,7 @@ fn the_windows_mend_moves_a_held_alab_server_only_watching_it_serve() {
 /// Members follow verified membership records across server failover (`F5` + `F13`): when the
 /// configured primary server goes down after a peer replicated new records, `sync_records_with_candidates`
 /// pulls the missing records from the surviving peer and merges the union into `paths.records_file()`.
+#[cfg(unix)]
 #[test]
 fn a_member_follows_records_across_failover_when_primary_dies() {
     // Every server it reads is its own on loopback, which answers or, stopped, refuses at once.
@@ -4355,21 +4403,25 @@ fn a_mac_a_release_behind_a_rotation_roots_the_genesis_the_new_key_signed() {
     assert!(load_records(&member).unwrap().log().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unequal_seq_parentless_partition_heals_preserving_lower_seq_entry_and_member() {
     unequal_partition_recovers(PartitionReader::Reachable);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_transient_primary_failure_cannot_overwrite_an_unmerged_branch() {
     unequal_partition_recovers(PartitionReader::FailingOrdinary);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_bounded_primary_failure_cannot_discard_an_unmerged_branch() {
     unequal_partition_recovers(PartitionReader::FailingBounded);
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum PartitionReader {
     Reachable,
@@ -4377,6 +4429,7 @@ enum PartitionReader {
     FailingBounded,
 }
 
+#[cfg(unix)]
 fn unequal_partition_recovers(reader: PartitionReader) {
     // Every server it reads is its own on loopback, which answers.
     let _answering = ServersAnswering::set();
@@ -4581,6 +4634,7 @@ fn unequal_partition_recovers(reader: PartitionReader) {
 /// after a `PUT`, or a newly started `0.146` server with no `.records` yet), the server replies
 /// with `X-Aterm-Records-Need: 1` on `GET /records?have=…` and `sync_records` re-posts the Mac's
 /// local store without waiting for another publish or mirror.
+#[cfg(unix)]
 #[test]
 fn a_member_re_posts_held_records_when_a_server_lacks_its_frontier() {
     use crate::membership_log::{Body, Entrant, Evidence, Log, Record, encode_records};
@@ -4662,6 +4716,7 @@ fn a_member_re_posts_held_records_when_a_server_lacks_its_frontier() {
     s1.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn merge_diverged_heads_cascades_cross_branch_revoke_to_deny_lists_pool_and_lease() {
     // Every server it reads is its own on loopback, which answers.
@@ -4900,6 +4955,7 @@ fn merge_diverged_heads_cascades_cross_branch_revoke_to_deny_lists_pool_and_leas
 ///
 /// CONTROL, in the test: the head the merge starts from lacks the entry, and an author's set
 /// of that value into its text is refused.
+#[cfg(unix)]
 #[test]
 fn vault_fill_door_carries_a_large_value_a_merged_head_holds() {
     const NAME: &str = "lab-inventory.json";

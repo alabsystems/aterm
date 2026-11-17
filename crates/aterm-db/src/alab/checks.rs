@@ -13,6 +13,7 @@ use super::registry::{
 };
 use crate::typed::{
     Kind, Table,
+    authority::Inert,
     cell::{self, Cells, Projection},
     check, keys,
     owned::OwnedRead,
@@ -82,6 +83,21 @@ pub fn sentence(kind: &str) -> Option<&'static str> {
         "preference-for-retired-account" => "A live link names a retired account",
         "account-login-retired" => "A live account's login is a retired address",
         "account-identity-retired" => "A live account's identity is a retired address",
+        "account-handle-shared" => {
+            "Live accounts of one provider, none named by the owner, derive one short name, so it \
+             names none of them"
+        }
+        "account-label-lost" => {
+            "The owner's label gives its account no slug: another account holds the one it makes, \
+             or it makes none"
+        }
+        "account-label-repeats-provider" => {
+            "The owner's label starts with its account's provider word, so the slug says it twice"
+        }
+        "inert-write" => {
+            "A write the authority rules hold inert: its column's writers would not make it, so \
+             it stays in history and is never shown"
+        }
         "label-ambiguous" => {
             "A machine's label is another live machine's alias, so it names two machines"
         }
@@ -121,6 +137,10 @@ pub fn heading(kind: &str) -> Option<&'static str> {
         "preference-for-retired-account" => "Link to a retired account",
         "account-login-retired" => "Retired login address",
         "account-identity-retired" => "Retired identity address",
+        "account-handle-shared" => "Short name shared",
+        "account-label-lost" => "Label gives no slug",
+        "account-label-repeats-provider" => "Label repeats the provider",
+        "inert-write" => "Write held inert",
         "label-ambiguous" => "Label names two machines",
         "address-key-elsewhere" => "Address another row is keyed by",
         "alias-of-retired" => "Alias of a retired address",
@@ -386,6 +406,26 @@ pub fn account_obs(read: &OwnedRead, accounts: &Projection) -> Vec<Finding> {
     found
 }
 
+/// The writes a read holds inert under the authority rules (docs/DESIGN-shared-files-2026-11-11.md
+/// §5, `typed::authority`): one `inert-write` finding per collection, naming each row that holds
+/// one. They stay in history with their authors and never project; how many records hold them
+/// is the count `aterm db table ls` and `aterm file status` show.
+pub fn inert(inert: &Inert) -> Vec<Finding> {
+    inert
+        .records
+        .keys()
+        .map(|&collection| Finding {
+            kind: "inert-write",
+            collection,
+            pks: inert
+                .rows(collection)
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        })
+        .collect()
+}
+
 /// A finding of what this Mac observed ([`observed`]), with the line that says which login it
 /// means: each sighting's CLI, how it was seen ([`super::observe::how`]), how long ago, and
 /// whether it waits for a pass. Never an address: the account the finding keys has no row to
@@ -555,6 +595,31 @@ pub fn lab(table: &Table, cells: &Cells) -> (Vec<Finding>, Vec<check::Finding>) 
                 pks: vec![pk.clone(), identity.to_owned()],
             });
         }
+    }
+    // Accounts' slugs (docs/DESIGN-shared-files-2026-11-11.md §10): live accounts no owner
+    // named that derive one short handle; an owner's label that names its account nothing, with
+    // the account holding its slug; a label that repeats its provider word, which is no refusal.
+    let slugs = super::account_names::findings(cells);
+    for pks in slugs.shared {
+        found.push(Finding {
+            kind: "account-handle-shared",
+            collection: ACCOUNT.name,
+            pks,
+        });
+    }
+    for (pk, holder) in slugs.lost {
+        found.push(Finding {
+            kind: "account-label-lost",
+            collection: ACCOUNT.name,
+            pks: std::iter::once(pk).chain(holder).collect(),
+        });
+    }
+    for pk in slugs.repeats {
+        found.push(Finding {
+            kind: "account-label-repeats-provider",
+            collection: ACCOUNT.name,
+            pks: vec![pk],
+        });
     }
     // Machines: a live label that is another live machine's alias names two machines.
     let machine_aliases: Vec<(&String, &crate::typed::cell::Field)> = machines

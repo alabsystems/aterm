@@ -54,7 +54,9 @@
 //! edit lies on a merge of each carry so far costs about 6e8 words.
 
 use super::{CandidateOp, DecodedOp};
+use crate::membership_log::RecordId;
 use crate::membership_log::reach::{Frontier, Reach, holds, tally};
+use crate::membership_log::rooted::Stated;
 use aterm_mesh_core::convergence::{beats, carries, conflicts, drops, replaces};
 use std::collections::{BTreeMap, HashMap};
 
@@ -152,7 +154,13 @@ pub(super) struct Register<'a> {
     class: Vec<usize>,
     pub(super) carries: Vec<bool>,
     /// The op each stands for: a carry, the op whose value it carries; every other op, itself.
+    /// Past `cands.len()`, the `j`th of `outside_reps`.
     pub(super) reps: Vec<usize>,
+    /// The reps a stated carry names that this register holds no op of
+    /// ([`CandidateOp::stated`]): ops a prune dropped, or ops this reader did not open.
+    outside_reps: Vec<RecordId>,
+    /// Whether such a rep lies in the past of the held record at an index.
+    outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
     /// What a writer held at each distinct frontier read so far, by its first word's place in
     /// the index and then its words.
     memo: HashMap<usize, HashMap<Box<[u64]>, Held>>,
@@ -162,7 +170,10 @@ pub(super) struct Register<'a> {
 }
 
 impl<'a> Register<'a> {
-    fn new(cands: &'a [CandidateOp]) -> Self {
+    fn new(
+        cands: &'a [CandidateOp],
+        outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
+    ) -> Self {
         let mut classes: BTreeMap<Writes<'a>, usize> = BTreeMap::new();
         let class = cands
             .iter()
@@ -176,6 +187,8 @@ impl<'a> Register<'a> {
             class,
             carries: vec![false; cands.len()],
             reps: (0..cands.len()).collect(),
+            outside_reps: Vec::new(),
+            outside,
             memo: HashMap::new(),
             #[cfg(test)]
             last: None,
@@ -184,23 +197,28 @@ impl<'a> Register<'a> {
 
     /// Op `k`'s class: two ops of one class write the same thing. Classes are numbered by
     /// their first op, in the register's order.
-    #[cfg(unix)] // read by the unix-only signing of a put's class (`entries.rs`)
+    #[cfg(any(unix, windows))] // read by the unix-only signing of a put's class (`entries.rs`)
     pub(super) fn class_of(&self, k: usize) -> usize {
         self.class[k]
     }
 
     /// Classify the ops of each of `registers` (each register's ops in record order, no op in
-    /// two) in one pass over `reach`, whose records' parents `parents` gives.
+    /// two) in one pass over `reach`, whose records' parents `parents` gives. `outside` says
+    /// whether a rep a register holds no op of (a stated carry's) lies in a held record's past.
     pub(super) fn classify_all<P, I>(
         registers: &[&'a [CandidateOp]],
         reach: &Reach,
+        outside: Option<&'a dyn Fn(&RecordId, usize) -> bool>,
         parents: P,
     ) -> Vec<Self>
     where
         P: Fn(usize) -> I,
         I: IntoIterator<Item = usize>,
     {
-        let mut all: Vec<Self> = registers.iter().map(|&cands| Self::new(cands)).collect();
+        let mut all: Vec<Self> = registers
+            .iter()
+            .map(|&cands| Self::new(cands, outside))
+            .collect();
         let groups: Vec<Vec<usize>> = registers
             .iter()
             .map(|cands| cands.iter().map(|op| op.index).collect())
@@ -218,6 +236,15 @@ impl<'a> Register<'a> {
     /// frontier an earlier op read takes what that one held. Looking a frontier up hashes its
     /// words and compares them once.
     fn classify(&mut self, k: usize, frontier: &Frontier<'_>, reach: &Reach) {
+        // A version-2 op reads by its statement, in every log ([`Log::stated`]).
+        let cands = self.cands;
+        if let Some(stated) = cands[k].stated.as_ref() {
+            if let Stated::Carry(rep) = stated {
+                self.carries[k] = true;
+                self.reps[k] = self.rep_slot(rep);
+            }
+            return;
+        }
         let (start, words) = frontier.words();
         tally(2 * words.len(), 0, 0);
         let known = self
@@ -269,6 +296,53 @@ impl<'a> Register<'a> {
         }
     }
 
+    /// Where `reps` names the op `rep`: its op here, or past `cands.len()` where this register
+    /// holds no op of it (a dropped op, or one this reader did not open). The frames already
+    /// read `rep` as what it stands for ([`Log::frame_reps`]), so it is taken as it is.
+    fn rep_slot(&mut self, rep: &RecordId) -> usize {
+        if let Some(j) = self.cands.iter().position(|op| op.record_id == *rep) {
+            return j;
+        }
+        let n = self.cands.len();
+        match self.outside_reps.iter().position(|id| id == rep) {
+            Some(j) => n + j,
+            None => {
+                self.outside_reps.push(*rep);
+                n + self.outside_reps.len() - 1
+            }
+        }
+    }
+
+    /// The id of the op op `i` stands for.
+    pub(super) fn rep_id(&self, i: usize) -> RecordId {
+        match self.reps[i].checked_sub(self.cands.len()) {
+            Some(j) => self.outside_reps[j],
+            None => self.cands[self.reps[i]].record_id,
+        }
+    }
+
+    /// The index in the log of the op op `i` stands for; `None` where this register holds no op
+    /// of it.
+    pub(super) fn rep_index(&self, i: usize) -> Option<usize> {
+        self.cands.get(self.reps[i]).map(|op| op.index)
+    }
+
+    /// Whether the rep of the carry `c` this register holds no op of lies in the past of ops of
+    /// two classes among `ops`: the carry's own, and another that replaced its value.
+    fn outside_rep_below_other(&self, c: usize, ops: &[usize]) -> bool {
+        let Some(below) = self.outside else {
+            return false;
+        };
+        let rep = self.rep_id(c);
+        let mut classes = ops
+            .iter()
+            .filter(|&&o| below(&rep, self.cands[o].index))
+            .map(|&o| self.class[o]);
+        classes
+            .next()
+            .is_some_and(|first| classes.any(|other| other != first))
+    }
+
     /// `ops` less each carry whose value another of them, writing something else, already
     /// replaced: a reseal on one side of a split loses to an edit or `Delete` on the other.
     ///
@@ -283,8 +357,11 @@ impl<'a> Register<'a> {
         let reps: Vec<usize> = ops
             .iter()
             .filter(|&&c| self.carries[c])
-            .map(|&c| cands[self.reps[c]].index)
+            .filter_map(|&c| self.rep_index(c))
             .collect();
+        let outside = ops
+            .iter()
+            .any(|&c| self.carries[c] && self.rep_index(c).is_none());
         #[cfg(test)]
         if mutant(Mutant::KeepEveryCarry) {
             return ops.to_vec();
@@ -292,7 +369,8 @@ impl<'a> Register<'a> {
         let Some(&first) = ops.first() else {
             return Vec::new();
         };
-        if reps.is_empty() || ops.iter().all(|&o| self.class[o] == self.class[first]) {
+        if (reps.is_empty() && !outside) || ops.iter().all(|&o| self.class[o] == self.class[first])
+        {
             return ops.to_vec();
         }
         let mut words: Vec<usize> = reps.iter().map(|r| r / 64).collect();
@@ -328,13 +406,16 @@ impl<'a> Register<'a> {
             .copied()
             .filter(|&c| {
                 // Whether an op of `ops` of another class has the carry's rep in its past.
-                let rep_below_other = self.carries[c] && {
-                    let rep = cands[self.reps[c]].index;
-                    let slot = words
-                        .binary_search(&(rep / 64))
-                        .expect("a carry's rep has its word");
-                    (twice[slot] >> (rep % 64)) & 1 == 1
-                };
+                let rep_below_other = self.carries[c]
+                    && match self.rep_index(c) {
+                        Some(rep) => {
+                            let slot = words
+                                .binary_search(&(rep / 64))
+                                .expect("a carry's rep has its word");
+                            (twice[slot] >> (rep % 64)) & 1 == 1
+                        }
+                        None => self.outside_rep_below_other(c, ops),
+                    };
                 !drops(self.carries[c], false, rep_below_other)
             })
             .collect()
@@ -364,10 +445,7 @@ impl<'a> Register<'a> {
 
     /// Whether op `i` beats op `w` in the winner order (`beats`).
     fn beats(&self, i: usize, w: usize) -> bool {
-        let (rep_i, rep_w) = (
-            &self.cands[self.reps[i]].record_id,
-            &self.cands[self.reps[w]].record_id,
-        );
+        let (rep_i, rep_w) = (self.rep_id(i), self.rep_id(w));
         beats(
             rep_i < rep_w,
             rep_i == rep_w,

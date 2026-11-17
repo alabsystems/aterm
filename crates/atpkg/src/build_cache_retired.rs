@@ -77,6 +77,20 @@ pub(super) mod history;
 /// Nothing in a leftover was written for this long before it goes.
 pub const UNWRITTEN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// How long one history read (one git run) may take: a git still going then is killed and its
+/// read refused, which keeps what it judges. The bound is each run's own, a hang detector, never
+/// a budget over a judgment's runs together, which a loaded Mac outlasts while every git keeps
+/// working. A caller's own end ([`Git::until`]) still ends every run.
+pub(in crate::build_cache) const READ_FOR: Duration = Duration::from_secs(30);
+
+/// When a history read that starts now must end: [`READ_FOR`] on, or the git's own end
+/// ([`Git::until`]) first. Both history readers (this module's private-store proof and the
+/// gone-registration pass, [`super::gone_entries`]) bound each run by it.
+pub(in crate::build_cache) fn read_until(git: &dyn Git) -> Instant {
+    let bound = Instant::now() + READ_FOR;
+    git.until().map_or(bound, |until| until.min(bound))
+}
+
 /// The gate's snapshot of `<checkout>`: `<checkout>-verify.noindex`.
 const SNAPSHOT: &str = "-verify.noindex";
 

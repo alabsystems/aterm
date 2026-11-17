@@ -1017,3 +1017,61 @@ fn the_display_admission_admits_a_peers_bound_and_nothing_one_field_off() {
         "a five-hour wall's end past its window and slack is no bound; the figure stands"
     );
 }
+
+/// A HELD JOURNAL TELLS ITS LISTENER WHEN IT SAYS SOMETHING ELSE ([`hold`]): a first read, an
+/// account's change and a read dropped (a policy turned the lab off) each call the listener
+/// once and answer `true`; a re-read that says the same at a later instant, and nothing held
+/// after nothing, call nothing and answer `false`. The slot always keeps what was read last.
+/// (This test is the only caller of `hold` in this binary, so the listener's count is its own.)
+///
+/// NEGATIVE CONTROL (run 2026-11-16): with `says_the_same` comparing the whole [`Seen`] (`==`,
+/// its read instant included), the test fails at "a re-read that says the same tells nothing"
+/// (`left: 2 right: 1`).
+#[test]
+fn a_held_journal_tells_its_listener_only_when_it_says_something_else() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static TOLD: AtomicUsize = AtomicUsize::new(0);
+    fn told() {
+        TOLD.fetch_add(1, Ordering::SeqCst);
+    }
+    assert!(listen(told));
+    assert!(!listen(told), "one listener");
+    let read = |at: i64, used: Option<LastUse>| {
+        Some(Arc::new(Seen {
+            accounts: BTreeMap::from([(
+                "ac-1".to_owned(),
+                AccountSeen {
+                    last_use: used,
+                    ..AccountSeen::default()
+                },
+            )]),
+            at,
+            ..Seen::default()
+        }))
+    };
+    let mut slot = None;
+    assert!(!hold(&mut slot, None), "nothing after nothing");
+    assert_eq!(TOLD.load(Ordering::SeqCst), 0);
+    assert!(hold(&mut slot, read(10, None)), "a first read tells");
+    assert_eq!(TOLD.load(Ordering::SeqCst), 1);
+    let told = hold(&mut slot, read(310, None));
+    assert_eq!(
+        TOLD.load(Ordering::SeqCst),
+        1,
+        "a re-read that says the same tells nothing"
+    );
+    assert!(!told, "and answers so");
+    assert_eq!(slot.as_ref().map(|seen| seen.at), Some(310), "kept as read");
+    let used = LastUse {
+        by: "m3".into(),
+        t: 300,
+    };
+    assert!(
+        hold(&mut slot, read(610, Some(used))),
+        "an account's change tells"
+    );
+    assert_eq!(TOLD.load(Ordering::SeqCst), 2);
+    assert!(hold(&mut slot, None), "a read dropped tells");
+    assert_eq!(TOLD.load(Ordering::SeqCst), 3);
+    assert!(slot.is_none());
+}

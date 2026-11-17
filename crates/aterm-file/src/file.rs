@@ -62,29 +62,195 @@ impl Read {
             .map_or(&[], |snapshot| snapshot.rows.as_slice())
     }
 
-    /// The rows `name` names: the row with that key, else every row one of the snapshot's
-    /// handle columns names exactly (an account's slug, a machine's label). No prefix, no
-    /// substring, no nearest match.
+    /// The rows `word` names, as [`resolve`] reads the snapshot's rows and its handle columns
+    /// (an account's slug, name and address; a machine's label and nickname): none, one, or
+    /// each of several.
     #[must_use]
-    pub fn named(&self, name: &str) -> Vec<&Row> {
+    pub fn named(&self, word: &str) -> Vec<&Row> {
         let Some(snapshot) = &self.snapshot else {
             return Vec::new();
         };
-        if let Some(row) = snapshot.rows.iter().find(|row| row.pk == name) {
-            return vec![row];
-        }
-        for handle in &snapshot.handles {
-            let rows: Vec<&Row> = snapshot
-                .rows
-                .iter()
-                .filter(|row| row.cell(handle) == name)
-                .collect();
-            if !rows.is_empty() {
-                return rows;
+        let rows: Vec<Named<'_>> = snapshot
+            .rows
+            .iter()
+            .map(|row| Named {
+                pk: &row.pk,
+                live: row.live,
+                handles: snapshot
+                    .handles
+                    .iter()
+                    .map(|handle| row.cell(handle))
+                    .collect(),
+            })
+            .collect();
+        resolve(word, &rows)
+            .places()
+            .into_iter()
+            .map(|place| &snapshot.rows[place])
+            .collect()
+    }
+
+    /// The one row `word` names ([`Self::named`]), or why it names none: a word that names no
+    /// row lists none, and one that names several lists each with its handles and key. A file
+    /// of accounts (its handles are [`ACCOUNT_HANDLES`]) says so in an account's words
+    /// ([`no_account`], [`many_accounts`]).
+    ///
+    /// # Errors
+    /// `word` names no row, or several.
+    pub fn one(&self, word: &str) -> Result<&Row, String> {
+        let handles = self
+            .snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.handles.as_slice());
+        let accounts = handles == ACCOUNT_HANDLES;
+        match self.named(word).as_slice() {
+            [row] => Ok(row),
+            [] if accounts => Err(no_account(word)),
+            [] => {
+                let by: Vec<&str> = handles.iter().map(String::as_str).collect();
+                Err(if by.is_empty() {
+                    format!("no row is named `{word}`: name one by its key")
+                } else {
+                    format!(
+                        "no row is named `{word}`: name one by its key or its {}",
+                        by.join(" or ")
+                    )
+                })
+            }
+            many if accounts => Err(many_accounts(
+                word,
+                many.iter()
+                    .map(|row| (row.cell("slug"), row.cell("name"), &*row.pk)),
+            )),
+            many => {
+                let mut why = format!("`{word}` names {} rows; name one by its key:", many.len());
+                for row in many {
+                    why.push_str("\n ");
+                    for handle in handles {
+                        why.push(' ');
+                        why.push_str(row.cell(handle));
+                        why.push(' ');
+                    }
+                    why.push(' ');
+                    why.push_str(&row.pk);
+                }
+                Err(why)
             }
         }
-        Vec::new()
     }
+}
+
+/// The handle columns of a file of accounts (`ai/accounts`), in the order a name tries them:
+/// the slug, the name (`claude ada.fb@alpha.example`) and the address.
+pub const ACCOUNT_HANDLES: [&str; 3] = ["slug", "name", "email"];
+
+/// One row as [`resolve`] reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Named<'a> {
+    /// Its key.
+    pub pk: &'a str,
+    /// Its lifecycle says live, or says nothing.
+    pub live: bool,
+    /// Its handle cells, in the order a name tries them; an empty cell names nothing.
+    pub handles: Vec<&'a str>,
+}
+
+/// What a word names among the rows [`resolve`] is given, by their places there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    One(usize),
+    None,
+    /// Several, in the order given.
+    Many(Vec<usize>),
+}
+
+impl Resolved {
+    /// The places it names: none, one, or each of several.
+    #[must_use]
+    pub fn places(self) -> Vec<usize> {
+        match self {
+            Self::One(place) => vec![place],
+            Self::None => Vec::new(),
+            Self::Many(places) => places,
+        }
+    }
+}
+
+/// The rows `word` names (docs/DESIGN-shared-files-2026-11-11.md §3, §10): the one resolver
+/// every read of a shared file and every account command passes. Exact only: no prefix, no
+/// substring, no folded case and no nearest match. The first of these that names a row answers:
+///
+/// 1. the row whose key is `word`, live or not;
+/// 2. among live rows, then among the others: each handle in turn, every row whose cell is
+///    `word`; then the same with the first `:` of `word` read as a space, so
+///    `oai:ada.fb@alpha.example` names what `oai ada.fb@alpha.example` does.
+///
+/// For accounts that is the slug, the `ac-` key, the provider word and the address in either
+/// spelling, and the address alone, which names every account that signs in as it: one
+/// address signed in to three providers is three accounts, and [`Resolved::Many`].
+#[must_use]
+pub fn resolve(word: &str, rows: &[Named<'_>]) -> Resolved {
+    if word.is_empty() {
+        return Resolved::None;
+    }
+    if let Some(place) = rows.iter().position(|row| row.pk == word) {
+        return Resolved::One(place);
+    }
+    let spaced = word
+        .split_once(':')
+        .map(|(provider, address)| format!("{provider} {address}"));
+    let width = rows.iter().map(|row| row.handles.len()).max().unwrap_or(0);
+    for live in [true, false] {
+        for wanted in std::iter::once(word).chain(spaced.as_deref()) {
+            for handle in 0..width {
+                let found: Vec<usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        row.live == live
+                            && row
+                                .handles
+                                .get(handle)
+                                .is_some_and(|cell| !cell.is_empty() && *cell == wanted)
+                    })
+                    .map(|(place, _)| place)
+                    .collect();
+                match found.as_slice() {
+                    [] => {}
+                    [place] => return Resolved::One(*place),
+                    _ => return Resolved::Many(found),
+                }
+            }
+        }
+    }
+    Resolved::None
+}
+
+/// What a word that names no account answers. It lists none: a typo never prints the lab's
+/// addresses.
+#[must_use]
+pub fn no_account(word: &str) -> String {
+    format!(
+        "no account is named `{word}`: name one by its slug, its key, or its provider word and \
+         address"
+    )
+}
+
+/// What a word that names several accounts answers: one line for each, its slug, its name (its
+/// provider word and address) and its key.
+#[must_use]
+pub fn many_accounts<'a>(
+    word: &str,
+    accounts: impl ExactSizeIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> String {
+    let mut why = format!(
+        "`{word}` names {} accounts; name one by its slug:",
+        accounts.len()
+    );
+    for (slug, name, pk) in accounts {
+        why.push_str(&format!("\n  {slug}  {name}  {pk}"));
+    }
+    why
 }
 
 fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, String> {
@@ -188,13 +354,87 @@ impl File {
         self.read_as(false)
     }
 
+    /// The published table ([`Self::published`]) with the cells, by row key and column, this
+    /// Mac's own writes would still change or hold back: each queued intent's, each published
+    /// one's the snapshot does not hold ([`Self::projected_from`]), which [`Self::read`] lays
+    /// over it, and each held one's. One read answers both, so the cells are the rows' beside
+    /// them.
+    #[must_use]
+    pub fn published_pending(&self) -> (Read, std::collections::BTreeSet<(String, String)>) {
+        let (read, outbox) = self.read_published();
+        let pending = crate::outbox::pending(&outbox, || self.frontier_of(&read));
+        (read, pending)
+    }
+
+    /// The frontier the snapshot here was projected from: the frontier file, where the status
+    /// says so ([`Self::vouched`]). A pass writes the frontier before the snapshot and the
+    /// status last, so a frontier read while a pass writes, or left by a pass cut short, can be
+    /// newer than the snapshot and name operations its rows do not hold: the status does not
+    /// name that one yet, and `None` answers, as it does under a status an earlier build wrote.
+    #[must_use]
+    pub fn projected_from(&self) -> Option<Frontier> {
+        let state = self.state()?;
+        let snapshot = self.snapshot().ok().flatten()?;
+        self.vouched(&state, &snapshot)
+    }
+
+    /// [`Self::projected_from`], where the snapshot here is the one at revision `rev`: what the
+    /// baseline at that revision holds, for a write read against it and for a done marker
+    /// settled once the pass recorded that revision in its status.
+    #[must_use]
+    pub fn projected_at(&self, rev: u64) -> Option<Frontier> {
+        let state = self.state()?;
+        let snapshot = self
+            .snapshot()
+            .ok()
+            .flatten()
+            .filter(|held| held.rev == rev)?;
+        self.vouched(&state, &snapshot)
+    }
+
+    /// The frontier file, where `state` says `snapshot` is its projection: the status records
+    /// the snapshot's revision and content ([`State::snapshot`]) and the fingerprint of the
+    /// frontier it was projected from, and the frontier file has that fingerprint. The three
+    /// files are read at different moments; a snapshot with the revision and content the status
+    /// names is the one it names, and a frontier with the fingerprint it names is that one, so
+    /// no order of reads pairs a snapshot with a frontier it was not projected from.
+    fn vouched(&self, state: &State, snapshot: &Snapshot) -> Option<Frontier> {
+        let content = aterm_codec::hex::encode_lower(&snapshot.content());
+        if state.rev != snapshot.rev || state.snapshot.as_deref() != Some(content.as_str()) {
+            return None;
+        }
+        self.frontier().filter(|frontier| {
+            aterm_codec::hex::encode_lower(&frontier.fingerprint()) == state.fingerprint
+        })
+    }
+
+    /// [`Self::vouched`] for the status and the snapshot `read` took.
+    fn frontier_of(&self, read: &Read) -> Option<Frontier> {
+        self.vouched(read.status.state.as_ref()?, read.snapshot.as_ref()?)
+    }
+
     fn read_as(&self, overlay: bool) -> Read {
+        let (mut read, outbox) = self.read_published();
+        if overlay {
+            // Only an unseen published write is judged against the frontier: a read with none
+            // hashes no snapshot and opens no frontier file.
+            let frontier = outbox.unseen().then(|| self.frontier_of(&read)).flatten();
+            read.snapshot =
+                crate::outbox::overlay(&self.name, read.snapshot.take(), &outbox, || frontier);
+        }
+        read
+    }
+
+    /// The published table and its status, with this Mac's intents as the read found them,
+    /// read first: a pass that marks a write seen does so once its snapshot holds it, so a
+    /// snapshot read after the marker is at least that one.
+    fn read_published(&self) -> (Read, crate::outbox::Outbox) {
+        let outbox = self.outbox();
         let state = self.state();
         let (snapshot, mut problem) = match self.snapshot() {
             Ok(snapshot) => (snapshot, None),
             Err(why) => (None, Some(format!("snapshot not read: {why}"))),
         };
-        let outbox = self.outbox();
         if let Some(why) = &outbox.problem {
             problem = Some(match problem {
                 Some(first) => format!("{first}; {why}"),
@@ -223,12 +463,7 @@ impl File {
             (Some(_), Some(word)) => (word, why),
             (Some(_), None) => (Word::Held, Some(Why::Custody)),
         };
-        let snapshot = if overlay {
-            crate::outbox::overlay(&self.name, snapshot, &outbox, || self.frontier())
-        } else {
-            snapshot
-        };
-        Read {
+        let read = Read {
             status: Status {
                 word,
                 why,
@@ -238,7 +473,8 @@ impl File {
                 held,
             },
             snapshot,
-        }
+        };
+        (read, outbox)
     }
 
     /// The file's status alone.
@@ -875,3 +1111,7 @@ pub use write::Look;
 #[cfg(test)]
 #[path = "file_cut_tests.rs"]
 pub(crate) mod cut;
+
+#[cfg(test)]
+#[path = "file_resolve_tests.rs"]
+mod resolve_tests;

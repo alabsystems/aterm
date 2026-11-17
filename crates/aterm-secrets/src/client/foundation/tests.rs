@@ -803,6 +803,7 @@ fn a_held_state_lock_reads_busy_not_an_error() {
 /// its Commons here, since a founding publishes to the vault and syncs this Mac's copy; the
 /// read names the switch that lets it, and turning sync back on finds the founding due.
 /// NEGATIVE CONTROL: a read that skips the off record reads the founding due.
+#[cfg(unix)]
 #[test]
 fn sync_turned_off_by_the_person_founds_nothing() {
     let lab = lab_open("default-agent-off");

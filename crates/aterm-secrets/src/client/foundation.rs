@@ -678,7 +678,7 @@ pub fn commons_foundable(paths: &Paths) -> crate::Result<Foundable> {
     }
     // A founding publishes to the vault and syncs this Mac's copy, which the person stopped:
     // `sync.vault` reads the same record as their choice.
-    if crate::service::subscriber_turned_off(&paths.home) {
+    if crate::off_record::subscriber_turned_off(&paths.home) {
         return Ok(Foundable::Elsewhere(format!(
             "vault {name}: sync is off on this Mac by your choice, so no pass founds its \
              Commons here: `aterm secrets agent on` lets it, or `aterm secrets commons init` \

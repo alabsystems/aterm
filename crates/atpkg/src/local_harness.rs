@@ -542,6 +542,8 @@ pub fn stage(
         links: Default::default(),
         vendor: String::new(),
         provenance: None,
+        key: String::new(),
+        key_inputs: String::new(),
     };
     let verify = |_: &Path| {
         lock.checked_layout().map_err(crate::StageError::Io)?;

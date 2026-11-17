@@ -18,6 +18,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
+use aterm_db::file::Renamed;
 use aterm_net::fleet_member::fleet_seed;
 use aterm_net::fleet_member::name_record::{
     By, ByKind, NickClass, ZERO_DIGEST, nicknames_in_books, node_of, node_word,
@@ -318,6 +319,119 @@ fn followed(held: &MachineName, row: Option<&Nickname>, now_ms: u64) -> Option<M
     Some(next)
 }
 
+/// Take the number an owner wrote to this Mac's own `lab/machines` row's `label` from any Mac
+/// (the Tables page, `aterm file set lab/machines <row> label <number>`) as the chosen number of
+/// the name kept in `state` (tracker package FL-170), as a read that shows the name makes it:
+/// the row's number is the Mac's, so one other than the name's chosen number renumbers it, and
+/// so does the name's own number where it is seeded or automatic, or a migration still waits on
+/// a choice ([`moves`]). The rename is judged as any is ([`change_claim`], against the books and
+/// the vault's labels `lab` reads) and recorded as [`Why::Registry`] with no author, since the
+/// registry keeps who wrote the row and when; `config`'s naming policy is read first, and the
+/// caller publishes the renamed name under the policy this answers, as a person's rename is
+/// published ([`publish::publish`]). Only a live snapshot that is this Mac's own binding, under
+/// the native source's admission through the write, renumbers it ([`registry::for_number`]); a
+/// retained one confers no naming authority. An automatic write or an import, a number another row won
+/// by the column's claim rule or whose claim is undecided, and a cell a write of this Mac's own
+/// is still changing (queued, or published and not yet in the snapshot) are not taken
+/// ([`registry::row_label`]); a write of this Mac's the publisher held gives way in that read
+/// once the row shows the value it met, which drops it, journals it and takes the row's value,
+/// and no person is asked; a rename
+/// here queues its number to the row before it commits ([`edit_name`]), so the row never shows
+/// the number it replaced with nothing of this Mac's on its way. Answers `None` where nothing
+/// renumbered the Mac.
+///
+/// # Errors
+/// The naming policy holds identity naming off or cannot be read; `lab` fails; the number is
+/// refused ([`judge`]: another Mac holds it, the vault gives it to another, …), which leaves the
+/// file as it was, so a later read judges it again; the file cannot be read, or a lock taken or
+/// the file replaced; the native source refuses admission.
+pub fn follow_number(
+    state: &Path,
+    config: &Path,
+    lab: impl FnOnce() -> io::Result<client::LabLabels>,
+    now_ms: u64,
+) -> io::Result<Option<(MachineName, publish::Policy)>> {
+    let Some(kept) = file::read(state)? else {
+        return Ok(None);
+    };
+    let take = |held: &MachineName| {
+        registry::row_label(state)
+            .flatten()
+            .filter(|&num| moves(held, num))
+    };
+    // Retained data may avoid work, but never authorize the write below.
+    let Some(num) = take(&kept) else {
+        return Ok(None);
+    };
+    let Some(row) = registry::for_number(state).filter(|row| row.number == num) else {
+        return Ok(None);
+    };
+    let policy = publish::Policy::read(config, num).map_err(io::Error::other)?;
+    let lab = read_lab(lab)?;
+    let by = editor(state, ByKind::Auto, false)?;
+    let follows = RowWrite::Follows(&row);
+    let set = edit_name(
+        state,
+        by,
+        None,
+        Origin::Kept,
+        now_ms,
+        false,
+        follows,
+        |base, locked| {
+            if take(base) != Some(num) {
+                return Ok(base.clone());
+            }
+            let to = NameTo { num, nick: None };
+            change_claim(base, &to, Some(&lab), locked, None, now_ms, Why::Registry)
+        },
+    )?;
+    Ok((set.changed && set.name.num == Some(num)).then_some((set.name, policy)))
+}
+
+/// [`follow_number`] as a read that shows the name runs it (the menu bar's title, `aterm name`),
+/// for the name kept in `state`: against the vault's labels ([`standing_vault`]) under `aterm`'s
+/// configuration, and once it renumbered the Mac, published as a person's rename is (the
+/// vault's chosen number, `aterm.toml`, macOS's names through `system`), where publication that
+/// does not finish stays pending as a rename's does. A follow that fails is journaled once until
+/// it fails another way, and the name stays as it is. Answers the renumbered name.
+pub fn renumber_from_registry(
+    state: &Path,
+    system: Option<&dyn publish::SystemNames>,
+    now_ms: u64,
+) -> Option<MachineName> {
+    static SAID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    let config = aterm_types::dirs::aterm_config_path()?;
+    let lab = || lab_labels(standing_vault().as_ref());
+    let followed = follow_number(state, &config, lab, now_ms);
+    let mut said = SAID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match followed {
+        Ok(Some((name, policy))) => {
+            *said = None;
+            drop(said);
+            if let Err(pending) = publish::publish(state, &config, &policy, system) {
+                aterm_log::info!(
+                    "machine name: {} taken from the lab registry; publication pending: {}",
+                    name.title(),
+                    pending.why()
+                );
+            }
+            Some(name)
+        }
+        Ok(None) => None,
+        Err(why) => {
+            let why = why.to_string();
+            if said.as_deref() != Some(why.as_str()) {
+                aterm_log::info!("machine name: the lab registry's number was not taken ({why})");
+                *said = Some(why);
+            }
+            None
+        }
+    }
+}
+
 fn first_registry(
     candidate: RegistryName,
     in_use: impl Fn(&str) -> bool,
@@ -405,6 +519,30 @@ pub struct NickSet {
     /// [`set_nick`] refuses a nickname another node carries (§5.4 of
     /// `docs/DESIGN-machine-names-2026-11-04.md`), so a nickname it sets reads `false` here.
     pub shared: bool,
+    /// The write the change queued to this Mac's registry row ([`registry::queue_rename`]), for
+    /// the command to publish ([`registry::offer`]); `None` where no row is this Mac's, the row
+    /// says it already, or for a dry run.
+    pub queued: Option<registry::Queued>,
+}
+
+/// Who asks for a rename: a person or a program (`kind`), in the aterm session `session` where
+/// one is known. The rename's registry write names both ([`registry::queue_rename`]); a bare
+/// [`ByKind`] asks in no session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Asker<'a> {
+    /// A person or a program.
+    pub kind: ByKind,
+    /// The aterm session the rename was asked in.
+    pub session: Option<&'a str>,
+}
+
+impl From<ByKind> for Asker<'_> {
+    fn from(kind: ByKind) -> Self {
+        Self {
+            kind,
+            session: None,
+        }
+    }
 }
 
 /// The number to choose, optionally choosing a nickname in the same atomic change.
@@ -425,9 +563,21 @@ pub struct NameSet {
     pub origin: Origin,
     /// A requested field changed in the local file.
     pub changed: bool,
+    /// The edit made, or after a dry run would make, a new claim on a number: the number, its
+    /// class or its migration moved, or a number asked for stands against another the row shows.
+    /// Outside a dry run, where a registry row is this Mac's, a rename asked for queued that
+    /// number to the row with its nickname, as one write, before the file changed ([`queued`]).
+    ///
+    /// [`queued`]: Self::queued
+    pub renumbered: bool,
     /// Another node in view carries the nickname this change kept (one it chose is refused
     /// where another node carries it, §5.4).
     pub shared: bool,
+    /// The write the edit queued to this Mac's registry row, the nickname it changes and a
+    /// number it moves to as one ([`registry::queue_rename`]), for the command to publish
+    /// ([`registry::offer`]); `None` where no row is this Mac's, the edit changes nothing there,
+    /// the row says it already, the edit follows the row, or for a dry run.
+    pub queued: Option<registry::Queued>,
 }
 
 /// Choose this machine's number and optionally its nickname, atomically under the name lock.
@@ -452,23 +602,31 @@ pub struct NameSet {
 /// moved under the lock while `lab` was unread, another node holds the chosen nickname,
 /// a lock cannot be taken, or the changed name cannot be written. Each refusal of the number or
 /// nickname, and an unread `lab`, carries its [`Refused`] ([`Refused::of`]).
-pub fn set_name(
+pub fn set_name<'a>(
     state: &Path,
     to: &NameTo,
     lab: impl FnOnce() -> io::Result<client::LabLabels>,
-    kind: ByKind,
+    asker: impl Into<Asker<'a>>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
     now_ms: u64,
     dry_run: bool,
 ) -> io::Result<NameSet> {
+    let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, kind, dry_run)?;
+    let by = editor(state, asker.kind, dry_run)?;
     // Whether the request keeps the stored number, as the lock below reads it again.
     let keeps = file::read(state)?.is_some_and(|name| !moves(&name, to.num));
     let lab = if keeps { None } else { Some(read_lab(lab)?) };
-    edit_name(state, by, origin, now_ms, dry_run, |held, locked| {
-        change_claim(held, to, lab.as_ref(), locked, by, now_ms, Why::Named)
-    })
+    edit_name(
+        state,
+        by,
+        asker.session,
+        origin,
+        now_ms,
+        dry_run,
+        RowWrite::Asked(to.num),
+        |held, locked| change_claim(held, to, lab.as_ref(), locked, by, now_ms, Why::Named),
+    )
 }
 
 /// Who makes an edit for `kind`: this node, its key minted where it has none, or for a dry run
@@ -501,17 +659,62 @@ struct Locked {
     taken: Vec<Nickname>,
 }
 
+/// What an edit writes to this Mac's registry row ([`edit_name`]): the nickname where the edit
+/// changes it (or asks for it, [`RowWrite::Nickname`]), and as one write with it, the number
+/// named here where the edit moves it.
+#[derive(Clone, Copy)]
+enum RowWrite<'a> {
+    /// The nickname alone: the edit renames the nickname, and the row is given the nickname
+    /// asked for even where the file held it already.
+    Nickname,
+    /// Nothing: the edit takes the row's number ([`follow_number`]), and the file is written
+    /// only under the admission of the source that decision read.
+    Follows(&'a registry::Renumber),
+    /// The number the edit moves to: an undo's.
+    Moved,
+    /// The number a rename asked for: where the edit moves to it, and where the name holds it
+    /// already and the row shows another number an owner wrote that no read followed yet, which
+    /// the request, the newer of the two, replaces.
+    Asked(Number),
+}
+
+impl RowWrite<'_> {
+    /// Whether `next`, the name an edit leaves, holds the number asked for while this Mac's
+    /// registry row shows another an owner wrote ([`registry::row_label`]).
+    fn asked_over_row(self, state: &Path, next: &MachineName) -> bool {
+        matches!(self, Self::Asked(num) if next.num == Some(num)
+            && registry::row_label(state).flatten().is_some_and(|row| row != num))
+    }
+}
+
 /// Edit this machine's name under the book lock and then the name lock, so no signed claim
 /// arrives between an edit's checks and its write: `edit` answers the name the stored one
 /// becomes, from what the books show ([`Locked`]), once the stored one has followed this Mac's
-/// registry row ([`followed`]), and the file is replaced with it unless `dry_run`. `by` names this node; a keyless dry run's `None` stands for a node absent from the
-/// books ([`absent_node`]).
+/// registry row's nickname ([`followed`]), and the file is replaced with it unless `dry_run`.
+/// What `row` says the edit writes to that row, its nickname and a number it moves to, is first
+/// queued as one write, asked in the aterm session `session` ([`registry::queue_rename`]), and a
+/// follow of the row's number is written only under its source's admission
+/// ([`registry::Renumber::with_admitted`]), the name lock held through both.
+/// `by` names this node; a keyless dry run's `None` stands for a node absent from the books
+/// ([`absent_node`]).
+///
+/// # Errors
+/// As `edit`; the row would not take the nickname or the number ([`Cause::Registry`]); a lock
+/// cannot be taken; the file cannot be replaced, which after the write was queued says so: the
+/// row holds it, and a later read takes it from there ([`follow_registry`], [`follow_number`]).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one private edit path; each argument is one fact every rename, undo and follow \
+              names"
+)]
 fn edit_name(
     state: &Path,
     by: Option<By>,
+    session: Option<&str>,
     origin: Origin,
     now_ms: u64,
     dry_run: bool,
+    label: RowWrite<'_>,
     edit: impl FnOnce(&MachineName, &mut Locked) -> io::Result<MachineName>,
 ) -> io::Result<NameSet> {
     aterm_net::fleet_member::write_held(state, aterm_net::fleet_member::Began::Here, |_| {
@@ -527,23 +730,90 @@ fn edit_name(
             taken,
         };
         let mut changed = false;
+        let mut renumbered = false;
         let mut preview = None;
-        let name = file::replace(state, |stored| {
+        let mut queued = None;
+        let admit = |write: &mut dyn FnMut() -> io::Result<()>| match label {
+            RowWrite::Follows(row) => row.with_admitted(write),
+            _ => write(),
+        };
+        let edited = |stored: &mut MachineName| {
             // The edit starts from the name as this Mac's registry row leaves it now
             // ([`row_followed`]), so it never writes over a nickname the row was given and no
             // read followed yet, and the row value it replaces counts as seen: the row still
             // holding it until this edit's own write arrives undoes nothing.
             let base = row_followed(state, stored, now_ms);
             let base = base.as_ref().unwrap_or(stored);
-            let next = edit(base, &mut locked)?;
+            let mut next = edit(base, &mut locked)?;
             // What the request changed, not what the follow did.
             changed = next != *base;
+            renumbered = next.num != base.num
+                || next.class != base.class
+                || next.migration != base.migration
+                || label.asked_over_row(state, &next);
+            // The row's name is the Mac's ([`follow_registry`], [`follow_number`]): what a rename
+            // changes in the row, its nickname and a number it moves to, is queued as one write
+            // before the file holds it, so no read finds the row showing what it replaced with
+            // nothing of this Mac's on its way, one operation holds the rename, and a row that
+            // would not take it refuses the rename; a dry run asks the row's rules alone. A
+            // nickname the edit leaves as it was is no part of it. A follow's values are the
+            // row's already.
+            let mut cells = Vec::with_capacity(2);
+            if !matches!(label, RowWrite::Follows(_)) {
+                if renumbered && let Some(num) = next.num {
+                    cells.push((Renamed::Label, num.to_string()));
+                }
+                if next.nick != base.nick || matches!(label, RowWrite::Nickname) {
+                    cells.push((Renamed::Nickname, next.nick.as_str().to_owned()));
+                }
+            }
+            let refused = |cells: &[(Renamed, String)], why: String| -> io::Error {
+                Refused::new(
+                    Cause::Registry,
+                    format!(
+                        "the lab registry's row would not take {} ({why}); no name changed",
+                        row_cells(cells)
+                    ),
+                )
+                .into()
+            };
+            if cells.is_empty() {
+                // Nothing of the row's changes.
+            } else if dry_run {
+                if let Some(why) = registry::refusal(state, &cells) {
+                    return Err(refused(&cells, why));
+                }
+            } else if let Some(by) = by {
+                match registry::queue_rename(state, &cells, by.kind, session) {
+                    registry::Written::Refused(why) => return Err(refused(&cells, why)),
+                    registry::Written::Queued(write) => {
+                        // The row shows this nickname once the write lands; should the write
+                        // give way to another writer's value instead, the row shows another,
+                        // which the next read follows ([`followed`]).
+                        if cells.iter().any(|(cell, _)| *cell == Renamed::Nickname) {
+                            next.row = file::RowSeen::Saw(Some(next.nick.clone()));
+                        }
+                        queued = Some((write, cells));
+                    }
+                    registry::Written::Unchanged | registry::Written::Unbound => {}
+                }
+            }
             if dry_run {
                 preview = Some(next);
             } else {
                 *stored = next;
             }
             Ok(())
+        };
+        let replaced = file::replace_admitted(state, edited, admit);
+        // The closure fails only before it queues: an error after is the file's write.
+        let name = replaced.map_err(|why| match &queued {
+            Some((_, cells)) => io::Error::other(format!(
+                "this Mac's lab registry row holds {}, and machine-name.toml could not be \
+                 written ({why}); a later read takes it from the row",
+                row_cells(cells)
+            )),
+            None => why,
         })?;
         let name = preview.unwrap_or(name);
         let shared = in_view(&locked.taken, name.nick.as_str());
@@ -551,10 +821,22 @@ fn edit_name(
             name,
             origin,
             changed,
+            renumbered,
             shared,
+            queued: queued.map(|(write, _)| write),
         })
     })
     .map_err(|e| io::Error::other(e.to_string()))?
+}
+
+/// `cells`, a rename's write to this Mac's registry row, in a person's words: `label m88 and
+/// nickname Otter`.
+fn row_cells(cells: &[(Renamed, String)]) -> String {
+    cells
+        .iter()
+        .map(|(cell, value)| format!("{} {value}", cell.column()))
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 /// `held` with its claim on `to.num`, judged against the vault's labels `lab` (unread only for a
@@ -710,6 +992,10 @@ pub enum Cause {
     /// Undo: History's newest change is not the one the undo was asked over, so the name changed
     /// after it was read ([`undo_last`]'s `seen`).
     Unseen,
+    /// This Mac's lab registry row would not take the number or the nickname, whose write to it
+    /// is queued before the name changes ([`registry::queue_rename`]): the name and the row would
+    /// part.
+    Registry,
 }
 
 impl Refused {
@@ -1241,17 +1527,18 @@ pub fn undo_publishes(name: &MachineName) -> Option<Number> {
 /// As [`ensure_in_view`]; History's newest change is not `seen`; History holds nothing to take
 /// back ([`undo_to`]); `lab` fails; the number or nickname is refused; a lock cannot be taken, or
 /// the name cannot be written. Each refusal carries its [`Refused`] ([`Refused::of`]).
-pub fn undo_last(
+pub fn undo_last<'a>(
     state: &Path,
     seen: Option<&Change>,
     lab: impl FnOnce() -> io::Result<client::LabLabels>,
-    kind: ByKind,
+    asker: impl Into<Asker<'a>>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
     now_ms: u64,
     dry_run: bool,
 ) -> io::Result<NameSet> {
+    let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, kind, dry_run)?;
+    let by = editor(state, asker.kind, dry_run)?;
     let renumbers = file::read(state)?
         .as_ref()
         .and_then(|name| undo_to(name).ok())
@@ -1261,30 +1548,41 @@ pub fn undo_last(
     } else {
         None
     };
-    edit_name(state, by, origin, now_ms, dry_run, |held, locked| {
-        if let Some(seen) = seen
-            && held.history.first() != Some(seen)
-        {
-            return Err(Refused::new(
+    edit_name(
+        state,
+        by,
+        asker.session,
+        origin,
+        now_ms,
+        dry_run,
+        RowWrite::Moved,
+        |held, locked| {
+            if let Some(seen) = seen
+                && held.history.first() != Some(seen)
+            {
+                return Err(Refused::new(
                 Cause::Unseen,
                 "this Mac's name changed after the undo read it, so nothing was undone: read the \
                  name again and undo over what it shows"
                     .to_owned(),
             )
             .into());
-        }
-        let to = undo_to(held)?;
-        let mut marked = held.clone();
-        if let Some(change) = marked.history.first_mut() {
-            change.undone = true;
-        }
-        match to {
-            UndoTo::Name(to) => {
-                change_claim(&marked, &to, lab.as_ref(), locked, by, now_ms, Why::Undone)
             }
-            UndoTo::Nickname(nick) => change_nick(&marked, nick, locked, by, now_ms, Why::Undone),
-        }
-    })
+            let to = undo_to(held)?;
+            let mut marked = held.clone();
+            if let Some(change) = marked.history.first_mut() {
+                change.undone = true;
+            }
+            match to {
+                UndoTo::Name(to) => {
+                    change_claim(&marked, &to, lab.as_ref(), locked, by, now_ms, Why::Undone)
+                }
+                UndoTo::Nickname(nick) => {
+                    change_nick(&marked, nick, locked, by, now_ms, Why::Undone)
+                }
+            }
+        },
+    )
 }
 
 /// Retire this Mac's earlier number `num` (`retired`), or restore it, in `was` (§5.6 card 3), for
@@ -1328,7 +1626,9 @@ pub fn retire_was(state: &Path, num: Number, retired: bool, kind: ByKind) -> io:
         name,
         origin: Origin::Kept,
         changed,
+        renumbered: false,
         shared,
+        queued: None,
     })
 }
 
@@ -1504,34 +1804,45 @@ pub fn renicked(name: &MachineName, nick: Nickname, by: Option<By>) -> Option<Ma
 /// read; the CSPRNG cannot be read; a book or name lock cannot be taken; another node holds the
 /// chosen name; the file cannot be replaced
 /// ([`file::replace`]).
-pub fn set_nick(
+pub fn set_nick<'a>(
     state: &Path,
     to: &NickTo,
-    kind: ByKind,
+    asker: impl Into<Asker<'a>>,
     roster: impl FnOnce() -> io::Result<Option<String>>,
     now_ms: u64,
     dry_run: bool,
 ) -> io::Result<NickSet> {
+    let asker = asker.into();
     let (_, origin) = ensure_in_view(state, roster, now_ms)?;
-    let by = editor(state, kind, dry_run)?;
+    let by = editor(state, asker.kind, dry_run)?;
     let why = match to {
         NickTo::Word(_) => Why::Nickname,
         NickTo::Random => Why::Drawn,
     };
-    let set = edit_name(state, by, origin, now_ms, dry_run, |stored, locked| {
-        let nick = match to {
-            NickTo::Word(word) => word.clone(),
-            NickTo::Random => file::draw_nick(|noun| {
-                in_view(&locked.taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
-            })?,
-        };
-        change_nick(stored, nick, locked, by, now_ms, why)
-    })?;
+    let set = edit_name(
+        state,
+        by,
+        asker.session,
+        origin,
+        now_ms,
+        dry_run,
+        RowWrite::Nickname,
+        |stored, locked| {
+            let nick = match to {
+                NickTo::Word(word) => word.clone(),
+                NickTo::Random => file::draw_nick(|noun| {
+                    in_view(&locked.taken, noun) || noun.eq_ignore_ascii_case(stored.nick.as_str())
+                })?,
+            };
+            change_nick(stored, nick, locked, by, now_ms, why)
+        },
+    )?;
     Ok(NickSet {
         name: set.name,
         origin: set.origin,
         changed: set.changed,
         shared: set.shared,
+        queued: set.queued,
     })
 }
 

@@ -70,6 +70,8 @@ pub struct Base {
     pub channel: Channel,
     /// The head's program blocks.
     pub programs: BTreeMap<String, Program>,
+    /// The head's keyed trees (`program -> key -> build`).
+    pub trees: BTreeMap<String, BTreeMap<String, Build>>,
 }
 
 impl Base {
@@ -130,6 +132,7 @@ impl Base {
             valid_until: Some(quad.index.valid_until.clone()),
             channel: quad.index.channels[0].clone(),
             programs: quad.index.programs.clone(),
+            trees: quad.index.trees.clone(),
         })
     }
 
@@ -156,6 +159,7 @@ impl Base {
                 pin_by_target: BTreeMap::new(),
             },
             programs: BTreeMap::new(),
+            trees: BTreeMap::new(),
         })
     }
 }
@@ -194,6 +198,11 @@ pub struct Plan {
     pub carried: Vec<(String, Build)>,
     /// Programs retired.
     pub retired: Vec<String>,
+    /// Every keyed tree listed (`program -> key -> build`): the head's, and the delta's added.
+    pub trees: BTreeMap<String, BTreeMap<String, Build>>,
+    /// Keyed trees this publish adds, `(program, key, build)`: each must be public before the
+    /// index is.
+    pub added_trees: Vec<(String, String, Build)>,
 }
 
 /// `<name>@<build>` / `<name>@<version>`, as the client reads a `yanked` entry.
@@ -278,6 +287,15 @@ fn vendor_pin(p: &str) -> Error {
     Error::refused(format!(
         "{p} is vendor-direct (atpkg::vendor_direct): its client follows the vendor, and no \
          index pins it — an index that still does drops it with --retire {p}"
+    ))
+}
+
+/// The refusal of any pin of keyed tree `p`.
+fn tree_pin(p: &str) -> Error {
+    Error::refused(format!(
+        "{p} is a keyed tree: a client asks for it by the key that names what it was built \
+         from (atpkg::keyed_tree), and no channel pins one by build number — list it with \
+         `--tree {p}:<key>=<build>`"
     ))
 }
 
@@ -395,6 +413,9 @@ pub fn plan(
             admit_alab_pin(def, b, head.pin.get(p).copied(), base.programs.get(p))?;
             switched.insert(def.name);
         }
+        if programs::get(p).is_some_and(programs::ProgramDef::is_tree) {
+            return Err(tree_pin(p));
+        }
         if programs::get(p).is_none() && !base.programs.contains_key(p) {
             return Err(Error::refused(format!(
                 "{p} is not a program this build knows (programs::PROGRAMS) — a new program \
@@ -489,6 +510,9 @@ pub fn plan(
             }
             if atpkg::vendor_direct::is_vendor(p) {
                 return Err(vendor_pin(p));
+            }
+            if programs::get(p).is_some_and(programs::ProgramDef::is_tree) {
+                return Err(tree_pin(p));
             }
             if !pin.contains_key(p) {
                 return Err(Error::refused(format!(
@@ -766,8 +790,24 @@ pub fn plan(
             retired.join(" ")
         ));
     }
-    if moved.is_empty() && added.is_empty() && delta.target_pins.is_empty() {
+    if moved.is_empty()
+        && added.is_empty()
+        && delta.target_pins.is_empty()
+        && delta.trees.is_empty()
+    {
         log.note("no pin moves: only the index number and the horizon move");
+    }
+
+    let (trees, added_trees) = plan_trees(base, delta)?;
+    if !added_trees.is_empty() {
+        log.say(format!(
+            "keyed trees listed (must be public before the index is): {}",
+            added_trees
+                .iter()
+                .map(|(p, k, b)| format!("{p}:{k}@{b}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
     }
 
     Ok(Plan {
@@ -789,7 +829,62 @@ pub fn plan(
         added,
         carried,
         retired,
+        trees,
+        added_trees,
     })
+}
+
+/// The head's keyed trees with `delta`'s added: each a keyed-tree row of the table
+/// ([`programs::ProgramDef::is_tree`]) under a 64-hex key at a positive build. A key the head
+/// lists keeps its build: a key names its bytes, so a published key never moves to another pack.
+/// # Errors
+/// A program that is not a keyed tree, a key that is not one, build 0, or a moved key.
+fn plan_trees(
+    base: &Base,
+    delta: &Delta,
+) -> Result<(
+    BTreeMap<String, BTreeMap<String, Build>>,
+    Vec<(String, String, Build)>,
+)> {
+    let mut trees = base.trees.clone();
+    let mut added = Vec::new();
+    for (program, keys) in &delta.trees {
+        if !programs::get(program).is_some_and(programs::ProgramDef::is_tree) {
+            return Err(Error::refused(format!(
+                "--tree {program}: not a keyed tree of the table (programs::PROGRAMS)"
+            )));
+        }
+        for (key, &build) in keys {
+            if atpkg::keyed_tree::TreeKey::parse(key).is_none() {
+                return Err(Error::usage(format!(
+                    "--tree {program}:{key}: the key is 64 lowercase hex"
+                )));
+            }
+            if build == 0 {
+                return Err(Error::usage(format!(
+                    "--tree {program}:{key}=0: a build is >= 1"
+                )));
+            }
+            match base.trees.get(program).and_then(|k| k.get(key)) {
+                Some(&was) if was == build => {}
+                Some(&was) => {
+                    return Err(Error::refused(format!(
+                        "REFUSING --tree {program}:{key}={build}: the head lists that key at \
+                         build {was}, and a key names its bytes — a listed key never moves to \
+                         another pack"
+                    )));
+                }
+                None => {
+                    trees
+                        .entry(program.clone())
+                        .or_default()
+                        .insert(key.clone(), build);
+                    added.push((program.clone(), key.clone(), build));
+                }
+            }
+        }
+    }
+    Ok((trees, added))
 }
 
 /// A TOML key: bare when it can be, quoted otherwise.
@@ -886,6 +981,15 @@ pub fn render(plan: &Plan) -> String {
             if let Some(v) = v {
                 let _ = writeln!(s, "{k} = {}", string(v));
             }
+        }
+    }
+    for (program, keys) in &plan.trees {
+        if keys.is_empty() {
+            continue;
+        }
+        let _ = writeln!(s, "\n[trees.{}]", key(program));
+        for (k, build) in keys {
+            let _ = writeln!(s, "{} = {build}", key(k));
         }
     }
     let c = &plan.channel;
@@ -2251,6 +2355,21 @@ fn parse(args: &[String], verb: bool) -> Result<(Delta, Options)> {
                              target"
                         )));
                     }
+                }
+            }
+            "--tree" => {
+                let v = flag_value(args, &mut i, flag)?;
+                let (p, cell) = v.split_once(':').ok_or_else(|| {
+                    Error::usage(format!("--tree {v}: expected <program>:<key>=<build>"))
+                })?;
+                let (k, b) = name_build(flag, cell)?;
+                if d.trees
+                    .entry(p.to_string())
+                    .or_default()
+                    .insert(k.clone(), b)
+                    .is_some()
+                {
+                    return Err(Error::usage(format!("--tree names {p}:{k} twice")));
                 }
             }
             "--yank" => {

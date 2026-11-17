@@ -151,6 +151,13 @@ impl Store {
             .ok_or_else(|| Error::new("invalid retained table header"))?;
         primary.writers.clear();
         primary.operation_bytes = 0;
+        // The view stands on the primary's floor, confirmed at its open, where it has none of
+        // its own: the primary's records came within the primary's quotas above that floor.
+        if self.floor.is_none()
+            && let Some(floor) = primary.floor.take()
+        {
+            self.recount_floor(floor.body);
+        }
         for (id, stored) in std::mem::take(&mut primary.records) {
             if let Some(existing) = self.records.get(&id) {
                 if existing.wire.as_slice() != stored.wire.as_slice()
@@ -162,7 +169,11 @@ impl Store {
                 }
                 continue;
             }
-            self.admit(&stored.header, stored.wire.len())?;
+            self.admit(
+                &stored.header,
+                stored.wire.len(),
+                stored.checkpoint.is_some(),
+            )?;
             if !stored.payload.awaiting_membership() {
                 index
                     .insert(stored.header.clone())
@@ -282,7 +293,13 @@ impl Store {
             // the source unchanged; an ineligible row acquires no receipt here.
             if self.records.contains_key(id)
                 || restricted.contains(&record.header.actor)
-                || self.admit(&record.header, record.wire.len()).is_err()
+                || self
+                    .admit(
+                        &record.header,
+                        record.wire.len(),
+                        record.checkpoint.is_some(),
+                    )
+                    .is_err()
             {
                 continue;
             }

@@ -15,6 +15,9 @@ fn grants() -> Grants {
             Access::NetworkHelper,
         ]
         .map(|access| {
+            if access == Access::LocalNetwork {
+                return Some(additional::local_network(Ok(Some(false))));
+            }
             let mut seen = Observation::unknown(Subject::Access(access));
             seen.standing = Standing::InPlace;
             seen.now = Some(access.wanted().into());
@@ -411,7 +414,6 @@ fn the_stage_completes_on_what_this_revision_handed_and_parks_otherwise() {
     // A recorded handoff is no reading of these grants. Their independent observations in
     // this fixture already confirm them, so the remaining legacy handoff can complete setup.
     for access in [
-        Access::LocalNetwork,
         Access::NameRule,
         Access::SpotlightScope,
         Access::NetworkAuth,
@@ -719,8 +721,38 @@ fn a_declined_debugger_record_is_no_opt_out() {
 fn init_keeps_network_and_password_requirements_visible_without_opt_in() {
     let mut grants = grants();
     grants.acquiring = false;
+    for (permission, now) in [
+        (Ok(Some(true)), "Allowed"),
+        (Ok(Some(false)), "Denied"),
+        (Ok(None), "Not answered"),
+        (
+            Err("planted app permission read refusal".into()),
+            "Not read",
+        ),
+    ] {
+        grants.additional[additional::index(Access::LocalNetwork).unwrap()] =
+            Some(additional::local_network(permission));
+        let seen = observation(Access::LocalNetwork, &grants, managed());
+        assert_eq!(seen.standing, Standing::NotNeeded, "{seen:?}");
+        assert_eq!(seen.now.as_deref(), Some(now));
+        assert!(!super::managed(Access::LocalNetwork, managed()));
+        assert!(seen.detail.as_deref().unwrap().contains("helper"));
+        if now == "Not read" {
+            assert!(
+                seen.detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("planted app permission read refusal")
+            );
+        }
+        assert!(
+            stage_rows(&grants, &[])
+                .iter()
+                .all(|row| row.name != Access::LocalNetwork.name()),
+            "raw app consent must never be an automatic setup step"
+        );
+    }
     for access in [
-        Access::LocalNetwork,
         Access::NameRule,
         Access::SpotlightScope,
         Access::NetworkAuth,
@@ -744,10 +776,104 @@ fn init_keeps_network_and_password_requirements_visible_without_opt_in() {
     }
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn broker_custody_and_network_membership_are_required_independently_of_app_consent() {
+    use aterm_uds::lan::{LanError, PROTOCOL, Unavailable, broker::BrokerHello};
+    let hello = || BrokerHello {
+        protocol: PROTOCOL,
+        build: "fixture".into(),
+        direct: None,
+    };
+    let helper_slot = additional::index(Access::NetworkHelper).unwrap();
+    let network_slot = additional::index(Access::NetworkAuth).unwrap();
+    let app_slot = additional::index(Access::LocalNetwork).unwrap();
+    let ready = || {
+        let mut grants = grants();
+        grants.fda = Fda::On;
+        grants.devtools = DevTools::On;
+        grants.debugger = Debugger::On;
+        grants.additional[helper_slot] = Some(additional::network_helper(Ok(hello()), || {
+            panic!("a current root hello needs no installer observation")
+        }));
+        grants
+    };
+    for permission in [Some(false), None, Some(true)] {
+        let mut grants = ready();
+        grants.additional[app_slot] = Some(additional::local_network(Ok(permission)));
+        let rows = stage_rows(&grants, &[]);
+        assert!(rows.iter().all(super::super::row_ready), "{rows:?}");
+        assert_eq!(
+            observation(Access::NetworkHelper, &grants, managed()).standing,
+            Standing::InPlace
+        );
+
+        // A12's lab identity cannot supply live ALab authorization, even with a working broker.
+        let mut auth = Observation::unknown(Subject::Access(Access::NetworkAuth));
+        auth.standing = Standing::NeedsYou;
+        auth.now = Some("Not joined".into());
+        grants.additional[network_slot] = Some(auth);
+        let rows = stage_rows(&grants, &[]);
+        let auth = rows
+            .iter()
+            .find(|row| row.name == Access::NetworkAuth.name())
+            .unwrap();
+        assert_eq!(auth.status, WAITING, "{rows:?}");
+        assert!(!super::super::row_ready(auth));
+    }
+
+    let direct = BrokerHello {
+        direct: Some("AllowedDirect".into()),
+        ..hello()
+    };
+    let mut helpers = vec![
+        None,
+        Some(additional::network_helper(Ok(direct), || {
+            panic!("direct app consent is never root helper custody")
+        })),
+    ];
+    for why in [
+        Unavailable::NotInstalled,
+        Unavailable::NotRunning,
+        Unavailable::SwitchedOff,
+        Unavailable::Outdated {
+            ours: PROTOCOL,
+            theirs: PROTOCOL + 1,
+        },
+        Unavailable::Refused("the peer is not root".into()),
+        Unavailable::Unchecked("the peer check did not finish".into()),
+    ] {
+        helpers.push(Some(additional::network_helper(
+            Err(LanError::Unavailable(why)),
+            || false,
+        )));
+    }
+    helpers.push(Some(additional::network_helper(
+        Err(LanError::Unavailable(Unavailable::NotInstalled)),
+        || true,
+    )));
+    for helper in helpers {
+        let mut grants = ready();
+        // Even an Allowed app grant cannot fill in missing, held, incompatible or non-root proof.
+        grants.additional[app_slot] = Some(additional::local_network(Ok(Some(true))));
+        grants.additional[helper_slot] = helper;
+        let rows = stage_rows(&grants, &[]);
+        let helper = rows
+            .iter()
+            .find(|row| row.name == Access::NetworkHelper.name())
+            .unwrap();
+        assert_eq!(helper.status, WAITING, "{rows:?}");
+        assert!(!super::super::row_ready(helper));
+        assert_ne!(
+            observation(Access::NetworkHelper, &grants, managed()).standing,
+            Standing::InPlace
+        );
+    }
+}
+
 #[test]
 fn unread_required_setup_evidence_never_completes_the_permissions_stage() {
     for access in [
-        Access::LocalNetwork,
         Access::NameRule,
         Access::SpotlightScope,
         Access::NetworkAuth,

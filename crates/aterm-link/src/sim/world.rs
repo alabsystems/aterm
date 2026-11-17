@@ -732,6 +732,11 @@ pub(crate) enum Mutant {
     /// Mac's published is taken for another writer's, and the post is published again beside
     /// it.
     AnywherePassesAnUnplacedProducer,
+    /// A reply in flight re-witnessed onto a log that continues its own below a fork keeps the
+    /// head it had on the log before, as every build before ATERM-KI-1116-2615 kept it, not
+    /// brought down to the fork (`StateDir::forget_log_offsets`): a copy the replay published
+    /// between the fork and that head goes unread, and the next replay publishes a second one.
+    RewitnessKeepsTheOldHead,
     /// A re-base's witness is written as any other witness is, not on the media
     /// (`Bridge::save_log_witness`, `StateDir::rebase_log_witness`), as every build before critic
     /// review F1: a power cut may bring back the witness of the log before it, and the next attach

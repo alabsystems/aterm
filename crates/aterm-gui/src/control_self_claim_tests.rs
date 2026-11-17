@@ -5816,6 +5816,40 @@ enum Hx07Main {
     Control(Box<Hx07Control>),
 }
 
+/// End one worker's work on return and unwind alike.
+#[cfg(unix)]
+struct Hx07Done<'a>(&'a std::sync::atomic::AtomicBool);
+
+#[cfg(unix)]
+impl Drop for Hx07Done<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Callback-local custody: cancel workers, then close their queued replies, before the scope joins.
+#[cfg(unix)]
+struct Hx07Owner<'a> {
+    _done: Hx07Done<'a>,
+    _drained: Hx07Done<'a>,
+    input: std::sync::mpsc::Receiver<Hx07Main>,
+}
+
+#[cfg(unix)]
+impl<'a> Hx07Owner<'a> {
+    fn new(
+        input: std::sync::mpsc::Receiver<Hx07Main>,
+        done: &'a std::sync::atomic::AtomicBool,
+        drained: &'a std::sync::atomic::AtomicBool,
+    ) -> Self {
+        Self {
+            _done: Hx07Done(done),
+            _drained: Hx07Done(drained),
+            input,
+        }
+    }
+}
+
 /// A control write for the main thread: the event, its mark and fence, and where its outcome goes.
 #[cfg(unix)]
 struct Hx07Control {
@@ -5846,6 +5880,80 @@ fn hx07_script() -> Vec<(Hx07Verb, Hx07Window)> {
     script
 }
 
+/// The real pipe reader, with a checkpoint a fault test can close independently of cancellation.
+#[cfg(unix)]
+fn hx07_read(
+    mut program: std::fs::File,
+    drained: &std::sync::atomic::AtomicBool,
+    mut next: impl FnMut() -> bool,
+    mut process: impl FnMut(&[u8]),
+) -> Vec<u8> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    while next() {
+        let stopping = drained.load(Ordering::Acquire);
+        match program.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut echo = Vec::new();
+                for &b in &buf[..n] {
+                    match b {
+                        b'\r' => echo.extend_from_slice(b"\r\nresponse\r\n"),
+                        b if b.is_ascii_lowercase() => {}
+                        b => echo.push(b),
+                    }
+                }
+                process(&echo);
+                out.extend_from_slice(&buf[..n]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if stopping {
+                    break;
+                }
+                aterm_uds::deadline::poll_yield();
+            }
+            Err(e) => panic!("read the program's input: {e}"),
+        }
+    }
+    out
+}
+
+/// The real person worker; a closed fault-test checkpoint retires it even with a broken guard.
+#[cfg(unix)]
+fn hx07_type_person(
+    done: &std::sync::atomic::AtomicBool,
+    hushed: &Mutex<bool>,
+    main: std::sync::mpsc::Sender<Hx07Main>,
+    mut next: impl FnMut() -> bool,
+) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const PAUSES_MS: [u64; 7] = [2, 5, 20, 80, 160, 240, 320];
+    let mut letters = (b'a'..=b'y').cycle();
+    for burst in 0usize.. {
+        for _ in 0..=burst % 8 {
+            if !next() || done.load(Ordering::Acquire) {
+                return;
+            }
+            {
+                let hush = hushed.lock().unwrap_or_else(PoisonError::into_inner);
+                if !*hush {
+                    let c = letters.next().expect("cycles");
+                    if main.send(Hx07Main::Person(c, None)).is_err() {
+                        return;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(PAUSES_MS[burst % PAUSES_MS.len()]));
+    }
+}
+
 /// One HX-07 run on a headless window whose session's program reads a pipe: claude-code-alab's
 /// proven claim of every duty stands (a scope fixture, as wide as its roster row); a person
 /// types `a`-`y` through the window's own input path (`as=person`'s route,
@@ -5869,7 +5977,6 @@ fn hx07_run(fenced: bool) -> Hx07Run {
         SupervisorInputCaller, SupervisorInputDelivery, SupervisorInputFence,
     };
     use aterm_agent::harness::contract::Scope;
-    use std::io::Read;
     use std::os::fd::{AsRawFd, IntoRawFd};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -5879,7 +5986,7 @@ fn hx07_run(fenced: bool) -> Hx07Run {
 
     let (rd, wr) = aterm_uds::pipe().expect("pipe");
     aterm_pty::set_nonblocking(rd.as_raw_fd(), true).expect("nonblocking program end");
-    let mut program = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let program = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
     let wr = wr.into_raw_fd();
     aterm_pty::set_nonblocking(wr, true).expect("nonblocking master");
     let mut app =
@@ -5911,39 +6018,21 @@ fn hx07_run(fenced: bool) -> Hx07Run {
     let drained = AtomicBool::new(false);
     let mut person: Vec<(u8, u64)> = Vec::new();
     let (writes, out) = std::thread::scope(|s| {
+        // This receiver and its pending replies must drop before the scope joins on a panic.
+        let owner = Hx07Owner::new(main_rx, &claimant_done, &drained);
         // The program: it echoes what the harness types (an Enter draws a response) and not the
         // person's letters, so the screen is quiet whenever the harness is.
         let reader = s.spawn(|| {
-            let mut out = Vec::new();
-            let mut buf = [0u8; 4096];
-            loop {
-                let stopping = drained.load(Ordering::Acquire);
-                match program.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut echo = Vec::new();
-                        for &b in &buf[..n] {
-                            match b {
-                                b'\r' => echo.extend_from_slice(b"\r\nresponse\r\n"),
-                                b if b.is_ascii_lowercase() => {}
-                                b => echo.push(b),
-                            }
-                        }
-                        term.lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .process(&echo);
-                        out.extend_from_slice(&buf[..n]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        if stopping {
-                            break;
-                        }
-                        aterm_uds::deadline::poll_yield();
-                    }
-                    Err(e) => panic!("read the program's input: {e}"),
-                }
-            }
-            out
+            hx07_read(
+                program,
+                &drained,
+                || true,
+                |echo| {
+                    term.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .process(echo);
+                },
+            )
         });
         // The person: bursts of one to eight keys a millisecond apart, and pauses from 2 ms to
         // a third of a second between them, so a key falls anywhere in a write; held off while
@@ -5951,34 +6040,14 @@ fn hx07_run(fenced: bool) -> Hx07Run {
         let typist = {
             let main = main_tx.clone();
             let (done, hushed) = (&claimant_done, &hushed);
-            s.spawn(move || {
-                const PAUSES_MS: [u64; 7] = [2, 5, 20, 80, 160, 240, 320];
-                let mut letters = (b'a'..=b'y').cycle();
-                for burst in 0usize.. {
-                    for _ in 0..=burst % 8 {
-                        if done.load(Ordering::Acquire) {
-                            return;
-                        }
-                        {
-                            let hush = hushed.lock().unwrap_or_else(PoisonError::into_inner);
-                            if !*hush {
-                                let c = letters.next().expect("cycles");
-                                if main.send(Hx07Main::Person(c, None)).is_err() {
-                                    return;
-                                }
-                            }
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    std::thread::sleep(Duration::from_millis(PAUSES_MS[burst % PAUSES_MS.len()]));
-                }
-            })
+            s.spawn(move || hx07_type_person(done, hushed, main, || true))
         };
         let claimant = {
             let main = main_tx.clone();
             let (ctx, term, store, holder, caller) = (&ctx, &term, &store, &holder, &caller);
             let (done, hushed) = (&claimant_done, &hushed);
             s.spawn(move || {
+                let _done = Hx07Done(done);
                 // Hold the person off (`on`) or let them go on; a hush takes every key handed
                 // before it first.
                 let hush = |on: bool| {
@@ -6015,6 +6084,9 @@ fn hx07_run(fenced: bool) -> Hx07Run {
                 };
                 let mut writes = Vec::new();
                 for (n, (verb, window)) in hx07_script().into_iter().enumerate() {
+                    if done.load(Ordering::Acquire) {
+                        break;
+                    }
                     hush(matches!(
                         window,
                         Hx07Window::Hushed | Hx07Window::BeforeEnter
@@ -6168,14 +6240,13 @@ fn hx07_run(fenced: bool) -> Hx07Run {
                         reply,
                     });
                 }
-                done.store(true, Ordering::Release);
                 writes
             })
         };
         drop(main_tx);
         let wid = crate::WindowId(0);
         loop {
-            match main_rx.recv_timeout(PATIENCE) {
+            match owner.input.recv_timeout(PATIENCE) {
                 Ok(Hx07Main::Person(c, ack)) => {
                     let ev = super::parse_key(&char::from(c).to_string()).expect("a letter");
                     let outcome = app.input_to_session_observed(
@@ -6238,7 +6309,7 @@ fn hx07_run(fenced: bool) -> Hx07Run {
             );
             aterm_uds::deadline::poll_yield();
         }
-        drained.store(true, Ordering::Release);
+        drop(owner);
         (writes, reader.join().expect("the reader"))
     });
     ctx.sink.sever_input();
@@ -6247,6 +6318,153 @@ fn hx07_run(fenced: bool) -> Hx07Run {
         person,
         writes,
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_panicked_hx07_claimant_retires_the_real_typist() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    const PATIENCE: Duration = Duration::from_secs(60);
+    let done = AtomicBool::new(false);
+    let hushed = Mutex::new(false);
+    let (main, input) = mpsc::channel();
+    let (at, paused) = mpsc::channel();
+    let (go, step) = mpsc::channel();
+    std::thread::scope(|s| {
+        // Callback-owned: a failed assertion closes the checkpoint before automatic joins.
+        let go = go;
+        let (done, hushed) = (&done, &hushed);
+        let typist = s.spawn(move || {
+            hx07_type_person(done, hushed, main, || {
+                at.send(()).expect("announce the next typing look");
+                step.recv().is_ok()
+            });
+        });
+        paused
+            .recv_timeout(PATIENCE)
+            .expect("typist at its first look");
+        let claimant = s.spawn(move || {
+            let _done = Hx07Done(done);
+            panic!("HX-07 injected claimant panic");
+        });
+        assert!(claimant.join().is_err(), "the claimant must unwind");
+        go.send(()).expect("release the typing look after unwind");
+        match input.recv_timeout(PATIENCE) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => panic!("hang: the typist never retired"),
+            Ok(_) => panic!("HX-07: the person kept typing after the claimant panicked"),
+        }
+        drop(go);
+        typist.join().expect("the person retired");
+    });
+}
+
+#[test]
+#[cfg(unix)]
+fn a_panicked_hx07_owner_retires_both_workers_and_queued_replies() {
+    use std::os::fd::AsRawFd;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WorkerStep {
+        Look,
+        End,
+    }
+
+    const PATIENCE: Duration = Duration::from_secs(60);
+    let (rd, _wr) = aterm_uds::pipe().expect("pipe");
+    aterm_pty::set_nonblocking(rd.as_raw_fd(), true).expect("nonblocking program end");
+    let program = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let done = AtomicBool::new(false);
+    let drained = AtomicBool::new(false);
+    let hushed = Mutex::new(true);
+    let (main, input) = mpsc::channel();
+    let (reply, replied) = mpsc::channel();
+    main.send(Hx07Main::Sync(reply))
+        .expect("queue an owned reply");
+    let (events, seen) = mpsc::channel();
+    let (go, step) = mpsc::channel();
+    let (typing_events, typing_seen) = mpsc::channel();
+    let (typing_go, typing_step) = mpsc::channel();
+    std::thread::scope(|s| {
+        // Independent of Hx07Done: a guard mutant cannot strand either worker on a red.
+        let go = go;
+        let typing_go = typing_go;
+        let drained_ref = &drained;
+        let reader = s.spawn(move || {
+            hx07_read(
+                program,
+                drained_ref,
+                || {
+                    events
+                        .send(WorkerStep::Look)
+                        .expect("announce the next read");
+                    step.recv().is_ok()
+                },
+                |_| panic!("the held-open pipe is empty"),
+            );
+            events
+                .send(WorkerStep::End)
+                .expect("announce reader retirement");
+        });
+        let (done_ref, hushed_ref) = (&done, &hushed);
+        let typist = s.spawn(move || {
+            hx07_type_person(done_ref, hushed_ref, main, || {
+                typing_events
+                    .send(WorkerStep::Look)
+                    .expect("announce the next typing look");
+                typing_step.recv().is_ok()
+            });
+            typing_events
+                .send(WorkerStep::End)
+                .expect("announce typist retirement");
+        });
+        assert_eq!(
+            seen.recv_timeout(PATIENCE)
+                .expect("reader at its first look"),
+            WorkerStep::Look
+        );
+        assert_eq!(
+            typing_seen
+                .recv_timeout(PATIENCE)
+                .expect("hushed typist at its first look"),
+            WorkerStep::Look
+        );
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            let _owner = Hx07Owner::new(input, &done, &drained);
+            panic!("HX-07 injected owner panic");
+        }));
+        assert!(panicked.is_err(), "the owner must unwind");
+        match replied.recv_timeout(PATIENCE) {
+            Err(RecvTimeoutError::Disconnected) => {}
+            Err(RecvTimeoutError::Timeout) => panic!("hang: the owner retained its queued reply"),
+            Ok(()) => panic!("no main thread answered the queued reply"),
+        }
+        go.send(()).expect("release the read after owner unwind");
+        typing_go
+            .send(())
+            .expect("release the typing look after owner unwind");
+        assert_eq!(
+            seen.recv_timeout(PATIENCE).expect("reader after unwind"),
+            WorkerStep::End
+        );
+        assert_eq!(
+            typing_seen
+                .recv_timeout(PATIENCE)
+                .expect("hushed typist after unwind"),
+            WorkerStep::End
+        );
+        drop(go);
+        drop(typing_go);
+        reader.join().expect("the reader retired");
+        typist.join().expect("the hushed person retired");
+    });
 }
 
 /// A person's key, forced: handed to the main thread, which acknowledges it once it is written.

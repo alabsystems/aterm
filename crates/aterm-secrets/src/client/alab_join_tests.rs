@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn route_wake_can_attempt_native_bootstrap_with_only_durable_intent() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -140,6 +141,7 @@ fn an_ambiguous_native_proof_never_falls_back_to_http_across_restarts() {
     assert!(read_machine_identity(&restarted).unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn native_bootstrap_is_attempted_before_any_default_vault_fetch() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -207,6 +209,7 @@ fn a_later_source_choice_or_sharing_hold_prevents_native_retry_and_fetch() {
 /// has, a stale intent beside that vault included. The churn lab's founder, made with
 /// `--no-agent`, keeps a subscriber-off record; with the gate read first, its subscriber
 /// failed every pass there and took no record in.
+#[cfg(unix)]
 #[test]
 fn the_bootstrap_gate_holds_a_pending_bootstrap_and_never_a_configured_pass() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -250,6 +253,7 @@ fn the_bootstrap_gate_holds_a_pending_bootstrap_and_never_a_configured_pass() {
     }
 }
 
+#[cfg(unix)]
 fn subscriber_attempt(
     paths: &Paths,
     attempt: impl Fn(&Paths, ExpectedConfig<'static>) -> crate::Result<()> + 'static,
@@ -265,6 +269,7 @@ fn subscriber_attempt(
     subscriber_pass(paths, &mut None, &FOUND_NONE)
 }
 
+#[cfg(unix)]
 #[test]
 fn bootstrap_intent_survives_first_fetch_and_authentication_failures_then_recovers() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -417,6 +422,7 @@ fn bootstrap_retry_preserves_sharing_off_and_a_later_source_choice() {
     assert!(!paths.dir.join(FILE).exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn sharing_off_during_bootstrap_fetch_holds_the_join_until_enabled_again() {
     let root = aterm_tempfile::tempdir().unwrap();

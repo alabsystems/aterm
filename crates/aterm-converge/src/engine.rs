@@ -660,7 +660,9 @@ fn explain_aside(item: &dyn Item, aside: &StoodAside) -> Explain {
         StoodAside::Lock(_) | StoodAside::Waiting(_) | StoodAside::Absent(_) => {
             item.explain(&Probe::Deferred { why: why.clone() }).remedy
         }
-        StoodAside::Permission(_) => item.explain(&Probe::Blocked { why: why.clone() }).remedy,
+        StoodAside::Permission(_) | StoodAside::Inputs(_) => {
+            item.explain(&Probe::Blocked { why: why.clone() }).remedy
+        }
     };
     Explain { why, remedy }
 }

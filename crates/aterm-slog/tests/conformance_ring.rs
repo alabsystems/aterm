@@ -568,6 +568,7 @@ fn perform(w: &mut World, action: &'static str) {
                 ids: w.log.id_counters(),
                 limits: w.limits,
                 at: stamp,
+                ident: aterm_slog::DescIdent::default(),
             };
             w.log = Log::from_carry(&out.lines, a).expect("the carry reads").0;
             w.updated = true;

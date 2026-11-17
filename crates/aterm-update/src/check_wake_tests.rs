@@ -378,6 +378,7 @@ fn a_told_wake_ends_a_day_long_wait_through_the_wall_relay() {
         woke: true,
         slept: Some(3 * HOUR),
         stepped: false,
+        zoned: false,
     });
     assert!(matches!(
         answer.recv_timeout(MUST_HAPPEN).ok(),
@@ -404,7 +405,8 @@ fn a_wake_with_no_sleep_before_it_posts_nothing() {
         tell_and_answer(Moved {
             woke: true,
             slept: None,
-            stepped: false
+            stepped: false,
+            zoned: false
         }),
         0
     );
@@ -419,7 +421,8 @@ fn a_wake_with_no_sleep_before_it_posts_nothing() {
         tell_and_answer(Moved {
             woke: true,
             slept: Some(HOUR),
-            stepped: false
+            stepped: false,
+            zoned: false
         }),
         2
     );

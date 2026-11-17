@@ -8,8 +8,8 @@
 //! agents; there is no MCP server.
 
 use super::{
-    Ask, CAPS, Capacity, Cursor, Diff, EntryKind, Filter, Handle, Inert, Page, Point, Revision,
-    Roll, Saved, TABLES, Usage, View, Writer, edit, find,
+    Ask, CAPS, Capacity, Compiled, Cursor, Diff, EntryKind, Filter, Handle, Inert, Page, Point,
+    Revision, Roll, Saved, TABLES, Usage, View, Writer, edit, find,
 };
 use crate::{
     Error, Result,
@@ -40,11 +40,15 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
   scan <app>/<role> <collection> [--where col=val]... [--tsv|--json] [--at <operation>]\n\
   history <app>/<role> [<collection> [<pk>]] [--column <name>] [--writer <actor|machine>]\n\
           [--kind aterm|import|explicit] [--limit <n>] [--after <cursor> --revision <rev>]\n\
+          [--tsv]\n\
                                         who changed what, in causal order, a page at a time\n\
                                         (100 entries unless --limit says): `next` is the\n\
                                         --after of the next page and `revision` its\n\
                                         --revision; a page that says `moved` starts again\n\
-                                        from the top, since the table moved under the cursor\n\
+                                        from the top, since the table moved under the cursor.\n\
+                                        Each writer is named by the machine row its Mac's\n\
+                                        facts bind; --tsv prints one line per changed cell:\n\
+                                        the time, the Mac, the kind, the place and the value\n\
   diff <app>/<role> [<collection>] <from> [<to>|head]\n\
                                         the cells added, retired, changed and conflict-changed\n\
                                         from one point to a later one, and who made each\n\
@@ -140,7 +144,7 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                 }
                 args.file = Some(value("--tsv")?);
             }
-            "--tsv" if matches!(verb, "scan" | "check") => args.tsv = true,
+            "--tsv" if matches!(verb, "scan" | "history" | "check") => args.tsv = true,
             "--request" if verb == "revert" => {
                 if args.request.is_some() {
                     return Err(Error::new("revert takes one --request <hex>"));
@@ -332,6 +336,9 @@ pub fn run(
             }
             ask.filter.row = args.operands.get(2).cloned();
             let page = handle.history_page(&ask)?;
+            if args.tsv {
+                return Ok(Output::Text(history_tsv(&handle, &page, &ask.filter)));
+            }
             Ok(Output::Json(history(&handle, &page, &ask.filter)))
         }
         "diff" => {
@@ -376,7 +383,7 @@ pub fn run(
             args.at_most(1)?;
             let handle = handle(args.operand(0, "<app>/<role>")?)?;
             let (view, usage) = handle.usage()?;
-            let checked = check(&handle, &view, &usage);
+            let checked = check(handle.compiled(), &view, &usage);
             if args.tsv {
                 let findings = checked["findings"]
                     .as_array()
@@ -645,10 +652,17 @@ fn schema(handle: &Handle, only: Option<&str>) -> Value {
 
 fn ls(handle: &Handle) -> Value {
     let compiled = handle.compiled();
-    let (view, usage): (View, Usage) = match handle.usage() {
-        Ok(read) => read,
-        Err(error) => return json!({"table": compiled.name(), "state": error.to_string()}),
-    };
+    match handle.usage() {
+        Ok((view, usage)) => summary(compiled, &view, &usage),
+        Err(error) => json!({"table": compiled.name(), "state": error.to_string()}),
+    }
+}
+
+/// `ls`'s line for one subscribed table: what `view` reads of `compiled` and what `usage` says
+/// this Mac's writer spent. Its `inert` counts the records past their writer's quota, the rows
+/// an owned collection holds inert, and the records holding a write the authority rules hold
+/// inert.
+pub(crate) fn summary(compiled: &Compiled, view: &View, usage: &Usage) -> Value {
     let mine = view.quota.spent.get(&usage.actor).copied().unwrap_or(0);
     let mut conflicts = 0;
     let mut malformed = 0;
@@ -688,7 +702,7 @@ fn ls(handle: &Handle) -> Value {
         "caps": {"records": CAPS.records, "bytes": CAPS.bytes,
             "writer_records": CAPS.writer_records, "writer_bytes": CAPS.writer_bytes},
         "quota": {"spent": mine, "of": compiled.table.self_quota},
-        "inert": view.quota.over.len() + owned_inert,
+        "inert": view.quota.over.len() + owned_inert + view.inert.total(),
         "refused": view.refused.len(),
         "conflicts": conflicts, "malformed": malformed, "schema": schema,
     })
@@ -917,8 +931,10 @@ pub fn schema_findings(table: &Table, view: &View) -> Vec<Value> {
         .collect()
 }
 
-fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
-    let compiled = handle.compiled();
+/// `check` of `compiled` as `view` reads it: the generic findings, a split schema, capacity, and
+/// the inert records as `ls` counts those of its cells (past their writer's quota, or holding a
+/// write the authority rules hold inert).
+pub(crate) fn check(compiled: &Compiled, view: &View, usage: &Usage) -> Value {
     let cells: Vec<&Collection> = compiled
         .table
         .collections
@@ -941,7 +957,7 @@ fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
             .map(|found| capacity_json(compiled.table, found, &usage.actor)),
     );
     json!({"table": compiled.name(), "complete": view.complete, "findings": findings,
-        "inert": view.quota.over.len(),
+        "inert": view.quota.over.len() + view.inert.total(),
         "refused": view.refused.iter().map(|id| hex::encode_lower(id)).collect::<Vec<_>>(),
         "malformed": projections.values().map(|p| p.malformed).sum::<usize>()})
 }
@@ -1038,7 +1054,9 @@ fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
         .map(|entry| {
             json!({
                 "operation": hex::encode_lower(&entry.operation),
+                "actor": hex::encode_lower(&entry.actor),
                 "machine": entry.machine.as_ref().map(keys::uuid32),
+                "mac": {"name": entry.mac.name(), "row": entry.mac.row()},
                 "authored_ms": entry.authored_ms,
                 "hlc": {"ms": entry.hlc.ms, "counter": entry.hlc.counter},
                 "request": entry.request.as_ref().map(|r| hex::encode_lower(r)),
@@ -1053,6 +1071,100 @@ fn history(handle: &Handle, page: &Page, filter: &Filter) -> Value {
     json!({"table": handle.compiled().name(), "revision": page.revision.text(),
         "moved": page.moved, "next": page.next.as_ref().map(Cursor::text),
         "operations": operations})
+}
+
+/// `history --tsv`: a header, then one line per change of each entry that `filter` names, in
+/// history's order: when history places it (its causal clock, UTC), the writing Mac
+/// ([`super::Mac::name`]), its kind, why it projects nothing where it does not ([`Inert`]: the
+/// value never took effect), and the change's collection, row, column and value as
+/// [`stored_json`] shows it, a set member as `+ member` or `− member`, a removed value as
+/// nothing. A key the JSON conceals ([`safe_key`] of the whole key) shows as the JSON shows
+/// it, in the row's place, and so does each part that is credential-shaped by itself. A page that moved under its cursor says so first; one with more after it names the
+/// next page's options last. Each comment line starts with `#`.
+fn history_tsv(handle: &Handle, page: &Page, filter: &Filter) -> String {
+    let field =
+        |text: &str| amacs::table::encode(text, amacs::table::Delimiter::Tab, false).into_owned();
+    let mut text = String::new();
+    if page.moved {
+        text.push_str("# the table moved under the cursor: this page starts from the top\n");
+    }
+    text.push_str("time\tmac\tkind\tinert\tcollection\trow\tcolumn\tvalue\toperation\n");
+    for entry in &page.entries {
+        let time = utc(entry.hlc.ms);
+        let mac = entry.mac.name();
+        for change in entry.changes.iter().filter(|c| filter.wants(c)) {
+            let concealed = safe_key(&change.key) != change.key.as_str();
+            let typed = handle
+                .compiled()
+                .table
+                .collection(&change.collection)
+                .filter(|collection| collection.kind == Kind::Cells && !concealed)
+                .and_then(|_| CellKey::parse(&change.key).ok());
+            let shown = stored_json(
+                handle,
+                &change.collection,
+                &change.key,
+                change.value.as_ref(),
+            );
+            let (row, column, value) = match typed {
+                Some(key) => {
+                    let value = match (key.elem.map(safe_key), shown.as_bool()) {
+                        (Some(member), Some(true)) => format!("+ {member}"),
+                        (Some(member), Some(false)) => format!("\u{2212} {member}"),
+                        _ => words(&shown),
+                    };
+                    (safe_key(key.pk), safe_key(key.col), value)
+                }
+                None => (safe_key(&change.key), "", words(&shown)),
+            };
+            let line = [
+                time.as_str(),
+                &mac,
+                entry.kind.word(),
+                entry.inert.map_or("", Inert::word),
+                safe_key(&change.collection),
+                row,
+                column,
+                &value,
+                &hex::encode_lower(&entry.operation),
+            ]
+            .map(field)
+            .join("\t");
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    if let Some(next) = &page.next {
+        text.push_str(&format!(
+            "# more: --after {} --revision {}\n",
+            next.text(),
+            page.revision.text()
+        ));
+    }
+    text
+}
+
+/// A shown value as words: a string as it is, nothing as nothing, anything else as its JSON.
+fn words(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        other => aterm_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// `ms` since the epoch as `YYYY-MM-DD HH:MM:SSZ`.
+fn utc(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (year, month, day) =
+        aterm_stamp::civil::civil_from_days(i64::try_from(secs / 86_400).unwrap_or(i64::MAX));
+    let rest = secs % 86_400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}Z",
+        rest / 3600,
+        rest % 3600 / 60,
+        rest % 60
+    )
 }
 
 /// The baseline file an export writes beside its TSV.

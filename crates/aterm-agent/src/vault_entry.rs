@@ -24,10 +24,10 @@ pub const SOURCE_PREFIX: &str = "vault:";
 pub(crate) enum Read {
     /// The verified value, as bounded UTF-8 text.
     #[cfg_attr(
-        all(not(unix), not(test)),
+        all(not(any(unix, windows)), not(test)),
         expect(
             dead_code,
-            reason = "the vault client builds on unix only: every other host's reader answers absent (tests build one)"
+            reason = "the vault client builds on unix and windows only: every other host's reader answers absent (tests build one)"
         )
     )]
     Present(String),
@@ -98,11 +98,11 @@ pub(crate) fn read_text(home: &Path, name: &str, max: usize) -> Read {
 /// Each of `names` under `home`, in order, every one from the same verified version of the
 /// vault, each bounded at `max` bytes.
 pub(crate) fn read_set(home: &Path, names: &[&str], max: usize) -> Vec<Read> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         store::read_set(home, names, max)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (home, max);
         names.iter().map(|_| Read::Absent).collect()
@@ -111,13 +111,13 @@ pub(crate) fn read_set(home: &Path, names: &[&str], max: usize) -> Vec<Read> {
 
 /// Whether a vault is configured under `home` (whatever this Mac's standing in it).
 pub(crate) fn configured(home: &Path) -> bool {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use aterm_secrets::client;
         client::config(&client::Paths::locate_for_home(home))
             .map_or(true, |config| config.is_some())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = home;
         false
@@ -127,12 +127,12 @@ pub(crate) fn configured(home: &Path) -> bool {
 /// The names this Mac's store holds, without any value; empty where it holds none or its record
 /// cannot be read.
 pub(crate) fn names(home: &Path) -> Vec<String> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use aterm_secrets::client;
         client::registered_names(&client::Paths::locate_for_home(home)).unwrap_or_default()
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = home;
         Vec::new()
@@ -212,7 +212,7 @@ fn process_key() -> [u8; 32] {
     })
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod store {
     use super::Read;
     use aterm_secrets::client::{self, EntryAdmission, EntryRead, Membership, Paths};
@@ -309,21 +309,24 @@ mod store {
 /// Seed `entries` into a file vault this test's `home` administers, as a member's sync would have
 /// it: the vault is made at `home/fixture.vault` on the first call, and a later call edits and
 /// publishes it again. An empty value removes the entry.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn seed(home: &Path, entries: &[(&str, &[u8])]) {
     seed_with(home, entries, |_| (false, None));
 }
 
-/// [`seed`] on a host where the vault client does not build (every one but unix): no vault can
-/// be made there and every reader above answers absent, so a test that seeds one cannot run on
-/// such a host. It compiles there, as the rest of its file does, and says so if it is run.
+/// [`seed`] on a host where the vault client does not build (every one but unix and windows): no
+/// vault can be made there and every reader above answers absent, so a test that seeds one cannot
+/// run on such a host. It compiles there, as the rest of its file does, and says so if it is run.
 ///
 /// # Panics
 /// Always.
-#[cfg(all(not(unix), any(test, debug_assertions)))]
+#[cfg(all(not(any(unix, windows)), any(test, debug_assertions)))]
 pub fn seed(home: &Path, entries: &[(&str, &[u8])]) {
     let _ = (home, entries);
-    panic!("a test vault is seeded on unix only: the vault client does not build on this host");
+    panic!(
+        "a test vault is seeded on unix and windows only: the vault client does not build on this \
+         host"
+    );
 }
 
 /// [`seed`] of one entry `name` holding `text`.
@@ -334,7 +337,7 @@ pub fn put(home: &Path, name: &str, text: impl AsRef<[u8]>) {
 
 /// The file vault at `home/fixture.vault` this test's `home` administers, made with this Mac
 /// named `host` where the home has no vault yet ([`seed`] names it `seed`).
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn ensure_vault(home: &Path, host: &str) -> aterm_secrets::client::Paths {
     use aterm_secrets::client;
     let paths = client::Paths::locate_for_home(home);
@@ -352,7 +355,7 @@ pub fn ensure_vault(home: &Path, host: &str) -> aterm_secrets::client::Paths {
 }
 
 /// [`seed`], each entry's put-if-absent flag and anchor chosen by `policy`.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn seed_with(
     home: &Path,
     entries: &[(&str, &[u8])],

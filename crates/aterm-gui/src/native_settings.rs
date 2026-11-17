@@ -14188,7 +14188,7 @@ fn status_words_width(text: &str) -> f32 {
 
 fn broken_words(text: &str, width: f32) -> usize {
     thread_local! {
-        static BROKEN: RefCell<UiKept<usize>> = RefCell::new(UiKept::default());
+        static BROKEN: RefCell<Box<UiKept<usize>>> = RefCell::new(Box::default());
     }
     StatusWordsShared::once(
         text,
@@ -37331,6 +37331,8 @@ struct UiSet {
 }
 
 /// Sets [`set_in_ui_face`] keeps, by what each was set in then its text, and the fonts they used.
+/// Each thread-local holds one behind a `Box`, so a thread's copy of the app's thread-locals
+/// keeps under its template budget (`crates/aterm-gui/tests/support/thread_local_template.rs`).
 struct UiKept<T> {
     fonts: Vec<Arc<aterm_render::font::Font>>,
     sets: aterm_hash::FxHashMap<UiSet, aterm_hash::FxHashMap<Box<str>, T>>,
@@ -37349,7 +37351,7 @@ impl<T> Default for UiKept<T> {
 
 /// `set`, kept for `text` in a UI face at a size in a `width` box where each width measured whole.
 fn set_in_ui_face<T: Clone>(
-    kept: &'static std::thread::LocalKey<RefCell<UiKept<T>>>,
+    kept: &'static std::thread::LocalKey<RefCell<Box<UiKept<T>>>>,
     at: (&str, (crate::widget::TextFace, f32), f32),
     set: impl FnOnce() -> T,
 ) -> T {
@@ -37358,7 +37360,7 @@ fn set_in_ui_face<T: Clone>(
 
 /// `read` of what [`set_in_ui_face`] sets, read where it is kept rather than copied out.
 fn read_in_ui_face<T: Clone, R>(
-    kept: &'static std::thread::LocalKey<RefCell<UiKept<T>>>,
+    kept: &'static std::thread::LocalKey<RefCell<Box<UiKept<T>>>>,
     (text, (face, px), width): (&str, (crate::widget::TextFace, f32), f32),
     set: impl FnOnce() -> T,
     read: impl Fn(&T) -> R,
@@ -37415,7 +37417,7 @@ fn ui_face_width(face: crate::widget::TextFace, px: f32) -> impl Fn(&str) -> f32
 
 thread_local! {
     /// The lines [`ui_set_lines`] set.
-    static UI_LINES: RefCell<UiKept<Vec<String>>> = RefCell::new(UiKept::default());
+    static UI_LINES: RefCell<Box<UiKept<Vec<String>>>> = RefCell::new(Box::default());
 }
 
 /// `text`'s lines in a box `width` wide in a UI face at `px` ([`set_in_ui_face`]).
@@ -37438,7 +37440,7 @@ fn ui_set_line_count(text: &str, (face, px): (crate::widget::TextFace, f32), wid
 /// Whether each of `text`'s pieces fits `width` in a UI face at `px` ([`set_in_ui_face`]).
 fn ui_pieces_fit(text: &str, (face, px): (crate::widget::TextFace, f32), width: f32) -> bool {
     thread_local! {
-        static FITS: RefCell<UiKept<bool>> = RefCell::new(UiKept::default());
+        static FITS: RefCell<Box<UiKept<bool>>> = RefCell::new(Box::default());
     }
     set_in_ui_face(&FITS, (text, (face, px), width), || {
         pieces_fit(text, width, &ui_face_width(face, px))

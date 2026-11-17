@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Names the wait of an agent's quiet call once per suspect episode, by the same identity-bound
-//! sample `sys name` takes ([`crate::sys_naming::command`]), before anything is said of it.
+//! sample `sys name` takes ([`crate::sys_naming::automatic`]), before anything is said of it.
 //!
 //! The kernel names few waits on macOS: a process asleep in `nanosleep` (a `sleep` the agent ran)
 //! or on a mutex shows no descriptor, knote or wait channel, so the engine sees only a quiet call
@@ -78,12 +78,10 @@ pub(crate) fn name_quiet_calls(view: &JobsView) {
     let spawned = std::thread::Builder::new()
         .name("aterm-auto-name".to_string())
         .spawn(move || {
-            let said = crate::sys_naming::command(
+            let said = crate::sys_naming::automatic(
                 &crate::sys_host::SYS,
                 tab,
                 NameTarget::Job(job.clone()),
-                true,
-                false,
             );
             if said.contains("why=busy") {
                 TRIED.forget(tab, &job);

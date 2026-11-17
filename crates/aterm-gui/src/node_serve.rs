@@ -489,7 +489,7 @@ fn relay_socket_path(relay_dir: &Path, pid: u32) -> PathBuf {
     relay_dir.join(format!("{RELAY_PREFIX}{pid}{RELAY_SUFFIX}"))
 }
 
-fn parse_relay_filename(name: &str) -> Option<u32> {
+pub(super) fn parse_relay_filename(name: &str) -> Option<u32> {
     let pid_str = name
         .strip_prefix(RELAY_PREFIX)?
         .strip_suffix(RELAY_SUFFIX)?;
@@ -1596,7 +1596,8 @@ fn busy_line(why: &str) -> String {
     )
 }
 
-/// This Mac's windows' survey facts for the 3-minute facts push, read as one
+/// This Mac's windows' survey facts for the 3-minute facts push (and the ask that keeps the
+/// windows' read of the home's checkouts on its clock, [`read_checkouts_when_due`]), read as one
 /// ([`survey_every_window`]): every window's sessions counted and the installed app's window's
 /// facts, with no look at the machine. The survey names no peer, so no window takes a look for
 /// it ([`relayed_survey`]) and the node job takes none (a look is taken only inside a
@@ -2233,7 +2234,12 @@ pub struct NodeServeConfig {
     /// (`None`: no one): a test's tap, by which a test waits for a generation that serves the
     /// configuration as it stands, never one its watch is about to end.
     pub on_generation: Option<OnGeneration>,
-    /// Poll interval for key rotation, config changes, and `_alab._tcp` reconciliation.
+    /// The old tick (KI-1108-2): with the fleet's file watch running, the pace kept while a state
+    /// no event tells lasts (a vault writer's hold, an unsettled deny read, the mesh on, a boot
+    /// trial) and the reach within which timed duties share a wake; where the watch did not
+    /// start, the period of every look, as it was. Key rotation, config changes and the other
+    /// watched inputs are passes at their events, the advert's route term every
+    /// `fleet_inputs::ADVERT_LOOK`, and a waiter rests at most `fleet_inputs::BACKSTOP`.
     pub tick_every: Duration,
     /// Maximum wait for a woken window's `wf-<pid>.sock` relay on windowless `spawn`.
     pub wake_timeout: Duration,
@@ -2572,6 +2578,16 @@ impl NodeUpdates {
         {
             self.look_owed.store(true, Ordering::Release);
         }
+    }
+
+    /// Whether this run owes work no file event tells: a boot trial pending, or a look a thread
+    /// that could not start left owed. The job's waits keep their old tick while it lasts. A
+    /// trial is pending from the run's boot until it settles, or once a window's custody of it
+    /// lapses (48 h after that window launched it, `aterm_update`'s window-trial wait), which no
+    /// file event or exit tells: the job meets it at its next wake, at most the backstop's 180 s
+    /// later (the advert look's 60 s while a vault node serves), and keeps the tick from then.
+    fn paced(&self) -> bool {
+        self.look_owed.load(Ordering::Acquire) || self.active_trial()
     }
 
     fn active_trial(&self) -> bool {
@@ -3739,8 +3755,10 @@ fn node_lan_gate() -> fn() -> Option<String> {
 }
 
 /// Local nonblocking upkeep retained by the node's owned runtime. Both idle
-/// rounds and the serving generation's existing watch invoke it.
-pub type NodeMaintenance = Arc<dyn Fn() + Send + Sync>;
+/// rounds and the serving generation's existing watch invoke it. It returns when it is next owed
+/// with nothing rung (`None`: only a ring owes it, [`super::fleet_inputs::wake_node_maintenance`]),
+/// so the job's waits keep its pace without a clock of their own.
+pub type NodeMaintenance = Arc<dyn Fn() -> Option<Instant> + Send + Sync>;
 
 /// Foreground entry point for `aterm node serve` (`systems.alab.aterm-node`, C20–C23,
 /// §4.13): the job's lock first ([`own_node_job`]), then its boot apply
@@ -3985,6 +4003,7 @@ fn serve_node_job(
     job_lock: NodeJobLock,
     maintenance: Option<NodeMaintenance>,
 ) -> ExitCode {
+    use super::fleet_inputs::Idle;
     if !cfg!(test) {
         crate::qos::set_self(crate::qos::Role::Background);
     }
@@ -4041,26 +4060,44 @@ fn serve_node_job(
     let bus_keeper = cfg.mesh.keep_bus();
     let mut mesh_logs = MeshHeld::default();
     mesh_logs.bus = bus_keeper.as_ref().map(|keeper| Arc::clone(keeper.slot()));
+    // What wakes each generation's watch between its passes (KI-1108-2): the job's inputs' file
+    // events. A generation's watch starts from the view taken before this round's reads, so a
+    // change made since is pending for it.
+    let inputs = super::fleet_inputs::NodeInputs::start(
+        super::fleet_inputs::process(),
+        &cfg.state_dir,
+        cfg.config_path.as_deref(),
+        cfg.vault_paths.as_ref(),
+        cfg.members
+            .as_deref()
+            .map(aterm_agent::fleet_log::LocalLog::read_files)
+            .unwrap_or_default(),
+        (&cfg.relay_dir, |name| parse_relay_filename(name).is_some()),
+    );
+
+    // The loop's rest between its looks: until what its reason to idle names happens, or the old
+    // tick where the file watch did not start.
+    let mut idle = super::fleet_inputs::NodeIdle::new(&inputs, &cfg.state_dir, cfg.tick_every);
 
     while !cfg.stop.is_set() {
+        let mut seen = super::fleet_inputs::Seen::new(inputs.bell());
         if let Some(updates) = cfg.updates.as_ref() {
             updates.start_owed_look(&cfg.relay_dir, &cfg.stop);
         }
-        if let Some(maintain) = &maintenance {
-            maintain();
-        }
+        let upkeep = maintenance.as_ref().and_then(|maintain| maintain());
         crate::heap_relief::relieve();
+        idle.round(upkeep, cfg.updates.as_ref().is_some_and(NodeUpdates::paced));
         if fleet_turned_off_or_swarm_disabled(&cfg) {
             advertiser.stop();
             port_lock = None;
-            cfg.stop.sleep(cfg.tick_every);
+            idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
         let Some(wanted) = wanted_for_node(&cfg) else {
             advertiser.stop();
             port_lock = None;
-            cfg.stop.sleep(cfg.tick_every);
+            idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         };
@@ -4069,7 +4106,7 @@ fn serve_node_job(
         else {
             advertiser.stop();
             port_lock = None;
-            cfg.stop.sleep(cfg.tick_every);
+            idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         };
@@ -4078,7 +4115,7 @@ fn serve_node_job(
             Err(_) => {
                 advertiser.stop();
                 port_lock = None;
-                cfg.stop.sleep(cfg.tick_every);
+                idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
                 checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
                 continue;
             }
@@ -4094,7 +4131,7 @@ fn serve_node_job(
             }
             advertiser.stop();
             port_lock = None;
-            cfg.stop.sleep(cfg.tick_every);
+            idle.wait(&cfg.stop, &mut seen, Idle::Broker);
             checkpoint_idle(&cfg, IdleCheckpoint::Waiting);
             continue;
         }
@@ -4115,7 +4152,7 @@ fn serve_node_job(
             let Ok(addr) = wanted.listen.parse::<SocketAddr>() else {
                 advertiser.stop();
                 port_lock = None;
-                cfg.stop.sleep(cfg.tick_every);
+                idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
                 checkpoint_idle(
                     &cfg,
                     IdleCheckpoint::Failed("node listen address is invalid"),
@@ -4125,7 +4162,7 @@ fn serve_node_job(
             if aterm_net::loopback::check(aterm_net::loopback::Reach::Listen(addr)).is_err() {
                 advertiser.stop();
                 port_lock = None;
-                cfg.stop.sleep(cfg.tick_every);
+                idle.wait(&cfg.stop, &mut seen, Idle::Inputs);
                 checkpoint_idle(
                     &cfg,
                     IdleCheckpoint::Failed("node listen address is refused"),
@@ -4136,12 +4173,12 @@ fn serve_node_job(
                 match NodeJobLock::try_acquire_port(&cfg.state_dir) {
                     Ok(Some(held)) => port_lock = Some(held),
                     Ok(None) => {
-                        cfg.stop.sleep(cfg.tick_every);
+                        idle.wait(&cfg.stop, &mut seen, Idle::PortHeld);
                         checkpoint_idle(&cfg, IdleCheckpoint::PortOwnedElsewhere);
                         continue;
                     }
                     Err(_) => {
-                        cfg.stop.sleep(cfg.tick_every);
+                        idle.wait(&cfg.stop, &mut seen, Idle::Paced);
                         checkpoint_idle(
                             &cfg,
                             IdleCheckpoint::Failed("node port custody is unreadable"),
@@ -4156,7 +4193,17 @@ fn serve_node_job(
                     if !keeps_port_after(&err) {
                         port_lock = None;
                     }
-                    cfg.stop.sleep(cfg.tick_every);
+                    // In use: until the window's release of it, or a backoff where no window
+                    // holds it; any other refusal, the old tick.
+                    idle.wait(
+                        &cfg.stop,
+                        &mut seen,
+                        if keeps_port_after(&err) {
+                            Idle::PortInUse
+                        } else {
+                            Idle::Paced
+                        },
+                    );
                     checkpoint_idle(&cfg, IdleCheckpoint::Failed("node listener could not bind"));
                     continue;
                 }
@@ -4165,7 +4212,7 @@ fn serve_node_job(
 
         let Ok(bound_addr) = listener.local_addr() else {
             port_lock = None;
-            cfg.stop.sleep(cfg.tick_every);
+            idle.wait(&cfg.stop, &mut seen, Idle::Paced);
             checkpoint_idle(
                 &cfg,
                 IdleCheckpoint::Failed("node bound address is unreadable"),
@@ -4186,6 +4233,7 @@ fn serve_node_job(
         let node = aterm_net::fleet_member::read_node_identity(&cfg.state_dir);
         mesh_logs.listening(bound_addr.port());
         let mesh_now = mesh_logs.get(&cfg, &node);
+        idle.serving();
         // A generation that served nothing (its watcher never started) gives the port back.
         if !serve_one_node_generation(
             &cfg,
@@ -4202,6 +4250,7 @@ fn serve_node_job(
             mesh_now.as_ref(),
             maintenance.as_ref(),
             traffic,
+            (&inputs, seen),
         ) {
             port_lock = None;
             checkpoint_idle(
@@ -5202,8 +5251,21 @@ fn denied_nodes_for(
     vault_paths: Option<&aterm_secrets::client::Paths>,
     cache: &Mutex<DeniedCache>,
 ) -> Option<Arc<[String]>> {
+    denied_nodes_read(state, vault_paths, cache).0
+}
+
+/// [`denied_nodes_for`], and whether its read settled: not where it met a vault writer, the
+/// vault moving under it or an error, which the next read may answer otherwise with no watched
+/// file moving (a writer lets go of the state lock without a file event), so the watch that
+/// judges on those events keeps the old tick while it lasts
+/// ([`super::fleet_inputs::denial_settled`]).
+fn denied_nodes_read(
+    state: &Path,
+    vault_paths: Option<&aterm_secrets::client::Paths>,
+    cache: &Mutex<DeniedCache>,
+) -> (Option<Arc<[String]>>, bool) {
     if !aterm_agent::fleet_vault::traffic_in_effect(state, vault_paths) {
-        return None;
+        return (None, true);
     }
     let observed = match vault_paths {
         Some(paths) => aterm_secrets::client::swarm_denial_snapshot_now(paths),
@@ -5211,6 +5273,7 @@ fn denied_nodes_for(
             Vec::new(),
         )),
     };
+    let settled = super::fleet_inputs::denial_settled(&observed);
     let (denied, said) = update_denied_nodes_cache(
         &mut cache.lock().unwrap_or_else(PoisonError::into_inner),
         observed,
@@ -5220,7 +5283,7 @@ fn denied_nodes_for(
         Some(line) => aterm_log::info!("node job {line}"),
         None => {}
     }
-    denied
+    (denied, settled)
 }
 
 struct NodeOpenEntry {
@@ -5374,6 +5437,10 @@ fn serve_one_node_generation(
     mesh_logs: Option<&Arc<aterm_mesh::Mesh>>,
     maintenance: Option<&NodeMaintenance>,
     traffic: aterm_agent::fleet_vault::Traffic,
+    (inputs, seen): (
+        &Arc<super::fleet_inputs::NodeInputs>,
+        super::fleet_inputs::Seen,
+    ),
 ) -> bool {
     if !traffic.current() {
         return false;
@@ -5573,6 +5640,8 @@ fn serve_one_node_generation(
         let relay_dir = cfg.relay_dir.clone();
         let health_inputs = health::Inputs::of(cfg);
         let maintenance = maintenance.cloned();
+        let inputs = Arc::clone(inputs);
+        let mesh_on = cfg.mesh.on;
         std::thread::Builder::new()
             .name("aterm-node-watch".to_owned())
             .spawn(move || {
@@ -5582,64 +5651,56 @@ fn serve_one_node_generation(
                 }
                 let mut last_facts_push = Instant::now();
                 let mut last_census_refresh = Instant::now();
-                let mut last_checkouts_read = None;
+                let mut checkouts = CheckoutsClock::default();
+                let mut window_ask = WindowAsk::default();
                 let hb_in_flight = Arc::new(AtomicBool::new(false));
                 let mut heartbeat =
                     HeartbeatClock::new(None, heartbeat_every(), crate::network_moved::watch());
                 let mut admission_network = crate::network_moved::watch_at_once();
-                // Keep the same finite cap as the stop-only sleep this wait replaces.
-                let tick_every = tick_every.min(Duration::from_secs(86_400 * 365));
-                let mut next_tick = Instant::now() + tick_every;
-                let mut wait_failed = false;
-                let mut route_refresh = route_refresh::RouteRefresh::new(Arc::clone(&listener_stop));
+                // A pass at a ring of the job's inputs or at its earliest duty, and admission at
+                // a move; the old tick where the file watch did not start.
+                let mut pace = super::fleet_inputs::Pace::node(&inputs, seen, tick_every);
+                let mut unreadable = super::fleet_inputs::Unreadable::default();
+                let mut route_refresh =
+                    route_refresh::RouteRefresh::new(Arc::clone(&listener_stop));
 
                 while !listener_stop.is_set() {
-                    let moved = match admission_network.wait_until(
+                    let pass = pace.wait(
+                        &mut admission_network,
                         &[stop.as_ref(), listener_stop.as_ref()],
-                        Some(next_tick),
-                    ) {
-                        Ok(woke) => {
-                            wait_failed = false;
-                            match woke {
-                                Some(crate::network_moved::Woke::Timer) => None,
-                                other => other,
-                            }
-                        }
-                        Err(error) => {
-                            if !wait_failed {
-                                aterm_log::warn!("node: the network wait failed: {error}; keeping its timed checks");
-                                wait_failed = true;
-                            }
-                            stop.sleep(next_tick.saturating_duration_since(Instant::now()));
-                            admission_network.take_at(Instant::now())
-                        }
-                    };
-                    if stop.is_set() || listener_stop.is_set() {
+                    );
+                    let Some(pass) = pass.filter(|_| !stop.is_set() && !listener_stop.is_set())
+                    else {
                         listener_stop.set();
                         return;
-                    }
-                    if moved.is_some()
+                    };
+                    if pass.moved.is_some()
                         && let Some(automatic) = &automatic
                     {
                         automatic.refresh();
                     }
-                    // Moves wake admission at once without renewing this independent deadline
-                    // or repeating unrelated upkeep before it is due.
-                    if Instant::now() < next_tick {
+                    // Moves wake admission at once without repeating unrelated upkeep before it
+                    // is due; a move the heartbeat owes a round for is a deadline of its own.
+                    if !pass.run {
+                        pace.heartbeat(heartbeat.next_due(hb_in_flight.load(Ordering::Acquire)));
                         continue;
                     }
+                    // A vault writer that holds its lock now may hold it across this pass's reads,
+                    // and lets it go with no file event: the old tick until a pass finds none.
+                    let writer = vault_paths
+                        .as_ref()
+                        .is_some_and(aterm_secrets::client::Paths::writer_holds_state);
                     if let Some(updates) = &updates_watch {
                         updates.start_owed_look(&relay_dir, &stop);
                     }
-                    if let Some(maintain) = &maintenance {
-                        maintain();
-                    }
+                    let upkeep = maintenance.as_ref().and_then(|maintain| maintain());
                     crate::heap_relief::relieve();
                     if aterm_agent::node_service::left_the_fleet(&state_dir) {
                         listener_stop.set();
                         return;
                     }
-                    if swarm_holds(config_path.as_deref()) {
+                    let switch = config_path.as_deref().map(aterm_secrets::swarm::enabled_at);
+                    if unreadable.holds(switch, pace.watching(), Instant::now()) {
                         listener_stop.set();
                         return;
                     }
@@ -5669,7 +5730,10 @@ fn serve_one_node_generation(
                     if let Some(automatic) = &automatic {
                         automatic.observe_membership(log.as_ref());
                     }
-                    let denied = denied_nodes_for(&state_dir, vault_paths.as_ref(), &denied_watch);
+                    let (denied, deny_settled) =
+                        denied_nodes_read(&state_dir, vault_paths.as_ref(), &denied_watch);
+                    #[cfg(test)]
+                    super::fleet_inputs::judged(&state_dir, denied.as_deref());
                     if !open_watch.is_empty() {
                         // No deny list read yet: every open drive or content read is cut, as the
                         // handshake refuses each new connection, until one is read.
@@ -5736,94 +5800,177 @@ fn serve_one_node_generation(
                             let deadline = now + route_refresh::WITHIN;
                             let current = || !stopped.is_set() && traffic.current();
                             let bindings = aterm_net::fleet_member::Keyring::read(&state);
-                            if !current() { return; }
-                            let mut routes = discovery.lock().unwrap_or_else(PoisonError::into_inner);
-                            routes.refresh(now,
-                                || watch.adverts(deadline.saturating_duration_since(Instant::now())),
+                            if !current() {
+                                return;
+                            }
+                            let mut routes =
+                                discovery.lock().unwrap_or_else(PoisonError::into_inner);
+                            routes.refresh(
+                                now,
+                                || {
+                                    watch
+                                        .adverts(deadline.saturating_duration_since(Instant::now()))
+                                },
                                 |hint| {
                                     let left = deadline.saturating_duration_since(Instant::now());
-                                    if !current() || left.is_zero()
+                                    if !current()
+                                        || left.is_zero()
                                         || (bindings.is_empty() && hint.mesh_node().is_none())
-                                    { return None; }
-                                    aterm_agent::node_service::prove_fleet_route(hint,
-                                        (&secret, me.as_ref()), (&keys, &bindings), left)
-                                });
-                            if current() && let Err(error) = routes.save(&state) {
-                                aterm_log::warn!("node discovery: could not save addresses: {error}");
+                                    {
+                                        return None;
+                                    }
+                                    aterm_agent::node_service::prove_fleet_route(
+                                        hint,
+                                        (&secret, me.as_ref()),
+                                        (&keys, &bindings),
+                                        left,
+                                    )
+                                },
+                            );
+                            if current()
+                                && let Err(error) = routes.save(&state)
+                            {
+                                aterm_log::warn!(
+                                    "node discovery: could not save addresses: {error}"
+                                );
                             }
                         });
                     }
+                    // One listing of the relay folder a pass: the relays the watch follows, and
+                    // whether a window answers surveys, as `has_live_window_relay` says it.
+                    let relays = read_live_relays(windows.dir());
+                    let window_live = relays.as_ref().is_ok_and(|live| !live.is_empty());
+                    inputs.refresh(relays.into_iter().flatten().map(|(pid, _)| pid));
                     if let Some(vp) = vault_paths.as_ref() {
-                        adv_watch.tick(
-                            vp,
-                            config_path.as_deref(),
-                            addr.port(),
-                            has_live_window_relay(windows.dir()),
-                        );
+                        adv_watch.tick(vp, config_path.as_deref(), addr.port(), window_live);
                     }
 
-                    read_checkouts_when_due(
-                        home_dir.as_deref(),
-                        &mut last_checkouts_read,
-                        FACTS_HEARTBEAT_EVERY,
-                    );
                     // No deny list read yet: this Mac's facts go to no one, and its heartbeat dials no
                     // one, until one is.
+                    let mut pushed = false;
                     if let Some(denied) = denied.as_deref()
                         && last_facts_push.elapsed() >= FACTS_HEARTBEAT_EVERY
                     {
                         last_facts_push = Instant::now();
                         push_node_facts_heartbeat(
                             &state_dir,
-                            &windows,
+                            (&windows, window_live),
                             home_dir.as_deref(),
                             config_path.as_deref(),
                             &secret_watch,
                             (denied, log.as_deref()),
-                         &|| traffic_watch.current(),);
+                            &|| traffic_watch.current(),
+                        );
+                        pushed = true;
                     }
+                    let checkouts_due = read_checkouts_when_due(
+                        (window_live, Instant::now()),
+                        denied.is_some().then_some(FactsPush {
+                            at: last_facts_push,
+                            went: pushed,
+                        }),
+                        &mut checkouts,
+                        FACTS_HEARTBEAT_EVERY,
+                        || {
+                            if let Some(home) = home_dir.as_deref() {
+                                crate::survey::refresh_home_repos_in(home);
+                            }
+                        },
+                        || {
+                            let windows = windows.clone();
+                            window_ask.start(move || {
+                                let _ = query_window_survey_facts(&windows);
+                            });
+                        },
+                    );
                     if last_census_refresh.elapsed() >= CENSUS_REFRESH_EVERY {
                         last_census_refresh = Instant::now();
                         maybe_refresh_local_census_at(&state_dir, home_dir.as_deref());
                     }
+                    let deny_read = denied.is_some();
+                    // Read before the heartbeat's round takes the log.
+                    let routes_on = browse_watch.is_some() && log.is_some();
+                    let owed = heartbeat
+                        .next_due(hb_in_flight.load(Ordering::Acquire))
+                        .is_some_and(|at| at <= Instant::now());
                     // A round still out takes no move: the move waits for the round after it.
-                    if let Some(woke) = heartbeat
-                        .dispatch_when_free(Instant::now(), hb_in_flight.load(Ordering::Acquire), || {
-                        // Widen only an existing matching vault record.
-                        aterm_agent::fleet_vault::keep(&state_dir, vault_paths.as_ref());
-                        if log.as_deref().is_some_and(|keys| {
-                            proved.as_ref().is_some_and(|(_, key)| !keys.admits(key))
-                        }) && let Some(vp) = vault_paths.as_ref()
-                            && let Some(me) =
-                                aterm_net::fleet_member::read_node_identity(&state_dir)
-                                    .ok()
-                                    .flatten()
-                            && aterm_agent::fleet_log::ensure_local_node_key_in_log(
-                                vp,
-                                &me,
-                                log.as_deref(),
-                            )
-                        {
-                            log = members_watch.as_ref().and_then(|members| members.keys());
-                        }
-                        match denied {
-                            Some(denied) => spawn_member_heartbeat_at(
-                                &state_dir,
-                                addr,
-                                secret_watch.clone(),
-                                (&listener_stop, &hb_in_flight),
-                                (denied, log, browse_watch.clone()),
-                                traffic_watch.clone(),
-                            ),
-                            None => {
-                                aterm_log::debug!("node job heartbeat skipped: {DENY_LIST_UNREAD}");
-                                false
+                    if let Some(woke) = heartbeat.dispatch_when_free(
+                        Instant::now(),
+                        hb_in_flight.load(Ordering::Acquire),
+                        || {
+                            // Widen only an existing matching vault record.
+                            aterm_agent::fleet_vault::keep(&state_dir, vault_paths.as_ref());
+                            if log.as_deref().is_some_and(|keys| {
+                                proved.as_ref().is_some_and(|(_, key)| !keys.admits(key))
+                            }) && let Some(vp) = vault_paths.as_ref()
+                                && let Some(me) =
+                                    aterm_net::fleet_member::read_node_identity(&state_dir)
+                                        .ok()
+                                        .flatten()
+                                && aterm_agent::fleet_log::ensure_local_node_key_in_log(
+                                    vp,
+                                    &me,
+                                    log.as_deref(),
+                                )
+                            {
+                                log = members_watch.as_ref().and_then(|members| members.keys());
                             }
-                        }
-                    }) {
+                            match denied {
+                                Some(denied) => spawn_member_heartbeat_at(
+                                    &state_dir,
+                                    addr,
+                                    secret_watch.clone(),
+                                    (&listener_stop, &hb_in_flight, Some(inputs.bell())),
+                                    (denied, log, browse_watch.clone()),
+                                    traffic_watch.clone(),
+                                ),
+                                None => {
+                                    aterm_log::debug!(
+                                        "node job heartbeat skipped: {DENY_LIST_UNREAD}"
+                                    );
+                                    false
+                                }
+                            }
+                        },
+                    ) {
                         super::say_heartbeat_woke("node job", woke);
                     }
-                    next_tick = Instant::now() + tick_every;
+                    #[cfg(test)]
+                    super::fleet_inputs::count_pass(&state_dir);
+                    let now = Instant::now();
+                    // The mesh's own work (its mail pass, its discovery) has inputs no file
+                    // event tells, so with it on the watch keeps its old tick, as it does while
+                    // a vault writer may have held this pass's reads.
+                    let paced = mesh_on
+                        || writer
+                        || !deny_settled
+                        || updates_watch.as_ref().is_some_and(NodeUpdates::paced);
+                    let busy = hb_in_flight.load(Ordering::Acquire);
+                    pace.passed(
+                        super::fleet_inputs::Duties {
+                            heartbeat: deny_read
+                                .then(|| {
+                                    super::fleet_inputs::heartbeat_after(
+                                        heartbeat.next_due(busy),
+                                        owed,
+                                        now,
+                                        heartbeat_every(),
+                                    )
+                                })
+                                .flatten(),
+                            facts: deny_read.then(|| last_facts_push + FACTS_HEARTBEAT_EVERY),
+                            checkouts: checkouts_due,
+                            census: Some(last_census_refresh + CENSUS_REFRESH_EVERY),
+                            maintenance: upkeep,
+                            advert: vault_paths
+                                .is_some()
+                                .then(|| now + super::fleet_inputs::ADVERT_LOOK),
+                            routes: routes_on.then(|| route_refresh.next_due()),
+                            settle: unreadable.settle(),
+                            ..super::fleet_inputs::Duties::default()
+                        },
+                        paced,
+                    );
                 }
             })
     };
@@ -6159,35 +6306,137 @@ fn serve_one_node_generation(
     true
 }
 
-/// The node job's own clock for the home's checkouts ([`crate::survey::refresh_home_repos_in`]):
-/// due at its first tick and `every` after the one before (`last`), whether or not any facts go
-/// out, as the window's facts heartbeat reads them. A survey of a windowless Mac then finds a read
+/// The node job's clock for the home's checkouts ([`read_checkouts_when_due`]): when it last read
+/// them itself, and when it last asked its windows a survey that names no peer, each as the
+/// instant that duty's period runs from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CheckoutsClock {
+    /// The job's own last read; `None` before its first, and while a window answers surveys.
+    read: Option<Instant>,
+    /// The last survey that names no peer this job asked its windows: its facts push's or the
+    /// clock's own; `None` before the first.
+    asked: Option<Instant>,
+}
+
+/// The node job's facts push as its checkouts clock reads it ([`read_checkouts_when_due`]), while a
+/// deny list is read: the job pushes facts and serves a peer's survey only then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FactsPush {
+    /// Its last instant (the generation's start before its first push): its next is due a period
+    /// after it.
+    pub(crate) at: Instant,
+    /// Whether it went at this pass: it then asked this Mac's windows a survey that names no peer,
+    /// where one answers surveys.
+    pub(crate) went: bool,
+}
+
+/// One read of the home's checkouts per Mac; when it is next due (`None`: nothing to clock, or
+/// past what an [`Instant`] holds).
+///
+/// While no window answers surveys (`window_live` false), the node job reads them itself
+/// (`refresh`, [`crate::survey::refresh_home_repos_in`]): due at its first tick and `every` after
+/// the one before, whether or not any facts go out, so a survey of a windowless Mac finds a read
 /// within the read's own refresh period, never only a read that survey started and does not wait
 /// for, which `--host any` would judge unable to say.
+///
+/// While a window answers, every survey this job serves is answered from the window's own read
+/// (`spawn_node_survey`, [`survey_every_window`]) and its facts push asks the window too, so a read
+/// of its own fed no reader and doubled the git starts and whole index reads of each pass
+/// (KI-1108-2): it reads nothing then. While a deny list is read (`facts`), it makes sure a survey
+/// that names no peer reached the window within `every`: the facts push's where it went at this
+/// pass, else its own (`ask`), whose answer starts the window's read where that is due
+/// (`crate::survey::Here::cached`), so the window's read keeps its own refresh clock. With none
+/// read it asks nothing: the job serves no peer's survey and pushes no facts, so no reader takes
+/// the window's read through it. Its own last read is forgotten meanwhile, so once no window
+/// answers the read is due at the next tick.
+///
+/// A read or ask made at this pass runs its period from the facts push's instant where that is
+/// within the period, else from `now` (the pass's): its next is then due with the push's, which
+/// the job's wait takes as one wake ([`super::fleet_inputs::Duties::earliest`]), never a pass of
+/// its own each period on a phase of its own. It comes no later than `every` after it was made,
+/// and an early one costs only the read's own refresh gate.
 pub(crate) fn read_checkouts_when_due(
-    home: Option<&Path>,
-    last: &mut Option<Instant>,
+    (window_live, now): (bool, Instant),
+    facts: Option<FactsPush>,
+    clock: &mut CheckoutsClock,
     every: Duration,
-) {
-    if last.is_some_and(|at| at.elapsed() < every) {
-        return;
+    refresh: impl FnOnce(),
+    ask: impl FnOnce(),
+) -> Option<Instant> {
+    let within = |at: Instant| now.saturating_duration_since(at) < every;
+    let made = facts
+        .map(|push| push.at)
+        .filter(|at| within(*at))
+        .unwrap_or(now);
+    if window_live {
+        clock.read = None;
+        let push = facts?;
+        if push.went {
+            clock.asked = Some(push.at);
+        } else if !clock.asked.is_some_and(within) {
+            clock.asked = Some(made);
+            ask();
+        }
+        return clock.asked.and_then(|at| at.checked_add(every));
     }
-    *last = Some(Instant::now());
-    if let Some(home) = home {
-        crate::survey::refresh_home_repos_in(home);
+    if !clock.read.is_some_and(within) {
+        clock.read = Some(made);
+        refresh();
+    }
+    clock.read.and_then(|at| at.checked_add(every))
+}
+
+/// The checkouts clock's own ask of this Mac's windows ([`read_checkouts_when_due`]), made off the
+/// pass's thread: its answer is not read, and a window slow to answer (up to
+/// [`SURVEY_ANSWER_WITHIN`] each) must not hold the pass from its next ring, which brings the deny
+/// list's and the members log's cuts of open links. One at a time: where one is still out when the
+/// next is due, that one stands for it. Dropped, an ask still out runs to its end alone.
+#[derive(Default)]
+struct WindowAsk {
+    out: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WindowAsk {
+    /// Start `ask` on a thread of its own unless one still runs; whether it started.
+    fn start(&mut self, ask: impl FnOnce() + Send + 'static) -> bool {
+        if self.out.as_ref().is_some_and(|out| !out.is_finished()) {
+            return false;
+        }
+        if let Some(ended) = self.out.take() {
+            let _ = ended.join();
+        }
+        let started = std::thread::Builder::new()
+            .name("aterm-node-checkouts-ask".to_owned())
+            .spawn(move || {
+                if !cfg!(test) {
+                    crate::qos::set_self(crate::qos::Role::Background);
+                }
+                ask();
+            });
+        match started {
+            Ok(out) => {
+                self.out = Some(out);
+                true
+            }
+            Err(error) => {
+                aterm_log::warn!("node job: the windows' checkouts ask did not start: {error}");
+                false
+            }
+        }
     }
 }
 
+/// Push this Mac's survey facts to its issuer: the facts every window here answers where one
+/// answers surveys (`window`), and the job's own collection otherwise.
 fn push_node_facts_heartbeat(
     state_dir: &Path,
-    windows: &WindowRelays,
+    (windows, window): (&WindowRelays, bool),
     home_dir: Option<&Path>,
     config_path: Option<&Path>,
     secret: &aterm_net::fleet::FleetSecret,
     (denied_nodes, log): (&[String], Option<&aterm_net::fleet_member::MemberKeys>),
     current: &dyn Fn() -> bool,
 ) {
-    let window = has_live_window_relay(windows.dir());
     let node = aterm_net::fleet_member::read_node_id(state_dir)
         .ok()
         .flatten();

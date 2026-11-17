@@ -275,6 +275,12 @@ fn native_directory_hashes_match_standard_vectors() {
 
 struct Fixed {
     files: BTreeMap<PathBuf, io::Result<Vec<u8>>>,
+    /// Paths that are links, with what each resolves to.
+    links: BTreeMap<PathBuf, PathBuf>,
+    /// Paths that do not resolve, with why.
+    unresolved: BTreeMap<PathBuf, io::ErrorKind>,
+    /// Files another account than 501 owns, with its uid.
+    owners: BTreeMap<PathBuf, u32>,
 }
 
 impl Fixed {
@@ -284,7 +290,25 @@ impl Fixed {
                 .into_iter()
                 .map(|(path, bytes)| (PathBuf::from(path), bytes))
                 .collect(),
+            links: BTreeMap::new(),
+            unresolved: BTreeMap::new(),
+            owners: BTreeMap::new(),
         }
+    }
+
+    fn unresolved(mut self, path: &str, why: io::ErrorKind) -> Self {
+        self.unresolved.insert(PathBuf::from(path), why);
+        self
+    }
+
+    fn owned(mut self, path: &str, uid: u32) -> Self {
+        self.owners.insert(PathBuf::from(path), uid);
+        self
+    }
+
+    fn linked(mut self, path: &str, to: &str) -> Self {
+        self.links.insert(PathBuf::from(path), PathBuf::from(to));
+        self
     }
 }
 
@@ -299,6 +323,23 @@ impl Files for Fixed {
 
     fn code_directories(&self, path: &Path) -> io::Result<CodeDirectories> {
         CodeDirectories::of_bytes(&self.read(path)?)
+    }
+
+    /// `path` with the first linked folder on the way to it resolved.
+    fn canonical(&self, path: &Path) -> io::Result<PathBuf> {
+        if let Some(why) = self.unresolved.get(path) {
+            return Err((*why).into());
+        }
+        for (link, target) in &self.links {
+            if let Ok(rest) = path.strip_prefix(link) {
+                return Ok(target.join(rest));
+            }
+        }
+        Ok(path.to_owned())
+    }
+
+    fn owner(&self, path: &Path) -> io::Result<u32> {
+        Ok(self.owners.get(path).copied().unwrap_or(501))
     }
 }
 
@@ -434,13 +475,303 @@ fn the_install_is_owed_by_what_an_account_reads() {
     assert!(read(&Fixed::new(vec![]), Path::new(SOURCE)).is_err());
 }
 
+/// A Mac has one broker, which admits its whole team: a job another bundle of this build's
+/// signer holds (a release cut's bundle holds it, the installed app reads it, and the other way
+/// round) reads in place while the image is that bundle's code or adoptable by it, so neither
+/// asks the Mac password to take it from the other.
+/// NEGATIVE CONTROLS: each of these reads the job another's, owed as before: the holder gone,
+/// of another team, with no team signature, or a link; holder and reader of one team under an
+/// identifier that is not [`BUNDLE_ID`]; a reader with no team signature (a development
+/// build); a holder with a link on the way to its executable, or one another account owns; an
+/// image neither the holder's nor adoptable by it; and a plist that is not, byte for byte, the
+/// one this build writes for the bundle it names. An image that is missing or not this
+/// signer's is owed whoever holds the job, readable or not. With an image this signer's, a
+/// holder this account may not read is unread, never owed. The elevation's own reading
+/// ([`read_own`]) takes no holder.
+#[test]
+fn a_job_another_bundle_of_this_signer_holds_reads_in_place() {
+    const HOLDER: &str = "/Users//a/aterm/dist/cut-app/aterm.app";
+    const READER: &str = "/Applications/aterm.app";
+    let exe = |bundle: &str| format!("{bundle}/{BUNDLE_EXECUTABLE}");
+    let (holder_exe, reader_exe) = (exe(HOLDER), exe(READER));
+    let build = |identifier: &str, team: &str, flags: u32, page: u8| {
+        let mut body = signed(0x20400, flags, identifier, Some(team));
+        body.push(page);
+        test_image(0x0100_000c, &[&body])
+    };
+    let (team, dev) = ("ABCDE12345", "com.aterm.aterm.dev");
+    let release = |page: u8| build(BUNDLE_ID, team, 0, page);
+    let image = super::super::IMAGE_EXECUTABLE;
+    let daemon = super::super::PLIST_PATH;
+    let names = |bundle: &str| plist_text(Path::new(bundle)).into_bytes();
+    // The holder's install, with the image, the holder and the reader as given.
+    let mac = |image_code: Option<Vec<u8>>, holder: io::Result<Vec<u8>>, reader: Vec<u8>| {
+        let mut files = vec![
+            (daemon, Ok(names(HOLDER))),
+            (holder_exe.as_str(), holder),
+            (reader_exe.as_str(), Ok(reader)),
+        ];
+        if let Some(code) = image_code {
+            files.push((image, Ok(code)));
+        }
+        Fixed::new(files)
+    };
+    let reads = |files: &Fixed, bundle: &str| read(files, Path::new(bundle)).unwrap();
+    let held_by = |holder: &str, image: Part| Reading {
+        image,
+        plist: Part::Current,
+        held_by: Some(PathBuf::from(holder)),
+    };
+    let own = Reading {
+        image: Part::Current,
+        plist: Part::Current,
+        held_by: None,
+    };
+    let adopting = Part::Adopting(team.to_owned());
+
+    let held = mac(Some(release(1)), Ok(release(1)), release(2));
+    assert_eq!(reads(&held, READER), held_by(HOLDER, Part::Current));
+    assert_eq!(reads(&held, HOLDER), own);
+    assert_eq!(
+        reads(&held, READER).words(),
+        format!("image current, plist current, held by another copy of this team at {HOLDER}")
+    );
+    // A holder root owns (an installed package) holds it for an account's copy too.
+    let roots = mac(Some(release(1)), Ok(release(1)), release(2)).owned(&holder_exe, 0);
+    assert_eq!(reads(&roots, READER), held_by(HOLDER, Part::Current));
+    // The holder was rebuilt, and the broker has yet to adopt it.
+    let rebuilt = mac(Some(release(3)), Ok(release(1)), release(2));
+    assert_eq!(reads(&rebuilt, READER), held_by(HOLDER, adopting.clone()));
+    assert_eq!(
+        reads(&rebuilt, HOLDER),
+        Reading {
+            image: adopting,
+            ..own.clone()
+        }
+    );
+    // The elevation reads its own bundle alone: a held job is another's to it.
+    assert_eq!(
+        read_own(&held, Path::new(READER)),
+        Ok(Reading {
+            image: Part::Adopting(team.to_owned()),
+            plist: Part::Differs,
+            held_by: None,
+        })
+    );
+    // The other way round: the installed app holds it and the cut's bundle reads it.
+    let installed = Fixed::new(vec![
+        (image, Ok(release(2))),
+        (daemon, Ok(names(READER))),
+        (holder_exe.as_str(), Ok(release(1))),
+        (reader_exe.as_str(), Ok(release(2))),
+    ]);
+    assert_eq!(reads(&installed, HOLDER), held_by(READER, Part::Current));
+
+    let anothers = |image: Part| Reading {
+        image,
+        plist: Part::Differs,
+        held_by: None,
+    };
+    let same_team = || anothers(Part::Adopting(team.to_owned()));
+    let mut longer = names(HOLDER);
+    longer.push(b'\n');
+    let owed = [
+        (
+            "the holder is gone",
+            mac(
+                Some(release(1)),
+                Err(io::ErrorKind::NotFound.into()),
+                release(2),
+            ),
+            same_team(),
+        ),
+        (
+            "a holder of another team",
+            mac(
+                Some(release(1)),
+                Ok(build(BUNDLE_ID, "ZZZZZ99999", 0, 1)),
+                release(2),
+            ),
+            same_team(),
+        ),
+        (
+            "a holder with no team signature",
+            mac(
+                Some(release(1)),
+                Ok(build(BUNDLE_ID, team, CS_ADHOC, 1)),
+                release(2),
+            ),
+            same_team(),
+        ),
+        (
+            "the image is the code of a holder of another team",
+            mac(
+                Some(build(BUNDLE_ID, "ZZZZZ99999", 0, 1)),
+                Ok(build(BUNDLE_ID, "ZZZZZ99999", 0, 1)),
+                release(2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "the image is the code of a holder with no team signature",
+            mac(
+                Some(build(BUNDLE_ID, team, CS_ADHOC, 1)),
+                Ok(build(BUNDLE_ID, team, CS_ADHOC, 1)),
+                release(2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "a holder that is a link",
+            mac(Some(release(1)), Ok(release(1)), release(2)).linked(HOLDER, "/Users//a/other.app"),
+            same_team(),
+        ),
+        (
+            "a holder whose Contents is a link",
+            mac(Some(release(1)), Ok(release(1)), release(2)).linked(
+                &format!("{HOLDER}/Contents"),
+                "/Applications/aterm.app/Contents",
+            ),
+            same_team(),
+        ),
+        (
+            "a holder that does not resolve",
+            mac(Some(release(1)), Ok(release(1)), release(2))
+                .unresolved(&holder_exe, io::ErrorKind::NotFound),
+            same_team(),
+        ),
+        (
+            "a holder another account owns",
+            mac(Some(release(1)), Ok(release(1)), release(2)).owned(&holder_exe, 502),
+            same_team(),
+        ),
+        (
+            "no image, and a holder this account may not read",
+            mac(
+                None,
+                Err(io::ErrorKind::PermissionDenied.into()),
+                release(2),
+            ),
+            anothers(Part::Missing),
+        ),
+        (
+            "an image of another team, and a holder this account may not read",
+            mac(
+                Some(build(BUNDLE_ID, "ZZZZZ99999", 0, 3)),
+                Err(io::ErrorKind::PermissionDenied.into()),
+                release(2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "one team under another identifier",
+            mac(
+                Some(build(dev, team, 0, 1)),
+                Ok(build(dev, team, 0, 1)),
+                build(dev, team, 0, 2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "a reader with no team signature",
+            mac(
+                Some(release(1)),
+                Ok(release(1)),
+                build(BUNDLE_ID, team, CS_ADHOC, 2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "an image of another team",
+            mac(
+                Some(build(BUNDLE_ID, "ZZZZZ99999", 0, 3)),
+                Ok(release(1)),
+                release(2),
+            ),
+            anothers(Part::Differs),
+        ),
+        (
+            "no image",
+            mac(None, Ok(release(1)), release(2)),
+            anothers(Part::Missing),
+        ),
+        (
+            "a plist this build does not write",
+            Fixed::new(vec![
+                (image, Ok(release(1))),
+                (daemon, Ok(longer)),
+                (holder_exe.as_str(), Ok(release(1))),
+                (reader_exe.as_str(), Ok(release(2))),
+            ]),
+            same_team(),
+        ),
+    ];
+    for (why, files, reading) in owed {
+        assert!(reading.owed(), "{why}");
+        assert_eq!(reads(&files, READER), reading, "{why}");
+    }
+
+    let unread = Part::Unread(format!("{holder_exe}: permission denied"));
+    for denied in [
+        mac(
+            Some(release(1)),
+            Err(io::ErrorKind::PermissionDenied.into()),
+            release(2),
+        ),
+        mac(Some(release(1)), Ok(release(1)), release(2))
+            .unresolved(&holder_exe, io::ErrorKind::PermissionDenied),
+    ] {
+        let reading = reads(&denied, READER);
+        assert_eq!(
+            reading,
+            Reading {
+                image: unread.clone(),
+                plist: unread.clone(),
+                held_by: None,
+            }
+        );
+        assert!(!reading.owed_with_job(|| Some(false), || Some(false)));
+    }
+}
+
+/// The bundle a plist names is read back only from a plist this build writes for it, whatever
+/// its path's characters.
+#[test]
+fn a_plists_source_is_read_back_exactly() {
+    for source in [
+        "/Applications/aterm.app",
+        "/Users//a & b/<new> \"cut\" 'app'/aterm.app",
+        "/Users//a/&amp;lt;/aterm.app",
+        "/Users//a/&lt;/aterm.app",
+    ] {
+        let plist = plist_text(Path::new(source));
+        assert_eq!(
+            named_source(plist.as_bytes()),
+            Some(PathBuf::from(source)),
+            "{plist}"
+        );
+    }
+    let relative = plist_text(Path::new("Applications/aterm.app"));
+    assert_eq!(named_source(relative.as_bytes()), None);
+    let edited = plist_text(Path::new("/Applications/aterm.app")).replace("KeepAlive", "keepAlive");
+    assert_eq!(named_source(edited.as_bytes()), None);
+    assert_eq!(named_source(b"\xff"), None);
+}
+
 /// [`read`] of `files` against the source reads `image` and `plist`, owed and current as
 /// those two say.
 fn check(files: Vec<(&str, io::Result<Vec<u8>>)>, image: Part, plist: Part) {
     let reading = read(&Fixed::new(files), Path::new("/Applications/aterm.app")).unwrap();
     let owed = image.owed() || plist.owed();
     let current = image == Part::Current && plist == Part::Current;
-    assert_eq!(reading, Reading { image, plist });
+    assert_eq!(
+        reading,
+        Reading {
+            image,
+            plist,
+            held_by: None
+        }
+    );
     assert_eq!(
         (reading.owed(), reading.current()),
         (owed, current),
@@ -457,6 +788,7 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
         let reading = Reading {
             image,
             plist: Part::Current,
+            held_by: None,
         };
         assert!(!reading.owed_with_job(|| Some(true), || panic!("nothing owed asks no switch")));
         assert!(reading.owed_with_job(|| Some(false), || Some(false)));
@@ -467,10 +799,12 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
         Reading {
             image: Part::Missing,
             plist: Part::Current,
+            held_by: None,
         },
         Reading {
             image: Part::Current,
             plist: Part::Differs,
+            held_by: None,
         },
     ] {
         assert!(reading.owed_with_job(
@@ -483,10 +817,12 @@ fn a_stopped_service_is_owed_even_when_its_files_need_no_repair() {
         Reading {
             image: Part::Unread("denied".into()),
             plist: Part::Current,
+            held_by: None,
         },
         Reading {
             image: Part::Current,
             plist: Part::Unread("denied".into()),
+            held_by: None,
         },
     ] {
         assert!(!reading.owed_with_job(
@@ -510,7 +846,11 @@ fn a_job_the_person_switched_off_is_owed_nothing() {
         (Part::Current, Part::Differs),
     ];
     for (image, plist) in parts {
-        let reading = Reading { image, plist };
+        let reading = Reading {
+            image,
+            plist,
+            held_by: None,
+        };
         for running in [Some(false), Some(true), None] {
             assert!(
                 !reading.owed_with_job(|| running, || Some(true)),

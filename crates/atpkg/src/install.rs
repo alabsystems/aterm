@@ -219,6 +219,30 @@ pub fn verify_and_stage(
     verify_stage(artifact, archive, build_dir, hooks, Purpose::install()?)
 }
 
+/// Verify a keyed tree's `archive` against its signed `artifact` and lay it once at the fresh
+/// `dir` ([`crate::keyed_tree`]). A key names the bytes, so a tree is never swapped over: the
+/// destination must be free, the tree is renamed into it whole, and no ready marker is written
+/// here (the caller marks it once its own records stand).
+///
+/// # Errors
+/// The operation was cancelled, the destination is occupied, or the digest, the extraction or
+/// the tree root refuses it.
+pub(crate) fn stage_fresh_tree(
+    artifact: &Artifact,
+    archive: &Path,
+    dir: &Path,
+) -> Result<String, StageError> {
+    aterm_update_core::check_operation().map_err(StageError::Io)?;
+    publication_destination(dir)?;
+    verify_stage(
+        artifact,
+        archive,
+        dir,
+        &StageHooks::NONE,
+        Purpose::Publication,
+    )
+}
+
 /// Verify and extract a publisher's scratch copy, including `elf-binary`'s declared GNU target,
 /// without claiming it can run on the publication host. This never writes a ready marker.
 /// The destination must be fresh so publication inspection cannot revoke a live install.

@@ -20,6 +20,7 @@ const COLLECTION: Collection = Collection {
     ],
     unique: &[],
     max_row: 1024,
+    authority: None,
 };
 
 #[test]
@@ -63,6 +64,7 @@ fn secret_get_scan_export_history_and_unknown_reader() {
         ops: vec![],
         quota: Default::default(),
         cells,
+        inert: Default::default(),
         owned: Default::default(),
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,

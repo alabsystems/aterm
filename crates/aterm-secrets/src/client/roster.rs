@@ -14,7 +14,7 @@ use crate::swarm_roster::{SeedAdmission, SheetHints, SwarmPolicy, seed_roster};
 ///
 /// # Errors
 /// Local state or the verified cache cannot be read safely, or `aterm-swarm-roster` is malformed.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn base_swarm_roster(paths: &Paths) -> crate::Result<Option<SwarmRoster>> {
     let Some(lock) = StateLock::observe(paths)? else {
         return Ok(None);

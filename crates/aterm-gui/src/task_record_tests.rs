@@ -581,6 +581,7 @@ fn a_carried_record_keeps_only_the_time_it_was_awake() {
         since: t0 + Duration::from_secs(6),
         started_unix_ms: 4_000,
         started: t0,
+        took_up: false,
         entered: 3,
         carried_entered: None,
         agent: None,
@@ -649,6 +650,7 @@ fn the_carried_row_round_trips_and_a_bad_row_is_none() {
         since: t0,
         started_unix_ms: 10_000,
         started: t0,
+        took_up: false,
         entered: 7,
         carried_entered: None,
         agent: Some(aterm_phase::Program::Agy),
@@ -821,6 +823,7 @@ fn the_reply_event_and_status_spellings() {
         since: Instant::now(),
         started_unix_ms: 0,
         started: Instant::now(),
+        took_up: false,
         entered: 3,
         carried_entered: None,
         agent: Some(aterm_phase::Program::Agy),
@@ -2032,6 +2035,7 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
         since: t0,
         started_unix_ms: 10_000,
         started: t0,
+        took_up: false,
         entered: 1,
         carried_entered: None,
         agent: None,
@@ -2108,6 +2112,169 @@ fn the_carry_holds_the_fact_word_and_its_rev_and_reads_them_leniently() {
     assert_eq!(TaskRecord::from_carry_row(&twice, None, t0, 10_000), None);
     let twice = format!("{} fact=hold-room@v1#1", record.carry_row(t0));
     assert_eq!(TaskRecord::from_carry_row(&twice, None, t0, 10_000), None);
+}
+
+/// A START THE STARTUP DEADLINE JUDGED CROSSES A SEAMLESS UPDATE ([`TaskRecord::took_up`]): a
+/// record that carries it writes `took_up=1`, which reads back and stands in the face the
+/// update's claims fence compares ([`TaskRecord::carry_face`]). A row without it, an older
+/// predecessor's, reads none, and so does any other value; a key carried twice is refused.
+#[test]
+fn the_carry_holds_a_start_the_deadline_judged_and_an_older_row_reads_none() {
+    let t0 = Instant::now();
+    let record = TaskRecord {
+        rev: 4,
+        state: TaskState::Working,
+        from: "ctl".into(),
+        manager_node: None,
+        told: Default::default(),
+        why: None,
+        checked: None,
+        left: None,
+        exit: None,
+        finished: false,
+        unfinished_exit: false,
+        result_bytes: 0,
+        result_path: None,
+        attention: false,
+        asks: Asks::default(),
+        since_unix_ms: 10_000,
+        since: t0,
+        started_unix_ms: 10_000,
+        started: t0,
+        took_up: true,
+        entered: 1,
+        carried_entered: None,
+        agent: Some(aterm_phase::Program::Codex),
+        program: None,
+        trusted_cwd: None,
+        fact: None,
+        program_block: None,
+        fact_rev: 0,
+        line: None,
+    };
+    let row = record.carry_row(t0);
+    assert_eq!(
+        row,
+        "rev=4 state=working from=ctl since=10000 result_bytes=0 attention=0 took_up=1 age_ms=0 \
+         agent=codex"
+    );
+    assert!(
+        TaskRecord::carry_face(&row)
+            .split_whitespace()
+            .any(|word| word == "took_up=1"),
+        "a start noted after the park moves the face the Commit compares"
+    );
+    let back = TaskRecord::from_carry_row(&row, None, t0, 10_000).expect("reads");
+    assert!(
+        back.took_up,
+        "the successor reads the predecessor's judgment"
+    );
+    assert_eq!(
+        back,
+        TaskRecord {
+            entered: 4,
+            ..record
+        }
+    );
+    assert_eq!(
+        back.carry_row(t0),
+        row,
+        "the row reads back to its own bytes"
+    );
+    let older = row.replace(" took_up=1", "");
+    let bare = TaskRecord::from_carry_row(&older, None, t0, 10_000).expect("an older row reads");
+    assert!(
+        !bare.took_up,
+        "an older predecessor's row judged no start here"
+    );
+    assert_eq!(
+        bare.carry_row(t0),
+        older,
+        "a start not judged carries nothing"
+    );
+    for odd in ["took_up=0", "took_up=yes", "took_up="] {
+        let read = TaskRecord::from_carry_row(&format!("{older} {odd}"), None, t0, 10_000)
+            .expect("still reads");
+        assert!(!read.took_up, "{odd}");
+    }
+    let twice = format!("{row} took_up=1");
+    assert_eq!(TaskRecord::from_carry_row(&twice, None, t0, 10_000), None);
+}
+
+/// THE START IS A FACT, NOT A MARK ([`note_task_took_up`]): noted only on the record the
+/// deadline's look read (its rev) while that record is open, it moves no rev, state, `why=` or
+/// attention and rings nothing, so no `await task` waiter wakes on it; a later mark keeps it. A
+/// new record has none, and a closed one takes none.
+#[test]
+fn the_start_is_noted_on_the_record_the_look_read_and_moves_no_rev() {
+    let handle = crate::session_store::test_handle(2211);
+    let ctx = &handle.ctx;
+    let wait = Duration::ZERO;
+    let (working, _) =
+        mark_session_task(ctx, 2211, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    assert!(!working.took_up, "a new record's start is not judged yet");
+    let record = || {
+        ctx.timeline
+            .lock()
+            .unwrap()
+            .task()
+            .cloned()
+            .expect("a task")
+    };
+    assert!(
+        !note_task_took_up(ctx, working.rev + 1, wait),
+        "a record the look did not read"
+    );
+    assert_eq!(record(), working);
+    let _ = crate::presence::take_task_wakes();
+    let waiter = crate::session_watch::Subscription::single(&ctx.watchers);
+    let rings = crate::harness_host::rings_here();
+    assert!(note_task_took_up(ctx, working.rev, wait));
+    assert_eq!(
+        record(),
+        TaskRecord {
+            took_up: true,
+            ..working.clone()
+        },
+        "a fact: no rev, state, why or attention moves"
+    );
+    assert_eq!(
+        crate::harness_host::rings_here(),
+        rings,
+        "it rings no waiter"
+    );
+    assert_eq!(
+        crate::presence::take_task_wakes(),
+        Vec::<u64>::new(),
+        "it posts no task wake"
+    );
+    assert!(
+        !waiter.wait(Duration::ZERO),
+        "it records no task-change: the session's watchers are not rung"
+    );
+    let (done, moved) =
+        mark_session_task(ctx, 2211, &TaskMark::new(TaskState::Done)).expect("unfenced");
+    assert!(moved && done.took_up, "a later mark keeps it");
+    assert_eq!(
+        crate::presence::take_task_wakes(),
+        [2211],
+        "CONTROL: a mark's wake is seen by the same instrument"
+    );
+    assert!(
+        waiter.wait(Duration::ZERO),
+        "CONTROL: a mark's task-change rings the session's watchers"
+    );
+    drop(waiter);
+
+    let closed = crate::session_store::test_handle(2212);
+    mark_session_task(&closed.ctx, 2212, &TaskMark::new(TaskState::Working)).expect("unfenced");
+    let (done, _) =
+        mark_session_task(&closed.ctx, 2212, &TaskMark::new(TaskState::Done)).expect("unfenced");
+    assert!(
+        !note_task_took_up(&closed.ctx, done.rev, wait),
+        "CONTROL: a closed record takes no start"
+    );
+    assert!(!closed.ctx.timeline.lock().unwrap().task().unwrap().took_up);
 }
 
 /// Every edit a record took before the fact word leaves the word and its rev as they stand,
@@ -3024,6 +3191,7 @@ fn worker_row(state: TaskState, why: Option<&'static str>, folder: &str) -> Stri
         since: now,
         started_unix_ms: 10_000,
         started: now,
+        took_up: false,
         entered: 3,
         carried_entered: None,
         agent: None,

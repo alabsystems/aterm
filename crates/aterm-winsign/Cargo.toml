@@ -26,12 +26,11 @@ path = "src/lib.rs"
 # switch, exactly as `pins::APPLE_TEAM_ID` is for the mac lane.
 aterm-update-core = { workspace = true }
 # A package's manifest and signature members (`msix`): the workspace's ZIP and XML readers. The
-# vault's filed request id, in hex (`principal`, Unix).
+# vault's filed request id, in hex (`principal`).
 aterm-codec = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
 # The Azure signing principal's one source: this host's vault registry, the value's parser, and
-# the need ledger a miss is filed in. The vault and its ledger are Unix; a Windows build has none.
+# the need ledger a miss is filed in. The vault client builds on Unix and on Windows, where
+# signtool runs.
 aterm-secrets = { workspace = true }
 
 [dev-dependencies]

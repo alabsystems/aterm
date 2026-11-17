@@ -20,7 +20,14 @@ use super::*;
 
 /// Read `sid`'s newest log from `fs` within `b`.
 fn view_with(fs: &dyn JournalFs, index: &Mutex<Index>, sid: &ShortId, b: Budgets) -> JournalRead {
-    view_picked(fs, index, sid, aterm_slog::journal::Pick::Newest, b)
+    view_picked(
+        fs,
+        index,
+        sid,
+        aterm_slog::DescIdent::default(),
+        aterm_slog::journal::Pick::Newest,
+        b,
+    )
 }
 use crate::session_timeline::SessionTimeline;
 
@@ -1049,6 +1056,70 @@ fn the_content_tier_never_reaches_the_journal() {
     let leaked =
         aterm_slog::encode_with_table(&rec, aterm_slog::Tier::Host, &mistiered).expect("fits");
     assert!(leaked.contains("SECRET-TITLE-42"));
+}
+
+/// AN IN-BAND TITLE NEVER REACHES THE JOURNAL: the claim a title a program printed makes,
+/// written by the in-band author's own path, is journaled as `mark - desc field=title src=engine
+/// conf=claim` with no text, while the ring holds its text at the content tier; and the record is
+/// no bus record, so no mirror or fabric reader is sent it.
+/// CONTROL: the same record encoded with `title` placed at the host tier leaks the text, so the
+/// journal is clean because of the key's tier.
+#[test]
+fn an_in_band_title_never_reaches_the_journal() {
+    let rig = Rig::new();
+    let tl = rig.sessions.add("s-inband");
+    let printed = "QZP9 the program's own topic";
+    {
+        let mut g = tl.lock().expect("tl");
+        let read = crate::session_log::InbandRead {
+            shown: printed,
+            untitled: false,
+            stands: crate::session_log::observed::TitleStands::Own,
+            program: None,
+            program_seq: 0,
+        };
+        g.slog_mut().observe_inband_title(&read, at(1));
+    }
+    let mut w = rig.writer();
+    w.pass();
+    let bytes = String::from_utf8(rig.fs.all_bytes()).expect("ascii");
+    assert!(!bytes.contains("QZP9"), "{bytes}");
+    assert!(
+        bytes.contains(" mark - desc field=title src=engine conf=claim t="),
+        "the claim's record is journaled: {bytes}"
+    );
+    let rec = tl
+        .lock()
+        .expect("tl")
+        .slog()
+        .log()
+        .window()
+        .find(|r| r.k == Kind::Desc)
+        .cloned()
+        .expect("the claim");
+    let content = aterm_slog::encode(&rec, aterm_slog::Tier::Content).expect("fits");
+    assert!(
+        content.contains(" title=QZP9%20the%20program's%20own%20topic "),
+        "the ring holds the text at the content tier: {content}"
+    );
+    assert!(!rec.is_bus_class(), "a claim is no bus record");
+    let mistiered: Vec<_> = aterm_slog::FIELDS
+        .iter()
+        .map(|&(k, t, c)| {
+            (
+                k,
+                if k == aterm_slog::Key::Title {
+                    aterm_slog::Tier::Host
+                } else {
+                    t
+                },
+                c,
+            )
+        })
+        .collect();
+    let leaked =
+        aterm_slog::encode_with_table(&rec, aterm_slog::Tier::Host, &mistiered).expect("fits");
+    assert!(leaked.contains("QZP9"), "CONTROL: {leaked}");
 }
 
 /// A session the rig's writer journals whose timeline a control context writes, so a test
@@ -3289,6 +3360,7 @@ fn a_cold_read_decodes_no_more_than_a_warm_one() {
         &rig.fs,
         &index,
         &sid,
+        aterm_slog::DescIdent::default(),
         aterm_slog::journal::Pick::Newest,
         b,
         cost,
@@ -3313,6 +3385,7 @@ fn a_cold_read_decodes_no_more_than_a_warm_one() {
         &rig.fs,
         &index,
         &sid,
+        aterm_slog::DescIdent::default(),
         aterm_slog::journal::Pick::Newest,
         Budgets::READER,
         &mut whole,

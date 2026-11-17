@@ -411,7 +411,16 @@ fn write_from_log_bundle_refuses_admitter_left_out_without_roster_entry() {
 
     let m3_revoked = Paths::for_home(&root.path().join("m3-revoked"));
     fsx::ensure_private_dir(&m3_revoked.dir).unwrap();
+    #[cfg(unix)]
     std::fs::copy(m3_ok.dir.join("identity"), m3_revoked.dir.join("identity")).unwrap();
+    // A Windows copy takes its access list from its folder: the key is written owner-only.
+    #[cfg(windows)]
+    fsx::write_atomic(
+        &m3_revoked.dir.join("identity"),
+        &std::fs::read(m3_ok.dir.join("identity")).unwrap(),
+        0o600,
+    )
+    .unwrap();
     let err = write_from_log_bundle(&m3_revoked, &make_bundle(&log))
         .expect_err("admitter left out of Everyone must be refused even without roster entry")
         .to_string();

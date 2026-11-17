@@ -729,6 +729,199 @@ fn automatic_records_past_the_quota_never_project() {
     assert!(registry.seed().is_err());
 }
 
+/// One account cell of `pk`, as `value` says who wrote it.
+fn account_cell(pk: &str, col: &str, value: &CellValue) -> Change {
+    cell::change(
+        &ACCOUNT,
+        CellKey {
+            pk,
+            col,
+            elem: None,
+        },
+        value,
+    )
+    .unwrap()
+}
+
+/// SF-07's exit (docs/DESIGN-shared-files-2026-11-11.md §5, §10). One address is three
+/// accounts: Claude, Codex and Google accounts born over it as `add account` births them (an
+/// owner record each, at account version 2) have three keys, each the canonical key of its realm
+/// and the address, and three slugs, `claude-fb-alpha`, `oai-fb-alpha` and `google-fb-alpha`,
+/// with the provider word and the address as their names. The slug, the key and the provider
+/// word with the address in either spelling name one account; the address alone names all three;
+/// a slug's prefix or tail names none.
+///
+/// An automatic write to an account is inert, one record for each rule, and leaves the account
+/// as its owner wrote it:
+/// - rule 2: an automatic `browser`, an Owner column;
+/// - rule 3a: an automatic `status=active` after the birth, a Birth column: it stays `pending`;
+/// - rule 3b: the second Mac's observer births the Claude account (`status=active`) before it
+///   hears of the owner's birth: after the exchange `status` reads `pending`, no conflict;
+/// - rule 4: an owner's `realm=codex` on the Claude row, a fixed column after its birth: the
+///   realm stays `claude`;
+/// - the verb rule: an automatic `r=1` label `claude-<6 hex>`, as an observer before version 2
+///   stored it, and an automatic `r=2` label `stolen`, on the Verb column `label`.
+///
+/// `view.inert` counts those six records for `account`, all on the Claude row, and its slug is
+/// still `claude-fb-alpha`. The owner's label `m2-work`, a machine's word in it, makes it
+/// `claude-m2-work`, and `claude-fb-alpha` then names no account.
+/// NEGATIVE CONTROL: with `authority::read` projecting every record as written (its opt-in test
+/// made `true`), the owner's realm write and the automatic label both stand: `` left:
+/// "oai-stolen" right: "claude-fb-alpha" ``. Each rule's own control is in
+/// `typed/authority_tests.rs`.
+#[test]
+fn one_address_is_three_accounts_slugged_claude_oai_and_google_and_an_automatic_owner_write_is_inert()
+ {
+    use super::account_names::{self, Found};
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let first = Registry::at(lab.paths[0].clone());
+    let scope = first.open().unwrap();
+    let second = Registry::at(lab.paths[1].clone());
+    let ada = "ada.fb@alpha.example.invalid";
+    let address = keys::address_pk(ada).unwrap();
+    let owner = |x: Value| CellValue::owner(ACCOUNT.version, x);
+    let automatic = |x: Value| CellValue::automatic(ACCOUNT.version, x);
+    let mut born = vec![vec![
+        cell::change(
+            &ADDRESS,
+            CellKey {
+                pk: &address,
+                col: "addr",
+                elem: None,
+            },
+            &CellValue::owner(ADDRESS.version, json!(ada)),
+        )
+        .unwrap(),
+        cell::change(
+            &ADDRESS,
+            CellKey {
+                pk: &address,
+                col: "row",
+                elem: None,
+            },
+            &CellValue::owner(ADDRESS.version, json!("live")),
+        )
+        .unwrap(),
+    ]];
+    let mut accounts = Vec::new();
+    for realm in ["claude", "codex", "google"] {
+        let pk = keys::account_pk(realm, &keys::claims_email(None, Some(ada)).unwrap()).unwrap();
+        let provider = keys::provider_of_realm(realm).unwrap();
+        born.push(vec![
+            account_cell(&pk, "provider", &owner(json!(provider))),
+            account_cell(&pk, "realm", &owner(json!(realm))),
+            account_cell(&pk, "login", &owner(json!(address))),
+            account_cell(&pk, "status", &owner(json!("pending"))),
+            account_cell(&pk, "row", &owner(json!("live"))),
+        ]);
+        accounts.push(pk);
+    }
+    let [claude, codex, google] = [&accounts[0], &accounts[1], &accounts[2]];
+    first.write(born).unwrap();
+    // The second Mac's observer births the Claude account before it hears of the owner's birth.
+    second
+        .write(vec![vec![
+            account_cell(claude, "provider", &automatic(json!(keys::ANTHROPIC))),
+            account_cell(claude, "realm", &automatic(json!("claude"))),
+            account_cell(claude, "login", &automatic(json!(address))),
+            account_cell(claude, "status", &automatic(json!("active"))),
+            account_cell(claude, "row", &automatic(json!("live"))),
+        ]])
+        .unwrap();
+    receive(&lab, 0, scope, &wires(&lab, 1, scope));
+    let old_label = format!("claude-{}", &claude[3..9]);
+    first
+        .write(vec![
+            vec![account_cell(
+                claude,
+                "browser",
+                &automatic(json!("default")),
+            )],
+            vec![account_cell(claude, "status", &automatic(json!("active")))],
+            vec![account_cell(claude, "realm", &owner(json!("codex")))],
+            vec![account_cell(
+                claude,
+                "label",
+                &CellValue::automatic(1, json!(old_label)),
+            )],
+            vec![account_cell(claude, "label", &automatic(json!("stolen")))],
+        ])
+        .unwrap();
+
+    let view = first.view().unwrap();
+    assert!(view.complete);
+    let names = account_names::of(&view);
+    assert_eq!(names[claude].slug, "claude-fb-alpha");
+    let shown: Vec<(&str, Option<&str>)> = [claude, codex, google]
+        .iter()
+        .map(|pk| (names[*pk].slug.as_str(), names[*pk].name.as_deref()))
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("claude-fb-alpha", Some(&*format!("claude {ada}"))),
+            ("oai-fb-alpha", Some(&*format!("oai {ada}"))),
+            ("google-fb-alpha", Some(&*format!("google {ada}"))),
+        ]
+    );
+    for word in ["claude-fb-alpha", claude.as_str()] {
+        assert_eq!(
+            account_names::named(&names, word),
+            Found::One(claude.as_str()),
+            "{word}"
+        );
+    }
+    for word in [format!("oai {ada}"), format!("oai:{ada}")] {
+        assert_eq!(
+            account_names::named(&names, &word),
+            Found::One(codex.as_str()),
+            "{word}"
+        );
+    }
+    let Found::Many(mut all) = account_names::named(&names, ada) else {
+        panic!("the address names every account it signs in");
+    };
+    all.sort_unstable();
+    let mut keys_of = vec![claude.as_str(), codex.as_str(), google.as_str()];
+    keys_of.sort_unstable();
+    assert_eq!(all, keys_of);
+    for word in ["claude-fb", "fb-alpha"] {
+        assert_eq!(account_names::named(&names, word), Found::None, "{word}");
+    }
+
+    let rows = view.project(&ACCOUNT);
+    let row = &rows.rows[claude];
+    assert_eq!(row.get("browser"), None, "rule 2");
+    assert_eq!(
+        row.get("status"),
+        Some(&json!("pending")),
+        "rules 3a and 3b"
+    );
+    assert!(!row.fields["status"].conflicted(), "rule 3b");
+    assert_eq!(row.get("realm"), Some(&json!("claude")), "rule 4");
+    assert_eq!(row.get("label"), None, "the verb rule");
+    assert_eq!(view.inert.records.get(ACCOUNT.name), Some(&6));
+    assert_eq!(
+        view.inert.rows(ACCOUNT.name),
+        std::collections::BTreeSet::from([claude.as_str()])
+    );
+
+    first
+        .write(vec![vec![account_cell(
+            claude,
+            "label",
+            &owner(json!("m2-work")),
+        )]])
+        .unwrap();
+    let names = account_names::of(&first.view().unwrap());
+    assert_eq!(names[claude].slug, "claude-m2-work");
+    assert_eq!(
+        account_names::named(&names, "claude-m2-work"),
+        Found::One(claude.as_str())
+    );
+    assert_eq!(account_names::named(&names, "claude-fb-alpha"), Found::None);
+}
+
 /// A Mac's facts row counts only at its own machine key: at another key it is inert.
 /// NEGATIVE CONTROL: with `View::read` reading no owned collection, the own-key row is missing:
 /// `` called `Option::unwrap()` on a `None` value ``.
@@ -837,7 +1030,7 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     assert_eq!(
         view.schema("account"),
         SchemaState::One {
-            version: 1,
+            version: ACCOUNT.version,
             row: ACCOUNT.schema_row()
         }
     );
@@ -862,13 +1055,13 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
 }
 
 /// A new grid row of a preference is born under the key of its machine and account, whichever
-/// way round the columns come, and refuses without both; the registry names no machine slot; and
-/// an account reads as its label, else its default, which names no machine.
+/// way round the columns come, and refuses without both; the registry names no machine slot and
+/// no account class.
 /// NEGATIVE CONTROL: with the `preference` arm removed from `registry::birth`, the grid refuses
 /// the row: `` called `Result::unwrap()` on an `Err` value: Error("preference: the grid adds no
 /// rows here; a lab verb or the importer keys them") ``.
 #[test]
-fn a_preference_is_born_from_its_pair_and_an_account_reads_its_label() {
+fn a_preference_is_born_from_its_pair() {
     let machine = keys::machine_pk("m8");
     let account = keys::account_pk("claude", "ann@example.test").unwrap();
     let values = std::collections::BTreeMap::from([
@@ -884,30 +1077,6 @@ fn a_preference_is_born_from_its_pair_and_an_account_reads_its_label() {
     assert_eq!(registry::REGISTRY.ends, ["preference"]);
     assert!(MACHINE.column("max_seats").is_none());
     assert!(ACCOUNT.column("class").is_none());
-    let change = |col: &str, x: Value| {
-        cell::change(
-            &ACCOUNT,
-            CellKey {
-                pk: &account,
-                col,
-                elem: None,
-            },
-            &CellValue::owner(1, x),
-        )
-        .unwrap()
-    };
-    let unnamed = apply(&[vec![change("realm", json!("claude"))]]);
-    let row = cell::project(&ACCOUNT, &unnamed).rows[&account].clone();
-    assert_eq!(
-        registry::account_label(&account, &row),
-        Some(keys::default_account_label("claude", &account).unwrap())
-    );
-    let named = apply(&[vec![change("label", json!("research"))]]);
-    let row = cell::project(&ACCOUNT, &named).rows[&account].clone();
-    assert_eq!(
-        registry::account_label(&account, &row).as_deref(),
-        Some("research")
-    );
 }
 
 /// What one read of the registry gives the harness: a partial history before anything else is

@@ -547,6 +547,15 @@ struct AgentRun {
     tracker: TurnTracker,
     /// Its harness turns' pairing between reads (a codex run's, gap 25).
     pairs: transcript::HarnessPairs,
+    /// Its first prompt the harness did not type, as aterm's default writer first read it, raw
+    /// and at most [`aterm_agent::harness::excerpt::EXCERPT_BYTES`]: what titles a run with no
+    /// task ([`SessionLog::keep_first_prompt`]). In memory only, never carried or journaled, so
+    /// it lapses with its run.
+    first_prompt: Option<Box<str>>,
+    /// Whether the run kept a first prompt: set with [`Self::first_prompt`] and, unlike its text
+    /// (which may hold a credential), carried across a seamless update (`kept=1`), so a run whose
+    /// kept prompt no claim could hold keeps the title the update carried.
+    kept_prompt: bool,
 }
 
 /// HOW LONG AN END aterm ASKED FOR STANDS ([`SessionLog::ask_end`]): the restart act's deadline
@@ -749,6 +758,14 @@ pub(crate) struct SessionLog {
     tab_opened_by: Option<aterm_slog::Actor>,
     /// What the tab spent, for its close's totals ([`tab::TabSpend`]).
     spend: tab::TabSpend,
+    /// Who the session is, for ranking its description claims ([`Self::set_desc_own`],
+    /// [`Self::set_desc_creator`]): its own sid and its creator's, each as [`sid_ident`] reads
+    /// it. No record or carry holds either, so they are kept here and told to every log this
+    /// session takes: to a carried log as it is read ([`Self::adopt_carried`], where an adopted
+    /// session's are said before the carry, `spawn::tell_adopted_ident`), and to any other on
+    /// [`Self::replace_log`].
+    desc_own: Option<ShortId>,
+    desc_creator: Option<ShortId>,
 }
 
 /// A person's gesture as [`SessionLog::person_input`] takes it from the seam (`crate::app_input::note_person_reaching`): the number of the gesture when it opened a burst (`HumanInputStamp::note_reaching`), and whether it reached the program ([`crate::human_input::reaches_program`]).
@@ -844,6 +861,8 @@ impl SessionLog {
             tab: None,
             tab_opened_by: None,
             spend: tab::TabSpend::default(),
+            desc_own: None,
+            desc_creator: None,
         }
     }
 }
@@ -883,6 +902,20 @@ pub(crate) fn sid_actor(sid: &str) -> Option<Actor> {
         .then(|| ShortId::new(sid))
         .flatten()
         .map(Actor::sid)
+}
+
+/// A SESSION'S IDENTITY AS A DESCRIPTION CLAIM RANKS IT: the id [`sid_actor`] names `sid` by,
+/// the one form every side of the comparison is read in. A claim's author reaches the log through
+/// [`exit_actor`] and so through [`sid_actor`]; the session's own sid and its creator's are read
+/// here, through the same function. A tab's ID has two written forms (`t…`, and the `s-…` one a
+/// tab opened before it keeps until it closes): each is one session's whole text, taken as it
+/// is written and never converted, so a session is the same identity wherever its sid is read.
+/// `None` for a word no session was minted with (`ctl`, a name someone chose).
+pub(crate) fn sid_ident(sid: &str) -> Option<ShortId> {
+    match sid_actor(sid) {
+        Some(Actor::Sid(id)) => Some(id),
+        _ => None,
+    }
 }
 
 /// The session outcome an `ExitReason` names.
@@ -945,6 +978,16 @@ impl SessionLog {
     /// The log.
     pub(crate) const fn log(&self) -> &Log {
         &self.log
+    }
+
+    /// The word the agent run `node` names (`agent=`, [`aterm_phase::Program::name`]) while it
+    /// is the open agent run this log follows: what aterm's default writer calls the program
+    /// where a run is open beneath the agent ([`crate::describe`]).
+    pub(crate) fn agent_word(&self, node: Node) -> Option<&'static str> {
+        self.agent
+            .as_ref()
+            .filter(|a| a.node == node)
+            .map(|a| a.who.name())
     }
 
     /// The log, for the journal writer's one write into it: installing its wake on a log that has none (a log made before the lane published it).
@@ -1042,7 +1085,9 @@ impl SessionLog {
         self.journal_start
     }
 
-    /// Put `log` in place of this one, keeping its journal wake: no path that replaces a session's log can leave it unrung.
+    /// Put `log` in place of this one, keeping its journal wake and who the session is: no path
+    /// that replaces a session's log can leave it unrung, or leave its description claims ranked as
+    /// if nobody had said whose session this is.
     pub(crate) fn replace_log(&mut self, log: Log) {
         let notify = self.log.notify().cloned();
         let rows = self.log.row_head();
@@ -1050,6 +1095,33 @@ impl SessionLog {
         self.log.set_notify(notify);
         self.log
             .keep_rows(crate::session_timeline_view::row_span, rows);
+        self.tell_desc_ident();
+    }
+
+    /// THE SESSION'S OWN SID, told when the store registers the session: a description claim
+    /// by a process inside this session is its own program's ([`aterm_slog::Rank::Program`]).
+    /// A word no session was minted with names nobody ([`sid_ident`]).
+    pub(crate) fn set_desc_own(&mut self, sid: &str) {
+        self.desc_own = sid_ident(sid);
+        self.tell_desc_ident();
+    }
+
+    /// THE SESSION'S CREATOR, told wherever its task record is set: the session `from` names
+    /// (`None`, `ctl` and a word no session was minted with name none). A description claim by
+    /// a process inside that session ranks [`aterm_slog::Rank::Creator`]. `from=` is what a
+    /// client declared, not what aterm observed: the spawning client's word through its
+    /// environment at spawn, or any owner-class client's later `task mark … from=`, which
+    /// changes it. So it stands for the creator only until the session's observed creator is
+    /// stored.
+    pub(crate) fn set_desc_creator(&mut self, from: Option<&str>) {
+        self.desc_creator = from.and_then(sid_ident);
+        self.tell_desc_ident();
+    }
+
+    /// Tell the log who the session is ([`Log::set_desc_ident`], which does nothing where the
+    /// log already holds this identity).
+    fn tell_desc_ident(&mut self) {
+        self.log.set_desc_ident(self.desc_own, self.desc_creator);
     }
 
     /// Continue the timeline's row ids past `carried`, the count a seamless update's manifest carried (`SessionRecord::timeline_id`, which holds the predecessor's overlap reserve): called before the successor's first record ([`crate::session_timeline::SessionTimeline::continue_ids`]).
@@ -1113,11 +1185,14 @@ impl SessionLog {
         self.clock = clock;
     }
 
-    /// The instant the agent run wants [`Self::tick`] at (monotonic ms): the turn tracker's, if a
-    /// settle is pending, or its pair wake's, if the clock alone settles a harness turn still
-    /// waiting for its act ([`Self::harness_pair`]), the sooner.
+    /// The instant this log wants [`Self::tick`] at (monotonic ms), the soonest of: the open
+    /// agent run's turn tracker's, if a settle is pending; its pair wake's, if the clock alone
+    /// settles a harness turn still waiting for its act ([`Self::harness_pair`]); and the in-band
+    /// title's, with or without an agent, while it holds a decision back
+    /// ([`Self::inband_wake`]).
     pub(crate) fn wake(&self) -> Option<u64> {
-        self.agent
+        let agent = self
+            .agent
             .as_ref()
             .filter(|a| self.log.is_open(a.node))
             .and_then(|a| {
@@ -1125,7 +1200,8 @@ impl SessionLog {
                     .into_iter()
                     .flatten()
                     .min()
-            })
+            });
+        [agent, self.inband_wake()].into_iter().flatten().min()
     }
 
     fn resync(&mut self) {
@@ -2215,6 +2291,8 @@ impl SessionLog {
                 by_screen: false,
                 tracker,
                 pairs: transcript::HarnessPairs::default(),
+                first_prompt: None,
+                kept_prompt: false,
             });
             self.note_agent_cmd(node);
         }
@@ -2290,55 +2368,18 @@ impl SessionLog {
     /// `mark agent word= rev= hseq= holder=` through [`Self::stream_mark`] for one a `state`
     /// record decided, then the turn tracker's transitions.
     ///
-    /// A move with no agent run open opens one: for the reader that read it, or, for a stream's
-    /// move, for the agent the claim's registry row names (a harness whose process name is in
-    /// no table still gets its run). Either run is one nothing but that source named
-    /// (`by_screen`), so the word `-` (the screen shows no agent, the record says `ended`) ends
-    /// it, and a process name that names the same agent later confirms it.
+    /// A move with no agent run open opens one ([`Self::open_named_run`]): for the reader that
+    /// read it, or, for a stream's move, for the agent the claim's registry row names.
     pub(crate) fn agent_moved(&mut self, m: AgentMove<'_>, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
         self.name_pending(self.cmd, None);
         let generic = |r: &aterm_phase::Program| matches!(r, aterm_phase::Program::Generic);
         let from_row = m.stream.map(|s| s.agent).filter(|r| !generic(r));
-        let named = from_row.or(m.reader).filter(|r| match r {
-            aterm_phase::Program::Claude
-            | aterm_phase::Program::Codex
-            | aterm_phase::Program::Grok
-            | aterm_phase::Program::Kimi
-            | aterm_phase::Program::Agy
-            | aterm_phase::Program::Muse => true,
-            aterm_phase::Program::Generic => false,
-        });
-        if self.agent.is_none()
-            && m.word != "-"
-            && let Some(reader) = named
+        if m.word != "-"
+            && let Some(who) = from_row.or(m.reader)
         {
-            let f = with(Fields::new(), Key::Agent, tok(Key::Agent, reader.name()));
-            let mut open = match m.stream {
-                Some(s) => Open::new(Kind::Agent, Src::Harness, Conf::Claim).by(s.by),
-                None => Open::new(Kind::Agent, Src::Screen, Conf::Strong),
-            }
-            .fields(f);
-            if let Some(parent) = self
-                .fg
-                .filter(|f| f.pgid == m.pgid)
-                .map(|f| f.node)
-                .or(self.cmd.map(|c| c.node))
-            {
-                open = open.under(parent);
-            }
-            if let Ok(node) = self.log.open(open, at) {
-                self.agent = Some(AgentRun {
-                    pgid: m.pgid,
-                    node,
-                    who: reader,
-                    by_screen: true,
-                    tracker: TurnTracker::new(node),
-                    pairs: transcript::HarnessPairs::default(),
-                });
-                self.note_agent_cmd(node);
-            }
+            self.open_named_run(who, m.pgid, m.stream.map(|s| s.by), at);
         }
         let word = Fields::new()
             .word(Key::Word, m.word)
@@ -2392,6 +2433,71 @@ impl SessionLog {
             return None;
         }
         wake
+    }
+
+    /// Open the agent run of `who` in the front group `pgid` where none is open: one the screen
+    /// reader named (`stream_by` is `None`: `src=screen conf=strong`) or one the claim's
+    /// registry row named for its stream (`src=harness conf=claim`, by the tab's own session;
+    /// a harness whose process name is in no table still gets its run). Either run is one
+    /// nothing but that source named (`by_screen`), so the word `-` (the screen shows no agent,
+    /// the record says `ended`) ends it, and a process name that names the same agent later
+    /// confirms it. Returns whether a run was opened.
+    fn open_named_run(
+        &mut self,
+        who: aterm_phase::Program,
+        pgid: i32,
+        stream_by: Option<Actor>,
+        at: Stamp,
+    ) -> bool {
+        if self.agent.is_some() || matches!(who, aterm_phase::Program::Generic) {
+            return false;
+        }
+        let f = with(Fields::new(), Key::Agent, tok(Key::Agent, who.name()));
+        let mut open = match stream_by {
+            Some(by) => Open::new(Kind::Agent, Src::Harness, Conf::Claim).by(by),
+            None => Open::new(Kind::Agent, Src::Screen, Conf::Strong),
+        }
+        .fields(f);
+        if let Some(parent) = self
+            .fg
+            .filter(|f| f.pgid == pgid)
+            .map(|f| f.node)
+            .or(self.cmd.map(|c| c.node))
+        {
+            open = open.under(parent);
+        }
+        let Ok(node) = self.log.open(open, at) else {
+            return false;
+        };
+        self.agent = Some(AgentRun {
+            pgid,
+            node,
+            who,
+            by_screen: true,
+            tracker: TurnTracker::new(node),
+            pairs: transcript::HarnessPairs::default(),
+            first_prompt: None,
+            kept_prompt: false,
+        });
+        self.note_agent_cmd(node);
+        true
+    }
+
+    /// THE CLAIM'S STREAM APPLIED A RECORD (D15): with no agent run open, one opens for
+    /// `agent`, the agent the claim's registry row names, whatever the record's kind and
+    /// whether or not it moved the agent word. Returns whether a run was opened.
+    #[cfg(unix)]
+    pub(crate) fn stream_applied(
+        &mut self,
+        agent: aterm_phase::Program,
+        by: Actor,
+        pgid: i32,
+        at: Stamp,
+    ) -> bool {
+        self.reconcile_person(at);
+        self.resync();
+        self.name_pending(self.cmd, None);
+        self.open_named_run(agent, pgid, Some(by), at)
     }
 
     /// A person's hands were on the session: the tracker attributes a turn that opens within 5 s to them (a run a waiting name opens later too, [`Typed`]).
@@ -2515,9 +2621,10 @@ impl SessionLog {
             .and_then(|a| a.tracker.ctl_turn_caused(log, by, ledger, cause, at))
     }
 
-    /// The host's settle wake: a resting word that has held closes its turn, and at its pair wake a
-    /// codex run's waiting harness turns are paired again ([`Self::harness_pair`]); the next
-    /// wake, either's still to come.
+    /// The host's settle wake: a resting word that has held closes its turn, at its pair wake a
+    /// codex run's waiting harness turns are paired again ([`Self::harness_pair`]), and the
+    /// in-band title writes what its bucket held back ([`Self::inband_tick`]); the next wake,
+    /// any of theirs still to come.
     pub(crate) fn tick(&mut self, at: Stamp) -> Option<u64> {
         self.reconcile_person(at);
         self.resync();
@@ -2530,13 +2637,15 @@ impl SessionLog {
             self.harness_pair(None, at);
         }
         let Self { log, agent, .. } = self;
-        agent.as_mut().and_then(|a| {
+        let agent = agent.as_mut().and_then(|a| {
             let settle = a.tracker.tick(log, at);
             [settle, a.pairs.wake.filter(|w| *w > at.mono_ms)]
                 .into_iter()
                 .flatten()
                 .min()
-        })
+        });
+        self.inband_tick(at);
+        [agent, self.inband_wake()].into_iter().flatten().min()
     }
 
     /// What the handoff manifest carries: the epoch and the node-id counters plus [`LOG_ID_RESERVE`], remembered as this process's ceiling.
@@ -2759,14 +2868,14 @@ impl crate::App {
     }
 }
 
-/// The settle wakes the event loop owes, by session: one entry per session whose turn tracker has a pending settle.
+/// The settle wakes the event loop owes, by session: one entry per session whose log wants its tick ([`SessionLog::wake`]): a turn tracker's pending settle, a harness pairing's wake, or an in-band title held back.
 #[derive(Debug, Default)]
 pub(crate) struct Wakes {
     at: BTreeMap<u64, u64>,
 }
 
 impl Wakes {
-    /// Session `id`'s tracker wants a tick at `wake` (monotonic ms), or none.
+    /// Session `id`'s log wants a tick at `wake` (monotonic ms), or none.
     pub(crate) fn note(&mut self, id: u64, wake: Option<u64>) {
         match wake {
             Some(w) => {
@@ -2864,7 +2973,7 @@ impl crate::App {
         self.follow_clause(id);
     }
 
-    /// THE SESSION LOG's settle ticks: each session whose turn tracker's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), its next wake replaces the entry, and its harness pairing's read wait as the tick left it goes to the rollout tap's ask ([`crate::session_status::StatusObserver::note_pair_wait`]).
+    /// THE SESSION LOG's settle ticks: each session whose log's wake is due is ticked under its timeline's leaf lock (the lock the sweep takes on this thread), its next wake replaces the entry, and its harness pairing's read wait as the tick left it goes to the rollout tap's ask ([`crate::session_status::StatusObserver::note_pair_wait`]).
     pub(crate) fn tick_session_logs(&mut self) {
         if self.session_status.slog_wakes.is_empty() {
             return;
@@ -2891,7 +3000,7 @@ impl crate::App {
         }
     }
 
-    /// The soonest settle tick owed, as an instant for the loop's deadline fold (`DeadlineOwner::SessionLog`), or `None` while no turn rests.
+    /// The soonest settle tick owed, as an instant for the loop's deadline fold (`DeadlineOwner::SessionLog`), or `None` while no log wants one.
     pub(crate) fn next_session_log_wake(&self) -> Option<std::time::Instant> {
         Some(log_instant(self.session_status.slog_wakes.next()?))
     }
@@ -3480,13 +3589,21 @@ pub(crate) use carry::{PreparedSlogCarry, SlogCarrySource};
 #[cfg(test)]
 pub(crate) use mark::{AWAIT_LOG_USAGE, MARK_USAGE, MarkReq};
 pub(crate) use mark::{
-    CAUSE_USAGE, CauseRef, DESC_VALUE_MAX, DescRefused, DescWrite, InputAct, InputVerb, LogAwait,
-    LogAwaitStep, cmd_mark, desc_stored, validate_cause,
+    CAUSE_USAGE, CauseRef, DescRefused, DescWrite, InputAct, InputVerb, LogAwait, LogAwaitStep,
+    ObservedClaim, cmd_mark, desc_stored, mark_is_desc, observed_stored, validate_cause,
 };
+
+#[path = "session_log_birth.rs"]
+mod birth;
+pub(crate) use birth::{Birth, BirthAuthor, Born};
 
 #[path = "session_log_desc.rs"]
 mod desc;
 pub(crate) use desc::{cmd_described, cmd_described_json};
+
+#[path = "session_log_inband.rs"]
+mod inband;
+pub(crate) use inband::InbandRead;
 
 #[path = "session_log_closed.rs"]
 mod closed;

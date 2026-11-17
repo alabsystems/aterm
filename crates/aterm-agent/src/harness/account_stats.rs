@@ -995,13 +995,34 @@ pub(super) fn since_span(s: i64) -> String {
     }
 }
 
-/// A window's `since` as its row says it: `18 used since 24h`, `new window since 13:00` or `reset
-/// used since 13:00`.
-fn since_text(since: &Since, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
+/// A window's `since` as its row says it: `18 used since 24h`, `new window since 13:00`,
+/// `refilled or raised since 13:00` (the series does not tell a limit reset spent from a refill
+/// or a raised allowance), or `reset used since 13:00` where the refill is at `spent`, the instant
+/// the record says this Mac's aterm spent a limit reset in the window ([`spent_at`]), as
+/// [`missing_text`] says it before a reading comes.
+fn since_text(since: &Since, spent: Option<i64>, now: i64, tz_at: &dyn Fn(i64) -> i64) -> String {
     match since.moved {
         Moved::Rose(points) => format!("{points} used since {}", since_span(since.span_s)),
         Moved::NewWindow(at) => format!("new window since {}", clock_local(at, now, tz_at)),
-        Moved::ResetUsed(at) => format!("reset used since {}", clock_local(at, now, tz_at)),
+        Moved::Refilled(at) if spent == Some(at) => {
+            format!("reset used since {}", clock_local(at, now, tz_at))
+        }
+        Moved::Refilled(at) => {
+            format!("refilled or raised since {}", clock_local(at, now, tz_at))
+        }
+    }
+}
+
+/// The instant the record of `account` says this Mac's aterm spent a limit reset inside window
+/// `id`: S5's word with neither a figure nor a reset ([`said_refill`], [`week_refill`]), which
+/// [`accounts::reset_outcome`] writes at the instant it dates the window's barrier. A refill or
+/// raise a reading showed writes no such word.
+fn spent_at(account: Option<&Account>, id: &str) -> Option<i64> {
+    let account = account?;
+    match id {
+        SESSION_LIMIT => said_refill(account.session_warning()),
+        WEEK_LIMIT => said_refill(account.week_warning()),
+        _ => week_refill(account.weeks_said.get(id)),
     }
 }
 
@@ -1042,7 +1063,8 @@ fn window_row(
         None => format!("{DASH}  {}", missing_text(win, look, tz_at)),
     };
     if let Some(since) = &win.since {
-        let _ = write!(row, "{DOT}{}", since_text(since, now, tz_at));
+        let spent = spent_at(look.record(), win.id);
+        let _ = write!(row, "{DOT}{}", since_text(since, spent, now, tz_at));
     }
     if win.id == Bucket::Fable.id()
         && let Some(p) = p
@@ -1291,14 +1313,15 @@ fn reason(missing: Missing) -> Value {
 }
 
 /// A window's `since` as `--json` carries it: `{span_s, used_pct, new_window(+), reset_used(+)}`,
-/// one of the last three set.
+/// one of the last three set; `reset_used` keeps its name for every refill or raise
+/// ([`Moved::Refilled`]).
 fn since_value(since: &Since) -> Value {
     let mut o = Map::new();
     o.insert("span_s".to_owned(), Value::from(since.span_s));
     let (rose, new_window, reset_used) = match since.moved {
         Moved::Rose(points) => (Some(points), None, None),
         Moved::NewWindow(at) => (None, Some(at), None),
-        Moved::ResetUsed(at) => (None, None, Some(at)),
+        Moved::Refilled(at) => (None, None, Some(at)),
     };
     o.insert("used_pct".to_owned(), Value::from(rose));
     put_time(&mut o, "new_window", new_window);

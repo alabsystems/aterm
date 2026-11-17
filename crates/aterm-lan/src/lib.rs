@@ -26,6 +26,10 @@ mod direct;
 #[cfg(target_os = "macos")]
 pub mod grant;
 #[cfg(unix)]
+mod log;
+#[cfg(unix)]
+mod peers;
+#[cfg(unix)]
 mod server;
 
 #[cfg(target_os = "macos")]

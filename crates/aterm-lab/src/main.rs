@@ -122,6 +122,8 @@ mod commons_startup;
 #[cfg(target_os = "macos")]
 mod composer_turn;
 #[cfg(target_os = "macos")]
+mod comprehension_gallery;
+#[cfg(target_os = "macos")]
 mod crash;
 #[cfg(target_os = "macos")]
 mod deck_motion;
@@ -999,6 +1001,12 @@ Outside any lab (no jail, no stub):
                                  instance at a time, into contact sheets, and judge each frame from the page's own
                                  layout: text >= 4.5:1, glyph >= 3:1, card >= 1.2:1, no clipped text, a 4 pt rhythm
                                  (`--help` for details)
+  comprehension-gallery [--view card|navigator] [--looks LOOK[,LOOK]]... [--scales 1|2[,1|2]] [--specimen PATH]
+                        [--keep] <out_dir>
+                                 the comprehension marks laid out as the card draws them, rendered offscreen through
+                                 the native page raster, one frame per look and scale, judged: text >= 4.5:1, mark >=
+                                 3:1, no clipped text, one column x, unread drawn `?`, every form distinct in grey
+                                 (`--help` for details)
   allocation-monitor --aterm PATH --targo PATH --sdk-bin ABS --out DIR [--look dark|light] [--keep]
                                  one attachment observes actual two-to-one fenced Targo builds in a private Allocation
                                  window; preserve both frames/audits, close the panel before peer release, run both outputs
@@ -1159,7 +1167,7 @@ Outside any lab (no jail, no stub):
                                  key the fold reads, and is otherwise admitted by the row of run 2's transcript carrying it
                                  and the check that read it, which the note names, or refuses NEW-KEY as one no run
                                  exercised; GONE reads a key the fold reads only on the rows it acts on
-  claude-wall-panel [--keep]
+  claude-wall-panel [--keep] [--record]
                                  measure the managed Claude Code's own /usage panel over a standing usage wall (~3 min):
                                  one session in a lab of its own (harness off, the stub's subscriber path with the
                                  profile scope, fullscreen) into the five-hour limit, then the weekly one; at each, with
@@ -1169,8 +1177,8 @@ Outside any lab (no jail, no stub):
                                  answered, the panel opens at a final read (read=settled|refused; refused here, the
                                  jail refusing the usage read) with the stub's figures, one GET /api/oauth/usage open
                                  or shut, no /v1/messages, the transcript's standing wall and the screen's wall,
-                                 continuation and dialog as they were. On a PASS the frames go to
-                                 aterm-phase's fixtures and CLAUDE_ACCOUNTS.wall_panel_measured_on is written to the
+                                 continuation and dialog as they were. On a PASS the frames this build has none of
+                                 yet (all of them with --record) go to aterm-phase's fixtures and CLAUDE_ACCOUNTS.wall_panel_measured_on is written to the
                                  build where the panel opened (else None); a FAIL keeps the frames and logs and leaves
                                  the checkout as it was (--keep: the lab stays up)
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
@@ -1436,6 +1444,7 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
         "music-render" => music_render::cmd(args),
         "video-sheet" => video_sheet::cmd(args),
         "system-state-gallery" => system_state_gallery::cmd_system_state_gallery(args),
+        "comprehension-gallery" => comprehension_gallery::cmd(args),
         "fsevents" => fsevents::cmd(args),
         "allocation-monitor" => allocation_monitor::cmd(args),
         "window-custody" => window_custody::cmd(args),

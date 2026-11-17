@@ -6,19 +6,31 @@
 //! file from its own vault folder through [`crate::members::desk::Local::of`], with no seam on the
 //! desk itself, and only the route this Mac's proof reader reads is scripted.
 
+#[cfg(unix)]
 use super::super::log_entries_tests::{TwoMacs, two_macs};
 use super::*;
+#[cfg(unix)]
 use crate::client::with_live_genesis;
-use crate::members::desk::{self, Desk, Local};
+use crate::members::desk;
+#[cfg(unix)]
+use crate::members::desk::{Desk, Local};
+#[cfg(unix)]
 use crate::members::join::{self, Joined, Missed, Stream};
+#[cfg(unix)]
 use crate::members::joiner::Joining;
+#[cfg(unix)]
 use crate::members::lab_lan;
+#[cfg(unix)]
 use aterm_netplace::facts::{Script, parse_script, script_here};
+#[cfg(unix)]
 use ring::signature::{Ed25519KeyPair, KeyPair as _};
+#[cfg(unix)]
 use std::net::IpAddr;
+#[cfg(unix)]
 use std::sync::Mutex;
 
 /// A fleet book with nothing against the proving Mac, every member at 0.148 or later.
+#[cfg(unix)]
 const CURRENT: Book = Book {
     node_id_held_out: false,
     node_id_seated: false,
@@ -27,18 +39,21 @@ const CURRENT: Book = Book {
 };
 
 /// The desk's default route: Wi-Fi, this Mac at 192.168.1.20 on the lab's /24.
+#[cfg(unix)]
 fn at_home() -> Script {
     parse_script(
         "route en0 192.168.1.20/24 via 192.168.1.1 hw aa:bb:cc:dd:ee:01\npath usable wifi\n",
     )
 }
 
+#[cfg(unix)]
 fn node_pair(tag: u8) -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&[tag ^ 0x5a; 32]).unwrap()
 }
 
 /// A fresh profile under `macs`'s root, pinned to the lab vault's signer at its URL and waiting
 /// there, unapproved (Pending), as `commons-lan pin` leaves the fourth Mac.
+#[cfg(unix)]
 fn pinned(macs: &TwoMacs, name: &str) -> Paths {
     let paths = Paths::for_home(&macs.root.path().join(name));
     let joined = join(
@@ -63,6 +78,7 @@ fn pinned(macs: &TwoMacs, name: &str) -> Paths {
 /// One proof of `joiner` (node key `pair`) from `from` to the desk `local` (built on `member`),
 /// the member reading its vault as on the live ALab genesis (`live`) or not, its desk asking the
 /// check before possession (`checks_first`) or going straight to its decision.
+#[cfg(unix)]
 fn proof(
     (member, local): (&Paths, Local),
     joiner: &Paths,
@@ -139,6 +155,7 @@ fn proof(
 /// NEGATIVE CONTROL: with `Local::of`'s `automatic_lan` read as the live vault's alone
 /// (`alab_url`, the lab home dropped), the desk does not mark the Mac on the named LAN as from
 /// its home: `assertion failed: local.automatically_admits(on_lan)`.
+#[cfg(unix)]
 #[test]
 fn a_lab_vault_that_names_its_home_lan_lets_a_mac_on_it_in_by_its_proof() {
     let _answering = ServersAnswering::set();
@@ -231,6 +248,7 @@ fn a_lab_vault_that_names_its_home_lan_lets_a_mac_on_it_in_by_its_proof() {
 /// NEGATIVE CONTROL: with `write_log_bundle`'s refusal of a bundle that starts another vault
 /// afresh removed, the Mac takes the other vault's bundle: `another vault's bundle: Joined {
 /// member: "m7", name: "m4", report: Report { written: ["shared"], … }, admission: Logged }`.
+#[cfg(unix)]
 #[test]
 fn a_mac_pinned_to_one_lab_vault_takes_no_bundle_of_another() {
     let _answering = ServersAnswering::set();
@@ -307,6 +325,7 @@ fn records_of(member: &Paths) -> usize {
 /// `write_records` (as before E1b), the refused proof leaves its `Admit` in the member's log:
 /// `assertion `left == right` failed: the path member keeps no Admit for a Mac it handed nothing`
 /// with `left: 9, right: 6`.
+#[cfg(unix)]
 #[test]
 fn a_member_whose_vault_is_read_from_a_path_signs_nothing_for_a_proof() {
     let root = aterm_tempfile::tempdir().expect("temp");

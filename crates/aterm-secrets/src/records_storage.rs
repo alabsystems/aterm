@@ -10,10 +10,13 @@
 
 use crate::{Error, Result, fsx};
 use aterm_digest::Sha256;
-use aterm_dirfd::{self as fd, AtFlags, FileType, Mode, OFlags, RenameFlags};
+use aterm_dirfd::{self as fd, Mode, OFlags, RenameFlags};
+#[cfg(unix)]
+use aterm_dirfd::{AtFlags, FileType};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -174,26 +177,41 @@ pub(crate) fn reader_path(entry: &Path) -> Result<PathBuf> {
 struct Judged {
     entry: PathBuf,
     held: usize,
-    parent: (u64, u64, u32, u32),
+    parent: ParentFacts,
     witnesses: Witnesses,
     files: [Option<fsx::Seen>; 2],
 }
+
+/// The parent's identity, owner and mode ([`Context::new`]).
+#[cfg(unix)]
+type ParentFacts = (u64, u64, u32, u32);
+
+/// The parent's identity and access on Windows: its volume, file id and attributes, and the
+/// digest of its owner and access list ([`fsx::access_digest`]).
+#[cfg(windows)]
+type ParentFacts = (u64, fsx::Ino, u32, [u8; 32]);
 
 impl Judged {
     /// What `entry`'s files show, each `lstat` `glance`'s where the caller looks through one
     /// ([`fsx::lstat_in`]).
     fn of(entry: &Path, witnesses: Witnesses, glance: Option<&fsx::Glance>) -> Result<Self> {
-        let parent = fsx::lstat_in(
-            glance,
-            entry
-                .parent()
-                .ok_or_else(|| refused("no parent directory"))?,
-        )?
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+        let parent_path = entry
+            .parent()
+            .ok_or_else(|| refused("no parent directory"))?;
+        let parent = fsx::lstat_in(glance, parent_path)?
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
         Ok(Self {
             entry: entry.to_path_buf(),
             held: crate::membership_log::RecordBudgets::current().held,
+            #[cfg(unix)]
             parent: (parent.dev(), parent.ino(), parent.uid(), parent.mode()),
+            #[cfg(windows)]
+            parent: (
+                parent.st_dev,
+                parent.st_ino,
+                parent.attributes,
+                fsx::access_digest(parent_path)?,
+            ),
             witnesses,
             files: [
                 fsx::seen_if_present_in(glance, &entry.join(HEADER))?,
@@ -377,6 +395,7 @@ pub(crate) fn write_path(entry: &Path, fence: bool) -> Result<WriteTarget> {
 /// Accept a snapshot only while its file is unchanged, before preparing any layout or
 /// raising its capacity. The returned target keeps that comparison and the write atomic
 /// with respect to other writers using the records lock.
+#[cfg(any(unix, test))]
 pub(crate) fn write_path_if_unchanged(
     entry: &Path,
     fence: bool,
@@ -502,7 +521,7 @@ enum Step {
     Pinned,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn interrupt_after_exchange(entry: &Path) -> Result<()> {
     Context::new(entry)?.prepare(|step| {
         if step == Step::Exchanged {
@@ -526,21 +545,39 @@ impl Context {
         let parent_path = entry
             .parent()
             .ok_or_else(|| refused("no parent directory"))?;
-        let metadata = std::fs::symlink_metadata(parent_path)?;
-        if !metadata.is_dir() || metadata.uid() != fsx::euid() || metadata.mode() & 0o022 != 0 {
-            return Err(refused("the parent directory is not safely owned"));
-        }
-        let canonical = parent_path.canonicalize()?;
-        let parent = File::from(syscall(fd::openat(
-            fd::CWD,
-            canonical.as_path(),
-            dir_flags(),
-            Mode::empty(),
-        ))?);
-        let opened = parent.metadata()?;
-        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-            return Err(refused("the parent directory changed while opening"));
-        }
+        #[cfg(unix)]
+        let parent = {
+            let metadata = std::fs::symlink_metadata(parent_path)?;
+            if !metadata.is_dir() || metadata.uid() != fsx::euid() || metadata.mode() & 0o022 != 0 {
+                return Err(refused("the parent directory is not safely owned"));
+            }
+            let canonical = parent_path.canonicalize()?;
+            let parent = File::from(syscall(fd::openat(
+                fd::CWD,
+                canonical.as_path(),
+                dir_flags(),
+                Mode::empty(),
+            ))?);
+            let opened = parent.metadata()?;
+            if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+                return Err(refused("the parent directory changed while opening"));
+            }
+            parent
+        };
+        // The folder judged by its name opened as itself ([`fsx::owned_unshared_dir_id`]), then
+        // opened from its volume's root through no reparse point (`aterm_dirfd::pin`), and the two
+        // held to one file id.
+        #[cfg(windows)]
+        let parent = {
+            let judged = fsx::owned_unshared_dir_id(parent_path)
+                .ok_or_else(|| refused("the parent directory is not safely owned"))?;
+            let canonical = parent_path.canonicalize()?;
+            let parent = File::from(syscall(fd::pin(&canonical))?);
+            if identity(&parent)? != judged {
+                return Err(refused("the parent directory changed while opening"));
+            }
+            parent
+        };
         let pin = pin_path(entry)?;
         let intent = intent_path(entry)?;
         Ok(Self {
@@ -559,8 +596,14 @@ impl Context {
             dir_flags(),
             Mode::empty(),
         ))?);
-        let metadata = directory.metadata()?;
-        if metadata.uid() != fsx::euid() || metadata.mode() & 0o7777 != 0o700 {
+        #[cfg(unix)]
+        let private = {
+            let metadata = directory.metadata()?;
+            metadata.uid() == fsx::euid() && metadata.mode() & 0o7777 == 0o700
+        };
+        #[cfg(windows)]
+        let private = private_dir_at(&self.parent, &self.name, &directory)?;
+        if !private {
             return Err(refused("the layout directory is not private and owned"));
         }
         Ok(directory)
@@ -601,8 +644,7 @@ impl Context {
     fn original_for(&self, header: &Layout) -> Result<Option<File>> {
         match (self.original()?, header.original) {
             (Some(mut file), Some((dev, ino))) => {
-                let metadata = file.metadata()?;
-                if (metadata.dev(), metadata.ino()) != (dev, ino)
+                if identity(&file)? != (dev, ino)
                     || copy_digest(&mut file, &mut std::io::sink())? != (header.len, header.digest)
                 {
                     return Err(refused(
@@ -640,19 +682,29 @@ impl Context {
     /// [`private_file`]'s checks of the pin in this parent, for a reader that read it within its
     /// bound.
     fn pin_is_private(&self) -> Result<()> {
-        let stat = match fd::fstatat(&self.parent, self.pin.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(error) if error.is_noent() => return Err(refused("a layout file is missing")),
-            Err(error) => return syscall(Err(error)),
-        };
-        if !FileType::from_raw_mode(stat.st_mode).is_file()
-            || stat.st_uid != fsx::euid()
-            || stat.st_mode & 0o7777 != 0o600
-            || stat.st_nlink != 1
+        #[cfg(windows)]
         {
-            return Err(refused("a layout file is not bounded, private and owned"));
+            optional_regular(&self.parent, &self.pin, usize::MAX)?
+                .ok_or_else(|| refused("a layout file is missing"))?;
+            Ok(())
         }
-        Ok(())
+        #[cfg(unix)]
+        {
+            let stat = match fd::fstatat(&self.parent, self.pin.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+            {
+                Ok(stat) => stat,
+                Err(error) if error.is_noent() => return Err(refused("a layout file is missing")),
+                Err(error) => return syscall(Err(error)),
+            };
+            if !FileType::from_raw_mode(stat.st_mode).is_file()
+                || stat.st_uid != fsx::euid()
+                || stat.st_mode & 0o7777 != 0o600
+                || stat.st_nlink != 1
+            {
+                return Err(refused("a layout file is not bounded, private and owned"));
+            }
+            Ok(())
+        }
     }
 
     fn raise_capacity(&self) -> Result<()> {
@@ -677,11 +729,17 @@ impl Context {
             Some(header) => header,
             None => {
                 let mut original = self.original()?;
-                let identity = original
-                    .as_ref()
-                    .map(|file| file.metadata())
-                    .transpose()?
-                    .map(|metadata| (metadata.dev(), metadata.ino()));
+                // Windows has no atomic exchange of two names (`aterm_dirfd::RenameFlags::EXCHANGE`),
+                // which a records file kept whole needs to become a layout: refused before any
+                // preparation is declared, so the file stays as it is (ATERM-KI-1116-52817).
+                #[cfg(windows)]
+                if original.is_some() {
+                    return Err(refused(
+                        "a records file kept whole cannot become a layout on Windows, which has no \
+                         atomic exchange of names",
+                    ));
+                }
+                let identity = original.as_ref().map(identity).transpose()?;
                 let (len, digest) = match original.as_mut() {
                     Some(file) => copy_digest(file, &mut std::io::sink())?,
                     None => (0, Sha256::digest(b"")),
@@ -695,7 +753,7 @@ impl Context {
                     capacity: crate::membership_log::RecordBudgets::current().held,
                 };
                 install_file(&self.parent, &self.intent, &header.encode())?;
-                aterm_durable::durable(&self.parent)?;
+                durable_dir(&self.parent)?;
                 header
             }
         };
@@ -704,7 +762,10 @@ impl Context {
         let old_name = format!(".aterm-records-{}", header.nonce);
         match fd::mkdirat(&self.parent, old_name.as_str(), Mode::RWXU) {
             Ok(()) => {}
+            #[cfg(unix)]
             Err(error) if error.raw_os_error() == libc::EEXIST => {}
+            #[cfg(windows)]
+            Err(error) if error == fd::Errno::EXIST => {}
             Err(error) => return syscall(Err(error)),
         }
         let directory = File::from(syscall(fd::openat(
@@ -713,8 +774,14 @@ impl Context {
             dir_flags(),
             Mode::empty(),
         ))?);
-        let metadata = directory.metadata()?;
-        if metadata.uid() != fsx::euid() || metadata.mode() & 0o7777 != 0o700 {
+        #[cfg(unix)]
+        let private = {
+            let metadata = directory.metadata()?;
+            metadata.uid() == fsx::euid() && metadata.mode() & 0o7777 == 0o700
+        };
+        #[cfg(windows)]
+        let private = private_dir_at(&self.parent, &old_name, &directory)?;
+        if !private {
             return Err(refused(
                 "the preparation directory is not private and owned",
             ));
@@ -760,11 +827,11 @@ impl Context {
                 ))?;
             }
         }
-        aterm_durable::durable(&directory)?;
+        durable_dir(&directory)?;
         after(Step::Copied)?;
         install_file(&directory, HEADER, &header.encode())?;
-        aterm_durable::durable(&directory)?;
-        aterm_durable::durable(&self.parent)?;
+        durable_dir(&directory)?;
+        durable_dir(&self.parent)?;
         after(Step::Prepared)?;
         self.original_for(&header)?;
         syscall(fd::renameat_with(
@@ -778,7 +845,7 @@ impl Context {
                 RenameFlags::NOREPLACE
             },
         ))?;
-        aterm_durable::durable(&self.parent)?;
+        durable_dir(&self.parent)?;
         after(Step::Exchanged)?;
         self.finish(after)
     }
@@ -804,8 +871,7 @@ impl Context {
                     &old_name,
                     crate::membership_log::MAX_RECORDS_STREAM,
                 )?;
-                let metadata = old.metadata()?;
-                if (metadata.dev(), metadata.ino()) != (dev, ino)
+                if identity(&old)? != (dev, ino)
                     || copy_digest(&mut old, &mut std::io::sink())? != (header.len, header.digest)
                 {
                     return Err(refused(
@@ -832,7 +898,7 @@ struct Layout {
     nonce: String,
     len: usize,
     digest: [u8; 32],
-    original: Option<(u64, u64)>,
+    original: Option<(u64, fsx::Ino)>,
     capacity: usize,
 }
 
@@ -964,6 +1030,7 @@ fn optional_regular(parent: &File, name: &str, max: usize) -> Result<Option<File
     Ok(Some(file))
 }
 
+#[cfg(unix)]
 fn private_file(file: &File, max: usize) -> Result<()> {
     let metadata = file.metadata()?;
     if !metadata.is_file()
@@ -975,6 +1042,46 @@ fn private_file(file: &File, max: usize) -> Result<()> {
         return Err(refused("a layout file is not bounded, private and owned"));
     }
     Ok(())
+}
+
+/// [`private_file`] on Windows: a plain file of one link and at most `max` bytes, the user's under
+/// the owner-only list ([`fsx::owner_only`], read off the handle, which a read or write open
+/// gives `READ_CONTROL`), what a Unix `0600` file of this user's is.
+#[cfg(windows)]
+fn private_file(file: &File, max: usize) -> Result<()> {
+    let metadata = fsx::meta_of(file)?;
+    if !metadata.file_type().is_file()
+        || !fsx::owner_only(file)?
+        || metadata.st_nlink != 1
+        || metadata.size > max as u64
+    {
+        return Err(refused("a layout file is not bounded, private and owned"));
+    }
+    Ok(())
+}
+
+/// The device and file number of the file `file` is open on: its `fstat`'s device and inode;
+/// on Windows its handle's volume and file id.
+fn identity(file: &File) -> std::io::Result<(u64, fsx::Ino)> {
+    Ok(fsx::id_of(&fsx::meta_of(file)?))
+}
+
+/// Whether the folder `name` in `parent`, open as `opened` (a listing open, which reads no
+/// access list), is the user's alone, what a Unix `0700` folder of this user's is: judged on a
+/// second open of the same name for its facts (`OFlags::PATH`, with `READ_CONTROL`), held to
+/// the same file id.
+#[cfg(windows)]
+fn private_dir_at(parent: &File, name: &str, opened: &File) -> Result<bool> {
+    let facts = File::from(syscall(fd::openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ))?);
+    let metadata = fsx::meta_of(&facts)?;
+    Ok(metadata.file_type().is_dir()
+        && fsx::id_of(&metadata) == identity(opened)?
+        && fsx::owner_only(&facts)?)
 }
 
 fn read_file(parent: &File, name: &str, max: usize) -> Result<Vec<u8>> {
@@ -991,6 +1098,21 @@ fn read_bounded(file: &mut File, max: usize) -> Result<Vec<u8>> {
         return Err(refused("a layout file grew past its bound"));
     }
     Ok(bytes)
+}
+
+/// Finish a change of the entries of the open directory `dir`: its flush on Unix. Windows has no
+/// flush of a directory (`FlushFileBuffers` on one is `Access is denied`, os error 5) and NTFS
+/// commits a directory's entries through its own log, as `aterm_durable`'s `Flush::dir` holds.
+fn durable_dir(dir: &File) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        aterm_durable::durable(dir)
+    }
+    #[cfg(windows)]
+    {
+        let _ = dir;
+        Ok(())
+    }
 }
 
 /// Publish a bounded piece of declared preparation once, using one reusable scratch file.
@@ -1017,7 +1139,7 @@ fn install_file(parent: &File, name: &str, bytes: &[u8]) -> Result<()> {
         name,
         RenameFlags::NOREPLACE,
     ))?;
-    aterm_durable::durable(parent)?;
+    durable_dir(parent)?;
     Ok(())
 }
 

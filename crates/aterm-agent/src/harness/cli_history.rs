@@ -145,22 +145,35 @@ fn clock(t: i64, tz_at: fn(i64) -> i64) -> String {
     hm(t, tz_at(t))
 }
 
-/// What happened, in words: `another account signed in to the home 14:02`, `reset used 14:10`
-/// (the five-hour window's), `week reset used 09:00`; a word this build does not know is printed
-/// as the word.
+/// What happened, in words: `another account signed in to the home 14:02`, `5h refilled or
+/// raised 14:10`, `week refilled or raised 09:00` (the series does not tell a limit reset spent
+/// from a refill or a raised allowance, [`RESET_USED`]), or `week reset used 09:00` where this
+/// Mac's ledger shows its aterm spent one then ([`Happened::spent`]), each window named as the
+/// day line's own part names it; a word this build does not know is printed as the word.
 fn happened_words(e: &Happened, tz_at: fn(i64) -> i64) -> String {
     let at = clock(e.t, tz_at);
     match (e.e.as_str(), e.w.as_deref()) {
         ("another-account", _) => format!("another account signed in to the home {at}"),
-        (RESET_USED, Some(WEEK_LIMIT)) => format!("week reset used {at}"),
-        (RESET_USED, _) => format!("reset used {at}"),
+        (RESET_USED, w) => {
+            let window = match w {
+                Some(WEEK_LIMIT) => "week ",
+                Some(SESSION_LIMIT) => "5h ",
+                _ => "",
+            };
+            let what = if e.spent {
+                "reset used"
+            } else {
+                "refilled or raised"
+            };
+            format!("{window}{what} {at}")
+        }
         (word, Some(w)) => format!("{word} ({w}) {at}"),
         (word, None) => format!("{word} {at}"),
     }
 }
 
 /// One day's line: `Sat Nov 7  week 42% → 29% left (resets Sun Nov 8 20:50) · 5h 3 windows,
-/// lowest 0% left, 1 used up · reset used 14:10`; the five-hour lowest is what was left at the
+/// lowest 0% left, 1 used up · 5h refilled or raised 14:10`; the five-hour lowest is what was left at the
 /// day's highest five-hour figure. A part that counts a close the backfill booked ends
 /// `(backfill)`.
 fn day_line(day: &HistoryDay, tz_at: fn(i64) -> i64) -> String {
@@ -606,6 +619,7 @@ pub(super) fn run(
             .zip(who.of.pk.as_deref())
             .and_then(|(seen, pk)| seen.accounts.get(pk));
         let lines = alab_seen::history(&who.asked(), &ledger, journal);
+        let spent = alab_seen::spent(&who.asked(), &ledger);
         let series = home.as_ref().map(|home| {
             let files: Vec<(PathBuf, bool)> = own
                 .into_iter()
@@ -640,7 +654,7 @@ pub(super) fn run(
                     }
                 }
             };
-            let days = days_of(&series, &lines, span, tz_at, env.now);
+            let days = days_of(&series, &lines, &spent, span, tz_at, env.now);
             (series, days, booked)
         });
         Block { who, lines, series }

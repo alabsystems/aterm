@@ -460,12 +460,14 @@ fn owned_helper_external_model_moves_require_explicit_current_credits() {
     assert!(cold_resolve_at(&c.seat, &seed, &intent, &facts, &derive).is_ok());
     // This body runs alone in its own child process (`test_alone::alone`), so the policy it
     // sets ends with that process and reaches no other test.
-    LIVE_ACCOUNTS_MODE.store(
+    HOST_POLICY.accounts.store(
         ACCOUNTS_SUPERVISED | ACCOUNTS_WALL | ACCOUNTS_USAGE_CREDITS,
         Ordering::SeqCst,
     );
     assert!(cold_intent_current(&intent));
-    LIVE_ACCOUNTS_MODE.store(ACCOUNTS_SUPERVISED | ACCOUNTS_WALL, Ordering::SeqCst);
+    HOST_POLICY
+        .accounts
+        .store(ACCOUNTS_SUPERVISED | ACCOUNTS_WALL, Ordering::SeqCst);
     assert!(
         !cold_intent_current(&intent),
         "credits revoked after Resolve must refuse the current launch"

@@ -605,6 +605,13 @@ fn pending_dir(paths: &Paths) -> PathBuf {
     paths.dir.join("everyone.pending")
 }
 
+/// Where this Mac's member writes wait to be signed: [`waiting_file`] and the folder of the
+/// pending sets ([`pending_dir`]), whose change moves what a reader of a write's standing finds
+/// still waiting (`claude_token::waiting_here`).
+pub(in super::super) fn wait_files(paths: &Paths) -> [PathBuf; 2] {
+    [waiting_file(paths), pending_dir(paths)]
+}
+
 /// What a pending set's plain text starts with. Then come the servers its publish may have sent
 /// its version to, one per line, then an empty line, then its writes ([`Waiting::encode`]).
 const PENDING_MAGIC: &[u8] = b"aterm/everyone-pending/1\n";
@@ -2604,17 +2611,17 @@ thread_local! {
 
 /// One write as [`Waiting::of_writes`] takes it: its name, the value it becomes (`None`: taken
 /// back to absent) and the values it may be signed over (`None`: none).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) type WriteShape<'a> = (&'a str, Option<&'a [u8]>, &'a [Option<&'a [u8]>]);
 
 /// Waiting writes as each name, the value it becomes (`None`: taken back to absent) and its
 /// bases ([`WaitingWrite::bases`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) type Shapes = BTreeMap<String, (Option<Vec<u8>>, BTreeSet<Option<[u8; 32]>>)>;
 
 /// The base `value` is in a write's bases ([`WaitingWrite::bases`]): its [`entry_digest`] as an
 /// `[everyone]` entry with no flag and no anchor.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn base_of(value: &[u8]) -> [u8; 32] {
     entry_digest(&Entry {
         name: String::new(),
@@ -2627,7 +2634,7 @@ pub(in super::super) fn base_of(value: &[u8]) -> [u8; 32] {
 
 /// What waits ([`waiting_file`]), and each pending set that opens ([`pending_dir`]) by version,
 /// oldest first, as [`Waiting::shapes`]: a set that does not open is left out.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn waiting_shapes(
     paths: &Paths,
     identity: &Identity,
@@ -2651,6 +2658,7 @@ pub(in super::super) fn waiting_shapes(
 impl Waiting {
     /// `[everyone]` writes of `writes`: each name, the value it becomes (`None`: taken back to
     /// absent) and the values it may be signed over (`None`: none).
+    #[cfg(unix)]
     pub(in super::super) fn of_writes(writes: &[WriteShape<'_>]) -> Self {
         Self(
             writes
@@ -2679,6 +2687,7 @@ impl Waiting {
 
     /// These writes with each of `more` among the bases of the write of `name`, where one is
     /// ([`WaitingWrite::bases`]).
+    #[cfg(unix)]
     pub(in super::super) fn with_bases(
         mut self,
         name: &str,
@@ -2691,12 +2700,14 @@ impl Waiting {
     }
 
     /// These writes and `other`'s, `other`'s where both write a name.
+    #[cfg(unix)]
     pub(in super::super) fn joined(mut self, other: Self) -> Self {
         self.0.extend(other.0);
         self
     }
 
     /// Each name, the value it becomes and its bases ([`Shapes`]).
+    #[cfg(unix)]
     pub(in super::super) fn shapes(&self) -> Shapes {
         self.0
             .iter()
@@ -2734,6 +2745,7 @@ impl Waiting {
     }
 
     /// Each name and the value it becomes (empty for a name taken back to absent).
+    #[cfg(unix)]
     pub(in super::super) fn values(&self) -> Values {
         self.0
             .iter()
@@ -2750,18 +2762,18 @@ impl Waiting {
 }
 
 /// What waits ([`waiting_file`]), as [`Waiting::values`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn waiting_values(paths: &Paths, identity: &Identity) -> Values {
     read_waiting(paths, identity).expect("waiting").values()
 }
 
 /// Waiting writes as each name and the value it becomes ([`Waiting::values`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) type Values = BTreeMap<String, Vec<u8>>;
 
 /// Each name that waits ([`waiting_file`]) and the member write it came from
 /// ([`WaitingWrite::draft`]), `None` for an edit's.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn waiting_drafts(
     paths: &Paths,
     identity: &Identity,
@@ -2776,7 +2788,7 @@ pub(in super::super) fn waiting_drafts(
 
 /// Whether the write of `name` that waits here may be signed over `read`, the log's value there,
 /// with no concurrent value beside it ([`WaitingWrite::stands_over`]); `None` where none waits.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn waits_over(
     paths: &Paths,
     identity: &Identity,
@@ -2792,7 +2804,7 @@ pub(in super::super) fn waits_over(
 
 /// What waits ([`waiting_file`]) and what is pending ([`pending_dir`]), by version, oldest first,
 /// as [`Waiting::values`].
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn waiting_and_pending(
     paths: &Paths,
     identity: &Identity,
@@ -2807,7 +2819,7 @@ pub(in super::super) fn waiting_and_pending(
 }
 
 /// The servers each pending set may have reached, by version, oldest first.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(in super::super) fn pending_reach(
     paths: &Paths,
     identity: &Identity,

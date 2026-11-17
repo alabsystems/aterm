@@ -244,6 +244,7 @@ fn adopt(log: &Log, ms: u64) -> CarryAdopt {
         ids: log.id_counters(),
         limits: Limits::SESSION,
         at: at(ms),
+        ident: aterm_slog::DescIdent::default(),
     }
 }
 

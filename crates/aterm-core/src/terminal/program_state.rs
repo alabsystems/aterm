@@ -15,6 +15,10 @@
 //! which is what every reader that decides reads. A program asks whether the terminal speaks the
 //! protocol with `OSC 7501 ; ?`, which the engine answers (`handle_osc_7501`); Claude Code, Grok
 //! Build, Muse Code, agy and Kimi Code write no report until it is answered.
+//!
+//! The root record's `title` is kept, from a known program and another alike
+//! ([`ProgramStateReport::title`]): it is text the program printed about itself, as an OSC 0 or 2
+//! title is, and is read as one. `msg` and `progress` are never read.
 
 /// The state word of an OSC 7501 report.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -413,6 +417,74 @@ impl OtherReport {
     }
 }
 
+/// The title a root record names (`title=<base64>`), as the reader keeps it: decoded, read as
+/// UTF-8 (a byte that is none replaced), cleaned as an OSC 0 or 2 title is
+/// ([`super::handler_osc::sanitize_title`]), and cut at a character boundary to
+/// [`ProgramTitle::MAX`] bytes. Kept inline, so a report stays `Copy`; empty is no title.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ProgramTitle {
+    /// How many of `bytes` are the title.
+    len: u8,
+    /// The title, then zeros.
+    bytes: [u8; ProgramTitle::MAX],
+}
+
+impl ProgramTitle {
+    /// The most base64 bytes of a `title` the reader takes, the protocol's cap; a longer one is
+    /// not taken.
+    const MAX_BASE64: usize = 256;
+    /// The longest title kept: what [`Self::MAX_BASE64`] bytes decode to. A byte that is not
+    /// UTF-8 is read as U+FFFD, three bytes, so a title that held such bytes can be longer
+    /// than this once read; it is cut, at a character boundary.
+    const MAX: usize = Self::MAX_BASE64 / 4 * 3;
+    /// No title.
+    const NONE: Self = Self {
+        len: 0,
+        bytes: [0; Self::MAX],
+    };
+
+    /// `text`, cut at a character boundary to [`Self::MAX`] bytes.
+    fn of(text: &str) -> Self {
+        let text = &text[..text.floor_char_boundary(Self::MAX)];
+        let mut bytes = [0; Self::MAX];
+        bytes[..text.len()].copy_from_slice(text.as_bytes());
+        Self {
+            len: u8::try_from(text.len()).unwrap_or_default(),
+            bytes,
+        }
+    }
+
+    /// The title read off a root record's `title=` value (`raw`): `Some(NONE)` for an empty one,
+    /// which takes the title away; `None` for one this reader does not take (past
+    /// [`Self::MAX_BASE64`], or not base64), which leaves the title as it was.
+    fn read(raw: &str) -> Option<Self> {
+        if raw.len() > Self::MAX_BASE64 {
+            return None;
+        }
+        let decoded = aterm_codec::base64::decode(raw).ok()?;
+        let text = super::handler_osc::sanitize_title(&String::from_utf8_lossy(&decoded));
+        Some(Self::of(&text))
+    }
+
+    /// The title.
+    fn as_str(&self) -> &str {
+        // Only whole characters of a `str` are kept ([`Self::of`]), so this never falls back.
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or_default()
+    }
+}
+
+impl Default for ProgramTitle {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl std::fmt::Debug for ProgramTitle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ProgramTitle").field(&self.as_str()).finish()
+    }
+}
+
 /// The engine's report of OSC 7501: what stands now and how many turns began, read by value on
 /// every status sweep ([`ProgramStateRecord::report`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -446,6 +518,10 @@ pub struct ProgramStateReport {
     /// was taken, or the first group said where none was said by then (`0` until then). The
     /// report is a run sign only while that group holds the front ([`Self::run_sign`]).
     writer: i32,
+    /// Moves each time the kept title ([`Self::title`]) changes, and only then.
+    pub title_seq: u64,
+    /// The title the newest root record that named one gave ([`Self::title`]).
+    title: ProgramTitle,
 }
 
 impl ProgramStateReport {
@@ -482,6 +558,26 @@ impl ProgramStateReport {
         }
         self.state
     }
+
+    /// THE TITLE A PROGRAM GAVE ITSELF in its root record's `title=` (base64), from a known
+    /// program or another alike: decoded, cleaned as an OSC 0 or 2 title is, at most 192 bytes;
+    /// `None` while none stands. A report with no `title` key leaves it, as does one past the
+    /// protocol's 256 base64 bytes or one that is not base64; an empty `title=`, a `clear` and a
+    /// full reset take it away. A child record never sets it, and a checkpoint carries none.
+    /// [`Self::title_seq`] moves with each change.
+    #[must_use]
+    #[inline]
+    pub fn title(&self) -> Option<&str> {
+        (self.title.len > 0).then(|| self.title.as_str())
+    }
+
+    /// Keep `title`, moving [`Self::title_seq`] where it differs from the one kept.
+    fn set_title(&mut self, title: ProgramTitle) {
+        if title != self.title {
+            self.title = title;
+            self.title_seq = self.title_seq.wrapping_add(1);
+        }
+    }
 }
 
 /// THE ENGINE'S RECORD OF OSC 7501: the report standing ([`Self::report`]) and the turns the
@@ -517,6 +613,14 @@ impl ProgramStateRecord {
         &self.ring
     }
 
+    /// The program's title's sequence ([`ProgramStateReport::title_seq`]), which a caller reads
+    /// around a report or a reset to learn whether the title moved.
+    #[inline]
+    #[must_use]
+    pub(super) const fn title_seq(&self) -> u64 {
+        self.report.title_seq
+    }
+
     /// Take one OSC 7501 body (the text after `7501;`) from a batch with no wall clock
     /// ([`Self::accept_at`] with `None`).
     #[cfg(test)]
@@ -530,6 +634,14 @@ impl ProgramStateRecord {
         let Some(next) = parse(body) else {
             return false;
         };
+        match next {
+            Body::Clear => self.report.set_title(ProgramTitle::NONE),
+            Body::Report(_) => {
+                if let Some(title) = title_in(body) {
+                    self.report.set_title(title);
+                }
+            }
+        }
         if let Body::Report(state) = next
             && !state.app.is_known()
         {
@@ -670,11 +782,15 @@ impl ProgramStateRecord {
         self.report.other.take(None);
     }
 
-    /// A full reset (RIS): no report stands, a known program's or another's.
+    /// A full reset (RIS): no report stands, a known program's or another's, and no title.
     #[inline]
     pub(super) const fn reset(&mut self) {
         self.report.other.take(None);
         let r = &mut self.report;
+        if r.title.len > 0 {
+            r.title = ProgramTitle::NONE;
+            r.title_seq = r.title_seq.wrapping_add(1);
+        }
         if r.state.is_some() {
             r.seq = r.seq.wrapping_add(1);
             r.began = r.seq;
@@ -733,8 +849,23 @@ enum Body {
     Report(ProgramState),
 }
 
+/// The title a report's body names ([`ProgramTitle::read`]): `None` where it names none, names
+/// two, or names one this reader does not take. Read only of a body [`parse`] takes, so never of
+/// a child record's.
+fn title_in(body: &str) -> Option<ProgramTitle> {
+    let mut titles = body
+        .split(':')
+        .filter_map(|item| item.strip_prefix("title="));
+    let raw = titles.next()?;
+    if titles.next().is_some() {
+        return None;
+    }
+    ProgramTitle::read(raw)
+}
+
 /// What one OSC 7501 body says ([`Body::Clear`], [`Body::Report`]): only the root record's, so a
-/// body naming an `id` (a child record's report, or its `clear`) is none.
+/// body naming an `id` (a child record's report, or its `clear`) is none. `msg` and `progress`
+/// are never read, and `title` is [`title_in`]'s.
 fn parse(body: &str) -> Option<Body> {
     if body.len() > MAX_BODY_BYTES {
         return None;

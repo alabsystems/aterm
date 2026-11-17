@@ -2907,7 +2907,7 @@ impl HeldBook<'_> {
         write_private(self.dir, ANSWERED_FILE, text.as_bytes())
     }
 
-    /// Write `secret` as this machine's [`KEY_FILE`], in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key every 2 s, and never sees half of one. A secret other than the one held is another fleet's (a join of another fleet or of an issuer's new secret, an init): this machine's stored fleet access ([`aterm_types::fleet_access::FILE`]), a level its person chose for the fleet it held, is removed first, so the members the new key admits find this machine Read Only, as a leave leaves it. A level above Read Only is written under this lock ([`access_held`]), so none comes between the removal and the key.
+    /// Write `secret` as this machine's [`KEY_FILE`], in the one spelling `fleet::read_key_file` reads (lowercase hex and a newline), whole: the listener reads the key again at each write of it, and never sees half of one. A secret other than the one held is another fleet's (a join of another fleet or of an issuer's new secret, an init): this machine's stored fleet access ([`aterm_types::fleet_access::FILE`]), a level its person chose for the fleet it held, is removed first, so the members the new key admits find this machine Read Only, as a leave leaves it. A level above Read Only is written under this lock ([`access_held`]), so none comes between the removal and the key.
     /// # Errors
     /// `secret` is no fleet secret, the stored fleet access of another fleet could not be removed (the key is then not written), or the key cannot be written.
     pub fn write_key(&self, secret: &[u8]) -> io::Result<()> {

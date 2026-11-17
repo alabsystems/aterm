@@ -75,6 +75,19 @@ pub enum Shape {
     /// payload by `atpkg-publish pack-bottle` (`git`, `gh`). An explicit `index --pin`
     /// selects the initial build; the Linux lane adds any declared GNU targets to that pin.
     Bottle(BottleDef),
+    /// A BUILD TREE another project's build reads whole (`docs/DESIGN-disk-custody-2026-11-12.md`
+    /// §5): packed whole by `atpkg-publish pack-tree` under the key that names what it was built
+    /// from, installed by the client under that key and handed out as copy-on-write clones
+    /// (`atpkg::keyed_tree`). It shims no tool, no lane reads it, and no channel pins it: a
+    /// client asks for a key, never a build number (`index --pin` refuses one).
+    Tree(TreeDef),
+}
+
+/// How a keyed tree is packed.
+#[derive(Clone, Copy, Debug)]
+pub struct TreeDef {
+    /// The Apple targets a tree is packed for; its key names the host it was built on.
+    pub darwin: &'static [Triple],
 }
 
 /// What a harness row's pack is held to beyond a plain row's
@@ -194,6 +207,42 @@ const fn harness(name: &'static str, tool: &'static str) -> ProgramDef {
             harness: Some(Harness { tool }),
         },
     }
+}
+
+/// A keyed tree: the client's row of it (`atpkg::keyed_tree::TREES`) names its repo, Apple
+/// silicon only, ungrouped.
+const fn tree(name: &'static str) -> ProgramDef {
+    let mut i = 0;
+    let trees = atpkg::keyed_tree::TREES;
+    while i < trees.len() {
+        if const_eq(trees[i].name, name) {
+            return ProgramDef {
+                name,
+                repo: trees[i].repo,
+                group: None,
+                system: None,
+                unavailable_hint: Some("A keyed build tree is packed for ARM macOS only"),
+                shape: Shape::Tree(TreeDef { darwin: ARM_DARWIN }),
+            };
+        }
+        i += 1;
+    }
+    panic!("a tree row is a keyed tree the client installs (atpkg::keyed_tree::TREES)")
+}
+
+const fn const_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Every program the channel pins, in index order.
@@ -385,6 +434,10 @@ pub static PROGRAMS: &[ProgramDef] = &[
             origin: BottleOrigin::Reference(&aterm_uds::host::upstream::CARCARA),
         }),
     },
+    // The two trees Trust's bootstrap needs that a Mac with no neighbouring worktree cannot
+    // clone (DC-16b): each a row of the client's `atpkg::keyed_tree::TREES`.
+    tree("llvm-tree"),
+    tree("trust-stage0"),
     ProgramDef {
         name: "node",
         repo: "aterm",
@@ -420,6 +473,7 @@ impl ProgramDef {
             Shape::Bundle(b) => b.darwin,
             Shape::Package(p) => p.darwin,
             Shape::Bottle(b) => b.darwin,
+            Shape::Tree(t) => t.darwin,
         }
     }
 
@@ -434,16 +488,26 @@ impl ProgramDef {
     pub const fn harness(&self) -> Option<Harness> {
         match self.shape {
             Shape::Plain { harness, .. } => harness,
-            Shape::Bundle(_) | Shape::Package(_) | Shape::Bottle(_) => None,
+            Shape::Bundle(_) | Shape::Package(_) | Shape::Bottle(_) | Shape::Tree(_) => None,
         }
     }
 
     /// Whether the Apple source-release lane tracks its repository. Package and bottle
     /// builds enter the channel through an explicit pin; the Linux lane can subsequently
-    /// extend a bottle pin with the GNU targets its definition declares.
+    /// extend a bottle pin with the GNU targets its definition declares. A keyed tree enters no
+    /// channel at all.
     #[must_use]
     pub const fn lane_tracked(&self) -> bool {
-        !matches!(self.shape, Shape::Package(_) | Shape::Bottle(_))
+        !matches!(
+            self.shape,
+            Shape::Package(_) | Shape::Bottle(_) | Shape::Tree(_)
+        )
+    }
+
+    /// Whether it is a keyed tree, which a client asks for by key and no channel pins.
+    #[must_use]
+    pub const fn is_tree(&self) -> bool {
+        matches!(self.shape, Shape::Tree(_))
     }
 }
 

@@ -25,9 +25,8 @@ use crate::wire::{Method, Origin, WireBody};
 use crate::write::{Effect, Ensured, Outcome, WriteOp};
 
 /// One repository-wide intent bucket: an unknown batch blocks another batch,
-/// including one whose inputs differ, until its intent is reconciled or, its
-/// writer able to send nothing more, agh's window for it ends
-/// (`Journal::closable`).
+/// including one whose inputs differ, until a complete origin observation
+/// reconciles its dead writer's intent.
 pub(crate) const ATOMIC_KEY: &str = "atomic refs";
 const ZERO: &str = "0000000000000000000000000000000000000000";
 const MAX_UPDATES: usize = 128;
@@ -63,7 +62,7 @@ impl AtomicRefWrite {
 
 /// One non-forced ref update. A zero `before` creates a missing ref; deletion
 /// (a zero `after`) is deliberately outside this operation.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RefUpdate {
     /// A fully qualified Git ref, including custom namespaces such as `refs/attest/`.
@@ -187,6 +186,8 @@ impl Refs<'_> {
         batch: &AtomicRefBatch,
         intents: &dyn IntentStore,
     ) -> Result<Outcome<Ensured<AtomicRefBatch>>> {
+        self.write_checks(permit)?;
+        self.reconcile_dead_writer(permit, intents, false)?;
         let node = self.atomic_node(permit, batch)?;
         let mut input = batch.variables(&node);
         let digest = Sha256Digest::of(&crate::github::encode_body(&input)?).to_string();
@@ -218,7 +219,8 @@ impl Refs<'_> {
                 permit,
                 ATOMIC_KEY,
             )?
-            .with_body_digest(Some(digest.clone()));
+            .with_body_digest(Some(digest.clone()))
+            .with_refs(batch.updates().to_vec());
         let acknowledged = Cell::new(false);
         let created = |answer: &crate::client::Answered| {
             let value = answer.json().ok()?;
@@ -265,6 +267,110 @@ impl Refs<'_> {
             Outcome::Refused(error) => Outcome::Refused(error),
             Outcome::NeverSent(error) => Outcome::NeverSent(error),
         })
+    }
+
+    /// Only read the abandoned request back. Never resend it, and never
+    /// clear a live writer, an old unowned record or incomplete evidence.
+    pub(crate) fn reconcile_dead_writer(
+        &self,
+        permit: &Permit,
+        intents: &dyn IntentStore,
+        native: bool,
+    ) -> Result<()> {
+        for intent in intents.open()?.into_iter().filter(|i| {
+            i.op == WriteOp::RefUpdateAtomic && i.key == ATOMIC_KEY && i.slug == self.slug
+        }) {
+            if !intent.writer.as_ref().is_some_and(|writer| writer.dead()) {
+                continue;
+            }
+            // The frontend may have registered and released a child after the
+            // open() snapshot. Once it is dead, refresh the durable custody:
+            // that frontend can no longer append another child registration.
+            let Some(current) = intents.latest(intent.op, &intent.key)? else {
+                continue;
+            };
+            if !current.open || current.intent.id != intent.id || current.intent.slug != self.slug {
+                continue;
+            }
+            let intent = current.intent;
+            let Some(writer) = intent.writer.as_ref().filter(|w| w.dead()) else {
+                continue;
+            };
+            let unresolved = || {
+                Error::new(Kind::OutcomeUnknown, format!(
+                    "intent {} has dead writer pid={} start={} boot={}; origin is mixed or unreadable",
+                    intent.id, writer.frontend().pid, writer.frontend().start, writer.boot()))
+                    .with_sub(Sub::IntentOpen { intent: intent.id.to_string() })
+                    .with_repo(self.slug.to_string())
+                    .with_next(format!("agh intent retract {} {} --confirm {}",
+                        self.slug, intent.id, intent.id))
+            };
+            let mut before = !intent.refs.is_empty();
+            let mut after = before;
+            let reader = self.writer_view(permit);
+            // GitHub hides an inaccessible repository behind 404. Prove writer
+            // visibility before interpreting a per-ref 404 as an absent ref.
+            if !native
+                && !reader
+                    .push_repo()
+                    .is_ok_and(|repo| self.slug.eq_full_name(&repo.full_name))
+            {
+                return Err(unresolved());
+            }
+            for update in &intent.refs {
+                // A malformed recorded ref is never interpolated into a read.
+                if !path::ref_name_ok(&update.reference)
+                    || !path::is_sha(&update.before)
+                    || !path::is_sha(&update.after)
+                {
+                    before = false;
+                    after = false;
+                    break;
+                }
+                let found = if native {
+                    self.gh
+                        .run_git(
+                            &crate::git::GitRun::ls_remote(&self.slug, Some(&update.reference))
+                                .with_named(permit.named()),
+                        )
+                        .and_then(|out| {
+                            crate::git::advertised_refs(&out.stdout, Some(&update.reference))
+                        })
+                        .and_then(|refs| match refs.get(&update.reference) {
+                            Some(oid) if path::is_sha(oid) && oid != ZERO => Ok(oid.clone()),
+                            Some(_) => {
+                                Err(Error::protocol("origin advertised an invalid existing ref"))
+                            }
+                            None => Ok(ZERO.into()),
+                        })
+                } else {
+                    match reader.atomic_ref(&update.reference) {
+                        Ok(found) => Ok(found.object.sha),
+                        Err(e) if e.kind == Kind::NotFound => Ok(ZERO.into()),
+                        Err(e) => Err(e),
+                    }
+                };
+                let Ok(found) = found else {
+                    before = false;
+                    after = false;
+                    break;
+                };
+                before &= found == update.before;
+                after &= found == update.after;
+            }
+            // Re-read custody after network reads. A PID is never a time-based lease.
+            if !writer.dead() {
+                continue;
+            }
+            if after {
+                intents.observe(&intent.id, Some(0))?;
+            } else if before {
+                intents.retract(&intent.id)?;
+            } else {
+                return Err(unresolved());
+            }
+        }
+        Ok(())
     }
 
     fn atomic_node(&self, permit: &Permit, batch: &AtomicRefBatch) -> Result<String> {

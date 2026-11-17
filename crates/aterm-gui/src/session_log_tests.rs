@@ -1822,11 +1822,41 @@ fn every_producer_runs_under_the_timeline_lock_alone() {
             g.record_cwd_change(Some("/a"));
             g.slog_mut()
                 .observe_title("t", crate::session_log::observed::TitleStands::Own, now);
+            let read = crate::session_log::InbandRead {
+                shown: "t",
+                untitled: false,
+                stands: crate::session_log::observed::TitleStands::Own,
+                program: Some("p"),
+                program_seq: 1,
+            };
+            g.slog_mut().observe_inband_title(&read, now);
+            g.slog_mut().inband_tick(now);
             let _ = g.slog_take_wake();
+            let derived = crate::describe::derive(&crate::describe::Read::default());
+            assert!(matches!(
+                crate::describe::write(&mut g, &derived, now),
+                Ok(n) if n > 0
+            ));
             let _ = g.note_harness_act("approve-all@v1", "codex-alab@1", Actor::Ctl);
             let working = crate::task_record::TaskMark::new(crate::task_record::TaskState::Working);
             let _ = g.mark_task(&working, &Default::default(), std::time::Instant::now(), 1);
             let _ = g.note_task_attention(crate::task_record::Asks::of_owners([1]));
+            let birth = super::Birth {
+                title: Some("t".into()),
+                matters: Some("m".into()),
+                package: Some("FL-04".into()),
+                from: None,
+                request_why: None,
+            };
+            let born = super::Born {
+                author: super::BirthAuthor::Stated(Actor::Ctl),
+                creator: None,
+                copied: None,
+            };
+            assert_eq!(g.slog_mut().claim_birth(&born.claims(&birth), now), 3);
+            if let Some(run) = g.slog().log().state().desc.open_agent() {
+                g.slog_mut().keep_first_prompt(run, "fix the parser");
+            }
             let _ = g.slog_take_wake();
         }
         let report = crate::manual_reset::ResetReport {
@@ -5543,6 +5573,7 @@ fn a_long_verdict_detail_never_costs_the_carry() {
         },
         limits: aterm_slog::Limits::SESSION,
         at: at(6_000),
+        ident: aterm_slog::DescIdent::default(),
     };
     assert!(aterm_slog::Log::from_carry(&out.lines, a).is_ok());
     assert!(aterm_slog::Log::from_carry(&lines, a).is_err());
@@ -6719,6 +6750,8 @@ fn the_always_present_host_lines_fit_the_carry_at_their_worst() {
         by_screen: true,
         tracker: TurnTracker::from_carry_line(&worst, now).expect("the worst line reads"),
         pairs: transcript::HarnessPairs::default(),
+        first_prompt: None,
+        kept_prompt: true,
     });
     s.typed = Typed {
         input: Some((max, Actor::sid(sid), Some(sid), now)),

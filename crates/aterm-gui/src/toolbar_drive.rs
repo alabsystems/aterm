@@ -468,6 +468,7 @@ mod macos {
             }
             Wake::MenuAction { action, .. } => format!("MenuAction({action:?})"),
             Wake::BeginSessionRename { tab, .. } => format!("BeginSessionRename({tab})"),
+            Wake::NativeRenameEdited { session, .. } => format!("NativeRenameEdited({session})"),
             Wake::CommitSessionRename { session, text, .. } => {
                 format!("CommitSessionRename({session},{text:?})")
             }

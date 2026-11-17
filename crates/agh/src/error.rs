@@ -509,9 +509,11 @@ pub enum Sub {
         /// The key.
         key: String,
     },
-    /// Unsent complete inventory race outside the requested refs. Their old
-    /// values still match, and main is unchanged or provably fast-forward.
-    /// A caller may retry only after rechecking all its own preconditions.
+    /// Unsent: main advanced, provably fast-forward, under a write whose
+    /// caller bound its policy to main (`AtomicRefBatch::observing_main`).
+    /// The requested refs still hold their old values. A write not bound to
+    /// main goes ahead over such a move and never carries this marker. The
+    /// caller may retry only after rechecking its own preconditions on main.
     GitInventoryChanged {
         /// The final observed main, which a retry must not rewind.
         main: String,

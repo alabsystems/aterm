@@ -2766,7 +2766,8 @@ pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 pub(crate) fn spawn_usage() -> String {
     format!(
         "ERR usage: spawn [window=<id>] [raise=<t|f>] [cwd=<path>] [split=<v|h>] [theme=<name>] \
-         [why=<one line>] [req=<id>] [connected=controlled|controller place=window|tab of=<sid> | agent=<{}> [model=<m>] \
+         [why=<one line>] [req=<id>] [package=<ids>] \
+         [connected=controlled|controller place=window|tab of=<sid> | agent=<{}> [model=<m>] \
          [autopilot=<land|cruise>] [from=<sid>] len=<n> | program=<pct> [arg=<pct>]... \
          [from=<sid>] len=<n>]\n",
         aterm_agent::harness::worker::started_words()
@@ -2864,6 +2865,9 @@ pub(crate) enum SpawnForm {
         /// The request this spawn's tab joins (`req=`, [`aterm_types::control_verbs::request_id`]),
         /// one its requester opened (`crate::requests_host::prepare`).
         req: Option<String>,
+        /// The tracker packages the session is for (`package=`, [`aterm_slog::desc_text`]'s rule:
+        /// 1 to 4 ids, none repeated), its `package` slot at birth.
+        package: Option<String>,
     },
     Connected {
         kind: crate::connections::ConnectedSpawnKind,
@@ -2883,7 +2887,7 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
     let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
     let (mut window, mut raise, mut theme) = (None, None, None);
     let (mut agent, mut model, mut effort, mut from, mut framed) = (None, None, None, None, false);
-    let (mut autopilot, mut why, mut req) = (None, None, None);
+    let (mut autopilot, mut why, mut req, mut package) = (None, None, None, None);
     let (mut program, mut args) = (None, Vec::new());
     let Some(tokens) = split_quoted_tokens(rest) else {
         return Err(None);
@@ -2981,6 +2985,12 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             if req.replace(id.to_owned()).is_some() {
                 return Err(refused());
             }
+        } else if let Some(v) = tok.strip_prefix("package=") {
+            // The `package` slot's one rule: refused, never cut.
+            let ids = aterm_slog::desc_text("package", v).map_err(|_| refused())?;
+            if package.replace(ids).is_some() {
+                return Err(refused());
+            }
         } else if tok.starts_with("len=") {
             framed = true;
         } else {
@@ -3030,6 +3040,7 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
             agent,
             why,
             req,
+            package,
         }),
         (Some(kind), Some(place), Some(origin))
             if split.is_none()
@@ -3037,7 +3048,8 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
                 && raise.is_none()
                 && agent.is_none()
                 && why.is_none()
-                && req.is_none() =>
+                && req.is_none()
+                && package.is_none() =>
         {
             Ok(SpawnForm::Connected {
                 kind,
@@ -3221,6 +3233,7 @@ pub(crate) fn cmd_spawn(
             agent,
             why,
             req,
+            package,
         } => {
             let frame = agent
                 .as_ref()
@@ -3268,6 +3281,7 @@ pub(crate) fn cmd_spawn(
                 }
             };
             let task = task.map(|order| under_drive(order, crate::fabric::serving_driver()));
+            let birth = crate::session_log::Birth::of(task.as_ref(), why, package);
             let fleet = crate::fabric::serving_requester();
             let shell = task
                 .is_none()
@@ -3280,6 +3294,15 @@ pub(crate) fn cmd_spawn(
                 Ok(begun) => begun,
                 Err(refusal) => return refusal,
             };
+            // Once a join is resolved: a joined request's given why is the reason of a spawn
+            // that gave none.
+            let birth = Box::new(
+                birth.joining(
+                    begun
+                        .as_ref()
+                        .and_then(crate::requests_host::Begun::joined_why),
+                ),
+            );
             let (request, receipt) = crate::requests_host::hand(begun, cwd.as_deref());
             let sent = call_main(proxy, |tx| Wake::SpawnSession {
                 aim,
@@ -3290,7 +3313,7 @@ pub(crate) fn cmd_spawn(
                 task,
                 shell,
                 fleet,
-                why,
+                birth,
                 by,
                 reply: tx,
                 request,
@@ -3394,6 +3417,16 @@ impl WorkerBlock {
             ),
         }
     }
+}
+
+/// A `from=` as this Mac's store resolves it ([`crate::App::resolved_from`]).
+pub(crate) struct ResolvedFrom {
+    /// The registered session's sid, else the text as given.
+    pub(crate) sid: String,
+    /// The registered session's local id.
+    pub(crate) local: Option<u64>,
+    /// The registered session's context.
+    pub(crate) ctx: Option<std::sync::Arc<crate::SessionCtx>>,
 }
 
 /// Prechecked shell dialect and environment needed to launch a spawned worker.
@@ -3833,11 +3866,8 @@ impl crate::App {
         let (from, caller) = match &order.caller {
             None => (crate::task_record::FROM_CTL.to_string(), None),
             Some(sid) => {
-                let g = self.store.read().unwrap_or_else(|p| p.into_inner());
-                match g.by_sid(sid) {
-                    Some(h) => (h.sid.as_str().to_string(), Some(h.local_id)),
-                    None => (sid.as_str().to_string(), None),
-                }
+                let resolved = self.resolved_from(sid);
+                (resolved.sid, resolved.local)
             }
         };
         Ok(WorkerStart {
@@ -3847,6 +3877,25 @@ impl crate::App {
             shell,
             dialect,
         })
+    }
+
+    /// THE SESSION `from` NAMES, as this Mac's store resolves it, so a worker's task record and
+    /// its birth claims name one creator: the registered session's sid, local id and context,
+    /// else the text as given and no session. The store's read lock is held only to clone them.
+    pub(crate) fn resolved_from(&self, from: &aterm_session::SessionId) -> ResolvedFrom {
+        let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+        match g.by_sid(from) {
+            Some(h) => ResolvedFrom {
+                sid: h.sid.as_str().to_string(),
+                local: Some(h.local_id),
+                ctx: Some(std::sync::Arc::clone(&h.ctx)),
+            },
+            None => ResolvedFrom {
+                sid: from.as_str().to_string(),
+                local: None,
+                ctx: None,
+            },
+        }
     }
 
     fn ready_worker(

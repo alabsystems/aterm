@@ -6,8 +6,6 @@
 
 use super::*;
 use crate::ai::connector::Region;
-use crate::harness::accounts::Auth;
-use crate::harness::accounts::rename_tests::{NOW, seed_reference};
 use crate::harness::alab_roster::test_machine;
 use std::collections::BTreeMap;
 use std::fs;
@@ -326,8 +324,8 @@ fn registry_name_fallback_distinguishes_unbound_pending_and_explicitly_disabled(
 
 /// A Mac's preferred accounts join in rank order with an unranked one last; an account this Mac
 /// does not prefer, or one that may not join (paused), is not added; an account the roster already
-/// has keeps the label the roster gives it, since only [`migrate`] renames; and a lab that names
-/// no machine for this Mac yields no fleet, so the sync reads what it always read.
+/// has keeps the label the roster gives it, since no sync renames a row; and a lab that names no
+/// machine for this Mac yields no fleet, so the sync reads what it always read.
 /// NEGATIVE CONTROL: with `fleet_for` taking the lab's label over the roster's, the kept row is
 /// renamed by the sync: `` left: ["m22-2", …] right: ["claude-bbbbbb", …] ``; with the
 /// `joinable` filter removed, the paused account joins.
@@ -337,7 +335,6 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
     paused.joinable = false;
     let lab = Lab {
         me: Some(test_machine("m22")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", None)]),
@@ -395,7 +392,6 @@ fn the_lab_fleet_adds_this_macs_preferred_accounts_in_rank_order() {
 fn a_preference_never_drops_a_row() {
     let lab = Lab {
         me: Some(test_machine("m22")),
-        settled: true,
         bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
@@ -446,301 +442,6 @@ fn a_preference_never_drops_a_row() {
     );
 }
 
-/// A scratch HOME with old-style rows: Claude Code's `m22` (the default login), `m22-2` and
-/// `m20-m22`, an unknown `kept`, and Kimi Code's `kimi-m16`, each login directory holding a file,
-/// with state (an `Ok` sign-in word), a session and a binding on record.
-struct Home {
-    _root: aterm_tempfile::TempDir,
-    home: PathBuf,
-    state: PathBuf,
-    config: PathBuf,
-}
-
-const CLAUDE_ROWS: [(&str, &str); 4] = [
-    ("m22", "ann"),
-    ("m22-2", "bob"),
-    ("m20-m22", "cy"),
-    ("kept", "dee"),
-];
-
-impl Home {
-    fn new() -> Self {
-        let root = aterm_tempfile::TempDir::new().unwrap();
-        let home = root.path().join("home");
-        let state = root.path().join("state");
-        let config = root.path().join("config");
-        for dir in [&home, &state, &config] {
-            fs::create_dir_all(dir).unwrap();
-        }
-        let bed = Self {
-            _root: root,
-            home,
-            state,
-            config,
-        };
-        for (cli, rows) in [
-            (Cli::Claude, CLAUDE_ROWS.to_vec()),
-            (Cli::Kimi, vec![("kimi-m16", "eve")]),
-        ] {
-            let store = bed.store(cli);
-            let rows: Vec<Row> = rows
-                .iter()
-                .map(|(label, local)| {
-                    let dir = (*label != "m22").then(|| store.logins_dir().join(label));
-                    if let Some(dir) = &dir {
-                        fs::create_dir_all(dir).unwrap();
-                        fs::write(dir.join("auth.json"), format!("login of {local}")).unwrap();
-                    }
-                    row(label, dir.as_deref(), local, cli)
-                })
-                .collect();
-            fs::write(
-                bed.roster(cli),
-                accounts::append_rows_for(cli, "", &rows).unwrap(),
-            )
-            .unwrap();
-            store
-                .transact_logins(NOW, &mut None, |state, logins| {
-                    for row in &rows {
-                        for kind in [1, 3, 7] {
-                            seed_reference(state, logins, &row.label, kind);
-                        }
-                    }
-                    Ok(Vec::new())
-                })
-                .unwrap();
-        }
-        bed
-    }
-
-    fn store(&self, cli: Cli) -> Store {
-        match cli {
-            Cli::Claude => Store::at(&self.state),
-            _ => Store::at_for(&self.state, cli, &self.home),
-        }
-    }
-
-    fn roster(&self, cli: Cli) -> PathBuf {
-        accounts::roster_beside_for(&self.config.join("aterm.toml"), cli).unwrap()
-    }
-
-    /// The lab of this home's accounts, each recorded under the label its row has (its legacy
-    /// label), but `kept`'s account, which the lab does not know.
-    fn lab(&self, settled: bool) -> Lab {
-        Lab {
-            me: Some(test_machine("m22")),
-            settled,
-            bound: Default::default(),
-            accounts: vec![
-                legacy(
-                    account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
-                    "m22",
-                ),
-                legacy(
-                    account("bob", Cli::Claude, "claude-bbbbbb", &[("m22", Some(2))]),
-                    "m22-2",
-                ),
-                legacy(
-                    account(
-                        "cy",
-                        Cli::Claude,
-                        "claude-cccccc",
-                        &[("m20", None), ("m22", None)],
-                    ),
-                    "m20-m22",
-                ),
-                legacy(
-                    account("eve", Cli::Kimi, "kimi-eeeeee", &[("m16", Some(1))]),
-                    "kimi-m16",
-                ),
-            ],
-            aliases: BTreeMap::new(),
-            mailboxes: BTreeMap::new(),
-            #[cfg(unix)]
-            machine_name: None,
-            places: Default::default(),
-        }
-    }
-
-    fn migrate(&self, lab: &Lab, cli: Cli) -> Result<Migrated, String> {
-        migrate(lab, cli, &self.store(cli), &self.roster(cli), NOW, &[])
-    }
-
-    /// Every file under the scratch root with its bytes.
-    fn tree(&self) -> BTreeMap<PathBuf, Vec<u8>> {
-        let mut out = BTreeMap::new();
-        let mut walk = vec![self.home.clone(), self.state.clone(), self.config.clone()];
-        while let Some(at) = walk.pop() {
-            for entry in fs::read_dir(&at).into_iter().flatten().flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    walk.push(path);
-                } else {
-                    out.insert(path.clone(), fs::read(&path).unwrap());
-                }
-            }
-        }
-        out
-    }
-
-    /// The migrated home, as it must read: each row under the lab's label, its login directory
-    /// the one it had with its login in it, the default login still the default, its state, its
-    /// session and its binding moved with it, and nothing left under an old label.
-    fn assert_migrated(&self) {
-        for (cli, moved) in [
-            (
-                Cli::Claude,
-                vec![
-                    ("m22", "claude-aaaaaa", "ann"),
-                    ("m22-2", "claude-bbbbbb", "bob"),
-                    ("m20-m22", "claude-cccccc", "cy"),
-                    ("kept", "kept", "dee"),
-                ],
-            ),
-            (Cli::Kimi, vec![("kimi-m16", "kimi-eeeeee", "eve")]),
-        ] {
-            let store = self.store(cli);
-            let roster = Roster::load_for(cli, &self.roster(cli)).unwrap();
-            let (state, _) = store.load(NOW).unwrap();
-            let (logins, _) = store.load_logins(NOW).unwrap();
-            for (old, new, local) in moved {
-                let row = roster.row(new).unwrap_or_else(|| panic!("{new} is a row"));
-                let was = (old != "m22").then(|| store.logins_dir().join(old));
-                assert_eq!(
-                    row.dir.as_deref(),
-                    was.as_deref().map(|dir| dir.to_str().unwrap()),
-                    "{new}'s login directory is pinned where {old}'s was"
-                );
-                if let Some(dir) = &was {
-                    assert_eq!(
-                        fs::read_to_string(dir.join("auth.json")).unwrap(),
-                        format!("login of {local}"),
-                        "{old}'s login is where it was"
-                    );
-                }
-                let env_login = was.as_deref().map(|dir| dir.to_str().unwrap());
-                assert_eq!(
-                    roster.row_for_login(env_login).map(|r| r.label.as_str()),
-                    Some(new),
-                    "a running session's login environment still names its row"
-                );
-                assert_eq!(
-                    state.accounts.get(new).map(|a| a.auth),
-                    Some(Auth::Ok),
-                    "{new} keeps its sign-in word: nobody is signed out"
-                );
-                assert!(state.sessions.values().any(|s| s.account == new));
-                assert!(logins.labels.contains_key(new));
-                if old != new {
-                    assert!(roster.row(old).is_none());
-                    assert!(!state.accounts.contains_key(old));
-                    assert!(!state.sessions.values().any(|s| s.account == old));
-                    assert!(!logins.labels.contains_key(old));
-                }
-            }
-        }
-    }
-}
-
-/// Migration gives every old-style row (`m22-2`, `m20-m22`, `kimi-m16`, and the default login's
-/// `m22`) the label the lab calls its account by, with its login directory pinned at the old path
-/// through `Row.dir`, and its state, sign-in word, session and binding moved by the rename
-/// machinery: nobody is signed out and a running session's login environment still resolves. A
-/// row the lab does not know stays as it is. A second run writes nothing, and a lab whose
-/// inventory has not equalled a peer's renames nothing.
-/// NEGATIVE CONTROL: with `migrate` giving a renamed row `store.login_dir(new label)` instead of
-/// keeping `dir`, `assert_migrated` fails on `claude-bbbbbb`'s directory; with the
-/// `move_accounts` call removed from the commit, it fails on `claude-aaaaaa`'s sign-in word
-/// (`left: None right: Some(Ok)`).
-#[test]
-fn migration_pins_every_login_and_moves_its_records() {
-    let bed = Home::new();
-    let untouched = bed.tree();
-    for cli in [Cli::Claude, Cli::Kimi] {
-        assert_eq!(
-            bed.migrate(&bed.lab(false), cli).unwrap(),
-            Migrated::default()
-        );
-    }
-    assert_eq!(bed.tree(), untouched, "an unsettled lab renames nothing");
-
-    let claude = bed.migrate(&bed.lab(true), Cli::Claude).unwrap();
-    assert_eq!(claude.moved.len(), 3);
-    let kimi = bed.migrate(&bed.lab(true), Cli::Kimi).unwrap();
-    assert_eq!(
-        kimi.moved,
-        [("kimi-m16".to_owned(), "kimi-eeeeee".to_owned())]
-    );
-    bed.assert_migrated();
-
-    let settled = bed.tree();
-    for cli in [Cli::Claude, Cli::Kimi] {
-        assert_eq!(
-            bed.migrate(&bed.lab(true), cli).unwrap(),
-            Migrated::default()
-        );
-    }
-    assert_eq!(bed.tree(), settled, "a second run writes nothing");
-}
-
-/// A crash midway through a migration's commit, at every step of its replay, leaves a receipt
-/// that fences every reader until it completes; the next run completes it, and the home reads
-/// exactly as an uninterrupted migration leaves it. A crash between two CLIs' migrations leaves the
-/// first done and the second untouched, which the next run finishes.
-/// NEGATIVE CONTROL: with `migrate` skipping `recover_sync_held`, the second run is refused by the
-/// pending receipt (`a sync commit is pending`) instead of completing it.
-#[test]
-fn a_crash_midway_through_a_migration_is_completed_by_the_next_run() {
-    for cut in 0..=5 {
-        let bed = Home::new();
-        accounts::SYNC_COMMIT_CUT.with(|c| c.set(Some(cut)));
-        let why = bed.migrate(&bed.lab(true), Cli::Claude).unwrap_err();
-        assert_eq!(why, "injected interruption", "cut {cut}");
-        assert!(
-            bed.store(Cli::Claude).load(NOW).is_err(),
-            "cut {cut}: a pending migration fences its readers"
-        );
-        let resumed = bed.migrate(&bed.lab(true), Cli::Claude).unwrap();
-        assert!(
-            resumed.moved.is_empty(),
-            "cut {cut}: the receipt finished it"
-        );
-        bed.migrate(&bed.lab(true), Cli::Kimi).unwrap();
-        bed.assert_migrated();
-    }
-}
-
-/// A row is renamed only from the label the lab recorded its account under, since that is the
-/// label its `<label>`-keyed sign-in secrets name and the mailbox config maps from the lab
-/// (`legacy_labels`); and never to a label the store still keeps records under, which
-/// `move_accounts` would refuse and so stall every later sync. Each such row keeps its label and
-/// the rest move.
-/// NEGATIVE CONTROL: with `renames`' `bridged` check removed, `m22` moves too (`moved` lists
-/// it); with its `retained` check removed, the migration is refused (`the destination retains
-/// local login or account state`).
-#[test]
-fn a_rename_waits_where_its_secrets_or_records_would_not_follow() {
-    let bed = Home::new();
-    bed.store(Cli::Claude)
-        .transact_logins(NOW, &mut None, |state, logins| {
-            seed_reference(state, logins, "claude-bbbbbb", 3);
-            Ok(Vec::new())
-        })
-        .unwrap();
-    let mut lab = bed.lab(true);
-    lab.accounts[0].legacy_label = None;
-    let done = bed.migrate(&lab, Cli::Claude).unwrap();
-    assert_eq!(
-        done.moved,
-        [("m20-m22".to_owned(), "claude-cccccc".to_owned())]
-    );
-    assert_eq!(done.kept, ["m22", "m22-2"]);
-    let roster = Roster::load_for(Cli::Claude, &bed.roster(Cli::Claude)).unwrap();
-    for label in ["m22", "m22-2", "claude-cccccc", "kept"] {
-        assert!(roster.row(label).is_some(), "{label} is a row");
-    }
-}
-
 /// A label an existing row of one account holds stays that row's: the lab's account of another
 /// address under the same label is not added, a higher-ranked one included, and a rebuild that
 /// put another address under the row's label gets the row back as it was, its login directory
@@ -751,7 +452,6 @@ fn a_rename_waits_where_its_secrets_or_records_would_not_follow() {
 fn a_label_another_account_holds_stays_with_its_row() {
     let lab = Lab {
         me: Some(test_machine("m22")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![
             account("gil", Cli::Claude, "work", &[("m22", Some(1))]),
@@ -813,7 +513,6 @@ fn a_source_the_owner_set_wins_over_the_lab() {
     fs::write(&plain, "").unwrap();
     let lab = Lab {
         me: Some(test_machine("m22")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![
             account("ann", Cli::Claude, "claude-aaaaaa", &[("m22", Some(1))]),
@@ -956,7 +655,6 @@ fn preference_bed(state: &aterm_spec::interp::State) -> (Lab, Roster) {
     x.joinable = state["joinable"] == 1;
     let lab = Lab {
         me: Some(test_machine("m1")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![x],
         aliases: BTreeMap::new(),
@@ -1107,7 +805,6 @@ fn an_account_asked_for_by_name_joins_with_no_preference() {
     paused.joinable = false;
     let lab = Lab {
         me: Some(test_machine("m1")),
-        settled: false,
         bound: Default::default(),
         accounts: vec![
             legacy(
@@ -1187,7 +884,6 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
     fs::write(&plain, "").unwrap();
     let lab = Lab {
         me: Some(test_machine("m1")),
-        settled: true,
         bound: Default::default(),
         accounts: vec![account(
             "ann",
@@ -1226,13 +922,15 @@ fn an_empty_lab_roster_stays_empty_and_keeps_every_row() {
 }
 
 /// The upkeep's trigger under the lab reads the lab and the roster alone: a roster that already
-/// holds every account this Mac prefers, in its derived order, is not due; one the lab prefers a
-/// new account for, one whose row stands in another order, one with an old pool's hold, and,
-/// once settled, one with a row to rename, are. The lab's digest moves with any account field and
-/// is none where the lab names no machine for this Mac.
+/// holds every account this Mac prefers, in its derived order, is not due, nor is one whose row
+/// has its account's legacy label, since no sync renames a row; one the lab
+/// prefers a new account for, one whose row stands in another order, and one with an old pool's
+/// hold are. The lab's digest moves with any account field and is none where the lab names no
+/// machine for this Mac.
 /// NEGATIVE CONTROL: with `sync_due`'s new-account clause removed, the added preference is not
 /// due (`a new preference is due`); with `fleet_digest`'s `preferred` loop removed, the digest
-/// does not move (`a preference moves the digest`).
+/// does not move (`a preference moves the digest`); with the deleted rename clause back in
+/// `sync_due`, the legacy row is due (`a legacy label is no change`).
 #[test]
 fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     let dir = aterm_tempfile::TempDir::new().unwrap();
@@ -1247,7 +945,6 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     let ann = account("ann", Cli::Claude, "claude-aaaaaa", &[("m1", Some(1))]);
     let lab = Lab {
         me: Some(test_machine("m1")),
-        settled: true,
         bound: Default::default(),
         accounts: vec![
             ann.clone(),
@@ -1269,10 +966,10 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
         Cli::Claude,
     );
     pool.class = Class::Pool;
-    let settled = vec![row("claude-aaaaaa", None, "ann", Cli::Claude), pool.clone()];
-    write(&settled);
+    let synced = vec![row("claude-aaaaaa", None, "ann", Cli::Claude), pool.clone()];
+    write(&synced);
     let digest = with_lab(lab.clone(), || {
-        assert!(!sync_due(Cli::Claude, &path, |_| false), "nothing to do");
+        assert!(!sync_due(Cli::Claude, &path), "nothing to do");
         fleet_digest(Cli::Claude).unwrap()
     });
     let mut more = lab.clone();
@@ -1283,20 +980,14 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
         &[("m1", Some(2))],
     ));
     with_lab(more, || {
-        assert!(
-            sync_due(Cli::Claude, &path, |_| false),
-            "a new preference is due"
-        );
+        assert!(sync_due(Cli::Claude, &path), "a new preference is due");
     });
     let mut moved = lab.clone();
     moved.accounts[1]
         .preferred
         .push((test_machine("m1"), Some(2)));
     with_lab(moved, || {
-        assert!(
-            sync_due(Cli::Claude, &path, |_| false),
-            "a row's order changed"
-        );
+        assert!(sync_due(Cli::Claude, &path), "a row's order changed");
         assert_ne!(
             fleet_digest(Cli::Claude).unwrap(),
             digest,
@@ -1307,38 +998,23 @@ fn a_sync_is_due_only_when_the_lab_would_change_the_roster() {
     held.held_by = Some("m9".into());
     write(&[row("claude-aaaaaa", None, "ann", Cli::Claude), held]);
     with_lab(lab.clone(), || {
-        assert!(
-            sync_due(Cli::Claude, &path, |_| false),
-            "an old hold is due"
-        );
+        assert!(sync_due(Cli::Claude, &path), "an old hold is due");
     });
     let mut old = pool;
     old.label = "m20-m1".into();
     write(&[row("claude-aaaaaa", None, "ann", Cli::Claude), old]);
     with_lab(lab.clone(), || {
-        assert!(sync_due(Cli::Claude, &path, |_| false), "a rename is due");
+        assert!(!sync_due(Cli::Claude, &path), "a legacy label is no change");
     });
-    with_lab(
-        Lab {
-            settled: false,
-            ..lab.clone()
-        },
-        || {
-            assert!(
-                !sync_due(Cli::Claude, &path, |_| false),
-                "an unsettled lab renames nothing"
-            )
-        },
-    );
     with_lab(Lab { me: None, ..lab }, || {
         assert!(fleet_digest(Cli::Claude).is_none());
-        assert!(!sync_due(Cli::Claude, &path, |_| false));
+        assert!(!sync_due(Cli::Claude, &path));
     });
 }
 
 /// The mailbox labels come from the lab where it names this Mac: every account's lab label and
-/// the legacy label a renamed row's secrets still name; none where it does not, so that Mac reads
-/// what it always read.
+/// the legacy label a row may still have and its secrets name; none where it does not, so that
+/// Mac reads what it always read.
 /// NEGATIVE CONTROL: with `mailbox_labels`' legacy push removed, `kimi-m16` maps to nothing.
 #[test]
 fn the_mailbox_labels_are_the_labs() {

@@ -27,5 +27,7 @@ pub fn row() -> Artifact {
         links: BTreeMap::new(),
         vendor: "Anthropic PBC".into(),
         provenance: None,
+        key: String::new(),
+        key_inputs: String::new(),
     }
 }

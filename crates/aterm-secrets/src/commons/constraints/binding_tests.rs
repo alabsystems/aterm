@@ -200,7 +200,7 @@ fn unreadable_unselected_retirement_prevents_return_under_new_keys_after_restart
     let new_recipient_same_writer = binding(&Identity::from_secret_bytes([27; 32]), 21, 1, 2);
     let safe = binding(&Identity::from_secret_bytes([29; 32]), 31, 3, 1);
     for reverse in [false, true] {
-        let directory = aterm_tempfile::tempdir().unwrap();
+        let directory = crate::private_scratch::tempdir();
         let trust = Trust {
             network: NETWORK,
             authority: authority(),
@@ -280,7 +280,7 @@ fn missing_and_conflicting_binding_evidence_withholds_all_device_authorization()
 #[test]
 fn binding_computation_limit_preserves_the_authenticated_journal() {
     let original = binding(&Identity::from_secret_bytes([19; 32]), 21, 1, 1);
-    let directory = aterm_tempfile::tempdir().unwrap();
+    let directory = crate::private_scratch::tempdir();
     let genesis = node(None, &[]);
     let mut journal = Journal::open(
         directory.path(),

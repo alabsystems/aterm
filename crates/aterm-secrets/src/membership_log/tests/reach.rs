@@ -264,7 +264,7 @@ impl Verdicts {
     fn check(&mut self, edges: &Edges<'_>, record: &Record, what: &'static str) {
         let now = edges
             .log
-            .check_against_parents(record)
+            .check_against_parents(record, &edges.log.indexes(record.parents()))
             .map_err(|e| e.to_string());
         let then = walked_check(edges, record).map_err(|e| e.to_string());
         if now != then {

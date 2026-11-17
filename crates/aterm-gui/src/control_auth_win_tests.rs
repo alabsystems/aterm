@@ -147,7 +147,7 @@ fn scratch(name: &str) -> std::path::PathBuf {
 #[test]
 fn the_owner_check_refuses_a_folder_across_elevations() {
     let me = tokens::own_user_sid();
-    let me_sid = tokens::Sid::parse(&me);
+    let me_sid = aterm_uds::acl::Sid::parse(&me).expect("the user's SID");
     if !aterm_uds::elevation::is_elevated() {
         assert_eq!(
             tokens::token_owner_sid(&tokens::own()),
@@ -161,7 +161,7 @@ fn the_owner_check_refuses_a_folder_across_elevations() {
             eprintln!("this account has no elevated token; its owner is taken as BA");
             "S-1-5-32-544".to_owned()
         });
-    let elevated_sid = tokens::Sid::parse(&elevated_owner);
+    let elevated_sid = aterm_uds::acl::Sid::parse(&elevated_owner).expect("the elevated owner");
     assert_ne!(
         elevated_owner, me,
         "an elevated token owns what it makes as Administrators, not as the user"
@@ -175,11 +175,11 @@ fn the_owner_check_refuses_a_folder_across_elevations() {
     let before = tokens::sddl_of(&dir);
     let owned_by = |sddl_owner: &str| {
         let sddl = format!("O:{sddl_owner}");
-        move |_: &[u16]| acl::Descriptor::from_sddl(&sddl)
+        move |_: &std::path::Path| acl::Descriptor::from_sddl(&sddl)
     };
-    let refused = |token_owner: &tokens::Sid, dir_owner: &str| {
+    let refused = |token_owner: &aterm_uds::acl::Sid, dir_owner: &str| {
         let read = owned_by(dir_owner);
-        let Err(err) = acl::verify_owner_and_harden_with(&dir, token_owner.ptr(), &read) else {
+        let Err(err) = acl::verify_owner_and_harden_with(&dir, token_owner, &read) else {
             panic!("a folder owned by {dir_owner} passed");
         };
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
@@ -200,9 +200,9 @@ fn the_owner_check_refuses_a_folder_across_elevations() {
         refused(&me_sid, stranger);
     }
     let ba = acl::Descriptor::from_sddl("O:BA").expect("O:BA");
-    acl::owner_verdict(ba.owner().expect("owner"), elevated_sid.ptr())
+    acl::owner_verdict(ba.owner().expect("owner").as_ref(), &elevated_sid)
         .expect("an elevated aterm keeps a folder it made");
-    acl::verify_owner_and_harden_with(&dir, me_sid.ptr(), &acl::Descriptor::owner_of_path)
+    acl::verify_owner_and_harden_with(&dir, &me_sid, &acl::owner_of_path)
         .expect("the user's own folder");
     assert_ne!(
         tokens::sddl_of(&dir),
@@ -262,7 +262,7 @@ fn the_elevated_owner_check_takes_only_administrators_or_system() {
         ("S-1-5-21-1-2-3-1001", false),
     ] {
         let sd = acl::Descriptor::from_sddl(&format!("O:{owner}")).expect("SDDL");
-        let verdict = acl::elevated_owner_verdict(sd.owner().expect("owner"), dir);
+        let verdict = acl::elevated_owner_verdict(sd.owner().expect("owner").as_ref(), dir);
         assert_eq!(verdict.is_ok(), passes, "{owner}: {verdict:?}");
         if let Err(e) = verdict {
             assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
@@ -440,11 +440,6 @@ mod tokens {
             let ok = unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) };
             assert!(ok != 0 && !sid.is_null(), "SID {text}");
             Self(sid)
-        }
-
-        /// The SID itself.
-        pub(super) fn ptr(&self) -> *mut c_void {
-            self.0
         }
     }
 

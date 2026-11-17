@@ -22356,6 +22356,7 @@ fn carried_across_an_update(h: &SessionHandle) {
         ids: log.id_counters(),
         limits: aterm_slog::Limits::SESSION,
         at: g.slog().now(),
+        ident: aterm_slog::DescIdent::default(),
     };
     let (continued, _, _) = aterm_slog::Log::from_carry(&out.lines, adopt).expect("reads");
     g.slog_mut().replace_log(continued);
@@ -25372,6 +25373,36 @@ fn a_fleet_spawn_carries_codex_effort_without_downgrading_other_engines() {
             drive_spawn(&format!("spawn {rest}"), rest, &homes, None).is_err(),
             "{rest}"
         );
+    }
+}
+
+/// A DRIVE'S WORKER CARRIES ITS `package=` (CX-04): the driven Mac takes the word on a worker's
+/// line as on its own, by the `package` slot's rule. CONTROL: a malformed one and a repeat are
+/// refused by name, and a plain fleet shell, which takes no option beyond its four, refuses it.
+#[test]
+fn a_drive_worker_spawn_carries_its_package() {
+    const CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+    let homes = |_sid: &SessionId| false;
+    let line = format!("spawn agent=claude cwd={CWD} package=FL-04,CX-01 len=1");
+    let line = line.as_str();
+    assert_eq!(
+        drive_spawn(line, line.strip_prefix("spawn ").unwrap(), &homes, None).unwrap(),
+        format!("{line} raise=false")
+    );
+    for (rest, word) in [
+        ("agent=claude package=fl-04 len=1", "package=fl-04"),
+        (
+            "agent=claude package=FL-04 package=CX-01 len=1",
+            "package=CX-01",
+        ),
+        (
+            &format!("cwd={CWD} why=\"check the disk\" package=FL-04") as &str,
+            "package=FL-04",
+        ),
+    ] {
+        let refused = drive_spawn(&format!("spawn {rest}"), rest, &homes, None)
+            .expect_err("CONTROL: refused");
+        assert!(refused.contains(&format!("`{word}`")), "{rest}: {refused}");
     }
 }
 

@@ -1153,7 +1153,8 @@ fn the_wall_stands_until_its_reset() {
         wall,
         Some(Wall {
             label: "5h",
-            resets: "3pm".into()
+            resets: "3pm".into(),
+            resets_at: DAY + 15 * 3600,
         })
     );
     assert!(wall_of(&rows, None, DAY + 15 * 3600 - 1, &utc).is_some());
@@ -1171,7 +1172,8 @@ fn the_wall_stands_until_its_reset() {
         wall_of(&both, None, two_pm + 700, &utc),
         Some(Wall {
             label: "7d",
-            resets: "Oct 1 at 9am".into()
+            resets: "Oct 1 at 9am".into(),
+            resets_at: 1_790_845_200,
         })
     );
 }
@@ -1495,6 +1497,7 @@ fn the_segment_says_runtime_and_tokens_at_each_grain() {
     let wall = || Wall {
         label: "5h",
         resets: "3pm".into(),
+        resets_at: 0,
     };
     let one = UsageFacts::of((vec![opus.clone()], More::default()), None, None)
         .expect("tokens")
@@ -1581,6 +1584,7 @@ fn unread_is_said_with_no_tokens_shown() {
     let wall = Wall {
         label: "5h",
         resets: "3pm".into(),
+        resets_at: 0,
     };
     let walled =
         UsageFacts::of((Vec::new(), More::default()), Some(wall), Some(&left_out)).expect("facts");

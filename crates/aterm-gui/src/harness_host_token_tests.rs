@@ -1782,3 +1782,132 @@ fn a_split_pair_is_settled_at_the_accounts_upkeep_with_no_session_anywhere() {
         assert!(returns_fixture(paths), "the same token, served");
     }
 }
+
+/// Makes `main` the unproven `active`, as a rotation onto it leaves it: chosen at `chosen`, the
+/// world's session its canary.
+#[cfg(unix)]
+fn unproven_active(w: &TapWorld, chosen: i64) {
+    let mut note = None;
+    accounts::Store::at(&w.state())
+        .transact(w.clock(), &mut note, |state| {
+            state.active = Some("main".to_owned());
+            state.proven = false;
+            state.rotations = vec![chosen];
+            state.canary = Some(accounts::Canary {
+                sid: TAP_SID.to_owned(),
+                at: chosen,
+                took: false,
+                native_receipt: None,
+            });
+            Ok(Vec::new())
+        })
+        .expect("the edit");
+}
+
+/// The accounts state of the world now.
+#[cfg(unix)]
+fn state_now(w: &TapWorld) -> accounts::State {
+    accounts::Store::at(&w.state())
+        .load(w.clock())
+        .expect("the state")
+        .0
+}
+
+/// Writes the account's token made at `minted_at` with its meta as `edit` leaves it, and its row
+/// here: a mint whose record names another account, or one already ended.
+#[cfg(unix)]
+fn mint_as(w: &TapWorld, vault: &Vault, minted_at: u64, edit: impl FnOnce(&mut Meta)) {
+    let mut meta = vault.meta(minted_at);
+    edit(&mut meta);
+    let written = claude_token::write(
+        &vault.paths,
+        &Key::parse(KEY).unwrap(),
+        &aterm_secrets::SecretBytes::from(FIXTURE_TOKEN.as_bytes()),
+        &meta,
+        OnBusy::Refuse(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+    )
+    .expect("the write");
+    assert_eq!(written, MemberWritten::Posted);
+    record_mint(w, minted_at);
+}
+
+/// m2, Claude Code 2.1.323, 2026-11-16: the move onto `m2-3` relaunched its session on the
+/// row's vault token, and no served turn of it could prove the row (a sign-in identity is a
+/// stored login's), so every rotation off it stayed held. A TURN SERVED ON THE ROW'S OWN VAULT
+/// TOKEN PROVES ITS ACCOUNT, told as the move's answer or as a served turn of a session on the
+/// unproven `active` ([`WorkerIdle::served_proof`], [`token_route::token_serves_row`]): the
+/// canary is answered, and the stored login's own word stands: the token served, not the login,
+/// whether the token is the first or one made again. Where no launch here starts on a token
+/// ([`token_route::LAUNCHES_ON_TOKEN`]), none proves it. NEGATIVE CONTROLS: a session still on
+/// a token a replacement took out of the vault, a token whose windows differ here, one made again
+/// whose record names another account and one ended prove nothing (each may be another
+/// account's, or no account's).
+#[cfg(unix)]
+#[test]
+fn a_turn_served_on_the_rows_vault_token_proves_the_unproven_active() {
+    for (told, standing) in [
+        ("the move's answer", "in use"),
+        ("a served turn", "in use"),
+        ("a served turn", "made again"),
+        ("a served turn", "replaced"),
+        ("a served turn", "windows differ"),
+        ("a served turn", "another account's"),
+        ("the move's answer", "ended"),
+    ] {
+        let case = format!("{told} on a token {standing}");
+        let (w, vault) = token_world();
+        let idle = w.worker(&tap_on(), tapped_argv(), true);
+        let minted = match standing {
+            "replaced" => {
+                mint(&w, &vault, born(&w) - 1);
+                first(&w)
+            }
+            "made again" => {
+                mint_as(&w, &vault, born(&w) - 1, |_| {});
+                born(&w) - 1
+            }
+            "another account's" => {
+                mint_as(&w, &vault, born(&w) - 1, |meta| {
+                    meta.email = "another@example.com".to_owned();
+                });
+                born(&w) - 1
+            }
+            "ended" => {
+                mint_as(&w, &vault, born(&w) - 1, |meta| {
+                    meta.expires_at = born(&w);
+                });
+                born(&w) - 1
+            }
+            _ => first(&w),
+        };
+        if standing == "windows differ" {
+            accounts_tokens::update_table(&accounts::Store::at(&w.state()), |table| {
+                let row = table.rows.get_mut(KEY).expect("the token's row");
+                row.verification.verdict = Some(Verdict::Differ);
+            })
+            .expect("the comparison's verdict");
+        }
+        on_token(&w, &idle, minted);
+        unproven_active(&w, w.clock() - 30);
+        let before = state_now(&w);
+        assert!(!before.proven, "PRECONDITION: {case}: unproven");
+        journal::with_keyer(keyer, || match told {
+            "the move's answer" => idle.account_served(),
+            _ => idle.login_served_at(w.clock() - 10),
+        });
+        let after = state_now(&w);
+        let proves = matches!(standing, "in use" | "made again") && token_route::LAUNCHES_ON_TOKEN;
+        assert_eq!(after.proven, proves, "{case}");
+        assert_eq!(
+            after.canary_since().is_none(),
+            proves,
+            "{case}: the canary answered only where proven"
+        );
+        assert_eq!(after.active.as_deref(), Some("main"), "{case}");
+        assert_eq!(
+            after.account("main").auth,
+            before.account("main").auth,
+            "{case}: the stored login's word stands"
+        );
+    }
+}

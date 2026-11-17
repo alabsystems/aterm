@@ -5,14 +5,14 @@
 //! changes. A recovery selects an existing payload; it cannot write a new one.
 
 use super::constraints::{Fact, Frontier, MAX_FACTS};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use crate::age::Recipient;
 use crate::{
     Error, Result, SecretBytes,
     age::{self, Identity},
 };
 use astream_wire::sync::{Digest, MAX_PARENTS};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 /// Maximum control snapshot plaintext, separate from ordinary secret files.
@@ -22,7 +22,7 @@ pub const MAX_NODE: usize = MAX_PAYLOAD + 32 * 1024;
 const LEGACY_DOMAIN: &[u8] = b"aterm/commons/control-node/1\0";
 const RESTRICTION_DOMAIN: &[u8] = b"aterm/commons/control-node/2\0";
 const DOMAIN: &[u8] = b"aterm/commons/control-node/3\0";
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAGIC: &[u8] = b"ACN3";
 
 mod foundation;
@@ -71,7 +71,7 @@ pub struct Node {
     id: Digest,
     foundation: bool,
     legacy: bool,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     binding_evidence: bool,
     facts: Vec<Fact>,
 }
@@ -79,7 +79,7 @@ pub struct Node {
 impl Node {
     /// Sign protocol fixtures, including deliberately invalid policy, for
     /// cross-crate conformance tests. Production publication uses the Admin API.
-    #[cfg(all(unix, any(test, debug_assertions)))]
+    #[cfg(all(any(unix, windows), any(test, debug_assertions)))]
     pub fn test_seal(
         seed: &[u8; 32],
         network: [u8; 16],
@@ -241,13 +241,13 @@ impl Node {
             id,
             foundation: false,
             legacy,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             binding_evidence: binding_facts,
             facts,
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn seal(
         seed: &[u8; 32],
         network: [u8; 16],
@@ -258,7 +258,7 @@ impl Node {
         Self::seal_restricted(seed, network, edit, recipients, authored_ms, &[])
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn seal_restricted(
         seed: &[u8; 32],
         network: [u8; 16],
@@ -377,7 +377,7 @@ impl Node {
         self.authority
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const fn binding_evidence(&self) -> bool {
         self.binding_evidence
     }
@@ -408,7 +408,7 @@ impl Node {
         Ok(plain)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn history_file_key(
         &self,
         identity: &Identity,
@@ -417,7 +417,7 @@ impl Node {
             .map_err(|_| Error::new("historical control file key could not be opened"))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn open_history_key(&self, key: &[u8; 16]) -> Result<SecretBytes> {
         let plain = age::decrypt_file_key(key, &self.ciphertext)
             .map_err(|_| Error::new("historical control payload could not be authenticated"))?;
@@ -429,7 +429,7 @@ impl Node {
 
     /// Each content-addressed control event occupies one one-record stream.
     /// Control conflicts are competing DAG heads, independent of actor clocks.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn header(&self) -> astream_wire::sync::Header {
         let mut actor = [0; 48];
         actor[..32].copy_from_slice(&self.id);

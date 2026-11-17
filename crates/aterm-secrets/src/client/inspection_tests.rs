@@ -6,6 +6,7 @@ use crate::{
     text::{Audience, Document},
 };
 
+#[cfg(unix)]
 fn history(paths: &Paths) -> crate::Result<Option<super::MembershipHistoryInspection>> {
     super::inspect_membership_history_until(
         paths,
@@ -13,6 +14,7 @@ fn history(paths: &Paths) -> crate::Result<Option<super::MembershipHistoryInspec
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn membership_history_is_readable_without_admin_or_current_commons_access() {
     use crate::client::log_entries_tests::{member_key, two_macs};
@@ -72,6 +74,7 @@ fn membership_history_is_readable_without_admin_or_current_commons_access() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn membership_history_counts_waiting_records_against_available_slots() {
     use crate::client::log_entries_tests::{member_key, two_macs};
@@ -119,6 +122,7 @@ fn membership_history_counts_waiting_records_against_available_slots() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn membership_inventory_compares_sets_not_counts_or_arrival_order() {
     use crate::client::log_entries_tests::{member_key, two_macs};
@@ -175,6 +179,7 @@ fn membership_inventory_compares_sets_not_counts_or_arrival_order() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn membership_history_distinguishes_busy_absent_and_foreign_state_from_zero() {
     let absent = aterm_tempfile::tempdir().unwrap();
@@ -268,6 +273,7 @@ fn control_inspection_distinguishes_absent_and_opaque_without_initializing() {
     assert!(!paths.dir.join("commons").exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn control_inspection_keeps_the_published_audience_before_the_log_overlay() {
     let macs = client::log_entries_tests::two_macs(&[]);

@@ -134,7 +134,17 @@ pub struct Seen {
     pub me: std::collections::BTreeSet<String>,
 }
 
-/// What gives the harness its [`Seen`]: the `aterm` executable's cache.
+impl Seen {
+    /// Whether `other` says what this says: the same accounts and the same own uuids, whatever
+    /// instant each was read at ([`Self::at`]), so a re-read that found nothing new is no move.
+    #[must_use]
+    pub fn says_the_same(&self, other: &Self) -> bool {
+        self.accounts == other.accounts && self.me == other.me
+    }
+}
+
+/// What gives the harness its [`Seen`]: the `aterm` executable's cache, which keeps what it
+/// read with [`hold`], so a change of what it holds is told to the one [`listen`]er.
 pub trait Source: Send + Sync {
     /// The journal as last read. `wait`: read once now when nothing is held yet (a verb a person
     /// ran); otherwise answer at once with what is held, starting a background read if none is.
@@ -146,6 +156,35 @@ static INSTALLED: OnceLock<Box<dyn Source>> = OnceLock::new();
 /// Install the process's [`Source`], once; a second install is refused.
 pub fn install(source: Box<dyn Source>) -> bool {
     INSTALLED.set(source).is_ok()
+}
+
+/// What [`hold`] calls when the journal held comes to say something else.
+static LISTENER: OnceLock<fn()> = OnceLock::new();
+
+/// Name the process's one listener, called when the journal a [`Source`] holds comes to say
+/// something else ([`hold`]), so a reader of [`journal`] that must not poll it (a footer that
+/// folds it) hears the move instead; a second listener is refused.
+pub fn listen(moved: fn()) -> bool {
+    LISTENER.set(moved).is_ok()
+}
+
+/// Keep `fresh` in `slot`, a [`Source`]'s held journal, and tell the [`listen`]er where it says
+/// something else than what `slot` held: a first read, one dropped (a policy turned the lab off)
+/// or an account's change; a re-read that says the same at a later instant
+/// ([`Seen::says_the_same`]) tells nothing. Answers whether the journal held moved, which is
+/// whether it told where [`listen`] named a listener; in a process that named none, nothing is
+/// told and the answer is the same.
+pub fn hold(slot: &mut Option<Arc<Seen>>, fresh: Option<Arc<Seen>>) -> bool {
+    let moved = match (slot.as_deref(), fresh.as_deref()) {
+        (None, None) => false,
+        (Some(held), Some(fresh)) => !held.says_the_same(fresh),
+        _ => true,
+    };
+    *slot = fresh;
+    if moved && let Some(listener) = LISTENER.get() {
+        listener();
+    }
+    moved
 }
 
 #[cfg(test)]
@@ -401,6 +440,14 @@ impl Bound {
         match self {
             Bound::Used { pct_x10, .. } => *pct_x10,
             Bound::Wall { .. } => 1000,
+        }
+    }
+
+    /// When the peer read it: the reading's instant, or when it saw the wall.
+    #[must_use]
+    pub const fn read(&self) -> i64 {
+        match self {
+            Bound::Used { read, .. } | Bound::Wall { read, .. } => *read,
         }
     }
 }
@@ -671,10 +718,8 @@ pub fn history(
 ) -> Vec<(i64, String)> {
     let mut out: Vec<(i64, u8, String)> = Vec::new();
     for event in ledger {
-        let mine = match (&asked.pk, &event.pk) {
-            (Some(pk), Some(key)) => pk == key,
-            _ => asked.label.as_deref() == Some(event.account.as_str()),
-        } || asked.label.is_some() && event.to.as_deref() == asked.label.as_deref();
+        let mine = of_asked(asked, event)
+            || asked.label.is_some() && event.to.as_deref() == asked.label.as_deref();
         if !mine {
             continue;
         }
@@ -697,6 +742,28 @@ pub fn history(
     }
     out.sort();
     out.into_iter().map(|(t, _, line)| (t, line)).collect()
+}
+
+/// Whether this Mac's ledger row `event` is about `asked`'s account: by key, or by label for a row
+/// written before its key was learned.
+fn of_asked(asked: &Asked, event: &super::accounts::Event) -> bool {
+    match (&asked.pk, &event.pk) {
+        (Some(pk), Some(key)) => pk == key,
+        _ => asked.label.as_deref() == Some(event.account.as_str()),
+    }
+}
+
+/// Each window a limit reset this Mac's aterm spent on `asked` refilled, with the reset's instant:
+/// the windows each [`super::accounts::Kind::ResetUsed`] row about it names
+/// ([`super::accounts::Event::refilled`]). A refill or raise a reading showed is no such row
+/// ([`super::accounts::Kind::Reset`]).
+#[must_use]
+pub fn spent(asked: &Asked, ledger: &[super::accounts::Event]) -> Vec<(i64, String)> {
+    ledger
+        .iter()
+        .filter(|event| event.kind == super::accounts::Kind::ResetUsed && of_asked(asked, event))
+        .flat_map(|event| event.refilled.iter().map(|w| (event.t, w.clone())))
+        .collect()
 }
 
 /// One history line as text: "2026-11-03T17:00:00Z m17 signed-in claude".

@@ -165,7 +165,7 @@ fn new_member_needs_explicit_historical_key_handoff() {
         .members;
     let (genesis, _) = prepare(&ROOT, NETWORK, 1, members[..1].to_vec(), None, &[], &[]).unwrap();
     let (next, _) = prepare(&ROOT, NETWORK, 2, members, Some(genesis.id()), &[], &[]).unwrap();
-    let directory = aterm_tempfile::tempdir().unwrap();
+    let directory = crate::private_scratch::tempdir();
     let mut journal = Journal::open(
         directory.path(),
         Trust {

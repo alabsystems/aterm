@@ -381,6 +381,7 @@ fn a_held_vault_that_has_not_changed_is_read_once() {
 /// is looked up: one whose mode lets other users read it is refused with `read_private`'s
 /// error, and one gone is none. NEGATIVE CONTROL (2026-11-09): with `held` admitting by
 /// `read_owned`'s rule, the widened file reads (`refused`).
+#[cfg(unix)]
 #[test]
 fn a_held_vault_is_admitted_at_every_read() {
     use std::os::unix::fs::PermissionsExt as _;

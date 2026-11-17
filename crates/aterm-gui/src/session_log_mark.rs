@@ -447,7 +447,7 @@ const LABEL_TTL_MAX_S: u64 = 3600;
 
 /// The most percent-encoded bytes a description claim's text holds ([`Key::Value`]'s cap): a
 /// longer one is refused, never cut.
-pub(crate) const DESC_VALUE_MAX: usize = 256;
+const DESC_VALUE_MAX: usize = 256;
 /// The longest a description claim may ask to stand: a day.
 const DESC_TTL_MAX_S: u64 = 86_400;
 /// How many more times a redacted, capped description is redacted and capped again before it
@@ -466,7 +466,9 @@ pub(crate) enum DescOn {
 }
 
 /// One description claim to write ([`SessionLog::claim_desc`]): `value` is the text as its
-/// writer gave it (already percent-decoded), and `None` withdraws the author's own claim.
+/// writer gave it (already percent-decoded), and `None` is a withdrawal, which removes the
+/// author's own claim and, for a person, every claim somebody put on the slot
+/// ([`aterm_slog::Described::withdraws`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DescWrite<'a> {
     pub(crate) on: DescOn,
@@ -479,7 +481,9 @@ pub(crate) struct DescWrite<'a> {
 }
 
 impl<'a> DescWrite<'a> {
-    /// A claim of the session's own `slot` with nothing but its text (`None` withdraws).
+    /// A claim of the session's own `slot` with nothing but its text (`None` is a withdrawal,
+    /// which removes the author's own claim and, for a person, every claim somebody put on the
+    /// slot: [`aterm_slog::Described::withdraws`]).
     pub(crate) const fn of_session(slot: &'a str, value: Option<&'a str>) -> DescWrite<'a> {
         DescWrite {
             on: DescOn::Session,
@@ -496,14 +500,9 @@ impl<'a> DescWrite<'a> {
 /// Why a description claim was not written ([`SessionLog::claim_desc`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DescRefused {
-    /// The slot is not a canonical [`Key::Field`] token.
-    Slot,
-    /// The text is empty once trimmed (a withdrawal is the absence of a text).
-    Empty,
-    /// The text is not one line of visible characters.
-    Formatting,
-    /// The text is over [`DESC_VALUE_MAX`] bytes percent-encoded.
-    TooLong,
+    /// The description rule refuses it ([`aterm_slog::desc_text`], [`aterm_slog::desc_admits`]):
+    /// its slot, its shape, its bound, its author for that slot, or a protocol line.
+    Claim(aterm_slog::ClaimRefused),
     /// Nothing but redaction notices is left of the text once redacted, or the text never
     /// stopped changing under the redactor.
     Credential,
@@ -522,16 +521,45 @@ pub(crate) enum DescRefused {
 }
 
 impl DescRefused {
+    /// The log's refusal of a `desc` record, as a claim's: the description rule's and an `upto=`
+    /// ahead of the log by name, any other (a closed session's) as the log's.
+    pub(super) const fn of_log(e: aterm_slog::Refused) -> DescRefused {
+        match e {
+            aterm_slog::Refused::UptoAhead(upto) => DescRefused::UptoAhead(upto),
+            aterm_slog::Refused::Claim(c) => DescRefused::Claim(c),
+            e => DescRefused::Log(e),
+        }
+    }
+
     /// The `mark` verb's reply for this refusal.
     pub(crate) fn mark_reply(self) -> String {
+        use aterm_slog::ClaimRefused;
         match self {
-            DescRefused::Slot => {
+            DescRefused::Claim(ClaimRefused::Slot) => {
                 "ERR mark: field= is a slot name of lower-case [a-z0-9.-], at most 24\n".to_string()
             }
-            DescRefused::Empty => "ERR mark: value is empty\n".to_string(),
-            DescRefused::Formatting => "ERR mark: value has forbidden formatting\n".to_string(),
-            DescRefused::TooLong => {
-                format!("ERR mark: value over {DESC_VALUE_MAX} bytes encoded\n")
+            DescRefused::Claim(ClaimRefused::Empty) => "ERR mark: value is empty\n".to_string(),
+            DescRefused::Claim(ClaimRefused::Formatting) => {
+                "ERR mark: value has forbidden formatting\n".to_string()
+            }
+            DescRefused::Claim(ClaimRefused::TooLong { max }) => {
+                format!("ERR mark: value over {max} bytes encoded\n")
+            }
+            DescRefused::Claim(ClaimRefused::Package) => {
+                "ERR mark: package is 1 to 4 tracker ids like FL-04, comma-separated\n".to_string()
+            }
+            DescRefused::Claim(ClaimRefused::InBand) => {
+                "ERR mark: in-band bytes state a title only\n".to_string()
+            }
+            DescRefused::Claim(ClaimRefused::DoneAuthor) => {
+                "ERR mark: done is declared by a person, the session's program, its creator or ctl\n"
+                    .to_string()
+            }
+            DescRefused::Claim(ClaimRefused::Protocol) => {
+                "ERR mark: value reads as a protocol line\n".to_string()
+            }
+            DescRefused::Claim(ClaimRefused::NoLine) => {
+                "ERR mark: a history line has a text\n".to_string()
             }
             DescRefused::Credential => "ERR mark: value reads as a credential\n".to_string(),
             DescRefused::NoNode(node) => format!("ERR mark: no node {node}\n"),
@@ -546,34 +574,17 @@ impl DescRefused {
     }
 }
 
-/// A description's text as its writer gave it, checked for shape before anything judges what
-/// it says: trimmed, not empty, one line with no control, bidi or invisible formatting
-/// character, and at most [`DESC_VALUE_MAX`] bytes percent-encoded.
-fn desc_text(raw: &str) -> Result<&str, DescRefused> {
-    let text = raw.trim();
-    if text.is_empty() {
-        return Err(DescRefused::Empty);
-    }
-    if crate::session_timeline::metadata_has_forbidden_formatting(text) {
-        return Err(DescRefused::Formatting);
-    }
-    if aterm_slog::field::encoded_len(text) > DESC_VALUE_MAX {
-        return Err(DescRefused::TooLong);
-    }
-    Ok(text)
-}
-
 /// `text` with its credentials redacted ([`crate::survey::redact`]) and cut at a character
-/// boundary to [`DESC_VALUE_MAX`] encoded bytes, then redacted and cut again until nothing
-/// changes: a redaction can lengthen a line, and a cut inside a word can leave one the
-/// redactor judges anew. Refused where nothing but redaction notices is left
+/// boundary to `cap` encoded bytes, then redacted and cut again until nothing changes: a
+/// redaction can lengthen a line, and a cut inside a word can leave one the redactor judges
+/// anew. Refused where nothing but redaction notices is left
 /// ([`crate::survey::only_redaction`]: the whole-line notice, or word notices alone, which
 /// say nothing about the session and would stand over a useful claim of a lower rank), where
 /// nothing is left at all, and where the text does not settle.
-fn redacted_to_cap(text: &str) -> Result<String, DescRefused> {
+fn redacted_to_cap(text: &str, cap: usize) -> Result<String, DescRefused> {
     let judged = |t: &str| {
         let redacted = crate::survey::redact(t);
-        aterm_slog::field::clamp_encoded(&redacted, DESC_VALUE_MAX)
+        aterm_slog::field::clamp_encoded(&redacted, cap)
             .trim()
             .to_string()
     };
@@ -594,21 +605,122 @@ fn redacted_to_cap(text: &str) -> Result<String, DescRefused> {
     }
 }
 
-/// THE TEXT A DESCRIPTION CLAIM BY `by` HOLDS for the text `raw` its writer gave: a person's
-/// as typed, every other author's redacted ([`redacted_to_cap`]), each checked for shape
-/// ([`desc_text`]) and held to what [`Key::Value`] stores whole. Pure, so a writer that must
-/// know whether a claim would repeat one already held can ask before it writes.
-pub(crate) fn desc_stored(raw: &str, by: Actor) -> Result<String, DescRefused> {
-    let text = desc_text(raw)?;
+/// THE TEXT A DESCRIPTION CLAIM OF `slot` BY `by` AT `src` HOLDS for the text `raw` its writer
+/// gave: judged by the description rule as written ([`aterm_slog::desc_text`]: one line, no
+/// hidden character, within the slot's bound, a well-formed `package`), which binds a person
+/// too; then a person's kept as typed and every other author's redacted and held to the slot's
+/// bound ([`redacted_to_cap`]); then judged as stored ([`aterm_slog::desc_admits`]: the author
+/// for that slot, and a protocol line from anyone but a person). The log applies that last rule
+/// again, so no claim it refuses is built. Pure, so a writer that must know whether a claim
+/// would repeat one already held can ask before it writes.
+pub(crate) fn desc_stored(
+    slot: &str,
+    raw: &str,
+    by: Actor,
+    src: Src,
+) -> Result<String, DescRefused> {
+    let text = aterm_slog::desc_text(slot, raw).map_err(DescRefused::Claim)?;
     let text = if by == Actor::Human {
-        text.to_string()
+        text
     } else {
-        redacted_to_cap(text)?
+        redacted_to_cap(&text, aterm_slog::slot_bound(slot))?
     };
-    if aterm_slog::BoundedText::new(Key::Value, &text).is_none_or(|t| t.as_str() != text) {
-        return Err(DescRefused::Formatting);
-    }
+    aterm_slog::desc_admits(slot, &text, by, src).map_err(DescRefused::Claim)?;
     Ok(text)
+}
+
+/// THE TEXT A CLAIM OF `slot` ATERM OBSERVED OR DERIVED HOLDS ([`SessionLog::claim_observed`])
+/// for the text `raw` it read, by `by` at `src`: never refused for its shape, since no writer
+/// chose it, but cleaned. Hidden and control characters are dropped, as
+/// [`aterm_slog::BoundedText`] drops them, the rest trimmed, redacted and cut to the cap of the
+/// key it is kept under ([`observed_key`]), and redacted again until it settles
+/// ([`redacted_to_cap`]). Refused where nothing is left ([`aterm_slog::ClaimRefused::Empty`]) or
+/// nothing but redaction notices ([`DescRefused::Credential`]), and where the description rule
+/// refuses what is left ([`aterm_slog::desc_admits`]: the author for that slot, or a protocol
+/// line). Pure, so the writer can ask whether a claim would repeat the one it holds before it
+/// writes.
+pub(crate) fn observed_stored(
+    slot: &str,
+    raw: &str,
+    content: bool,
+    by: Actor,
+    src: Src,
+) -> Result<String, DescRefused> {
+    let key = observed_key(content);
+    let cap = match key.cap() {
+        aterm_slog::Cap::Text(cap) => cap,
+        _ => DESC_VALUE_MAX,
+    };
+    let shown: String = raw
+        .chars()
+        .filter(|c| !crate::session_timeline::is_forbidden_metadata_char(*c))
+        .collect();
+    let shown = shown.trim();
+    if shown.is_empty() {
+        return Err(DescRefused::Claim(aterm_slog::ClaimRefused::Empty));
+    }
+    let text = redacted_to_cap(shown, cap)?;
+    if aterm_slog::BoundedText::new(key, &text).is_none_or(|t| t.as_str() != text) {
+        return Err(DescRefused::Claim(aterm_slog::ClaimRefused::Formatting));
+    }
+    aterm_slog::desc_admits(slot, &text, by, src).map_err(DescRefused::Claim)?;
+    Ok(text)
+}
+
+/// THE FIELDS OF A `desc` RECORD, the one shape every writer of one builds: the slot, the text
+/// under `key` (`value=` at the host tier, or `title=` at the content tier for a title a program
+/// printed; none for a withdrawal) and the `as=` name. A writer adds its own keys after these
+/// (`upto=`, `ttl=`, `re=`). A text or name over its key's cap is left out; every writer has
+/// already held the text to its slot's bound.
+pub(super) fn desc_fields(
+    slot: aterm_slog::BoundedToken,
+    key: Key,
+    text: Option<&str>,
+    as_name: Option<&str>,
+) -> Fields {
+    let mut f = Fields::new();
+    let _ = f.set(Key::Field, aterm_slog::Val::Tok(slot));
+    if let Some(t) = text.and_then(|t| aterm_slog::BoundedText::new(key, t)) {
+        let _ = f.set(key, aterm_slog::Val::Text(t));
+    }
+    if let Some(a) = as_name.and_then(|a| aterm_slog::BoundedText::new(Key::As, a)) {
+        let _ = f.set(Key::As, aterm_slog::Val::Text(a));
+    }
+    f
+}
+
+/// The key a claim aterm observed or derived keeps its text under: `title=`, content tier, for
+/// what a program printed (`content`), else `value=`, host tier.
+const fn observed_key(content: bool) -> Key {
+    if content { Key::Title } else { Key::Value }
+}
+
+/// One claim aterm itself observed or derived ([`SessionLog::claim_observed`]): no writer
+/// chose its text, so its author and source are what aterm saw, never a connection's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ObservedClaim<'a> {
+    /// The subject: the session, or an open agent run of it.
+    pub(crate) on: Node,
+    pub(crate) slot: &'a str,
+    /// The text as aterm read it; `None` withdraws the author's own claim on `on`.
+    pub(crate) text: Option<&'a str>,
+    /// Whether the text is content tier: kept under `title=`, in memory alone, out of the
+    /// journal, the bus and every carry (a title a program printed). Otherwise it is kept under
+    /// `value=`, host tier, as every other claim's text.
+    pub(crate) content: bool,
+    pub(crate) by: Actor,
+    pub(crate) src: Src,
+    pub(crate) conf: Conf,
+    /// The name the claim gives where it came from (`as=`): aterm's default writer names the
+    /// rung its title came from ([`crate::describe::Rung`]). Listed, never the author.
+    pub(crate) as_name: Option<&'a str>,
+}
+
+/// Whether `rest` (a `mark` request's arguments) asks for a description claim: its second word,
+/// the kind as [`MarkReq::parse`] reads it, is `desc`. Asked before the request is parsed, by the
+/// dispatch that must know whose claim it would be.
+pub(crate) fn mark_is_desc(rest: &str) -> bool {
+    rest.split_whitespace().nth(1) == Some("desc")
 }
 
 /// A parsed `mark` request: what it asks to write, checked for shape (the
@@ -755,15 +867,12 @@ impl MarkReq {
                 "field" if desc => {
                     if aterm_slog::BoundedToken::new(Key::Field, v).is_none_or(|t| t.as_str() != v)
                     {
-                        return Err(DescRefused::Slot.mark_reply());
+                        return Err(DescRefused::Claim(aterm_slog::ClaimRefused::Slot).mark_reply());
                     }
                     req.slot = Some(v.to_string());
                 }
-                "value" if desc => {
-                    let decoded = aterm_codec::pct::decode(v);
-                    let text = desc_text(&decoded).map_err(DescRefused::mark_reply)?;
-                    req.value = Some(text.to_string());
-                }
+                // Judged once every argument is read, against its slot.
+                "value" if desc => req.value = Some(aterm_codec::pct::decode(v)),
                 "upto" if desc => {
                     req.upto = Some(
                         v.bytes()
@@ -797,6 +906,11 @@ impl MarkReq {
         };
         if missing {
             return Err(usage());
+        }
+        if let (Some(slot), Some(raw)) = (req.slot.as_deref(), req.value.as_deref()) {
+            let text =
+                aterm_slog::desc_text(slot, raw).map_err(|e| DescRefused::Claim(e).mark_reply())?;
+            req.value = Some(text);
         }
         if kind == Kind::Label
             && let Some(t) = &req.text
@@ -924,9 +1038,10 @@ impl SessionLog {
     /// WRITE A DESCRIPTION CLAIM: the one place a `desc` record is appended, for the `mark`
     /// verb and for a title write alike, so no claim reaches the log (and from it the journal
     /// and the `subscribe` log stream) without these checks. The slot is a canonical token and
-    /// is never rewritten. The text of every author but a person is redacted and held to
-    /// [`DESC_VALUE_MAX`] encoded bytes before the record is built ([`desc_stored`]); a
-    /// person's is stored as typed. The claim lands on the session, on its open agent run, or
+    /// is never rewritten. The text is judged by the description rule, a person's included, and
+    /// that of every author but a person is redacted and held to its slot's bound before the
+    /// record is built ([`desc_stored`]); a person's is stored as typed. The claim lands on the
+    /// session, on its open agent run, or
     /// on a named open agent run ([`DescOn`]). `upto` may not be past the record itself. Every
     /// author but a person spends from the mark limiter. Returns the record's seq and node.
     pub(crate) fn claim_desc(
@@ -937,8 +1052,11 @@ impl SessionLog {
     ) -> Result<(u64, Node), DescRefused> {
         let slot = aterm_slog::BoundedToken::new(Key::Field, write.slot)
             .filter(|t| t.as_str() == write.slot)
-            .ok_or(DescRefused::Slot)?;
-        let value = write.value.map(|v| desc_stored(v, by)).transpose()?;
+            .ok_or(DescRefused::Claim(aterm_slog::ClaimRefused::Slot))?;
+        let value = write
+            .value
+            .map(|v| desc_stored(write.slot, v, by, Src::Mark))
+            .transpose()?;
         let node = match write.on {
             DescOn::Session => Node::SESSION,
             DescOn::Front => self
@@ -964,25 +1082,12 @@ impl SessionLog {
         if limited && let Err(retry_ms) = self.consumers.limiter.peek(&by, at.mono_ms) {
             return Err(DescRefused::Busy(retry_ms));
         }
-        let mut f = Fields::new();
-        let _ = f.set(Key::Field, aterm_slog::Val::Tok(slot));
-        if let Some(t) = value
-            .as_deref()
-            .and_then(|v| aterm_slog::BoundedText::new(Key::Value, v))
-        {
-            let _ = f.set(Key::Value, aterm_slog::Val::Text(t));
-        }
+        let mut f = desc_fields(slot, Key::Value, value.as_deref(), write.as_name);
         if let Some(upto) = write.upto {
             let _ = f.set(Key::Upto, aterm_slog::Val::U(upto));
         }
         if let Some(s) = write.ttl {
             let _ = f.set(Key::Ttl, aterm_slog::Val::U(s));
-        }
-        if let Some(a) = write
-            .as_name
-            .and_then(|a| aterm_slog::BoundedText::new(Key::As, a))
-        {
-            let _ = f.set(Key::As, aterm_slog::Val::Text(a));
         }
         if let Some(r) = write.re {
             let _ = f.set(Key::Re, aterm_slog::Val::Id(r));
@@ -991,14 +1096,57 @@ impl SessionLog {
             .at(node)
             .by(by)
             .fields(f);
-        let seq = self.log.mark(mark, at).map_err(|e| match e {
-            aterm_slog::Refused::UptoAhead(upto) => DescRefused::UptoAhead(upto),
-            e => DescRefused::Log(e),
-        })?;
+        let seq = self.log.mark(mark, at).map_err(DescRefused::of_log)?;
         if limited {
             self.consumers.limiter.spend(&by, at.mono_ms);
         }
         Ok((seq, node))
+    }
+
+    /// WRITE A CLAIM ATERM OBSERVED OR DERIVED: the one place, beside [`Self::claim_desc`] for
+    /// the claims a writer sends, where aterm appends a `desc` of its own seeing. Two kinds are
+    /// shaped for it: a title a program printed (OSC 0, OSC 2, an OSC 7501 report's `title`),
+    /// written by nobody at `src=engine conf=claim` with its text at the content tier
+    /// ([`ObservedClaim::content`]), which ranks [`aterm_slog::Rank::Inband`]; and a value aterm
+    /// derives itself, by `aterm` at `src=aterm`, its text at the host tier, which ranks
+    /// [`aterm_slog::Rank::Derived`], with the `as=` name that says where it came from
+    /// ([`ObservedClaim::as_name`]). The subject is named, never resolved: the session, or an
+    /// agent run that is open. The text is always redacted and cut to its key's cap
+    /// ([`observed_stored`]). No author's mark tokens are spent: such claims come from no
+    /// connection, and their writers bound their own rate, so a program that prints titles
+    /// fast cannot starve the authors that share the limiter's overflow bucket. Returns the
+    /// record's seq.
+    pub(crate) fn claim_observed(
+        &mut self,
+        claim: &ObservedClaim<'_>,
+        at: Stamp,
+    ) -> Result<u64, DescRefused> {
+        let slot = aterm_slog::BoundedToken::new(Key::Field, claim.slot)
+            .filter(|t| t.as_str() == claim.slot)
+            .ok_or(DescRefused::Claim(aterm_slog::ClaimRefused::Slot))?;
+        let text = claim
+            .text
+            .map(|t| observed_stored(claim.slot, t, claim.content, claim.by, claim.src))
+            .transpose()?;
+        if claim.on != Node::SESSION {
+            match self.log.open_entry(claim.on) {
+                Some(e) if e.kind == Kind::Agent => {}
+                Some(_) => return Err(DescRefused::NotAgent(claim.on)),
+                None if self.log.issued(claim.on) => return Err(DescRefused::NotOpen(claim.on)),
+                None => return Err(DescRefused::NoNode(claim.on)),
+            }
+        }
+        let f = desc_fields(
+            slot,
+            observed_key(claim.content),
+            text.as_deref(),
+            claim.as_name,
+        );
+        let mark = Mark::new(Kind::Desc, claim.src, claim.conf)
+            .at(claim.on)
+            .by(claim.by)
+            .fields(f);
+        self.log.mark(mark, at).map_err(DescRefused::of_log)
     }
 
     /// A SELF-SUPERVISED AGENT'S ACT: what a

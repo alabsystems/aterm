@@ -82,7 +82,6 @@ fn fresh(paths: &Paths, config: &Path) -> &'static Cache {
     Box::leak(Box::new(Cache {
         paths: paths.clone(),
         config: config.to_path_buf(),
-        settled: None,
         held: Mutex::new(Held {
             projected: None,
             pending: true,
@@ -90,6 +89,87 @@ fn fresh(paths: &Paths, config: &Path) -> &'static Cache {
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),
     }))
+}
+
+/// The lab a cache holds is the one a read of the shared files answers now: a write of this
+/// Mac's own that is queued, held, dropped or settled moves no status file and moves what a read
+/// lays over the snapshot, so the cache reads again. The naming follow depends on it: once this
+/// Mac's held write of its own row gives way (`aterm_db::file::yield_held`), the lab that
+/// authorizes the follow must show the row without it (tracker package FL-170).
+///
+/// NEGATIVE CONTROL, observed: with the cache keyed on the status files alone, the lab held
+/// from before the write is served: `left: Some("m7") right: Some("m12")`.
+#[test]
+fn a_write_of_this_macs_own_moves_the_lab_a_cache_holds() {
+    use aterm_db::alab::registry::{MACHINE, MACHINE_FACTS};
+    use aterm_db::typed::{cell, keys};
+    use aterm_json::json;
+    use aterm_secrets::commons::roster::Role;
+
+    let lab = aterm_db::table::fixture::Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let config = paths.home.join("aterm.toml");
+    aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    let machine = keys::machine_pk("m7");
+    let owner = |col: &str, value: aterm_json::Value| {
+        cell::change(
+            &MACHINE,
+            cell::CellKey {
+                pk: &machine,
+                col,
+                elem: None,
+            },
+            &cell::CellValue::owner(MACHINE.version, value),
+        )
+        .unwrap()
+    };
+    let cells = vec![
+        owner("label", json!("m7")),
+        owner("status", json!("active")),
+    ];
+    let facts = aterm_db::database::Change {
+        collection: MACHINE_FACTS.name.into(),
+        key: keys::uuid32(&lab.machine(0)),
+        value: Some(json!({"r": 1, "n": 1, "mac": machine, "label": "m7"})),
+    };
+    registry.write(vec![cells, vec![facts]]).unwrap();
+    materialize(paths, &config);
+    let cache = fresh(paths, &config);
+    let label = || {
+        alab_roster::Source::snapshot(&cache)
+            .lab()
+            .and_then(|lab| lab.me.as_ref().and_then(|me| me.label.clone()))
+    };
+    assert_eq!(label().as_deref(), Some("m7"));
+    let status = |paths: &Paths| {
+        let root = aterm_db::file::root(paths);
+        std::fs::read(root.state(&aterm_db::file::MACHINES.file())).unwrap()
+    };
+    let before = status(paths);
+    let env = aterm_db::file::Env {
+        by: "person",
+        session: None,
+        now_ms: 1,
+        attempt: Duration::ZERO,
+        json: false,
+        stdin: None,
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test queues a write of this Mac's own row as a rename asked for here does"
+    )]
+    let queued = aterm_db::file::rename(
+        paths,
+        &config,
+        &machine,
+        &[(aterm_db::file::Renamed::Label, "m12")],
+        &env,
+    );
+    queued.expect("queued");
+    assert_eq!(status(paths), before, "the write moved no status file");
+    assert_eq!(label().as_deref(), Some("m12"));
 }
 
 /// SF-04's exit (docs/DESIGN-shared-files-2026-11-11.md §11): the harness's lab is read from
@@ -190,7 +270,7 @@ fn the_lab_is_served_from_the_snapshot_across_a_restart_while_the_registry_refus
     let native = registry.observe_projection(&config).unwrap();
     assert_eq!(
         decided(&live),
-        decided(&first.lab_for_source(native.source())),
+        decided(&Cache::lab_for_source(native.source())),
         "the snapshot's lab decides as the registry's own projection does"
     );
 
@@ -268,7 +348,6 @@ fn current_local_policy_withholds_a_cached_projection_without_erasing_it() {
     let cache = Cache {
         paths: Paths::for_home(dir.path()),
         config: config.clone(),
-        settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),
@@ -350,7 +429,6 @@ pub(super) fn naming(label: Option<&str>) -> Projected<Inventory> {
     Projected {
         lab: Arc::new(harness_lab(
             &naming_view(label, MachineNickname::Unset),
-            false,
             &BTreeMap::new(),
         )),
         source: Inventory([7; 32]),
@@ -403,7 +481,8 @@ fn equal_machine_labels_do_not_transfer_a_preference_between_registry_keys() {
             pk: "account-one".into(),
             provider: None,
             realm: Some("claude".into()),
-            label: Some("claude-one".into()),
+            slug: "claude-one".into(),
+            name: None,
             legacy_label: None,
             login: Some("one@example.test".into()),
             identity: None,
@@ -422,7 +501,7 @@ fn equal_machine_labels_do_not_transfer_a_preference_between_registry_keys() {
     });
 
     let project =
-        |view: &LabView| harness_lab_with_placed(view, &BTreeMap::new(), true, &BTreeMap::new());
+        |view: &LabView| harness_lab_with_placed(view, &BTreeMap::new(), &BTreeMap::new());
     let foreign = project(&view);
     assert_eq!(foreign.class_of(&foreign.accounts[0]), Class::Pool);
     assert!(
@@ -446,6 +525,86 @@ fn equal_machine_labels_do_not_transfer_a_preference_between_registry_keys() {
     );
 }
 
+/// A row a sync adds is named by its account's reserved slug, which never changes and no other
+/// account takes, never by its slug, which moves: once the owner relabels Ada's account `m2-work`
+/// and Bea's alone derives the short handle Ada's slug was (`claude-fb-alpha`), a Mac whose
+/// roster still holds Ada's row under that old slug keeps it, and adds Bea under her own key's
+/// label, which no row of Ada's holds.
+/// NEGATIVE CONTROL: with `harness_lab_with_placed` labelling an account by its slug (`label:
+/// account.slug.clone()`, as it did), Ada's label is the slug her relabel moved: `` left:
+/// "claude-m2-work" right: "claude-039f9d73b57117c8" ``.
+#[test]
+fn a_row_a_sync_adds_is_named_by_a_key_no_other_account_takes() {
+    use aterm_agent::harness::{
+        accounts::{Roster, Row},
+        alab_roster,
+    };
+    use aterm_db::{
+        alab::view::{Account, Preference},
+        typed::keys,
+    };
+
+    let (ada_email, bea_email) = (
+        "ada.fb@alpha.example.invalid",
+        "bea.fb@alpha.example.invalid",
+    );
+    let ada = keys::account_pk("claude", ada_email).unwrap();
+    let bea = keys::account_pk("claude", bea_email).unwrap();
+    let account = |pk: &str, slug: &str, email: &str| Account {
+        pk: pk.into(),
+        provider: Some("anthropic".into()),
+        realm: Some("claude".into()),
+        slug: slug.into(),
+        name: None,
+        legacy_label: None,
+        login: Some(email.into()),
+        identity: None,
+        status: Some("active".into()),
+        plan: None,
+        region: None,
+        flow: None,
+        browser: None,
+        live: true,
+    };
+    let mut view = naming_view(Some("m3"), MachineNickname::Unset);
+    view.accounts
+        .insert(ada.clone(), account(&ada, "claude-m2-work", ada_email));
+    view.accounts
+        .insert(bea.clone(), account(&bea, "claude-fb-alpha", bea_email));
+    for pk in [&ada, &bea] {
+        view.preferences.push(Preference {
+            machine: "pk-me".into(),
+            account: pk.clone(),
+            rank: Some(1),
+        });
+    }
+    let lab = harness_lab_with_placed(&view, &BTreeMap::new(), &BTreeMap::new());
+    for account in &lab.accounts {
+        assert_eq!(account.label, keys::reserved_slug("claude", &account.pk));
+    }
+    // Ada's row here, named by the slug her account went by when it was added.
+    let existing = Roster {
+        rows: vec![Row {
+            label: "claude-fb-alpha".into(),
+            email: Some(ada_email.into()),
+            ..Row::default()
+        }],
+    };
+    let fleet = alab_roster::fleet_for(&lab, Cli::Claude, Some(&existing)).unwrap();
+    let label_of = |email: &str| {
+        fleet
+            .accounts
+            .iter()
+            .find(|account| account.email == email)
+            .map(|account| account.label.clone())
+    };
+    assert_eq!(label_of(ada_email).as_deref(), Some("claude-fb-alpha"));
+    assert_eq!(
+        label_of(bea_email),
+        Some(keys::reserved_slug("claude", &bea))
+    );
+}
+
 #[test]
 fn a_bound_registry_name_creates_the_same_local_mirror_the_cli_and_menu_read() {
     use aterm_agent::machine_name::{Origin, ensure_from_registry_for_test, file};
@@ -459,7 +618,7 @@ fn a_bound_registry_name_creates_the_same_local_mirror_the_cli_and_menu_read() {
                 automatic,
             },
         );
-        let lab = harness_lab(&view, false, &BTreeMap::new());
+        let lab = harness_lab(&view, &BTreeMap::new());
         let expected = registry_name(&view).unwrap().unwrap();
         assert_eq!(lab.machine_name, Some(Ok(expected.clone())));
         let state = aterm_tempfile::tempdir().unwrap();
@@ -533,7 +692,6 @@ fn naming_policy_and_pending_status_are_read_from_one_retained_snapshot() {
     let cache = Cache {
         paths: Paths::for_home(root.path()),
         config: config.clone(),
-        settled: None,
         held: Mutex::new(held),
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),
@@ -583,7 +741,6 @@ fn an_unread_registry_keeps_both_consumers_pending_without_a_history_marker() {
         let cache = Cache {
             paths: Paths::for_home(root.path()),
             config: root.path().join("aterm.toml"),
-            settled: None,
             held: Mutex::new(held),
             refreshing: Mutex::new(()),
             mail_refused: Mutex::new(None),
@@ -620,7 +777,7 @@ fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
         Some("m3")
     );
     assert_eq!(lab.me.as_ref().map(|me| me.key.as_str()), Some("pk-me"));
-    assert!(!lab.settled && !held.pending);
+    assert!(lab.mailboxes.is_empty() && !held.pending);
     assert_eq!(held.projected.as_ref().unwrap().source, Inventory([7; 32]));
     for (read, what) in [
         (Err("source history incomplete".into()), "a partial history"),
@@ -639,11 +796,12 @@ fn a_look_preserves_a_projection_and_keeps_unknown_absence_pending() {
         );
     }
     let mut next = naming(Some("m3"));
-    Arc::make_mut(&mut next.lab).settled = true;
+    Arc::make_mut(&mut next.lab).mailboxes =
+        BTreeMap::from([("ada@example.test".to_owned(), "box@example.test".to_owned())]);
     next.source = Inventory([8; 32]);
     look(&mut held, Ok(Some(next)));
     assert!(
-        held.lab().is_some_and(|lab| lab.settled),
+        held.lab().is_some_and(|lab| !lab.mailboxes.is_empty()),
         "a complete read installs local overlays with the new source"
     );
     assert_eq!(held.projected.as_ref().unwrap().source, Inventory([8; 32]));
@@ -662,7 +820,6 @@ fn current_commons_policy_hides_a_source_and_preserves_its_history() {
     let cache = Cache {
         paths: Paths::for_home(root.path()),
         config: root.path().join("aterm.toml"),
-        settled: None,
         held: Mutex::new(nothing_held()),
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),
@@ -740,10 +897,10 @@ fn current_commons_policy_hides_a_source_and_preserves_its_history() {
     );
 }
 
-/// The lab is read from the shared files a pass wrote, and its mail routes and settlement from
-/// the registry read beside them.
+/// The lab is read from the shared files a pass wrote, and its mail routes from the registry read
+/// beside them.
 #[test]
-fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
+fn native_cache_projects_mail_from_its_captured_source() {
     use aterm_db::alab::registry::{ADDRESS, MAILBOX};
     use aterm_db::typed::{cell, keys};
     use aterm_json::json;
@@ -784,18 +941,9 @@ fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
     registry.write(vec![changes]).unwrap();
     let config = paths.home.join("aterm.toml");
     let source = registry.observe_projection(&config).unwrap();
-    let settled = paths.home.join("settled-observation");
-    aterm_types::fs_restricted::ensure_private_dir(&settled).unwrap();
-    aterm_uds::atomic_file::write(
-        &settled.join("settled"),
-        aterm_codec::hex::encode_lower(&table.digest()).as_bytes(),
-        0o600,
-    )
-    .unwrap();
     let cache = Cache {
         paths: paths.clone(),
         config,
-        settled: Some(settled.clone()),
         held: Mutex::new(Held {
             projected: None,
             pending: true,
@@ -832,18 +980,6 @@ fn native_cache_projects_mail_and_settlement_from_its_captured_source() {
         projected.lab.mailboxes["ai@example.test"],
         "owner@example.test"
     );
-    assert!(projected.lab.settled);
-    aterm_uds::atomic_file::write(
-        &settled.join("settled"),
-        aterm_codec::hex::encode_lower(&[0; 32]).as_bytes(),
-        0o600,
-    )
-    .unwrap();
-    cache.refresh();
-    assert!(
-        !cache.capture().1.unwrap().lab.settled,
-        "a different table's settlement cannot attach to this source"
-    );
 }
 
 #[test]
@@ -853,7 +989,6 @@ fn a_new_installation_is_an_absent_source_without_custody() {
     let cache: &'static Cache = Box::leak(Box::new(Cache {
         paths: paths.clone(),
         config: paths.home.join("aterm.toml"),
-        settled: None,
         held: Mutex::new(Held {
             projected: None,
             pending: true,
@@ -890,7 +1025,6 @@ fn native_cache_does_not_convert_missing_projection_to_fallback_authority() {
     let cache: &'static Cache = Box::leak(Box::new(Cache {
         paths: paths.clone(),
         config: paths.home.join("aterm.toml"),
-        settled: None,
         held: Mutex::new(Held {
             projected: None,
             pending: true,
@@ -936,7 +1070,8 @@ fn native_cache_does_not_convert_missing_projection_to_fallback_authority() {
 
 #[test]
 fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save() {
-    use aterm_db::typed::cell;
+    use aterm_db::alab::registry::{ACCOUNT, ADDRESS};
+    use aterm_db::typed::{Collection, cell, keys};
     use aterm_secrets::commons::roster::Role;
 
     for change in 0..8 {
@@ -946,24 +1081,12 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
         let table = registry.open().unwrap();
         let config = paths.home.join("aterm.toml");
         aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
-        let settled = paths.home.join("settlement");
-        aterm_uds::private_file::create_private_dir(&settled).unwrap();
-        let write_settlement = |digest: &[u8]| {
-            aterm_uds::atomic_file::write(
-                &settled.join("settled"),
-                aterm_codec::hex::encode_lower(digest).as_bytes(),
-                0o600,
-            )
-            .unwrap()
-        };
-        write_settlement(&table.digest());
         if change == 5 {
             fixture.rotate(&[Role::Reader]);
         }
         let cache: &'static Cache = Box::leak(Box::new(Cache {
             paths: paths.clone(),
             config: config.clone(),
-            settled: Some(settled.clone()),
             held: Mutex::new(Held {
                 projected: None,
                 pending: true,
@@ -992,10 +1115,9 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
                     ]])
                     .unwrap();
                 assert_eq!(
-                    decided(
-                        &cache
-                            .lab_for_source(registry.observe_projection(&config).unwrap().source())
-                    ),
+                    decided(&Cache::lab_for_source(
+                        registry.observe_projection(&config).unwrap().source()
+                    )),
                     decided(&old_lab)
                 );
                 if change == 4 {
@@ -1005,7 +1127,48 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
             2 => {
                 aterm_uds::atomic_file::write(&config, b"[alab]\nroster = false\n", 0o600).unwrap()
             }
-            3 => write_settlement(&[0; 32]),
+            3 => {
+                // Made up: an account the lab lists once this write lands.
+                const BEA: &str = "bea@example.test";
+                let address = keys::address_pk(BEA).unwrap();
+                let account = keys::account_pk("claude", BEA).unwrap();
+                let owner = |collection: &'static Collection,
+                             pk: &str,
+                             col: &str,
+                             value: aterm_json::Value| {
+                    cell::change(
+                        collection,
+                        cell::CellKey {
+                            pk,
+                            col,
+                            elem: None,
+                        },
+                        &cell::CellValue::owner(collection.version, value),
+                    )
+                    .unwrap()
+                };
+                registry
+                    .write(vec![vec![
+                        owner(&ADDRESS, &address, "addr", aterm_json::json!(BEA)),
+                        owner(
+                            &ACCOUNT,
+                            &account,
+                            "provider",
+                            aterm_json::json!("anthropic"),
+                        ),
+                        owner(&ACCOUNT, &account, "realm", aterm_json::json!("claude")),
+                        owner(&ACCOUNT, &account, "login", aterm_json::json!(address)),
+                        owner(&ACCOUNT, &account, "status", aterm_json::json!("active")),
+                    ]])
+                    .unwrap();
+                assert_ne!(
+                    decided(&Cache::lab_for_source(
+                        registry.observe_projection(&config).unwrap().source()
+                    )),
+                    decided(&old_lab),
+                    "the lab lists the account the write made"
+                );
+            }
             6 | 7 => {
                 let recovery = paths.dir.join("commons/recovery/tables");
                 aterm_types::fs_restricted::ensure_private_dir(&recovery).unwrap();
@@ -1027,8 +1190,8 @@ fn native_receipt_guard_rechecks_history_policy_and_overlays_before_account_save
         let result =
             alab_roster::test_publish_source_roster(&store, &roster, "# admitted\n", source);
         // A write that leaves the lab as it was (1, and 4 read again) decides nothing
-        // differently: the receipt is admitted. A changed policy (2) or settlement (3), or a
-        // registry the admission cannot read whole (6), admits none.
+        // differently: the receipt is admitted. A changed policy (2), a write that changes the
+        // lab (3), or a registry the admission cannot read whole (6), admits none.
         let admitted = matches!(change, 0 | 1 | 4 | 5 | 7);
         assert_eq!(result.is_ok(), admitted, "change={change}: {result:?}");
         assert_eq!(roster.exists(), admitted);
@@ -1074,7 +1237,6 @@ fn caller_policy_is_observed_even_without_a_host_projection() {
     let cache: &'static Cache = Box::leak(Box::new(Cache {
         paths: Paths::for_home(root.path()),
         config,
-        settled: None,
         held: Mutex::new(Held {
             projected: None,
             pending: false,
@@ -1102,7 +1264,6 @@ fn equal_visible_labs_keep_the_source_of_each_complete_refresh() {
     let cache = Cache {
         paths: Paths::for_home(root.path()),
         config: root.path().join("aterm.toml"),
-        settled: None,
         held: Mutex::new(nothing_held()),
         refreshing: Mutex::new(()),
         mail_refused: Mutex::new(None),
@@ -1128,64 +1289,6 @@ fn equal_visible_labs_keep_the_source_of_each_complete_refresh() {
     aterm_uds::atomic_file::write(&cache.config, b"[alab\n", 0o600).unwrap();
     let (pending, hidden) = cache.capture();
     assert!(pending.pending() && hidden.is_none());
-}
-
-/// A completed round settles a table only where its witness counts an operation of one of
-/// the registry's generations, not settled yet, that the registry holds here, and the held
-/// table, a read of custody and the catalog, is read only for such a witness.
-/// NEGATIVE CONTROL: without the `count > 0` filter, `` an empty witness `` settles the held
-/// table; without the `is_generation` filter, `` another application `` reads the held table.
-#[test]
-fn a_round_settles_only_a_witness_that_counts_an_operation_of_the_table_held_here() {
-    use aterm_secrets::commons::journal::Trust;
-    let trust = Trust {
-        network: [3; 16],
-        authority: [4; 32],
-        genesis: [5; 32],
-    };
-    let registry = |compiled: &aterm_db::att::Compiled| compiled.descriptor(trust).unwrap().scope;
-    let held = registry(&aterm_db::att::REGISTRY);
-    let next = registry(&aterm_db::att::REGISTRY_2);
-    let other = aterm_db::catalog::Descriptor::application(trust, "aterm.lab", "tables", 1)
-        .unwrap()
-        .scope;
-    let unread = || -> Option<[u8; 32]> { panic!("the held table is read only for a witness") };
-    let unsettled = |_: &[u8; 32]| false;
-    assert_eq!(
-        witness_table(Some((0, held)), unsettled, || Some(held.digest())),
-        None,
-        "an empty witness"
-    );
-    assert_eq!(
-        witness_table(Some((3, next)), unsettled, || Some(held.digest())),
-        None,
-        "another generation"
-    );
-    assert_eq!(
-        witness_table(Some((3, held)), unsettled, || None),
-        None,
-        "no table held here"
-    );
-    assert_eq!(witness_table(None, unsettled, unread), None, "no witness");
-    assert_eq!(
-        witness_table(Some((0, held)), unsettled, unread),
-        None,
-        "an empty witness"
-    );
-    assert_eq!(
-        witness_table(Some((3, other)), unsettled, unread),
-        None,
-        "another application"
-    );
-    assert_eq!(
-        witness_table(Some((3, held)), |table| *table == held.digest(), unread),
-        None,
-        "settled already"
-    );
-    assert_eq!(
-        witness_table(Some((3, held)), unsettled, || Some(held.digest())),
-        Some(held.digest())
-    );
 }
 
 /// A shipped build holds a lab only in the person's own environment: a build tool's run, a
@@ -1274,32 +1377,4 @@ fn placements_are_named_from_each_looks_logins() {
         Some("hub@example.test"),
         "seen once added"
     );
-}
-
-/// `settled_in` admits only an owner-private `settled` witness inside a `0700` `alab`
-/// directory and refuses symlinks or group/other-readable files.
-/// NEGATIVE CONTROL: `std::fs::read_to_string` accepted a `0644` file and a symlink target.
-#[test]
-fn settled_witness_must_be_owner_private() {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    let temp = aterm_tempfile::TempDir::new().unwrap();
-    let alab_dir = temp.path().join("alab");
-    aterm_types::fs_restricted::ensure_private_dir(&alab_dir).unwrap();
-    let table = [0x5a_u8; 32];
-    let hex = aterm_codec::hex::encode_lower(&table);
-    let settled_path = alab_dir.join("settled");
-    aterm_agent::harness::atomic_write::write_atomic_mode(&settled_path, &hex, Some(0o600))
-        .unwrap();
-    assert!(settled_in(&alab_dir, &table));
-    assert!(!settled_in(&alab_dir, &[0x5b_u8; 32]));
-
-    std::fs::set_permissions(&settled_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(!settled_in(&alab_dir, &table));
-
-    std::fs::remove_file(&settled_path).unwrap();
-    let outside = temp.path().join("outside");
-    aterm_agent::harness::atomic_write::write_atomic_mode(&outside, &hex, Some(0o600)).unwrap();
-    std::os::unix::fs::symlink(&outside, &settled_path).unwrap();
-    assert!(!settled_in(&alab_dir, &table));
 }

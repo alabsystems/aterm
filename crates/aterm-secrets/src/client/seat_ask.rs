@@ -149,19 +149,23 @@ fn removed_by_an_act(log: &Log, recipient: &crate::age::Recipient) -> bool {
 /// ([`Seat::Unjudged`]), the Mac is in, or local state cannot be read.
 #[must_use]
 pub fn dropped(paths: &Paths) -> bool {
+    dropped_judged(paths).unwrap_or(false)
+}
+
+/// [`dropped`] with its fault told apart: `Err` where the configuration, the state, the identity
+/// or the log could not be read, which [`dropped`] answers `false`.
+pub(super) fn dropped_judged(paths: &Paths) -> crate::Result<bool> {
     if read_dropped() {
-        return matches!(config(paths), Ok(Some(_)))
-            && load_state(paths).is_ok_and(|state| state.membership == Stored::Revoked);
+        return Ok(config(paths)?.is_some() && load_state(paths)?.membership == Stored::Revoked);
     }
-    judged_by(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|(membership, log, recipient)| {
+    Ok(
+        judged_by(paths)?.is_some_and(|(membership, log, recipient)| {
             membership == Stored::Revoked
                 && judge(&log, &recipient) == Seat::Out
                 && log.audience_left_out_recipient(&EpochAudience::Everyone, &recipient)
                 && !removed_by_an_act(&log, &recipient)
-        })
+        }),
+    )
 }
 
 /// What `aterm secrets status` says of a Mac its vault let go (`Membership::Revoked` at `seq`,
@@ -215,6 +219,7 @@ thread_local! {
 }
 
 /// Whether this build's self-ask is off ([`NO_SEAT_ASK`]); never in a release build.
+#[cfg(unix)]
 fn self_ask_off() -> bool {
     #[cfg(any(test, debug_assertions))]
     return NO_SEAT_ASK.with(std::cell::Cell::get)
@@ -355,6 +360,7 @@ fn seat_memoized(paths: &Paths) -> Seat {
 
 /// Whether this Mac's vault subscriber asks ALab's members for a seat on this round
 /// ([`seat_asks`], the seat read memoized), unless the negative control is on.
+#[cfg(unix)]
 pub(super) fn asks_for_seat(paths: &Paths) -> bool {
     !self_ask_off() && asks_with(paths, &seat_memoized)
 }

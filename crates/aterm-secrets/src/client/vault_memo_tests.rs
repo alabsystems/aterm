@@ -224,6 +224,10 @@ fn a_take_of_the_state_lock_under_a_look_panics_rather_than_wait_on_it() {
     }
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -253,6 +257,10 @@ fn a_memo_observes_current_data_and_refuses_a_missing_layout_file() {
 /// fewer records than the layout pins, which the selection refuses (`check_capacity`).
 /// NEGATIVE CONTROL: with the capacity left out of a layout's judgement
 /// (`records_storage::Judged`), the memo answers the records it read under the larger one.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
     fn budget(held: usize) -> crate::membership_log::RecordBudgets {
@@ -295,6 +303,10 @@ fn a_pinned_layout_is_read_again_under_a_smaller_record_capacity() {
 /// with the selection's witnesses looking at the intent whatever stands and a plain file only
 /// where no intent stands beside it (both as eb0e73e0f1 had them), a file with an intent beside it
 /// is unjudged.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn records_the_selection_refuses_are_unjudged() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -345,6 +357,10 @@ fn records_the_selection_refuses_are_unjudged() {
 /// (2026-11-11): with the witnesses looking at the intent whatever stands (before this law), the
 /// stamps take `[1, 2, 1]`, the pinned layout's first judgement looking at its witnesses again
 /// after it (`records_storage::Judgements::layout`).
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn a_records_selection_looks_at_its_intent_only_where_it_reads_it() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -381,6 +397,10 @@ fn a_records_selection_looks_at_its_intent_only_where_it_reads_it() {
 /// selection, and the standing moves with it (`data_path` refuses this one). NEGATIVE CONTROL
 /// (2026-11-11): with the witnesses looking at the intent whatever stands (before this law), the
 /// plain file's standing moves (`a plain records file: an intent beside it moves no stamp`).
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_intent_beside_records_read_past_it_moves_nothing_a_reader_holds() {
     let c = crate::membership_log::store::classified_tests::chain();
@@ -434,6 +454,7 @@ fn an_intent_beside_records_read_past_it_moves_nothing_a_reader_holds() {
 /// A signed vault's warm deny list has the same directory refusal as a fresh read, and
 /// recovers when the original directory returns. Negative control on 02da6d5d7c: the fresh
 /// read refused the symlink but the memo returned its earlier list, failing this test.
+#[cfg(unix)]
 #[test]
 fn a_warm_deny_list_refuses_a_symlinked_vault_directory() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -772,6 +793,7 @@ fn a_mid_apply_answer_is_read_again_at_the_next_call() {
 /// NEGATIVE CONTROL (2026-11-01): with the memo's `StateLock::narrow_owned` call removed (the
 /// observation alone, as before), the wide lock fails the observation, no answer settles and
 /// every call reads again (`left: 2, right: 1`, `a read past a wide lock is kept`).
+#[cfg(unix)]
 #[test]
 fn a_read_past_a_wide_lock_narrows_it_and_is_kept() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -955,6 +977,7 @@ fn an_observation_takes_the_descriptor_an_earlier_one_left_unlocked() {
 /// comparing it with the file at the lock's path, the observation after a lock file was
 /// renamed over judges the old one and refuses it (`has 0 hard links`); without judging the
 /// folder, the symlinked folder is observed (`a symlinked folder is refused`).
+#[cfg(unix)]
 #[test]
 fn an_idle_descriptor_is_judged_as_a_file_just_opened() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1019,6 +1042,7 @@ fn an_idle_descriptor_is_judged_as_a_file_just_opened() {
 /// (`with_device_files`), `the observation stamps are its inputs' own (plain records)`; with the
 /// composed stamps leaving the device files out, the same; with `state` not carried (`state:
 /// None`), the same.
+#[cfg(unix)]
 #[test]
 fn a_looks_observation_stamps_are_its_inputs_own() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1156,5 +1180,76 @@ fn a_looks_moment_stands_only_beside_its_own_observation() {
     assert!(
         !Under::of(&other, &look.moment).caching_for(&paths),
         "a look's moment beside another observation stands for nothing"
+    );
+}
+
+/// A writer's hold on the vault's state lock is seen, and so is its release, which moves no file a
+/// listener watches; a home with no vault has no writer. Scratch vaults only.
+/// NEGATIVE CONTROL: a reader's shared observation is no writer's hold.
+#[test]
+fn a_listener_sees_a_writer_hold_the_state_lock_and_let_go() {
+    let empty = aterm_tempfile::tempdir().unwrap();
+    assert!(
+        !Paths::locate_for_home(empty.path()).writer_holds_state(),
+        "no vault: no writer"
+    );
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = signed_denial(root.path(), "writer", "gone");
+    assert!(!paths.writer_holds_state(), "CONTROL: no writer yet");
+    let reader = StateLock::observe(&paths)
+        .unwrap()
+        .expect("a reader observes the lock");
+    assert!(
+        !paths.writer_holds_state(),
+        "CONTROL: a reader is no writer"
+    );
+    drop(reader);
+    let writer = StateLock::take(&paths).unwrap();
+    assert!(paths.writer_holds_state(), "a writer holds it");
+    drop(writer);
+    assert!(!paths.writer_holds_state(), "its release is seen");
+}
+
+/// A fleet listener watches every file a memo here re-reads on a change, the standing files
+/// beside them, and not the state lock, whose churn would wake it at every vault operation.
+/// NEGATIVE CONTROL: the state lock is among the memo inputs (so leaving it out is a choice the
+/// filter makes), and a set with the envelope taken out fails the coverage check.
+#[test]
+fn a_fleet_listener_watches_every_memo_input_but_the_lock() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::locate_for_home(root.path());
+    let watched = paths.fleet_judgment_files();
+    let missing = |set: &[PathBuf]| -> Vec<PathBuf> {
+        observation_inputs(&paths)
+            .unwrap()
+            .into_iter()
+            .chain(paths.standing_files())
+            .filter(|file| *file != paths.lock_file() && !set.contains(file))
+            .collect()
+    };
+    assert_eq!(
+        missing(&watched),
+        Vec::<PathBuf>::new(),
+        "every input is watched"
+    );
+    assert!(
+        !watched.contains(&paths.lock_file()),
+        "the state lock is not watched"
+    );
+    assert!(
+        observation_inputs(&paths)
+            .unwrap()
+            .contains(&paths.lock_file()),
+        "CONTROL: the memos do stamp the lock"
+    );
+    let without_envelope: Vec<PathBuf> = watched
+        .iter()
+        .filter(|file| **file != paths.cache_file())
+        .cloned()
+        .collect();
+    assert_eq!(
+        missing(&without_envelope),
+        vec![paths.cache_file()],
+        "CONTROL: the check names a file left out"
     );
 }

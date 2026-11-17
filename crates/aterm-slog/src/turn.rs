@@ -260,7 +260,7 @@ pub enum Verdict {
     Question,
     /// `-`: no identified agent.
     Gone,
-    /// `wall`: a wall whose kind nothing names (a harness's `walled` state with no wall on the screen). The word is published and logged; the tracker opens no wall step for it, since a step, its need and its settle each carry a [`WallKind`] and none is guessed.
+    /// `wall`: a wall whose kind nothing names (a harness's `walled` state with no wall on the screen). It is treated as every wall is: a wall step with no `wall=`, the need `wall`, and a settle that closes its turn `out=wall`. No kind is guessed.
     Walled,
     /// `stopped`: the agent's process is stopped by job control. aterm reads it from the kernel; it changes nothing about an open step or turn.
     Stopped,
@@ -351,8 +351,8 @@ pub enum ScreenStep {
     Approval(BoxWord),
     /// The question dialog.
     Question,
-    /// A wall.
-    Wall(WallKind),
+    /// A wall, of a kind or (`None`) of a kind nothing names.
+    Wall(Option<WallKind>),
     /// An input stall.
     Stall,
     /// The survey.
@@ -366,7 +366,8 @@ impl ScreenStep {
         match (self, v) {
             (ScreenStep::Approval(a), Verdict::Prompt(b)) => a == b,
             (ScreenStep::Question, Verdict::Prompt(b)) => b.is_question(),
-            (ScreenStep::Wall(a), Verdict::Wall(b)) => a == b,
+            (ScreenStep::Wall(Some(a)), Verdict::Wall(b)) => a == b,
+            (ScreenStep::Wall(None), Verdict::Walled) => true,
             (ScreenStep::Stall, Verdict::Unresponsive) | (ScreenStep::Survey, Verdict::Survey) => {
                 true
             }
@@ -394,8 +395,8 @@ pub enum SettleCause {
     Idle,
     /// `question`
     Question,
-    /// `wall:<kind>`
-    Wall(WallKind),
+    /// `wall:<kind>`, or the bare `wall` (`None`).
+    Wall(Option<WallKind>),
     /// `survey`
     Survey,
 }
@@ -467,7 +468,8 @@ const fn settle_word(c: SettleCause) -> &'static str {
     match c {
         SettleCause::Idle => "idle",
         SettleCause::Question => "question",
-        SettleCause::Wall(k) => k.wire(),
+        SettleCause::Wall(Some(k)) => k.wire(),
+        SettleCause::Wall(None) => "wall",
         SettleCause::Survey => "survey",
     }
 }
@@ -477,7 +479,8 @@ fn settle_from_word(w: &str) -> Option<SettleCause> {
         "idle" => Some(SettleCause::Idle),
         "question" => Some(SettleCause::Question),
         "survey" => Some(SettleCause::Survey),
-        w if w.starts_with("wall:") => WallKind::from_name(w).map(SettleCause::Wall),
+        "wall" => Some(SettleCause::Wall(None)),
+        w if w.starts_with("wall:") => WallKind::from_name(w).map(|k| SettleCause::Wall(Some(k))),
         _ => None,
     }
 }
@@ -999,7 +1002,7 @@ impl TurnTracker {
         self.tx.refuted = None;
         match v {
             // A word that names no step and ends none: an open box, wall or turn stands as it was.
-            Verdict::Unknown | Verdict::Walled | Verdict::Stopped => return None,
+            Verdict::Unknown | Verdict::Stopped => return None,
             Verdict::Gone => {
                 self.close_turn(log, TurnOut::Gone, Conf::Strong, None, false, at);
                 if self.step.is_some() {
@@ -1033,10 +1036,14 @@ impl TurnTracker {
                 };
                 self.ensure_step(log, what, None, None, at);
             }
-            Verdict::Wall(k) => {
-                self.ensure_step(log, ScreenStep::Wall(k), wall_detail(), None, at);
+            Verdict::Wall(_) | Verdict::Walled => {
+                let kind = match v {
+                    Verdict::Wall(k) => Some(k),
+                    _ => None,
+                };
+                self.ensure_step(log, ScreenStep::Wall(kind), wall_detail(), None, at);
                 if self.turn.is_some() {
-                    self.arm(SettleCause::Wall(k), at);
+                    self.arm(SettleCause::Wall(kind), at);
                 }
             }
             Verdict::Unresponsive => self.ensure_step(log, ScreenStep::Stall, None, None, at),
@@ -1056,7 +1063,7 @@ impl TurnTracker {
                     self.arm(SettleCause::Question, at);
                 }
             }
-            Verdict::Gone | Verdict::Unknown | Verdict::Walled | Verdict::Stopped => {}
+            Verdict::Gone | Verdict::Unknown | Verdict::Stopped => {}
         }
         self.wake_at()
     }
@@ -1720,7 +1727,7 @@ impl TurnTracker {
                     s.push_str(" step_box=");
                     s.push_str(b.word());
                 }
-                ScreenStep::Wall(k) => {
+                ScreenStep::Wall(Some(k)) => {
                     s.push_str(" step_wall=");
                     s.push_str(k.name());
                 }
@@ -1822,7 +1829,10 @@ impl TurnTracker {
                 let what = match get("step_what")? {
                     "approval" => ScreenStep::Approval(BoxWord::from_wire(get("step_box")?)),
                     "question" => ScreenStep::Question,
-                    "wall" => ScreenStep::Wall(WallKind::from_name(get("step_wall")?)?),
+                    "wall" => ScreenStep::Wall(match get("step_wall") {
+                        Some(kind) => Some(WallKind::from_name(kind)?),
+                        None => None,
+                    }),
                     "stall" => ScreenStep::Stall,
                     "survey" => ScreenStep::Survey,
                     _ => return None,
@@ -2251,7 +2261,10 @@ impl TurnTracker {
                 let _ = f.set(Key::Box, Val::Word(b.word()));
             }
             ScreenStep::Wall(k) => {
-                let _ = f.set(Key::Wall, Val::Word(k.name()));
+                // A wall of no named kind carries no `wall=`: its need is the bare `wall`.
+                if let Some(k) = k {
+                    let _ = f.set(Key::Wall, Val::Word(k.name()));
+                }
                 if let Some(t) = detail
                     .as_deref()
                     .and_then(|d| crate::field::BoundedToken::new(Key::Detail, d))
@@ -3671,7 +3684,7 @@ impl TurnTracker {
         let Some(h) = self
             .step
             .clone()
-            .filter(|h| h.what == ScreenStep::Wall(kind))
+            .filter(|h| h.what == ScreenStep::Wall(Some(kind)))
         else {
             return;
         };
@@ -3696,13 +3709,15 @@ impl TurnTracker {
                 self.forget_step();
                 if self
                     .settle
-                    .is_some_and(|s| s.cause == SettleCause::Wall(kind))
+                    .is_some_and(|s| s.cause == SettleCause::Wall(Some(kind)))
                 {
                     self.settle = None;
                 }
                 self.tx.refuted = Some(kind);
                 if !h.under_turn
-                    && let Some(c) = self.last_close.filter(|c| c.out == TurnOut::Wall(kind))
+                    && let Some(c) = self
+                        .last_close
+                        .filter(|c| c.out == TurnOut::Wall(Some(kind)))
                 {
                     let mut f = Fields::new();
                     let _ = f.set(Key::Out, Val::Word("done"));

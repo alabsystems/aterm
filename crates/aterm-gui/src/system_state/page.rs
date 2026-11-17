@@ -6,15 +6,17 @@
 //! Needs-you card while something needs the person, one inset grouped list of five lines, and
 //! the footer while nothing runs. Collapsed, it fits a 900×644 window with no scrolling; a line
 //! the person opens shows its rows inside the list, which scrolls where they do not fit, and the
-//! page itself never scrolls. The layout is regular where the page's content fits the viewport
-//! at the regular measures, and compact otherwise (§4.1's breakpoint is on content height).
+//! page itself never scrolls. Its measures are the window's alone (§4.1): the lockup's size and
+//! whether the page is regular or compact are chosen against the room the page's fullest
+//! ordinary moment takes, never against what it shows now, so nothing an ordinary run does
+//! reflows the page.
 
 use std::sync::Arc;
 
-use aterm_effects::pet_glyphs_gen::PetGlyphId;
+use aterm_effects::rainbow_road::CatPose;
 
 use super::lines::{self, CardItem, Hero, Line, LineView, Mark};
-use super::lockup::LockupSpec;
+use super::lockup::{LockupPaint, LockupSpec};
 use super::marks::{self, Ground};
 use super::{
     Chip, FADE_STRIP, PHRASE_FIELD, PHRASE_JOIN, QUEUED_RESTORE_NOTE, RESTORE_FINISHED,
@@ -70,7 +72,12 @@ pub(super) struct Metrics {
     pad_y: f32,
     /// The content's width.
     pub(super) inner: f32,
+    /// The least room the lockup takes (the words alone, over a caret and capsule).
     lockup_h: f32,
+    /// The lockup's words' size, which sets the whole lockup's ([`Page::size`]).
+    pub(super) lockup_px: f32,
+    /// The road and the cat show after the words (else the words alone).
+    pub(super) road: bool,
     headline_h: f32,
     sub_h: f32,
     /// The space between the hero, the card, the list and the footer.
@@ -112,6 +119,8 @@ impl Metrics {
             pad_y: s(16.0, 8.0),
             inner: (width - pad_x * 2.0).max(1.0),
             lockup_h: s(48.0, 40.0),
+            lockup_px: LOCKUP_PX[usize::from(compact)].0,
+            road: false,
             headline_h: s(32.0, 28.0),
             sub_h: s(24.0, 20.0),
             gap: s(12.0, 8.0),
@@ -138,14 +147,36 @@ impl Metrics {
         Self::words_w(SemanticRole::Text, StyleRef::Plain, words) + 28.0
     }
 
-    /// The hero's height: §4.1's 120 [96].
-    fn hero_h(&self) -> f32 {
-        let least: f32 = if self.compact { 96.0 } else { 120.0 };
-        least.max(
-            self.lockup_h + self.headline_h + self.sub_h + if self.compact { 8.0 } else { 16.0 },
-        )
+    /// The hero's room between and about its lockup and its words: a quarter above the lockup,
+    /// half between it and the headline, a quarter under the sub-line.
+    const fn lead(&self) -> f32 {
+        if self.compact { 8.0 } else { 16.0 }
+    }
+
+    /// The headline's type step: Display 24 [Title 20], whatever the words.
+    const fn headline_style(&self) -> StyleRef {
+        if self.compact {
+            StyleRef::Primary
+        } else {
+            StyleRef::Hero
+        }
+    }
+
+    /// One line of the headline at its step.
+    fn headline_line(&self) -> f32 {
+        let (px, _) =
+            crate::native_ui::text_paint_metrics(SemanticRole::Heading, self.headline_style());
+        self.headline_h.max(on_grid(px * 1.3))
     }
 }
+
+/// The lockup's words' size, regular, from the design's Mono 22 down to the least a regular page
+/// takes it at; below that the page is compact, and the lockup goes on down from the compact top
+/// to Caption 11, the least the brand's words stay legible at (a shorter window scrolls its list
+/// instead). The words alone (Serious Mode, High Contrast, a pane too narrow for the road) take
+/// the same sizes; only a pane too narrow for them at 11 sets them smaller, down to 7, where the
+/// alternative is cutting the name.
+const LOCKUP_PX: [(f32, f32); 2] = [(22.0, 16.0), (16.0, 11.0)];
 
 /// `text` set in a box `width` wide in the face and size `role` and `style` paint: whole words,
 /// a word broken only where it cannot fit a line ([`crate::native_settings::wrap_to_box`]).
@@ -337,6 +368,12 @@ pub(super) struct Page<'a, 'b> {
     /// A window too short for the card itself (several things need the person at once): the
     /// card rides at the list's top, where the list opens, so none of its items is cut.
     card_in_list: bool,
+    /// The pass that builds the tree drawn, not one that measures: only it asks for the
+    /// lockup's images and records what the lockup paints.
+    drawing: bool,
+    /// Every line laid out collapsed, whichever the person opened: the measure of the page's
+    /// collapsed list ([`Page::collapsed_list_h`]).
+    collapsed: bool,
 }
 
 /// Whether `node`, or a node under it, has `key`: the footer spans only the controls it holds.
@@ -382,25 +419,142 @@ impl<'a, 'b> Page<'a, 'b> {
             tight: false,
             footer_in_list: false,
             card_in_list: false,
+            drawing: false,
+            collapsed: false,
         }
     }
 
-    /// The tree at regular measures where the page's content fits the viewport, else compact.
+    /// The tree, at the window's measures ([`Self::size`]). Content the window's measures do
+    /// not reserve room for (several things need the person at once, a note of several lines)
+    /// takes its room from the list, which scrolls inside; where even one line of the list
+    /// would not fit beside it, the footer joins the list's end, then the card its top, so no
+    /// control leaves the window.
     pub(super) fn tree(mut self) -> UiTree {
         let height = self.cx.viewport.height.max(120.0);
         let width = self.cx.viewport.width.max(64.0);
-        self.m = Metrics::new(width, false);
-        if self.content_height() > height {
-            self.m = Metrics::new(width, true);
-            // Compact and still too short for the hero, the card, the footer and one line: the
-            // lockup goes before any control leaves the window, then the footer joins the
-            // list's end, and then the card its top.
-            let least = self.least_list();
-            self.tight = self.fixed_height() + least > height;
-            self.footer_in_list = self.tight && self.fixed_height() + least > height;
-            self.card_in_list = self.footer_in_list && self.fixed_height() + least > height;
-        }
+        self.size(width, height);
+        let least = self.least_list();
+        self.footer_in_list = self.fixed_height() + least > height;
+        self.card_in_list = self.footer_in_list && self.fixed_height() + least > height;
+        self.drawing = true;
         self.build(height)
+    }
+
+    /// The page's measures for a `width` × `height` window, chosen from the window alone (§4.1),
+    /// so an ordinary run never reflows the page: regular, with the lockup's words at the
+    /// largest whole size from Mono 22 down to 16 at which the page's fullest ordinary moment
+    /// ([`Self::reserved_height`]) fits; else compact, from 16 down to Caption 11, the least
+    /// that stays legible; else compact with the lockup at that least, the list scrolling in
+    /// what is left of a one-line list; else compact with no lockup, the sub-line's count
+    /// carrying the progress (`tight`). The fallback keeps the least size, not the largest that
+    /// leaves one line, so a taller window never sets a smaller lockup. A pane too narrow for
+    /// the road shows the words alone in its place.
+    fn size(&mut self, width: f32, height: f32) {
+        let road = self.kitty_shows();
+        for compact in [false, true] {
+            self.m = Metrics::new(width, compact);
+            let list = self.collapsed_list_h();
+            for (px, road) in self.lockup_sizes(road) {
+                self.m.lockup_px = px;
+                self.m.road = road;
+                if self.reserved_height(list) <= height {
+                    return;
+                }
+            }
+        }
+        // Too short for the fullest moment at any size: the least lockup, and the list, given
+        // what is left, scrolls; too short for that, no lockup.
+        let list = self.least_list();
+        if let Some((px, road)) = self.lockup_sizes(road).pop() {
+            self.m.lockup_px = px;
+            self.m.road = road;
+            if self.reserved_height(list) <= height {
+                return;
+            }
+        }
+        self.m = Metrics::new(width, true);
+        self.tight = true;
+    }
+
+    /// The lockup's sizes the page's width admits at its measures, largest first, each its
+    /// words' size and whether the road shows: the sizes ([`LOCKUP_PX`]) at which it fits the
+    /// width whole, with the road where it shows; where none does and the page is compact or
+    /// shows no road, the words alone, set smaller to fit down to 7 points (the narrowest pane,
+    /// 128 points, 104 inside). Judged with the longer words (`aterm · ALab`), so a Mac found to
+    /// be ALab's mid-run sets nothing smaller.
+    fn lockup_sizes(&self, road: bool) -> Vec<(f32, bool)> {
+        let m = &self.m;
+        let spec = |px: f32, kitty: bool| LockupSpec {
+            kitty,
+            px,
+            alab: true,
+            ..self.lockup_spec()
+        };
+        let (top, least) = LOCKUP_PX[usize::from(m.compact)];
+        let mut sizes = Vec::new();
+        let mut px = top;
+        while px >= least {
+            if spec(px, road).least_width() <= m.inner {
+                sizes.push((px, road));
+            }
+            px -= 1.0;
+        }
+        if sizes.is_empty() && (m.compact || !road) {
+            let mut px = top;
+            while spec(px, false).least_width() > m.inner && px > 7.0 {
+                px -= 1.0;
+            }
+            sizes.push((px, false));
+        }
+        sizes
+    }
+
+    /// The height of the page's fullest ordinary moment at its measures, its collapsed list
+    /// `list` tall: the hero (the lockup's room, a headline line, the sub-line with Stop beside
+    /// it), the tallest card one thing that needs the person makes ([`Self::reserved_card_h`]),
+    /// one line of a note, the collapsed list and the footer, each a gap apart, inside the
+    /// page's pad. Each is reserved at its one-row measure: in a narrow pane (under 480 points),
+    /// where a headline, a sub-line or a card's reason may wrap and a card's button stacks
+    /// under its title, what wraps takes its room from the list, which scrolls there. Such a
+    /// pane keeps its measures through a run, not the promise that its list never scrolls.
+    fn reserved_height(&self, list: f32) -> f32 {
+        let m = &self.m;
+        let hero = self.lockup_room() + m.lead() + m.headline_line() + m.sub_h.max(m.control_h);
+        m.pad_y * 2.0
+            + hero
+            + m.gap
+            + self.reserved_card_h()
+            + m.gap
+            + m.text_line
+            + m.gap
+            + list
+            + m.gap
+            + m.control_h
+    }
+
+    /// The tallest card one thing that needs the person makes: its title, step and button on
+    /// one band, its reason (a note's line) and what comes next (a text line) under them
+    /// ([`Self::card_item`]).
+    fn reserved_card_h(&self) -> f32 {
+        let m = &self.m;
+        let band = m.line_h.min(44.0 * m.scale);
+        band + (RHYTHM + m.note_line) + (RHYTHM + m.text_line) + 2.0 * RHYTHM + 2.0 * m.card_pad_y
+    }
+
+    /// The list's height with every line collapsed and the switches' caption over them, at the
+    /// page's measures: each line laid out on the widest phrase a line says while it is read
+    /// (its scope), never the phrase it says now, so it is the same through a run.
+    fn collapsed_list_h(&mut self) -> f32 {
+        let held = (self.card_in_list, self.footer_in_list);
+        (self.card_in_list, self.footer_in_list, self.collapsed) = (false, false, true);
+        let mut h = self.list_content(0.0).1;
+        (self.card_in_list, self.footer_in_list) = held;
+        self.collapsed = false;
+        self.spans.clear();
+        if !self.stacked() && !self.lines.iter().any(|line| line.switch.is_some()) {
+            h += self.m.note_line + RHYTHM;
+        }
+        h
     }
 
     /// The least the list is given: one line whole above the strip a scrolling list fades out in.
@@ -408,7 +562,7 @@ impl<'a, 'b> Page<'a, 'b> {
         on_grid(self.m.line_h + FADE_STRIP.min(self.m.line_h / 3.0))
     }
 
-    /// The page's height without its list.
+    /// The page's height without its list, as it stands now.
     fn fixed_height(&mut self) -> f32 {
         let m = self.m;
         let hero = self.hero_node().1;
@@ -425,12 +579,6 @@ impl<'a, 'b> Page<'a, 'b> {
         };
         self.spans.clear();
         m.pad_y * 2.0 + hero + m.gap + notes + card + footer
-    }
-
-    /// The page's height with every line at its own height, the list unscrolled.
-    fn content_height(&mut self) -> f32 {
-        let list = self.list_content(0.0).1;
-        self.fixed_height() + list
     }
 
     fn build(mut self, height: f32) -> UiTree {
@@ -503,64 +651,109 @@ impl<'a, 'b> Page<'a, 'b> {
         .then(|| NodeMotion::endless(0, aterm_messages::motion::Cadence::SPINNER))
     }
 
-    /// Whether the kitty and the ribbon show: not in Serious Mode, not under High Contrast.
+    /// Whether the road and the cat show: not in Serious Mode, not under High Contrast.
     fn kitty_shows(&self) -> bool {
         !self.cx.motion.serious && !marks::Looks::now().high_contrast
     }
 
-    /// The pose of the moment (§4.5's table; SCR-2 jumps to it, SCR-3 glides).
-    fn wanted_pose(&self) -> PetGlyphId {
+    /// The cat's pose of the moment (§4.5's table): walking while a step runs, sitting between
+    /// steps, a paw raised and looking up for the person, ears back for a failure, a loaf once
+    /// the Mac is ready.
+    fn wanted_pose(&self) -> CatPose {
         let hero = &self.hero;
-        if self.card.iter().any(|item| item.mark == Mark::NeedsYou) {
-            PetGlyphId::PetSitLookup
-        } else if self.card.iter().any(|item| item.mark == Mark::Failed) {
-            PetGlyphId::PetSitEar
+        if self
+            .card
+            .iter()
+            .any(|item| !item.retained && item.mark == Mark::NeedsYou)
+        {
+            CatPose::LookUp
+        } else if self
+            .card
+            .iter()
+            .any(|item| !item.retained && item.mark == Mark::Failed)
+        {
+            CatPose::Worried
         } else if hero.total > 0
             && hero.done == hero.total
             && !hero.as_last_read
             && !self.app.status.busy
         {
-            PetGlyphId::PetLoaf
+            CatPose::Loaf
         } else if self.app.status.running() {
-            PetGlyphId::PetStand
+            CatPose::Walk
         } else {
-            PetGlyphId::PetSit
+            CatPose::Sit
         }
     }
 
-    /// The lockup (§4.5): the page's progress indicator.
-    fn lockup(&self) -> UiNode {
+    /// The lockup's moment (§4.5) at the size the window gives it ([`Self::size`]).
+    fn lockup_spec(&self) -> LockupSpec {
         let m = &self.m;
-        let kitty = self.kitty_shows();
-        let scale = self.cx.terminal_scale.max(1.0);
-        let wanted = self.wanted_pose();
-        let mut spec = LockupSpec {
-            kitty,
-            px: if m.compact { 17.0 } else { 22.0 },
-            scale,
+        LockupSpec {
+            kitty: m.road,
+            px: m.lockup_px,
+            scale: self.cx.terminal_scale.max(1.0),
             alab: lines::alab_lockup(&self.app.status, self.app.plan.selection),
+            dark: self.cx.motion.page_dark,
             done: u32::try_from(self.hero.done).unwrap_or(u32::MAX),
             total: u32::try_from(self.hero.total).unwrap_or(u32::MAX),
-            pose: wanted,
+            pose: self.wanted_pose(),
+        }
+    }
+
+    /// The room the lockup takes in the hero, on the rhythm: the design box under its headroom
+    /// with the road, else the words alone's.
+    fn lockup_room(&self) -> f32 {
+        self.m
+            .lockup_h
+            .max(on_grid(self.lockup_spec().needed_height()))
+    }
+
+    /// The lockup (§4.5): the page's progress indicator. Its node takes its room in the hero
+    /// and, with the road, reaches on over the words under it by the road's glow
+    /// ([`LockupSpec::glow_below`]), drawn there as the design spills it. A measuring pass draws
+    /// nothing and asks for nothing; the pass that builds the tree drawn asks for the moment's
+    /// images at the page's inner width (the lockup spans it), paints the moment kept
+    /// meanwhile, and records what it painted ([`super::prebake::Requester`]).
+    fn lockup(&self) -> UiNode {
+        let m = &self.m;
+        let spec = self.lockup_spec();
+        let paint = if self.drawing && spec.kitty {
+            let wanted = spec.wanted(m.inner);
+            let requester = &self.view.lockup_requester;
+            requester.want(&wanted.keys());
+            let paint = spec.paint(m.inner, self.view.lockup_drawn.get());
+            if paint.images.is_some() {
+                self.view.lockup_drawn.set(paint.images);
+            }
+            requester.drew(
+                &paint
+                    .images
+                    .map_or_else(Vec::new, |images| images.keys().to_vec()),
+            );
+            paint
+        } else {
+            self.draws_no_images();
+            LockupPaint {
+                spec,
+                images: None,
+                pending: false,
+            }
         };
-        // A narrow page sets the whole lockup smaller rather than cut it.
-        while spec.least_width() > m.inner && spec.px > 8.0 {
-            spec.px -= 1.0;
-        }
-        if kitty {
-            let h = spec.kitty_height();
-            super::kitty::prewarm(wanted, h, scale);
-            spec.pose = super::kitty::pose_to_draw(wanted, self.view.kitty_pose.get(), h, scale);
-            self.view.kitty_pose.set(Some(spec.pose));
-        }
+        // VoiceOver hears the run as it is, whichever moment the images still show.
         let (done, total) = (spec.done, spec.total);
+        let below = if spec.kitty {
+            on_grid(spec.glow_below())
+        } else {
+            0.0
+        };
         UiNode::new(
             "system-state/progress",
             UiContent::Custom(AuditedCustomNode {
                 audit_id: crate::native_ui::SYSTEM_STATE_BRAND_AUDIT,
                 role: SemanticRole::ProgressIndicator,
                 label: self.hero.progress_label().to_owned(),
-                paint: Some(spec.value()),
+                paint: Some(paint.value()),
                 action: None,
                 focusable: false,
                 focused: false,
@@ -573,8 +766,18 @@ impl<'a, 'b> Page<'a, 'b> {
         .layout(
             Layout::default()
                 .width(Length::Fill)
-                .height(Length::Fixed(m.lockup_h.max(on_grid(spec.needed_height())))),
+                .height(Length::Fixed(self.lockup_room() + below)),
         )
+    }
+
+    /// The pass that builds the tree drawn, with a lockup that draws no images (the words alone,
+    /// or no lockup at all): the view wants and keeps none, so a road it drew before Serious
+    /// Mode, High Contrast or a narrower or shorter window is neither kept nor baked again.
+    fn draws_no_images(&self) {
+        if self.drawing {
+            self.view.lockup_drawn.set(None);
+            self.view.lockup_requester.none();
+        }
     }
 
     /// A text button: quiet words, as Stop is in the hero.
@@ -672,37 +875,33 @@ impl<'a, 'b> Page<'a, 'b> {
     }
 
     /// The hero (§4.1): lockup, headline and sub-line, with Stop beside the sub-line while a run
-    /// goes. 120 [96] tall; a headline or sub-line the width cannot hold on one line takes the
-    /// lines it needs.
+    /// goes. The lockup's room, a quarter of the lead above it, half between it and the headline
+    /// and a quarter under the sub-line, so the lockup and the headline stand where the window
+    /// puts them whatever the words say; a headline or sub-line the width cannot hold on one
+    /// line takes the lines it needs, below them.
     fn hero_node(&self) -> (UiNode, f32) {
         let m = &self.m;
         let hero = &self.hero;
-        let lockup = (!self.tight).then(|| self.lockup());
-        let lockup_h = match lockup.as_ref().map(|lockup| lockup.layout.height) {
-            Some(Length::Fixed(h)) => h,
-            Some(_) => m.lockup_h,
-            None => 0.0,
-        };
-        // Display 24 [Title 20]; a headline wider than the page steps down to Title, then wraps.
-        let mut style = if m.compact {
-            StyleRef::Primary
+        let lockup = if self.tight {
+            self.draws_no_images();
+            None
         } else {
-            StyleRef::Hero
+            Some(self.lockup())
         };
-        if style == StyleRef::Hero
-            && Metrics::words_w(SemanticRole::Heading, style, &hero.headline) > m.inner
-        {
-            style = StyleRef::Primary;
-        }
-        let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, style);
-        let line_h = m.headline_h.max(on_grid(px * 1.3));
+        let lockup_h = if lockup.is_some() {
+            self.lockup_room()
+        } else {
+            0.0
+        };
+        // Display 24 [Title 20], whatever the headline says: a longer one wraps.
+        let style = m.headline_style();
         let (headline, headline_h) = words_node(
             "system-state/headline",
             &hero.headline,
             SemanticRole::Heading,
             style,
             m.inner,
-            line_h,
+            m.headline_line(),
         );
         // The live region: the phase alone, so a count that moves is never announced (§4.7).
         let status = UiNode::new(
@@ -718,13 +917,8 @@ impl<'a, 'b> Page<'a, 'b> {
             .layout(Layout::default().height(Length::Fixed(headline_h)))
             .children(vec![headline, status]);
         let (sub, sub_h) = self.sub_row();
-        let height = if self.tight {
-            headline_h + sub_h + 4.0
-        } else {
-            m.hero_h()
-                .max(lockup_h + headline_h + sub_h + if m.compact { 8.0 } else { 16.0 })
-        };
-        let lead = (height - lockup_h - headline_h - sub_h).max(0.0);
+        let lead = if self.tight { 4.0 } else { m.lead() };
+        let height = lockup_h + lead + headline_h + sub_h;
         let column = || {
             Layout::column()
                 .width(Length::Fill)
@@ -816,7 +1010,8 @@ impl<'a, 'b> Page<'a, 'b> {
                     line.max(height),
                 )
             }));
-            let height = line.max(if buttons_w > 0.0 { m.control_h } else { 0.0 });
+            // Stop's seat is kept when Stop goes, so the run's end moves nothing under it.
+            let height = line.max(m.control_h);
             return (
                 group("system-state/sub-row")
                     .layout(Layout::row().gap(8.0).height(Length::Fixed(height)))
@@ -911,7 +1106,9 @@ impl<'a, 'b> Page<'a, 'b> {
         let mut height = 0.0;
         let items = self.card.clone();
         // One default action (§4.8): the first button the card holds; any after it is quiet.
-        let default = items.iter().position(|item| item.button.is_some());
+        let default = items
+            .iter()
+            .position(|item| !item.retained && item.button.is_some());
         for (index, item) in items.iter().enumerate() {
             if index > 0 {
                 children.push(rule(format!("system-state/card/{}/rule", item.id)));
@@ -950,7 +1147,14 @@ impl<'a, 'b> Page<'a, 'b> {
             UiNode::new(
                 "system-state/card",
                 UiContent::Group(GroupSpec {
-                    label: Some("Needs you".to_owned()),
+                    label: Some(if self.card.iter().any(|item| item.retained) {
+                        format!(
+                            "Needs you, as last read; {}",
+                            lines::retained_phase(self.app)
+                        )
+                    } else {
+                        "Needs you".to_owned()
+                    }),
                     role: SemanticRole::Group,
                     style: StyleRef::Plain,
                 }),
@@ -1024,7 +1228,7 @@ impl<'a, 'b> Page<'a, 'b> {
                         label.clone(),
                         visual,
                         face_style,
-                        true,
+                        !item.retained,
                         m.control_h,
                     ),
                     w,
@@ -1036,7 +1240,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     face.clone(),
                     None,
                     face_style,
-                    true,
+                    !item.retained,
                     m.control_h,
                     below_room,
                 );
@@ -1056,6 +1260,13 @@ impl<'a, 'b> Page<'a, 'b> {
             // The reason is its own line, read next: the button carries none, so it is heard once.
             if let UiContent::Button(control) = &mut node.content {
                 control.action = ActionId::new(button.action.clone());
+                if item.retained {
+                    control.spec.label =
+                        format!("{label}, as last read; {}", lines::retained_phase(self.app));
+                    if control.spec.visual_label.is_none() {
+                        control.spec.visual_label = Some(face.clone());
+                    }
+                }
             }
             node = node.layout(
                 Layout::default()
@@ -1072,7 +1283,11 @@ impl<'a, 'b> Page<'a, 'b> {
         let mut head = vec![mark_node(
             &key,
             (item.mark, ground),
-            self.spins(item.mark),
+            if item.retained {
+                None
+            } else {
+                self.spins(item.mark)
+            },
             marks::MARK_SLOT,
             band,
         )];
@@ -1235,7 +1450,8 @@ impl<'a, 'b> Page<'a, 'b> {
                 SemanticRole::Text,
                 StyleRef::Secondary,
                 below_room,
-                m.note_line,
+                // Body text: a note's line cuts its descenders.
+                m.text_line,
             );
             column.push(indented(
                 &format!("{key}/next-seat"),
@@ -1246,12 +1462,12 @@ impl<'a, 'b> Page<'a, 'b> {
             height += RHYTHM + words_h;
         }
         if item.phrase {
-            let (node, h) = self.phrase_block(&key, below_room);
+            let (node, h) = self.phrase_block(&key, below_room, !item.retained);
             column.push(indented(&format!("{key}/phrase-seat"), node, indent, h));
             height += RHYTHM + h;
         }
         if item.vault {
-            let (node, h) = self.vault_fields(&key, below_room);
+            let (node, h) = self.vault_fields(&key, below_room, !item.retained);
             column.push(indented(&format!("{key}/vault-seat"), node, indent, h));
             height += RHYTHM + h;
         }
@@ -1262,6 +1478,12 @@ impl<'a, 'b> Page<'a, 'b> {
         let mut label = item.title.clone();
         if let Some(step) = &item.step {
             label = format!("{label}, {step}");
+        }
+        if item.retained {
+            label.push_str(&format!(
+                ", as last read; {}",
+                lines::retained_phase(self.app)
+            ));
         }
         (
             UiNode::new(
@@ -1287,9 +1509,9 @@ impl<'a, 'b> Page<'a, 'b> {
     }
 
     /// The phrase field, its Join and the line under them (lead decision 6).
-    fn phrase_block(&self, key: &str, width: f32) -> (UiNode, f32) {
+    fn phrase_block(&self, key: &str, width: f32, enabled: bool) -> (UiNode, f32) {
         let m = &self.m;
-        let enabled = self.app.phrase_editable();
+        let enabled = enabled && self.app.phrase_editable();
         let help = self.app.phrase_help();
         let input = self.app.phrase.projection();
         let field_w = (width - Metrics::button_w("Joining…") - 8.0).clamp(40.0, 360.0);
@@ -1408,12 +1630,13 @@ impl<'a, 'b> Page<'a, 'b> {
                 }))
                 .state(ControlState {
                     enabled,
-                    focused: self
-                        .view
-                        .common
-                        .last_focus
-                        .as_ref()
-                        .is_some_and(|focus| focus.as_str() == key),
+                    focused: enabled
+                        && self
+                            .view
+                            .common
+                            .last_focus
+                            .as_ref()
+                            .is_some_and(|focus| focus.as_str() == key),
                     ..ControlState::default()
                 })
                 .style(StyleRef::Secondary),
@@ -1427,16 +1650,21 @@ impl<'a, 'b> Page<'a, 'b> {
     }
 
     /// The vault's address and password fields and its Join, each field under its caption.
-    fn vault_fields(&self, key: &str, width: f32) -> (UiNode, f32) {
-        let (node, height, _) = self.vault_fields_at(key, width);
+    fn vault_fields(&self, key: &str, width: f32, enabled: bool) -> (UiNode, f32) {
+        let (node, height, _) = self.vault_fields_at(key, width, enabled);
         (node, height)
     }
 
     /// [`Self::vault_fields`], with where the address field, the password field and Join sit in
     /// it (top, height), so focus scrolls the list to the field itself, never only its caption.
-    fn vault_fields_at(&self, key: &str, width: f32) -> (UiNode, f32, [(f32, f32); 3]) {
+    fn vault_fields_at(
+        &self,
+        key: &str,
+        width: f32,
+        enabled: bool,
+    ) -> (UiNode, f32, [(f32, f32); 3]) {
         let m = &self.m;
-        let enabled = self.app.vault_editable();
+        let enabled = enabled && self.app.vault_editable();
         let field_w = width.clamp(40.0, 420.0);
         let caption = |caption_key: &str, words: &str| {
             words_node(
@@ -1754,6 +1982,9 @@ impl<'a, 'b> Page<'a, 'b> {
 
     /// Whether `line` is the one the person opened.
     fn open(&self, line: &LineView) -> bool {
+        if self.collapsed {
+            return false;
+        }
         #[cfg(test)]
         if self.view.every_line_open.get() {
             return line.expandable();
@@ -1781,12 +2012,23 @@ impl<'a, 'b> Page<'a, 'b> {
         // setup. A key's name stays whole on one line where the phrase wraps.
         let phrase = lines::phrase_with_state(line.word, &line.phrase)
             .replace("Caps Lock", "Caps\u{a0}Lock");
-        let layout_phrases: Vec<String> = line
-            .layout_phrases
-            .iter()
-            .map(|phrase| phrase.replace("Caps Lock", "Caps\u{a0}Lock"))
-            .collect();
-        let phrase_style = if line.quiet {
+        // The window's budget ([`Self::collapsed_list_h`]) lays every line out on the widest
+        // phrase a line says while it is read, whatever it says now: the budget, and the
+        // measures chosen from it, are the same through a run. A longer phrase later wraps in
+        // the list, which scrolls; the measures stay.
+        let reserving = self.collapsed;
+        let layout_phrases: Vec<String> = if reserving {
+            Line::ALL
+                .iter()
+                .map(|line| lines::phrase_with_state(lines::CHECKING_WORD, line.scope()))
+                .collect()
+        } else {
+            line.layout_phrases.clone()
+        }
+        .iter()
+        .map(|phrase| phrase.replace("Caps Lock", "Caps\u{a0}Lock"))
+        .collect();
+        let phrase_style = if line.quiet && !reserving {
             StyleRef::Quiet
         } else {
             StyleRef::Secondary
@@ -1878,7 +2120,7 @@ impl<'a, 'b> Page<'a, 'b> {
                     lines_in(phrase, SemanticRole::Text, phrase_style, words_room).len() as f32
                         * m.text_line
                 })
-                .fold(phrase_h, f32::max);
+                .fold(if reserving { 0.0 } else { phrase_h }, f32::max);
             head_h = (pad * 2.0 + title_h + reserved_h).max(band);
             info.push(
                 group(format!("{key}/words"))
@@ -2476,7 +2718,8 @@ impl<'a, 'b> Page<'a, 'b> {
         if !open {
             return out;
         }
-        let (fields, fields_h, at) = self.vault_fields_at("system-state/vault", room.min(420.0));
+        let (fields, fields_h, at) =
+            self.vault_fields_at("system-state/vault", room.min(420.0), true);
         let keys = [
             "system-state/url",
             "system-state/password",

@@ -185,6 +185,7 @@ fn bounded_denial_pins_a_removed_or_unsigned_source() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_denial_does_not_wait_on_expiry_revocation_absence_or_io_error() {
     let (_root, paths) = denial_fixture();
@@ -386,6 +387,7 @@ fn parse_denied_nodes_keeps_values_out_of_errors() {
 /// !StateLock::narrow_owned(&admin_paths)...`). NEGATIVE CONTROL (2026-11-05): with
 /// `observe_narrowed` taking no lock as wide, the roster's read fails on it (`assertion failed:
 /// swarm_roster_until(&admin_paths, ...`).
+#[cfg(unix)]
 #[test]
 fn an_own_wide_lock_is_narrowed_by_the_deny_list_read_and_a_foreign_or_linked_one_is_not() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};

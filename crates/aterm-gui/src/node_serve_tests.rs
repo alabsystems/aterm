@@ -100,10 +100,16 @@ fn refused_live_config_withdraws_existing_drive_grants() {
 
 #[path = "node_serve_tests/bus_log.rs"]
 mod bus_log;
+#[path = "node_serve_tests/checkouts.rs"]
+mod checkouts;
 #[path = "node_serve_tests/fresh_enrollment.rs"]
 mod fresh_enrollment;
 #[path = "node_serve_tests/held_logs.rs"]
 mod held_logs;
+#[path = "node_serve_tests/idle.rs"]
+mod idle;
+#[path = "node_serve_tests/inputs.rs"]
+mod inputs;
 #[path = "node_serve_tests/mesh_links.rs"]
 mod mesh_links;
 #[path = "node_serve_tests/needs.rs"]
@@ -2358,16 +2364,22 @@ fn the_node_job_waits_for_the_lan_broker_before_it_serves_the_lan() {
         mesh: NodeMesh::off(),
     };
     let server = std::thread::spawn(move || run_node_serve_with(cfg));
-    aterm_spec::wait::until_within(
-        aterm_spec::wait::MUST_HAPPEN,
-        "the job looks for the broker three times",
-        || (LOOKS.load(Ordering::Acquire) >= 3).then_some(()),
-    );
+    // Between its looks the job rests for a broker socket that answers, which this test binary's
+    // scratch broker folder never gets: a ring of its inputs brings each next look.
+    for looks in 1..=3 {
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the job looks for the broker",
+            || (LOOKS.load(Ordering::Acquire) >= looks).then_some(()),
+        );
+        crate::fleet_listen::fleet_inputs::ring_node(&state_dir);
+    }
     assert!(
         !node_port_holds_lock(&state_dir),
         "the job served the LAN before the broker answered"
     );
     BROKER_ANSWERS.store(true, Ordering::Release);
+    crate::fleet_listen::fleet_inputs::ring_node(&state_dir);
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the job serves the port once the broker answers",
@@ -6425,8 +6437,21 @@ fn a_windowless_members_checkouts_are_read_again_with_no_survey() {
         },
     );
 
-    let mut last = Some(Instant::now());
-    super::read_checkouts_when_due(Some(&home), &mut last, super::FACTS_HEARTBEAT_EVERY);
+    let read = |clock: &mut super::CheckoutsClock| {
+        super::read_checkouts_when_due(
+            (false, Instant::now()),
+            None,
+            clock,
+            super::FACTS_HEARTBEAT_EVERY,
+            || crate::survey::refresh_home_repos_in(&home),
+            || unreachable!("no window answers here"),
+        );
+    };
+    let mut clock = super::CheckoutsClock {
+        read: Some(Instant::now()),
+        asked: None,
+    };
+    read(&mut clock);
     // A read started runs beside the caller: it is running still, or it has ended, the latest
     // read its own (written before it lets go). Neither: none started.
     assert!(
@@ -6439,9 +6464,9 @@ fn a_windowless_members_checkouts_are_read_again_with_no_survey() {
         "a clock not yet due reads nothing"
     );
 
-    let mut last = None;
-    super::read_checkouts_when_due(Some(&home), &mut last, super::FACTS_HEARTBEAT_EVERY);
-    assert!(last.is_some(), "the first tick is due");
+    let mut clock = super::CheckoutsClock::default();
+    read(&mut clock);
+    assert!(clock.read.is_some(), "the first tick is due");
     let read = aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
         "the node job's own read of the home",

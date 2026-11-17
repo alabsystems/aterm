@@ -2,32 +2,41 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+#[cfg(unix)]
 use crate::client::log_entries_tests::{
     LabTemplate, TwoMacs, copy_private_tree, hand, join_host, member_key, off_this_thread,
     two_macs, two_macs_with,
 };
+#[cfg(unix)]
 use crate::commons::bootstrap::Bootstrap;
+#[cfg(unix)]
 use crate::membership_log::encode_records;
 
+#[cfg(unix)]
 #[path = "convergence_tests.rs"]
 mod convergence;
 
+#[cfg(unix)]
 #[path = "gap_heal_conformance_tests.rs"]
 mod gap_heal;
 
+#[cfg(unix)]
 #[path = "capacity_tests.rs"]
 mod capacity;
 
 /// The byte bound as a budget by class (FL-145), declared here for this lab.
+#[cfg(unix)]
 #[path = "vault_fill_tests.rs"]
 mod vault_fill;
 
 /// One-mesh W3's tests of `log_entries/waiting.rs`, beside it, declared here for this lab.
+#[cfg(unix)]
 #[path = "log_entries/waiting_tests.rs"]
 mod waiting;
 
 /// The tests of `log_entries/member.rs` (DESIGN-claude-setup-token S2), beside it, declared here
 /// for this lab.
+#[cfg(unix)]
 #[path = "log_entries/member_tests.rs"]
 mod member;
 
@@ -36,6 +45,7 @@ mod member;
 mod claude_token;
 
 /// P3's binding (3) for waiting writes, beside them, declared here for this lab.
+#[cfg(unix)]
 #[path = "log_entries/waiting_conformance_tests.rs"]
 mod waiting_conformance;
 
@@ -82,6 +92,7 @@ fn tender_clocks_survive_the_full_record_bound() {
 
 /// A Mac that asks `member` to join under `name` from its own home `dir`: [`newcomer`] with the
 /// home apart from the name, so two Macs can ask under one name.
+#[cfg(unix)]
 fn asker(
     root: &Path,
     member: &Paths,
@@ -109,6 +120,7 @@ fn asker(
 
 /// `m7` lets in a Mac asking under `name` by the log, and posts the records so `m22` can pull
 /// them. Returns the Mac's home, actor and age recipient.
+#[cfg(unix)]
 fn let_in(macs: &TwoMacs, dir: &str, name: &str) -> (Paths, MemberId, Recipient) {
     let admitted = let_in_by(macs, &macs.m7, dir, name);
     post_records_to_servers(&macs.m7).expect("m7 posts the admission");
@@ -117,6 +129,7 @@ fn let_in(macs: &TwoMacs, dir: &str, name: &str) -> (Paths, MemberId, Recipient)
 
 /// `member` lets in a Mac asking under `name` by the log, keeping the records to itself. Returns
 /// the Mac's home, actor and age recipient.
+#[cfg(unix)]
 fn let_in_by(
     macs: &TwoMacs,
     member: &Paths,
@@ -134,6 +147,7 @@ fn let_in_by(
     )
 }
 
+#[cfg(unix)]
 fn log_of(paths: &Paths) -> Log {
     load_records(paths)
         .expect("records")
@@ -143,6 +157,7 @@ fn log_of(paths: &Paths) -> Log {
 }
 
 /// The members' age recipients, as `paths`' log evaluates them.
+#[cfg(unix)]
 fn active(paths: &Paths) -> BTreeSet<Recipient> {
     log_of(paths)
         .membership()
@@ -155,6 +170,7 @@ fn active(paths: &Paths) -> BTreeSet<Recipient> {
 /// Every epoch of `audience` some `Wrap` in `log` hands to `recipient`, whether or not the log
 /// still counts that `Wrap`: what a Mac holding `recipient`'s identity can open from the records,
 /// once removed as before.
+#[cfg(unix)]
 fn epochs_wrapped_to(log: &Log, recipient: &Recipient) -> BTreeSet<RecordId> {
     log.records()
         .filter_map(|r| match r.body() {
@@ -177,6 +193,7 @@ fn epochs_wrapped_to(log: &Log, recipient: &Recipient) -> BTreeSet<RecordId> {
 /// NEGATIVE CONTROL: in `rotate_after_removal`, skip the `[everyone]` epoch (`if false &&
 /// opened.max_generation…`): the newest `[everyone]` epoch is still the one m7 wrapped to m40 on
 /// admission, m7's put goes under it, and the `"no Wrap hands m40 the epoch"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_removed_mac_cannot_read_a_value_put_after_its_removal() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -282,6 +299,7 @@ fn a_removed_mac_cannot_read_a_value_put_after_its_removal() {
 /// NEGATIVE CONTROL: in `resolve`, take the first match (`[first, ..] => Ok(...)` before the
 /// `many` arm): `remove_member(m7, "m40")` removes one of the two and the `"m40 names two Macs"`
 /// expect_err fails.
+#[cfg(unix)]
 #[test]
 fn remove_by_label_refuses_a_label_naming_two_macs() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -316,6 +334,7 @@ fn remove_by_label_refuses_a_label_naming_two_macs() {
 ///
 /// NEGATIVE CONTROL: in `named_target`, drop the `Target::Seat(_) if membership.removal(..)` arm:
 /// the repeat is refused as no member, and the "removed already" assert fails.
+#[cfg(unix)]
 #[test]
 fn a_person_removes_the_seat_the_resolver_named_where_the_word_names_two_macs() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -357,6 +376,7 @@ fn a_person_removes_the_seat_the_resolver_named_where_the_word_names_two_macs() 
 /// NEGATIVE CONTROL: in `cut_tables_first`, make the first arm
 /// `Target::Actor(actor) | Target::Seat(actor) => actor`: the repeat's Share cut and m7's own
 /// cut are recorded, and the assert fails.
+#[cfg(unix)]
 #[test]
 fn a_refused_seat_signs_no_table_cutoff() {
     on_table_cuts(record_table_cuts);
@@ -392,6 +412,7 @@ fn a_refused_seat_signs_no_table_cutoff() {
 ///
 /// NEGATIVE CONTROL: in `draft_removal`, make `by_person` `matches!(target, Target::Word(_))`:
 /// the twin's seat stays in, and the "every seat of the recipient" assert fails.
+#[cfg(unix)]
 #[test]
 fn a_seats_removal_takes_every_seat_of_its_recipient() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -425,6 +446,7 @@ fn a_seats_removal_takes_every_seat_of_its_recipient() {
 ///
 /// NEGATIVE CONTROL: in `named_target`, make the recipient check `false && …`: the seat's
 /// removal signs, and the `expect_err` fails.
+#[cfg(unix)]
 #[test]
 fn a_person_does_not_remove_this_macs_twin_seat() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -472,6 +494,7 @@ fn a_person_does_not_remove_this_macs_twin_seat() {
 ///
 /// NEGATIVE CONTROL: make `coalesce_concurrent_commons_epochs` return `Ok(())` at once: neither
 /// Mac signs, two `[everyone]` epochs stay in use, and the `"one Mac mints"` assert fails.
+#[cfg(unix)]
 #[test]
 fn concurrent_removals_mint_one_higher_epoch_covering_both() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -563,6 +586,7 @@ fn concurrent_removals_mint_one_higher_epoch_covering_both() {
 
 /// m22 signs its share of the quorum `Remove` of `target` at the cutoff m7's plain `Remove` of it
 /// named, and m7 keeps it: two of the voters, a quorum.
+#[cfg(unix)]
 fn second_share(macs: &TwoMacs, target: MemberId) {
     let held = log_of(&macs.m7);
     let cutoff = held
@@ -598,6 +622,7 @@ fn second_share(macs: &TwoMacs, target: MemberId) {
 /// NEGATIVE CONTROL: in `Local::of`, leave `removed` empty (`client::RemovedNotes::default()`):
 /// m40's row carries no note and reads as a new Mac asking to join (the ghost returns), and the
 /// `"m40 shows as removed"` expect fails.
+#[cfg(unix)]
 #[test]
 fn a_removed_mac_asking_again_shows_as_removed_not_new() {
     use crate::members::desk::{Asking, Desk, Handing, Local};
@@ -708,6 +733,7 @@ fn a_removed_mac_asking_again_shows_as_removed_not_new() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
     use crate::members::desk::Handing;
@@ -787,6 +813,7 @@ fn an_older_restore_cannot_undo_the_current_rosters_later_removal() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_signed_draft_extending_the_current_log_can_project_its_new_member() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -843,6 +870,7 @@ fn a_signed_draft_extending_the_current_log_can_project_its_new_member() {
 ///
 /// NEGATIVE CONTROL: make `removes_by_log` also require the admin key (`admin_cached(paths)`):
 /// the `"a plain member removes"` assert fails (proven 2026-10-29).
+#[cfg(unix)]
 #[test]
 fn a_vault_with_a_log_removes_by_any_member() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -1017,6 +1045,7 @@ fn an_undo_names_the_incarnation_with_removals_to_undo() {
 /// false`): the successor stays a member and the `"both seats are removed"` assert fails. Make
 /// `is_other_active_member` read the one recipient again (`rec != recipient`): the successor
 /// counts as another Mac holding its own label, and the deny-list assert fails.
+#[cfg(unix)]
 #[test]
 fn a_persons_removal_of_a_stolen_mac_cuts_removes_and_denies_its_writer_successor() {
     use crate::client::{Succeeding, Succession, admit_successor};
@@ -1132,6 +1161,7 @@ fn a_persons_removal_of_a_stolen_mac_cuts_removes_and_denies_its_writer_successo
 /// which m7 let in on its statement with nobody asked: a seat with an age identity of its own,
 /// under m7's name. m22 has seeded a swarm roster, so a stolen Mac's removal writes deny-lists.
 /// The successor's home has not yet written its vault from the bundle m7 handed it.
+#[cfg(unix)]
 struct Succeeded {
     macs: TwoMacs,
     actor7: MemberId,
@@ -1142,6 +1172,7 @@ struct Succeeded {
     bundle: crate::members::Bundle,
 }
 
+#[cfg(unix)]
 impl Succeeded {
     fn new() -> Self {
         use crate::client::{Succeeding, Succession, admit_successor};
@@ -1281,6 +1312,7 @@ impl Succeeded {
 /// successor as another Mac holding its own label (the deny-list assert); the cascade keeping
 /// every roster row but the Mac's own (`if own_row`) keeps the successor's row, whose labels
 /// then survive (`"the successor's roster row goes"`).
+#[cfg(unix)]
 #[test]
 fn an_admins_stolen_revoke_takes_the_macs_writer_successor_out_with_it() {
     on_table_cuts(record_table_cuts);
@@ -1361,6 +1393,7 @@ fn an_admins_stolen_revoke_takes_the_macs_writer_successor_out_with_it() {
 /// MUTANT: `super::remove::with_successors` returning `recipients.clone()` alone leaves the
 /// successor seated and wrapped (`"both seats are removed"`); the retry's unchanged retirement
 /// counting the recipients named alone (`targets.len()`) counts one (`"the same two"`).
+#[cfg(unix)]
 #[test]
 fn an_admins_retire_of_a_mac_takes_its_writer_successor_out_with_it() {
     on_table_cuts(record_table_cuts);
@@ -1397,6 +1430,7 @@ fn an_admins_retire_of_a_mac_takes_its_writer_successor_out_with_it() {
 ///
 /// MUTANT: `successors_below` reading the Mac's current seats alone (not its removed ones) finds
 /// no successor below a Mac already out (`"both seats are removed"`).
+#[cfg(unix)]
 #[test]
 fn an_admins_retire_takes_out_the_successor_an_older_removal_left() {
     on_table_cuts(record_table_cuts);
@@ -1434,6 +1468,7 @@ fn an_admins_retire_takes_out_the_successor_an_older_removal_left() {
 /// own (`"does not remove its Mac"`); deleting the planner's successor refusal leaves the
 /// retirement to refuse only later, as a member removing itself, which names no succession
 /// (`"the planner names the succession"`).
+#[cfg(unix)]
 #[test]
 fn a_removal_of_a_mac_from_its_successors_own_home_is_refused_and_cuts_nothing() {
     on_table_cuts(record_table_cuts);
@@ -1833,6 +1868,7 @@ fn a_macs_writer_successors_are_the_seats_it_admitted_alone_under_its_own_name()
 /// before): the `"revoke sends an unproved founder to the admin"` assert fails. Restore the old
 /// carry (keep a seatless recipient every newest head wraps) and the `"seatless m7 drops"`
 /// assert fails.
+#[cfg(unix)]
 #[test]
 fn revoke_sends_a_mac_the_log_does_not_seat_to_the_admins_revoke() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -1921,6 +1957,7 @@ fn revoke_sends_a_mac_the_log_does_not_seat_to_the_admins_revoke() {
 ///
 /// NEGATIVE CONTROL: make `restored_by_log` return two empty sets: the steward's rows stand, and
 /// the `"m40 is denied nothing"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
     use crate::members::desk::Handing;
@@ -2026,6 +2063,7 @@ fn a_mac_allowed_again_after_the_stewards_deny_rows_is_back_in_the_roster() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_denials() {
     use crate::members::desk::Handing;
@@ -2226,6 +2264,7 @@ fn a_mac_allowed_again_under_a_new_device_key_clears_its_node_and_recipient_deni
 /// NEGATIVE CONTROL: make `Log::rekey_dues` skip host lists: m22's passes mint nothing for
 /// `[m22 m40]`, whose newest epoch still wraps m40, and the `"m22 rotates [m22 m40]"` assert
 /// fails.
+#[cfg(unix)]
 #[test]
 fn a_host_list_the_remover_cannot_open_is_named_and_rotated_by_its_members() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -2316,6 +2355,7 @@ fn a_host_list_the_remover_cannot_open_is_named_and_rotated_by_its_members() {
 ///
 /// NEGATIVE CONTROL: make `vault_admin_named` return `None`: `aterm secrets revoke m7` would sign
 /// a log `Remove`, and the routing assert and the note assert fail.
+#[cfg(unix)]
 #[test]
 fn an_envelope_admin_is_revoked_with_the_admin_key_and_a_log_removal_says_the_key_stays() {
     let macs = two_macs_with(&[(Audience::Everyone, "shared", b"v1".as_slice())], true);
@@ -2353,6 +2393,7 @@ fn an_envelope_admin_is_revoked_with_the_admin_key_and_a_log_removal_says_the_ke
 /// age recipient (a node id names no envelope machine).
 ///
 /// NEGATIVE CONTROL: make `vault_admin_holding` return `None`: the note assert fails.
+#[cfg(unix)]
 #[test]
 fn a_seats_removal_of_an_envelope_admin_says_the_key_stays() {
     let macs = two_macs_with(&[(Audience::Everyone, "shared", b"v1".as_slice())], true);
@@ -2594,6 +2635,7 @@ fn removing_one_split_clashed_mac_does_not_deny_surviving_mac_or_mark_restored_m
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_removed_mac_asking_again_with_fresh_secrets_key_and_same_node_key_is_restored() {
     use crate::members::desk::{Asking, Desk, Handing, Local};
@@ -3064,6 +3106,7 @@ fn notes_of_and_kept_out_prefer_quorum_removal_and_newest_removed_seat_over_inca
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_removal() {
     let seat = |tag: u8| Seat {
@@ -3202,6 +3245,7 @@ fn removed_labels_overlay_and_local_label_resolution_enforce_node_and_recipient_
 /// F21's split (the design's tests 4 to 6): m22 = A (the admin), m7 = Y, m40 = R, m42 and m44
 /// other members, and m41 = X, whom m22 lets in on side 1 during the split; with `w`, also m43 =
 /// W, whom m7 lets in on side 2 and who puts `w-entry` under m40's epoch.
+#[cfg(unix)]
 pub(crate) struct KeyedSplit {
     pub(crate) macs: TwoMacs,
     pub(super) m40: Paths,
@@ -3222,6 +3266,7 @@ pub(crate) struct KeyedSplit {
 /// `[everyone]` epoch it holds. A removal concurrent with its signer's own still holds (F16), so
 /// m22 removes m42 too: after the heal no newest epoch is wrapped to a removed Mac, F16's
 /// coverage rule has nothing to do, and only F21's reseal is due.
+#[cfg(unix)]
 pub(crate) fn keyed_split(w: bool) -> KeyedSplit {
     let macs = two_macs(&[
         (Audience::Everyone, "shared", b"v1".as_slice()),
@@ -3267,6 +3312,7 @@ pub(crate) fn keyed_split(w: bool) -> KeyedSplit {
     }
 }
 
+#[cfg(unix)]
 impl KeyedSplit {
     /// Every Mac here, the removed one included.
     pub(super) fn all(&self) -> Vec<&Paths> {
@@ -3349,6 +3395,7 @@ impl KeyedSplit {
 ///   writes wait for a holder".
 /// - `tend_epochs_at` records nothing after a reseal (`if false && !uncovered.is_empty() …`):
 ///   fails "m7's reseal records what m40 could read".
+#[cfg(unix)]
 #[test]
 fn a_mac_that_cannot_open_a_keyed_epoch_never_reseals_over_it() {
     let split = keyed_split(false);
@@ -3465,6 +3512,7 @@ fn a_mac_that_cannot_open_a_keyed_epoch_never_reseals_over_it() {
 /// - `reseal_audience` issues no `Delete` of a keyed `Delete` winner (its loop over
 ///   `keyed_deletes` takes none): fails "m41 reads no other", left `Some([111, 49])`, right
 ///   `None`.
+#[cfg(unix)]
 #[test]
 fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
     let split = keyed_split(false);
@@ -3597,6 +3645,7 @@ fn the_vault_pass_after_the_heal_reseals_an_epoch_kept_readable() {
 /// newest epoch wraps a removed Mac (no rotation is due, so no write waits for a key), but `E0`
 /// wins `shared` and still wraps m40: a departure the log made, whose reseal is due. Returns the
 /// two Macs, m22's text before the split and m40's recipient.
+#[cfg(unix)]
 fn departure_heal() -> (TwoMacs, Document, Recipient) {
     let macs = two_macs(&[
         (Audience::Everyone, "shared", b"v1".as_slice()),
@@ -3629,6 +3678,7 @@ fn departure_heal() -> (TwoMacs, Document, Recipient) {
 
 /// What m22's publish of `doc`, overlaid with its log so it changes no entry, signs into
 /// `[everyone]`: the kinds of the `Epoch`s and `Put`s it drafts there.
+#[cfg(unix)]
 fn unchanged_publish(m22: &Paths, doc: &Document) -> Vec<Kind> {
     let identity = read_identity(m22).unwrap().unwrap();
     let mut doc = doc.clone();
@@ -3667,6 +3717,7 @@ fn unchanged_publish(m22: &Paths, doc: &Document) -> Vec<Kind> {
 ///
 /// NEGATIVE CONTROL: `log_entries::DEPARTURE_MINTS` (an unchanged edit mints for the log's
 /// departure, as before) makes m22's publish mint a fresh `[everyone]` epoch and re-put entries.
+#[cfg(unix)]
 #[test]
 fn an_unchanged_publish_mints_nothing_for_a_departure_the_log_made() {
     let (macs, doc, _) = departure_heal();
@@ -3730,6 +3781,7 @@ fn an_unchanged_publish_mints_nothing_for_a_departure_the_log_made() {
 ///
 /// NEGATIVE CONTROL: `tend_epochs_at` never recording rule 8 (its `resealed` read as `false`):
 /// fails "the tender records what m40 could read".
+#[cfg(unix)]
 #[test]
 fn the_ranked_tender_reseals_a_keyed_epoch_and_records_rule_8() {
     let split = keyed_split(false);
@@ -3760,6 +3812,7 @@ fn the_ranked_tender_reseals_a_keyed_epoch_and_records_rule_8() {
 ///
 /// NEGATIVE CONTROL: `RekeyDue::turn` ranking the carriers for a reseal alone (every holder of a
 /// newest epoch, whatever is due): fails "m41, which holds no key of E, takes no rank".
+#[cfg(unix)]
 #[test]
 fn a_mac_without_a_key_of_the_keyed_epoch_takes_no_reseal_rank() {
     let split = keyed_split(false);
@@ -3816,6 +3869,7 @@ fn a_mac_without_a_key_of_the_keyed_epoch_takes_no_reseal_rank() {
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
 /// `reseal_audience` attesting whether or not it opens the audience whole: fails "a Mac that does
 /// not open the audience whole covers nothing".
+#[cfg(unix)]
 #[test]
 fn a_reseal_that_carries_no_value_covers_nothing() {
     let split = keyed_split(false);
@@ -3873,6 +3927,7 @@ fn a_reseal_that_carries_no_value_covers_nothing() {
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
 /// `OpenedAudienceEntries::reputs_whole` ignoring `keyless_keyed`: fails "m41's removal re-puts
 /// no entry it did not change".
+#[cfg(unix)]
 #[test]
 fn a_mac_without_a_keyed_key_never_reputs_whole_after_the_reseal() {
     let split = keyed_split(false);
@@ -3984,6 +4039,7 @@ fn a_mac_that_does_not_open_all_of_commons_puts_only_a_changed_descriptor() {
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, and confirmed with cmp): rule 4's
 /// full reseal reduced to any counting epoch (`full` returns `true`, so neither the head clause
 /// nor the attestation clause holds it back): fails "E stays uncovered after m43's partial mint".
+#[cfg(unix)]
 #[test]
 fn a_partial_mint_never_retires_an_epoch_kept_readable() {
     let split = keyed_split(true);
@@ -4059,10 +4115,12 @@ fn a_partial_mint_never_retires_an_epoch_kept_readable() {
 
 /// The homes of [`KeyedSplit`] (`w` on) before the heal, kept as a template each
 /// `KeyedEpochs` replay copies, with m40 = R's own write `T` put under its epoch on side 2.
+#[cfg(unix)]
 struct KeyedEpochsFixture {
     split: KeyedSplit,
 }
 
+#[cfg(unix)]
 impl KeyedEpochsFixture {
     const HOMES: [&'static str; 5] = ["m22", "m7", "m40", "m41", "m43"];
 
@@ -4075,6 +4133,7 @@ impl KeyedEpochsFixture {
 
 /// One replay of the `KeyedEpochs` model through the real client: m22 = A, m7 = Y, m40 = R,
 /// m41 = X and m43 = W, each a copy of the fixture's home.
+#[cfg(unix)]
 struct KeyedEpochsHarness<'a> {
     fixture: &'a KeyedEpochsFixture,
     m22: Paths,
@@ -4087,6 +4146,7 @@ struct KeyedEpochsHarness<'a> {
     edited: bool,
 }
 
+#[cfg(unix)]
 impl<'a> KeyedEpochsHarness<'a> {
     fn replay(fixture: &'a KeyedEpochsFixture, run_dir: &Path, path: &[&str]) -> Self {
         let template = fixture.split.macs.root.path();
@@ -4251,6 +4311,7 @@ impl<'a> KeyedEpochsHarness<'a> {
 
 /// The `KeyedEpochs` projection: `action` run through the real client on `h`'s Macs, then the
 /// model's state read back from them.
+#[cfg(unix)]
 fn keyed_epochs_transition(
     h: &mut KeyedEpochsHarness<'_>,
     action: &str,
@@ -4279,6 +4340,7 @@ fn keyed_epochs_transition(
 ///   has `"covered": 1, "gap": 0, "hx": 0, "sx": 2`.
 /// - rule 4's full reseal reduced to any counting epoch (`full` returns `true`): the replaced
 ///   reading's oracle fails first, `the keyed epochs disagree with the replaced reading`.
+#[cfg(unix)]
 #[test]
 fn keyed_epochs_model_conforms_and_catches_mutants() {
     let model = aterm_models_swarm::keyed_epochs_model();
@@ -4394,6 +4456,7 @@ fn keyed_epochs_model_conforms_and_catches_mutants() {
 // keeps its `[everyone]` writes unsigned until the new key arrives.
 
 /// Record budgets whose keyed one is `keyed`, the weighed one as in production.
+#[cfg(unix)]
 fn keyed_budget(keyed: usize) -> crate::membership_log::RecordBudgets {
     crate::membership_log::RecordBudgets {
         weighed: crate::membership_log::MAX_WEIGHED_RECORDS,
@@ -4405,6 +4468,7 @@ fn keyed_budget(keyed: usize) -> crate::membership_log::RecordBudgets {
 /// The record budgets in which `keyed` held records fill the log as `of` would fill
 /// [`crate::membership_log::MAX_KEYED_RECORDS`]: one of one-mesh §8's fills, scaled to a lab's
 /// log.
+#[cfg(unix)]
 fn scaled_budget(keyed: usize, of: usize) -> crate::membership_log::RecordBudgets {
     keyed_budget(keyed * crate::membership_log::MAX_KEYED_RECORDS / of)
 }
@@ -4412,6 +4476,7 @@ fn scaled_budget(keyed: usize, of: usize) -> crate::membership_log::RecordBudget
 /// Each Mac of `all` runs its vault pass ([`vault_pass_at`]) at each of `steps`
 /// [`log_entries::GAP_STEP_MS`] steps from `t0`, what one signs carried to every other Mac of
 /// `all` at once. Returns what the passes signed.
+#[cfg(unix)]
 fn passes(all: &[Paths], t0: u64, steps: u64) -> Vec<Record> {
     let mut signed = Vec::new();
     for k in 0..steps {
@@ -4435,12 +4500,14 @@ fn passes(all: &[Paths], t0: u64, steps: u64) -> Vec<Record> {
 /// the lab, its seven Macs (m44 last), m44's recipient, the log's keyed records and the tender's
 /// bound on what the coalesce signs ([`log_entries::rekey_bound`]), the same before the
 /// heal and after.
+#[cfg(unix)]
 fn stop_lab() -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
     stop_lab_after(|_| {})
 }
 
 /// [`stop_lab`], built after `prepare` ran over the six Macs, each holding one log: what a test
 /// writes there is in every Mac's log before the heads part.
+#[cfg(unix)]
 fn stop_lab_after(
     prepare: impl FnOnce(&convergence::Six),
 ) -> (convergence::Six, Vec<Paths>, Recipient, usize, usize) {
@@ -4509,6 +4576,7 @@ fn stop_lab_after(
 /// - `within_automatic_stop` returning `ready` at once (no stop; restored with cp from a backup
 ///   plus touch, confirmed with cmp): the test fails "the coalesce waits past the stop: 36 keyed +
 ///   10 planned > 45", left `{Everyone: 1}`, right `{}`.
+#[cfg(unix)]
 #[test]
 fn past_the_automatic_stop_a_coalesce_no_removal_made_waits_and_a_heal_does_not() {
     let stop_of = |keyed: usize| keyed_budget(keyed).automatic_keyed_stop();
@@ -4591,6 +4659,7 @@ fn past_the_automatic_stop_a_coalesce_no_removal_made_waits_and_a_heal_does_not(
 }
 
 /// The numbers of a refusal's text, in order.
+#[cfg(unix)]
 fn numbers_of(text: &str) -> Vec<usize> {
     text.split(|c: char| !c.is_ascii_digit())
         .filter(|word| !word.is_empty())
@@ -4613,8 +4682,9 @@ fn numbers_of(text: &str) -> Vec<usize> {
 /// - `draft_removal` with no fill check (`if false && fill.passes()`; restored with cp from a
 ///   backup plus touch, confirmed with cmp): the first removal signs into the log's hard bound and
 ///   fails with the log's own "membership log holds its limit of keyed records (Epoch, Wrap, Put,
-///   Delete, Node, Name)", no fill and no "the membership log is full", so the test's first
-///   refusal assert fails.
+///   Delete, Node, Name, Checkpoint)", no fill and no "the membership log is full", so the
+///   test's first refusal assert fails.
+#[cfg(unix)]
 #[test]
 fn a_removal_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fill() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"never-printed".as_slice())]);
@@ -4668,6 +4738,7 @@ fn a_removal_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fil
 /// What [`writer_over_removal`] saw: the lab, the records the publish signed, what each of the
 /// three passes signed, m7's batch, and whether m22's waiting file was there after the publish
 /// and is after the passes.
+#[cfg(unix)]
 struct WriterOverRemoval {
     lab: convergence::Six,
     published: Vec<Record>,
@@ -4683,6 +4754,7 @@ struct WriterOverRemoval {
 /// Then m22's pass runs at `t0` (the rotation is still due: m22 waits the remover's grace); it
 /// takes m7's whole batch, its pass runs a step later and once more a step after that, and every
 /// other Mac takes its records.
+#[cfg(unix)]
 fn writer_over_removal(dont_wait: bool) -> WriterOverRemoval {
     let lab = convergence::six_with(true);
     let (m22, m7) = (&lab.all[0], &lab.all[1]);
@@ -4745,6 +4817,7 @@ fn writer_over_removal(dont_wait: bool) -> WriterOverRemoval {
 ///   restored with cp from a backup plus touch, confirmed with cmp): the test fails "the publish
 ///   signs nothing while the newest epoch wraps m42: [Epoch, Wrap, Wrap, Wrap, Wrap, Wrap, Put]",
 ///   a Commons epoch beside the rotation due.
+#[cfg(unix)]
 #[test]
 fn a_writer_that_holds_a_remove_keeps_its_everyone_put_unsigned_until_the_new_key() {
     let run = writer_over_removal(false);
@@ -4821,6 +4894,7 @@ fn a_writer_that_holds_a_remove_keeps_its_everyone_put_unsigned_until_the_new_ke
 }
 
 /// The epoch the op that wins `name` in `[everyone]` is sealed under, as `paths` opens its log.
+#[cfg(unix)]
 fn winning_epoch(paths: &Paths, name: &str) -> Option<RecordId> {
     let identity = read_identity(paths).unwrap().unwrap();
     let log = log_of(paths);
@@ -4846,6 +4920,7 @@ fn winning_epoch(paths: &Paths, name: &str) -> Option<RecordId> {
 /// backup plus touch, confirmed with cmp): the publish signs nothing, the admission hands m44
 /// the old epoch, and the test fails "m44 is handed no Wrap of the epoch shared = v1 is sealed
 /// under".
+#[cfg(unix)]
 #[test]
 fn a_delete_from_everyone_while_a_rotation_is_due_writes_at_once_and_reseals_what_stays() {
     let lab = convergence::six_with(true);
@@ -4949,6 +5024,7 @@ fn a_delete_from_everyone_while_a_rotation_is_due_writes_at_once_and_reseals_wha
 }
 
 /// How [`cut_publish`] ends m22's publish early.
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Cut {
     /// Before any server took the version (`CUT_BEFORE_STORE`).
@@ -4963,6 +5039,7 @@ enum Cut {
 /// What [`cut_publish`] saw: whether m22's write was pending and whether it waited after the
 /// publish, whether it waited after m22's sync, and what m22's passes signed once m7's batch
 /// arrived.
+#[cfg(unix)]
 struct CutPublish {
     lab: convergence::Six,
     pending: bool,
@@ -4974,6 +5051,7 @@ struct CutPublish {
 /// [`writer_over_removal`]'s shape with the publish cut short by `cut`: m22, which holds m7's
 /// `Remove` of m42 and not its rotation, publishes `shared` = v2 and the publish ends with an
 /// error. m22 then syncs, takes m7's whole batch, and its pass runs twice, a step apart.
+#[cfg(unix)]
 fn cut_publish(cut: Cut) -> CutPublish {
     let lab = convergence::six_with(true);
     let (m22, m7) = (&lab.all[0], &lab.all[1]);
@@ -5024,6 +5102,7 @@ fn cut_publish(cut: Cut) -> CutPublish {
 }
 
 /// The `[everyone]` `Put`s among `records` (a `Put`'s name is sealed; m22 writes only `shared`).
+#[cfg(unix)]
 fn everyone_puts(records: &[Record]) -> usize {
     records
         .iter()
@@ -5052,6 +5131,7 @@ fn everyone_puts(records: &[Record]) -> usize {
 /// restored with cp from a backup plus touch, confirmed with cmp): the publish no server took
 /// signs its `Put` once the rotation arrives, and the test fails "a publish no server took never
 /// signs its write".
+#[cfg(unix)]
 #[test]
 fn a_waiting_write_is_signed_only_once_a_server_took_its_version() {
     let never = cut_publish(Cut::BeforeStore);
@@ -5100,6 +5180,7 @@ fn a_waiting_write_is_signed_only_once_a_server_took_its_version() {
 /// (`sets.clear();` before its push; restored with cp from a backup plus touch, confirmed with
 /// cmp): the refusal drops the only set, m22's sync lands nothing, and the test fails "the sync
 /// that reads the stored version lands its write".
+#[cfg(unix)]
 #[test]
 fn a_waiting_write_on_a_stored_version_outlasts_a_later_publish_refused_as_not_newer() {
     let run = cut_publish(Cut::AfterStoreThenStale);
@@ -5129,6 +5210,7 @@ fn a_waiting_write_on_a_stored_version_outlasts_a_later_publish_refused_as_not_n
 }
 
 /// The audience a `Epoch`, `Put` or `Delete` record names, for a failure's message.
+#[cfg(unix)]
 fn audience_of(record: &Record) -> Option<EpochAudience> {
     match record.body() {
         Body::Epoch { audience, .. }
@@ -5141,6 +5223,7 @@ fn audience_of(record: &Record) -> Option<EpochAudience> {
 /// What [`concurrent_removals_and_a_write`] saw: the lab, the scaled stop and limit, the keyed
 /// records before the publish, what the publish and then the passes signed, and whether a write
 /// still waits on m7 after them.
+#[cfg(unix)]
 struct ConcurrentRemovals {
     lab: convergence::Six,
     stop: usize,
@@ -5158,6 +5241,7 @@ struct ConcurrentRemovals {
 /// as 8,600 fill 12,288, past the stop. At that fill m7, an admin and no remover (its own pass
 /// waits the removers' grace), publishes `shared` = v2, and then the four remaining Macs' passes
 /// run 16 steps, `stop_holds` setting `remove::STOP_HOLDS_REMOVALS` for all of it.
+#[cfg(unix)]
 fn concurrent_removals_and_a_write(stop_holds: bool) -> ConcurrentRemovals {
     let lab = convergence::six_with(true);
     let (m22, m7, m40) = (&lab.all[0], &lab.all[1], &lab.all[2]);
@@ -5218,6 +5302,7 @@ fn concurrent_removals_and_a_write(stop_holds: bool) -> ConcurrentRemovals {
 /// run in the test as a CONTROL, and once with it set for the first run too: the same passes sign
 /// nothing, m7's write still waits, and the test fails "the coalesce is signed past the stop",
 /// left `{}`, right `{Everyone: 1, Commons: 1}`.
+#[cfg(unix)]
 #[test]
 fn two_concurrent_removals_past_the_stop_coalesce_and_the_held_put_is_then_signed() {
     let run = concurrent_removals_and_a_write(false);
@@ -5293,7 +5378,8 @@ fn two_concurrent_removals_past_the_stop_coalesce_and_the_held_put_is_then_signe
 /// `draft_retire_in_log_with` with no fill check (`if false && fill.passes()`): the revoke at the
 /// log's own keyed count signs into the log's hard bound and fails "removal cannot fit: at least
 /// 13 complete records … (membership log holds its limit of keyed records (Epoch, Wrap, Put,
-/// Delete, Node, Name))", with no fill, and the first refusal assert fails.
+/// Delete, Node, Name, Checkpoint))", with no fill, and the first refusal assert fails.
+#[cfg(unix)]
 #[test]
 fn a_revoke_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fill() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"never-printed".as_slice())]);
@@ -5352,6 +5438,7 @@ fn a_revoke_whose_worst_case_passes_the_keyed_budget_refuses_and_prints_the_fill
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp):
 /// `RemovalFill::of` with one re-key for every audience (`let rekeys = 1`): fails "two re-keys of
 /// the ring: [14, 8, 11, 14], the ring's bound 3", left 3, right 6.
+#[cfg(unix)]
 #[test]
 fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -5421,6 +5508,7 @@ fn a_removal_reserves_two_rekeys_of_an_audience_it_does_not_mint() {
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): the bound
 /// counting every `Put` and `Delete` of the audience (its old arm): fails "the bound counts no
 /// superseded write: 31, of 25 writes".
+#[cfg(unix)]
 #[test]
 fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write() {
     let split = keyed_split(false);
@@ -5500,9 +5588,11 @@ fn the_planned_cost_of_an_audience_not_opened_whole_counts_no_superseded_write()
 
 /// What the recording table-cuts hook saw: each call's vault, target and pass, and whether the
 /// target was still a member then.
+#[cfg(unix)]
 static TABLE_CUT_CALLS: std::sync::Mutex<Vec<(std::path::PathBuf, MemberId, CutPass, bool)>> =
     std::sync::Mutex::new(Vec::new());
 
+#[cfg(unix)]
 fn record_table_cuts(paths: &Paths, member: &MemberId, pass: CutPass) -> usize {
     // Installed for the whole test binary, so it never fails another test's removal.
     let seated = load_records(paths)
@@ -5519,6 +5609,7 @@ fn record_table_cuts(paths: &Paths, member: &MemberId, pass: CutPass) -> usize {
 /// `aterm secrets revoke` signs its table cutoffs too (one-mesh §4.10, B11): the vault
 /// revocation runs the installed table-cuts hook on the revoked seat, before its `Remove`, as the
 /// first remover. CONTROL: no call names m40 before the revoke.
+#[cfg(unix)]
 #[test]
 fn a_vault_revocation_cuts_the_revoked_seats_tables_before_its_remove() {
     on_table_cuts(record_table_cuts);
@@ -5551,6 +5642,7 @@ fn a_vault_revocation_cuts_the_revoked_seats_tables_before_its_remove() {
 /// records it signed while a member still name it.
 /// NEGATIVE CONTROL: with `seats_ever` listing only `members()`, m40 is missing and the assertion
 /// fails.
+#[cfg(unix)]
 #[test]
 fn every_seat_ever_held_is_listed_a_removed_one_included() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);

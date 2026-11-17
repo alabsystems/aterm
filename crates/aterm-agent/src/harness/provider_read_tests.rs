@@ -151,3 +151,37 @@ fn a_capture_holds_only_what_its_body_reported() {
     let ((), none) = captured(|| ());
     assert!(none.is_empty());
 }
+
+/// THE CLAUDE WALL DOOR (FL-118b): a rung its holder claimed reads its own account once, its reason
+/// `at-wall`; spent on another account, it records and reads nothing.
+#[test]
+fn a_claimed_wall_rung_reads_its_own_account_at_its_wall() {
+    use super::super::accounts;
+    let mut state = accounts::State::default();
+    accounts::note_wall_wait(&mut state, "main", "s-1", 0);
+    let claim = accounts::claim_wall_read(&mut state, "main", "s-1", 60).expect("rung 0");
+    let (other, none) = captured(|| {
+        claim
+            .read_use()
+            .begin(accounts::panel_account("work-2"), 60, None)
+    });
+    assert!(other.is_err());
+    assert!(none.is_empty());
+    let claim = accounts::claim_wall_read(&mut state, "main", "s-1", 120).expect("rung 1");
+    let (own, probes) = captured(|| {
+        claim
+            .read_use()
+            .begin(accounts::panel_account("main"), 120, None)
+    });
+    assert!(own.is_ok());
+    assert_eq!(
+        probes,
+        vec![ProbeEvent {
+            at: 120,
+            read: Read::ClaudePanel,
+            account: Some("main".into()),
+            login: None,
+            why: InUse::AtWall,
+        }]
+    );
+}

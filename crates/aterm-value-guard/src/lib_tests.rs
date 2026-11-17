@@ -112,6 +112,35 @@ fn a_url_carrying_a_password_is_credential_shaped() {
     }
 }
 
+/// A handle is words of lower-case letters and digits joined by one `-`, at most its column's
+/// bytes, and a machine-shaped word is a word like any other; a token fits that grammar, so the
+/// free-text refusals come first and name it as a credential.
+/// NEGATIVE CONTROL: with `handle` checking only the length before the grammar (no `text`),
+/// the Anthropic key's shape passes: `` assertion `left == right` failed: "sk-ant-" is refused ``.
+#[test]
+fn a_handle_is_lower_case_words_joined_by_one_dash_and_may_name_a_machine() {
+    for ok in [
+        "m2", "m2-work", "fb-gmail", "kimi-m16", "m106-m38", "a", "0",
+    ] {
+        assert_eq!(handle(ok, 32), Ok(()), "{ok:?} is a handle");
+    }
+    for bad in [
+        "", "-", "m2-", "-m2", "m2--work", "team a", "Main", "m2_work", "m2.work", "ann@x",
+    ] {
+        assert!(handle(bad, 32).is_err(), "{bad:?} is no handle");
+    }
+    assert_eq!(handle("main-desk", 8), Err(Refusal::Length));
+    assert_eq!(handle("team a", 32), Err(Refusal::Handle));
+    // In halves, so no scan reads a credential here.
+    let key = concat!("sk-ant-", "api03-abcdefghij");
+    assert_eq!(
+        handle(key, 32),
+        Err(Refusal::CredentialShape),
+        "{:?} is refused",
+        &key[..7]
+    );
+}
+
 /// The tracker's secret rule refuses a real secret and lets the tracker's own text stand: a
 /// provider's prefix with a token's body, a PEM private key, an `otpauth://` seed, an upper-case
 /// or grouped TOTP seed, a URL's password and a random key are refused; a commit, a long path or

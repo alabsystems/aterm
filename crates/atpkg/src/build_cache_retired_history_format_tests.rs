@@ -5,10 +5,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::Instant;
 
 use super::super::GitCli;
-use super::{ELAPSED, Read, Snapshot};
+use super::{Read, Snapshot};
 
 #[test]
 fn actual_git_configuration_records_keep_every_format_guard() {
@@ -68,7 +67,6 @@ fn actual_git_configuration_records_keep_every_format_guard() {
         let read = Read {
             git: &GitCli,
             checkout: scratch.path(),
-            deadline: Instant::now() + ELAPSED,
         };
         let result = read.format(&snapshot, witness);
         match expected {

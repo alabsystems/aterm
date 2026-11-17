@@ -517,11 +517,13 @@ pub struct Receipt {
     /// The profiles its `incremental` (Trust's DC-12b) names a unit of: those whose units the
     /// build compiled into the profile's `incremental/` folder, which a member's unit of a
     /// profile with incremental compilation on is. `None` for a receipt with no `incremental`
-    /// (written before DC-12b), which says nothing of it. A selection's name leaves out what
-    /// turns incremental compilation on or off (`CARGO_INCREMENTAL`, which aterm-verify's main
-    /// lane sets to `0` in the build directory plain builds share), though a member's unit hash
-    /// holds it: two builds of one selection that differ there replace each other's receipt and
-    /// use two sets of units, neither of which supersedes the other ([`Self::same_variant`]).
+    /// (written before DC-12b), which says nothing of it. From Trust's DC-12e on, a selection
+    /// names whether its profile compiles incrementally, so a plain build and aterm-verify's main
+    /// lane (`CARGO_INCREMENTAL=0`, in the build directory plain builds share) each keep a receipt
+    /// of their own. A targo before DC-12e left that out of the name, though a member's unit hash
+    /// holds it: two builds of one selection that differ there replaced each other's receipt and
+    /// used two sets of units, neither of which supersedes the other ([`Self::same_variant`],
+    /// which still judges those receipts and the move a directory makes onto the new names).
     pub incremental: Option<BTreeSet<String>>,
 }
 

@@ -1087,6 +1087,10 @@ fn of_ledger(
     let t = secs(event.t)?;
     let (kind, src, why, word) = match event.kind {
         Kind::Rotate => ("switch", "cli-output", None, None),
+        // One word for every refill: a limit reset this Mac's aterm spent, and a refill or a
+        // raised allowance a reading showed (a reset a person or another Mac's aterm spent among
+        // them). The fleet's fold cuts the window at either, and the word is the registry's,
+        // which Macs of every build read.
         Kind::ResetUsed | Kind::Reset => ("reset-used", "cli-output", None, None),
         Kind::ResetFailed => ("error", "error", Some("reset-failed"), None),
         Kind::Auth => match Auth::parse(&event.why) {
@@ -1137,8 +1141,8 @@ fn of_ledger(
     Some((word, note))
 }
 
-/// The notes a reset's ledger row becomes ([`of_ledger`]'s `note`): one `reset-used` for each
-/// window the row says the reset refilled ([`Event::refilled`]), of the account's workspace
+/// The notes a reset's or a refill's ledger row becomes ([`of_ledger`]'s `note`): one
+/// `reset-used` for each window the row says was refilled or raised ([`Event::refilled`]), of the account's workspace
 /// (`sub`) where it has one as its readings and walls are, so a Mac's fold cuts that window's
 /// earlier readings and walls and no other window's. A row that names no window the journal
 /// holds (a reset spent with the limit still standing, a row written before rows named them) is

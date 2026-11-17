@@ -191,8 +191,8 @@ pub enum TurnOut {
     Done,
     /// The agent asked in prose (`conf=heuristic`).
     Asked,
-    /// The turn ended on a wall.
-    Wall(WallKind),
+    /// The turn ended on a wall, of a kind or (`None`, `out=wall`) of a kind nothing named.
+    Wall(Option<WallKind>),
     /// The turn was interrupted.
     Interrupted,
     /// An API error ended it.
@@ -320,7 +320,8 @@ impl Out {
             Out::Turn(o) => match o {
                 TurnOut::Done => "done",
                 TurnOut::Asked => "asked",
-                TurnOut::Wall(k) => k.wire(),
+                TurnOut::Wall(Some(k)) => k.wire(),
+                TurnOut::Wall(None) => "wall",
                 TurnOut::Interrupted => "interrupted",
                 TurnOut::Error => "error",
                 TurnOut::Gone => "gone",
@@ -387,7 +388,7 @@ pub fn need_rank(word: &str) -> u8 {
     match word {
         w if w.starts_with("approval:") => 0,
         "question" => 1,
-        w if w.starts_with("wall:") => 2,
+        w if w == "wall" || w.starts_with("wall:") => 2,
         "unresponsive" => 3,
         "failure" => 4,
         "escalated" => 5,

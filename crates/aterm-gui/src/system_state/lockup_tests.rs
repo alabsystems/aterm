@@ -9,9 +9,32 @@ fn spec(px: f32, scale: f32, done: u32, total: u32) -> LockupSpec {
         px,
         scale,
         alab: true,
+        dark: dark(),
         done,
         total,
-        pose: PetGlyphId::PetSit,
+        pose: CatPose::Sit,
+    }
+}
+
+fn roles() -> Roles {
+    Roles::from_theme(aterm_render::Theme::default())
+}
+
+/// Whether the test's page ([`roles`]) paints on a dark ground.
+fn dark() -> bool {
+    crate::native_appearance::surface_is_dark(super::super::marks::page_ground(&roles()))
+}
+
+/// What a lockup paints for `spec` in a lockup `width` wide with its own images (baked).
+fn baked_paint(spec: LockupSpec, width: f32) -> LockupPaint {
+    let wanted = spec.wanted(width);
+    for (art, w, h) in wanted.keys() {
+        art.keep(w, h, art.bake(w, h).into());
+    }
+    LockupPaint {
+        spec,
+        images: Some(wanted),
+        pending: false,
     }
 }
 
@@ -22,136 +45,418 @@ fn lockup_values_round_trip() {
         LockupSpec {
             kitty: false,
             alab: false,
-            pose: PetGlyphId::PetLoaf,
+            dark: !dark(),
+            pose: CatPose::Loaf,
             ..spec(17.0, 1.0, 0, 0)
+        },
+        LockupSpec {
+            pose: CatPose::Worried,
+            ..spec(19.0, 1.5, 3, 9)
         },
     ] {
         assert_eq!(LockupSpec::parse(Some(&value.value())), value);
+        for images in [
+            None,
+            Some(Baked {
+                spec: LockupSpec {
+                    pose: CatPose::Walk,
+                    ..value
+                },
+                width: 640.5,
+            }),
+        ] {
+            for pending in [false, true] {
+                let paint = LockupPaint {
+                    spec: value,
+                    images,
+                    pending,
+                };
+                assert_eq!(LockupPaint::parse(Some(&paint.value())), paint);
+            }
+        }
     }
     // Unreadable numbers fall back; a count past the total is the total.
-    let read = LockupSpec::parse(Some("kitty,NaN,0,1,20,16,99"));
+    let read = LockupSpec::parse(Some("kitty,NaN,0,1,1,20,16,99"));
     assert_eq!(
         (read.px, read.scale, read.done, read.total),
         (22.0, 2.0, 16, 16)
     );
-    assert_eq!(read.pose, POSES[0]);
+    assert_eq!(read.pose, CatPose::ALL[0]);
 }
 
-#[test]
-fn the_caret_runs_from_the_words_to_the_far_end_as_steps_finish() {
-    let width = 852.0;
-    let start = spec(22.0, 2.0, 0, 16);
-    let half = spec(22.0, 2.0, 8, 16);
-    let end = spec(22.0, 2.0, 16, 16);
-    let (a, b, c) = (
-        start.caret_x(width),
-        half.caret_x(width),
-        end.caret_x(width),
-    );
-    assert!(a < b && b < c, "{a} {b} {c}");
-    assert!(a >= start.words_end(), "the caret starts past the words");
-    // The kitty fits at the far end, whichever pose it is in.
-    let advance = start.advance();
-    assert!(c + caret_width(advance) + end.kitty_width() <= width + 0.01);
-    // Halfway is halfway along the caret's path.
-    assert!(((b - a) - (c - b)).abs() < 0.01);
-    // Nothing known yet: the start.
-    assert_eq!(spec(22.0, 2.0, 0, 0).caret_x(width), a);
-}
-
-#[test]
-fn the_kitty_keeps_its_face_and_whole_device_pixels_on_every_display() {
-    for (px, room) in [(17.0, 40.0), (22.0, 48.0)] {
-        for scale in [1.0_f32, 2.0, 3.0] {
-            let s = spec(px, scale, 0, 1);
-            let device = s.kitty_height() * scale;
-            assert!((device - device.round()).abs() < 0.001, "{px} {scale}");
-            if scale >= 2.0 {
-                assert!(device >= KITTY_MIN_DEVICE_PX - 0.01, "{px} {scale}");
-            }
-            assert!(
-                s.needed_height() <= room,
-                "the lockup keeps its height: {px} {scale}"
-            );
-            assert!(s.least_width() > s.words_end());
-        }
-    }
-}
-
-/// The first stripe's panels `paint_ribbon` draws past the words, left to right.
-fn past_the_words(dark: bool, words_end: f32, caret_x: f32) -> Vec<(f32, [u8; 4])> {
-    let surface = if dark { [30, 30, 30] } else { [231, 231, 231] };
+/// The images `paint_lockup` draws in `rect` for `paint`, in order, and their device sizes.
+fn images_of(paint: LockupPaint, rect: LogicalRect) -> Vec<(ImageArt, LogicalRect, (u32, u32))> {
     let mut prims = Vec::new();
-    paint_ribbon(
-        &mut prims, surface, dark, 20.0, 10.0, 0.0, words_end, caret_x,
-    );
-    let top = 20.0 - 5.0;
-    let mut past: Vec<(f32, [u8; 4])> = prims
+    paint_lockup(&mut prims, rect, Some(&paint.value()), &roles());
+    prims
         .iter()
         .filter_map(|prim| match prim {
-            DrawPrim::Panel { x, y, fill, .. }
-                if (*y - top).abs() < 0.01 && *x >= words_end - 0.01 =>
-            {
-                Some((*x, *fill))
-            }
+            DrawPrim::Image {
+                x,
+                y,
+                w,
+                h,
+                art,
+                device,
+                ..
+            } => Some((*art, LogicalRect::new(*x, *y, *w, *h), *device)),
             _ => None,
         })
-        .collect();
-    past.sort_by(|a, b| a.0.total_cmp(&b.0));
-    past
+        .collect()
 }
 
-/// THE RIBBON IS THE BRAND'S TRAIL, NOT A NYAN BAND (§4.5, D4): past the words it rises from
-/// the trail's own strength toward the caret, like a comet's tail, and at the caret it is
-/// never half again as strong as the trail; and it draws nothing past the words until the
-/// caret stands 4 pt clear of them. NEGATIVE CONTROL: with room, it does draw there.
+/// The images `paint_lockup` draws for `spec` in `rect`, its own images baked.
+fn images(value: &LockupSpec, rect: LogicalRect) -> Vec<(ImageArt, LogicalRect)> {
+    images_of(baked_paint(*value, rect.width), rect)
+        .into_iter()
+        .map(|(art, at, _)| (art, at))
+        .collect()
+}
+
+/// THE ROAD STARTS AFTER THE WORDS AND THE CAT RIDES IT TO THE RUN'S PROGRESS (§4.5): the road's
+/// image starts past the words, the cat's feet stand at `p` of their way along it, and nothing
+/// the cat draws reaches back over the words. NEGATIVE CONTROL: as steps finish, the cat moves.
 #[test]
-fn the_ribbon_rises_like_a_comet_from_the_trail_and_never_piles_up_at_the_start() {
-    for dark in [true, false] {
-        let (under, filled) = if dark {
-            (UNDER_WORDS_DARK, FILLED_DARK)
-        } else {
-            (UNDER_WORDS_LIGHT, FILLED_LIGHT)
+fn the_cat_rides_the_road_from_the_words_to_the_far_end_as_steps_finish() {
+    let rect = LogicalRect::new(24.0, 10.0, 852.0, 170.0);
+    let start = spec(22.0, 2.0, 0, 16);
+    let words_end = rect.x + start.words_end();
+    let mut cats = Vec::new();
+    for done in [0, 8, 16] {
+        let value = spec(22.0, 2.0, done, 16);
+        let drawn = images(&value, rect);
+        assert_eq!(drawn.len(), 2, "a road and a cat");
+        let (ImageArt::Road(road), road_at) = drawn[0] else {
+            panic!("the road first: {drawn:?}");
         };
-        assert!(filled > under && filled <= under * 1.5, "dark: {dark}");
-        assert!(past_the_words(dark, 200.0, 200.0 + LEAST_PAST - 0.5).is_empty());
-        let past = past_the_words(dark, 200.0, 600.0);
-        assert!(past.len() > 4, "the ribbon past the words draws");
-        let surface = if dark { [30, 30, 30] } else { [231, 231, 231] };
-        let palette = aterm_effects::harness_card::CardPalette::Cruise;
-        let rgb = palette.art(palette.stripe_t(0), dark);
-        let rgb = [(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8];
-        let apart = |fill: [u8; 4]| {
-            (0..3)
-                .map(|i| (i32::from(fill[i]) - i32::from(surface[i])).abs())
-                .sum::<i32>()
+        let (ImageArt::Cat(_), cat_at) = drawn[1] else {
+            panic!("then the cat: {drawn:?}");
         };
-        let rises: Vec<i32> = past.iter().map(|(_, fill)| apart(*fill)).collect();
+        assert!(road_at.x > words_end, "the road starts past the words");
         assert!(
-            rises.windows(2).all(|pair| pair[0] <= pair[1]) && rises[0] < rises[rises.len() - 1],
-            "dark {dark}: it rises toward the caret: {rises:?}"
+            road_at.right() <= rect.right() + 0.5,
+            "and ends inside the lockup"
         );
-        let at = |a: f32| {
-            apart(rgba(
-                crate::native_appearance::mix_srgb(surface, rgb, a),
-                255,
-            ))
-        };
-        let (first, last) = (past[0].1, past[past.len() - 1].1);
+        // The cat's feet, in points, against where the road says they stand.
+        let unit = road_at.height / design::ROAD_H;
+        let (fx, _) = road.road().feet();
+        let feet = cat_at.x + design::CAT_FEET.0 * unit;
+        let want = road_at.x + (fx - design::ROAD_X) * unit;
         assert!(
-            apart(first) <= at(under + 0.02),
-            "dark {dark}: it starts at the trail's"
+            (feet - want).abs() <= 1.0,
+            "{done}: feet {feet}, want {want}"
         );
+        // Whatever the cat's box overlaps of the words' line, it draws nothing there.
+        let words_line = LogicalRect::new(
+            rect.x,
+            rect.y + (design::BASELINE - 20.0) * unit,
+            words_end - rect.x,
+            20.0 * unit,
+        );
+        if let Some(cross) = words_line.intersect(cat_at) {
+            let part = crate::widget::ArtSpan {
+                left: (cross.x - cat_at.x) / cat_at.width,
+                top: (cross.y - cat_at.y) / cat_at.height,
+                right: (cross.right() - cat_at.x) / cat_at.width,
+                bottom: (cross.bottom() - cat_at.y) / cat_at.height,
+            };
+            assert_eq!(
+                drawn[1].0.mask().drawn(part),
+                None,
+                "{done}: the cat draws over the words"
+            );
+        }
+        cats.push(feet);
+    }
+    assert!(cats[0] < cats[1] && cats[1] < cats[2], "{cats:?}");
+    assert!(
+        ((cats[1] - cats[0]) - (cats[2] - cats[1])).abs() < 1.5,
+        "halfway is halfway"
+    );
+}
+
+/// The lockup's images stand on whole device pixels at the size they are baked at, and the
+/// view bakes ahead exactly what the painter draws.
+#[test]
+fn the_images_sit_on_whole_device_pixels_and_match_what_is_baked_ahead() {
+    for (px, scale) in [
+        (17.0, 1.0),
+        (22.0, 1.0),
+        (22.0, 1.5),
+        (22.0, 2.0),
+        (22.0, 3.0),
+    ] {
+        let value = spec(px, scale, 5, 16);
+        let width = 700.0;
+        let rect = LogicalRect::new(16.0, 8.0, width, value.needed_height());
+        let drawn = images_of(baked_paint(value, width), rect);
+        assert_eq!(drawn.len(), 2);
+        let device = |v: f32| v * scale;
+        for (_, at, _) in &drawn {
+            for v in [at.x, at.y, at.width, at.height] {
+                assert!(
+                    (device(v) - device(v).round()).abs() < 0.01,
+                    "{px} {scale}: {at:?}"
+                );
+            }
+        }
+        let keys = value.wanted(width).keys();
+        for (art, at, size) in &drawn {
+            let key = (
+                *art,
+                device(at.width).round() as u32,
+                device(at.height).round() as u32,
+            );
+            assert_eq!((key.1, key.2), *size, "{px} {scale}: drawn at its size");
+            assert!(keys.contains(&key), "{px} {scale}: {key:?} is baked ahead");
+        }
+        assert!(value.least_width() > value.words_end());
         assert!(
-            apart(last) <= at(filled),
-            "dark {dark}: and ends at its full strength"
+            value.needed_height() > px * 6.0,
+            "the design's box: {}",
+            value.needed_height()
         );
     }
 }
 
-/// HIGH CONTRAST AND SERIOUS MODE SHOW ONE PROGRESS (§4.9's rubric): the caret stays after
-/// the words, and the capsule after it fills as steps finish, full at done. NEGATIVE CONTROL:
-/// with the kitty the caret is what moves.
+/// A new moment never waits on a bake: the last moment's road and cat stay until the new ones
+/// are kept. NEGATIVE CONTROL: once they are, the new moment draws.
+#[test]
+fn a_new_moment_waits_for_its_bakes_and_the_last_one_stays_meanwhile() {
+    let width = 300.0;
+    let last = LockupSpec {
+        pose: CatPose::Walk,
+        ..spec(9.0, 1.0, 3, 8)
+    }
+    .wanted(width);
+    let wanted = LockupSpec {
+        pose: CatPose::LookUp,
+        ..spec(9.0, 1.0, 4, 8)
+    };
+    let keep = |baked: Baked| {
+        for (art, w, h) in baked.keys() {
+            art.keep(w, h, art.bake(w, h).into());
+        }
+    };
+    // Nothing kept: the words alone.
+    assert_eq!(wanted.paint(width, Some(last)).images, None);
+    keep(last);
+    assert_eq!(wanted.paint(width, Some(last)).images, Some(last));
+    // Its words are the moment's own all along.
+    assert_eq!(wanted.paint(width, Some(last)).spec, wanted);
+    keep(wanted.wanted(width));
+    assert_eq!(
+        wanted.paint(width, Some(last)).images,
+        Some(wanted.wanted(width))
+    );
+    // Images baked for the other ground are not drawn on this one.
+    let other = LockupSpec {
+        dark: !wanted.dark,
+        ..wanted
+    };
+    assert_eq!(other.paint(width, Some(last)).images, None);
+}
+
+/// A LIVE RESIZE AND A NEW DISPLAY NEVER BAKE WHERE THEY PAINT (§4.5): a lockup grown wider, or
+/// on a display of another scale, whose own images are not baked yet paints the road and the
+/// cat it painted last, one to one as they were baked, clipped to the node; rasterizing that
+/// frame keeps nothing new and leaves the new size unbaked. NEGATIVE CONTROL: the held road
+/// draws (its pixels show over the ground), and once the new size's images are kept they draw.
+#[test]
+fn a_width_or_scale_change_paints_the_last_images_and_never_bakes() {
+    let before = spec(22.0, 2.0, 5, 16);
+    let width = 700.0;
+    let last = baked_paint(before, width).images.expect("baked");
+    for now in [
+        // Wider, the road a step longer.
+        (spec(22.0, 2.0, 5, 16), 900.0),
+        // Narrower.
+        (spec(22.0, 2.0, 5, 16), 560.0),
+        // The window moved to a 1x display.
+        (spec(22.0, 1.0, 5, 16), 700.0),
+    ] {
+        let (spec_now, width_now) = now;
+        let wanted = spec_now.wanted(width_now);
+        assert!(!wanted.ready(), "{now:?}: the new size is not baked yet");
+        let paint = spec_now.paint(width_now, Some(last));
+        assert_eq!(
+            paint.images,
+            Some(last),
+            "{now:?}: the last images are held"
+        );
+        let rect = LogicalRect::new(24.0, 8.0, width_now, spec_now.needed_height());
+        let mut prims = Vec::new();
+        paint_lockup(&mut prims, rect, Some(&paint.value()), &roles());
+        let drawn: Vec<(ImageArt, (u32, u32))> = prims
+            .iter()
+            .filter_map(|prim| match prim {
+                DrawPrim::Image { art, device, .. } => Some((*art, *device)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drawn,
+            last.keys().map(|(art, w, h)| (art, (w, h))).to_vec(),
+            "{now:?}: one to one as baked"
+        );
+        // Clipped to the node.
+        assert!(prims.iter().any(|prim| matches!(
+            prim,
+            DrawPrim::ClipPush { x, y, w, h } if (*x, *y, *w, *h) == (rect.x, rect.y, rect.width, rect.height)
+        )));
+        let kept = crate::widget::images_kept_bytes();
+        let ground = [0x10, 0x12, 0x18, 0xFF];
+        let scale = spec_now.scale;
+        let (w, h) = (
+            ((rect.right() + 24.0) * scale) as u32,
+            ((rect.bottom() + 8.0) * scale) as u32,
+        );
+        let pixels = crate::tray_raster::rasterize_tray_pixels(&prims, w, h, scale, ground);
+        let mut alone = Vec::new();
+        let words = LockupPaint {
+            spec: spec_now,
+            images: None,
+            pending: true,
+        };
+        paint_lockup(&mut alone, rect, Some(&words.value()), &roles());
+        let alone = crate::tray_raster::rasterize_tray_pixels(&alone, w, h, scale, ground);
+        assert_eq!(
+            crate::widget::images_kept_bytes(),
+            kept,
+            "{now:?}: the raster kept nothing new"
+        );
+        assert!(!wanted.ready(), "{now:?}: and baked nothing");
+        let painted = |pixels: &[u8]| {
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|p| p[..3].iter().zip(&ground).any(|(a, b)| a.abs_diff(*b) > 40))
+                .count()
+        };
+        let (held, words) = (painted(&pixels), painted(&alone));
+        assert!(
+            held > words * 3,
+            "{now:?}: the held road and cat draw ({held} pixels, the words alone {words})"
+        );
+    }
+    // Baked at last, the new width draws.
+    let wanted = baked_paint(before, 900.0).images.expect("baked");
+    assert_eq!(before.paint(900.0, Some(last)).images, Some(wanted));
+}
+
+/// A COLD FIRST FRAME DRAWS THE WORDS ALONE (§4.5): with nothing baked, the lockup paints its
+/// chevron and words and no image, and the raster bakes nothing.
+#[test]
+fn a_cold_first_frame_draws_the_words_and_no_image() {
+    let cold = spec(22.0, 2.0, 0, 16);
+    let paint = cold.paint(852.0, None);
+    assert_eq!(paint.images, None);
+    let rect = LogicalRect::new(0.0, 0.0, 852.0, cold.needed_height());
+    let mut prims = Vec::new();
+    paint_lockup(&mut prims, rect, Some(&paint.value()), &roles());
+    assert!(
+        !prims
+            .iter()
+            .any(|prim| matches!(prim, DrawPrim::Image { .. }))
+    );
+    assert!(
+        prims
+            .iter()
+            .any(|prim| matches!(prim, DrawPrim::Text { .. }))
+    );
+    let _ = crate::tray_raster::rasterize_tray_pixels(&prims, 100, 100, 2.0, [0, 0, 0, 255]);
+    assert_eq!(crate::widget::images_kept_bytes(), 0);
+}
+
+/// THE WORDS KEEP THEIR HIERARCHY (§4.5): `aterm` in the brand face's strong weight (SF Mono
+/// Bold, Iosevka Term Bold where SF Mono is missing), `ALab` and the separator in its regular
+/// (SF Mono Medium, Iosevka Term Regular), each quieter. NEGATIVE CONTROL: the strong weight is
+/// a heavier face than the regular (its stems wider at the same size).
+#[test]
+fn aterm_is_bold_and_alab_and_the_separator_quieter() {
+    let value = spec(22.0, 2.0, 0, 16);
+    let rect = LogicalRect::new(0.0, 0.0, 852.0, value.needed_height());
+    let mut prims = Vec::new();
+    paint_lockup(
+        &mut prims,
+        rect,
+        Some(&value.paint(852.0, None).value()),
+        &roles(),
+    );
+    // The words are drawn a character at a time; each run is one weight, face and ink.
+    let mut words: Vec<(String, TextWeight, TextFace, crate::widget::Rgba)> = Vec::new();
+    for prim in &prims {
+        if let DrawPrim::Text {
+            s,
+            weight,
+            face,
+            color,
+            ..
+        } = prim
+        {
+            match words.last_mut() {
+                Some(run) if (run.1, run.2, run.3) == (*weight, *face, *color) => run.0.push_str(s),
+                _ => words.push((s.clone(), *weight, *face, *color)),
+            }
+        }
+    }
+    let roles = roles();
+    assert_eq!(
+        words,
+        vec![
+            (
+                "aterm".to_owned(),
+                TextWeight::Bold,
+                TextFace::Brand(TextWeight::Bold),
+                rgba(roles.text_primary, 255)
+            ),
+            (
+                "·".to_owned(),
+                TextWeight::Regular,
+                TextFace::Brand(TextWeight::Regular),
+                rgba(roles.text_tertiary, 255)
+            ),
+            (
+                "ALab".to_owned(),
+                TextWeight::Regular,
+                TextFace::Brand(TextWeight::Regular),
+                rgba(roles.text_secondary, 255)
+            ),
+        ]
+    );
+    // The bold inks more of the same word than the regular: a heavier face, not a fallback.
+    let ink = |face: TextFace| {
+        let prims = vec![text_prim(
+            2.0,
+            30.0,
+            "aterm".to_owned(),
+            TypeStep::Body.px(22.0),
+            TextWeight::Regular,
+            face,
+            [255, 255, 255, 255],
+        )];
+        crate::tray_raster::rasterize_tray_pixels(&prims, 200, 40, 1.0, [0, 0, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| u32::from(p[0]))
+            .sum::<u32>()
+    };
+    let (bold, regular) = (
+        ink(TextFace::Brand(TextWeight::Bold)),
+        ink(TextFace::Brand(TextWeight::Regular)),
+    );
+    assert!(regular > 0, "the brand face draws");
+    assert!(
+        bold as f32 > regular as f32 * 1.25,
+        "bold {bold} against regular {regular}"
+    );
+}
+
+/// HIGH CONTRAST AND SERIOUS MODE SHOW ONE PROGRESS (§4.9's rubric): the caret stays after the
+/// words, and the capsule after it fills as steps finish, full at done; neither the road nor
+/// the cat is drawn. NEGATIVE CONTROL: with the road, the images draw.
 #[test]
 fn the_words_alone_show_one_progress_and_a_full_track_at_done() {
     let width = 852.0;
@@ -159,27 +464,21 @@ fn the_words_alone_show_one_progress_and_a_full_track_at_done() {
         kitty: false,
         ..spec(22.0, 2.0, done, 16)
     };
-    let carets: Vec<f32> = [0, 8, 16].map(|done| text(done).caret_x(width)).to_vec();
+    let carets: Vec<f32> = [0, 8, 16].map(|done| text(done).caret_x()).to_vec();
     assert!(
         carets.iter().all(|x| (x - carets[0]).abs() < 0.01),
         "{carets:?}"
     );
-    let kitty: Vec<f32> = [0, 16]
-        .map(|done| spec(22.0, 2.0, done, 16).caret_x(width))
-        .to_vec();
-    assert!(
-        kitty[1] > kitty[0] + 100.0,
-        "with the kitty the caret moves"
+    let rect = LogicalRect::new(0.0, 0.0, width, 48.0);
+    assert!(images(&text(8), rect).is_empty(), "the words alone");
+    assert_eq!(
+        images(&spec(22.0, 2.0, 8, 16), rect).len(),
+        2,
+        "with the road"
     );
-    let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
     let capsule = |done| {
         let mut prims = Vec::new();
-        paint_lockup(
-            &mut prims,
-            LogicalRect::new(0.0, 0.0, width, 48.0),
-            Some(&text(done).value()),
-            &roles,
-        );
+        paint_lockup(&mut prims, rect, Some(&text(done).value()), &roles());
         let capsules: Vec<(f32, f32, f32)> = prims
             .iter()
             .filter_map(|prim| match prim {
@@ -210,4 +509,38 @@ fn a_mac_outside_alab_says_aterm_alone() {
     assert_eq!(alab.words(), "aterm · ALab");
     assert_eq!(elsewhere.words(), "aterm");
     assert!(elsewhere.least_width() < alab.least_width());
+}
+
+/// THE WORDS SPAN THE DESIGN'S WIDTH (§4.5): set in SF Mono, `aterm` bold, with the design's
+/// letter spacing, `aterm · ALab` runs about 193 units from where the words begin (the design's
+/// measure at Mono 22), so the road starts where the design starts it. NEGATIVE
+/// CONTROL: the words alone, without the spacing, are 3.6 units shorter.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_words_span_the_designs_width() {
+    let value = spec(22.0, 2.0, 0, 16);
+    let unit = value.px / design::DESIGN_PX;
+    let words = (value.words_end() / unit) - design::WORDS_X;
+    assert!(
+        (words - 193.0).abs() <= 2.0,
+        "`aterm · ALab` spans {words:.1} units at Mono 22"
+    );
+    let bare: f32 = value
+        .runs()
+        .iter()
+        .map(|(text, weight, _)| {
+            crate::tray_raster::ui_text_width_for(TextFace::Brand(*weight), text, value.words_px())
+        })
+        .sum::<f32>()
+        / unit;
+    assert!(
+        (words - bare - 12.0 * LETTER_SPACING).abs() < 0.5,
+        "the spacing: {words:.1} against {bare:.1}"
+    );
+    let road = value.road_x() / unit;
+    assert!(
+        (road - design::ROAD_X).abs() <= 3.0,
+        "the road starts at {road:.1} units, the design's {}",
+        design::ROAD_X
+    );
 }

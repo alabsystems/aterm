@@ -19,6 +19,14 @@ fn tab_lines(ctx: &SessionCtx) -> Vec<String> {
     reply.lines().skip(1).map(str::to_string).collect()
 }
 
+/// A spawn's birth that gives only its `why=` line.
+fn why_birth(why: &str) -> crate::session_log::Birth {
+    crate::session_log::Birth {
+        matters: Some(why.to_owned()),
+        ..crate::session_log::Birth::default()
+    }
+}
+
 /// A person's new tab in the headless app's window, and its context.
 fn person_tab(app: &mut App) -> (u64, Arc<SessionCtx>) {
     let id = app.next_session_id;
@@ -138,7 +146,7 @@ fn a_requests_why_is_recorded_in_its_tabs_open() {
         let _act = ActScope::asking(
             ExitActor::fleet_drive(&"87be5228".repeat(4), None),
             "spawn",
-            Some("check the m72 disk"),
+            why_birth("check the m72 disk"),
             Some(aterm_types::control_verbs::Requester::default()),
         );
         parked_worker(&mut app)
@@ -166,7 +174,7 @@ fn a_requests_why_is_recorded_in_its_tabs_open() {
         aterm_types::control_verbs::REQUEST_WHY_BYTES
     );
     let (_, whole) = {
-        let _act = ActScope::asking(ExitActor::Ctl, "spawn", Some(&longest), None);
+        let _act = ActScope::asking(ExitActor::Ctl, "spawn", why_birth(&longest), None);
         parked_worker(&mut app)
     };
     let opened = tab_lines(&whole);
@@ -206,7 +214,7 @@ fn drive_spawn_open_records_requester() {
         let _act = ActScope::asking(
             ExitActor::fleet_drive(&node, requester.sid()),
             "spawn",
-            Some("check the m72 disk"),
+            why_birth("check the m72 disk"),
             Some(requester),
         );
         parked_worker(&mut app)
@@ -227,7 +235,7 @@ fn drive_spawn_open_records_requester() {
         let _act = ActScope::asking(
             ExitActor::fleet_drive(&node, None),
             "spawn",
-            Some("check the m72 disk"),
+            why_birth("check the m72 disk"),
             Some(Requester::default()),
         );
         parked_worker(&mut app)
@@ -237,13 +245,18 @@ fn drive_spawn_open_records_requester() {
         let _act = ActScope::asking(
             ExitActor::fleet_drive(&node, requester.sid()),
             "spawn",
-            Some("check the m72 disk"),
+            why_birth("check the m72 disk"),
             Some(requester),
         );
         parked_worker(&mut app)
     };
     let (_, local) = {
-        let _act = ActScope::asking(ExitActor::Ctl, "spawn", Some("check the m72 disk"), None);
+        let _act = ActScope::asking(
+            ExitActor::Ctl,
+            "spawn",
+            why_birth("check the m72 disk"),
+            None,
+        );
         parked_worker(&mut app)
     };
     for (ctx, by) in [

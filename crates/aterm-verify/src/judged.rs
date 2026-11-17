@@ -140,21 +140,92 @@ pub fn deadline() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60)
 }
 
+/// The pause ceiling of an append's first lost race ([`race_pause`]).
+pub const RACE_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// The longest pause ceiling of a lost race ([`race_pause`]).
+pub const RACE_PAUSE_MAX: std::time::Duration = std::time::Duration::from_secs(32);
+
+/// How long an append waits after its `race`th lost compare-and-swap (from 1), before it reads
+/// the journal again: a ceiling that doubles from [`RACE_PAUSE`] each race up to
+/// [`RACE_PAUSE_MAX`], and of it at least half, the rest by `draw` (equal jitter). So a loser
+/// never pushes, reads and pushes again back to back, and two writers that lost to each other
+/// do not read again in step.
+pub(crate) fn race_pause(race: u32, draw: u64) -> std::time::Duration {
+    let doubled = RACE_PAUSE.saturating_mul(1 << race.saturating_sub(1).min(16));
+    let ceiling = doubled.min(RACE_PAUSE_MAX);
+    let half = ceiling / 2;
+    let spread = u64::try_from((ceiling - half).as_millis()).unwrap_or(u64::MAX);
+    half + std::time::Duration::from_millis(draw % spread.saturating_add(1))
+}
+
+/// A random draw for [`race_pause`]: the system's random bytes, else the clock's nanoseconds.
+fn race_draw() -> u64 {
+    let mut bytes = [0_u8; 8];
+    match aterm_uds::rand::fill(&mut bytes) {
+        Ok(()) => u64::from_le_bytes(bytes),
+        Err(_) => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| u64::from(since.subsec_nanos())),
+    }
+}
+
+/// Wait out `pause`, ended early by an interrupt the landing took (`exec::group::taken`), read
+/// each `aterm_uds::deadline::STOP_TICK`: the live pause of a lost race ([`append_land`]).
+fn wait_out(pause: std::time::Duration) {
+    let until = std::time::Instant::now() + pause;
+    while crate::exec::group::taken().is_none() {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(aterm_uds::deadline::STOP_TICK));
+    }
+}
+
 /// Initial reads and assembly must admit publication before `read_until`. The first admitted
 /// writer starts one shared publication window, including race readback and later attempts.
-/// No race renews that window; each writer retains its owner through settlement.
-struct AppendBudget {
+/// No race renews that window; each writer retains its owner through settlement. A budget that
+/// pauses waits out [`race_pause`] after each rejected push, before its readback ([`Self::lost`]).
+struct AppendBudget<'a> {
     read_until: std::time::Instant,
     publication_until: std::cell::Cell<Option<std::time::Instant>>,
+    /// The races this append lost so far.
+    races: std::cell::Cell<u32>,
+    /// Wait out a lost race's pause; `None`: a single attempt, which never pauses.
+    pause: Option<&'a dyn Fn(std::time::Duration)>,
 }
 
 struct MutationBudget(std::time::Instant);
 
-impl AppendBudget {
+impl<'a> AppendBudget<'a> {
     fn new(read_until: std::time::Instant) -> Self {
         Self {
             read_until,
             publication_until: std::cell::Cell::new(None),
+            races: std::cell::Cell::new(0),
+            pause: None,
+        }
+    }
+
+    /// [`Self::new`], each lost race waited out by `pause` ([`Self::lost`]).
+    fn pausing(read_until: std::time::Instant, pause: &'a dyn Fn(std::time::Duration)) -> Self {
+        Self {
+            pause: Some(pause),
+            ..Self::new(read_until)
+        }
+    }
+
+    /// A push of this append was rejected: count the race and, where this budget pauses, wait
+    /// out its [`race_pause`], never past the budget's deadline, before the journal is read
+    /// again, so the next attempt pushes over a head read just now.
+    fn lost(&self) {
+        let race = self.races.get().saturating_add(1);
+        self.races.set(race);
+        if let Some(pause) = self.pause {
+            let left = self
+                .deadline()
+                .saturating_duration_since(std::time::Instant::now());
+            pause(race_pause(race, race_draw()).min(left));
         }
     }
 
@@ -903,7 +974,7 @@ fn publish(
     parent: Option<&str>,
     tree: &str,
     message: &str,
-    budget: &AppendBudget,
+    budget: &AppendBudget<'_>,
 ) -> Result<Appended, String> {
     let started = std::time::Instant::now();
     let timed = |why| {
@@ -947,10 +1018,14 @@ fn publish(
         &sha,
         &run,
         crate::remote::WriteRunner(&write),
+        &|| budget.lost(),
     )
     .map_err(timed)
 }
 
+/// Push `sha` over `parent` as the journal's head, the compare-and-swap: `Holds` where it took,
+/// `Raced` with the head a rejected push then reads, where another write moved the journal.
+/// `lost` runs once a push is rejected, before that read ([`AppendBudget::lost`]).
 fn push_journal(
     root: &Path,
     name: &str,
@@ -958,6 +1033,7 @@ fn push_journal(
     sha: &str,
     run: &crate::remote::Runner<'_>,
     write: crate::remote::WriteRunner<'_>,
+    lost: &dyn Fn(),
 ) -> Result<Appended, String> {
     let context = |why| {
         format!(
@@ -974,13 +1050,19 @@ fn push_journal(
         }
     };
     // A race is retryable only when the remote actually moved. Authentication/network failures
-    // remain errors, rather than turning into a tight retry loop.
+    // remain errors, rather than turning into a tight retry loop. The pause comes before the
+    // read, so the next attempt pushes over the head as it is after it.
+    lost();
     let head = remote.fetch(REF).map_err(|read| {
         context(format!(
             "{why}; {}: {read}",
             ReadContext::AfterPushFailure.word()
         ))
     })?;
+    if head.as_deref() == Some(sha) {
+        // Another writer may have published this exact commit before our expected-ref check.
+        return Ok(Appended::Holds(sha.to_owned()));
+    }
     if head.as_deref() != parent {
         return Ok(Appended::Raced(head));
     }
@@ -1318,9 +1400,18 @@ pub fn land_append(
     until: std::time::Instant,
 ) -> Result<Appended, String> {
     let budget = AppendBudget::new(until);
-    land_append_with(root, remote, parent, records, now, &budget, &mut |bytes| {
-        write_blob(root, bytes, budget.deadline())
-    })
+    land_append_with(
+        root,
+        remote,
+        parent,
+        records,
+        now,
+        &budget,
+        &mut AppendObjects {
+            blob: &mut |bytes| write_blob(root, bytes, budget.deadline()),
+            list: &mut |id| ls_tree(root, id, budget.deadline()),
+        },
+    )
 }
 
 fn write_blob(root: &Path, bytes: &[u8], until: std::time::Instant) -> Result<String, String> {
@@ -1348,20 +1439,66 @@ fn cached_blobs(
     }
 }
 
-/// [`land_append`], with blob publication shared across attempts by the caller.
+/// Object operations shared by the attempts of one append to one repository.
+struct AppendObjects<'a> {
+    blob: &'a mut dyn FnMut(&[u8]) -> Result<String, String>,
+    list: &'a mut dyn FnMut(&str) -> Result<Entries, String>,
+}
+
+/// Reuse successful listings of immutable object IDs within one repository append. Keep at
+/// most 4 MiB of keys and entry data (container allocation overhead is additional); larger
+/// or later listings still read normally, without displacing earlier cached directories.
+fn cached_trees(
+    list: impl FnMut(&str) -> Result<Entries, String>,
+) -> impl FnMut(&str) -> Result<Entries, String> {
+    cached_trees_with_budget(list, 4 * 1024 * 1024)
+}
+
+fn cached_trees_with_budget(
+    mut list: impl FnMut(&str) -> Result<Entries, String>,
+    mut remaining: usize,
+) -> impl FnMut(&str) -> Result<Entries, String> {
+    let mut read = std::collections::BTreeMap::<String, Entries>::new();
+    move |id| {
+        if let Some(entries) = read.get(id) {
+            return Ok(entries.clone());
+        }
+        let entries = list(id)?;
+        let bytes = entries.iter().fold(
+            id.len()
+                .saturating_add(std::mem::size_of::<(String, Entries)>()),
+            |bytes, (name, entry)| {
+                bytes
+                    .saturating_add(std::mem::size_of::<(String, Entry)>())
+                    .saturating_add(name.len())
+                    .saturating_add(entry.mode.len())
+                    .saturating_add(entry.kind.len())
+                    .saturating_add(entry.id.len())
+            },
+        );
+        if bytes <= remaining {
+            remaining -= bytes;
+            read.insert(id.to_owned(), entries.clone());
+        }
+        Ok(entries)
+    }
+}
+
+/// [`land_append`], with object operations shared across attempts by the caller.
 fn land_append_with(
     root: &Path,
     remote: &str,
     parent: Option<&str>,
     records: &[crate::land_record::Signed],
     now: u64,
-    budget: &AppendBudget,
-    blob: &mut dyn FnMut(&[u8]) -> Result<String, String>,
+    budget: &AppendBudget<'_>,
+    objects: &mut AppendObjects<'_>,
 ) -> Result<Appended, String> {
+    let AppendObjects { blob, list } = objects;
     let until = budget.deadline();
     let today = now / 86_400;
     let mut trees = Trees {
-        list: &mut |id| ls_tree(root, id, until),
+        list: *list,
         make: &mut |entries| mktree(root, entries, until),
     };
     let mut edits = Vec::new();
@@ -1407,18 +1544,15 @@ fn land_append_with(
             blob: blob(by.to_string().as_bytes())?,
         });
     }
-    let mut fails = Vec::new();
+    let mut fails = std::collections::BTreeSet::new();
     let mut appended = Vec::new();
     for record in records {
         let (_, expired, fail) = crate::land_spool::kept_as(&record.path, today)?;
         if expired {
             continue;
         }
-        if fail {
-            if fails.contains(&record.path.as_str()) {
-                continue;
-            }
-            fails.push(record.path.as_str());
+        if fail && !fails.insert(record.path.as_str()) {
+            continue;
         }
         appended.push(record);
     }
@@ -1451,11 +1585,11 @@ fn land_append_with(
     publish(root, remote, parent, &tree, &message, budget)
 }
 
-/// Append `records` until an append holds them ([`land_append`]): each race carries the observed
-/// journal head into the next attempt. Initial reads and assembly share `until`; the first
-/// admitted mutation starts one work window shared by race readback and all later attempts.
-/// A writer retains its owner through settlement. The head that holds
-/// them (`None`: no records, and no journal).
+/// Append `records` until an append holds them ([`land_append`]): each race waits out its
+/// [`race_pause`] and carries the head it then reads into the next attempt. Initial reads and
+/// assembly share `until`; the first admitted mutation starts one work window shared by race
+/// pauses, readback and all later attempts. A writer retains its owner through settlement. The
+/// head that holds them (`None`: no records, and no journal).
 /// # Errors
 /// As [`land_append`], or the deadline passed.
 pub fn append_land(
@@ -1465,12 +1599,17 @@ pub fn append_land(
     now: u64,
     until: std::time::Instant,
 ) -> Result<Option<String>, String> {
-    let budget = AppendBudget::new(until);
+    let budget = AppendBudget::pausing(until, &wait_out);
     let mut blob = cached_blobs(|bytes| write_blob(root, bytes, budget.deadline()));
+    let mut list = cached_trees(|id| ls_tree(root, id, budget.deadline()));
+    let mut objects = AppendObjects {
+        blob: &mut blob,
+        list: &mut list,
+    };
     append_land_through(
         records.is_empty(),
         || head_in(root, remote, budget.deadline(), ReadContext::AppendHead),
-        |parent| land_append_with(root, remote, parent, records, now, &budget, &mut blob),
+        |parent| land_append_with(root, remote, parent, records, now, &budget, &mut objects),
     )
 }
 

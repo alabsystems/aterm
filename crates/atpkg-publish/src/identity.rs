@@ -98,6 +98,22 @@ pub(crate) fn copy_regular_file(from: &Path, to: &Path) -> std::io::Result<std::
     Ok(meta)
 }
 
+/// Lay `to` from the regular file `from` as a copy-on-write clone where the volume makes one
+/// (`std::fs::copy`: `fclonefileat` on APFS, `copy_file_range` on Linux) and as a byte copy
+/// elsewhere, with `from`'s mode: for a scratch snapshot of a tree too large to copy by default.
+pub(crate) fn clone_regular_file(from: &Path, to: &Path) -> std::io::Result<std::fs::Metadata> {
+    let meta = std::fs::symlink_metadata(from)?;
+    if !meta.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let _ = std::fs::remove_file(to);
+    std::fs::copy(from, to)?;
+    Ok(meta)
+}
+
 /// Rename `from` to `to` only while `to` is absent: an existing `to` is an `AlreadyExists` error
 /// and both are left as they were. Unix uses the kernel's NOREPLACE rename, so an entry created
 /// meanwhile is never replaced.

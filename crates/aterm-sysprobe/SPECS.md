@@ -3,11 +3,11 @@
 
 # aterm-sysprobe: spec recovery from its unit tests
 
-Source: `crates/aterm-sysprobe`. The recovered spec table below maps 56 test functions
+Source: `crates/aterm-sysprobe`. The recovered spec table below maps 62 test functions
 across the files listed in §2. The statements describe the mapped code and test samples;
 they are not proof claims.
 
-Result: **34 specs**, covering **56 tests**. Every mapped test is a spec sample (§4).
+Result: **36 specs**, covering **62 tests**. Every mapped test is a spec sample (§4).
 
 ## 0. Notation used in the statements
 
@@ -71,20 +71,22 @@ unix-diag-listeners	contract	linux::{unix_diag_request,unix_diag_listeners,unix_
 socket-settled	contract	jobs::macos::settled	∀ flags, e, a: settled(flags, e, a) = false when flags & PROC_FLAG_INEXIT ≠ 0; otherwise e when flags & PROC_FLAG_EXEC ≠ 0; otherwise a ≥ Some(SETTLE_US = 2,000,000) (an unread age, None, is not). So an exiting process is never settled, a program it exec'd is settled exactly when the caller says the reader's last pass found it running that program, and a fork that never exec'd is settled once it is SETTLE_US µs old.	src/jobs/tests.rs::only_a_settled_process_has_its_sockets_read	bit masks, an Option<u64> comparison	0,1,3
 socket-read-gate	other	jobs::macos::{fds,spawning,spawning_with,sockets_readable,read}, machine::owned_count, jobs::sockets_readable, JobsReader::read_all_at	Effects(libproc, sysctl). spawning(p, now) = true when p's PROC_PIDTBSDINFO is refused or its pbi_flags has PROC_FLAG_INEXIT; otherwise spawning_with(now, the MAX_CHILDREN (256) slots, n = proc_listchildpids(p), the errno it left, kinfo's start). spawning_with is true when the list is incomplete (machine::owned_count is None: n < 0, n ≥ the slots, or n = 0 with errno set) or a listed pid > 0 has a start that is unread (a child gone since the listing too), 0, or less than SETTLE_US before now (saturating, so a start after now counts); otherwise false. fds(p, …, now, s) reads PROC_PIDFDSOCKETINFO of none of p's descriptors unless s ∧ some socket lies within the detail budget (the first MAX_FD_DETAILS (128) vnode, pipe, socket and kqueue descriptors of the list, in order) ∧ ¬spawning(p, now), checked after the list and before any detail read; then it reads every socket within the budget before any other detail. Every other socket reads FdKind::Other. read(pid, fds = true, …, now, execd_then) passes s = settled(pbi_flags, execd_then(start, name), now − start) (socket-settled), false when the BSD record is unread. On macOS sockets_readable(pid) = settled(pbi_flags, true, now − start) at now_us() (a timed reader's gate: no spawning check, which cannot see a spawn that starts after it), false for pid 0, pid > i32::MAX or a refused BSD record; it is true on every other platform. Each is a snapshot: a process can start a spawn, exit or close a socket right after it.	src/jobs/tests.rs::a_programs_socket_reads_from_the_second_pass_that_finds_it_running, src/jobs/tests.rs::a_spawners_socket_reads_other_while_its_child_is_young, src/jobs/tests.rs::a_forks_socket_reads_once_it_kept_its_parents_program_long_enough, src/jobs/tests.rs::a_timed_readers_gate_passes_a_program_at_once_and_a_fork_once_it_is_settled, src/jobs/tests.rs::only_complete_child_observations_clear_the_spawn_guard	FFI proc_pidinfo, proc_listchildpids and proc_pidfdinfo into fixed buffers, sysctl(KERN_PROC_PID), composition with socket-settled	0,7,8
 complete-event-queues	contract	jobs::JobsReader::event_queues, jobs::macos::event_queues, jobs::event_queues::{read_complete,complete_bytes,complete_notes,exact_record,known_queue}	Queue-only observation lists at most MAX_FDS descriptors and spends at most MAX_FD_DETAILS detail reads on queues alone. Each strict libproc read clears and captures errno: a zero refusal, negative result, partial/misaligned byte count or overflow cannot prove emptiness. Only a complete positive KQUEUEINFO admits EXTINFO, whose result counts notes, not bytes; fewer than MAX_KNOTES known notes are required. A cut descriptor list, over-budget queue set, unread or saturated notes, wrong descriptor/kind, unsupported platform, unread process or changed/exiting BSD birth returns None. Unrelated files, pipes and sockets spend no queue-detail slots; ordinary sampling retains its existing shared budget. These observations confer no control authority and do not freeze the descriptor table. A real isolated late kqueue remains readable after unrelated descriptors exhaust ordinary sampling; zero/refusal/cut/unread/saturation controls establish no absence.	src/jobs/event_queues_tests.rs::{only_a_complete_queue_scope_admits_absence_and_unrelated_descriptors_spend_no_queue_budget,zero_refused_short_and_misaligned_libproc_answers_cannot_prove_empty_scope,an_unsupported_queue_reader_returns_unknown_instead_of_an_empty_set,a_real_late_kqueue_is_read_without_spending_the_ordinary_detail_budget}	Bounded libproc listing/detail reads, same-birth bracket, strict result decoders, pure complete-scope admission and an owned isolated process	0,1,7,8
+vm-guest-firmware	contract	vm_guest::names_a_guest, vm_guest::names_a_guest_hypervisor, vm_guest::vm_guest_of	∀ firmware f: names_a_guest(f) ⇔ (some field of f among bios_vendor, manufacturer, product, split at each byte that is not an ASCII letter or digit into its nonempty words, has a word equal, ASCII case ignored, to one of GUEST_WORDS = {qemu, vmware, virtualbox, innotek, parallels, bochs, xen, kvm, bhyve, q35, i440fx, digitalocean, droplet, hetzner, vultr, openstack, ovirt, rhev, nutanix}, or a run of consecutive words equal, case ignored, to one of GUEST_PHRASES = {amazon ec2, google compute engine, alibaba cloud, tencent cloud, huawei cloud}) ∨ (manufacturer trimmed = "Microsoft Corporation" ∧ product trimmed = "Virtual Machine", ASCII case ignored: Hyper-V and Azure; a Surface, Microsoft's too, is no guest; a Chromebook's firmware naming Google alone is none). ∀ 12-byte s: names_a_guest_hypervisor(s) ⇔ s ∈ GUEST_HYPERVISORS = {"KVMKVMKVM\0\0\0", "Linux KVM Hv", "VMwareVMware", "XenVMMXenVMM", "VBoxVBoxVBox", "TCGTCGTCGTCG", "bhyve bhyve ", " lrpepyh  vr", "ACRNACRNACRN"} ("Microsoft Hv" never). ∀ read, hypervisors: vm_guest_of(read, hypervisors) = Some(true) when some signature of hypervisors() names a guest, whatever read() gives; else None when read() = None or names no field; else Some(names_a_guest(read())).	src/vm_guest_tests.rs::every_hypervisors_virtual_firmware_names_a_guest, src/vm_guest_tests.rs::every_clouds_virtual_firmware_names_a_guest, src/vm_guest_tests.rs::a_makers_own_firmware_names_no_guest, src/vm_guest_tests.rs::an_unread_firmware_answers_nothing, src/vm_guest_tests.rs::a_guest_hypervisors_signature_names_a_guest_whatever_the_firmware_says	&str splitting and ASCII case folding, slice windows, byte-array equality, Option, closures	0,1,3,5,7,13
+vm-guest-read	other	vm_guest, vm_guest::hypervisor_signatures, win::firmware, hv_vmm_present	Effects(sysctl, registry, cpuid). vm_guest() = hv_vmm_present() on macOS; on x86-64 Windows vm_guest_of(firmware, hypervisor_signatures) and on other 64-bit Windows vm_guest_of(firmware, no signatures), where firmware() reads BIOSVendor, SystemManufacturer and SystemProductName under HKLM\HARDWARE\DESCRIPTION\System\BIOS, each trimmed and None where unread or empty, and hypervisor_signatures() is empty where CPUID leaf 1 clears ECX bit 31 and else holds EBX‖ECX‖EDX of CPUID leaf 0x40000000 + 0x100·n for each n < 256 (Linux's hypervisor_cpuid_base walk); None elsewhere. Never the hypervisor bit alone and never "Microsoft Hv", which Windows 11 reads of itself on bare metal under virtualization-based security (measured 2026-11-16 on the owner's desktop: the bit set, "Microsoft Hv" at 0x40000000, zeros at every other base, vm_guest() = Some(false)).	src/vm_guest_tests.rs::windows_reads_the_firmware_it_judges	registry reads (FFI), the cpuid instruction	0,1,3,5,7,8,13
 ```
 
-### Kinds (34)
+### Kinds (36)
 
 | kind | count | ids |
 |---|---|---|
-| contract | 19 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, memory-used, mac-available, activity-between, activity-member, stat-pgrp, children-pids, program-check-judge, program-check-stranded, procargs-parse, vnode-terminal, fresh-dylib, unix-listener-decode, unix-diag-listeners, socket-settled, complete-event-queues |
+| contract | 20 | meminfo-facts, swap-pages-sum, auxv-lookup, read-bounded-cap, memory-used, mac-available, activity-between, activity-member, stat-pgrp, children-pids, program-check-judge, program-check-stranded, procargs-parse, vnode-terminal, fresh-dylib, unix-listener-decode, unix-diag-listeners, socket-settled, complete-event-queues, vm-guest-firmware |
 | table-property | 1 | pressure-level-table |
 | invariant | 1 | whole-lines-torn-tail-ignored |
 | refinement | 1 | swap-meter-rate |
 | round-trip | 1 | memory-wire-codecs |
-| other (effectful host facts) | 11 | path-key-native-oracles, process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate |
+| other (effectful host facts) | 12 | path-key-native-oracles, process-cwd-path-own, group-memory-members, machine-memory-within-physical, swapped-kib-counter, lone-group-leader, stdin-sharers, group-usage-members, hid-idle-clock, program-check-read, socket-read-gate, vm-guest-read |
 
-Total: 19 + 1 + 1 + 1 + 1 + 11 = 34.
+Total: 20 + 1 + 1 + 1 + 1 + 12 = 36.
 
 ## 2. Test → spec map (TSV)
 
@@ -148,6 +150,12 @@ src/procargs_tests.rs	a_buffer_without_its_header_is_no_answer	procargs-parse
 src/procargs_tests.rs	this_process_reads_back_as_it_was_exec_d	procargs-parse	
 src/procargs_tests.rs	a_record_past_what_the_kernel_hands_over_reads_as_nothing	procargs-parse	
 src/procargs_tests.rs	a_reused_buffer_reads_a_record_whole_or_not_at_all	procargs-parse	
+src/vm_guest_tests.rs	every_hypervisors_virtual_firmware_names_a_guest	vm-guest-firmware	
+src/vm_guest_tests.rs	a_makers_own_firmware_names_no_guest	vm-guest-firmware	
+src/vm_guest_tests.rs	an_unread_firmware_answers_nothing	vm-guest-firmware	
+src/vm_guest_tests.rs	every_clouds_virtual_firmware_names_a_guest	vm-guest-firmware	
+src/vm_guest_tests.rs	a_guest_hypervisors_signature_names_a_guest_whatever_the_firmware_says	vm-guest-firmware	
+src/vm_guest_tests.rs	windows_reads_the_firmware_it_judges	vm-guest-read	vm-guest-firmware
 ```
 
 ## 4. Tests that are not spec samples

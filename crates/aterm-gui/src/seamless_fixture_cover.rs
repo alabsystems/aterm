@@ -166,11 +166,48 @@ pub(crate) struct Recorded {
     control: Lists,
 }
 
-/// One record's lists as a `fields.toml` holds them: what the hold reads back
-/// is what its desks wrote (its `unwritten` list is for the reader).
+impl Recorded {
+    /// Its lists in [`DeskFields::records`]' order.
+    fn lists(&self) -> [&Lists; 4] {
+        [&self.manifest, &self.layout, &self.meta, &self.control]
+    }
+}
+
+/// One record's lists as a `fields.toml` holds them: what its desks wrote, and what its
+/// schema had that no desk wrote. A field in neither is one that release's schema lacked.
 #[derive(serde::Deserialize)]
 struct Lists {
     written: Vec<String>,
+    unwritten: Vec<String>,
+}
+
+impl Lists {
+    fn recorded(&self, field: &str) -> bool {
+        self.written
+            .iter()
+            .chain(&self.unwritten)
+            .any(|f| f == field)
+    }
+}
+
+/// What a field hold judges.
+#[derive(Clone, Copy)]
+pub(crate) enum Judged<'a> {
+    /// Main's own desks, against the newest release that recorded its fields, if any.
+    Main(Option<&'a Recorded>),
+    /// A cut release's own desks, read through main's schema, against the `fields.toml` that
+    /// release recorded. A line cut from a base behind main cannot have written a field main
+    /// added later; the generator's own hold of main's desks holds those.
+    Release(&'a Recorded),
+}
+
+impl<'a> Judged<'a> {
+    fn baseline(self) -> Option<&'a Recorded> {
+        match self {
+            Judged::Main(baseline) => baseline,
+            Judged::Release(recorded) => Some(recorded),
+        }
+    }
 }
 
 impl DeskFields {
@@ -283,27 +320,35 @@ impl DeskFields {
         out
     }
 
-    /// What these desks leave uncovered, one `<record> <field> (<why>)` each.
-    pub(crate) fn uncovered(
-        &self,
-        baseline: Option<&Recorded>,
-        unhanded: &[(&str, &str)],
-    ) -> Vec<String> {
-        let was = baseline.map(|baseline| {
-            [
-                &baseline.manifest,
-                &baseline.layout,
-                &baseline.meta,
-                &baseline.control,
-            ]
-        });
+    /// The fields main's schema has that `release` recorded neither as written nor as
+    /// unwritten, one `<record> <field>` each: added on main since that release was cut.
+    pub(crate) fn added_since(&self, release: &Recorded) -> Vec<String> {
+        let mut added = Vec::new();
+        for ((record, cover), lists) in self.records().into_iter().zip(release.lists()) {
+            for field in cover.never_written() {
+                if !lists.recorded(field) {
+                    added.push(format!("{record} {field}"));
+                }
+            }
+        }
+        added
+    }
+
+    /// What these desks leave uncovered, one `<record> <field> (<why>)` each. Judging a
+    /// release ([`Judged::Release`]), a field [`Self::added_since`] names is not counted.
+    pub(crate) fn uncovered(&self, judged: Judged<'_>, unhanded: &[(&str, &str)]) -> Vec<String> {
+        let was = judged.baseline().map(Recorded::lists);
         let mut uncovered = Vec::new();
         for (at, (record, cover)) in self.records().into_iter().enumerate() {
             let was_written: &[String] = was.map_or(&[][..], |was| was[at].written.as_slice());
             let listed = |field: &str| unhanded.contains(&(record, field));
+            let added = |field: &str| match judged {
+                Judged::Release(release) => !release.lists()[at].recorded(field),
+                Judged::Main(_) => false,
+            };
             let never = cover.never_written();
             for field in &never {
-                if !listed(field) {
+                if !listed(field) && !added(field) {
                     uncovered.push(format!("{record} {field} (no desk writes it)"));
                 }
             }
@@ -1020,7 +1065,7 @@ impl SerializeStructVariant for Compound<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeskFields, FieldCover, Recorded};
+    use super::{DeskFields, FieldCover, Judged, Recorded};
 
     #[derive(serde::Serialize)]
     struct Inner {
@@ -1067,12 +1112,15 @@ mod tests {
             ],
         });
         let baseline: Recorded = aterm_toml::from_str(&both.to_toml()).expect("its own record");
-        assert!(both.uncovered(Some(&baseline), &[]).is_empty());
+        assert!(
+            both.uncovered(Judged::Main(Some(&baseline)), &[])
+                .is_empty()
+        );
         let line_only = walked(&Desk {
             shapes: vec![Shape::Line],
         });
         assert_eq!(
-            line_only.uncovered(Some(&baseline), &[]),
+            line_only.uncovered(Judged::Main(Some(&baseline)), &[]),
             [
                 "manifest Inner.always (its desks wrote it)",
                 "manifest Inner.hint (its desks wrote it)",
@@ -1153,28 +1201,28 @@ mod tests {
         };
         let unwritten = walked(None);
         assert_eq!(
-            unwritten.uncovered(None, &[]),
+            unwritten.uncovered(Judged::Main(None), &[]),
             ["manifest Inner.hint (no desk writes it)"]
         );
         let baseline: Recorded =
             aterm_toml::from_str(&unwritten.to_toml()).expect("its own record");
         assert_eq!(
-            unwritten.uncovered(Some(&baseline), &[]),
+            unwritten.uncovered(Judged::Main(Some(&baseline)), &[]),
             ["manifest Inner.hint (no desk writes it)"],
             "a baseline that left it unwritten does not excuse it"
         );
         assert!(
             unwritten
-                .uncovered(Some(&baseline), &[("manifest", "Inner.hint")])
+                .uncovered(Judged::Main(Some(&baseline)), &[("manifest", "Inner.hint")])
                 .is_empty()
         );
         assert_eq!(
-            walked(Some(7)).uncovered(Some(&baseline), &[("manifest", "Inner.hint")]),
+            walked(Some(7)).uncovered(Judged::Main(Some(&baseline)), &[("manifest", "Inner.hint")]),
             ["manifest Inner.hint (listed as no handoff's, but a desk writes it)"]
         );
         assert_eq!(
             unwritten.uncovered(
-                Some(&baseline),
+                Judged::Main(Some(&baseline)),
                 &[("manifest", "Inner.hint"), ("manifest", "Inner.gone")]
             ),
             ["manifest Inner.gone (listed, but no desk reaches it)"]
@@ -1192,12 +1240,73 @@ mod tests {
         let mut old_release: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
         old_release.manifest.written.push("Inner.retired".into());
         let list = [("manifest", "Inner.hint"), ("manifest", "Inner.retired")];
-        assert!(fields.uncovered(Some(&old_release), &list).is_empty());
+        assert!(
+            fields
+                .uncovered(Judged::Main(Some(&old_release)), &list)
+                .is_empty()
+        );
         assert_eq!(
-            fields.uncovered(Some(&new_release), &list),
+            fields.uncovered(Judged::Main(Some(&new_release)), &list),
             ["manifest Inner.retired (listed, but no desk reaches it)"]
         );
-        assert!(fields.uncovered(Some(&new_release), &list[..1]).is_empty());
+        assert!(
+            fields
+                .uncovered(Judged::Main(Some(&new_release)), &list[..1])
+                .is_empty()
+        );
+    }
+
+    /// RL-73: the after-cut hold reads a release's desks through main's schema, so a field
+    /// main added after that release's base is one no desk of it could write. Judging the
+    /// release, a field its `fields.toml` lists neither as written nor as unwritten is named
+    /// as added since and not counted; main's own hold still counts it. A field the release
+    /// wrote and main's reading lost, and one it recorded as unwritten, still fail.
+    /// CONTROL: before RL-73 the after-cut hold judged as main's does, and the first assertion
+    /// failed with `manifest Inner.hint (no desk writes it)` (0.202.0's
+    /// OutputStateRepr.other_program_state).
+    #[test]
+    fn a_field_the_release_never_recorded_is_left_to_mains_own_generator() {
+        let mut fields = DeskFields::default();
+        fields.manifest.walk(&Inner {
+            hint: None,
+            always: 1,
+        });
+        let mut release: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
+        release
+            .manifest
+            .unwritten
+            .retain(|field| field != "Inner.hint");
+        assert!(
+            fields.uncovered(Judged::Release(&release), &[]).is_empty(),
+            "{:?}",
+            fields.uncovered(Judged::Release(&release), &[])
+        );
+        assert_eq!(fields.added_since(&release), ["manifest Inner.hint"]);
+        assert_eq!(
+            fields.uncovered(Judged::Main(Some(&release)), &[]),
+            ["manifest Inner.hint (no desk writes it)"],
+            "main's own hold still counts a field no desk of main writes"
+        );
+
+        let mut dropped: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
+        dropped
+            .manifest
+            .unwritten
+            .retain(|field| field != "Inner.hint");
+        dropped.manifest.written.push("Inner.dropped".into());
+        assert_eq!(
+            fields.uncovered(Judged::Release(&dropped), &[]),
+            ["manifest Inner.dropped (its desks wrote it)"],
+            "a field the release wrote and main no longer writes still fails"
+        );
+
+        let recorded: Recorded = aterm_toml::from_str(&fields.to_toml()).unwrap();
+        assert!(fields.added_since(&recorded).is_empty());
+        assert_eq!(
+            fields.uncovered(Judged::Release(&recorded), &[]),
+            ["manifest Inner.hint (no desk writes it)"],
+            "a field the release recorded as unwritten is still held"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@
 use crate::field::{Key, Val};
 use crate::rec::Rec;
 
+#[path = "fold_card_src.rs"]
+pub mod card_src;
 #[path = "fold_desc.rs"]
 pub mod desc;
 #[path = "fold_mail.rs"]
@@ -14,10 +16,17 @@ pub mod mail;
 mod snap;
 use crate::vocab::{Actor, CLS_WORDS, Conf, Kind, Lvl, Node, Op, Src};
 use crate::words::{BoxWord, Out, StepOut, WallKind, need_rank};
+pub use card_src::{
+    MATTERS_AS_CREATOR, MATTERS_AS_PACKAGE, MATTERS_AS_WHY, MattersSrc, PACKAGE_AS_SPAWN,
+    TITLE_AS_FOLDER, TITLE_AS_PROGRAM, TITLE_AS_PROMPT, TITLE_AS_TASK, TitleSrc, is_birth,
+    matters_src, title_src,
+};
 pub use desc::{
-    DESC_AGENTS, DESC_CARRY_BYTES, DESC_CLAIMS, DESC_CLAIMS_MAX, DESC_HEAP_BYTES, DESC_SLOTS,
-    DESC_TEXT_BYTES, DESC_TURN_RING, DESC_UNKNOWN_SLOTS, DescClaim, DescIdent, DescRow, DescSlot,
-    DescSubject, Described, KNOWN_SLOTS, Rank, Shown, rank_of,
+    CardKey, ClaimRefused, DESC_AGENTS, DESC_CARRY_BYTES, DESC_CLAIMS, DESC_CLAIMS_MAX,
+    DESC_HEAP_BYTES, DESC_HISTORY, DESC_SLOTS, DESC_STALE_TURNS, DESC_TEXT_BYTES, DESC_TURN_RING,
+    DESC_UNKNOWN_SLOTS, DescClaim, DescIdent, DescRow, DescSlot, DescSubject, Described, HISTORY,
+    HISTORY_EVENTS, HistLine, HistRow, KNOWN_SLOTS, PACKAGE_BYTES, PACKAGE_IDS, PER_TURN_SLOTS,
+    Rank, STATED_SLOTS, Shown, desc_admits, desc_text, rank_of, slot_bound,
 };
 pub use mail::{
     MAIL_LINK_WINDOW_MS, MAX_MAIL_WAITING, MailLink, MailLinkOf, MailWaiting, mail_in_window,
@@ -717,6 +726,7 @@ impl Fold {
             Op::Gap => self.on_gap(r, reset),
             Op::Snap => {}
         }
+        self.desc_card(r);
     }
 
     /// THE HEURISTIC MAIL LINK of turn `node` (phase 5, [`mail`]): the delivered mail it most likely acted on, always [`Conf::Heuristic`]; held for the open turns and the newest closed one.
@@ -1338,7 +1348,14 @@ impl Fold {
 
     fn raise(&mut self, need: Need) {
         let mut all: Vec<Need> = self.st.needs.iter_mut().filter_map(Option::take).collect();
-        all.retain(|n| !(n.node == need.node && n.word == need.word && n.by == need.by));
+        // The stream's needs and every other source's are apart: the session's own harness and
+        // the session's own `mark` are both `by=<sid>`, and one must not replace the other's.
+        all.retain(|n| {
+            !(n.node == need.node
+                && n.word == need.word
+                && n.by == need.by
+                && (n.src == Src::Harness) == (need.src == Src::Harness))
+        });
         all.push(need);
         all.sort_by_key(|n| (need_precedence(n), n.since_seq));
         all.truncate(MAX_NEEDS);
@@ -1391,7 +1408,7 @@ fn turn_bucket<'a>(t: &'a mut Totals, out: &str) -> &'a mut u32 {
         "asked" => &mut t.asked,
         "interrupted" => &mut t.interrupted,
         "error" => &mut t.errors,
-        w if w.starts_with("wall:") => &mut t.walled,
+        w if w == "wall" || w.starts_with("wall:") => &mut t.walled,
         _ => &mut t.other,
     }
 }
@@ -1423,7 +1440,7 @@ pub fn starts_epoch(r: &Rec, ep: u32) -> bool {
         && r.f.get_u(Key::Epoch).is_some_and(|e| e > u64::from(ep))
 }
 
-/// The need words a `need` mark may raise (§7.4): `review`, `decision`, `help`, and `escalated` from the owner's attention flag (`src=meta`, §7.1). The session's own harness (`src=harness`) may also raise what its program shows: a box (`approval:<kind>`), a `question` or a wall (`wall:<kind>`), each a word [`may_observe`] declares. What only aterm sees (`unresponsive`, `failure`, `exited`, `escalated`) no harness mark raises.
+/// The need words a `need` mark may raise (§7.4): `review`, `decision`, `help`, and `escalated` from the owner's attention flag (`src=meta`, §7.1). The session's own harness (`src=harness`) may also raise what its program shows: a box (`approval:<kind>`), a `question` or a wall (`wall:<kind>`, or the bare `wall`), each a word [`may_observe`] declares. What only aterm sees (`unresponsive`, `failure`, `exited`, `escalated`) no harness mark raises.
 #[must_use]
 pub fn mark_may_raise(src: Src, word: &str) -> bool {
     matches!(word, "review" | "decision" | "help")
@@ -1450,7 +1467,7 @@ pub fn mark_need_node(r: &Rec) -> Node {
     }
 }
 
-/// THE NEEDS A FOLD NAMES AS OBSERVED (§7.1), declared once: whether [`need_raised`] gives `word` for a record that is no claim. A box's step ([`BoxWord::need`] of each of [`BoxWord::all`], which an unknown or missing `box=` reads as `other`'s, and the question dialog's `question`), a wall's ([`WallKind::wire`] of each of [`WallKind::ALL`]), an input stall's `unresponsive`, a failed run's `failure`, the session's close's `exited`, and `escalated`, the one word [`mark_may_raise`] takes from a source other than a consumer's mark (the owner's attention flag, `src=meta`). The other mark words (`review`, `decision`, `help`) are claims, and the rest of [`crate::vocab::NEED_WORDS`] is what a mark or a snapshot may spell but no fold raises: [`Need::observed`] holds a need to this list, so [`SessionState::top_observed_need`] names nothing else.
+/// THE NEEDS A FOLD NAMES AS OBSERVED (§7.1), declared once: whether [`need_raised`] gives `word` for a record that is no claim. A box's step ([`BoxWord::need`] of each of [`BoxWord::all`], which an unknown or missing `box=` reads as `other`'s, and the question dialog's `question`), a wall's ([`WallKind::wire`] of each of [`WallKind::ALL`], and the bare `wall` of a wall step that names no kind), an input stall's `unresponsive`, a failed run's `failure`, the session's close's `exited`, and `escalated`, the one word [`mark_may_raise`] takes from a source other than a consumer's mark (the owner's attention flag, `src=meta`). The other mark words (`review`, `decision`, `help`) are claims, and the rest of [`crate::vocab::NEED_WORDS`] is what a mark or a snapshot may spell but no fold raises: [`Need::observed`] holds a need to this list, so [`SessionState::top_observed_need`] names nothing else.
 #[must_use]
 pub fn may_observe(word: &str) -> bool {
     match word.split_once(':') {
@@ -1459,7 +1476,10 @@ pub fn may_observe(word: &str) -> bool {
         Some(_) => false,
         None => {
             word == BoxWord::QUESTION.need()
-                || matches!(word, "unresponsive" | "failure" | "exited" | "escalated")
+                || matches!(
+                    word,
+                    "wall" | "unresponsive" | "failure" | "exited" | "escalated"
+                )
         }
     }
 }
@@ -1514,7 +1534,7 @@ pub fn need_precedence(n: &Need) -> u8 {
     }
 }
 
-/// The need a step's open raises (§7.1): `approval:<kind>`, `question`, `wall:<kind>`, or `unresponsive` for an input stall.
+/// The need a step's open raises (§7.1): `approval:<kind>`, `question`, `wall:<kind>` (the bare `wall` for a wall step with no `wall=`), or `unresponsive` for an input stall.
 #[must_use]
 pub fn step_need(r: &Rec) -> Option<&'static str> {
     if r.op != Op::Open || r.node.lvl != Lvl::Step {
@@ -1526,11 +1546,11 @@ pub fn step_need(r: &Rec) -> Option<&'static str> {
                 .map_or("approval:other", |b| BoxWord::from_wire(b).need()),
         ),
         Kind::Question => Some("question"),
-        Kind::Wall => {
-            r.f.get_word(Key::Wall)
-                .and_then(WallKind::from_name)
-                .map(WallKind::wire)
-        }
+        // A wall step with no `wall=` is a wall of a kind nothing named: the bare `wall`.
+        Kind::Wall => match r.f.get_word(Key::Wall) {
+            Some(kind) => WallKind::from_name(kind).map(WallKind::wire),
+            None => Some("wall"),
+        },
         Kind::Stall => Some("unresponsive"),
         _ => None,
     }
@@ -1566,7 +1586,12 @@ pub fn shown_label(st: &SessionState, now_wall: u64) -> Option<&Claim> {
         })
 }
 
-/// THE DESCRIPTION A READER IS SHOWN for `slot` (`title`, `description`, any other) at `now_wall`: the claim that stands for the session, or the one that stands for its open agent run (the newest agent run still open) when that one's author outranks the session's. A tie goes to the session.
+/// THE DESCRIPTION A READER IS SHOWN for `slot` (`title`, `description`, any other) at `now_wall`,
+/// by the two scopes' rule (R1): of the claim that stands for the session and the one that stands
+/// for its open agent run (the newest agent run still open), a `title`, `matters` or `done` claim
+/// on the session from a person, the session's own program or its creator stands over the agent's;
+/// otherwise, and for every other slot, the better rank stands and a tie goes to the session. One
+/// claim, never a union of the two.
 #[must_use]
 pub fn shown<'a>(st: &'a SessionState, slot: &str, now_wall: u64) -> Option<Shown<'a>> {
     let session = st.desc.shown_in(Node::SESSION, slot, now_wall);
@@ -1574,11 +1599,28 @@ pub fn shown<'a>(st: &'a SessionState, slot: &str, now_wall: u64) -> Option<Show
         .desc
         .open_agent()
         .and_then(|a| st.desc.shown_in(a, slot, now_wall));
-    match (session, agent) {
-        (Some(s), Some(a)) if a.rank < s.rank => Some(a),
-        (None, a) => a,
-        (s, _) => s,
-    }
+    desc::two_scopes(slot, session, agent)
+}
+
+/// THE HISTORY A READER IS SHOWN: the session's lines and its open agent run's, newest first (by
+/// seq), at most `n`, each with the rank its author was admitted at and the event it reports. The
+/// card reads 3, `described` 8 and `described history` up to 16.
+#[must_use]
+pub fn shown_history(st: &SessionState, n: usize) -> Vec<HistRow<'_>> {
+    let scopes = std::iter::once(Node::SESSION).chain(st.desc.open_agent());
+    let mut rows: Vec<HistRow<'_>> = scopes
+        .flat_map(|scope| {
+            st.desc.history(scope).iter().map(move |line| HistRow {
+                scope,
+                line,
+                rank: line.rank,
+                event: line.event(),
+            })
+        })
+        .collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.line.seq));
+    rows.truncate(n);
+    rows
 }
 
 /// The verdict claims a reader is shown, in order: a proven author's newest (the harness's), the newest trusted one when it is another claim, then the newest of any author when that is yet another.
@@ -1642,6 +1684,7 @@ pub fn need_words(word: &str, detail: Option<&str>) -> Option<(Words, Tone)> {
                 ))
             }
         }
+        "wall" => Some((Words::fit("wall", ""), Tone::Attention)),
         "unresponsive" => Some((Words::fit("not responding", ""), Tone::Attention)),
         "failure" => {
             let words = match detail {

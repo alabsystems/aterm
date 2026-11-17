@@ -78,7 +78,7 @@ pub struct ProgressBound {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(unix)]
 pub(crate) enum ConfigQuery {
-    Names { read_only: bool },
+    Names { access: crate::git::ConfigAccess },
     CommitRead,
     WorktreeFlag,
 }
@@ -291,6 +291,16 @@ pub(crate) fn check(spec: &ChildSpec) -> Result<()> {
 /// child/group before returning, while a remote write may already have happened.
 #[cfg(any(unix, test))]
 pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) -> Result<ChildOut> {
+    run_observing(spec, stopped, None)
+}
+
+/// A native writer's child is held before exec until its identity is durable.
+#[cfg(any(unix, test))]
+pub(crate) fn run_observing(
+    spec: &ChildSpec,
+    stopped: &mut dyn FnMut() -> bool,
+    record: Option<&dyn Fn(u32) -> Result<()>>,
+) -> Result<ChildOut> {
     check(spec)?;
     if stopped() {
         return Err(interrupted(SideEffect::None));
@@ -365,6 +375,41 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
         }
         return run_record_spool(spec, &mut cmd, input, path, stopped);
     }
+    #[cfg(unix)]
+    if let Some(record) = record {
+        let output = deadline::output_from_journaled(
+            &mut cmd,
+            input,
+            until.unwrap_or_else(|| Instant::now() + spec.budget),
+            spec.progress.as_ref().map(|p| p.window),
+            stopped,
+            &|pid| record(pid).map_err(|error| std::io::Error::other(error.why.clone())),
+        )
+        .map_err(|error| {
+            if stopped() {
+                interrupted(SideEffect::Unknown)
+            } else if matches!(error, RunError::TimedOut)
+                && let Some(progress) = &spec.progress
+            {
+                classify_progress_failure(
+                    spec,
+                    deadline::ProgressError::Stalled {
+                        window: progress.window,
+                        waiting_on: progress.waiting_on.clone(),
+                    },
+                )
+            } else {
+                classify_failure(spec, error)
+            }
+        })?;
+        return Ok(ChildOut {
+            code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        });
+    }
+    #[cfg(not(unix))]
+    let _ = record;
     let output = match &spec.progress {
         Some(progress) => deadline::output_from_while_process_progressing_unless(
             &mut cmd,
@@ -527,8 +572,8 @@ fn interrupted(effect: SideEffect) -> Error {
 fn config_output(spec: &ChildSpec, mut out: ChildOut) -> ChildOut {
     if let Some(query) = spec.config_input {
         out.stdout = match query {
-            ConfigQuery::Names { read_only } if out.code == Some(0) => {
-                crate::git::project_config_names(&out.stdout, read_only)
+            ConfigQuery::Names { access } if out.code == Some(0) => {
+                crate::git::project_config_names(&out.stdout, access)
             }
             ConfigQuery::CommitRead if out.code == Some(0) => {
                 crate::git::project_commit_config(&out.stdout)

@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 mod down_set_tests;
 #[path = "payload_tests.rs"]
 mod payload_tests;
+#[path = "vault_checkpoint_tests.rs"]
+mod vault_checkpoint;
 
 const FOUNDING_SEED: [u8; 32] = [99; 32];
 

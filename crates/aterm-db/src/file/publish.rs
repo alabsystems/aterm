@@ -35,16 +35,21 @@
 //!   ([`super::Class::Owner`]) takes no Mac's statement of its own row, and a Mac file
 //!   ([`super::Class::Mac`]) no owner's write: the intent is held with the rule
 //!   ([`super::Class::refuses`]), never signed. This is the publisher's rule alone. Code that
-//!   writes the registry itself (a Mac's self-registration, the importer) passes no outbox, and
-//!   its cells project as any other until the materializer judges them by the merge rules
-//!   (`file::admit`, not built yet).
+//!   writes the registry itself (a Mac's self-registration, the importer) passes no outbox; what
+//!   it writes is judged by every read instead, under the authority rules of a collection that
+//!   opts into them ([`crate::typed::authority`]), and projects as written in one that does not.
+//! - **The table's rules hold every write and revert** as they hold a grid save or an owner verb
+//!   ([`Compiled::rules`], as the owner's word): a fixed column written only at its row's
+//!   birth, the table's own guard (an account's label naming another account's slug), a
+//!   reference to a row the table holds, no unique set two live rows come to share and no
+//!   retired row a live row names. A refused intent is held with the rule.
 //! - **Nothing here reads.** A pass opens no reader of a shared file and runs no materializer
 //!   pass; the verb that asked runs one afterwards.
 
 use super::Type;
 use crate::{
     Error, Result,
-    att::{self, Compiled, View},
+    att::{self, Author, Compiled, View},
     catalog::{Directory, policy::Policy},
     database::{Change, Command},
     documents::{application, log::Log},
@@ -69,6 +74,18 @@ use std::{
 
 /// How long a write verb's own attempt may take before it answers `queued`.
 pub const INLINE: Duration = Duration::from_secs(2);
+
+/// How a hold's reason begins where the register moved under the write: another writer's value
+/// reached it after the snapshot the write was read against.
+pub const MOVED: &str = "changed since it was written";
+
+/// The cells a hold for [`MOVED`] names, each `<row>.<column>` with its row's key made safe
+/// (`keys::safe_key`), as the publisher lists them; `None` for a hold of any other reason.
+#[must_use]
+pub fn moved(why: &str) -> Option<Vec<&str>> {
+    let cells = why.strip_prefix(MOVED)?.strip_prefix(": ")?;
+    Some(cells.split(", ").collect())
+}
 
 /// What bounds one pass.
 #[derive(Clone, Copy, Debug)]
@@ -520,10 +537,11 @@ impl Writer<'_, '_> {
             let Some(target) = outbox::digest(target) else {
                 return Ok(Step::Hold("it names no operation to revert".to_owned()));
             };
-            let command = match log.compensate(request, target, &view.quota.over) {
-                Ok(command) => command,
-                Err(error) => return Ok(Step::Hold(error.to_string())),
-            };
+            let command =
+                match log.compensate(request, target, &view.quota.over, &view.inert.changes) {
+                    Ok(command) => command,
+                    Err(error) => return Ok(Step::Hold(error.to_string())),
+                };
             // A file reverts only what wrote it: an operation that changed another collection
             // is undone through that one's file, under its own history.
             if command
@@ -539,7 +557,9 @@ impl Writer<'_, '_> {
                 )));
             }
             if let Some(changes) = command.changes()
-                && let Some(refused) = (self.compiled.guard)(&mut [changes.to_vec()], &view.cells)?
+                && let Some(refused) =
+                    self.compiled
+                        .rules(&mut [changes.to_vec()], view, Author::Owner)?
             {
                 return Ok(Step::Hold(Error::from(refused).to_string()));
             }
@@ -585,17 +605,14 @@ impl Writer<'_, '_> {
                         .iter()
                         .map(|stale| format!("{}.{}", keys::safe_key(&stale.pk), stale.column))
                         .collect();
-                    return Ok(Step::Hold(format!(
-                        "changed since it was written: {}",
-                        moved.join(", ")
-                    )));
+                    return Ok(Step::Hold(format!("{MOVED}: {}", moved.join(", "))));
                 }
                 settled.rows
             };
             if rows.is_empty() {
                 return Ok(Step::Holds);
             }
-            if let Some(refused) = (self.compiled.guard)(&mut rows, &view.cells)? {
+            if let Some(refused) = self.compiled.rules(&mut rows, view, Author::Owner)? {
                 return Ok(Step::Hold(Error::from(refused).to_string()));
             }
             // One intent, one record: its rows are never split across two.
@@ -937,7 +954,7 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
     aterm_spec_anchor::spec_unmodeled(
         machine = "SharedFile",
         action = "ChooseAuthority",
-        reason = "The model's choice of the law one walk checks: no code chooses it, and the authority area's code is SF-07's."
+        reason = "The model's choice of the law one walk checks: no code chooses it. shared_file_conforms takes the authority area's steps on a collection opted into the authority rules (typed::authority)."
     )
 )]
 #[cfg_attr(
@@ -1063,9 +1080,10 @@ fn publish_intents(paths: &Paths, config: &Path, only: Option<&Name>, pass: &Pas
 #[doc(hidden)]
 pub fn shared_file_environment() {}
 
-/// The `SharedFile` steps no code of this build takes as its own: authority on merge (SF-07),
-/// the face and its commit (SF-06), the rotation pool (SF-09), a Mac's reading of a window,
-/// and the Mac rows and entries the journal's typed readers merge (`typed::owned`).
+/// The `SharedFile` steps no code of this build takes as its own: the face and its commit
+/// (SF-06), the rotation pool (SF-09), a Mac's reading of a window, and the Mac rows and entries
+/// the journal's typed readers merge (`typed::owned`). The steps of authority on merge are the
+/// authority rules' (`typed::authority`).
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -1097,46 +1115,6 @@ pub fn shared_file_environment() {}
         machine = "SharedFile",
         action = "ForeignEntry",
         reason = "A Mac's own entry of the journal ring's event log is merged by typed::owned::read_log, which keeps an entry only at its signer's own key by the rule read_owned's AlabCells anchors hold, and the materializer projects ai/events from that read: file::tests' SF-08 exit test holds every Mac's events to the file and an older build's reading of the same record."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "OwnerWrites",
-        reason = "Column authority (Owner over Automatic) is SF-07's projection: this build's files hold owner columns only."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "AutomaticWrites",
-        reason = "Column authority (Owner over Automatic) is SF-07's projection: this build's files hold owner columns only."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "Birth",
-        reason = "Birth cells under an owner's candidate are SF-07's projection."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "OwnerSets",
-        reason = "Birth cells under an owner's candidate are SF-07's projection."
-    )
-)]
-#[cfg_attr(
-    any(test, debug_assertions),
-    aterm_spec_anchor::spec_unmodeled(
-        machine = "SharedFile",
-        action = "Rewrite",
-        reason = "A fixed column's identity after birth is SF-07's projection; the typed grid already refuses the edit (grid::plan)."
     )
 )]
 #[cfg_attr(

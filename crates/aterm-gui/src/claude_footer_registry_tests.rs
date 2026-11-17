@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10).
+//! REGISTRY WAKE (`docs/DESIGN-card-engine-2026-10-19.md` §3.10), on the footer's input
+//! watches (`claude_inputs`): a process's registry row is a looked path like any other.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -9,8 +10,10 @@ use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{Asks, Command, FOLLOW_UPS, Job, LogWake, NO_TAP, REGISTRY_READ, Resolver, WATCH_FOR};
-use crate::claude_registry::{RegistryWatch, Sink, row_of};
+use super::{
+    Asks, Command, FOLLOW_UPS, Job, LogWake, NO_TAP, REGISTRY_READ, Resolver, RosterAsks, WATCH_FOR,
+};
+use crate::claude_inputs::{InputWatch, Sink};
 use crate::session_timeline::SessionTimeline;
 
 const MUST_HAPPEN: Duration = aterm_spec::wait::MUST_HAPPEN;
@@ -39,7 +42,7 @@ fn claude_of(pid: i32) -> PathBuf {
 }
 
 fn row_path(pid: i32) -> PathBuf {
-    row_of(&claude_of(pid), u32::try_from(pid).expect("a positive pid"))
+    claude_of(pid).join("sessions").join(format!("{pid}.json"))
 }
 
 fn args_of(pid: i32) -> Option<atpkg::caller_shell::ProcArgs> {
@@ -61,9 +64,12 @@ const ASKS: Asks = Asks {
     files: |_| None,
     tap: NO_TAP,
     args: args_of,
-    roster: no_roster,
+    roster: RosterAsks::Given(no_roster),
     home: super::rig::scratch_home,
     route: |_, _, _| aterm_agent::harness::accounts::AuthRoute::Stored,
+    default: |_, _| {},
+    catalog: |_| {},
+    wall: |_| std::time::SystemTime::now(),
 };
 
 fn lay(pid: i32, sessions: bool) {
@@ -93,7 +99,7 @@ fn resolver(
 ) -> (Resolver, Receiver<Command>) {
     let (tx, rx) = channel();
     let sink: Sink = Arc::new(move |told| tx.send(Command::from(told)).is_ok());
-    (Resolver::new(RegistryWatch::new(open, sink), ASKS), rx)
+    (Resolver::new(InputWatch::new(open, sink), ASKS), rx)
 }
 
 fn timeline_of(pid: i32) -> Arc<Mutex<SessionTimeline>> {
@@ -114,7 +120,7 @@ fn ask(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pid: i32) -> Comman
 fn told(rx: &Receiver<Command>) -> Vec<Command> {
     let first = rx
         .recv_timeout(MUST_HAPPEN)
-        .expect("the registry watch told nothing");
+        .expect("the input watch told nothing");
     std::iter::once(first)
         .chain(std::iter::from_fn(|| rx.try_recv().ok()))
         .collect()
@@ -145,8 +151,17 @@ fn reads(timeline: &Arc<Mutex<SessionTimeline>>) -> Vec<String> {
         .collect()
 }
 
+/// The instant `secs` seconds past `t0`.
+fn at(t0: Instant, secs: u64) -> Instant {
+    t0 + Duration::from_secs(secs)
+}
+
+/// A ROW CREATED AFTER THE ASK IS READ ON ITS WATCH: the ask's read finds no row and looks at
+/// where it would be, which is watched at `sessions/`; a row renamed in is told, and owes the
+/// session a read at its floor ([`super::RECHECK`] after the ask's read), which finds it. The row
+/// is watched on its own file from then on.
 #[test]
-fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
+fn a_row_created_after_the_ask_is_read_on_its_watch() {
     const PID: i32 = 2_000_000_101;
     lay(PID, true);
     let t0 = Instant::now();
@@ -154,27 +169,32 @@ fn a_row_created_after_the_ask_is_read_on_the_directory_event() {
     let timeline = timeline_of(PID);
     resolver.turn([ask(SESSION, &timeline, PID)], || t0);
     assert_eq!(version(&timeline), None, "no row yet");
-    assert!(resolver.registry.is_live(), "the process is awaited");
     assert_eq!(
-        resolver.registry.level_of(&claude_of(PID)),
+        resolver.inputs.level_of(&row_path(PID)),
         Some(claude_of(PID).join("sessions"))
     );
     rename_row_in(PID);
-    resolver.turn(told(&rx), || t0);
-    assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
+    resolver.turn(told(&rx), || at(t0, 1));
+    assert_eq!(version(&timeline), None, "inside the floor: not yet read");
     assert_eq!(
-        reads(&timeline),
-        ["cause=ask row=0", "cause=placed row=0", "cause=event row=1"]
+        resolver.next(at(t0, 1)),
+        Some(at(t0, 2)),
+        "owed at the floor's end"
     );
-    assert!(!resolver.registry.is_live(), "found: no watch, no thread");
+    resolver.turn(std::iter::empty(), || at(t0, 2));
+    assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
+    assert_eq!(reads(&timeline), ["cause=ask row=0", "cause=input row=1"]);
     assert_eq!(
-        resolver.next(t0),
-        Some(t0 + FOLLOW_UPS[0]),
-        "no clock read before the first follow-up"
+        resolver.inputs.level_of(&row_path(PID)),
+        Some(row_path(PID)),
+        "found: watched on its own file"
     );
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
+/// A ROW CREATED EMPTY THEN WRITTEN IN PLACE IS READ ON EACH WATCH: the empty file is told from
+/// `sessions/` and its read misses, which moves the watch onto the file; the write in place is
+/// told from the file, and read.
 #[test]
 fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     const PID: i32 = 2_000_000_102;
@@ -184,9 +204,12 @@ fn a_row_created_empty_then_written_is_read_on_the_file_event() {
     let timeline = timeline_of(PID);
     resolver.turn([ask(SESSION, &timeline, PID)], || t0);
     std::fs::File::create(row_path(PID)).unwrap();
-    resolver.turn(told(&rx), || t0);
+    resolver.turn(told(&rx), || at(t0, 2));
     assert_eq!(version(&timeline), None, "an empty row says nothing");
-    assert!(resolver.registry.file_watched(&row_path(PID)));
+    assert_eq!(
+        resolver.inputs.level_of(&row_path(PID)),
+        Some(row_path(PID))
+    );
     while rx.try_recv().is_ok() {}
     std::fs::OpenOptions::new()
         .write(true)
@@ -194,22 +217,19 @@ fn a_row_created_empty_then_written_is_read_on_the_file_event() {
         .unwrap()
         .write_all(row_text(PID).as_bytes())
         .unwrap();
-    resolver.turn(told(&rx), || t0);
+    resolver.turn(told(&rx), || at(t0, 4));
     assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
     assert_eq!(
         reads(&timeline),
-        [
-            "cause=ask row=0",
-            "cause=placed row=0",
-            "cause=event row=0",
-            "cause=placed row=0",
-            "cause=event row=1"
-        ]
+        ["cause=ask row=0", "cause=input row=0", "cause=input row=1"]
     );
-    assert!(!resolver.registry.is_live());
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
+/// SESSIONS MADE AFTER THE ASK MOVES THE WATCH INWARD: with no Claude dir yet, the row is
+/// watched at the nearest level there; a write beside it is told and reads nothing, since the
+/// row still names nothing; `sessions/` made moves the watch onto it at the next settle, with
+/// no read, and the row renamed in is read.
 #[test]
 fn sessions_made_after_the_ask_moves_the_watch_inward() {
     const PID: i32 = 2_000_000_103;
@@ -219,37 +239,41 @@ fn sessions_made_after_the_ask_moves_the_watch_inward() {
     let timeline = timeline_of(PID);
     resolver.turn([ask(SESSION, &timeline, PID)], || t0);
     assert_eq!(
-        resolver.registry.level_of(&claude_of(PID)),
+        resolver.inputs.level_of(&row_path(PID)),
         Some(root_of(PID)),
         "the nearest level there"
     );
-    std::fs::write(root_of(PID).join(".claude.json"), b"{}").unwrap();
-    resolver.turn(told(&rx), || t0);
+    std::fs::write(root_of(PID).join("beside.json"), b"{}").unwrap();
+    resolver.turn(told(&rx), || at(t0, 2));
     assert_eq!(
         reads(&timeline),
-        ["cause=ask row=0", "cause=placed row=0"],
-        "a write outside sessions/ opens no row"
+        ["cause=ask row=0", "cause=follow-up row=0"],
+        "a write beside the row owes no read (the read at 2 s is the clock's)"
     );
     std::fs::create_dir_all(claude_of(PID).join("sessions")).unwrap();
-    while resolver.registry.level_of(&claude_of(PID)) != Some(claude_of(PID).join("sessions")) {
-        resolver.turn(told(&rx), || t0);
-    }
+    resolver.turn(told(&rx), || at(t0, 3));
+    assert_eq!(
+        resolver.inputs.level_of(&row_path(PID)),
+        Some(claude_of(PID).join("sessions"))
+    );
     while rx.try_recv().is_ok() {}
     rename_row_in(PID);
-    resolver.turn(told(&rx), || t0);
+    resolver.turn(told(&rx), || at(t0, 4));
     assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
     assert_eq!(
         reads(&timeline),
         [
             "cause=ask row=0",
-            "cause=placed row=0",
-            "cause=placed row=0",
-            "cause=event row=1"
+            "cause=follow-up row=0",
+            "cause=input row=1"
         ]
     );
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
+/// A ROW WRITTEN BEFORE ITS WATCH IS READ WHEN THE WATCH IS PLACED (law L3 PlaceBeforeRead):
+/// a row renamed in between the ask's read and the settle that places its watch is no event,
+/// but the placement finds the look moved and owes the session a read at its floor.
 #[test]
 fn a_row_written_before_its_watch_is_read_when_the_watch_is_placed() {
     const PID: i32 = 2_000_000_104;
@@ -261,18 +285,22 @@ fn a_row_written_before_its_watch_is_read_when_the_watch_is_placed() {
     resolver.serve_commands([ask(SESSION, &timeline, PID)], &mut clock);
     rename_row_in(PID);
     resolver.settle(&mut clock);
-    assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
-    assert_eq!(reads(&timeline), ["cause=ask row=0", "cause=placed row=1"]);
-    assert!(!resolver.registry.is_live());
+    resolver.inputs.wake_and_settle();
     assert!(
         rx.try_recv().is_err(),
         "nothing to tell: the write came first"
     );
+    resolver.turn(std::iter::empty(), || at(t0, 2));
+    assert_eq!(version(&timeline).as_deref(), Some("2.1.287"));
+    assert_eq!(reads(&timeline), ["cause=ask row=0", "cause=placed row=1"]);
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
 
+/// THE WATCHES GO WITH THEIR SESSIONS: a stopped session's looks go with it, and the watch on
+/// its row with them, while the other session's stands; once the other's watch lapses
+/// ([`WATCH_FOR`], its process gone), nothing is watched and the thread is gone.
 #[test]
-fn the_watch_drops_when_nothing_awaits() {
+fn the_watches_go_with_their_sessions() {
     const PID: i32 = 2_000_000_105;
     const OTHER: i32 = 2_000_000_106;
     lay(PID, true);
@@ -284,8 +312,8 @@ fn the_watch_drops_when_nothing_awaits() {
         [ask(SESSION, &one, PID), ask(SESSION + 1, &two, OTHER)],
         || t0,
     );
-    assert!(resolver.registry.level_of(&claude_of(PID)).is_some());
-    assert!(resolver.registry.level_of(&claude_of(OTHER)).is_some());
+    assert!(resolver.inputs.level_of(&row_path(PID)).is_some());
+    assert!(resolver.inputs.level_of(&row_path(OTHER)).is_some());
     resolver.turn(
         [Command::Stop {
             session: SESSION,
@@ -294,19 +322,23 @@ fn the_watch_drops_when_nothing_awaits() {
         }],
         || t0,
     );
-    assert_eq!(resolver.registry.level_of(&claude_of(PID)), None);
-    assert!(resolver.registry.level_of(&claude_of(OTHER)).is_some());
-    assert!(resolver.registry.is_live(), "the other still awaits");
+    assert_eq!(resolver.inputs.level_of(&row_path(PID)), None);
+    assert!(resolver.inputs.level_of(&row_path(OTHER)).is_some());
+    assert!(resolver.inputs.is_live(), "the other's watch stands");
     resolver.retain(t0 + WATCH_FOR);
     assert!(
-        !resolver.registry.is_live(),
-        "nothing awaits: no watch, no thread"
+        !resolver.inputs.is_live(),
+        "nothing looked at: no watch, no thread"
     );
     for pid in [PID, OTHER] {
         let _ = std::fs::remove_dir_all(root_of(pid));
     }
 }
 
+/// WITH THE WATCH REFUSED THE ROW WAITS FOR THE FIRST FOLLOW-UP: no watcher places nothing, so the
+/// session stays on the clocks arm it starts on ([`super::Arm::Clocks`]), a row renamed in is
+/// told by nothing and read at [`FOLLOW_UPS`]`[0]` and at no instant before it, and each read's
+/// dev row says the clocks arm it was read on.
 #[test]
 fn with_the_watch_refused_the_row_waits_for_the_first_follow_up() {
     const PID: i32 = 2_000_000_107;
@@ -316,7 +348,12 @@ fn with_the_watch_refused_the_row_waits_for_the_first_follow_up() {
         resolver(|| Err(std::io::Error::from(std::io::ErrorKind::Unsupported)));
     let timeline = timeline_of(PID);
     resolver.turn([ask(SESSION, &timeline, PID)], || t0);
-    assert!(!resolver.registry.is_live());
+    assert!(!resolver.inputs.is_live());
+    assert_eq!(
+        resolver.schedule.watched[&SESSION].arm,
+        super::Arm::Clocks,
+        "no watcher: the session is on the clocks arm"
+    );
     rename_row_in(PID);
     assert_eq!(resolver.next(t0), Some(t0 + FOLLOW_UPS[0]));
     let before = t0 + FOLLOW_UPS[0] - Duration::from_millis(1);
@@ -328,6 +365,24 @@ fn with_the_watch_refused_the_row_waits_for_the_first_follow_up() {
     assert_eq!(
         reads(&timeline),
         ["cause=ask row=0", "cause=follow-up row=1"]
+    );
+    let arms: Vec<String> = timeline
+        .lock()
+        .unwrap()
+        .since(None)
+        .filter(|event| event.kind == REGISTRY_READ)
+        .filter_map(|event| {
+            event
+                .payload
+                .split_whitespace()
+                .find(|word| word.starts_with("arm="))
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(
+        arms,
+        ["arm=clocks", "arm=clocks"],
+        "a session is on the clocks arm until a settle finds it watched, and none does here"
     );
     let _ = std::fs::remove_dir_all(root_of(PID));
 }
@@ -413,11 +468,13 @@ fn an_ask_after_the_resolver_ended_starts_another_which_takes_it() {
     use std::cell::{Cell, RefCell};
     let lane = super::Lane::new();
     let timeline = Arc::new(Mutex::new(SessionTimeline::for_test()));
-    let job = || Job {
-        session: SESSION,
-        timeline: Arc::clone(&timeline),
-        pgid: 42,
-        wake: LogWake::default(),
+    let job = || {
+        Command::Request(Job {
+            session: SESSION,
+            timeline: Arc::clone(&timeline),
+            pgid: 42,
+            wake: LogWake::default(),
+        })
     };
     // The resolvers started, each as its thread would hold it, and whether a start succeeds.
     let started = RefCell::new(Vec::new());

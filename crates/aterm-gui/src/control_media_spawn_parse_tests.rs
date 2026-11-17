@@ -407,6 +407,7 @@ fn plain_spawn_parses_with_and_without_cwd() {
             agent: None,
             why: None,
             req: None,
+            package: None,
         })
     );
     assert_eq!(
@@ -420,6 +421,7 @@ fn plain_spawn_parses_with_and_without_cwd() {
             agent: None,
             why: None,
             req: None,
+            package: None,
         })
     );
     assert_eq!(
@@ -433,6 +435,7 @@ fn plain_spawn_parses_with_and_without_cwd() {
             agent: None,
             why: None,
             req: None,
+            package: None,
         })
     );
     assert_eq!(
@@ -446,6 +449,7 @@ fn plain_spawn_parses_with_and_without_cwd() {
             agent: None,
             why: None,
             req: None,
+            package: None,
         })
     );
     assert_eq!(
@@ -459,6 +463,7 @@ fn plain_spawn_parses_with_and_without_cwd() {
             agent: None,
             why: Some("rebuild the cache".to_string()),
             req: None,
+            package: None,
         }),
         "a request's one line, which its tab's open keeps"
     );
@@ -631,6 +636,27 @@ fn spawn_takes_one_req_and_refuses_it_on_the_connected_form() {
         Err(None)
     );
     assert!(super::spawn_usage().contains("[req=<id>]"));
+}
+
+/// `package=` IS A WORD OF EVERY PLAIN FORM (CX-04): a shell's, an agent worker's and a program
+/// worker's line each carry it, as the `package` slot's rule admits it (trimmed, whole). CONTROL:
+/// a line with none carries none, and the usage line names it.
+#[test]
+fn spawn_parses_package_on_every_plain_form() {
+    let package_of = |line: &str| match parse_spawn_args(line) {
+        Ok(SpawnForm::Plain { package, .. }) => package,
+        other => panic!("{line}: {other:?}"),
+    };
+    for line in [
+        "cwd=/tmp package=FL-04,CX-01",
+        "agent=claude package=FL-04,CX-01 len=1",
+        "program=/bin/cat arg=-n package=FL-04,CX-01 len=1",
+        r#"why="ship it" "package= FL-04,CX-01 ""#,
+    ] {
+        assert_eq!(package_of(line).as_deref(), Some("FL-04,CX-01"), "{line}");
+    }
+    assert_eq!(package_of("agent=claude len=1"), None, "CONTROL");
+    assert!(super::spawn_usage().contains("[req=<id>] [package=<ids>]"));
 }
 
 #[test]

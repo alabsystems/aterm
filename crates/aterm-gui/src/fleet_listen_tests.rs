@@ -863,6 +863,46 @@ fn a_move_told_while_a_round_is_out_still_gets_a_round() {
     );
 }
 
+/// THE NEXT ROUND IS DUE BY THE CLOCK AND THE MOVE IT HAS NOT TAKEN (KI-1108-2): a waiter that
+/// keeps the heartbeat's deadline reads it from the clock, never polls it: `every` after the
+/// last round, a move's spread after it was told (the earlier of the two), at once before the
+/// first round, and none while a round is out, whose end rings the waiter. Memory only.
+/// NEGATIVE CONTROL: once the move's round went out the deadline is the interval's again, from
+/// that round, so the spread's instant came from the move the clock had not taken.
+#[cfg(unix)]
+#[test]
+fn the_next_round_is_due_by_the_clock_and_the_move_it_has_not_taken() {
+    use crate::network_moved::{Moved, Woke};
+    let spread = Duration::from_millis(2_500);
+    let moved = std::sync::Arc::new(Moved::spread_by(spread));
+    let every = Duration::from_secs(3 * 3600);
+    let before = std::time::Instant::now();
+    let first = HeartbeatClock::new(None, every, moved.watch()).next_due(false);
+    assert!(
+        first.is_some_and(|at| at >= before && at <= std::time::Instant::now()),
+        "at once before the first round: {first:?}"
+    );
+    let t0 = std::time::Instant::now() + Duration::from_secs(3600);
+    let mut heartbeat = HeartbeatClock::new(Some(t0), every, moved.watch());
+    assert_eq!(heartbeat.next_due(false), Some(t0 + every), "the interval");
+    assert_eq!(heartbeat.next_due(true), None, "none while a round is out");
+    moved.tell_at(Woke::Route, t0);
+    assert_eq!(
+        heartbeat.next_due(false),
+        Some(t0 + spread),
+        "the move, once this Mac's spread passed"
+    );
+    assert_eq!(
+        heartbeat.dispatch_when_free(t0 + spread, false, || true),
+        Some(Woke::Route)
+    );
+    assert_eq!(
+        heartbeat.next_due(false),
+        Some(t0 + spread + every),
+        "CONTROL: the interval again, from the round the move made"
+    );
+}
+
 /// A DRIVE IS NAMED BY ITS PROVEN NODE.
 #[cfg(unix)]
 #[test]
@@ -941,22 +981,37 @@ fn a_held_place_names_the_act_that_moves_the_listener() {
     let dir = aterm_tempfile::tempdir().expect("scratch folder");
     let state = dir.path().join("state");
     aterm_uds::private_file::ensure_private_dir(&state).unwrap();
-    let held = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
+    let held = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state), false);
     assert!(
         held.starts_with("fleet listener: 127.0.0.1:58733 is held by another process")
             && held.contains(": `aterm fleet join --port <n>` moves it; tried again every"),
         "{held}"
     );
+    // With the file watch running it is tried again at the events that can free it, and at
+    // least as often as the longest backoff.
+    let watched = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state), true);
+    assert!(
+        watched.ends_with(
+            "moves it; tried again when an aterm lets it go or the network moves, and at least \
+             every 60s"
+        ),
+        "{watched}"
+    );
     aterm_uds::private_file::write_private(&state, aterm_net::fleet_member::CODE_FILE, b"code\n")
         .unwrap();
-    let issuer = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state));
+    let issuer = unbound_line(addr, std::io::ErrorKind::AddrInUse, Some(&state), false);
     assert!(
         issuer.contains(": `aterm fleet init --rotate --port <n>` moves it (every member"),
         "{issuer}"
     );
-    let absent = unbound_line(addr, std::io::ErrorKind::AddrNotAvailable, Some(&state));
+    let absent = unbound_line(
+        addr,
+        std::io::ErrorKind::AddrNotAvailable,
+        Some(&state),
+        false,
+    );
     assert!(
-        absent.contains("is not an address of this machine yet") && !absent.contains("moves"),
+        absent.contains("is not an address of this machine yet") && !absent.contains("moves it"),
         "{absent}"
     );
 }
@@ -1903,4 +1958,155 @@ fn denied_nodes_cache_retains_list_while_locked_and_cuts_open_drive() {
     assert!(!still_open(&revoked_grant));
     assert!(still_open(&good_grant));
     drop((open_revoked, open_good));
+}
+
+/// A WINDOW THAT LEAVES THE PORT TO THE NODE READS ITS GRANTS AND DENY LIST ONLY FOR A HOLD
+/// (KI-1108-2): with no remote hold to judge, a yielding window's wake reads neither aterm.toml
+/// nor the vault; with holds it reads them once however many there are, lifts each its grants no
+/// longer let drive, and answers whether that deny read settled. Memory only.
+/// NEGATIVE CONTROL: the same holds under a grant for every member stand.
+#[cfg(unix)]
+#[test]
+fn a_yielding_window_reads_its_grants_only_for_a_hold() {
+    use std::cell::Cell;
+    let key = aterm_net::fleet::NodeKey::from_bytes([0x5a; 32]);
+    let bound = |_: &str| Some(key);
+    let reads = Cell::new(0);
+    let none: Vec<aterm_net::fleet::DriveGrant> = Vec::new();
+    let every = vec![
+        aterm_net::fleet::DriveGrant::from_word(aterm_net::fleet::ALL_MEMBERS).expect("a grant"),
+    ];
+    let granting = Cell::new(none.clone());
+    let read = || {
+        reads.set(reads.get() + 1);
+        (
+            granting.take(),
+            Some(Arc::from(Vec::<String>::new())),
+            false,
+        )
+    };
+    let lifted = Cell::new(0);
+    let holds = |still: &dyn Fn(&str) -> bool| {
+        let gone = ["a1", "b2"].into_iter().filter(|node| !still(node)).count();
+        lifted.set(gone);
+        gone
+    };
+    let no_hold = |_: &dyn Fn(&str) -> bool| 0;
+
+    assert_eq!(
+        lift_undriving_holds_once_held(&no_hold, &bound, &read),
+        None
+    );
+    assert_eq!(reads.get(), 0, "no hold, no read");
+
+    assert_eq!(
+        lift_undriving_holds_once_held(&holds, &bound, &read),
+        Some(false),
+        "the read's settling is answered"
+    );
+    assert_eq!(reads.get(), 1, "two holds, one read");
+    assert_eq!(lifted.get(), 2, "no grant: both holds are lifted");
+
+    granting.set(every);
+    lift_undriving_holds_once_held(&holds, &bound, &read);
+    assert_eq!(
+        lifted.get(),
+        0,
+        "CONTROL: a grant for every member keeps both"
+    );
+}
+
+/// A REMOTE HOLD RINGS THE WINDOW'S FLEET LISTENER (KI-1108-2): a hold a driving node sets is an
+/// input of the listener's lift ([`lift_undriving_holds`]), which judges remote holds only at a
+/// look and has no file event to wake it, so the hold's apply asks the window's inputs to ring
+/// where their file watch runs (after the hold is in place): one that lands after the listener's
+/// last look, relayed by a node about to cut that drive or held at a fence, is judged at the next
+/// look, not at the backstop. Memory only, the asks counted on this thread, which no other
+/// test's ring moves.
+/// NEGATIVE CONTROLS: a bridge's hold and a remote hold of a session that is not here ask no
+/// ring.
+#[cfg(unix)]
+#[test]
+fn a_remote_hold_rings_the_windows_fleet_listener() {
+    use crate::control::{Scope, hold_line_for_test};
+    let handle = crate::session_store::test_handle(0);
+    let sid = handle.sid.as_str().to_owned();
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(handle);
+    let rings = fleet_inputs::window_rings_on_this_thread;
+    let before = rings();
+    assert_eq!(
+        hold_line_for_test(
+            &store,
+            &format!("hold {sid} on reason=stop origin=fleet"),
+            Scope::Bridge
+        ),
+        "OK hold=1\n"
+    );
+    assert_eq!(rings(), before, "CONTROL: a bridge's hold asks no ring");
+    let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
+        node: "0b".repeat(16),
+        host: "mac-0b".to_owned(),
+    });
+    let elsewhere = format!("hold {} on", "1".repeat(sid.len()));
+    assert!(
+        hold_line_for_test(&store, &elsewhere, Scope::Owner).starts_with("ERR"),
+        "no such session here"
+    );
+    assert_eq!(
+        rings(),
+        before,
+        "CONTROL: a remote hold refused asks no ring"
+    );
+    assert_eq!(
+        hold_line_for_test(&store, &format!("hold {sid} on"), Scope::Owner),
+        "OK hold=1\n"
+    );
+    assert_eq!(rings(), before + 1, "the remote hold rings the listener");
+}
+
+/// THE WINDOW WATCHES WHAT ITS LISTENER JUDGES BY, AS THIS PROCESS RESOLVES IT (KI-1108-2): the
+/// production composition of a window's fleet inputs ([`window_inputs_on`]) names its state
+/// folder's fleet files and `node-port.lock`, the `aterm.toml` it reads and the vault the rule
+/// names, so a rotated key, `fleet-off`, the node's take, a grant taken back or a denial wakes its
+/// listener. Paths only, over a watch that did not start: nothing is watched or read.
+/// NEGATIVE CONTROL: with no vault (none found, or one that cannot be found) the vault's files are
+/// not named while the state folder's and aterm.toml still are.
+#[cfg(unix)]
+#[test]
+fn the_window_watches_what_its_listener_judges_by() {
+    let (inputs, _) =
+        fleet_inputs::Inputs::start(|_| Err(std::io::Error::other("no file events here")));
+    let inputs = Arc::new(inputs);
+    let state = aterm_types::dirs::state_dir().expect("this test binary's state folder");
+    let config = crate::app_config::config_path().expect("this test binary's aterm.toml");
+    let home = aterm_tempfile::tempdir().unwrap();
+    let vault = aterm_secrets::client::Paths::locate_for_home(home.path());
+    let missing = |named: &[std::path::PathBuf], vault: Option<&aterm_secrets::client::Paths>| {
+        let mut required = fleet_inputs::fleet_files(&state, Some(&config), vault);
+        required.push(state.join(aterm_agent::node_service::NODE_PORT_LOCK));
+        required.retain(|file| !named.contains(file));
+        required
+    };
+    let named = window_inputs_on(&inputs, Ok(Some(vault.clone()))).named();
+    assert_eq!(
+        missing(&named, Some(&vault)),
+        Vec::<std::path::PathBuf>::new(),
+        "every input its listener judges by"
+    );
+    for none in [Ok(None), Err("no vault".to_owned())] {
+        let named = window_inputs_on(&inputs, none).named();
+        assert_eq!(
+            missing(&named, None),
+            Vec::<std::path::PathBuf>::new(),
+            "the state folder's and aterm.toml"
+        );
+        assert!(
+            vault
+                .fleet_judgment_files()
+                .iter()
+                .all(|file| !named.contains(file)),
+            "CONTROL: no vault, none of its files"
+        );
+    }
 }

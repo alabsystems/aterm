@@ -18,6 +18,9 @@ use aterm_digest::Sha256;
 use aterm_types::machine_name::Number;
 use std::collections::BTreeMap;
 
+/// The glance and task words a record holds, which [`crate::words`] defines on every platform.
+pub use crate::words::{State, Task};
+
 /// A value and when it was read, Unix milliseconds. It has no `Default`: an unread value is the
 /// `None` of an `Option<At<T>>`, never a zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,67 +150,6 @@ impl Harness {
             Self::Grok => &["grok"],
             Self::Kimi => &["kimi:global", "kimi:mainland-cn"],
             Self::Other => &[],
-        }
-    }
-}
-
-/// What an agent is doing, by its row's own words.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum State {
-    /// At work.
-    Busy,
-    /// At rest.
-    Idle,
-    /// Waiting on a person.
-    Waiting,
-    /// At a limit.
-    Walled,
-    /// Its task is stalled.
-    Stuck,
-    /// Any other word, or none.
-    Unknown,
-}
-
-impl State {
-    /// Every word, in the order a schema lists them.
-    pub const WORDS: &'static [&'static str] =
-        &["busy", "idle", "waiting", "walled", "stuck", "unknown"];
-
-    /// Its word.
-    pub const fn word(self) -> &'static str {
-        match self {
-            Self::Busy => "busy",
-            Self::Idle => "idle",
-            Self::Waiting => "waiting",
-            Self::Walled => "walled",
-            Self::Stuck => "stuck",
-            Self::Unknown => "unknown",
-        }
-    }
-}
-
-/// A session's task, as its row's `task=` says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Task {
-    Working,
-    Done,
-    Failed,
-    Exited,
-    Stalled,
-}
-
-impl Task {
-    /// Every word, in the order a schema lists them.
-    pub const WORDS: &'static [&'static str] = &["working", "done", "failed", "exited", "stalled"];
-
-    /// Its word.
-    pub const fn word(self) -> &'static str {
-        match self {
-            Self::Working => "working",
-            Self::Done => "done",
-            Self::Failed => "failed",
-            Self::Exited => "exited",
-            Self::Stalled => "stalled",
         }
     }
 }

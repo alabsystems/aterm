@@ -298,6 +298,8 @@ struct Fold {
     asked: Option<i64>,
     /// The request in hand already has its first answer.
     answered: bool,
+    /// The model that first answer names (`message.model`), while [`Self::answered`].
+    answer_model: Option<String>,
     /// The last local command's row was `/login`'s own.
     login_command: bool,
     /// A main-chain assistant row was folded: [`Self::response`] is of it.
@@ -473,6 +475,11 @@ impl Conversation {
             {
                 self.served.push((asked, at));
                 fold.answered = true;
+                fold.answer_model = v
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
             }
         }
         if let Some(response) = response {
@@ -527,6 +534,44 @@ impl Conversation {
         let skip = usize::from(from > 0);
         Some(Self::of_rows(rows.into_iter().skip(skip), from > 0))
     }
+}
+
+/// A REQUEST A MODEL SERVED, as the end of its transcript shows it ([`served_request`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServedRequest {
+    /// When the prompt or tool result that began the request was written, Unix seconds: the
+    /// latest instant the request can have been sent, so what the model's answer proves of the
+    /// account (room in a window) was true then, and not at the later time its reply was written.
+    pub(crate) asked: i64,
+    /// The model the request's first answer names (`message.model`).
+    pub(crate) model: String,
+}
+
+/// THE LAST REQUEST THE ROWS `tail` (the end of one transcript, its earlier rows unread) SHOW
+/// SERVED, by the rule an adoption's [`Conversation::fold`] holds: the last prompt or tool result
+/// of the main chain, where the first answer on its chain is of ANOTHER API RESPONSE than the one
+/// in flight when it was written, and that answer names a model. A request begun before an
+/// earlier one ends (a row of the response in flight at it answers nothing), a tool's result or a
+/// prompt with no assistant row read before it, and a request with no answer yet each show none,
+/// so a reply is never dated after the request it answered: a limit met between a request and the
+/// reply that ends it is not one the reply speaks against.
+#[must_use]
+pub(crate) fn served_request(tail: &str) -> Option<ServedRequest> {
+    let mut conversation = Conversation::default();
+    let mut fold = Fold {
+        cut: true,
+        ..Fold::default()
+    };
+    for line in tail.lines() {
+        conversation.fold(&mut fold, line);
+    }
+    if !fold.answered {
+        return None;
+    }
+    Some(ServedRequest {
+        asked: fold.asked?,
+        model: fold.answer_model?,
+    })
 }
 
 /// Where the transcript of each conversation of `sessions` is under the Claude home

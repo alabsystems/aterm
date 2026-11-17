@@ -37,6 +37,10 @@ fn base(seed: &[u8; 32]) -> Store {
     Store::dormant(&[envelope::signer_public(seed).unwrap()])
 }
 
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-52817: a records file kept whole becomes a layout by an atomic exchange of names, which Windows lacks"
+)]
 #[test]
 fn an_observed_capacity_change_refuses_even_a_warm_cached_snapshot() {
     let home = aterm_tempfile::tempdir().unwrap();
@@ -656,6 +660,7 @@ fn the_decoding_digest_includes_the_entire_ignored_tail() {
     assert_eq!(reader.finish(), crate::membership_log::head::digest(&wire));
 }
 
+#[cfg(unix)]
 #[test]
 fn reversion_after_decoder_reads_cannot_authenticate_different_bytes() {
     use std::os::unix::fs::FileExt;

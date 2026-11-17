@@ -1732,6 +1732,97 @@ fn the_registry_view_keeps_the_observed_columns_and_the_unbound_seats() {
     }
 }
 
+/// `ai-accounts set` names an account as every account verb does, by its slug, its key, or its
+/// provider word and address in either spelling: the write lands on that account's row alone.
+/// The default `<cli>-<6 hex>` label the importer stored names none, and an address two accounts
+/// sign in with names neither and lists both by slug; neither writes anything. An account's realm
+/// is written once, at its birth: `realm oai` on the Codex account is refused as a fixed column
+/// (`typed::check::fixed_after_birth`), and its realm stays `codex`.
+/// NEGATIVE CONTROLS: with the `AiAccounts` arm of `row_named` matching the stored `label` again
+/// (`named_row(…, |row| row.get("label") == Some(name))`), the slug names no account: `` Err(Error
+/// ("no account goes by that name")) ``; with `fixed_after_birth` left out of `Compiled::rules`,
+/// the guard's realm rule refuses it instead: `` written once: account.realm: row ac-…: write
+/// this realm as `codex`, the word every Mac reads it by ``.
+#[test]
+fn ai_accounts_set_names_an_account_by_its_slug_key_or_name() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let registry = crate::alab::Registry::at(paths.clone());
+    registry.open().unwrap();
+    let ann = "ann@example.invalid";
+    let ad = keys::address_pk(ann).unwrap();
+    let claude = keys::account_pk("claude", ann).unwrap();
+    let codex = keys::account_pk("codex", ann).unwrap();
+    let mut changes = vec![
+        put(&ADDRESS, &ad, "addr", json!(ann)),
+        put(&ADDRESS, &ad, "row", json!("live")),
+    ];
+    let mut defaults = Vec::new();
+    for (realm, pk) in [("claude", &claude), ("codex", &codex)] {
+        // The `<cli>-<6 hex>` label an importer before account version 2 stored.
+        let default = format!("{realm}-{}", &pk[3..9]);
+        changes.extend([
+            put(&ACCOUNT, pk, "realm", json!(realm)),
+            put(&ACCOUNT, pk, "login", json!(ad)),
+            put(&ACCOUNT, pk, "status", json!("active")),
+            put(&ACCOUNT, pk, "row", json!("live")),
+            cell::change(
+                &ACCOUNT,
+                CellKey {
+                    pk,
+                    col: "label",
+                    elem: None,
+                },
+                &CellValue::imported(1, json!(default), "sr-0000000000000000"),
+            )
+            .unwrap(),
+        ]);
+        defaults.push(default);
+    }
+    registry.write(vec![changes]).unwrap();
+    let store = Memory::default();
+    let set = |list: &[&str]| view(paths, Noun::AiAccounts, list, &mut no_grid, b"", &store);
+    let cell_of = |pk: &str, column: &str| {
+        registry.view().unwrap().project(&ACCOUNT).rows[pk]
+            .get(column)
+            .cloned()
+    };
+    for (word, pk, status) in [
+        ("claude-ann-example", &claude, "paused"),
+        (codex.as_str(), &codex, "broken"),
+        ("oai ann@example.invalid", &codex, "paused"),
+        ("claude:ann@example.invalid", &claude, "banned"),
+    ] {
+        let written = set(&["set", word, "status", status]).unwrap();
+        assert_eq!(written["ac"], json!(pk), "{word}");
+        assert_eq!(cell_of(pk, "status"), Some(json!(status)), "{word}");
+    }
+    assert_eq!(cell_of(&claude, "status"), Some(json!("banned")));
+    assert_eq!(cell_of(&codex, "status"), Some(json!("paused")));
+    for default in &defaults {
+        let none = set(&["set", default, "status", "active"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(none, aterm_file::no_account(default));
+    }
+    let several = set(&["set", ann, "status", "active"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        several.contains("names 2 accounts")
+            && several.contains("claude-ann-example")
+            && several.contains("oai-ann-example"),
+        "{several}"
+    );
+    assert_eq!(cell_of(&claude, "status"), Some(json!("banned")));
+    assert_eq!(cell_of(&codex, "status"), Some(json!("paused")));
+    let oai = set(&["set", "oai-ann-example", "realm", "oai"])
+        .unwrap_err()
+        .to_string();
+    assert!(oai.contains("written once"), "written once: {oai}");
+    assert_eq!(cell_of(&codex, "realm"), Some(json!("codex")));
+}
+
 /// `set <machine> nickname_aliases <members>` writes registry.4's text set member by member
 /// (LT-15B): each member the text names that the set lacks is added, each it holds that the text
 /// leaves out is removed, and one another writer added since stands unless the text drops it.

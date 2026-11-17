@@ -7,7 +7,7 @@
 use super::*;
 use crate::table::{
     conflict::Conflict,
-    store::{APPEND_FAILS, INDEX_BUILDS, INDEX_CAPACITY, with_append_sink, with_replay_admitted},
+    store::{APPEND_FAILS, INDEX_BUILDS, with_append_sink, with_replay_admitted},
     tests::frontier,
 };
 use astream_wire::sync::{Header, Index, MAX_PARENTS};
@@ -15,7 +15,7 @@ use std::collections::BTreeSet;
 
 /// An index given `headers` in turn, as an open that built its index as it replayed gave them.
 fn fold<'h>(headers: impl IntoIterator<Item = &'h Header>) -> Index {
-    let mut index = Index::new(INDEX_CAPACITY);
+    let mut index = Index::new(usize::MAX);
     for header in headers {
         index.insert(header.clone()).unwrap();
     }

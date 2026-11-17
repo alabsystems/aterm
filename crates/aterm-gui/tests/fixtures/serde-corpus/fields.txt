@@ -58,7 +58,7 @@ CheckpointMeta/shell.held_cwd	ok	path host
 CheckpointMeta/shell.cwd_before_job	ok	path host
 Policy/(root)	ok	schema_version profile defaults rules rate_limits
 Policy/defaults	ok	unmatched shell_integration_require_nonce
-Index/(root)	ok	schema index_build generated_at valid_until machine_id roster_seq programs channels
+Index/(root)	ok	schema index_build generated_at valid_until machine_id roster_seq programs channels trees
 Status/(root)	err	not a derived table
 Vec<String>/(root)	err	not a derived table
 Config/keybindings	err	not a derived table

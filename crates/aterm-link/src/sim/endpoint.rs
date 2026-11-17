@@ -28,6 +28,9 @@ pub(crate) struct EpRules {
     pub(crate) exit_moves_roster: bool,
     /// The endpoint names that count at all, as an aterm before it does not.
     pub(crate) names_roster: bool,
+    /// `link log` takes a `continues=` from another log only marked `proved=1`, and only from
+    /// lane 12 (`LINK_PROVED_LANE`), as aterm's `cmd_link_log` does: any other answers usage.
+    pub(crate) cross_id: bool,
 }
 
 impl Default for EpRules {
@@ -40,6 +43,7 @@ impl Default for EpRules {
             mirror_forgets: true,
             exit_moves_roster: true,
             names_roster: true,
+            cross_id: true,
         }
     }
 }
@@ -1284,9 +1288,10 @@ impl EpState {
         format!("OK hold={}\n", u8::from(on))
     }
 
-    /// `link log <id> [continues=<f> was=<old>]`: a change forgets the
+    /// `link log <id> [continues=<f> was=<old> [proved=1]]`: a change forgets the
     /// sessions' offsets; from lane 3 on, a session holding `old` keeps those
-    /// below `f`.
+    /// below `f`. `old` is an earlier generation of `id`'s log, or, marked
+    /// `proved=1` from lane 12 on, another log ([`EpRules::cross_id`]).
     fn link_log<'a>(&mut self, mut words: impl Iterator<Item = &'a str>) -> String {
         let Some(ident) = words.next().map(str::to_string) else {
             return "ERR usage: link log\n".to_string();
@@ -1303,6 +1308,22 @@ impl EpState {
         } else {
             None
         };
+        if let Some((_, was)) = continues.as_ref().filter(|_| self.rules.cross_id) {
+            let proved = self.rules.lane >= aterm_types::control_verbs::LINK_PROVED_LANE
+                && field("proved") == Some("1");
+            let split = |s: &str| -> Option<(String, u64)> {
+                let (id, generation) = s.split_once('.')?;
+                Some((id.to_string(), crate::parse_uint(generation)?))
+            };
+            let lawful = match (split(was), split(&ident)) {
+                (Some((was_id, _)), Some((id, _))) if proved => was_id != id,
+                (Some((was_id, w)), Some((id, n))) => was_id == id && w < n,
+                _ => false,
+            };
+            if !lawful {
+                return "ERR usage: link log\n".to_string();
+            }
+        }
         let forgets = self.rules.forgets;
         let chain = self.rules.chain;
         let mut changed = self.log.as_ref().is_some_and(|was| *was != ident);

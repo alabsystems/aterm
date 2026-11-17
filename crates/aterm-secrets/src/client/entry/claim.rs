@@ -471,5 +471,5 @@ impl EntrySnapshot {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod frontier_tests;

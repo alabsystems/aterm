@@ -36,7 +36,7 @@ impl Interleaved {
     fn new(acknowledged: Witness, pending: bool) -> Self {
         let cap = usize::try_from(acknowledged.count)
             .unwrap_or(0)
-            .min(crate::table::store::JOURNAL_RECORDS);
+            .min(crate::table::store::journal_records());
         Self {
             acknowledged,
             pending,

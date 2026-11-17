@@ -9,6 +9,8 @@ struct Counted {
     fixed: Fixed,
     reads: Cell<usize>,
     sweeps: Cell<usize>,
+    /// What [`Machine::person`] answers.
+    person: Cell<bool>,
 }
 
 impl Counted {
@@ -24,11 +26,16 @@ impl Counted {
             fixed,
             reads: Cell::new(0),
             sweeps: Cell::new(0),
+            person: Cell::new(false),
         }
     }
 }
 
 impl Machine for Counted {
+    fn person(&self) -> bool {
+        self.person.get()
+    }
+
     fn read(&self, path: Option<&std::path::Path>) -> Reading {
         self.reads.set(self.reads.get() + 1);
         self.fixed.read(path)
@@ -278,4 +285,70 @@ fn a_held_lock_is_the_captures_answer_after_one_try() {
             .is_some()
     );
     drop(claim);
+}
+
+/// A PERSON'S ENVELOPE IS JUDGED AS ADMISSION WOULD MARK IT ([`ResourceProbe::person`]). On 10
+/// GiB available of 36, another process's 8 GiB claim has waited an hour, laid by an agent. An
+/// 8 GiB envelope is possible on a probe taken where a person asks: admission would mark its
+/// claim and serve it first. At a place this process stands at, the place's mark governs
+/// ([`Place::standing`]).
+///
+/// NEGATIVE CONTROLS. The same probe taken where no person asks blocks the envelope behind that
+/// waiter, and so does a person's probe judging it at a place an agent's claim of this process
+/// minted after that waiter.
+#[test]
+fn a_persons_probe_is_not_blocked_behind_an_agents_earlier_waiter() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let ledger = Ledger::at(dir.path().join("ledger"));
+    let machine = Counted::new();
+    machine.fixed.set(Reading::of_gib(36, 10, 12));
+    let me = std::process::id();
+    let other = if me == 2 { 3 } else { 2 };
+    let row = |pid| Proc {
+        pid,
+        charged: 1,
+        footprint: 1,
+        ..Proc::default()
+    };
+    machine
+        .fixed
+        .set_procs(Some(Procs::of(vec![row(me), row(other)])));
+    let t0 = now_ms() - 3_600_000;
+    let waiting = Waiter::enter_stand_in(
+        &ledger,
+        &machine,
+        Need::new("agent build").mem_gib(8),
+        Some(other),
+        t0,
+    )
+    .unwrap();
+    let need = Need::new("candidate").mem_gib(8);
+    let at = Instant::now();
+    let probe = |person: bool| {
+        machine.person.set(person);
+        ResourceProbe::capture_at(&ledger, &machine, at)
+            .unwrap()
+            .observed()
+            .unwrap()
+    };
+    assert_eq!(probe(false).check_at(&need, at), ProbeDecision::Blocked);
+    assert_eq!(probe(true).check_at(&need, at), ProbeDecision::Possible);
+
+    // An agent's place, minted after the waiter: its mark, none, governs a person's probe.
+    machine.person.set(false);
+    let mine = Waiter::enter_stand_in(
+        &ledger,
+        &machine,
+        Need::new("agent binary").mem_gib(1),
+        None,
+        t0 + 1,
+    )
+    .unwrap();
+    let place = mine.place();
+    assert_eq!(place.standing(), Some((t0 + 1, false)));
+    assert!(matches!(
+        probe(true).rejection_placed(&need, at, Some(&place)),
+        Some(ProbeRejection::Waiting(_))
+    ));
+    drop((mine, waiting));
 }

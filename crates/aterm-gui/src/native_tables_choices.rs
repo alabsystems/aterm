@@ -68,7 +68,7 @@ fn ty_words(ty: &Ty, named: &dyn Fn(&str) -> String) -> String {
         Ty::Bool => "true or false".into(),
         Ty::Int { .. } => "number".into(),
         Ty::Uint => "whole number".into(),
-        Ty::Text(_) | Ty::Prose(_) | Ty::AccountLabel(_) => "text".into(),
+        Ty::Text(_) | Ty::Prose(_) | Ty::Handle(_) => "text".into(),
         Ty::Command(_) => "command".into(),
         Ty::Commit => "commit".into(),
         Ty::Digest => "digest".into(),
@@ -114,7 +114,7 @@ fn plural(ty: &Ty) -> Option<&'static str> {
     Some(match ty {
         Ty::Int { .. } => "numbers",
         Ty::Uint => "whole numbers",
-        Ty::Text(_) | Ty::Prose(_) | Ty::AccountLabel(_) => "texts",
+        Ty::Text(_) | Ty::Prose(_) | Ty::Handle(_) => "texts",
         Ty::Command(_) => "commands",
         Ty::Commit => "commits",
         Ty::Digest => "digests",

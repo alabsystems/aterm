@@ -17,7 +17,7 @@ use alab_policy::vocab::{ApiCause, Phase, WallKind};
 ///
 /// Its minor goes up once per public release window in which its sources changed
 /// ([`crate::CliHarness::sources`]); `targo --unverified ship harness-bump` writes the bump.
-pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 21, "0.21");
+pub const HARNESS_VER: crate::HarnessVersion = crate::HarnessVersion::new(0, 22, "0.22");
 
 const SPINNER: std::ops::RangeInclusive<char> = '\u{2801}'..='\u{28FF}';
 

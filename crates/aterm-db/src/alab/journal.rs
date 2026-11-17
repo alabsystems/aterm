@@ -66,6 +66,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::EV_BATCH,
+        authority: None,
     }
 );
 
@@ -100,6 +101,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::USE_ROW,
+        authority: None,
     }
 );
 
@@ -126,6 +128,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::SUM_ROW,
+        authority: None,
     }
 );
 
@@ -147,6 +150,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::RELAY_ROW,
+        authority: None,
     }
 );
 
@@ -171,6 +175,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::PLACE_ROW,
+        authority: None,
     }
 );
 
@@ -205,6 +210,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::UPD_ROW,
+        authority: None,
     }
 );
 
@@ -295,6 +301,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::LOGIN_ROW,
+        authority: None,
     }
 );
 
@@ -347,6 +354,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: caps::USAGE_ROW,
+        authority: None,
     }
 );
 

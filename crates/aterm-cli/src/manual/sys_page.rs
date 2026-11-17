@@ -58,6 +58,11 @@ pub(super) const SECTIONS: &[Section] = &[
         body: || LEFT_BODY.to_owned(),
     },
     Section {
+        name: "boot",
+        summary: "saved boot cuts, CPU counter readings, delivered UI events and coverage",
+        body: boot_body,
+    },
+    Section {
         name: "cpu",
         summary: "scheduling and QoS, the CPU hardware sample, `sys report`, `sys policy`",
         body: cpu_body,
@@ -119,6 +124,10 @@ pub(super) const VIEW_ROWS: &[(&str, &str)] = &[
     (
         "report",
         "the CPU hardware report, with any anomaly a worker left",
+    ),
+    (
+        "boot",
+        "saved boot CPU counters and delivered UI events, with actual cut times and coverage",
     ),
     (
         "left",
@@ -228,7 +237,7 @@ const OPTIONS_BODY: &str = r#"  aterm ctl @self sys [<view>] [scope=] [top=] [fr
       panes (the default), then its window, every tab of the request the target's tab is one
       of, aterm including proved shared app work, or the machine. left takes pane, tab or
       aterm. cores, gpu, mem and net take it and print the same rows; overview, tab, aterm,
-      global, why and report refuse it. Beyond the target's tab (disk: beyond its window) a
+      global, why, report and boot refuse it. Beyond the target's tab (disk: beyond its window) a
       scope is the owner's.
       scope=request adds a line request=<id> tabs=<n> cpu_s= peak_mb= disk_written_mb=
       claims=<n> claimed_mb=: what its tabs' process trees spent (those that left as recorded,
@@ -258,6 +267,48 @@ const OPTIONS_BODY: &str = r#"  aterm ctl @self sys [<view>] [scope=] [top=] [fr
       the session `aterm ctl` adds to each sys request as the caller: paths print only for its
       tab. It can narrow a reply, never widen one
 "#;
+
+fn boot_body() -> String {
+    format!(
+        r#"  aterm ctl @self sys boot [top=<1-64>] [--json]
+
+RECORDS
+  The uptime targets are 180 and 900 seconds after boot (3 and 15 minutes), including sleep.
+  Each target refers to an actual observation and its time. A late observation can serve both
+  targets; no reading is invented at a missed target time. Restored records keep their cuts
+  through relaunch, including prior boots, within a fixed cap of {boots} boots and {kib} KiB.
+  Late start, late cuts, missing identity or counters, resets and persistence errors remain
+  explicit coverage. An unavailable value is never a measured zero.
+
+CPU
+  Process, inherited child and coalition counters are separate accounts. Updates can arrive
+  late, so the readings do not establish when that CPU ran or a startup CPU ceiling.
+  Historical credits keep the own/tab assignment made when published growth was accepted;
+  closing a tab retains its earlier tab credits. Missing history stays partial. The own
+  account does not establish exact app overhead.
+
+UI EVENTS
+  Wake counts are delivered UI events in the recorded aterm process and counter epoch.
+  They are not machine wake counts. Missing event coverage is separate from an empty census.
+
+READING THE REPLY
+  boot_record       boot identity, first observation time and coverage
+  boot_observation  actual continuous time, source identity, raw counters and historical credits
+  boot_target       requested uptime and the index of its actual observation
+  boot_ui_wake      delivered event variant and count; top= bounds these rows per observation
+  --json keeps every bounded event variant and writes unsigned counters as decimal strings.
+  persistence, busy and dirty describe saving separately from the observation's coverage.
+  scope=, depth= and instances= are refused. The common fresh=, since= and caller= options
+  still apply (aterm help sys options).
+
+EXAMPLES
+  aterm ctl @self sys boot               read the saved cuts and their coverage
+  aterm ctl @self sys boot --json        export the same recorded observations
+"#,
+        boots = aterm_vitals::boot_cost::MAX_BOOTS,
+        kib = aterm_vitals::boot_cost::MAX_BYTES / 1024,
+    )
+}
 
 /// `aterm help sys output`, with the unavailable words from the code's closed set.
 fn output_body() -> String {

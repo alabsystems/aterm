@@ -43,6 +43,21 @@ impl Vault {
     }
 }
 
+/// A copy of `from` at the new name `to`, as private as the vault's files: `std::fs::copy`, which
+/// keeps a Unix file's `0600`; on Windows, where a copy takes its access list from its folder, a
+/// new owner-only file with its bytes.
+fn copy_private(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(unix)]
+    std::fs::copy(from, to).unwrap();
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let bytes = std::fs::read(from).unwrap();
+        let mut file = crate::fsx::create_private_file_new(to).unwrap();
+        file.write_all(&bytes).unwrap();
+    }
+}
+
 fn writer(paths: &client::Paths) -> Option<std::fs::File> {
     let file = std::fs::File::open(paths.dir.join(".lock")).unwrap();
     #[expect(
@@ -885,6 +900,7 @@ fn a_look_digests_its_log_state_once() {
 /// NEGATIVE CONTROL (2026-11-11): with `Under::log_state` keeping whether or not it looked afresh,
 /// the unsettled look's first digest is kept and the second reads nothing (`left: (0, 0), right:
 /// (1, 1)`, `an unsettled file feeds no kept derivation (unsettled, call 1)`).
+#[cfg(unix)]
 #[test]
 fn an_unsettled_file_feeds_no_kept_derivation() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -1061,7 +1077,7 @@ fn a_session_look_with_no_observation_judges_as_its_own_calls() {
         let look = client::VaultLook::new(&vault.paths);
         let put_away = lock.with_extension("put-away");
         std::fs::rename(&lock, &put_away).unwrap();
-        std::fs::copy(&put_away, &lock).unwrap();
+        copy_private(&put_away, &lock);
         let writing = writer(&vault.paths).unwrap();
         let judged = a_session_through(&vault, &look);
         let own = a_session_on_own_calls(&vault);
@@ -1133,7 +1149,7 @@ fn a_source_read_look_judges_as_a_look_of_its_own() {
         let look = source_read().into_look(&vault.paths);
         let put_away = lock.with_extension("put-away");
         std::fs::rename(&lock, &put_away).unwrap();
-        std::fs::copy(&put_away, &lock).unwrap();
+        copy_private(&put_away, &lock);
         let writing = writer(&vault.paths).unwrap();
         let judged = a_session_through(&vault, &look);
         let own = a_session_on_own_calls(&vault);
@@ -1281,7 +1297,7 @@ fn a_record_history_through_a_look_judges_as_its_own_calls() {
         let look = source_read().into_look(&vault.paths);
         let put_away = lock.with_extension("put-away");
         std::fs::rename(&lock, &put_away).unwrap();
-        std::fs::copy(&put_away, &lock).unwrap();
+        copy_private(&put_away, &lock);
         let writing = writer(&vault.paths).unwrap();
         let key = |look: Option<&client::VaultLook<'_>>| {
             kept.with_key_in(&vault.journal, look, |key| *key == own_key)
@@ -1508,7 +1524,7 @@ fn a_look_confirms_the_control_anchor_it_judged_custody_through() {
         );
 
         let copy = anchor.with_extension("copy");
-        std::fs::copy(&anchor, &copy).unwrap();
+        copy_private(&anchor, &copy);
         std::fs::rename(&copy, &anchor).unwrap();
         assert!(
             vault.bootstrap.anchor_settled_in(&look),
@@ -1603,7 +1619,7 @@ fn a_source_read_through_a_look_holding_the_vault_is_the_looks() {
     let lock = vault.paths.dir.join(".lock");
     let put_away = lock.with_extension("put-away");
     std::fs::rename(&lock, &put_away).unwrap();
-    std::fs::copy(&put_away, &lock).unwrap();
+    copy_private(&put_away, &lock);
     let read = vault.bootstrap.local_source_read_in(&look).unwrap();
     assert!(
         read.is_some(),
@@ -1666,6 +1682,7 @@ fn a_failed_vault_read_cannot_poison_commons_access_without_an_input_change() {
     assert!(vault.bootstrap.access_in(&vault.journal).unwrap().is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn warm_commons_keys_refuse_a_vault_that_loses_private_permissions() {
     use std::os::unix::fs::PermissionsExt as _;

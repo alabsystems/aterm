@@ -2732,6 +2732,46 @@ fn timed_row(id: &str, outcome: Outcome, elapsed_ms: u64, why: Option<&str>) -> 
     }
 }
 
+#[test]
+fn a_standing_row_parks_only_when_every_incomplete_row_has_a_standing_cause() {
+    let mut source = timed_row("source", Outcome::Person, 0, Some("checkout preserved"));
+    source.class = Some(aterm_converge::Class::Install);
+    let mut inherited = timed_row("dependent", Outcome::Blocked, 0, Some("waiting"));
+    inherited.class = source.class;
+    inherited.waits_on = Some(source.id.clone());
+    let mut pass = Pass {
+        due: Due::NotDue,
+        rows: vec![source, inherited],
+        unrecorded: None,
+    };
+    assert!(!pass.complete());
+    assert!(
+        pass.waits_for_input(),
+        "inherited waits use their original cause"
+    );
+    let mut transient = timed_row("transient", Outcome::Failed, 0, Some("unclassified"));
+    transient.class = Some(aterm_converge::Class::Install);
+    pass.rows.push(transient);
+    assert!(
+        !pass.waits_for_input(),
+        "one transient failure keeps the retry"
+    );
+    pass.rows.pop();
+    pass.unrecorded = Some("record write failed".into());
+    assert!(
+        !pass.waits_for_input(),
+        "an unwritten record still needs a retry"
+    );
+    pass.unrecorded = None;
+    pass.rows[1].waits_on = Some("missing source".into());
+    assert!(!pass.waits_for_input(), "an unknown cause is not standing");
+    pass.rows.clear();
+    assert!(
+        !pass.waits_for_input(),
+        "no work does not invent a standing cause"
+    );
+}
+
 /// A count of gits by subcommand, for [`cost::line`]'s own laws: each `(word, n)` of
 /// [`crate::port::GIT_WORDS`] counted `n` times.
 fn git_by(counts: &[(&str, u64)]) -> crate::port::GitBy {

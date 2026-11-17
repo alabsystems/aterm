@@ -140,6 +140,17 @@ impl Filter {
             .unwrap_or_default()
     }
 
+    /// What the cell bar says of a selected row the filter leaves out: `not among the live
+    /// rows`, `… the retired rows`, `… the conflicted rows`. All rows leave none out.
+    pub(crate) fn left_out_words(self) -> String {
+        match self {
+            Self::Live => format!("not among the {} rows", aterm_db::typed::grid::LIVE),
+            Self::Word(w) => format!("not among the {w} rows"),
+            Self::Conflicted => "not among the conflicted rows".to_owned(),
+            Self::All => "not among the rows shown".to_owned(),
+        }
+    }
+
     /// What the grid says where the filter leaves no row.
     pub(crate) fn none_words(self) -> String {
         match self {
@@ -339,8 +350,9 @@ impl TablesApp {
         Some(pk)
     }
 
-    /// Take back the new row `pk` of `sheet` and every cell staged in it.
-    fn drop_row(&mut self, sheet: &str, pk: &str) {
+    /// Take back the new row `pk` of `sheet` and every cell staged in it: its pane's Remove,
+    /// and the Undo of its line in the history drawer.
+    pub(super) fn drop_row(&mut self, sheet: &str, pk: &str) {
         let staged: Vec<At> = self
             .staged
             .keys()

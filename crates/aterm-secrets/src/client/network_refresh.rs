@@ -188,6 +188,7 @@ fn retain(
     completed_at_ms: u64,
 ) {
     let _ = (|| -> crate::Result<()> {
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         let Some(_guard) = StateLock::try_take_existing(paths)? else {
             return Ok(());
@@ -195,13 +196,20 @@ fn retain(
         if config(paths)?.as_ref() != Some(expected) {
             return Ok(());
         }
-        let metadata = std::fs::symlink_metadata(paths.state_file())
-            .map_err(|error| Error::new(error.to_string()))?;
-        if !metadata.is_file()
-            || metadata.uid() != fsx::euid()
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o7777 != 0o600
+        #[cfg(unix)]
         {
+            let metadata = std::fs::symlink_metadata(paths.state_file())
+                .map_err(|error| Error::new(error.to_string()))?;
+            if !metadata.is_file()
+                || metadata.uid() != fsx::euid()
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o7777 != 0o600
+            {
+                return Ok(());
+            }
+        }
+        #[cfg(windows)]
+        if !fsx::private_file_settled(&paths.state_file()) {
             return Ok(());
         }
         let recipient = read_identity(paths)?.map(|key| key.recipient().0);
@@ -258,26 +266,6 @@ pub(super) fn project(
         && receipt.configuration == network_observation::configuration_binding(config)
         && receipt.recipient == recipient)
         .then_some(receipt.observation)
-}
-
-/// Read optional refresh history without fetching, repairing files or renewing its time.
-/// # Errors
-/// A writer holds the observation lock, or existing configuration, identity or state
-/// cannot be safely read. Contention is not an absent retained observation.
-pub fn observe_network_refresh(
-    paths: &Paths,
-    expected: &Config,
-) -> crate::Result<Option<VaultNetworkRefresh>> {
-    let _guard = match StateLock::observe_classified(paths)? {
-        StateObservation::Absent => return Ok(None),
-        StateObservation::Busy => return Err(Error::new("vault network-refresh history is busy")),
-        StateObservation::Held(guard) => guard,
-    };
-    if config(paths)?.as_ref() != Some(expected) {
-        return Ok(None);
-    }
-    let recipient = read_identity(paths)?.map(|key| key.recipient().0);
-    Ok(project(expected, recipient, &load_state(paths)?))
 }
 
 impl Receipt {

@@ -204,8 +204,9 @@ pub(super) fn served_since_notice(jsonl: &str, notice: &str) -> bool {
 /// break of the agent's own background work), with `since` no earlier than the process's start: a
 /// reply before it is another process's, perhaps on another login, and one before the turn opened
 /// is no news of that turn. The stamp dates the evidence, so a strike recorded after the reply
-/// and before the break was read is no strike the reply speaks for.
-pub(super) fn served_since(jsonl: &str, since: i64) -> Option<i64> {
+/// and before the break was read is no strike the reply speaks for. The host dates a served
+/// point's proof of its account by it too (`harness_host.rs`' `served_proof`).
+pub fn served_since(jsonl: &str, since: i64) -> Option<i64> {
     let mut served = None;
     for line in jsonl.lines() {
         let Ok(v) = crate::harness::transcript::conversation(line) else {

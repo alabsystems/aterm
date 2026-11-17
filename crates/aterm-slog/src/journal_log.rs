@@ -6,6 +6,7 @@
 
 use super::{CarryError, GapWhy, Limits, Log, MAX_HOLES, MAX_OPEN, OpenEntry, Rollup, level_slot};
 use crate::field::{Fields, Key, Val};
+use crate::fold::DescIdent;
 use crate::rec::{Rec, Stamp};
 use crate::vocab::{Actor, Conf, Kind, Lvl, Node, Op, Src};
 
@@ -87,7 +88,10 @@ impl Log {
         )
     }
 
-    /// Rebuilds a read-only [`Log`] by replaying `img`'s records and recording its gaps and losses.
+    /// Rebuilds a read-only [`Log`] by replaying `img`'s records and recording its gaps and losses,
+    /// the session being `ident` ([`Log::set_desc_ident`]), told before the first record: a
+    /// history line's rank is fixed when it is admitted, so a replay judges each line as the live
+    /// log under that identity did.
     ///
     /// # Errors
     ///
@@ -95,7 +99,7 @@ impl Log {
     /// of order, a seq past [`super::SEQ_LIMIT`] or the head, records out of
     /// order or in a range never held, overlaps out of order, or more records
     /// than [`JOURNAL_IMAGE_MAX_RECORDS`].
-    pub fn from_journal(img: &JournalImage) -> Result<Log, CarryError> {
+    pub fn from_journal(img: &JournalImage, ident: DescIdent) -> Result<Log, CarryError> {
         if img.recs.len() > JOURNAL_IMAGE_MAX_RECORDS {
             return Err(CarryError::Bound("more journal records than a read holds"));
         }
@@ -131,6 +135,7 @@ impl Log {
         )
         .unwrap_or(Limits::SESSION);
         let mut log = Log::with_limits(img.ep, limits);
+        log.set_desc_ident(ident.own, ident.creator);
         log.base_ep = img.base;
         log.first_seq = img.first;
         log.holes = img.holes.iter().copied().collect();

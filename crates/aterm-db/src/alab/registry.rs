@@ -96,6 +96,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -131,6 +132,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -187,6 +189,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -211,6 +214,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -262,6 +266,7 @@ macro_rules! machine_collection {
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
         );
     };
@@ -323,6 +328,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 4096,
+        authority: None,
     }
 );
 
@@ -403,6 +409,7 @@ macro_rules! address_collection {
         ],
         unique: &[&["addr"]],
         max_row: 0,
+        authority: None,
     }
         );
     };
@@ -590,6 +597,17 @@ impl AddressIndex {
 ///   in as that address. So an account keyed from an address its row no longer says (retired for
 ///   a rename and brought back, or renamed past by two Macs' concurrent edits) is never made live
 ///   again, and no second account is added beside it.
+/// - An account's `realm` holds the realm's own word ([`keys::REALMS`]): `oai`, `openai` or
+///   `Claude` is refused, naming the word to write, since a Mac matches the cell exactly (the
+///   harness's rotation, an older build's sightings) and would not know the row.
+/// - An account's `provider` is its realm's ([`keys::provider_of_realm`]): a save that writes
+///   either and leaves them disagreeing is refused, naming the provider to write.
+/// - An account's `label` is refused where it makes no slug ([`keys::owner_slug`]: its handle
+///   empty or too long, or a slug the guards withhold), and where its slug is one another
+///   account goes by now, or another label of the save makes: an owner's label never moves the
+///   name a person or a script already uses for another account, so of two owners' labels that
+///   make one slug only concurrent writes and older builds leave a pair, which the lowest
+///   operation digest settles (`keys::account_slugs`).
 ///
 /// Every refusal names row keys and columns, never an address.
 ///
@@ -601,6 +619,10 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
     let mut domains: Vec<(usize, String, Value)> = Vec::new();
     // Each account this save writes a column of its key in, or makes live: the first such column.
     let mut keyed: BTreeMap<String, String> = BTreeMap::new();
+    // Each account label this save writes, by row.
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    // Each account this save writes its provider or realm in.
+    let mut providers: BTreeSet<String> = BTreeSet::new();
     for (record, changes) in rows.iter().enumerate() {
         for change in changes {
             let account = change.collection == ACCOUNT.name;
@@ -613,6 +635,18 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
                 continue;
             };
             if account {
+                match (key.col, value.x.as_str()) {
+                    ("realm", Some(text)) if keys::canonical_realm(text) != Some(text) => {
+                        return Ok(Some(refused(&ACCOUNT, key.pk, "realm", realm_rule(text))));
+                    }
+                    ("label", Some(text)) => {
+                        labels.insert(key.pk.to_owned(), text.to_owned());
+                    }
+                    ("provider" | "realm", _) => {
+                        providers.insert(key.pk.to_owned());
+                    }
+                    _ => {}
+                }
                 let makes_live =
                     key.col == crate::typed::LIFECYCLE && value.x.as_str() == Some("live");
                 if makes_live || ["realm", "login", "identity"].contains(&key.col) {
@@ -641,7 +675,12 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
             }
         }
     }
-    if renamed.is_empty() && domains.is_empty() && keyed.is_empty() {
+    if renamed.is_empty()
+        && domains.is_empty()
+        && keyed.is_empty()
+        && labels.is_empty()
+        && providers.is_empty()
+    {
         return Ok(None);
     }
     let addresses = cell::project(&ADDRESS, cells);
@@ -788,7 +827,131 @@ pub fn guard(rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>>
             ));
         }
     }
+    for pk in &providers {
+        let Some(row) = accounts.rows.get(pk) else {
+            continue;
+        };
+        let one = |column: &str| {
+            row.fields
+                .get(column)
+                .filter(|field| !field.conflicted())
+                .and_then(cell::Field::value)
+                .and_then(Value::as_str)
+        };
+        if let (Some(provider), Some(realm)) = (one("provider"), one("realm"))
+            && let Some(own) = keys::provider_of_realm(realm)
+            && provider != own
+        {
+            return Ok(Some(refused(
+                &ACCOUNT,
+                pk,
+                "provider",
+                format!("this realm's provider is `{own}`; write that"),
+            )));
+        }
+    }
+    if let Some(refusal) = label_refusal(&labels, &accounts, cells) {
+        return Ok(Some(refusal));
+    }
     Ok(None)
+}
+
+/// Why an account's `realm` cell refuses `text`: it holds the realm's own word. The typed text is
+/// never quoted.
+fn realm_rule(text: &str) -> String {
+    match keys::canonical_realm(text) {
+        Some(realm) => format!("write this realm as `{realm}`, the word every Mac reads it by"),
+        None => format!(
+            "no provider realm goes by that word; write one of {}",
+            keys::REALMS.join(", ")
+        ),
+    }
+}
+
+/// The refusal of the first account label of `labels` that names no account, or whose slug is
+/// another account's slug or a label a Mac's roster row of another account carries ([`guard`]),
+/// over `accounts` as they read once the save lands and the table's `cells` as they were before
+/// it. A label on a row whose realm does not read as one value is judged once the realm does.
+fn label_refusal(
+    labels: &BTreeMap<String, String>,
+    accounts: &cell::Projection,
+    cells: &Cells,
+) -> Option<Refused> {
+    if labels.is_empty() {
+        return None;
+    }
+    let names = super::account_names::of_cells(cells);
+    let realm_of = |pk: &str| {
+        accounts
+            .rows
+            .get(pk)
+            .and_then(|row| row.fields.get("realm"))
+            .filter(|field| !field.conflicted())
+            .and_then(cell::Field::value)
+            .and_then(Value::as_str)
+    };
+    // Every slug another account holds (its slug now, and its 16-hex one), and every label a
+    // Mac's roster row of it may carry (its legacy label, and the default an earlier build gave
+    // rows), which the fleet fold resolves to it as it resolves a slug (`fleet::fold`): a slug
+    // spelled like one would make that word name neither account.
+    let mut held: BTreeMap<String, (&str, bool)> = BTreeMap::new();
+    for (pk, theirs) in &names {
+        held.insert(theirs.slug.clone(), (pk.as_str(), false));
+        if let Some(realm) = realm_of(pk) {
+            held.insert(keys::reserved_slug(realm, pk), (pk.as_str(), false));
+        }
+    }
+    for (pk, row) in &accounts.rows {
+        let legacy = row
+            .fields
+            .get("legacy_label")
+            .filter(|field| !field.conflicted())
+            .and_then(cell::Field::value)
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let earlier = realm_of(pk).and_then(|realm| keys::earlier_row_label(realm, pk));
+        for label in legacy.into_iter().chain(earlier) {
+            held.entry(label).or_insert((pk.as_str(), true));
+        }
+    }
+    let mut making: BTreeMap<String, &str> = BTreeMap::new();
+    for (pk, label) in labels {
+        let Some(realm) = realm_of(pk) else {
+            continue;
+        };
+        let refuse = |rule: String| Some(refused(&ACCOUNT, pk, "label", rule));
+        let Some(slug) = keys::owner_slug(realm, label) else {
+            return refuse(format!(
+                "this label names no account: its slug is the provider word, a `-` and the \
+                 label's letters and digits, at most {} of them and never shaped like a \
+                 credential (an xAI account's at most 19); write a shorter label",
+                keys::MAX_HANDLE
+            ));
+        };
+        match held.get(&slug).filter(|(other, _)| *other != pk.as_str()) {
+            Some((other, false)) => {
+                return refuse(format!(
+                    "account {} goes by `{slug}` now; write another label, or rename that \
+                     account first",
+                    safe(other)
+                ));
+            }
+            Some((other, true)) => {
+                return refuse(format!(
+                    "a Mac's roster row of account {} is labelled `{slug}`; write another label",
+                    safe(other)
+                ));
+            }
+            None => {}
+        }
+        if let Some(other) = making.insert(slug.clone(), pk.as_str()) {
+            return refuse(format!(
+                "account {} is labelled `{slug}` in this save too; write another label",
+                safe(other)
+            ));
+        }
+    }
+    None
 }
 
 /// A refusal of `collection.column` in row `pk` ([`crate::typed::Refused`]).
@@ -893,6 +1056,7 @@ macro_rules! mailbox_collection {
         ],
         unique: &[&["label"]],
         max_row: 0,
+        authority: None,
     }
         );
     };
@@ -963,6 +1127,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 16 * 1024,
+        authority: None,
     }
 );
 
@@ -991,6 +1156,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 1024,
+        authority: None,
     }
 );
 
@@ -1023,6 +1189,7 @@ macro_rules! phone_collection {
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
         );
     };
@@ -1066,17 +1233,27 @@ crate::att_collection!(
     /// A provider account: one claims identity at one provider realm, keyed by **the canonical
     /// account key** (`typed::keys::account_pk`), so the importer, the harness, the claims rows
     /// and journal events all name one row without a lookup.
+    ///
+    /// Version 2 (docs/DESIGN-shared-files-2026-11-11.md §5, §10) puts the collection under the
+    /// authority rules (`typed::authority`): a Mac that observes an account no row names births it
+    /// (provider, realm, login, `status=pending` and its lifecycle, in one record), and every
+    /// other cell is the owner's; provider and realm are fixed at birth; `label`, the handle the
+    /// account's slug takes, only an owner's verb writes, so the default `<cli>-<6 hex>` label the
+    /// importer and an older observer stored names nothing, at whatever version they wrote it;
+    /// and two live accounts of one realm under one label are a finding.
     pub ACCOUNT = Collection {
         name: "account",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "ac",
         derive: Derive::BirthSha256,
         columns: &[
-            Column::new("provider", Ty::Ref("provider")),
-            Column::new("realm", Ty::Text(32)),
-            Column::new("login", Ty::Ref("address")),
+            Column::new("provider", Ty::Ref("provider"))
+                .writer(Writer::Birth)
+                .fixed(),
+            Column::new("realm", Ty::Text(32)).writer(Writer::Birth).fixed(),
+            Column::new("login", Ty::Ref("address")).writer(Writer::Birth),
             // The provider identity when the login is an alias.
             Column::new("identity", Ty::Ref("address")).null(),
             Column::new(
@@ -1093,10 +1270,14 @@ crate::att_collection!(
             )
             .null(),
             Column::new("status", Ty::Enum(ACCOUNT_STATUS))
-                .on_conflict(OnConflict::Prefer(&["banned", "broken", "paused", "pending", "active"])),
-            // A name the owner can change, never a machine (`guard::account_label`); empty reads
-            // as the default, `keys::default_account_label`.
-            Column::new("label", Ty::AccountLabel(32)).null(),
+                .on_conflict(OnConflict::Prefer(&["banned", "broken", "paused", "pending", "active"]))
+                .writer(Writer::Birth),
+            // The handle the owner names the account by, which its slug takes after the provider
+            // word (`alab::account_names`); empty, the slug's handle derives from the address. A
+            // word shaped like a machine name is allowed (`guard::handle`).
+            Column::new("label", Ty::Handle(keys::MAX_HANDLE))
+                .null()
+                .writer(Writer::Verb),
             Column::new("services", Ty::Set(&Ty::Enum(SERVICES))),
             Column::new("plan", Ty::Ref("plan")).null(),
             Column::new("plan_since", Ty::Day).null(),
@@ -1110,14 +1291,16 @@ crate::att_collection!(
             // The harness label at migration (`m8-2`, `m106-m38`, `kimi-m16`): what a Mac already
             // calls this row, so its login directory never moves.
             Column::new("legacy_label", Ty::Text(64)).null(),
-            row(),
+            row().writer(Writer::Birth),
             note(),
             src(),
             notes_src(),
         ],
-        // Two live accounts under one name are a finding; the name is never a key.
-        unique: &[&["label"]],
+        // Two live accounts of one realm under one label are a finding; the label is never a
+        // key, and slugs, which start with the realm's provider word, are unique across the lab.
+        unique: &[&["realm", "label"]],
         max_row: 0,
+        authority: Some(2),
     }
 );
 
@@ -1140,6 +1323,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1178,6 +1362,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1186,10 +1371,12 @@ crate::att_collection!(
     /// never an identity or a limit: nothing refuses, drops or signs out an account because no
     /// preference names it, and any number of machines may prefer one account. Owner and import
     /// rows only: this Mac's automatic use of an account is a journal `place` row, which never
-    /// spends the registry's lifetime records.
+    /// spends the registry's lifetime records. Version 2 puts it under the authority rules
+    /// (`typed::authority`), so an automatic cell never projects and the pair is fixed at birth,
+    /// and a conflicted `rank` reads as the smaller, tried first.
     pub PREFERENCE = Collection {
         name: "preference",
-        version: 1,
+        version: 2,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "pf",
@@ -1198,7 +1385,9 @@ crate::att_collection!(
             Column::new("machine", Ty::Ref("machine")).fixed(),
             Column::new("account", Ty::Ref("account")).fixed(),
             // Smaller is tried first; none sorts after every number.
-            Column::new("rank", Ty::Uint).null(),
+            Column::new("rank", Ty::Uint)
+                .null()
+                .on_conflict(OnConflict::Min),
             Column::new("why", Ty::Enum(&["owner", "import"])),
             Column::new("since", Ty::Time).null(),
             row(),
@@ -1208,6 +1397,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: Some(2),
     }
 );
 
@@ -1258,6 +1448,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1393,6 +1584,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1426,6 +1618,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1472,6 +1665,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1860,10 +2054,18 @@ pub fn birth(
                         ))
                     })
             };
+            let realm = need("realm")?;
+            if keys::canonical_realm(realm) != Some(realm) {
+                return Err(Error::new(&format!(
+                    "{}.realm: {}",
+                    collection.name,
+                    realm_rule(realm)
+                )));
+            }
             let login = address_of(need("login")?)?;
             let identity = text("identity").map(address_of).transpose()?;
             let email = keys::claims_email(identity, Some(login))?;
-            keys::account_pk(need("realm")?, &email)
+            keys::account_pk(realm, &email)
         }
         "subaccount" => keys::subaccount_pk(need("account")?, need("key")?),
         "auth-route" => keys::auth_route_pk(need("account")?, need("method")?),
@@ -1915,18 +2117,6 @@ pub fn set_by(collection: &str, column: &str) -> Option<&'static str> {
     }
 }
 
-/// What an account row is called: the owner's or the import's `label`, else its default, from
-/// the key and the realm. `None` only for a row with neither a label nor a known realm.
-pub fn account_label(pk: &str, row: &cell::Row) -> Option<String> {
-    row.get("label")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| {
-            let realm = row.get("realm").and_then(Value::as_str)?;
-            keys::default_account_label(realm, pk).ok()
-        })
-}
-
 /// What a person reads for a reference to a row, as one read of a registry generation holds it:
 /// a machine by its label, an account by its provider word and its login's address (the owner,
 /// 2026-11-11, "An account's name and slug" in docs/OWNER_RULINGS.md). Every surface that
@@ -1963,9 +2153,11 @@ impl Names {
             for (pk, row) in view.project(account).rows {
                 let address = text(&row, "login")
                     .and_then(|login| addresses.rows.get(&login).and_then(|a| text(a, "addr")));
+                // Without an address, the label the owner gave it: a read admits no other
+                // (`typed::authority`), and an account has no default label.
                 let words = match (text(&row, "provider"), address) {
                     (Some(provider), Some(address)) => format!("{provider} \u{b7} {address}"),
-                    (Some(provider), None) => match account_label(&pk, &row) {
+                    (Some(provider), None) => match text(&row, "label") {
                         Some(label) => format!("{provider} \u{b7} {label}"),
                         None => provider,
                     },

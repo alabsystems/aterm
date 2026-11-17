@@ -86,6 +86,27 @@ fn reset_zeroes_counts_and_keeps_names() {
     assert_eq!(table.names[0].get(), Some(&"WarmupResult"), "names survive");
     assert_eq!(table.names[1].get(), Some(&"ControlPrepared"));
     assert_eq!(table.names[2].get(), None, "no slot was claimed again");
+    assert_eq!(
+        table.lifetime(),
+        (vec![("ControlPrepared", 2), ("WarmupResult", 1)], false)
+    );
+}
+
+#[test]
+fn lifetime_overflow_survives_metrics_reset() {
+    use std::sync::atomic::Ordering;
+    let table = local_table();
+    let slot = table.slot("ControlPrepared");
+    table.lifetime[slot].store(u64::MAX, Ordering::Relaxed);
+    table.note("ControlPrepared");
+    table.reset();
+    assert!(table.lifetime().1);
+    assert!(table.attribution().is_empty());
+    table.note("ControlPrepared");
+    assert_eq!(
+        table.lifetime(),
+        (vec![("ControlPrepared", u64::MAX)], true)
+    );
 }
 
 #[test]

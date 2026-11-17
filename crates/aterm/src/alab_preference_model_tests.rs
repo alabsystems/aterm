@@ -54,7 +54,8 @@ fn fixture(state: &State) -> LabView {
             pk: ACCOUNT.into(),
             provider: None,
             realm: Some("claude".into()),
-            label: Some("claude-one".into()),
+            slug: "claude-one".into(),
+            name: None,
             legacy_label: None,
             login: Some("one@example.test".into()),
             identity: None,
@@ -107,7 +108,7 @@ pub(crate) fn project(state: &State, action: &str) -> State {
         return next;
     }
     let view = fixture(state);
-    let lab = harness_lab_with_placed(&view, &BTreeMap::new(), true, &BTreeMap::new());
+    let lab = harness_lab_with_placed(&view, &BTreeMap::new(), &BTreeMap::new());
     let account = &lab.accounts[0];
     let preference = lab.me.as_ref().and_then(|me| account.preferred_on(&me.key));
     assert_eq!(

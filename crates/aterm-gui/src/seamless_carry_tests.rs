@@ -1288,6 +1288,55 @@ fn a_senders_retirements_take_its_sidecars_and_nothing_else() {
     assert!(path("seamless-PID-bbbb.s0.ctl").exists());
 }
 
+/// The password sheet's spacing rides the person-stamps sidecar as `q<id> <streak>:<ms>` and
+/// reads back as written. NEGATIVE CONTROLS: a row with no streak, no time, a streak of zero,
+/// a sign, a word or a non-numeric id is dropped, and the rows beside it still read.
+#[test]
+fn the_sheet_spacing_row_round_trips_and_a_malformed_one_is_dropped() {
+    let dir = crate::control_auth::socket_dir().expect("scratch control dir");
+    let path = |tag: &str| {
+        dir.join(format!(
+            "seamless-{}-{}-{tag}.person",
+            std::process::id(),
+            aterm_uds::rand::hex_token::<8>().expect("a token")
+        ))
+    };
+    let quiet = PersonStamp::SheetQuiet {
+        streak: 2,
+        remaining_ms: 15_000,
+    };
+    let written = path("written");
+    assert!(write_person_stamps(
+        &written,
+        &[(7, quiet), (7, PersonStamp::Keyed(90))]
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap(),
+        "q7 2:15000\n7 90\n"
+    );
+    assert_eq!(
+        take_person_stamps(&written, &dir),
+        [(7, quiet), (7, PersonStamp::Keyed(90))]
+    );
+
+    let planted = path("planted");
+    write_private_new(
+        &planted,
+        b"q7 0:5\nq7 2\nq7 :5\nq7 2:\nq7 -2:5\nq7 2:-5\nq7 two:5\nqx 2:5\nq 2:5\nq8 3:40\n",
+    )
+    .expect("the fixture");
+    assert_eq!(
+        take_person_stamps(&planted, &dir),
+        [(
+            8,
+            PersonStamp::SheetQuiet {
+                streak: 3,
+                remaining_ms: 40
+            }
+        )]
+    );
+}
+
 #[test]
 fn a_sidecar_is_never_written_through_a_planted_path() {
     let Some(_env) = env_alone() else { return };

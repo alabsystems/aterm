@@ -2531,6 +2531,77 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let _ = std::fs::remove_dir_all(&twin);
 }
 
+/// **A REPLY RE-WITNESSED ONTO A MOVED LOG TAKES ITS HEAD DOWN TO ITS FORK**
+/// (ATERM-KI-1116-2615). Past the fork, the new log's offsets name records published since the
+/// move, so a read from the old head would miss a copy published there. Generation 0's reply,
+/// journaled at head 90, takes its fork, 41. Generation 1's, at head 140, takes 138. One at head
+/// 35, below its fork, keeps it, and `Anywhere` stays anywhere. NEGATIVE CONTROL
+/// (`StateDir::rewitness_keeps_the_head`, the seam `Mutant::RewitnessKeepsTheOldHead` sets): each
+/// keeps the head it had on the log before.
+#[test]
+fn a_reply_re_witnessed_onto_a_moved_log_takes_its_head_down_to_its_fork() {
+    let log = |generation| astream_broker::LogIdentity {
+        id: [0x3c; 16],
+        generation,
+    };
+    let lineage =
+        astream_broker::Lineage::from_steps(&[(1, 41), (2, 138)]).expect("a lineage astream reads");
+    let entry = |seq: u64, re: u64, generation: u64, at: Head| InFlight {
+        pin: PublishPin {
+            seq,
+            via_key: false,
+            identity: None,
+            original: None,
+            original_off: None,
+            owner: None,
+            at: None,
+        },
+        subject: "/f/f/in/n-a/s-b/n-a/ack".into(),
+        body: format!("v=1 t=1 re={re}").into_bytes(),
+        log: Some(log(generation)),
+        at: Some(at),
+    };
+    let journaled = [
+        (1, 40, 0, Head::From(90), Head::From(41)),
+        (2, 30, 0, Head::From(35), Head::From(35)),
+        (3, 137, 1, Head::From(140), Head::From(138)),
+        (4, 100, 1, Head::Anywhere, Head::Anywhere),
+    ];
+    for control in [false, true] {
+        let dir = scratch(&format!("rewitness-head-{control}"));
+        let st = StateDir::open(&dir).unwrap();
+        for &(seq, re, generation, at, _) in &journaled {
+            st.set_in_flight(&entry(seq, re, generation, at)).unwrap();
+        }
+        st.rewitness_keeps_the_head(control);
+        assert_eq!(
+            st.forget_log_offsets(150, Some(log(2)), Some(138), Some(&lineage))
+                .unwrap(),
+            Vec::new(),
+            "control={control}: every reply lies below its fork"
+        );
+        let want: Vec<(u64, InFlight)> = journaled
+            .iter()
+            .map(|&(seq, re, generation, at, clamped)| {
+                let head = if control { at } else { clamped };
+                (
+                    seq,
+                    InFlight {
+                        log: Some(log(2)),
+                        ..entry(seq, re, generation, head)
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(
+            st.in_flight().unwrap(),
+            want,
+            "control={control}: re-witnessed onto generation 2, each head at most its fork"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// **ON A LOG THAT CONTINUES NONE A PIN'S HEAD IS ANYWHERE; ON A MOVE, DOWN TO ITS FORK**
 /// (ATERM-KI-1114-1414): another id told with a lineage, the same id continuing nothing and
 /// another id told without one are alike, since astream gives a log that kept its records

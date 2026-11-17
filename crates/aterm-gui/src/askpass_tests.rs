@@ -123,7 +123,7 @@ fn backoff_widens_on_cancel_and_clears_on_answer() {
     let t0 = Instant::now();
     assert!(b.quiet_for(1, t0).is_none(), "clear before any cancel");
 
-    b.on_cancel(1, t0);
+    b.on_cancel(1, t0, t0);
     let first = b.quiet_for(1, t0).expect("quiet after a cancel");
     assert!(first <= Duration::from_secs(10) && first > Duration::from_secs(9));
     assert!(
@@ -131,7 +131,7 @@ fn backoff_widens_on_cancel_and_clears_on_answer() {
         "another session is unaffected"
     );
 
-    b.on_cancel(1, t0);
+    b.on_cancel(1, t0, t0);
     let second = b.quiet_for(1, t0).expect("still quiet");
     assert!(second > first, "{second:?} should exceed {first:?}");
 
@@ -349,4 +349,112 @@ fn off_switch_dangling_marker_is_still_an_off_entry() {
         Some(&marker),
         super::marker_metadata_at
     ));
+}
+
+/// A streak eases by itself: each whole [`QUIET_MAX`] a window stood with no sheet after its
+/// quiet window ran out takes one end off it, so sheets a program let lapse long ago do not make
+/// a person wait five minutes. The quiet time is read to when the sheet was RAISED: a sheet
+/// raised as the quiet window ran out that then stood to its deadline (as long as `QUIET_MAX`)
+/// widens the streak like any other.
+/// NEGATIVE CONTROLS: a second short of `QUIET_MAX` eases nothing; one `QUIET_MAX` eases one
+/// step, not the whole streak, so a pause is never the faster way to the next sheet.
+#[test]
+fn a_streak_eases_one_step_for_each_quiet_max_with_no_sheet() {
+    let second = Duration::from_secs(1);
+    let mut b = Backoff::default();
+    let t0 = Instant::now();
+    b.on_cancel(1, t0, t0);
+    // Raised the moment the quiet window ran out, left to its deadline: the second, 20 s.
+    let raised = t0 + QUIET_BASE;
+    let ended = raised + ASKPASS_DEADLINE;
+    b.on_cancel(1, raised, ended);
+    assert_eq!(b.quiet_for(1, ended), Some(QUIET_BASE * 2));
+    let until = ended + QUIET_BASE * 2;
+
+    // A second short of QUIET_MAX after that: the third, 40 s.
+    let near = until + QUIET_MAX - second;
+    b.on_cancel(1, near, near);
+    assert_eq!(b.quiet_for(1, near), Some(QUIET_BASE * 4), "the third");
+    let until = near + QUIET_BASE * 4;
+
+    // One QUIET_MAX of quiet takes one end off: 3 - 1 + 1, the third again, not the first.
+    let eased = until + QUIET_MAX;
+    b.on_cancel(1, eased, eased);
+    assert_eq!(b.quiet_for(1, eased), Some(QUIET_BASE * 4), "one step");
+    let until = eased + QUIET_BASE * 4;
+
+    // Three of them take all three off: the first again.
+    let long = until + QUIET_MAX * 3;
+    b.on_cancel(1, long, long + second);
+    assert_eq!(b.quiet_for(1, long + second), Some(QUIET_BASE));
+
+    // However long a streak ran, it eases from the widest quiet window's step.
+    let mut b = Backoff::default();
+    for _ in 0..40 {
+        b.on_cancel(2, t0, t0);
+    }
+    assert_eq!(b.quiet_for(2, t0), Some(QUIET_MAX));
+    let later = t0 + QUIET_MAX + QUIET_MAX * 2;
+    b.on_cancel(2, later, later);
+    assert_eq!(b.quiet_for(2, later), Some(QUIET_BASE * 16), "6 - 2 + 1");
+}
+
+/// What an update's successor takes up is the streak and the quiet time left, and it goes on
+/// from there. NEGATIVE CONTROLS: a quiet window that ran out, a window never spaced and one an
+/// answer cleared carry nothing; a row with no streak or no time left spaces nothing.
+#[test]
+fn a_running_quiet_window_is_carried_and_taken_up_with_its_streak() {
+    let secs = Duration::from_secs;
+    let mut outgoing = Backoff::default();
+    let t0 = Instant::now();
+    outgoing.on_cancel(1, t0, t0);
+    outgoing.on_cancel(1, t0, t0);
+    assert_eq!(outgoing.carried(1, t0 + secs(5)), Some((2, secs(15))));
+    assert_eq!(outgoing.carried(1, t0 + secs(20)), None, "ran out");
+    assert_eq!(outgoing.carried(2, t0), None, "never spaced");
+    outgoing.on_answer(1);
+    assert_eq!(outgoing.carried(1, t0), None, "answered");
+
+    let mut successor = Backoff::default();
+    let t1 = Instant::now();
+    successor.adopt(7, 2, secs(15), t1);
+    assert_eq!(successor.quiet_for(7, t1), Some(secs(15)));
+    assert_eq!(successor.quiet_for(7, t1 + secs(15)), None);
+    successor.on_cancel(7, t1 + secs(15), t1 + secs(15));
+    assert_eq!(
+        successor.quiet_for(7, t1 + secs(15)),
+        Some(secs(40)),
+        "the third of the streak, not the first"
+    );
+    successor.adopt(8, 0, secs(15), t1);
+    successor.adopt(8, 2, Duration::ZERO, t1);
+    assert_eq!(successor.quiet_for(8, t1), None);
+}
+
+/// A carried row comes from a file a program of the same user could have written, so it can
+/// space a window no longer than that many unanswered sheets would have: the time left is held
+/// to the streak's own quiet window and the streak to the one that first reaches the widest.
+/// A window already quiet for longer keeps its own. NEGATIVE CONTROL: a shorter own quiet
+/// window gives way to the carried one.
+#[test]
+fn a_carried_spacing_is_held_to_what_its_streak_could_have_set() {
+    let secs = Duration::from_secs;
+    let mut b = Backoff::default();
+    let now = Instant::now();
+    b.adopt(1, 1, secs(3600), now);
+    assert_eq!(b.quiet_for(1, now), Some(QUIET_BASE));
+    b.adopt(2, u32::MAX, secs(3600), now);
+    assert_eq!(b.quiet_for(2, now), Some(QUIET_MAX));
+    // The held streak widens no further, and does not overflow.
+    b.on_cancel(2, now, now);
+    assert_eq!(b.quiet_for(2, now), Some(QUIET_MAX));
+
+    for _ in 0..3 {
+        b.on_cancel(3, now, now);
+    }
+    b.adopt(3, 1, secs(5), now);
+    assert_eq!(b.quiet_for(3, now), Some(secs(40)), "its own, longer");
+    b.on_cancel(4, now, now);
+    b.adopt(4, 3, secs(30), now);
+    assert_eq!(b.quiet_for(4, now), Some(secs(30)), "the carried, longer");
 }

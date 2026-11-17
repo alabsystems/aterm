@@ -135,6 +135,7 @@ impl World {
                 ids: self.log.id_counters(),
                 limits: limits(),
                 at: at(self.clock),
+                ident: aterm_slog::DescIdent::default(),
             },
         )
         .expect("the carry reads");

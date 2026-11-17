@@ -11,7 +11,7 @@ use super::{
     NodeInfo, OpenEntry, Rollup, closes_over_half, evict_class,
 };
 use crate::field::{Fields, Tier, Val};
-use crate::fold::{Fold, SnapError};
+use crate::fold::{DescIdent, Fold, SnapError};
 use crate::line::{decode, encode, encoded_size};
 use crate::rec::{Rec, Stamp};
 use crate::turn::rebase;
@@ -115,6 +115,10 @@ pub struct CarryAdopt {
     pub limits: Limits,
     /// Now, on this process's clocks.
     pub at: Stamp,
+    /// WHO THE SESSION IS, as the host knows it when it adopts the carry: the carried claims are
+    /// ranked, settled and keyed for the card under it as the fold reads them
+    /// ([`Fold::from_snapshot_as`]), so a host that says it again after the read moves nothing.
+    pub ident: DescIdent,
 }
 
 /// What a read carry continued.
@@ -737,7 +741,7 @@ impl Log {
         if recs.len() as u64 != carried {
             return Err(CarryError::Shape("a carry missing records"));
         }
-        let fold = Fold::from_snapshot(&fold_lines).map_err(CarryError::Fold)?;
+        let fold = Fold::from_snapshot_as(&fold_lines, a.ident).map_err(CarryError::Fold)?;
         fold.agrees_with_open(&open).map_err(CarryError::Fold)?;
         if fold.state().closed.is_some()
             || recs

@@ -98,6 +98,7 @@ fn lab_with_host(name: &str, host: &str) -> Lab {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_legacy_reserved_host_gets_an_admitted_discovery_name_without_reconfiguration() {
     let lab = lab_with_host("alab", crate::alab_advertised());
@@ -240,6 +241,7 @@ impl Lab {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn server_role_survives_only_same_context_transient_reads() {
     let lab = lab("alab");
@@ -371,6 +373,7 @@ fn server_role_survives_only_same_context_transient_reads() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn denied_server_never_falls_back_during_a_failed_or_pending_apply() {
     let lab = lab("alab");
@@ -535,6 +538,7 @@ fn a_steward_read_waits_for_a_vault_pass_applying_now() {
 /// stopped. Once the record goes, it is the steward again.
 /// NEGATIVE CONTROL: a `stewardship` that skips the record reads the admin as the steward, and
 /// its pass forms, publishes and syncs on the Mac whose person stopped vault sync.
+#[cfg(unix)]
 #[test]
 fn an_admin_whose_person_turned_vault_sync_off_is_no_steward() {
     let lab = lab("steward-sync-off");
@@ -914,6 +918,7 @@ fn a_vault_with_no_log_still_revokes_through_the_admin_key() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
     let lab = lab("steward-deny-roster-and-log");
@@ -1121,6 +1126,7 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
 /// Off macOS the server step removes the member server an earlier release installed, in each
 /// shape a release wrote, and leaves a person's server (any other shape, or one a pin record
 /// names) as it is. It takes the job's decision lock only once there is one to remove.
+#[cfg(unix)]
 #[test]
 fn the_member_server_a_release_installed_goes_and_a_persons_stays() {
     use crate::service::{Job, unit_file};

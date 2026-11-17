@@ -15,6 +15,7 @@
 
 use super::pk_grammar;
 use crate::{Error, Result};
+use astream_wire::sync::Digest;
 use aterm_codec::hex;
 use aterm_digest::{Sha256, hmac_sha256_parts};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,9 +45,22 @@ pub const XAI: &str = "xai";
 /// registry and the account key.
 pub const PROVIDERS: [&str; 6] = [ANTHROPIC, OPENAI, GOOGLE, META, KIMI, XAI];
 
+/// Every canonical realm ([`canonical_realm`]): what an account's `realm` cell holds, the one
+/// spelling every Mac and every build reads.
+pub const REALMS: [&str; 7] = [
+    "claude",
+    "codex",
+    "google",
+    "grok",
+    "kimi:global",
+    "kimi:mainland-cn",
+    "meta",
+];
+
 /// The canonical realm for `raw`: the claims ring's spelling for a pooled provider (it agrees
 /// with `harness/claims.rs` `canonical_pool_realm` on every spelling that accepts, the empty
-/// default included), or the provider word for an unpooled one. agy is the one pooled CLI whose
+/// default included), or the provider word for an unpooled one. Each realm's own word as every
+/// surface prints it ([`provider_word`]: `oai`, `kimicn`) names it too. agy is the one pooled CLI whose
 /// claims realm is not its account realm: its accounts are Google's, so the claims ring's `agy`
 /// (and `antigravity`) key as `google`, the realm a read of agy is attributed by and the
 /// importer files its rows under.
@@ -57,7 +71,10 @@ pub fn canonical_realm(raw: &str) -> Option<&'static str> {
         || trimmed.eq_ignore_ascii_case("anthropic")
     {
         Some("claude")
-    } else if trimmed.eq_ignore_ascii_case("codex") || trimmed.eq_ignore_ascii_case("openai") {
+    } else if trimmed.eq_ignore_ascii_case("codex")
+        || trimmed.eq_ignore_ascii_case("openai")
+        || trimmed.eq_ignore_ascii_case("oai")
+    {
         Some("codex")
     } else if trimmed.eq_ignore_ascii_case("grok")
         || trimmed.eq_ignore_ascii_case("x")
@@ -73,6 +90,7 @@ pub fn canonical_realm(raw: &str) -> Option<&'static str> {
         || trimmed.eq_ignore_ascii_case("kimi-mainland-cn")
         || trimmed.eq_ignore_ascii_case("kimi:cn")
         || trimmed.eq_ignore_ascii_case("kimi-cn")
+        || trimmed.eq_ignore_ascii_case("kimicn")
     {
         Some("kimi:mainland-cn")
     } else if trimmed.eq_ignore_ascii_case("google")
@@ -334,33 +352,6 @@ pub fn preference_pk(machine: &str, account: &str) -> Result<String> {
     Ok(prefix_hex("pf", &sha.finalize()[..11]))
 }
 
-/// The CLI word a realm's default account label starts with: the CLI that signs in to it.
-fn realm_cli(realm: &str) -> Option<&'static str> {
-    Some(match canonical_realm(realm)? {
-        "claude" => "claude",
-        "codex" => "codex",
-        "grok" => "grok",
-        "kimi:global" | "kimi:mainland-cn" => "kimi",
-        "google" => "agy",
-        "meta" => "muse",
-        _ => return None,
-    })
-}
-
-/// An account's default label, `<cli>-<6 hex of its key>`: it names no machine and no address,
-/// so a row keeps it wherever the account runs.
-///
-/// # Errors
-/// An unknown realm, or `account` is not an account key.
-pub fn default_account_label(realm: &str, account: &str) -> Result<String> {
-    let cli = realm_cli(realm).ok_or_else(|| Error::new("unknown provider realm"))?;
-    let hex = account
-        .strip_prefix("ac-")
-        .filter(|_| is_digest_pk(account, "ac"))
-        .ok_or_else(|| Error::new("a label names an account"))?;
-    Ok(format!("{cli}-{}", &hex[..6]))
-}
-
 /// The provider word of an account's realm (docs/DESIGN-shared-files-2026-11-11.md §10): what
 /// every surface says before the account's address, and what its slug starts with. A product
 /// word, so Kimi's two realms stay apart, and `kimicn` holds no `-`, so no Kimi account's handle
@@ -384,8 +375,22 @@ pub fn account_name(realm: &str, claims_email: &str) -> Option<String> {
     Some(format!("{} {claims_email}", provider_word(realm)?))
 }
 
-/// The most bytes a slug's handle holds.
-pub const MAX_HANDLE: usize = 56;
+/// The most bytes of a slug: one less than the run of 40 letters, digits and `-` the value
+/// guards withhold as credential-shaped (`guard::credential_shaped`), so no slug is withheld for
+/// its length alone. A slug the guards withhold for its shape names no account
+/// ([`account_slugs`]): an `xai-` slug whose handle holds 20 bytes or more reads as an xAI key,
+/// so an xAI account's handle holds at most 19. The bound also keeps a slug a vault name inside
+/// `claude-code-<label>-oauth`, the entry the vault keeps a roster row's sign-in snapshot under
+/// (`aterm_secrets::envelope`'s grammar, `[a-z0-9][a-z0-9-]{0,62}`, leaves 45 bytes there), as
+/// it keeps the [`reserved_slug`] a new row is labelled by.
+pub const MAX_SLUG: usize = 39;
+
+/// The most bytes of the word a slug starts with: every provider word ([`provider_word`];
+/// `google` and `kimicn` are the longest), and an unknown realm's, which is cut to fit.
+pub const MAX_WORD: usize = 6;
+
+/// The most bytes a slug's handle holds: whatever the word, the slug fits [`MAX_SLUG`].
+pub const MAX_HANDLE: usize = MAX_SLUG - MAX_WORD - 1;
 
 /// `text` lower-cased, every run of bytes outside `[a-z0-9]` written as one `-`, with none
 /// leading or trailing.
@@ -429,131 +434,333 @@ pub struct Slugged<'a> {
     /// Its key, `ac-<16 hex>`.
     pub pk: &'a str,
     pub realm: &'a str,
-    /// The owner's `label` cell, when one is written.
-    pub label: Option<&'a str>,
+    /// The handle its owner named it by: the `label` its row holds, and the operation that
+    /// wrote it, a carried candidate's own (`crate::alab::account_names` reads it; the authority
+    /// rules hold a label an import or an automatic path wrote inert, so it never reaches here).
+    pub handle: Option<(&'a str, Digest)>,
     /// Its claims address, when its address rows resolve.
     pub claims_email: Option<&'a str>,
     pub live: bool,
 }
 
+/// `<word>-<handle>`, where the handle is one a slug may hold: not empty, at most
+/// [`MAX_HANDLE`] bytes, and the slug not one the value guards withhold (`guard::withheld`).
+fn handle_slug(word: &str, handle: &str) -> Option<String> {
+    if handle.is_empty() || handle.len() > MAX_HANDLE {
+        return None;
+    }
+    let slug = format!("{word}-{handle}");
+    (!super::guard::withheld(&slug)).then_some(slug)
+}
+
+/// The slug an owner's `label` makes for an account of `realm` (design §10): `<provider
+/// word>-<handle>`, the handle being the label lower-cased with each run of bytes outside
+/// `[a-z0-9]` one `-`. `None` where it makes none: the handle is empty or longer than
+/// [`MAX_HANDLE`] bytes, or the value guards would withhold the slug (an `xai-` slug whose
+/// handle holds 20 bytes or more reads as an xAI key). Such a label names no account, and the
+/// registry refuses an owner's write of one (`alab::registry::guard`).
+pub fn owner_slug(realm: &str, label: &str) -> Option<String> {
+    handle_slug(&slug_word(realm), &handle_of(label))
+}
+
+/// The slug account `pk` of `realm` keeps for itself whatever the rows say, `<word>-<16 hex of
+/// its key>`, which no handle of another account takes ([`account_slugs`]) and no owner's label
+/// makes (`alab::registry::guard`). It never changes, so it is also the label a roster row a
+/// sync adds for the account takes: a local key no other account can come to hold.
+pub fn reserved_slug(realm: &str, pk: &str) -> String {
+    format!(
+        "{}-{}",
+        slug_word(realm),
+        pk.strip_prefix("ac-").unwrap_or(pk)
+    )
+}
+
+/// The label builds before SF-07 gave account `pk` of `realm`, `<cli>-<6 hex of its key>`, the
+/// CLI word being the CLI that signs in to the realm (`claude-1a2b3c`, `codex-…`, `grok-…`,
+/// `kimi-…` for both Kimi realms, `agy-…`, `muse-…`). Nothing writes it now; the roster rows
+/// Macs renamed to it (from 2026-11-02) keep it until SF-10 re-keys every row by its account
+/// key, so the fleet fold resolves a session's word by it (`fleet::fold`) and an owner's label
+/// never makes it another account's slug (`alab::registry::guard`). `None` for a realm no CLI
+/// signs in to or a key that is no account's.
+pub fn earlier_row_label(realm: &str, pk: &str) -> Option<String> {
+    let cli = match canonical_realm(realm)? {
+        "claude" => "claude",
+        "codex" => "codex",
+        "grok" => "grok",
+        "kimi:global" | "kimi:mainland-cn" => "kimi",
+        "google" => "agy",
+        "meta" => "muse",
+        _ => return None,
+    };
+    let hex = pk.strip_prefix("ac-").filter(|_| is_digest_pk(pk, "ac"))?;
+    Some(format!("{cli}-{}", &hex[..6]))
+}
+
+/// The word a slug of `realm` starts with: its provider word, else the realm's own letters and
+/// digits cut to [`MAX_WORD`], else `acct`.
+fn slug_word(realm: &str) -> String {
+    provider_word(realm).map_or_else(
+        || {
+            let mut word = handle_of(realm).replace('-', "");
+            word.truncate(MAX_WORD);
+            if word.is_empty() {
+                "acct".to_owned()
+            } else {
+                word
+            }
+        },
+        str::to_owned,
+    )
+}
+
 /// Every account's slug, by key (design §10): `<provider word>-<handle>`, one short word that
-/// names the account in every command, file name and wire.
+/// names the account in every command, file name and wire, unique across the lab. Provider
+/// words map one to one onto realms and none followed by `-` begins another (`kimi-`,
+/// `kimicn-`), so slugs unique within each realm are unique across the lab, and two Macs that
+/// hold the same history compute the same slugs, before a table roll and after it. Live accounts
+/// are named first, so a retired row never takes a live one's slug, then retired ones, each
+/// group in three steps:
 ///
-/// - The handle is the owner's `label` when one is set (a label that is only the row's default
-///   `<cli>-<6 hex>` is not the owner's word and is not one).
-/// - Otherwise it derives from the claims address ([`address_handles`]), and two live accounts
-///   of one realm that derive one handle both take the long one.
-/// - A handle that is empty or longer than [`MAX_HANDLE`] bytes, an account with no readable
-///   address, a slug the value guards would refuse to show (`guard::withheld`), and any slug
-///   another account still holds after that take the first 6 hex of the key instead (then all
-///   16), so slugs are distinct and showable whatever the rows say. Live accounts are named
-///   first: a retired row never takes a live one's slug.
+/// 1. **The owner's handles** ([`owner_slug`]). An account the owner named takes its handle.
+///    Where two owners' handles make one slug, the write with the lowest operation digest takes
+///    it: an order every Mac reads alike, which a roll keeps, since a carried candidate keeps the
+///    operation that wrote it. The others are named as if unnamed. This build's owner writes
+///    never make such a pair (the registry refuses a label whose slug another account holds,
+///    `alab::registry::guard`); concurrent writes and older builds can.
+/// 2. **The derived handles**, from the claims address ([`address_handles`]). Two live accounts
+///    of one realm that derive one short handle both take the long one, or the key where the
+///    long one does not fit, and the short slug names no account, live or retired, while they
+///    share it: the slug the first of them held names nothing once a second arrives. A handle
+///    whose slug is taken, or that two accounts of this step both want, goes long; a long one
+///    taken or wanted twice goes to the key.
+/// 3. **The key**: `<word>-<first 6 hex>`, or all 16 where those are taken.
 ///
-/// The key never changes; a slug changes when the owner writes the label, when the address
+/// A handle that is empty or longer than [`MAX_HANDLE`] bytes, an account with no readable
+/// address, and a slug the value guards would refuse to show (`guard::withheld`) go to the next
+/// step. No handle takes another account's 16-hex slug ([`reserved_slug`]), so every account has
+/// one.
+///
+/// The key never changes; a slug changes when the owner names the account, when the address
 /// changes, or when a second account arrives with the same handle.
 pub fn account_slugs(accounts: &[Slugged<'_>]) -> BTreeMap<String, String> {
-    let word = |account: &Slugged<'_>| -> String {
-        provider_word(account.realm).map_or_else(
-            || {
-                let word = handle_of(account.realm).replace('-', "");
-                if word.is_empty() {
-                    "account".to_owned()
-                } else {
-                    word
-                }
-            },
-            str::to_owned,
-        )
+    let words: Vec<String> = accounts
+        .iter()
+        .map(|account| slug_word(account.realm))
+        .collect();
+    let digits_of = |at: usize| -> &str {
+        let pk = accounts[at].pk;
+        pk.strip_prefix("ac-").unwrap_or(pk)
     };
-    fn hex<'a>(account: &Slugged<'a>) -> &'a str {
-        account.pk.strip_prefix("ac-").unwrap_or(account.pk)
-    }
     let fits = |handle: &str| !handle.is_empty() && handle.len() <= MAX_HANDLE;
-    let labelled = |account: &Slugged<'_>| -> Option<String> {
-        let label = account.label?;
-        if default_account_label(account.realm, account.pk).is_ok_and(|default| default == label) {
-            return None;
-        }
-        Some(handle_of(label)).filter(|handle| fits(handle))
-    };
-    // Each account's handle: (the handle, and the long one it takes on a clash).
-    let mut handles: Vec<(String, Option<String>)> = accounts
-        .iter()
-        .map(|account| {
-            if let Some(label) = labelled(account) {
-                return (label, None);
-            }
-            match account.claims_email.and_then(address_handles) {
-                Some((short, long)) if fits(&short) => (short, Some(long).filter(|l| fits(l))),
-                _ => (String::new(), None),
-            }
-        })
+    // Each account's last resort, which no other account may take.
+    let whole: BTreeMap<String, usize> = (0..accounts.len())
+        .map(|at| (format!("{}-{}", words[at], digits_of(at)), at))
         .collect();
-    // Two live accounts of one realm with one derived handle both take the long handle.
-    let mut derived: BTreeMap<(String, &str), usize> = BTreeMap::new();
-    for (account, (handle, long)) in accounts.iter().zip(&handles) {
-        if account.live && long.is_some() {
-            *derived.entry((word(account), handle.as_str())).or_default() += 1;
-        }
-    }
-    let clashing: Vec<bool> = accounts
-        .iter()
-        .zip(&handles)
-        .map(|(account, (handle, long))| {
-            account.live
-                && long.is_some()
-                && derived
-                    .get(&(word(account), handle.as_str()))
-                    .is_some_and(|count| *count > 1)
-        })
-        .collect();
-    for ((handle, long), clash) in handles.iter_mut().zip(clashing) {
-        if clash && let Some(long) = long.take() {
-            *handle = long;
-        }
-    }
     let mut out: BTreeMap<String, String> = BTreeMap::new();
+    // The slugs no account may take now: each one taken, and each short slug two live accounts
+    // share.
     let mut taken: BTreeSet<String> = BTreeSet::new();
+    let free = |taken: &BTreeSet<String>, at: usize, slug: &str| {
+        !taken.contains(slug)
+            && whole.get(slug).is_none_or(|owner| *owner == at)
+            && !super::guard::withheld(slug)
+    };
     for live in [true, false] {
-        // A slug two accounts of this pass both claim goes to neither.
-        let mut claims: BTreeMap<String, usize> = BTreeMap::new();
-        for (account, (handle, _)) in accounts.iter().zip(&handles) {
-            if account.live == live && !handle.is_empty() {
-                *claims
-                    .entry(format!("{}-{handle}", word(account)))
-                    .or_default() += 1;
+        let group: Vec<usize> = (0..accounts.len())
+            .filter(|at| accounts[*at].live == live)
+            .collect();
+        // 1. The owner's handles, by slug.
+        let mut owned: BTreeMap<String, Vec<(usize, Digest)>> = BTreeMap::new();
+        for &at in &group {
+            if let Some((label, operation)) = accounts[at].handle
+                && let Some(slug) = handle_slug(&words[at], &handle_of(label))
+            {
+                owned.entry(slug).or_default().push((at, operation));
             }
         }
-        let mut by_key = Vec::new();
-        for (account, (handle, _)) in accounts.iter().zip(&handles) {
-            if account.live != live {
+        let mut named: BTreeSet<usize> = BTreeSet::new();
+        for (slug, wanting) in owned {
+            // The lowest operation digest, then the lowest key, for one record that named two
+            // accounts alike.
+            let first = wanting
+                .iter()
+                .min_by_key(|(at, operation)| (*operation, accounts[*at].pk))
+                .map(|(at, _)| *at);
+            if let Some(at) = first
+                && free(&taken, at, &slug)
+            {
+                taken.insert(slug.clone());
+                out.insert(accounts[at].pk.to_owned(), slug);
+                named.insert(at);
+            }
+        }
+        // 2. The derived handles: (the short one, the long one), each when it fits.
+        let unnamed: Vec<usize> = group
+            .iter()
+            .copied()
+            .filter(|at| !named.contains(at))
+            .collect();
+        let derived: BTreeMap<usize, (Option<String>, Option<String>)> = unnamed
+            .iter()
+            .map(|&at| {
+                let pair = accounts[at].claims_email.and_then(address_handles).map_or(
+                    (None, None),
+                    |(short, long)| {
+                        (
+                            Some(short).filter(|h| fits(h)),
+                            Some(long).filter(|h| fits(h)),
+                        )
+                    },
+                );
+                (at, pair)
+            })
+            .collect();
+        // Every live account of a realm that derives a short handle counts toward it, whether or
+        // not its long handle fits.
+        let mut sharing: BTreeMap<(&str, &str), usize> = BTreeMap::new();
+        if live {
+            for (at, (short, _)) in &derived {
+                if let Some(short) = short {
+                    *sharing
+                        .entry((words[*at].as_str(), short.as_str()))
+                        .or_default() += 1;
+                }
+            }
+        }
+        for ((word, short), count) in &sharing {
+            if *count > 1 {
+                taken.insert(format!("{word}-{short}"));
+            }
+        }
+        let mut choices: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+        for (at, (short, long)) in &derived {
+            let shared = short.as_ref().is_some_and(|short| {
+                sharing
+                    .get(&(words[*at].as_str(), short.as_str()))
+                    .is_some_and(|count| *count > 1)
+            });
+            let handles: Vec<&String> = if shared {
+                long.iter().collect()
+            } else {
+                short.iter().chain(long).collect()
+            };
+            choices.insert(
+                *at,
+                handles
+                    .into_iter()
+                    .map(|handle| format!("{}-{handle}", words[*at]))
+                    .collect(),
+            );
+        }
+        // Each round offers every account still unnamed its next choice; a slug taken, or wanted
+        // by two of them in one round, is no account's in that round.
+        let depth = choices.values().map(Vec::len).max().unwrap_or(0);
+        for round in 0..depth {
+            let mut wanted: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (at, slugs) in &choices {
+                if !out.contains_key(accounts[*at].pk)
+                    && let Some(slug) = slugs.get(round)
+                {
+                    wanted.entry(slug).or_default().push(*at);
+                }
+            }
+            for (slug, wanting) in wanted {
+                if let [at] = wanting.as_slice()
+                    && free(&taken, *at, slug)
+                {
+                    taken.insert(slug.to_owned());
+                    out.insert(accounts[*at].pk.to_owned(), slug.to_owned());
+                }
+            }
+        }
+        // 3. The key.
+        for at in unnamed {
+            if out.contains_key(accounts[at].pk) {
                 continue;
             }
-            let slug = format!("{}-{handle}", word(account));
-            if !handle.is_empty()
-                && !super::guard::withheld(&slug)
-                && claims.get(&slug) == Some(&1)
-                && taken.insert(slug.clone())
-            {
-                out.insert(account.pk.to_owned(), slug);
-            } else {
-                by_key.push(account);
-            }
-        }
-        for account in by_key {
-            let hex = hex(account);
-            let short = format!("{}-{}", word(account), hex.get(..6).unwrap_or(hex));
-            let slug = if taken.insert(short.clone()) {
+            let digits = digits_of(at);
+            let short = format!("{}-{}", words[at], digits.get(..6).unwrap_or(digits));
+            let slug = if free(&taken, at, &short) {
                 short
             } else {
-                let whole = format!("{}-{hex}", word(account));
-                taken.insert(whole.clone());
-                whole
+                format!("{}-{digits}", words[at])
             };
-            out.insert(account.pk.to_owned(), slug);
+            taken.insert(slug.clone());
+            out.insert(accounts[at].pk.to_owned(), slug);
         }
     }
     out
+}
+
+/// What [`account_slugs`] settled that `aterm db alab check` reports (`alab::checks`), each by
+/// key and never by value, over live accounts alone: a retired row takes what the live ones
+/// leave by design.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlugFindings {
+    /// Each set of live accounts of one provider, none named by its owner, that derive one short
+    /// handle: they took the long one, or the key, and the short slug names none of them.
+    pub shared: Vec<Vec<String>>,
+    /// Each live account whose owner's label names it nothing, and the account that holds the
+    /// slug the label makes, where one does: an earlier owner's label, or a key's own slug.
+    pub lost: Vec<(String, Option<String>)>,
+    /// Each live account whose owner's label starts with its own provider word, so its slug
+    /// says the word twice (`claude-claude-work`). It names the account; it is reported, never
+    /// refused.
+    pub repeats: Vec<String>,
+}
+
+/// The findings of `slugs`, the slugs [`account_slugs`] gave `accounts`.
+#[must_use]
+pub fn slug_findings(accounts: &[Slugged<'_>], slugs: &BTreeMap<String, String>) -> SlugFindings {
+    let mut found = SlugFindings::default();
+    let holder: BTreeMap<&str, &str> = slugs
+        .iter()
+        .map(|(pk, slug)| (slug.as_str(), pk.as_str()))
+        .collect();
+    let reserved: BTreeMap<String, &str> = accounts
+        .iter()
+        .map(|account| (reserved_slug(account.realm, account.pk), account.pk))
+        .collect();
+    let mut sharing: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for account in accounts.iter().filter(|account| account.live) {
+        let word = slug_word(account.realm);
+        let slug = slugs.get(account.pk).map(String::as_str);
+        let mut named = false;
+        if let Some((label, _)) = account.handle {
+            let handle = handle_of(label);
+            if handle == word || handle.starts_with(&format!("{word}-")) {
+                found.repeats.push(account.pk.to_owned());
+            }
+            let wanted = handle_slug(&word, &handle);
+            named = wanted.is_some() && wanted.as_deref() == slug;
+            if !named {
+                let held = wanted.as_deref().and_then(|wanted| {
+                    holder
+                        .get(wanted)
+                        .copied()
+                        .or_else(|| reserved.get(wanted).copied())
+                        .filter(|other| *other != account.pk)
+                });
+                found
+                    .lost
+                    .push((account.pk.to_owned(), held.map(str::to_owned)));
+            }
+        }
+        // An account its owner's label does not name derives its slug, as `account_slugs`'s
+        // second step does.
+        if !named
+            && let Some((short, _)) = account.claims_email.and_then(address_handles)
+            && !short.is_empty()
+            && short.len() <= MAX_HANDLE
+        {
+            sharing
+                .entry((word, short))
+                .or_default()
+                .push(account.pk.to_owned());
+        }
+    }
+    found.shared = sharing.into_values().filter(|pks| pks.len() > 1).collect();
+    found
 }
 
 /// An import source's key: a digest of its bytes, so a re-run of the same file collapses.

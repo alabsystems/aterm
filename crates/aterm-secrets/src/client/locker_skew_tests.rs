@@ -169,6 +169,7 @@ fn every_build_reads_version_one_and_a_format_this_build_does_not_know_needs_it(
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn the_programs_checked_are_the_running_one_and_the_one_its_job_starts_next() {
     let unit = PathBuf::from("/u/systems.alab.aterm-secrets.plist");

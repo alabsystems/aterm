@@ -1544,8 +1544,7 @@ fn the_app_moves_the_live_edge_only_where_motion_is_allowed() {
 /// A resting window's deck draws as an unfocused one's (`crate::window_rest`): still, on the
 /// background cadence, so a reading speaks for fifteen seconds and the loop is asked for no frame
 /// but the grey's; after a touch (a person's event, which stirs the window and attends it
-/// again) the deck holds still until a reading lands, which brings the motion back. A stir that
-/// is no touch leaves it still once its attention has lapsed (`crate::window_rest::ATTENTION`).
+/// again) the deck holds still until a reading lands, which brings the motion back.
 #[cfg(unix)]
 #[test]
 fn a_resting_window_draws_the_deck_still() {

@@ -5,86 +5,18 @@
 //! decides which claim stands, turns behind, lapses, and the carry snapshot's lines.
 
 use aterm_slog::{
-    Actor, CarryBudget, Close, Conf, DESC_AGENTS, DESC_CARRY_BYTES, DESC_CLAIMS, DESC_HEAP_BYTES,
-    DESC_SLOTS, DESC_TURN_RING, DESC_UNKNOWN_SLOTS, DescRow, Fields, Fold, Key, Kind, Limits, Log,
-    Mark, Node, Open, Out, Rank, Rec, Refused, RunOut, ShortId, SnapError, Src, TurnOut, shown,
+    Actor, CarryBudget, ClaimRefused, Close, Conf, DESC_AGENTS, DESC_CARRY_BYTES, DESC_CLAIMS,
+    DESC_HEAP_BYTES, DESC_HISTORY, DESC_SLOTS, DESC_TURN_RING, DESC_UNKNOWN_SLOTS, Fields, Fold,
+    KNOWN_SLOTS, Key, Kind, Limits, Log, Mark, Node, Open, Out, Rank, Rec, Refused, RunOut,
+    SnapError, Src, shown,
 };
 
+use crate::support::desc::{agent, desc, listing, say, sid, stands, turn, unsay, writer};
 use crate::support::{WALL0, agent_session, at};
-
-/// A claim's fields: `slot` is `value`.
-fn say(slot: &str, value: &str) -> Fields {
-    Fields::new()
-        .tok(Key::Field, slot)
-        .and_then(|f| f.text(Key::Value, value))
-        .expect("a claim's fields")
-}
-
-/// A withdrawal's fields: `slot`, and no value.
-fn unsay(slot: &str) -> Fields {
-    Fields::new().tok(Key::Field, slot).expect("a slot")
-}
-
-/// A `desc` mark by `by` (observed at `src`) on `node`, at `ms`.
-fn desc(log: &mut Log, by: Actor, src: Src, node: Node, f: Fields, ms: u64) -> u64 {
-    log.mark(
-        Mark::new(Kind::Desc, src, Conf::Claim)
-            .by(by)
-            .at(node)
-            .fields(f),
-        at(ms),
-    )
-    .expect("a desc mark")
-}
-
-/// A writer aterm ran, naming itself `name`, says `slot` of `node` is `value`.
-fn writer(log: &mut Log, name: &str, node: Node, slot: &str, value: &str, ms: u64) -> u64 {
-    let f = say(slot, value).text(Key::As, name).expect("as=");
-    desc(log, Actor::Aterm, Src::Mark, node, f, ms)
-}
-
-fn sid(s: &str) -> ShortId {
-    ShortId::new(s).expect("a sid")
-}
-
-/// The text and rank of the claim a reader is shown for `slot`, `ms` into the test.
-fn stands<'a>(log: &'a Log, slot: &str, ms: u64) -> Option<(&'a str, Rank)> {
-    shown(log.state(), slot, WALL0 + ms).map(|s| (s.claim.value.as_str(), s.rank))
-}
-
-/// Every claim, as `described` lists it, `ms` into the test.
-fn listing(log: &Log, ms: u64) -> Vec<DescRow<'_>> {
-    log.state().desc.listing(WALL0 + ms)
-}
-
-/// A turn of `run` that opens at `ms` and closes a millisecond later; the close's seq.
-fn turn(log: &mut Log, run: Node, ms: u64) -> u64 {
-    let t = log
-        .open(
-            Open::new(Kind::Turn, Src::Screen, Conf::Strong).under(run),
-            at(ms),
-        )
-        .expect("a turn opens");
-    log.close(
-        t,
-        Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong),
-        at(ms + 1),
-    )
-    .expect("the turn closes")
-}
-
-/// Another agent run under the session.
-fn agent(log: &mut Log, ms: u64) -> Node {
-    log.open(
-        Open::new(Kind::Agent, Src::Status, Conf::Strong).under(Node::SESSION),
-        at(ms),
-    )
-    .expect("an agent run opens")
-}
 
 /// A person's title stands over a control client's, whichever was written last: the client's claim
 /// is recorded and listed under the person's, and takes nothing from it. CONTROL: once the person
-/// withdraws their own, the same ctl claim stands.
+/// has cleared the slot, the same ctl claim written again stands.
 #[test]
 fn a_ctl_title_does_not_replace_a_persons() {
     let mut log = Log::new(1);
@@ -128,7 +60,20 @@ fn a_ctl_title_does_not_replace_a_persons() {
         40,
     );
     assert_eq!(
-        stands(&log, "title", 50),
+        stands(&log, "title", 45),
+        None,
+        "a person's withdrawal clears the slot: the script's title goes with their own"
+    );
+    desc(
+        &mut log,
+        Actor::Ctl,
+        Src::Mark,
+        Node::SESSION,
+        say("title", ctl),
+        50,
+    );
+    assert_eq!(
+        stands(&log, "title", 55),
         Some((ctl, Rank::Ctl)),
         "CONTROL: with no person's claim above it the ctl title stands"
     );
@@ -403,8 +348,9 @@ fn a_claim_on_a_turn_describes_its_agent_and_a_tie_goes_to_the_session() {
     );
 }
 
-/// A withdrawal (a `desc` mark with no value) removes its own author's claim and nobody else's:
-/// a control client cannot clear a person's title. CONTROL: the person's own withdrawal does.
+/// A withdrawal (a `desc` mark with no value) by anyone but a person removes its own author's
+/// claim and nobody else's: a control client cannot clear a person's title. CONTROL: the person's
+/// own withdrawal does.
 #[test]
 fn a_withdrawal_removes_only_its_authors_claim() {
     let mut log = Log::new(1);
@@ -441,6 +387,185 @@ fn a_withdrawal_removes_only_its_authors_claim() {
     assert!(
         authors(&log).is_empty() && stands(&log, "title", 100).is_none(),
         "CONTROL: its own author withdraws it"
+    );
+}
+
+/// Eight authors' titles on the session, one of each rank a claim can have: a person's, the
+/// harness's (program), the creator's (a session the log is told created this one), a writer's
+/// aterm ran, a control client's, a program's own in-band title, aterm's derived one, and
+/// another session's (listed). Returns the next free millisecond.
+fn a_title_of_every_rank(log: &mut Log) -> u64 {
+    let creator = sid("s-bbbbbbbbbbbbbbbbbbbb");
+    let peer = sid("s-cccccccccccccccccccc");
+    log.set_desc_ident(None, Some(creator));
+    let mark = |log: &mut Log, by: Actor, value: &str, ms: u64| {
+        desc(log, by, Src::Mark, Node::SESSION, say("title", value), ms)
+    };
+    mark(log, Actor::Human, "a person's", 10);
+    mark(log, Actor::Harness, "the program's", 11);
+    mark(log, Actor::Sid(creator), "its creator's", 12);
+    writer(log, "namer", Node::SESSION, "title", "a writer's", 13);
+    mark(log, Actor::Ctl, "a script's", 14);
+    let inband = Fields::new()
+        .tok(Key::Field, "title")
+        .and_then(|f| f.text(Key::Title, "vim README.md"))
+        .expect("an in-band title");
+    desc(log, Actor::Nobody, Src::Engine, Node::SESSION, inband, 15);
+    let derived = say("title", "derived from the command");
+    desc(log, Actor::Aterm, Src::Aterm, Node::SESSION, derived, 16);
+    mark(log, Actor::Sid(peer), "another session's", 17);
+    18
+}
+
+/// The ranks of the session's `title` claims, best first.
+fn title_ranks(log: &Log) -> Vec<Rank> {
+    listing(log, 100).iter().map(|r| r.rank).collect()
+}
+
+/// A person's withdrawal clears the slot of every claim somebody put on it (the person's own, the
+/// program's, the creator's, a writer's, a control client's, another session's) and leaves the
+/// two aterm observes or derives itself: the program's in-band title and the derived value. It
+/// clears a control client's title even where the person holds no claim of their own. CONTROL:
+/// before the withdrawal all eight are held, and the person's claim stood.
+#[test]
+fn a_persons_withdrawal_clears_what_others_put_on_the_slot() {
+    let mut log = Log::new(1);
+    agent_session(&mut log, 0);
+    let next = a_title_of_every_rank(&mut log);
+    assert_eq!(
+        title_ranks(&log),
+        [
+            Rank::Person,
+            Rank::Program,
+            Rank::Creator,
+            Rank::Writer,
+            Rank::Ctl,
+            Rank::Inband,
+            Rank::Derived,
+            Rank::Listed,
+        ],
+        "CONTROL: every author's claim is held"
+    );
+    assert_eq!(stands(&log, "title", 100).map(|s| s.1), Some(Rank::Person));
+    let withdraws = |log: &Log, by: Actor| {
+        let d = &log.state().desc;
+        d.withdraws(Node::SESSION, "title", by, Src::Mark, None)
+    };
+    assert!(withdraws(&log, Actor::Human));
+    let human = Actor::Human;
+    desc(
+        &mut log,
+        human,
+        Src::Mark,
+        Node::SESSION,
+        unsay("title"),
+        next,
+    );
+    assert_eq!(
+        title_ranks(&log),
+        [Rank::Inband, Rank::Derived],
+        "what aterm observes of the program and its own default stay"
+    );
+    assert_eq!(
+        stands(&log, "title", 100),
+        Some(("vim README.md", Rank::Inband))
+    );
+    assert!(
+        !withdraws(&log, Actor::Human),
+        "a second withdrawal would remove nothing"
+    );
+    let say_ctl = say("title", "a script's, again");
+    desc(
+        &mut log,
+        Actor::Ctl,
+        Src::Mark,
+        Node::SESSION,
+        say_ctl,
+        next + 1,
+    );
+    assert_eq!(
+        stands(&log, "title", 100),
+        Some(("a script's, again", Rank::Ctl))
+    );
+    assert!(
+        withdraws(&log, Actor::Human),
+        "the person holds no claim, and their withdrawal would still clear the script's"
+    );
+    let at_ms = next + 2;
+    desc(
+        &mut log,
+        human,
+        Src::Mark,
+        Node::SESSION,
+        unsay("title"),
+        at_ms,
+    );
+    assert_eq!(title_ranks(&log), [Rank::Inband, Rank::Derived]);
+}
+
+/// A control client's withdrawal removes its own claim and no other author's, whoever they are:
+/// not a person's, the program's, the creator's, a writer's, an in-band or derived one, or
+/// another session's. The same holds for the program's withdrawal. CONTROL: the client's own
+/// claim does go, and a person's withdrawal of the same slot removes the others (the test
+/// above).
+#[test]
+fn nobody_but_a_person_withdraws_another_authors_claim() {
+    let mut log = Log::new(1);
+    agent_session(&mut log, 0);
+    let next = a_title_of_every_rank(&mut log);
+    let ctl = Actor::Ctl;
+    desc(
+        &mut log,
+        ctl,
+        Src::Mark,
+        Node::SESSION,
+        unsay("title"),
+        next,
+    );
+    assert_eq!(
+        title_ranks(&log),
+        [
+            Rank::Person,
+            Rank::Program,
+            Rank::Creator,
+            Rank::Writer,
+            Rank::Inband,
+            Rank::Derived,
+            Rank::Listed,
+        ],
+        "CONTROL: the client's own claim went, and only it"
+    );
+    let harness = Actor::Harness;
+    let at_ms = next + 1;
+    desc(
+        &mut log,
+        harness,
+        Src::Mark,
+        Node::SESSION,
+        unsay("title"),
+        at_ms,
+    );
+    assert_eq!(
+        title_ranks(&log),
+        [
+            Rank::Person,
+            Rank::Creator,
+            Rank::Writer,
+            Rank::Inband,
+            Rank::Derived,
+            Rank::Listed,
+        ],
+        "the program takes back its own"
+    );
+    assert_eq!(
+        stands(&log, "title", 100),
+        Some(("a person's", Rank::Person)),
+        "the person's claim stands through both"
+    );
+    let d = &log.state().desc;
+    assert!(
+        !d.withdraws(Node::SESSION, "title", ctl, Src::Mark, None),
+        "a client that holds no claim would remove nothing"
     );
 }
 
@@ -876,11 +1001,14 @@ fn an_unknown_slot_is_listed_and_a_ninth_is_dropped_and_counted() {
     );
 }
 
-/// The store is bounded however many claims are written: at most three agents beside the session
-/// (a fourth agent's first claim drops the oldest agent's claims and counts it), ten slots a
-/// subject and eight claims a slot, and the fold's footprint charges exactly the store's heap,
-/// which stays under the declared bound. CONTROL: with every claim at its longest the heap comes
-/// within a kilobyte of that bound, so the bound is the arithmetic and not slack.
+/// The store is bounded however many claims and lines are written: at most three agents beside
+/// the session (a fourth agent's first claim drops the oldest agent's claims and counts it),
+/// fourteen slots a subject (the six known ones and eight others), eight claims a slot and
+/// sixteen history lines, and the fold's footprint charges exactly the store's heap, which stays
+/// under the declared bound. `done` is claimed by other sessions (aterm's writers may not hold
+/// one) and `package` by four ids of 25 characters. CONTROL: with every claim and line at its
+/// longest the heap comes within a kilobyte of that bound, so the bound is the arithmetic and not
+/// slack.
 #[test]
 fn the_store_is_bounded_and_the_fold_charges_its_heap() {
     let mut log = Log::new(1);
@@ -888,22 +1016,48 @@ fn the_store_is_bounded_and_the_fold_charges_its_heap() {
     for i in 0..DESC_AGENTS {
         agents.push(agent(&mut log, 1 + i as u64));
     }
-    let empty = log.fold().footprint();
     assert_eq!(
         log.state().desc.heap(),
         0,
         "CONTROL: an empty store is free"
     );
-    let mut slots = vec!["title".to_string(), "description".to_string()];
+    // A turn has closed before anything is measured, so the rest of the fold holds the newest
+    // closed turn throughout and only the store grows.
+    turn(&mut log, agents[1], 5);
+    let (empty, ring) = (log.fold().footprint(), log.state().desc.heap());
+    let mut slots: Vec<String> = KNOWN_SLOTS.iter().map(|s| (*s).to_string()).collect();
     slots.extend((0..=DESC_UNKNOWN_SLOTS).map(|i| format!("{i}{}", "x".repeat(23))));
     let value = "v".repeat(256);
+    let package = ["AAAAAAAA", "BBBBBBBB", "CCCCCCCC", "DDDDDDDD"]
+        .map(|p| format!("{p}-{}", "0123456789abcdef"))
+        .join(",");
+    assert_eq!(package.len(), 103);
     let mut ms = 10;
     for scope in std::iter::once(Node::SESSION).chain(agents.iter().copied()) {
         for slot in &slots {
             for author in 0..=DESC_CLAIMS {
                 ms += 1;
                 let name = format!("{author}{}", "n".repeat(39));
-                writer(&mut log, &name, scope, slot, &value, ms);
+                let text = if slot == "package" { &package } else { &value };
+                if slot == "done" {
+                    let peer = sid(&format!("s-{author:0>20}"));
+                    let f = say(slot, text).text(Key::As, &name).expect("as=");
+                    desc(&mut log, Actor::Sid(peer), Src::Mark, scope, f, ms);
+                } else {
+                    writer(&mut log, &name, scope, slot, text, ms);
+                }
+            }
+        }
+    }
+    let name = "n".repeat(40);
+    for _ in 0..=DESC_HISTORY {
+        for run in &agents[1..] {
+            ms += 2;
+            turn(&mut log, *run, ms);
+            for scope in [Node::SESSION, *run] {
+                ms += 1;
+                let f = say("history", &value).text(Key::As, &name).expect("as=");
+                desc(&mut log, Actor::Aterm, Src::Mark, scope, f, ms);
             }
         }
     }
@@ -915,28 +1069,33 @@ fn the_store_is_bounded_and_the_fold_charges_its_heap() {
         assert_eq!(
             (sub.slots.len(), sub.dropped_slots),
             (DESC_SLOTS, 1 + DESC_CLAIMS as u32),
-            "{}: ten slots, and the eleventh's nine claims counted",
+            "{}: fourteen slots, and the fifteenth's nine claims counted",
             sub.node
         );
         for slot in &sub.slots {
             assert_eq!((slot.claims.len(), slot.dropped), (DESC_CLAIMS, 1));
         }
+        assert_eq!(sub.history.len(), DESC_HISTORY, "{}", sub.node);
+        assert!(sub.lines_older > 0, "{}: older lines counted", sub.node);
     }
     assert!(d.heap() <= DESC_HEAP_BYTES, "{} B", d.heap());
     assert!(DESC_HEAP_BYTES - d.heap() < 1024, "{} B", d.heap());
-    assert_eq!(log.fold().footprint() - empty, d.heap());
+    assert_eq!(log.fold().footprint() - empty, d.heap() - ring);
 }
 
 /// A fold with claims crosses a snapshot whole: every claim with its author, source, `as=`, `re=`,
-/// its incumbent and how far behind it is, so the fold reads the same after it and folds on the
-/// same. The host names the session again afterwards, and the two agree then too. A program's own
-/// title (content tier) is never written: neither the snapshot nor a carry's records hold its
-/// text. CONTROL: a host-tier claim's text is in the carry.
+/// its incumbent and how far behind it is, so the fold read as the session the host named before
+/// anyone described it reads the same after it and folds on the same. The host names the session
+/// again afterwards, and nothing moves. A program's own title (content tier) is never written:
+/// neither the snapshot nor a carry's records hold its text. CONTROL: a host-tier claim's text is
+/// in the carry.
 #[test]
 fn a_carry_round_trips_claims_with_their_authors_and_no_content_text() {
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let peer = sid("s-0123456789abcdef0123");
+    log.set_desc_ident(Some(peer), None);
+    let ident = *log.state().desc.ident();
     for (i, by) in [Actor::Human, Actor::Ctl, Actor::Sid(peer)]
         .into_iter()
         .enumerate()
@@ -962,7 +1121,7 @@ fn a_carry_round_trips_claims_with_their_authors_and_no_content_text() {
     );
     let snap = log.fold().snapshot();
     let refs: Vec<&str> = snap.iter().map(String::as_str).collect();
-    let mut back = Fold::from_snapshot(&refs).expect("the snapshot reads");
+    let mut back = Fold::from_snapshot_as(&refs, ident).expect("the snapshot reads");
     assert_eq!(back.state(), log.state(), "the state as it stood");
     assert_eq!(back.snapshot(), snap, "and it writes the same lines");
     let authors = |d: &aterm_slog::Described| -> Vec<(Node, String, Actor, Option<u32>)> {
@@ -972,9 +1131,8 @@ fn a_carry_round_trips_claims_with_their_authors_and_no_content_text() {
             .collect()
     };
     assert_eq!(authors(&back.state().desc).len(), 5);
-    log.set_desc_ident(Some(peer), None);
     back.set_desc_ident(Some(peer), None);
-    assert_eq!(back.state(), log.state(), "named again, they agree");
+    assert_eq!(back.state(), log.state(), "named again, nothing moves");
     let from = log.last_seq();
     turn(&mut log, run, 60);
     writer(&mut log, "planner", run, "description", "next", 70);
@@ -1013,8 +1171,7 @@ fn a_carry_round_trips_claims_with_their_authors_and_no_content_text() {
     );
     let snap = log.fold().snapshot();
     let refs: Vec<&str> = snap.iter().map(String::as_str).collect();
-    let mut back = Fold::from_snapshot(&refs).expect("the snapshot reads");
-    back.set_desc_ident(Some(peer), None);
+    let back = Fold::from_snapshot_as(&refs, ident).expect("the snapshot reads");
     let mut want = authors(&log.state().desc);
     want.retain(|(_, _, by, _)| *by != Actor::Nobody);
     assert_eq!(
@@ -1080,4 +1237,98 @@ fn a_carry_leaves_out_what_does_not_fit_and_counts_it() {
             "{slot}: the same claim stands"
         );
     }
+}
+
+/// IN-BAND BYTES CARRY A TITLE ONLY: a `desc` aterm read off what a program printed (no author,
+/// `src=engine`) of any slot but `title` is refused by the log, whether its text is a `title=` or
+/// a `value=`, and nothing is appended; the same records applied to a fold directly (as a journal
+/// an earlier build wrote would hold them) are not stored and are counted, and the count crosses
+/// a carry. Its `title` is stored, at the in-band rank, with its text at the content tier.
+/// CONTROL: the same `description` from a control client is stored and stands.
+#[test]
+fn an_in_band_claim_of_any_slot_but_the_title_is_dropped_and_counted() {
+    let mut log = Log::new(1);
+    agent_session(&mut log, 0);
+    let printed = |slot: &str, key: Key| {
+        Fields::new()
+            .tok(Key::Field, slot)
+            .and_then(|f| f.text(key, "what a printed file says"))
+            .expect("an in-band claim")
+    };
+    let records = [
+        printed("description", Key::Title),
+        printed("description", Key::Value),
+        printed("summary", Key::Title),
+    ];
+    let before = log.last_seq();
+    let mut fold = log.fold().clone();
+    for (i, f) in records.into_iter().enumerate() {
+        let refused = log.mark(
+            Mark::new(Kind::Desc, Src::Engine, Conf::Claim)
+                .by(Actor::Nobody)
+                .at(Node::SESSION)
+                .fields(f.clone()),
+            at(10 + i as u64),
+        );
+        assert_eq!(refused, Err(Refused::Claim(ClaimRefused::InBand)));
+        fold.apply(&Rec {
+            seq: before + 1 + i as u64,
+            t: WALL0 + 10 + i as u64,
+            op: aterm_slog::Op::Mark,
+            node: Node::SESSION,
+            par: None,
+            k: Kind::Desc,
+            src: Src::Engine,
+            conf: Conf::Claim,
+            by: Actor::Nobody,
+            f,
+        });
+    }
+    assert_eq!(log.last_seq(), before, "the log appended nothing");
+    assert!(listing(&log, 20).is_empty(), "{:?}", listing(&log, 20));
+    assert!(fold.state().desc.listing(WALL0 + 20).is_empty());
+    assert_eq!(fold.state().desc.refused(), 3);
+    let snap = fold.snapshot();
+    assert!(
+        snap.iter()
+            .any(|l| l.starts_with("fold desc-sub - ") && l.contains(" refused=3")),
+        "{snap:?}"
+    );
+    let refs: Vec<&str> = snap.iter().map(String::as_str).collect();
+    let back = Fold::from_snapshot(&refs).expect("the snapshot reads");
+    assert_eq!(back.state().desc.refused(), 3, "the count crosses");
+    desc(
+        &mut log,
+        Actor::Nobody,
+        Src::Engine,
+        Node::SESSION,
+        printed("title", Key::Title),
+        30,
+    );
+    let rows = listing(&log, 40);
+    assert!(
+        rows.len() == 1
+            && rows[0].slot == "title"
+            && rows[0].rank == Rank::Inband
+            && rows[0].claim.content,
+        "the title is the in-band claim it may be: {rows:?}"
+    );
+    desc(
+        &mut log,
+        Actor::Ctl,
+        Src::Mark,
+        Node::SESSION,
+        say("description", "what a printed file says"),
+        50,
+    );
+    assert_eq!(
+        stands(&log, "description", 60),
+        Some(("what a printed file says", Rank::Ctl)),
+        "CONTROL: a control client's description is stored"
+    );
+    assert_eq!(
+        log.state().desc.refused(),
+        0,
+        "the log refused, so the fold saw nothing"
+    );
 }

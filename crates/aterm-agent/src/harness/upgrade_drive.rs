@@ -2681,6 +2681,14 @@ fn legacy_build_version(build_dir: &Path, build: u64) -> Option<String> {
         .map(|version| version.to_string())
 }
 
+/// The Claude Code build process `pid` runs, by its executable ([`claude_build_version`]): what a
+/// wall door holds against the build `lab claude-wall-panel` measured
+/// ([`super::accounts::wall_read_due`]). `None` where the executable names no build.
+#[must_use]
+pub fn claude_build_of(pid: u32) -> Option<String> {
+    claude_build_version(&exe_of(pid)?).map(|version| version.to_string())
+}
+
 /// The build `sf`'s session runs: the version its record names, and for a record that names
 /// none readable, the build its process's executable is ([`claude_build_version`]).
 pub(super) fn running_version(sf: &SessionFile) -> Option<Version> {

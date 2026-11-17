@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 
 /// A window that draws the deck, a stand-in probe thread, and a network source that publishes a
 /// new revision at every read (`stopped` holds it at the last one, `busy` makes it answer
-/// nothing), observed at the wall clock's now.
+/// nothing). The `n`th read is observed `n` ms after a second before the rig was made: always in
+/// the wall clock's past and fresh, and one millisecond later at each read, so every read moves
+/// what the band draws (the network), however close together the wall clock puts two reads.
 struct Rig {
     app: crate::App,
     wid: crate::WindowId,
@@ -36,6 +38,9 @@ impl Rig {
         let busy = Arc::new(AtomicBool::new(false));
         let (count, stop, hold) = (reads.clone(), stopped.clone(), busy.clone());
         let published = std::sync::Mutex::new(inactive_snapshot());
+        let first_ms = aterm_time::unix_millis()
+            .expect("a wall clock")
+            .saturating_sub(1_000);
         app.network_source = Some(Arc::new(move |_| {
             let n = count.fetch_add(1, Ordering::SeqCst) + 1;
             if hold.load(Ordering::SeqCst) {
@@ -48,7 +53,7 @@ impl Rig {
                     ..Default::default()
                 };
                 next.network.visibility = Visibility::Active;
-                next.network.observed_at_ms = aterm_time::unix_millis().expect("a wall clock");
+                next.network.observed_at_ms = first_ms + n;
                 *published = Arc::new(next);
             }
             Some(published.clone())
@@ -208,6 +213,41 @@ fn a_reading_that_never_lands_holds_the_band_back_one_period() {
     assert!(!rig.app.network_ride.owes());
 }
 
+/// A change the ride holds keeps whether it moved the band: where its reading does not land and
+/// the next ask reads nothing new, that ask's own frame still reaches the window that draws the
+/// band, though nothing it read moved the band.
+///
+/// NEGATIVE CONTROL, run: with `band_asked` in `service_network_state_at` left at
+/// `band_moved || field_moved` (no `band_owed`), this fails at "the held band change is drawn"
+/// (left `frames`, right `frames + 1`).
+#[test]
+fn a_held_band_change_is_drawn_at_the_next_ask_though_that_ask_read_nothing_new() {
+    let mut rig = Rig::new(false);
+    rig.start();
+    let frames = rig.frames_asked();
+    rig.ask();
+    assert_eq!(
+        rig.frames_asked(),
+        frames,
+        "the change waits for its reading"
+    );
+    rig.stopped.store(true, Ordering::SeqCst);
+    let revision = rig.app.network_snapshot.revision;
+    let reads = rig.reads();
+    rig.ask();
+    assert_eq!(rig.reads(), reads + 1, "the second ask polled");
+    assert_eq!(
+        rig.app.network_snapshot.revision, revision,
+        "and read nothing new"
+    );
+    assert_eq!(
+        rig.frames_asked(),
+        frames + 1,
+        "the held band change is drawn"
+    );
+    assert!(!rig.app.network_ride.owes());
+}
+
 /// While the observer republishes, the ride's deadline is the adopted observation's expiry,
 /// later than the next ask; a read that finds the reader busy arms one retry a second on,
 /// which draws what it reads at once, and a second busy read arms none.
@@ -254,7 +294,58 @@ fn the_ride_keeps_the_expiry_edge_and_one_retry_after_a_busy_read() {
         None,
         "a second busy read arms nothing: the next reading's ask reads again"
     );
-    let _ = rig.stopped.load(Ordering::SeqCst);
+}
+
+/// The band's own frame (here the first poll's, asked at once) is asked of the window on screen
+/// that draws the deck and of no window that is covered, though it carries the band too or its
+/// lens shows Network State, as the reading's frame is: a covered window draws what it shows
+/// once it shows again.
+///
+/// Negative control, run once by hand and restored by copy: the band's frame loop in
+/// `service_network_state` without its skip of an occluded window fails "the covered window is
+/// asked no frame, nor the covered window whose lens shows Network State" (left `[1, 1]`, right
+/// `[0, 0]`).
+#[test]
+fn the_bands_own_frame_skips_a_covered_window() {
+    let mut rig = Rig::new(false);
+    let (covered, lensed) = (crate::WindowId(1), crate::WindowId(2));
+    for (wid, session) in [(covered, 92), (lensed, 93)] {
+        rig.app
+            .install_window_state(wid, crate::stub_session(session), 24, 80);
+        let mut ws = rig.app.windows.get_mut(&wid).expect("the covered window");
+        ws.occluded = true;
+        if wid == covered {
+            ws.carries_band = true;
+        } else {
+            ws.stats_lens.open = Some(crate::stats_lens::Lens {
+                focus: crate::stats_paint::Instrument::NetworkState,
+                bar: crate::stats_paint::Bar::Global,
+                how: crate::stats_lens::Opened::Pinned,
+            });
+        }
+    }
+    assert!(
+        rig.app.window_bars(covered) == crate::stats_deck::StatsBars::Deck
+            && crate::stats_deck::stats_drawn_on(&rig.app.windows[&covered]),
+        "CONTROL: the covered window draws the deck"
+    );
+    let frames = |rig: &Rig, wid| rig.app.windows[&wid].redraw_requests_for_test.get();
+    let t0 = Instant::now();
+    rig.app.service_vitals(t0);
+    let before = [rig.wid, covered, lensed].map(|wid| frames(&rig, wid));
+    rig.app.service_network_state(t0);
+    assert_eq!(rig.reads(), 1, "the first turn polls at once");
+    assert_eq!(
+        frames(&rig, rig.wid),
+        before[0] + 1,
+        "the window on screen draws the band"
+    );
+    assert_eq!(
+        [frames(&rig, covered), frames(&rig, lensed)],
+        [before[1], before[2]],
+        "the covered window is asked no frame, nor the covered window whose lens shows Network \
+         State"
+    );
 }
 
 /// [`next_expiry`] names the first millisecond at which [`fresh_snapshot`] changes what it left

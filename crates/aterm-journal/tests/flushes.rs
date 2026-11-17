@@ -6,7 +6,7 @@
 //! reading is taken. The binary takes the full flushes aterm ships (`F_FULLFSYNC` on Apple),
 //! whatever test mark it inherits, so a timing here is never a test's plain `fsync(2)`.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 use aterm_journal::{Limits, Log};
 use std::time::{Duration, Instant};

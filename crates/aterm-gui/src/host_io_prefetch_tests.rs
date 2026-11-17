@@ -3,6 +3,60 @@
 
 use super::*;
 
+fn reset_fetched() {
+    FETCHED.with(|slot| {
+        if let Some(fetched) = slot.get() {
+            *fetched.borrow_mut() = Fetched::default();
+        }
+    });
+}
+
+#[test]
+fn default_reads_and_empty_callbacks_leave_optional_state_unallocated() {
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let terminal = std::sync::Mutex::new(Terminal::new(4, 8));
+        let mut prefetch = Prefetch::default();
+        assert!(!Flags::of(&crate::term_lock(&terminal)).any());
+        let ((), callbacks) = aterm_heap_count::allocations_in(|| {
+            assert!(take_clipboard_query().is_none());
+            assert!(take_kitty_medium(KittyMedium::TempFile, "/not-requested").is_none());
+        });
+        let slices: &[&[u8]] = &[
+            b"agent output",
+            b"\x1b]52;c;?\x07",
+            b"\x1b_Ga=T,t=f;L3RtcC9ub3Q=\x1b\\",
+        ];
+        let ((), reads) = aterm_heap_count::allocations_in(|| {
+            for _ in 0..32 {
+                for slice in slices {
+                    let fetched = prefetch.reads(&terminal, slice);
+                    assert_eq!(fetched.covered(), slice.len());
+                    drop(fetched);
+                    prefetch.held(&crate::term_lock(&terminal));
+                }
+            }
+        });
+        let absent = FETCHED.with(|slot| slot.get().is_none());
+        send.send((callbacks, reads, absent)).unwrap();
+    });
+    let (callbacks, reads, absent) = receive
+        .recv_timeout(std::time::Duration::from_secs(60))
+        .expect("default-reader thread hang detector");
+    worker.join().unwrap();
+    assert_eq!(callbacks, 0, "empty callbacks need no prefetch state");
+    assert_eq!(
+        reads, 0,
+        "neither first nor repeated disabled reads allocate"
+    );
+    assert!(absent);
+    assert_eq!(
+        size_of::<OnceCell<Box<RefCell<Fetched>>>>(),
+        size_of::<usize>(),
+        "optional state must not grow the per-thread template"
+    );
+}
+
 /// The reads one slice makes through counting readers, and what the
 /// engine can take of them: (pasteboard reads, queries answered, medium
 /// reads by name).
@@ -71,6 +125,35 @@ fn a_burst_is_read_for_the_requests_the_engine_will_make() {
             (first.1 + second.1, [first.2, second.2].concat()),
             (2, vec!["/tmp/a.png".to_string()]),
             "cut at {cut}"
+        );
+    }
+}
+
+#[test]
+fn disabling_prefetch_discards_the_carried_request_before_reenable() {
+    for (whole, expected) in [
+        (
+            file("a=T,f=100,t=f", "/tmp/admitted.png"),
+            (0, 0, vec!["/tmp/admitted.png".to_string()]),
+        ),
+        (b"\x1b]52;c;?\x07".to_vec(), (1, 1, Vec::new())),
+    ] {
+        reset_fetched();
+        let (head, tail) = whole.split_at(whole.len() / 2);
+        assert_eq!(reads(head, ALL), (0, 0, Vec::new()));
+        assert_eq!(reads(tail, ALL), expected, "an admitted split completes");
+
+        assert_eq!(reads(head, ALL), (0, 0, Vec::new()));
+        assert_eq!(reads(b"gap", Flags::default()), (0, 0, Vec::new()));
+        assert_eq!(
+            reads(tail, ALL),
+            (0, 0, Vec::new()),
+            "a disabled slice revokes the earlier carried request"
+        );
+        assert_eq!(
+            reads(&whole, ALL),
+            expected,
+            "new admitted requests still work"
         );
     }
 }
@@ -203,7 +286,7 @@ struct Ingested {
 fn ingest(parts: &[&[u8]], flags: Flags) -> Ingested {
     use aterm_core::terminal::kitty_graphics::take_kitty_payload_decodes_for_test;
 
-    FETCHED.with(|fetched| *fetched.borrow_mut() = Fetched::default());
+    reset_fetched();
     let mut terminal = Terminal::new(4, 8);
     terminal.set_cell_pixel_size(10, 20);
     terminal.set_kitty_file_resolver(take_kitty_medium);
@@ -244,7 +327,7 @@ fn ingest(parts: &[&[u8]], flags: Flags) -> Ingested {
 fn ingest_inline_as_reader(parts: &[&[u8]], enabled: bool) -> Ingested {
     use aterm_core::terminal::kitty_graphics::take_kitty_payload_decodes_for_test;
 
-    FETCHED.with(|fetched| *fetched.borrow_mut() = Fetched::default());
+    reset_fetched();
     let term = std::sync::Mutex::new(Terminal::new(4, 8));
     {
         let mut terminal = crate::term_lock(&term);

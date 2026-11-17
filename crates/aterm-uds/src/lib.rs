@@ -398,8 +398,8 @@ pub mod backup;
 pub mod atomic_file;
 pub mod quiet_state;
 
-/// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with.
-#[cfg(unix)]
+/// This account's own home as the account database has it ([`account::home`]), whatever `$HOME` says: what a launchd job of this login runs with; on Windows the user's profile folder, whatever `USERPROFILE` says.
+#[cfg(any(unix, windows))]
 pub mod account;
 
 /// Test support (test and debug builds, macOS and Linux): the call a thread of this process sleeps in, as the kernel has it ([`asleep::asleep`]), which tells a thread queued for a file lock (`flock(2)`) from one that polls.
@@ -441,6 +441,9 @@ pub mod file_lock;
 /// Path-aware file events, with optional debounce and content-stamp filtering.
 pub mod file_watch;
 
+/// Windows security descriptors, aterm-dirfd's (whose handle-relative creates make owner-only files and folders with them): this token's accounts, a protected access list built from the accounts a caller names, files and folders made with a descriptor at their creation, and the owner-only verdict [`private_file`] holds them to.
+#[cfg(windows)]
+pub use aterm_dirfd::acl;
 /// Descriptor-pinned app-image cloning and confined filesystem seals.
 #[cfg(unix)]
 pub mod app_image;
@@ -486,8 +489,8 @@ pub mod partition;
 pub mod peer;
 /// This Mac's sleep and wake as the system announces them (`IORegisterForSystemPower`), each handed to a handler on a thread of its own and a will-sleep acknowledged once the handler returned; elsewhere nothing is heard.
 pub mod power;
-/// Unix-only: strict private files, the user's own regular file directly in the user's own 0700 directory, with no second link, no symlink and no ACL grant (lifted from aterm-net's `fleet_member`).
-#[cfg(unix)]
+/// Strict private files, the user's own regular file directly in the user's own private directory, with no second link and no link at all (lifted from aterm-net's `fleet_member`): on Unix a 0700 directory and a 0600 file with no ACL grant; on Windows a folder and a file of the token user's under a protected access list of the user and SYSTEM alone, given at creation, and no reparse point.
+#[cfg(any(unix, windows))]
 pub mod private_file;
 /// `KERN_PROCARGS2`, a process's exec path, argument words and initial environment: the one reader ([`procargs::read`], macOS) and the one parser ([`procargs::parse`]) every crate reads it through, aterm-sysprobe's (its `kproc` reads a process with it, and this crate depends on that one).
 #[cfg(any(unix, windows))]
@@ -507,6 +510,10 @@ pub mod process;
 /// Async-signal-safe capture and off-handler process attribution.
 #[cfg(unix)]
 pub mod signal_origin;
+
+/// Windows: bytes sealed to this Windows user by DPAPI in the user's scope ([`dpapi::seal`], [`dpapi::unseal`]), and a blob this user cannot open told from a call that failed.
+#[cfg(windows)]
+pub mod dpapi;
 
 /// Atomic image-specific signalling available only from actual owned children.
 pub mod owned_signal;

@@ -190,3 +190,23 @@ fn a_layouts_shape_ignores_the_ticking_fingerprint() {
     );
     assert!(layout_shape("inspection-source scale=1.000\n").is_empty());
 }
+
+/// A LOCKUP STILL BAKING IS NOT SETTLED: the audit's `paint-lockup` line says whether the
+/// lockup's moment still waits on its images, which change no rect; its landing changes the
+/// shape too. NEGATIVE CONTROL: a lockup drawing its own moment is not pending.
+#[test]
+fn a_lockup_still_baking_is_not_settled() {
+    let audit = |drawn: &str, pending: bool| {
+        format!(
+            "paint-node key=\"system-state/progress\" kind=custom rect=0.0,0.0,10.0,10.0\n\
+             paint-lockup key=\"system-state/progress\" road=true drawn={drawn} pending={pending}\n"
+        )
+    };
+    assert!(lockup_pending(&audit("words", true)));
+    assert!(!lockup_pending(&audit("moment", false)));
+    assert_ne!(
+        layout_shape(&audit("words", true)),
+        layout_shape(&audit("moment", false))
+    );
+    assert!(!lockup_pending("paint-node key=\"x\" pending=true\n"));
+}

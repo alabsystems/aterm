@@ -1019,3 +1019,239 @@ fn bitbucket_values_mirror_the_oracle_generator() {
     assert_eq!(v("https://bitbucket.org/foo/bar"), None);
     assert_eq!(v("https://example.com/foo/downloads/x-1.2.tar.gz"), None);
 }
+
+/// r422: ElectronBuilder URL match edges, as probed
+/// against the oracle's `URL_MATCH_REGEX` (explicit
+/// only, priority 0).
+#[test]
+fn electron_builder_match_mirrors_the_oracle() {
+    let m = electron_builder_match;
+    assert!(m("https://x.io/a/b.yaml"));
+    assert!(m("https://x.io/a/b.yml?x=1"));
+    assert!(m("https://x.io/b.yml"));
+    assert!(m("https://x.io/a/b.YML"));
+    assert!(m("http://x.io/a/b.yml"));
+    assert!(!m("https://x.io/"));
+    assert!(!m("https://x.io/a/b.yml/"));
+    assert!(!m("https://x.io/a/.yml"));
+    assert!(!m("https://x.io/a/b.yml?x=1?y=2"));
+    assert!(!m("ftp://x.io/a/b.yml"));
+}
+
+/// r423: Ruby `String#tr` semantics for the ScanTr
+/// page-block shape (sets, ranges, short-to padding,
+/// empty-to deletion).
+#[test]
+fn ruby_tr_mirrors_ruby() {
+    assert_eq!(ruby_tr("1_2_3", "_", "."), "1.2.3");
+    assert_eq!(ruby_tr("1/2", "/", "."), "1.2");
+    assert_eq!(ruby_tr("2_8R1", "_R", ".r"), "2.8r1");
+    assert_eq!(ruby_tr("abc", "a-c", "x"), "xxx");
+    assert_eq!(ruby_tr("a-b", "-", "."), "a.b");
+    assert_eq!(ruby_tr("a_b", "_", ""), "ab");
+    assert_eq!(ruby_tr("hello", "el", "ip"), "hippo");
+}
+
+/// r424: `Date.parse` ("%Y%m%d") for month-name
+/// captures, calendar-validated like Ruby.
+#[test]
+fn date_ymd_mirrors_ruby_date_parse() {
+    assert_eq!(date_ymd("09Mar2016").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("March 9, 2016").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("September 30, 2024").as_deref(), Some("20240930"));
+    assert_eq!(date_ymd("2016Mar09").as_deref(), Some("20160309"));
+    assert_eq!(date_ymd("Feb 29, 2024").as_deref(), Some("20240229"));
+    assert_eq!(date_ymd("Feb 29, 2023"), None);
+    assert_eq!(date_ymd("Smarch 9, 2016"), None);
+    assert_eq!(date_ymd("March 2016"), None);
+}
+
+/// r425: the gsub/sub/reject page shapes apply like
+/// their Ruby originals.
+#[test]
+fn page_shape_gsub_sub_reject() {
+    use super::super::super::formula::PageShape;
+    let apply = |shape: &PageShape, v: &str, re: Option<&LcRegex>| page_shape_apply(shape, v, re);
+    let g = PageShape::ScanGsub("_rev_".into(), ".".into());
+    assert_eq!(apply(&g, "23_rev_9", None), Ok(Some("23.9".to_string())));
+    let sub_re = lc_regex("%2Bdbg", "i").ok();
+    let sub = PageShape::ScanSub("%2Bdbg".into(), "i".into(), "".into());
+    assert_eq!(
+        apply(&sub, "1.2%2Bdbg-3", sub_re.as_ref()),
+        Ok(Some("1.2-3".to_string()))
+    );
+    assert_eq!(
+        apply(&sub, "1.2", sub_re.as_ref()),
+        Ok(Some("1.2".to_string()))
+    );
+    let rej = PageShape::ScanRejectEq("2.22".into());
+    assert_eq!(apply(&rej, "2.22", None), Ok(None));
+    assert_eq!(apply(&rej, "2.30", None), Ok(Some("2.30".to_string())));
+}
+
+/// r426: a reduced `:github_releases` block applies
+/// its guards/source/transform over release objects.
+#[test]
+fn github_releases_block_applies() {
+    use super::super::super::formula::{GhRelBlock, GhRelSource, GhRelThen};
+    fn rel(tag: &str, name: Option<&str>, draft: bool, pre: bool) -> agh::model::ReleaseObject {
+        agh::model::ReleaseObject {
+            id: 1,
+            tag_name: tag.to_string(),
+            name: name.map(str::to_string),
+            draft,
+            prerelease: pre,
+            immutable: false,
+            target_commitish: String::new(),
+            created_at: String::new(),
+            published_at: None,
+            html_url: String::new(),
+            body: None,
+            assets: Vec::new(),
+            raw: aterm_json::Value::Null,
+        }
+    }
+    let re = lc_regex(r"^v?(\d+(?:[.-]\d+)+)$", "i").unwrap();
+    let releases = vec![
+        rel("v1-2", Some("API v1-2"), false, false),
+        rel("v1.3", Some("Tool 1.3"), false, true),
+        rel("v1.4", Some("Tool 1.4"), false, false),
+        rel("v9.9", Some("Tool 9.9"), true, false),
+    ];
+    let block = GhRelBlock {
+        skip_draft: true,
+        skip_prerelease: false,
+        name_skip: Some(("^api".into(), "i".into())),
+        source: GhRelSource::TagName,
+        then: GhRelThen::Tr("-".into(), ".".into()),
+    };
+    let found = github_releases_versions_with(
+        "https://github.com/sample/tool/releases/download/v1/tool.tgz",
+        &re,
+        Some(&block),
+        |_| Ok(releases),
+    );
+    assert!(
+        matches!(found, Found::Versions(v, _) if v == ["1.3", "1.4"]),
+        "draft skipped, prerelease kept, API-named skipped"
+    );
+    assert!(version_patch_nonzero("3.5.1"));
+    assert!(!version_patch_nonzero("3.5.0"));
+    assert!(!version_patch_nonzero("3.5"));
+}
+
+/// r427: YAML block scalars (`>-` folded appcast
+/// values) parse; clip vs strip chomping.
+#[test]
+fn yaml_block_scalars_parse() {
+    let doc = "version: 2.8.55\nfiles:\n  - url: >-\n      https://example.com/app.zip\n    size: 12\nnotes: |\n  line1\n  line2\n";
+    let root = yaml_parse(doc).unwrap();
+    let YNode::Map(entries) = &root else {
+        panic!("map root")
+    };
+    let get = |k: &str| entries.iter().find(|(ek, _)| ek == k).map(|(_, v)| v);
+    assert!(matches!(get("version"), Some(YNode::Scalar(v, _)) if v == "2.8.55"));
+    let Some(YNode::Seq(items)) = get("files") else {
+        panic!("files seq")
+    };
+    let Some(YNode::Map(first)) = items.first() else {
+        panic!("file map")
+    };
+    let url = first.iter().find(|(k, _)| k == "url").map(|(_, v)| v);
+    assert!(matches!(url, Some(YNode::Scalar(v, _)) if v == "https://example.com/app.zip"));
+    assert!(matches!(get("notes"), Some(YNode::Scalar(v, _)) if v == "line1\nline2\n"));
+}
+
+/// r428: regex-less HeaderMatch detects versions
+/// from raw header values (the oracle's
+/// `Version.parse` fallback on content-disposition
+/// and location).
+#[test]
+fn header_values_detect_versions() {
+    assert_eq!(
+        version_parse("https://downloads.example.org/gui/monero-gui-mac-armv8-v0.18.5.4.dmg")
+            .as_deref(),
+        Some("0.18.5.4")
+    );
+    // The trailing quote keeps ".tar" in the stem —
+    // the oracle detects the same string.
+    assert_eq!(
+        version_parse("attachment; filename=\"spidermonkey-140.11.0.tar.xz\"").as_deref(),
+        Some("140.11.0.tar")
+    );
+}
+
+/// r430: multi-capture extraction mirrors Ruby
+/// `scan` arrays (pythia's adjacent groups, jasp's
+/// optional nested second group).
+#[test]
+fn extract_groups_mirror_ruby_scan() {
+    let re = lc_regex(r"href=.*?pythia(\d)(\d{3})\.t", "i").unwrap();
+    assert_eq!(re.group_count, 2);
+    let m = re.whole.find("xx href=\"pythia8315.tar.gz\" yy").unwrap();
+    assert_eq!(
+        extract_groups(&re, m.as_str()),
+        vec![Some("8".to_string()), Some("315".to_string())]
+    );
+    let re = lc_regex(
+        r"href=.*?JASP[._-]v?(\d+(?:\.\d+)+)[._-]macOS[._-]arm64(?:_(\d+))?\.dmg",
+        "i",
+    )
+    .unwrap();
+    assert_eq!(re.group_count, 2);
+    let content =
+        "href=\"x/JASP-0.99.0.0-macOS-arm64.dmg\" href=\"y/JASP-0.99.1-macOS-arm64_2.dmg\"";
+    let got: Vec<Vec<Option<String>>> = re
+        .whole
+        .find_iter(content)
+        .map(|mm| extract_groups(&re, mm.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            vec![Some("0.99.0.0".to_string()), None],
+            vec![Some("0.99.1".to_string()), Some("2".to_string())],
+        ]
+    );
+}
+
+/// r430: group extraction on a page-wide match
+/// (>512 chars) finds the split Ruby's backtracking
+/// lands on, not the first version-shaped text in
+/// the match (the old re-search shortcut).
+#[test]
+fn extract_group_long_match_finds_real_split() {
+    let re = lc_regex(
+        r"href=.*?JASP[._-]v?(\d+(?:\.\d+)+)[._-]macOS[._-]arm64(?:_(\d+))?\.dmg",
+        "im",
+    )
+    .unwrap();
+    let filler = " filler 9.9 and 1.0 text".repeat(40);
+    let page =
+        format!("href=\"/x\"{filler} content=\"0.05;url=z\" JASP-0.99.0.0-MacOS-arm64.dmg end");
+    let m = re.whole.find(&page).unwrap();
+    assert!(m.as_str().len() > 512);
+    assert_eq!(
+        extract_groups(&re, m.as_str()),
+        vec![Some("0.99.0.0".to_string()), None]
+    );
+}
+
+/// r432: URI.join for directory-walk fetches.
+#[test]
+fn uri_join_directory_forms() {
+    assert_eq!(
+        uri_join("https://example.org/util-linux/", "v2.41/"),
+        "https://example.org/util-linux/v2.41/"
+    );
+    assert_eq!(
+        uri_join("https://example.org/texlive/", "2024"),
+        "https://example.org/texlive/2024"
+    );
+    assert_eq!(
+        uri_join("https://example.org/a/page.html", "b/"),
+        "https://example.org/a/b/"
+    );
+    assert_eq!(version_patch_value("4.3.2"), 2);
+    assert_eq!(version_patch_value("4.3"), 0);
+}

@@ -700,6 +700,21 @@ pub(crate) fn machine_type() -> crate::machine_type::MachineType {
     })
 }
 
+/// The firmware's BIOS vendor, manufacturer and product name as the registry keeps them
+/// ([`crate::vm_guest::vm_guest`]), each trimmed, `None` where missing or empty.
+pub(crate) fn firmware() -> Option<crate::vm_guest::Firmware> {
+    let field = |name| {
+        reg_string(BIOS_KEY, name)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+    };
+    Some(crate::vm_guest::Firmware {
+        bios_vendor: field("BIOSVendor"),
+        manufacturer: field("SystemManufacturer"),
+        product: field("SystemProductName"),
+    })
+}
+
 /// [`crate::machine_model`] on Windows: the firmware's product name as the registry keeps it.
 pub(crate) fn machine_model() -> Option<String> {
     reg_string(BIOS_KEY, "SystemProductName")

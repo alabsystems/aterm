@@ -45,6 +45,10 @@ pub const HELD: u8 = 75;
 /// The runner ran without failure but admitted work still waits on a precondition or readback.
 pub const UNFINISHED: u8 = 76;
 
+/// A pass has unfinished work whose standing cause requires an input change.
+/// Its starter keeps the work owed without scheduling a retry on the clock.
+pub const STANDING: u8 = 78;
+
 /// The vault subscriber's `--trigger` word (`aterm_machines::sync::Trigger::Subscriber`).
 pub const SUBSCRIBER: &str = "subscriber";
 
@@ -161,6 +165,8 @@ pub enum Last {
     Ended,
     /// It ran without failure, with admitted work still unfinished ([`UNFINISHED`]).
     Unfinished,
+    /// Its unfinished work waits for an input change ([`STANDING`]), not a clock retry.
+    Standing,
     /// It exited unsuccessfully (exit [`HELD`] included), or ended by a signal.
     Failed,
     /// It ran nothing: another owner held what it needs, and it is owed again without spending
@@ -180,6 +186,7 @@ impl Last {
         let last = match child.try_wait() {
             Ok(None) | Err(_) => Self::Running,
             Ok(Some(status)) if status.code() == Some(i32::from(UNFINISHED)) => Self::Unfinished,
+            Ok(Some(status)) if status.code() == Some(i32::from(STANDING)) => Self::Standing,
             Ok(Some(status)) if status.success() => Self::Ended,
             Ok(Some(_)) => Self::Failed,
         };
@@ -207,7 +214,7 @@ impl RunnerRetry {
                 self.at = Some(now_ms.saturating_add(pause));
                 self.delay = pause.saturating_mul(2).min(LONGEST_RETRY_MS);
             }
-            Last::Ended => {
+            Last::Ended | Last::Standing => {
                 self.at = None;
                 self.delay = 0;
             }
@@ -246,8 +253,8 @@ impl RunnerRetry {
 /// runner at a time: a start that comes due while the last one runs, waiting for the lock
 /// another pass holds included, is owed to the round after its end, so a version that moved
 /// something during a pass is never left to the next recheck. An unfinished or failed runner
-/// retries on a bounded backoff; every time here is elapsed milliseconds on the subscriber's
-/// monotonic clock.
+/// retries on a bounded backoff; a standing result retains its work without a deadline until
+/// an input moves. Every time here is elapsed milliseconds on the subscriber's monotonic clock.
 #[derive(Debug, Default)]
 pub struct Due {
     /// The last refresh boundary's local start and remaining wait. A shared
@@ -272,6 +279,13 @@ pub struct Due {
     observed: RefreshObservation,
     /// A pass failed since the last healthy one ([`Due::failed`]).
     failing: bool,
+    /// The owned pass stopped on standing inputs. Neither backoff nor periodic refresh
+    /// starts it again until a request, identity transition or route change is observed.
+    parked: bool,
+    /// The standing pass's work, retained without a clock deadline.
+    parked_request: Option<RepositoryRequest>,
+    /// Identity debt carried by that pass is still owed when an input wakes it.
+    parked_identity: bool,
     /// Automatic work was held. Its next admitted input capture owes fresh readback.
     activation: bool,
     retry: RunnerRetry,
@@ -300,10 +314,14 @@ impl Due {
     /// When time alone next makes [`Due::poll`] start a runner, on the same clock: the kept
     /// retry, identity's own retry, or the recheck after the last refresh boundary. Every other
     /// start waits on an event its owner hears (a request, a move of routes, a runner's end).
-    /// `None` before the first start, which [`Due::at_start`] makes.
+    /// `None` before the first start, which [`Due::at_start`] makes, and while all owed work
+    /// waits for an input change.
     #[must_use]
     pub(crate) fn next_at(&self) -> Option<u64> {
-        let recheck = self.started.map(|(at, wait)| at.saturating_add(wait));
+        let recheck = self
+            .started
+            .filter(|_| !self.parked)
+            .map(|(at, wait)| at.saturating_add(wait));
         [self.retry.at, self.identity_retry.at, recheck]
             .into_iter()
             .flatten()
@@ -329,7 +347,12 @@ impl Due {
 
     /// Retain a request while the owned runner or a shared retry still holds the lane.
     pub(crate) fn request(&mut self, request: RepositoryRequest) {
-        self.pending = merge_requests(self.pending, Some(request));
+        self.pending = merge_requests(
+            merge_requests(self.parked_request.take(), self.pending),
+            Some(request),
+        );
+        self.identity_pending |= std::mem::take(&mut self.parked_identity);
+        self.parked = false;
     }
 
     /// Note `cause` for the next start's note. It changes no pacing.
@@ -477,11 +500,17 @@ impl Due {
         } else {
             last
         };
-        if self.identity_running && matches!(last, Last::Ended | Last::Failed | Last::Unfinished) {
+        if self.identity_running
+            && matches!(
+                last,
+                Last::Ended | Last::Failed | Last::Unfinished | Last::Standing
+            )
+        {
+            self.parked_identity |= last == Last::Standing;
             self.identity_running = false;
             // A late result retires only the identity that child carried. Newer input stays
             // immediately pending; otherwise its own failure retains a local retry.
-            if last == Last::Ended || !self.identity_pending {
+            if matches!(last, Last::Ended | Last::Standing) || !self.identity_pending {
                 self.identity_retry.reaped(last, now_ms);
             }
         }
@@ -496,12 +525,12 @@ impl Due {
         }
         // A started job already took its captured work from the queues. A later
         // success cannot clear retry work that arrived while that job ran.
-        if last != Last::Ended || self.retry_request.is_none() {
+        if !matches!(last, Last::Ended | Last::Standing) || self.retry_request.is_none() {
             self.retry.reaped(last, now_ms);
             match last {
                 Last::Failed => self.retry_cause = Causes::RETRY_FAILED,
                 Last::Unfinished => self.retry_cause = Causes::RETRY_UNFINISHED,
-                Last::Ended => self.retry_cause = Causes::default(),
+                Last::Ended | Last::Standing => self.retry_cause = Causes::default(),
                 Last::None | Last::Running | Last::Held => {}
             }
         }
@@ -517,6 +546,15 @@ impl Due {
                     self.acknowledged(now_ms);
                 }
             }
+            Last::Standing | Last::None | Last::Running | Last::Held => {}
+        }
+        match last {
+            Last::Standing => {
+                self.parked = true;
+                self.parked_request =
+                    merge_requests(self.parked_request, Some(self.repository_request));
+            }
+            Last::Ended | Last::Failed | Last::Unfinished => self.parked = false,
             Last::None | Last::Running | Last::Held => {}
         }
     }
@@ -548,7 +586,15 @@ impl Due {
                 self.observed.version,
             )));
         }
-        self.pending = merge_requests(self.pending, called);
+        if let Some(request) = called {
+            self.request(request);
+        }
+        // An input that arrived while the child ran remains work for its successor.
+        if self.pending.is_some() || self.identity_pending {
+            self.pending = merge_requests(self.parked_request.take(), self.pending);
+            self.identity_pending |= std::mem::take(&mut self.parked_identity);
+            self.parked = false;
+        }
         // A new Refresh supersedes retained retry inputs before acknowledgment
         // can demote it to Repair. A local Repair alone leaves that retry intact.
         if self
@@ -578,7 +624,8 @@ impl Due {
                 self.started = Some((now_ms, RECHECK_MS));
             }
         }
-        if let Some(RepositoryRequest::Refresh(request)) = self.retry_request
+        if !self.parked
+            && let Some(RepositoryRequest::Refresh(request)) = self.retry_request
             && let Some(remaining) = self.observed.retry_for(request)
         {
             self.retry.at = Some(now_ms.saturating_add(remaining));
@@ -661,6 +708,11 @@ impl Due {
             .routes
             .replace(routes)
             .is_some_and(|before| before != routes);
+        if moved {
+            self.parked = false;
+        } else if self.parked {
+            return;
+        }
         let went_back = self.started.is_some_and(|(at, _)| now_ms < at);
         let request = if moved || went_back {
             if moved {

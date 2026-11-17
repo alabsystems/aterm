@@ -8,8 +8,13 @@
 use super::*;
 use crate::typed::secret::Store as _;
 use crate::{
-    alab::registry::{
-        ADDRESS, COLLECTIONS, MACHINE_FACTS, MODEL, PHONE, PROVIDER, REGISTRY_2, REGISTRY_3,
+    alab::{
+        account_names,
+        registry::{
+            ACCOUNT, ADDRESS, COLLECTIONS, MACHINE_FACTS, MODEL, PHONE, PROVIDER, REGISTRY_2,
+            REGISTRY_3,
+        },
+        view::LabView,
     },
     catalog::release::Kept,
     table::tests::{Lab, repair_commons, repair_commons_among_first, repair_commons_first},
@@ -590,6 +595,124 @@ fn a_roll_restates_everything_and_releases_the_sealed_generation() {
     assert_eq!(image(&b.view().unwrap()), image(&before));
     assert_eq!(release(&lab, 1).released, vec![first_id(&lab)]);
     assert!(!stores_first(&lab, 1));
+}
+
+/// One cell of account `pk`, as the owner writes it.
+fn account_cell(pk: &str, col: &str, x: Value) -> Change {
+    cell::change(
+        &ACCOUNT,
+        CellKey {
+            pk,
+            col,
+            elem: None,
+        },
+        &CellValue::owner(1, x),
+    )
+    .unwrap()
+}
+
+/// Account `pk`'s `label` cell as an owner's write of a build before account version 2 stored
+/// it: free text this build's handle grammar would refuse (`Work`), which projects as stored.
+fn stored_label(pk: &str, x: Value) -> Change {
+    Change {
+        collection: ACCOUNT.name.to_owned(),
+        key: CellKey {
+            pk,
+            col: "label",
+            elem: None,
+        }
+        .encode()
+        .unwrap(),
+        value: Some(CellValue::owner(1, x).encode()),
+    }
+}
+
+/// The operation that wrote account `pk`'s one `label` candidate in `view`: a carried label's
+/// own, not the roll's.
+fn label_operation(view: &View, pk: &str) -> Digest {
+    let accounts = view.project(&ACCOUNT);
+    let [candidate] = accounts.rows[pk].fields["label"].candidates() else {
+        panic!("one label candidate");
+    };
+    candidate.operation
+}
+
+/// Two owners' labels that make one slug, the later written over the earlier's history with the
+/// lower operation digest (as a build older than the registry's label rule could write them),
+/// give the slug to the lower digest, and a roll, which carries each label at the operation that
+/// wrote it into a generation whose history holds neither, leaves every account's slug where it
+/// was: `account_names::of`, which the materializer and the commands read, and LabView give one
+/// answer before and after.
+/// The first generation's history orders the two writes and the second's holds neither, so a
+/// rule that read the view's history (the causally first write, as before) would answer
+/// differently on each side of the roll; the assertions on `causal` hold that precondition.
+/// NEGATIVE CONTROL: with `account_slugs` taking the highest digest (`max_by_key`), ann's account
+/// keeps the slug: `` left: "claude-bob-example" right: "claude-work" ``.
+#[test]
+fn a_roll_leaves_two_owners_labels_for_one_slug_where_they_were() {
+    let lab = Lab::new(&[Role::Writer]);
+    let a = Registry::at(lab.paths[0].clone());
+    a.open().unwrap();
+    let (ann_at, bob_at) = ("ann@example.test", "bob@example.test");
+    let ann = keys::account_pk("claude", ann_at).unwrap();
+    let bob = keys::account_pk("claude", bob_at).unwrap();
+    let mut born = address(ann_at);
+    born.extend(address(bob_at));
+    for (pk, at) in [(&ann, ann_at), (&bob, bob_at)] {
+        born.extend([
+            account_cell(pk, "realm", json!("claude")),
+            account_cell(pk, "login", json!(keys::address_pk(at).unwrap())),
+            account_cell(pk, "row", json!("live")),
+        ]);
+    }
+    a.write(vec![born, vec![account_cell(&ann, "label", json!("work"))]])
+        .unwrap();
+    // Ann's label, written again over its own last write until its digest is in the upper half:
+    // below a digest left where it fell, 64 of Bob's writes find none in one run of 65 on
+    // average, and one run of the whole library found none. Each write here and each of Bob's
+    // below is then at least even odds, so 64 of each leave a chance of 2^-63.
+    let mut first = label_operation(&a.view().unwrap(), &ann);
+    for _ in 0..64 {
+        if first[0] >= 0x80 {
+            break;
+        }
+        a.write(vec![vec![account_cell(&ann, "label", json!("work"))]])
+            .unwrap();
+        first = label_operation(&a.view().unwrap(), &ann);
+    }
+    assert!(first[0] >= 0x80, "a write of ann's in the upper half");
+    // Bob's label, written again over its own last write until its digest is below ann's.
+    let mut later = None;
+    for spelling in ["Work", "WORK"].into_iter().cycle().take(64) {
+        a.write(vec![vec![stored_label(&bob, json!(spelling))]])
+            .unwrap();
+        let operation = label_operation(&a.view().unwrap(), &bob);
+        if operation < first {
+            later = Some(operation);
+            break;
+        }
+    }
+    let later = later.expect("a write below ann's digest");
+    let before = a.view().unwrap();
+    assert!(before.causal.observes(&later, &first));
+    let names = account_names::of(&before);
+    assert_eq!(names[&bob].slug, "claude-work");
+    assert_eq!(names[&ann].slug, "claude-ann-example");
+    let lab_view = |view: &View| {
+        let none = owned::OwnedRead::default();
+        LabView::read_view(view, &none, &none, None).names
+    };
+    assert_eq!(lab_view(&before), names);
+
+    let rolled = a.roll(true, now_ms()).unwrap();
+    assert!(rolled.sealed, "{rolled:?}");
+    assert_eq!(a.generation().generation, 2);
+    let after = a.view().unwrap();
+    assert_eq!(label_operation(&after, &bob), later);
+    assert_eq!(label_operation(&after, &ann), first);
+    assert!(!after.causal.observes(&later, &first));
+    assert_eq!(account_names::of(&after), names);
+    assert_eq!(lab_view(&after), names);
 }
 
 /// The three-Mac split (design §11 step 13): m1 rolls alone while m2 and m3, which have not

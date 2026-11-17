@@ -36,18 +36,22 @@ fn an_art_masks_counts_find_what_a_pixel_scan_finds() {
         -0.3, 0.0, 0.01, 0.1, 0.25, 0.333, 0.5, 0.6, 0.77, 0.9, 0.999, 1.0, 1.4,
     ];
     for art in [
-        ImageArt::Kitty {
-            pose: ImageArt::BRAND_POSE,
+        ImageArt::Cat(aterm_effects::rainbow_road::CatArt {
+            pose: aterm_effects::rainbow_road::CatPose::Walk,
+            tilt: -6,
             dark: false,
-        },
-        ImageArt::Kitty {
-            pose: ImageArt::BRAND_POSE,
+        }),
+        ImageArt::Cat(aterm_effects::rainbow_road::CatArt {
+            pose: aterm_effects::rainbow_road::CatPose::Loaf,
+            tilt: 0,
             dark: true,
-        },
-        ImageArt::Kitty {
-            pose: aterm_effects::pet_glyphs_gen::PetGlyphId::PetLoaf,
+        }),
+        ImageArt::Road(aterm_effects::rainbow_road::RoadArt {
+            length: 500,
+            permille: 300,
+            done: false,
             dark: true,
-        },
+        }),
     ] {
         let mask = art.mask();
         let alpha: Vec<u8> = art
@@ -246,10 +250,12 @@ fn samples() -> Vec<DrawPrim> {
             y: 3.0,
             w: 24.0,
             h: 12.0,
-            art: ImageArt::Kitty {
-                pose: ImageArt::BRAND_POSE,
+            art: ImageArt::Cat(aterm_effects::rainbow_road::CatArt {
+                pose: aterm_effects::rainbow_road::CatPose::Sit,
+                tilt: 2,
                 dark: true,
-            },
+            }),
+            device: (48, 24),
             alpha: 200,
         },
     ]
@@ -332,18 +338,60 @@ impl Nudge for u8 {
     }
 }
 
+impl Nudge for (u32, u32) {
+    /// Each side's low bit.
+    fn nudges(&self) -> Vec<Self> {
+        vec![(self.0 ^ 1, self.1), (self.0, self.1 ^ 1)]
+    }
+}
+
 impl Nudge for ImageArt {
     fn nudges(&self) -> Vec<Self> {
-        let Self::Kitty { pose, dark } = *self;
-        let other = if pose == ImageArt::BRAND_POSE {
-            aterm_effects::pet_glyphs_gen::PetGlyphId::PetSit
-        } else {
-            ImageArt::BRAND_POSE
-        };
-        vec![
-            Self::Kitty { pose, dark: !dark },
-            Self::Kitty { pose: other, dark },
-        ]
+        use aterm_effects::rainbow_road::{CatArt, CatPose, RoadArt};
+        match *self {
+            Self::Cat(cat) => vec![
+                Self::Cat(CatArt {
+                    dark: !cat.dark,
+                    ..cat
+                }),
+                Self::Cat(CatArt {
+                    pose: if cat.pose == CatPose::Sit {
+                        CatPose::Walk
+                    } else {
+                        CatPose::Sit
+                    },
+                    ..cat
+                }),
+                Self::Cat(CatArt {
+                    tilt: cat.tilt ^ 1,
+                    ..cat
+                }),
+                Self::Road(RoadArt {
+                    length: 400,
+                    permille: 0,
+                    done: false,
+                    dark: cat.dark,
+                }),
+            ],
+            Self::Road(road) => vec![
+                Self::Road(RoadArt {
+                    permille: road.permille ^ 1,
+                    ..road
+                }),
+                Self::Road(RoadArt {
+                    length: road.length ^ 1,
+                    ..road
+                }),
+                Self::Road(RoadArt {
+                    done: !road.done,
+                    ..road
+                }),
+                Self::Road(RoadArt {
+                    dark: !road.dark,
+                    ..road
+                }),
+            ],
+        }
     }
 }
 
@@ -460,7 +508,7 @@ fn nudged(p: &DrawPrim) -> Vec<(&'static str, DrawPrim)> {
         DrawPrim::ClipPush { .. } => nudged!(p, ClipPush(x, y, w, h)),
         DrawPrim::FadePush { .. } => nudged!(p, FadePush(y, h, from, to)),
         DrawPrim::BandIcon { .. } => nudged!(p, BandIcon(x, y, size, icon, color)),
-        DrawPrim::Image { .. } => nudged!(p, Image(x, y, w, h, art, alpha)),
+        DrawPrim::Image { .. } => nudged!(p, Image(x, y, w, h, art, device, alpha)),
         DrawPrim::ClipPop | DrawPrim::FadePop | DrawPrim::SubpixelPush | DrawPrim::SubpixelPop => {
             Vec::new()
         }

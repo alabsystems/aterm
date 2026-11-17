@@ -211,6 +211,7 @@ fn update(w: &mut World, what: &str) -> (Vec<&'static str>, Vec<u64>) {
                 ids: w.log.id_counters(),
                 limits: w.log.limits(),
                 at: stamp,
+                ident: aterm_slog::DescIdent::default(),
             };
             w.log = Log::from_carry(&out.lines, a).expect("the carry reads").0;
             w.run = w.log.open_nodes().first().map(|e| e.node);

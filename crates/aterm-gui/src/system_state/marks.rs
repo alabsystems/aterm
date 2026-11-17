@@ -61,7 +61,7 @@ pub(crate) const SYSTEM_RED: SystemColor = SystemColor {
 
 /// What a mark's ink is held to against its ground: [`MARK_CONTRAST`] with a little to spare,
 /// so the pixels it paints, rounded to the screen's, still clear it.
-const MARK_INK_CONTRAST: f32 = MARK_CONTRAST + 0.1;
+pub(crate) const MARK_INK_CONTRAST: f32 = MARK_CONTRAST + 0.1;
 
 /// The width of a stroke a mark draws: two points, so a level or upright stroke covers whole
 /// pixels and paints its ink itself, never only a blend of it with the ground.

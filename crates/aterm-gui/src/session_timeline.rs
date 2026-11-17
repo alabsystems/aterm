@@ -549,14 +549,23 @@ impl SessionMeta {
     }
 
     /// Whether the live scoped claim's own record stream, opened in `epoch`, has applied a
-    /// record of `kind` (its wire word): the stream feeds that kind, and its built-in reader
-    /// stands down for it. The stream's state outlives its claim, so the claim is read too: a
-    /// released or lapsed claim, and another claimant's, feed nothing.
+    /// record of `kind` (its wire word) and the claim still holds `scope`, the scope that kind
+    /// is admitted under: the stream feeds that kind, and its built-in reader stands down for
+    /// it. The stream's state and its applied kinds outlive the claim and its grant, so the
+    /// claim is read too: a released or lapsed claim, another claimant's, and one renewed
+    /// without `scope` (whose records of the kind are dropped from then on) feed nothing.
     #[must_use]
-    pub(crate) fn stream_applied(&self, kind: &str, epoch: &str, now_us: u64) -> bool {
+    pub(crate) fn stream_applied(
+        &self,
+        kind: &str,
+        scope: aterm_agent::harness::contract::Scope,
+        epoch: &str,
+        now_us: u64,
+    ) -> bool {
         match (self.live_scoped(now_us), &self.stream) {
             (Some(scoped), Some(stream)) => {
                 stream.proven == scoped.proven
+                    && scoped.claim.scopes.contains(scope)
                     && stream.epoch == epoch
                     && stream.applied.contains(kind)
             }
@@ -2310,6 +2319,9 @@ pub(crate) enum MetaWriteError {
     },
     /// A title from anyone but a person that reads whole as a credential.
     Credential,
+    /// A title from anyone but a person in which the harness's turn-end readers read a head
+    /// (`NEEDS YOU:`, `Nothing left:`, `Could not finish:`, `LANDED`).
+    ProtocolLine,
     /// The title's author is short of a mark token for this long.
     Busy {
         retry_ms: u64,
@@ -2943,11 +2955,16 @@ fn claim_supervisor_with(
     }
     if supervisor_changed {
         record_supervisor(ctx, &meta, Some(holder), by);
-    } else if renewed_identity_changed {
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .forget_holder_acts();
+    } else if renewed_identity_changed || renewed_scoped_changed {
+        // A renewal writes no `meta-change`, and it can still end a stream's stand-down:
+        // another process now holds the claim, or the grant no longer names `state`.
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if renewed_identity_changed {
+            timeline.forget_holder_acts();
+        }
+        if timeline.settle_stream_claim(&meta) {
+            timeline.ring();
+        }
     }
     let changed =
         supervisor_changed || renewed_identity_changed || renewed_scoped_changed || lapsed.any();
@@ -3471,6 +3488,13 @@ fn release_supervisor_if(
     }
     if was_live {
         record_supervisor(ctx, &meta, None, by);
+    } else {
+        // A claim whose `ttl=` had passed is released with no `meta-change`, and no lapse
+        // record follows a claim that is gone: its stream's stand-down ends here.
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if timeline.settle_stream_claim(&meta) {
+            timeline.ring();
+        }
     }
     drop(meta);
     if let Some(proven) = proven {
@@ -3625,6 +3649,14 @@ pub(crate) const TITLE_CHANGE: &str = "title-change";
 
 /// The `cwd-change` kind.
 pub(crate) const CWD_CHANGE: &str = "cwd-change";
+
+/// The text a timeline holds of the folder `cwd` ([`SessionTimeline::cwd_text`]): bounded as the
+/// log's `cwd=` is; `None` for none, an empty one, or one nothing of which survives the bound.
+fn held_cwd(cwd: Option<&str>) -> Option<String> {
+    cwd.filter(|c| !c.is_empty())
+        .and_then(|c| aterm_slog::BoundedText::new(aterm_slog::Key::Cwd, c))
+        .map(|c| c.as_str().to_owned())
+}
 
 /// The supervisor key's wire name, as its `meta-change` names it.
 pub(crate) const SUPERVISOR_FIELD: &str = "supervisor";
@@ -3817,6 +3849,17 @@ pub(crate) fn write_session_meta(
 ) -> Result<bool, MetaWriteError> {
     let value = validated_meta_value(field, edit)?;
     try_apply_meta_value(ctx, field, value, by)
+}
+
+/// A driver's commit of `field` that states nothing (a rename field committed as it opened,
+/// `crate::app_rename::TabRenameEdit::seed`): no claim and no record, but the field counts as
+/// written by a driver, as after any write, so the restore graft keeps its hands off it
+/// ([`SessionMeta::driver_wrote`]).
+pub(crate) fn note_unstated_meta_write(ctx: &crate::SessionCtx, field: MetaField) {
+    ctx.meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .driver_writes |= field.bit();
 }
 
 /// What an adopted session's recorders say about the time before the seamless update that
@@ -4037,6 +4080,25 @@ pub(crate) struct SessionTimeline {
     /// ([`crate::survey::WordsRead`]): what a worker's last topic post is newer than, or not, where
     /// the word's row carries no time ([`crate::survey::last_words`]).
     words_read: crate::survey::WordsRead,
+    /// The folder the drift flush last read (OSC 7, [`Self::record_cwd_change`]), or an adopted
+    /// session's hydrated engine held ([`Self::seed_adopted_cwd`]), held to `cwd=`'s bound: the
+    /// session log keeps only its fingerprint, and aterm's default writer names the folder
+    /// ([`crate::describe`]).
+    cwd_text: Option<String>,
+    /// Since a seamless update adopted this session ([`Self::note_unread_after_update`]), whether
+    /// this process has yet to read its folder: the hydrated engine reported none, and the drift
+    /// flush has not read it since, whatever it would find.
+    cwd_unread: bool,
+    /// Since a seamless update adopted this session, whether this process has yet to read its
+    /// agent's words: neither the footer's resolver ([`Self::set_claude_excerpts`]) nor the
+    /// rollout tap ([`Self::set_codex_survey`]) has answered.
+    words_unread: bool,
+    /// The newest seq of the log a seamless update adopted, as of the adoption (0 for a session
+    /// never adopted): a claim at or below it is one the update carried.
+    carried_seq: u64,
+    /// What aterm's default writer keeps of this session between its passes
+    /// ([`crate::describe::Held`]).
+    described: crate::describe::Held,
     /// The conversation whose whole token counters this timeline last sent on a survey row, and
     /// since when (Unix ms) it has sent them unbroken ([`Self::token_epoch`]).
     token_epoch: Option<(String, u64)>,
@@ -4211,6 +4273,13 @@ pub(crate) fn path_columns(
 /// Every platform builds this file and the wire library is Unix only, so the record's word is
 /// kept here under its own type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(unix),
+    expect(
+        dead_code,
+        reason = "only the Unix control stream reads a `state` record into one"
+    )
+)]
 pub(crate) enum StreamedState {
     Starting,
     Idle,
@@ -4767,15 +4836,31 @@ impl SessionTimeline {
         );
         let at = self.slog.now();
         self.slog.observe_meta(change, escalated, at);
-        // The stream's state stands only under its own live claim: a claim that was released,
-        // lapsed or taken by another claimant hands the state and the composer back to the
-        // screen reader. A claim kept through a grace keeps the reader down.
-        if self.agent.stream.as_ref().is_some_and(|fed| {
-            !meta.stream_applied(STATE_KIND, &fed.epoch, crate::metrics::now_us())
-        }) {
+        self.settle_stream_claim(meta);
+        self.ring();
+    }
+
+    /// THE END OF THE STAND-DOWN, under the meta → timeline hold of whoever moved the claim
+    /// (`meta` is the store as the move left it). The stream's state stands only under its own
+    /// live claim holding the scope `state`: a claim that was released (live or with its
+    /// `ttl=` already past), lapsed, taken by another claimant, renewed by another process
+    /// under the same holder, or renewed without `state` hands the state and the composer back
+    /// to the screen reader. A claim kept live through a grace keeps the reader down. Every
+    /// claim move calls this: through [`Self::record_meta_change`] where it writes a
+    /// `meta-change`, and directly where it writes none. Returns whether the stand-down ended.
+    pub(crate) fn settle_stream_claim(&mut self, meta: &SessionMeta) -> bool {
+        let ended = self.agent.stream.as_ref().is_some_and(|fed| {
+            !meta.stream_applied(
+                STATE_KIND,
+                aterm_agent::harness::contract::Scope::State,
+                &fed.epoch,
+                crate::metrics::now_us(),
+            )
+        });
+        if ended {
             self.end_stream_state();
         }
-        self.ring();
+        ended
     }
 
     /// A raw `meta-change` row for a test that pins the timeline's own shapes and not a writer's.
@@ -4787,12 +4872,48 @@ impl SessionTimeline {
     /// The one `cwd-change` writer: a row iff the session log's `cwd` mark moved; returns whether
     /// it recorded one.
     pub(crate) fn record_cwd_change(&mut self, cwd: Option<&str>) -> bool {
+        // Held before the mark's own test: a carried log already holds the folder's
+        // fingerprint, and the text is wanted after an update too.
+        let text = held_cwd(cwd);
+        let moved = self.cwd_unread || self.cwd_text != text;
+        if moved {
+            self.cwd_text = text;
+            self.cwd_unread = false;
+        }
         let at = self.slog.now();
         if !self.slog.observe_cwd(cwd, at) {
+            if moved {
+                // What aterm's default writer reads of the folder moved and no record says so (as
+                // where a carried log already holds the folder's fingerprint): it is told.
+                crate::describe::ring();
+            }
             return false;
         }
+        // The mark's append rings the default writer through the log's one callback.
         self.record(CWD_CHANGE);
         true
+    }
+
+    /// THE ADOPTED SESSION'S FOLDER, as its hydrated engine reports it, before the session is
+    /// registered ([`crate::spawn::fit_adopted_log`]): held as [`Self::record_cwd_change`] holds
+    /// it, with no mark (a carried log already holds its fingerprint, and the drift flush's
+    /// later read of the same folder moves nothing) and no ring (no pass reads a session the
+    /// store does not hold). An engine that reports none leaves the folder unread.
+    pub(crate) fn seed_adopted_cwd(&mut self, cwd: Option<&str>) {
+        if let Some(text) = held_cwd(cwd) {
+            self.cwd_text = Some(text);
+            self.cwd_unread = false;
+        }
+    }
+
+    /// A SEAMLESS UPDATE ADOPTED THIS SESSION'S LOG ([`crate::spawn::mark_handoff_gap`], after
+    /// the adoption): the folder and an agent's words aterm's default writer derives from live
+    /// only in memory, so this process has not read them yet, and the claims the log carried, up
+    /// to its newest seq now, are the update's ([`crate::describe`]).
+    pub(crate) fn note_unread_after_update(&mut self) {
+        self.cwd_unread = true;
+        self.words_unread = true;
+        self.carried_seq = self.slog.log().last_seq();
     }
 
     /// The one `title-change` writer: a row iff the session log's title mark moved; returns
@@ -5040,7 +5161,8 @@ impl SessionTimeline {
         &mut self.slog
     }
 
-    /// When the session log's turn tracker wants its settle tick (monotonic ms), if one is pending.
+    /// When the session log wants its settle tick (monotonic ms), if one is owed
+    /// ([`crate::session_log::SessionLog::wake`]).
     pub(crate) fn slog_wake(&self) -> Option<u64> {
         self.slog.wake()
     }
@@ -5304,7 +5426,16 @@ impl SessionTimeline {
             self.record("task-change");
         }
         self.task = Some(next.clone());
+        self.tell_task_creator();
         (next, changed)
+    }
+
+    /// Tell the session log who created the session, as its task record now names it
+    /// ([`crate::session_log::SessionLog::set_desc_creator`]): called wherever the record is
+    /// set, so the creator the log ranks a description claim by is the record's `from`.
+    fn tell_task_creator(&mut self) {
+        let from = self.task.as_ref().map(|task| task.from.as_str());
+        self.slog.set_desc_creator(from);
     }
 
     /// A worker's agent is currently identified in this tab. Program workers have their own
@@ -5424,6 +5555,7 @@ impl SessionTimeline {
         self.slog.observe_task(&next, at);
         self.record("task-change");
         self.task = Some(next);
+        self.tell_task_creator();
         (outcome, true)
     }
 
@@ -5432,6 +5564,7 @@ impl SessionTimeline {
     pub(crate) fn seed_task(&mut self, record: crate::task_record::TaskRecord) {
         self.pending_task_exit = None;
         self.task = Some(record);
+        self.tell_task_creator();
     }
 
     /// Note the result files the record just seeded came with under other session IDs
@@ -5493,6 +5626,20 @@ impl SessionTimeline {
         true
     }
 
+    /// Note that the startup deadline judged the worker of the task record at revision `rev`
+    /// started ([`crate::task_record::note_task_took_up`]): taken where the record is still at
+    /// `rev` and `working` or `stalled`. Moves no rev. Whether that record carries it now.
+    pub(crate) fn note_task_took_up(&mut self, rev: u64) -> bool {
+        use crate::task_record::TaskState;
+        let Some(task) = self.task.as_mut().filter(|task| {
+            task.rev == rev && matches!(task.state, TaskState::Working | TaskState::Stalled)
+        }) else {
+            return false;
+        };
+        task.took_up = true;
+        true
+    }
+
     /// Name the agent a worker's spawn started on its task record.
     pub(crate) fn set_task_worker(
         &mut self,
@@ -5519,6 +5666,8 @@ impl SessionTimeline {
         if let Some(task) = self.task.as_mut() {
             task.line = line;
         }
+        // No record says so: aterm's default writer is told.
+        crate::describe::ring();
     }
 
     /// The Mac the task's manager runs on, where that is another Mac
@@ -5562,9 +5711,10 @@ impl SessionTimeline {
     }
 
     /// THE STREAM'S ARM of the state: a `state` record the claim's stream applied. From here
-    /// until the claim ends ([`Self::record_meta_change`]) the record decides the agent word and
+    /// until the claim stops feeding it ([`Self::settle_stream_claim`]) the record decides the agent word and
     /// the composer, and the screen reader's reading only supplies the kind `asking` and
     /// `walled` do not name. Returns whether the published word or detail moved.
+    #[cfg(any(unix, test))]
     pub(crate) fn publish_stream_state(&mut self, fed: StreamFed) -> bool {
         let old_word = self.agent.word;
         self.agent.stream = Some(fed);
@@ -5576,6 +5726,35 @@ impl SessionTimeline {
             crate::harness_host::ring_phase();
         }
         changed || task_changed
+    }
+
+    /// THE CLAIM'S STREAM APPLIED A RECORD of any kind (D15): where no agent run is open, one
+    /// opens for `agent`, the agent the claim's registry row names. The one exception is a
+    /// stream whose standing `state` is `ended`: the record said the agent is gone, and a
+    /// `beat` after it opens nothing. Called after the record itself was applied, so a `state`
+    /// that moved the word has opened the run already, with its mark on it.
+    #[cfg(unix)]
+    pub(crate) fn stream_applied_record(
+        &mut self,
+        agent: aterm_phase::Program,
+        by: aterm_slog::Actor,
+    ) -> bool {
+        if self
+            .agent
+            .stream
+            .as_ref()
+            .is_some_and(|fed| fed.state == StreamedState::Ended)
+        {
+            return false;
+        }
+        let at = self.slog.now();
+        let opened = self
+            .slog
+            .stream_applied(agent, by, self.agent.program_pgid, at);
+        if opened {
+            self.ring_rows();
+        }
+        opened
     }
 
     /// The stream's state no longer stands: the screen reader feeds the state and the composer
@@ -6477,15 +6656,18 @@ impl SessionTimeline {
             .map(|(_, at)| at)
     }
 
-    /// The footer resolver's excerpts for `pgid`, applied only while that group is in front.
+    /// The footer resolver's excerpts for `pgid`, applied only while that group is in front:
+    /// whether what aterm's default writer reads of them moved ([`crate::describe::excerpts_seen`]),
+    /// which tells it. A re-read that found what it held tells it nothing.
     pub(crate) fn set_claude_excerpts(
         &mut self,
         pgid: i32,
         excerpts: Option<crate::survey::ClaudeExcerpts>,
-    ) {
+    ) -> bool {
         if self.agent.program_pgid != pgid {
-            return;
+            return false;
         }
+        let before = crate::describe::excerpts_seen(self);
         let held = self
             .claude_excerpts
             .as_ref()
@@ -6499,12 +6681,53 @@ impl SessionTimeline {
             aterm_gui_timing::wall_ms(),
         );
         self.claude_excerpts = excerpts.map(|e| (pgid, e));
+        self.words_unread = false;
+        let moved = crate::describe::excerpts_seen(self) != before;
+        if moved {
+            // No record says so: aterm's default writer is told.
+            crate::describe::ring();
+        }
+        moved
     }
 
     /// When each of the agent's words this timeline holds last changed as read
     /// ([`Self::words_read`]).
     pub(crate) const fn words_read(&self) -> crate::survey::WordsRead {
         self.words_read
+    }
+
+    /// The folder the drift flush last read ([`Self::record_cwd_change`]) or the adopted engine
+    /// held ([`Self::seed_adopted_cwd`]); `None` where it read none, or has yet to read one after
+    /// an update ([`Self::cwd_unread`]).
+    pub(crate) fn cwd_text(&self) -> Option<&str> {
+        self.cwd_text.as_deref()
+    }
+
+    /// Whether this process has yet to read the folder of a session a seamless update adopted.
+    pub(crate) const fn cwd_unread(&self) -> bool {
+        self.cwd_unread
+    }
+
+    /// Whether this process has yet to read the words of the agent of a session a seamless
+    /// update adopted.
+    pub(crate) const fn words_unread(&self) -> bool {
+        self.words_unread
+    }
+
+    /// The newest seq of the log a seamless update adopted, as of the adoption; 0 for a session
+    /// never adopted.
+    pub(crate) const fn carried_seq(&self) -> u64 {
+        self.carried_seq
+    }
+
+    /// What aterm's default writer keeps of this session between its passes.
+    pub(crate) const fn described(&self) -> &crate::describe::Held {
+        &self.described
+    }
+
+    /// [`Self::described`], for the writer's pass.
+    pub(crate) const fn described_mut(&mut self) -> &mut crate::describe::Held {
+        &mut self.described
     }
 
     /// SINCE WHEN THE ROW'S TOKEN COUNTERS HAVE COUNTED `conversation` UNBROKEN (a survey row's
@@ -6613,6 +6836,7 @@ impl SessionTimeline {
         if self.agent.program_pgid != pgid {
             return false;
         }
+        let before = crate::describe::excerpts_seen(self);
         let (ctx, goal) = (survey.facts.ctx_left_pct, survey.goal.is_some());
         let held = self
             .codex_survey
@@ -6625,8 +6849,13 @@ impl SessionTimeline {
             aterm_gui_timing::wall_ms(),
         );
         self.codex_survey = Some((pgid, survey));
+        self.words_unread = false;
         let at = self.slog().now();
         self.slog_mut().observe_codex_facts(ctx, Some(goal), at);
+        if crate::describe::excerpts_seen(self) != before {
+            // The excerpts move with no record of their own: aterm's default writer is told.
+            crate::describe::ring();
+        }
         true
     }
 

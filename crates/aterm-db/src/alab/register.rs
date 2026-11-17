@@ -93,6 +93,12 @@ pub struct Me {
     /// The label derived from a holder-signed number choice, its fallback during a conflict
     /// included. Never an OS-name hint.
     pub chosen: Option<String>,
+    /// The number this Mac's latest holder-signed choice names, as it signed it: what
+    /// [`Me::chosen`] settled from.
+    pub signed: Option<String>,
+    /// The labels the membership log gives the vault's other current members: numbers this Mac
+    /// cannot take, whoever writes one to its row (not every such number: the log's alone).
+    pub held: std::collections::BTreeSet<String>,
     /// [`keys::hw_hint`] of this Mac's hardware under this network.
     pub hw_hint: String,
     /// When the vault's roster says this Mac was admitted, where it says.
@@ -508,13 +514,45 @@ fn own_node(
 }
 
 /// Follow a signed choice, or replace an automatic label that lost its claim. A nodeless
-/// sheet row may share a signed choice until `merge` folds it in.
+/// sheet row may share a signed choice until `merge` folds it in. A label an owner wrote (no
+/// automatic path's, no import's) other than the number this Mac signed is not written over,
+/// nor one conflicted with it, unless the membership log gives it to another current member
+/// ([`Me::held`]): this Mac takes such a label as its number
+/// (`aterm_agent::machine_name::follow_number`, tracker package FL-170) and signs it, so a pass
+/// never puts the signed choice it replaced, a clash label, a seat fallback or a fresh number
+/// back in its place. One the log gives another member this Mac's rename refuses, so nothing
+/// would ever sign it: the pass writes this Mac's own number back (a fresh automatic one where
+/// it signed none), and that member's row keeps its claim. A label the rename refuses for
+/// another reason (another Mac's roster alias, claim or vault name, a denied label, the policy's
+/// server number, a number the LAN books give another) stays as the owner wrote it and is
+/// judged again at each read. The number this Mac signed, which a rename here
+/// writes to its row, is followed to what the vault settled it as (a clash label after a
+/// concurrent loss).
 fn number_change(
     input: &Input<'_>,
     (machine, machines): (&Collection, &Projection),
     facts: &OwnedRead,
     mac: &str,
 ) -> Result<Vec<Change>> {
+    let unsigned = |candidate: &crate::typed::cell::Candidate| {
+        !candidate.value.a
+            && candidate.value.s.is_none()
+            && candidate.value.x.as_str() != input.me.signed.as_deref()
+            && !candidate
+                .value
+                .x
+                .as_str()
+                .is_some_and(|label| input.me.held.contains(label))
+    };
+    if machines.rows.get(mac).is_some_and(|row| {
+        !row.raw.contains("label")
+            && row
+                .fields
+                .get("label")
+                .is_some_and(|field| field.candidates().iter().any(unsigned))
+    }) {
+        return Ok(Vec::new());
+    }
     let Some(label) = input.me.chosen.as_deref() else {
         if machines.rows.get(mac).is_some_and(|row| {
             row.claims.get("label").is_some_and(|canonical| {
@@ -522,6 +560,30 @@ fn number_change(
             }) && row.fields.get("label").is_some_and(|field| {
                 !field.conflicted() && field.candidates().iter().all(|candidate| candidate.value.a)
             })
+        }) {
+            return Ok(vec![automatic(
+                machine,
+                mac,
+                "label",
+                Value::from(birth_label(input, machines)?),
+            )?]);
+        }
+        // An owner's label another member holds, on a Mac that signed no number: a fresh one.
+        let anothers = |candidate: &crate::typed::cell::Candidate| {
+            !candidate.value.a
+                && candidate.value.s.is_none()
+                && candidate
+                    .value
+                    .x
+                    .as_str()
+                    .is_some_and(|label| input.me.held.contains(label))
+        };
+        if machines.rows.get(mac).is_some_and(|row| {
+            !row.raw.contains("label")
+                && row
+                    .fields
+                    .get("label")
+                    .is_some_and(|field| field.candidates().iter().any(anothers))
         }) {
             return Ok(vec![automatic(
                 machine,

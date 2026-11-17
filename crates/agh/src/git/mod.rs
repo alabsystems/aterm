@@ -25,7 +25,9 @@ pub use control::{
     ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
 };
 pub use fetch::{FETCH_ROWS_MAX, FetchBatch, FetchRow};
-pub use run::{FetchScope, GitOp, GitOut, GitRun, HelperCommand, HelperHost};
+pub use run::{
+    FetchScope, GitOp, GitOut, GitRun, HelperCommand, HelperHost, OBJECT_SOURCE_WORDS, Overriding,
+};
 
 /// Admit Git's complete `rev-parse --is-shallow-repository` answer for a native push.
 /// Callers may use the same admission before expensive checks; the push rechecks it.
@@ -135,7 +137,7 @@ pub enum NativePushPhase {
 // `Github::run_git` (client.rs) calls it as `crate::git::run(self, run)`. The function and
 // the module share the name in different namespaces.
 #[cfg(unix)]
-pub(crate) use run::{project_commit_config, project_config_names};
+pub(crate) use run::{ConfigAccess, project_commit_config, project_config_names};
 pub(crate) use run::{run, run_with_credential};
 
 /// The username the helper answers: GitHub ignores it for a token, and a fixed one keeps

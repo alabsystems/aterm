@@ -46,10 +46,8 @@ fn serve(source: &str) -> ExitCode {
     };
     match aterm_lan::serve(opts) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("aterm lan serve: {error}");
-            ExitCode::FAILURE
-        }
+        // The broker reports its failure through the same bounded sink as its live work.
+        Err(_) => ExitCode::FAILURE,
     }
 }
 

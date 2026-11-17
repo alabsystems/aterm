@@ -508,11 +508,12 @@ fn launch_offer_ax_navigation(action: Action) {
     // (init-on-by-default design §6.1), and navigation before it answers nothing.
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
-    // A window 270 points tall (a headless window's scale is 1), whatever this platform's
-    // face makes a row: the page's head shows and its accounts line lies below it.
+    // A window 420 points tall (a headless window's scale is 1), whatever this platform's
+    // face makes a row: the page's head, with its least lockup, shows and its accounts line
+    // lies below it.
     let (_, cell_h) = app.win_cell_size(wid);
     let mut window = app.windows.get_mut(&wid).unwrap();
-    window.rows = u16::try_from(270 / cell_h).unwrap();
+    window.rows = u16::try_from(420 / cell_h).unwrap();
     window.cols = 90;
     window.os_window_for_test = true;
     drop(window);

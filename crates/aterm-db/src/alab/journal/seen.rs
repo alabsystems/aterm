@@ -21,11 +21,11 @@
 //!   the reset-less readings made inside the window (readings are snapshots and never add up, and
 //!   a lower reading frees nothing), shows the reset as unknown where those groups disagree beyond
 //!   their resolution, and says "reset at T, not read since" once every reset read has passed with
-//!   nothing read since, never a guessed 0. A `reset-used` (a limit reset spent) from any Mac
-//!   cuts the window it names, of its key: a reading or a wall of that window made before the
-//!   newest one is from before the refill and says nothing of the window now, and a reading
-//!   another Mac dated within the clock-skew bound after it counts only until a later reading
-//!   the refill surely precedes. One that names no window (the limit still stood) cuts nothing,
+//!   nothing read since, never a guessed 0. A `reset-used` (a limit reset spent, or a refill or a
+//!   raised allowance a Mac's usage tap read) from any Mac cuts the window it names, of its key:
+//!   a reading or a wall of that window made before the newest one is from before the refill and
+//!   says nothing of the window now, and a reading another Mac dated within the clock-skew bound
+//!   after it counts only until a later reading the refill surely precedes. One that names no window (the limit still stood) cuts nothing,
 //!   and one dated past the skew bound ahead of the read is not believed. A workspace's
 //!   readings are its sub-account's (`sa-` key) and are folded under the account.
 //! - **Plan** is the newest plan word a Mac's CLI reported for the account ([`Seen::plan`]): a

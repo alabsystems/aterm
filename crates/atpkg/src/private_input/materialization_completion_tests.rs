@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::private_input::Producer;
-use std::{fs, time::Duration};
+use std::fs;
 
 fn cache_is_locked(path: &Path) -> bool {
     let file = fs::OpenOptions::new()
@@ -248,8 +248,10 @@ fn the_original_endpoint_expiring_during_postchecks_never_publishes_ready() {
         .unwrap()
         .finish()
         .unwrap();
-    // This finite endpoint is the behavior under test, not a latency claim.
-    let endpoint = Instant::now() + Duration::from_secs(2);
+    // Allow the standard liveness budget for filesystem/cache setup. The SAME
+    // original endpoint must then actually expire inside the postcheck; this
+    // control asserts lifecycle ordering, not setup speed.
+    let endpoint = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let attempt = MaterializationAttempt::create(
         world.path(),
         "attempt",
@@ -259,8 +261,10 @@ fn the_original_endpoint_expiring_during_postchecks_never_publishes_ready() {
     .unwrap();
     let completed = CompletedMaterialization::from_native_return(attempt);
     let cache = completed.cargo_home().to_owned();
+    let entered = std::cell::Cell::new(false);
     let error = completed
         .finish_with(|original| {
+            entered.set(true);
             while let Some(left) = endpoint.checked_duration_since(Instant::now()) {
                 std::thread::park_timeout(left);
             }
@@ -272,6 +276,7 @@ fn the_original_endpoint_expiring_during_postchecks_never_publishes_ready() {
         })
         .err()
         .expect("elapsed original endpoint must refuse");
+    assert!(entered.get(), "the postcheck must actually run");
     assert!(cache_is_locked(&cache));
     assert_eq!(
         fs::read(world.path().join("attempt/.input-owner")).unwrap(),
@@ -347,8 +352,10 @@ fn successful_transition_cannot_publish_after_original_endpoint() {
         .unwrap()
         .finish()
         .unwrap();
-    // This endpoint defines the behavior; it is not a latency measurement.
-    let end = Instant::now() + Duration::from_secs(2);
+    // Allow the standard liveness budget for filesystem/cache setup, then wait
+    // out this SAME original endpoint inside the actual transition. Its expiry
+    // defines the behavior; the fixture makes no setup-latency claim.
+    let end = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let attempt =
         MaterializationAttempt::create(world.path(), "attempt", vec![source.lend().unwrap()], end)
             .unwrap();

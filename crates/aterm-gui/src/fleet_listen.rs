@@ -17,8 +17,10 @@ use aterm_uds::stop::Stop;
 
 use crate::app_config::FleetConfig;
 
-/// How often a bind refused `EADDRINUSE` or `EADDRNOTAVAIL`, or a key that cannot be used, is
-/// tried again, and how often a served key is read again.
+/// The window's fleet listener's old pace: how often a bind refused `EADDRINUSE` or
+/// `EADDRNOTAVAIL`, or a key that cannot be used, is tried again, and how often a served key is
+/// read again, where its file watch did not start, and while a state no event tells lasts. With
+/// the watch running each is looked at again at its events (KI-1108-2, [`fleet_inputs`]).
 pub(crate) const RETRY: Duration = aterm_net::fleet::KEY_READ_EVERY;
 
 const RETRY_SEAM: &str = "ATERM_DEBUG_FLEET_RETRY_MS";
@@ -75,6 +77,15 @@ pub(crate) fn seam_or(seam: &str, default: Duration) -> Duration {
 fn retry() -> Duration {
     static EVERY: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *EVERY.get_or_init(|| seam_or(RETRY_SEAM, RETRY))
+}
+
+/// The longest the window's fleet listener rests with nothing heard while its file watch runs
+/// ([`fleet_inputs::BACKSTOP`]), or what [`RETRY_SEAM`] names: a test world that names a short
+/// retry keeps it as the backstop, and one that names a long one hears only events.
+#[cfg(unix)]
+fn backstop() -> Duration {
+    static MOST: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| seam_or(RETRY_SEAM, fleet_inputs::BACKSTOP))
 }
 
 /// How long a proved connection is served ([`aterm_net::fleet::SERVED_WITHIN`]). A unit test's
@@ -151,6 +162,23 @@ impl HeartbeatClock {
         }
         self.last = Some(now);
         Some(woke)
+    }
+
+    /// When the next round is due with nothing else heard: the move this clock has not taken,
+    /// once its spread passed, or `every` after the last round (now before the first); `None`
+    /// while one is in flight (`busy`), whose end rings its waiter.
+    pub(crate) fn next_due(&self, busy: bool) -> Option<std::time::Instant> {
+        if busy {
+            return None;
+        }
+        let interval = self
+            .last
+            .map_or_else(std::time::Instant::now, |last| last + self.every);
+        Some(
+            self.moved
+                .due()
+                .map_or(interval, |moved| moved.min(interval)),
+        )
     }
 }
 
@@ -662,20 +690,42 @@ mod denial_cache_model_tests;
 /// `unknown_custody_cannot_use_a_cached_deny_list`).
 #[cfg(unix)]
 fn denied_nodes_now() -> Option<Arc<[String]>> {
-    let state = aterm_types::dirs::state_dir()?;
-    let vault = vault_here().ok()?;
+    denied_nodes_read().0
+}
+
+/// [`denied_nodes_now`], and whether its read settled: not where it met a vault writer, the vault
+/// moving under it or an error, which the next read may answer otherwise with no watched file
+/// moving, so a wait that judges on those files' events keeps the old tick while it lasts
+/// ([`fleet_inputs::denial_settled`]).
+#[cfg(unix)]
+fn denied_nodes_read() -> (Option<Arc<[String]>>, bool) {
+    let (Some(state), Ok(vault)) = (aterm_types::dirs::state_dir(), vault_here()) else {
+        return (None, true);
+    };
     if !aterm_agent::fleet_vault::traffic_in_effect(&state, vault.as_ref()) {
-        return None;
+        return (None, true);
     }
     let observed = match vault {
-        None => return Some(Arc::from(&[][..])),
+        None => return (Some(Arc::from(&[][..])), true),
         Some(paths) => aterm_secrets::client::swarm_denial_snapshot_now(&paths),
     };
+    let settled = fleet_inputs::denial_settled(&observed);
     let (denied, said) = update_denied_nodes_cache(&mut DENIED_NODES.lock_or_recover(), observed);
     if let Some(line) = said {
         note_fleet(&line, denied.is_none());
     }
-    denied
+    (denied, settled)
+}
+
+/// Whether a writer holds the state lock of the vault this process reads now
+/// ([`aterm_secrets::client::Paths::writer_holds_state`]): it lets go with no file event, so a
+/// look that may have read under it keeps the old tick until a look finds none.
+#[cfg(unix)]
+fn vault_writer_holds() -> bool {
+    vault_here()
+        .ok()
+        .flatten()
+        .is_some_and(|paths| paths.writer_holds_state())
 }
 
 #[cfg(unix)]
@@ -728,6 +778,12 @@ fn still_drives(
 /// admits no key.
 #[cfg(unix)]
 pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
+    window_local_log()?.keys()
+}
+
+/// The membership log [`window_log`] reads its admission from, made at the first ask.
+#[cfg(unix)]
+fn window_local_log() -> Option<&'static aterm_agent::fleet_log::LocalLog> {
     static LOG: std::sync::OnceLock<Option<aterm_agent::fleet_log::LocalLog>> =
         std::sync::OnceLock::new();
     LOG.get_or_init(|| {
@@ -737,8 +793,44 @@ pub(crate) fn window_log() -> Option<Arc<aterm_net::fleet_member::MemberKeys>> {
             .as_ref()
             .map(aterm_agent::fleet_log::LocalLog::of)
     })
-    .as_ref()?
-    .keys()
+    .as_ref()
+}
+
+/// This window process's fleet inputs ([`fleet_inputs::WindowInputs`]), started at the first ask
+/// over [`window_inputs_on`] of the vault it reads ([`vault_here`]).
+#[cfg(unix)]
+fn window_inputs() -> &'static Arc<fleet_inputs::WindowInputs> {
+    fleet_inputs::window(|inputs| window_inputs_on(inputs, vault_here()))
+}
+
+/// A window's fleet inputs on `inputs`: the fleet files of this process's state folder, its
+/// aterm.toml, the vault `vault` names ([`vault_here`]'s answer: none where it found none or
+/// could not find it) and the files its membership log reads ([`window_local_log`]).
+#[cfg(unix)]
+fn window_inputs_on(
+    inputs: &Arc<fleet_inputs::Inputs>,
+    vault: Result<Option<aterm_secrets::client::Paths>, String>,
+) -> Arc<fleet_inputs::WindowInputs> {
+    let vault = vault.ok().flatten();
+    fleet_inputs::WindowInputs::start(
+        inputs,
+        aterm_types::dirs::state_dir().as_deref(),
+        crate::app_config::config_path().as_deref(),
+        vault.as_ref(),
+        window_local_log()
+            .map(aterm_agent::fleet_log::LocalLog::read_files)
+            .unwrap_or_default(),
+    )
+}
+
+/// A driving node set or lifted a remote hold here: ring the window's fleet listener, whose lift
+/// ([`lift_undriving_holds`]) judges remote holds only at a look, so a hold that lands after its
+/// last look (one a node relayed just before it cut that drive, or one that waited out a fence)
+/// is judged at the next one rather than at the backstop (KI-1108-2). Off the file watch the old
+/// tick's next look meets it, as it did, and nothing is rung.
+#[cfg(unix)]
+pub(crate) fn remote_hold_moved() {
+    fleet_inputs::ring_window_watching();
 }
 
 /// THE RULE for which vault this process's fleet readers read, the window's and the node job's
@@ -967,9 +1059,47 @@ fn lift_undriving_holds(
     bound: &dyn Fn(&str) -> Option<aterm_net::fleet::NodeKey>,
     denied_nodes: &[String],
 ) {
-    let lifted = crate::control::lift_ungranted_remote_holds(&|node| {
+    say_lifted(crate::control::lift_ungranted_remote_holds(&|node| {
         still_drives(grants, || bound(node), node, denied_nodes)
-    });
+    }));
+}
+
+/// The grants a window serves, the deny list it read and whether that read settled
+/// ([`lift_undriving_holds_once_held`]).
+#[cfg(unix)]
+type HoldsRead = (
+    Vec<aterm_net::fleet::DriveGrant>,
+    Option<Arc<[String]>>,
+    bool,
+);
+
+/// [`lift_undriving_holds`] of the grants and deny list `read` gives, read only once `lift`
+/// ([`crate::control::lift_ungranted_remote_holds`]) meets a remote hold to judge, and at most
+/// once: a wake of a window that leaves the port to the node job and holds no remote hold reads
+/// neither aterm.toml nor the vault (KI-1108-2). Whether that deny read settled; `None` where
+/// nothing was read.
+#[cfg(unix)]
+fn lift_undriving_holds_once_held(
+    lift: &dyn Fn(&dyn Fn(&str) -> bool) -> usize,
+    bound: &dyn Fn(&str) -> Option<aterm_net::fleet::NodeKey>,
+    read: &dyn Fn() -> HoldsRead,
+) -> Option<bool> {
+    let held = std::cell::OnceCell::new();
+    say_lifted(lift(&|node| {
+        let (grants, denied, _) = held.get_or_init(read);
+        still_drives(
+            grants,
+            || bound(node),
+            node,
+            denied.as_deref().unwrap_or_default(),
+        )
+    }));
+    held.get().map(|(_, _, settled)| *settled)
+}
+
+/// Journal the `lifted` remote holds whose nodes may drive no more, where there were any.
+#[cfg(unix)]
+fn say_lifted(lifted: usize) {
     if lifted > 0 {
         note_fleet(
             &format!("fleet: {lifted} remote hold(s) lifted: their nodes may drive no more"),
@@ -1321,6 +1451,8 @@ pub(crate) fn configure_fleet_listener(fleet: Option<&FleetConfig>) {
         desk.revision = desk.revision.wrapping_add(1);
         drop(desk);
         FLEET_CHANGED.notify_all();
+        #[cfg(unix)]
+        fleet_inputs::ring_window();
         return;
     }
     move_fleet(desk, wanted);
@@ -1346,6 +1478,8 @@ fn move_fleet(mut desk: std::sync::MutexGuard<'_, FleetDesk>, wanted: Option<Wan
     }
     drop(desk);
     FLEET_CHANGED.notify_all();
+    #[cfg(unix)]
+    fleet_inputs::ring_window();
 }
 
 /// `status`'s `fleet=` word: `off`, `listening`, `retrying` or `refused:<why>`.
@@ -1657,31 +1791,51 @@ fn members_ask() -> Option<aterm_net::fleet::AskHandler> {
 /// and grants it is accepted under ([`served_now`]).
 #[cfg(unix)]
 fn serve_fleet_port(generation: u64, addr: SocketAddr) {
+    use fleet_inputs::Rest;
     let (mut revision, mesh) = {
         let desk = FLEET_DESK.lock_or_recover();
         (desk.revision, desk.mesh)
     };
+    // What wakes this generation between its looks (KI-1108-2): its inputs' events, a change of
+    // `[fleet]`, and what each rest names; the old tick where the file watch did not start.
+    let window = window_inputs();
+    let mut rest = fleet_inputs::WindowRest::new(
+        window,
+        aterm_types::dirs::state_dir().as_deref(),
+        (retry(), backstop()),
+        crate::network_moved::watch_at_once(),
+    );
     loop {
+        // Taken before this round's reads: a change made during them is pending at its rest.
+        let mut seen = fleet_inputs::Seen::new(window.bell());
         let Some(traffic) = capture_traffic_here() else {
             stand_fleet(
                 generation,
                 Standing::Refused("vault"),
                 "fleet traffic paused: this Mac's fleet tenure does not match its current vault",
             );
-            if wait_fleet_unchanged(generation) {
+            if wait_fleet_unchanged(generation, (&mut rest, &mut seen), Rest::Inputs) {
                 continue;
             }
             return;
         };
         if let Some(line) = window_yields_port(mesh, node_job_running_now) {
-            let serving = served_now();
-            lift_undriving_holds(
-                &serving.grants,
+            let read = lift_undriving_holds_once_held(
+                &crate::control::lift_ungranted_remote_holds,
                 &keyring_now(),
-                denied_nodes_now().as_deref().unwrap_or_default(),
+                &|| {
+                    let writer = vault_writer_holds();
+                    let (denied, settled) = denied_nodes_read();
+                    (served_now().grants, denied, settled && !writer)
+                },
             );
             stand_fleet(generation, Standing::Listening, line);
-            if wait_fleet_tick(generation, &mut revision) {
+            let why = match read {
+                Some(false) => Rest::Paced,
+                _ if mesh => Rest::Inputs,
+                _ => Rest::NodeHolds,
+            };
+            if wait_fleet_tick(generation, &mut revision, (&mut rest, &mut seen), why) {
                 continue;
             }
             return;
@@ -1693,18 +1847,29 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                     generation,
                     Standing::Refused(error.word()),
                     &format!(
-                        "fleet listener not started: {error}; read again every {:?}",
-                        retry()
+                        "fleet listener not started: {error}; {}",
+                        looked_again(rest.watching())
                     ),
                 );
-                if wait_fleet_unchanged(generation) {
+                if wait_fleet_unchanged(generation, (&mut rest, &mut seen), Rest::Inputs) {
                     continue;
                 }
                 return;
             }
         };
+        // While this window has the port bound it holds `window-port.lock`, let go only once the
+        // listener has closed (declared before it, so dropped after it): a node job whose bind met
+        // the port in use waits for that release, not a clock (KI-1108-2).
+        let _window_port: Option<aterm_agent::node_service::NodeJobLock>;
         let listener = match aterm_uds::kept_out(|| TcpListener::bind(addr)) {
-            Ok(listener) => listener,
+            Ok(listener) => {
+                _window_port = aterm_types::dirs::state_dir().and_then(|state| {
+                    aterm_agent::node_service::NodeJobLock::try_acquire_window_port(&state)
+                        .ok()
+                        .flatten()
+                });
+                listener
+            }
             Err(error)
                 if matches!(
                     error.kind(),
@@ -1715,9 +1880,9 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 stand_fleet(
                     generation,
                     Standing::Retrying,
-                    &unbound_line(addr, error.kind(), state.as_deref()),
+                    &unbound_line(addr, error.kind(), state.as_deref(), rest.watching()),
                 );
-                if wait_fleet_unchanged(generation) {
+                if wait_fleet_unchanged(generation, (&mut rest, &mut seen), Rest::Unbound) {
                     continue;
                 }
                 return;
@@ -1745,12 +1910,13 @@ fn serve_fleet_port(generation: u64, addr: SocketAddr) {
                 let proved = node
                     .as_ref()
                     .map(|node| (node.node().to_owned(), node.key()));
+                let seen = seen.clone();
                 move || {
                     watch_fleet_generation(
                         (generation, addr),
                         (&stop, &rekeyed),
                         (&secret, proved),
-                        &traffic,
+                        (&traffic, seen),
                     );
                 }
             });
@@ -2850,6 +3016,7 @@ fn unbound_line(
     addr: SocketAddr,
     kind: std::io::ErrorKind,
     state: Option<&std::path::Path>,
+    watching: bool,
 ) -> String {
     let why = match (kind, state) {
         (std::io::ErrorKind::AddrInUse, Some(state)) => format!(
@@ -2859,10 +3026,26 @@ fn unbound_line(
         (std::io::ErrorKind::AddrInUse, None) => "is held by another process".to_owned(),
         _ => "is not an address of this machine yet".to_owned(),
     };
-    format!(
-        "fleet listener: {addr} {why}; tried again every {:?}",
-        retry()
-    )
+    let again = if watching {
+        format!(
+            "tried again when an aterm lets it go or the network moves, and at least every {:?}",
+            fleet_inputs::FOREIGN_MOST.max(retry())
+        )
+    } else {
+        format!("tried again every {:?}", retry())
+    };
+    format!("fleet listener: {addr} {why}; {again}")
+}
+
+/// How the listener's line says a key it cannot use is read again: at each change of it while
+/// its file watch runs ([`fleet_inputs`]), else on the old tick.
+#[cfg(unix)]
+fn looked_again(watching: bool) -> String {
+    if watching {
+        "read again when it changes".to_owned()
+    } else {
+        format!("read again every {:?}", retry())
+    }
 }
 
 /// This machine's fleet secret, from `<state>/fleet.key`.
@@ -2891,8 +3074,10 @@ fn read_node_key() -> Option<aterm_net::fleet::NodeIdentity> {
 }
 
 /// While `generation` listens at `addr`, serves `secret` and proves the node `proved` (its id and
-/// key), read them again every [`RETRY`], or at once when a reload changes `[fleet]` in place:
-/// another key moves the listener, and `[fleet]` is followed where it stands ([`follow_serving`]).
+/// key), read them again at each event of the window's inputs, or at once when a reload changes
+/// `[fleet]` in place ([`fleet_inputs::Pace`], `seen` the view the listener took before its
+/// reads; every [`RETRY`] where its file watch did not start): another key moves the listener,
+/// and `[fleet]` is followed where it stands ([`follow_serving`]).
 #[cfg(unix)]
 fn watch_fleet_generation(
     (generation, addr): (u64, SocketAddr),
@@ -2901,7 +3086,7 @@ fn watch_fleet_generation(
         &aterm_net::fleet::FleetSecret,
         Option<(String, aterm_net::fleet::NodeKey)>,
     ),
-    traffic: &aterm_agent::fleet_vault::Traffic,
+    (traffic, seen): (&aterm_agent::fleet_vault::Traffic, fleet_inputs::Seen),
 ) {
     use aterm_net::fleet::KEY_FILE;
     use aterm_net::fleet_member::{NODE_FILE, NODE_KEY_FILE, read_node_identity};
@@ -2929,7 +3114,21 @@ fn watch_fleet_generation(
         every,
         crate::network_moved::watch(),
     );
-    while wait_fleet_tick(generation, &mut revision) && !stop.is_set() {
+    let window = window_inputs();
+    let mut pace = fleet_inputs::Pace::window(window, seen, retry(), backstop());
+    // A move only makes the heartbeat due, once this Mac's spread after it passed.
+    let mut network = crate::network_moved::watch();
+    while let Some(pass) = pace.wait(&mut network, &[stop])
+        && fleet_current(generation, &mut revision)
+        && !stop.is_set()
+    {
+        if !pass.run {
+            pace.heartbeat(heartbeat.next_due(hb_in_flight.load(Ordering::Acquire)));
+            continue;
+        }
+        // A vault writer that holds its lock now may hold it across this pass's reads, and lets
+        // it go with no file event: the old tick until a pass finds none.
+        let writer = vault_writer_holds();
         if node_job_running_now() {
             rekeyed.store(true, Ordering::Release);
             stop.set();
@@ -2946,7 +3145,7 @@ fn watch_fleet_generation(
         }
         let why = match read_fleet_key() {
             Ok(now) if now == *secret && node_now() == proved => {
-                follow_serving(generation, addr);
+                let settled = follow_serving(generation, addr);
                 // Each dial selects the broker at the transport boundary for LAN targets.
                 // Loopback peers remain reachable without a LAN broker.
                 let now = std::time::Instant::now();
@@ -2961,11 +3160,34 @@ fn watch_fleet_generation(
                     last_census_refresh = std::time::Instant::now();
                     maybe_refresh_local_census();
                 }
+                let owed = heartbeat.next_due(busy).is_some_and(|at| at <= now);
+                // The round's end rings the watch, which keeps no deadline while it is out.
+                let over = pace.watching().then_some(window.bell());
                 if let Some(woke) = heartbeat.dispatch_when_free(now, busy, || {
-                    spawn_member_heartbeat(addr, secret.clone(), (stop, &hb_in_flight), traffic)
+                    spawn_member_heartbeat(
+                        addr,
+                        secret.clone(),
+                        (stop, &hb_in_flight, over),
+                        traffic,
+                    )
                 }) {
                     say_heartbeat_woke("fleet listener", woke);
                 }
+                let now = std::time::Instant::now();
+                pace.passed(
+                    fleet_inputs::Duties {
+                        heartbeat: fleet_inputs::heartbeat_after(
+                            heartbeat.next_due(hb_in_flight.load(Ordering::Acquire)),
+                            owed,
+                            now,
+                            every,
+                        ),
+                        facts: Some(last_facts_push + FACTS_HEARTBEAT_EVERY),
+                        census: Some(last_census_refresh + CENSUS_REFRESH_EVERY),
+                        ..fleet_inputs::Duties::default()
+                    },
+                    writer || !settled,
+                );
                 continue;
             }
             Ok(now) if now == *secret => format!("{NODE_FILE} or {NODE_KEY_FILE} changed"),
@@ -2997,7 +3219,11 @@ fn initial_heartbeat_anchor(every: Duration) -> Option<std::time::Instant> {
 fn spawn_member_heartbeat(
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
+    (ended, in_flight, over): (
+        &Arc<Stop>,
+        &Arc<AtomicBool>,
+        Option<&Arc<fleet_inputs::Bell>>,
+    ),
     traffic: &aterm_agent::fleet_vault::Traffic,
 ) -> bool {
     let Some(state) = aterm_types::dirs::state_dir() else {
@@ -3029,7 +3255,7 @@ fn spawn_member_heartbeat(
         &state,
         addr,
         secret,
-        (ended, in_flight),
+        (ended, in_flight, over),
         (denied, log, crate::network_moved::alab_tcp()),
         traffic.clone(),
     )
@@ -3083,7 +3309,11 @@ fn spawn_member_heartbeat_at(
     state: &std::path::Path,
     addr: SocketAddr,
     secret: aterm_net::fleet::FleetSecret,
-    (ended, in_flight): (&Arc<Stop>, &Arc<AtomicBool>),
+    (ended, in_flight, over): (
+        &Arc<Stop>,
+        &Arc<AtomicBool>,
+        Option<&Arc<fleet_inputs::Bell>>,
+    ),
     (denied, log, browse): HeartbeatReach,
     traffic: aterm_agent::fleet_vault::Traffic,
 ) -> bool {
@@ -3104,6 +3334,7 @@ fn spawn_member_heartbeat_at(
         return false;
     }
     let flag = Arc::clone(in_flight);
+    let over = over.cloned();
     let ended = Arc::clone(ended);
     let state = state.to_path_buf();
     let reg = Registration {
@@ -3120,13 +3351,17 @@ fn spawn_member_heartbeat_at(
             if !cfg!(test) {
                 crate::qos::set_self(crate::qos::Role::Background);
             }
-            struct Guard(Arc<AtomicBool>);
+            // The round's end frees the next and rings the waiter that keeps its deadline.
+            struct Guard(Arc<AtomicBool>, Option<Arc<fleet_inputs::Bell>>);
             impl Drop for Guard {
                 fn drop(&mut self) {
                     self.0.store(false, Ordering::Release);
+                    if let Some(over) = &self.1 {
+                        over.ring();
+                    }
                 }
             }
-            let _guard = Guard(flag);
+            let _guard = Guard(flag, over);
             let current = || traffic.current();
             let within = heartbeat_within();
             let hb_deadline = std::time::Instant::now() + within;
@@ -3205,11 +3440,11 @@ fn spawn_member_heartbeat_at(
 /// Follow `[fleet]` while `generation` listens at `addr`, as each connection is served
 /// ([`served_now`]): hang up each open one it serves no more ([`cut_unserved_with_denied`]), lift
 /// each hold of a node that may drive no more ([`lift_undriving_holds`]), and say where it stands
-/// once that moved.
+/// once that moved. Whether its deny read settled ([`denied_nodes_read`]).
 #[cfg(unix)]
-fn follow_serving(generation: u64, addr: SocketAddr) {
+fn follow_serving(generation: u64, addr: SocketAddr) -> bool {
     let serving = served_now();
-    let denied = denied_nodes_now();
+    let (denied, settled) = denied_nodes_read();
     let held = std::cell::OnceCell::new();
     let keys_and_log = || {
         held.get_or_init(|| {
@@ -3256,25 +3491,44 @@ fn follow_serving(generation: u64, addr: SocketAddr) {
         denied.as_deref().unwrap_or_default(),
     );
     stand_fleet(generation, Standing::Listening, &serving.line(addr));
+    settled
 }
 
-fn wait_fleet_unchanged(generation: u64) -> bool {
-    let desk = FLEET_DESK.lock_or_recover();
-    let (desk, _) = FLEET_CHANGED
-        .wait_timeout_while(desk, retry(), |desk| desk.generation == generation)
-        .unwrap_or_else(PoisonError::into_inner);
-    desk.generation == generation
+/// Rest for `why` ([`fleet_inputs::WindowRest`], `seen` the view taken before this round's
+/// reads): whether `generation` is still the listener's after it.
+#[cfg(unix)]
+fn wait_fleet_unchanged(
+    generation: u64,
+    (rest, seen): (&mut fleet_inputs::WindowRest, &mut fleet_inputs::Seen),
+    why: fleet_inputs::Rest,
+) -> bool {
+    rest.wait(seen, why, &|| {
+        FLEET_DESK.lock_or_recover().generation == generation
+    });
+    FLEET_DESK.lock_or_recover().generation == generation
 }
 
 /// [`wait_fleet_unchanged`], ended early too by a change of `[fleet]` in place past `revision`,
 /// which it moves to.
-fn wait_fleet_tick(generation: u64, revision: &mut u64) -> bool {
+#[cfg(unix)]
+fn wait_fleet_tick(
+    generation: u64,
+    revision: &mut u64,
+    (rest, seen): (&mut fleet_inputs::WindowRest, &mut fleet_inputs::Seen),
+    why: fleet_inputs::Rest,
+) -> bool {
+    let at = *revision;
+    rest.wait(seen, why, &|| {
+        let desk = FLEET_DESK.lock_or_recover();
+        desk.generation == generation && desk.revision == at
+    });
+    fleet_current(generation, revision)
+}
+
+/// Whether `generation` is still the listener's, `revision` moved to the desk's.
+#[cfg(unix)]
+fn fleet_current(generation: u64, revision: &mut u64) -> bool {
     let desk = FLEET_DESK.lock_or_recover();
-    let (desk, _) = FLEET_CHANGED
-        .wait_timeout_while(desk, retry(), |desk| {
-            desk.generation == generation && desk.revision == *revision
-        })
-        .unwrap_or_else(PoisonError::into_inner);
     *revision = desk.revision;
     desk.generation == generation
 }
@@ -3360,6 +3614,10 @@ fn note_fleet(line: &str, refusal: bool) {
 #[cfg(test)]
 #[path = "fleet_listen_tests.rs"]
 mod tests;
+
+#[cfg(unix)]
+#[path = "fleet_inputs.rs"]
+pub(crate) mod fleet_inputs;
 
 #[cfg(unix)]
 #[path = "node_serve.rs"]

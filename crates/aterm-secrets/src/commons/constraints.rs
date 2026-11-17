@@ -6,10 +6,10 @@
 //! grant; they never grant membership. Union is monotone across branches and recovery.
 
 use super::binding::Binding;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use super::node::Node;
 use crate::{Error, Result};
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 use astream_wire::sync::Header;
 use astream_wire::sync::{Actor, Digest, Index};
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,9 +19,9 @@ pub const MAX_FACTS: usize = 256;
 /// The per-node fact bound of 0.145 and earlier, which refuse a node with more facts. A node
 /// over it is written only through the C26 gate (`super::hearing`).
 pub const LEGACY_MAX_FACTS: usize = 64;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 const MAX_RETIRED_ACTORS: usize = 4096;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 /// Maximum distinct signed actor bindings retained by a Commons control history.
 pub const MAX_BINDINGS: usize = 4096;
 
@@ -84,7 +84,7 @@ impl Fact {
             Err(Error::new("invalid control restriction"))
         }
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn encode(&self, wire: &mut Vec<u8>) {
         match self {
             Self::Retire { actor } => {
@@ -166,7 +166,7 @@ pub struct Constraints {
     retired_recipients: BTreeSet<crate::age::Recipient>,
 }
 impl Constraints {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn collect<'a>(
         network: [u8; 16],
         authority: [u8; 32],
@@ -355,7 +355,7 @@ impl Constraints {
     /// Collect signed restrictive facts across every retained control node without requiring a
     /// single ready head, so log-backed Commons tables still honor retained table cutoffs and
     /// retirements even when the legacy control journal holds competing branches (`F18`).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn collect_retained<'a>(
         network: [u8; 16],
         authority: [u8; 32],
@@ -948,8 +948,8 @@ fn allowed_prefix(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod binding_tests;

@@ -1956,13 +1956,13 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     ] {
         let (root, home, repo) = repo_under("provider", place, "main");
         assert_eq!(
-            read_git_head_in(Some(&home), &repo),
+            read_git_head_in(Some(&home), &repo, None),
             GitHeadRead::Absent,
             "{place}"
         );
         std::fs::create_dir_all(repo.join("src")).unwrap();
         assert_eq!(
-            read_git_head_in(Some(&home), &repo.join("src")),
+            read_git_head_in(Some(&home), &repo.join("src"), None),
             GitHeadRead::Absent,
             "{place}/src"
         );
@@ -1976,7 +1976,7 @@ fn read_git_head_opens_nothing_under_a_file_provider_domain() {
     ] {
         let (root, home, repo) = repo_under("ordinary", place, "main");
         assert_eq!(
-            read_git_head_in(Some(&home), &repo),
+            read_git_head_in(Some(&home), &repo, None),
             GitHeadRead::Found("main".into(), repo.clone()),
             "{place}"
         );
@@ -2003,14 +2003,14 @@ fn a_worktree_pointing_into_a_provider_domain_is_absent() {
         )
         .unwrap();
         assert_eq!(
-            read_git_head_in(Some(&home), &wt),
+            read_git_head_in(Some(&home), &wt, None),
             GitHeadRead::Absent,
             "{place}"
         );
         let link = home.join("src").join("link");
         std::os::unix::fs::symlink(&provider_repo, &link).unwrap();
         assert_eq!(
-            read_git_head_in(Some(&home), &link),
+            read_git_head_in(Some(&home), &link, None),
             GitHeadRead::Absent,
             "{place} symlink"
         );
@@ -2105,6 +2105,7 @@ fn the_model_leads_then_the_wall_then_the_account() {
             Some(Wall {
                 label: "5h",
                 resets: "3pm".into(),
+                resets_at: 0,
             }),
             None,
         ),
@@ -2433,8 +2434,10 @@ fn a_resume_to_another_session_never_pairs_its_model_with_the_old_usage() {
 }
 
 /// A mid-write sessions file keeps the fold of the session last named,
-/// with or without a kernel start time; a torn only parse yields no facts
-/// and the next good read folds nothing again.
+/// with or without a kernel start time: a read of a row rewritten since the
+/// last parses it once (a row that stands is not parsed again at all); a
+/// torn only parse yields no facts and the next good read folds nothing
+/// again.
 #[cfg(unix)]
 #[test]
 fn a_torn_read_of_the_same_session_keeps_its_fold() {
@@ -2460,6 +2463,9 @@ fn a_torn_read_of_the_same_session_keeps_its_fold() {
         let shown = read(&mut cache).and_then(|f| f.usage).expect("control");
         assert!(shown.wall.is_some(), "control");
 
+        // Rewritten in place, as Claude Code rewrites it: the next read parses it again.
+        let row = claude.join("sessions/4242.json");
+        std::fs::write(&row, std::fs::read(&row).unwrap()).unwrap();
         let (facts, reads) = read_torn_after_first(
             &claude,
             4242,
@@ -3371,6 +3377,7 @@ fn narrow_rule_walled() -> FooterFacts {
             Some(Wall {
                 label: "7d",
                 resets: "Oct 1 at 9am".into(),
+                resets_at: 0,
             }),
             None,
         )
@@ -6493,6 +6500,7 @@ fn a_transcript_limit_without_recovery_observations_has_an_ephemeral_unknown_vie
             wall: Some(super::super::session_usage::Wall {
                 label: "7d",
                 resets: reset.into(),
+                resets_at: 0,
             }),
             ..Default::default()
         }),
@@ -6546,6 +6554,7 @@ fn an_unobserved_recovery_keeps_its_reset_in_disclosure_and_the_rule_its_wall() 
             wall: Some(super::super::session_usage::Wall {
                 label: "7d",
                 resets: reset.into(),
+                resets_at: 0,
             }),
             ..Default::default()
         }),
@@ -6599,6 +6608,7 @@ fn a_paused_recovery_keeps_the_provider_wall_without_becoming_a_wait() {
             wall: Some(super::super::session_usage::Wall {
                 label: "7d",
                 resets: "tomorrow".into(),
+                resets_at: 0,
             }),
             ..Default::default()
         }),
@@ -6649,6 +6659,7 @@ fn unavailable_recovery_withdraws_current_claims_without_rewriting_the_decision(
         Some(super::super::session_usage::Wall {
             label: "7d",
             resets: "tomorrow".into(),
+            resets_at: 0,
         });
     let unavailable = facts.account_progress_view().unwrap().into_owned();
     assert_eq!(unavailable.phase, ProgressPhase::Unknown);
@@ -6981,6 +6992,7 @@ fn a_transcript_limit_survives_an_older_idle_account_observation() {
             wall: Some(super::super::session_usage::Wall {
                 label: "7d",
                 resets: "tomorrow".into(),
+                resets_at: 0,
             }),
             ..Default::default()
         }),

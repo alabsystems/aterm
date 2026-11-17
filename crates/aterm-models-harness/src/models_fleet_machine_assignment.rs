@@ -24,14 +24,13 @@ use aterm_spec::derive::Model;
 ///    and never by the order a withdrawn preference left (`Unprefer`); an account asked for by
 ///    name takes the same order. `dropped`, `unasked` and `misordered`
 ///    record the opposite.
-/// 3. **Labels name no machine** (`alab_roster::{fleet_for, renames}`,
-///    `accounts_sync::build_machine_roster`'s default login). One account's row on this Mac:
-///    `lbl` 0 none, 1 a machine-shaped label (its legacy label, `m1-2`), 2 its lab label, 3 a
-///    label the owner gave; `dflt` the account is this Mac's default login (its row dirless, under
-///    whatever label it already has); `settled` this Mac's registry inventory equalled a peer's.
-///    A sync names a new row by the lab and never renames one; a migration renames only from the
-///    legacy label, only once settled, and every legacy row once settled, the default login's
-///    too. `minted`, `resynced`, `misnamed`, `early` and `stale` record the opposite.
+/// 3. **Labels name no machine** (`alab_roster::fleet_for`, `accounts_sync::build_machine_roster`'s
+///    default login). One account's row on this Mac: `lbl` 0 none, 1 a machine-shaped label (its
+///    legacy label, `m1-2`), 2 its lab label, 3 a label the owner gave; `dflt` the account is this
+///    Mac's default login (its row dirless, under whatever label it already has). A sync names a
+///    new row by the lab and never renames one, a legacy row and the default login's included,
+///    whether or not this Mac's registry is settled: a row's label keys what this Mac holds of the
+///    account, which a rename would leave behind. `minted` and `resynced` record the opposite.
 /// 4. **An alias chain resolves to one effective mailbox** (`aterm-db`'s `alab::mail::{effective,
 ///    alias_cycle}`, `LabView::{aliases, mailboxes}` and `checks::lab`, then
 ///    `mailbox_routes::resolve_index` with `alab_roster::{mailbox_of, mail_targets}`). One login
@@ -55,16 +54,13 @@ use aterm_spec::derive::Model;
 /// refused, 10 a stored class word overrides the derived order, 11 a row several Macs prefer reads
 /// as pool, 12 a sync drops a row another Mac prefers, 13 a sync adds an account another Mac
 /// prefers, 14 a sync keeps the stored order of a row this Mac no longer prefers, 21 the default
-/// login is named after the machine, 22 a migration renames an owner's
-/// label, 23 a migration renames before the registry is settled, 24 a sync renames a row to its
-/// lab label, 25 a sync renames the default login's legacy row, 26 a settled migration skips the
-/// default login's legacy row, 31 the address's own route beats the lab's mailbox, 32 a chain
-/// link's route beats the address's own, 33 a domain route beats the chain, 34 the farther link's
-/// route beats the nearer's, 35 the chain is followed one link only, 36 a retired address is
-/// followed, 37 the chain lists the alias itself round a cycle, 38 the chain's mailbox beats the
-/// alias's own, 39 the effective mailbox is read through a retired link, 40 `check` reports a
-/// retired target only on the alias's own link, 41 `check` reports no cycle, 42 `check` reports
-/// no self-link.
+/// login is named after the machine, 24 a sync renames a legacy row to its lab label, 31 the
+/// address's own route beats the lab's mailbox, 32 a chain link's route beats the address's own,
+/// 33 a domain route beats the chain, 34 the farther link's route beats the nearer's, 35 the chain
+/// is followed one link only, 36 a retired address is followed, 37 the chain lists the alias
+/// itself round a cycle, 38 the chain's mailbox beats the alias's own, 39 the effective mailbox is
+/// read through a retired link, 40 `check` reports a retired target only on the alias's own link,
+/// 41 `check` reports no cycle, 42 `check` reports no self-link.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn fleet_machine_assignment_model() -> Model {
@@ -75,8 +71,8 @@ pub fn fleet_machine_assignment_model() -> Model {
             var case = 0; var accepted = 0; var exact = 1;
             var here = 0; var other = 0; var row = 0; var cls = 0;
             var dropped = 0; var unasked = 0; var misordered = 0;
-            var lbl = 0; var dflt = 0; var settled = 0;
-            var minted = 0; var resynced = 0; var misnamed = 0; var early = 0; var stale = 0;
+            var lbl = 0; var dflt = 0;
+            var minted = 0; var resynced = 0;
             var lm = 0; var link = 0; var hop = 0; var hg = 0; var rg = 0; var mb = 0;
             var own = 0; var rh = 0; var rr = 0; var dom = 0;
             var fol = 0; var t1 = 0; var t2 = 0; var eff = 0; var frt = 0; var fcy = 0;
@@ -140,26 +136,15 @@ pub fn fleet_machine_assignment_model() -> Model {
                     || (Buggy == 14 && row == 1 && here == 0 && cls == 1) {1} else {misordered};
             }
 
-            // 3. Labels: rows a Mac already had, its default login and the inventory round, then
-            // a sync or a migration.
+            // 3. Labels: rows a Mac already had and its default login, then a sync.
             action RowLegacy when (area == 3 && lbl == 0) { lbl = 1; }
             action RowOwner when (area == 3 && lbl == 0) { lbl = 3; }
             action DefaultLogin when (area == 3 && dflt == 0) { dflt = 1; }
-            action Settle when (area == 3 && settled == 0) { settled = 1; }
             action SyncLabels when (area == 3) {
                 lbl = if lbl == 0 {if dflt == 1 {if Buggy == 21 {1} else {2}} else {0}}
-                    else {if (Buggy == 24 || (Buggy == 25 && dflt == 1)) && lbl == 1 {2} else {lbl}};
+                    else {if Buggy == 24 && lbl == 1 {2} else {lbl}};
                 minted = if Buggy == 21 && lbl == 0 && dflt == 1 {1} else {minted};
-                resynced = if (Buggy == 24 || (Buggy == 25 && dflt == 1)) && lbl == 1 {1}
-                    else {resynced};
-            }
-            action Migrate when (area == 3) {
-                lbl = if Buggy == 26 && dflt == 1 && lbl == 1 {lbl}
-                    else {if (lbl == 1 && (settled == 1 || Buggy == 23))
-                    || (Buggy == 22 && lbl == 3 && settled == 1) {2} else {lbl}};
-                stale = if Buggy == 26 && dflt == 1 && lbl == 1 && settled == 1 {1} else {stale};
-                misnamed = if Buggy == 22 && lbl == 3 && settled == 1 {1} else {misnamed};
-                early = if Buggy == 23 && lbl == 1 && settled == 0 {1} else {early};
+                resynced = if Buggy == 24 && lbl == 1 {1} else {resynced};
             }
 
             // 4. Mail: the lab's rows (each a registry change, read again by `Follow`) and this
@@ -231,9 +216,6 @@ pub fn fleet_machine_assignment_model() -> Model {
             invariant OrderIsThisMacsPreference: misordered == 0;
             invariant NoMachineLabelMinted: minted == 0;
             invariant SyncNeverRenames: resynced == 0;
-            invariant RenameOnlyFromLegacy: misnamed == 0;
-            invariant RenameOnlyOnceSettled: early == 0;
-            invariant SettledMigrationRenamesLegacy: stale == 0;
             invariant ChainFollowedToItsEnd: if fol == 1 && link == 1 && hg == 0 {
                 t1 == 1 && (hop == 0 || hop == 2 || rg == 1 || t2 == 1)
             } else { 1 == 1 };

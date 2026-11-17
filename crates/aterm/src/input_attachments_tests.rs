@@ -698,7 +698,10 @@ fn background_keeper_requires_a_local_aqua_birth_but_no_terminal_or_vault() {
     )
     .expect("unread admission retains the actual maintenance callback");
     for _ in 0..3 {
-        retained();
+        assert!(
+            retained().is_some_and(|at| at > Instant::now()),
+            "an unread admission names when it is read again"
+        );
     }
     assert_eq!(samples.load(Ordering::SeqCst), 4);
     assert_eq!(starts.load(Ordering::SeqCst), 0);
@@ -756,7 +759,11 @@ fn background_keeper_requires_a_local_aqua_birth_but_no_terminal_or_vault() {
         retained();
         let refused_samples = samples.load(Ordering::SeqCst);
         session.store(2, Ordering::SeqCst);
-        retained();
+        assert_eq!(
+            retained(),
+            None,
+            "CONTROL: a refused session names no deadline"
+        );
         assert_eq!(samples.load(Ordering::SeqCst), refused_samples);
     }
 }

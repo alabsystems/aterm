@@ -43,6 +43,7 @@ fn put_or_delete(rng: &mut Rng, index: usize, op: DecodedOp) -> CandidateOp {
         record_id,
         epoch: [0; 32],
         op,
+        stated: None,
     }
 }
 
@@ -84,7 +85,7 @@ fn resolve(
     let reach = indexed(parents);
     let ops: Vec<&[CandidateOp]> = registers.iter().map(Vec::as_slice).collect();
     WORK.set(Work::default());
-    let resolved = Register::classify_all(&ops, &reach, |x| parents[x].iter().copied())
+    let resolved = Register::classify_all(&ops, &reach, None, |x| parents[x].iter().copied())
         .iter()
         .map(|register| oracle::resolved(register, &register.siblings(&reach)))
         .collect();
@@ -101,7 +102,7 @@ fn disagreements(parents: &[Vec<usize>], registers: &[Vec<CandidateOp>]) -> usiz
         .zip(registers)
         .filter(|(got, cands)| {
             let before = |a: usize, b: usize| past[b][a];
-            let (want, _) = oracle::resolve(cands, &before, usize::MAX);
+            let (want, _) = oracle::resolve(cands, &before, &|_, _| false, usize::MAX);
             let fold = oracle::island(cands, &before);
             oracle::ISLAND_CHECKED.set(oracle::ISLAND_CHECKED.get() + usize::from(fold.is_some()));
             want.as_ref() != Ok(*got) || fold.is_some_and(|fold| want.as_ref() != Ok(&fold))
@@ -206,7 +207,7 @@ fn pinned(
     let reach = indexed(parents);
     let old = registers
         .iter()
-        .map(|cands| oracle::resolve(cands, &|a, b| reach.before(a, b), budget).0)
+        .map(|cands| oracle::resolve(cands, &|a, b| reach.before(a, b), &|_, _| false, budget).0)
         .collect();
     (work, old)
 }
@@ -480,7 +481,7 @@ fn a_frontier_of_reseals_and_edits_reads_one_word_per_op() {
 
     // What the last write's writer held: its frontier is the 6,000 reseals and edits.
     let reach = indexed(&parents);
-    let register = Register::classify_all(&[registers[0].as_slice()], &reach, |x| {
+    let register = Register::classify_all(&[registers[0].as_slice()], &reach, None, |x| {
         parents[x].iter().copied()
     })
     .pop()

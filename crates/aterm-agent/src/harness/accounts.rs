@@ -18,6 +18,7 @@ pub use crate::ai::connector::Cli;
 use crate::ai::connector::{Flow, Region, RowKeys, Seam};
 
 use super::one_line;
+pub use super::sign_in_ladder::RunningSignIn;
 
 #[path = "accounts_outbox.rs"]
 pub mod outbox;
@@ -834,13 +835,7 @@ impl Roster {
                     i + 1
                 ));
             }
-            if let Some(twin) = rows.iter().find(|r| {
-                same_provider_realm(cli, r.vendor.region, row.vendor.region)
-                    && r.email
-                        .as_deref()
-                        .zip(row.email.as_deref())
-                        .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-            }) {
+            if let Some(twin) = rows.iter().find(|r| same_email(cli, r, &row)) {
                 return Err(format!(
                     "{file}: rows `{}` and `{}` name one email in the same provider realm; an account is one row: {}",
                     twin.label,
@@ -848,14 +843,7 @@ impl Roster {
                     drop_one_of(twin, &row)
                 ));
             }
-            if matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy)
-                && let Some(twin) = rows.iter().find(|r| {
-                    same_provider_realm(cli, r.vendor.region, row.vendor.region)
-                        && r.expected_identity_email()
-                            .zip(row.expected_identity_email())
-                            .is_some_and(|(a, b)| email_matches(a, b))
-                })
-            {
+            if let Some(twin) = rows.iter().find(|r| same_identity(cli, r, &row)) {
                 return Err(format!(
                     "{file}: rows `{}` and `{}` expect one provider identity; an account is one row: {}",
                     twin.label,
@@ -905,6 +893,17 @@ impl Roster {
     #[must_use]
     pub fn row(&self, label: &str) -> Option<&Row> {
         self.rows.iter().find(|r| r.label == label)
+    }
+
+    /// The row of `cli`'s roster that already lists the account `row` names, under whatever
+    /// label: one naming the same email, or expecting the same provider identity, in the same
+    /// provider realm, the pairs [`Roster::parse_for`] refuses as one account on two rows. `None`
+    /// where `row` names no address or no row names its account.
+    #[must_use]
+    pub fn row_of_account(&self, cli: Cli, row: &Row) -> Option<&Row> {
+        self.rows
+            .iter()
+            .find(|r| same_email(cli, r, row) || same_identity(cli, r, row))
     }
 
     /// Looks up the roster row matching a process's [`LOGIN_ENV`] value.
@@ -984,10 +983,29 @@ pub fn roster_text(path: &Path) -> Result<Option<String>, String> {
     read_bounded(path, MAX_ROSTER_BYTES).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Whether rows `a` and `b` of `cli`'s roster name one email in the same provider realm.
+fn same_email(cli: Cli, a: &Row, b: &Row) -> bool {
+    same_provider_realm(cli, a.vendor.region, b.vendor.region)
+        && a.email
+            .as_deref()
+            .zip(b.email.as_deref())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+/// Whether rows `a` and `b` of `cli`'s roster expect one provider identity in the same provider
+/// realm: for Claude Code, Codex, Kimi and agy, whose providers report the identity a login is.
+fn same_identity(cli: Cli, a: &Row, b: &Row) -> bool {
+    matches!(cli, Cli::Claude | Cli::Codex | Cli::Kimi | Cli::Agy)
+        && same_provider_realm(cli, a.vendor.region, b.vendor.region)
+        && a.expected_identity_email()
+            .zip(b.expected_identity_email())
+            .is_some_and(|(a, b)| email_matches(a, b))
+}
+
 /// Which of two rows naming one account a person removes to admit the roster: the row with a login
 /// directory of its own beside the row on this machine's own login, which keeps the account on
-/// the login this machine runs (a lab sync then gives that row the lab's label), else the later
-/// row, which the first one already covers.
+/// the login this machine runs, under the label it has, else the later row, which the first one
+/// already covers.
 fn drop_one_of(first: &Row, later: &Row) -> String {
     let (keep, drop) = if later.dir.is_none() {
         (later, first)
@@ -4553,6 +4571,27 @@ fn on_token_where(launches: bool, row: &Row, state: &State, now: i64) -> Option<
     read.ends.get(&row.label).copied().filter(|end| *end > now)
 }
 
+/// The first second after `now` at which [`on_token_here`] of `row` can answer otherwise with
+/// `state` as it stands, by the clock alone: the reading coming to stand (its `read_at`, where
+/// that is ahead), the reading aging out ([`TOKENS_HERE_FRESH_S`] past it), and the row's token
+/// ending. `None` where none of them is ahead, or on a host where no launch starts on a token.
+#[must_use]
+pub fn on_token_turns(row: &Row, state: &State, now: i64) -> Option<i64> {
+    if !super::token_route::LAUNCHES_ON_TOKEN {
+        return None;
+    }
+    let read = state.tokens_here.as_ref()?;
+    [
+        Some(read.read_at),
+        read.read_at.checked_add(TOKENS_HERE_FRESH_S + 1),
+        read.ends.get(&row.label).copied(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|at| *at > now)
+    .min()
+}
+
 /// Computes the [`LoginState`] of `row` at `now` from `logins` and `state`: where
 /// [`signed_out_here`] holds, [`LoginState::OnToken`] while the row runs on its vault token here
 /// ([`on_token_here`]) and [`LoginState::Expired`] otherwise, whatever its records forecast; and
@@ -5942,12 +5981,16 @@ pub fn move_accounts(
                 state.prepared_accounts.remove(*from),
                 logins.labels.remove(*from),
                 state.claimed_at.remove(*from),
+                state.wall_reads.remove(*from),
             )
         })
         .collect();
-    for (to, record, lease, home, prepared, binding, claimed) in moved {
+    for (to, record, lease, home, prepared, binding, claimed, ladder) in moved {
         if let Some(at) = claimed {
             state.claimed_at.insert(to.to_owned(), at);
+        }
+        if let Some(ladder) = ladder {
+            state.wall_reads.insert(to.to_owned(), ladder);
         }
         if let Some(record) = record {
             state.accounts.insert(to.to_owned(), record);
@@ -6017,6 +6060,7 @@ pub(super) fn label_is_retained(state: &State, logins: &Logins, label: &str) -> 
             .probe
             .as_ref()
             .is_some_and(|claim| claim.account == label)
+        || state.wall_reads.contains_key(label)
         || state
             .reset
             .as_ref()
@@ -6142,10 +6186,13 @@ pub struct Wall {
     pub attempts: u32,
     /// This window was cleared at `at`, rather than observed standing.
     pub cleared: bool,
-    /// The newest observation it stands on, where that is not `at` ([`Wall::seen()`]): of a wall
-    /// standing, its newest sighting, while `at` keeps its first ([`note_wall`]); of a lifted
-    /// one, when the proof that lifted it was served (a read's, a refill's, a reset step's
-    /// claim, another Mac's lift), while `at` is when the lift was recorded here.
+    /// The newest observation it stands on ([`Wall::seen()`]): of a wall standing, its newest
+    /// sighting, while `at` keeps its first ([`note_wall`]); of a lifted one, when the proof that
+    /// lifted it was served (a read's, a refill's, a reset step's claim, another Mac's lift, a
+    /// served request's), while `at` is the lift's mark, the instant after which a wall observed
+    /// raises the window again ([`Account::cleared_since`]): when the lift was recorded here, or,
+    /// for a lift a session here proved itself, its proof's own time (a served request,
+    /// [`note_served`]; its own sample's room, [`note_model_room`]).
     pub seen: Option<i64>,
 }
 
@@ -6514,7 +6561,7 @@ pub const MAX_WINDOWS: usize = 8;
 pub const REFILL_MIN_X10: u32 = 10;
 
 /// A drop no one process saw, smaller than this in tenths of a percent, is no refill
-/// ([`note_reading_held`]): it is two processes' figures, each served by its own request, set
+/// ([`note_reading_held`], [`note_panel_sample`]): it is two sources' figures, each served by its own request, set
 /// beside each other rather than one process's figure before and after. A refill or a raised
 /// allowance moves the figure by tens of points (m2 on 2026-11-15: 99% held, 69% read).
 pub const REFILL_UNSEEN_MIN_X10: u32 = 50;
@@ -6532,7 +6579,10 @@ pub struct WindowFig {
     pub by: String,
     /// Where it came from: in the state, [`SOURCE_TAP`] or [`SOURCE_SAMPLE`].
     pub source: String,
-    /// A limit reset used inside this window ([`WindowRead::refilled`], [`reset_outcome`]).
+    /// The window's refill barrier: when this Mac's aterm spent a limit reset inside it
+    /// ([`reset_outcome`]), or a usage tap or a `/usage` panel read it refilled or its allowance
+    /// raised ([`WindowRead::refilled`], [`REFILL_UNSEEN_MIN_X10`], [`note_panel_sample`]);
+    /// nothing records which of these a reading's was.
     pub epoch_at: Option<i64>,
 }
 
@@ -6610,8 +6660,8 @@ pub struct WindowRead {
     pub pct_x10: u32,
     /// The window's reset.
     pub reset: i64,
-    /// The figure the vendor refilled the window from, where it did ([`REFILL_MIN_X10`],
-    /// [`TapRead::seen_before`]).
+    /// The figure the window fell from inside it, where the process that read it saw it fall
+    /// ([`REFILL_MIN_X10`], [`TapRead::seen_before`]): refilled, or its allowance raised.
     pub refilled: Option<u32>,
 }
 
@@ -7192,6 +7242,53 @@ impl Account {
             .filter(|cleared| at < *cleared)
             .max()
     }
+
+    /// Whether the turn `s` served on this account lifts a wall of it ([`note_served`]): its
+    /// answer names a real model, no usage credits carried the account at the request (on, or
+    /// an episode still standing then: a turn served on credits says nothing of a window), and
+    /// a wall last sighted standing before the request ([`Wall::seen()`]) is one its model draws
+    /// on ([`draws_on`]). A wall sighted at or after the request stands, though the reply that
+    /// answered it was written later.
+    #[must_use]
+    pub fn served_lifts(&self, s: &ServedTurn<'_>) -> bool {
+        if s.model.is_empty() || s.model == SYNTHETIC_MODEL {
+            return false;
+        }
+        let on_credits = match &self.credits {
+            Some(Credits::On(_)) => true,
+            Some(Credits::InUse(carried)) => carried.stands(s.at),
+            Some(Credits::Off(_)) | None => false,
+        };
+        !on_credits
+            && self.walls.iter().any(|(window, wall)| {
+                !wall.cleared && wall.seen() < s.at && draws_on(s.model, window)
+            })
+    }
+
+    /// Whether a session's own read asked for at `at`, showing `window`'s row with room, lifts
+    /// that window's wall ([`note_model_room`]): it stands and was last seen standing before
+    /// the read ([`Wall::seen()`]).
+    #[must_use]
+    pub fn room_lifts(&self, window: &str, at: i64) -> bool {
+        self.walls
+            .get(window)
+            .is_some_and(|wall| !wall.cleared && wall.seen() < at)
+    }
+
+    /// When the proof that lifted `window`'s wall was served ([`Wall::seen()`]), where its newest
+    /// word is a lift `machine` made itself and not a wall observed standing: a served request
+    /// ([`note_served`]), a read ([`note_room`], [`note_model_room`]), a refill or a reset step,
+    /// each dated by `machine`'s own clock. Another Mac's lift ([`note_peer_lift`]) is dated by
+    /// that Mac's clock, which can run ahead of this one's, and is no word here: a lift of an
+    /// earlier episode, stamped ahead, would read as made after a limit met since. A session
+    /// moved onto Opus at Fable's limit reads Fable's (`IdleHost::fable_lift`).
+    #[must_use]
+    pub fn lifted_at(&self, window: &str, machine: &str) -> Option<i64> {
+        self.walls
+            .get(window)
+            .filter(|wall| wall.cleared && wall.by == machine)
+            .map(Wall::seen)
+    }
 }
 
 /// Machine-local record of which account a supervised session is running on.
@@ -7621,6 +7718,9 @@ pub struct State {
     pub rotations: Vec<i64>,
     /// Machine-local: the probe's claim.
     pub probe: Option<ProbeClaim>,
+    /// Machine-local: the wall ladder of each account whose sessions wait at its usage wall, by
+    /// label ([`WallLadder`], [`claim_wall_read`]). Never synced or published.
+    pub wall_reads: BTreeMap<String, WallLadder>,
     /// Machine-local: the reset's claim.
     pub reset: Option<ResetClaim>,
     /// Who holds each account, by label, as the account claims settle it
@@ -7688,6 +7788,7 @@ impl PartialEq for State {
             login_dir_spans,
             rotations,
             probe,
+            wall_reads,
             reset,
             leases,
             home_accounts,
@@ -7716,6 +7817,7 @@ impl PartialEq for State {
             && *login_dir_spans == other.login_dir_spans
             && *rotations == other.rotations
             && *probe == other.probe
+            && *wall_reads == other.wall_reads
             && *reset == other.reset
             && *leases == other.leases
             && *home_accounts == other.home_accounts
@@ -7753,6 +7855,7 @@ impl Default for State {
             login_dir_spans: BTreeMap::new(),
             rotations: Vec::new(),
             probe: None,
+            wall_reads: BTreeMap::new(),
             reset: None,
             leases: BTreeMap::new(),
             home_accounts: BTreeSet::new(),
@@ -7822,6 +7925,58 @@ fn label(v: Option<&Value>) -> Option<String> {
     v.and_then(Value::as_str)
         .filter(|s| admissible_label(s))
         .map(str::to_owned)
+}
+
+/// [`WallLadder`] as `state.json` keeps it.
+fn wall_ladder_json(ladder: &WallLadder) -> Value {
+    let mut o = Map::new();
+    o.insert("since".to_owned(), Value::from(ladder.since));
+    o.insert(
+        "read".to_owned(),
+        ladder.read.map_or(Value::Null, Value::from),
+    );
+    o.insert(
+        "waiters".to_owned(),
+        Value::Object(
+            ladder
+                .waiters
+                .iter()
+                .map(|(sid, w)| {
+                    let mut row = Map::new();
+                    row.insert("since".to_owned(), Value::from(w.since));
+                    row.insert("seen".to_owned(), Value::from(w.seen));
+                    (sid.clone(), Value::Object(row))
+                })
+                .collect(),
+        ),
+    );
+    Value::Object(o)
+}
+
+/// [`wall_ladder_json`]'s reader: a ladder with no waiter left is none.
+fn wall_ladder_of(v: &Value) -> Option<WallLadder> {
+    let waiters: BTreeMap<String, WallWaiter> = v
+        .get("waiters")?
+        .as_object()?
+        .iter()
+        .filter(|(sid, _)| !sid.is_empty() && *sid == &one_line(sid, WORD_MAX))
+        .filter_map(|(sid, w)| {
+            Some((
+                sid.clone(),
+                WallWaiter {
+                    since: int(w.get("since"))?,
+                    seen: int(w.get("seen"))?,
+                },
+            ))
+        })
+        .take(MAX_WALL_WAITERS)
+        .collect();
+    (!waiters.is_empty()).then_some(())?;
+    Some(WallLadder {
+        since: int(v.get("since"))?,
+        read: count(v.get("read")),
+        waiters,
+    })
 }
 
 fn wall_json(w: &Wall) -> Value {
@@ -8446,6 +8601,17 @@ impl State {
                 Value::Object(m)
             }),
         );
+        if !self.wall_reads.is_empty() {
+            o.insert(
+                "wall_reads".to_owned(),
+                Value::Object(
+                    self.wall_reads
+                        .iter()
+                        .map(|(label, ladder)| (label.clone(), wall_ladder_json(ladder)))
+                        .collect(),
+                ),
+            );
+        }
         o.insert(
             "reset".to_owned(),
             self.reset.as_ref().map_or(Value::Null, |c| {
@@ -8690,6 +8856,14 @@ impl State {
                 at: int(c.get("at"))?,
             })
         });
+        let wall_reads = doc
+            .get("wall_reads")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .filter(|(label, _)| admissible_label(label))
+            .filter_map(|(label, ladder)| Some((label.clone(), wall_ladder_of(ladder)?)))
+            .collect();
         let reset = doc.get("reset").and_then(|c| {
             Some(ResetClaim {
                 account: label(c.get("account"))?,
@@ -8907,6 +9081,7 @@ impl State {
             login_dir_spans: login_dir_spans.into_iter().collect(),
             rotations,
             probe,
+            wall_reads,
             reset,
             leases,
             home_accounts,
@@ -10618,7 +10793,11 @@ pub enum Kind {
     LoginEnded,
     /// A renewal's check answered another account than the row's ([`note_wrong_account`]).
     WrongAccount,
-    /// A limit reset was used inside a window ([`note_reading`], [`WindowRead::refilled`]).
+    /// A usage tap or a `/usage` panel read a window refilled or its allowance raised inside it
+    /// ([`note_reading`], [`note_panel_sample`], [`WindowRead::refilled`],
+    /// [`REFILL_UNSEEN_MIN_X10`]): a limit reset spent by anyone but this Mac's aterm (a person,
+    /// another Mac's aterm), a refill or a raised allowance, which a reading cannot tell apart. A
+    /// limit reset this Mac's aterm spent is [`Kind::ResetUsed`].
     Reset,
     /// Another account signed in to the home ([`note_reading`]).
     Epoch,
@@ -11138,6 +11317,133 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
     out
 }
 
+/// The model a transcript row carries where Claude Code wrote the row itself (a limit notice, an
+/// API error) and no model answered: never evidence of a served turn ([`Account::served_lifts`]).
+pub const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// A turn a model served: a session's transcript ended on the model's own reply
+/// ([`record_served`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServedTurn<'a> {
+    /// The model id the request's first answer names (`message.model`).
+    pub model: &'a str,
+    /// When the request was made: when the prompt or tool result that began it was written,
+    /// Unix seconds (`login_adoption::served_request`), never the later time its reply was
+    /// written, so a limit met while the reply streamed is no wall the turn speaks against.
+    pub at: i64,
+}
+
+/// Whether a turn `model` served speaks for `window`: any model draws on the five-hour window and
+/// the week of all models, and a model on its own weekly bucket alone
+/// ([`super::profile::Bucket::id`]), so an Opus turn says nothing of Fable's limit. A wall filed
+/// under no limit type ([`UNNAMED_WINDOW`]), a month, another model's bucket or a type this build
+/// does not know is no window a served turn speaks for.
+#[must_use]
+pub fn draws_on(model: &str, window: &str) -> bool {
+    match window {
+        SESSION_LIMIT | WEEK_LIMIT => true,
+        _ => super::profile::model_bucket(model).is_some_and(|bucket| bucket.id() == window),
+    }
+}
+
+/// Lifts the walls a served turn shows gone: each wall of `account` whose newest sighting
+/// ([`Wall::seen()`]) is before the request `s` was made, of a window its model draws on
+/// ([`draws_on`], [`Account::served_lifts`]). Both the mark ([`Wall::at`]) and the proof's time
+/// ([`Wall::seen`]) are the request's own time, not `now`: the answer proves room as of the
+/// request alone, so a wall observed after it (a sibling's rejection, met while the reply
+/// streamed or filed later) still raises the window, and one observed before it does not. An
+/// account with no record gets none, and none is made for it.
+pub fn note_served(state: &mut State, account: &str, s: &ServedTurn<'_>, now: i64) -> Vec<Event> {
+    let by = state.machine.clone();
+    let Some(record) = state.accounts.get_mut(account) else {
+        return Vec::new();
+    };
+    if !record.served_lifts(s) {
+        return Vec::new();
+    }
+    let at = s.at.min(now);
+    let short = super::usage::model_short(s.model);
+    let mut out = Vec::new();
+    for (window, wall) in &mut record.walls {
+        if !wall.cleared && wall.seen() < at && draws_on(s.model, window) {
+            wall.cleared = true;
+            wall.at = at;
+            wall.by = by.clone();
+            wall.attempts = 0;
+            wall.seen = Some(at);
+            out.push(
+                Event::new(now, Kind::Wall, account)
+                    .because(&format!("{window}{WALL_LIFTED}a turn {short} served")),
+            );
+        }
+    }
+    out
+}
+
+/// Lifts `window`'s wall of `account` (a model's weekly bucket, [`super::profile::Bucket::id`])
+/// that a read asked for at `read_at` shows with room: a session's own `/usage` sample whose row
+/// of that model's week is below full ([`record_model_room`]). A wall last seen standing at or
+/// after `read_at` ([`Wall::seen()`]) stands, and so does one already lifted. As a served
+/// request's lift ([`note_served`]), the read's own time is both the mark and the proof's time,
+/// so a wall another session meets after the read raises the window again though the read is
+/// recorded later. An account with no record gets none, and none is made for it.
+pub fn note_model_room(
+    state: &mut State,
+    account: &str,
+    window: &str,
+    read_at: i64,
+    now: i64,
+) -> Vec<Event> {
+    let by = state.machine.clone();
+    let at = read_at.min(now);
+    let Some(record) = state
+        .accounts
+        .get_mut(account)
+        .filter(|record| record.room_lifts(window, at))
+    else {
+        return Vec::new();
+    };
+    let Some(wall) = record.walls.get_mut(window) else {
+        return Vec::new();
+    };
+    wall.cleared = true;
+    wall.at = at;
+    wall.by = by;
+    wall.attempts = 0;
+    wall.seen = Some(at);
+    vec![
+        Event::new(now, Kind::Wall, account)
+            .because(&format!("{window}{WALL_LIFTED}a read shows room")),
+    ]
+}
+
+/// What a settled `/usage` panel of `account`, its read claimed at `claimed`, records at `now`
+/// (`sample`, the loop's read of it): its figures ([`note_panel_sample`], recorded at `now` and
+/// served no earlier than the earlier of its claim and the loop's own read time, since the probe
+/// opens the panel after its claim), and a lift of each wall it shows with room ([`note_room`])
+/// where that wall was written before the read, by that same earlier time: a wall another session
+/// met after the panel was read stands, though the read is recorded after it.
+pub fn note_panel_read(
+    state: &mut State,
+    account: &str,
+    sample: &Sample,
+    claimed: i64,
+    now: i64,
+) -> Vec<Event> {
+    let served = claimed.min(sample.at);
+    let recorded = Sample {
+        at: now,
+        ..sample.clone()
+    };
+    let mut events = note_panel_sample(state, account, recorded, Some(served), now);
+    let read = Sample {
+        at: served,
+        ..sample.clone()
+    };
+    events.extend(note_room(state, account, &read, now));
+    events
+}
+
 /// Records what a read of `account` at `at` shows of each Codex limit other than the codex bucket
 /// ([`super::codex_app_login::Usage::limits`]), in [`Account::limit_walls`] alone, so a handoff
 /// asked about a limit passes over a row that cannot take its session there as the records hold
@@ -11322,10 +11628,63 @@ pub(super) fn lay_unread_until(state: &mut State, account: &str, until: i64) {
     });
 }
 
-/// Records a settled `/usage` panel [`Sample`] for `account` at `now`.
+/// How far apart a `/usage` panel's reset and a held figure's may be and still name one window
+/// ([`note_panel_sample`]): the panel names its reset to the minute, and Claude Code 2.1.287 drew
+/// the minute before the vendor's instant (`claude-2.1.287-usage-whole.txt`: the week's
+/// `Oct 8 at 8:59am` beside Fable's `9am`), where a usage tap carries the instant itself.
+pub const PANEL_RESET_SLACK_S: i64 = 60;
+
+/// How long after a window's refill barrier a screen read's `/usage` panel figure of that window
+/// is held back ([`note_panel_sample`]). A screen read cannot say when its panel was drawn, and one
+/// drawn before the refill may still be on screen; past this bound the panel is taken as read, so
+/// a panel a person or an agent opens days after a refill (the account used up meanwhile on other
+/// Macs) is recorded and can turn the row low. A bound chosen, not measured: a `/usage` panel is
+/// opened to be read, and one left drawn across a refill for longer than this is the miss accepted.
+pub const SCREEN_PANEL_HOLD_S: i64 = 3600;
+
+/// Records a [`Sample`] for `account` at `now` whose figures were served at its own `at` (a
+/// provider's read, a rollout's rate limits): [`note_panel_sample`] served no earlier than that,
+/// so a figure served before a window's refill barrier is held back and one served after it may
+/// open one.
 pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -> Vec<Event> {
+    let served = sample.at;
+    note_panel_sample(state, account, sample, Some(served), now)
+}
+
+/// Records a settled `/usage` panel [`Sample`] for `account` at `now`, recorded at its `at` and
+/// served no earlier than `served_after` where its source bounds that (a probe's claim, a launch
+/// made for the read, a provider's answer); `None` for a screen read, whose panel may have been
+/// drawn at any time before.
+///
+/// A figure of a window whose held figure carries a refill barrier ([`WindowFig::epoch_at`]; the
+/// same reset to [`PANEL_RESET_SLACK_S`], or a panel row naming none) is of the refilled window
+/// only where the panel was served at or after the barrier, or, for a screen read, where it was
+/// recorded [`SCREEN_PANEL_HOLD_S`] or more after it. Within a window use only grows, so a panel
+/// served before it may show the allowance the refill or raise replaced, more used than the figure
+/// that opened it; taken as read at its record time, that figure would turn the row back to low
+/// and let a later reading open a second barrier for the one refill. It is held back, as a tap
+/// figure of a process begun before the barrier is ([`note_reading_held`]): the sample keeps the
+/// window's held figure in its place (none where the barrier cut that figure), and the ledger row
+/// says so.
+///
+/// A panel served after this Mac's held figure of the window, under its reset, that reads it at
+/// least [`REFILL_UNSEEN_MIN_X10`] less used shows the window was refilled or its allowance raised
+/// between them, as a tap reading of a process begun after that figure does: it opens the
+/// window's barrier at its record time, by which the change surely came, and its figure becomes
+/// the held one, so a later reading that cannot show its order is held back rather than merged
+/// against the higher figure the refill replaced. A screen read shows no order and opens none; nor
+/// does a panel row naming no reset. A screen read of the held figure's own whole is dated as that
+/// figure is: its record time is no serve time, and would make the held figure look newer than
+/// the processes that began after it.
+pub fn note_panel_sample(
+    state: &mut State,
+    account: &str,
+    sample: Sample,
+    served_after: Option<i64>,
+    now: i64,
+) -> Vec<Event> {
     let by = state.machine.clone();
-    let sample = Sample {
+    let mut sample = Sample {
         session_pct: sample.session_pct.filter(|p| *p <= PCT_MAX),
         week_pct: sample.week_pct.filter(|p| *p <= PCT_MAX),
         session_read_at: sample
@@ -11367,14 +11726,108 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
     let shown = |pct: Option<u32>| {
         pct.map_or_else(|| "– (not on the panel)".to_owned(), |p| format!("{p}%"))
     };
-    let event = Event::new(sample.at, Kind::Sample, account).because(&format!(
-        "session {} week {}",
-        shown(sample.session_pct),
-        shown(sample.week_pct)
-    ));
+    let (at, machine) = (sample.at, sample.by.clone());
+    let mut said = Vec::with_capacity(2);
+    let mut events = Vec::new();
+    for (name, bucket) in [("session", SESSION_LIMIT), ("week", WEEK_LIMIT)] {
+        let (pct, reset, read_at) = if bucket == SESSION_LIMIT {
+            (
+                &mut sample.session_pct,
+                &mut sample.session_reset,
+                &mut sample.session_read_at,
+            )
+        } else {
+            (
+                &mut sample.week_pct,
+                &mut sample.week_reset,
+                &mut sample.week_read_at,
+            )
+        };
+        // The held figure of the panel's window: current, and of its reset where the row names
+        // one.
+        let held = record
+            .windows
+            .get(bucket)
+            .filter(|held| {
+                held.current(now)
+                    && reset.is_none_or(|r| {
+                        r.abs_diff(held.reset) <= PANEL_RESET_SLACK_S.unsigned_abs()
+                    })
+            })
+            .cloned();
+        let barred = held.as_ref().filter(|held| {
+            held.epoch_at.is_some_and(|epoch| match served_after {
+                Some(served) => served < epoch,
+                None => at < epoch.saturating_add(SCREEN_PANEL_HOLD_S),
+            })
+        });
+        let opens = held.as_ref().filter(|held| {
+            barred.is_none()
+                && reset.is_some()
+                && held.by == machine
+                && !held.cut()
+                && served_after.is_some_and(|served| served > held.at)
+                && pct.is_some_and(|panel| {
+                    panel
+                        .saturating_mul(10)
+                        .saturating_add(REFILL_UNSEEN_MIN_X10)
+                        <= held.pct_x10
+                })
+        });
+        let word = match (barred, opens, *pct) {
+            (Some(held), _, Some(panel)) => {
+                let kept = (!held.cut()).then(|| (held.whole(), held.reset, held.at));
+                *pct = kept.map(|(p, _, _)| p);
+                *reset = kept.map(|(_, r, _)| r);
+                *read_at = kept.map(|(_, _, at)| at);
+                format!(
+                    "{} (the panel's {panel}% held back: it may predate the window's refill or \
+                     raise)",
+                    kept.map_or_else(|| "–".to_owned(), |(p, _, _)| format!("{p}%"))
+                )
+            }
+            (None, Some(held), Some(panel)) => {
+                record.windows.insert(
+                    bucket.to_owned(),
+                    WindowFig {
+                        pct_x10: panel.saturating_mul(10),
+                        reset: held.reset,
+                        at,
+                        by: machine.clone(),
+                        source: SOURCE_SAMPLE.to_owned(),
+                        epoch_at: Some(at),
+                    },
+                );
+                events.push(
+                    Event::new(at, Kind::Reset, account)
+                        .refilling([bucket])
+                        .because(&format!(
+                            "{bucket} read clearly less used by a /usage panel served after its \
+                             last figure: refilled or raised inside its window (resets {})",
+                            super::usage::rfc3339_utc(held.reset)
+                        )),
+                );
+                format!("{panel}% (refilled or raised)")
+            }
+            (None, None, Some(panel)) => {
+                if served_after.is_none()
+                    && let Some(held) = held.as_ref().filter(|held| {
+                        !held.cut()
+                            && [held.whole(), held.pct_x10.saturating_add(5) / 10].contains(&panel)
+                    })
+                {
+                    *read_at = Some(held.at);
+                }
+                shown(*pct)
+            }
+            (_, _, None) => shown(*pct),
+        };
+        said.push(format!("{name} {word}"));
+    }
+    events.push(Event::new(at, Kind::Sample, account).because(&said.join(" ")));
     record.before = record.sample.replace(sample);
     record.sample_context = None;
-    vec![event]
+    events
 }
 
 /// How long a usage tap's unchanged figure is held before it is written again ([`note_reading`]).
@@ -11679,7 +12132,7 @@ pub fn note_reading_held(
                         if raised {
                             "read clearly less used by a process begun after its last figure: refilled or raised"
                         } else {
-                            "refilled"
+                            "read less used by the process that read it more used: refilled or raised"
                         },
                         super::usage::rfc3339_utc(merged.as_ref().map_or(0, |m| m.reset))
                     )),
@@ -11704,12 +12157,7 @@ pub fn note_reading_held(
             wall.seen = Some(refilled);
             changed = true;
             events.push(Event::new(now, Kind::Wall, account).because(&format!(
-                "{bucket}{WALL_LIFTED}it {} inside its window",
-                if raised {
-                    "was refilled or raised"
-                } else {
-                    "refilled"
-                }
+                "{bucket}{WALL_LIFTED}it was refilled or raised inside its window"
             )));
         }
         if merged.is_some() {
@@ -12114,7 +12562,12 @@ pub fn forget_session(state: &mut State, sid: &str) -> bool {
             over.canary = None;
         }
     }
-    state.sessions.remove(sid).is_some() || canary || passed.is_some()
+    let mut waited = false;
+    state.wall_reads.retain(|_, ladder| {
+        waited |= ladder.waiters.remove(sid).is_some();
+        !ladder.waiters.is_empty()
+    });
+    state.sessions.remove(sid).is_some() || canary || passed.is_some() || waited
 }
 
 /// Removes session rows not updated within [`SESSION_KEEP_S`] of `now`.
@@ -12155,6 +12608,392 @@ pub fn claim_probe(state: &mut State, account: &str, sid: &str, now: i64) -> Opt
         at: now,
     });
     Some(Event::new(now, Kind::Probe, account).with_sid(&sid))
+}
+
+/// The wall ladder's first rungs, seconds after its start ([`WallLadder::since`]): its holder reads
+/// the account's `/usage` 1, 2, 4 and 8 minutes after the wall was observed.
+pub const WALL_RUNGS_S: [i64; 4] = [60, 2 * 60, 4 * 60, 8 * 60];
+
+/// Past the last of [`WALL_RUNGS_S`], a rung every this long: four reads an hour at the most.
+pub const WALL_RUNG_EVERY_S: i64 = 15 * 60;
+
+/// A waiter not seen at its wall within this long is gone ([`note_wall_wait`]): every waiter is
+/// asked again by the next rung ([`WallLadder::ask_at`]), [`WALL_RUNG_EVERY_S`] at the most apart.
+pub const WALL_WAITER_KEEP_S: i64 = 2 * WALL_RUNG_EVERY_S;
+
+/// How long after the holder's rung the other waiters are asked again: its read lands first, and
+/// a lift it makes is theirs at that ask ([`WallLadder::ask_at`]).
+pub const WALL_WAITER_LAG_S: i64 = 30;
+
+/// The most sessions one account's ladder lists.
+pub const MAX_WALL_WAITERS: usize = 64;
+
+/// Machine-local: the `/usage` reads of one account whose sessions wait at its usage wall
+/// (FL-118b): one session, the one that has waited longest ([`WallLadder::holder`]), reads once a
+/// rung ([`wall_rung`]), and no other session of the account reads. Never synced or published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WallLadder {
+    /// Where its rungs count from: the wall's first observation, or a person's typing in a
+    /// waiting tab ([`note_wall_person`]).
+    pub since: i64,
+    /// The newest rung read ([`wall_rung`]), `None` before the first: a read refused, unsettled
+    /// or showing the wall full climbs the rung all the same.
+    pub read: Option<u32>,
+    /// The sessions waiting at the wall, by session id.
+    pub waiters: BTreeMap<String, WallWaiter>,
+}
+
+/// One session waiting at its account's wall ([`WallLadder::waiters`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallWaiter {
+    /// When it began to wait.
+    pub since: i64,
+    /// When it was last seen waiting ([`WALL_WAITER_KEEP_S`]).
+    pub seen: i64,
+}
+
+/// The rung of a ladder started at `since` that stands at `now`: `None` before the first.
+#[must_use]
+pub fn wall_rung(since: i64, now: i64) -> Option<u32> {
+    let after = now.checked_sub(since)?;
+    let early = WALL_RUNGS_S.iter().take_while(|at| **at <= after).count();
+    let last = WALL_RUNGS_S[WALL_RUNGS_S.len() - 1];
+    let rung = if early < WALL_RUNGS_S.len() {
+        early.checked_sub(1)?
+    } else {
+        let more = usize::try_from((after - last) / WALL_RUNG_EVERY_S).unwrap_or(usize::MAX);
+        (WALL_RUNGS_S.len() - 1).saturating_add(more)
+    };
+    Some(u32::try_from(rung).unwrap_or(u32::MAX))
+}
+
+/// When rung `rung` of a ladder started at `since` stands ([`wall_rung`]).
+#[must_use]
+pub fn wall_rung_at(since: i64, rung: u32) -> i64 {
+    let rung = usize::try_from(rung).unwrap_or(usize::MAX);
+    WALL_RUNGS_S.get(rung).map_or_else(
+        || {
+            let more = i64::try_from(rung - (WALL_RUNGS_S.len() - 1)).unwrap_or(i64::MAX);
+            since
+                .saturating_add(WALL_RUNGS_S[WALL_RUNGS_S.len() - 1])
+                .saturating_add(more.saturating_mul(WALL_RUNG_EVERY_S))
+        },
+        |at| since.saturating_add(*at),
+    )
+}
+
+impl WallLadder {
+    /// The session that reads: the one that has waited longest, the lowest session id among
+    /// equals.
+    #[must_use]
+    pub fn holder(&self) -> Option<&str> {
+        self.waiters
+            .iter()
+            .min_by_key(|(sid, w)| (w.since, sid.as_str()))
+            .map(|(sid, _)| sid.as_str())
+    }
+
+    /// Whether `sid` may read the rung due at `now`: its holder, or, once that rung has stood
+    /// [`WALL_WAITER_LAG_S`] unread, any waiter, so a holder that cannot read (a person's draft
+    /// in its tab, a loop that no longer asks) never holds the account's reads back: whoever
+    /// claims it first reads it, and no other ([`claim_wall_read`]).
+    #[must_use]
+    pub fn reads(&self, sid: &str, now: i64) -> bool {
+        if !self.waiters.contains_key(sid) {
+            return false;
+        }
+        self.holder() == Some(sid)
+            || self.due(now).is_some_and(|rung| {
+                now >= wall_rung_at(self.since, rung).saturating_add(WALL_WAITER_LAG_S)
+            })
+    }
+
+    /// The rung due at `now`: one that stands and is not read yet.
+    #[must_use]
+    pub fn due(&self, now: i64) -> Option<u32> {
+        wall_rung(self.since, now).filter(|rung| self.read < Some(*rung))
+    }
+
+    /// When the next rung not read stands.
+    #[must_use]
+    pub fn next_at(&self) -> i64 {
+        wall_rung_at(
+            self.since,
+            self.read.map_or(0, |read| read.saturating_add(1)),
+        )
+    }
+
+    /// When `sid` is asked again at its wall: the holder at its next rung, every other waiter
+    /// [`WALL_WAITER_LAG_S`] after it, so the holder's lift is theirs at that ask.
+    #[must_use]
+    pub fn ask_at(&self, sid: &str) -> i64 {
+        let next = self.next_at();
+        if self.holder() == Some(sid) {
+            next
+        } else {
+            next.saturating_add(WALL_WAITER_LAG_S)
+        }
+    }
+}
+
+/// Notes `sid` waiting at `account`'s usage wall at `now`: the first waiter starts the account's
+/// ladder ([`WallLadder`]), a later one joins it, and one seen again keeps when it began to wait.
+/// A waiter not seen within [`WALL_WAITER_KEEP_S`] is dropped first, and the session leaves any
+/// other account's ladder (a sign-in moved it). Returns whether the session is on the ladder.
+pub fn note_wall_wait(state: &mut State, account: &str, sid: &str, now: i64) -> bool {
+    let sid = one_line(sid, WORD_MAX);
+    if sid.is_empty() || !admissible_label(account) {
+        return false;
+    }
+    state.wall_reads.retain(|label, ladder| {
+        if label != account {
+            ladder.waiters.remove(&sid);
+        }
+        !ladder.waiters.is_empty()
+    });
+    let ladder = state
+        .wall_reads
+        .entry(account.to_owned())
+        .or_insert_with(|| WallLadder {
+            since: now,
+            read: None,
+            waiters: BTreeMap::new(),
+        });
+    ladder
+        .waiters
+        .retain(|_, w| now.saturating_sub(w.seen) < WALL_WAITER_KEEP_S);
+    if let Some(waiter) = ladder.waiters.get_mut(&sid) {
+        waiter.seen = now.max(waiter.seen);
+        return true;
+    }
+    if ladder.waiters.len() >= MAX_WALL_WAITERS {
+        return false;
+    }
+    if ladder.waiters.is_empty() {
+        ladder.since = now;
+        ladder.read = None;
+    }
+    ladder.waiters.insert(
+        sid,
+        WallWaiter {
+            since: now,
+            seen: now,
+        },
+    );
+    true
+}
+
+/// `sid` no longer waits at `account`'s wall: its wall lifted or ended, it moved, or it ended. The
+/// ladder stops when nothing waits. Returns whether it was waiting.
+pub fn wall_wait_over(state: &mut State, account: &str, sid: &str) -> bool {
+    let Some(ladder) = state.wall_reads.get_mut(account) else {
+        return false;
+    };
+    let was = ladder.waiters.remove(sid).is_some();
+    if ladder.waiters.is_empty() {
+        state.wall_reads.remove(account);
+    }
+    was
+}
+
+/// One ask of `sid` at `account`'s usage wall at `now` (a host's ladder step): a session the
+/// advice takes off the wall (`leaves`: a resume, a move) leaves the ladder ([`wall_wait_over`]);
+/// any other waits on it ([`note_wall_wait`]) and is asked again in the seconds this returns
+/// ([`WallLadder::ask_at`]). `None` where it does not wait.
+pub fn wall_ladder_step(
+    state: &mut State,
+    account: &str,
+    sid: &str,
+    leaves: bool,
+    now: i64,
+) -> Option<i64> {
+    if leaves {
+        wall_wait_over(state, account, sid);
+        return None;
+    }
+    if !note_wall_wait(state, account, sid, now) {
+        return None;
+    }
+    let ladder = state.wall_reads.get(account)?;
+    Some(ladder.ask_at(sid).saturating_sub(now).max(0))
+}
+
+/// `sid` stands at no usage wall now (a point that is not one: a person's message served, its
+/// wall ended, a sign-in moved it): it leaves every ladder it waited on, and a ladder stops when
+/// nothing waits. Returns whether it waited on one.
+pub fn wall_wait_left(state: &mut State, sid: &str) -> bool {
+    let mut waited = false;
+    state.wall_reads.retain(|_, ladder| {
+        waited |= ladder.waiters.remove(sid).is_some();
+        !ladder.waiters.is_empty()
+    });
+    waited
+}
+
+/// A person typed in `sid`'s tab while it waited at `account`'s wall: the ladder starts again at
+/// its first rung, counted from `now`. Returns whether it did.
+pub fn note_wall_person(state: &mut State, account: &str, sid: &str, now: i64) -> bool {
+    let Some(ladder) = state
+        .wall_reads
+        .get_mut(account)
+        .filter(|l| l.waiters.contains_key(sid))
+    else {
+        return false;
+    };
+    ladder.since = now;
+    ladder.read = None;
+    true
+}
+
+/// Why a session's read of its account at its wall was not claimed ([`claim_wall_read`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallNo {
+    /// The session is not on the account's ladder.
+    NotWaiting,
+    /// Another session of the account has waited longer: it reads, unless the rung stands
+    /// [`WALL_WAITER_LAG_S`] unread ([`WallLadder::reads`]).
+    NotHolder,
+    /// No rung is due; the next stands at `at`.
+    NotDue {
+        /// When it does.
+        at: i64,
+    },
+    /// Another account's read was claimed within [`PROBE_APART_S`]: two walled accounts read
+    /// apart, never together; asked again at `at`.
+    Apart {
+        /// When that spacing ends.
+        at: i64,
+    },
+}
+
+impl WallNo {
+    /// The word the host's log says.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::NotWaiting => "not-waiting",
+            Self::NotHolder => "not-holder",
+            Self::NotDue { .. } => "not-due",
+            Self::Apart { .. } => "apart",
+        }
+    }
+}
+
+/// The sealed door of a read made at an account's wall ([`super::provider_read::WallDoor`]): only
+/// a claimed rung makes one ([`WallClaim::read_use`]).
+pub struct WallUse(super::provider_read::Account);
+
+impl super::provider_read::WallDoor for WallUse {
+    fn account(self) -> super::provider_read::Account {
+        self.0
+    }
+}
+
+/// A rung claimed by its holder ([`claim_wall_read`]): the journal's row and the read's authority.
+pub struct WallClaim {
+    /// The [`Kind::Probe`] row the claim writes.
+    pub event: Event,
+    /// The rung it reads.
+    pub rung: u32,
+    door: WallUse,
+}
+
+impl WallClaim {
+    /// The one `/usage` read this rung makes ([`super::provider_read::Use::wall_read_use`]), for
+    /// the account's own panel in the holder's tab: its reason is `at-wall`.
+    #[must_use]
+    pub fn read_use(self) -> super::provider_read::Use {
+        super::provider_read::Use::wall_read_use(self.door)
+    }
+}
+
+/// The account a Claude Code panel read of `account` binds ([`super::provider_read::Account`]):
+/// the row's label stands for its home, as the host's turn-end probe binds it.
+#[must_use]
+pub fn panel_account(account: &str) -> super::provider_read::Account {
+    super::provider_read::Account::in_home(
+        super::provider_read::Read::ClaudePanel,
+        Path::new(account),
+        Some(account),
+    )
+}
+
+/// Whether `sid` holds `account`'s due rung at `now` ([`claim_wall_read`] would claim it), on a
+/// Claude Code build whose panel `lab claude-wall-panel` measured over a wall: `measured_on` is
+/// [`crate::ai::connector::Accounts::wall_panel_measured_on`], `running` the session's own build.
+/// Elsewhere no read is made at a wall, and the wall ends on its schedule.
+#[must_use]
+pub fn wall_read_due(
+    state: &State,
+    account: &str,
+    sid: &str,
+    measured_on: Option<&str>,
+    running: Option<&str>,
+    now: i64,
+) -> bool {
+    let measured = measured_on.is_some_and(|built| running == Some(built));
+    measured
+        && state.wall_reads.get(account).is_some_and(|ladder| {
+            ladder.reads(sid, now) && ladder.due(now).is_some() && !apart(state, account, now)
+        })
+}
+
+/// Whether another account's read claimed within [`PROBE_APART_S`] holds `account`'s back.
+fn apart(state: &State, account: &str, now: i64) -> bool {
+    state
+        .probe
+        .as_ref()
+        .is_some_and(|c| c.account != account && recent(c.at, now, PROBE_APART_S))
+}
+
+/// Claims `account`'s due rung for `sid`, its holder, at `now`: the rung is read whether the panel
+/// then shows room, the wall full, or nothing, so a read that lifts nothing climbs it. The claim is
+/// also the machine's probe claim ([`State::probe`]), which spaces walled accounts
+/// [`PROBE_APART_S`] apart.
+///
+/// # Errors
+///
+/// [`WallNo`]: the session is not waiting, another waited longer, no rung is due, or another
+/// account read within [`PROBE_APART_S`].
+pub fn claim_wall_read(
+    state: &mut State,
+    account: &str,
+    sid: &str,
+    now: i64,
+) -> Result<WallClaim, WallNo> {
+    let held_apart = apart(state, account, now).then(|| {
+        state
+            .probe
+            .as_ref()
+            .map_or(now, |c| c.at.saturating_add(PROBE_APART_S))
+    });
+    let ladder = state
+        .wall_reads
+        .get_mut(account)
+        .filter(|l| l.waiters.contains_key(sid))
+        .ok_or(WallNo::NotWaiting)?;
+    let rung = ladder.due(now).ok_or(WallNo::NotDue {
+        at: ladder.next_at(),
+    })?;
+    if !ladder.reads(sid, now) {
+        return Err(WallNo::NotHolder);
+    }
+    if let Some(at) = held_apart {
+        return Err(WallNo::Apart { at });
+    }
+    ladder.read = Some(rung);
+    state.probe = Some(ProbeClaim {
+        account: account.to_owned(),
+        sid: sid.to_owned(),
+        at: now,
+    });
+    Ok(WallClaim {
+        event: Event::new(now, Kind::Probe, account)
+            .with_sid(sid)
+            .because(&format!("at-wall rung {rung}")),
+        rung,
+        door: WallUse(panel_account(account)),
+    })
 }
 
 /// Outcome of attempting to claim a limit-reset slot via [`claim_reset`].
@@ -12685,14 +13524,10 @@ pub fn take_canary(
     )
 }
 
-/// Marks `account` as proven when it serves a response, releasing any canary hold.
+/// Marks `account` as proven when its stored login serves a response, releasing any canary hold
+/// ([`prove_on_token`]), and records that login signed in.
 pub fn prove(state: &mut State, account: &str, now: i64) -> Option<Event> {
-    if state.active.as_deref() != Some(account) || state.proven {
-        return None;
-    }
-    state.proven = true;
-    state.canary = None;
-    state.undo.clear();
+    let event = prove_on_token(state, account, now)?;
     let contextual = state.contextual_auth;
     if let Some(record) = account_mut(state, account) {
         record.clear_auth_context();
@@ -12702,7 +13537,34 @@ pub fn prove(state: &mut State, account: &str, now: i64) -> Option<Event> {
             record.auth_scope.observe_entry();
         }
     }
+    Some(event)
+}
+
+/// MARKS `account` PROVEN WHERE ITS VAULT TOKEN SERVED A RESPONSE, releasing any canary hold:
+/// `active` served since it was chosen ([`State::proven`]), and the rotation's undo and canary
+/// end. Its stored login served nothing, so its word is left as it stands: a sign-in is a stored
+/// login's service, which a token route leaves out ([`AuthRoute::is_stored`]). `None` where
+/// `account` is not `active` or `active` is proven already.
+pub fn prove_on_token(state: &mut State, account: &str, now: i64) -> Option<Event> {
+    if state.active.as_deref() != Some(account) || state.proven {
+        return None;
+    }
+    state.proven = true;
+    state.canary = None;
+    state.undo.clear();
     Some(Event::new(now, Kind::Proven, account))
+}
+
+/// Whether a response served at `at` (unix seconds) is news of `state`'s `active` since it was
+/// chosen ([`State::proven`]): no earlier than the newest rotation [`State::rotations`] holds.
+/// One served before it says nothing of the account the rotation chose.
+#[must_use]
+pub fn served_since_chosen(state: &State, at: i64) -> bool {
+    state
+        .rotations
+        .iter()
+        .max()
+        .is_none_or(|&chosen| at >= chosen)
 }
 
 /// Record a response admitted against the current login and bind its proof to that context.
@@ -13819,12 +14681,41 @@ impl Store {
         super::sign_in_ladder::signing_in(self, self.cli)
     }
 
+    /// The file [`Self::signing_in`] reads: the record of the sign-in this Mac runs now, written
+    /// at its start and removed at its end, for a reader that watches it.
+    #[must_use]
+    pub fn signing_in_file(&self) -> PathBuf {
+        super::sign_in_ladder::running_file(self)
+    }
+
+    /// What [`Self::signing_in_file`] names for this store's CLI, whether or not its process
+    /// still lives: one read of the file, for a reader that holds it while the file stands and
+    /// asks [`RunningSignIn::lives`] of the kernel at each look.
+    #[must_use]
+    pub fn signing_in_record(&self) -> Option<RunningSignIn> {
+        super::sign_in_ladder::running_record(self, self.cli)
+    }
+
     /// A started sign-in's record for a test of what reads [`Self::signing_in`]: this store's
     /// CLI's `label` reads as signing in, by this process, until what this returns drops.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn signing_in_fixture(&self, label: &str, at: i64) -> Option<Box<dyn std::any::Any>> {
         super::sign_in_ladder::running_fixture(self, self.cli, label, at)
+    }
+
+    /// [`Self::signing_in_fixture`], the record naming the live process `pid` as the one that
+    /// runs the sign-in: `label` reads as signing in while it lives, and the record stays once it
+    /// dies, as a sign-in killed mid-run leaves it, until what this returns drops.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn signing_in_fixture_by(
+        &self,
+        label: &str,
+        at: i64,
+        pid: u32,
+    ) -> Option<Box<dyn std::any::Any>> {
+        super::sign_in_ladder::running_fixture_by(self, self.cli, label, at, pid)
     }
 
     /// Claude Code's store directory beside it (the same directory for Claude Code's own): the
@@ -14649,6 +15540,41 @@ impl Store {
         self.check_sync_read_receipt(&receipt)
             .map_err(SyncError::into_message)?;
         Ok((state, note))
+    }
+
+    /// The files [`Self::load`] reads or looks at: [`Self::state_file`], the sync receipt and its
+    /// witness, [`Self::machine_file`], and the state's publication witness and
+    /// [`Self::ledger_path`], which it looks at where the state is absent. While none of them
+    /// moved (`aterm_uds::file_watch::FileStamp`: device, inode, length, modification and change
+    /// times), a load gives what the last one gave, but for two things of its own: the second it
+    /// loads at caps a stamp ahead of it ([`STAMP_SKEW_S`]), and it mints an id where neither the
+    /// state nor the machine file names one.
+    #[must_use]
+    pub fn state_files(&self) -> Vec<PathBuf> {
+        let [receipt, witness] = self.sync_receipt_files();
+        vec![
+            self.state_file(),
+            receipt,
+            witness,
+            self.machine_file(),
+            self.state_witness_file(),
+            self.ledger_path(),
+        ]
+    }
+
+    /// The files [`Self::load_logins`] reads or looks at: [`Self::logins_file`], the sync receipt
+    /// and its witness, and the bindings' publication witness, which it looks at where they are
+    /// absent. While none of them moved, a load gives what the last one gave, but that the second
+    /// it loads at caps a stamp ahead of it.
+    #[must_use]
+    pub fn logins_files(&self) -> Vec<PathBuf> {
+        let [receipt, witness] = self.sync_receipt_files();
+        vec![
+            self.logins_file(),
+            receipt,
+            witness,
+            self.logins_witness_file(),
+        ]
     }
 
     /// [`Self::load`] without its receipt check, as [`Self::logins_as_stored`] is
@@ -15639,7 +16565,8 @@ pub enum Recorded {
     NotThisProcess,
     /// The row was written before the owner cleared this account's walls ([`pin`]).
     Cleared,
-    /// What a session's screen said of the account's usage is on record now ([`record_usage`]).
+    /// What a session's screen said of the account's usage is on record now ([`record_usage`]),
+    /// or a served turn's or a sample's lifts are ([`record_served`], [`record_model_room`]).
     Usage {
         /// The account the session runs on ([`Me::label`]).
         account: String,
@@ -15955,6 +16882,126 @@ pub fn record_usage(
             walled,
         },
         Ok(_) => Recorded::Unchanged,
+    }
+}
+
+/// Records a turn a supervised session's model served ([`ServedTurn`]) as evidence about the
+/// account its process runs once reconciled with what its login file said (`seen`,
+/// [`observed_me`]), as [`record_wall`] does: the walls the served request shows gone are
+/// lifted ([`note_served`]), and each lift's row wakes the sessions waiting on the account
+/// ([`Event::wakes`]). A request older than the process is another login's (a conversation
+/// carried across an account move holds the old account's turns) and lifts nothing. It reads
+/// the store once with no lock and takes the lock only where a wall would lift, so a turn end on
+/// an account with nothing to lift writes nothing; no provider is read.
+pub fn record_served(
+    store: &Store,
+    captured: &UsageRoster,
+    sid: &str,
+    (who, seen): (&ProcessLogin, &super::observe::Observation),
+    s: &ServedTurn<'_>,
+    process_started: i64,
+    now: i64,
+) -> Recorded {
+    let roster = captured.roster();
+    let me = observed_me(roster, who, seen);
+    let Some(account) = me.label() else {
+        return Recorded::NotListed;
+    };
+    if !me.default_home || !me.route.on_account() {
+        return Recorded::NotStored;
+    }
+    if s.at < process_started {
+        return Recorded::NotThisProcess;
+    }
+    if let Ok((state, _)) = store.load(now)
+        && state
+            .accounts
+            .get(account)
+            .is_none_or(|record| !record.served_lifts(s))
+    {
+        return Recorded::Unchanged;
+    }
+    let sid = one_line(sid, WORD_MAX);
+    let done = store.observe_usage_within(
+        store.ladder,
+        now,
+        captured,
+        (who, seen),
+        |state| {
+            Ok(note_served(state, account, s, now)
+                .into_iter()
+                .map(|event| event.with_sid(&sid))
+                .collect())
+        },
+        |_| (),
+    );
+    match done.map(|(events, ())| events) {
+        Err(why) => Recorded::Refused(why),
+        Ok(events) if events.is_empty() => Recorded::Unchanged,
+        Ok(events) => Recorded::Usage {
+            account: account.to_string(),
+            events: events.len(),
+            walled: None,
+        },
+    }
+}
+
+/// Records that a supervised session's own `/usage` sample, asked for at `read_at`, showed
+/// `window`'s row (a model's weekly bucket) with room, on the account its process runs once
+/// reconciled with what its login file said (`seen`, [`observed_me`]), as [`record_served`]
+/// does: the wall of that window last seen standing before the read is lifted
+/// ([`note_model_room`]), and its row wakes the sessions waiting on the account
+/// ([`Event::wakes`]) while every session of it moved off that model reads the lift
+/// ([`Account::lifted_at`]). It reads the store once with no lock and takes the lock only where
+/// the wall would lift; no provider is read.
+pub fn record_model_room(
+    store: &Store,
+    captured: &UsageRoster,
+    sid: &str,
+    (who, seen): (&ProcessLogin, &super::observe::Observation),
+    window: &str,
+    read_at: i64,
+    now: i64,
+) -> Recorded {
+    let roster = captured.roster();
+    let me = observed_me(roster, who, seen);
+    let Some(account) = me.label() else {
+        return Recorded::NotListed;
+    };
+    if !me.default_home || !me.route.on_account() {
+        return Recorded::NotStored;
+    }
+    let at = read_at.min(now);
+    if let Ok((state, _)) = store.load(now)
+        && state
+            .accounts
+            .get(account)
+            .is_none_or(|record| !record.room_lifts(window, at))
+    {
+        return Recorded::Unchanged;
+    }
+    let sid = one_line(sid, WORD_MAX);
+    let done = store.observe_usage_within(
+        store.ladder,
+        now,
+        captured,
+        (who, seen),
+        |state| {
+            Ok(note_model_room(state, account, window, at, now)
+                .into_iter()
+                .map(|event| event.with_sid(&sid))
+                .collect())
+        },
+        |_| (),
+    );
+    match done.map(|(events, ())| events) {
+        Err(why) => Recorded::Refused(why),
+        Ok(events) if events.is_empty() => Recorded::Unchanged,
+        Ok(events) => Recorded::Usage {
+            account: account.to_string(),
+            events: events.len(),
+            walled: None,
+        },
     }
 }
 
@@ -16699,3 +17746,7 @@ mod reconcile_tests;
 #[cfg(test)]
 #[path = "accounts_peer_lift_tests.rs"]
 mod peer_lift_tests;
+
+#[cfg(test)]
+#[path = "accounts_epoch_order_tests.rs"]
+mod epoch_order_tests;

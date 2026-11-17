@@ -940,15 +940,18 @@ mod seam {
     }
 
     thread_local! {
-        static SEAM: RefCell<Option<Seam>> = const { RefCell::new(None) };
+    // Behind a `Box`: every thread's copy of the composed app's thread-local template is held to
+    // 8 KiB (`crates/aterm/tests/native_thread_local_template.rs`), and a boxed seam costs each
+    // thread a pointer and the cell's borrow flag, not its whole value.
+        static SEAM: RefCell<Option<Box<Seam>>> = const { RefCell::new(None) };
     }
 
     pub(super) fn install<T>(user: Ledger, to: To, f: impl FnOnce() -> T) -> (T, Vec<Row>) {
         /// This capture, installed over the one it replaced (none, or an outer capture), which
         /// it puts back however `f` ends.
-        struct Installed(Option<Option<Seam>>);
+        struct Installed(Option<Option<Box<Seam>>>);
         impl Installed {
-            fn restore(&mut self) -> Option<Seam> {
+            fn restore(&mut self) -> Option<Box<Seam>> {
                 let outer = self.0.take()?;
                 SEAM.with(|seam| std::mem::replace(&mut *seam.borrow_mut(), outer))
             }
@@ -958,7 +961,7 @@ mod seam {
                 let _ = self.restore();
             }
         }
-        let outer = SEAM.with(|seam| seam.borrow_mut().replace(Seam { user, to }));
+        let outer = SEAM.with(|seam| seam.borrow_mut().replace(Box::new(Seam { user, to })));
         let mut installed = Installed(Some(outer));
         let out = f();
         let rows = match installed.restore().map(|seam| seam.to) {
@@ -970,7 +973,7 @@ mod seam {
 
     /// The capture's writer, where one is installed on this thread.
     pub(super) fn user() -> Option<Writer> {
-        SEAM.with(|seam| seam.try_borrow().ok()?.as_ref().map(Seam::writer))
+        SEAM.with(|seam| seam.try_borrow().ok()?.as_deref().map(Seam::writer))
     }
 
     /// Where one is installed on this thread: its writer for `ledger`'s rows where `ledger` is

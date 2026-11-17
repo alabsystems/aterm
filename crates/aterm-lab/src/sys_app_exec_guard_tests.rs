@@ -5,6 +5,23 @@ use super::*;
 use aterm_toolchain::record_lock::RecordLock;
 use std::os::fd::{AsFd as _, AsRawFd as _, OwnedFd};
 
+/// The error of a native exec of the missing `program`, once the exec was tried. The exec
+/// refuses (`WouldBlock` with no OS error, before it duplicates any guard) while this process
+/// reads the process table, and another test of this binary may be reading it: on a loaded Mac
+/// one read outlasts the second the gate waits, so the refusal is waited out, not judged.
+fn tried_exec(program: &str, guards: &[std::os::fd::BorrowedFd<'_>]) -> std::io::Error {
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "this process's process-table reads settle, so the native exec is tried",
+        || {
+            let error = exec_as_app_with_guards(program, &[program.into()], &[], 1, guards);
+            let refused =
+                error.kind() == std::io::ErrorKind::WouldBlock && error.raw_os_error().is_none();
+            (!refused).then_some(error)
+        },
+    )
+}
+
 #[test]
 fn app_exec_refuses_process_reads_and_reopens_after_failure() {
     const CASE: &str =
@@ -86,14 +103,8 @@ fn failed_app_exec_preserves_original_guard_flags_and_closes_temporary_sources()
     assert_ne!(before & libc::FD_CLOEXEC, 0);
     let missing = world.path().join("missing-program");
     let program = missing.to_str().unwrap();
-    let error = exec_as_app_with_guards(
-        program,
-        &[program.into()],
-        &[],
-        1,
-        &[std::os::fd::AsFd::as_fd(&guard)],
-    );
-    assert!(error.raw_os_error().is_some());
+    let error = tried_exec(program, &[std::os::fd::AsFd::as_fd(&guard)]);
+    assert!(error.raw_os_error().is_some(), "{error}");
     assert_eq!(flags(guard.as_raw_fd()), before);
     let open = || std::fs::File::open(&path).unwrap();
     assert!(matches!(
@@ -146,8 +157,8 @@ fn failed_two_role_exec_preserves_both_original_descriptions() {
     let borrowed: Vec<_> = descriptors.iter().map(std::os::fd::AsFd::as_fd).collect();
     let missing = world.path().join("missing");
     let program = missing.to_str().unwrap();
-    let error = exec_as_app_with_guards(program, &[program.into()], &[], 1, &borrowed);
-    assert!(error.raw_os_error().is_some());
+    let error = tried_exec(program, &borrowed);
+    assert!(error.raw_os_error().is_some(), "{error}");
     for (fd, before) in descriptors.iter().zip(before) {
         assert_eq!(flags(fd.as_raw_fd()), before);
     }

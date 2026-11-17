@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use aterm_window::dpi::{LogicalPosition, PhysicalSize};
+use aterm_window::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize, Position};
 use aterm_window::event_loop::ActiveEventLoop;
 use aterm_window::window::Window;
 
@@ -604,20 +604,25 @@ impl App {
         // ([`Self::take_dock_record`]); a detach takes its source's, and a window landed off the
         // loop (Cmd-N, a connected spawn) the origin its booking reserved
         // ([`Self::inherit_dock_record`]), since the front may have moved while it spawned.
-        ws.dock.pref = self
+        (ws.dock.pref, ws.dock.by_default) = self
             .frontmost_window
             .and_then(|front| self.windows.get(&front))
-            .and_then(|parent| parent.dock.pref);
+            .map_or((None, false), |parent| {
+                (parent.dock.pref, parent.dock.by_default)
+            });
         self.windows.insert(wid, Box::new(ws));
     }
 
-    /// Window `child` takes window `parent`'s dock record: a tab torn from a window that need
-    /// not be the front one.
+    /// Window `child` takes window `parent`'s dock record, and whether the default wrote it: a
+    /// tab torn from a window that need not be the front one.
     pub(crate) fn inherit_dock_record(&mut self, parent: WindowId, child: WindowId) {
-        let pref = self.windows.get(&parent).and_then(|ws| ws.dock.pref);
+        let record = self
+            .windows
+            .get(&parent)
+            .map_or((None, false), |ws| (ws.dock.pref, ws.dock.by_default));
         if let Some(mut route_guard_ws) = self.windows.get_mut(&child) {
             let ws = &mut **route_guard_ws;
-            ws.dock.pref = pref;
+            (ws.dock.pref, ws.dock.by_default) = record;
         }
     }
 
@@ -718,25 +723,19 @@ impl App {
         observe: Option<&aterm_session::SessionId>,
         carried: Option<CarriedFrame>,
         placement: ((Option<i32>, Option<i32>), Option<bool>),
-        dock: (Option<u16>, DockBirth),
+        dock: DockRow,
     ) -> Option<WindowId> {
-        let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
-        let previous_front = self.frontmost_window;
-        let wid = self.create_window_logical(
-            rows,
-            cols,
-            cwd_override,
-            kept,
-            adopt,
-            lineage_parent,
-            observe,
-        )?;
-        self.frontmost_window = previous_front;
-        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-            let ws = &mut **route_guard_ws;
-            ws.take_carried_frame(carried_inner_px);
-        }
-        self.take_dock_record(wid, dock.0, dock.1);
+        let wid = self.create_restored_window_logical(carried, dock, |app, rows, cols| {
+            app.create_window_logical(
+                rows,
+                cols,
+                cwd_override,
+                kept,
+                adopt,
+                lineage_parent,
+                observe,
+            )
+        })?;
         #[cfg(any(windows, target_os = "linux"))]
         self.stage_restore_placement(wid, placement.0, placement.1);
         #[cfg(not(any(windows, target_os = "linux")))]
@@ -746,6 +745,29 @@ impl App {
             return None;
         }
         self.sync_active_session();
+        Some(wid)
+    }
+
+    /// [`Self::create_window_internal_connected`]'s logical birth of a restored or carried
+    /// window: its grid and frame from `carried` (else the front's grid), made by `spawn` at that
+    /// grid with the front left as it was, then the carried frame and the row's dock record
+    /// `dock` ([`Self::take_dock_record`]), all before its first attach. Only `spawn` (a shell's,
+    /// which needs the event loop's proxy) is the caller's, so a fixture drives the rest.
+    pub(crate) fn create_restored_window_logical(
+        &mut self,
+        carried: Option<CarriedFrame>,
+        dock: DockRow,
+        spawn: impl FnOnce(&mut Self, u16, u16) -> Option<WindowId>,
+    ) -> Option<WindowId> {
+        let ((rows, cols), carried_inner_px) = self.new_window_frame(carried);
+        let previous_front = self.frontmost_window;
+        let wid = spawn(self, rows, cols)?;
+        self.frontmost_window = previous_front;
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            ws.take_carried_frame(carried_inner_px);
+        }
+        self.take_dock_record(wid, dock);
         Some(wid)
     }
 
@@ -1262,10 +1284,11 @@ impl App {
                     aterm_render::frame_size_px(total_rows, cols as usize, cell_w, cell_h, pad, 0)
                         .0
                         .saturating_add(usize::from(side_inset_cells) * cell_w);
+                let saved = self.windows.get(&wid).and_then(|ws| ws.carried_inner_px);
                 self.fit_birth_dock_at_attach(
                     wid,
                     &window,
-                    u32::try_from(docked_w).unwrap_or(u32::MAX),
+                    (u32::try_from(docked_w).unwrap_or(u32::MAX), saved),
                     scale,
                 );
                 let side_inset_cells = self.windows.get(&wid).map_or(0, |ws| ws.dock.cells);
@@ -1338,14 +1361,14 @@ impl App {
                 {
                     // Before the join: the dock's width at the cached cells the frame was
                     // sized by, not the renderer's, which is still being built.
-                    let (x, y) = self.restored_origin_among(
+                    window.set_outer_position(self.restored_origin_among(
                         wid,
+                        DesktopPlane::NATIVE,
                         &monitors_px(&window),
-                        window.outer_size().width,
+                        (window.outer_size().width, window.scale_factor()),
                         (x, y),
                         inset,
-                    );
-                    window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+                    ));
                 }
                 let backdrop = self.early_reveal_backdrop();
                 #[cfg(windows)]
@@ -1433,7 +1456,7 @@ impl App {
             ws.metrics = crate::MetricsView::applied(self.font_px, pad, pad_top, head);
         }
         let docked_w = self.window_frame_px_for(wid, rows, cols).width;
-        self.fit_birth_dock_at_attach(wid, &window, docked_w, scale);
+        self.fit_birth_dock_at_attach(wid, &window, (docked_w, carried), scale);
         size = self.attach_frame_px(wid, rows, cols, carried);
         self.regrid_to_attach_frame(wid, size);
         let _ = window.request_inner_size(size);
@@ -1523,8 +1546,7 @@ impl App {
             if let Some((x, y)) = placement.outer
                 && restored_position_on_screen(&window, x, y)
             {
-                let (x, y) = self.restored_origin(wid, &window, x, y);
-                window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+                window.set_outer_position(self.restored_origin(wid, &window, x, y));
             }
             #[cfg(windows)]
             if placement.maximized {
@@ -3670,12 +3692,13 @@ pub(crate) const DOCK_KEEPS_COLS: u16 = 80;
 
 /// What a window's birth knows of where its dock would go: whether a saved layout row brought
 /// it back, whether that row held it to its screen (maximized or full screen, so it cannot be
-/// born wider), and the origin the row saved.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// born wider), the origin the row saved, and the scale that origin's px were read at.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct DockBirth {
     pub(crate) restored: bool,
     pub(crate) held: bool,
     pub(crate) origin: Option<(i32, i32)>,
+    pub(crate) scale: Option<f64>,
 }
 
 impl DockBirth {
@@ -3685,6 +3708,32 @@ impl DockBirth {
             restored: true,
             held: wl.maximized == Some(true) || wl.show.fullscreen == Some(true),
             origin: wl.outer_x.zip(wl.outer_y),
+            scale: wl.scale.filter(|s| s.is_finite() && *s > 0.0),
+        }
+    }
+}
+
+/// What a window takes from the layout row it is born from, before its first attach
+/// ([`App::take_dock_record`]): the row's dock record, whether the default wrote it, and its
+/// birth.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DockRow {
+    /// `None` never decided, `Some(0)` hidden, `Some(k)` shown at `k` cells ([`Dock::pref`]).
+    pub(crate) pref: Option<u16>,
+    /// The shown record was the default's ([`Dock::by_default`]).
+    pub(crate) by_default: bool,
+    pub(crate) birth: DockBirth,
+}
+
+impl DockRow {
+    /// THE RECORD A RESTORED ROW GIVES ITS WINDOW: `wl`'s dock record and who wrote it, and
+    /// the birth it gives. Only a shown record is the default's: a row that says
+    /// `dock_by_default` beside no shown dock (hand-edited) is read as its record alone.
+    pub(crate) fn of(wl: &crate::restore::WindowLayout) -> Self {
+        Self {
+            pref: wl.dock,
+            by_default: wl.dock_by_default && wl.dock.is_some_and(|k| k != 0),
+            birth: DockBirth::of_row(wl),
         }
     }
 }
@@ -3712,18 +3761,27 @@ pub(crate) enum BirthDock {
 }
 
 /// THE DOCK BIRTH RULE. `pref` is the window's record (`None` never decided, `Some(0)` its person
-/// hid it, `Some(k)` shown, born at [`DOCK_CELLS`] whatever `k`), `on` whether windows dock at birth
-/// ([`docks_by_default`]), `held` whether the window is held to its screen, `room` whether its
-/// screen holds it wider. The setting is a switch over the record: off, no window is born docked
-/// whatever its record says.
+/// hid it, `Some(k)` shown, born at [`DOCK_CELLS`] whatever `k`), `by_default` whether a shown
+/// record was the default's rather than its person's Show ([`Dock::by_default`]), `on` whether
+/// windows dock at birth ([`docks_by_default`]), `held` whether the window is held to its screen,
+/// `room` whether its screen holds it wider. The setting decides what the default decides: an
+/// undecided window, and one the default docked. A person's Show or Hide is theirs, whatever the
+/// setting says.
 #[must_use]
-pub(crate) const fn birth_dock(pref: Option<u16>, on: bool, held: bool, room: bool) -> BirthDock {
+pub(crate) const fn birth_dock(
+    pref: Option<u16>,
+    by_default: bool,
+    on: bool,
+    held: bool,
+    room: bool,
+) -> BirthDock {
     match pref {
-        _ if !on => BirthDock::Hidden,
         Some(0) => BirthDock::Hidden,
         // The record says shown; this build's dock is `DOCK_CELLS` wide, whatever width a row
         // carries (another build's, a corrupt or hand-edited file), so none is born a column
         // wider than its screen.
+        Some(_) if !by_default => BirthDock::Shown(DOCK_CELLS),
+        _ if !on => BirthDock::Hidden,
         Some(_) => BirthDock::Shown(DOCK_CELLS),
         None if held || !room => BirthDock::Inside(DOCK_CELLS),
         None => BirthDock::Shown(DOCK_CELLS),
@@ -3759,13 +3817,123 @@ pub(crate) fn docked_origin_x(x: i32, outer_w: u32, dock_w: u32, screen: (i32, u
     i32::try_from(slid).unwrap_or(x)
 }
 
-/// The monitor of `monitors` whose rectangle holds `origin`, all in physical px.
-fn monitor_holding(monitors: &[MonitorRectPx], origin: (i32, i32)) -> Option<MonitorRectPx> {
-    let (x, y) = (f64::from(origin.0), f64::from(origin.1));
+/// How a window system lays its displays out, as it reports a display's rectangle and a
+/// window's origin in physical px.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DesktopPlane {
+    /// One plane in points: a display's px are its points times its own scale, and a window's
+    /// its points times the window's (macOS: `CGDisplayBounds`, `-[NSWindow frame]`). On
+    /// displays of different scale the px rectangles overlap, so only points say which display
+    /// a place is on.
+    Points,
+    /// One plane in physical px, shared by every display and window (Windows' per-monitor
+    /// aware virtual screen, X11).
+    Pixels,
+}
+
+impl DesktopPlane {
+    /// The plane this build's window system lays its displays on.
+    pub(crate) const NATIVE: Self = if cfg!(target_os = "macos") {
+        Self::Points
+    } else {
+        Self::Pixels
+    };
+
+    /// `px`, read at scale `from`, as px at scale `to`: on a plane of points, through the
+    /// point it stands for; on a plane of px, as it is.
+    fn rescale(self, px: f64, from: f64, to: f64) -> f64 {
+        match self {
+            Self::Points => px / from.max(f64::EPSILON) * to,
+            Self::Pixels => px,
+        }
+    }
+
+    /// An origin `(x, y)` in px read at scale `scale`, as the place a window is put at: on a
+    /// plane of points, the point it stands for, which the window system places whatever scale
+    /// the window has when it is moved (a restored macOS window is born on the main display, at
+    /// that display's scale, before it is moved); on a plane of px, the px.
+    pub(crate) fn place(self, (x, y): (i32, i32), scale: f64) -> Position {
+        match self {
+            Self::Points => {
+                let scale = scale.max(f64::EPSILON);
+                LogicalPosition::new(f64::from(x) / scale, f64::from(y) / scale).into()
+            }
+            Self::Pixels => PhysicalPosition::new(x, y).into(),
+        }
+    }
+}
+
+/// The monitor of `monitors` whose rectangle holds `origin`, a window's px read at scale
+/// `scale`, judged on `plane` in one unit: each monitor's rectangle at its own scale and the
+/// origin at its own, so on displays of different scale it is the monitor the window is on.
+fn monitor_holding(
+    plane: DesktopPlane,
+    monitors: &[MonitorRectPx],
+    origin: (i32, i32),
+    scale: f64,
+) -> Option<MonitorRectPx> {
+    let unit = |px: f64, scale: f64| plane.rescale(px, scale, 1.0);
+    let (x, y) = (
+        unit(f64::from(origin.0), scale),
+        unit(f64::from(origin.1), scale),
+    );
     monitors
         .iter()
-        .find(|m| x >= m.x && x < m.x + m.w && y >= m.y && y < m.y + m.h)
+        .find(|m| {
+            let (left, top) = (unit(m.x, m.scale), unit(m.y, m.scale));
+            let (w, h) = (unit(m.w, m.scale), unit(m.h, m.scale));
+            x >= left && x < left + w && y >= top && y < top + h
+        })
         .copied()
+}
+
+/// How near a frame's edge may lie to its screen's visible edge and still meet it, in points:
+/// the gap macOS leaves round a tiled window under "Tiled windows have margins", with room for
+/// the px rounding of a saved frame.
+const TILE_EDGE_PTS: f64 = 16.0;
+
+/// THE PLACED-FRAME RULE. macOS tells aterm nothing of a tile, so a frame (`frame`, its outer
+/// rectangle in points, top-left origin) is judged placed rather than floating by where it
+/// stands in its screen's visible frame (`visible`, less the menu bar and the Dock): its left
+/// or right edge meets the visible frame's, and its top and bottom meet a tile row's (the
+/// visible frame's top and bottom, a half or the whole screen; or its top or bottom and its
+/// middle, a quarter), each within [`TILE_EDGE_PTS`]. A placed window is held as a maximized one
+/// is: a default dock goes inside it and never grows it over its neighbour.
+#[must_use]
+pub(crate) fn frame_is_placed(frame: WorkAreaPts, visible: WorkAreaPts) -> bool {
+    let finite = [
+        frame.x, frame.y, frame.w, frame.h, visible.x, visible.y, visible.w, visible.h,
+    ]
+    .into_iter()
+    .all(f64::is_finite);
+    if !finite || frame.w <= 0.0 || frame.h <= 0.0 || visible.w <= 0.0 || visible.h <= 0.0 {
+        return false;
+    }
+    let meets = |a: f64, b: f64| (a - b).abs() <= TILE_EDGE_PTS;
+    let (top, bottom) = (visible.y, visible.y + visible.h);
+    let middle = visible.y + visible.h / 2.0;
+    let (frame_top, frame_bottom) = (frame.y, frame.y + frame.h);
+    let side = meets(frame.x, visible.x) || meets(frame.x + frame.w, visible.x + visible.w);
+    let row = (meets(frame_top, top) && meets(frame_bottom, bottom))
+        || (meets(frame_top, top) && meets(frame_bottom, middle))
+        || (meets(frame_top, middle) && meets(frame_bottom, bottom));
+    side && row
+}
+
+/// What a default dock's birth fit reads of the window's screens, all read by the caller
+/// ([`App::fit_birth_dock_on`]), so the judgment needs no OS window.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BirthScreens<'a> {
+    pub(crate) plane: DesktopPlane,
+    pub(crate) monitors: &'a [MonitorRectPx],
+    /// Each screen's visible frame in points; empty where the window system names none, and
+    /// then no saved frame is judged to stand in a tile ([`App::fit_birth_dock_on`]).
+    pub(crate) visible: &'a [WorkAreaPts],
+    /// The visible frame of the screen the window is on now, in points: the area judged where
+    /// the saved origin lies on no screen.
+    pub(crate) current: Option<WorkAreaPts>,
+    /// The window's scale now.
+    pub(crate) scale: f64,
 }
 
 /// Every live monitor of `window`'s display set, in physical px.
@@ -3799,6 +3967,11 @@ pub(crate) struct Dock {
     /// only where it agrees with the grid and frame written beside it ([`Self::written`]); a
     /// new window takes it from the window it came from.
     pub(crate) pref: Option<u16>,
+    /// The shown record was written by the default (a birth docked by it, or its docking paid
+    /// inside), not by a person's Show (`WindowLayout::dock_by_default`): `[navigator] dock`
+    /// decides it at the next birth as it decides an undecided window ([`birth_dock`]). A dock
+    /// act clears it; it goes with the record to a new window. Only beside a shown record.
+    pub(crate) by_default: bool,
     /// What the window's birth knows of its place ([`DockBirth`]).
     pub(crate) birth: DockBirth,
     /// A default docking the window could not be born with ([`Owed`]).
@@ -3827,6 +4000,33 @@ impl Dock {
     /// as one `site=dock` resize rather than being born wider than its screen.
     pub(crate) fn written(&self) -> Option<u16> {
         self.pref.filter(|&k| k == 0 || k == self.cells)
+    }
+
+    /// Whether the record a capture writes ([`Self::written`], or the record as it came where
+    /// `as_came`, a headless app's) is a shown one the default wrote.
+    pub(crate) fn written_by_default(&self, as_came: bool) -> bool {
+        let written = if as_came { self.pref } else { self.written() };
+        self.by_default && written.is_some_and(|k| k != 0)
+    }
+
+    /// Take `row`'s record and birth: whatever the window inherited, since a row with no record
+    /// is one never decided.
+    pub(crate) const fn take_row(&mut self, row: DockRow) {
+        self.pref = row.pref;
+        self.by_default = row.by_default;
+        self.birth = row.birth;
+    }
+
+    /// THE LAUNCH'S FIRST WINDOW takes the record and birth of `manifest`'s first row, at
+    /// `carried_origin` (a handoff's carried place) where one came
+    /// ([`crate::restore::bootstrap_dock`]): the launch's own write, which it makes before the
+    /// window attaches and the DK-4 exit test drives.
+    pub(crate) fn take_bootstrap(
+        &mut self,
+        manifest: Option<&crate::restore::RestoreManifest>,
+        carried_origin: Option<(i32, i32)>,
+    ) {
+        self.take_row(crate::restore::bootstrap_dock(manifest, carried_origin));
     }
 
     /// The window's restore re-grid settled: a default docking owed after it is due now. This
@@ -3955,6 +4155,7 @@ impl App {
             let old = ws.dock.cells;
             if old == cells {
                 ws.dock.pref = Some(cells);
+                ws.dock.by_default = false;
                 return Ok(());
             }
             if cells < old && !aterm_messages::chrome::fall_allowed(ws.regrow_floor.floor(), now) {
@@ -4006,8 +4207,10 @@ impl App {
             ws.dock.cells = cells;
             // The record is the committed state: a waiting Hide, a refused Show and a fall
             // owed to a client with no area leave it as the grid and frame a capture writes
-            // still have it.
+            // still have it. A commit is a person's act ([`Self::settle_birth_docks`] marks
+            // the default's own pay).
             ws.dock.pref = Some(cells);
+            ws.dock.by_default = false;
             if cells > old {
                 ws.regrow_floor.rose(now);
             }
@@ -4103,6 +4306,7 @@ impl App {
         };
         if raise == 0 && wanted == 0 {
             ws.dock.pref = Some(0);
+            ws.dock.by_default = false;
         }
         ws.dock_card = None;
         ws.dock.presented = None;
@@ -4181,7 +4385,14 @@ impl App {
                 .is_some_and(|ws| ws.cols >= DOCK_KEEPS_COLS.saturating_add(cells));
             if keeps {
                 match self.set_dock_at(wid, cells, now) {
-                    Ok(()) => moved = true,
+                    Ok(()) => {
+                        moved = true;
+                        // The default docked it, not its person: the setting still decides it.
+                        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+                            let ws = &mut **route_guard_ws;
+                            ws.dock.by_default = ws.dock.pref.is_some_and(|k| k != 0);
+                        }
+                    }
                     Err(refusal) => aterm_log::info!("navigator dock: default inside: {refusal}"),
                 }
             } else if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
@@ -4208,13 +4419,11 @@ impl App {
         (ws.dock.cells != 0).then_some(ws.dock.view).flatten()
     }
 
-    /// Window `wid` takes the dock record `dock` and the birth `birth` of its layout row: set
-    /// whatever it inherited, since a row with no record (`None`) is one never decided.
-    pub(crate) fn take_dock_record(&mut self, wid: WindowId, dock: Option<u16>, birth: DockBirth) {
+    /// Window `wid` takes the dock record and birth of its layout row ([`Dock::take_row`]).
+    pub(crate) fn take_dock_record(&mut self, wid: WindowId, row: DockRow) {
         if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
             let ws = &mut **route_guard_ws;
-            ws.dock.pref = dock;
-            ws.dock.birth = birth;
+            ws.dock.take_row(row);
         }
     }
 
@@ -4234,31 +4443,33 @@ impl App {
     /// Only a window with no OS window and no dock is seated. Whether a dock view was made
     /// ([`Self::unseat_birth_dock`] undoes it).
     pub(crate) fn seat_birth_dock(&mut self, wid: WindowId) -> bool {
-        let Some((pref, birth)) = self
+        // A headless app is born with no dock and keeps its rows' records as they came.
+        if self.headless {
+            return false;
+        }
+        let Some((pref, by_default, birth)) = self
             .windows
             .get(&wid)
             .filter(|ws| ws.os_window.is_none() && ws.dock.cells == 0 && ws.dock.view.is_none())
-            .map(|ws| (ws.dock.pref, ws.dock.birth))
+            .map(|ws| (ws.dock.pref, ws.dock.by_default, ws.dock.birth))
         else {
             return false;
         };
         let on = self.docks_at_birth();
-        match birth_dock(pref, on, birth.held, true) {
+        match birth_dock(pref, by_default, on, birth.held, true) {
             BirthDock::Hidden => {
-                // The setting hid a record that says shown: the window lives undocked, so its
-                // record is undecided again. Kept, a capture would write "shown" beside an
-                // undocked grid and frame, and the windows opened from it would inherit it; a
-                // birth after the setting comes back on then decides it as a default one (the
+                // The setting hid a shown record the default wrote: the window lives undocked,
+                // so its record is undecided again. Kept, a capture would write "shown" beside
+                // an undocked grid and frame, and the windows opened from it would inherit it;
+                // a birth after the setting comes back on then decides it as a default one (the
                 // screen fit, the slide, a held window's one `site=dock` pay). The width is
-                // always `DOCK_CELLS`, so nothing is lost. A headless app keeps its rows'
-                // records as they came.
-                if !on
-                    && !self.headless
-                    && pref.is_some_and(|k| k != 0)
+                // always `DOCK_CELLS`, so nothing is lost.
+                if pref.is_some_and(|k| k != 0)
                     && let Some(mut route_guard_ws) = self.windows.get_mut(&wid)
                 {
                     let ws = &mut **route_guard_ws;
                     ws.dock.pref = None;
+                    ws.dock.by_default = false;
                 }
                 false
             }
@@ -4269,6 +4480,8 @@ impl App {
                         ws.dock.view = Some(view);
                         ws.dock.cells = cells;
                         ws.dock.born_default = pref.is_none();
+                        // An undecided window the default docks keeps a record that says so.
+                        ws.dock.by_default = by_default || pref.is_none();
                         ws.dock.pref = Some(cells);
                         ws.dock_card = None;
                         ws.dock.presented = None;
@@ -4316,17 +4529,16 @@ impl App {
 
     /// Fit a dock window `wid` was born with by default to its screen: where the docked frame
     /// (`docked_w_pts`, its outer width in points) is wider than the screen's area
-    /// (`area_w_pts`), the window is born without it and owes it inside. A dock its record
-    /// asked for is kept. Whether it was unseated.
+    /// (`area_w_pts`), or the window stood placed in a tile of its screen (`placed`,
+    /// [`frame_is_placed`]), the window is born without it and owes it inside, as a held window
+    /// does. A dock its record asked for is kept. Whether it was unseated.
     pub(crate) fn fit_birth_dock_to(
         &mut self,
         wid: WindowId,
         docked_w_pts: f64,
         area_w_pts: Option<f64>,
+        placed: bool,
     ) -> bool {
-        let Some(area_w_pts) = area_w_pts else {
-            return false;
-        };
         let Some(restored) = self
             .windows
             .get(&wid)
@@ -4335,7 +4547,7 @@ impl App {
         else {
             return false;
         };
-        if docked_w_pts <= area_w_pts {
+        if !placed && area_w_pts.is_none_or(|area_w_pts| docked_w_pts <= area_w_pts) {
             return false;
         }
         // Before its attach, a restored window's restore has still to close.
@@ -4343,59 +4555,147 @@ impl App {
         true
     }
 
-    /// [`Self::fit_birth_dock_to`] window `wid`, about to attach in `window` at a docked inner
-    /// frame `frame_w` px wide at display `scale`: the docked frame's outer width against the
-    /// screen its saved origin lies on, else the screen `window` is on now. The Windows early
-    /// reveal fits it at its cached cell metrics, before it sizes, places and shows the
-    /// window, so the window is revealed at the frame and origin it keeps; the attach fits it
-    /// again at the joined renderer's, a no-op where the reveal already decided.
+    /// [`Self::fit_birth_dock_to`] window `wid` among `screens`, for a docked frame
+    /// `docked_w_pts` wide and the frame its row saved, `saved_px` (its outer size in px at the
+    /// row's scale), where it saved one. The screen's area is that of the screen its saved
+    /// origin lies on ([`monitor_holding`]), else of the screen the window is on now; the saved
+    /// frame is placed where it stands in a tile of the visible frame its origin lies in, among
+    /// the screens' visible frames the window system names ([`frame_is_placed`],
+    /// [`BirthScreens::visible`]). Only macOS names them; elsewhere no frame is judged placed
+    /// here: the screen the window is on now is no stand-in, since a Windows window moves
+    /// between its early reveal's fit and its attach's, and the two would judge different
+    /// screens, and a Linux tiler's answer is the initial-frame settle's
+    /// (`judge_birth_dock_frame`). Whether the dock was unseated.
+    pub(crate) fn fit_birth_dock_on(
+        &mut self,
+        wid: WindowId,
+        screens: &BirthScreens<'_>,
+        docked_w_pts: f64,
+        saved_px: Option<(f64, f64)>,
+    ) -> bool {
+        let Some((origin, origin_scale)) = self
+            .windows
+            .get(&wid)
+            .filter(|ws| ws.dock.born_default)
+            .map(|ws| {
+                let scale = ws.dock.birth.scale.unwrap_or(screens.scale);
+                (ws.dock.birth.origin, scale.max(f64::EPSILON))
+            })
+        else {
+            return false;
+        };
+        let area_w_pts = origin
+            .and_then(|origin| {
+                monitor_holding(screens.plane, screens.monitors, origin, origin_scale)
+            })
+            .map(|m| m.w / m.scale.max(f64::EPSILON))
+            .or_else(|| screens.current.map(|area| area.w));
+        let placed = origin.zip(saved_px).is_some_and(|((x, y), (w, h))| {
+            let frame = WorkAreaPts {
+                x: f64::from(x) / origin_scale,
+                y: f64::from(y) / origin_scale,
+                w: w / origin_scale,
+                h: h / origin_scale,
+            };
+            let holds = |v: &WorkAreaPts| {
+                frame.x >= v.x && frame.x < v.x + v.w && frame.y >= v.y && frame.y < v.y + v.h
+            };
+            screens
+                .visible
+                .iter()
+                .copied()
+                .find(holds)
+                .is_some_and(|visible| frame_is_placed(frame, visible))
+        });
+        let unseated = self.fit_birth_dock_to(wid, docked_w_pts, area_w_pts, placed);
+        if unseated {
+            if placed {
+                aterm_log::info!(
+                    "navigator dock: window {} starts without its dock: its saved frame stands \
+                     in a tile of its screen",
+                    wid.0
+                );
+            } else {
+                aterm_log::info!(
+                    "navigator dock: window {} starts without its dock: {docked_w_pts:.0} pt \
+                     docked is wider than its screen's {:.0} pt",
+                    wid.0,
+                    area_w_pts.unwrap_or_default()
+                );
+            }
+        }
+        unseated
+    }
+
+    /// [`Self::fit_birth_dock_on`] window `wid`, about to attach in `window` at a docked inner
+    /// frame `frame_w` px wide at display `scale`, its row's saved inner frame `saved` (the
+    /// carried frame) where it has one: the screens, their visible frames and the border are
+    /// read off the OS window here. The Windows early reveal fits it at its cached cell metrics,
+    /// before it sizes, places and shows the window, so the window is revealed at the frame and
+    /// origin it keeps; the attach fits it again at the joined renderer's, a no-op where the
+    /// reveal already decided.
     fn fit_birth_dock_at_attach(
         &mut self,
         wid: WindowId,
         window: &Window,
-        frame_w: u32,
+        (frame_w, saved): (u32, Option<PhysicalSize<u32>>),
         scale: f64,
     ) {
-        let Some(ws) = self.windows.get(&wid).filter(|ws| ws.dock.born_default) else {
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.dock.born_default)
+        {
             return;
-        };
-        let (scale, origin) = (scale.max(f64::EPSILON), ws.dock.birth.origin);
-        let border = window
-            .outer_size()
-            .width
-            .saturating_sub(window.inner_size().width);
-        let docked_w_pts = f64::from(frame_w.saturating_add(border)) / scale;
-        let area_w_pts = origin
-            .and_then(|origin| monitor_holding(&monitors_px(window), origin))
-            .map(|m| m.w / m.scale.max(f64::EPSILON))
-            .or_else(|| self.work_area_pts(window).map(|area| area.w));
-        if self.fit_birth_dock_to(wid, docked_w_pts, area_w_pts) {
-            aterm_log::info!(
-                "navigator dock: window {} starts without its dock: {docked_w_pts:.0} pt docked \
-                 is wider than its screen's {:.0} pt",
-                wid.0,
-                area_w_pts.unwrap_or_default()
-            );
         }
+        let (outer, inner) = (window.outer_size(), window.inner_size());
+        let border = (
+            outer.width.saturating_sub(inner.width),
+            outer.height.saturating_sub(inner.height),
+        );
+        let docked_w_pts = f64::from(frame_w.saturating_add(border.0)) / scale.max(f64::EPSILON);
+        let saved_px = saved.map(|size| {
+            (
+                f64::from(size.width.saturating_add(border.0)),
+                f64::from(size.height.saturating_add(border.1)),
+            )
+        });
+        let (monitors, visible) = (
+            monitors_px(window),
+            self.apprt.screens_work_area_pts(window),
+        );
+        let screens = BirthScreens {
+            plane: DesktopPlane::NATIVE,
+            monitors: &monitors,
+            visible: &visible,
+            current: self.work_area_pts(window),
+            scale: window.scale_factor(),
+        };
+        self.fit_birth_dock_on(wid, &screens, docked_w_pts, saved_px);
     }
 
-    /// Where window `wid`, attached in `window`, is placed for its saved origin `(x, y)`: born
-    /// with a default dock, slid left by what the dock pushed past the right edge of the screen
-    /// that origin lies on ([`docked_origin_x`]); else at `(x, y)`.
+    /// Where window `wid`, attached in `window`, is placed for its saved origin `(x, y)`, px its
+    /// row read at the row's scale: born with a default dock, slid left by what the dock pushed
+    /// past the right edge of the screen that origin lies on ([`docked_origin_x`]); else at
+    /// `(x, y)`. Either is the place the window system puts the window at
+    /// ([`DesktopPlane::place`]): on macOS the point the row's px stand for, whatever display the
+    /// window was born on.
     pub(crate) fn restored_origin(
         &self,
         wid: WindowId,
         window: &Window,
         x: i32,
         y: i32,
-    ) -> (i32, i32) {
+    ) -> Position {
+        let window_scale = window.scale_factor();
         if !self.born_with_default_dock(wid) {
-            return (x, y);
+            return DesktopPlane::NATIVE.place((x, y), self.row_scale(wid, window_scale));
         }
         self.restored_origin_among(
             wid,
+            DesktopPlane::NATIVE,
             &monitors_px(window),
-            window.outer_size().width,
+            (window.outer_size().width, window_scale),
             (x, y),
             self.win_side_inset_px(wid),
         )
@@ -4409,31 +4709,51 @@ impl App {
             .is_some_and(|ws| ws.dock.born_default && ws.dock.cells != 0)
     }
 
-    /// [`Self::restored_origin`] among `monitors`, for a frame `outer_w` wide whose dock is
-    /// `dock_w` px, both read by the caller: no renderer metric is read here, so the Windows
-    /// early reveal, which runs before the backend joins (a `Pending` slot panics on any
-    /// metric read), passes the dock's width at the cached cell metrics it sized its frame by.
+    /// The scale window `wid`'s layout row read its px at ([`DockBirth::scale`]), else the
+    /// window's, `window_scale`: a row from before the field, or a window no row brought back.
+    fn row_scale(&self, wid: WindowId, window_scale: f64) -> f64 {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.dock.birth.scale)
+            .unwrap_or(window_scale)
+    }
+
+    /// [`Self::restored_origin`] among `monitors` laid on `plane`, for a frame `outer_w` px
+    /// wide at the window's scale `window_scale` whose dock is `dock_w` px at that scale, all
+    /// read by the caller: no renderer metric is read here, so the Windows early reveal, which
+    /// runs before the backend joins (a `Pending` slot panics on any metric read), passes the
+    /// dock's width at the cached cell metrics it sized its frame by. The saved origin's
+    /// screen is judged at the scale the row read it at (else the window's,
+    /// [`monitor_holding`]), and the slide is made in that row's px; the place returned is the
+    /// point those px stand for on a plane of points, so a window born at another display's
+    /// scale lands where the slide was judged ([`DesktopPlane::place`]).
     pub(crate) fn restored_origin_among(
         &self,
         wid: WindowId,
+        plane: DesktopPlane,
         monitors: &[MonitorRectPx],
-        outer_w: u32,
+        (outer_w, window_scale): (u32, f64),
         (x, y): (i32, i32),
         dock_w: usize,
-    ) -> (i32, i32) {
-        if !self.born_with_default_dock(wid) {
-            return (x, y);
-        }
-        let Some(screen) = monitor_holding(monitors, (x, y)) else {
-            return (x, y);
+    ) -> Position {
+        let row_scale = self.row_scale(wid, window_scale);
+        let x = if self.born_with_default_dock(wid)
+            && let Some(screen) = monitor_holding(plane, monitors, (x, y), row_scale)
+        {
+            let at_row = |px: f64, scale: f64| plane.rescale(px, scale, row_scale).round();
+            docked_origin_x(
+                x,
+                at_row(f64::from(outer_w), window_scale) as u32,
+                at_row(dock_w as f64, window_scale) as u32,
+                (
+                    at_row(screen.x, screen.scale) as i32,
+                    at_row(screen.w, screen.scale) as u32,
+                ),
+            )
+        } else {
+            x
         };
-        let slid = docked_origin_x(
-            x,
-            outer_w,
-            u32::try_from(dock_w).unwrap_or(u32::MAX),
-            (screen.x as i32, screen.w as u32),
-        );
-        (slid, y)
+        plane.place((x, y), row_scale)
     }
 
     /// THE OS'S ANSWER TO A DEFAULT DOCK (Linux): window `wid`, born wider by a dock its birth
@@ -4491,6 +4811,7 @@ impl App {
         if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
             let ws = &mut **route_guard_ws;
             ws.dock.pref = None;
+            ws.dock.by_default = false;
             ws.dock.owed = if after_restore {
                 Owed::AfterRestore(cells)
             } else {

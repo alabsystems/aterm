@@ -23,7 +23,6 @@ fn lab() -> Lab {
     };
     Lab {
         me: Some(test_machine("m22")),
-        settled: false,
         accounts: vec![
             account("ann", "claude-aaaaaa", true),
             account("carol", "claude-cccccc", false),
@@ -86,4 +85,84 @@ fn an_account_asked_for_by_name_joins_this_roster_and_writes_no_preference() {
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     let roster = accounts::Roster::load(&roster_path).unwrap();
     assert_eq!(roster.row("plain").and_then(|r| r.email.clone()), None);
+}
+
+/// A lab account this roster already lists under its legacy label (`m22-2`, which no sync renames
+/// to the lab's `claude-bbbbbb`) is listed, not added again: `add claude-bbbbbb` and `add m22-2`
+/// each name the `m22-2` row and its sign-in step, exit 1 and write nothing, as an `add` of a
+/// label the roster lists always did. So is an `add` of a new label with that row's address.
+/// NEGATIVE CONTROL: with `accounts_add_admitted`'s lookups by the name asked for and by account
+/// (`roster.row(named)`, `Roster::row_of_account`) removed, `add claude-bbbbbb` appends a second
+/// row of the account and the roster's own refusal answers (`name one email`), telling the person
+/// to remove a row that is not there (`already listed`).
+#[test]
+fn an_account_listed_under_its_legacy_label_is_named_not_added_again() {
+    let tmp = tmp_dir("accounts-asked-legacy");
+    let env = env_at(&tmp);
+    crate::test_config::write(env.config.as_ref().unwrap(), "").unwrap();
+    let roster_path = env.accounts_roster().unwrap();
+    let dir = env.accounts_store().login_dir("m22-2").unwrap();
+    let legacy = accounts::Row {
+        label: "m22-2".into(),
+        email: Some("bob@example.test".into()),
+        dir: Some(dir.to_str().unwrap().to_owned()),
+        ..accounts::Row::default()
+    };
+    let text = accounts::append_rows_for(Cli::Claude, "", &[legacy]).unwrap();
+    std::fs::create_dir_all(roster_path.parent().unwrap()).unwrap();
+    std::fs::write(&roster_path, &text).unwrap();
+    let mut lab = lab();
+    lab.accounts.push(LabAccount {
+        pk: "ac-000000000000000b".into(),
+        cli: Cli::Claude,
+        vendor: accounts::Vendor::default(),
+        label: "claude-bbbbbb".into(),
+        legacy_label: Some("m22-2".into()),
+        email: "bob@example.test".into(),
+        identity: None,
+        browser: None,
+        joinable: true,
+        preferred: vec![(test_machine("m22"), Some(1))],
+    });
+    with_lab(lab, || {
+        for (name, says) in [
+            (
+                "claude-bbbbbb",
+                "the account `claude-bbbbbb` names is already listed",
+            ),
+            ("m22-2", "`m22-2` is already listed"),
+        ] {
+            let (code, out, err) = add(&env, name);
+            assert_eq!(code, ExitCode::from(1), "{name}: {out}{err}");
+            assert!(err.contains(says), "{name}: {err}");
+            assert!(
+                err.contains("`aterm harness accounts renew m22-2` signs it in"),
+                "{name}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&roster_path).unwrap(),
+                text,
+                "{name}"
+            );
+        }
+    });
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_add(
+        Cli::Claude,
+        &env,
+        &accounts::Row {
+            label: "bob".into(),
+            email: Some("Bob@example.test".into()),
+            ..accounts::Row::default()
+        },
+        &mut out,
+        &mut err,
+    );
+    let err = String::from_utf8(err).unwrap();
+    assert_eq!(code, ExitCode::from(1), "{err}");
+    assert!(
+        err.contains("the account `bob` names is already listed") && err.contains("as `m22-2`"),
+        "{err}"
+    );
+    assert_eq!(std::fs::read_to_string(&roster_path).unwrap(), text);
 }

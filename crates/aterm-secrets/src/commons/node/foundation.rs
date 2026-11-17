@@ -52,7 +52,7 @@ impl Node {
             id,
             foundation: true,
             legacy: false,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             binding_evidence: true,
             facts: Vec::new(),
         })
@@ -116,5 +116,5 @@ impl Node {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 mod tests;

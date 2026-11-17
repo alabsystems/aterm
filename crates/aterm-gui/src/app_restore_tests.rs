@@ -2039,6 +2039,8 @@ fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
 fn single_leaf_window(leaf: restore::TerminalLeafRestore) -> restore::WindowLayout {
     restore::WindowLayout {
         dock: None,
+        dock_by_default: false,
+        scale: None,
         rows: 24,
         cols: 80,
         active_tab: 0,

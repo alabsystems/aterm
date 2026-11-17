@@ -6,7 +6,9 @@ use std::cell::RefCell;
 use aterm_net::fleet_member::name_record::ByKind;
 use aterm_types::machine_name::Nickname;
 
-use super::{Written, refusal, row_nick, write_nick, write_nick_with};
+use aterm_db::file::Renamed;
+
+use super::{Queued, Written, note, offer, queue_rename, refusal, row_label, row_nick, write_with};
 
 const ROW: &str = "mc-0123456789abcdef";
 
@@ -14,97 +16,95 @@ fn heron() -> Nickname {
     Nickname::parse("Heron").expect("a nickname")
 }
 
-/// Each write `write_nick_with` asks for, and what it made of `answer`.
+/// The cells a rename to `m12 Heron` leaves in the row.
+fn cells() -> Vec<(Renamed, String)> {
+    vec![
+        (Renamed::Label, "m12".to_owned()),
+        (Renamed::Nickname, "Heron".to_owned()),
+    ]
+}
+
+/// One write `write_with` asked for: the row, its cells and the author's word.
+type Call = (String, Vec<(Renamed, String)>, String);
+
+/// The write a door that queues it answers.
+fn wi() -> Queued {
+    Queued {
+        id: "01ab".to_owned(),
+        unflushed: None,
+    }
+}
+
+/// Each write `write_with` asks for, and what it made of `answer`.
 fn asked(
     row: Option<&str>,
     kind: ByKind,
-    answer: Result<&str, &str>,
-) -> (Written, Vec<[String; 3]>) {
+    answer: Result<Option<Queued>, &str>,
+) -> (Written, Vec<Call>) {
     let calls = RefCell::new(Vec::new());
-    let written = write_nick_with(row, &heron(), kind, |row, nick, by| {
-        calls
-            .borrow_mut()
-            .push([row.to_owned(), nick.to_owned(), by.to_owned()]);
-        answer.map(str::to_owned).map_err(str::to_owned)
+    let written = write_with(row, &cells(), kind, |row, cells, by| {
+        calls.borrow_mut().push((
+            row.to_owned(),
+            cells
+                .iter()
+                .map(|(cell, value)| (*cell, (*value).to_owned()))
+                .collect(),
+            by.to_owned(),
+        ));
+        answer.map_err(str::to_owned)
     });
     (written, calls.into_inner())
 }
 
+/// A rename's cells reach this Mac's own row, by its key, as one write, a person's act, and the
+/// answer names the intent that holds them.
 #[test]
-fn a_nickname_rename_queues_the_registry_row_write() {
-    let (written, calls) = asked(Some(ROW), ByKind::Person, Ok("published 7f3a\n"));
-    assert_eq!(
-        calls,
-        [[ROW.to_owned(), "Heron".to_owned(), "person".to_owned()]],
-        "this Mac's own row gets the nickname, by its key, as a person's act"
-    );
-    assert_eq!(written, Written::Said("published 7f3a".to_owned()));
-    assert_eq!(
-        written.note().as_deref(),
-        Some("lab registry: published 7f3a")
-    );
+fn a_rename_queues_its_cells_as_one_registry_row_write() {
+    let (written, calls) = asked(Some(ROW), ByKind::Person, Ok(Some(wi())));
+    assert_eq!(calls, [(ROW.to_owned(), cells(), "person".to_owned())]);
+    assert_eq!(written, Written::Queued(wi()));
 }
 
 #[test]
 fn an_answer_of_two_lines_is_one_note() {
-    let (written, _) = asked(
-        Some(ROW),
-        ByKind::Person,
-        Ok("queued 01ab: the store is busy\nnote: the outbox was not flushed\n"),
-    );
     assert_eq!(
-        written.note().as_deref(),
-        Some("lab registry: queued 01ab: the store is busy; note: the outbox was not flushed")
+        note("queued 01ab: the store is busy\nnote: the outbox was not flushed\n"),
+        "lab registry: queued 01ab: the store is busy; note: the outbox was not flushed"
     );
 }
 
 #[test]
-fn a_row_that_says_it_already_is_no_note() {
-    let (written, calls) = asked(
-        Some(ROW),
-        ByKind::Person,
-        Ok("unchanged: lab/machines already says it\n"),
-    );
+fn a_row_that_says_it_already_is_unchanged() {
+    let (written, calls) = asked(Some(ROW), ByKind::Person, Ok(None));
     assert_eq!(calls.len(), 1);
     assert_eq!(written, Written::Unchanged);
-    assert_eq!(written.note(), None);
 }
 
 #[test]
 fn a_program_rename_is_written_as_a_program_act() {
     for kind in [ByKind::Agent, ByKind::Auto] {
-        let (_, calls) = asked(Some(ROW), kind, Ok("published 7f3a"));
-        assert_eq!(calls[0][2], "program", "{kind:?}");
+        let (_, calls) = asked(Some(ROW), kind, Ok(Some(wi())));
+        assert_eq!(calls[0].2, "program", "{kind:?}");
     }
 }
 
 #[test]
 fn no_row_of_this_mac_writes_nothing() {
-    let (written, calls) = asked(None, ByKind::Person, Ok("published 7f3a"));
+    let (written, calls) = asked(None, ByKind::Person, Ok(Some(wi())));
     assert!(calls.is_empty(), "{calls:?}");
     assert_eq!(written, Written::Unbound);
-    assert_eq!(written.note(), None);
 }
 
 #[test]
 fn a_refused_write_says_why() {
-    let (written, calls) = asked(
-        Some(ROW),
-        ByKind::Person,
-        Err("lab/machines: row mc-0123456789abcdef is not published yet"),
-    );
+    let why = "lab/machines: row mc-0123456789abcdef is not published yet";
+    let (written, calls) = asked(Some(ROW), ByKind::Person, Err(why));
     assert_eq!(calls.len(), 1);
-    assert_eq!(
-        written.note().as_deref(),
-        Some(
-            "the lab registry's row was not written: lab/machines: row mc-0123456789abcdef is \
-             not published yet"
-        )
-    );
+    assert_eq!(written, Written::Refused(why.to_owned()));
 }
 
 /// A rename of a name kept anywhere but this account's live state writes no registry row, and a
-/// read of one follows none ([`row_nick`]): on
+/// read of one follows none ([`row_nick`], [`row_label`]): on
 /// 2026-11-15 a build without this rule let `name_cli`'s tests, renaming scratch names, queue
 /// owner writes of the developer's own Mac's row, two of which were signed.
 #[test]
@@ -118,26 +118,25 @@ fn a_rename_of_a_name_kept_elsewhere_writes_no_row() {
         aterm_types::dirs::state_dir().expect("a state folder"),
     ] {
         assert_eq!(
-            write_nick(
-                &state,
-                &heron(),
-                ByKind::Person,
-                None,
-                std::time::Duration::ZERO
-            ),
+            queue_rename(&state, &cells(), ByKind::Person, None),
             Written::Unbound,
             "{}",
             state.display()
         );
-        assert_eq!(
-            refusal(&state, &Nickname::parse("Password").expect("a nickname")),
-            None,
-            "{}",
-            state.display()
-        );
+        assert_eq!(offer(&state, &wi()), None, "{}", state.display());
+        assert_eq!(refusal(&state, &cells()), None, "{}", state.display());
         assert_eq!(row_nick(&state), None, "{}", state.display());
+        assert_eq!(row_label(&state), None, "{}", state.display());
         assert!(super::for_follow(&state).is_none(), "{}", state.display());
+        assert!(super::for_number(&state).is_none(), "{}", state.display());
     }
+}
+
+/// The nickname follow of the seam a test installed.
+fn follow_of(seam: &mut Option<super::Seam>) -> &mut super::Follow {
+    seam.as_mut()
+        .and_then(|seam| seam.follow.as_mut())
+        .expect("a follow seam")
 }
 
 #[test]
@@ -188,8 +187,12 @@ fn automatic_follow_requires_admission_and_the_current_owning_number() {
         guard: Some(super::ReceiptGuard::new(Admission(allowed.clone()))),
         row: None,
     };
-    let previous = super::ROW.with(|row| row.replace(Some(input.clone())));
-    struct Reset(Option<super::Follow>);
+    let seam = super::Seam {
+        follow: Some(input.clone()),
+        ..super::Seam::default()
+    };
+    let previous = super::ROW.with(|row| row.replace(Some(seam)));
+    struct Reset(Option<super::Seam>);
     impl Drop for Reset {
         fn drop(&mut self) {
             super::ROW.with(|row| row.replace(self.0.take()));
@@ -210,10 +213,10 @@ fn automatic_follow_requires_admission_and_the_current_owning_number() {
     );
 
     allowed.store(true, Ordering::Release);
-    super::ROW.with(|row| row.borrow_mut().as_mut().unwrap().number = Number::new(86));
+    super::ROW.with(|row| follow_of(&mut row.borrow_mut()).number = Number::new(86));
     assert_eq!(follow_registry(root.path(), 3).unwrap(), None);
     assert_eq!(file::read(root.path()).unwrap(), Some(held.clone()));
-    super::ROW.with(|row| row.borrow_mut().as_mut().unwrap().number = Some(number));
+    super::ROW.with(|row| follow_of(&mut row.borrow_mut()).number = Some(number));
     let followed = follow_registry(root.path(), 4).unwrap().unwrap();
     assert_eq!(followed.nick, heron());
     assert_eq!(followed.num, held.num);

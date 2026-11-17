@@ -90,6 +90,12 @@ pub(crate) trait AppRt {
         None
     }
 
+    /// The usable placement area of every screen of `window`'s desktop, in points, top-left
+    /// origin, as [`Self::window_work_area_pts`] gives one; empty where none is named.
+    fn screens_work_area_pts(&self, _window: &Window) -> Vec<crate::app_window::WorkAreaPts> {
+        Vec::new()
+    }
+
     /// The EDR POTENTIAL of the screen `window` occupies.
     fn screen_edr_potential(&self, _window: &Window) -> f32 {
         1.0
@@ -538,6 +544,45 @@ impl AppRt for AppRtMacOS {
                 h: visible.size.height,
             })
         }
+    }
+
+    fn screens_work_area_pts(&self, _window: &Window) -> Vec<crate::app_window::WorkAreaPts> {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGMainDisplayID() -> u32;
+            fn CGDisplayBounds(display: u32) -> aterm_objc::CGRect;
+        }
+
+        let mut areas = Vec::new();
+        // SAFETY: `+[NSScreen screens]` is `+(NSArray *)`, +0, read on the main thread a window's
+        // attach runs on; `-count` and `-objectAtIndex:` read it; `-visibleFrame` is a
+        // side-effect-free `-(NSRect)` read on each screen; the CoreGraphics pair is a flat
+        // display-bounds getter that neither allocates nor dispatches.
+        unsafe {
+            let all = crate::appkit::send_id(
+                aterm_objc::class(c"NSScreen").as_id(),
+                aterm_objc::sel!(screens),
+            );
+            if all.is_null() {
+                return areas;
+            }
+            let main_height = CGDisplayBounds(CGMainDisplayID()).size.height;
+            for index in 0..crate::appkit::send_usize(all, aterm_objc::sel!(count)) {
+                let screen =
+                    crate::appkit::send_id_usize(all, aterm_objc::sel!(objectAtIndex:), index);
+                if screen.is_null() {
+                    continue;
+                }
+                let visible = crate::appkit::send_rect(screen, aterm_objc::sel!(visibleFrame));
+                areas.push(crate::app_window::WorkAreaPts {
+                    x: visible.origin.x,
+                    y: main_height - visible.size.height - visible.origin.y,
+                    w: visible.size.width,
+                    h: visible.size.height,
+                });
+            }
+        }
+        areas
     }
 
     fn send_notification_init(

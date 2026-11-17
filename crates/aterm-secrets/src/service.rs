@@ -5,6 +5,10 @@
 //! and the server.
 
 use crate::Error;
+use crate::off_record::secrets_dir;
+pub use crate::off_record::{
+    server_off_path, server_turned_off, subscriber_off_path, subscriber_turned_off,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -150,21 +154,6 @@ pub fn daemon_plist_text(
     plist_text_in(DAEMON_LABEL, program, args, log, Domain::Gui, bundle_id)
 }
 
-/// The record that the person turned this login's subscriber off:
-/// `~/.config/aterm/secrets/subscriber-off`. `agent off` writes it, and so does a `join` or
-/// `create` with `--no-agent` where no subscriber runs; an [`install`] of the subscriber
-/// removes it. aterm's setup (System State, `aterm init`) reads it as the person's choice: Sync
-/// shows off, and the files stay as last synced with no subscriber installed.
-pub fn subscriber_off_path(home: &Path) -> PathBuf {
-    secrets_dir(home).join("subscriber-off")
-}
-
-/// Whether the person turned this login's subscriber off ([`subscriber_off_path`]). A record
-/// that cannot be read is no record.
-pub fn subscriber_turned_off(home: &Path) -> bool {
-    crate::fsx::kind(&subscriber_off_path(home)).is_ok_and(|kind| kind != crate::fsx::Kind::Missing)
-}
-
 /// Record that the person turned this login's subscriber off ([`subscriber_off_path`]), in
 /// the 0700 `~/.config/aterm/secrets`.
 pub fn record_subscriber_off(home: &Path) -> crate::Result<()> {
@@ -179,20 +168,6 @@ fn record_subscriber_off_locked(home: &Path) -> crate::Result<()> {
         b"the subscriber was turned off by choice; aterm secrets agent on turns it back on\n",
         0o600,
     )
-}
-
-/// The record that the person turned this login's vault server off:
-/// `~/.config/aterm/secrets/server-off`. `server off` writes it, and an [`install`] of the server
-/// removes it, so automatic setup (`sync.steward.server.standby`) and [`move_held`] leave the
-/// server off by choice.
-pub fn server_off_path(home: &Path) -> PathBuf {
-    secrets_dir(home).join("server-off")
-}
-
-/// Whether the person turned this login's vault server off ([`server_off_path`]). A record that
-/// cannot be read is no record.
-pub fn server_turned_off(home: &Path) -> bool {
-    crate::fsx::kind(&server_off_path(home)).is_ok_and(|kind| kind != crate::fsx::Kind::Missing)
 }
 
 /// Record that the person turned this login's vault server off ([`server_off_path`]), in the 0700
@@ -323,11 +298,6 @@ fn clear_server_off(home: &Path) -> crate::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::new(format!("{}: {e}", path.display()))),
     }
-}
-
-/// `~/.config/aterm/secrets`.
-fn secrets_dir(home: &Path) -> PathBuf {
-    home.join(".config").join("aterm").join("secrets")
 }
 
 /// `<label>.service`.
@@ -1607,22 +1577,7 @@ fn systemctl() -> crate::Result<PathBuf> {
     systemctl_path(&SYSTEMCTL_PATHS, &|path| path.is_file())
 }
 
-/// Whether `a` and `b` name one folder: one device and inode where both can be read (so a
-/// symlinked or differently spelled home is the same one), else one canonical path.
-pub(crate) fn one_folder(a: &Path, b: &Path) -> bool {
-    #[cfg(unix)]
-    let same = {
-        use std::os::unix::fs::MetadataExt as _;
-        match (std::fs::metadata(a), std::fs::metadata(b)) {
-            (Ok(a), Ok(b)) => Some((a.dev(), a.ino()) == (b.dev(), b.ino())),
-            _ => None,
-        }
-    };
-    #[cfg(not(unix))]
-    let same = None;
-    let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    same.unwrap_or_else(|| canonical(a) == canonical(b))
-}
+pub(crate) use crate::making::one_folder;
 
 /// Refuses an unresolved account home or a `home` that is not `account`.
 pub fn own_home(home: &Path, account: Option<&Path>) -> crate::Result<()> {

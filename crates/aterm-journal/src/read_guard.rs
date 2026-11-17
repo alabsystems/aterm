@@ -12,7 +12,7 @@ use super::*;
 pub struct ReadGuard {
     dir: PathBuf,
     name: String,
-    identity: (u64, u64),
+    identity: FileIdentity,
     _lock: WriterLock,
 }
 
@@ -45,6 +45,7 @@ impl ReadGuard {
         let name = format!("{name}.lock");
         let judged = private_file::JudgedDir::private(dir)?;
         let (file, metadata) = aterm_uds::kept_out(|| judged.open(&name)).map_err(read_error)?;
+        let identity = seen(&file, &metadata)?.identity;
         #[cfg(test)]
         let take_lock = tests::MUTANT.get() != 1;
         #[cfg(not(test))]
@@ -59,7 +60,7 @@ impl ReadGuard {
         let guard = Self {
             dir: dir.into(),
             name,
-            identity: (metadata.dev(), metadata.ino()),
+            identity,
             _lock: WriterLock(file),
         };
         #[cfg(test)]
@@ -82,8 +83,10 @@ impl ReadGuard {
     /// The directory or lock is no longer private, is missing, or names a
     /// different file from the one this guard holds.
     pub fn check(&self) -> io::Result<()> {
-        let (_, current) = private_file::open_private(&self.dir, &self.name).map_err(read_error)?;
-        if current.nlink() != 1 || (current.dev(), current.ino()) != self.identity {
+        let current = private_file::open_private(&self.dir, &self.name)
+            .map_err(read_error)
+            .and_then(|(file, metadata)| seen(&file, &metadata))?;
+        if current.links != 1 || current.identity != self.identity {
             return Err(io::Error::other("journal read lock was replaced"));
         }
         Ok(())

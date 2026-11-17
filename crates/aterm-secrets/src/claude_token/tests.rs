@@ -6,29 +6,36 @@
 //! the removal tests for their lab. No assertion prints a value: the fixture token appears in no
 //! test output.
 
+#[cfg(unix)]
 use super::*;
-use crate::claude_token::{
-    Check, ExpiryFrom, Key, Lookup, Meta, MintedBy, Mismatch, SOON_SECS, Standing, State, Verified,
-};
+#[cfg(unix)]
+use crate::claude_token::{Check, Key, Lookup, Mismatch, SOON_SECS, Standing, State, Verified};
+use crate::claude_token::{ExpiryFrom, Meta, MintedBy};
 use crate::membership_log::MemberId;
+#[cfg(unix)]
 use crate::membership_log::entries::OUTER_ONLY;
 use std::collections::BTreeSet;
 
 /// The fixture token: inert, in the setup-token grammar.
+#[cfg(unix)]
 const TOKEN: &[u8] = concat!("sk-ant-", "oat01-inert_fixture-token-0123456789").as_bytes();
 
 /// A fixture replacement token, inert too.
+#[cfg(unix)]
 const NEXT: &[u8] = concat!("sk-ant-", "oat01-inert_fixture-token-replaced").as_bytes();
 
+#[cfg(unix)]
 fn key() -> Key {
     Key::parse("ac-0123456789abcdef").unwrap()
 }
 
 /// A person's patience: the hang detector, never a latency budget.
+#[cfg(unix)]
 fn soon() -> std::time::Instant {
     std::time::Instant::now() + std::time::Duration::from_secs(60)
 }
 
+#[cfg(unix)]
 fn refuse() -> OnBusy {
     OnBusy::Refuse(soon())
 }
@@ -53,6 +60,7 @@ fn a_year() -> u64 {
 }
 
 /// Whether `bytes` holds any run of eight bytes of the fixture token.
+#[cfg(unix)]
 fn holds_token(bytes: &[u8]) -> bool {
     bytes
         .windows(8)
@@ -60,11 +68,13 @@ fn holds_token(bytes: &[u8]) -> bool {
 }
 
 /// Three seated members, `[everyone] shared` held: m22, m7, m40.
+#[cfg(unix)]
 struct Lab {
     macs: TwoMacs,
     m40: Paths,
 }
 
+#[cfg(unix)]
 impl Lab {
     fn new() -> Self {
         let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -110,6 +120,7 @@ impl Lab {
     }
 }
 
+#[cfg(unix)]
 fn read(paths: &Paths) -> crate::claude_token::TokenRead {
     match crate::claude_token::read(paths, &key(), std::time::Duration::from_secs(60)).unwrap() {
         Lookup::Found(read) => read,
@@ -118,11 +129,13 @@ fn read(paths: &Paths) -> crate::claude_token::TokenRead {
     }
 }
 
+#[cfg(unix)]
 fn standing_of(paths: &Paths) -> Standing {
     read(paths).standing
 }
 
 /// Whether the read on `paths` returns exactly the fixture token.
+#[cfg(unix)]
 fn returns_token(paths: &Paths) -> bool {
     read(paths)
         .token()
@@ -131,6 +144,7 @@ fn returns_token(paths: &Paths) -> bool {
 
 /// Whether the Mac at `paths` has a file, or a row of what its apply records it reads by name,
 /// of either of the token's names.
+#[cfg(unix)]
 fn materialized(paths: &Paths) -> bool {
     let state = load_state(paths).unwrap();
     [key().entry(), key().meta_entry()].iter().any(|name| {
@@ -144,6 +158,7 @@ fn materialized(paths: &Paths) -> bool {
 
 /// `write` then `read` returns the value on each of three members, the standing reads one draft,
 /// and neither name ever becomes a file. A write of a value outside the grammar is refused.
+#[cfg(unix)]
 #[test]
 fn write_then_read_returns_the_value_on_each_member_and_never_materializes() {
     let lab = Lab::new().minted();
@@ -186,6 +201,7 @@ fn write_then_read_returns_the_value_on_each_member_and_never_materializes() {
 /// What a build before S4 sees: decoding only the outer layer, the entries hold no byte of the
 /// fixture token, and so neither does the file its materializer would write (the value, at the
 /// entry's name), nor the vault's records. CONTROL: a current build opens it.
+#[cfg(unix)]
 #[test]
 fn an_outer_layer_only_decode_holds_no_byte_of_the_token() {
     let lab = Lab::new().minted();
@@ -223,6 +239,7 @@ fn an_outer_layer_only_decode_holds_no_byte_of_the_token() {
 /// An older build's re-`Put` of every `[everyone]` entry under a fresh epoch wrapped to the
 /// current members: it carries the inner ciphertext verbatim, so the seal still names the mint's
 /// epoch.
+#[cfg(unix)]
 fn older_build_reseals(paths: &Paths) {
     let identity = read_identity(paths).unwrap().unwrap();
     let (bootstrap, actor, incarnation) = member_key(paths);
@@ -276,6 +293,7 @@ fn older_build_reseals(paths: &Paths) {
 /// afterwards and handed only the new epoch. CONTROL: once a current build seals every entry
 /// again under a fresh epoch (m7's member unset of another name), the seal moves forward and m41
 /// reads it.
+#[cfg(unix)]
 #[test]
 fn a_re_put_carrying_the_inner_seal_reads_only_where_its_sealing_epoch_opens() {
     let lab = Lab::new().minted();
@@ -310,6 +328,7 @@ fn a_re_put_carrying_the_inner_seal_reads_only_where_its_sealing_epoch_opens() {
 /// A value with a CR, an LF, a second line or another prefix, put under the class name in one
 /// draft with its meta, reads `mismatched (value)` and is never returned; so does a plain value
 /// an older admin put with no inner seal. A meta put in another draft reads `mismatched (draft)`.
+#[cfg(unix)]
 #[test]
 fn a_value_outside_the_grammar_or_the_draft_is_mismatched() {
     let lab = Lab::new();
@@ -366,6 +385,7 @@ fn a_value_outside_the_grammar_or_the_draft_is_mismatched() {
 /// it. NEGATIVE CONTROL: a route that serves nothing beyond its minting Mac
 /// (`MintedBy::serves_unverified` keyed on `minted_here` alone) fails `in use on every Mac from
 /// mint`; with the minting Mac's gate on `verify` put back, m22's verification is refused.
+#[cfg(unix)]
 #[test]
 fn a_token_is_unverified_until_verified_then_active_soon_and_ended_by_the_clock() {
     let lab = Lab::new().minted_by(Some(MintedBy::Window));
@@ -486,6 +506,7 @@ fn a_token_is_unverified_until_verified_then_active_soon_and_ended_by_the_clock(
 /// own stamp by [`crate::claude_token::BY_WINDOWS`] replaces it, and then every Mac serves the
 /// token. NEGATIVE CONTROL: with [`Meta::verification`] counting any stamp, m22 reads the sample's
 /// token `active` and serves it.
+#[cfg(unix)]
 #[test]
 fn an_earlier_builds_sample_stamp_verifies_nothing_on_any_mac() {
     for by in [None, Some(MintedBy::Terminal)] {
@@ -601,6 +622,7 @@ fn a_meta_names_the_route_that_made_its_token_and_one_naming_none_still_parses()
 /// by its `minted_at`; once m7 has replaced that token (another `minted_at`), the same `verify`
 /// is refused and writes nothing, so the vault's token stays unverified on every Mac. CONTROL:
 /// naming the token the vault holds now, it is written.
+#[cfg(unix)]
 #[test]
 fn a_verify_of_a_token_the_vault_no_longer_holds_writes_nothing() {
     let lab = Lab::new().minted();
@@ -670,6 +692,7 @@ fn a_verify_of_a_token_the_vault_no_longer_holds_writes_nothing() {
 /// and on m22. NEGATIVE CONTROL (by hand, then restored): with `verify` standing on nothing
 /// (`write_pair`'s `read` `None`), it signs the compared token's pair over the replacement,
 /// putting that token back, stamped.
+#[cfg(unix)]
 #[test]
 fn a_verify_never_writes_over_a_replacement_committed_after_its_read() {
     let lab = Lab::new().minted();
@@ -731,6 +754,7 @@ fn a_verify_never_writes_over_a_replacement_committed_after_its_read() {
 
 /// After m22 removes m40, which was handed the epoch that sealed the token, the token reads
 /// `exposed (removed m40)`, and stays in use.
+#[cfg(unix)]
 #[test]
 fn a_token_a_removed_mac_was_handed_is_exposed() {
     let lab = Lab::new().minted();
@@ -762,6 +786,7 @@ fn a_token_a_removed_mac_was_handed_is_exposed() {
 /// afterwards and handed every record, opens neither: no name of the class, and no epoch key
 /// that sealed the token. NEGATIVE CONTROL: removed by plain `Delete`s under the old epoch
 /// (`UNSET_UNDER_OLD_EPOCH`), m41 is handed the key that opens it.
+#[cfg(unix)]
 #[test]
 fn after_remove_a_later_admit_opens_neither_name() {
     for old_epoch in [false, true] {
@@ -813,6 +838,7 @@ fn after_remove_a_later_admit_opens_neither_name() {
 }
 
 /// Whether the Mac at `paths` reads no entry of the account at all.
+#[cfg(unix)]
 fn absent(paths: &Paths) -> bool {
     matches!(
         crate::claude_token::read(paths, &key(), std::time::Duration::from_secs(60)).unwrap(),
@@ -821,6 +847,7 @@ fn absent(paths: &Paths) -> bool {
 }
 
 /// How a Mac back on the LAN gets what it signed off it to a vault server.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum Rejoin {
     /// One records pass ([`sync_records`]), which a subscriber's pass and every `sync` of a vault
@@ -847,6 +874,7 @@ enum Rejoin {
 /// m7's verifying write, which the server takes, and a sync, both read it `active`.
 ///
 /// With m7's `rejoin` step left out, m40's read after its sync fails.
+#[cfg(unix)]
 fn off_the_lan_and_back(rejoin: Rejoin) {
     let Lab { macs, m40 } = Lab::new();
     let TwoMacs {
@@ -980,6 +1008,7 @@ fn off_the_lan_and_back(rejoin: Rejoin) {
 /// of the minting Mac's, or the post a `signed here` row's reader retries, puts it in use on the
 /// others, and the verifying write then labels it `active` there ([`off_the_lan_and_back`], which
 /// holds the negative control).
+#[cfg(unix)]
 #[test]
 fn a_token_minted_with_no_server_is_in_use_here_and_on_another_mac_after_rejoin() {
     for rejoin in [Rejoin::RecordsPass, Rejoin::Post] {
@@ -988,6 +1017,7 @@ fn a_token_minted_with_no_server_is_in_use_here_and_on_another_mac_after_rejoin(
 }
 
 /// How a replacement token's meta compares with the meta of the token it replaces.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum Replacing {
     /// The same record, byte for byte (a replacement minted within the second of the token it
@@ -999,6 +1029,7 @@ enum Replacing {
 }
 
 /// Where the vault pass that signs a waiting replacement finds a vault server.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum Signing {
     /// The server answers: the minting Mac's sync runs its records pass, then its vault pass,
@@ -1016,6 +1047,7 @@ enum Signing {
 /// existing token; m7, which minted the replacement, then reads it as one draft, signed by m7 and
 /// minted here, with its meta; m22 and m40 read the same after a sync, signed by m7 and not minted
 /// there.
+#[cfg(unix)]
 fn replaced_while_waiting(replacing: Replacing, signing: Signing) {
     let Lab { macs, m40 } = Lab::new().minted();
     let TwoMacs {
@@ -1150,6 +1182,7 @@ fn replaced_while_waiting(replacing: Replacing, signing: Signing) {
 /// `sign_waiting_writes_by`), and again with each entry landed as a draft of its own (by hand,
 /// then restored), `SameMeta` fails on the minting Mac with `Mismatched(Draft)`: the pass signs
 /// the token and leaves the meta, which the log holds already. `NewMeta` passes either way.
+#[cfg(unix)]
 #[test]
 fn a_replacement_that_waited_for_the_vault_pass_reads_as_one_draft() {
     for replacing in [Replacing::SameMeta, Replacing::NewMeta] {
@@ -1166,6 +1199,7 @@ fn a_replacement_that_waited_for_the_vault_pass_reads_as_one_draft() {
 /// m22 removes m40, keeping the records to itself, and m7 is handed the `Remove` alone: the
 /// removal's rotation is due on m7 (one-mesh M4), so m7's member writes wait for its next vault
 /// pass. Returns m22's records since, the `Remove` first, which hand m7 the new key.
+#[cfg(unix)]
 fn rotation_due_on_m7(lab: &Lab) -> Vec<Record> {
     let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
     let base = convergence::ids(m22);
@@ -1183,6 +1217,7 @@ fn rotation_due_on_m7(lab: &Lab) -> Vec<Record> {
 }
 
 /// A verification m7 wrote at `now` (unix seconds).
+#[cfg(unix)]
 fn verified_at(now: u64) -> Verified {
     Verified {
         on: "m7".into(),
@@ -1203,6 +1238,7 @@ fn verified_at(now: u64) -> Verified {
 ///
 /// NEGATIVE CONTROL (by hand, then restored): with the pass judging each waiting write alone
 /// (`draft_verdicts` cut from `sign_waiting_writes_by`), m7 reads `Mismatched(Draft)`.
+#[cfg(unix)]
 #[test]
 fn a_verification_that_waited_for_a_rotation_reads_as_one_draft() {
     let lab = Lab::new().minted();
@@ -1260,6 +1296,7 @@ fn a_verification_that_waited_for_a_rotation_reads_as_one_draft() {
 /// stands on the value it read over a write of its name that leaves another value, the
 /// verification answers `Waiting(PendingOfThisMac)`; with that assertion relaxed too, m7 reads
 /// after the pass a token that is not the replacement, and reads it as one draft (`Readable`).
+#[cfg(unix)]
 #[test]
 fn a_verification_never_replaces_a_replacement_that_waits() {
     let lab = Lab::new().minted();
@@ -1344,6 +1381,7 @@ fn a_verification_never_replaces_a_replacement_that_waits() {
 ///
 /// NEGATIVE CONTROL (by hand, then restored): with the names taken back one at a time, a lock
 /// take each, the second take fails, and the meta's write alone still waits ("both or neither").
+#[cfg(unix)]
 #[test]
 fn a_removal_takes_back_both_entries_of_a_waiting_replacement_or_neither() {
     let lab = Lab::new().minted();
@@ -1385,6 +1423,7 @@ fn a_removal_takes_back_both_entries_of_a_waiting_replacement_or_neither() {
 }
 
 /// How a `--replace` comes to wait for the vault pass.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug)]
 enum WaitsBy {
     /// A vault pass holds m7's draft claim past the write's patience (`OnBusy::Wait`, as
@@ -1403,6 +1442,7 @@ enum WaitsBy {
 /// and signs nothing. The replacement lands, the next pass signs it, and m7 reads it with its own
 /// meta, unverified, signed by m7 and minted here; m22 reads the same; nothing is journalled
 /// overtaken.
+#[cfg(unix)]
 fn verified_while_a_replacement_lands(waits: WaitsBy) {
     let lab = Lab::new().minted();
     let chain = match waits {
@@ -1501,6 +1541,7 @@ fn verified_while_a_replacement_lands(waits: WaitsBy) {
 /// verified meta between the read and the landing, and the pass drops the whole replacement as
 /// overtaken, so m7 reads the first token. With the author lock let go before the landing,
 /// `Rotation` fails the same way.
+#[cfg(unix)]
 #[test]
 fn a_verification_never_comes_between_a_replacements_read_and_its_landing() {
     for waits in [WaitsBy::Busy, WaitsBy::Rotation] {
@@ -1519,6 +1560,7 @@ fn a_verification_never_comes_between_a_replacements_read_and_its_landing() {
 /// NEGATIVE CONTROL (by hand, then restored): with `verify` standing on the token it read alone
 /// (the meta's `read_as` `None`), the verification answers `Waiting(PendingOfThisMac)`; with that
 /// assertion relaxed too, m7 reads after the pass the first meta, verified.
+#[cfg(unix)]
 #[test]
 fn a_verification_never_replaces_a_waiting_replacement_that_keeps_the_token() {
     let lab = Lab::new().minted();
@@ -1576,6 +1618,7 @@ fn a_verification_never_replaces_a_waiting_replacement_that_keeps_the_token() {
 /// Whether `bytes` holds any run of sixteen bytes of the fixture token: longer than any run the
 /// token shares with what a file may name it by (its entry names and `claude-token:<key>` share
 /// `e-token-` and `0123456789` with it).
+#[cfg(unix)]
 fn holds_token_value(bytes: &[u8]) -> bool {
     bytes
         .windows(16)
@@ -1583,6 +1626,7 @@ fn holds_token_value(bytes: &[u8]) -> bool {
 }
 
 /// Every regular file under `dir`, at any depth.
+#[cfg(unix)]
 fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let mut folders = vec![dir.to_path_buf()];
@@ -1612,6 +1656,7 @@ fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// CONTROLS: before the write both wait; m40's sight names the entry while it waits, so its name
 /// alone answers nothing; m7's need is the refusal's; and the scan finds the token in a file that
 /// holds it.
+#[cfg(unix)]
 #[test]
 fn a_need_of_a_token_ends_once_a_token_in_use_arrives_and_no_file_holds_it() {
     use crate::need::{self, Purpose, Reason, Want};
@@ -1743,12 +1788,57 @@ fn a_need_of_a_token_ends_once_a_token_in_use_arrives_and_no_file_holds_it() {
     lab.macs.server.stop();
 }
 
+/// A TOKEN STANDINGS READ OPENS ONLY FILES ITS INPUTS STAMP, AND MOVES NONE OF THEM; A REFUSAL
+/// RECORDED HERE MOVES THEM: every file `listed` and `waiting_here` open on a member that holds a
+/// token is among [`crate::client::token_view_files`], so a reader that watches those files and
+/// holds [`crate::client::token_view_inputs`] from before its read hears every change it shows,
+/// and its own read leaves the stamps as they were, so it reads again for nothing it did itself.
+///
+/// NEGATIVE CONTROL (run 2026-11-14): with the refusals file left out of `token_view_named`, the
+/// test fails at `read but not stamped`: `listed` opens the refusals file, which nothing stamps.
+#[cfg(unix)]
+#[test]
+fn a_standings_read_opens_only_files_its_inputs_stamp() {
+    let lab = Lab::new().minted();
+    let paths = &lab.macs.m7;
+    let before = crate::client::token_view_inputs(paths).expect("the inputs stamp");
+    let files = crate::client::token_view_files(paths);
+    let opened = crate::fsx::reads_under(&paths.home);
+    let listed = crate::claude_token::listed(paths).unwrap();
+    let _ = crate::claude_token::waiting_here(paths, &key()).unwrap();
+    let mut read = crate::fsx::reads_under(&paths.home);
+    read.retain(|path, count| {
+        *count -= opened.get(path).copied().unwrap_or(0);
+        *count > 0
+    });
+    let Lookup::Found(standings) = listed else {
+        panic!("the member reads its vault's tokens");
+    };
+    assert_eq!(standings.len(), 1, "the one token the lab minted");
+    assert!(!read.is_empty(), "the read opened its files");
+    let unstamped: Vec<_> = read.keys().filter(|path| !files.contains(path)).collect();
+    assert!(unstamped.is_empty(), "read but not stamped: {unstamped:#?}");
+    assert!(
+        crate::client::token_view_inputs(paths).as_ref() == Some(&before),
+        "a standings read moves none of its inputs"
+    );
+    let now = aterm_time::unix_secs().unwrap();
+    assert!(crate::claude_token::note_refused(paths, &standing_of(paths), 401, now).unwrap());
+    assert!(
+        crate::client::token_view_inputs(paths).is_some_and(|after| after != before),
+        "a refusal recorded here moves the inputs"
+    );
+    lab.macs.server.stop();
+}
+
 /// A third fixture token, inert too: another Mac's concurrent `--replace`.
+#[cfg(unix)]
 const THIRD: &[u8] = concat!("sk-ant-", "oat01-inert_fixture-token-concurrent").as_bytes();
 
 /// The fixture meta, made in aterm's window, carrying a refutation by `on` at `now`, as a later
 /// build writes one (FL-132): a meta of schema 2, which no build that reads only schema 1 parses,
 /// so none can write it back without the refutation.
+#[cfg(unix)]
 fn refuted_json(on: &str, now: u64) -> String {
     let json = Meta {
         minted_by: Some(MintedBy::Window),
@@ -1769,6 +1859,7 @@ fn refuted_json(on: &str, now: u64) -> String {
 /// m7 verifies its window-made token while m22, which has not read that verification, writes the
 /// pair again with a refuted meta (schema 2): two concurrent drafts, and every Mac syncs. Returns
 /// the refuted meta's bytes.
+#[cfg(unix)]
 fn verified_and_refuted(lab: &Lab, now: u64) -> String {
     let (m22, m7) = (&lab.macs.m22, &lab.macs.m7);
     assert_eq!(
@@ -1790,15 +1881,18 @@ fn verified_and_refuted(lab: &Lab, now: u64) -> String {
 }
 
 /// `paths`' settle of the pair at `now`.
+#[cfg(unix)]
 fn settle_at(paths: &Paths, now: u64) -> crate::claude_token::Settled {
     crate::claude_token::settle(paths, &key(), now, soon()).unwrap()
 }
 
 /// `paths`' settle of the pair now.
+#[cfg(unix)]
 fn settle(paths: &Paths) -> crate::claude_token::Settled {
     settle_at(paths, aterm_time::unix_secs().unwrap())
 }
 
+#[cfg(unix)]
 impl Lab {
     /// The Mac labelled `label`.
     fn named(&self, label: &str) -> &Paths {
@@ -1832,6 +1926,7 @@ impl Lab {
 
 /// The value the register `name` holds on `paths`' log, its winner opened from its inner seal:
 /// what a settle wrote, whether or not this build reads the pair it stands in.
+#[cfg(unix)]
 fn held_value(paths: &Paths, name: &str) -> Option<Vec<u8>> {
     let identity = crate::client::machine_identity(paths).unwrap();
     let log = log_of(paths);
@@ -1848,6 +1943,7 @@ fn held_value(paths: &Paths, name: &str) -> Option<Vec<u8>> {
 }
 
 /// How many ops the register `name` holds on `paths`' log.
+#[cfg(unix)]
 fn ops_of(paths: &Paths, name: &str) -> usize {
     let identity = crate::client::machine_identity(paths).unwrap();
     let log = log_of(paths);
@@ -1868,6 +1964,7 @@ fn ops_of(paths: &Paths, name: &str) -> usize {
 /// does not read (`mismatched (value)`, served nowhere), holding the same token. A later
 /// verification is refused, and a second settle finds nothing. NEGATIVE CONTROL (by hand, then
 /// restored): with `merged_meta`'s merit reversed, the pair reads `active`.
+#[cfg(unix)]
 #[test]
 fn a_concurrent_verify_and_refute_are_settled_by_one_seat_with_no_new_mint() {
     use crate::claude_token::Settled;
@@ -1937,6 +2034,7 @@ fn a_concurrent_verify_and_refute_are_settled_by_one_seat_with_no_new_mint() {
 /// TWO CONCURRENT VERIFICATIONS SETTLE TO A VERIFIED PAIR: m7 and m22 each verify m7's token
 /// before reading the other's, so the pair splits; the writer with the lower seat settles it with
 /// one of the two verified metas, and every Mac reads it `active`, the token the one minted.
+#[cfg(unix)]
 #[test]
 fn two_concurrent_verifications_settle_to_a_verified_pair() {
     use crate::claude_token::Settled;
@@ -1987,6 +2085,7 @@ fn two_concurrent_verifications_settle_to_a_verified_pair() {
 
 /// Twelve accounts' keys: which of two concurrent ops a register puts first is the order of two
 /// record ids, so a rule that follows it holds on some keys and not others.
+#[cfg(unix)]
 fn twelve_keys() -> Vec<Key> {
     (0..12)
         .map(|n| Key::parse(&format!("ac-{n:016x}")).unwrap())
@@ -1994,6 +2093,7 @@ fn twelve_keys() -> Vec<Key> {
 }
 
 /// `paths`' read of `key`'s pair.
+#[cfg(unix)]
 fn read_of(paths: &Paths, key: &Key) -> crate::claude_token::TokenRead {
     match crate::claude_token::read(paths, key, std::time::Duration::from_secs(60)).unwrap() {
         Lookup::Found(read) => read,
@@ -2012,6 +2112,7 @@ fn read_of(paths: &Paths, key: &Key) -> crate::claude_token::TokenRead {
 /// winner, an account whose register puts the earlier mint first settles on it; with the kept
 /// token the lowest seat's (`Reverse` of its draft's seat for `minted_at_of`), half the accounts
 /// settle on the earlier mint, by its writer, in every run.
+#[cfg(unix)]
 #[test]
 fn concurrent_replacements_settle_on_the_latest_mint_by_its_writer() {
     use crate::claude_token::Settled;
@@ -2102,6 +2203,7 @@ fn concurrent_replacements_settle_on_the_latest_mint_by_its_writer() {
 /// meta paired by its own draft, not the draft of the write it carries (`settle` reading
 /// `draft_of(id)` for `draft_of(&opened.stands_for(id))`), an account whose meta register's winner
 /// is m22's verification settles the replacement under it.
+#[cfg(unix)]
 #[test]
 fn a_reseal_before_the_settle_pairs_no_token_with_another_tokens_meta() {
     use crate::claude_token::Settled;
@@ -2189,6 +2291,7 @@ fn a_reseal_before_the_settle_pairs_no_token_with_another_tokens_meta() {
 /// the kept pair's writer), and every Mac then reads m40's token beside its own meta. NEGATIVE
 /// CONTROL (by hand, then restored): with the settle's ranking by `minted_at` alone, the refuted
 /// token is kept.
+#[cfg(unix)]
 #[test]
 fn a_refuted_token_never_outranks_a_concurrent_replacement() {
     use crate::claude_token::Settled;
@@ -2268,6 +2371,7 @@ fn a_refuted_token_never_outranks_a_concurrent_replacement() {
 /// made at 2 000, never beside the verification of the token it replaced. NEGATIVE CONTROL (by
 /// hand, then restored): with the settle's draft filter cut, the verified meta of the token made
 /// at 1 000 lands beside the new token.
+#[cfg(unix)]
 #[test]
 fn a_verification_racing_a_replacement_settles_to_the_new_token_beside_its_own_meta() {
     use crate::claude_token::Settled;
@@ -2336,6 +2440,7 @@ fn a_verification_racing_a_replacement_settles_to_the_new_token_beside_its_own_m
 /// every Mac then reads `mismatched (value)` and serves nowhere. NEGATIVE CONTROL (by hand, then
 /// restored): with `judge` parsing the meta before it looks at the drafts, every Mac reads
 /// `mismatched (value)` and nothing reaches the settle.
+#[cfg(unix)]
 #[test]
 fn two_concurrent_refutations_of_a_later_schema_read_split_and_one_seat_settles_them() {
     use crate::claude_token::Settled;
@@ -2390,6 +2495,7 @@ fn two_concurrent_refutations_of_a_later_schema_read_split_and_one_seat_settles_
 /// from each Mac's first sighting of the split: then the other writer's turn begins, and the first
 /// reads `Theirs` naming it; a turn later m40's, a Mac that wrote nothing, which settles it there.
 /// Every Mac then reads one draft.
+#[cfg(unix)]
 #[test]
 fn a_seat_whose_turn_passes_hands_the_settle_on() {
     use crate::claude_token::{SETTLE_TURN_SECS, Settled};
@@ -2441,6 +2547,7 @@ fn a_seat_whose_turn_passes_hands_the_settle_on() {
 /// Whose turn the Mac labelled `label` reads it is at `now` (its own clock) to settle the pair,
 /// with no write: its own label where it would write, else the seat it names. Its first look
 /// records its sighting of the split, as a settle's does.
+#[cfg(unix)]
 fn owner_at(lab: &Lab, label: &str, now: u64) -> String {
     use crate::claude_token::{Plan, Settled};
     match crate::claude_token::plan(lab.named(label), &key(), now, soon()).unwrap() {
@@ -2461,6 +2568,7 @@ fn owner_at(lab: &Lab, label: &str, now: u64) -> String {
 /// reads the second turn from the 23rd minute: "every Mac names one seat at +23 min: [("m22",
 /// "m7"), ("m7", "m22"), ("m40", "m7")]" (m7's seat first in that run, so for those minutes
 /// neither writer writes; with m22's first, both would).
+#[cfg(unix)]
 #[test]
 fn macs_whose_clocks_differ_by_minutes_read_one_turn_at_a_time() {
     use crate::claude_token::{SETTLE_TURN_SECS, Settled};
@@ -2523,6 +2631,7 @@ fn macs_whose_clocks_differ_by_minutes_read_one_turn_at_a_time() {
 /// CONTROL (by hand, then restored): with the turns measured from the latest sibling's
 /// `authored_ms`, every Mac reads the first turn for an hour and more: "m7 one turn after its
 /// sighting, left: "m7", right: "m22"" (m7's seat first in that run).
+#[cfg(unix)]
 #[test]
 fn a_writer_clock_an_hour_ahead_holds_no_mac_past_one_turn() {
     use crate::claude_token::{SETTLE_TURN_SECS, Settled};
@@ -2572,6 +2681,7 @@ fn a_writer_clock_an_hour_ahead_holds_no_mac_past_one_turn() {
 /// clock went back, left: "m7", right: "m22"" (m7's seat first in that run); with the settle that
 /// finds the pair whole dropping no row (`forget_settled` cut), "the settled split's row is
 /// dropped: {"schema":1,"sighted":[{"at":…,"key":"…","split":"e884…"}]}".
+#[cfg(unix)]
 #[test]
 fn a_clock_set_back_runs_the_turns_on_from_where_it_stands() {
     use crate::claude_token::SETTLE_TURN_SECS;
@@ -2630,6 +2740,7 @@ fn a_clock_set_back_runs_the_turns_on_from_where_it_stands() {
 /// `turns_since` returning the sighting alone, "every Mac reads the second seat's turn at +45
 /// min: left: [("m7", "m7"), ("m22", "m22"), ("m40", "m22")], right: [("m7", "m22"), ("m22",
 /// "m22"), ("m40", "m22")]" (m7's seat first in that run).
+#[cfg(unix)]
 #[test]
 fn a_seat_that_looks_first_after_its_turn_writes_nothing_beside_the_next() {
     use crate::claude_token::{SETTLE_TURN_SECS, Settled};
@@ -2677,6 +2788,7 @@ fn a_seat_that_looks_first_after_its_turn_writes_nothing_beside_the_next() {
 /// leaves the sighting as it was, left: "{…"at":1794815249,…}", right: "{…"at":1794815279,…}"" (the
 /// sighting moved thirty seconds back), and without that assertion "m40 reads the turn the second
 /// seat reads, left: "m7", right: "m22"" (m7's seat second in that run).
+#[cfg(unix)]
 #[test]
 fn a_callers_moment_read_before_the_sighting_leaves_it_where_it_is() {
     use crate::claude_token::SETTLE_TURN_SECS;
@@ -2718,6 +2830,7 @@ fn a_callers_moment_read_before_the_sighting_leaves_it_where_it_is() {
 /// NEGATIVE CONTROL (by hand, then restored): with every error taking the lock read as held, "a
 /// lock that cannot be taken is an error: Held("this Mac's sighting of the split could not be
 /// recorded just now")".
+#[cfg(unix)]
 #[test]
 fn a_sightings_lock_that_cannot_be_taken_is_an_error() {
     use crate::claude_token::Settled;
@@ -2811,6 +2924,7 @@ fn settle_turns_are_seats_in_order_never_labels() {
 /// ([`crate::client::MemberEntry::settles`]), which the log no longer holds: it is refused and
 /// signs nothing, and the replacement stands. NEGATIVE CONTROL (by hand, then restored): with the
 /// draft's check of the settled ops cut, the settle signs the refuted pair over the replacement.
+#[cfg(unix)]
 #[test]
 fn a_settle_never_replaces_a_write_it_did_not_read() {
     use crate::claude_token::Settled;

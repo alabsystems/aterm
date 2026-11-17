@@ -50,14 +50,14 @@ pub enum Miss {
 /// # Errors
 /// Why there is none: the registry cannot be read, it names no entry, or the store holds no
 /// readable or well-formed value for it; with [`Miss::File`], also the request filed for it.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn from_vault(miss: Miss) -> Result<Principal, String> {
     let paths = aterm_secrets::client::Paths::locate().map_err(|e| e.to_string())?;
     from_vault_in(&paths, miss)
 }
 
 /// [`from_vault`] for the vault under `paths`.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn from_vault_in(paths: &aterm_secrets::client::Paths, miss: Miss) -> Result<Principal, String> {
     use aterm_secrets::need::catalog::AZURE_SIGNING_PRINCIPAL_ENTRY as ENTRY;
     use aterm_secrets::need::{Purpose, Want};
@@ -87,7 +87,7 @@ fn from_vault_in(paths: &aterm_secrets::client::Paths, miss: Miss) -> Result<Pri
 }
 
 /// The principal in the store's entry `name`, read in place.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn held(paths: &aterm_secrets::client::Paths, name: &str) -> Result<Principal, String> {
     let bytes = aterm_secrets::client::read_in_place(paths, name)
         .map_err(|e| format!("the vault entry {name}: {e}"))?
@@ -104,15 +104,16 @@ fn held(paths: &aterm_secrets::client::Paths, name: &str) -> Result<Principal, S
     ))
 }
 
-/// No vault reaches this host: its registry and need ledger are Unix.
+/// No vault reaches this host: the vault client, its registry and need ledger build on Unix and
+/// Windows only.
 ///
 /// # Errors
 /// Always.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub fn from_vault(_: Miss) -> Result<Principal, String> {
     Err(
-        "no vault on this host (the secrets registry and need ledger are Unix), so it holds no \
-         Azure signing principal"
+        "no vault on this host (the secrets registry and need ledger build on Unix and Windows \
+         only), so it holds no Azure signing principal"
             .to_owned(),
     )
 }

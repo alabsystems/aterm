@@ -42,15 +42,20 @@
 //!   those, so a mark that is dropped shows as a count, where the time it moved would not.
 
 use std::cell::RefCell;
+#[cfg(any(unix, test))]
 use std::collections::VecDeque;
+#[cfg(any(unix, test))]
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+#[cfg(any(unix, test))]
+use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use aterm_uds::cpu::ThreadsCpu;
 
 /// The passes the second line covers.
+#[cfg(any(unix, test))]
 pub(crate) const WINDOW: usize = 8;
 
 /// One thing a pass counts.
@@ -151,6 +156,7 @@ impl Count {
         Self::MemoAdmin,
     ];
 
+    #[cfg(any(unix, test))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Passes => "passes",
@@ -234,6 +240,7 @@ impl Phase {
         Self::Pause,
     ];
 
+    #[cfg(any(unix, test))]
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Before => "before",
@@ -265,6 +272,7 @@ pub(crate) struct PassCounts {
     threads: [ThreadsCpu; Phase::ALL.len()],
     /// Every total as each of the last [`WINDOW`] passes ended, oldest first, and before them
     /// the totals as the pass before those ended (none: every total 0).
+    #[cfg(any(unix, test))]
     ended: Mutex<VecDeque<Vec<u64>>>,
 }
 
@@ -276,6 +284,7 @@ impl Default for PassCounts {
             cpu_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             wall_ns: std::array::from_fn(|_| AtomicU64::new(0)),
             threads: std::array::from_fn(|_| ThreadsCpu::new()),
+            #[cfg(any(unix, test))]
             ended: Mutex::new(VecDeque::from([Vec::new()])),
         }
     }
@@ -283,6 +292,7 @@ impl Default for PassCounts {
 
 impl PassCounts {
     /// `what` so far.
+    #[cfg(any(unix, test))]
     pub(crate) fn get(&self, what: Count) -> u64 {
         self.counts[what as usize].load(Ordering::Relaxed)
     }
@@ -300,6 +310,7 @@ impl PassCounts {
     }
 
     /// Every total's name, in the order [`Self::totals`] gives them.
+    #[cfg(any(unix, test))]
     fn names() -> Vec<String> {
         let mut names: Vec<String> = Count::ALL
             .iter()
@@ -318,6 +329,7 @@ impl PassCounts {
         names
     }
 
+    #[cfg(any(unix, test))]
     fn totals(&self) -> Vec<u64> {
         let mut totals: Vec<u64> = Count::ALL.iter().map(|what| self.get(*what)).collect();
         for phase in Phase::ALL {
@@ -336,6 +348,7 @@ impl PassCounts {
     /// A pass ended: its totals are kept for the window, and where the passes so far are due
     /// ([`aterm_uds::tally::due`]) the two lines to say, the totals and the last passes'. Call it
     /// on the loop's thread, which reads its clock first so the lines hold the pass's time.
+    #[cfg(any(unix, test))]
     pub(crate) fn pass_ended(&self) -> Option<[String; 2]> {
         settle();
         let totals = self.totals();
@@ -458,6 +471,7 @@ pub(crate) fn add_n(what: Count, n: usize) {
     });
 }
 
+#[cfg(any(unix, test))]
 fn settle() {
     let _ = HERE.try_with(|here| {
         if let Some(here) = here.borrow_mut().as_mut() {
@@ -500,6 +514,7 @@ fn work(counts: &Arc<PassCounts>, phase: Phase, clock: bool) -> Working {
 /// This thread is a subscriber loop's (or one pass's) until the guard drops: what it counts goes
 /// to `counts`, and its time to the [`Phase`] it is in, [`Phase::Rest`] to begin with. On a thread
 /// that already works for a pass it changes nothing.
+#[cfg(any(unix, test))]
 pub(crate) fn metered(counts: &Arc<PassCounts>) -> Working {
     work(counts, Phase::Rest, true)
 }
@@ -543,6 +558,7 @@ impl Started {
 
 /// This thread is in `phase` from now, until the next [`enter`] or the end of a [`within`] around
 /// this one: on the loop's thread one entry of `phase` is counted.
+#[cfg(any(unix, test))]
 pub(crate) fn enter(phase: Phase) {
     let _ = HERE.try_with(|here| {
         if let Some(here) = here.borrow_mut().as_mut() {

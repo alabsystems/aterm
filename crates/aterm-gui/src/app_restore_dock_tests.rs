@@ -9,14 +9,14 @@ use super::tests::{
     adopt_as, bare_leaf, grid_of, handed_off_shell, handoff_into_moved_window, owe_restore_regrid,
     present_scripted, resize_sites, window_of,
 };
-use crate::app_window::DockBirth;
+use crate::app_window::DockRow;
 use crate::{App, WindowId, restore};
 
 const WID: WindowId = WindowId(0);
 
-/// A birth case: the row's dock field, the setting, the cells the window is born with, and the
-/// record it keeps.
-type BirthCase = (Option<u16>, Option<bool>, u16, Option<u16>);
+/// A birth case: the row's dock field and whether the default wrote it, the setting, the cells
+/// the window is born with, and the record it keeps and whether it is the default's.
+type BirthCase = (Option<u16>, bool, Option<bool>, u16, Option<u16>, bool);
 
 /// `[navigator] dock` set to `on`, so the process environment (a scratch world, CI) cannot
 /// decide it.
@@ -40,6 +40,14 @@ fn row(dock: Option<u16>, held: bool, cols: u16) -> restore::WindowLayout {
         ..window_of(vec![restore::RestoredSplitTree::leaf(
             restore::RestoredView::Terminal(bare_leaf()),
         )])
+    }
+}
+
+/// A row whose shown dock the default docked (`dock_by_default`), not its person.
+fn default_docked_row(held: bool, cols: u16) -> restore::WindowLayout {
+    restore::WindowLayout {
+        dock_by_default: true,
+        ..row(Some(30), held, cols)
     }
 }
 
@@ -128,7 +136,7 @@ fn an_upgrade_docks_the_navigator_and_resizes_no_handed_off_shell() {
         let (mut new, shells) = handed_over_desk();
         let (r, c) = (new.windows[&WID].rows, new.windows[&WID].cols);
         let wl = row(None, false, c);
-        new.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        new.take_dock_record(WID, DockRow::of(&wl));
         // The carried frame: the predecessor's window, which held no dock.
         let old = new.window_frame_px_for(WID, r, c);
         assert!(seat_windowed(&mut new, WID), "grew={grew}: seated");
@@ -189,17 +197,32 @@ fn a_manifest_with_no_dock_field_restores_docked() {
         let text = restore::RestoreManifest::new(vec![row(dock, false, 80)])
             .to_toml()
             .expect("serialize");
+        assert!(
+            !text.contains("dock_by_default"),
+            "a person's record says nothing of the default: {text}"
+        );
         let back = restore::RestoreManifest::from_toml(&text).expect("parse");
         assert_eq!(back.windows[0].dock, dock, "{text}");
+        assert!(!back.windows[0].dock_by_default);
     }
+    // The default's record says so, and round-trips.
+    let text = restore::RestoreManifest::new(vec![default_docked_row(false, 80)])
+        .to_toml()
+        .expect("serialize");
+    let back = restore::RestoreManifest::from_toml(&text).expect("parse");
+    assert_eq!(back.windows[0].dock, Some(30), "{text}");
+    assert!(back.windows[0].dock_by_default, "{text}");
 
     // Each birth site, with a row that says `dock`, under the setting `on`: the cells the
-    // window is born with and the record it then holds.
+    // window is born with and the record it then holds. Each site writes the record through
+    // the restore's own code, which needs no event loop: only a shell's spawn is stood in for.
     type Site = fn(&mut App, &restore::WindowLayout) -> WindowId;
     let sites: [(&str, Site); 4] = [
+        // `restore_window`'s native branch, before its tabs are rebuilt and it attaches.
         ("native restore window", |app, wl| {
-            let wid = app.create_native_restore_window(wl.rows, wl.cols);
-            app.take_dock_record(wid, wl.dock, DockBirth::of_row(wl));
+            let front = app.frontmost_window;
+            let wid = app.begin_native_restore_window(wl);
+            assert_eq!(app.frontmost_window, front, "the front is left as it was");
             wid
         }),
         ("native sliced fill", |app, wl| {
@@ -208,51 +231,72 @@ fn a_manifest_with_no_dock_field_restores_docked() {
                 .expect("a native fill");
             let host = filling.pending_host.take().expect("a pending host");
             assert_eq!(host.dock.pref, wl.dock, "the host took the row's record");
+            assert_eq!(host.dock.by_default, wl.dock_by_default);
             assert!(host.dock.birth.restored);
             app.windows.insert(filling.wid, host);
             filling.wid
         }),
-        // `create_window_internal_connected`'s logical half (its shell spawn needs an event
-        // loop): the window `create_window_logical` installs, then the row's record.
+        // `restore_window`'s shell branch: `create_window_internal_connected`'s logical birth,
+        // its shell spawn (which needs the event loop's proxy) stood in for by the window
+        // `create_window_logical` installs.
         ("shell restore window", |app, wl| {
-            let session = app.next_session_id;
-            let wid = app.insert_logical_window(crate::stub_session(session), wl.rows, wl.cols);
-            app.take_dock_record(wid, wl.dock, DockBirth::of_row(wl));
-            wid
+            app.create_restored_window_logical(
+                crate::app_window::CarriedFrame::of(wl),
+                DockRow::of(wl),
+                |app, rows, cols| {
+                    let session = app.next_session_id;
+                    Some(app.insert_logical_window(crate::stub_session(session), rows, cols))
+                },
+            )
+            .expect("a window")
         }),
+        // The launch's first window, through the launch's own write: a handoff's carried place
+        // over the row's.
         ("bootstrap window", |app, wl| {
             let manifest = restore::RestoreManifest::new(vec![wl.clone()]);
-            let (dock, birth) = restore::bootstrap_dock(Some(&manifest), None);
-            assert!(birth.restored);
-            app.take_dock_record(WID, dock, birth);
+            let carried = Some((40, 50));
+            let mut ws = app.windows.get_mut(&WID).unwrap();
+            ws.dock.take_bootstrap(Some(&manifest), carried);
+            assert!(ws.dock.birth.restored);
+            assert_eq!(
+                ws.dock.birth.origin, carried,
+                "a handoff's carried place wins"
+            );
             WID
         }),
     ];
-    let cases: [BirthCase; 4] = [
-        // No field, the setting on: born docked, and the record now says so.
-        (None, Some(true), 30, Some(30)),
-        (Some(30), Some(true), 30, Some(30)),
+    let cases: [BirthCase; 7] = [
+        // No field, the setting on: born docked, and the record now says so, and that the
+        // default docked it.
+        (None, false, Some(true), 30, Some(30), true),
+        (Some(30), false, Some(true), 30, Some(30), false),
+        (Some(30), true, Some(true), 30, Some(30), true),
         // CONTROL: a Hide stays hidden.
-        (Some(0), Some(true), 0, Some(0)),
-        // The setting off over a shown row: hidden, the record undecided again, so it is
-        // written beside the undocked grid and frame as what it is.
-        (Some(30), Some(false), 0, None),
+        (Some(0), false, Some(true), 0, Some(0), false),
+        // The setting off over a shown row the default wrote: hidden, the record undecided
+        // again, so it is written beside the undocked grid and frame as what it is.
+        (Some(30), true, Some(false), 0, None, false),
+        // A person's Show outlives the setting.
+        (Some(30), false, Some(false), 30, Some(30), false),
+        (None, false, Some(false), 0, None, false),
     ];
     for (name, site) in sites {
-        for (dock, on, cells, pref) in cases {
+        for (dock, by_default, on, cells, pref, keeps_default) in cases {
             let mut app = App::headless_for_test();
             dock_setting(&mut app, on);
             app.headless = false;
-            let wid = site(&mut app, &row(dock, false, 80));
+            let wl = restore::WindowLayout {
+                dock_by_default: by_default,
+                ..row(dock, false, 80)
+            };
+            let wid = site(&mut app, &wl);
             app.seat_birth_dock(wid);
             let ws = &app.windows[&wid];
-            assert_eq!(ws.dock.cells, cells, "{name}: dock={dock:?} on={on:?}");
-            assert_eq!(ws.dock.pref, pref, "{name}: dock={dock:?} on={on:?}");
-            assert_eq!(
-                app.dock_view(wid).is_some(),
-                cells != 0,
-                "{name}: dock={dock:?} on={on:?}"
-            );
+            let case = format!("{name}: dock={dock:?} by_default={by_default} on={on:?}");
+            assert_eq!(ws.dock.cells, cells, "{case}");
+            assert_eq!(ws.dock.pref, pref, "{case}");
+            assert_eq!(ws.dock.by_default, keeps_default, "{case}");
+            assert_eq!(app.dock_view(wid).is_some(), cells != 0, "{case}");
         }
     }
 }
@@ -265,7 +309,7 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
         let (mut app, shells, before) = three_programs_at(140);
         let mut wl = row(None, !show_fullscreen, 140);
         wl.show.fullscreen = show_fullscreen.then_some(true);
-        app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        app.take_dock_record(WID, DockRow::of(&wl));
         assert!(!seat_windowed(&mut app, WID), "held: not born wider");
         assert_eq!(app.windows[&WID].dock.cells, 0);
         assert!(app.windows[&WID].dock.owes_birth_dock());
@@ -295,7 +339,12 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
             "a second park adds nothing"
         );
         assert!(!app.windows[&WID].dock.owes_birth_dock());
-        assert_eq!(app.capture_restore_manifest().windows[0].dock, Some(30));
+        let saved = app.capture_restore_manifest().windows[0].clone();
+        assert_eq!(saved.dock, Some(30));
+        assert!(
+            saved.dock_by_default,
+            "the default docked it inside, not its person"
+        );
     }
 
     // The restore's re-grid owed to a size still to land: nothing until a frame pays it, then
@@ -303,7 +352,7 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
     {
         let (mut app, shells, before) = three_programs_at(140);
         let wl = row(None, true, 140);
-        app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        app.take_dock_record(WID, DockRow::of(&wl));
         seat_windowed(&mut app, WID);
         let t0 = std::time::Instant::now();
         owe_restore_regrid(&mut app, WID, false, t0);
@@ -331,7 +380,7 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
     {
         let (mut app, handed) = handoff_into_moved_window((27, 140));
         let wl = row(None, true, 140);
-        app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        app.take_dock_record(WID, DockRow::of(&wl));
         seat_windowed(&mut app, WID);
         close_pass(&mut app);
         app.settle_messages(std::time::Instant::now());
@@ -346,7 +395,7 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
     {
         let (mut app, shells, before) = three_programs_at(140);
         let wl = row(None, true, 140);
-        app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        app.take_dock_record(WID, DockRow::of(&wl));
         seat_windowed(&mut app, WID);
         close_pass(&mut app);
         {
@@ -367,13 +416,111 @@ fn a_held_window_restored_with_a_dock_books_one_dock_resize_and_none_under_resto
     }
 }
 
+/// MACOS TILED HALVES. macOS tells aterm nothing of a tile, so a restored window whose saved
+/// frame stands in a tile of its screen's visible frame (it spans the visible height and meets
+/// one side: `frame_is_placed`) is held as a maximized one is: its default dock is not born
+/// beside it, so it does not grow over its neighbour, and goes inside once the restore settles,
+/// one `site=dock` resize per program. CONTROL: the same window floating grows by the column,
+/// and no program is resized.
+#[test]
+fn a_tiled_window_owes_its_default_dock_inside_and_a_floating_one_grows() {
+    use crate::app_window::{BirthScreens, DesktopPlane, DockBirth, MonitorRectPx, WorkAreaPts};
+    // One 1440 x 900 pt display at scale 2, less a 25 pt menu bar.
+    let monitors = [MonitorRectPx {
+        x: 0.0,
+        y: 0.0,
+        w: 2880.0,
+        h: 1800.0,
+        scale: 2.0,
+    }];
+    let visible = [WorkAreaPts {
+        x: 0.0,
+        y: 25.0,
+        w: 1440.0,
+        h: 875.0,
+    }];
+    let screens = BirthScreens {
+        plane: DesktopPlane::Points,
+        monitors: &monitors,
+        visible: &visible,
+        current: None,
+        scale: 2.0,
+    };
+    // (the saved origin and frame in the row's px at scale 2, whether it is a tile)
+    let saved: [((i32, i32), (f64, f64), bool); 3] = [
+        // The right half: 720 x 875 pt at (720, 25) pt.
+        ((1440, 50), (1440.0, 1750.0), true),
+        // The left half.
+        ((0, 50), (1440.0, 1750.0), true),
+        // CONTROL: floating, 900 x 600 pt at (100, 120) pt.
+        ((200, 240), (1800.0, 1200.0), false),
+    ];
+    for (origin, frame, tiled) in saved {
+        let (mut app, shells, before) = three_programs_at(140);
+        let rows = app.windows[&WID].rows;
+        let birth = DockBirth {
+            origin: Some(origin),
+            scale: Some(2.0),
+            ..DockBirth::of_row(&row(None, false, 140))
+        };
+        app.take_dock_record(
+            WID,
+            DockRow {
+                pref: None,
+                by_default: false,
+                birth,
+            },
+        );
+        assert!(seat_windowed(&mut app, WID), "PRECONDITION: a default dock");
+        // The docked frame (the saved one and the column) fits the screen's 1440 pt: only the
+        // tile decides.
+        let docked_w_pts = frame.0 / 2.0 + 240.0;
+        assert_eq!(
+            app.fit_birth_dock_on(WID, &screens, docked_w_pts, Some(frame)),
+            tiled,
+            "origin={origin:?}"
+        );
+        if tiled {
+            let ws = &app.windows[&WID];
+            assert_eq!(ws.dock.cells, 0, "origin={origin:?}: not born beside it");
+            assert!(ws.dock.owes_birth_dock(), "owed inside");
+            assert_eq!(ws.dock.pref, None, "still undecided");
+            close_pass(&mut app);
+            app.settle_messages(std::time::Instant::now());
+            assert_eq!(app.windows[&WID].dock.cells, 30, "inside once settled");
+            for id in &shells {
+                assert_eq!(grid_of(&app, *id), (rows, 110), "shell {id}");
+            }
+            assert_eq!(
+                booked_since(&app, &shells, &before),
+                vec![vec!["site=dock".to_owned()]; 3],
+                "origin={origin:?}"
+            );
+        } else {
+            assert_eq!(app.windows[&WID].dock.cells, 30, "CONTROL: born beside it");
+            assert!(!app.windows[&WID].dock.owes_birth_dock());
+            close_pass(&mut app);
+            app.settle_messages(std::time::Instant::now());
+            for id in &shells {
+                assert_eq!(grid_of(&app, *id), (rows, 140), "CONTROL: shell {id}");
+            }
+            assert!(
+                booked_since(&app, &shells, &before)
+                    .iter()
+                    .all(Vec::is_empty),
+                "CONTROL: no program resized"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_window_that_cannot_keep_eighty_columns_starts_without_the_dock() {
     // 109 columns: no room for 80 beside the column, so it starts without it and stays
     // undecided.
     let (mut app, shells, before) = three_programs_at(109);
     let wl = row(None, true, 109);
-    app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+    app.take_dock_record(WID, DockRow::of(&wl));
     seat_windowed(&mut app, WID);
     close_pass(&mut app);
     app.settle_messages(std::time::Instant::now());
@@ -412,7 +559,7 @@ fn a_window_that_cannot_keep_eighty_columns_starts_without_the_dock() {
     // CONTROL: 110 columns keeps 80, and docks inside with exactly one dock resize.
     let (mut app, shells, before) = three_programs_at(110);
     let wl = row(None, true, 110);
-    app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+    app.take_dock_record(WID, DockRow::of(&wl));
     seat_windowed(&mut app, WID);
     close_pass(&mut app);
     app.settle_messages(std::time::Instant::now());
@@ -447,33 +594,122 @@ fn a_window_saved_with_the_dock_shown_restores_at_the_frame_it_had() {
         let manifest = old.capture_manifest(handoff, false);
         let saved = manifest.windows[0].clone();
         assert_eq!(saved.dock, Some(30), "handoff={handoff}");
+        assert!(!saved.dock_by_default, "handoff={handoff}: a person's Show");
         assert_eq!((saved.rows, saved.cols), (rows, 90));
         let carried = saved
             .inner_px
             .map(|[w, h]| aterm_window::dpi::PhysicalSize::new(w, h));
         assert_eq!(carried, Some(frame), "handoff={handoff}: the whole window");
 
+        // A person's Show is theirs: the frame it had, whatever the setting says.
         for on in [Some(true), Some(false)] {
             let mut new = App::headless_for_test();
-            new.take_dock_record(WID, saved.dock, DockBirth::of_row(&saved));
+            new.take_dock_record(WID, DockRow::of(&saved));
             dock_setting(&mut new, on);
             new.headless = false;
             new.seat_birth_dock(WID);
             let size = new.attach_frame_px(WID, saved.rows, saved.cols, carried);
-            if on == Some(false) {
-                // CONTROL: born without the dock, the carried frame is refused: the window
-                // comes back 30 cells narrower, its grid kept.
-                assert!(size.width < frame.width, "CONTROL: handoff={handoff}");
-            } else {
-                assert_eq!(size, frame, "handoff={handoff} on={on:?}: the frame it had");
-                assert_eq!(new.grid_dims_for(WID, size), (rows, 90));
-            }
+            assert_eq!(size, frame, "handoff={handoff} on={on:?}: the frame it had");
+            assert_eq!(new.grid_dims_for(WID, size), (rows, 90));
         }
     }
 }
 
+/// THE RECORD SAYS WHO SHOWED THE DOCK. A window the default docked writes a record that says
+/// so, carried by a quit and a handoff, so with `[navigator] dock = false` it comes back as the
+/// setting says: no dock, at the grid it had, its frame narrowed by the column and no program
+/// resized, its record undecided again. A person's Show writes a plain record and outlives the
+/// setting (`a_window_saved_with_the_dock_shown_restores_at_the_frame_it_had`); a Show over a
+/// default docking makes it the person's, and a new window takes the record with who wrote it.
+#[test]
+fn a_default_docking_says_so_and_the_setting_still_decides_it() {
+    let mut old = App::headless_for_test();
+    dock_setting(&mut old, Some(true));
+    old.headless = false;
+    let (rows, cols) = (old.windows[&WID].rows, old.windows[&WID].cols);
+    let bare = old.window_frame_px_for(WID, rows, cols);
+    old.take_dock_record(WID, DockRow::of(&row(None, false, cols)));
+    assert!(
+        old.seat_birth_dock(WID),
+        "PRECONDITION: born wider by default"
+    );
+    let frame = old.attach_frame_px(WID, rows, cols, None);
+    let cw = u32::try_from(old.win_cell_size(WID).0).unwrap();
+    assert_eq!(
+        frame.width,
+        bare.width + 30 * cw,
+        "PRECONDITION: born wider"
+    );
+    old.windows.get_mut(&WID).unwrap().win_px = Some(frame);
+    assert!(old.windows[&WID].dock.by_default);
+
+    // A new window takes the record with who wrote it.
+    let session = old.next_session_id;
+    let child = old.insert_logical_window(crate::stub_session(session), rows, cols);
+    assert_eq!(old.windows[&child].dock.pref, Some(30));
+    assert!(
+        old.windows[&child].dock.by_default,
+        "the child's is the default's too"
+    );
+    old.close_window_logical(child);
+
+    for handoff in [false, true] {
+        let saved = old.capture_manifest(handoff, false).windows[0].clone();
+        assert_eq!(saved.dock, Some(30), "handoff={handoff}");
+        assert!(
+            saved.dock_by_default,
+            "handoff={handoff}: the default's record"
+        );
+        assert_eq!((saved.rows, saved.cols), (rows, cols));
+        let carried = saved
+            .inner_px
+            .map(|[w, h]| aterm_window::dpi::PhysicalSize::new(w, h));
+        assert_eq!(carried, Some(frame), "handoff={handoff}");
+
+        // The setting still on: the frame it had.
+        let mut new = App::headless_for_test();
+        new.take_dock_record(WID, DockRow::of(&saved));
+        dock_setting(&mut new, Some(true));
+        new.headless = false;
+        assert!(new.seat_birth_dock(WID));
+        assert!(new.windows[&WID].dock.by_default, "handoff={handoff}");
+        let size = new.attach_frame_px(WID, rows, cols, carried);
+        assert_eq!(size, frame, "handoff={handoff}: the frame it had");
+
+        // The setting off: no dock, the grid it had, the frame narrowed by the column.
+        let mut new = App::headless_for_test();
+        new.take_dock_record(WID, DockRow::of(&saved));
+        dock_setting(&mut new, Some(false));
+        new.headless = false;
+        assert!(
+            !new.seat_birth_dock(WID),
+            "handoff={handoff}: the setting hid it"
+        );
+        let ws = &new.windows[&WID];
+        assert_eq!(ws.dock.cells, 0);
+        assert_eq!(ws.dock.pref, None, "undecided again");
+        assert!(!ws.dock.by_default);
+        let size = new.attach_frame_px(WID, rows, cols, carried);
+        assert_eq!(size, bare, "handoff={handoff}: narrowed by the column");
+        assert_eq!(size.width, frame.width - 30 * cw);
+        assert_eq!(
+            new.grid_dims_for(WID, size),
+            (rows, cols),
+            "the grid it had"
+        );
+    }
+
+    // A person's Show over the default docking makes the record theirs.
+    old.set_dock_at(WID, 30, std::time::Instant::now())
+        .expect("already shown: the record changes");
+    assert!(!old.windows[&WID].dock.by_default);
+    let saved = old.capture_manifest(false, false).windows[0].clone();
+    assert_eq!(saved.dock, Some(30));
+    assert!(!saved.dock_by_default, "a person's record now");
+}
+
 /// A WRITTEN RECORD AGREES WITH THE GRID AND FRAME BESIDE IT. A window the setting kept
-/// undocked over a row that said shown lives undocked: its row must not say shown, or a birth
+/// undocked over a row the default said shown lives undocked: its row must not say shown, or a birth
 /// after the setting comes back on is a record's (no screen fit, no slide, a held window born
 /// wider than its screen and re-gridded under `site=restore`) rather than the default's. Round
 /// trip: captured with the setting off, born with it on, a free row is a default birth (fitted
@@ -484,8 +720,8 @@ fn a_window_saved_with_the_dock_shown_restores_at_the_frame_it_had() {
 fn a_window_the_setting_kept_undocked_writes_no_shown_record() {
     for held in [false, true] {
         let (mut app, _, _) = three_programs_at(140);
-        let wl = row(Some(30), held, 140);
-        app.take_dock_record(WID, wl.dock, DockBirth::of_row(&wl));
+        let wl = default_docked_row(held, 140);
+        app.take_dock_record(WID, DockRow::of(&wl));
         dock_setting(&mut app, Some(false));
         app.headless = false;
         assert!(!app.seat_birth_dock(WID), "held={held}: the setting hid it");
@@ -505,7 +741,7 @@ fn a_window_the_setting_kept_undocked_writes_no_shown_record() {
         let (mut new, shells_new, before_new) = three_programs_at(saved.cols);
         let mut saved = saved;
         saved.maximized = held.then_some(true);
-        new.take_dock_record(WID, saved.dock, DockBirth::of_row(&saved));
+        new.take_dock_record(WID, DockRow::of(&saved));
         let seated = seat_windowed(&mut new, WID);
         if held {
             assert!(!seated, "a held row is not born wider than its screen");

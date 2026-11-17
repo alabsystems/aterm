@@ -188,7 +188,7 @@ pub(crate) fn flush_step(run: &mut Run) -> Option<Flush> {
             sequence: run.sequence,
             roster: [7; 32],
             period: week,
-            revert: false,
+            revert: None,
             changes: planned.changes.clone(),
         });
     }

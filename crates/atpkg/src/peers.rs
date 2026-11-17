@@ -802,8 +802,8 @@ fn links(_meta: &std::fs::Metadata) -> u64 {
 
 /// The person's off (`serve-units --off`): record it ([`Layout::units_off`]), so every server
 /// of this store stops once its watch hears it (or within [`FALLBACK_POLL`] where no file events
-/// run) and none starts, then remove `units/` and every build's kept unit, so the store keeps
-/// none. It stands until [`turn_on`]. A store not made yet has its prefix made for the record
+/// run) and none starts, then remove `units/` and every build's and keyed tree's kept unit
+/// ([`crate::keyed_tree::kept_units`]), so the store keeps none. It stands until [`turn_on`]. A store not made yet has its prefix made for the record
 /// ([`Layout::ensure_dir`]), so an off a person writes before the first pass holds from that pass
 /// on.
 ///
@@ -857,6 +857,9 @@ pub fn turn_off(layout: &Layout) -> io::Result<()> {
                 }
             }
         }
+    }
+    for unit in crate::keyed_tree::kept_units(layout) {
+        let _ = std::fs::remove_file(unit);
     }
     Ok(())
 }

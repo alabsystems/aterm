@@ -156,7 +156,11 @@ impl Log {
         out
     }
 
-    /// The read-only log a [`Log::closed_summary`] wrote.
+    /// THE READ-ONLY LOG A [`Log::closed_summary`] WROTE. A summary keeps no description claim and
+    /// no history line (`Fold::closed_snapshot`), so it is read as no session in particular and
+    /// needs no identity ([`Log::set_desc_ident`]): nothing it holds is ranked by one. One whose
+    /// fold holds a claim, a line or a card revision is refused, since read here it would rank
+    /// the session's own and its creator's claims as nobody's.
     /// # Errors
     /// A [`CarryError`] for a summary this build does not read.
     pub fn from_closed_summary(text: &str) -> Result<Log, CarryError> {
@@ -239,6 +243,14 @@ impl Log {
             Fold::from_snapshot(&fold_lines).map_err(CarryError::Fold)?
         };
         fold.agrees_with_open(&[]).map_err(CarryError::Fold)?;
+        let desc = &fold.state().desc;
+        if desc.card_rev() > 0
+            || desc
+                .subjects()
+                .any(|s| !s.slots.is_empty() || !s.history.is_empty())
+        {
+            return Err(CarryError::Shape("a summary holding a description claim"));
+        }
         let mut log = Log::with_limits(ep, Limits::SESSION);
         log.base_ep = base;
         log.first_seq = first;

@@ -12516,7 +12516,6 @@ fn init_required_authorization_keeps_unread_evidence_unread() {
     use aterm_machines::init::Grant;
     use aterm_types::macos_setup::{Access, Standing};
     for access in [
-        Access::LocalNetwork,
         Access::NameRule,
         Access::SpotlightScope,
         Access::NetworkAuth,

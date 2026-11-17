@@ -866,11 +866,380 @@ fn yaml_strategy_block_shapes() {
         ),
         None
     );
+    // r430: multi-capture scan forms.
+    let jn = |body: &str| {
+        let text = format!(
+            "class X < Formula\n  livecheck do\n    url \"https://example.com/\"\n    regex(/v(\\d+)(\\d+)/i)\n{body}\n  end\nend\n"
+        );
+        parse_livecheck_block(&text).and_then(|s| s.page_block.map(|b| b.shape))
+    };
+    assert_eq!(
+        jn(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match.join(\".\") }\n    end"
+        ),
+        Some(super::super::formula::PageShape::ScanJoin(".".into()))
+    );
+    assert_eq!(
+        jn(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[1] ? \"#{match[0]},#{match[1]}\" : match[0] }\n    end"
+        ),
+        Some(super::super::formula::PageShape::ScanCsvOpt)
+    );
     // The regex-capture form needs the regex parameter.
     assert_eq!(
         shape("    strategy :yaml do |yaml|\n      yaml.dig(\"a\")&.[](regex, 1)\n    end"),
         None
     );
+    // r422: `:electron_builder` blocks reduce the same way
+    // (the oracle runs them through the Yaml strategy).
+    assert_eq!(
+        shape("    strategy :electron_builder do |yaml|\n      yaml.dig(\"version\")\n    end"),
+        Some(YamlShape::Dig(vec![JsonKey::Key("version".into())]))
+    );
+}
+
+/// r423: `page.scan(regex).map { |m| m[0].tr(..) }`
+/// blocks reduce to a ScanTr data shape; anything
+/// else in a page_match block stays block-only.
+#[test]
+fn page_match_tr_block_shapes() {
+    use super::super::formula::PageShape;
+    let spec = |body: &str| {
+        let text = format!(
+            "class X < Formula\n  livecheck do\n    url \"https://example.com/\"\n    regex(/v(\\d+)/i)\n{body}\n  end\nend\n"
+        );
+        parse_livecheck_block(&text)
+    };
+    let shape = |body: &str| spec(body).and_then(|s| s.page_block.map(|b| b.shape));
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].tr(\"_\", \".\") }\n    end"
+        ),
+        Some(PageShape::ScanTr("_".into(), ".".into()))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match&.first&.tr(\"_R\", \".r\") }\n    end"
+        ),
+        Some(PageShape::ScanTr("_R".into(), ".r".into()))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :sourceforge do |page, regex|\n      page.scan(regex).map { |match| match.first.tr(\"_\", \".\") }\n    end"
+        ),
+        Some(PageShape::ScanTr("_".into(), ".".into()))
+    );
+    // No regex param, no reduction.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page|\n      page.scan(regex).map { |match| match[0].tr(\"_\", \".\") }\n    end"
+        ),
+        None
+    );
+    // A computed map body does not reduce.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| Date.parse(match.first) }\n    end"
+        ),
+        None
+    );
+    // r424: Date.parse("%Y%m%d") bodies reduce, direct
+    // and assign-then-ternary forms.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| Date.parse(match.first)&.strftime(\"%Y%m%d\") }\n    end"
+        ),
+        Some(PageShape::ScanDateYmd)
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map do |match|\n        date_str = match&.first\n        date_str ? Date.parse(date_str)&.strftime(\"%Y%m%d\") : nil\n      end\n    end"
+        ),
+        Some(PageShape::ScanDateYmd)
+    );
+    // Another strftime format does not reduce.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| Date.parse(match.first)&.strftime(\"%Y-%m-%d\") }\n    end"
+        ),
+        None
+    );
+    // r425: literal gsub, regex sub with literal
+    // replacement, and the reject-one-version form.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].gsub(\"_rev_\", \".\") }\n    end"
+        ),
+        Some(PageShape::ScanGsub("_rev_".into(), ".".into()))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match&.first&.sub(/%2Bdbg/i, \"\") }\n    end"
+        ),
+        Some(PageShape::ScanSub("%2Bdbg".into(), "i".into(), "".into()))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| ((version = match.first) == \"2.22\") ? nil : version }\n    end"
+        ),
+        Some(PageShape::ScanRejectEq("2.22".into()))
+    );
+    // r431: backreference replacements reduce
+    // (r425 left them block-only), as do the
+    // tr+sub chain and digit-chunk scan.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].sub(/x/, '\\1') }\n    end"
+        ),
+        Some(PageShape::ScanSubBackref(
+            "x".into(),
+            "".into(),
+            "\\1".into()
+        ))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match.first.sub(/^(\\d)(\\d+)$/, '\\1.\\2') }\n    end"
+        ),
+        Some(PageShape::ScanSubBackref(
+            "^(\\d)(\\d+)$".into(),
+            "".into(),
+            "\\1.\\2".into()
+        ))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map do |match|\n        match[0].tr(\"~\", \"_\").sub(/\\.(\\h{7})$/, '-\\1')\n      end\n    end"
+        ),
+        Some(PageShape::ScanTrSubBackref(
+            "~".into(),
+            "_".into(),
+            "\\.(\\h{7})$".into(),
+            "".into(),
+            "-\\1".into()
+        ))
+    );
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].scan(/\\d{2}/).map(&:to_i).join(\".\") }\n    end"
+        ),
+        Some(PageShape::ScanChunks(2, ".".into()))
+    );
+    // Negated tr sets do not reduce.
+    assert_eq!(
+        shape(
+            "    strategy :page_match do |page, regex|\n      page.scan(regex).map { |match| match[0].tr(\"^a\", \".\") }\n    end"
+        ),
+        None
+    );
+}
+
+/// r426: `:github_releases` blocks reduce to data
+/// shapes (the seven core bodies; calabash's
+/// cross-formula suffix stays block-only).
+#[test]
+fn github_releases_block_shapes() {
+    use super::super::formula::{GhRelBlock, GhRelSource, GhRelThen};
+    let spec = |body: &str| {
+        let text = format!(
+            "class X < Formula\n  livecheck do\n    url :stable\n    regex(/^v?(\\d+(?:[.-]\\d+)+)$/i)\n{body}\n  end\nend\n"
+        );
+        parse_livecheck_block(&text)
+    };
+    let shape = |body: &str| spec(body).and_then(|s| s.ghrel_block);
+    let base = GhRelBlock {
+        skip_draft: true,
+        skip_prerelease: true,
+        name_skip: None,
+        source: GhRelSource::TagName,
+        then: GhRelThen::Identity,
+    };
+    // saxon: tr on the capture.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        match = release[\"tag_name\"]&.match(regex)\n        next if match.blank?\n\n        match[1]&.tr(\"-\", \".\")\n      end\n    end"
+        ),
+        Some(GhRelBlock {
+            then: GhRelThen::Tr("-".into(), ".".into()),
+            ..base.clone()
+        })
+    );
+    // kpt: name guard.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        next if release[\"name\"]&.match?(/^api/i)\n\n        match = release[\"tag_name\"]&.match(regex)\n        next if match.blank?\n\n        match[1]\n      end\n    end"
+        ),
+        Some(GhRelBlock {
+            name_skip: Some(("^api".into(), "i".into())),
+            ..base.clone()
+        })
+    );
+    // polynote: prerelease kept (commented-out guard).
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] # || release[\"prerelease\"]\n\n        match = release[\"tag_name\"]&.match(regex)\n        next if match.blank?\n\n        match[1]\n      end\n    end"
+        ),
+        Some(GhRelBlock {
+            skip_prerelease: false,
+            ..base.clone()
+        })
+    );
+    // portable-openssl: non-zero patch via filter_map.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.filter_map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        match = release[\"tag_name\"]&.match(regex)\n        next if match.blank?\n\n        version = Version.new(match[1])\n        next if version.patch.to_i.zero?\n\n        version\n      end\n    end"
+        ),
+        Some(GhRelBlock {
+            then: GhRelThen::NonZeroPatch,
+            ..base.clone()
+        })
+    );
+    // core-lightning: asset download URLs, flattened.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      json.map do |release|\n        next if release[\"draft\"] || release[\"prerelease\"]\n\n        release[\"assets\"]&.map do |asset|\n          match = asset[\"browser_download_url\"]&.match(regex)\n          next if match.blank?\n\n          match[1]\n        end\n      end.flatten\n    end"
+        ),
+        Some(GhRelBlock {
+            source: GhRelSource::AssetDownloadUrl,
+            ..base.clone()
+        })
+    );
+    // calabash: cross-formula state does not reduce.
+    assert_eq!(
+        shape(
+            "    strategy :github_releases do |json, regex|\n      saxon_suffix = \"-1\"\n\n      json.map do |release|\n        next if release[\"draft\"]\n\n        match[1] if match[1].end_with?(saxon_suffix)\n      end\n    end"
+        ),
+        None
+    );
+}
+
+/// r427: cask conditional locals (`on_arch_conditional`,
+/// `arch`/`os` stanzas) and `Time.now.to_i` cache
+/// busters substitute in livecheck url/regex at load;
+/// the `version` family stays url-only.
+#[test]
+fn cask_livecheck_locals_substitute() {
+    use super::super::formula::LivecheckUrl;
+    let text = "cask \"x\" do\n  arch arm: \"apple\", intel: \"intel\"\n  folder = on_arch_conditional arm: \"arm64\", intel: \"x86_64\"\n  livecheck do\n    url \"https://example.com/updates_#{folder}.xml?noCache=#{Time.now.to_i}\"\n    regex(/app-v(\\d+)-#{arch}\\.dmg/i)\n  end\nend\n";
+    let spec = parse_livecheck_block(text).unwrap();
+    let Some(LivecheckUrl::Literal(url)) = &spec.url else {
+        panic!("url literal expected, got {:?}", spec.url);
+    };
+    // This host is arm64 or x86_64; either way both
+    // tokens resolved and no interpolation remains.
+    assert!(url.starts_with("https://example.com/updates_"), "{url}");
+    assert!(url.contains(".xml?noCache=1"), "{url}");
+    assert!(!url.contains("#{"), "{url}");
+    let re = spec.regex.unwrap();
+    assert!(
+        re == "app-v(\\d+)-apple\\.dmg" || re == "app-v(\\d+)-intel\\.dmg",
+        "{re}"
+    );
+    // A nested conditional as a kwarg value resolves too.
+    let text = "cask \"x\" do\n  arch arm: \"arm64\", intel: on_system_conditional(macos: \"x64\", linux: \"x86_64\")\n  livecheck do\n    url \"https://example.com/#{arch}/latest.yml\"\n  end\nend\n";
+    let spec = parse_livecheck_block(text).unwrap();
+    assert!(
+        matches!(&spec.url, Some(LivecheckUrl::Literal(u)) if !u.contains("#{")),
+        "{:?}",
+        spec.url
+    );
+    // Unknown locals still refuse the whole block.
+    assert!(
+        parse_livecheck_block(
+            "cask \"x\" do\n  livecheck do\n    url \"https://example.com/#{nope}/\"\n  end\nend\n"
+        )
+        .is_none()
+    );
+}
+
+/// r429: dig bodies ending `.split("-")&.first`
+/// reduce for :json and :yaml/:electron_builder.
+#[test]
+fn dig_split_first_shapes() {
+    use super::super::formula::{JsonKey, JsonShape, YamlShape};
+    let spec = |url: &str, body: &str| {
+        let text =
+            format!("class X < Formula\n  livecheck do\n    url \"{url}\"\n{body}\n  end\nend\n");
+        parse_livecheck_block(&text)
+    };
+    let j = spec(
+        "https://example.com/x.json",
+        "    strategy :json do |json|\n      json[\"version\"]&.split(\"-\")&.first\n    end",
+    )
+    .and_then(|s| s.json_block.map(|b| b.shape));
+    assert_eq!(
+        j,
+        Some(JsonShape::DigSplitFirst(
+            vec![JsonKey::Key("version".into())],
+            "-".into()
+        ))
+    );
+    let y = spec(
+        "https://example.com/latest-mac.yml",
+        "    strategy :electron_builder do |yaml|\n      yaml[\"version\"]&.split(\"-\")&.first\n    end",
+    )
+    .and_then(|s| s.yaml_block.map(|b| b.shape));
+    assert_eq!(
+        y,
+        Some(YamlShape::DigSplitFirst(
+            vec![JsonKey::Key("version".into())],
+            "-".into()
+        ))
+    );
+    // `.last` does not reduce.
+    let n = spec(
+        "https://example.com/x.json",
+        "    strategy :json do |json|\n      json[\"version\"]&.split(\"-\")&.last\n    end",
+    )
+    .and_then(|s| s.json_block.map(|b| b.shape));
+    assert_eq!(n, None);
+}
+
+/// r432: the three two-stage directory-walk bodies
+/// (gnu-getopt, texlive, singular) reduce to DirWalk.
+#[test]
+fn dirwalk_block_shapes() {
+    use super::super::formula::{DirBlank, PageShape};
+    let spec = |url: &str, re: &str, body: &str| {
+        let text = format!(
+            "class X < Formula\n  livecheck do\n    url \"{url}\"\n    regex({re})\n{body}\n  end\nend\n"
+        );
+        parse_livecheck_block(&text).and_then(|s| s.page_block.map(|b| b.shape))
+    };
+    let gnu = spec(
+        "https://example.org/util-linux/",
+        "/href=.*?util-linux[._-]v?(\\d+(?:\\.\\d+)+)\\.t/i",
+        "    strategy :page_match do |page, regex|\n      versions = page.scan(%r{href=[\"']?v?(\\d+(?:\\.\\d+)+)/?[\"' >]}i)\n                     .flatten\n                     .uniq\n                     .sort_by { |v| Version.new(v) }\n      next versions if versions.blank?\n\n      dir_versions = []\n      versions[-2..].reverse_each do |version|\n        dir_page = Homebrew::Livecheck::Strategy.page_content(\n          URI.join(@url, \"v#{version}/\").to_s,\n        )\n        next versions if dir_page[:content].blank?\n\n        dir_versions = dir_page[:content].scan(regex).flatten\n        break unless dir_versions.empty?\n      end\n\n      dir_versions.presence || versions\n    end",
+    );
+    let Some(PageShape::DirWalk(w)) = gnu else {
+        panic!("gnu-getopt dirwalk, got {gnu:?}")
+    };
+    assert!(w.last_two && w.empty_scan_stage1 && w.blank == DirBlank::NextCandidate);
+    assert_eq!((w.dir_pre.as_str(), w.dir_post.as_str()), ("v", "/"));
+    assert!(w.stage1_regex.is_some() && w.stage2_regex.is_none());
+
+    let tex = spec(
+        "https://example.org/texlive/",
+        "/href=.*?texlive[._-]v?(\\d+(?:\\.\\d+)*)[._-]source\\.t/i",
+        "    strategy :page_match do |page, regex|\n      years = page.scan(%r{href=[\"']?v?(\\d+(?:\\.\\d+)*)/?[\"' >]}i)\n                  .flatten\n                  .uniq\n                  .map { |v| Version.new(v) }\n                  .sort\n      next if years.blank?\n\n      newest_year = years.last.to_s\n      year_page = Homebrew::Livecheck::Strategy.page_content(URI.join(@url, newest_year).to_s)\n      next if year_page[:content].blank?\n\n      year_page[:content].scan(regex).flatten\n    end",
+    );
+    let Some(PageShape::DirWalk(w)) = tex else {
+        panic!("texlive dirwalk, got {tex:?}")
+    };
+    assert!(!w.last_two && w.blank == DirBlank::Nothing && !w.empty_scan_stage1);
+
+    let sing = spec(
+        "https://example.org/SOURCES/",
+        "%r{href=[\"']?v?(\\d+(?:[.-]\\d+)+)/?[\"' >]}i",
+        "    strategy :page_match do |page, regex|\n      versions = page.scan(regex)\n                     .flatten\n                     .uniq\n                     .map { |v| Version.new(v.tr(\"-\", \".\")) }\n                     .reject { |v| v.patch >= 90 }\n                     .sort\n      next versions if versions.blank?\n\n      newest_version = versions.last\n\n      dir_page = Homebrew::Livecheck::Strategy.page_content(\n        URI.join(@url, \"#{newest_version.to_s.tr(\".\", \"-\")}/\").to_s,\n      )\n      next versions if dir_page[:content].blank?\n\n      dir_versions = dir_page[:content].scan(/href=.*?singular[._-]v?(\\d+(?:\\.\\d+)+(?:p\\d+)?)\\.t/i).flatten\n\n      dir_versions || versions\n    end",
+    );
+    let Some(PageShape::DirWalk(w)) = sing else {
+        panic!("singular dirwalk, got {sing:?}")
+    };
+    assert_eq!(w.reject_patch_ge, Some(90));
+    assert_eq!(w.stage1_tr, Some(("-".into(), ".".into())));
+    assert_eq!(w.dir_tr, Some((".".into(), "-".into())));
+    assert!(w.blank == DirBlank::Stage1 && w.stage2_regex.is_some());
 }
 
 /// r400: `:json` guarded map bodies reduce to data:

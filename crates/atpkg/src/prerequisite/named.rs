@@ -59,6 +59,7 @@ impl HeldBuild {
     }
 
     pub(super) fn new(want: Prerequisite, tool: HeldTool) -> Result<Self, String> {
+        want.require_namespace()?;
         let namespace = aterm_tempfile::Builder::new()
             .prefix("atpkg-named-prerequisite-")
             .suffix(".noindex")
@@ -131,6 +132,7 @@ impl HeldBuild {
 /// # Errors
 /// Configuration, signed index/package, recipe, installed tree or lease admission fails.
 pub fn configured_build(want: Prerequisite, build: u64, who: &str) -> Result<HeldBuild, String> {
+    want.require_namespace()?;
     HeldBuild::new(want, configured_tool(want, build, who)?)
 }
 

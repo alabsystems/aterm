@@ -12,25 +12,80 @@
 //! authenticates every replayed record and supplies an independently pinned anchor.
 //! One writer at a time holds the exclusive lock; readers take none, and see only
 //! the prefix the checkpoint attests ([`read_committed`]).
+//!
+//! On Windows the private files are `aterm_uds::private_file`'s there (owner the token user,
+//! a protected access list of the user and SYSTEM alone, no reparse point, one link) and a
+//! file's identity is its volume and 128-bit file id ([`FileIdentity`]). astream locks its
+//! log whole there with a lock Windows makes mandatory (`LockFileEx` through the log's own
+//! handle), which refuses a read through any other handle while it is held: the writer reads
+//! its own log through the log's descriptor ([`BrokerLog::copy_bytes_to`]), and recovery
+//! through the handle that holds its lock, but a reader beside a live writer is refused
+//! (`ERROR_LOCK_VIOLATION`, passed on as it is) until the writer drops (ATERM-KI-1116-48213).
 #![forbid(unsafe_code)]
-#![cfg(unix)]
-#![cfg_attr(
-    all(unix, anchor_rules, any(test, debug_assertions)),
-    feature(macro_attr)
-)]
+#![cfg(any(unix, windows))]
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 use astream_broker::{BrokerLog, BrokerRecord, Durability, OpenOptions as LogOptions, Prepared};
 use astream_wire::Offset;
 use aterm_durable::Flush;
 use aterm_uds::private_file::{self, PrivateFileError};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Instant,
 };
+
+/// A file's identity as the journal compares it: `(dev, ino)` on Unix; on Windows the volume's
+/// serial number and the file's 128-bit id (`FILE_ID_INFO`), which only a query of an open
+/// handle gives: a Windows `Metadata` carries neither.
+#[cfg(unix)]
+pub type FileIdentity = (u64, u64);
+/// A file's identity as the journal compares it: `(dev, ino)` on Unix; on Windows the volume's
+/// serial number and the file's 128-bit id (`FILE_ID_INFO`), which only a query of an open
+/// handle gives ([`aterm_dirfd::file_id`]): a Windows `Metadata` carries neither.
+#[cfg(windows)]
+pub type FileIdentity = (u64, u128);
+
+/// What the journal reads of a file it opened: its length (from `metadata`, read of that open
+/// file), which file it is, and how many names it has.
+struct Seen {
+    len: u64,
+    identity: FileIdentity,
+    links: u64,
+}
+
+/// [`Seen`] of `file`, whose metadata is `metadata`.
+#[cfg(unix)]
+fn seen(_file: &File, metadata: &std::fs::Metadata) -> io::Result<Seen> {
+    Ok(Seen {
+        len: metadata.len(),
+        identity: (metadata.dev(), metadata.ino()),
+        links: metadata.nlink(),
+    })
+}
+
+/// [`Seen`] of `file`, whose metadata is `metadata`: identity and link count from one query of
+/// the handle each (`FileIdInfo`, `FileStandardInfo`), read through `aterm_dirfd`.
+#[cfg(windows)]
+fn seen(file: &File, metadata: &std::fs::Metadata) -> io::Result<Seen> {
+    let stat = aterm_dirfd::fstat(file)?;
+    Ok(Seen {
+        len: metadata.len(),
+        identity: (stat.st_dev, stat.st_ino),
+        links: stat.st_nlink,
+    })
+}
+
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`: recovery's open of the log shares
+/// everything, as every private open does, so a rename over a file it holds still lands.
+#[cfg(windows)]
+const SHARE_ALL: u32 = 0x0000_0007;
 
 /// Create or validate a private directory and durably publish its name.
 /// # Errors
@@ -146,8 +201,8 @@ pub struct Log {
     poisoned: bool,
     pending_anchor: Option<Vec<u8>>,
     anchor: Vec<u8>,
-    identity: (u64, u64),
-    writer_identity: (u64, u64),
+    identity: FileIdentity,
+    writer_identity: FileIdentity,
     _writer: WriterLock,
 }
 impl Log {
@@ -259,16 +314,41 @@ impl Log {
         }
         let identity = recover_uncommitted(dir, &layout, fresh)
             .map_err(|error| stage_error(&layout, "recovery", error))?;
+        #[cfg(unix)]
         let mut checkpoint = None;
         let log = BrokerLog::open_opts(dir.join(&layout.astream), log_options(), || {
-            let (checked, present, metadata) = Checkpoint::load(dir, &layout, fresh)?;
-            if metadata.len() != checked.length || (metadata.dev(), metadata.ino()) != identity {
-                return Err(io::Error::other("journal changed between its writer locks"));
+            #[cfg(unix)]
+            {
+                let (checked, present, seen) = Checkpoint::load(dir, &layout, fresh)?;
+                if seen.len != checked.length || seen.identity != identity {
+                    return Err(io::Error::other("journal changed between its writer locks"));
+                }
+                checkpoint = Some((checked, present));
             }
-            checkpoint = Some((checked, present));
+            // Under astream's lock, which refuses every read but its own handle's here: only
+            // the length and the file are checked before astream's recovery may look at it.
+            // The bytes are hashed through the log's own descriptor once it is open, below,
+            // before anything is read from it or appended.
+            #[cfg(windows)]
+            {
+                let (length, seen) = Checkpoint::peek(dir, &layout, fresh)?;
+                if seen.len != length || seen.identity != identity {
+                    return Err(io::Error::other("journal changed between its writer locks"));
+                }
+            }
             Ok(Prepared::Nothing)
         })
         .map_err(|error| stage_error(&layout, "astream open", error))?;
+        #[cfg(windows)]
+        let checkpoint = {
+            let (checked, present, seen) =
+                Checkpoint::load_through(dir, &layout, fresh, Through::Log(&log))
+                    .map_err(|error| stage_error(&layout, "astream open", error))?;
+            if seen.len != checked.length || seen.identity != identity {
+                return Err(io::Error::other("journal changed between its writer locks"));
+            }
+            Some((checked, present))
+        };
         let (checkpoint, present) =
             checkpoint.ok_or_else(|| io::Error::other("journal was not prepared"))?;
         let stats = log.stats();
@@ -317,13 +397,14 @@ impl Log {
             };
             checkpoint.save(dir, &layout, flush)?;
         }
-        let (_, metadata) = private_file::open_private(dir, &layout.astream)
-            .map_err(|_| io::Error::other("journal lost its private inode"))?;
+        let astream = private_file::open_private(dir, &layout.astream)
+            .map_err(|_| io::Error::other("journal lost its private inode"))
+            .and_then(|(file, metadata)| seen(&file, &metadata))?;
         // An existing checkpoint may be visible after its previous writer failed the
         // rename's directory barrier, or its commit. Finish that publication even without
         // rewriting it: the open's full flush, which covers this open's own checkpoint too.
         aterm_durable::durable_dir(dir)?;
-        if (metadata.dev(), metadata.ino()) != identity {
+        if astream.identity != identity {
             return Err(io::Error::other("journal inode changed during open"));
         }
         let opened = Self {
@@ -363,20 +444,22 @@ impl Log {
         // descriptor: every access calls this, and open(2) is the cost.
         let dir = private_file::JudgedDir::judge(&self.dir)
             .map_err(|_| io::Error::other("journal lost its private inode"))?;
-        let (_, metadata) = dir
+        let astream = dir
             .open(&self.layout.astream)
-            .map_err(|_| io::Error::other("journal lost its private inode"))?;
-        let (_, lock) = dir
+            .map_err(|_| io::Error::other("journal lost its private inode"))
+            .and_then(|(file, metadata)| seen(&file, &metadata))?;
+        let lock = dir
             .open(&self.layout.lock)
-            .map_err(|_| io::Error::other("journal lost its writer lease"))?;
+            .map_err(|_| io::Error::other("journal lost its writer lease"))
+            .and_then(|(file, metadata)| seen(&file, &metadata))?;
         let anchor_ok = match dir.read(&self.layout.anchor, 4096) {
             Ok(bytes) => bytes == self.anchor,
             Err(PrivateFileError::Missing) => self.pending_anchor.is_some(),
             Err(_) => false,
         };
-        if (metadata.dev(), metadata.ino()) != self.identity
-            || metadata.len() != self.log.stats().retained_bytes as u64
-            || (lock.dev(), lock.ino()) != self.writer_identity
+        if astream.identity != self.identity
+            || astream.len != self.log.stats().retained_bytes as u64
+            || lock.identity != self.writer_identity
             || !anchor_ok
             || dir.read(&self.layout.checkpoint, 40).ok().as_deref()
                 != Some(&self.checkpoint.bytes())
@@ -691,18 +774,17 @@ impl Log {
         // below finds nothing to cover and skips: there the checkpoint is flushed in full
         // itself. On an Ordered log it takes barriers, ordered behind the record's.
         let ordered = self.served_ordered();
-        if let Err(error) = self
+        let length = self.log.stats().retained_bytes as u64;
+        #[cfg(unix)]
+        let extended = self.checkpoint.extend(&self.dir, &self.layout, length);
+        #[cfg(windows)]
+        let extended = self
             .checkpoint
-            .extend(
-                &self.dir,
-                &self.layout,
-                self.log.stats().retained_bytes as u64,
-            )
-            .and_then(|()| {
-                self.checkpoint
-                    .save(&self.dir, &self.layout, self.checkpoint_flush(ordered))
-            })
-        {
+            .extend_log(&self.dir, &self.layout, length, &self.log);
+        if let Err(error) = extended.and_then(|()| {
+            self.checkpoint
+                .save(&self.dir, &self.layout, self.checkpoint_flush(ordered))
+        }) {
             self.poisoned = true;
             return Err(io::Error::other(CheckpointFailure {
                 path: self.dir.join(&self.layout.checkpoint),
@@ -968,12 +1050,12 @@ pub mod seam {
     }
 }
 
-/// One journal file's acknowledged prefix: the astream file's `(dev, ino)` and
+/// One journal file's acknowledged prefix: the astream file's identity ([`FileIdentity`]) and
 /// the exact bytes its checkpoint attests. Equal values name identical bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Acknowledged {
-    /// The astream file's `(dev, ino)`.
-    pub identity: (u64, u64),
+    /// The astream file's identity: `(dev, ino)` on Unix ([`FileIdentity`]).
+    pub identity: FileIdentity,
     /// Acknowledged physical bytes, from offset zero.
     pub length: u64,
     /// SHA-256 of exactly those bytes.
@@ -1073,21 +1155,24 @@ pub fn committed_files(dir: &Path, name: &str) -> CommittedFiles {
     }
 }
 
-/// What a read of a journal ([`read_committed_opened`]) opened, each file by the `(dev, ino)` of
-/// its open descriptor. Each is a private open, which refuses a file with a second link, so a file
-/// another folder holds for the read is another inode, or one moved out of the journal's folder.
+/// What a read of a journal ([`read_committed_opened`]) opened, each file by the identity
+/// ([`FileIdentity`]) of its open descriptor. Each is a private open, which refuses a file with a
+/// second link, so a file another folder holds for the read is another inode, or one moved out of
+/// the journal's folder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Opened {
     /// The anchor's.
-    pub anchor: (u64, u64),
+    pub anchor: FileIdentity,
     /// The checkpoint's whose acknowledgement the read took.
-    pub checkpoint: (u64, u64),
+    pub checkpoint: FileIdentity,
     /// The astream file's.
-    pub astream: (u64, u64),
+    pub astream: FileIdentity,
 }
 
 /// Read an established journal's acknowledged prefix without taking any lock,
-/// so it works beside a live writer. The checkpoint is read first; then exactly
+/// so it works beside a live writer on Unix (on Windows astream's lock, which is mandatory
+/// there, refuses the read of the astream file's bytes while a writer holds the journal:
+/// ATERM-KI-1116-48213). The checkpoint is read first; then exactly
 /// the bytes it counts are read from the astream file and must hash to it. A
 /// writer replaces the checkpoint by atomic rename only after the bytes it
 /// covers are written and flushed ahead of it, never rewrites bytes below it,
@@ -1110,7 +1195,8 @@ pub struct Opened {
 /// prefix over the limits; an astream file that is missing, not private or
 /// shorter than the prefix; bytes that do not hash to the checkpoint; and an attested
 /// prefix that does not decode into in-order records. A failed read of the
-/// astream file's bytes is passed on as it is.
+/// astream file's bytes is passed on as it is: on Windows, `ERROR_LOCK_VIOLATION` while a
+/// writer holds the journal open.
 pub fn read_committed(
     dir: &Path,
     name: &str,
@@ -1139,8 +1225,8 @@ pub fn read_committed_opened(
     // One directory verdict for the three files, as in `Log::intact`.
     let judged = private_file::JudgedDir::judge(dir)
         .map_err(|_| io::Error::other("journal anchor is not private"))?;
-    let anchor_opened = match judged.read_with_metadata(&layout.anchor, 4096) {
-        Ok((bytes, metadata)) if bytes == anchor => (metadata.dev(), metadata.ino()),
+    let anchor_opened = match judged.read_with_file(&layout.anchor, 4096) {
+        Ok((bytes, file, metadata)) if bytes == anchor => seen(&file, &metadata)?.identity,
         Ok(_) => return Err(io::Error::other("journal anchor changed")),
         Err(PrivateFileError::Missing) => {
             return Err(io::Error::other("established journal anchor is missing"));
@@ -1162,8 +1248,11 @@ pub fn read_committed_opened(
             .take(41)
             .read_to_end(&mut bytes)
             .map_err(|_| malformed())?;
-        let metadata = file.metadata().map_err(|_| malformed())?;
-        match metadata.nlink() {
+        let opened = file
+            .metadata()
+            .and_then(|metadata| seen(&file, &metadata))
+            .map_err(|_| malformed())?;
+        match opened.links {
             0 if relinked < 3 => {
                 relinked += 1;
                 #[cfg(test)]
@@ -1177,7 +1266,7 @@ pub fn read_committed_opened(
         if bytes.len() != 40 {
             return Err(malformed());
         }
-        break (bytes, (metadata.dev(), metadata.ino()));
+        break (bytes, opened.identity);
     };
     let mut length = [0; 8];
     length.copy_from_slice(&checkpoint[..8]);
@@ -1198,7 +1287,7 @@ pub fn read_committed_opened(
         return Err(io::Error::other("journal lost acknowledged bytes"));
     }
     let acknowledged = Acknowledged {
-        identity: (metadata.dev(), metadata.ino()),
+        identity: seen(&file, &metadata)?.identity,
         length,
         digest,
     };
@@ -1326,7 +1415,7 @@ impl Drop for WriterLock {
         let _ = self.0.unlock();
     }
 }
-fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLock, (u64, u64))> {
+fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLock, FileIdentity)> {
     // The parent names the journal's directory. On the journal's device a barrier orders
     // that name ahead of everything the open writes after it, and the open's last full
     // flush makes it durable; on another device it is flushed in full here.
@@ -1334,6 +1423,7 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLoc
     if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
         Flush::ordered_if_same_device(parent, dir).dir(parent)?;
     }
+    #[cfg(unix)]
     match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1344,6 +1434,15 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLoc
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(error),
+    }
+    // Made, where missing, under the user's protected access list from its creation, never
+    // given one after; an elevated process makes none (`private_file::ELEVATED`), so it opens
+    // no writer. One that is there is judged below, as on Unix.
+    #[cfg(windows)]
+    match private_file::open_private_rw(dir, &layout.lock) {
+        Ok(_) => {}
+        Err(PrivateFileError::Io(error)) => return Err(error),
+        Err(_) => return Err(io::Error::other("journal lock is not private")),
     }
     let judged = private_file::JudgedDir::judge(dir)
         .map_err(|_| io::Error::other("journal lock is not private"))?;
@@ -1359,10 +1458,11 @@ fn lock(dir: &Path, layout: &Layout, deadline: Instant) -> io::Result<(WriterLoc
         },
     )?;
     let lock = WriterLock(file);
-    let writer_identity = (metadata.dev(), metadata.ino());
-    let (_, current) = private_file::open_private(dir, &layout.lock)
-        .map_err(|_| io::Error::other("journal lock is not private"))?;
-    if (current.dev(), current.ino()) != writer_identity {
+    let writer_identity = seen(&lock.0, &metadata)?.identity;
+    let current = private_file::open_private(dir, &layout.lock)
+        .map_err(|_| io::Error::other("journal lock is not private"))
+        .and_then(|(file, metadata)| seen(&file, &metadata))?;
+    if current.identity != writer_identity {
         return Err(io::Error::other("journal lock changed while acquiring it"));
     }
     Ok((lock, writer_identity))
@@ -1442,12 +1542,115 @@ struct Checkpoint {
     length: u64,
     hash: aterm_digest::Sha256,
 }
+/// Where a Windows checkpoint reads the astream file's bytes. astream locks its log whole with
+/// `File::try_lock` (`LockFileEx` through its own handle), and Windows makes that lock
+/// mandatory: while it is held, a read through any other handle, this process's included, is
+/// refused (`ERROR_LOCK_VIOLATION`). So the bytes are read through the handle that holds the
+/// lock, and the name is still opened, and judged private, for the length and the identity.
+/// (On Unix the lock is advisory and the bytes are read through that judged open of the name.)
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Through<'a> {
+    /// Recovery's own handle, which holds the physical lock while it checks the prefix.
+    Held(&'a File),
+    /// The open log's own descriptor ([`BrokerLog::copy_bytes_to`]): it copies from offset
+    /// zero, so an extension reads the whole log and hashes only its new bytes.
+    Log(&'a BrokerLog),
+}
+
+/// The bytes `[from, to)` of what [`BrokerLog::copy_bytes_to`] writes from offset zero, into a
+/// hash; how far it wrote is `at`.
+#[cfg(windows)]
+struct Window<'a> {
+    at: u64,
+    from: u64,
+    to: u64,
+    hash: &'a mut aterm_digest::Sha256,
+}
+
+#[cfg(windows)]
+impl io::Write for Window<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let start = self.at;
+        let end = start.saturating_add(bytes.len() as u64);
+        let first = self.from.clamp(start, end);
+        let last = self.to.clamp(first, end);
+        let window = usize::try_from(first - start)
+            .ok()
+            .zip(usize::try_from(last - start).ok())
+            .and_then(|(first, last)| bytes.get(first..last))
+            .ok_or_else(|| io::Error::other("journal checkpoint length overflow"))?;
+        self.hash.update(window);
+        self.at = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl Checkpoint {
-    fn load(
+    /// The checkpoint `dir` holds, its prefix read again and hashed through a judged open of
+    /// the astream file's name; whether it was there (a fresh journal's may not be); and what
+    /// that open saw.
+    #[cfg(unix)]
+    fn load(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(Self, bool, Seen)> {
+        Self::load_with(dir, layout, fresh, |checkpoint, judged, length| {
+            checkpoint.extend_in(dir, judged, layout, length)
+        })
+    }
+
+    /// [`Self::load`]'s Windows twin: the prefix's bytes are read `through` the handle that
+    /// holds the log's lock ([`Through`]).
+    #[cfg(windows)]
+    fn load_through(
         dir: &Path,
         layout: &Layout,
         fresh: bool,
-    ) -> io::Result<(Self, bool, std::fs::Metadata)> {
+        through: Through<'_>,
+    ) -> io::Result<(Self, bool, Seen)> {
+        Self::load_with(dir, layout, fresh, |checkpoint, judged, length| {
+            checkpoint.extend_through(dir, judged, layout, length, through)
+        })
+    }
+
+    /// The length the checkpoint `dir` holds attests (0 where a fresh journal has none, whose
+    /// astream file must then be empty) and what a judged open of the astream file's name sees,
+    /// reading none of its bytes: what astream's open lets the journal check under its lock on
+    /// Windows ([`Through`]).
+    #[cfg(windows)]
+    fn peek(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(u64, Seen)> {
+        let malformed = || io::Error::other("journal checkpoint is malformed or not private");
+        let judged = private_file::JudgedDir::judge(dir).map_err(|_| malformed())?;
+        let length = match judged.read(&layout.checkpoint, 40) {
+            Ok(bytes) if bytes.len() == 40 => Some(u64::from_le_bytes(
+                bytes[..8].try_into().map_err(|_| malformed())?,
+            )),
+            Err(PrivateFileError::Missing) if fresh => None,
+            _ => return Err(malformed()),
+        };
+        let seen = judged
+            .open(&layout.astream)
+            .map_err(|_| io::Error::other("journal is not private"))
+            .and_then(|(file, metadata)| seen(&file, &metadata))?;
+        if length.is_none() && seen.len != 0 {
+            return Err(io::Error::other(
+                "nonempty journal has no acknowledgement checkpoint",
+            ));
+        }
+        Ok((length.unwrap_or(0), seen))
+    }
+
+    /// The checkpoint `dir` holds, its prefix hashed by `extend`; whether it was there; and
+    /// what `extend`'s open of the astream file saw (a fresh journal's own open, where there
+    /// is none).
+    fn load_with(
+        dir: &Path,
+        layout: &Layout,
+        fresh: bool,
+        extend: impl FnOnce(&mut Self, &private_file::JudgedDir<'_>, u64) -> io::Result<Seen>,
+    ) -> io::Result<(Self, bool, Seen)> {
         let mut checkpoint = Self {
             length: 0,
             hash: aterm_digest::Sha256::new(),
@@ -1461,56 +1664,83 @@ impl Checkpoint {
                         .try_into()
                         .map_err(|_| io::Error::other("invalid journal checkpoint"))?,
                 );
-                let metadata = checkpoint.extend_in(dir, &judged, layout, length)?;
+                let seen = extend(&mut checkpoint, &judged, length)?;
                 if checkpoint.hash.clone().finalize() != bytes[8..] {
                     return Err(io::Error::other(
                         "acknowledged journal history changed; preserve it for authenticated repair",
                     ));
                 }
-                Ok((checkpoint, true, metadata))
+                Ok((checkpoint, true, seen))
             }
             Err(PrivateFileError::Missing) if fresh => {
-                let (_, metadata) = judged
+                let seen = judged
                     .open(&layout.astream)
-                    .map_err(|_| io::Error::other("journal is not private"))?;
-                if metadata.len() != 0 {
+                    .map_err(|_| io::Error::other("journal is not private"))
+                    .and_then(|(file, metadata)| seen(&file, &metadata))?;
+                if seen.len != 0 {
                     return Err(io::Error::other(
                         "nonempty journal has no acknowledgement checkpoint",
                     ));
                 }
-                Ok((checkpoint, false, metadata))
+                Ok((checkpoint, false, seen))
             }
             _ => Err(io::Error::other(
                 "journal checkpoint is malformed or not private",
             )),
         }
     }
-    fn extend(&mut self, dir: &Path, layout: &Layout, length: u64) -> io::Result<()> {
-        let judged = private_file::JudgedDir::judge(dir).map_err(|error| {
+
+    /// `dir`'s verdict for an append's extension.
+    fn judge(dir: &Path) -> io::Result<private_file::JudgedDir<'_>> {
+        private_file::JudgedDir::judge(dir).map_err(|error| {
             context_error(
                 format!("judge directory {}", dir.display()),
                 private_error(error),
             )
-        })?;
+        })
+    }
+
+    #[cfg(unix)]
+    fn extend(&mut self, dir: &Path, layout: &Layout, length: u64) -> io::Result<()> {
+        let judged = Self::judge(dir)?;
         self.extend_in(dir, &judged, layout, length).map(|_| ())
     }
-    fn extend_in(
+
+    /// [`Self::extend`]'s Windows twin, through the open log's own descriptor
+    /// ([`Through::Log`]).
+    #[cfg(windows)]
+    fn extend_log(
         &mut self,
+        dir: &Path,
+        layout: &Layout,
+        length: u64,
+        log: &BrokerLog,
+    ) -> io::Result<()> {
+        let judged = Self::judge(dir)?;
+        self.extend_through(dir, &judged, layout, length, Through::Log(log))
+            .map(|_| ())
+    }
+
+    /// The astream file opened by its name under `judged`, and what the open saw, which must
+    /// hold the bytes up to `length`, no fewer than this checkpoint has, within the limits.
+    fn open_to(
+        &self,
         dir: &Path,
         judged: &private_file::JudgedDir<'_>,
         layout: &Layout,
         length: u64,
-    ) -> io::Result<std::fs::Metadata> {
-        let (mut file, metadata) = judged.open(&layout.astream).map_err(|error| {
+    ) -> io::Result<(File, Seen)> {
+        let (file, metadata) = judged.open(&layout.astream).map_err(|error| {
             context_error(
                 format!("open private {}", dir.join(&layout.astream).display()),
                 private_error(error),
             )
         })?;
+        let seen = seen(&file, &metadata)?;
         if length < self.length
             || length > layout.limits.bytes as u64
-            || metadata.len() < length
-            || metadata.len()
+            || seen.len < length
+            || seen.len
                 > layout
                     .limits
                     .bytes
@@ -1520,6 +1750,78 @@ impl Checkpoint {
                 "journal lost acknowledged bytes or exceeded its capacity",
             ));
         }
+        Ok((file, seen))
+    }
+
+    #[cfg(unix)]
+    fn extend_in(
+        &mut self,
+        dir: &Path,
+        judged: &private_file::JudgedDir<'_>,
+        layout: &Layout,
+        length: u64,
+    ) -> io::Result<Seen> {
+        let (file, seen) = self.open_to(dir, judged, layout, length)?;
+        self.read_to(&file, dir, layout, length)?;
+        Ok(seen)
+    }
+
+    /// [`Self::extend_in`]'s Windows twin: the bytes are read `through` the handle that holds
+    /// the log's lock, and the name is opened and judged for the length and the identity all
+    /// the same. A recovery handle on another file than the name's is refused.
+    #[cfg(windows)]
+    fn extend_through(
+        &mut self,
+        dir: &Path,
+        judged: &private_file::JudgedDir<'_>,
+        layout: &Layout,
+        length: u64,
+        through: Through<'_>,
+    ) -> io::Result<Seen> {
+        let (file, named) = self.open_to(dir, judged, layout, length)?;
+        drop(file);
+        match through {
+            Through::Held(held) => {
+                if seen(held, &held.metadata()?)?.identity != named.identity {
+                    return Err(io::Error::other(
+                        "journal changed while its prefix was checked",
+                    ));
+                }
+                self.read_to(held, dir, layout, length)?;
+            }
+            Through::Log(log) => {
+                let mut window = Window {
+                    at: 0,
+                    from: self.length,
+                    to: length,
+                    hash: &mut self.hash,
+                };
+                let copied = log.copy_bytes_to(&mut window).map_err(|error| {
+                    context_error(
+                        format!("read {}", dir.join(&layout.astream).display()),
+                        error,
+                    )
+                })?;
+                if copied < length {
+                    return Err(io::Error::other(
+                        "journal lost acknowledged bytes or exceeded its capacity",
+                    ));
+                }
+                self.length = length;
+            }
+        }
+        Ok(named)
+    }
+
+    /// Hash the astream file's bytes from this checkpoint's length to `length`, read from
+    /// `file` at those offsets, and take `length` as this checkpoint's.
+    fn read_to(
+        &mut self,
+        mut file: &File,
+        dir: &Path,
+        layout: &Layout,
+        length: u64,
+    ) -> io::Result<()> {
         file.seek(SeekFrom::Start(self.length)).map_err(|error| {
             context_error(
                 format!("seek {}", dir.join(&layout.astream).display()),
@@ -1541,7 +1843,7 @@ impl Checkpoint {
             remaining -= count as u64;
         }
         self.length = length;
-        Ok(metadata)
+        Ok(())
     }
     fn bytes(&self) -> [u8; 40] {
         let mut bytes = [0; 40];
@@ -1559,25 +1861,10 @@ impl Checkpoint {
 /// The checkpoint is the application's commit point. Preserve any bytes after
 /// it for diagnosis, then roll back that unacknowledged suffix. The application
 /// writer and the physical file are both locked while this happens; astream's
-/// prepare callback rechecks the prefix after taking over the physical lock.
-fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(u64, u64)> {
-    let (_, admitted) = private_file::open_private(dir, &layout.astream)
-        .map_err(|_| io::Error::other("journal is not private"))?;
-    let file = aterm_uds::kept_out(|| {
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(dir.join(&layout.astream))
-    })?;
-    let opened = file.metadata()?;
-    if opened.dev() != admitted.dev()
-        || opened.ino() != admitted.ino()
-        || opened.mode() != admitted.mode()
-        || opened.uid() != admitted.uid()
-    {
-        return Err(io::Error::other("journal changed during private open"));
-    }
+/// prepare callback rechecks the prefix after taking over the physical lock (on Windows its
+/// length and file, and the open log's own descriptor its bytes: [`Through`]).
+fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<FileIdentity> {
+    let (file, opened) = open_for_recovery(dir, layout)?;
     #[expect(
         clippy::disallowed_methods,
         reason = "WriterLock is CLOEXEC/CLOFORK and unlocks the physical file before transferring ownership to astream"
@@ -1586,8 +1873,12 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
         .map_err(lock_error)
         .map_err(|error| stage_error(layout, "physical recovery lock", error))?;
     let mut held = WriterLock(file);
+    #[cfg(unix)]
     let (checkpoint, _, checked) = Checkpoint::load(dir, layout, fresh)?;
-    if checked.dev() != opened.dev() || checked.ino() != opened.ino() {
+    #[cfg(windows)]
+    let (checkpoint, _, checked) =
+        Checkpoint::load_through(dir, layout, fresh, Through::Held(&held.0))?;
+    if checked.identity != opened {
         return Err(io::Error::other(
             "journal changed while its prefix was checked",
         ));
@@ -1596,17 +1887,17 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
         .limits
         .bytes
         .saturating_add(layout.limits.record_bytes);
-    if checked.len() > max_journal_bytes as u64 {
+    if checked.len > max_journal_bytes as u64 {
         return Err(io::Error::other(
             "journal lost acknowledged bytes or exceeded its capacity",
         ));
     }
     let tail_len = checked
-        .len()
+        .len
         .checked_sub(checkpoint.length)
         .ok_or_else(|| io::Error::other("journal lost acknowledged bytes"))?;
     if tail_len == 0 {
-        return Ok((opened.dev(), opened.ino()));
+        return Ok(opened);
     }
     let mut tail = vec![
         0;
@@ -1665,7 +1956,57 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
     aterm_durable::durable_dir(dir)?;
     held.0.set_len(checkpoint.length)?;
     aterm_durable::durable(&held.0)?;
-    Ok((opened.dev(), opened.ino()))
+    Ok(opened)
+}
+
+/// The astream file opened to read and write for recovery, never through a link, and checked
+/// to be the file a private open of its name judged just before, with its identity.
+#[cfg(unix)]
+fn open_for_recovery(dir: &Path, layout: &Layout) -> io::Result<(File, FileIdentity)> {
+    let (_, admitted) = private_file::open_private(dir, &layout.astream)
+        .map_err(|_| io::Error::other("journal is not private"))?;
+    let file = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(dir.join(&layout.astream))
+    })?;
+    let opened = file.metadata()?;
+    if opened.dev() != admitted.dev()
+        || opened.ino() != admitted.ino()
+        || opened.mode() != admitted.mode()
+        || opened.uid() != admitted.uid()
+    {
+        return Err(io::Error::other("journal changed during private open"));
+    }
+    Ok((file, (opened.dev(), opened.ino())))
+}
+
+/// The astream file opened to read and write for recovery, as itself (a reparse point put at
+/// its name is opened, never followed, and is another file), sharing everything as every
+/// private open does, and checked to be the file a private open of its name judged just
+/// before, with its identity. Windows keeps no mode or owner on the handle to compare: an
+/// access list changed in between is judged again on the private open of the name the
+/// prefix's check makes ([`Checkpoint::load_through`]) once this one holds the lock.
+#[cfg(windows)]
+fn open_for_recovery(dir: &Path, layout: &Layout) -> io::Result<(File, FileIdentity)> {
+    let admitted = private_file::open_private(dir, &layout.astream)
+        .map_err(|_| io::Error::other("journal is not private"))
+        .and_then(|(file, metadata)| seen(&file, &metadata))?;
+    let file = aterm_uds::kept_out(|| {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(SHARE_ALL)
+            .custom_flags(aterm_uds::acl::FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir.join(&layout.astream))
+    })?;
+    let opened = seen(&file, &file.metadata()?)?;
+    if opened.identity != admitted.identity {
+        return Err(io::Error::other("journal changed during private open"));
+    }
+    Ok((file, opened.identity))
 }
 
 #[cfg(test)]

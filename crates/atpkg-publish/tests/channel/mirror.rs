@@ -997,3 +997,72 @@ impl ReleaseHost for RefusesOne {
         self.inner.fetch_repo(slug, dir)
     }
 }
+
+/// A signed keyed-tree pack of `llvm-tree` build 3 whose one row is signed for `key`, laid on the
+/// staging owner's `trust` release.
+fn lay_tree_pack(rig: &Rig, key: &str) {
+    let inputs = format!("variant = \"{key}\"\n");
+    let signed_key = atpkg::keyed_tree::TreeKey::of_inputs(inputs.as_bytes());
+    let bytes = b"keyed tree payload".to_vec();
+    let asset = "llvm-tree-3-aarch64-apple-darwin.tar.zst";
+    let toml = format!(
+        "schema = 1\nprogram = \"llvm-tree\"\nbuild_number = 3\nversion = \"llvm-20.1.8\"\n\
+         exposes = []\n\n[[artifact]]\ntarget = \"{MAC}\"\nkind = \"keyed-tree\"\n\
+         protocol = \"github-release\"\nasset = \"{asset}\"\nsha256 = \"{}\"\nsize = {}\n\
+         key = \"{signed_key}\"\nkey_inputs = {inputs:?}\n",
+        super::sha256_hex(&bytes),
+        bytes.len()
+    );
+    let slug = Slug::new("alabsystems", "trust");
+    let tag = "atpkg-llvm-tree-3";
+    rig.host.put_asset(&slug, tag, asset, bytes);
+    rig.host.put_asset(
+        &slug,
+        tag,
+        "pkg-llvm-tree-3.toml.sig",
+        rig.keys.sign(toml.as_bytes()),
+    );
+    rig.host
+        .put_asset(&slug, tag, "pkg-llvm-tree-3.toml", toml.into_bytes());
+}
+
+/// An index listing `llvm-tree`'s pack of `key` at build 3 beside the usual pin.
+fn tree_quad(rig: &Rig, key: &str) -> VerifiedQuad {
+    let dir = rig.path("quad");
+    let text = format!(
+        "{}\n[trees.llvm-tree]\n{key} = 3\n",
+        index().render(&rig.keys)
+    );
+    rig.keys.write_quad(&dir, &text);
+    quad::verify_dir(&rig.ctx, &dir).expect("the quad verifies")
+}
+
+/// The packs an index lists keyed trees at are made public with the pinned ones, on the tree's
+/// repository, each held to carry the key the index lists it under.
+#[test]
+fn a_listed_tree_pack_is_mirrored_and_held_to_its_key() {
+    let rig = Rig::new("mirror-tree");
+    rig.lay_pack("alabsystems", "ay", 8256, &[MAC]);
+    let key = atpkg::keyed_tree::TreeKey::of_inputs(b"variant = \"a\"\n").to_string();
+    lay_tree_pack(&rig, "a");
+    let q = tree_quad(&rig, &key);
+    let (report, _) = ok(&rig, &q, true);
+    let planned: Vec<&str> = report.planned.iter().map(|(t, _)| t.as_str()).collect();
+    assert_eq!(planned, ["atpkg-ay-8256", "atpkg-llvm-tree-3"]);
+    assert!(
+        rig.host.calls().contains(
+            &"fetch alabsystems/trust atpkg-llvm-tree-3 pkg-llvm-tree-3.toml".to_string()
+        ),
+        "the tree's public copy is read on its own repository"
+    );
+
+    let other = Rig::new("mirror-tree-other-key");
+    other.lay_pack("alabsystems", "ay", 8256, &[MAC]);
+    lay_tree_pack(&other, "b");
+    let q = tree_quad(&other, &key);
+    let e = err(&other, &q, true);
+    assert!(
+        e.contains(&format!("signs no keyed-tree row of key {key}")),
+        "{e}"
+    );
+}

@@ -218,7 +218,6 @@ fn native_producers_reach_the_receipt_guard_without_publishing_first() {
         let empty = route == 3 || route == 5;
         let lab = Lab {
             me: Some(test_machine("m16")),
-            settled: route == 6,
             accounts: if empty { Vec::new() } else { vec![account] },
             ..Lab::default()
         };
@@ -404,62 +403,6 @@ fn explicit_sheet_rechecks_eligibility_without_observing_unrelated_configuration
 }
 
 #[test]
-fn a_valid_migration_stays_committed_when_a_later_sync_plan_is_refused() {
-    let bed = Bed::new();
-    let cli = Cli::Codex;
-    let login = bed.home.join("existing-login");
-    fs::create_dir_all(&login).unwrap();
-    fs::write(login.join("identity"), "preserved").unwrap();
-    let original = Row {
-        label: "legacy".into(),
-        email: Some("one@example.test".into()),
-        dir: Some(login.to_str().unwrap().into()),
-        ..Row::default()
-    };
-    fs::write(
-        bed.roster(cli),
-        accounts::append_rows_for(cli, "", &[original]).unwrap(),
-    )
-    .unwrap();
-    let mut first = native_account("native-one", "one@example.test", 1);
-    first.legacy_label = Some("legacy".into());
-    let registry = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
-        me: Some(test_machine("m16")),
-        settled: true,
-        accounts: vec![first, native_account("native-two", "two@example.test", 2)],
-        ..Lab::default()
-    })));
-    let mut committed = Vec::new();
-    let result = sync_cli_with_replan(
-        cli,
-        (&bed.home, &bed.state, &bed.config),
-        (None, None),
-        SyncCaller::Person,
-        1,
-        (&fetch_source_text, &[]),
-        || {
-            committed = bed.images(cli);
-            assert!(bed.store(cli).source_policy().unwrap().retired());
-            registry.set(SourceSnapshot::Pending);
-        },
-    );
-    assert!(result.is_err());
-    assert!(!committed.is_empty());
-    assert_eq!(bed.images(cli), committed);
-    let roster = Roster::load_for(cli, &bed.roster(cli)).unwrap();
-    assert!(roster.row("legacy").is_none());
-    assert_eq!(
-        roster.row("native-one").unwrap().dir.as_deref(),
-        login.to_str()
-    );
-    assert!(roster.row("native-two").is_none());
-    assert_eq!(
-        fs::read_to_string(login.join("identity")).unwrap(),
-        "preserved"
-    );
-}
-
-#[test]
 fn every_provider_refuses_changed_sources_after_signin_custody() {
     for cli in OTHER_CLIS {
         for vault in [
@@ -547,7 +490,6 @@ fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
             let registry = TestSourceOverride::new(if native {
                 SourceSnapshot::Present(Arc::new(Lab {
                     me: Some(test_machine("m16")),
-                    settled: true,
                     ..Lab::default()
                 }))
             } else {
@@ -601,8 +543,11 @@ fn providers_retire_empty_replacements_and_preserve_explicit_inputs() {
     }
 }
 
+/// A native sync from the lab commits the legacy source's retirement whole at every cut of its
+/// commit, the next run completing an interrupted one, and keeps the row under the label
+/// it had: no sync renames a row to its account's lab label.
 #[test]
-fn native_label_migration_commits_its_retirement_at_every_cut() {
+fn a_native_sync_commits_its_retirement_at_every_cut_and_keeps_the_rows_label() {
     use crate::harness::alab_roster::LabAccount;
     for cut in [0, 4, 6, 7, usize::MAX] {
         let bed = Bed::new();
@@ -633,7 +578,6 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
         bed.put(&legacy, "preserved legacy input");
         let _source = TestSourceOverride::new(SourceSnapshot::Present(Arc::new(Lab {
             me: Some(test_machine("m16")),
-            settled: true,
             accounts: vec![LabAccount {
                 pk: "ac-0000000000000001".into(),
                 cli,
@@ -665,12 +609,9 @@ fn native_label_migration_commits_its_retirement_at_every_cut() {
             result.unwrap();
         }
         assert!(store.source_policy().unwrap().retired());
-        assert!(
-            Roster::load_for(cli, &bed.roster(cli))
-                .unwrap()
-                .row("native")
-                .is_some()
-        );
+        let roster = Roster::load_for(cli, &bed.roster(cli)).unwrap();
+        assert!(roster.row("legacy").is_some(), "cut {cut}");
+        assert!(roster.row("native").is_none(), "cut {cut}");
         #[cfg(unix)]
         assert_eq!(bed.held(&legacy).as_deref(), Some("preserved legacy input"));
     }

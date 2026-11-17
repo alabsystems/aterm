@@ -1442,6 +1442,8 @@ store behind it is doing, and it never opens that store.
   aterm file refresh [<name>]            project the store to the snapshot now
   aterm file set <name> <row> <column> [<value> | --stdin]
                                          write one cell (no value clears it)
+  aterm file set <name> <row> <column>=<value>...
+                                         several cells of one row as one write
   aterm file add <name> <column>=<value>...
   aterm file rm <name> <row>             retire the row (its history stays)
   aterm file revert <name> <operation>
@@ -2081,8 +2083,10 @@ THE FOOTER
     week is used: what was left of this tab's week as read on this Mac in solid steps
     (blank before its first reading), `▕` now, then what is projected to be left of
     whichever account carries the work as a thin line falling to the floor, with `↺` a
-    reset, `→` a hand-off (the next account's name after it where it fits, else its
-    local part, else that cut to 12 cells), `╳` a stop
+    reset (in the measured past also where the week was refilled or raised: a limit reset
+    spent, a refill or a raised allowance, which a reading cannot tell apart), `→` a
+    hand-off (the next account's name after it where it fits, else its local part, else
+    that cut to 12 cells), `╳` a stop
     (every account out, or the wall the work waits at now), `$` usage credits and `┄`
     not projected (after an account the work would reach whose week aterm holds no
     exact figure of, or the whole week with no pace yet, a paused recovery or a tab the
@@ -2113,8 +2117,10 @@ THE FOOTER
   this tab runs on and, where it applies, `+ Make a vault token` (the token's own
   dates are in `Copy details`); the plan, the five-hour window, credits, when
   and where the figure was read, a `Forecast` for a pool account (`runs out ~Sat 03:00`,
-  `lasts to its reset`, or `none:` and the reason) and the account's history as two
-  charts (the last eight days, and whole weeks ending today; words in a narrow pane);
+  `lasts to its reset`, `out since ~19:20` of a week already spent, `depends on
+  <account> after ~Tue 19:00` where it turns on an account aterm cannot read, or
+  `none:` and the reason) and the account's history as two charts (the last eight
+  days, and whole weeks ending today; words in a narrow pane);
   this account's home, this Mac and the others that hold it. What aterm does not know
   it says so, with the reason (`not read yet`, `not checked on this Mac`,
   `not known: ...`), never as none or zero: a Mac whose clock disagrees with this one
@@ -2629,8 +2635,11 @@ FOR AN AGENT
   * The password is the operator's to type, on the sheet. Never ask for it in
     the conversation, and never pipe it to `sudo -S`.
   * A cancelled or unanswered prompt fails with `no password was provided`.
-    Repeats on the same session after a cancel are refused for a widening
-    quiet window.
+    Each prompt that ends with no password (a cancel, five minutes with no
+    answer, or your call ending first: Esc, a tool timeout) makes the window
+    wait before its next sheet: 10 seconds, doubling to 5 minutes, across an
+    update too. Requests inside that wait are refused at once with no sheet;
+    wait it out rather than loop.
   * The sheet waits up to 5 minutes, longer than a shell tool's default
     2-minute command timeout. Give a sudo command a longer timeout (300000 ms
     or more), or it is backgrounded before the operator answers.
@@ -2639,7 +2648,8 @@ FOR AN AGENT
     root to its own end. Cancel on the sheet declines the password.
   * The sheet attaches only while the session shows in its window's active
     tab: from a background tab (a spawned worker's), while another sheet is
-    open, or soon after a cancel, sudo is refused at once with no sheet
+    open, or soon after a prompt that got no password, sudo is refused at once
+    with no sheet
     (`not-frontmost` from a background tab), and aterm never switches tabs to
     show one.
   * `sudo -n` never prompts, so it raises no sheet: it runs only where sudo

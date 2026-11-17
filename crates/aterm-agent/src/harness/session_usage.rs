@@ -645,10 +645,38 @@ impl SessionUsage {
         Some(path.parent()?.join(path.file_stem()?).join("subagents"))
     }
 
-    /// Whether a refresh now could find anything the last one did not: the last one did not catch up and did read something.
+    /// What a watch must stand on for [`Self::moved`] to be heard of the subagents: every
+    /// directory the last walk looked at (there or not yet), and each subagent transcript
+    /// followed that is still written to (neither released after [`QUIET_AFTER`] nor frozen
+    /// rewritten). A released one is read on at a refresh another file's move causes.
+    #[must_use]
+    pub fn followed(&self) -> Vec<PathBuf> {
+        self.dirs_seen
+            .iter()
+            .map(|dir| dir.path.clone())
+            .chain(
+                self.subagents
+                    .values()
+                    .filter(|cursor| !cursor.released && !cursor.rewritten)
+                    .map(|cursor| cursor.path().to_path_buf()),
+            )
+            .collect()
+    }
+
+    /// Whether the last refresh stopped before the files' end (its budget ran out) having read
+    /// something: a refresh now folds on from where it stopped, whether or not a file moved. One
+    /// that read nothing (a file it could not read) is not behind: another refresh would read
+    /// nothing either until a file moves.
+    #[must_use]
+    pub const fn behind(&self) -> bool {
+        !self.caught_up && self.progressed
+    }
+
+    /// Whether a refresh now could find anything the last one did not: the last one is
+    /// [`Self::behind`], or a file it follows moved.
     #[must_use]
     pub fn moved(&self) -> bool {
-        (!self.caught_up && self.progressed)
+        self.behind()
             || std::fs::metadata(self.main.path()).map_or(true, |m| !self.main.unchanged(&m))
             || self.dirs_seen.iter().any(DirSeen::moved)
             || self
@@ -1087,6 +1115,22 @@ pub struct Wall {
     pub label: &'static str,
     /// The reset as the notice printed it.
     pub resets: String,
+    /// The reset, Unix seconds, as [`wall_of`] placed it: at it the wall goes.
+    pub resets_at: i64,
+}
+
+impl Wall {
+    /// The earliest wall second after `now` at which [`wall_of`] says this wall otherwise, with
+    /// no row written since: within a day of the reset a reset its notice gave as a span drops
+    /// its date (`Nov 15 at 3pm` turns `3pm` at `resets_at − 86 399`), and at the reset the wall
+    /// goes. A wall whose words hold no date passes the first second unchanged: earlier is
+    /// allowed. `None` once both are past.
+    #[must_use]
+    pub fn changes_after(&self, now: i64) -> Option<i64> {
+        [self.resets_at.saturating_sub(86_399), self.resets_at]
+            .into_iter()
+            .find(|t| *t > now)
+    }
 }
 
 /// The wall `rows` (the newest limit-notice row per window, from the main transcript's fold) shows at `now`.
@@ -1125,7 +1169,11 @@ pub fn wall_of(
         }
         _ => text.split(" (").next().unwrap_or(text).trim().to_owned(),
     };
-    Some(Wall { label, resets })
+    Some(Wall {
+        label,
+        resets,
+        resets_at,
+    })
 }
 
 fn local_clock(unix: i64, offset: i64, now: i64) -> String {
@@ -1260,6 +1308,14 @@ impl UsageFacts {
             return Some(self);
         }
         Self::of((Vec::new(), More::default()), self.wall, None)
+    }
+
+    /// The earliest wall second after `now` at which these facts say otherwise with nothing
+    /// written since: their wall's ([`Wall::changes_after`]). The totals, the runtime and the
+    /// served time are the transcript's, which hold no time of their own.
+    #[must_use]
+    pub fn changes_after(&self, now: i64) -> Option<i64> {
+        self.wall.as_ref()?.changes_after(now)
     }
 }
 

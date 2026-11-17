@@ -4189,6 +4189,33 @@ pub fn session_logins_at(
     home: Option<&std::path::Path>,
     now: i64,
 ) -> Vec<SessionLogin> {
+    let mut out: Vec<SessionLogin> = Vec::new();
+    for dir in session_login_dirs(store, roster, now) {
+        if let Some(record) = home.and_then(|home| profile::login_record(home, dir.as_deref()))
+            && !out
+                .iter()
+                .any(|seen| accounts::email_matches(&seen.email, &record.email))
+        {
+            out.push(SessionLogin {
+                email: record.email,
+                account_id: record.key.map(|key| key.to_string()),
+                default: dir.is_none(),
+            });
+        }
+    }
+    out
+}
+
+/// The logins the sessions on this Mac run on, whose records [`session_logins_at`] reads: the
+/// machine's default login (`None`, which every session on no row runs on), then the login
+/// directory of each row a session recorded in the accounts state of `store` is on, the rows read
+/// from the roster at `roster`, each once.
+#[must_use]
+pub fn session_login_dirs(
+    store: Option<&Store>,
+    roster: Option<&std::path::Path>,
+    now: i64,
+) -> Vec<Option<String>> {
     let mut dirs: Vec<Option<String>> = vec![None];
     if let Some(store) = store
         && let Ok((state, _)) = store.load(now)
@@ -4203,21 +4230,7 @@ pub fn session_logins_at(
             }
         }
     }
-    let mut out: Vec<SessionLogin> = Vec::new();
-    for dir in dirs {
-        if let Some(record) = home.and_then(|home| profile::login_record(home, dir.as_deref()))
-            && !out
-                .iter()
-                .any(|seen| accounts::email_matches(&seen.email, &record.email))
-        {
-            out.push(SessionLogin {
-                email: record.email,
-                account_id: record.key.map(|key| key.to_string()),
-                default: dir.is_none(),
-            });
-        }
-    }
-    out
+    dirs
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use aterm_spec::derive::Model;
 
 /// Each law of `SharedFile` with the one mutant that breaks it, in the order of the design's
 /// table (docs/DESIGN-shared-files-2026-11-11.md §8): the mutant at index `i` is `Buggy == i + 1`.
-pub const SHARED_FILE_LAWS: [(&str, &str); 17] = [
+pub const SHARED_FILE_LAWS: [(&str, &str); 18] = [
     ("ReadTotal", "ReadOpensCustody"),
     ("SnapshotMonotone", "RefreshTakesOlder"),
     ("HeldNeverLive", "HeldReadAsLive"),
@@ -23,6 +23,7 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 17] = [
     ("LimitsByReset", "ClockOrdersReadings"),
     ("NoSecretMaterialized", "SecretInSnapshot"),
     ("LiveIsCurrent", "SkipOnFrontier"),
+    ("OwnerVerbOnly", "ImportNamesAccount"),
 ];
 
 /// One shared file on one Mac, with a peer Mac writing beside it
@@ -94,13 +95,15 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 17] = [
 ///    successor signs the intent again and it still has one record. An intent no record
 ///    carries, on a register that moved, is held (`Hold`). `lost` records a candidate replaced
 ///    unobserved, `fsig` a record signed by a fenced actor.
-/// 3. **Authority on merge** (`aterm_db::file::admit`,
+/// 3. **Authority on merge** (`aterm_db::typed::authority`,
 ///    `aterm_db_core::file_merge::eligible_owned`). The mine row visible at this Mac's key and
 ///    the log entry visible under its uuid are signed by `rowby` and `logby` (0 none, 1 this
 ///    Mac, 2 the peer); the log snapshot keeps `logrows` of the `logged` entries. On an Owner
 ///    column `proj` is what projects (0 nothing, 1 the owner's cell, 2 an automatic cell). On a
 ///    Birth-or-Owner column `birth` and `own` are the two candidates and `bshown` the Birth
-///    cell showing. `ident` is the provider and realm (0 unborn, 1 as born, 2 rewritten).
+///    cell showing. `ident` is the provider and realm (0 unborn, 1 as born, 2 rewritten). On a
+///    column only an owner's verb writes (an account's name), `named` is the owner's write and
+///    `vlabel` what projects (0 nothing, 1 the owner's name, 2 an imported or automatic one).
 /// 4. **The face.** `face` is the face against what the materializer last wrote (0 the same, 1 a
 ///    cell edited, 2 a row missing); a pass that sees it changed (`Watch`) queues nothing, a
 ///    `Commit` turns differing cells into `intents`, and `Restore` rewrites it. The row is
@@ -125,7 +128,8 @@ pub const SHARED_FILE_LAWS: [(&str, &str); 17] = [
 /// provider or realm, 12 a watcher publishes a file write, 13 a row missing from a committed
 /// face is retired, 14 the pool is the linked accounts only, 15 the fold takes the reading
 /// whose clock read last, 16 a credential-shaped value is projected, 17 a pass whose frontier
-/// is the snapshot's projects nothing again, whatever else its projection reads has moved.
+/// is the snapshot's projects nothing again, whatever else its projection reads has moved, 18
+/// an import's or an automatic path's name projects on a verb column.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn shared_file_model() -> Model {
@@ -146,6 +150,7 @@ pub fn shared_file_model() -> Model {
             var cb = 0; var mine = 0; var recs = 0; var lost = 0; var fsig = 0;
             var rowby = 0; var logby = 0; var logged = 0; var logrows = 0;
             var proj = 0; var oc = 0; var birth = 0; var own = 0; var bshown = 0; var ident = 0;
+            var named = 0; var vlabel = 0;
             var face = 0; var commits = 0; var intents = 0; var rowlive = 1; var asked = 0;
             var held = 0; var link = 0; var built = 0; var inpool = 0;
             var ra = 0; var pa = 0; var rb = 0; var pb = 0; var folded = 0;
@@ -283,7 +288,8 @@ pub fn shared_file_model() -> Model {
 
             // 3. Authority on merge: a row and an entry at this Mac's key, signed by it or by the
             // peer; an automatic cell on an Owner column; a Birth cell and an Owner candidate; a
-            // write to a fixed column after birth.
+            // write to a fixed column after birth; a name an owner's verb writes, and one an
+            // import or an automatic path writes.
             action OwnRow when (area == 3 && rowby == 0) { rowby = 1; }
             action ForeignRow when (area == 3) { rowby = if Buggy == 8 {2} else {rowby}; }
             action OwnEntry when (area == 3 && 3 > logged) {
@@ -303,6 +309,8 @@ pub fn shared_file_model() -> Model {
             action Rewrite when (area == 3 && birth == 1) {
                 ident = if Buggy == 11 {2} else {ident};
             }
+            action OwnerNames when (area == 3 && named == 0) { named = 1; vlabel = 1; }
+            action ImportNames when (area == 3) { vlabel = if Buggy == 18 {2} else {vlabel}; }
 
             // 4. The face: edits, a pass that sees them, a commit by name, a restore, a removal.
             action EditCell when (area == 4 && face == 0 && 2 > commits) { face = 1; }
@@ -361,6 +369,7 @@ pub fn shared_file_model() -> Model {
             invariant LimitsByReset: fr1 == fr2 && fp1 == fp2;
             invariant NoSecretMaterialized: ssecret == 0;
             invariant LiveIsCurrent: stale == 0;
+            invariant OwnerVerbOnly: vlabel <= 1;
             bound OutboxWithinCap: q <= Cap;
             bound LogWithinKeep: logrows <= Keep;
         }

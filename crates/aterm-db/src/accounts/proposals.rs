@@ -321,7 +321,7 @@ impl Proposals {
             if let Some(id) = log.revert_retry(session.actor(), request, operation)? {
                 return receipt(session, store, &id);
             }
-            let command = log.compensate(request, operation, &BTreeSet::new())?;
+            let command = log.compensate(request, operation, &BTreeSet::new(), &BTreeSet::new())?;
             application::append(session, store, &encode(&command)?)
         })
     }

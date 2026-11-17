@@ -17,6 +17,9 @@ use super::*;
 use crate::error::Kind;
 use crate::needs;
 
+#[path = "journal_migration_tests.rs"]
+mod migration;
+
 /// The simulated clock's start, as `tests/common.rs` names it.
 const SIM_START: u64 = 1_760_000_000;
 /// The hang detector for a wait that must end (plan §1).
@@ -56,6 +59,8 @@ fn draft(op: WriteOp, key: &str) -> IntentDraft {
         body_digest: None,
         grant: None,
         after: None,
+        writer: None,
+        refs: Vec::new(),
     }
 }
 
@@ -188,6 +193,8 @@ fn record_bodies_are_exact() {
         body_digest: Some(format!("sha256:{notes}")),
         grant: Some("fixture-caller".to_string()),
         at_secs: SIM_START,
+        writer: None,
+        refs: Vec::new(),
     }));
     let url = "https://github.com/alabsystems/aterm/releases/tag/v1";
     let rows: Vec<(JournalRecord, String)> = vec![
@@ -837,6 +844,23 @@ fn a_full_journal_still_closes_its_open_intents() {
     let fx = fx();
     let journal = journal(root.path(), &fx);
     let a = begin(&journal, draft(WriteOp::ReleaseCreate, "v1"));
+    let before = fill_to(&journal, JOURNAL_MAX - JOURNAL_RESERVE - 8000);
+    let refs = (0..16)
+        .map(|i| crate::github::refs::RefUpdate {
+            reference: format!("refs/attest/{i}/{}", "a".repeat(512)),
+            before: "0".repeat(40),
+            after: "1".repeat(40),
+        })
+        .collect();
+    let large = draft(WriteOp::RefUpdateAtomic, "atomic refs").with_refs(refs);
+    assert_eq!(
+        journal
+            .begin(&large)
+            .expect_err("batch cannot spend closing reserve")
+            .sub,
+        Sub::JournalFull { len: before }
+    );
+    assert_eq!(std::fs::metadata(journal.path()).unwrap().len(), before);
     let len = fill_to(&journal, JOURNAL_MAX - JOURNAL_RESERVE);
     let gap = (JOURNAL_MAX - JOURNAL_RESERVE) - len;
     assert!(gap < 100, "{gap}");
@@ -1351,504 +1375,4 @@ fn journals_lists_every_repository() {
         .map(|(slug, _)| slug.key())
         .collect();
     assert_eq!(listed, ["alabsystems/aterm", "fixture-dev/app"]);
-}
-
-/// An atomic ref draft that asks the request `sha256:<digit × 64> 812`.
-fn atomic(digit: char) -> IntentDraft {
-    draft(WriteOp::RefUpdateAtomic, "atomic refs")
-        .with_request(format!("sha256:{} 812", digit.to_string().repeat(64)))
-}
-
-/// Whether intent `id`'s holder file is beside the journal.
-fn holder_there(journal: &Journal, id: &IntentId) -> bool {
-    let (dir, name) = journal.holder_file(id);
-    dir.join(name).exists()
-}
-
-/// Whether the journal holds a Retracted record of `id`, which closed it.
-fn retracted(journal: &Journal, id: &IntentId) -> bool {
-    journal
-        .view(id)
-        .expect("view")
-        .is_some_and(|view| view.retracted.is_some() && !view.open)
-}
-
-/// Whether the next atomic begin would close `id` (`Journal::closable`).
-fn closable(journal: &Journal, id: &IntentId) -> bool {
-    let view = journal.view(id).expect("view").expect("the intent");
-    journal.closable(&view).expect("the clock")
-}
-
-/// `draft`, begun after `after`, is refused on `after`'s open intent.
-fn stopped(journal: &Journal, draft: IntentDraft, after: &IntentId) {
-    let e = journal
-        .begin(&draft.with_after(Some(after.clone())))
-        .expect_err("the open atomic intent stops this batch");
-    assert_eq!(e.exit(), 13);
-    assert_eq!(
-        e.sub,
-        Sub::IntentOpen {
-            intent: after.to_string()
-        }
-    );
-}
-
-#[test]
-fn a_running_writers_atomic_intent_needs_a_full_window_after_it_ends() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let first = begin(&writer, atomic('1'));
-    assert!(
-        holder_there(&writer, &first),
-        "an atomic begin holds a holder file"
-    );
-    let other = journal(root.path(), &fx);
-    stopped(&other, atomic('2'), &first);
-    fx.sleep(crate::git::GRANT_MAX)
-        .expect("the simulated clock");
-    assert!(!closable(&other, &first), "its writer holds it");
-    stopped(&other, atomic('2'), &first);
-
-    // Its process ends without settling: the kernel lets the lock go.
-    drop(writer);
-    assert!(
-        !closable(&other, &first),
-        "the old begin cannot consume the late-arrival window"
-    );
-    stopped(&other, atomic('2'), &first);
-    fx.sleep(crate::git::GRANT_MAX)
-        .expect("the simulated clock");
-    assert!(
-        !closable(&other, &first),
-        "rounding never shortens the window"
-    );
-    fx.sleep(Duration::from_secs(1))
-        .expect("the simulated clock");
-    assert!(closable(&other, &first));
-    let second = other
-        .begin(&atomic('2').with_after(Some(first.clone())))
-        .unwrap_or_else(|e| {
-            panic!(
-                "an ended writer after its full late-arrival window: {}",
-                e.why
-            )
-        });
-    assert!(retracted(&other, &first), "the next begin closed it");
-    assert!(
-        !holder_there(&other, &first),
-        "its holder file goes with it"
-    );
-    assert!(holder_there(&other, &second));
-    other.settle(&second, &Settled::NeverSent).expect("settled");
-    assert!(
-        !holder_there(&other, &second),
-        "a settled writer leaves no holder file"
-    );
-}
-
-#[test]
-fn a_free_holders_first_observation_survives_reopening_and_is_not_refreshed() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let first = begin(&writer, atomic('1'));
-    drop(writer);
-    let other = journal(root.path(), &fx);
-    assert!(
-        !closable(&other, &first),
-        "a request may still land inside the window"
-    );
-    stopped(&other, atomic('2'), &first);
-    fx.sleep(crate::git::GRANT_MAX / 2)
-        .expect("the simulated clock");
-    assert!(!closable(&other, &first));
-    drop(other);
-    let reopened = journal(root.path(), &fx);
-    assert!(!closable(&reopened, &first));
-    fx.sleep(crate::git::GRANT_MAX / 2)
-        .expect("the simulated clock");
-    assert!(!closable(&reopened, &first));
-    fx.sleep(Duration::from_secs(1))
-        .expect("the simulated clock");
-    assert!(
-        closable(&reopened, &first),
-        "probing does not restart the window"
-    );
-    begin(&reopened, atomic('2'));
-    assert!(retracted(&reopened, &first));
-}
-
-#[test]
-fn a_long_unknown_atomic_write_gets_its_full_window_after_settle() {
-    let root = scratch();
-    let fx = fx();
-    let journal = journal(root.path(), &fx);
-    let unknown = begin(&journal, atomic('1'));
-    fx.sleep(crate::git::GRANT_MAX * 2 + Duration::from_millis(900))
-        .expect("a long-running write");
-    journal
-        .settle(
-            &unknown,
-            &Settled::Unknown {
-                why: "no answer".into(),
-            },
-        )
-        .expect("settled unknown");
-    assert!(
-        holder_there(&journal, &unknown),
-        "Unknown keeps its retirement fence"
-    );
-    assert!(!closable(&journal, &unknown));
-    stopped(&journal, atomic('1'), &unknown);
-    stopped(&journal, atomic('2'), &unknown);
-    fx.sleep(crate::git::GRANT_MAX - Duration::from_millis(900))
-        .expect("the simulated clock");
-    assert!(
-        !closable(&journal, &unknown),
-        "whole-second clock rounding must not close after only 899.1 seconds"
-    );
-    fx.sleep(Duration::from_secs(1))
-        .expect("the simulated clock");
-    assert!(closable(&journal, &unknown));
-    begin(&journal, atomic('1'));
-    assert!(retracted(&journal, &unknown));
-    assert!(!holder_there(&journal, &unknown));
-}
-
-#[test]
-fn an_old_atomic_intent_with_no_holder_file_starts_a_persistent_free_window() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let legacy = begin(&writer, atomic('1'));
-    // As an agh before holders left it: no holder file, and no lock.
-    drop(writer);
-    let (dir, name) = journal(root.path(), &fx).holder_file(&legacy);
-    aterm_uds::private_file::remove_private(&dir, &name).expect("the holder file goes");
-    fx.sleep(crate::git::GRANT_MAX * 2)
-        .expect("an old legacy intent");
-    let other = journal(root.path(), &fx);
-    stopped(&other, atomic('2'), &legacy);
-    assert!(
-        !holder_there(&other, &legacy),
-        "a free observation never recreates the missing writer's holder"
-    );
-    drop(other);
-    let other = journal(root.path(), &fx);
-    assert!(!closable(&other, &legacy));
-    fx.sleep(crate::git::GRANT_MAX)
-        .expect("the simulated clock");
-    assert!(!closable(&other, &legacy));
-    fx.sleep(Duration::from_secs(1))
-        .expect("the simulated clock");
-    begin(&other, atomic('2'));
-    assert!(retracted(&other, &legacy));
-}
-
-#[test]
-fn a_failed_atomic_settle_retires_the_writer_without_consuming_its_free_window() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let id = begin(&writer, atomic('1'));
-    writer
-        .observe(&id, None)
-        .expect("a complete frame after the intent that will be damaged");
-    fx.sleep(crate::git::GRANT_MAX * 2)
-        .expect("a long-running write");
-    let clean = bytes(&writer);
-    let mut damaged = clean.clone();
-    damaged[FRAME_OVERHEAD + 3] ^= 0x01;
-    write_raw(&writer, &damaged);
-    let e = writer
-        .settle(
-            &id,
-            &Settled::Unknown {
-                why: "the write answered no outcome".into(),
-            },
-        )
-        .expect_err("a damaged journal cannot record the outcome");
-    assert_eq!(e.sub, Sub::JournalFault { at: 0 });
-    assert!(holder_there(&writer, &id));
-    write_raw(&writer, &clean);
-    let other = journal(root.path(), &fx);
-    assert_eq!(
-        other.view(&id).expect("view").expect("intent").settled,
-        None
-    );
-    assert!(!closable(&other, &id));
-    stopped(&other, atomic('2'), &id);
-    fx.sleep(crate::git::GRANT_MAX + Duration::from_secs(1))
-        .expect("the full late-arrival window");
-    assert!(
-        closable(&other, &id),
-        "failed persistence still releases the writer's lock"
-    );
-    begin(&other, atomic('2'));
-    assert!(retracted(&other, &id));
-}
-
-#[test]
-fn a_damaged_retirement_fence_cannot_inherit_the_old_begins_age() {
-    use std::os::unix::fs::FileExt as _;
-
-    for truncated in [true, false] {
-        let root = scratch();
-        let fx = fx();
-        let writer = journal(root.path(), &fx);
-        let id = begin(&writer, atomic('1'));
-        writer
-            .settle(
-                &id,
-                &Settled::Unknown {
-                    why: "no answer".into(),
-                },
-            )
-            .expect("an unknown outcome");
-        let (dir, name) = writer.holder_file(&id);
-        let mut damaged = std::fs::read(dir.join(&name)).expect("a persisted retirement fence");
-        assert!(!damaged.is_empty());
-        if truncated {
-            damaged.truncate(damaged.len() / 2);
-        } else {
-            damaged.extend_from_slice(b"invalid trailing bytes\n");
-        }
-        let file = aterm_uds::private_file::open_private_rw(&dir, &name).expect("the holder");
-        file.set_len(0).expect("emptied");
-        file.write_all_at(&damaged, 0)
-            .expect("a damaged retirement fence");
-        drop(file);
-        fx.sleep(crate::git::GRANT_MAX * 2)
-            .expect("the begin and old retirement are past their windows");
-        let view = writer.view(&id).expect("view").expect("the open intent");
-        assert!(
-            !matches!(writer.closable(&view), Ok(true)),
-            "an unreadable retirement fence must refuse or restart a full window"
-        );
-        assert!(!retracted(&writer, &id));
-    }
-}
-
-#[test]
-fn a_retirement_fence_in_the_readers_future_never_looks_elapsed() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let id = begin(&writer, atomic('1'));
-    fx.sleep(crate::git::GRANT_MAX * 2)
-        .expect("a long-running writer");
-    writer
-        .settle(
-            &id,
-            &Settled::Unknown {
-                why: "no answer".into(),
-            },
-        )
-        .expect("an unknown outcome");
-    let earlier = Arc::new(Fx::simulated(SIM_START));
-    let reader = journal(root.path(), &earlier);
-    assert!(
-        !closable(&reader, &id),
-        "a backward clock cannot underflow the grace"
-    );
-}
-
-#[test]
-fn taking_a_holder_again_cannot_reuse_its_old_mature_retirement_fence() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let id = begin(&writer, atomic('1'));
-    writer
-        .settle(
-            &id,
-            &Settled::Unknown {
-                why: "no answer".into(),
-            },
-        )
-        .expect("a retirement fence");
-    fx.sleep(crate::git::GRANT_MAX + Duration::from_secs(1))
-        .expect("the old fence matures");
-    assert!(closable(&writer, &id));
-    // A failed begin can leave an orphan beside the next begin's same deterministic id.
-    // Exercise that holder reuse directly, without sending or settling another write.
-    writer.hold(&id).expect("take the old holder again");
-    assert!(!closable(&writer, &id), "the new holder is live");
-    drop(writer.holders.lock_or_recover().remove(id.as_str()));
-    assert!(
-        !closable(&writer, &id),
-        "the old fence cannot mature a new holder"
-    );
-    fx.sleep(crate::git::GRANT_MAX + Duration::from_secs(1))
-        .expect("the new retirement's full grace");
-    assert!(closable(&writer, &id));
-}
-
-#[test]
-fn the_next_atomic_begin_sweeps_only_journal_closed_free_holders() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let free = begin(&writer, atomic('1'));
-    writer
-        .append(&JournalRecord::Settled {
-            intent: free.clone(),
-            outcome: Settled::NeverSent,
-        })
-        .expect("a closing record before the writer removes its holder");
-    let held = begin(&writer, atomic('2'));
-    writer
-        .append(&JournalRecord::Settled {
-            intent: held.clone(),
-            outcome: Settled::NeverSent,
-        })
-        .expect("a closing record whose writer still owns its holder");
-    // One writer's held descriptors stand for two processes: the first ended after its
-    // closing record, while the second is still completing its holder cleanup.
-    drop(writer.holders.lock_or_recover().remove(free.as_str()));
-    let other = journal(root.path(), &fx);
-    other
-        .close_finished(&atomic('3'))
-        .expect("a closed-holder sweep");
-    assert!(
-        !holder_there(&other, &free),
-        "the free stale holder is removed"
-    );
-    assert!(
-        holder_there(&other, &held),
-        "a held inode is never unlinked"
-    );
-    drop(writer);
-    other
-        .close_finished(&atomic('3'))
-        .expect("the writer ended");
-    assert!(!holder_there(&other, &held));
-}
-
-#[test]
-fn a_closed_legacy_free_fence_is_swept_only_after_its_reader_unlocks_it() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let legacy_fence = |digit| {
-        let id = begin(&writer, atomic(digit));
-        drop(writer.holders.lock_or_recover().remove(id.as_str()));
-        let (dir, name) = writer.holder_file(&id);
-        aterm_uds::private_file::remove_private(&dir, &name).expect("a legacy missing holder");
-        assert!(
-            !closable(&writer, &id),
-            "the first free observation is persisted"
-        );
-        let (dir, name) = writer.free_file(&id);
-        let lock = aterm_uds::private_file::PrivateLock::take_existing(
-            &dir,
-            &name,
-            Duration::ZERO,
-            "held",
-        )
-        .expect("the free-observation fence")
-        .expect("the observation created its fence");
-        writer
-            .append(&JournalRecord::Settled {
-                intent: id,
-                outcome: Settled::NeverSent,
-            })
-            .expect("a closing record before recovery-fence cleanup");
-        (dir.join(name), lock)
-    };
-    let (free_path, free_lock) = legacy_fence('1');
-    let (held_path, held_lock) = legacy_fence('2');
-    drop(free_lock);
-    let other = journal(root.path(), &fx);
-    other
-        .close_finished(&atomic('3'))
-        .expect("a closed-fence sweep");
-    assert!(!free_path.exists(), "the closed free fence is removed");
-    assert!(held_path.exists(), "a reader's locked fence is preserved");
-    drop(held_lock);
-    other
-        .close_finished(&atomic('3'))
-        .expect("the reader unlocked its fence");
-    assert!(!held_path.exists());
-}
-
-#[test]
-fn a_faulted_journal_neither_closes_an_old_intent_nor_sweeps_a_closed_holder() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let closed = begin(&writer, atomic('1'));
-    writer
-        .append(&JournalRecord::Settled {
-            intent: closed.clone(),
-            outcome: Settled::NeverSent,
-        })
-        .expect("a closing record before holder cleanup");
-    let open = begin(&writer, atomic('2'));
-    let clean = bytes(&writer);
-    writer
-        .append(&JournalRecord::Settled {
-            intent: open.clone(),
-            outcome: Settled::Unknown {
-                why: "no answer".into(),
-            },
-        })
-        .expect("an outcome after the open intent");
-    writer
-        .observe(&open, None)
-        .expect("a complete frame after the outcome that will be damaged");
-    let mut damaged = bytes(&writer);
-    damaged[clean.len() + FRAME_OVERHEAD + 3] ^= 0x01;
-    write_raw(&writer, &damaged);
-    drop(writer);
-    fx.sleep(crate::git::GRANT_MAX * 2).expect("old intents");
-    let other = journal(root.path(), &fx);
-    other
-        .close_finished(&atomic('3'))
-        .expect("a fault closes nothing");
-    assert_eq!(bytes(&other), damaged);
-    assert!(holder_there(&other, &closed));
-    assert!(holder_there(&other, &open));
-    let e = other
-        .begin(&atomic('3').with_after(Some(open)))
-        .expect_err("the fault must still stop the next batch");
-    assert_eq!(e.sub.slug().as_deref(), Some("journal_fault"));
-    assert_eq!(bytes(&other), damaged);
-}
-
-/// NEGATIVE CONTROL: with `Journal::holds_writer` true for every op, a release create holds a
-/// holder file: `` assertion failed: !holder_there(&writer, &release) ``.
-#[test]
-fn only_an_atomic_begin_holds_a_holder_file_and_another_ops_intent_still_stops_its_key() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let release = begin(&writer, draft(WriteOp::ReleaseCreate, "v1"));
-    assert!(!holder_there(&writer, &release));
-    drop(writer);
-    fx.sleep(crate::git::GRANT_MAX)
-        .expect("the simulated clock");
-    let other = journal(root.path(), &fx);
-    let e = other
-        .begin(&draft(WriteOp::ReleaseCreate, "v1").with_after(Some(release.clone())))
-        .expect_err("an open release create stops its key whoever wrote it");
-    assert_eq!(e.exit(), 13);
-    assert!(!retracted(&other, &release));
-}
-
-#[test]
-fn a_retract_removes_a_free_holder_file() {
-    let root = scratch();
-    let fx = fx();
-    let writer = journal(root.path(), &fx);
-    let first = begin(&writer, atomic('1'));
-    drop(writer);
-    let other = journal(root.path(), &fx);
-    assert!(holder_there(&other, &first));
-    other.retract(&first).expect("retracted");
-    assert!(
-        !holder_there(&other, &first),
-        "a closed intent keeps no holder file"
-    );
 }

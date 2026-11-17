@@ -4,13 +4,17 @@
 //! What a subscriber's pass counts ([`crate::pass_counts`]), driven through the production pass
 //! against vault servers on loopback: counted, never timed.
 
+#[cfg(unix)]
 use super::log_entries_tests::{join_host, start_loopback_server};
 use super::*;
+#[cfg(unix)]
 use crate::pass_counts::PassCounts;
+#[cfg(unix)]
 use std::sync::Arc;
 
 /// A member (`m9`) of a `team` vault at seq 2, its source a server on loopback, `peers` more
 /// servers that each hold the same seq 2, and one more that holds no vault.
+#[cfg(unix)]
 struct Lab {
     root: aterm_tempfile::TempDir,
     admin: Paths,
@@ -24,6 +28,7 @@ struct Lab {
     held: Vec<u8>,
 }
 
+#[cfg(unix)]
 fn lab(peers: usize) -> Lab {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let source = start_loopback_server(&root.path().join("source"));
@@ -70,6 +75,7 @@ fn lab(peers: usize) -> Lab {
     }
 }
 
+#[cfg(unix)]
 impl Lab {
     /// One more peer, a server on loopback that holds `bytes` as the vault.
     fn serve(&mut self, name: &str, bytes: &[u8]) {
@@ -89,6 +95,7 @@ impl Lab {
 }
 
 /// Every count of `counts` that is not 0, by name.
+#[cfg(unix)]
 fn counted(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     Count::ALL
         .iter()
@@ -99,6 +106,7 @@ fn counted(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 
 /// One pass of the member over the lab's peers, counted alone: its counts, and the threads
 /// that ended in each phase they were started in.
+#[cfg(unix)]
 fn pass(at: &Lab, repaired: &mut Repaired) -> (Arc<PassCounts>, SyncOutcome) {
     let found = |_: &Config| at.found.clone();
     let found = PeerDiscovery::supplied(&found);
@@ -113,6 +121,7 @@ fn pass(at: &Lab, repaired: &mut Repaired) -> (Arc<PassCounts>, SyncOutcome) {
 /// what it asks of the held vault's entry and of signatures are counted too, and an entry
 /// another test's vaults pushed out of the process's cache of parsed vaults is parsed and asked
 /// again, as a signature this process has not verified before is computed.
+#[cfg(unix)]
 fn sites(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     let kept = [
         "parses",
@@ -127,6 +136,7 @@ fn sites(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 }
 
 /// `base` at `advance` versions later, descending from `parent`, signed with `seed`.
+#[cfg(unix)]
 fn signed_from(base: &[u8], seed: &[u8; 32], advance: u64, parent: [u8; 32]) -> Vec<u8> {
     let base = envelope::parse(base).unwrap();
     envelope::sign(
@@ -143,6 +153,7 @@ fn signed_from(base: &[u8], seed: &[u8; 32], advance: u64, parent: [u8; 32]) -> 
     .unwrap()
 }
 
+#[cfg(unix)]
 fn threads(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     Phase::ALL
         .iter()
@@ -156,6 +167,7 @@ fn threads(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 
 /// The marks into each phase the pass's thread passed, by the phase's name, less those it
 /// passed none of.
+#[cfg(unix)]
 fn entries(counts: &PassCounts) -> Vec<(&'static str, u64)> {
     Phase::ALL
         .iter()
@@ -185,6 +197,7 @@ fn entries(counts: &PassCounts) -> Vec<(&'static str, u64)> {
 /// `fresh_probe` 3 and `fresh_select_peer` 3, and `memo_probe` and `memo_select_peer` are
 /// absent); delete `let _select = pass_counts::within(Phase::Select);` in
 /// `sync_repairing_inner` (`("select", 1)` is absent from the phases entered).
+#[cfg(unix)]
 #[test]
 fn a_pass_counts_what_it_asked_what_each_peer_answered_and_who_verified() {
     let _answering = ServersAnswering::set();
@@ -259,6 +272,7 @@ fn a_pass_counts_what_it_asked_what_each_peer_answered_and_who_verified() {
 /// `fresh_probe` 1, wants 3 and 2); keep each body verified whole
 /// (`CACHE.parsed(SecretBytes::from(bytes), None)` in its whole arm): the other body is an entry
 /// (`chain_cache::keeps(&fork)`).
+#[cfg(unix)]
 #[test]
 fn a_body_that_is_not_the_held_bytes_is_verified_whole_on_every_pass() {
     let _answering = ServersAnswering::set();
@@ -320,6 +334,7 @@ fn a_body_that_is_not_the_held_bytes_is_verified_whole_on_every_pass() {
 ///
 /// Negative control: delete `pass_counts::add(Count::ProbeWholeReads)` in
 /// `probe_peers_for_sync` (`probe_whole_reads` is absent, wants 1).
+#[cfg(unix)]
 #[test]
 fn a_probed_body_longer_than_the_first_read_is_counted_as_a_second_request() {
     let _answering = ServersAnswering::set();
@@ -376,6 +391,7 @@ fn a_probed_body_longer_than_the_first_read_is_counted_as_a_second_request() {
 ///
 /// Negative control: delete `pass_counts::add(Count::FreshFloor)` in `floor` (`left: (0, 1)`,
 /// `right: (1, 1)`).
+#[cfg(unix)]
 #[test]
 fn a_floor_that_verifies_the_held_bytes_is_counted_as_its_own_site() {
     let _answering = ServersAnswering::set();
@@ -466,6 +482,7 @@ fn each_answer_is_counted_as_what_it_was() {
 /// Negative controls: delete the `log(&line)` of the lines in `subscriber_loop_projecting` (no
 /// line holds `pass counts`: 0 lines, wants 4); delete the `pass_counts::enter(Phase::Pause)`
 /// before a healthy pass's pause (the second pass's lines hold no `pause_entries`, wants 1).
+#[cfg(unix)]
 #[test]
 fn the_loop_says_its_counts_in_its_log_as_a_due_pass_ends() {
     use std::sync::atomic::AtomicUsize;

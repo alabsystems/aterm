@@ -109,6 +109,7 @@ fn transcript_only_recovery_reads_remain_unknown_and_foreground_bound() {
     footer.usage.get_or_insert_with(Default::default).wall = Some(Wall {
         label: "5h",
         resets: "3pm".into(),
+        resets_at: 0,
     });
     assert!(timeline.set_claude_footer(42, Some(100), Some(footer)));
     let progress = snapshot(&timeline).expect("typed wall is disclosed");

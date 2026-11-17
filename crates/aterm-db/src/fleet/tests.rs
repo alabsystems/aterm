@@ -103,12 +103,13 @@ fn lab_of(labels: &[&str]) -> LabView {
     lab
 }
 
-fn account(realm: &str, address: &str, label: &str) -> Account {
+fn account(realm: &str, address: &str, slug: &str) -> Account {
     Account {
         pk: keys::account_pk(realm, address).expect("a test address is an address"),
         provider: keys::provider_of_realm(realm).map(str::to_owned),
         realm: Some(realm.to_owned()),
-        label: Some(label.to_owned()),
+        slug: slug.to_owned(),
+        name: None,
         legacy_label: None,
         login: Some(address.to_owned()),
         identity: None,
@@ -271,6 +272,11 @@ fn labels(tables: &FleetTables) -> Vec<String> {
         .collect()
 }
 
+/// Every registry machine and account is one row, in order, and each account shows the slug
+/// every command names it by.
+/// NEGATIVE CONTROL: with `fold` filling `AccountRow.slug` from the stored label (`account.label
+/// .clone()`, as before), each row shows the default label: `` left: Some("claude-…") right:
+/// Some("claude-pool…-fixture") ``.
 #[test]
 fn every_registry_machine_and_account_is_a_row_in_order_and_nothing_unread_is_zero() {
     let (inputs, tables) = fixture_tables();
@@ -315,7 +321,8 @@ fn every_registry_machine_and_account_is_a_row_in_order_and_nothing_unread_is_ze
         )
     );
 
-    // Every registry account is one row, by provider then label.
+    // Every registry account is one row, by provider then slug: the slug every command names it
+    // by, never its stored label.
     assert_eq!(tables.accounts.len(), fixture::ACCOUNTS);
     let keys: BTreeSet<&str> = tables
         .accounts
@@ -328,8 +335,13 @@ fn every_registry_machine_and_account_is_a_row_in_order_and_nothing_unread_is_ze
             .accounts
             .windows(2)
             .all(|pair| (&pair[0].provider, &pair[0].slug) < (&pair[1].provider, &pair[1].slug)),
-        "accounts come by provider, then label"
+        "accounts come by provider, then slug"
     );
+    for row in &tables.accounts {
+        let slug = row.slug.as_deref().expect("every account has a slug");
+        assert_eq!(Some(slug), lab.slug(&row.account));
+        assert_eq!(lab.accounts[&row.account].slug, slug);
+    }
 
     // Every sighted agent is one row, keyed by its machine and session.
     assert_eq!(tables.agents.len(), fixture::AGENTS);
@@ -835,11 +847,11 @@ fn where_an_account_is_expected_comes_only_from_preference() {
 }
 
 #[test]
-fn an_account_word_is_resolved_by_its_harness_realm_or_its_label() {
+fn an_account_word_is_resolved_by_its_harness_realm_or_its_slug() {
     let mut lab = lab_of(&["m3"]);
     lab.me = Some(keys::machine_pk("m3"));
     let claude = account("claude", "both@lab.example", "claude-both");
-    let codex = account("codex", "both@lab.example", "codex-both");
+    let codex = account("codex", "both@lab.example", "oai-both");
     let (claude_pk, codex_pk) = (claude.pk.clone(), codex.pk.clone());
     lab.accounts.insert(claude.pk.clone(), claude);
     lab.accounts.insert(codex.pk.clone(), codex);
@@ -852,7 +864,7 @@ fn an_account_word_is_resolved_by_its_harness_realm_or_its_label() {
             Some("both@lab.example"),
         ),
         agent("s3", Harness::Other, State::Busy, Some("both@lab.example")),
-        agent("s4", Harness::Other, State::Busy, Some("codex-both")),
+        agent("s4", Harness::Other, State::Busy, Some("oai-both")),
         agent(
             "s5",
             Harness::Claude,
@@ -882,6 +894,70 @@ fn an_account_word_is_resolved_by_its_harness_realm_or_its_label() {
     assert_eq!(tables.counts.unresolved_accounts, 2);
     assert_eq!(cell_of(&tables.agents[5], "account"), Cell::Empty);
     assert_eq!(shown_of(&tables.agents[5], "account"), "");
+}
+
+/// A session whose footer read no address reports its roster row's label, which names the
+/// account whose row it is in every form a build gave rows: the reserved slug a row a sync adds
+/// takes now, the default `<cli>-<6 hex>` label an earlier build gave rows (until SF-10 re-keys
+/// them), and the legacy label; the slug resolves as before. Ada's slug moved when the owner
+/// relabelled her account, and the short handle it was now derives Bea's: neither of Ada's row
+/// labels names Bea.
+/// NEGATIVE CONTROL: with `accounts_by_name` naming by slug alone (its `rows` and legacy label
+/// left out), only Bea's slug names an account: `` left: [Unresolved, Unresolved,
+/// Resolved("ac-…"), Unresolved, Unresolved, Unresolved] ``.
+#[test]
+fn a_row_label_of_any_build_names_the_account_whose_row_it_is() {
+    let mut lab = lab_of(&["m3"]);
+    lab.me = Some(keys::machine_pk("m3"));
+    let ada = account("claude", "ada.fb@alpha.example", "claude-m2-work");
+    let bea = account("claude", "bea.fb@alpha.example", "claude-fb-alpha");
+    let mut oai = account("codex", "cy.m8@beta.example", "oai-m8-beta");
+    oai.legacy_label = Some("m8-2".to_owned());
+    let (ada_pk, bea_pk, oai_pk) = (ada.pk.clone(), bea.pk.clone(), oai.pk.clone());
+    let words = [
+        keys::earlier_row_label("claude", &ada_pk).unwrap(),
+        keys::reserved_slug("claude", &ada_pk),
+        "claude-fb-alpha".to_owned(),
+        keys::earlier_row_label("codex", &oai_pk).unwrap(),
+        keys::reserved_slug("codex", &oai_pk),
+        "m8-2".to_owned(),
+    ];
+    assert!(words[0].starts_with("claude-") && words[3].starts_with("codex-"));
+    for account in [ada, bea, oai] {
+        lab.accounts.insert(account.pk.clone(), account);
+    }
+    let agents: Vec<AgentSeen> = words
+        .iter()
+        .enumerate()
+        .map(|(n, word)| {
+            agent(
+                &format!("s{n}"),
+                Harness::Claude,
+                State::Busy,
+                Some(word.as_str()),
+            )
+        })
+        .collect();
+    let tables = tables(&Inputs {
+        lab: live(lab, NOW),
+        read: read_of(vec![MachineSeen::own(
+            Some("m3"),
+            answered(words.len() as u32, agents),
+        )]),
+        ..Inputs::default()
+    });
+    let accounts: Vec<&AccountRef> = tables.agents.iter().map(|row| &row.account).collect();
+    assert_eq!(
+        accounts,
+        [
+            &AccountRef::Resolved(ada_pk.clone()),
+            &AccountRef::Resolved(ada_pk),
+            &AccountRef::Resolved(bea_pk),
+            &AccountRef::Resolved(oai_pk.clone()),
+            &AccountRef::Resolved(oai_pk.clone()),
+            &AccountRef::Resolved(oai_pk),
+        ]
+    );
 }
 
 #[test]
@@ -1886,6 +1962,7 @@ fn an_accounts_sessions_are_unread_once_no_answer_speaks_for_agents() {
     let other = account("claude", "two@lab.example", "claude-two");
     let mut more = LabView::clone(inputs.lab.value().expect("a registry"));
     more.accounts.insert(other.pk.clone(), other);
+    fixture::name_accounts(&mut more);
     let counted = tables(&Inputs {
         lab: live(more, NOW),
         ..inputs.clone()
@@ -1893,7 +1970,7 @@ fn an_accounts_sessions_are_unread_once_no_answer_speaks_for_agents() {
     let zero = counted
         .accounts
         .iter()
-        .find(|row| row.slug.as_deref() == Some("claude-two"))
+        .find(|row| row.slug.as_deref() == Some("claude-two-lab"))
         .expect("the other account");
     assert_eq!(
         (zero.agents, shown_of(zero, "agents")),
@@ -2752,7 +2829,8 @@ fn logged(uuid: &str, value: Value) -> (String, Event) {
 }
 
 /// A lab of m3 (bound to [`UUID`]) and m22 (bound to [`UUID_2`]) with the Claude accounts
-/// `claude-<letter>` of `letters`, in that order, and their keys.
+/// `<letter>@lab.example` of `letters`, named as `alab::account_names` names them
+/// ([`fixture::name_accounts`]), so their rows come in that order, and their keys.
 fn lab_with_accounts(letters: &[&str]) -> (LabView, Vec<String>) {
     let mut lab = lab_of(&["m3", "m22"]);
     lab.bound.insert(UUID.to_owned(), keys::machine_pk("m3"));
@@ -2768,6 +2846,7 @@ fn lab_with_accounts(letters: &[&str]) -> (LabView, Vec<String>) {
         pks.push(row.pk.clone());
         lab.accounts.insert(row.pk.clone(), row);
     }
+    fixture::name_accounts(&mut lab);
     (lab, pks)
 }
 

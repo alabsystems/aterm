@@ -146,6 +146,11 @@ fn retained_gui_network_inspection_does_not_refresh_producers() {
                 Some("Cached")
             );
             assert!(!lines[1].contains("not-exposed-"));
+            assert_eq!(
+                value["services_derived"],
+                Value::Null,
+                "no reader of the services' derivations"
+            );
             if let Some(body) = previous_body.replace(lines[1].clone()) {
                 assert_eq!(lines[1], body);
             }
@@ -234,4 +239,104 @@ fn retained_gui_network_inspection_does_not_refresh_producers() {
             }))
         );
     }
+}
+
+/// An inspection names how the services' observer has derived, read through its runtime's handle
+/// as the inspection runs: after ten samples of one writer's home holding the account table with
+/// one proposal (`service_state::kept_tests`' count-law fixture), whose files nothing moves, the
+/// observer took ten samples, derived the secrets and the accounts standings once each, and found
+/// no part of a key moved. Each count a reader gives is named by its own part.
+///
+/// NEGATIVE CONTROL (2026-11-15, run again on the merge of main f581bd69910, whose vault writes
+/// no file under the home and so leaves five parts of a key), run and then restored: with
+/// `Derivations::count` counting no derivation and no moved part (returning at once), it fails at
+/// the first inspection: `left:
+/// Object({"accounts": Number(Number(Unsigned(0))), "moved": Object({…}), "samples":
+/// Number(Number(Unsigned(10))), "secrets": Number(Number(Unsigned(0)))})`, against `"accounts":
+/// …(1)` and `"secrets": …(1)` on the right.
+///
+/// Unix only: the services' observer it starts (`aterm_db::service_state`) builds only there.
+#[cfg(unix)]
+#[test]
+fn an_inspection_names_the_services_derivations() {
+    use aterm_db::{
+        accounts::proposals::Proposals, database::Change, service_state::Runtime,
+        table::fixture::Lab,
+    };
+    use aterm_secrets::commons::roster::Role;
+
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = lab.paths[0].clone();
+    let proposals = Proposals::at(paths.clone());
+    proposals.initialize().unwrap();
+    proposals
+        .write(
+            [1; 16],
+            vec![Change {
+                collection: "accounts".into(),
+                key: "one".into(),
+                value: Some(json!({"provider":"claude", "method":"oauth"})),
+            }],
+        )
+        .unwrap();
+    let config = paths.home.join("config.toml");
+    let runtime = Runtime::start_resting(paths, config, std::time::Duration::ZERO).unwrap();
+    let handle = runtime.observation();
+    for n in 1..=10u64 {
+        // A publication read asks for the next sample; the counts, read until it is published,
+        // ask for none, so each sample answers one ask.
+        let _ = handle.try_publication();
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            &format!("the services' sample {n}"),
+            || {
+                handle
+                    .derivations()
+                    .filter(|derivations| derivations.samples >= n)
+            },
+        );
+    }
+    let mut app = crate::App::headless_for_test();
+    let reader = handle.clone();
+    app.service_derivations = Some(Arc::new(move || reader.derivations()));
+    let inspected = |app: &mut crate::App| {
+        let lines = app
+            .inspect_app(super::super::InspectRequest::Network)
+            .unwrap();
+        aterm_json::from_str::<Value>(&lines[1]).unwrap()["services_derived"].clone()
+    };
+    assert_eq!(
+        inspected(&mut app),
+        json!({
+            "samples": 10,
+            "secrets": 1,
+            "accounts": 1,
+            "moved": {
+                "vault": 0, "custody": 0, "tables": 0,
+                "generation": 0, "config": 0,
+            },
+        })
+    );
+    drop(runtime);
+
+    app.service_derivations = Some(Arc::new(|| {
+        Some(Derivations {
+            samples: 20,
+            secrets: 2,
+            accounts: 3,
+            moved: [4, 5, 6, 7, 8],
+        })
+    }));
+    assert_eq!(
+        inspected(&mut app),
+        json!({
+            "samples": 20,
+            "secrets": 2,
+            "accounts": 3,
+            "moved": {
+                "vault": 4, "custody": 5, "tables": 6,
+                "generation": 7, "config": 8,
+            },
+        })
+    );
 }

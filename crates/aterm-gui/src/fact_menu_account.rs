@@ -952,25 +952,54 @@ fn forecast(ctx: &Ctx<'_>) -> Option<(Words, NoteTone)> {
             NoteTone::Label,
         ));
     }
-    let projected = facts.outlook.as_deref().and_then(|outlook| {
-        let label = facts.account_row.as_deref()?;
-        let row = outlook.rows.iter().find(|row| row.label == label)?;
-        Some((outlook, row.window(Window::Week)?.projection?))
-    });
-    let Some((outlook, projection)) = projected else {
+    let Some(outlook) = facts.outlook.as_deref() else {
         return Some((Words::of("not worked out yet"), NoteTone::Label));
     };
-    let (words, tone) =
-        match projection.fills_at {
-            // An instant a pace projects is said to its lead's grain, as line E says its own: a
-            // constant pace cannot place it to the minute.
-            Some(at) => (
-                Words::said("runs out ~", "runs out about")
-                    .then_tight(ctx.when(outlook::round_down(at, outlook.as_of, &ctx.offsets))),
+    // An instant a pace projects is said to its lead's grain, as line E says its own: a
+    // constant pace cannot place it to the minute.
+    let about = |t: i64| ctx.when(outlook::round_down(t, outlook.as_of, &ctx.offsets));
+    let label = facts.account_row.as_deref();
+    let projection = label
+        .and_then(|label| outlook.rows.iter().find(|row| row.label == label))
+        .and_then(|row| row.window(Window::Week)?.projection);
+    let (words, tone) = match (projection, label) {
+        // A week out already: since when, at no pace.
+        (
+            Some(outlook::Proj {
+                fills_at: Some(at), ..
+            }),
+            _,
+        ) if at <= outlook.as_of => {
+            return Some((
+                Words::said("out since ~", "out since about").then_tight(about(at)),
                 NoteTone::Warn,
-            ),
-            None => (Words::of("lasts to its reset"), NoteTone::Value),
-        };
+            ));
+        }
+        (
+            Some(outlook::Proj {
+                fills_at: Some(at), ..
+            }),
+            _,
+        ) => (
+            Words::said("runs out ~", "runs out about").then_tight(about(at)),
+            NoteTone::Warn,
+        ),
+        (Some(_), _) => (Words::of("lasts to its reset"), NoteTone::Value),
+        // What the week holds at its reset turns on a row the replay cannot read: which, and
+        // from when, as the CLI's week line says ([`outlook::Outlook::turns_on`]).
+        (None, Some(label)) if let Some(lean) = outlook.turns_on(label, Window::Week) => {
+            let name = outlook.name_of(&lean.row);
+            (
+                Words::said(
+                    format!("depends on {name} after ~"),
+                    format!("depends on {name} after about"),
+                )
+                .then_tight(about(lean.at)),
+                NoteTone::Value,
+            )
+        }
+        (None, _) => return Some((Words::of("not worked out yet"), NoteTone::Label)),
+    };
     Some((
         match outlook.day_pct() {
             Some(pct) => words.then(Words::said(
@@ -1040,8 +1069,11 @@ fn axis_cells(cells: usize, labels: &[(usize, String)]) -> Vec<PlotCell> {
 /// The eight-day chart: the week left as it was read, one cell a few hours of the local clock
 /// (a midnight is a cell edge), the last cell the current one. Its first row is its name and
 /// its axis, which names each day at its midnight; its two band rows draw each cell's last
-/// reading, and on the lower one mark where a new week began (`↺`), where a reading was 0 left
-/// (`╳`) and where none was made after the first held (`┄`). Nothing is drawn between readings.
+/// reading, and on the lower one mark where a new week began or the week was refilled or raised
+/// (`↺`: a new reset, or a new refill barrier under one reset, [`Read::epoch`], which says a limit
+/// reset spent, a refill and a raised allowance alike), where a reading was 0 left (`╳`) and where
+/// none was made after the first held (`┄`). Nothing is drawn between readings; a reader is told
+/// which a `↺` is.
 fn eight_day_rows(ctx: &Ctx<'_>, reads: &[Read], whose: &str) -> Vec<MenuRow> {
     let plot = ctx.room.saturating_sub(FACT_LABEL_CELLS);
     let per_day: i64 = match plot {
@@ -1059,7 +1091,8 @@ fn eight_day_rows(ctx: &Ctx<'_>, reads: &[Read], whose: &str) -> Vec<MenuRow> {
     let last = bucket(ctx.now);
     let first = last - i64::try_from(cells).unwrap_or(0) + 1;
     let mut held: Vec<Option<&Read>> = vec![None; cells];
-    let mut began = vec![false; cells];
+    // What each cell's `↺` is, in a reader's words: a new week, or the week refilled or raised.
+    let mut began: Vec<Option<&str>> = vec![None; cells];
     let mut before: Option<&Read> = None;
     for read in reads {
         let at = usize::try_from(bucket(read.t) - first)
@@ -1067,8 +1100,14 @@ fn eight_day_rows(ctx: &Ctx<'_>, reads: &[Read], whose: &str) -> Vec<MenuRow> {
             .filter(|at| *at < cells);
         if let Some(at) = at {
             held[at] = Some(read);
-            if before.is_some_and(|b| b.reset != read.reset || b.epoch != read.epoch) {
-                began[at] = true;
+            // A new week outranks a refill in the same cell, as the footer chart's `↺` does
+            // (`Chart::turned`): a later reading's barrier never hides the week that began.
+            match before {
+                Some(b) if b.reset != read.reset => began[at] = Some("a new week from"),
+                Some(b) if b.epoch != read.epoch => {
+                    began[at].get_or_insert("the week refilled or raised by");
+                }
+                _ => {}
             }
         }
         before = Some(read);
@@ -1079,7 +1118,7 @@ fn eight_day_rows(ctx: &Ctx<'_>, reads: &[Read], whose: &str) -> Vec<MenuRow> {
     let (mut upper, mut lower) = (lead(""), lead(""));
     for (at, read) in held.iter().enumerate() {
         let (top, bottom) = match read {
-            _ if began[at] => (cell(' ', PlotInk::Read), cell('\u{21ba}', PlotInk::Mark)),
+            _ if began[at].is_some() => (cell(' ', PlotInk::Read), cell('\u{21ba}', PlotInk::Mark)),
             Some(read) if read.x10 >= 1000 => {
                 (cell(' ', PlotInk::Read), cell('\u{2573}', PlotInk::Warn))
             }
@@ -1113,10 +1152,14 @@ fn eight_day_rows(ctx: &Ctx<'_>, reads: &[Read], whose: &str) -> Vec<MenuRow> {
             left(first),
             outlook::spoken_when(first.t, ctx.now, &ctx.offsets)
         ));
-        for (at, _) in began.iter().enumerate().filter(|(_, began)| **began) {
+        for (at, words) in began
+            .iter()
+            .enumerate()
+            .filter_map(|(at, words)| Some((at, (*words)?)))
+        {
             if let Some(read) = held[at] {
                 said.push_str(&format!(
-                    ", a new week from {}",
+                    ", {words} {}",
                     outlook::spoken_when(read.t, ctx.now, &ctx.offsets)
                 ));
             }
@@ -1218,18 +1261,29 @@ fn weeks_rows(ctx: &Ctx<'_>, days: &[DayPoint]) -> (Vec<MenuRow>, usize, usize) 
     )
 }
 
-/// The charts' legend, under the name column where the room holds both.
+/// The charts' legend, under the name column where the room holds both. A `↺` is a reset, a
+/// refill or a raised allowance, said whole wherever the room holds the words; only a room too
+/// narrow for them (the narrowest chart's, [`CHART_ROOM`]) says `reset/refill`.
 fn legend_row(room: usize) -> MenuRow {
-    let words = [
-        ('\u{21ba}', PlotInk::Mark, " week reset  "),
-        ('\u{2573}', PlotInk::Warn, " out  "),
-        ('\u{2504}', PlotInk::Track, " not read"),
-    ];
-    let cells: usize = words
-        .iter()
-        .map(|(_, _, word)| 1 + word.chars().count())
-        .sum();
-    let mut row = if FACT_LABEL_CELLS + cells <= room {
+    let legend = |reset: &'static str| {
+        [
+            ('\u{21ba}', PlotInk::Mark, reset),
+            ('\u{2573}', PlotInk::Warn, " out  "),
+            ('\u{2504}', PlotInk::Track, " not read"),
+        ]
+    };
+    let cells = |words: &[(char, PlotInk, &str); 3]| -> usize {
+        words
+            .iter()
+            .map(|(_, _, word)| 1 + word.chars().count())
+            .sum()
+    };
+    let (whole, short) = (
+        legend(" reset, refill or raise  "),
+        legend(" reset/refill  "),
+    );
+    let words = if cells(&whole) <= room { whole } else { short };
+    let mut row = if FACT_LABEL_CELLS + cells(&words) <= room {
         lead("")
     } else {
         Vec::new()
@@ -1238,7 +1292,10 @@ fn legend_row(room: usize) -> MenuRow {
         row.push(cell(mark, ink));
         row.extend(word.chars().map(|ch| cell(ch, PlotInk::Value)));
     }
-    MenuRow::plot(row, "Legend: a week reset, out, not read")
+    MenuRow::plot(
+        row,
+        "Legend: a week reset, or a refill or raise inside the week; out; not read",
+    )
 }
 
 /// The `History` fact and its charts: whose readings and since when, the eight days by the

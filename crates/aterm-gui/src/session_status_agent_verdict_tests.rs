@@ -258,6 +258,106 @@ fn a_box_under_a_ticking_row_is_published_though_the_status_revision_never_moves
     );
 }
 
+/// `status composer=` READS THE CURRENT-STATE RECORD, whichever source fed it. The sweep feeds
+/// the record the screen reader's composer with each verdict it publishes, and
+/// `session_status_record` prints the record's; while a stream's `state` stands, the record's
+/// composer is that record's, and the sweep's reading is kept and decides nothing.
+/// NEGATIVE HALF: before any sweep the word is `-`; the stream's composer differs from what
+/// the reader holds at each moment it is compared, so a `status` that read the reader would
+/// print another word; and once the stream's state ends the reader's word is printed again.
+#[test]
+fn status_composer_reads_the_record_through_the_sweep_and_under_a_stream() {
+    use aterm_messages::presence::ComposerState;
+
+    let (mut app, sid) = app_with_stub();
+    let shown = |app: &App| -> String {
+        let record = app.session_status_record(sid).expect("live");
+        record
+            .split(' ')
+            .find_map(|word| word.strip_prefix("composer="))
+            .unwrap_or_else(|| panic!("composer= in {record}"))
+            .to_string()
+    };
+    let reader = |app: &App| -> &'static str {
+        app.session_status
+            .agent_reading(sid)
+            .1
+            .map_or("-", |reading| reading.composer.word())
+    };
+    assert_eq!(shown(&app), "-", "NEGATIVE HALF: nothing was read yet");
+
+    // The sweep reads an empty input box, then one that holds text (which Claude Code's
+    // reader cannot tell from placeholder text, so it reads `-`), and `status` prints each.
+    let mut t = Instant::now();
+    let step = Duration::from_millis(300);
+    let mut sweep = |app: &mut App, rows: &[String]| {
+        paint(app, sid, rows);
+        let _ = app.observe_session_statuses(t);
+        t += step;
+    };
+    let typed = |secs: u32| {
+        let mut rows = busy_screen(secs);
+        rows[21] = "\u{276f} fix the build before lunch".into();
+        rows
+    };
+    sweep(&mut app, &busy_screen(0));
+    sweep(&mut app, &busy_screen(1));
+    assert_eq!(
+        published(&app, sid).word,
+        "busy",
+        "CONTROL: the sweep read Claude"
+    );
+    assert_eq!(
+        reader(&app),
+        "empty",
+        "CONTROL: the reader read the input box"
+    );
+    assert_eq!(shown(&app), "empty", "the sweep fed the record its reading");
+    sweep(&mut app, &typed(2));
+    assert_eq!(reader(&app), "-", "CONTROL: the reader read the box again");
+    assert_eq!(shown(&app), "-", "and the sweep fed that on too");
+
+    // A stream's `state` stands, saying the box holds a draft while the reader holds `-`.
+    let fed = crate::session_timeline::StreamFed {
+        state: crate::session_timeline::StreamedState::Idle,
+        composer: ComposerState::Draft,
+        epoch: "e1".to_string(),
+        hseq: 1,
+        holder: "claude-code-alab@4242".to_string(),
+        by: aterm_slog::Actor::Nobody,
+        agent: aterm_phase::Program::Claude,
+        line: String::new(),
+    };
+    let timeline = app.pool.get(sid).expect("pooled").ctx.timeline.clone();
+    timeline.lock().unwrap().publish_stream_state(fed);
+    assert_eq!(reader(&app), "-");
+    assert_eq!(
+        shown(&app),
+        "draft",
+        "`status` prints the record's composer, not the reader's"
+    );
+    let record = app.session_status_record(sid).expect("live");
+    assert!(record.contains(" agent=idle "), "{record}");
+    // The sweep goes on reading; under the stream its reading is kept and decides nothing.
+    sweep(&mut app, &busy_screen(3));
+    assert_eq!(
+        reader(&app),
+        "empty",
+        "CONTROL: the sweep read the box again"
+    );
+    assert_eq!(shown(&app), "draft");
+
+    // The stream's state ends (no claim holds it): the reader's word is printed again.
+    {
+        let ctx = &app.pool.get(sid).expect("pooled").ctx;
+        let meta = ctx.meta.lock().unwrap();
+        assert!(timeline.lock().unwrap().settle_stream_claim(&meta));
+    }
+    assert_eq!(shown(&app), "empty");
+    let record = app.session_status_record(sid).expect("live");
+    assert!(record.contains(" agent=busy "), "{record}");
+}
+
 /// `agent_gen=` and `agent_fp=` match the screen the verdict was read from.
 #[test]
 fn the_verdict_carries_the_stamp_of_the_screen_it_was_read_from() {

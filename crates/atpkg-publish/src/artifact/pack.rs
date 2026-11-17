@@ -1205,6 +1205,41 @@ pub fn write_bottle_manifest(
     sign::write_sig(pkg, &sig).map(Some)
 }
 
+/// Sign a keyed tree's manifest bytes when a signer is given, verify the pair and hold the
+/// parsed document to what was packed ([`pkgdoc::check_parsed_tree`]), and only then write the
+/// manifest and its signature.
+/// # Errors
+/// The signer's or the self-check's refusal; neither file is written after one, and a signature
+/// an earlier run left is removed (it covers other bytes).
+pub fn write_tree_manifest(
+    ctx: &Ctx,
+    doc: &pkgdoc::Doc,
+    header: &Header,
+    row: &pkgdoc::TreeRow,
+    pkg: &Path,
+    signer: Option<&Signer>,
+) -> Result<Option<PathBuf>> {
+    let _ = std::fs::remove_file(sign::sig_path(pkg));
+    let sig = match signer {
+        Some(s) => {
+            let (sig, parsed) = sign::sign_checked(&s.key, doc.bytes(), &s.authority)?;
+            pkgdoc::check_parsed_tree(&parsed, header, row)?;
+            Some(sig)
+        }
+        None => None,
+    };
+    crate::lane::report::write_atomic_bytes(pkg, doc.bytes())?;
+    let Some(sig) = sig else {
+        eprintln!(
+            "atpkg-publish: wrote {} UNSIGNED — no client accepts it until a rostered \
+             machine runs `atpkg-publish sign` over these exact bytes",
+            ctx.shown(pkg)
+        );
+        return Ok(None);
+    };
+    sign::write_sig(pkg, &sig).map(Some)
+}
+
 /// [`Pack`] over explicit tools — the seam the tests drive.
 /// # Errors
 /// Any gate's refusal; nothing is signed or uploaded after one.

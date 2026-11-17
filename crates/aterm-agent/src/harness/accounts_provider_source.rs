@@ -271,45 +271,6 @@ impl ProviderSource {
         protection.check(&[output])
     }
 
-    pub(super) fn migrate(
-        &mut self,
-        cli: Cli,
-        env: &Env,
-        store: &accounts::Store,
-        held: &accounts::Lock,
-        roster: &Path,
-    ) -> Result<bool, SyncError> {
-        if matches!(self.selected, Selected::Native)
-            && let Some(lab) = self
-                .admission
-                .as_ref()
-                .ok_or("native source observation is missing")?
-                .chosen(cli, roster, self.named.as_deref())?
-                .and_then(|fleet| fleet.lab_snapshot)
-        {
-            let migrated = super::super::alab_roster::migrate_held(
-                &lab,
-                cli,
-                store,
-                held,
-                roster,
-                env.now,
-                (self.named.is_none(), self.receipt_guard()?),
-            )?;
-            if !migrated.moved.is_empty() {
-                // This writer just committed its own monotonic retirement with migration.
-                // Keep the original source/configuration observation and advance only policy.
-                self.policy = store.source_policy()?;
-                self.admission = self
-                    .admission
-                    .take()
-                    .map(|admission| admission.with_policy(self.policy.clone(), false));
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     pub(super) fn load(&self, cli: Cli, roster: &Path) -> Result<Option<LoadedFleet>, SyncError> {
         if matches!(self.selected, Selected::Native) {
             let fleet = self

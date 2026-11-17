@@ -1229,6 +1229,7 @@ impl GuiWorld {
                 ids,
                 limits: aterm_slog::Limits::new(8, 1 << 20).expect("a ring"),
                 at,
+                ident: aterm_slog::DescIdent::default(),
             },
         )
         .expect("the successor reads the carry");

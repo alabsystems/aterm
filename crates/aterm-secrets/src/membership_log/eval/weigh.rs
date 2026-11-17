@@ -47,7 +47,7 @@
 //! nothing breaks a tie by where a record sits in the order.
 
 use super::{AuthScratch, Authorization, Bits, Candidate, Graph, Memo, Weighed, membership_void};
-use crate::membership_log::{Kind, MemberId};
+use crate::membership_log::MemberId;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod relations;
@@ -501,13 +501,12 @@ impl<'w, 'a> Walk<'w, 'a> {
         let mut order: Vec<usize> = apart.weighed.keys().copied().collect();
         order.sort_by_cached_key(|&q| {
             let Candidate { member, cutoff, .. } = &candidates[q];
-            let record = &graph.records[*cutoff];
-            let own = record.actor() == member;
+            let own = graph.signer_of(*cutoff) == member;
             (
                 *member,
                 own,
-                if own { record.sequence() } else { 0 },
-                *record.id(),
+                if own { graph.sequence_of(*cutoff) } else { 0 },
+                *graph.id_of(*cutoff),
             )
         });
         let mut diffs = Vec::with_capacity(order.len());
@@ -672,7 +671,7 @@ impl<'w, 'a> Walk<'w, 'a> {
                 }
                 continue;
             }
-            if graph.records[cutoff].kind() == Kind::Admit && !class.auth[graph.slot[cutoff]] {
+            if graph.unauthorized_admit(cutoff, &class.auth) {
                 // No cutoff: nobody votes there.
                 for &j in here.iter().filter(|&&j| j != one) {
                     relations.set_undoes(one, j);

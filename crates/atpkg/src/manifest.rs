@@ -39,6 +39,11 @@ pub struct Index {
     /// `[[channels]]`: named, pinned program sets (`stable`/`nightly`).
     #[serde(default)]
     pub channels: Vec<Channel>,
+    /// `[trees.<program>]`: each published keyed tree's key and the build whose signed pack
+    /// carries it (`program -> key -> build`, [`crate::keyed_tree`]). No channel pins a tree; a
+    /// client asks for one by key ([`Self::tree_build`]).
+    #[serde(default)]
+    pub trees: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 /// One `[programs.<name>]` entry: where the program's release manifests live and how it may be installed.
@@ -128,6 +133,13 @@ impl Index {
             .iter()
             .find(|c| c.name == name)
             .map(|c| c.for_target(triple))
+    }
+
+    /// The build whose signed pack carries keyed tree `program`'s tree of `key`, iff the
+    /// verified index names one ([`Self::trees`]).
+    #[must_use]
+    pub fn tree_build(&self, program: &str, key: &str) -> Option<u64> {
+        self.trees.get(program)?.get(key).copied()
     }
 
     /// The named program, iff the verified index names it.
@@ -278,6 +290,14 @@ pub struct Artifact {
     /// `[artifact.provenance]`: which compiler built this row's payload, as the packer's lineage scan recorded it ([`crate::lineage`]).
     #[serde(default)]
     pub provenance: Option<Provenance>,
+    /// `keyed-tree` only: the key the tree is installed and asked for under, 64 lowercase hex
+    /// naming what it was built from ([`crate::keyed_tree`]); empty on every other row.
+    #[serde(default)]
+    pub key: String,
+    /// `keyed-tree` only: the text [`Self::key`] is the SHA-256 of, which says what the tree was
+    /// built from, signed so anyone can audit what a key covers; empty on every other row.
+    #[serde(default)]
+    pub key_inputs: String,
 }
 
 impl Artifact {
@@ -472,6 +492,11 @@ fn validate_rows(m: &PkgManifest) -> Result<(), Reject> {
     for a in &m.artifacts {
         if a.kind == "vendor-fetch" {
             return Err(Reject::RetiredKind(VENDOR_FETCH_RETIRED));
+        }
+        // A key and its inputs name a keyed tree and nothing else, and a keyed tree is always
+        // named by a key its signed inputs hash to.
+        if !crate::keyed_tree::row_is_bound(&a.kind, &a.key, &a.key_inputs) {
+            return Err(Reject::Malformed);
         }
         let release_shaped = matches!(a.protocol.as_str(), "github-release" | "https");
         if release_shaped && (a.asset.is_empty() || a.sha256.is_empty() || !a.sha512.is_empty()) {

@@ -10,7 +10,8 @@ use aterm_slog::journal::{
     decode_line, encode_frame, take, take_frames, view_of,
 };
 use aterm_slog::{
-    Actor, Conf, Cursor, Fields, GapWhy, Key, Kind, Log, Node, Op, Open, Rec, ShortId, Src, Val,
+    Actor, Conf, Cursor, DescIdent, Fields, GapWhy, Key, Kind, Log, Node, Op, Open, Rec, ShortId,
+    Src, Val,
 };
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
@@ -178,7 +179,14 @@ impl World {
 
     /// The view's variables from a read of it.
     fn read(&mut self, m: Mutant) {
-        let v = view_of(&sid(), &[self.chain()], false, m.rules).expect("a view");
+        let v = view_of(
+            &sid(),
+            DescIdent::default(),
+            &[self.chain()],
+            false,
+            m.rules,
+        )
+        .expect("a view");
         let read = v.log.read(Cursor::new(v.log.ep(), 0), usize::MAX);
         let mut recs: Vec<Rec> = read.recs.iter().map(|r| (*r).clone()).collect();
         if m.reverse_closes {

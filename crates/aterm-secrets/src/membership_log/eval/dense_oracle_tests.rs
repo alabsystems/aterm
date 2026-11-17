@@ -121,7 +121,7 @@ fn project(records: &[Record], peers: &[Peer], reference: bool) -> Projection {
             (actor, cutoff)
         })
         .collect();
-    let effective = graph.effective(&weighing);
+    let effective = graph.effective(&weighing, None);
     let mut before = BTreeSet::new();
     let flags = records
         .iter()

@@ -24,12 +24,12 @@ const TICK_MS: u64 = 500;
 /// The model's word code for a verdict.
 fn code(v: Verdict) -> i64 {
     match v {
-        Verdict::Unknown | Verdict::Walled | Verdict::Stopped => 0,
+        Verdict::Unknown | Verdict::Stopped => 0,
         Verdict::Busy => 1,
         Verdict::Idle => 2,
         Verdict::Prompt(b) if b.is_question() => 3,
         Verdict::Prompt(_) => 4,
-        Verdict::Wall(_) => 5,
+        Verdict::Wall(_) | Verdict::Walled => 5,
         Verdict::Unresponsive => 6,
         Verdict::Survey => 7,
         Verdict::Question => 8,
@@ -43,13 +43,13 @@ fn see(v: Verdict) -> &'static str {
         Verdict::Busy => "SeeBusy",
         Verdict::Prompt(b) if b.is_question() => "SeeDialog",
         Verdict::Prompt(_) => "SeeBox",
-        Verdict::Wall(_) => "SeeWall",
+        Verdict::Wall(_) | Verdict::Walled => "SeeWall",
         Verdict::Unresponsive => "SeeStall",
         Verdict::Survey => "SeeSurvey",
         Verdict::Idle => "SeeIdle",
         Verdict::Question => "SeeQuestion",
         Verdict::Gone => "SeeGone",
-        Verdict::Unknown | Verdict::Walled | Verdict::Stopped => "SeeUnknown",
+        Verdict::Unknown | Verdict::Stopped => "SeeUnknown",
     }
 }
 
@@ -557,6 +557,7 @@ pub fn handoff(
             ids: log.id_counters(),
             limits,
             at,
+            ident: aterm_slog::DescIdent::default(),
         };
         let (next, host, _) = Log::from_carry(&out.lines, adopt).expect("the carry reads");
         *log = next;
@@ -930,7 +931,7 @@ fn apply_step(m: &Model, rig: &mut Rig, step: Step) {
         }
         Step::TxRefute => {
             let kind = match rig.tracker.view(rig.now).step {
-                Some((_, ScreenStep::Wall(k), _)) => k,
+                Some((_, ScreenStep::Wall(Some(k)), _)) => k,
                 _ => WallKind::UsageSession,
             };
             let mut path = Vec::new();
@@ -1277,8 +1278,8 @@ fn settle_policy_is_the_models() {
     );
     let k = WallKind::UsageWeekly;
     assert_eq!(
-        settle_out(SettleCause::Wall(k), false),
-        (TurnOut::Wall(k), Conf::Strong)
+        settle_out(SettleCause::Wall(Some(k)), false),
+        (TurnOut::Wall(Some(k)), Conf::Strong)
     );
 }
 

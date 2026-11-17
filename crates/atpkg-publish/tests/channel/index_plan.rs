@@ -54,6 +54,7 @@ fn base(n: u64, pin: &[(&str, u64)]) -> Base {
             pin_by_target: BTreeMap::new(),
         },
         programs,
+        trees: BTreeMap::new(),
     }
 }
 
@@ -304,6 +305,76 @@ fn a_new_program_is_a_table_row_and_a_vendor_program_is_never_pinned() {
         );
         assert!(err.contains(&format!("{v} is vendor-direct")), "{err}");
     }
+}
+
+/// A keyed tree is asked for by key: neither a pin nor a target overlay names one, so the
+/// index's rows and pins are what they were.
+#[test]
+fn keyed_trees_are_never_pinned() {
+    let b = base(21, &[("ay", 1)]);
+    for t in ["llvm-tree", "trust-stage0"] {
+        let err = refused(&b, &delta(&["--pin", &format!("{t}=3")]));
+        assert!(err.contains(&format!("{t} is a keyed tree")), "{err}");
+        let err = refused(
+            &b,
+            &delta(&["--pin", "ay=2", "--target-pin", &format!("{LINUX}:{t}=3")]),
+        );
+        assert!(err.contains(&format!("{t} is a keyed tree")), "{err}");
+    }
+}
+
+/// A keyed tree is listed by key, never pinned: `--tree` adds `[trees.<program>]` rows the
+/// client reads as `Index::tree_build`, the head's rows are carried, a listed key never moves to
+/// another build, and only a keyed-tree program under a real key is listed.
+#[test]
+fn keyed_trees_are_listed_by_key_and_a_listed_key_never_moves() {
+    let k1 = "a".repeat(64);
+    let k2 = "b".repeat(64);
+    let mut b = base(21, &[("ay", 1)]);
+    b.trees
+        .insert("llvm-tree".into(), BTreeMap::from([(k1.clone(), 3_u64)]));
+    let (p, _) = ok(
+        &b,
+        &delta(&[
+            "--tree",
+            &format!("trust-stage0:{k2}=5"),
+            "--tree",
+            &format!("llvm-tree:{k1}=3"),
+        ]),
+    );
+    assert_eq!(
+        p.added_trees,
+        vec![("trust-stage0".to_string(), k2.clone(), 5)]
+    );
+    assert_eq!(
+        p.channel.pin.get("llvm-tree"),
+        None,
+        "no channel pins a tree"
+    );
+    let text = render(&p);
+    assert!(
+        text.contains(&format!("[trees.llvm-tree]\n{k1} = 3\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("[trees.trust-stage0]\n{k2} = 5\n")),
+        "{text}"
+    );
+    let parsed: atpkg::Index = aterm_toml::from_str(&text).expect("the client parses it");
+    assert_eq!(parsed.tree_build("llvm-tree", &k1), Some(3));
+    assert_eq!(parsed.tree_build("trust-stage0", &k2), Some(5));
+    assert_eq!(parsed.tree_build("llvm-tree", &k2), None);
+    assert_eq!(
+        parsed.channels[0].pin, p.channel.pin,
+        "the pins are as they were"
+    );
+
+    let err = refused(&b, &delta(&["--tree", &format!("llvm-tree:{k1}=4")]));
+    assert!(err.contains("never moves to another pack"), "{err}");
+    let err = refused(&b, &delta(&["--tree", &format!("ay:{k2}=4")]));
+    assert!(err.contains("not a keyed tree"), "{err}");
+    let err = refused(&b, &delta(&["--tree", "llvm-tree:ABC=4"]));
+    assert!(err.contains("64 lowercase hex"), "{err}");
 }
 
 const HARNESSES: [(&str, &str); 5] = [
@@ -646,6 +717,7 @@ fn index_of(p: &Plan) -> atpkg::Index {
         roster_seq: Some(p.roster_seq),
         programs: p.programs.iter().cloned().collect(),
         channels: vec![p.channel.clone()],
+        trees: p.trees.clone(),
     }
 }
 

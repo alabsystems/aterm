@@ -269,10 +269,10 @@ pub const fn past_legacy(held: usize) -> bool {
     held > LEGACY_RECORDS
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use mark::{FormatMark, Mark};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod mark {
     use crate::Error;
     #[cfg(test)]
@@ -361,7 +361,7 @@ mod mark {
         }
 
         /// Where it is: what a test's faults are keyed by ([`inject`]).
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         pub(crate) fn path(&self) -> &Path {
             &self.path
         }
@@ -408,6 +408,10 @@ mod mark {
         /// `format` is [`super::FORMAT_ONE`] (which no mark names), the mark cannot be read, or
         /// the write or its flush fails: the mark may not be stored, and the caller holds nothing
         /// that needed it.
+        ///
+        /// Unix only, as its writers are (the server, [`super::after_format_mark`]): a Windows
+        /// member reads the mark and stores none.
+        #[cfg(unix)]
         pub(crate) fn store(&self, format: u32) -> crate::Result<()> {
             if format <= super::FORMAT_ONE {
                 return Err(Error::new("format 1 is stated by no format mark"));
@@ -435,6 +439,7 @@ mod mark {
 
         /// The lock file beside the mark that [`Self::store`] holds while it reads and writes:
         /// the mark itself is replaced by a rename, so a lock on it would guard nothing.
+        #[cfg(unix)]
         fn lock_path(&self) -> PathBuf {
             let mut name = self.path.as_os_str().to_owned();
             name.push(".lock");
@@ -443,8 +448,10 @@ mod mark {
     }
 
     /// An exclusive `flock` on [`FormatMark::lock_path`], released by `LOCK_UN` when dropped.
+    #[cfg(unix)]
     struct StoreLock(std::fs::File);
 
+    #[cfg(unix)]
     impl StoreLock {
         /// Wait for it and take it.
         fn take(path: &std::path::Path) -> crate::Result<Self> {
@@ -459,6 +466,7 @@ mod mark {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for StoreLock {
         fn drop(&mut self) {
             let _ = self.0.unlock();
@@ -524,14 +532,14 @@ mod mark {
     }
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 pub(crate) use mark::{Faults, faults, inject};
 
 /// Whether the node whose log `store` holds and whose mark is `mark` has crossed.
 ///
 /// # Errors
 /// The mark's path cannot be read ([`Mark::stored`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn crossed(mark: &Mark, store: &crate::membership_log::Store) -> crate::Result<bool> {
     let held = store
         .log()
@@ -545,7 +553,7 @@ pub(crate) fn crossed(mark: &Mark, store: &crate::membership_log::Store) -> crat
 ///
 /// # Errors
 /// As [`crossed`], or the format mark cannot be read ([`FormatMark::stored`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn stated(
     mark: &Mark,
     format: &FormatMark,
@@ -597,7 +605,7 @@ pub(crate) fn after_format_mark<T>(
     write()
 }
 
-#[cfg(all(unix, test))]
+#[cfg(all(any(unix, windows), test))]
 #[path = "crossing/fixture.rs"]
 pub(crate) mod fixture;
 

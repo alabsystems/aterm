@@ -215,6 +215,13 @@ pub struct Outbox {
 
 impl Outbox {
     /// The queued intents no done marker names: what the publisher still has to settle.
+    /// Whether a published write no pass marked seen is here: the one case in which a read asks
+    /// which frontier the snapshot holds ([`laid`]).
+    #[must_use]
+    pub fn unseen(&self) -> bool {
+        self.done.iter().any(|done| !done.seen && done.op.is_some())
+    }
+
     pub fn waiting(&self) -> impl Iterator<Item = &Intent> {
         self.queued
             .iter()
@@ -263,7 +270,7 @@ impl From<io::Error> for Refused {
 /// Who reaches what is held by clippy.toml's `disallowed-methods` rows, a lint and not the type
 /// system: a call passes where its one statement carries `#[expect(clippy::disallowed_methods,
 /// reason = …)]` naming the explicit verb it is. [`OwnerAct::verb`] is called by aterm-db's
-/// `file::write::verb` (which only `aterm file`'s own entry and aterm-db's `file::rename_nick`,
+/// `file::write::verb` (which only `aterm file`'s own entry and aterm-db's `file::rename`,
 /// a rename of this Mac asked for by name, run, each under a row of its own) and by this crate's
 /// `outbox drop`; [`owner_act_for_test`] by each crate's one test
 /// helper; and the verbs that settle or remove a queued intent without one ([`File::claim`],
@@ -726,21 +733,57 @@ fn mark(snapshot: &mut Snapshot, held: &Held) {
     }
 }
 
+/// This Mac's intents a read lays over the published snapshot, in the order it lays them: each
+/// published one the snapshot does not hold (`frontier`, what it was projected from, does not
+/// show it projected), then each waiting one. A held one is only marked, never laid.
+fn laid<'a>(outbox: &'a Outbox, frontier: impl FnOnce() -> Option<Frontier>) -> Vec<&'a Intent> {
+    let unseen: Vec<&Done> = outbox
+        .done
+        .iter()
+        .filter(|done| !done.seen && done.op.is_some())
+        .collect();
+    let mut laid = Vec::new();
+    if !unseen.is_empty() {
+        let frontier = frontier();
+        laid.extend(
+            unseen
+                .into_iter()
+                .filter(|done| !done.projected(frontier.as_ref()))
+                .map(|done| &done.intent),
+        );
+    }
+    laid.extend(outbox.waiting());
+    laid
+}
+
+/// The cells, by the row key a read shows and the column, that this Mac's own writes would still
+/// change: each a read lays over the published snapshot ([`overlay`]) and each held one marks.
+pub(crate) fn pending(
+    outbox: &Outbox,
+    frontier: impl FnOnce() -> Option<Frontier>,
+) -> std::collections::BTreeSet<(String, String)> {
+    laid(outbox, frontier)
+        .into_iter()
+        .chain(outbox.held.iter().map(|held| &held.intent))
+        .flat_map(|intent| {
+            intent
+                .edits
+                .iter()
+                .map(|edit| (intent.shown_key(edit), edit.column.clone()))
+        })
+        .collect()
+}
+
 /// The snapshot a read of a file with intents answers: `published` with every waiting intent
-/// and every published one its projection does not hold yet laid over it, and every held one
-/// marked. With nothing materialized here the table is this Mac's own writes.
+/// and every published one its projection does not hold yet laid over it ([`laid`]), and every
+/// held one marked. With nothing materialized here the table is this Mac's own writes.
 pub(crate) fn overlay(
     name: &Name,
     published: Option<Snapshot>,
     outbox: &Outbox,
     frontier: impl FnOnce() -> Option<Frontier>,
 ) -> Option<Snapshot> {
-    let unseen: Vec<&Done> = outbox
-        .done
-        .iter()
-        .filter(|done| !done.seen && done.op.is_some())
-        .collect();
-    if outbox.queued.is_empty() && outbox.held.is_empty() && unseen.is_empty() {
+    if outbox.queued.is_empty() && outbox.held.is_empty() && !outbox.unseen() {
         return published;
     }
     let mut snapshot = published.unwrap_or_else(|| Snapshot {
@@ -759,15 +802,7 @@ pub(crate) fn overlay(
         handles: Vec::new(),
         rows: Vec::new(),
     });
-    if !unseen.is_empty() {
-        let frontier = frontier();
-        for done in unseen {
-            if !done.projected(frontier.as_ref()) {
-                apply(&mut snapshot, &done.intent);
-            }
-        }
-    }
-    for intent in outbox.waiting() {
+    for intent in laid(outbox, frontier) {
         apply(&mut snapshot, intent);
     }
     for held in &outbox.held {
@@ -779,43 +814,76 @@ pub(crate) fn overlay(
 impl File {
     /// This file's intents as they are on disk now. No error: a file that cannot be read is
     /// named in [`Outbox::problem`] and reads as holding nothing.
+    ///
+    /// An intent moves between the three files in two writes, and no reader holds the writers'
+    /// lock: a publisher writes its done marker or held line and then dequeues it, and a requeue
+    /// or a superseding write queues the new intent and then trims the held list. So the queued
+    /// file is read before and after the other two, until both reads list the same intents: no
+    /// move landed partway through such a read, and each intent is in a list. A file that keeps
+    /// moving is read with every intent either queued read found, which shows a write on its way
+    /// rather than none.
     #[must_use]
     pub fn outbox(&self) -> Outbox {
+        /// How many times a read is made again while writers move intents under it.
+        const AGAIN: usize = 4;
         let (root, name) = (self.root(), self.name());
-        let mut problems = Vec::new();
-        let mut take = |what: &str, lines: io::Result<usize>| match lines {
-            Ok(0) => {}
-            Ok(raw) => problems.push(format!("{what}: {raw} lines this build does not read")),
-            Err(error) => problems.push(format!("{what} not read: {error}")),
-        };
-        let held = match lines(&root.held(name), |value| held_of(value, name)) {
-            Ok(lines) => {
-                take("held intents", Ok(lines.raw.len()));
-                lines.read
-            }
-            Err(error) => {
-                take("held intents", Err(error));
-                Vec::new()
-            }
-        };
-        let done = match lines(&root.done(name), |value| done_of(value, name)) {
-            Ok(lines) => {
-                take("done markers", Ok(lines.raw.len()));
-                lines.read
-            }
-            Err(error) => {
-                take("done markers", Err(error));
-                Vec::new()
-            }
-        };
-        let queued = match lines(&root.outbox(name), |value| Intent::of(value, name)) {
-            Ok(lines) => {
-                take("outbox", Ok(lines.raw.len()));
-                lines.read
-            }
-            Err(error) => {
-                take("outbox", Err(error));
-                Vec::new()
+        let mut tries = 0;
+        let (held, done, queued, problems) = loop {
+            tries += 1;
+            let mut problems = Vec::new();
+            let mut take = |what: &str, lines: io::Result<usize>| match lines {
+                Ok(0) => {}
+                Ok(raw) => problems.push(format!("{what}: {raw} lines this build does not read")),
+                Err(error) => problems.push(format!("{what} not read: {error}")),
+            };
+            let before = lines(&root.outbox(name), |value| Intent::of(value, name))
+                .map(|lines| lines.read)
+                .unwrap_or_default();
+            let held = match lines(&root.held(name), |value| held_of(value, name)) {
+                Ok(lines) => {
+                    take("held intents", Ok(lines.raw.len()));
+                    lines.read
+                }
+                Err(error) => {
+                    take("held intents", Err(error));
+                    Vec::new()
+                }
+            };
+            let done = match lines(&root.done(name), |value| done_of(value, name)) {
+                Ok(lines) => {
+                    take("done markers", Ok(lines.raw.len()));
+                    lines.read
+                }
+                Err(error) => {
+                    take("done markers", Err(error));
+                    Vec::new()
+                }
+            };
+            let mut queued = match lines(&root.outbox(name), |value| Intent::of(value, name)) {
+                Ok(lines) => {
+                    take("outbox", Ok(lines.raw.len()));
+                    lines.read
+                }
+                Err(error) => {
+                    take("outbox", Err(error));
+                    Vec::new()
+                }
+            };
+            let ids = |list: &[Intent]| {
+                list.iter()
+                    .map(|intent| intent.id.clone())
+                    .collect::<Vec<_>>()
+            };
+            let settled = ids(&before) == ids(&queued);
+            if settled || tries == AGAIN {
+                if !settled {
+                    let gone: Vec<Intent> = before
+                        .into_iter()
+                        .filter(|intent| !queued.iter().any(|kept| kept.id == intent.id))
+                        .collect();
+                    queued.splice(0..0, gone);
+                }
+                break (held, done, queued, problems);
             }
         };
         // A held intent a later one resolves is no longer held, whatever a crash between the
@@ -1312,7 +1380,9 @@ mod write {
         /// # Errors
         /// A local file could not be read or written.
         pub fn settle_done(&self) -> io::Result<()> {
-            let frontier = self.frontier();
+            // Only the frontier the snapshot was projected from says what it holds, and only
+            // once the pass recorded its status: a write is read against the baseline at the
+            // status's revision, which holds what a marker seen says it holds.
             let (queued, held, done) = self.stored()?;
             let pending = done.read.iter().any(|done| !done.seen);
             let stale = held
@@ -1322,6 +1392,10 @@ mod write {
             if !pending && !stale && done.read.len() <= DONE_KEPT {
                 return Ok(());
             }
+            // Asked only where a marker waits on it: at rest a pass reads no snapshot here.
+            let frontier = pending
+                .then(|| self.state().and_then(|state| self.projected_at(state.rev)))
+                .flatten();
             let _lock = self.outbox_lock()?;
             let (queued, mut held, mut done) = self.stored()?;
             let waiting =

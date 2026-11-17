@@ -13,7 +13,7 @@ use crate::{
 pub(crate) const ROOT: [u8; 32] = [11; 32];
 pub(crate) const NETWORK: [u8; 16] = [7; 16];
 pub(crate) struct Fixture {
-    _directory: aterm_tempfile::TempDir,
+    _directory: crate::private_scratch::PrivateScratch,
     pub(crate) identities: Vec<Identity>,
     pub(crate) requests: Vec<Request>,
     pub(crate) eligibility: Eligibility,
@@ -143,7 +143,7 @@ impl Fixture {
             })
             .collect();
         let genesis = create(&ROOT, &eligibility, NETWORK, enrollments).unwrap();
-        let directory = aterm_tempfile::tempdir().unwrap();
+        let directory = crate::private_scratch::tempdir();
         let mut journal = Journal::open(
             directory.path(),
             Trust {
@@ -257,7 +257,7 @@ fn an_extra_outer_recipient_cannot_open_any_network_key_capsule() {
             outsider.recipient(),
         ],
     );
-    let directory = aterm_tempfile::tempdir().unwrap();
+    let directory = crate::private_scratch::tempdir();
     let mut journal = Journal::open(
         directory.path(),
         Trust {
@@ -487,7 +487,7 @@ fn later_epoch_evidence_cannot_supply_a_missing_fact_on_the_selected_basis() {
         0,
     )
     .unwrap();
-    let directory = aterm_tempfile::tempdir().unwrap();
+    let directory = crate::private_scratch::tempdir();
     let mut journal = Journal::open(
         directory.path(),
         Trust {
@@ -545,7 +545,7 @@ fn capsule_context_and_canonical_roster_checks_reject_authenticated_malformed_pa
                 fixture.identities[1].recipient(),
             ],
         );
-        let directory = aterm_tempfile::tempdir().unwrap();
+        let directory = crate::private_scratch::tempdir();
         let mut journal = Journal::open(
             directory.path(),
             Trust {

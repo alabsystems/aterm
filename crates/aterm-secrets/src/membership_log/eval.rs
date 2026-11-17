@@ -94,6 +94,7 @@
 //! came in, and one signer's records stand in the order it signed them.
 
 use super::reach::Reach;
+use super::rooted::{StubView, VIRTUAL};
 use super::{Body, Entrant, Founder, Kind, MemberId, Record, RecordId};
 use crate::age::Recipient;
 use crate::commons::binding::Binding;
@@ -107,12 +108,15 @@ use std::sync::Arc;
 mod weigh;
 
 /// What the evaluator reads: a log's held records (the genesis first, each after its parents),
-/// each one's index by id, and their reachability, all as [`super::Log`] owns them.
+/// each one's index by id, and their reachability, all as [`super::Log`] owns them; and, for a
+/// log rooted at a checkpoint, its stubs ([`super::rooted`]): a `Remove` whose cutoff a prune
+/// dropped reads it at the stub's own index ([`super::rooted::VIRTUAL`]), past every held one.
 #[derive(Clone, Copy)]
 pub(super) struct History<'a> {
     pub(super) records: &'a [Record],
     pub(super) at: &'a BTreeMap<RecordId, usize>,
     pub(super) reach: &'a Reach,
+    pub(super) stubs: Option<StubView<'a>>,
 }
 
 /// A slice of records indexed as a log indexes them, for the tests that evaluate one directly.
@@ -140,6 +144,7 @@ impl Indexed {
             records,
             at: &self.at,
             reach: &self.reach,
+            stubs: None,
         }
     }
 }
@@ -375,7 +380,8 @@ pub struct RevokingRow {
 pub struct Membership {
     members: BTreeMap<MemberId, Member>,
     chosen_labels: BTreeMap<MemberId, String>,
-    number_choices: BTreeSet<MemberId>,
+    /// Each member's latest holder-signed number choice, as it signed it.
+    number_choices: BTreeMap<MemberId, String>,
     removed: BTreeMap<MemberId, Removal>,
     removed_recipients: BTreeSet<Recipient>,
     revoking_rows: BTreeSet<RevokingRow>,
@@ -407,9 +413,15 @@ impl Membership {
     /// must follow that result too.
     pub fn label_after_choice(&self, member: &MemberId) -> Option<&str> {
         self.number_choices
-            .contains(member)
+            .contains_key(member)
             .then(|| self.label(member))
             .flatten()
+    }
+
+    /// The number `member`'s latest holder-signed choice names, as it signed it, before any
+    /// settling: [`Self::label_after_choice`] is what it became.
+    pub fn number_choice(&self, member: &MemberId) -> Option<&str> {
+        self.number_choices.get(member).map(String::as_str)
     }
 
     /// Every member, by actor.
@@ -770,7 +782,7 @@ pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelati
         weigh::CHECKED.with(|checked| checked.set(false));
         (accepted, relations)
     };
-    let named = |q: usize| (candidates[q].member, *records[candidates[q].cutoff].id());
+    let named = |q: usize| (candidates[q].member, *graph.id_of(candidates[q].cutoff));
     (
         accepted.into_iter().map(named).collect(),
         relations
@@ -789,6 +801,11 @@ pub(super) fn weigh_relations(records: &[Record], by_pairs: bool) -> NamedRelati
 #[derive(Debug)]
 pub(super) struct Effective {
     counts: Vec<bool>,
+    /// Whether each of a rooted log's stubs counts, by its index in [`super::rooted::Virtual`]:
+    /// what [`Effective::counts`] answers at a stub's position ([`VIRTUAL`]).
+    stub_counts: Vec<bool>,
+    /// The records a settled checkpoint's prune drops, by position ([`Gone`]).
+    gone: Gone,
     /// Whether each record is authorized with nothing void (`batch_may_wrap`'s negative control).
     #[cfg(any(test, debug_assertions))]
     plain: Vec<bool>,
@@ -806,9 +823,20 @@ pub(super) struct Effective {
 }
 
 impl Effective {
-    /// Whether record `index` is authorized, unvoided and not cut off by an effective removal.
+    /// Whether record `index` is authorized, unvoided, not cut off by an effective removal, and
+    /// not dropped by a settled checkpoint's prune ([`Gone`]). A stub's index
+    /// ([`VIRTUAL`]) answers for the record a prune dropped.
     pub(super) fn counts(&self, index: usize) -> bool {
-        self.counts.get(index).copied().unwrap_or(false)
+        match index.checked_sub(VIRTUAL) {
+            Some(k) => self.stub_counts.get(k).copied().unwrap_or(false),
+            None => self.counts.get(index).copied().unwrap_or(false),
+        }
+    }
+
+    /// Whether a settled checkpoint's prune drops the record at position `index`, held or a
+    /// stub's ([`Gone`]).
+    pub(super) fn is_gone(&self, index: usize) -> bool {
+        self.gone.contains(&index)
     }
 
     /// Whether record `index` counts ([`Effective::counts`]) and every Mac that holds it reads it
@@ -891,9 +919,18 @@ impl Effective {
     }
 }
 
-/// Compute [`Effective`] over `history`'s records, given its weighing.
-pub(super) fn effective_records(history: History<'_>, weighing: &Weighing) -> Effective {
-    Graph::new(history).effective(weighing)
+/// The records a settled checkpoint's prune drops, by position (a held record's index, or a
+/// stub's past [`VIRTUAL`]): none of them counts ([`super::checkpoint::gone`]).
+pub(super) type Gone = BTreeSet<usize>;
+
+/// Compute [`Effective`] over `history`'s records, given its weighing, with none of the records
+/// `gone` names counting.
+pub(super) fn effective_records(
+    history: History<'_>,
+    weighing: &Weighing,
+    gone: Option<&Gone>,
+) -> Effective {
+    Graph::new(history).effective(weighing, gone)
 }
 
 /// Founding `Genesis` or effective `Admit` [`RecordId`] that grants `binding` a seat in
@@ -943,13 +980,12 @@ pub(super) fn undo_cutoff(
     weighing: &Weighing,
     actor: &MemberId,
 ) -> Option<RecordId> {
-    let records = history.records;
     let graph = Graph::new(history);
     let mut scratch = graph.scratch();
     let plain = graph.authorized_records(&graph.no_void(), &weighing.apart.plain, &mut scratch);
     graph
         .undo_cutoff(actor, &plain, weighing, &mut scratch)
-        .map(|at| *records[at].id())
+        .map(|at| *graph.id_of(at))
 }
 
 /// Where F16's quorum `Remove` of `actor` stands ([`super::Log::undo`]); `took_effect` is left
@@ -979,7 +1015,7 @@ pub(super) fn undo(history: History<'_>, weighing: &Weighing, actor: &MemberId) 
         .collect();
     Some(Undo {
         member: *actor,
-        cutoff: *records[cutoff].id(),
+        cutoff: *graph.id_of(cutoff),
         voters,
         signed,
         took_effect: false,
@@ -1377,9 +1413,12 @@ struct Graph<'a> {
     at: &'a BTreeMap<RecordId, usize>,
     /// The log's reachability, which the graph borrows.
     reach: &'a Reach,
+    /// A rooted log's stubs, each at its index past every held record's ([`VIRTUAL`]).
+    stubs: Option<StubView<'a>>,
     #[cfg(test)]
     oracle: Option<Vec<Bits>>,
-    /// Each `Remove`'s cutoff, by record index.
+    /// Each `Remove`'s cutoff, by record index: a held record's, or a stub's where a prune
+    /// dropped it.
     cutoffs: BTreeMap<usize, usize>,
     /// The weighed records (the genesis, every `Admit` and every `Remove`), ascending: every
     /// record the weighing reads the liveness of. A weighed record's slot is its place here, and
@@ -1412,7 +1451,12 @@ struct Graph<'a> {
 
 impl<'a> Graph<'a> {
     fn new(history: History<'a>) -> Self {
-        let History { records, at, reach } = history;
+        let History {
+            records,
+            at,
+            reach,
+            stubs,
+        } = history;
         assert!(
             reach.len() == records.len() && at.len() == records.len(),
             "the index belongs to this ordered history"
@@ -1421,7 +1465,11 @@ impl<'a> Graph<'a> {
             .iter()
             .enumerate()
             .filter_map(|(i, r)| match r.body() {
-                Body::Remove { cutoff, .. } => at.get(cutoff).map(|&c| (i, c)),
+                Body::Remove { cutoff, .. } => at
+                    .get(cutoff)
+                    .copied()
+                    .or_else(|| stubs?.virt.index(cutoff))
+                    .map(|c| (i, c)),
                 _ => None,
             })
             .collect();
@@ -1509,6 +1557,7 @@ impl<'a> Graph<'a> {
             records,
             at,
             reach,
+            stubs,
             #[cfg(test)]
             oracle: None,
             cutoffs,
@@ -1533,8 +1582,12 @@ impl<'a> Graph<'a> {
         }
     }
 
-    /// Whether record `a` is in record `b`'s strict causal past.
+    /// Whether record `a` is in record `b`'s strict causal past. Either may be a stub's index
+    /// ([`VIRTUAL`]), as a dropped cutoff is; a whole log has none.
     fn before(&self, a: usize, b: usize) -> bool {
+        if (a | b) >= VIRTUAL {
+            return self.stubs.is_some_and(|stubs| stubs.before(a, b));
+        }
         #[cfg(test)]
         if let Some(past) = &self.oracle {
             return past[b].get(a);
@@ -1543,11 +1596,118 @@ impl<'a> Graph<'a> {
     }
     /// Whether record `a` is record `b` or in its causal past.
     fn upto(&self, a: usize, b: usize) -> bool {
+        if (a | b) >= VIRTUAL {
+            return a == b || self.before(a, b);
+        }
         #[cfg(test)]
         if self.oracle.is_some() {
             return a == b || self.before(a, b);
         }
         self.reach.upto(a, b)
+    }
+
+    /// The stub at index `i`, as its [`super::rooted::Virtual`] numbers it; `None` for a held
+    /// record.
+    fn stub_at(&self, i: usize) -> Option<usize> {
+        self.stubs.and_then(|stubs| stubs.virt.at(i))
+    }
+
+    /// The id of the record at index `i`, held or a stub.
+    fn id_of(&self, i: usize) -> &RecordId {
+        match (self.stubs, self.stub_at(i)) {
+            (Some(stubs), Some(k)) => &stubs.virt.ids[k],
+            _ => self.records[i].id(),
+        }
+    }
+
+    /// The signer of the record at index `i`, held or a stub.
+    fn signer_of(&self, i: usize) -> &MemberId {
+        match (self.stubs, self.stub_at(i)) {
+            (Some(stubs), Some(k)) => &stubs.virt.actor[k],
+            _ => self.records[i].actor(),
+        }
+    }
+
+    /// The signer's sequence of the record at index `i`, held or a stub.
+    fn sequence_of(&self, i: usize) -> u64 {
+        match (self.stubs, self.stub_at(i)) {
+            (Some(stubs), Some(k)) => stubs.virt.sequence[k],
+            _ => self.records[i].sequence(),
+        }
+    }
+
+    /// The compact actor of the signer of the record at index `i`, held or a stub: the no-seat
+    /// actor `actors.len()` for a signer that is no actor.
+    fn actor_of(&self, i: usize) -> usize {
+        match self.stub_at(i) {
+            Some(_) => self
+                .actor_at
+                .get(self.signer_of(i))
+                .copied()
+                .unwrap_or(self.actors.len()),
+            None => self.signer_actor[i],
+        }
+    }
+
+    /// Whether each of a rooted log's stubs ([`super::rooted`]) counts, by its index in
+    /// [`super::rooted::Virtual`], as [`Graph::effective`] counts a held record: no quorum voids
+    /// it, its signer is a member in its past under the quorums that take effect, and no standing
+    /// `Remove` of its signer cuts it. Empty for a whole log.
+    fn stub_counts(
+        &self,
+        weighing: &Weighing,
+        standing: &Standing,
+        scratch: &mut AuthScratch,
+    ) -> Vec<bool> {
+        let Some(stubs) = self.stubs else {
+            return Vec::new();
+        };
+        (0..stubs.virt.ids.len())
+            .map(|k| {
+                let v = VIRTUAL + k;
+                let signer = self.signer_of(v);
+                let void = weighing.accepted.iter().any(|&q| {
+                    let cand = &weighing.candidates[q];
+                    cand.member == *signer && !self.upto(v, cand.cutoff)
+                });
+                scratch.next_scope();
+                let authorized = self.is_member_before(
+                    self.actor_of(v),
+                    v,
+                    &weighing.void,
+                    &weighing.settled,
+                    scratch,
+                );
+                !void && authorized && !self.cut(v, &standing.removes, &standing.admits)
+            })
+            .collect()
+    }
+
+    /// A rooted log's dropped `Put`s and `Delete`s, each at its stub's index with the epoch it
+    /// names and whether it counts (`stub_counts`). Empty for a whole log.
+    fn stub_ops(&self, stub_counts: &[bool]) -> Vec<(usize, RecordId, bool)> {
+        let Some(stubs) = self.stubs else {
+            return Vec::new();
+        };
+        #[cfg(test)]
+        if super::rooted::mutant(super::rooted::Mutant::KeyedHeldOnly) {
+            return Vec::new();
+        }
+        stubs
+            .virt
+            .op_epoch
+            .iter()
+            .enumerate()
+            .filter_map(|(k, epoch)| Some((VIRTUAL + k, (*epoch)?, stub_counts[k])))
+            .collect()
+    }
+
+    /// Whether the cutoff at `i` is an `Admit` that `authorized` (by slot) leaves unauthorized:
+    /// no cutoff, so nobody votes there. A prune drops no `Admit`, so a stub never is one.
+    fn unauthorized_admit(&self, i: usize, authorized: &[bool]) -> bool {
+        self.stub_at(i).is_none()
+            && self.records[i].kind() == Kind::Admit
+            && !authorized[self.slot[i]]
     }
 
     /// Scratch for one evaluation's passes over this graph's weighed records.
@@ -1638,7 +1798,7 @@ impl<'a> Graph<'a> {
                 let Candidate { member, cutoff, .. } = &candidates[q];
                 Quorum {
                     member: *member,
-                    cutoff: *self.records[*cutoff].id(),
+                    cutoff: *self.id_of(*cutoff),
                     signers: apart.weighed[&q].counted.clone(),
                 }
             })
@@ -1870,7 +2030,7 @@ impl<'a> Graph<'a> {
         &self,
         labels: &mut BTreeMap<MemberId, String>,
         standing: &Standing,
-    ) -> (BTreeMap<MemberId, String>, BTreeSet<MemberId>) {
+    ) -> (BTreeMap<MemberId, String>, BTreeMap<MemberId, String>) {
         let unproved: BTreeSet<_> = self
             .listed()
             .iter()
@@ -1916,7 +2076,10 @@ impl<'a> Graph<'a> {
                 pending.insert(*member, (claim, name.clone()));
             }
         }
-        let number_choices = pending.keys().copied().collect();
+        let number_choices = pending
+            .iter()
+            .map(|(member, (_, name))| (*member, name.clone()))
+            .collect();
         let mut chosen = BTreeMap::new();
         loop {
             // Discard causally later claims before comparing ids. Mixing causality and ids
@@ -2601,7 +2764,7 @@ impl<'a> Graph<'a> {
         authorized: &[bool],
         scratch: &mut AuthScratch,
     ) -> Option<BTreeSet<MemberId>> {
-        if self.records[cutoff].kind() == Kind::Admit && !authorized[self.slot[cutoff]] {
+        if self.unauthorized_admit(cutoff, authorized) {
             return None;
         }
         scratch.next_scope();
@@ -3003,7 +3166,7 @@ impl<'a> Graph<'a> {
         }
     }
 
-    fn effective(self, weighing: &Weighing) -> Effective {
+    fn effective(self, weighing: &Weighing, gone: Option<&Gone>) -> Effective {
         let mut scratch = self.scratch();
         let (effects, authorized) = self.settled(weighing, &mut scratch);
         let plain = self.authorized_records(&self.no_void(), &weighing.apart.plain, &mut scratch);
@@ -3018,8 +3181,22 @@ impl<'a> Graph<'a> {
                 && authorized[i]
                 && !self.cut(i, &standing.removes, &standing.admits);
         }
+        let mut stub_counts = self.stub_counts(weighing, &standing, &mut scratch);
+        // A record a settled checkpoint's prune drops counts nowhere ([`super::rooted`]'s rule
+        // on `Remove`s behind a final cut).
+        for &at in gone.into_iter().flatten() {
+            let slot = match at.checked_sub(VIRTUAL) {
+                Some(k) => stub_counts.get_mut(k),
+                None => counts.get_mut(at),
+            };
+            if let Some(slot) = slot {
+                *slot = false;
+            }
+        }
+        let stub_ops = self.stub_ops(&stub_counts);
         let dependents = self.dependents(
             &counts,
+            &stub_ops,
             &Authority {
                 plain: &plain,
                 authorized: &authorized,
@@ -3041,6 +3218,8 @@ impl<'a> Graph<'a> {
         }
         Effective {
             counts,
+            stub_counts,
+            gone: gone.cloned().unwrap_or_default(),
             #[cfg(any(test, debug_assertions))]
             plain,
             undo_share,
@@ -3066,6 +3245,7 @@ impl<'a> Graph<'a> {
     fn dependents(
         &self,
         counts: &[bool],
+        stub_ops: &[(usize, RecordId, bool)],
         auth: &Authority<'_>,
         scratch: &mut AuthScratch,
     ) -> BTreeMap<usize, Vec<usize>> {
@@ -3086,11 +3266,24 @@ impl<'a> Graph<'a> {
         // there, by slot.
         let mut views: BTreeMap<Vec<usize>, (Vec<bool>, Authorization)> = BTreeMap::new();
         let no_void = self.no_void();
-        for (d, record) in self.records.iter().enumerate().skip(1) {
-            let (Body::Put { epoch, .. } | Body::Delete { epoch, .. }) = record.body() else {
-                continue;
-            };
-            if !counts[d] {
+        // The held `Put`s and `Delete`s, then a rooted log's dropped ones at their stubs'
+        // indexes ([`VIRTUAL`]): a write a prune dropped depends on its epoch as in the whole log.
+        let held_ops =
+            self.records
+                .iter()
+                .enumerate()
+                .skip(1)
+                .filter_map(|(d, record)| match record.body() {
+                    Body::Put { epoch, .. } | Body::Delete { epoch, .. } => {
+                        Some((d, epoch, counts[d]))
+                    }
+                    _ => None,
+                });
+        let dropped_ops = stub_ops
+            .iter()
+            .map(|(v, epoch, counts)| (*v, epoch, *counts));
+        for (d, epoch, counts_d) in held_ops.chain(dropped_ops) {
+            if !counts_d {
                 continue;
             }
             let Some(&e) = self.at.get(epoch) else {
@@ -3163,11 +3356,11 @@ impl<'a> Graph<'a> {
             || !member_signed(e)
             || !matches!(self.records[e].body(), Body::Epoch { .. })
             || !self.before(e, d)
-            || self.signer(d)[..32] == self.signer(e)[..32]
+            || self.signer_of(d)[..32] == self.signer(e)[..32]
         {
             return false;
         }
-        let writer = self.signer_actor[d];
+        let writer = self.actor_of(d);
         if !self.is_founder[writer]
             && !self.admits_of[writer]
                 .iter()
@@ -3332,10 +3525,26 @@ impl<'a> Graph<'a> {
         scratch: &mut AuthScratch,
     ) -> Option<usize> {
         let n = self.records.len();
-        let mine: Vec<usize> = (1..n).filter(|&i| self.signer(i) == actor).collect();
+        let held_mine: Vec<usize> = (1..n).filter(|&i| self.signer(i) == actor).collect();
+        // In a rooted log, `actor`'s records a prune dropped stand at their stubs' indexes: the
+        // cutoff is its last record before the first contested act, held or dropped, as the whole
+        // log reads it. A prune drops no `Admit` or `Remove`, so every act is held.
+        let stubs: Vec<usize> = self.stubs.map_or_else(Vec::new, |stubs| {
+            (0..stubs.virt.ids.len()).map(|k| VIRTUAL + k).collect()
+        });
+        let mine: Vec<usize> = held_mine
+            .iter()
+            .copied()
+            .chain(
+                stubs
+                    .iter()
+                    .copied()
+                    .filter(|&v| self.signer_of(v) == actor),
+            )
+            .collect();
         let mut let_in: BTreeSet<MemberId> = BTreeSet::new();
         let mut acts: Vec<usize> = Vec::new();
-        for &i in &mine {
+        for &i in &held_mine {
             match self.records[i].body() {
                 Body::Admit { entrant, .. } => {
                     if entrant.member() != *actor {
@@ -3369,8 +3578,29 @@ impl<'a> Graph<'a> {
             })
             .collect();
         let mut acknowledged: Vec<usize> = Vec::new();
-        for (r, &authorized) in plain.iter().enumerate().skip(1) {
-            let signer = self.signer(r);
+        // A record a prune dropped acknowledged what it built on in the whole log, so a rooted
+        // log reads it at its stub: its authorization with nothing void reads only the weighed
+        // records in its past, which a prune keeps.
+        let no_void = self.no_void();
+        let dropped_plain: Vec<(usize, bool)> = stubs
+            .iter()
+            .map(|&v| {
+                scratch.next_scope();
+                let signer = self.actor_at.get(self.signer_of(v)).copied();
+                let signer = signer.unwrap_or(self.actors.len());
+                let plain =
+                    self.is_member_before(signer, v, &no_void, &weighing.apart.plain, scratch);
+                (v, plain)
+            })
+            .collect();
+        let readers = plain
+            .iter()
+            .copied()
+            .enumerate()
+            .skip(1)
+            .chain(dropped_plain);
+        for (r, authorized) in readers {
+            let signer = self.signer_of(r);
             if !authorized
                 || signer == actor
                 || let_in.contains(signer)
@@ -3406,8 +3636,9 @@ impl<'a> Graph<'a> {
                 .copied()
                 .filter(|&i| self.before(i, first))
                 .max_by(|&a, &b| {
-                    let (a, b) = (&self.records[a], &self.records[b]);
-                    a.sequence().cmp(&b.sequence()).then(b.id().cmp(a.id()))
+                    self.sequence_of(a)
+                        .cmp(&self.sequence_of(b))
+                        .then(self.id_of(b).cmp(self.id_of(a)))
                 });
             before.or_else(|| {
                 let founder = self.founders().any(|seat| seat.member() == *actor);
@@ -3423,7 +3654,6 @@ impl<'a> Graph<'a> {
                     .min_by(|&a, &b| self.records[a].id().cmp(self.records[b].id()))
             })
         };
-        let no_void = self.no_void();
         let mut reachable = |cutoff: usize| -> bool {
             let Some(members) =
                 self.members_at_cutoff(cutoff, &no_void, &weighing.apart.plain, scratch)
@@ -3467,7 +3697,7 @@ impl<'a> Graph<'a> {
         removes: &BTreeMap<MemberId, Vec<usize>>,
         admits: &BTreeMap<MemberId, Vec<usize>>,
     ) -> bool {
-        let signer = self.signer(i);
+        let signer = self.signer_of(i);
         let restored_after = |r: usize| {
             admits.get(signer).is_some_and(|entries| {
                 entries

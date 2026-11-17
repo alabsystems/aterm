@@ -10487,6 +10487,11 @@ impl Bridge {
             self.fx
                 .mutant(crate::sim::world::Mutant::ReadBackFromTheAttachHead),
         );
+        #[cfg(test)]
+        self.state.rewitness_keeps_the_head(
+            self.fx
+                .mutant(crate::sim::world::Mutant::RewitnessKeepsTheOldHead),
+        );
         let keep_below = keep_below.map(|f| f.min(head));
         let kept = |off: u64| keep_below.is_some_and(|f| off < f);
         #[cfg(test)]

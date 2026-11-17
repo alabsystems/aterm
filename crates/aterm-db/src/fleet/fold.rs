@@ -284,14 +284,29 @@ fn machines_by_name(lab: &LabView) -> BTreeMap<&str, Option<&str>> {
     best.into_iter().map(|(name, (_, pk))| (name, pk)).collect()
 }
 
-/// Each account label and legacy label to the one account it names; a name two accounts share
-/// names neither.
-fn accounts_by_name(lab: &LabView) -> BTreeMap<&str, Option<&str>> {
-    let mut by_name: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+/// Each name an account goes by to the one account it names; a name two accounts share names
+/// neither. The names: its slug; and the labels a Mac's roster row of it may carry, which a
+/// session reports where its footer read no address: its reserved slug, which a row a sync adds
+/// takes (`keys::reserved_slug`), the default `<cli>-<6 hex>` label an earlier build gave rows
+/// until SF-10 re-keys them (`keys::earlier_row_label`), and its legacy label.
+fn accounts_by_name(lab: &LabView) -> BTreeMap<String, Option<&str>> {
+    let mut by_name: BTreeMap<String, Option<&str>> = BTreeMap::new();
     for account in lab.accounts.values() {
-        for name in account.label.iter().chain(account.legacy_label.iter()) {
+        let slug = Some(account.slug.clone()).filter(|slug| !slug.is_empty());
+        let rows = account.realm.as_deref().into_iter().flat_map(|realm| {
+            [
+                Some(keys::reserved_slug(realm, &account.pk)),
+                keys::earlier_row_label(realm, &account.pk),
+            ]
+        });
+        let names: BTreeSet<String> = slug
+            .into_iter()
+            .chain(rows.flatten())
+            .chain(account.legacy_label.clone())
+            .collect();
+        for name in names {
             by_name
-                .entry(name.as_str())
+                .entry(name)
                 .and_modify(|pk| {
                     if *pk != Some(account.pk.as_str()) {
                         *pk = None;
@@ -319,7 +334,7 @@ const EVERY_REALM: &[&str] = &[
 /// only when exactly one answers), a label by the one account that goes by it.
 fn resolve(
     lab: &LabView,
-    by_name: &BTreeMap<&str, Option<&str>>,
+    by_name: &BTreeMap<String, Option<&str>>,
     harness: Harness,
     word: &AccountWord,
 ) -> Option<String> {
@@ -1085,7 +1100,7 @@ pub fn fold(inputs: &Inputs, now_ms: u64) -> Folded {
         accounts.push(AccountRow {
             account: account.pk.clone(),
             provider: account.provider.clone(),
-            slug: account.label.clone(),
+            slug: lab.and_then(|lab| lab.slug(pk)).map(str::to_owned),
             login: account.login.as_deref().map(str::to_ascii_lowercase),
             status: if account.live {
                 status_word(ACCOUNT_STATUS, account.status.as_deref())

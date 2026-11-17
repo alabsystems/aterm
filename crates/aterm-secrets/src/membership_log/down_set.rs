@@ -164,11 +164,11 @@ impl Search<'_> {
     /// a single record, hashed before), those of the newest records first.
     fn parents(&mut self) -> ControlFlow<End> {
         let log = self.log;
-        for record in log.order.iter().rev() {
+        for (i, record) in log.order.iter().enumerate().rev() {
             if record.parents().len() < 2 {
                 continue;
             }
-            let newest = self.newest(log.indexes(record.parents()))?;
+            let newest = self.newest(log.placed_parents(i).collect())?;
             if newest.len() >= 2 {
                 self.hash(newest.iter())?;
             }
@@ -305,13 +305,9 @@ impl Peel {
         let parents: Vec<Vec<u32>> = log
             .order
             .iter()
-            .map(|record| {
-                let mut at: Vec<u32> = record
-                    .parents()
-                    .iter()
-                    .filter_map(|parent| log.held.get(parent))
-                    .map(|at| *at as u32)
-                    .collect();
+            .enumerate()
+            .map(|(i, _)| {
+                let mut at: Vec<u32> = log.placed_parents(i).map(|at| at as u32).collect();
                 at.sort_unstable();
                 at.dedup();
                 for parent in &at {

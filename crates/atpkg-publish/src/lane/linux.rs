@@ -260,9 +260,12 @@ impl Class {
             return Self::Vendor;
         }
         match def.map(|d| d.shape) {
-            Some(Shape::Plain {
-                harness: Some(_), ..
-            }) => Self::AppleOnly,
+            Some(
+                Shape::Plain {
+                    harness: Some(_), ..
+                }
+                | Shape::Tree(_),
+            ) => Self::AppleOnly,
             Some(Shape::Plain { .. }) => Self::Plain,
             Some(Shape::Bundle(_)) => Self::Bundle,
             Some(Shape::Bottle(b)) if !b.linux.is_empty() => Self::Bottle,

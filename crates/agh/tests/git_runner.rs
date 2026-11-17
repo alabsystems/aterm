@@ -1976,8 +1976,9 @@ fn native_push_incremental_preserves_raw_signed_objects_and_ignores_source_graft
 
 /// A real fixture push supplies the objects; its receive reply is replaced once.
 /// Restoring BEFORE models receive failure before commit. Keeping AFTER models
-/// a committed transaction whose reply was lost. The protected reason is the
-/// negative control: it must not read or retry.
+/// a committed transaction whose reply was lost. Another writer's main on top
+/// of ours leaves the outcome unknown and the intent open. The protected reason
+/// is the negative control: it must not read or retry.
 #[test]
 fn native_push_receive_failures_reread_before_retrying() {
     use agh::policy::{RouteRequest, RouteTarget};
@@ -2062,14 +2063,29 @@ fn native_push_receive_failures_reread_before_retrying() {
             .unwrap()
             .into_result();
         if stalled {
+            use agh::journal::IntentStore as _;
             let error = result.unwrap_err();
             assert_eq!(
                 (error.kind, error.side_effect),
-                (Kind::CouldNotRun, SideEffect::None)
+                (Kind::OutcomeUnknown, SideEffect::Unknown)
             );
             assert!(error.why.contains("no remote ref progress"));
+            assert_eq!(
+                journal.open().unwrap().len(),
+                1,
+                "BEFORE after an uncertain receive does not close its intent"
+            );
         } else if conflict {
-            assert_eq!(result.unwrap_err().kind, Kind::Conflict);
+            use agh::journal::IntentStore as _;
+            // Another writer moved main on top of our receive: the send's
+            // effect is unknown, so the intent stays open (review R1).
+            let error = result.unwrap_err();
+            assert_eq!(
+                (error.kind, error.side_effect),
+                (Kind::OutcomeUnknown, SideEffect::Unknown),
+                "{error:?}"
+            );
+            assert_eq!(journal.open().unwrap().len(), 1);
         } else if reason == "failed" {
             result.expect("receive failure converges from freshly observed refs");
             assert_eq!(
@@ -3121,7 +3137,16 @@ fn a_fetch_refuses_rewrites_in_each_worktree_config_without_following_includes()
         let original = std::fs::read(&config).unwrap();
         for (key, value, expected) in rows {
             host_git(dir, &["config", "--worktree", "--no-includes", key, value]);
-            for operation in [GitRun::check_local(&slug, dir), GitRun::fetch(&slug, dir)] {
+            // A repository agh only reads objects from may set a hook path, which no child
+            // follows; a clone it fetches into may not.
+            let screened = if key == "core.hooksPath" {
+                gh.run_git(&GitRun::check_local(&slug, dir))
+                    .unwrap_or_else(|e| panic!("{key} in a read-only source: {}", e.why));
+                vec![GitRun::fetch(&slug, dir)]
+            } else {
+                vec![GitRun::check_local(&slug, dir), GitRun::fetch(&slug, dir)]
+            };
+            for operation in screened {
                 let error = gh
                     .run_git(&operation)
                     .expect_err("worktree rewrite")
@@ -4895,6 +4920,120 @@ fn authenticated_git_keeps_its_wall_bound() {
 }
 
 #[test]
+fn an_exact_ref_read_refuses_a_retained_tail_that_would_hide_its_target() {
+    let world = World::canonical("git-exact-ref-complete");
+    let reference = "refs/heads/main";
+    let exact = format!("{}\t{reference}\n", common::MAIN_SHA);
+    let mut advertisement = exact.clone();
+    for i in 0..512 {
+        let prefix = format!("refs/x{i:04}/");
+        let suffix = format!("/{reference}");
+        let padding = "a".repeat(128 - 42 - prefix.len() - suffix.len());
+        advertisement.push_str(&format!(
+            "{}\t{prefix}{padding}{suffix}\n",
+            common::MAIN_SHA,
+        ));
+    }
+    let tail = &advertisement[exact.len()..];
+    assert_eq!(tail.len(), 64 * 1024);
+    assert!(
+        agh::git::advertised_refs(tail, Some(reference))
+            .unwrap()
+            .is_empty(),
+        "the aligned tail alone looks like a complete absence observation"
+    );
+    let fx = Arc::new(Fx::simulated(live_start()).with_git_answers_for_tests(vec![
+        git_answer(0, advertisement.as_bytes(), ""),
+        git_answer(0, exact.as_bytes(), ""),
+    ]));
+    let gh = git_builder(
+        world.router.clone(),
+        common::endpoints(&world.fake),
+        &world.dirs,
+        git_env(),
+        live_start(),
+    )
+    .fx(fx.clone())
+    .build();
+    let run = GitRun::ls_remote(&common::slug("fixture-dev/app"), Some(reference));
+    let error = gh
+        .run_git(&run)
+        .expect_err("oversized exact ref observation");
+    assert_eq!(error.kind, Kind::CouldNotRun);
+    assert_eq!(error.sub, agh::Sub::Protocol);
+    assert_eq!(error.side_effect, SideEffect::None);
+    let complete = gh.run_git(&run).expect("a complete exact ref observation");
+    let refs = agh::git::advertised_refs(&complete.stdout, Some(reference)).unwrap();
+    assert_eq!(
+        refs.get(reference).map(String::as_str),
+        Some(common::MAIN_SHA)
+    );
+    assert_eq!(fx.git_answers_remaining_for_tests(), Some(0));
+}
+
+#[test]
+fn native_recovery_never_treats_an_advertised_zero_oid_as_an_absent_ref() {
+    use agh::github::refs::{AtomicRefBatch, RefUpdate};
+    use agh::journal::{IntentDraft, IntentStore as _, IntentWriter};
+    use agh::policy::{RouteRequest, RouteTarget};
+    use agh::write::WriteOp;
+
+    let world = World::canonical("native-recovery-zero");
+    let reference = "refs/attest/recovery";
+    let zero = "0".repeat(40);
+    let advertisement = format!("{zero}\t{reference}\n");
+    let fx = Arc::new(
+        Fx::simulated(live_start()).with_git_answers_for_tests(vec![git_answer(
+            0,
+            advertisement.as_bytes(),
+            "",
+        )]),
+    );
+    let gh = git_builder(
+        world.router.clone(),
+        common::endpoints(&world.fake),
+        &world.dirs,
+        git_env(),
+        live_start(),
+    )
+    .fx(fx.clone())
+    .build();
+    let slug = common::slug("fixture-dev/app");
+    let permit = common::permit(&gh, &RouteRequest::write(RouteTarget::Repo(slug.clone())));
+    let batch = AtomicRefBatch::new(vec![RefUpdate {
+        reference: reference.into(),
+        before: zero,
+        after: common::MAIN_SHA.into(),
+    }])
+    .unwrap();
+    let mut writer = IntentWriter::current().unwrap();
+    let IntentWriter::Tracked { agh, .. } = &mut writer else {
+        panic!("current writer must track native child custody");
+    };
+    agh.start ^= 1;
+    let mut draft = IntentDraft::new(
+        WriteOp::RefUpdateAtomic,
+        &slug,
+        &permit,
+        "fixture-fingerprint",
+        "atomic refs",
+    )
+    .with_request(format!("sha256:{} 1", "0".repeat(64)))
+    .with_refs(batch.updates().to_vec());
+    draft.writer = Some(writer);
+    let journal = gh.journal(&slug).unwrap();
+    let id = journal.begin(&draft).unwrap();
+    let error = gh
+        .refs(&slug)
+        .push_atomic(&permit, world.path(), &batch, &journal)
+        .expect_err("an existing zero object is not an absence observation");
+    assert_eq!(error.kind, Kind::OutcomeUnknown);
+    assert_eq!(error.side_effect, SideEffect::None);
+    assert!(journal.view(&id).unwrap().unwrap().open);
+    assert_eq!(fx.git_answers_remaining_for_tests(), Some(0));
+}
+
+#[test]
 fn anonymous_git_404_is_final_and_does_not_consume_the_next_answer() {
     let world = World::canonical("git-retry-404");
     let (gh, fx) = scripted_anonymous_git(
@@ -5550,13 +5689,39 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
         .unwrap()
         .into_result()
         .expect_err("receive transaction made no progress while its ref stayed locked");
-    assert_eq!(refused.kind, Kind::CouldNotRun);
-    assert!(refused.why.contains("no remote ref progress"));
+    assert_eq!(
+        (refused.kind, refused.side_effect),
+        (Kind::OutcomeUnknown, SideEffect::Unknown),
+        "{refused:?}"
+    );
+    assert!(
+        refused.why.contains("no remote ref progress"),
+        "{refused:?}"
+    );
     assert_eq!(
         host_git(backend.repository(), &["show-ref"]),
         host_git(&seed, &["show-ref"])
     );
-    assert!(journal.open().unwrap().is_empty());
+    assert_eq!(journal.open().unwrap().len(), 1);
+    let native = journal
+        .latest(agh::write::WriteOp::RefUpdateAtomic, "atomic refs")
+        .unwrap()
+        .unwrap();
+    let writer = native.intent.writer.unwrap();
+    assert_eq!(
+        writer.frontend(),
+        agh::journal::WriterProcess::read(std::process::id()).unwrap()
+    );
+    let agh::journal::IntentWriter::Tracked {
+        agh,
+        git: Some(git),
+        ..
+    } = writer
+    else {
+        panic!("a released native writer must record its child");
+    };
+    assert_ne!(git.pid, agh.pid);
+    assert_eq!(native.intent.refs, batch.updates());
     assert!(
         backend
             .seen()
@@ -5564,6 +5729,11 @@ fn native_http_objects_atomic_refusal_and_lost_reply_use_real_git_and_helper() {
             .any(|r| r.post && r.service == Some(Service::Receive) && r.backend_attempted)
     );
     std::fs::remove_file(&lock).unwrap();
+
+    // The generic transaction failure did not prove this receive unsent. Keep
+    // its intent open until the fixture's operator explicitly retracts it;
+    // the live retry loop must never manufacture NeverSent from BEFORE reads.
+    journal.retract(&native.intent.id).unwrap();
 
     gh.refs(&slug)
         .push_atomic(&permit, &source, &batch, &journal)

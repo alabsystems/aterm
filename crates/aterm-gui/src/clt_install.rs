@@ -801,6 +801,8 @@ pub(crate) struct Terminal {
     installer_seen: bool,
     /// How the program ended was read and acted on ([`App::developer_tools_install_ended`]).
     ended: bool,
+    /// A successful current attempt waiting for another tab before it can close.
+    close_when_safe: bool,
     /// The window already wrote the tab's last line (its install never started), so its end
     /// adds none.
     told: bool,
@@ -868,6 +870,7 @@ impl Terminal {
             receipt,
             installer_seen: false,
             ended: false,
+            close_when_safe: false,
             told: false,
             claim: None,
             stop_sent: false,
@@ -1134,9 +1137,14 @@ impl RootSteps {
 /// its image or plist missing or not this build's, or its service stopped; a running image of
 /// the source's own signing team adopts with no password, and a job launchd lists switched off
 /// stays the person's, owing nothing), or `spotlight`, a folder of this account's home besides
-/// Documents and Desktop that setup has never excluded from Spotlight nor failed to, which is
-/// `aterm init`'s own reading (`aterm_machines::init_spotlight::scope_owed`). A step that cannot
-/// be read is not owed: no password is asked for want of a reading. Only macOS reads it.
+/// Documents and Desktop still indexed in a home setup's password has never scoped (a folder
+/// made since a password scoped it waits for the next root transaction and asks nothing by
+/// itself), which is the reading every `aterm init` shares
+/// (`aterm_machines::init_spotlight::automatic_scope_owed`).
+/// A step that cannot be read is not owed: no password is asked for want of a reading. Only
+/// macOS reads it. [`read_root_steps`] then leaves out the broker and developer mode where a
+/// root apply already failed at them for good with the inputs they read now
+/// (`aterm_types::macos_setup::refused`), as `aterm init` does for a run nobody asked for.
 #[cfg(any(target_os = "macos", all(test, unix)))]
 pub(crate) fn root_steps_owed_by(
     mode: aterm_containment::consent::DebuggerMode,
@@ -1193,13 +1201,25 @@ pub(crate) fn read_root_steps() -> bool {
                 let refused =
                     std::fs::symlink_metadata(aterm_types::macos_setup::ADMITTED_NAME_RULE_REFUSED)
                         .is_ok();
+                // A step a root apply already failed at for good, with the inputs it reads now, is
+                // not asked for by itself again (`aterm_types::macos_setup::refused`).
                 let broker = aterm_uds::lan::install::owed_here(
                     || aterm_secrets::service::system_job_running(aterm_uds::lan::LABEL),
                     || aterm_uds::launchd::system_job_switched_off(aterm_uds::lan::LABEL),
-                );
+                ) && !aterm_types::macos_setup::refused::broker_stands_here();
                 let spotlight = aterm_types::macos_setup::spotlight_scope::automatic_owed_here();
-                let owed =
+                let mut owed =
                     root_steps_owed_by(debugger.mode, member, rule, refused, broker, spotlight);
+                if owed.debugger
+                    && aterm_types::macos_setup::refused::developer_mode_stands_here(
+                        &aterm_types::macos_setup::refused::developer_mode_key(
+                            debugger.mode == aterm_containment::consent::DebuggerMode::Enabled,
+                            uid,
+                        ),
+                    )
+                {
+                    owed.debugger = false;
+                }
                 aterm_log::info!("System State: setup's one Mac password owes this Mac: {owed:?}");
                 let _ = crate::workstation_setup::send_setup_wake(Wake::RootStepsOwed(owed));
             }
@@ -2557,12 +2577,34 @@ impl App {
         // itself and no tab is left for a person to close (nux round 9, item 12); an older one's
         // late end keeps its tab and its result. The last tab of its window stays, since closing
         // that would end the window.
-        if current
-            && matches!(exit, Some(aterm_pty::ChildExit::Code(0)))
-            && !self.close_ends_window(session)
-            && let Err(why) = self.close_session_by_id(session)
-        {
-            aterm_log::info!("System State: the Mac Setup tab stays open: {why}");
+        if current && matches!(exit, Some(aterm_pty::ChildExit::Code(0))) {
+            if let Some(terminal) = self
+                .workstation_setup
+                .developer_tools_session
+                .iter_mut()
+                .find(|terminal| terminal.session == session)
+            {
+                terminal.close_when_safe = true;
+            }
+            self.close_successful_developer_tools_tabs();
+        }
+    }
+
+    /// Retry successful tabs retained while they were their window's last tab.
+    pub(crate) fn close_successful_developer_tools_tabs(&mut self) {
+        let sessions: Vec<_> = self
+            .workstation_setup
+            .developer_tools_session
+            .iter()
+            .filter(|terminal| terminal.close_when_safe)
+            .map(|terminal| terminal.session)
+            .collect();
+        for session in sessions {
+            if !self.close_ends_window(session)
+                && let Err(why) = self.close_session_by_id(session)
+            {
+                aterm_log::info!("System State: the Mac Setup tab stays open: {why}");
+            }
         }
     }
 

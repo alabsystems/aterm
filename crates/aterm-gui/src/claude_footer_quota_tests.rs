@@ -892,6 +892,7 @@ fn the_quota_row_costs_nothing_at_rest() {
             wall: Some(Wall {
                 label: "7d",
                 resets: "Sat 10:00".into(),
+                resets_at: 0,
             }),
             ..probe::usage(48_000_000).expect("usage")
         })

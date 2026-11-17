@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 const ENTRIES: usize = 1_000_000;
 const DEPTH: usize = 64;
+/// How long one walk may take ([`Budget::begin_walk`]).
 const ELAPSED: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -247,6 +248,8 @@ impl Directory {
     }
 }
 
+/// What one custody observation may walk: [`ENTRIES`] entries across all its walks, [`DEPTH`]
+/// deep, each walk within [`ELAPSED`] of its own start.
 pub(super) struct Budget {
     entries: usize,
     start: Instant,
@@ -258,6 +261,19 @@ impl Budget {
             entries: 0,
             start: Instant::now(),
         }
+    }
+
+    /// A budget whose walk's clock started at `start`.
+    #[cfg(test)]
+    pub(super) fn started(start: Instant) -> Self {
+        Self { entries: 0, start }
+    }
+
+    /// Starts one walk's clock. [`ELAPSED`] bounds each walk alone, a hang detector, never a
+    /// proof's walks and the git runs between them together, which a loaded Mac outlasts while
+    /// every step keeps working; the entry bound still spans them all.
+    pub(super) fn begin_walk(&mut self) {
+        self.start = Instant::now();
     }
 
     fn entry(&mut self) -> io::Result<()> {

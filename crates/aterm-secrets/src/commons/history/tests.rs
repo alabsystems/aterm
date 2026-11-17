@@ -179,7 +179,7 @@ fn handoff_scenario(action: &str) -> bool {
         }
         "Forked" | "DiscardedIssuance" => {
             // Fork at the genesis so the handoff's issuance node can be discarded.
-            let dir = aterm_tempfile::tempdir().unwrap();
+            let dir = crate::private_scratch::tempdir();
             let mut alternate = Journal::open(dir.path(), f.journal.trust()).unwrap();
             alternate.ingest(f.genesis.bytes()).unwrap();
             let grants = (0..2)

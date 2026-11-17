@@ -9,8 +9,11 @@
 //! Commons by default reads the same approvers ([`approvers`]) before it publishes.
 
 use super::{Error, Paths};
+#[cfg(unix)]
 use crate::service::{self, Job};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// A release number: `MAJOR.MINOR.PATCH`.
 pub(super) type Version = (u64, u64, u64);
@@ -105,6 +108,7 @@ pub(super) fn judge(from: &str, to: &str, own: &Own, running: &Running) -> crate
 /// (`running_program` of its pid), and the one its unit starts next (`unit_program`) where that
 /// differs. Why none are named where the job's state is unknown, or an installed job's program
 /// cannot be named at all: an unchecked approver is the one each reader of this exists for.
+#[cfg(unix)]
 pub(super) fn programs(
     state: crate::Result<service::State>,
     running_program: &dyn Fn(u32) -> Option<PathBuf>,
@@ -185,6 +189,7 @@ pub(super) fn check(paths: &Paths, from: &str, to: &str) -> crate::Result<()> {
 /// This Mac's approvers: each program its subscriber runs or starts next ([`programs`]), with
 /// the release its `--version` names, `own`'s where it is this program. Why they cannot be read
 /// where [`programs`] says.
+#[cfg(unix)]
 pub(super) fn approvers(paths: &Paths, own: &Own) -> Result<Vec<Running>, String> {
     #[cfg(test)]
     if let Some(played) = PLAYED.with(|played| played.borrow().clone()) {
@@ -209,6 +214,19 @@ pub(super) fn approvers(paths: &Paths, own: &Own) -> Result<Vec<Running>, String
             }
         })
         .collect())
+}
+
+/// This Mac's approvers off Unix: none. The subscriber that approves is a job only launchd or
+/// systemd runs (`crate::service`), and no build here installs one, so no older program here
+/// reads the locker a publish rewrites.
+#[cfg(not(unix))]
+pub(super) fn approvers(paths: &Paths, own: &Own) -> Result<Vec<Running>, String> {
+    #[cfg(test)]
+    if let Some(played) = PLAYED.with(|played| played.borrow().clone()) {
+        return Ok(played);
+    }
+    let _ = (paths, own);
+    Ok(Vec::new())
 }
 
 /// [`judge`] over each of the subscriber's programs. A running program refused while the one its
@@ -251,6 +269,7 @@ pub(super) fn first_reader(custody: &str, own: Version) -> Option<Version> {
 /// Why the approver in process `pid` cannot read an admin locker in format `custody`: its
 /// program is an older release than [`first_reader`]. `None` where it can, it is this program,
 /// or its program or release cannot be read.
+#[cfg(unix)]
 pub(super) fn unreadable_by(pid: u32, custody: &str) -> Option<String> {
     let own = own().ok()?;
     let need = first_reader(custody, own.version)?;
@@ -275,6 +294,7 @@ fn canonical(path: PathBuf) -> PathBuf {
 }
 
 /// The executable the kernel records for `pid`.
+#[cfg(unix)]
 fn program_of(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -292,6 +312,7 @@ fn program_of(pid: u32) -> Option<PathBuf> {
 }
 
 /// The release `program --version` names.
+#[cfg(unix)]
 pub(super) fn version_of(program: &Path) -> Result<Version, String> {
     crate::service::program_release(program).map_err(|error| error.to_string())
 }

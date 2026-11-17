@@ -2,6 +2,9 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
+#[path = "run_output_proof_tests.rs"]
+mod output_proof;
+
 /// A stall report names the credential-free operation and its exact internal phase, without
 /// copying ref rows or raw argv into the diagnostic.
 #[test]
@@ -92,6 +95,49 @@ fn the_config_screen_names_every_rewriting_key_and_no_other() {
     }
 }
 
+use super::ConfigAccess;
+
+const ACCESSES: [ConfigAccess; 3] = [
+    ConfigAccess::Write,
+    ConfigAccess::Read,
+    ConfigAccess::ObjectSource,
+];
+
+/// RL-30: a repository agh only reads objects from may set exactly the keys a word on every
+/// child makes inert, in any spelling; a clone it fetches into or writes may not, and every
+/// other guarded key stays refused for an object source too.
+#[test]
+fn only_an_object_source_may_set_the_keys_every_child_overrides() {
+    let verdict = |key: &str, access| -> aterm_json::Value {
+        aterm_json::from_slice(&super::unix::project_config_names(
+            format!("core.bare\0{key}\0").as_bytes(),
+            access,
+        ))
+        .unwrap()
+    };
+    let allowed = aterm_json::json!({"Allowed": {"keys": 2}});
+    for key in ["core.hooksPath", "CORE.FSMONITOR", "core.sshcommand"] {
+        assert_eq!(verdict(key, ConfigAccess::ObjectSource), allowed, "{key}");
+        for access in [ConfigAccess::Read, ConfigAccess::Write] {
+            assert_ne!(verdict(key, access), allowed, "{key} {access:?}");
+        }
+    }
+    for key in [
+        "url.https://x/.insteadOf",
+        "core.gitProxy",
+        "core.alternateRefsCommand",
+        "remote.origin.uploadpack",
+        "remote.origin.promisor",
+        "extensions.partialClone",
+        "hook.x.command",
+        "credential.helper",
+        "include.path",
+        "protocol.ext.allow",
+    ] {
+        assert_ne!(verdict(key, ConfigAccess::ObjectSource), allowed, "{key}");
+    }
+}
+
 #[test]
 fn http_transport_tuning_passes_the_config_screen() {
     // Independent of the implementation's allowlist: restoring the blanket HTTP refusal
@@ -108,11 +154,11 @@ fn http_transport_tuning_passes_the_config_screen() {
     ] {
         for prefix in ["http.", "HTTP.https://github.com/owner/repo.git."] {
             let key = format!("{prefix}{var}");
-            for read_only in [false, true] {
+            for access in ACCESSES {
                 let project = |key: &str| {
                     super::unix::project_config_names(
                         format!("core.bare\0{key}\0").as_bytes(),
-                        read_only,
+                        access,
                     )
                 };
                 let allowed: aterm_json::Value = aterm_json::from_slice(&project(&key)).unwrap();
@@ -180,9 +226,9 @@ fn http_security_protocol_and_unknown_options_stay_refused() {
     ] {
         for prefix in ["http.", "HtTp.https://github.com/owner/repo.git."] {
             let key = format!("{prefix}{var}\0");
-            for read_only in [false, true] {
+            for access in ACCESSES {
                 let verdict: aterm_json::Value = aterm_json::from_slice(
-                    &super::unix::project_config_names(key.as_bytes(), read_only),
+                    &super::unix::project_config_names(key.as_bytes(), access),
                 )
                 .unwrap();
                 assert_eq!(
@@ -195,32 +241,100 @@ fn http_security_protocol_and_unknown_options_stay_refused() {
     }
 }
 
+/// Each guarded ref is judged on its own. Main is an object witness: a move is
+/// handed back for the caller's fast-forward proof, never refused as a byte
+/// difference. NEGATIVE CONTROL: the whole-listing comparison refused every
+/// row below that has a moved main, the tag push of the 0.204.0 cut among them.
 #[test]
-fn inventory_movement_is_only_a_conflict_when_an_expected_ref_changed() {
+fn inventory_is_judged_per_ref_with_main_only_an_object_witness() {
     use crate::error::{Kind, SideEffect};
-    let owner = "a".repeat(40);
-    let updates = vec![crate::github::refs::RefUpdate {
-        reference: crate::git::RELEASE_LEASE_REF.into(),
-        before: owner.clone(),
-        after: "0".repeat(40),
-    }];
-    let moved_main = format!(
-        "{owner}\t{}\n{}\trefs/heads/main\n",
-        crate::git::RELEASE_LEASE_REF,
-        "b".repeat(40)
+    use crate::git::{
+        ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
+    };
+    use std::collections::BTreeMap;
+    const MAIN: &str = "refs/heads/main";
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+    let (owner, old, new, other) = (
+        "a".repeat(40),
+        "b".repeat(40),
+        "d".repeat(40),
+        "c".repeat(40),
     );
-    let error = super::unix::inventory_change(&updates, moved_main.as_bytes());
+    let tag = vec![crate::github::refs::RefUpdate {
+        reference: "refs/tags/v1.0.0".into(),
+        before: ZERO.into(),
+        after: owner.clone(),
+    }];
+    let judge = |updates: &[crate::github::refs::RefUpdate],
+                 control: Option<&ControlRefTransaction>,
+                 listing: &[(&str, &str)]| {
+        let current: BTreeMap<&str, &str> = listing.iter().copied().collect();
+        super::unix::judge_inventory(updates, control, Some(&old), &current)
+            .map(|moved| moved.map(|(before, after)| (before.to_owned(), after.to_owned())))
+    };
+    // An ordinary tag create: main as judged, or advanced, goes ahead.
+    assert_eq!(judge(&tag, None, &[(MAIN, &old)]).unwrap(), None);
+    assert_eq!(
+        judge(&tag, None, &[(MAIN, &new)]).unwrap(),
+        Some((old.clone(), new.clone()))
+    );
+    // A main that disappeared witnesses nothing.
+    let error = judge(&tag, None, &[]).unwrap_err();
     assert_eq!(
         (error.kind, error.side_effect),
         (Kind::CouldNotRun, SideEffect::None)
     );
-    let moved_lease = moved_main.replacen(&owner, &"c".repeat(40), 1);
-    let error = super::unix::inventory_change(&updates, moved_lease.as_bytes());
+    // A main that appeared was never a witness.
+    let current = BTreeMap::from([(MAIN, new.as_str())]);
+    assert_eq!(
+        super::unix::judge_inventory(&tag, None, None, &current).unwrap(),
+        None
+    );
+    // A requested ref that moved is the caller's conflict, main moved or not.
+    for main in [&old, &new] {
+        let error = judge(&tag, None, &[(MAIN, main), ("refs/tags/v1.0.0", &other)]).unwrap_err();
+        assert_eq!(
+            (error.kind, error.side_effect),
+            (Kind::Conflict, SideEffect::None)
+        );
+        assert!(error.why.contains(&other), "{}", error.why);
+    }
+    // A single lease create: its unrequested fence sibling must stay absent.
+    let lease = ControlRefTransaction::new(
+        &owner,
+        vec![ControlRefChange {
+            reference: RELEASE_LEASE_REF.into(),
+            before: None,
+            after: Some(owner.clone()),
+        }],
+    )
+    .unwrap();
+    let rows = vec![crate::github::refs::RefUpdate {
+        reference: RELEASE_LEASE_REF.into(),
+        before: ZERO.into(),
+        after: owner.clone(),
+    }];
+    assert_eq!(
+        judge(&rows, Some(&lease), &[(MAIN, &new)]).unwrap(),
+        Some((old.clone(), new.clone()))
+    );
+    let error = judge(
+        &rows,
+        Some(&lease),
+        &[(MAIN, &old), (PUBLISHER_FENCE_REF, &other)],
+    )
+    .unwrap_err();
     assert_eq!(
         (error.kind, error.side_effect),
         (Kind::Conflict, SideEffect::None)
     );
-    assert!(error.why.contains(&"c".repeat(40)));
+    let error = judge(
+        &rows,
+        Some(&lease),
+        &[(MAIN, &new), (RELEASE_LEASE_REF, &owner)],
+    )
+    .unwrap_err();
+    assert_eq!(error.kind, Kind::Conflict);
 }
 
 #[test]
@@ -292,14 +406,30 @@ fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
             crate::git::RELEASE_LEASE_REF,
         ),
     ] {
+        let after = "a".repeat(40);
+        let source = if matches!(&op, super::GitOp::PushRefs { .. }) {
+            after.as_str()
+        } else {
+            "(delete)"
+        };
+        let sibling = if matches!(&op, super::GitOp::PushRefs { .. }) {
+            format!("\n!\t{after}:refs/tags/other\t[remote rejected] (atomic push failure)")
+        } else {
+            String::new()
+        };
         let line = format!(
-            "!\tcommit:{reference}\t[remote rejected] (cannot lock ref '{reference}': is at {actual} but expected {before})"
+            "!\t{source}:{reference}\t[remote rejected] (cannot lock ref '{reference}': is at {actual} but expected {before})"
         );
-        let error = classify(&op, &line);
+        let error = classify(&op, &format!("{line}{sibling}"));
         assert_eq!(
             (error.kind, error.side_effect, error.exit()),
             (Kind::Conflict, SideEffect::None, 9)
         );
+        if !sibling.is_empty() {
+            let incomplete = classify(&op, &line);
+            assert_eq!(incomplete.side_effect, SideEffect::Unknown);
+            assert_ne!(incomplete.kind, Kind::Conflict);
+        }
         for bad in [
             line.replace(&format!("'{reference}'"), "'refs/heads/other'"),
             line.replace(
@@ -310,7 +440,11 @@ fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
             line.replace(&format!("at {actual}"), &format!("at {before}")),
             format!("{line} extra"),
         ] {
-            assert_ne!(classify(&op, &bad).kind, Kind::Conflict, "{bad}");
+            assert_ne!(
+                classify(&op, &format!("{bad}{sibling}")).kind,
+                Kind::Conflict,
+                "{bad}"
+            );
         }
         for (other, expected) in [
             ("protected branch hook declined", Kind::Refused),
@@ -318,9 +452,232 @@ fn receive_pack_lock_conflicts_match_the_requested_ref_and_expected_object() {
         ] {
             let other = format!("!\tcommit:refs/heads/other\t[remote rejected] ({other})");
             for rows in [format!("{line}\n{other}"), format!("{other}\n{line}")] {
-                assert_eq!(classify(&op, &rows).kind, expected, "{rows}");
+                let error = classify(&op, &rows);
+                if matches!(
+                    &op,
+                    super::GitOp::PushRefs { .. } | super::GitOp::PushControl { .. }
+                ) {
+                    assert_eq!(
+                        (error.kind, error.side_effect),
+                        (Kind::CouldNotRun, SideEffect::Unknown),
+                        "inconsistent atomic report: {rows}"
+                    );
+                } else {
+                    assert_eq!(error.kind, expected, "{rows}");
+                }
             }
         }
+    }
+}
+
+#[test]
+fn atomic_receive_lock_conflicts_need_every_requested_rejection_and_exact_old_values() {
+    use crate::error::{Kind, SideEffect};
+    use crate::fx::child::ChildOut;
+    use crate::github::refs::{AtomicRefBatch, RefUpdate};
+    let zero = "0".repeat(40);
+    let before = "b".repeat(40);
+    let after = "a".repeat(40);
+    let actual = "c".repeat(40);
+    let redactor = crate::redact::Redactor::new();
+    let slug = crate::slug::Slug::new("fixture-dev", "app").unwrap();
+    for (op, reference, absent) in [
+        (
+            super::GitOp::PushRefs {
+                dir: "/unused".into(),
+                batch: AtomicRefBatch::new(vec![
+                    RefUpdate {
+                        reference: "refs/tags/new".into(),
+                        before: zero.clone(),
+                        after: after.clone(),
+                    },
+                    RefUpdate {
+                        reference: "refs/heads/other".into(),
+                        before: before.clone(),
+                        after: after.clone(),
+                    },
+                ])
+                .unwrap(),
+                dry_run: false,
+            },
+            "refs/tags/new",
+            true,
+        ),
+        (
+            super::GitOp::PushControl {
+                dir: "/unused".into(),
+                transaction: crate::git::ControlRefTransaction::new(
+                    &after,
+                    vec![crate::git::ControlRefChange {
+                        reference: crate::git::RELEASE_LEASE_REF.into(),
+                        before: None,
+                        after: Some(after.clone()),
+                    }],
+                )
+                .unwrap(),
+                dry_run: false,
+            },
+            crate::git::RELEASE_LEASE_REF,
+            true,
+        ),
+        (
+            super::GitOp::PushRefs {
+                dir: "/unused".into(),
+                batch: AtomicRefBatch::new(vec![RefUpdate {
+                    reference: "refs/heads/update".into(),
+                    before: before.clone(),
+                    after: after.clone(),
+                }])
+                .unwrap(),
+                dry_run: false,
+            },
+            "refs/heads/update",
+            false,
+        ),
+    ] {
+        let mut stdout = format!(
+            "To https://github.com/fixture-dev/app.git\n!\t{after}:{reference}\t[remote rejected] (atomic transaction failed)\n"
+        );
+        if reference == "refs/tags/new" {
+            stdout.push_str(&format!(
+                "!\t{after}:refs/heads/other\t[remote rejected] (atomic transaction failed)\n"
+            ));
+        }
+        stdout.push_str("Done\n");
+        let classify = |out: &ChildOut| super::unix::failed(&op, out, &redactor, &slug, true);
+        for reason in [
+            "reference already exists".to_string(),
+            format!("reference is missing but expected {before}"),
+            format!("is at {actual} but expected {before}"),
+        ] {
+            let out = ChildOut {
+                code: Some(1),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: format!("remote: error: cannot lock ref '{reference}': {reason}        \n")
+                    .into_bytes(),
+            };
+            let applies = absent == (reason == "reference already exists");
+            let error = classify(&out);
+            if !applies {
+                assert_ne!(error.kind, Kind::Conflict, "{reference}: {reason}");
+                continue;
+            }
+            assert_eq!(
+                (error.kind, error.side_effect),
+                (Kind::Conflict, SideEffect::None),
+                "{reference}: {reason}"
+            );
+            let mut negatives = Vec::new();
+            for malformed in [
+                stdout.replace("!\t", "*\t"),
+                stdout.replace("atomic transaction failed", "failed"),
+                stdout.replace(
+                    &format!("{after}:{reference}"),
+                    &format!("{actual}:{reference}"),
+                ),
+                stdout.lines().take(1).collect::<Vec<_>>().join("\n"),
+                format!(
+                    "{stdout}!\t{after}:{reference}\t[remote rejected] (atomic transaction failed)\n"
+                ),
+            ] {
+                negatives.push(ChildOut {
+                    stdout: malformed.into_bytes(),
+                    ..out.clone()
+                });
+            }
+            if reference == "refs/tags/new" {
+                negatives.push(ChildOut {
+                    stdout: stdout.replace(
+                        &format!("!\t{after}:refs/heads/other\t[remote rejected] (atomic transaction failed)\n"),
+                        "",
+                    ).into_bytes(),
+                    ..out.clone()
+                });
+            }
+            for malformed in [
+                String::from_utf8(out.stderr.clone())
+                    .unwrap()
+                    .replace(reference, "refs/heads/unrequested"),
+                format!("remote: error: cannot lock ref '{reference}': {reason} extra\n"),
+            ] {
+                negatives.push(ChildOut {
+                    stderr: malformed.into_bytes(),
+                    ..out.clone()
+                });
+            }
+            negatives.push(ChildOut {
+                code: None,
+                ..out.clone()
+            });
+            negatives.push(ChildOut {
+                stdout: vec![b'\n'; ChildOut::OUTPUT_KEEP],
+                ..out.clone()
+            });
+            for negative in negatives {
+                let error = classify(&negative);
+                assert_ne!(error.kind, Kind::Conflict, "{negative:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn atomic_stale_info_needs_complete_exact_request_rows() {
+    use crate::error::{Kind, SideEffect};
+    use crate::fx::child::ChildOut;
+    use crate::github::refs::{AtomicRefBatch, RefUpdate};
+    let before = "b".repeat(40);
+    let after = "a".repeat(40);
+    let op = super::GitOp::PushRefs {
+        dir: "/unused".into(),
+        batch: AtomicRefBatch::new(
+            ["refs/heads/main", "refs/heads/other"]
+                .into_iter()
+                .map(|reference| RefUpdate {
+                    reference: reference.into(),
+                    before: before.clone(),
+                    after: after.clone(),
+                })
+                .collect(),
+        )
+        .unwrap(),
+        dry_run: false,
+    };
+    let first = format!("!\t{after}:refs/heads/main\t[rejected] (stale info)\n");
+    let second = format!("!\t{after}:refs/heads/other\t[rejected] (atomic push failed)\n");
+    let complete = format!("{first}{second}");
+    let redactor = crate::redact::Redactor::new();
+    let slug = crate::slug::Slug::new("fixture-dev", "app").unwrap();
+    let classify = |stdout: &str| {
+        super::unix::failed(
+            &op,
+            &ChildOut {
+                code: Some(1),
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: b"stale info\n".to_vec(),
+            },
+            &redactor,
+            &slug,
+            true,
+        )
+    };
+    let known = classify(&complete);
+    assert_eq!(
+        (known.kind, known.side_effect),
+        (Kind::Conflict, SideEffect::None)
+    );
+    for incomplete in [
+        "stale info\n".into(),
+        first.clone(),
+        second,
+        format!("{complete}{first}"),
+        complete.replace(&after, &"c".repeat(40)),
+        complete.replace("refs/heads/other", "refs/heads/unrequested"),
+        format!("{}{complete}", "\n".repeat(ChildOut::OUTPUT_KEEP)),
+    ] {
+        let error = classify(&incomplete);
+        assert_ne!(error.kind, Kind::Conflict);
+        assert_eq!(error.side_effect, SideEffect::Unknown);
     }
 }
 

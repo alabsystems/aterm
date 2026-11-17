@@ -3768,6 +3768,61 @@ fn claims_of_other_processes_ahead_of_a_front_are_counted() {
     assert_eq!(front_claim_in(&later, 4700), None);
 }
 
+/// A PERSON'S WAITING FRONT NAMES NO AGENT CLAIM IT GOES BEFORE ([`front_claim_in`]), in the
+/// order admission keeps ([`Need::priority`]): an agent's claim that waits since earlier is
+/// behind a person's front, while the held claims, and a Release claim and a leading claim that
+/// wait since later, are still ahead of it. A person's later waiter is ahead of an agent's front.
+///
+/// NEGATIVE CONTROL: the same front unmarked still lists the earlier agent waiter as ahead.
+#[test]
+fn a_persons_waiting_front_names_no_agent_claim_it_goes_before() {
+    const FRONT: u32 = 4100;
+    let person = |mut r: Record| {
+        r.need.person = true;
+        r
+    };
+    let mut release = record(4500, 7_000, 2 * GIB, false);
+    release.need.rank = aterm_capacity::Rank::Release;
+    let mut leading = record(4600, 8_000, 2 * GIB, false);
+    leading.need.leads = true;
+    let records = [
+        person(record(FRONT, 5_000, 4 * GIB, false)),
+        record(4200, 3_000, 8 * GIB, true),
+        record(4300, 4_000, 12 * GIB, false),
+        record(4400, 6_000, 2 * GIB, false),
+        release,
+        leading,
+    ];
+    assert_eq!(
+        front_claim_in(&records, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: vec![4200, 4500, 4600]
+        }),
+        "the held claim, the Release and the leading claim; no agent waiter, earlier or later"
+    );
+    let mut unmarked = records.clone();
+    unmarked[0].need.person = false;
+    assert_eq!(
+        front_claim_in(&unmarked, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: vec![4200, 4300, 4500, 4600]
+        }),
+        "unmarked, the agent waiter since earlier is ahead"
+    );
+    // An agent's front stands behind a person's waiter laid after it.
+    let mut behind = unmarked;
+    behind[3].need.person = true;
+    assert_eq!(
+        front_claim_in(&behind, FRONT),
+        Some(FrontClaim::Waiting {
+            mem: 4 * GIB,
+            ahead: vec![4200, 4300, 4400, 4500, 4600]
+        })
+    );
+}
+
 #[test]
 fn trust_cargo_admission_uses_cargo_words_and_lane() {
     for args in [

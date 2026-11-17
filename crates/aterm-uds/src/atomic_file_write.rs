@@ -62,7 +62,7 @@ pub fn write_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Option<Flush>)
 pub fn write_entry_flushed(path: &Path, bytes: &[u8], mode: u32, flush: Flush) -> io::Result<()> {
     let (_, landed) = write_captured_context(
         path,
-        mode,
+        MakeTemp::Mode(mode),
         |writer| writer.write_all(bytes),
         |_| Ok(()),
         || Ok(()),
@@ -281,7 +281,7 @@ pub(super) fn write_captured_landing<T>(
 ) -> io::Result<(T, Landed)> {
     write_captured_context(
         path,
-        mode,
+        MakeTemp::Mode(mode),
         produce,
         capture,
         check,
@@ -299,9 +299,20 @@ struct WriteFlush {
     diagnose: bool,
 }
 
+/// How [`write_captured_context`] makes its temporary beside the path.
+enum MakeTemp {
+    /// [`create_temp_beside`] with this mode, which on Unix the temporary is given again on its
+    /// descriptor once written.
+    Mode(u32),
+    /// On Windows, [`create_temp_secured`] with a private file's descriptor.
+    #[cfg(windows)]
+    Secured(crate::acl::Descriptor),
+}
+
+/// The careful write, its temporary made beside `path` as `temp` says.
 fn write_captured_context<T>(
     path: &Path,
-    mode: u32,
+    temp: MakeTemp,
     produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
     capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
     check: impl FnOnce() -> io::Result<()>,
@@ -312,8 +323,12 @@ fn write_captured_context<T>(
         std::fs::create_dir_all(parent)
             .map_err(|e| write_context("create directory", parent, e))?;
     }
-    let (tmp, file) = create_temp_beside(path, mode)
-        .map_err(|e| write_context("create temporary beside", path, e))?;
+    let (tmp, file) = match &temp {
+        MakeTemp::Mode(mode) => create_temp_beside(path, *mode),
+        #[cfg(windows)]
+        MakeTemp::Secured(descriptor) => create_temp_secured(path, descriptor),
+    }
+    .map_err(|e| write_context("create temporary beside", path, e))?;
     let mut temporary = Temporary {
         path: tmp,
         armed: true,
@@ -322,10 +337,11 @@ fn write_captured_context<T>(
     let context = |operation, error| write_context(operation, &temporary.path, error);
     produce(&mut file).map_err(|e| context("write", e))?;
     #[cfg(unix)]
-    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
-        .map_err(|e| context("fchmod", e))?;
-    #[cfg(windows)]
-    let _ = mode;
+    {
+        let MakeTemp::Mode(mode) = temp;
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode))
+            .map_err(|e| context("fchmod", e))?;
+    }
     if let Some(mode) = flush.mode {
         let result = if flush.diagnose {
             mode.file_diagnosed(&file)
@@ -556,16 +572,11 @@ pub fn temp_target(name: &std::ffi::OsStr) -> Option<&str> {
 pub(super) fn create_temp_salted(
     path: &Path,
     mode: u32,
-    mut salt: impl FnMut() -> io::Result<String>,
+    salt: impl FnMut() -> io::Result<String>,
 ) -> io::Result<(PathBuf, std::fs::File)> {
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt as _;
-    let name = path
-        .file_name()
-        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-    for _ in 0..8 {
-        let salt = salt()?;
-        let tmp = path.with_file_name(temp_component(&name, &salt));
+    create_temp_opened(path, salt, |tmp| {
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -574,25 +585,146 @@ pub(super) fn create_temp_salted(
             .custom_flags(crate::atomic_file::LOCK_OPEN_FLAGS);
         #[cfg(windows)]
         let _ = mode;
-        match options.open(&tmp) {
-            Ok(f) => {
-                // A mode of 0600 does not suppress inherited macOS ACL grants.
-                // Refuse before handing the descriptor to a payload producer.
-                #[cfg(unix)]
-                if mode & 0o077 == 0 {
-                    let private = astream_sys::owner_private(&f).and_then(|verdict| {
-                        verdict.map(|_| ()).map_err(|why| {
-                            io::Error::new(io::ErrorKind::PermissionDenied, why.to_string())
-                        })
-                    });
-                    if let Err(error) = private {
-                        drop(f);
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(error);
-                    }
-                }
-                return Ok((tmp, f));
+        let f = options.open(tmp)?;
+        // A mode of 0600 does not suppress inherited macOS ACL grants.
+        // Refuse before handing the descriptor to a payload producer.
+        #[cfg(unix)]
+        if mode & 0o077 == 0 {
+            let private = astream_sys::owner_private(&f).and_then(|verdict| {
+                verdict
+                    .map(|_| ())
+                    .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why.to_string()))
+            });
+            if let Err(error) = private {
+                drop(f);
+                let _ = std::fs::remove_file(tmp);
+                return Err(error);
             }
+        }
+        Ok(f)
+    })
+}
+
+/// A NEW private file beside `path` to write it through, made with `descriptor` at its creation
+/// ([`crate::acl::create_file`]): its owner and access list are the file's from its first
+/// moment.
+/// # Errors
+/// As [`create_temp_beside`].
+#[cfg(windows)]
+pub fn create_temp_secured(
+    path: &Path,
+    descriptor: &crate::acl::Descriptor,
+) -> io::Result<(PathBuf, std::fs::File)> {
+    create_temp_opened(path, crate::rand::hex_token::<SALT_BYTES>, |tmp| {
+        crate::acl::create_file(tmp, descriptor)
+    })
+}
+
+/// [`write_with_metadata`] on Windows with the temporary made with `descriptor` at its creation
+/// ([`create_temp_secured`]), so `path` has that owner and access list from the rename on, or,
+/// with none, made as [`create_temp_beside`] makes it (taking its folder's entries); `capture`
+/// reads the completed temporary (its identity, say) before the rename, and its answer is
+/// returned once the rename landed. The directory's flush after it is best-effort, as
+/// [`write_with`]'s.
+/// # Errors
+/// As [`write_with`], or `capture`'s.
+#[cfg(windows)]
+pub fn write_secured_with<T>(
+    path: &Path,
+    descriptor: Option<crate::acl::Descriptor>,
+    produce: impl FnOnce(&mut dyn io::Write) -> io::Result<()>,
+    capture: impl FnOnce(&std::fs::File) -> io::Result<T>,
+) -> io::Result<T> {
+    let temp = descriptor.map_or(MakeTemp::Mode(0o644), MakeTemp::Secured);
+    let (captured, landed) = write_captured_context(
+        path,
+        temp,
+        produce,
+        capture,
+        || Ok(()),
+        WriteFlush {
+            mode: Some(Flush::Durable),
+            diagnose: false,
+        },
+        best_effort(Flush::dir),
+    )
+    .map_err(|failure| failure.error)?;
+    landed?;
+    Ok(captured)
+}
+
+/// [`write`] of a private file on Windows: the temporary is made with `descriptor`
+/// ([`create_temp_secured`]), so `path` has its owner and access list from the rename on.
+/// # Errors
+/// As [`write`].
+#[cfg(windows)]
+pub(crate) fn write_secured(
+    path: &Path,
+    bytes: &[u8],
+    descriptor: crate::acl::Descriptor,
+) -> io::Result<()> {
+    write_captured_context(
+        path,
+        MakeTemp::Secured(descriptor),
+        |writer| writer.write_all(bytes),
+        |_| Ok(()),
+        || Ok(()),
+        WriteFlush {
+            mode: Some(Flush::Durable),
+            diagnose: false,
+        },
+        best_effort(Flush::dir),
+    )
+    .map_err(|failure| failure.error)?
+    .1
+}
+
+/// [`write_entry_flushed`] of a private file on Windows: the temporary is made with
+/// `descriptor` ([`create_temp_secured`]).
+/// # Errors
+/// As [`write_entry_flushed`].
+#[cfg(windows)]
+pub(crate) fn write_entry_secured(
+    path: &Path,
+    bytes: &[u8],
+    descriptor: crate::acl::Descriptor,
+    flush: Flush,
+) -> io::Result<()> {
+    let (_, landed) = write_captured_context(
+        path,
+        MakeTemp::Secured(descriptor),
+        |writer| writer.write_all(bytes),
+        |_| Ok(()),
+        || Ok(()),
+        WriteFlush {
+            mode: Some(flush),
+            diagnose: true,
+        },
+        |flush, dir| {
+            flush
+                .dir_diagnosed(dir)
+                .map_err(|error| write_error("flush directory", dir, error))
+        },
+    )
+    .map_err(WriteFailure::into_io)?;
+    landed
+}
+
+/// A new temporary beside `path`, named with a fresh `salt` and made by `open`, which fails
+/// `AlreadyExists` on a name that is taken: eight names are tried.
+fn create_temp_opened(
+    path: &Path,
+    mut salt: impl FnMut() -> io::Result<String>,
+    mut open: impl FnMut(&Path) -> io::Result<std::fs::File>,
+) -> io::Result<(PathBuf, std::fs::File)> {
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    for _ in 0..8 {
+        let salt = salt()?;
+        let tmp = path.with_file_name(temp_component(&name, &salt));
+        match open(&tmp) {
+            Ok(f) => return Ok((tmp, f)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
         }

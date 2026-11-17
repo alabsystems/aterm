@@ -231,7 +231,14 @@ pub(crate) fn escape_display(s: &str) -> String {
     out
 }
 
-/// The decline backoff, kept per instance and keyed per WINDOW (design §3.4 step 5, O5): after a cancel, the next request for that window inside the quiet window is refused at once; it starts at 10 s and doubles to 5 min on each consecutive cancel, and an answer resets it.
+/// The decline backoff, kept per instance and keyed per WINDOW (design §3.4 step 5, O5): after a
+/// sheet ends with no password (a Cancel, an empty field, its deadline, its caller's hang-up, a
+/// withdrawn request, its tab closing, the update backstop), the next request for that window
+/// inside the quiet window is refused at once. The quiet window starts at 10 s and doubles to
+/// 5 min on each consecutive such end. An answer resets it, and each [`QUIET_MAX`] the window
+/// stood with no sheet after a quiet window ran out takes one end off the streak, so sheets a
+/// program let lapse long ago do not make a person wait. An update's successor takes up a quiet
+/// window still running ([`Self::carried`], [`Self::adopt`]).
 #[derive(Default)]
 pub(crate) struct Backoff {
     per_window: std::collections::HashMap<u64, Quiet>,
@@ -243,8 +250,18 @@ struct Quiet {
     streak: u32,
 }
 
-const QUIET_BASE: Duration = Duration::from_secs(10);
-const QUIET_MAX: Duration = Duration::from_secs(300);
+pub(crate) const QUIET_BASE: Duration = Duration::from_secs(10);
+pub(crate) const QUIET_MAX: Duration = Duration::from_secs(300);
+
+/// The streak whose quiet window first reaches [`QUIET_MAX`]; a longer one waits no longer.
+const STREAK_MAX: u32 = 6;
+
+/// The quiet window a streak of `streak` consecutive unanswered sheets sets.
+fn quiet_span(streak: u32) -> Duration {
+    QUIET_BASE
+        .saturating_mul(1u32 << streak.saturating_sub(1).min(STREAK_MAX - 1))
+        .min(QUIET_MAX)
+}
 
 impl Backoff {
     /// Whether `window` is inside a quiet window now; `Some(remaining)` refuses.
@@ -255,23 +272,60 @@ impl Backoff {
             .map(|q| q.until - now)
     }
 
-    /// Record a cancel: start or widen the quiet window.
-    pub(crate) fn on_cancel(&mut self, window: u64, now: Instant) {
+    /// Record a sheet, raised at `raised`, that ended at `now` with no password: start or widen
+    /// the quiet window. Each whole [`QUIET_MAX`] between the last quiet window running out and
+    /// this sheet being raised takes one end off the streak. The time is read to `raised`, not
+    /// to `now`: a sheet that stood to its deadline (as long as `QUIET_MAX`) was no quiet time.
+    /// And it steps down rather than starting again, so waiting is never the faster way to the
+    /// next sheet: a pause of `QUIET_MAX` buys back at most the one step it is as long as.
+    pub(crate) fn on_cancel(&mut self, window: u64, raised: Instant, now: Instant) {
         let streak = self
             .per_window
             .get(&window)
-            .map_or(0, |q| q.streak)
+            .map_or(0, |q| {
+                let quiet = raised.saturating_duration_since(q.until);
+                let eased = quiet.as_secs() / QUIET_MAX.as_secs();
+                q.streak
+                    .min(STREAK_MAX)
+                    .saturating_sub(u32::try_from(eased).unwrap_or(u32::MAX))
+            })
             .saturating_add(1);
-        let span = QUIET_BASE
-            .saturating_mul(1u32 << streak.saturating_sub(1).min(5))
-            .min(QUIET_MAX);
         self.per_window.insert(
             window,
             Quiet {
-                until: now + span,
+                until: now + quiet_span(streak),
                 streak,
             },
         );
+    }
+
+    /// What an update's successor takes up for `window`: the streak and what is left of a
+    /// quiet window still running. One that ran out carries nothing.
+    pub(crate) fn carried(&self, window: u64, now: Instant) -> Option<(u32, Duration)> {
+        self.per_window
+            .get(&window)
+            .filter(|q| q.until > now)
+            .map(|q| (q.streak, q.until - now))
+    }
+
+    /// Take up the spacing an outgoing process carried for `window` ([`Self::carried`]), read
+    /// from a file a program of the same user could have written: the streak is held to
+    /// [`STREAK_MAX`] and the time left to what that streak sets, so a carried row can refuse
+    /// no longer than that many unanswered sheets would have, and a window already quiet for
+    /// longer keeps its own.
+    pub(crate) fn adopt(&mut self, window: u64, streak: u32, remaining: Duration, now: Instant) {
+        if streak == 0 || remaining.is_zero() {
+            return;
+        }
+        let streak = streak.min(STREAK_MAX);
+        let until = now + remaining.min(quiet_span(streak));
+        if self
+            .per_window
+            .get(&window)
+            .is_none_or(|own| own.until < until)
+        {
+            self.per_window.insert(window, Quiet { until, streak });
+        }
     }
 
     /// Record an answer: clear the window's quiet window.

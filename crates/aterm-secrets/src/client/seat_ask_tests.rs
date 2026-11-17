@@ -3,19 +3,29 @@
 
 //! One-mesh S1: a live seatless recipient takes its seat by itself, with the same keys.
 
+#[cfg(unix)]
 use super::super::log_entries_tests::{TwoMacs, join_host, member_key, two_macs};
+#[cfg(unix)]
 use super::super::readmit::{Book, prove_at_ms};
 
 use super::*;
+#[cfg(unix)]
 use crate::members::desk::{self, Desk, Local};
+#[cfg(unix)]
 use crate::members::join::{self, Stream};
+#[cfg(unix)]
 use crate::members::joiner::Joining;
+#[cfg(unix)]
 use crate::membership_log::{EpochAudience, Kind, MemberId, Record};
+#[cfg(unix)]
 use crate::text::Audience;
+#[cfg(unix)]
 use ring::signature::{Ed25519KeyPair, KeyPair};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A fleet book in which every member reads moved seats.
+#[cfg(unix)]
 const CURRENT: Book = Book {
     node_id_held_out: false,
     node_id_seated: false,
@@ -27,6 +37,7 @@ const CURRENT: Book = Book {
 /// envelope alone after the genesis, as m22 let in 28 of ALab's recipients: the newest
 /// `[everyone]` epoch wraps its recipient and no seat binds it. Its identity is a release
 /// build's (unmarked) unless `lab`.
+#[cfg(unix)]
 struct Seatless {
     macs: TwoMacs,
     s: Paths,
@@ -34,6 +45,7 @@ struct Seatless {
     alab: crate::envelope::Retired,
 }
 
+#[cfg(unix)]
 fn seatless(lab: bool) -> Seatless {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let s = Paths::for_home(&macs.root.path().join("s"));
@@ -62,10 +74,12 @@ fn seatless(lab: bool) -> Seatless {
     Seatless { macs, s, alab }
 }
 
+#[cfg(unix)]
 fn node_pair(tag: u8) -> Ed25519KeyPair {
     Ed25519KeyPair::from_seed_unchecked(&[tag; 32]).expect("node key")
 }
 
+#[cfg(unix)]
 fn log_of(paths: &Paths) -> crate::membership_log::Log {
     load_records(paths)
         .expect("records")
@@ -75,6 +89,7 @@ fn log_of(paths: &Paths) -> crate::membership_log::Log {
 }
 
 /// The records `after` holds that `before` did not, by kind.
+#[cfg(unix)]
 fn added(before: &crate::membership_log::Log, after: &crate::membership_log::Log) -> Vec<Kind> {
     let held: std::collections::BTreeSet<_> = before.records().map(|r| *r.id()).collect();
     after
@@ -87,6 +102,7 @@ fn added(before: &crate::membership_log::Log, after: &crate::membership_log::Log
 /// The ask `s`'s subscriber makes through `ask_members_if_due`, as `aterm members`'s hook makes
 /// it (`members_cli::ask_members`): a proof of `s`'s own request and node key to m22's desk,
 /// reached on the home ALab LAN, at `now_ms` on m22's clock. Counts each ask in `asks`.
+#[cfg(unix)]
 fn asking<'a>(
     world: &'a Seatless,
     pair: &'a Ed25519KeyPair,
@@ -96,6 +112,7 @@ fn asking<'a>(
     asking_authorized(world, pair, asks, now_ms, &|| Ok(()), &|| {})
 }
 
+#[cfg(unix)]
 fn asking_authorized<'a>(
     world: &'a Seatless,
     pair: &'a Ed25519KeyPair,
@@ -184,6 +201,7 @@ fn asking_authorized<'a>(
 }
 
 /// A subscriber round's ask, its pause gone by (`ask_members_if_due`).
+#[cfg(unix)]
 fn round(paths: &Paths, asked: &mut MembersAsked, ask: &dyn Fn(&Paths) -> crate::Result<usize>) {
     if let Some(at) = asked.at {
         asked.at = at.checked_sub(ask_members_pause(asked.asks) + Duration::from_secs(1));
@@ -191,6 +209,7 @@ fn round(paths: &Paths, asked: &mut MembersAsked, ask: &dyn Fn(&Paths) -> crate:
     ask_members_if_due(paths, asked, ask, &|line| eprintln!("round: {line}"));
 }
 
+#[cfg(unix)]
 fn me(paths: &Paths, of: &Paths) -> MemberId {
     let trust = crate::commons::bootstrap::Bootstrap::required(of)
         .expect("member")
@@ -206,6 +225,7 @@ fn me(paths: &Paths, of: &Paths) -> MemberId {
 
 /// Why `paths`'s Network State cards read it unusable: its secrets card's blocker
 /// ([`observe_materialization`]) and its accounts card's ([`crate::commons::observe`]).
+#[cfg(unix)]
 fn cards(
     paths: &Paths,
 ) -> (
@@ -232,6 +252,7 @@ fn cards(
 ///
 /// NEGATIVE CONTROL: [`seat_ask::NO_SEAT_ASK`] on in
 /// [`a_seatless_recipient_that_asks_nothing_drops_at_the_next_rotation`].
+#[cfg(unix)]
 #[test]
 fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
     let _answering = ServersAnswering::set();
@@ -319,6 +340,7 @@ fn a_seatless_recipient_asks_once_and_takes_a_seat_with_the_same_key() {
 /// NEGATIVE CONTROL (2026-11-11): with the memo marked by the records entry's length and
 /// modification time, as it was while every records write renamed a file into that directory,
 /// the seated Mac's next ask still answers the memoized seatless read (`the seat is read`).
+#[cfg(unix)]
 #[test]
 fn a_seat_appended_to_a_layouts_data_file_is_read_by_the_next_ask() {
     use std::os::unix::fs::MetadataExt as _;
@@ -356,6 +378,7 @@ fn a_seat_appended_to_a_layouts_data_file_is_read_by_the_next_ask() {
     world.macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vault() {
     use std::sync::atomic::AtomicBool;
@@ -416,6 +439,7 @@ fn a_seat_proof_rechecks_stop_before_merging_without_rewriting_the_existing_vaul
 /// with the self-ask off ([`seat_ask::NO_SEAT_ASK`], as 0.154.0 and before), the seatless Mac's
 /// rounds ask nothing, and the next `[everyone]` rotation, whose carry is the current seats,
 /// drops it.
+#[cfg(unix)]
 #[test]
 fn a_seatless_recipient_that_asks_nothing_drops_at_the_next_rotation() {
     let _answering = ServersAnswering::set();
@@ -457,6 +481,7 @@ fn a_seatless_recipient_that_asks_nothing_drops_at_the_next_rotation() {
 /// [`Seat::Unjudged`] and "revoked (out as of seq N)". Its counterpart,
 /// [`a_removed_key_never_gets_a_seat_back`], holds a `Remove`d Mac to "revoked": with
 /// `removed_by_an_act` cut from [`dropped`], it reads "dropped" there and fails.
+#[cfg(unix)]
 #[test]
 fn a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped() {
     let _answering = ServersAnswering::set();
@@ -545,6 +570,7 @@ fn a_recipient_a_rotation_drops_with_no_remove_reads_out_and_says_dropped() {
 ///
 /// NEGATIVE CONTROL: [`seat_ask::REVOKED_UNJUDGED`] on (no dropped judgment), the same join goes
 /// on as before f299: it moves the Mac to pending and queues its request with the refused key.
+#[cfg(unix)]
 #[test]
 fn a_dropped_macs_join_sends_no_key_and_keeps_its_way_back() {
     let _answering = ServersAnswering::set();
@@ -642,6 +668,7 @@ fn a_join_reads_the_configured_vault_again_by_name_and_pin_not_address() {
 
 /// A seatless Mac whose identity a test, a debug build, a lab lane or a VM made founds its own
 /// lab: its rounds ask ALab's members nothing, though its log reads it seatless.
+#[cfg(unix)]
 #[test]
 fn a_lab_identity_that_is_seatless_asks_for_no_seat() {
     let world = seatless(true);
@@ -664,6 +691,7 @@ fn a_lab_identity_that_is_seatless_asks_for_no_seat() {
 /// Mac reads its removal, the log reads its recipient [`Seat::Out`], its rounds ask nothing, and
 /// a proof it makes anyway, under a fresh node key, is refused for the removal with nothing
 /// signed.
+#[cfg(unix)]
 #[test]
 fn a_removed_key_never_gets_a_seat_back() {
     let _answering = ServersAnswering::set();
@@ -744,6 +772,7 @@ fn a_removed_key_never_gets_a_seat_back() {
 ///
 /// NEGATIVE CONTROL: the run accepting by `client::accepts_bundle` alone refuses the bundle
 /// ("already in a vault") and the run's `expect` fails.
+#[cfg(unix)]
 #[test]
 fn a_persons_allow_seats_a_seatless_recipient_off_the_lan() {
     let _answering = ServersAnswering::set();

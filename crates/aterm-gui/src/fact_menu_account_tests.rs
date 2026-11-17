@@ -481,7 +481,7 @@ fn lines(rows: &[MenuRow]) -> Vec<String> {
             }
             MenuRow::Plot { cells, .. } => {
                 let text: String = cells.iter().map(|cell| cell.ch).collect();
-                if text.contains("week reset") {
+                if text.contains("reset, refill or raise") || text.contains("reset/refill") {
                     text
                 } else {
                     "<chart>".into()
@@ -612,7 +612,7 @@ fn state_a_a_login_outside_this_macs_pool() {
             "<chart>",
             "<chart>",
             "<chart>",
-            "         \u{21ba} week reset  \u{2573} out  \u{2504} not read",
+            "         \u{21ba} reset, refill or raise  \u{2573} out  \u{2504} not read",
             "Machine \u{2500}\u{2500}",
             "Home     m15 \u{b7} set on the accounts sheet since 2 Oct",
             "m15      in use \u{b7} claimed since 13:05",
@@ -700,7 +700,7 @@ fn state_b_a_pool_account_at_home_here_with_a_vault_token() {
             "<chart>",
             "<chart>",
             "<chart>",
-            "         \u{21ba} week reset  \u{2573} out  \u{2504} not read",
+            "         \u{21ba} reset, refill or raise  \u{2573} out  \u{2504} not read",
             "5-hour limit reached on 3 of the 49 days read",
             "Machine \u{2500}\u{2500}",
             "Home     this Mac (m20) \u{b7} assigned since 12 Oct",
@@ -2497,6 +2497,111 @@ fn the_eight_day_band_marks_a_reset_an_out_and_a_gap() {
             "{room}"
         );
     }
+}
+
+/// A `↺` UNDER ONE RESET IS A REFILL OR RAISE, AND SAID SO. The same eight days with a refill
+/// barrier from the eleventh reading on (a limit reset spent, a refill or a raised allowance,
+/// which no reading tells apart) mark that reading's cell `↺` beside the new week's, and a reader
+/// is told `the week refilled or raised by` for it and `a new week from` for the new week alone.
+/// Negative control: saying every `↺` a new week (the reset arm alone) fails the count.
+#[test]
+fn the_eight_day_band_says_a_refill_is_no_new_week() {
+    let mut facts = state_a(60);
+    let mut history = (*facts.card.as_ref().expect("a card").history).clone();
+    let epoch = history.reads[10].t;
+    for read in &mut history.reads[10..=20] {
+        read.epoch = Some(epoch);
+    }
+    facts.card.as_mut().expect("a card").history = Arc::new(history);
+    let rows = account_rows(&facts);
+    let at = chart(&rows, "8 days").expect("the eight-day chart");
+    let marks = plot_cells(&rows[at + 2])
+        .iter()
+        .filter(|cell| cell.ch == '\u{21ba}')
+        .count();
+    assert_eq!(marks, 2, "the refill's cell and the new week's");
+    let said = match &rows[at + 2] {
+        MenuRow::Plot { spoken, .. } => spoken.clone(),
+        _ => String::new(),
+    };
+    assert_eq!(
+        said.matches(", the week refilled or raised by ").count(),
+        1,
+        "{said}"
+    );
+    assert_eq!(said.matches(", a new week from ").count(), 1, "{said}");
+}
+
+/// THE LEGEND SAYS A `↺` IS A RESET, A REFILL OR A RAISE WHEREVER THE ROOM HOLDS THE WORDS: under
+/// the name column at 60 cells, from the row's start at 44, and `reset/refill` only at the
+/// narrowest chart room (33 cells), where nothing longer fits; its spoken words say all three at
+/// every room. Negative control: the short words at every room fail the first assertion.
+#[test]
+fn the_legend_says_a_raise_where_the_room_holds_it() {
+    for (room, words, led) in [
+        (60, " reset, refill or raise  ", true),
+        (44, " reset, refill or raise  ", false),
+        (33, " reset/refill  ", false),
+    ] {
+        let rows = account_rows(&state_a(room));
+        let (text, spoken) = rows
+            .iter()
+            .find_map(|row| match row {
+                MenuRow::Plot { cells, spoken, .. } if spoken.starts_with("Legend:") => Some((
+                    cells.iter().map(|cell| cell.ch).collect::<String>(),
+                    spoken.clone(),
+                )),
+                _ => None,
+            })
+            .expect("the legend");
+        assert!(text.contains(&format!("\u{21ba}{words}")), "{room}: {text}");
+        assert!(text.chars().count() <= room, "{room}: {text}");
+        assert_eq!(text.starts_with(' '), led, "{room}: {text}");
+        assert!(spoken.contains("a refill or raise"), "{room}: {spoken}");
+    }
+}
+
+/// A NEW WEEK OUTRANKS A REFILL IN ONE CELL. The new week's first reading and, an hour later in
+/// the same cell, one whose refill barrier opened under the new reset (it stands on every reading
+/// after): the cell's one `↺` is the new week, and a reader is told `a new week from` for it,
+/// never only `the week refilled or raised by`, as the footer chart gives the reset precedence
+/// (`Chart::turned`). Negative control: letting the later reading's barrier overwrite the cell's
+/// words drops the new week, and the first count fails.
+#[test]
+fn a_new_week_outranks_a_refill_in_one_cell() {
+    let mut facts = state_a(60);
+    let mut history = (*facts.card.as_ref().expect("a card").history).clone();
+    let first = history
+        .reads
+        .windows(2)
+        .position(|pair| pair[0].reset != pair[1].reset)
+        .expect("a new week")
+        + 1;
+    let barrier = history.reads[first].t + HOUR;
+    let mut refilled = history.reads[first];
+    refilled.t = barrier;
+    history.reads.insert(first + 1, refilled);
+    for read in &mut history.reads[first + 1..] {
+        read.epoch = Some(barrier);
+    }
+    facts.card.as_mut().expect("a card").history = Arc::new(history);
+    let rows = account_rows(&facts);
+    let at = chart(&rows, "8 days").expect("the eight-day chart");
+    let marks = plot_cells(&rows[at + 2])
+        .iter()
+        .filter(|cell| cell.ch == '\u{21ba}')
+        .count();
+    assert_eq!(marks, 1, "one cell");
+    let said = match &rows[at + 2] {
+        MenuRow::Plot { spoken, .. } => spoken.clone(),
+        _ => String::new(),
+    };
+    assert_eq!(said.matches(", a new week from ").count(), 1, "{said}");
+    assert_eq!(
+        said.matches(", the week refilled or raised by ").count(),
+        0,
+        "{said}"
+    );
 }
 
 /// THE WEEKS ROW DRAWS WHOLE WEEKS ENDING TODAY: one cell a local day, seven weeks at 60

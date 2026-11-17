@@ -9,8 +9,9 @@ use crate::supervise::approvals::{
     model_switch_reason, open_model_switch, open_wall,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAt, FABLE_FALLBACK, FableWeek, LaunchModel, RULE_ACCOUNT, RULE_MODEL_FALLBACK,
-    RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim, decide_turn_end,
+    AccountAt, BackBy, FABLE_FALLBACK, FableLift, FableWeek, LaunchModel, RULE_ACCOUNT,
+    RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim,
+    decide_turn_end,
 };
 use alab_policy::words::RULE_CONTINUE;
 use aterm_phase::prompt::fixtures as fx;
@@ -134,6 +135,8 @@ struct FableHost {
     /// The account's record of Fable's week ([`IdleHost::fable_week`]), and how often it was read.
     fable_week: Mutex<Option<FableWeek>>,
     week_reads: AtomicUsize,
+    /// The lift of Fable's limit the account's record holds ([`IdleHost::fable_lift`]).
+    fable_lift: Mutex<FableLift>,
 }
 
 impl FableHost {
@@ -197,6 +200,9 @@ impl IdleHost for FableHost {
     fn fable_week(&self) -> Option<FableWeek> {
         self.week_reads.fetch_add(1, Ordering::SeqCst);
         *self.fable_week.lock().unwrap()
+    }
+    fn fable_lift(&self) -> FableLift {
+        *self.fable_lift.lock().unwrap()
     }
     fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<RestartAnswer> {
         self.asked.lock().unwrap().push(why.clone());
@@ -787,6 +793,98 @@ fn a_fable_limit_with_no_reset_waits_on_a_sample_or_the_accounts_record_never_a_
     let open = open_model_switch(&ledger, Some(SID)).map(|o| o.back_at_unix);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(open, Some(None), "a passed reset times nothing");
+}
+
+/// THE LOOP TELLS THE SWITCH WHAT THE ACCOUNT'S RECORD SAYS OF FABLE'S LIMIT AT EACH POINT IT
+/// DECIDES (FL-116, `Session::fable_lift_look`): a lift after the switch was made returns the
+/// session at the quiet point, two hours before the reset its notice named, with one
+/// model-restore NOTE; where the record holds no lift any more at the next point (a session of
+/// the account met Fable's limit again), the return waits for the notice's reset again, with one
+/// NOTE that says so, and a new lift makes it due again. CONTROLS: a lift dated before the switch
+/// returns nothing and notes nothing.
+/// A record the host could not read (`FableLift::Unread`) between the two moves nothing and
+/// notes nothing: the return the lift made due stands.
+/// NEGATIVE CONTROL: with the loop asking only while no lift timed the return (or reading a
+/// record with no lift as nothing to tell), the point after the record took the lift back
+/// returns the session into Fable's limit; with an unread record read as one with no lift, the
+/// point it was not read at returns nothing and notes the lift taken back.
+#[test]
+fn the_loop_returns_a_switch_on_the_records_lift_and_holds_it_once_the_lift_is_taken_back() {
+    let (dir, ledger) = ledger_at("lift-taken-back");
+    let made = seed_switch(&ledger, Some(RESET), None, false, false);
+    let host = FableHost::launched(LaunchModel::Unnamed, &["relaunched"]);
+    let opts = opts_for(&host);
+    let mut m = Mock::new(vec![ended("Fixed the parser.")]);
+    let mut s = later_loop(&mut m, &ledger, NOW);
+    let mut heard = Heard::default();
+    let decide = |s: &mut Session<'_, Mock>, heard: &mut Heard, seq| {
+        let p = point_at(s, ended("Fixed the parser."), seq);
+        s.turn_end_looked(&p, None, &opts, heard)
+            .expect("a decision")
+    };
+    let lifted = |n: usize, heard: &Heard| {
+        heard
+            .noted
+            .iter()
+            .filter(|l| l.contains("rule=model-restore@v1 Fable's limit lifted on the account"))
+            .count()
+            == n
+    };
+
+    *host.fable_lift.lock().unwrap() = FableLift::Lifted { at: made - 60 };
+    let a = decide(&mut s, &mut heard, 101);
+    assert_eq!(
+        returns(&a),
+        None,
+        "CONTROL: a lift before the switch: {a:?}"
+    );
+    assert!(heard.noted.is_empty(), "{:#?}", heard.noted);
+
+    *host.fable_lift.lock().unwrap() = FableLift::Lifted { at: made + 60 };
+    let a = decide(&mut s, &mut heard, 102);
+    assert_eq!(returns(&a), Some(None), "the lift returns it: {a:?}");
+    assert!(lifted(1, &heard), "{:#?}", heard.noted);
+
+    let notes = heard.noted.len();
+    *host.fable_lift.lock().unwrap() = FableLift::Unread;
+    let a = decide(&mut s, &mut heard, 103);
+    assert_eq!(
+        returns(&a),
+        Some(None),
+        "a record the host could not read takes nothing back: {a:?}"
+    );
+    assert_eq!(
+        heard.noted.len(),
+        notes,
+        "and notes nothing: {:#?}",
+        heard.noted
+    );
+
+    *host.fable_lift.lock().unwrap() = FableLift::Unlifted;
+    let a = decide(&mut s, &mut heard, 104);
+    assert_eq!(
+        returns(&a),
+        None,
+        "not into the limit the record holds: {a:?}"
+    );
+    assert!(
+        heard.noted.iter().any(|l| l
+            .contains("rule=model-restore@v1 Fable's limit stands on the account's record again")),
+        "{:#?}",
+        heard.noted
+    );
+    assert_eq!(
+        s.turn_end.model_switch().and_then(|m| m.back_by),
+        Some(BackBy::Notice),
+        "timed by the notice's reset again"
+    );
+
+    *host.fable_lift.lock().unwrap() = FableLift::Lifted { at: NOW - 30 };
+    let a = decide(&mut s, &mut heard, 105);
+    assert_eq!(returns(&a), Some(None), "a new lift returns it: {a:?}");
+    assert!(lifted(2, &heard), "{:#?}", heard.noted);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A MODEL SWITCH IS READ BACK BY A LOOP THAT STARTS AFTER IT, and a switch an older build wrote

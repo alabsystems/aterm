@@ -40,6 +40,11 @@ impl Known {
     fn holds(&self, id: &TabId) -> bool {
         self.ids().any(|known| known.short() == id.short())
     }
+
+    /// The fleet glance's IDs for other Macs now, replacing the last read whole.
+    fn note_fleet(&mut self, ids: impl IntoIterator<Item = TabId>) {
+        self.fleet = ids.into_iter().collect();
+    }
 }
 
 static KNOWN: Mutex<Option<Known>> = Mutex::new(None);
@@ -93,7 +98,7 @@ pub(crate) fn keep(text: &str) -> Option<SessionId> {
 /// The tab IDs the fleet glance names for other Macs now.
 pub(crate) fn note_fleet(ids: impl IntoIterator<Item = TabId>) {
     let fleet: HashSet<TabId> = ids.into_iter().collect();
-    with(|k| k.fleet = fleet);
+    with(|k| k.note_fleet(fleet));
 }
 
 /// `sid` as a person reads it: a tab ID at its first five characters, longer only as far as it

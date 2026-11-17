@@ -22,6 +22,7 @@
 //!   counting ones ([`OpenedAudienceEntries::keyed_winning`]), so no writer reuses the epoch and
 //!   no member hands it on.
 
+use super::rooted::Stated;
 use super::{
     Body, Draft, EpochAudience, Kind, Log, MAX_FOUNDERS, MemberId, Reader, Record, RecordId, eval,
 };
@@ -250,13 +251,13 @@ pub struct OpenedEntries {
 /// public convenience readers discard this evidence only after selection.
 pub(crate) struct SelectedEntries {
     pub(crate) opened: OpenedEntries,
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) operations: BTreeMap<(Audience, String), RecordId>,
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) puts: BTreeMap<(Audience, String), RecordId>,
     /// Audiences whose current and retained keyed history this reader opens
     /// completely. Other private audiences do not obscure a complete one.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) complete: BTreeSet<Audience>,
 }
 
@@ -303,7 +304,7 @@ pub(super) fn check_audience(audience: &EpochAudience) -> Result<()> {
 /// whose fields bound it, here for the kinds whose body depends on their audience and value. A
 /// re-key's room is reserved in bytes as well as records with them (one-mesh proofs P6, F6:
 /// `client/remove.rs`' `RemovalFill`).
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) mod most_bytes {
     use super::{DELETE_MAGIC, EpochAudience, PUT_MAGIC, encode_audience_wire};
 
@@ -341,7 +342,7 @@ pub(crate) mod most_bytes {
     /// as where its command queues it, so the class it is asked there is never less critical
     /// than the one its signed record has.
     #[must_use]
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn put_least(
         of: &EpochAudience,
         name: usize,
@@ -697,7 +698,7 @@ thread_local! {
 
 /// The resolves of this Mac's entries and the entry records opened on this thread so far, which
 /// a test differences around the pass it counts.
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn resolves_and_opens() -> (usize, usize) {
     (
         AUDIENCE_RESOLVES.with(std::cell::Cell::get),
@@ -837,7 +838,7 @@ fn open_inner(
 
 /// How many bytes the value of the entry `name` takes in a `Put`'s plaintext, for the in-memory
 /// `value`: a Claude Code token entry's with its inner seal ([`inner::stored_len`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[must_use]
 pub(crate) fn stored_value_len(name: &str, value: &[u8]) -> usize {
     if inner_sealed(name) {
@@ -935,7 +936,7 @@ impl EntryOpening<'_> {
 
     /// The meta of the text `Put` at `index`, opened: a shelved winner of an entry the head
     /// classed, read back.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn text_put_meta(&self, index: usize) -> Result<EntryMeta> {
         let entry = self.text_put(index)?;
         Ok(EntryMeta {
@@ -983,7 +984,7 @@ enum OpenedPut {
 /// What the resolve of a log read through the vault's head takes of it ([`super::head`]): the
 /// head's reading of each op it names, for the identity that resolves, and the entries the ops
 /// opened here name.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Shelf<'a> {
     log: &'a Log,
     recipient: &'a crate::age::Recipient,
@@ -1003,7 +1004,7 @@ struct Shelf<'a> {
 }
 
 /// The shelved ops a [`Shelf`] placed ([`Shelf::place`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 struct Placed {
     /// The entries classed as the head says.
     served: BTreeSet<(Audience, String)>,
@@ -1013,7 +1014,7 @@ struct Placed {
     unplaced: Vec<(usize, u32)>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl<'a> Shelf<'a> {
     fn of(log: &'a Log, recipient: &'a crate::age::Recipient) -> Self {
         Self {
@@ -1126,6 +1127,7 @@ impl<'a> Shelf<'a> {
                     record_id: *record.id(),
                     epoch: *epoch,
                     op: DecodedOp::Put(head_meta(index, &key.1, class)),
+                    stated: None,
                 });
             }
             placed.served.insert(key);
@@ -1136,7 +1138,7 @@ impl<'a> Shelf<'a> {
 
 /// An op of an entry classed by the head, as its register reads it: its write is the head's
 /// number for it, the same for two ops exactly where they write the same thing.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn head_meta(index: usize, name: &str, class: u32) -> EntryMeta {
     EntryMeta {
         index,
@@ -1187,7 +1189,7 @@ impl ResolvedEntries {
         Ok(summary)
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     fn into_named(self, log: &Log, names: &[&str]) -> Result<Vec<Entry>> {
         Ok(self.into_selection(log, Some(names))?.opened.entries)
     }
@@ -1204,7 +1206,7 @@ impl ResolvedEntries {
             keyed: &summary.keyed_keys,
             effective: log.effective(),
         };
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         let complete = entries
             .keys()
             .filter(|audience| summary.reputs_whole(&EpochAudience::from(*audience)))
@@ -1230,19 +1232,19 @@ impl ResolvedEntries {
                 },
             );
         }
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         let selected_key = |key: &(Audience, String)| {
             selected
                 .get(&key.1)
                 .is_some_and(|entry| entry.audience == key.0)
         };
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         let operations = summary
             .winning_ops
             .into_iter()
             .filter(|(key, _)| selected_key(key))
             .collect();
-        #[cfg(any(unix, test))]
+        #[cfg(any(unix, windows, test))]
         let puts = summary
             .winning_puts
             .into_iter()
@@ -1255,16 +1257,16 @@ impl ResolvedEntries {
                 unwrapped_epochs: summary.unwrapped_keys.into_keys().collect(),
                 hidden_epochs: summary.hidden_epochs,
             },
-            #[cfg(any(unix, test))]
+            #[cfg(any(unix, windows, test))]
             operations,
-            #[cfg(any(unix, test))]
+            #[cfg(any(unix, windows, test))]
             puts,
-            #[cfg(any(unix, test))]
+            #[cfg(any(unix, windows, test))]
             complete,
         })
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     fn into_audience_named(
         self,
         log: &Log,
@@ -1331,6 +1333,10 @@ struct CandidateOp {
     record_id: RecordId,
     epoch: RecordId,
     op: DecodedOp,
+    /// What every log reads of a version-2 op ([`Log::stated`]): its own statement, so the
+    /// reading never turns on which ops a prune dropped. `None` for a version-1 op: its frontier
+    /// says it.
+    stated: Option<Stated>,
 }
 
 /// Drop each winning entry whose anchor (`if-absent=<anchor>`) no view of `by_audience` holds as a
@@ -2341,7 +2347,7 @@ impl Log {
     /// Unlike [`Log::open_entries`], this neither merges host values over Everyone nor
     /// requires a current epoch key. An unavailable reader is `None`; a visible resolution
     /// without requested winners is `Some(empty)`.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn open_audience_entries_named(
         &self,
         identity: &Identity,
@@ -2355,7 +2361,7 @@ impl Log {
 
     /// Whether a member with no envelope locker can follow this log. Validate all eligible
     /// payloads without materializing their values; a concurrent epoch's wrap gap is not removal.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn admits_without_locker(&self, identity: &Identity) -> Result<bool> {
         let me = identity.recipient();
         if self.recipient_is_removed(&me)
@@ -2394,7 +2400,7 @@ impl Log {
     /// Open selected names only after the same complete validation, register selection,
     /// host precedence and anchor closure as [`Log::open_entries`]. A readable view with
     /// none of the names is `Some(empty)`; reader or current-key unavailability is `None`.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn open_entries_named(
         &self,
         identity: &Identity,
@@ -2421,7 +2427,7 @@ impl Log {
         Ok(Some(resolved.into_selection(self, names)?))
     }
 
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     fn open_entries_named_with_digest(
         &self,
         identity: &Identity,
@@ -2549,7 +2555,7 @@ impl Log {
         };
         // A log read through the vault's head: its shelved `Put`s are taken as the head says the
         // resolve that wrote it read them, unopened, where that holds ([`Shelf`]).
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let mut shelf = Shelf::of(self, &my_recipient);
         let mut open_put = |i: usize, record: &Record| -> Result<Option<OpenedPut>> {
             let Body::Put {
@@ -2586,6 +2592,7 @@ impl Log {
                         record_id: *record.id(),
                         epoch: *epoch,
                         op: DecodedOp::Put(entry),
+                        stated: None,
                     },
                 )))
             } else {
@@ -2605,7 +2612,7 @@ impl Log {
                 Body::Put {
                     audience, epoch, ..
                 } => {
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     if !excluded_audiences.contains(audience)
                         && self
                             .op_key(i, epoch, &unwrapped, &keyed_keys, effective)
@@ -2614,11 +2621,11 @@ impl Log {
                     {
                         continue;
                     }
-                    #[cfg(not(unix))]
+                    #[cfg(not(any(unix, windows)))]
                     let _ = (audience, epoch);
                     match open_put(i, record)? {
                         Some(OpenedPut::Text(key, op)) => {
-                            #[cfg(unix)]
+                            #[cfg(any(unix, windows))]
                             shelf.opened(record.id(), &key);
                             registers.entry(key).or_default().push(op);
                         }
@@ -2647,13 +2654,14 @@ impl Log {
                     let plain = open_aead(epoch_key, record, audience, epoch, salt, ciphertext)?;
                     let name = decode_delete_plaintext(&plain)?;
                     let key = (text_aud, name);
-                    #[cfg(unix)]
+                    #[cfg(any(unix, windows))]
                     shelf.opened(record.id(), &key);
                     registers.entry(key).or_default().push(CandidateOp {
                         index: i,
                         record_id: *record.id(),
                         epoch: *epoch,
                         op: DecodedOp::Delete,
+                        stated: None,
                     });
                 }
                 _ => {}
@@ -2663,7 +2671,7 @@ impl Log {
         // other counted op of the entry is one the head names too; opened as a full resolve opens
         // them where an op the head does not name writes the entry, or none it names here says
         // which entry it is.
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         let (served, mut real) = {
             let placed = shelf.place(&mut registers);
             for (i, _) in placed.unplaced {
@@ -2676,9 +2684,14 @@ impl Log {
             }
             (placed.served, placed.real)
         };
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         commons_candidates.sort_by_key(|control| control.index);
         drop(open_put);
+        // Every log reads a version-2 op by its statement ([`super::rooted`]).
+        let reps = self.frame_reps();
+        for op in registers.values_mut().flatten() {
+            op.stated = self.stated(op.index, &reps);
+        }
 
         let mut conflicts = BTreeSet::new();
         let mut concurrent: BTreeMap<(Audience, String), Vec<RecordId>> = BTreeMap::new();
@@ -2695,9 +2708,15 @@ impl Log {
         let registers: Vec<((Audience, String), Vec<CandidateOp>)> =
             registers.into_iter().collect();
         let ops: Vec<&[CandidateOp]> = registers.iter().map(|(_, ops)| ops.as_slice()).collect();
-        let (order, held) = (&self.order, &self.held);
-        let classified = Register::classify_all(&ops, effective.reach(), |x| {
-            order[x].parents().iter().map(move |parent| held[parent])
+        // A stated carry's rep no op of its register is (one a prune dropped, at its stub, or one
+        // this reader did not open) lies in a held op's past as the log places it
+        // ([`super::rooted`]).
+        let rep_before = |rep: &RecordId, at: usize| {
+            self.position(rep)
+                .is_some_and(|from| self.position_before(from, at))
+        };
+        let classified = Register::classify_all(&ops, effective.reach(), Some(&rep_before), |x| {
+            self.placed_parents(x)
         });
         for (((audience, name), candidates), register) in registers.iter().zip(&classified) {
             // A carry changes nothing, so it loses to a concurrent sibling that changes the
@@ -2705,13 +2724,10 @@ impl Log {
             // made on the other. Siblings that write the same thing are no conflict.
             let siblings = register.siblings(effective.reach());
             #[cfg(test)]
-            register::oracle::check(candidates, effective, register, &siblings);
+            register::oracle::check(candidates, effective, &rep_before, register, &siblings);
             for &i in &siblings {
                 if register.reps[i] != i {
-                    carried.insert(
-                        candidates[i].record_id,
-                        candidates[register.reps[i]].record_id,
-                    );
+                    carried.insert(candidates[i].record_id, register.rep_id(i));
                 }
             }
             if siblings.len() > 1 {
@@ -2729,7 +2745,7 @@ impl Log {
             }
             if let DecodedOp::Put(entry) = &winner.op {
                 // An entry classed by the head reads its winner as the winner says it.
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 let entry = &if served.contains(&(audience.clone(), name.clone())) {
                     match real.remove(&winner.index) {
                         Some(entry) => entry,
@@ -2738,22 +2754,28 @@ impl Log {
                 } else {
                     entry.clone()
                 };
-                let semantic = &candidates[register.reps[w]];
+                // The op whose value the winner writes: in a rooted log, a stub's where a prune
+                // dropped it, at the stub's position ([`Log::position`]).
+                let semantic = register.rep_id(w);
+                let semantic_at = match register.rep_index(w) {
+                    Some(at) => at,
+                    None => self.position(&semantic).unwrap_or(winner.index),
+                };
                 if matches!(audience, Audience::Hosts(_)) {
-                    let precedence = semantic;
+                    let precedence = (semantic_at, semantic);
                     #[cfg(test)]
                     let precedence = if HOST_WRAPPER_PRECEDENCE.get() {
-                        winner
+                        (winner.index, winner.record_id)
                     } else {
                         precedence
                     };
                     host_winners.entry(name.clone()).or_default().push((
                         audience.clone(),
-                        precedence.index,
-                        precedence.record_id,
+                        precedence.0,
+                        precedence.1,
                     ));
                 }
-                winning_ops.insert((audience.clone(), name.clone()), semantic.record_id);
+                winning_ops.insert((audience.clone(), name.clone()), semantic);
                 winning_puts.insert((audience.clone(), name.clone()), winner.record_id);
                 by_audience
                     .entry(audience.clone())
@@ -2799,7 +2821,19 @@ impl Log {
 
         let mut winning_host_audience: BTreeMap<String, Audience> = BTreeMap::new();
         for (name, candidates) in host_winners {
-            let maximal = effective.newest(&candidates, |c| c.1);
+            let maximal = if candidates.iter().any(|c| c.1 >= super::rooted::VIRTUAL) {
+                // A winner's rep a prune dropped stands at its stub.
+                candidates
+                    .iter()
+                    .filter(|a| {
+                        !candidates
+                            .iter()
+                            .any(|b| a.1 != b.1 && self.position_before(a.1, b.1))
+                    })
+                    .collect()
+            } else {
+                effective.newest(&candidates, |c| c.1)
+            };
             if maximal.len() > 1 {
                 for (aud, _, _) in &maximal {
                     conflicts.insert((aud.clone(), name.clone()));
@@ -2809,7 +2843,7 @@ impl Log {
                 winning_host_audience.insert(name, aud.clone());
             }
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if super::head::wants(self, &my_recipient.0) {
             let mut resolved = super::head::Resolved::default();
             for (number, (((_, name), candidates), register)) in
@@ -2933,7 +2967,17 @@ impl Log {
             return Vec::new();
         }
         let effective = self.effective();
-        // Each counting `Remove` of `member` with its cutoff, and each counting `Admit` of it.
+        // Whether position `a` lies in position `b`'s strict past: in a rooted log either may be
+        // a stub's ([`super::rooted::VIRTUAL`]), a dropped cutoff or a winner's dropped rep.
+        let before = |a: usize, b: usize| {
+            if (a | b) >= super::rooted::VIRTUAL {
+                self.position_before(a, b)
+            } else {
+                effective.before(a, b)
+            }
+        };
+        // Each counting `Remove` of `member` with its cutoff, held or dropped ([`Log::position`]),
+        // and each counting `Admit` of it.
         let removes: Vec<(usize, usize)> = self
             .order
             .iter()
@@ -2943,7 +2987,7 @@ impl Log {
                 Body::Remove {
                     member: out,
                     cutoff,
-                } if out == member => self.record_index(cutoff).map(|cut| (i, cut)),
+                } if out == member => self.position(cutoff).map(|cut| (i, cut)),
                 _ => None,
             })
             .collect();
@@ -2957,10 +3001,10 @@ impl Log {
         // `Admit` of it that follows that `Remove` lies in `at`'s past (as `cut` reads it).
         let while_out = |at: usize| {
             removes.iter().any(|&(r, cut)| {
-                !(cut == at || effective.before(at, cut))
+                !(cut == at || before(at, cut))
                     && !admits
                         .iter()
-                        .any(|&a| effective.before(r, a) && effective.before(a, at))
+                        .any(|&a| effective.before(r, a) && before(a, at))
             })
         };
         let mut recipients: BTreeSet<Recipient> = BTreeSet::new();
@@ -2990,14 +3034,24 @@ impl Log {
             .winning_ops
             .iter()
             .filter(|(_, op)| {
-                let Some(at) = self.record_index(op) else {
+                let Some(at) = self.position(op) else {
                     return false;
                 };
-                let record = &self.order[at];
-                let Body::Put { epoch, .. } = record.body() else {
-                    return false;
+                // A winner's rep a prune dropped is read off its stub: its signer and epoch.
+                let (actor, epoch) = match self.get(op) {
+                    Some(record) => match record.body() {
+                        Body::Put { epoch, .. } => (record.actor(), epoch),
+                        _ => return false,
+                    },
+                    None => match self.stub(op) {
+                        Some(stub) if stub.kind == Kind::Put => match &stub.epoch {
+                            Some(epoch) => (&stub.actor, epoch),
+                            None => return false,
+                        },
+                        _ => return false,
+                    },
                 };
-                record.actor() != member && while_out(at) && reaches(epoch)
+                actor != member && while_out(at) && reaches(epoch)
             })
             .map(|(key, _)| key.clone())
             .collect()
@@ -3033,7 +3087,7 @@ impl Log {
     ///
     /// # Errors
     /// A `Wrap` or `Put` addressed to `identity` fails to open.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn put_lineage(
         &self,
         identity: &Identity,
@@ -3107,7 +3161,7 @@ impl Log {
     ///
     /// # Errors
     /// A `Put` sealed under an epoch key `opened` holds fails to open.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn everyone_values(
         &self,
         opened: &OpenedAudienceEntries,
@@ -3136,7 +3190,7 @@ impl Log {
     ///
     /// # Errors
     /// A `Put` sealed under an epoch key `opened` holds fails to open.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn everyone_puts_of_drafts(
         &self,
         opened: &OpenedAudienceEntries,
@@ -3179,7 +3233,7 @@ impl Log {
     /// The `[everyone]` `Put` `record`, at `index` of the log, as `opened` opens it: the value it
     /// writes under `name` (opened from its inner seal), [`Opened::Other`] for another name or
     /// another body, [`Opened::Unopened`] where no epoch key `opened` holds opens it.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn everyone_put_opened(
         &self,
         opened: &OpenedAudienceEntries,
@@ -3217,7 +3271,7 @@ impl Log {
 
     /// Every recipient a `Wrap` of `epoch` in this log hands its key to, whether or not the log
     /// still counts that `Wrap`: who could open what `epoch` seals, once they held these records.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub(crate) fn wrapped_to(&self, epoch: &RecordId) -> BTreeSet<Recipient> {
         self.order
@@ -3236,7 +3290,7 @@ impl Log {
 
 /// What one draft put under an `[everyone]` name, as a Mac opens it
 /// ([`Log::everyone_puts_of_drafts`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) enum DraftPut {
     /// The value its first `Put` of the name that opens here writes.
     Wrote(SecretBytes),
@@ -3247,7 +3301,7 @@ pub(crate) enum DraftPut {
 }
 
 /// One `[everyone]` `Put` as a Mac opens it ([`Log::everyone_put_opened`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 enum Opened {
     /// The value it writes under the name asked for.
     Wrote(SecretBytes),
@@ -3258,7 +3312,7 @@ enum Opened {
 }
 
 /// The `Put`s of one `[everyone]` value as a Mac opens them ([`Log::put_lineage`]).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Lineage {
     /// Each `Put` of the value, in record order.
@@ -3268,7 +3322,7 @@ pub(crate) struct Lineage {
 }
 
 /// One `Put` of a [`Lineage`].
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LineagePut {
     /// The `Put`.

@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[cfg(unix)]
 #[test]
 fn a_log_read_before_an_authority_change_cannot_supply_the_new_roster() {
     let macs = super::super::log_entries_tests::two_macs(&[]);
@@ -29,6 +30,7 @@ fn a_log_read_before_an_authority_change_cannot_supply_the_new_roster() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_membership_log_cannot_admit_a_cached_admin() {
     struct FailedReads(PathBuf);
@@ -72,6 +74,7 @@ fn an_unreadable_membership_log_cannot_admit_a_cached_admin() {
 /// NEGATIVE CONTROLS (2026-11-05): with the `Held` arm of [`with_roster_observation`] releasing
 /// its lock, or with `file.try_lock_shared()` gone from `StateLock::classify`, it fails at
 /// "a writer took the state lock under a roster read".
+#[cfg(unix)]
 #[test]
 fn a_roster_read_keeps_a_writer_out_and_its_overlay_keeps_a_log_removal() {
     let macs = super::super::log_entries_tests::two_macs(&[]);

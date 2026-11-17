@@ -27,7 +27,7 @@ pub use detect::{
     ACTIVITIES, Activity, ActivityId, Candidate, CauseId, Context, Evidence, Term, WakeFact, detect,
 };
 pub use episodes::{DeckCause, OpenCause, deck_cause};
-pub use reap::{ReapLedger, ReapTotals, Scope};
+pub use reap::{HistoricalReported, ReapLedger, ReapTotals, Scope};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
 
 /// A map keyed by the kernel's integer ids (pids, coalition ids, a pid and
@@ -1082,6 +1082,10 @@ impl PreparedWhy {
 }
 
 impl WhyState {
+    pub(crate) fn historical_reported(&self) -> HistoricalReported {
+        self.reap.historical_reported()
+    }
+
     pub(crate) fn has_pending_native(&self) -> bool {
         self.reap.has_pending_native()
     }
@@ -1281,6 +1285,7 @@ impl WhyState {
         let (Some(procs), Some(uid), Some((members, owners))) =
             (s.procs.as_deref(), s.self_uid, attribution)
         else {
+            self.reap.mark_historical_incomplete();
             return;
         };
         let delegated: Vec<bool> = owners.iter().map(Option::is_some).collect();

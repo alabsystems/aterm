@@ -268,7 +268,8 @@ fn line_layout_phrases(
     partly: bool,
 ) -> Vec<String> {
     let mut phrases = vec![phrase_with_state(state.word, &state.phrase)];
-    if !matches!(state.word, "done" | "as last read" | "not joined") {
+    let problem = matches!(state.mark, Mark::Failed | Mark::NeedsYou | Mark::Waiting);
+    if !problem && !matches!(state.word, "done" | "as last read" | "not joined") {
         return phrases;
     }
     let managed: Vec<&RowView> = members.iter().copied().filter(|row| row.managed).collect();
@@ -300,7 +301,7 @@ fn line_layout_phrases(
                 history_summary(line, not_joined)
             ));
         }
-    } else if state.word == "as last read" {
+    } else if state.word == "as last read" || problem {
         for phase in ["current reading unavailable", "checking", "waiting to read"] {
             phrases.push(format!("{lead}Some results as last read · {phase}"));
         }
@@ -373,11 +374,28 @@ pub(crate) struct CardButton {
     pub(crate) face: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PasswordAction {
+    Finish,
+    MacSetupTab,
+}
+
+/// The individual request behind a consolidated password card. Grouping may change while
+/// one step is unread; its original reason and action still distinguish a changed request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PasswordStep {
+    pub(super) subject: Subject,
+    note: Option<String>,
+    action: PasswordAction,
+}
+
 /// One thing the card asks of the person (§4.8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CardItem {
     /// Its key's last word (`system-state/card/<id>`).
     pub(crate) id: String,
+    /// Presentation history kept through a new reading, never a current request or action.
+    pub(crate) retained: bool,
     pub(crate) mark: Mark,
     /// What to do, said once.
     pub(crate) title: String,
@@ -389,6 +407,7 @@ pub(crate) struct CardItem {
     pub(crate) button: Option<CardButton>,
     /// The row it stands for, which its line then leaves out.
     pub(crate) subject: Option<Subject>,
+    pub(super) password_steps: Vec<PasswordStep>,
     /// It holds the phrase field ([`super::PHRASE_FIELD`]).
     pub(crate) phrase: bool,
     /// It holds the vault's address and password fields.
@@ -404,12 +423,14 @@ impl CardItem {
     fn new(id: impl Into<String>, mark: Mark, title: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            retained: false,
             mark,
             title: title.into(),
             step: None,
             reason: None,
             button: None,
             subject: None,
+            password_steps: Vec::new(),
             phrase: false,
             vault: false,
             code: false,
@@ -446,6 +467,12 @@ impl CardItem {
         self.subject = Some(subject);
         self
     }
+
+    pub(super) fn subjects(&self) -> impl Iterator<Item = Subject> + '_ {
+        self.subject
+            .into_iter()
+            .chain(self.password_steps.iter().map(|step| step.subject))
+    }
 }
 
 /// The Secrets item's Copy Command: the command that approves this Mac, for an admin Mac.
@@ -478,12 +505,24 @@ pub(super) const GO_TO_INSTALLER_LABEL: &str = "Go to installer: Apple's Command
 /// meet it — the permission walk's page, the Command Line Tools' password, the vault's Allow and phrase, a code to approve, a failed step with what aterm does
 /// next.
 pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem> {
+    app.card_with_history(rows, current_card_items(app, rows))
+}
+
+pub(super) fn current_card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem> {
     let status = &app.status;
     let mut items = Vec::new();
     if !app.plan_known || status.newer() {
         return items;
     }
     let needs = |row: &RowView| row.managed && row.standing == Some(Standing::NeedsYou);
+    let password_action = if matches!(
+        status.mac_setup,
+        Some(super::ToolsInstall::Password | super::ToolsInstall::Recovered)
+    ) {
+        PasswordAction::MacSetupTab
+    } else {
+        PasswordAction::Finish
+    };
     let password_rows: Vec<_> = rows
         .iter()
         .filter(|row| {
@@ -497,15 +536,14 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
         })
         .collect();
     if password_rows.len() > 1 {
-        let reason = password_rows
+        let steps = password_rows
             .iter()
-            .map(|row| {
-                row.note
-                    .clone()
-                    .unwrap_or_else(|| row.subject.name().into())
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+            .map(|row| row.subject.name().to_owned())
+            .collect::<Vec<_>>();
+        let reason = format!(
+            "Finish these steps together: {}.",
+            crate::toolchain_words::and_list(&steps)
+        );
         let mut item = CardItem::new(
             "mac-password",
             Mark::NeedsYou,
@@ -513,6 +551,14 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
         )
         .reason(Some(reason))
         .for_row(password_rows[0].subject);
+        item.password_steps = password_rows
+            .iter()
+            .map(|row| PasswordStep {
+                subject: row.subject,
+                note: row.note.clone(),
+                action: password_action,
+            })
+            .collect();
         item = if matches!(
             status.mac_setup,
             Some(super::ToolsInstall::Password | super::ToolsInstall::Recovered)
@@ -572,6 +618,16 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                     format!("Turn on {}", access.name())
                 };
                 let mut item = CardItem::new(slug, Mark::NeedsYou, title).reason(row.note.clone());
+                if matches!(
+                    access,
+                    Access::NameRule | Access::SpotlightScope | Access::NetworkHelper
+                ) {
+                    item.password_steps.push(PasswordStep {
+                        subject,
+                        note: row.note.clone(),
+                        action: password_action,
+                    });
+                }
                 if let Some(walk) = status.walk.filter(|walk| walk.access == access) {
                     item.step = Some(format!("Step {} of {}", walk.at, walk.of));
                     let next: Vec<&str> = rows
@@ -968,18 +1024,20 @@ fn line_state(
     let carded: Vec<&RowView> = managed
         .iter()
         .copied()
-        .filter(|row| card.iter().any(|item| item.subject == Some(row.subject)))
+        .filter(|row| {
+            card.iter()
+                .any(|item| !item.retained && item.subject == Some(row.subject))
+        })
         .collect();
     if let Some(first) = carded.first() {
-        if card
-            .iter()
-            .any(|item| item.subject == Some(first.subject) && item.mark == Mark::Waiting)
-        {
+        if card.iter().any(|item| {
+            !item.retained && item.subject == Some(first.subject) && item.mark == Mark::Waiting
+        }) {
             return with_lead(LineState::new(Mark::Waiting, waiting_for(first)));
         }
-        let failed = card
-            .iter()
-            .any(|item| item.subject == Some(first.subject) && item.mark == Mark::Failed);
+        let failed = card.iter().any(|item| {
+            !item.retained && item.subject == Some(first.subject) && item.mark == Mark::Failed
+        });
         if failed {
             return with_lead(LineState::new(Mark::Failed, "Failed"));
         }
@@ -1381,7 +1439,9 @@ pub(crate) fn progress(
                 && (row.settled() || last_confirmed(row))
                 && row.chip != Some(super::Chip::Waiting)
                 && !matches!(&row.value, RowValue::Muted(word) if word == super::OFFERED_WORD)
-                && !card.iter().any(|item| item.subject == Some(row.subject))
+                && !card
+                    .iter()
+                    .any(|item| !item.retained && item.subject == Some(row.subject))
                 && !steps.failed.contains(&row.subject)
                 && !steps.retried.contains(&row.subject)
                 && (!steps.unconfirmed.contains(&row.subject) || last_confirmed(row))
@@ -1394,11 +1454,37 @@ fn last_confirmed(row: &RowView) -> bool {
     row.managed && row.chip == Some(super::Chip::LastKnown)
 }
 
+/// The accepted reading's phase while its prior card remains presentation history. Before the
+/// observer publishes its subjects, the setup status supplies the queued state.
+pub(super) fn retained_phase(app: &SystemStateApp) -> &'static str {
+    let status = &app.status;
+    let queued = if status.observing.is_empty() {
+        status.queued
+    } else {
+        status.observing.iter().all(|(_, _, queued)| *queued)
+    };
+    if queued { "queued" } else { "checking" }
+}
+
 /// THE HERO RULE (§4.3, pure): the phase headline, from the headline rule's own reading
 /// ([`super::headline`]), the sub-line, where the counts live, and the live region's words.
 pub(crate) fn hero(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero {
     let mut hero = hero_words(app, rows, card);
     hero.phase = phase_words(app, &hero, card);
+    if card.iter().any(|item| item.retained) {
+        let phase = retained_phase(app);
+        if let Some(previous) = &app.check_card {
+            hero.headline.clone_from(&previous.headline);
+        }
+        hero.as_last_read = true;
+        hero.sub = if hero.total > 0 {
+            format!("{} · {phase}", hero.progress_caption())
+        } else {
+            format!("Setup details as last read · {phase}")
+        };
+        hero.phase = format!("Setup details as last read; {phase}");
+        return hero;
+    }
     if rows
         .iter()
         .any(|row| matches!(row.value, RowValue::LastKnown(_)))
@@ -1418,7 +1504,7 @@ fn phase_words(app: &SystemStateApp, hero: &Hero, card: &[CardItem]) -> String {
     let status = &app.status;
     let needs: Vec<&CardItem> = card
         .iter()
-        .filter(|item| item.mark == Mark::NeedsYou)
+        .filter(|item| !item.retained && item.mark == Mark::NeedsYou)
         .collect();
     match needs.as_slice() {
         [item] => return item.title.clone(),
@@ -1427,7 +1513,7 @@ fn phase_words(app: &SystemStateApp, hero: &Hero, card: &[CardItem]) -> String {
     }
     let failed: Vec<String> = card
         .iter()
-        .filter(|item| item.mark == Mark::Failed)
+        .filter(|item| !item.retained && item.mark == Mark::Failed)
         .filter_map(|item| item.subject.map(|subject| subject.name().to_owned()))
         .collect();
     if !failed.is_empty() {
@@ -1497,9 +1583,12 @@ fn hero_words(app: &SystemStateApp, rows: &[RowView], card: &[CardItem]) -> Hero
     }
     let needs = card
         .iter()
-        .filter(|item| item.mark == Mark::NeedsYou)
+        .filter(|item| !item.retained && item.mark == Mark::NeedsYou)
         .count();
-    let failed = card.iter().filter(|item| item.mark == Mark::Failed).count();
+    let failed = card
+        .iter()
+        .filter(|item| !item.retained && item.mark == Mark::Failed)
+        .count();
     if needs > 0 {
         hero.headline = things(needs);
         if status.running() {

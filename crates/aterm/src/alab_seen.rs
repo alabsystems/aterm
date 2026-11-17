@@ -139,11 +139,7 @@ fn detail(view: &LabView, event: &aterm_db::alab::journal::Event) -> String {
     }
     if let Some(to) = &event.to {
         sep(&mut out);
-        let label = view
-            .accounts
-            .get(to.as_str())
-            .and_then(|a| a.label.as_deref())
-            .unwrap_or_else(|| to.as_str());
+        let label = view.slug(to.as_str()).unwrap_or_else(|| to.as_str());
         out.push_str("to=");
         out.push_str(label);
     }
@@ -372,10 +368,13 @@ impl Cache {
                 return;
             }
             crate::alab_view::LocalRosterPolicy::Disabled => {
-                *self
-                    .held
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                alab_seen::hold(
+                    &mut self
+                        .held
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    None,
+                );
                 *self
                     .lab
                     .lock()
@@ -405,10 +404,14 @@ impl Cache {
             Ok(Some(seen)) => {
                 let names = Names::of(&view, &seen, self.label);
                 let fresh = Arc::new(harness_seen(&names, &seen));
-                *self
-                    .held
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);
+                // A re-read that says the same tells the listener nothing (`alab_seen::hold`).
+                alab_seen::hold(
+                    &mut self
+                        .held
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    Some(fresh),
+                );
                 Reading::Read(Arc::new(seen))
             }
             Ok(None) => Reading::Off,

@@ -3,8 +3,9 @@
 
 //! The Tables page (docs/PLAN.md LT-08): the registry's stored tables, each a grid of its live
 //! rows, the owner's edits staged and written in one Write through the same save
-//! `aterm db table apply` makes ([`crate::tables_store`]), and a row's fields with their writers
-//! and its history in the pane beside the grid.
+//! `aterm db table apply` makes ([`crate::tables_store`]), a row's fields with their writers in
+//! the pane beside the grid, and every cell edit of the table in the history drawer under it
+//! ([`history`]).
 //!
 //! - **Rail.** Every collection of the registry generation in use, as its compiled table lists
 //!   them ([`crate::tables_store::listed`]): under STORED the owner's, under SET BY ATERM what
@@ -32,12 +33,14 @@
 //!   width (never over Check or the narrow page's list of tables, which are no table's grid).
 //!   The grid gives the bar that row of its own room, so nothing else on the page moves for
 //!   it; in a window so short that the grid under it would not keep its name, type and group
-//!   lines and one whole row (a narrow page's grid as it stands with a row selected), the bar
-//!   gives way and the grid keeps the room. Whether it stands is the window's to say, judged
-//!   as if changes waited to be written and the line under the grid stood three lines high:
-//!   no selection and no staged change takes the bar away or brings it back, and a line under
-//!   the grid that wraps further takes its room from the grid's, down to the three lines the
-//!   grid keeps without the bar, so the bar never pushes the page past the window. It says
+//!   lines and one whole row beside the history drawer's line (a narrow page's grid as it
+//!   stands with a row selected), the bar gives way and the grid keeps the room. Whether it
+//!   stands is the window's to say, with the filters' chips while any stands (counted as the tools
+//!   row is, so a filter added in a short window can take the bar away), judged as if changes
+//!   waited to be written and the line under the grid stood three lines high: no selection and no
+//!   staged change takes the bar away or brings it back, and a line under the grid that wraps
+//!   further takes its room from the grid's, down to the three lines the grid keeps without the
+//!   bar, so the bar never pushes the page past the window. It says
 //!   which cell is selected (its row's key and its column; what of the row's own key tells it
 //!   apart, dimmed, where another row shows that key too; a range's rows and columns), the
 //!   cell's whole value as the grid shows it and nothing the grid does not (a secret's cell
@@ -53,12 +56,13 @@
 //!   the value the cell holds the bar names no writer and no time: where that value came
 //!   from is said once, by the line under the grid. A range says how many of its cells are
 //!   filled, and of whole numbers their sum, least and most. The cell whose value is said is
-//!   one the grid shows: a selected cell whose row the find field leaves out is named by its
-//!   address, as the line under the grid still tells of it, and said to be not among the rows
-//!   found. Where the line is too narrow the address and the value stay and the state's
-//!   words are cut at their end (left out where the value leaves them no room); only then is
-//!   the address cut, in its row's key before its column's words, and the value at the bar's
-//!   end. Each seat the line shows is spoken whole whatever it cuts. The bar takes no key and
+//!   one the grid shows: a selected cell whose row the grid leaves out is named by its address,
+//!   as the line under the grid still tells of it, with what leaves it out: not among the rows
+//!   found (the find), left out by the filters (the find passes it), or not among the live rows
+//!   (or the retired ones: the lifecycle filter). Where the line is too narrow the address and
+//!   the value stay and the state's words are cut at their end (left out where the value leaves
+//!   them no room); only then is the address cut, in its row's key before its column's words,
+//!   and the value at the bar's end. Each seat the line shows is spoken whole whatever it cuts. The bar takes no key and
 //!   no focus: an open cell's field or list of words keeps them.
 //! - **Grid.** A sheet: ruled cells of one height under a header line of column names, each row
 //!   numbered at its left. The header line stays at the top while the rows scroll under it, and
@@ -118,20 +122,53 @@
 //!   as a bar along its foot. Copy, ranges, Tab's path and the arrows take the drawn columns
 //!   alone, and a column with a change not written or a refused cell is never hidden or folded.
 //!   The choice is the view's, per table, while the tab lives ([`native_tables_columns`]).
+//! - **Filters.** Each column's header carries a mark at its right end (its press of its own;
+//!   the header's still sorts) that opens a list of the values its rows hold, each with how many
+//!   rows hold it, and the one-press choices `Only rows with a value` and `Only rows that are
+//!   empty`; a number's or a time's column also takes `At least` and `At most`. Each filter that
+//!   stands is a chip in words in a line under the tools (`ROLE is worker, desk`); filters join
+//!   with and, after the lifecycle filter and beside the find, judge what the read holds, and
+//!   leave a row with a staged cell and a new row shown. The heading counts the rows shown of
+//!   those the lifecycle filter leaves (`24 of 156 rows`). The chips' line takes its room from
+//!   the grid's, once, and counts in the window's judgment of the cell bar and the history
+//!   drawer as the tools row does. A press that asks for a row they alone leave out (Check's Show
+//!   row, a line of the history drawer) clears them; Show row first empties the find and widens
+//!   the lifecycle filter where they leave the row out, and a line of the drawer keeps both. The
+//!   filters are the view's, per table ([`native_tables_filters`]).
 //! - **Blue** means only "not yet written" ([`StyleRef::Unwritten`], the palette's one fixed
 //!   [`crate::native_appearance::NOT_WRITTEN`], never the accent): a staged cell, its staged
-//!   words in the cell bar and the pane, the rail's count of them, the Write bar. Nothing else
-//!   on the page wears it.
-//! - **Writers** are named by their Mac's label (`m73`), resolved from what aterm holds; a writer
-//!   none names shows the start of its machine id, dimmed.
+//!   words in the cell bar and the pane, the rail's count of them, the Write bar, the history
+//!   drawer's lines of them. Nothing else on the page wears it.
+//! - **Writers** are named by the machine row their Mac's facts bind, as history names it: its
+//!   label (`m73`), else its key; a writer no row binds shows the start of its machine id,
+//!   dimmed.
 //! - **A conflict** shows every value, sorted by its words, and the pane lists each with its
 //!   writer and a Keep; no clock picks one. A Write is compared against what each staged cell
 //!   held when the person last saw it: when it was staged, or when it was opened, since an
 //!   open cell covers what a read brings.
 //! - **Secrets** never reach the page: a secret cell names its secret-store entry, read-only here.
 //!   Addresses and phone numbers are ordinary data and read as stored.
-//! - **As of.** Each history entry offers the table as that operation's causal past holds it
-//!   (`aterm db table get|scan|export --at`, the same projection), read only, each cell changed
+//! - **History.** A drawer under the grid and the line under it, over the Write bar, closed until
+//!   it is asked for, lists the cells each record set, newest first in the registry's order, for
+//!   the selected cell, the selected row or the whole table, whatever the find and the filters
+//!   show; a line and its grid cell select each other, a line of a column the Columns list hid
+//!   shows it again, and one of a row the filters alone leave out clears them (one the find or
+//!   the lifecycle filter leaves out is named in its head, the filters kept). It takes its height
+//!   out of the grid's room, once, at every width, so nothing else moves for it; every table the
+//!   rail lists has one (a table of a Mac's own rows lists what was read of it), and Check and the
+//!   narrow page's list of tables have none. Whether it stands is the window's to say, judged on
+//!   the room the cell bar is (under the filters' chips while any stands, so a filter added in a
+//!   short window can take it away), so no selection and no staged change takes it away or brings
+//!   it back; its line comes out of that judged room first, so in a window too short for its line,
+//!   the cell bar and the grid under the bar the cell bar gives way first, and the drawer gives
+//!   way, with the pane's way to it, only where that room leaves three lines of grid less than its
+//!   line, at every width. It never runs the page past the window: a line under the grid wrapped
+//!   onto more than three lines takes its room from the grid, down to three lines that the grid,
+//!   its bar and the drawer's line keep between them. Its list is one Tab stop, Up and Down moving
+//!   among its lines. The pane lists no history: its History of this row opens the drawer on the
+//!   row.
+//! - **As of.** Each record in the drawer offers the table as that operation's causal past holds
+//!   it (`aterm db table get|scan|export --at`, the same projection), read only, each cell changed
 //!   since marked in the grid and listed in the pane with what it holds now and who wrote that
 //!   (`aterm db table diff <operation> head`); Now returns to the table as it is.
 //!
@@ -158,8 +195,13 @@ use crate::native_ui::{
 };
 use crate::native_workers::{one_line, text_width};
 
+#[path = "native_tables_history.rs"]
+mod history;
 #[path = "native_tables_columns.rs"]
 mod native_tables_columns;
+
+#[path = "native_tables_filters.rs"]
+mod native_tables_filters;
 
 /// The page's name, on its tab and its heading.
 pub(crate) const TABLES_TITLE: &str = "Tables";
@@ -227,11 +269,11 @@ pub(crate) enum AuthorKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Author {
     pub(crate) kind: AuthorKind,
-    /// The writing Mac's label (`m73`), where aterm knows one: its actor's seat, that seat's
-    /// machine, that machine's label ([`crate::tables_store`]'s `Writers`).
+    /// The writing Mac's name (`m73`), where its facts bind a machine row: that row's name as
+    /// history gives it (`aterm_db::att::Mac::name`).
     pub(crate) label: Option<String>,
-    /// The start of the writer's Commons machine id (of its actor where none is known), which
-    /// the page shows, dimmed, where no label is known.
+    /// The start of the writer's Commons machine id (of its actor where the roster binds no
+    /// machine), which the page shows, dimmed, where no row binds.
     pub(crate) id: String,
     /// The time the writer's clock claimed, signed with the operation.
     pub(crate) at_ms: u64,
@@ -1352,13 +1394,15 @@ pub(crate) struct Editing {
     pub(crate) choice: Option<Choice>,
 }
 
-/// The rows a sheet shows, top down, worked out once for each read, find, sort and filter: a
-/// staged cell, a key and a redraw leave it as it is, so a row never moves under the selection,
-/// but for a row the filter leaves out, which shows while a change to it is staged.
+/// The rows a sheet shows, top down, worked out once for each read, find, sort, lifecycle filter
+/// and set of filters on its values: a staged cell, a key and a redraw leave it as it is, so a
+/// row never moves under the selection, but for a row the lifecycle filter leaves out, which
+/// shows while a change to it is staged.
 #[derive(Default)]
 struct Order {
     /// What it was worked out from: the sheet, the read ([`TablesApp::reads`]), the find's
-    /// words and the sorted column with its direction.
+    /// words, the sorted column with its direction, the lifecycle filter, the rows it leaves out
+    /// that a staged change shows, and the filters on the columns' values.
     of: Option<OrderOf>,
     /// Each shown row's place among the sheet's rows.
     rows: Vec<usize>,
@@ -1378,6 +1422,7 @@ type OrderOf = (
     Option<(String, bool)>,
     rows::Filter,
     BTreeSet<String>,
+    native_tables_filters::Filters,
 );
 
 /// A range's other corner: the cell it began at, among the rows as they stood then.
@@ -1410,6 +1455,9 @@ pub(crate) struct TablesViewState {
     pub(crate) check: crate::native_tables_check::CheckView,
     /// Which columns the grid draws, and the list that chooses them ([`native_tables_columns`]).
     columns: native_tables_columns::ColumnsView,
+    /// Which rows the grid shows by the values of their columns, and the list that chooses them
+    /// ([`native_tables_filters`]).
+    filters: native_tables_filters::FiltersView,
     /// The pane's Keep and Undo buttons, top down, as it last laid them out, each with where it
     /// stands in the pane's list: the arrows move among them, scrolling the one reached into
     /// view.
@@ -1445,6 +1493,9 @@ pub(crate) struct TablesViewState {
     /// view state, kept across reads and written nowhere. A sheet not named shows its rows in
     /// the order the registry holds them.
     sort: BTreeMap<String, (String, bool)>,
+    /// The history drawer under the grid: open or closed, its scope, its list's scroll and the
+    /// records opened in it. View state, kept nowhere and written nowhere.
+    history: history::Drawer,
     /// Which rows each sheet shows by their lifecycle ([`rows::Filter`]): view state, kept
     /// across reads. A sheet not named shows its live rows.
     pub(crate) life: BTreeMap<&'static str, rows::Filter>,
@@ -1467,6 +1518,7 @@ impl Default for TablesViewState {
             narrow: Cell::new(false),
             check: crate::native_tables_check::CheckView::default(),
             columns: native_tables_columns::ColumnsView::default(),
+            filters: native_tables_filters::FiltersView::default(),
             pane_keys: std::cell::RefCell::new(Vec::new()),
             rail_scroll: 0.0,
             rail_limit: Cell::new(0.0),
@@ -1485,6 +1537,7 @@ impl Default for TablesViewState {
             resizing: None,
             anchor: None,
             sort: BTreeMap::new(),
+            history: history::Drawer::default(),
             life: BTreeMap::new(),
         }
     }
@@ -1498,7 +1551,8 @@ const EDIT: &str = "tables/edit";
 const FIND: &str = "tables/find";
 pub(crate) const WRITE: &str = "tables/write";
 const DISCARD: &str = "tables/discard";
-const AS_OF: &str = "tables/pane/asof/";
+/// A record's As of, in the history drawer: the operation's digest follows.
+const AS_OF: &str = "tables/history/asof/";
 const NOW: &str = "tables/now";
 /// A column's right edge in the header line: held and dragged, it sizes the column.
 const EDGE: &str = "tables/edge/";
@@ -1525,7 +1579,13 @@ impl TablesViewState {
     /// Scroll an `act` on a cell, a header or its edge outside the grid's room into view; whether
     /// anything moved.
     pub(crate) fn reveal_listed_control(&mut self, key: &UiKey) -> bool {
+        if key.as_str().starts_with(history::KEY) {
+            return self.history.reveal(key.as_str());
+        }
         if let Some(moved) = self.reveal_columns_control(key.as_str()) {
+            return moved;
+        }
+        if let Some(moved) = self.reveal_filters_control(key.as_str()) {
             return moved;
         }
         if let Some(name) = key.as_str().strip_prefix(SHEET) {
@@ -1582,14 +1642,16 @@ impl TablesViewState {
         self.common.last_focus = Some(UiKey::new(key.to_owned()));
     }
 
-    /// The rows the find field leaves, a row with a staged cell among them, in the order the
-    /// sheet's sorted column gives ([`Self::sort`]); in the sheet's own order where none is
-    /// sorted. Only this view is ordered: the sheet and what a Write is compared against are not.
+    /// The rows the lifecycle filter, the find field and the filters on the columns' values
+    /// leave, a row with a staged cell and a new row among them, in the order the sheet's sorted
+    /// column gives ([`Self::sort`]); in the sheet's own order where none is sorted. Only this
+    /// view is ordered: the sheet and what a Write is compared against are not.
     ///
     /// A cell stands by the value the registry holds, never by words staged in it, and the order
-    /// is worked out once for each read, find and sort ([`Order`]): typing into the sorted column
-    /// leaves every row where it is, so Return and Tab reach the cell that was beside the edited
-    /// one. A staged cell takes its place once it is written and read back.
+    /// is worked out once for each read, find, sort and set of filters ([`Order`]): typing into
+    /// the sorted column, or a filtered one, leaves every row where it is, so Return and Tab reach
+    /// the cell that was beside the edited one. A staged cell takes its place once it is written
+    /// and read back.
     fn shown_rows<'a>(&self, app: &TablesApp, sheet: &'a Sheet) -> Vec<&'a SheetRow> {
         self.put_in_order(app, sheet);
         let order = self.order.borrow();
@@ -1606,8 +1668,9 @@ impl TablesViewState {
         self.order.borrow().rows.len()
     }
 
-    /// Work [`Self::order`] out where the read, the find, the sort, the filter or the rows a
-    /// staged change shows it was worked out from are no longer the ones in force.
+    /// Work [`Self::order`] out where the read, the find, the sort, the filter, the rows a
+    /// staged change shows or the filters on the columns' values it was worked out from are no
+    /// longer the ones in force.
     fn put_in_order(&self, app: &TablesApp, sheet: &Sheet) {
         let find = self.find.value().trim().to_lowercase();
         let filter = self.filter(sheet);
@@ -1622,34 +1685,24 @@ impl TablesViewState {
             // and the fills stop counting it ([`Self::life_shows`]). A row the filter admits
             // shows whatever is staged in it, so a typed cell moves no row.
             rows::shown_by_staging(app, sheet, filter),
+            // The filters judge what the read holds: a staged cell moves no row.
+            self.filters_of(sheet),
         );
         if self.order.borrow().of.as_ref() == Some(&of) {
             return;
         }
         let find = of.2.as_str();
-        let staged = |row: &SheetRow| {
-            app.staged
-                .keys()
-                .any(|(c, p, _)| c == sheet.name && *p == row.pk)
-        };
+        let filters = &of.6;
         let mut rows: Vec<usize> = sheet
             .rows
             .iter()
             .enumerate()
             // A row the lifecycle filter leaves out still shows while a change to it is staged.
             .filter(|(_, row)| self.life_shows(app, sheet, row))
-            .filter(|(_, row)| {
-                find.is_empty()
-                    || row.pk.starts_with(find)
-                    || staged(row)
-                    || sheet.columns.iter().any(|column| {
-                        column.group != Group::Linked
-                            && row
-                                .cells
-                                .get(&column.name)
-                                .is_some_and(|c| c.text.to_lowercase().contains(find))
-                    })
-            })
+            .filter(|(_, row)| found(app, sheet, row, find))
+            // A row with a staged cell, and a new row, show whatever the filters: no row leaves
+            // while it is typed in.
+            .filter(|(_, row)| !native_tables_filters::leave_out(app, sheet, filters, row))
             .map(|(at, _)| at)
             .collect();
         if let Some((column, descending)) = self.sorted(sheet) {
@@ -1682,12 +1735,11 @@ impl TablesViewState {
             rows.extend(ranked.into_iter().map(|(_, at)| at));
         }
         let mut order = self.order.borrow_mut();
-        // A new read of the same sheet, find and sort that moved the selected row: it comes back
-        // into view, as a move of the selection would bring it.
-        let read_moved = order
-            .of
-            .as_ref()
-            .is_some_and(|was| (was.0, &was.2, &was.3) == (of.0, &of.2, &of.3) && was.1 != of.1);
+        // A new read of the same sheet, find, sort and filters that moved the selected row: it
+        // comes back into view, as a move of the selection would bring it.
+        let read_moved = order.of.as_ref().is_some_and(|was| {
+            (was.0, &was.2, &was.3, &was.6) == (of.0, &of.2, &of.3, &of.6) && was.1 != of.1
+        });
         if read_moved && let Some(pk) = &self.row {
             let was = order.keys.iter().position(|key| key == pk);
             let now = rows.iter().position(|at| sheet.rows[*at].pk == *pk);
@@ -1865,8 +1917,11 @@ impl TablesViewState {
     }
 
     /// Show row `pk` of sheet `name` selected, at `column` where the sheet shows that column and
-    /// else at its key column: the table chosen as the rail chooses it, the find emptied where
-    /// it leaves the row out, and the row scrolled into view.
+    /// else at its key column: the table chosen as the rail chooses it, and each of the find, the
+    /// lifecycle filter and the filters on the columns' values giving way only where it leaves
+    /// the row out (the find emptied, the lifecycle filter set to all rows, the filters cleared
+    /// by [`Self::clear_filters_for`]'s rule, which the find and the lifecycle filter have given
+    /// way to first), so a narrowing that passes the row stands; the row scrolled into view.
     pub(crate) fn show_row(
         &mut self,
         app: &TablesApp,
@@ -1888,13 +1943,19 @@ impl TablesViewState {
             .filter(|column| sheet.columns.iter().any(|c| c.name == *column))
             .unwrap_or(&sheet.key)
             .to_owned();
-        if !self.shown_rows(app, sheet).iter().any(|row| row.pk == pk) {
-            self.find = TextInputState::new(String::new());
+        if let Some(row) = sheet.rows.iter().find(|row| row.pk == pk) {
+            if !found(app, sheet, row, &self.find.value().trim().to_lowercase()) {
+                self.find = TextInputState::new(String::new());
+            }
+            // A row the lifecycle filter leaves out (a retired one a finding names) shows among
+            // all.
+            if !self.life_shows(app, sheet, row) {
+                self.life.insert(name, rows::Filter::All);
+            }
         }
-        // A row the lifecycle filter leaves out (a retired one a finding names) shows among all.
-        if !self.shown_rows(app, sheet).iter().any(|row| row.pk == pk) {
-            self.life.insert(name, rows::Filter::All);
-        }
+        // Last, as the rule clears the filters only where nothing else leaves the row out: a
+        // row they leave out shows once they are cleared; one they pass keeps them.
+        self.clear_filters_for(app, sheet, pk);
         self.select(pk, &column);
         if moved {
             // The columns' places are the last sheet's until this one is laid out.
@@ -2226,6 +2287,29 @@ impl TablesViewState {
     }
 }
 
+/// Whether a change to `row` of `sheet` is staged.
+fn staged(app: &TablesApp, sheet: &Sheet, row: &SheetRow) -> bool {
+    app.staged
+        .keys()
+        .any(|(c, p, _)| c == sheet.name && *p == row.pk)
+}
+
+/// Whether the find's words `find` (trimmed and lowered) leave `row` of `sheet`: none are typed,
+/// the row's key starts with them, a change to it is staged, or a cell of it but a linked count
+/// holds them.
+fn found(app: &TablesApp, sheet: &Sheet, row: &SheetRow, find: &str) -> bool {
+    find.is_empty()
+        || row.pk.starts_with(find)
+        || staged(app, sheet, row)
+        || sheet.columns.iter().any(|column| {
+            column.group != Group::Linked
+                && row
+                    .cells
+                    .get(&column.name)
+                    .is_some_and(|c| c.text.to_lowercase().contains(find))
+        })
+}
+
 /// Where the grid stands across so the column from `start` to `end` shows in `room`: scrolled
 /// no further than it takes to show the column whole. A column wider than the room is left
 /// where it is while it fills the room, and is otherwise shown from its start.
@@ -2435,6 +2519,9 @@ fn edit(input: &mut TextInputState, event: TextInputEvent) {
 impl TablesApp {
     /// The page's reducer, apart from the runtime's bookkeeping.
     fn act(&mut self, view: &mut TablesViewState, event: AppEvent) -> bool {
+        if let Some(done) = native_tables_filters::act(self, view, &event) {
+            return done;
+        }
         if let Some(done) = native_tables_columns::act(self, view, &event) {
             return done;
         }
@@ -2528,6 +2615,9 @@ impl TablesApp {
                     view.focus(PICKER);
                     return true;
                 }
+                if let Some(taken) = self.history_act(view, &key) {
+                    return taken;
+                }
                 if let Some(name) = key.strip_prefix(SHEET) {
                     view.close_edit(self, false);
                     if let Some(name) = self
@@ -2550,6 +2640,7 @@ impl TablesApp {
                             view.scroll.set(0.0);
                             view.across = 0.0;
                             view.pane_scroll = 0.0;
+                            view.history.another_table();
                         }
                         // The chosen table's line stays in the rail's view.
                         view.rail_reveal(name);
@@ -2862,6 +2953,26 @@ impl TablesApp {
                 view.step_pane(rows);
                 true
             }
+            // Up and Down in the history drawer's list move from line to line, which comes
+            // into view; the grid's selection stays.
+            AppEvent::StepFocus(rows)
+                if view
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .is_some_and(|key| view.history.step(key.as_str(), rows).is_some()) =>
+            {
+                let to = view
+                    .common
+                    .last_focus
+                    .as_ref()
+                    .and_then(|key| view.history.step(key.as_str(), rows));
+                if let Some(to) = to {
+                    view.history.reveal(&to);
+                    view.focus(&to);
+                }
+                true
+            }
             AppEvent::StepFocus(rows) => {
                 view.close_edit(self, false);
                 view.step(self, rows, 0);
@@ -2886,6 +2997,14 @@ impl TablesApp {
                         .is_some_and(|editing| editing.choice.is_some()) =>
             {
                 view.step_choice(lines.signum());
+                true
+            }
+            // A wheel over the open history drawer scrolls its list, not the grid's rows; over
+            // the closed one, which has no list, the grid's.
+            AppEvent::ScrollAt { lines, key }
+                if key.as_str().starts_with(history::KEY) && view.history.open =>
+            {
+                view.history.wheel(lines);
                 true
             }
             AppEvent::ScrollAt { lines, key }
@@ -2929,6 +3048,13 @@ impl TablesApp {
             }
             _ => false,
         }
+    }
+
+    /// Whether Tab (or Shift-Tab) leaves an open list of a column's values: the keys are on it.
+    /// The list is one stop of Tab's: the page closes it, the keys back on the control it opened
+    /// from ([`AppEvent::StepAcross`]), and Tab goes on from there.
+    pub(crate) fn tab_leaves_list(&self, view: &TablesViewState) -> bool {
+        view.filters_keyed()
     }
 
     /// Whether Tab (or Shift-Tab, `backwards`) moves within the sheet: focus is on a cell or in
@@ -3174,11 +3300,20 @@ impl NativeAppModel for TablesApp {
         if let Some(shown) = self.current(view) {
             view.sheet = shown;
         }
-        let open = view.columns.open;
+        let open = (view.columns.open, view.filters.is_open());
         let acted = self.act(view, event);
-        // The selection moves off a column no longer drawn; and a list of columns the event
+        // The selection moves off a column no longer drawn, first, since the drawer's Cell scope
+        // lists the selected cell's lines; then the keys off a line of a column's values the
+        // list no longer offers, and last off a drawer line the next layout does not lay out.
+        // Each of the two moves only keys on its own controls and rests them on none of the
+        // other's (a line of the list, its mark or chip, or the find; Hide history), so neither
+        // strands keys the other moved. A list of columns or of a column's values the event
         // closed repaints, whatever the page made of the event itself.
-        let settled = view.settle_columns(self) || open != view.columns.open;
+        let moved = view.settle_columns(self);
+        let filtered = view.settle_filters(self);
+        let rested = view.settle_history_keys(self);
+        let settled =
+            moved || filtered || rested || open != (view.columns.open, view.filters.is_open());
         self.recheck();
         if acted || settled {
             view.common.presentation_revision = view.common.presentation_revision.wrapping_add(1);
@@ -3402,15 +3537,13 @@ fn field(key: &str, label: &str, input: &TextInputState, view: &TablesViewState)
     )
 }
 
-/// `n rows`, `1 row`, `n of m`.
+/// `n rows`, `1 row`, `n of m rows`.
 fn rows_words(shown: usize, all: usize) -> String {
+    let rows = if all == 1 { "row" } else { "rows" };
     if shown == all {
-        match all {
-            1 => "1 row".into(),
-            n => format!("{n} rows"),
-        }
+        format!("{all} {rows}")
     } else {
-        format!("{shown} of {all}")
+        format!("{shown} of {all} {rows}")
     }
 }
 
@@ -3491,11 +3624,16 @@ fn content_width<'a>(
     sheet: &Sheet,
     rows: impl Iterator<Item = &'a SheetRow>,
 ) -> f32 {
-    let header = text_width(&column.label, SemanticRole::Text, StyleRef::Note).max(text_width(
-        &crate::native_tables_choices::type_words(column, |name| app.title_of(name)),
-        SemanticRole::Text,
-        StyleRef::Note,
-    )) + HEAD_ROOM;
+    // The name keeps room beside it for the column's filter mark; the type's words, under it,
+    // need none.
+    let header = (text_width(&column.label, SemanticRole::Text, StyleRef::Note)
+        + native_tables_filters::HEAD_MARK)
+        .max(text_width(
+            &crate::native_tables_choices::type_words(column, |name| app.title_of(name)),
+            SemanticRole::Text,
+            StyleRef::Note,
+        ))
+        + HEAD_ROOM;
     let widest = rows
         .filter_map(|row| row.cells.get(&column.name).map(|cell| (row, cell)))
         .map(|(row, cell)| {
@@ -3911,6 +4049,26 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
     let across_limit = (beside - room_beside).max(0.0);
     view.across_limit.set(across_limit);
     let across = view.across.min(across_limit);
+    // Where each column's filter mark ends, across the grid (its left rule, the row numbers,
+    // the key column, then the rest as scrolled, held inside the room beside the key column):
+    // its list opens under it ([`native_tables_filters::list`]).
+    {
+        let inset = native_tables_filters::mark_inset();
+        let mut marks = BTreeMap::new();
+        let mut at = 0.0;
+        for (n, (column, w)) in columns.iter().zip(&widths).enumerate() {
+            let right = if n == 0 {
+                pinned
+            } else {
+                at += w;
+                pinned + (at - across).clamp(0.0, room_beside)
+            };
+            if !native_tables_columns::is_stub(column) {
+                marks.insert(column.name.clone(), 1.0 + gutter + right - inset);
+            }
+        }
+        view.filters.laid_marks(marks);
+    }
     // A line of the grid: its number's and its key column's seats, then the rest, scrolled
     // across and clipped where the key column ends.
     // `listed` keeps what the lane scrolls off its side in the tree, as the rows' list keeps
@@ -4016,11 +4174,13 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             None => (None, ""),
         };
         let mark_w = if mark.is_some() { SORT_MARK } else { 0.0 };
+        // The name and the sort's mark keep clear of the filter's mark at the header's end.
+        let filter_w = native_tables_filters::HEAD_MARK;
         let mut face = vec![fitted(
             format!("{key}/word"),
             &column.label,
             StyleRef::Note,
-            (w - 20.0 - mark_w).max(1.0),
+            (w - 20.0 - mark_w - filter_w).max(1.0),
         )];
         if let Some(mark) = mark {
             face.push(group(format!("{key}/lead")).layout(Layout::default().width(Length::Fill)));
@@ -4045,10 +4205,17 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     ),
                 ),
                 group(format!("{key}/face"))
-                    .layout(Layout::row().padding(Insets::symmetric(10.0, 0.0)))
+                    .layout(Layout::row().padding(Insets {
+                        left: 10.0,
+                        right: 10.0 + filter_w,
+                        ..Insets::default()
+                    }))
                     .children(face)
                     .paint_only_tree(),
                 native_tables_columns::fill_bar(&key, fill, filled, *w),
+                // The filter's mark, a press of its own over the header's: the header's press
+                // still sorts.
+                native_tables_filters::mark(view, sheet, column),
                 edge(column),
             ],
         ));
@@ -4321,26 +4488,39 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         lines.push(lane(format!("tables/row/{}", row.pk), cells, line, false));
     }
     if rows.is_empty() {
+        // What left every row out: the lifecycle filter, the find, or the filters on the
+        // columns' values, which the grid offers to clear.
+        let find = view.find.value().trim().to_lowercase();
+        let passed = sheet
+            .rows
+            .iter()
+            .any(|row| view.life_shows(app, sheet, row) && found(app, sheet, row, &find));
         let words_now = if sheet.rows.is_empty() {
             "No rows".to_owned()
-        } else if view.find.value().trim().is_empty() {
+        } else if passed && !view.filters_of(sheet).is_empty() {
+            String::new()
+        } else if find.is_empty() {
             view.filter(sheet).none_words()
         } else {
             "No row has these words".to_owned()
         };
-        lines.push(
-            padded(
-                "tables/rows/none/seat".into(),
-                fitted(
-                    "tables/rows/none",
-                    &words_now,
-                    StyleRef::Note,
-                    room_across - 20.0,
-                ),
-                room_across,
-            )
-            .layout_height(line),
-        );
+        if words_now.is_empty() {
+            lines.push(native_tables_filters::none_pass(room_across, line));
+        } else {
+            lines.push(
+                padded(
+                    "tables/rows/none/seat".into(),
+                    fitted(
+                        "tables/rows/none",
+                        &words_now,
+                        StyleRef::Note,
+                        room_across - 20.0,
+                    ),
+                    room_across,
+                )
+                .layout_height(line),
+            );
+        }
     }
     let body = group("tables/rows")
         .layout(
@@ -4652,6 +4832,31 @@ fn since_runs(since: &Since) -> Vec<Run> {
 
 /// What the cell bar says of a selected cell whose row the find field leaves out of the grid.
 const NOT_FOUND: &str = "not among the rows found";
+/// What it says where the find passes the row and the filters on the columns' values leave it
+/// out.
+const FILTERED: &str = "left out by the filters";
+
+/// What the cell bar says of selected `row`, which the grid does not show: why, in the words of
+/// what leaves it out, the find first ([`NOT_FOUND`]), then the filters on the columns' values
+/// ([`FILTERED`]), then the lifecycle filter (`not among the live rows`).
+fn left_out_words(
+    app: &TablesApp,
+    view: &TablesViewState,
+    sheet: &Sheet,
+    row: &SheetRow,
+) -> String {
+    if !found(app, sheet, row, &view.find.value().trim().to_lowercase()) {
+        NOT_FOUND.to_owned()
+    } else if native_tables_filters::leave_out(app, sheet, &view.filters_of(sheet), row) {
+        FILTERED.to_owned()
+    } else if !view.life_shows(app, sheet, row) {
+        view.filter(sheet).left_out_words()
+    } else {
+        // Nothing leaves the row out, so only its cell's column is not drawn, a selection the
+        // columns' settling moves to a column drawn ([`TablesViewState::settle_columns`]).
+        NOT_FOUND.to_owned()
+    }
+}
 
 /// The cell bar's words for the selection: a range's size and what it holds, the selected
 /// cell's address, value and state, or that no cell is selected. Every
@@ -4659,10 +4864,11 @@ const NOT_FOUND: &str = "not among the rows found";
 /// cell reads its entry name or its mask here as it does there, and a cell a Mac reports
 /// another value of reads the value it holds, as the grid's cell does. The cell whose value
 /// and state are said is one the grid shows ([`TablesViewState::stands`]), the one a copy or a
-/// Delete acts on. A selection whose row the find field leaves out is still the selection the
-/// line under the grid and the pane tell of, so the bar names it by its address and says only
-/// that it is [`NOT_FOUND`]; a selection that names no cell of the sheet (none, or a row a new
-/// read no longer holds) is no cell here, as it is none to that line.
+/// Delete acts on. A selection whose row the grid leaves out (the find field, the filters on the
+/// columns' values or the lifecycle filter) is still the selection the line under the grid and
+/// the pane tell of, so the bar names it by its address and says only what leaves it out
+/// ([`left_out_words`]); a selection that names no cell of the sheet (none, or a row a new read
+/// no longer holds) is no cell here, as it is none to that line.
 ///
 /// The state is what the grid marks on the cell, in the grid's order: a staged cell is not
 /// written, and `refused` first where the check or a Write refused it ([`TablesApp::refusal`]),
@@ -4723,9 +4929,9 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
         ))
     });
     let Some((row, column)) = selected else {
-        // A selected cell whose row the find leaves out: the line under the grid and the pane
+        // A selected cell whose row the grid leaves out: the line under the grid and the pane
         // still tell of it ([`provenance`] finds it as this does), so the bar names it too,
-        // and says the grid does not show it. Its value is not said: the grid shows none.
+        // and says what leaves it out. Its value is not said: the grid shows none.
         let hidden = view.row.as_ref().zip(view.column.as_ref()).and_then(|at| {
             Some((
                 sheet.rows.iter().find(|row| row.pk == *at.0)?,
@@ -4736,7 +4942,7 @@ fn bar_words(app: &TablesApp, view: &TablesViewState, sheet: &Sheet) -> BarWords
             Some((row, column)) => BarWords {
                 address: address_runs(sheet, row, column),
                 value: None,
-                state: vec![run(NOT_FOUND, StyleRef::Note)],
+                state: vec![run(left_out_words(app, view, sheet, row), StyleRef::Note)],
             },
             None => BarWords {
                 address: vec![run("No cell selected", StyleRef::Note)],
@@ -5244,7 +5450,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             &mut children,
             fitted(
                 "tables/pane/none",
-                "Select a row to see its fields and history",
+                "Select a row to see its fields",
                 StyleRef::Note,
                 inner,
             ),
@@ -5579,107 +5785,25 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             );
         }
     }
-    // History: newest first, one entry per operation that set a cell of this row, each offering
-    // the table as that operation's causal past holds it.
-    let history = row_history(sheet, &row.pk);
-    if !history.is_empty() {
+    // The row's history is the drawer's: the pane opens it on this row, wherever the drawer
+    // stands (in every window but one too short for its line and three lines of grid).
+    if view.history.drawn.get() {
         push(
             &mut children,
-            fitted("tables/pane/history", "HISTORY", StyleRef::Note, inner),
-            line + 6.0,
-        );
-    }
-    let shown_at = app.as_of().map(|at| at.operation);
-    for (n, (operation, by, changes)) in history.iter().enumerate().take(60) {
-        let key = format!("tables/pane/written/{n}");
-        let here = shown_at == Some(*operation);
-        let style = if here {
-            StyleRef::Primary
-        } else {
-            StyleRef::Plain
-        };
-        push(
-            &mut children,
-            group(format!("{key}/line"))
-                .layout(Layout::row().gap(6.0))
-                .children(writer(&key, by, &by.when(now), style, inner).into()),
-            line,
-        );
-        for (m, change) in changes.iter().enumerate() {
-            push(
-                &mut children,
-                fitted(format!("{key}/{m}"), change, StyleRef::Note, inner - 12.0).layout(
-                    Layout::default().padding(Insets {
-                        left: 12.0,
-                        ..Insets::default()
-                    }),
-                ),
-                line - 2.0,
-            );
-        }
-        // The table as this operation's causal past holds it.
-        push(
-            &mut children,
-            group(format!("{key}/asof"))
-                .layout(Layout::row().padding(Insets {
-                    left: 12.0,
-                    ..Insets::default()
-                }))
+            group("tables/pane/history/seat")
+                .layout(Layout::row())
                 .children(vec![button(
-                    &format!("{AS_OF}{}", aterm_codec::hex::encode_lower(operation)),
-                    "As of",
-                    &format!("The table as of {} \u{b7} {}", by.who(), by.when(now)),
+                    history::OF_ROW,
+                    "History of this row",
+                    "History of this row",
                     StyleRef::Secondary,
-                    !here && app.movable(),
+                    true,
                 )]),
-            line + 2.0,
+            line + 6.0,
         );
     }
     *view.pane_keys.borrow_mut() = actions;
     pane_frame(children, width, height, view, tall.get())
-}
-
-/// A row's history, newest first: the operation, who, and each field it set as
-/// `Field: was → now`.
-fn row_history(sheet: &Sheet, pk: &str) -> Vec<([u8; 32], Author, Vec<String>)> {
-    let mut last: BTreeMap<&str, &str> = BTreeMap::new();
-    let mut out = Vec::new();
-    for written in &sheet.written {
-        let mut lines = Vec::new();
-        for cell in written.cells.iter().filter(|c| c.pk == pk) {
-            // A birth reads as one: the row's lifecycle first set live.
-            if cell.column == aterm_db::typed::LIFECYCLE
-                && cell.now == aterm_db::typed::grid::LIVE
-                && !last.contains_key(aterm_db::typed::LIFECYCLE)
-            {
-                lines.insert(0, "Row \u{2192} added".to_owned());
-                last.insert(aterm_db::typed::LIFECYCLE, aterm_db::typed::grid::LIVE);
-                continue;
-            }
-            // The import columns are not shown.
-            let Some(column) = sheet.columns.iter().find(|c| c.name == cell.column) else {
-                continue;
-            };
-            let was = last.get(cell.column.as_str()).copied().unwrap_or("");
-            let line = if cell.now.starts_with("+ ") || cell.now.starts_with('\u{2212}') {
-                format!("{}: {}", field_words(column), cell.now)
-            } else {
-                format!(
-                    "{}: {} \u{2192} {}",
-                    field_words(column),
-                    value_words(was),
-                    value_words(&cell.now)
-                )
-            };
-            lines.push(line);
-            last.insert(cell.column.as_str(), cell.now.as_str());
-        }
-        if !lines.is_empty() {
-            out.push((written.operation, written.by.clone(), lines));
-        }
-    }
-    out.reverse();
-    out
 }
 
 fn pane_frame(
@@ -6168,6 +6292,9 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
     let mut room = height - 32.0;
     // A pane below the main column's other children, where the page is narrow.
     let mut below: Option<UiNode> = None;
+    // Where a column's list of values opens, down the main column: under the grid's header line,
+    // or under the chips' line.
+    let mut filter_at: (f32, Option<f32>) = (0.0, None);
     let sheet = app.current(view).and_then(|name| app.sheet(name));
     if narrow && view.picking {
         main.push(
@@ -6222,6 +6349,18 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
         );
         main.push(tools(app, view, sheet, main_w, line));
         room -= head_h + 10.0 + line + 4.0 + 10.0;
+        // The filters that stand, as chips on lines of their own under the tools: their height
+        // and the gap under them come off the room once, as the tools row's do, before the cell
+        // bar and the history drawer are judged on what is left.
+        let mut grid_top = 16.0 + head_h + 10.0 + line + 4.0 + 10.0;
+        if let Some((chips, chips_h)) =
+            sheet.and_then(|s| native_tables_filters::chips(app, view, s, main_w, line))
+        {
+            main.push(chips);
+            room -= chips_h + 10.0;
+            filter_at.1 = Some(grid_top);
+            grid_top += chips_h + 10.0;
+        }
         let bar = write_bar(app, main_w);
         // The write bar's height and the gap over it, and the line under the grid at its least.
         let write_h = 40.0 * scale().max(1.0) + 10.0;
@@ -6229,40 +6368,76 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
         let bar_h = if bar.is_some() { write_h } else { 0.0 };
         let said = sheet.map(|sheet| provenance_line(app, view, sheet, main_w));
         let said_h = said.as_ref().map_or(said_least, |(_, h)| *h);
-        // Whether the cell bar stands is the window's to say (its height, its width and the
-        // text scale), never the selection's or a staged change's: it is judged on the room the
-        // grid would have under a write bar and three lines of the line under the grid, whether
-        // or not either is there, and on a narrow page on half of that, as the grid stands with
-        // a row selected. The bar stands where that room holds it and, under it, the grid's own
-        // lines ([`grid_chrome`]) and one whole row, so the row the grid keeps in view shows
-        // whole. So typing into a cell, or selecting one whose line wraps, neither takes the
-        // bar away nor brings it back, and while the line wraps onto three lines or fewer the
-        // grid under the bar keeps its whole row and the write bar ends inside the window.
+        // One budget for the grid's share: the cell bar over the grid and the history drawer's
+        // line under it. Whether each stands is the window's to say (its height, its width and
+        // the text scale) with the view the person set over the grid, the tools row and the
+        // filters' chips while any stands (a filter is the view's, as the find is, never a
+        // selection), and never the selection's or a staged change's: both are judged on the
+        // room the grid would have under the tools and the chips, a write bar and three lines of
+        // the line under the grid, whether or not either is there. So a filter added in a short
+        // window can take the bar, then the drawer, away, and taking it off brings them back. The
+        // drawer's line is the one way to the table's records
+        // and As of, so it is taken out of that room first: the drawer stands where what is left
+        // holds three lines of grid. The bar is judged on what the drawer's line leaves, and on a
+        // narrow page on half of that, as the grid stands with a row selected: it stands where
+        // that holds the bar and, under it, the grid's own lines ([`grid_chrome`]) and one whole
+        // row, so the row the grid keeps in view shows whole. So the bar stands only where the
+        // drawer does, and in a window too short for both the bar gives way first. Typing into a
+        // cell, or selecting one whose line wraps, takes neither away nor brings either back, and
+        // while the line wraps onto three lines or fewer the grid under the bar keeps its whole
+        // row and the write bar ends inside the window.
         let cell_line = row_height();
         let under_bar = grid_chrome() + row_height();
         let said_judged = (3.0 * said_line()).max(said_least);
         let steady = room - write_h - said_judged - 10.0;
-        let barred = (if narrow { steady * 0.5 } else { steady }) >= cell_line + under_bar;
+        let drawer_least = if sheet.is_some() {
+            history::least()
+        } else {
+            0.0
+        };
+        let drawn = sheet.is_some() && steady - drawer_least >= line * 3.0;
+        let barred =
+            (if narrow { steady * 0.5 } else { steady }) - drawer_least >= cell_line + under_bar;
         room -= bar_h + said_h + 10.0;
+        let drawer_room = if drawn { drawer_least } else { 0.0 };
         // Narrow, with a row selected, the grid takes half what is left and the row's pane the
-        // rest below it; with none, the grid takes it all, and never less than three lines.
-        // Under its bar the grid keeps its own lines and a whole row as far as the room holds
-        // them: a line wrapped onto more than three lines takes its room from the grid's, down
-        // to the three lines a page without the bar keeps, so the bar never pushes the write bar
+        // rest below it; with none, the grid takes it all. The share keeps the work's least (under
+        // the bar the grid's own lines and a whole row, else three lines of grid) and the
+        // drawer's line, as far as the room holds them: a line wrapped onto more than three lines
+        // takes its room from the grid's, down to three lines that the grid, its bar and the
+        // drawer's line keep between them, so neither the bar nor the drawer pushes the write bar
         // past the window's foot.
         let below_row = narrow && view.row.is_some();
-        let floor = if barred {
-            (cell_line + under_bar).min(room.max(line * 3.0))
+        let keep = if barred {
+            cell_line + under_bar
         } else {
             line * 3.0
-        };
+        } + drawer_room;
+        let floor = keep.min(room.max(line * 3.0));
         let grid_h = if below_row { room * 0.5 } else { room }.max(floor);
         // The cell bar stands on the grid, a row high, at every width, in the room worked out
         // above for the grid: the grid gives the bar that row, once, so the line under it and
         // a narrow page's pane stand where they would without the bar. In a window too short
         // for the bar over the grid's lines and a row the bar gives way and the grid keeps the
-        // room.
-        let sheet_h = if barred { grid_h - cell_line } else { grid_h };
+        // room. The history drawer under the line takes its height out of the same share, once,
+        // and never what the work's floor keeps ([`history::heights`]): the line, the write bar
+        // and a narrow page's pane stand where they would without it, but where half the room is
+        // less than the work's least and the drawer's line, which the share then rises to.
+        let bar_row = if barred { cell_line } else { 0.0 };
+        let (work_h, drawer_h) = if drawn {
+            history::heights(
+                grid_h,
+                bar_row,
+                floor - drawer_room,
+                height - 32.0,
+                view.history.open,
+            )
+        } else {
+            (grid_h, 0.0)
+        };
+        view.history.drawn.set(drawn);
+        let sheet_h = work_h - bar_row;
+        filter_at.0 = grid_top + bar_row + 1.0 + head_line() + row_height();
         match (sheet, &app.unread) {
             (Some(sheet), _) => {
                 let mut work = Vec::with_capacity(2);
@@ -6272,11 +6447,14 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
                 work.push(grid(app, view, sheet, main_w, sheet_h).layout_height(sheet_h));
                 main.push(
                     group("tables/work")
-                        .layout(Layout::column().height(Length::Fixed(grid_h)))
+                        .layout(Layout::column().height(Length::Fixed(work_h)))
                         .children(work),
                 );
                 if let Some((line, h)) = said {
                     main.push(line.layout_height(h));
+                }
+                if drawn {
+                    main.push(history::drawer(app, view, sheet, main_w, drawer_h));
                 }
                 if below_row {
                     below = Some(pane(
@@ -6327,7 +6505,19 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
             let under = 16.0 + head_h + 10.0 + line + 4.0 + 2.0;
             native_tables_columns::list(app, view, sheet, (16.0 + main_w, under, height - 16.0))
         });
-    columns.push(match list {
+    // The open list of a column's values, under its mark or its chip.
+    let values = sheet
+        .filter(|_| !(narrow && view.picking) && !view.check.open)
+        .and_then(|sheet| {
+            native_tables_filters::list(
+                app,
+                view,
+                sheet,
+                (16.0, 16.0 + main_w, 16.0),
+                (filter_at.0, filter_at.1, height - 16.0),
+            )
+        });
+    columns.push(match list.or(values) {
         Some(list) => native_tables_columns::over(main, list, main_w + 32.0),
         None => main,
     });

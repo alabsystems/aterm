@@ -49,7 +49,7 @@ usage: aterm file <verb> [--json]
                                          (--published: the snapshot alone); the state on stderr
   path <name>                            where its face is
   status [<name>]                        state, why, revision, rows, face=written|edited|missing
-  get <name> <row> [<column>]            one row or one cell; <row> is a key or the row's name
+  get <name> <row> [<column>]            one row or one cell; <row> is its key or its name
   rows <name> [--where col=val]... [--join <ref column>]
   watch <name> [--timeout <seconds>] [--changes <n>]
                                          a line each time a pass records a new state or revision
@@ -57,18 +57,22 @@ usage: aterm file <verb> [--json]
   refresh [<name>]                       run one materializer pass now (opens custody)
   set <name> <row> <column> [<value> | --stdin]
                                          write one cell (no value clears it)
+  set <name> <row> <column>=<value>...   several cells of one row as one write
   add <name> <column>=<value>...         a new row, born under its derived key
   rm <name> <row>                        retire the row (its history stays)
   revert <name> <operation>              undo one operation while its cells still hold it
   resolve <name> <id> mine|theirs        a held write: queue mine again, or keep theirs
   outbox [<name>]                        this Mac's queued and held writes, without values
   outbox drop <id>                       drop one of them
-A name is <set>/<leaf>: ai/accounts, ai/links, lab/machines. Every answer carries a state word
-(live, held, never, off), and none of them is an error: a read answers from the snapshot on
-this Mac whatever the replica's custody is doing. A write is queued on this Mac first and
-answers `published <operation>` or `queued <id>: <why>`; a queued write is published when this
-Mac's writer can sign it, and one whose cell changed meanwhile is held, shown as
-`⚠ mine ‖ theirs`, never applied and never dropped. Exit 0 ok, 2 usage, 3 problems, 4 conflict.
+A name is <set>/<leaf>: ai/accounts, ai/links, lab/machines. A row is named exactly by its key
+or a name: an account by its slug, its provider word and address (`oai ada@x.example` or
+`oai:ada@x.example`) or an address that names one account; a machine by its label or nickname.
+Every answer carries a state word (live, held, never, off), and none of them is an error: a read
+answers from the snapshot on this Mac whatever the replica's custody is doing. A write is
+queued on this Mac first and answers `published <operation>` or `queued <id>: <why>`; a queued
+write is published when this Mac's writer can sign it, and one whose cell changed meanwhile is
+held, shown as `⚠ mine ‖ theirs`, never applied and never dropped. Exit 0 ok, 2 usage (a word
+that names no row, or several), 3 problems, 4 conflict.
 ";
 
 struct Words<'a> {
@@ -346,40 +350,11 @@ fn status(root: &Root, known: &[Known], word: Option<&str>, json: bool) -> Answe
     }
 }
 
-/// The one row `word` names in `read`: its key, or an exact cell of one of the snapshot's
-/// handle columns; `provider:address` is also read as `provider address`.
+/// The one row `word` names in `read` ([`Read::one`]): a usage refusal, with the state, where
+/// it names none or several.
 fn one_row<'a>(file: &File, read: &'a Read, word: &str) -> Result<&'a Row, Answer> {
-    let mut rows = read.named(word);
-    if rows.is_empty()
-        && let Some((before, after)) = word.split_once(':')
-    {
-        rows = read.named(&format!("{before} {after}"));
-    }
-    match rows.as_slice() {
-        [row] => Ok(row),
-        [] => Err(Answer::usage(&format!(
-            "{}: no row is named that ({})",
-            file.name(),
-            read.status.line()
-        ))),
-        many => {
-            let handles = read
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.handles.as_slice())
-                .unwrap_or_default();
-            let mut why = format!("{}: that names {} rows:\n", file.name(), many.len());
-            for row in many {
-                for handle in handles {
-                    why.push_str(row.cell(handle));
-                    why.push_str("  ");
-                }
-                why.push_str(&row.pk);
-                why.push('\n');
-            }
-            Err(Answer::usage(why.trim_end()))
-        }
-    }
+    read.one(word)
+        .map_err(|why| Answer::usage(&format!("{}: {why} ({})", file.name(), read.status.line())))
 }
 
 fn get(file: &File, rest: &[&str], json: bool) -> Answer {

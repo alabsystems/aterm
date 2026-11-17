@@ -505,15 +505,14 @@ fn results_nobody_waited_for_bring_no_wake_and_a_waiting_frame_exactly_one() {
     g.entering.recv_timeout(LIMIT).unwrap();
     assert_eq!(g.wakes.load(Ordering::SeqCst), 1, "one wait, one wake");
 
+    // Teardown: the last acquisition ends and the worker retires. No frame waits for that last
+    // result, so no count here could show a closed surface's wake;
+    // `close_queues_retirement_behind_a_request_that_has_not_started` holds that law with a
+    // frame that waited.
     g.release.send(()).unwrap();
     let (retired, retirement) = mpsc::channel();
     assert!(g.worker.close(Retired(retired)).is_ok());
     retirement.recv_timeout(LIMIT).unwrap();
-    assert_eq!(
-        g.wakes.load(Ordering::SeqCst),
-        1,
-        "a closed surface is not woken"
-    );
 }
 
 /// The worker's order, on its own loop: the wake is posted with the result already published,

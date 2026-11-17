@@ -58,6 +58,32 @@ pub(super) fn record_usage(
     )
 }
 
+fn record_served(
+    store: &Store,
+    roster: &Roster,
+    sid: &str,
+    looked: (&ProcessLogin, &crate::harness::observe::Observation),
+    s: &ServedTurn<'_>,
+    started: i64,
+    now: i64,
+) -> Recorded {
+    let (_directory, captured) = usage_fixture(store, roster);
+    super::record_served(store, &captured, sid, looked, s, started, now)
+}
+
+fn record_model_room(
+    store: &Store,
+    roster: &Roster,
+    sid: &str,
+    looked: (&ProcessLogin, &crate::harness::observe::Observation),
+    window: &str,
+    read_at: i64,
+    now: i64,
+) -> Recorded {
+    let (_directory, captured) = usage_fixture(store, roster);
+    super::record_model_room(store, &captured, sid, looked, window, read_at, now)
+}
+
 fn tmp(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-accounts-{tag}-"))
@@ -3069,6 +3095,51 @@ fn a_rotation_is_one_sessions_and_is_proven_by_its_accounts_first_response() {
     );
     assert_eq!(prove(&mut s, "work-2", NOW + 60), None, "proven once");
     assert_eq!(s.canary_since(), None);
+}
+
+/// A ROTATION'S ACCOUNT SERVED ON ITS VAULT TOKEN IS PROVEN AND ITS STORED LOGIN'S WORD STANDS
+/// ([`prove_on_token`]; m2, 2026-11-16: `m2-3`'s move ran on its token, and no served turn could
+/// prove it): the canary, the undo and the hold end as a stored login's response ends them, and
+/// the row's login, which served nothing, stays as it was. A response served before the rotation
+/// chose the account is no news of it ([`served_since_chosen`]). NEGATIVE CONTROL: a stored
+/// login's response ([`prove`]) records that login working.
+#[test]
+fn a_token_served_response_proves_the_rotation_and_leaves_its_stored_login() {
+    let mut s = on_main();
+    limited(&mut s, "main", NOW + 3 * HOUR);
+    rotation(&mut s, Some("main"), "main", "work-2", NOW).expect("rotates");
+    let rotated = s.clone();
+    assert!(
+        !served_since_chosen(&s, NOW - 1),
+        "served before the rotation"
+    );
+    assert!(served_since_chosen(&s, NOW));
+    assert!(
+        served_since_chosen(&State::default(), NOW),
+        "no rotation on record"
+    );
+    assert_eq!(prove_on_token(&mut s, "pool-a", NOW + 30), None);
+    let proven = prove_on_token(&mut s, "work-2", NOW + 30).expect("served on its token");
+    assert_eq!(
+        (proven.kind, proven.account.as_str()),
+        (Kind::Proven, "work-2")
+    );
+    assert!(s.proven);
+    assert_eq!(s.canary_since(), None);
+    assert!(s.undo.is_empty(), "nothing to go back to");
+    assert_eq!(
+        s.account("work-2").auth,
+        rotated.account("work-2").auth,
+        "the stored login served nothing"
+    );
+    assert_eq!(
+        prove_on_token(&mut s, "work-2", NOW + 60),
+        None,
+        "proven once"
+    );
+    let mut stored = rotated;
+    prove(&mut stored, "work-2", NOW + 30).expect("served on its stored login");
+    assert_eq!(stored.accounts["work-2"].auth, Auth::Ok, "CONTROL");
 }
 
 #[test]
@@ -8448,7 +8519,7 @@ fn a_refill_inside_a_window_lifts_the_wall_it_replaced_and_wakes_the_wait() {
     assert_eq!(kinds, [Kind::Reset, Kind::Wall, Kind::Sample]);
     assert_eq!(
         events[1].why,
-        "five_hour lifted: it refilled inside its window"
+        "five_hour lifted: it was refilled or raised inside its window"
     );
     assert!(events[1].wakes(), "a waiting tab decides again");
     let record = &s.accounts["main"];
@@ -8751,9 +8822,10 @@ fn a_reset_used_inside_a_window_opens_an_epoch_and_the_refill_stands() {
     let kinds: Vec<Kind> = events.iter().map(|e| e.kind).collect();
     assert_eq!(kinds, [Kind::Reset, Kind::Sample]);
     assert!(
-        events[0]
-            .why
-            .starts_with("five_hour refilled inside its window"),
+        events[0].why.starts_with(
+            "five_hour read less used by the process that read it more used: refilled or raised \
+                 inside its window"
+        ),
         "{}",
         events[0].why
     );
@@ -10265,6 +10337,9 @@ fn a_relative_login_file_never_names_the_default_account() {
     }
 }
 
+#[path = "accounts_wall_ladder_tests.rs"]
+mod wall_ladder;
+
 #[path = "accounts_login_attribution_tests.rs"]
 mod login_attribution;
 
@@ -11709,6 +11784,586 @@ fn weeks_said_loads_only_the_weeks_a_screen_names() {
             .collect::<Vec<_>>(),
         [FABLE, "seven_day_sonnet"]
     );
+}
+
+/// A model id of Opus's family and one of Fable's, as a reply's `message.model` names them.
+const OPUS_MODEL: &str = "claude-opus-5-5";
+const FABLE_MODEL: &str = "claude-fable-5-2";
+
+/// Raises a wall of each of `windows` on `label`'s record, observed standing at `at` with a reset
+/// three hours after it, as a session's limit notice files one.
+fn raise_walls(store: &Store, label: &str, windows: &[&str], at: i64) {
+    let mut note = None;
+    store
+        .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
+            let until = Some(at + 3 * HOUR);
+            let mut events = Vec::new();
+            for window in windows {
+                events.extend(note_wall(state, label, window, until, at, at));
+            }
+            Ok(events)
+        })
+        .expect("written");
+}
+
+/// Files, at [`NOW`], the turn `model` served at `at` for a session of the own row whose process
+/// started at `started`.
+/// When this Mac's own evidence lifted `window`'s wall of the own row ([`Account::lifted_at`]).
+fn lifted_here(store: &Store, window: &str) -> Option<i64> {
+    let (state, _) = store.load(NOW).expect("ours");
+    state.account(OWN).lifted_at(window, &state.machine)
+}
+
+fn serve(store: &Store, model: &str, at: i64, started: i64) -> Recorded {
+    record_served(
+        store,
+        &own_row(),
+        "s-sib",
+        (&stored(), &crate::harness::observe::Observation::Unread),
+        &ServedTurn { model, at },
+        started,
+        NOW,
+    )
+}
+
+/// The reasons of the ledger's rows that lift a wall.
+fn lift_rows(store: &Store) -> Vec<String> {
+    rows_of(store, Kind::Wall)
+        .into_iter()
+        .filter(|why| why.contains(WALL_LIFTED))
+        .collect()
+}
+
+/// A WALL MET WHILE A REPLY STREAMED IS NOT LIFTED BY IT ([`note_served`], FL-116): the turn is
+/// dated by the request its reply answered (`login_adoption::served_request`), a tool's result
+/// written two minutes back, not by the reply's row half a minute back, so a wall another session
+/// met a minute back, between the two, stood after the request and is not lifted. CONTROL: a
+/// wall raised before the request is lifted, as of the request.
+/// NEGATIVE CONTROL: dated by its reply's row (`ServedTurn { at: NOW - 30 }`), the same turn
+/// lifts the wall met while it streamed.
+#[test]
+fn a_wall_met_while_a_reply_streamed_is_not_lifted_by_it() {
+    let row = |kind: &str, id: &str, parent: &str, at: i64, body: &str| {
+        let stamp = aterm_types::rfc3339::format_rfc3339(u64::try_from(at).unwrap());
+        format!(
+            "{{\"type\":\"{kind}\",\"uuid\":\"{id}\",\"parentUuid\":\"{parent}\",\
+             \"isSidechain\":false,\"timestamp\":\"{stamp}\",\"message\":{body}}}\n"
+        )
+    };
+    let reply = |id: &str| {
+        format!(
+            "{{\"id\":\"{id}\",\"role\":\"assistant\",\"model\":\"{OPUS_MODEL}\",\
+             \"content\":[{{\"type\":\"text\",\"text\":\"done\"}}]}}"
+        )
+    };
+    let result = r#"{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"ok"}]}"#;
+    let tail = [
+        row(
+            "assistant",
+            "a-call",
+            "u-0",
+            NOW - 3 * MIN,
+            &reply("msg_call"),
+        ),
+        row("user", "u-result", "a-call", NOW - 2 * MIN, result),
+        row(
+            "assistant",
+            "a-reply",
+            "u-result",
+            NOW - 30,
+            &reply("msg_reply"),
+        ),
+    ]
+    .concat();
+    let served = crate::harness::login_adoption::served_request(&tail).expect("served");
+    assert_eq!(served.asked, NOW - 2 * MIN, "dated by its request");
+    let started = NOW - 3 * HOUR;
+    let file = |wall_at: i64| {
+        let dir = tmp("served-streamed");
+        let store = Store::at(dir.path());
+        raise_walls(&store, OWN, &[SESSION_LIMIT], wall_at);
+        let recorded = serve(&store, &served.model, served.asked, started);
+        (recorded, lifted_here(&store, SESSION_LIMIT))
+    };
+    assert_eq!(
+        file(NOW - MIN),
+        (Recorded::Unchanged, None),
+        "met while the reply streamed"
+    );
+    assert_eq!(
+        file(NOW - 150),
+        (
+            Recorded::Usage {
+                account: OWN.to_string(),
+                events: 1,
+                walled: None,
+            },
+            Some(NOW - 2 * MIN)
+        ),
+        "CONTROL: raised before the request"
+    );
+}
+
+/// ONE SESSION'S OWN `/usage` SAMPLE WITH ROOM ON A MODEL'S ROW LIFTS THAT MODEL'S WALL
+/// ([`record_model_room`], FL-116): Fable's wall, raised an hour back, is lifted as of the
+/// minute-old read, with one row that says a read shows room, and every session of the account
+/// reads the lift as this Mac's ([`Account::lifted_at`]); the 5-hour wall beside it stands, as a
+/// sample of Fable's row says nothing of it. Filing it again changes nothing.
+/// CONTROLS: a Fable wall seen standing again after the read was asked for is not lifted, and a
+/// read of an account with no wall of the window writes nothing.
+/// NEGATIVE CONTROL: with [`Account::room_lifts`] judging the wall by its first sighting
+/// (`wall.at`), the read older than its newest sighting lifts it.
+#[test]
+fn a_samples_room_on_a_models_row_lifts_that_models_wall() {
+    let sample = |store: &Store, at: i64| {
+        record_model_room(
+            store,
+            &own_row(),
+            "s-sib",
+            (&stored(), &crate::harness::observe::Observation::Unread),
+            FABLE,
+            at,
+            NOW,
+        )
+    };
+    let dir = tmp("sample-room");
+    let store = Store::at(dir.path());
+    raise_walls(&store, OWN, &[SESSION_LIMIT, FABLE], NOW - HOUR);
+    assert_eq!(
+        sample(&store, NOW - MIN),
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 1,
+            walled: None,
+        }
+    );
+    assert_eq!(lifted_here(&store, FABLE), Some(NOW - MIN));
+    assert_eq!(
+        lifted_here(&store, SESSION_LIMIT),
+        None,
+        "a sample of Fable's row alone"
+    );
+    assert_eq!(
+        lift_rows(&store),
+        [format!("{FABLE}{WALL_LIFTED}a read shows room")]
+    );
+    assert_eq!(sample(&store, NOW - 30), Recorded::Unchanged, "lifted once");
+
+    let dir = tmp("sample-room-again");
+    let store = Store::at(dir.path());
+    raise_walls(&store, OWN, &[FABLE], NOW - HOUR);
+    let mut note = None;
+    store
+        .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
+            Ok(note_wall(
+                state,
+                OWN,
+                FABLE,
+                Some(NOW + 2 * HOUR),
+                NOW - 30,
+                NOW - 30,
+            ))
+        })
+        .expect("written");
+    assert_eq!(
+        held(&store, OWN, NOW).walls[FABLE].at,
+        NOW - HOUR,
+        "the same wall"
+    );
+    assert_eq!(
+        sample(&store, NOW - MIN),
+        Recorded::Unchanged,
+        "seen again after the read"
+    );
+    assert_eq!(lifted_here(&store, FABLE), None);
+
+    let dir = tmp("sample-room-none");
+    let store = Store::at(dir.path());
+    raise_walls(&store, OWN, &[SESSION_LIMIT], NOW - HOUR);
+    assert_eq!(
+        sample(&store, NOW - MIN),
+        Recorded::Unchanged,
+        "no wall of the window"
+    );
+    assert!(lift_rows(&store).is_empty());
+}
+
+/// A WALL SIGHTED STANDING AGAIN AFTER A REPLY IS NOT LIFTED BY IT ([`note_served`], FL-116): a
+/// wall first observed before the reply but met again after it ([`Wall::seen()`], the newest
+/// sighting [`note_wall`] keeps) stood after the reply, so the reply proves nothing of it and the
+/// session waiting there is not woken. CONTROL: a reply after that newest sighting lifts it, its
+/// proof time the reply's ([`Account::lifted_at`]).
+/// NEGATIVE CONTROL: judged by the wall's first sighting (`wall.at`) in place of its newest, the
+/// reply between the two lifts the wall (`left: Usage { .. }`, `right: Unchanged`).
+#[test]
+fn a_wall_sighted_again_after_a_reply_is_not_lifted_by_it() {
+    let dir = tmp("served-sighted-again");
+    let store = Store::at(dir.path());
+    let started = NOW - 3 * HOUR;
+    let mut note = None;
+    for at in [NOW - HOUR, NOW - 10 * MIN] {
+        store
+            .transact_within(&LOCK_LADDER, NOW, &mut note, |state| {
+                Ok(note_wall(
+                    state,
+                    OWN,
+                    SESSION_LIMIT,
+                    Some(NOW + 2 * HOUR),
+                    at,
+                    at,
+                ))
+            })
+            .expect("written");
+    }
+    let wall = held(&store, OWN, NOW).walls[SESSION_LIMIT].clone();
+    assert_eq!(
+        (wall.at, wall.seen()),
+        (NOW - HOUR, NOW - 10 * MIN),
+        "its first sighting kept, its newest noted"
+    );
+    assert_eq!(
+        serve(&store, OPUS_MODEL, NOW - 20 * MIN, started),
+        Recorded::Unchanged
+    );
+    let record = held(&store, OWN, NOW);
+    assert!(
+        !record.walls[SESSION_LIMIT].cleared,
+        "it stood after the reply"
+    );
+    assert!(lift_rows(&store).is_empty(), "{:?}", lift_rows(&store));
+
+    assert_eq!(
+        serve(&store, OPUS_MODEL, NOW - 5 * MIN, started),
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 1,
+            walled: None,
+        },
+        "CONTROL: a reply after its newest sighting"
+    );
+    assert_eq!(lifted_here(&store, SESSION_LIMIT), Some(NOW - 5 * MIN));
+}
+
+/// A TURN A MODEL SERVED IS EVIDENCE ABOUT ITS ACCOUNT ([`record_served`], FL-116): every wall of
+/// the account observed before the reply, of a window the reply's model draws on, is lifted as of
+/// the reply, by a row that wakes the sessions waiting on the account, so each resumes at its
+/// next look ([`Account::cleared_since`]); no provider is read. The mark is the reply's own time:
+/// a wall observed after the reply raises the window again, and one observed before it does not.
+/// CONTROLS: a reply older than the wall, or at its instant, lifts nothing and wakes nobody; a
+/// reply older than the process is another login's; the same reply filed twice writes its rows
+/// once; an account with no record gets none; and a reply of a process whose login file names
+/// another row lifts that row's wall and never the believed row's.
+/// NEGATIVE CONTROL: with `note_served` lifting nothing (its loop removed) the first filing is
+/// `left: Unchanged`, `right: Usage { account: "main", events: 2, walled: None }`; with its mark
+/// `now` in place of the reply's time, the wall observed 30 s before the filing stays lifted
+/// (`left: None`).
+#[test]
+fn a_turn_served_after_a_wall_lifts_it_and_wakes_the_wait() {
+    use crate::harness::journal::ObservedSrc;
+    use crate::harness::observe::{Observation, Observed};
+    const UNICORN: &str = "unicorn@example.test";
+    const BRONTO: &str = "bronto@example.test";
+    let walled = |tag: &str| {
+        let dir = tmp(tag);
+        let store = Store::at(dir.path());
+        raise_walls(&store, OWN, &[SESSION_LIMIT, WEEK_LIMIT], NOW - HOUR);
+        (dir, store)
+    };
+    let stands = Some(NOW + 2 * HOUR + RESET_GRACE_S);
+    let started = NOW - 3 * HOUR;
+
+    let (_dir, store) = walled("served");
+    assert_eq!(held(&store, OWN, NOW).limited_until(NOW), stands);
+    assert!(
+        !store.wake_path().exists(),
+        "a wall observed standing wakes nobody"
+    );
+    let (recorded, reads) =
+        crate::harness::provider_read::captured(|| serve(&store, OPUS_MODEL, NOW - MIN, started));
+    assert_eq!(
+        recorded,
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 2,
+            walled: None,
+        }
+    );
+    assert!(reads.is_empty(), "no provider is read: {reads:?}");
+    let record = held(&store, OWN, NOW);
+    for window in [SESSION_LIMIT, WEEK_LIMIT] {
+        let wall = &record.walls[window];
+        assert_eq!(
+            (wall.cleared, wall.at),
+            (true, NOW - MIN),
+            "{window}: lifted as of the reply"
+        );
+    }
+    assert_eq!(record.limited_until(NOW), None);
+    assert_eq!(
+        record.cleared_since(SESSION_LIMIT, NOW - HOUR, NOW),
+        Some(NOW - MIN),
+        "the wait on that wall resumes"
+    );
+    let lifts: Vec<Event> = store
+        .tail(50)
+        .expect("reads")
+        .into_iter()
+        .filter(|e| e.kind == Kind::Wall && e.why.contains(WALL_LIFTED))
+        .collect();
+    assert_eq!(
+        lifts.iter().map(|e| e.why.as_str()).collect::<Vec<_>>(),
+        [
+            "five_hour lifted: a turn opus served",
+            "seven_day lifted: a turn opus served",
+        ]
+    );
+    assert!(lifts.iter().all(Event::wakes), "a waiting tab looks again");
+    assert!(
+        lifts
+            .iter()
+            .all(|e| e.sid.as_deref() == Some("s-sib") && e.t == NOW),
+        "{lifts:?}"
+    );
+    assert!(store.wake_path().exists(), "the lift touches the marker");
+
+    // Filed twice: the rows are written once and nobody is woken again.
+    #[cfg(unix)]
+    let marker = |s: &Store| {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(s.wake_path()).expect("stat").ino()
+    };
+    #[cfg(unix)]
+    let woken = marker(&store);
+    assert_eq!(
+        serve(&store, OPUS_MODEL, NOW - MIN, started),
+        Recorded::Unchanged
+    );
+    assert_eq!(lift_rows(&store).len(), 2, "its rows are written once");
+    #[cfg(unix)]
+    assert_eq!(marker(&store), woken, "the marker is not touched again");
+
+    // The mark is the reply's time: a wall observed before the reply stays lifted, and one
+    // observed after it (a sibling's rejection filed later) raises the window.
+    let mut after = store.load(NOW).expect("ours").0;
+    let reset = Some(NOW + 2 * HOUR);
+    assert!(
+        note_wall(&mut after, OWN, SESSION_LIMIT, reset, NOW - 2 * MIN, NOW).is_empty(),
+        "an older observer does not raise it again"
+    );
+    assert_eq!(after.accounts[OWN].limited_until(NOW), None);
+    assert_eq!(
+        note_wall(&mut after, OWN, SESSION_LIMIT, reset, NOW - 30, NOW).len(),
+        1
+    );
+    assert_eq!(
+        after.accounts[OWN].limited_until(NOW),
+        stands,
+        "the reply proved room at its own time alone"
+    );
+
+    for (at, started, expect, why) in [
+        (
+            NOW - 2 * HOUR,
+            started,
+            Recorded::Unchanged,
+            "a reply older than the wall",
+        ),
+        (
+            NOW - HOUR,
+            started,
+            Recorded::Unchanged,
+            "a reply at the wall's own instant",
+        ),
+        (
+            NOW - MIN,
+            NOW - 30,
+            Recorded::NotThisProcess,
+            "a reply older than the process",
+        ),
+    ] {
+        let (_dir, store) = walled("served-control");
+        assert_eq!(serve(&store, OPUS_MODEL, at, started), expect, "{why}");
+        assert_eq!(
+            held(&store, OWN, NOW).limited_until(NOW),
+            stands,
+            "{why}: the walls stand"
+        );
+        assert!(lift_rows(&store).is_empty(), "{why}");
+        assert!(!store.wake_path().exists(), "{why}: nobody is woken");
+    }
+
+    let turn = ServedTurn {
+        model: OPUS_MODEL,
+        at: NOW - MIN,
+    };
+    let mut bare = state();
+    assert!(note_served(&mut bare, "main", &turn, NOW).is_empty());
+    assert!(
+        bare.accounts.is_empty(),
+        "an account with no record gets none"
+    );
+
+    // The process's login file names another row than its environment's belief: the reply is
+    // that row's evidence.
+    let login_dir = crate::harness::host_path::toml(std::path::Path::new(at!("/logins/m15")));
+    let two = Roster::parse_for(
+        Cli::Claude,
+        &format!(
+            "[[account]]\nlabel = \"m22\"\nclass = \"dedicated\"\nemail = \"{BRONTO}\"\n\
+             [[account]]\nlabel = \"m15\"\nclass = \"dedicated\"\ndir = {login_dir}\n\
+             email = \"{UNICORN}\"\n"
+        ),
+    )
+    .expect("parses");
+    let dir = tmp("served-other-row");
+    let store = Store::at(dir.path());
+    for label in ["m22", "m15"] {
+        raise_walls(&store, label, &[SESSION_LIMIT], NOW - HOUR);
+    }
+    let seen = Observation::Seen(Observed {
+        cli: Cli::Claude.into(),
+        email: UNICORN.to_owned(),
+        key: None,
+        region: None,
+        src: ObservedSrc::Profile,
+        path: "/home/someone/.claude.json".into(),
+        mtime: Some(1),
+        plan: None,
+    });
+    assert_eq!(
+        record_served(
+            &store,
+            &two,
+            "s-sib",
+            (&stored(), &seen),
+            &turn,
+            started,
+            NOW
+        ),
+        Recorded::Usage {
+            account: "m15".to_string(),
+            events: 1,
+            walled: None,
+        }
+    );
+    let after = store.load(NOW).expect("ours").0;
+    assert!(after.accounts["m15"].walls[SESSION_LIMIT].cleared);
+    assert!(
+        !after.accounts["m22"].walls[SESSION_LIMIT].cleared,
+        "never the believed row's"
+    );
+}
+
+/// A TURN SERVED WHILE USAGE CREDITS CARRY THE ACCOUNT SAYS NOTHING OF A WINDOW
+/// ([`Account::served_lifts`]): credits on, or an episode still standing at the reply, and the
+/// reply lifts no wall, writes no row and wakes nobody.
+/// CONTROLS: credits off, and an episode that had lapsed by the reply, each lift both walls.
+/// NEGATIVE CONTROL: with `served_lifts` not reading `credits`, the standing episode's filing is
+/// `left: Usage { account: "main", events: 2, walled: None }`, `right: Unchanged`.
+#[test]
+fn a_turn_served_on_usage_credits_lifts_no_wall() {
+    let run = |credits: Credits| {
+        let dir = tmp("served-credits");
+        let store = Store::at(dir.path());
+        raise_walls(&store, OWN, &[SESSION_LIMIT, WEEK_LIMIT], NOW - HOUR);
+        set_credits(&store, OWN, credits);
+        let recorded = serve(&store, OPUS_MODEL, NOW - MIN, NOW - 3 * HOUR);
+        (
+            recorded,
+            held(&store, OWN, NOW).limited_until(NOW),
+            lift_rows(&store).len(),
+            store.wake_path().exists(),
+        )
+    };
+    let stood = (
+        Recorded::Unchanged,
+        Some(NOW + 2 * HOUR + RESET_GRACE_S),
+        0,
+        false,
+    );
+    let lifted = (
+        Recorded::Usage {
+            account: OWN.to_string(),
+            events: 2,
+            walled: None,
+        },
+        None,
+        2,
+        true,
+    );
+    let carrying = CreditsUse {
+        since: NOW - 2 * HOUR,
+        seen: NOW - MIN,
+        until: Some(NOW + HOUR),
+        told: false,
+    };
+    assert!(carrying.stands(NOW - MIN));
+    assert_eq!(run(Credits::InUse(carrying)), stood, "a standing episode");
+    assert_eq!(run(Credits::On(NOW - DAY)), stood, "credits on");
+
+    assert_eq!(run(org_off()), lifted, "CONTROL: credits off");
+    let lapsed = CreditsUse {
+        since: NOW - 8 * HOUR,
+        seen: NOW - 2 * HOUR,
+        until: Some(NOW - 2 * HOUR),
+        told: false,
+    };
+    assert!(!lapsed.stands(NOW - MIN));
+    assert_eq!(
+        run(Credits::InUse(lapsed)),
+        lifted,
+        "CONTROL: an episode that lapsed before the reply"
+    );
+}
+
+/// ONLY A MODEL'S OWN TURN SPEAKS FOR ITS LIMIT ([`draws_on`]): a served Opus turn lifts the
+/// five-hour wall and Opus's weekly wall, and leaves Fable's wall and a wall filed under no limit
+/// type standing; a served Fable turn lifts Fable's and leaves Opus's.
+/// CONTROLS: a reply naming no model, or the `<synthetic>` one Claude Code writes for its own
+/// rows, lifts nothing.
+/// NEGATIVE CONTROL: with `draws_on` answering `true` for every window, the Opus turn's filing
+/// has `events: 4` and `lifted_at(FABLE)` is `Some`.
+#[test]
+fn a_turn_served_on_another_model_leaves_a_models_wall_standing() {
+    const OPUS_WEEK: &str = "seven_day_opus";
+    let windows = [SESSION_LIMIT, OPUS_WEEK, FABLE, UNNAMED_WINDOW];
+    let run = |model: &str| {
+        let dir = tmp("served-model");
+        let store = Store::at(dir.path());
+        raise_walls(&store, OWN, &windows, NOW - HOUR);
+        let recorded = serve(&store, model, NOW - MIN, NOW - 3 * HOUR);
+        let record = held(&store, OWN, NOW);
+        let lifted: Vec<&str> = windows
+            .into_iter()
+            .filter(|window| record.walls[*window].cleared)
+            .collect();
+        (recorded, lifted, lifted_here(&store, FABLE))
+    };
+    let two = Recorded::Usage {
+        account: OWN.to_string(),
+        events: 2,
+        walled: None,
+    };
+    assert_eq!(
+        run(OPUS_MODEL),
+        (two.clone(), vec![SESSION_LIMIT, OPUS_WEEK], None),
+        "an Opus turn says nothing of Fable's limit, nor of an unnamed one"
+    );
+    assert_eq!(
+        run(FABLE_MODEL),
+        (two, vec![SESSION_LIMIT, FABLE], Some(NOW - MIN)),
+        "CONTROL: Fable's own turn lifts Fable's wall as of its reply, and not Opus's"
+    );
+    for model in ["<synthetic>", ""] {
+        assert_eq!(
+            run(model),
+            (Recorded::Unchanged, Vec::new(), None),
+            "CONTROL: `{model}` is no model's turn"
+        );
+    }
+    assert!(draws_on(OPUS_MODEL, WEEK_LIMIT));
+    assert!(draws_on(FABLE_MODEL, WEEK_LIMIT));
+    assert!(!draws_on(FABLE, FABLE), "a bucket id is no model id");
 }
 
 /// A LIMIT WALL WALLS ITS LIMIT'S HANDOFFS ALONE: a wall of the Codex limit `codex_other`

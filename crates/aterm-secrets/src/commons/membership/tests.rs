@@ -124,7 +124,7 @@ fn explicit_approval_binds_keys_and_exact_current_head_without_granting_roster_m
     let request = request(&identity, NETWORK, root(), 23);
     let doc = document(&identity);
     let genesis = genesis(&identity);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = journal(dir.path(), &genesis);
     journal.ingest(genesis.bytes()).unwrap();
     let certificate =
@@ -184,7 +184,7 @@ fn approval_rechecks_recipient_context_readiness_and_retired_writer_key() {
     let request = request(&identity, NETWORK, root(), 23);
     let doc = document(&identity);
     let genesis = genesis(&identity);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = journal(dir.path(), &genesis);
     assert!(approve(&ROOT_SEED, &journal, &doc, "m1", proof(&identity, &request)).is_err());
     journal.ingest(genesis.bytes()).unwrap();
@@ -236,7 +236,7 @@ fn approval_rechecks_recipient_context_readiness_and_retired_writer_key() {
         )
         .is_err()
     );
-    let fork_dir = aterm_tempfile::tempdir().unwrap();
+    let fork_dir = crate::private_scratch::tempdir();
     let mut forked = self::journal(fork_dir.path(), &genesis);
     forked.ingest(genesis.bytes()).unwrap();
     for payload in [b"left".as_slice(), b"right".as_slice()] {
@@ -331,7 +331,7 @@ fn approval_transition(
     let request = request(&identity, NETWORK, root(), 23);
     let mut doc = document(&identity);
     let genesis = genesis(&identity);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = journal(dir.path(), &genesis);
     if action != "IncompleteControl" {
         journal.ingest(genesis.bytes()).unwrap();
@@ -382,7 +382,7 @@ fn a_valid_authority_signature_cannot_override_invalid_certificate_fields() {
     let request = request(&identity, NETWORK, root(), 23);
     let doc = document(&identity);
     let genesis = genesis(&identity);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = journal(dir.path(), &genesis);
     journal.ingest(genesis.bytes()).unwrap();
     let certificate =

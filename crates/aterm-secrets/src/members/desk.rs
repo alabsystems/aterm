@@ -37,6 +37,8 @@ use crate::commons::Unavailable;
 use crate::commons::binding::{Pending, Request};
 use crate::commons::bootstrap::{Availability, Bootstrap, Device};
 use crate::commons::journal::Trust;
+#[cfg(unix)]
+use crate::home_lan::{HomeNet, home_net};
 use crate::pake::{ChannelId, MemberSession, Nonce, PhraseId, Phrases, Share, Tag};
 use crate::{Error, Result, SecretBytes};
 use aterm_time::Instant;
@@ -45,6 +47,27 @@ use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// The home LAN a member's desk lets a proving Mac in from, where it reads none: off Unix, where
+/// this Mac is (its route and its network, `aterm_netplace::facts`) is not read, so none is ever
+/// made and the desk lets no Mac in by its LAN ([`Local::automatically_admits`]).
+#[cfg(not(unix))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeNet {}
+
+#[cfg(not(unix))]
+impl HomeNet {
+    /// Whether `peer` is on this home LAN: there is none to be on.
+    const fn holds(&self, _peer: IpAddr) -> bool {
+        match *self {}
+    }
+}
+
+/// This Mac's home ALab LAN where it reads none (off Unix): none.
+#[cfg(not(unix))]
+const fn home_net() -> Option<HomeNet> {
+    None
+}
 
 /// How many requests a desk holds. Past it the oldest settled one (ignored, let in, or allowed
 /// with a phrase that can no longer admit) goes, else an asking one of the sources that hold the
@@ -219,7 +242,7 @@ pub struct Local {
     /// This member's home LAN when it read its place: the home ALab LAN on the default ALab vault
     /// (`crate::home_lan::home_net`), the network a lab vault names in a debug build
     /// (`members::lab_lan::home`). Only a host on it is let in by its proof.
-    home: Option<crate::home_lan::HomeNet>,
+    home: Option<HomeNet>,
     /// Where [`Self::home`] is read again from ([`Desk::home_from`]).
     home_from: HomeFrom,
     /// Its vault is the live ALab's by its genesis ([`client::on_live_genesis`]): a lab identity's
@@ -332,14 +355,14 @@ impl Local {
         });
         // A debug build's lab vault names its own home LAN (`super::lab_lan`); a release build
         // compiles no such seam, and its desk admits by the live vault's home alone.
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(all(unix, any(test, debug_assertions)))]
         let lab_home = {
             let home = super::lab_lan::home(paths, config.as_ref(), live_genesis);
             whole &= home.is_ok();
             home.unwrap_or(None)
         };
-        #[cfg(not(any(test, debug_assertions)))]
-        let lab_home: Option<crate::home_lan::HomeNet> = None;
+        #[cfg(not(all(unix, any(test, debug_assertions))))]
+        let lab_home: Option<HomeNet> = None;
         let automatic_lan = alab_url || lab_home.is_some();
         let name = config.map(|config| config.host).unwrap_or_default();
         // A removed Mac that asks again shows as removed, not new (F16): from the log this Mac
@@ -361,16 +384,12 @@ impl Local {
             Default::default()
         };
         // Read here, on the desk's lane or a connection thread, never a window's main thread.
-        let home = if alab_url {
-            crate::home_lan::home_net()
-        } else {
-            lab_home
-        };
+        let home = if alab_url { home_net() } else { lab_home };
         // A lab vault's home is its file and this Mac's route together (`super::lab_lan::home`),
         // read again only with the vault.
-        #[cfg(any(test, debug_assertions))]
+        #[cfg(all(unix, any(test, debug_assertions)))]
         let lab = std::fs::symlink_metadata(paths.dir.join(super::lab_lan::FILE)).is_ok();
-        #[cfg(not(any(test, debug_assertions)))]
+        #[cfg(not(all(unix, any(test, debug_assertions))))]
         let lab = false;
         let home_from = if alab_url {
             HomeFrom::Place
@@ -412,7 +431,7 @@ impl Local {
 
     /// Whether `other` is this member as [`Local::of`] read it: every field it reads, the device
     /// by the request it signs.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn reads_as(&self, other: &Self) -> bool {
         self.request.bytes() == other.request.bytes()
             && self.trust == other.trust
@@ -505,7 +524,7 @@ impl Local {
 
     /// Supply authenticated LAN policy and admitted recipients in an isolated fixture, this member
     /// on the test home network ([`crate::home_lan::HomeNet::test`], `192.168.1.0/24`).
-    #[cfg(any(test, debug_assertions))]
+    #[cfg(all(unix, any(test, debug_assertions)))]
     #[must_use]
     pub fn with_automatic_lan(self, admitted_recipients: impl IntoIterator<Item = String>) -> Self {
         Self {
@@ -547,7 +566,7 @@ impl Local {
     /// This member on the home ALab LAN `home`, or on none: the seam a test moves it with.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
-    pub fn with_home(self, home: Option<crate::home_lan::HomeNet>) -> Self {
+    pub fn with_home(self, home: Option<HomeNet>) -> Self {
         Self { home, ..self }
     }
 
@@ -922,7 +941,7 @@ impl Desk {
     /// what [`Local::of`] read kept: a network move, or a day that made a LAN home, changes only
     /// this, so the desk takes it without reading the vault again. Only a member whose home is
     /// its place's ([`HomeFrom::Place`]) takes one; any other keeps what [`Local::of`] read.
-    pub fn on_home(&mut self, home: Option<crate::home_lan::HomeNet>) {
+    pub fn on_home(&mut self, home: Option<HomeNet>) {
         if self.local.home_from == HomeFrom::Place {
             self.local.home = home;
         }

@@ -662,11 +662,12 @@ fn a_fold_names_as_observed_exactly_the_words_it_declares() {
     let producers: BTreeSet<&str> = BoxWord::all()
         .map(BoxWord::need)
         .chain(WallKind::ALL.iter().map(|k| k.wire()))
-        .chain(["unresponsive", "failure", "exited", "escalated"])
+        .chain(["wall", "unresponsive", "failure", "exited", "escalated"])
         .collect();
     assert_eq!(
         declared, producers,
-        "the declaration is every box's need, every wall's, and the four the fold raises itself"
+        "the declaration is every box's need, every wall's (the bare `wall` of a wall step \
+         that names no kind among them), and the four the fold raises itself"
     );
     for w in NEED_WORDS {
         assert_eq!(aterm_slog::may_observe(w), declared.contains(w), "{w}");

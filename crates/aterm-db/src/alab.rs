@@ -27,6 +27,8 @@
 //!   enrollment to a machine row.
 //! - [`view`]: LabView, what the harness reads of the registry: this Mac's preferences, the Macs
 //!   preferring an account and where an address's codes arrive, projected once and cached.
+//! - [`account_names`]: each account's slug and name, derived in one place, and the account a
+//!   word names, which every account command resolves the same way.
 //! - [`discover`]: what a Mac records of a Proton mailbox's address list while the mailbox is open
 //!   to read a sign-in code.
 //! - [`sighted`]: where and when each account was sighted, one fold of every Mac's `account-obs`
@@ -34,6 +36,7 @@
 //! - [`export`]: the files older Macs still read, generated from the registry and the journal's
 //!   place rows by the owner's one admin writer, and `check`'s drift of them.
 
+pub mod account_names;
 pub mod checks;
 #[cfg(unix)]
 pub mod command;

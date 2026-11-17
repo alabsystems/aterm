@@ -18,15 +18,18 @@
 //!   of the signal, a panicked one's before the panic goes on, and that of a run whose handoff
 //!   the receiving image refused by that image. A run killed outright, or one a step that is not
 //!   cut short holds past the interrupt's report grace, has none.
-//! - Each record goes to the spool as it is made, and is held in this run as well. The run
-//!   publishes after its last use of main: one compare-and-swap append, at its end, carries this
-//!   run's records with every record the spool still holds that its kind's reader takes (one it
-//!   refuses is said and stays), so a kill, a failed append or a spool that could not be written
-//!   loses none the spool keeps, and none another landing of the clone appended is appended
-//!   twice. A run a signal interrupted does not append: its next land does. A merge conflict also
-//!   defers its append where this run's records, including its end, were kept in the spool;
-//!   otherwise it still attempts publication to rescue records held only in memory. A failed append never changes the exit, and
-//!   is not a push race: it counts against neither [`COMPOSES`] nor [`RETRIES`].
+//! - Each record goes to the spool as it is made, and is held in this run as well. Only a run that
+//!   landed publishes, after its verdict and once it has let the checkout's landing lock go
+//!   ([`deliver`]): one compare-and-swap append carries this run's records with every record the
+//!   spool still holds that its kind's reader takes (one it refuses is said and stays), so a
+//!   kill, a failed append or a spool that could not be written loses none the spool keeps, and
+//!   none another landing of the clone appended is appended twice. A run that pushed no landing
+//!   (a red, a conflict, a run that could not run or found nothing to land) leaves its records in
+//!   the clone's spool, shared by its worktrees, for the clone's next run that lands to append
+//!   ([`WHO_APPENDS`]), where all of them, its end included, were kept and the spool confirms
+//!   them durable; otherwise it publishes to rescue records held only in memory. A run a signal
+//!   interrupted does not append either. A failed append never changes the exit, and is not a
+//!   push race: it counts against neither [`COMPOSES`] nor [`RETRIES`].
 //! - Nothing reads the records to decide anything: a landing's verdicts, its exit and what it
 //!   pushes are the same with them as without them.
 
@@ -47,13 +50,27 @@ mod io_tests;
 /// [`Records::publish`]'s append.
 pub type AppendSeam<'a> = Box<dyn FnMut(&Path, &[Signed], u64) -> Result<(), String> + 'a>;
 
-/// When the run delivers the records its end has kept.
-#[derive(Clone, Copy)]
+/// Who appends the records a run keeps in the clone's spool: a later run that lands appends what
+/// the spool holds ([`Records::publish`]), and so does `verify land records --flush`. It names
+/// no time to run the flush: a red run defers its records so that it does not race the journal,
+/// and a flush after each one would race it again.
+pub(super) const WHO_APPENDS: &str = concat!(
+    "the clone's next landing that lands appends them ",
+    "(so does `targo --unverified verify land records --flush`)"
+);
+
+/// What a run's end leaves its delivery to do and say ([`finish`], [`deliver`]).
+#[must_use = "a run's end is delivered"]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Delivery {
-    /// Attempt publication at the run's end.
-    Publish,
-    /// Leave a fully kept run for the clone's next land; rescue unkept records by publishing.
-    DeferIfKept,
+    /// The run took this signal: the clone's spool keeps its records, and it appends none.
+    Interrupted(i32),
+    /// The clone's spool keeps every record of the run for a later run that lands
+    /// ([`WHO_APPENDS`]): nothing to append.
+    Kept,
+    /// Append the run's records with the spool's. `Some`: the run pushed nothing, but the spool
+    /// did not confirm them durable, for this reason, so the append rescues them.
+    Publish(Option<String>),
 }
 
 /// The records' seams for writing: the journal's append, the clone's spool, this Mac's signer
@@ -80,6 +97,14 @@ pub struct Records<'a> {
     pub interrupt: Box<dyn Fn() -> Option<i32> + 'a>,
     /// What this run has recorded so far.
     pub tally: Tally,
+    /// The checkout's landing lock this run holds (`super::Git::hold`, which `run` and
+    /// `resume_cli` take; `None` where it holds none), let go by [`deliver`] before it appends,
+    /// so the checkout can land again while the records go to the journal. The lock guards the
+    /// checkout's HEAD, index, handoff and kept judgment, none of which the append touches; what
+    /// the append writes (the clone's spool, under the spool's own lock, objects in the clone's
+    /// store and the remote journal) a landing in any other worktree of the clone writes as
+    /// well, which this lock never kept apart.
+    pub lock: Option<aterm_toolchain::record_lock::RecordLock>,
 }
 
 /// What a run has recorded so far, and what its next records need.
@@ -148,7 +173,7 @@ fn unreadable(signed: &Signed) -> Option<String> {
 }
 
 /// Why [`Records::publish`] left records out of the journal, and whether this clone's spool
-/// keeps every one of them for its next land.
+/// keeps every one of them for its next append ([`WHO_APPENDS`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Unwritten {
     /// Why no append held them.
@@ -259,7 +284,7 @@ impl Records<'_> {
     ///
     /// # Errors
     /// The append failed: [`Unwritten`] says whether the spool keeps every record of this run
-    /// for this clone's next land.
+    /// for this clone's next append ([`WHO_APPENDS`]).
     pub(super) fn publish(
         &mut self,
         root: &Path,
@@ -274,7 +299,7 @@ impl Records<'_> {
                     .iter()
                     .map(|(file, why)| format!("{} ({why})", file.display()))
                     .collect();
-                let mut files: Vec<String> = pending
+                let mut files: std::collections::BTreeSet<String> = pending
                     .unreadable
                     .iter()
                     .filter_map(|(file, _)| file.file_name()?.to_str().map(str::to_owned))
@@ -307,8 +332,10 @@ impl Records<'_> {
             }
         };
         let mut unkept = unkept;
+        let mut paths: std::collections::BTreeSet<String> =
+            appended.iter().map(|held| held.path.clone()).collect();
         for made in &self.tally.made {
-            if appended.iter().any(|held| held.path == made.signed.path) {
+            if paths.contains(&made.signed.path) {
                 continue;
             }
             // The spool took it, was listed, and no file of its path failed to read: it no
@@ -324,6 +351,7 @@ impl Records<'_> {
             if !made.spooled {
                 unkept.get_or_insert_with(|| "the spool did not keep it".to_owned());
             }
+            paths.insert(made.signed.path.clone());
             appended.push(made.signed.clone());
         }
         if appended.is_empty() {
@@ -524,18 +552,20 @@ pub(super) fn result_of(decision: &Decision) -> &'static str {
 
 /// The run's end, whatever its exit `code`: its end record (the exit, the interrupt it took, the
 /// checkout as it stands, and its landing where main holds one), kept with the rest of the run's
-/// records; then the delivery selected by the landing, after its last use of main. An interrupt
-/// leaves the records local. [`Delivery::DeferIfKept`] does so only when this run's records,
-/// including its end, were kept: otherwise [`Records::publish`] attempts to rescue records held
-/// only in memory. An append that failed is said, and changes nothing: the exit is `code` either
-/// way.
+/// records, after the run's last use of main; then what is left to deliver them, which says
+/// nothing until [`deliver`]. A run that took an interrupt leaves them in the clone
+/// ([`Delivery::Interrupted`]: it dies of the signal). So does a run that pushed no landing,
+/// where this run's records, its end included, were all kept and the spool confirms them durable
+/// ([`Delivery::Kept`]), so a verdict that pushed nothing waits on no journal. The spool is the
+/// clone's, shared by its worktrees, so the next run that lands from any of them appends them
+/// ([`WHO_APPENDS`]). Else [`Delivery::Publish`]: a run that landed publishes, and one whose
+/// records the spool does not confirm publishes to rescue those held only in memory.
 pub(super) fn finish(
     git: &Git<'_>,
     records: &mut Records<'_>,
     say: &mut dyn FnMut(&str),
     code: i32,
-    delivery: Delivery,
-) {
+) -> Delivery {
     let signal = (records.interrupt)();
     let now = (records.now)();
     let head = git.head().unwrap_or_default();
@@ -545,6 +575,7 @@ pub(super) fn finish(
         git.tree(&head).unwrap_or_default()
     };
     let landing = records.tally.landing.clone();
+    let landed = landing.is_some();
     let result = match (&landing, code) {
         (Some(_), _) => "landed",
         (None, exit::PASS) => "nothing",
@@ -565,34 +596,59 @@ pub(super) fn finish(
     };
     let end_kept = records.run_record(Kind::End, end, &mut *say);
     if let Some(signal) = signal {
-        say(&format!(
-            "verify land: interrupted by signal {signal}: this run's records are kept in this \
-             clone, and its next land appends them"
-        ));
-        return;
+        return Delivery::Interrupted(signal);
     }
-    if matches!(delivery, Delivery::DeferIfKept)
-        && end_kept
-        && records.tally.made.iter().all(|made| made.spooled)
-    {
-        match records.spool.flush() {
-            Ok(()) => {
-                say(
-                    "verify land: this run's records are kept in this clone; its next land appends them",
-                );
-                return;
-            }
-            Err(why) => say(&format!(
-                "verify land: this run's records were not confirmed durable in this clone \
-                 ({why}); attempting journal publication"
-            )),
+    if landed || !end_kept || !records.tally.made.iter().all(|made| made.spooled) {
+        return Delivery::Publish(None);
+    }
+    match records.spool.flush() {
+        Ok(()) => Delivery::Kept,
+        Err(why) => Delivery::Publish(Some(why)),
+    }
+}
+
+/// Deliver the run's records as [`finish`] left them, once the landing's verdict is said: first
+/// let the checkout's landing lock go ([`Records::lock`]), so a land of the checkout can start
+/// while this run appends; then say where the records go and, for [`Delivery::Publish`], append
+/// them ([`Records::publish`]). An append that failed is said, and changes nothing: the exit is
+/// the run's either way.
+pub(super) fn deliver(
+    root: &Path,
+    records: &mut Records<'_>,
+    say: &mut dyn FnMut(&str),
+    delivery: Delivery,
+) {
+    drop(records.lock.take());
+    let unconfirmed = match delivery {
+        Delivery::Interrupted(signal) => {
+            say(&format!(
+                "verify land: interrupted by signal {signal}: this run's records are kept in this \
+                 clone; {WHO_APPENDS}"
+            ));
+            return;
         }
-    }
-    if let Err(Unwritten { why, unkept }) = records.publish(git.root, &mut *say) {
+        Delivery::Kept => {
+            say(&format!(
+                "verify land: this run's records are kept in this clone; {WHO_APPENDS}"
+            ));
+            return;
+        }
+        Delivery::Publish(unconfirmed) => unconfirmed,
+    };
+    say(&match unconfirmed {
+        None => "verify land: appending this run's records to the journal; this checkout may land \
+                 again meanwhile"
+            .to_owned(),
+        Some(why) => format!(
+            "verify land: this run's records were not confirmed durable in this clone ({why}); \
+             appending them to the journal; this checkout may land again meanwhile"
+        ),
+    });
+    if let Err(Unwritten { why, unkept }) = records.publish(root, &mut *say) {
         say(&match unkept {
             None => format!(
                 "verify land: this run's records were not appended to the journal ({why}); they \
-                 are kept in this clone, and its next land appends them"
+                 are kept in this clone; {WHO_APPENDS}"
             ),
             Some(spool) => format!(
                 "verify land: this run's records were not appended to the journal ({why}), nor \
@@ -668,6 +724,7 @@ pub(super) fn live(root: &Path) -> Records<'static> {
         run,
         interrupt: Box::new(crate::exec::group::taken),
         tally: Tally::default(),
+        lock: None,
     }
 }
 

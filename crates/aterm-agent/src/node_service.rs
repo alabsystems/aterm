@@ -37,6 +37,12 @@ pub fn left_the_fleet(state_dir: &Path) -> bool {
 /// the fleet port or is about to bind it ([`node_port_holds_lock`]).
 pub const NODE_PORT_LOCK: &str = "node-port.lock";
 
+/// Exclusive advisory lock a window holds in `<state_dir>` while it has the fleet port bound
+/// ([`NodeJobLock::try_acquire_window_port`]): a node job whose bind meets the port in use waits
+/// for this lock's release ([`wait_port_released`]) rather than retrying on a clock, and a port in
+/// use while no window holds it is a foreign program's.
+pub const WINDOW_PORT_LOCK: &str = "window-port.lock";
+
 /// Marker written by `aterm node off` in `<state_dir>` so `sync.node` leaves the job off.
 pub const NODE_OFF_FILE: &str = "node-off";
 
@@ -47,6 +53,14 @@ const NODE_ADMIN_LOCK: &str = "node-admin.lock";
 #[cfg(all(test, unix))]
 thread_local! {
     static NODE_ADMIN_WAITER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    // Told as `wait_port_released` is about to wait, on the thread that waits: a test releases
+    // the lock only once its waiter is there.
+    static PORT_WAITER_ENTERING: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -294,10 +308,43 @@ impl NodeJobLock {
     /// yields the port to a job that serves it and never to one that idles. `Ok(None)` while
     /// another process holds it.
     ///
+    /// Taking it writes this process's id into the file through the held descriptor
+    /// ([`Self::mark_taken`]), so a window that watches the file hears the take as a change of
+    /// its stamp: a flock alone moves nothing a file watch sees. A shared probe
+    /// ([`node_port_holds_lock`]) writes nothing, so probes are never heard.
+    ///
     /// # Errors
     /// As [`Self::try_acquire`].
     pub fn try_acquire_port(state_dir: &Path) -> std::io::Result<Option<Self>> {
-        Self::try_acquire_at(state_dir, NODE_PORT_LOCK)
+        Self::try_acquire_marked(state_dir, NODE_PORT_LOCK)
+    }
+
+    /// Try to acquire `<state_dir>/window-port.lock` ([`WINDOW_PORT_LOCK`]) without blocking, as
+    /// a window that bound the fleet port does, marked as [`Self::try_acquire_port`] marks its
+    /// take. `Ok(None)` while another process holds it.
+    ///
+    /// # Errors
+    /// As [`Self::try_acquire`].
+    pub fn try_acquire_window_port(state_dir: &Path) -> std::io::Result<Option<Self>> {
+        Self::try_acquire_marked(state_dir, WINDOW_PORT_LOCK)
+    }
+
+    fn try_acquire_marked(state_dir: &Path, name: &str) -> std::io::Result<Option<Self>> {
+        let held = Self::try_acquire_at(state_dir, name)?;
+        if let Some(lock) = &held {
+            lock.mark_taken();
+        }
+        Ok(held)
+    }
+
+    /// Write `<pid>\n` over the held lock file through its own descriptor. The id is only the
+    /// change's carrier, never read for a decision; a write that fails leaves the lock held and
+    /// only unheard, so the watcher's backstop answers for it.
+    fn mark_taken(&self) {
+        use std::os::unix::fs::FileExt as _;
+        let line = format!("{}\n", std::process::id());
+        let _ = self.file.set_len(0);
+        let _ = self.file.write_all_at(line.as_bytes(), 0);
     }
 
     fn try_acquire_at(state_dir: &Path, name: &str) -> std::io::Result<Option<Self>> {
@@ -377,6 +424,45 @@ pub fn node_job_holds_lock(state_dir: &Path) -> bool {
 #[must_use]
 pub fn node_port_holds_lock(state_dir: &Path) -> bool {
     holds_lock_at(state_dir, NODE_PORT_LOCK)
+}
+
+/// Whether a window has the fleet port bound now: it holds `<state_dir>/window-port.lock`
+/// ([`NodeJobLock::try_acquire_window_port`]).
+#[cfg(unix)]
+#[must_use]
+pub fn window_port_holds_lock(state_dir: &Path) -> bool {
+    holds_lock_at(state_dir, WINDOW_PORT_LOCK)
+}
+
+/// Block until no process holds `<state_dir>/<name>` exclusively ([`NODE_PORT_LOCK`] or
+/// [`WINDOW_PORT_LOCK`]): one shared take that waits in the kernel and is let go at once. The
+/// holder's release, a crash's included (the kernel lets a dead process's lock go), ends the
+/// wait, so a waiter needs no clock. A file that is not there is held by no one, and returns at
+/// once. The descriptor is close-on-exec and close-on-fork, so no child keeps the wait.
+///
+/// # Errors
+/// The file could not be opened (other than missing) or the wait failed.
+#[cfg(unix)]
+pub fn wait_port_released(state_dir: &Path, name: &str) -> std::io::Result<()> {
+    let file = match aterm_uds::kept_out(|| aterm_uds::private_file::open_private(state_dir, name))
+    {
+        Ok((file, _)) => file,
+        Err(_) if !state_dir.join(name).exists() => return Ok(()),
+        Err(error) => return Err(std::io::Error::other(error.to_string())),
+    };
+    #[cfg(test)]
+    PORT_WAITER_ENTERING.with(|entering| {
+        if let Some(entering) = entering.borrow().as_ref() {
+            let _ = entering.send(());
+        }
+    });
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a shared wait on a CLOEXEC/CLOFORK descriptor that NodeJobProbe::drop releases by LOCK_UN as soon as it is granted"
+    )]
+    file.lock_shared()?;
+    drop(NodeJobProbe(file));
+    Ok(())
 }
 
 #[cfg(unix)]

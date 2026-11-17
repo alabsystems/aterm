@@ -294,6 +294,8 @@ impl IntentStore for MemIntents {
                 body_digest: draft.body_digest.clone(),
                 grant: draft.grant.clone(),
                 at_secs: SIM_START,
+                writer: draft.writer.clone(),
+                refs: draft.refs.clone(),
             },
             settled: None,
         });

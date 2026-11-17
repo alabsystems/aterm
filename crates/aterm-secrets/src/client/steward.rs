@@ -109,7 +109,7 @@ fn steward_copy(paths: &Paths) -> crate::Result<Result<StewardCopy, String>> {
     }
     // A steward's publish ends in a sync of this Mac's copy, which the person stopped: the
     // founding by default stands aside for the same record ([`commons_foundable`]).
-    if crate::service::subscriber_turned_off(&paths.home) {
+    if crate::off_record::subscriber_turned_off(&paths.home) {
         return no(&sync_turned_off());
     }
     if read_identity(paths)?.is_none() || fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
@@ -750,7 +750,7 @@ pub(crate) struct AlabRoleContext {
     recipient: [u8; 32],
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl AlabRoleContext {
     pub(crate) fn for_role_test(tag: u8) -> Self {
         Self {
@@ -1216,6 +1216,7 @@ pub fn steward_ensure_lease(
 }
 
 /// Minimum release carrying F6 and F7 (`DESIGN-fluid-swarm` §4.1 F6, §4.3 step 1).
+#[cfg(unix)]
 pub(crate) const FLUID_SERVER_MIN_RELEASE: locker_skew::Version = (0, 146, 0);
 
 /// Whether a member vault server is found and fed on this OS. Members find one another's servers,
@@ -1224,9 +1225,11 @@ pub(crate) const FLUID_SERVER_MIN_RELEASE: locker_skew::Version = (0, 146, 0);
 /// nothing finds or feeds a member server (a Linux member's held no vault in its life), so the
 /// step installs none and removes the one an earlier release installed
 /// ([`member_server_installed`]).
+#[cfg(unix)]
 pub(crate) const MEMBER_SERVER_FOUND: bool = cfg!(target_os = "macos");
 
 /// Why the step serves nothing off macOS ([`MEMBER_SERVER_FOUND`]).
+#[cfg(unix)]
 fn unfound_member_server() -> String {
     "a member vault server is found, and finds the servers it pulls from, over Bonjour, which \
      aterm advertises and browses on macOS only, so one here is neither found nor fed"
@@ -1234,6 +1237,7 @@ fn unfound_member_server() -> String {
 }
 
 /// The arguments, after its program, of the member server this step installs for `label`.
+#[cfg(unix)]
 fn member_server_args(label: String) -> Vec<String> {
     vec![
         "secrets".to_owned(),
@@ -1251,6 +1255,7 @@ fn member_server_args(label: String) -> Vec<String> {
 /// installed, in this release's shape ([`member_server_args`]) or an earlier one's, which pinned
 /// the ALab key of its day and passed no `--no-keep-awake`. Any other shape is a person's
 /// (`aterm secrets server on`), which the step leaves as it is.
+#[cfg(unix)]
 pub(crate) fn member_server_installed(args: &[String]) -> bool {
     let words: Vec<&str> = args.iter().map(String::as_str).collect();
     let pinned = format!("{}=", crate::ALAB_VAULT);
@@ -1281,6 +1286,7 @@ pub(crate) fn member_server_installed(args: &[String]) -> bool {
 ///
 /// # Errors
 /// The job's pin record cannot be read.
+#[cfg(unix)]
 pub fn stale_member_server(paths: &Paths) -> crate::Result<Option<String>> {
     if MEMBER_SERVER_FOUND
         || !crate::service::server_retire_due(&paths.home, &member_server_installed)?
@@ -1299,6 +1305,7 @@ pub fn stale_member_server(paths: &Paths) -> crate::Result<Option<String>> {
 ///
 /// # Errors
 /// The job's decision lock or pin record cannot be read, or the job did not stop or go.
+#[cfg(unix)]
 pub fn retire_stale_member_server(paths: &Paths) -> crate::Result<Option<String>> {
     if MEMBER_SERVER_FOUND {
         return Ok(None);
@@ -1312,6 +1319,7 @@ pub fn retire_stale_member_server(paths: &Paths) -> crate::Result<Option<String>
 /// Outcome of the member vault server step (`sync.steward.server.standby`, `DESIGN-fluid-swarm`
 /// §4.1 F6 & §4.3 step 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(unix)]
 pub enum StewardStandbyServer {
     /// Not applicable on this machine (not an active URL-backed ALab member, turned off by
     /// choice, or not macOS).
@@ -1331,6 +1339,7 @@ pub enum StewardStandbyServer {
     Done(String),
 }
 
+#[cfg(unix)]
 pub(super) fn check_standby_eligibility(
     paths: &Paths,
     _observed_network_id: Option<&str>,
@@ -1348,12 +1357,12 @@ pub(super) fn check_standby_eligibility(
             "the configured vault is a local file rather than a URL vault".to_owned(),
         ));
     }
-    if crate::service::subscriber_turned_off(&paths.home) {
+    if crate::off_record::subscriber_turned_off(&paths.home) {
         return Ok(Err(
             "sync is off on this Mac by your choice (`aterm secrets agent off`)".to_owned(),
         ));
     }
-    if crate::service::server_turned_off(&paths.home) {
+    if crate::off_record::server_turned_off(&paths.home) {
         return Ok(Err(
             "the vault server is off on this Mac by your choice (`aterm secrets server off`)"
                 .to_owned(),
@@ -1381,6 +1390,7 @@ pub(super) fn check_standby_eligibility(
 
 /// How long a held server moved onto this aterm has to serve its store's ALab vault before it
 /// is put back ([`serves_alab`]).
+#[cfg(unix)]
 pub(crate) const SERVES_WITHIN: Duration = Duration::from_secs(60);
 
 /// A held server job this aterm moves (`sync.steward.server.standby`): its release,
@@ -1522,6 +1532,7 @@ pub(crate) fn steward_standby_server_check_with(
 /// Vault configuration or service state cannot be read, or a vault pass held the state lock
 /// past the wait ([`writer_outlasted_wait`]). Unavailable membership evidence returns
 /// [`StewardStandbyServer::Idle`] until a later observation can verify it.
+#[cfg(unix)]
 pub fn steward_standby_server_check(
     paths: &Paths,
     observed_network_id: Option<&str>,
@@ -1546,6 +1557,7 @@ pub fn steward_standby_server_check(
 
 /// Move a held job onto a program, counting it moved once the closure it is given finds it
 /// serving ([`crate::service::move_held_serving`]).
+#[cfg(unix)]
 type MoveHeld<'a> = dyn FnMut(
         &crate::service::Held,
         &Path,
@@ -1629,6 +1641,7 @@ pub(crate) fn steward_ensure_standby_server_with(
 /// # Errors
 /// Service program lookup or launchd/systemd installation fails, or a vault pass held the
 /// state lock past the wait ([`writer_outlasted_wait`]).
+#[cfg(unix)]
 pub fn steward_ensure_standby_server(
     paths: &Paths,
     observed_network_id: Option<&str>,

@@ -608,6 +608,71 @@ pub fn reveal_in<T>(
     Ok(Ok(consume(held.plaintext())))
 }
 
+/// What the one value a reveal would hand a sign-in holds, in value-free words.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// A character other than whitespace.
+    Usable,
+    /// Whitespace alone.
+    Blank,
+    /// Nothing.
+    Empty,
+}
+
+impl Standing {
+    fn of(held: &Secret) -> Self {
+        let value = held.plaintext();
+        if value.is_empty() {
+            Self::Empty
+        } else if value.chars().all(char::is_whitespace) {
+            Self::Blank
+        } else {
+            Self::Usable
+        }
+    }
+}
+
+/// Whether a sign-in could be handed `ask`'s credential now, answered by the same read
+/// [`reveal_in`] makes and handing nothing on: `Ok(Ok(_))` what the one value the cell opens
+/// to holds ([`Standing`]), `Ok(Err(_))` why a reveal would be withheld. The value is read in
+/// this process, compared with its other candidates and dropped (zeroized); it leaves in no
+/// form and reaches no surface, so nothing is journalled. This is what a caller that only
+/// decides whether to start a sign-in asks: a reveal is for the sign-in that types the value.
+///
+/// # Errors
+/// The store cannot be read.
+pub fn usable_in(
+    addresses: &Projection,
+    mailboxes: &Projection,
+    table: &str,
+    store: &dyn Store,
+    ask: Ask<'_>,
+) -> Result<std::result::Result<Standing, Withheld>> {
+    Ok(
+        open_credential(addresses, mailboxes, table, Values::Store(store), ask)?
+            .map(|(_, held)| Standing::of(&held)),
+    )
+}
+
+/// [`usable_in`] over this Mac's registry, as [`reveal`] reads it: the store where the
+/// generation's cells name store entries, the generation's opener below the third.
+///
+/// # Errors
+/// The registry is not declared here, its log does not read, or the store cannot be read.
+#[cfg(unix)]
+pub fn usable(
+    registry: &Registry,
+    store: &dyn Store,
+    ask: Ask<'_>,
+) -> Result<std::result::Result<Standing, Withheld>> {
+    let handle = crate::att::Handle::at(registry.paths().clone(), &crate::att::REGISTRY);
+    let table = handle.compiled().name();
+    read_with(&handle, store, |addresses, mailboxes, values| {
+        Ok(open_credential(addresses, mailboxes, &table, values, ask)?
+            .map(|(_, held)| Standing::of(&held)))
+    })
+}
+
 /// The registry's live mailboxes on this Mac ([`mailboxes`]), read as an observer.
 ///
 /// # Errors

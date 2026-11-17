@@ -1210,12 +1210,23 @@ impl RunningMark {
         label: &str,
         at: i64,
     ) -> Option<Self> {
+        Self::note_by(store, cli, label, at, std::process::id())
+    }
+
+    /// [`Self::note`], naming process `pid` as the sign-in lock's holder.
+    fn note_by(
+        store: &super::accounts::Store,
+        cli: super::accounts::Cli,
+        label: &str,
+        at: i64,
+        pid: u32,
+    ) -> Option<Self> {
         let path = running_path(store);
         let text = Running {
             cli: cli.id().to_owned(),
             label: label.to_owned(),
             at,
-            holder: holder(std::process::id())?,
+            holder: holder(pid)?,
         }
         .text();
         super::atomic_write::write_atomic(&path, &text).ok()?;
@@ -1247,23 +1258,90 @@ pub(super) fn running_fixture(
     RunningMark::note(store, cli, label, at).map(|mark| Box::new(mark) as Box<dyn std::any::Any>)
 }
 
-/// The label of `cli`'s row whose sign-in runs on `store`'s Mac now, in this process or another:
-/// what [`SIGNIN_RUNNING_FILE`] names while the process it names, the sign-in lock's holder,
-/// still lives as that same process ([`holder`] reads the identity the record holds). A sign-in
-/// killed mid-run leaves its record, which then names nothing, even once another process takes
-/// its number.
-#[must_use]
-pub(super) fn signing_in(
+/// [`running_fixture`], the record naming the live process `pid` as the holder: `label` reads as
+/// signing in while that process lives as itself, and its record stays when it dies, as a
+/// sign-in killed mid-run leaves it, until what this returns drops.
+#[cfg(any(test, debug_assertions))]
+pub(super) fn running_fixture_by(
     store: &super::accounts::Store,
     cli: super::accounts::Cli,
-) -> Option<String> {
+    label: &str,
+    at: i64,
+    pid: u32,
+) -> Option<Box<dyn std::any::Any>> {
+    RunningMark::note_by(store, cli, label, at, pid)
+        .map(|mark| Box::new(mark) as Box<dyn std::any::Any>)
+}
+
+/// Where `store`'s Mac names its running sign-in ([`SIGNIN_RUNNING_FILE`]), for a reader that
+/// looks at the file before it reads it.
+#[must_use]
+pub(super) fn running_file(store: &super::accounts::Store) -> std::path::PathBuf {
+    running_path(store)
+}
+
+/// The sign-in a record of [`SIGNIN_RUNNING_FILE`] names for one CLI: its row's label and the
+/// process that runs it, the sign-in lock's holder, by its identity, whether or not that process
+/// still lives ([`Self::lives`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningSignIn {
+    label: String,
+    holder: aterm_uds::process::Identity,
+}
+
+impl RunningSignIn {
+    /// The label of the row the sign-in runs for.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Whether the process the record names still lives as that same process ([`holder`] reads
+    /// its identity now from the process table, not from the record). A sign-in killed mid-run
+    /// leaves its record, which then names nothing, even once another process takes its number.
+    #[must_use]
+    pub fn lives(&self) -> bool {
+        holder(self.holder.pid.unsigned_abs()) == Some(self.holder)
+    }
+
+    /// The process the record names, the sign-in lock's holder, by its identity as the record
+    /// holds it: what a reader watches for the exit that ends the sign-in, killed or not, while
+    /// its record stays.
+    #[must_use]
+    pub fn holder(&self) -> aterm_uds::process::Identity {
+        self.holder
+    }
+}
+
+/// What [`SIGNIN_RUNNING_FILE`] names for `cli` on `store`'s Mac, alive or not: one read of the
+/// file. `None` where there is no record, or it is another CLI's or no record at all.
+#[must_use]
+pub(super) fn running_record(
+    store: &super::accounts::Store,
+    cli: super::accounts::Cli,
+) -> Option<RunningSignIn> {
     let running = super::accounts::read_bounded(&running_path(store), 4096)
         .ok()
         .flatten()
         .as_deref()
         .and_then(Running::parse)?;
-    (running.cli == cli.id() && holder(running.holder.pid.unsigned_abs()) == Some(running.holder))
-        .then_some(running.label)
+    (running.cli == cli.id()).then_some(RunningSignIn {
+        label: running.label,
+        holder: running.holder,
+    })
+}
+
+/// The label of `cli`'s row whose sign-in runs on `store`'s Mac now, in this process or another:
+/// what [`SIGNIN_RUNNING_FILE`] names while the process it names, the sign-in lock's holder,
+/// still lives as that same process ([`running_record`], [`RunningSignIn::lives`]).
+#[must_use]
+pub(super) fn signing_in(
+    store: &super::accounts::Store,
+    cli: super::accounts::Cli,
+) -> Option<String> {
+    running_record(store, cli)
+        .filter(RunningSignIn::lives)
+        .map(|running| running.label)
 }
 
 /// Why this Mac may start one sign-in. There is no other reason to start one.

@@ -727,6 +727,9 @@ fn fx_window(
     };
     crate::restore::WindowLayout {
         dock: None,
+        dock_by_default: false,
+        // A capture with an OS window writes the scale its origin and frame were read at.
+        scale: Some(2.0),
         rows,
         cols,
         active_tab: 0,
@@ -4259,6 +4262,9 @@ fn fx_carried_state_desk() -> FxDesk {
         ],
     );
     front.inner_px = inner_px;
+    // The default docked the navigator in this window (DK-4), and its record says so, so the
+    // successor's birth leaves it to `[navigator] dock` as it would an undecided window.
+    (front.dock, front.dock_by_default) = (Some(30), true);
     let co_view = leaf_of(0, "zsh", &|leaf| leaf.theme = Some("Nord".to_string()));
     let mut parked_worker = fx_tab(worker);
     parked_worker.parked = true;
@@ -5136,7 +5142,7 @@ const NO_HANDOFF_WRITES: &[(&str, &str)] = &[
 ];
 
 fn fx_record_fields() {
-    use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, newest_recorded};
+    use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, Judged, newest_recorded};
     let out = std::path::PathBuf::from(
         std::env::var_os("ATERM_HANDOFF_FIXTURE_OUT")
             .expect("set ATERM_HANDOFF_FIXTURE_OUT to tests/fixtures/handoff/v<release>"),
@@ -5145,20 +5151,18 @@ fn fx_record_fields() {
     let baseline = newest_recorded(&root, &out);
     let fields = DeskFields::of_release(&out);
     std::fs::write(out.join(FIELDS_FILE), fields.to_toml()).expect("write fields.toml");
-    fx_assert_field_hold(
-        &fields,
-        baseline
-            .as_ref()
-            .map(|(tag, record)| (tag.as_str(), record)),
-    );
+    let (tag, baseline) = baseline.map_or((None, None), |(tag, record)| (Some(tag), Some(record)));
+    fx_assert_field_hold(&fields, tag.as_deref(), Judged::Main(baseline.as_ref()));
 }
 
 // After-cut uses the recorded release itself as the baseline: an older release can
-// still mention a retired field and would hide a stale NO_HANDOFF_WRITES entry.
+// still mention a retired field and would hide a stale NO_HANDOFF_WRITES entry. A field
+// that release's fields.toml does not list at all is one main added after its base, which
+// no desk of it could write: it is named and left to the generator's own hold of main.
 #[test]
 #[ignore = "after-cut checks the staged release with main's compiled reader"]
 fn check_landed_handoff_fields() {
-    use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, Recorded};
+    use crate::seamless::fixture_cover::{DeskFields, FIELDS_FILE, Judged, Recorded};
     let release = std::path::PathBuf::from(
         std::env::var_os("ATERM_HANDOFF_FIELD_HOLD_RELEASE")
             .expect("after-cut names the release directory"),
@@ -5166,12 +5170,19 @@ fn check_landed_handoff_fields() {
     let text = std::fs::read_to_string(release.join(FIELDS_FILE)).expect("release's fields.toml");
     let baseline: Recorded = aterm_toml::from_str(&text).expect("release's recorded fields");
     let tag = release.file_name().expect("release tag").to_string_lossy();
-    fx_assert_field_hold(&DeskFields::of_release(&release), Some((&tag, &baseline)));
+    fx_assert_field_hold(
+        &DeskFields::of_release(&release),
+        Some(&tag),
+        Judged::Release(&baseline),
+    );
 }
 
+/// Hold `fields` as `judged` says; `release` names the recorded release it is held against.
+/// Judging a cut release, each field main added since is named and left to main's own hold.
 fn fx_assert_field_hold(
     fields: &crate::seamless::fixture_cover::DeskFields,
-    baseline: Option<(&str, &crate::seamless::fixture_cover::Recorded)>,
+    release: Option<&str>,
+    judged: crate::seamless::fixture_cover::Judged<'_>,
 ) {
     let off_macos: &[(&str, &str)] = if cfg!(target_os = "macos") {
         &[]
@@ -5179,15 +5190,20 @@ fn fx_assert_field_hold(
         NO_HANDOFF_WRITES_OFF_MACOS
     };
     let unhanded: Vec<(&str, &str)> = NO_HANDOFF_WRITES.iter().chain(off_macos).copied().collect();
-    let uncovered = fields.uncovered(baseline.map(|(_, recorded)| recorded), &unhanded);
+    if let (crate::seamless::fixture_cover::Judged::Release(recorded), Some(release)) =
+        (judged, release)
+    {
+        for field in fields.added_since(recorded) {
+            eprintln!("{field}: added on main since {release}, held by main's generator");
+        }
+    }
+    let uncovered = fields.uncovered(judged, &unhanded);
     assert!(
         uncovered.is_empty(),
         "carried fields and variants no desk here writes{}; give each a value in \
          a desk, as a real session would carry it, or name one no handoff writes \
          in NO_HANDOFF_WRITES with why (tests/fixtures/handoff/README.md):\n  {}",
-        baseline.map_or_else(String::new, |(release, _)| format!(
-            " (held since {release})"
-        )),
+        release.map_or_else(String::new, |release| format!(" (held since {release})")),
         uncovered.join("\n  ")
     );
 }

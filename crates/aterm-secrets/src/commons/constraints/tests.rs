@@ -175,7 +175,7 @@ fn newly_admitted_member_enforces_history_it_cannot_decrypt() {
     let admission = node(Some(retirement.id()), &[&old, &new], b"new member", &[]);
     assert!(genesis.open(&new).is_err());
     assert!(retirement.open(&new).is_err());
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &genesis);
     journal.ingest(admission.bytes()).unwrap();
     assert!(journal.constraints().is_err());
@@ -217,7 +217,7 @@ fn selected_old_payload_cannot_discard_a_nonselected_revocation_or_key_epoch() {
     );
     let right = node(Some(genesis.id()), &[&old, &new], b"key 31", &[]);
     let recovery = recover(&[left.id(), right.id()], right.id());
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &genesis);
     for event in [&recovery, &right, &genesis] {
         journal.ingest(event.bytes()).unwrap();
@@ -248,7 +248,7 @@ fn equal_epoch_conflicts_and_old_key_reuse_require_a_fresh_higher_epoch() {
     let left = node(Some(genesis.id()), &[&identity], b"left", &[epoch(2, 37)]);
     let right = node(Some(genesis.id()), &[&identity], b"right", &[epoch(2, 43)]);
     let recovery = recover(&[left.id(), right.id()], left.id());
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &genesis);
     for event in [&genesis, &left, &right, &recovery] {
         journal.ingest(event.bytes()).unwrap();
@@ -478,7 +478,7 @@ fn legacy_history_stays_readable_but_cannot_supply_complete_policy_evidence() {
         b"legacy private"
     );
     let fresh = node(Some(legacy.id()), &[&identity], b"fresh", &[epoch(1, 31)]);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &legacy);
     journal.ingest(legacy.bytes()).unwrap();
     journal.ingest(fresh.bytes()).unwrap();
@@ -512,7 +512,7 @@ fn numeric_epoch_cannot_hide_an_unobserved_retirement_or_republish_an_old_key() 
         &[epoch(100, 37)],
     );
     let recovery = recover(&[retired.id(), concurrent.id()], concurrent.id());
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &genesis);
     for event in [&genesis, &retired, &concurrent, &recovery] {
         journal.ingest(event.bytes()).unwrap();
@@ -601,7 +601,7 @@ fn rotation_covers_retirements_across_bitmap_words() {
 fn computation_limit_preserves_history_and_withholds_current_policy() {
     let identity = Identity::from_secret_bytes([13; 32]);
     let genesis = node(None, &[&identity], b"start", &[]);
-    let dir = aterm_tempfile::tempdir().unwrap();
+    let dir = crate::private_scratch::tempdir();
     let mut journal = open(dir.path(), &genesis);
     journal.ingest(genesis.bytes()).unwrap();
     let mut parent = genesis.id();

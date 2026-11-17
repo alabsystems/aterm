@@ -1304,9 +1304,11 @@ fn check_reports_the_lab_rules() {
     assert!(!text.contains('@'));
 }
 
-/// `prefer` writes the owner's mapping and `unprefer` ends it: by label or legacy label, never by
-/// address. A repeat writes nothing, and a re-prefer brings the same row back. Nothing but the
-/// preference row is written: the account, its status and its login are as they were.
+/// `prefer` writes the owner's mapping and `unprefer` ends it, the account named by its slug, or
+/// by its provider word and address; an address two accounts sign in with names neither, and the
+/// default label names none. A repeat writes nothing, and a re-prefer brings the same row back.
+/// Nothing but the preference row is written: the account, its status and its login are as they
+/// were.
 /// NEGATIVE CONTROL: with `prefer` not skipping a value already held (`if false && current...`),
 /// the repeat rewrites the cells: `` left: Number(4) right: Number(0) `` at the repeat's `written`.
 #[test]
@@ -1318,20 +1320,25 @@ fn prefer_and_unprefer_write_one_mapping() {
     let mut opened = Vec::new();
     import(paths, &["--apply"], &vault, &logins, &mut opened);
     let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
-    let label = keys::default_account_label("claude", &claude).unwrap();
+    // The `<cli>-<6 hex>` label builds before account version 2 stored.
+    let default = format!("claude-{}", &claude[3..9]);
+    let label = "claude-ann-example";
     let before = Registry::at(paths.clone())
         .view()
         .unwrap()
         .project(&ACCOUNT);
     let mut no_review = |_: &Path| Ok(());
     let mut verb = |list: &[&str]| run(paths, &words(list), None, &mut no_review, NOW);
-    assert!(verb(&["prefer", "m4", "ann@example.invalid"]).is_err());
-    assert!(verb(&["prefer", "m404", &label]).is_err());
+    // Claude and Codex both sign in as ann.
+    let both = verb(&["prefer", "m4", "ann@example.invalid"]).unwrap_err();
+    assert!(both.to_string().contains("names 2 accounts"), "{both}");
+    assert!(verb(&["prefer", "m4", &default]).is_err());
+    assert!(verb(&["prefer", "m404", label]).is_err());
     // A row the import wrote becomes the owner's on the owner's word.
-    let m3 = verb(&["prefer", "m3", &label]).unwrap();
+    let m3 = verb(&["prefer", "m3", label]).unwrap();
     let imported = m3["preference"].as_str().unwrap().to_owned();
     assert_eq!(m3["written"], json!(1));
-    let first = verb(&["prefer", "m4", &label, "--rank", "2"]).unwrap();
+    let first = verb(&["prefer", "m4", label, "--rank", "2"]).unwrap();
     assert!(first["written"].as_u64().unwrap() > 0, "{first}");
     let pk = first["preference"].as_str().unwrap().to_owned();
     let read = || {
@@ -1343,15 +1350,16 @@ fn prefer_and_unprefer_write_one_mapping() {
     assert_eq!(read().rows[&pk].get("rank"), Some(&json!(2)));
     assert_eq!(read().rows[&pk].get("why"), Some(&json!("owner")));
     assert_eq!(read().rows[&imported].get("why"), Some(&json!("owner")));
-    let again = verb(&["prefer", "m4", &label, "--rank", "2"]).unwrap();
+    let again = verb(&["prefer", "m4", "claude:ann@example.invalid", "--rank", "2"]).unwrap();
     assert_eq!(again["written"], json!(0));
-    verb(&["unprefer", "m4", &label]).unwrap();
+    assert_eq!(again["preference"], json!(pk));
+    verb(&["unprefer", "m4", label]).unwrap();
     assert_eq!(read().rows[&pk].lifecycle(), Some("ended"));
     assert_eq!(
-        verb(&["unprefer", "m4", &label]).unwrap()["written"],
+        verb(&["unprefer", "m4", "claude ann@example.invalid"]).unwrap()["written"],
         json!(0)
     );
-    verb(&["prefer", "m4", &label]).unwrap();
+    verb(&["prefer", "m4", label]).unwrap();
     assert!(read().rows[&pk].live());
     assert_eq!(
         Registry::at(paths.clone())
@@ -1453,12 +1461,12 @@ fn prefer_refuses_retired_keys_while_unprefer_ends_preferences_on_retired_labels
     let mut opened = Vec::new();
     import(paths, &["--apply"], &vault, &logins, &mut opened);
     let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
-    let label = keys::default_account_label("claude", &claude).unwrap();
+    let label = "claude-ann-example";
     let m4 = keys::machine_pk("m4");
     let mut no_review = |_: &Path| Ok(());
     let mut verb = |list: &[&str]| run(paths, &words(list), None, &mut no_review, NOW);
 
-    let pref = verb(&["prefer", "m4", &label]).unwrap()["preference"]
+    let pref = verb(&["prefer", "m4", label]).unwrap()["preference"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1467,10 +1475,10 @@ fn prefer_refuses_retired_keys_while_unprefer_ends_preferences_on_retired_labels
         .unwrap();
 
     // `prefer` by retired machine `pk` is refused instead of creating `preference-on-retired-machine`.
-    assert!(verb(&["prefer", &m4, &label]).is_err());
+    assert!(verb(&["prefer", &m4, label]).is_err());
 
     // `unprefer` by retired machine label still ends the lingering preference.
-    let ended = verb(&["unprefer", "m4", &label]).unwrap();
+    let ended = verb(&["unprefer", "m4", label]).unwrap();
     assert_eq!(ended["row"], json!("ended"));
     assert_eq!(
         Registry::at(paths.clone())
@@ -1482,11 +1490,18 @@ fn prefer_refuses_retired_keys_while_unprefer_ends_preferences_on_retired_labels
         Some("ended")
     );
 
-    // Retiring the account also blocks `prefer` by account `pk`.
+    // Retiring the account also blocks `prefer` by account `pk`, and by its slug.
     Registry::at(paths.clone())
         .write(vec![vec![put(&ACCOUNT, &claude, "row", json!("retired"))]])
         .unwrap();
     assert!(verb(&["prefer", "m3", &claude]).is_err());
+    let retired = verb(&["prefer", "m3", label]).unwrap_err();
+    assert!(
+        retired
+            .to_string()
+            .contains("(claude-ann-example) is not live"),
+        "{retired}"
+    );
 }
 
 /// `prefer` refuses a retired machine or account even when named by key, while `unprefer` still
@@ -1772,41 +1787,59 @@ fn verb(paths: &Paths, list: &[&str]) -> Result<Value> {
     verb_io(paths, list, &mut |_: &Path, _| Ok(()), "")
 }
 
-/// The readers print the registry by key and label: `accounts` gives each account's label and
-/// the machines that prefer it, `mail` each address's key, its mailbox's key and label and the
-/// accounts that sign in with it, and no reader prints an address.
-/// NEGATIVE CONTROL: with `mail` adding each row's `addr` to its entry (`"addr": text(row,
-/// "addr")`), the report holds an address: `` mail: {"addresses":[{"accounts":… ``.
+/// The readers print each account by its key, its slug and its name, its provider word and
+/// address: `accounts` with the machines that prefer it, `preferences` beside each machine's
+/// label. `mail` prints each address by key, its mailbox's key and label and the accounts that
+/// sign in with it by key and slug, and neither it nor `machines` prints an address. A verb that
+/// takes an account takes its slug, its provider word and address, or an address of one account.
+/// NEGATIVE CONTROL: with `accounts` printing the label in place of the slug (`"slug":
+/// account.label`), the account's slug is its default label: `` left: String("claude-bc0a84")
+/// right: String("claude-ann-example") ``. With `mail` adding each row's `addr` to its entry
+/// (`"addr": text(row, "addr")`), its report holds an address: `` mail: {"addresses":[… ``.
 #[test]
-fn the_readers_print_keys_and_labels_never_an_address() {
+fn the_readers_print_each_account_by_slug_provider_and_address() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let scratch = aterm_tempfile::tempdir().unwrap();
     let (vault, logins) = sheets(scratch.path());
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
     let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
-    let label = keys::default_account_label("claude", &claude).unwrap();
-    for name in [
-        "machines",
-        "accounts",
-        "preferences",
-        "mail",
-        "signins",
-        "quota",
-    ] {
+    let codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
+    for name in ["machines", "mail"] {
         let out = verb(paths, &[name]).unwrap();
         let text = aterm_json::to_string(&out).unwrap();
         assert!(!text.contains('@'), "{name}: {text}");
     }
     let accounts = verb(paths, &["accounts"]).unwrap();
-    let ann = accounts["accounts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["ac"] == json!(claude))
-        .unwrap();
-    assert_eq!(ann["label"], json!(label));
+    let account = |pk: &str| {
+        accounts["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["ac"] == json!(pk))
+            .unwrap()
+            .clone()
+    };
+    let ann = account(&claude);
+    assert_eq!(ann["slug"], json!("claude-ann-example"));
+    assert_eq!(ann["name"], json!("claude ann@example.invalid"));
+    assert_eq!(ann["realm"], json!("claude"));
+    assert!(ann.get("label").is_none(), "{ann}");
     assert!(!ann["preferred_by"].as_array().unwrap().is_empty());
+    assert_eq!(account(&codex)["slug"], json!("oai-ann-example"));
+    assert_eq!(account(&codex)["name"], json!("oai ann@example.invalid"));
+    let preferences = verb(paths, &["preferences"]).unwrap();
+    assert!(
+        preferences["preferences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["ac"] == json!(claude)
+                && p["slug"] == json!("claude-ann-example")
+                && p["name"] == json!("claude ann@example.invalid")
+                && p["machine"] == json!("m3")),
+        "{preferences}"
+    );
     let mail = verb(paths, &["mail"]).unwrap();
     let ad = keys::address_pk("ann@example.invalid").unwrap();
     let entry = mail["addresses"]
@@ -1820,7 +1853,7 @@ fn the_readers_print_keys_and_labels_never_an_address() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|a| a["ac"] == json!(claude))
+            .any(|a| a["ac"] == json!(claude) && a["slug"] == json!("claude-ann-example"))
     );
     assert_eq!(mail["mailboxes"].as_array().unwrap().len(), 1);
     let machines = verb(paths, &["machines"]).unwrap();
@@ -1832,7 +1865,98 @@ fn the_readers_print_keys_and_labels_never_an_address() {
             .any(|m| m["label"] == json!("m3") && m["prefers"].as_u64().unwrap() > 0)
     );
     assert!(verb(paths, &["machines", "extra"]).is_err());
-    assert!(verb(paths, &["who", "ann@example.invalid"]).is_err());
+    // A verb takes the account by any of its names; an address two accounts share names neither.
+    for word in [
+        "claude-ann-example",
+        claude.as_str(),
+        "claude ann@example.invalid",
+        "claude:ann@example.invalid",
+    ] {
+        assert_eq!(
+            verb(paths, &["who", word]).unwrap()["ac"],
+            json!(claude),
+            "{word}"
+        );
+    }
+    let cy = keys::account_pk("claude", "cy@example.invalid").unwrap();
+    assert_eq!(
+        verb(paths, &["who", "cy@example.invalid"]).unwrap()["ac"],
+        json!(cy)
+    );
+    let several = verb(paths, &["who", "ann@example.invalid"]).unwrap_err();
+    let mut lines = [
+        format!("{claude}  claude-ann-example  claude ann@example.invalid  {claude}"),
+        format!("{codex}  oai-ann-example  oai ann@example.invalid  {codex}"),
+    ];
+    // By key, as the resolver lists them; the key the line ends with is all a line shows of it.
+    lines.sort();
+    let lines = lines.map(|line| line[claude.len() + 2..].to_owned());
+    assert_eq!(
+        several.to_string(),
+        format!(
+            "`ann@example.invalid` names 2 accounts; name one by its slug:\n  {}\n  {}",
+            lines[0], lines[1]
+        )
+    );
+    let none = verb(paths, &["who", "ann-example"]).unwrap_err();
+    assert_eq!(none.to_string(), aterm_file::no_account("ann-example"));
+}
+
+/// `retire account` names an account as every account verb does: `oai:<address>` retires the
+/// Codex account and leaves the Claude account of that address live. The default `<cli>-<6 hex>`
+/// label the importer stored names none, and the address both sign in with names neither and
+/// lists both by slug; neither writes anything. While m3's preference of the Codex account is
+/// live, its retire is refused naming that row; once `unprefer` ends it, the retire is written.
+/// NEGATIVE CONTROL: with `retire` matching the stored `label` or `legacy_label` again (as
+/// before), the default label names the Claude account and retires it: `` called
+/// `Result::unwrap_err()` on an `Ok` value ``.
+#[test]
+fn retire_account_takes_an_accounts_names_and_refuses_a_default_label_or_a_shared_address() {
+    let lab = Lab::new(&[Role::Writer]);
+    let paths = &lab.paths[0];
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
+    let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
+    let codex = keys::account_pk("codex", "ann@example.invalid").unwrap();
+    let live = |pk: &str| {
+        Registry::at(paths.clone())
+            .view()
+            .unwrap()
+            .project(&ACCOUNT)
+            .rows[pk]
+            .live()
+    };
+    for (realm, pk) in [("claude", &claude), ("codex", &codex)] {
+        // The `<cli>-<6 hex>` label builds before account version 2 stored.
+        let default = format!("{realm}-{}", &pk[3..9]);
+        let none = verb(paths, &["retire", "account", &default]).unwrap_err();
+        assert_eq!(none.to_string(), aterm_file::no_account(&default));
+    }
+    let several = verb(paths, &["retire", "account", "ann@example.invalid"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        several.contains("names 2 accounts")
+            && several.contains("claude-ann-example")
+            && several.contains("oai-ann-example"),
+        "{several}"
+    );
+    assert!(live(&claude) && live(&codex));
+    // m3's preference of the Codex account is live, so its retire is refused until that ends
+    // (`typed::check::retired_referenced`), and `unprefer` names it the same way.
+    let held = verb(paths, &["retire", "account", "oai:ann@example.invalid"])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        held.contains(&keys::safe_key(&codex)) && held.contains("live preference row"),
+        "{held}"
+    );
+    assert!(live(&claude) && live(&codex));
+    verb(paths, &["unprefer", "m3", "oai:ann@example.invalid"]).unwrap();
+    let retired = verb(paths, &["retire", "account", "oai:ann@example.invalid"]).unwrap();
+    assert_eq!(retired["pk"], json!(codex));
+    assert!(live(&claude) && !live(&codex));
 }
 
 /// `add machine` writes a planned row once and refuses a label another machine holds; `relabel`
@@ -1929,12 +2053,14 @@ fn the_owner_adds_relabels_and_retires_a_machine() {
 }
 
 /// `add account` reads its address from stdin, never argv, births the address row and a
-/// `pending` account under the canonical key, prints only keys and the default label, and refuses
-/// the same account twice.
-/// NEGATIVE CONTROL: with `add_account` printing the address it read (`"addr": addr` in its
-/// report), the report holds an `@`: `` {"ac":"ac-…","addr":"new@example.test",… ``.
+/// `pending` account under the canonical key, answers its key, its slug and its name (its
+/// provider word and the address), and refuses the same account twice. It takes the provider
+/// word every surface prints (`oai`).
+/// NEGATIVE CONTROL: with `add_account` reading the names before its birth is in (`handle.view()`
+/// called before `commit_owner`), the new account has no slug or name: `` left: Null right:
+/// String("claude-new-example") ``.
 #[test]
-fn an_account_is_added_from_stdin_and_its_address_never_printed() {
+fn an_account_is_added_from_stdin_and_answers_its_slug_and_name() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
     let scratch = aterm_tempfile::tempdir().unwrap();
@@ -1948,10 +2074,11 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
         "new@example.test\n",
     )
     .unwrap();
-    let text = aterm_json::to_string(&added).unwrap();
-    assert!(!text.contains('@'), "{text}");
     let ac = keys::account_pk("claude", "new@example.test").unwrap();
     assert_eq!(added["ac"], json!(ac));
+    assert_eq!(added["slug"], json!("claude-new-example"));
+    assert_eq!(added["name"], json!("claude new@example.test"));
+    assert!(added.get("label").is_none(), "{added}");
     assert_eq!(added["address_born"], json!(true));
     let view = Registry::at(paths.clone()).view().unwrap();
     let row = &view.project(&ACCOUNT).rows[&ac];
@@ -1982,19 +2109,21 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
     // An existing address gets an account of another realm without a second address row.
     let codex = verb_io(
         paths,
-        &["add", "account", "codex"],
+        &["add", "account", "oai"],
         &mut open,
         "new@example.test",
     )
     .unwrap();
     assert_eq!(codex["address_born"], json!(false));
+    assert_eq!(codex["realm"], json!("codex"));
+    assert_eq!(codex["slug"], json!("oai-new-example"));
 }
 
 /// `add account` signs in with the row whose `addr` says the address now: a renamed row's new
 /// address links that row and births no second one, its old address (whose key the row still
 /// holds) is refused, an account beside a live one of the realm that signs in as that address
-/// (a rename went past it) is refused, and a retired row is refused; nothing it prints holds an
-/// address.
+/// (a rename went past it) is refused, and a retired row is refused. What it answers names the
+/// account by its slug and its name, the address that row says now; no refusal holds an address.
 /// NEGATIVE CONTROL: with `add_account` keying the login by `keys::address_pk` again (born where
 /// that key has no row), the new address's add births a row beside the one saying it, which the
 /// registry's rules refuse: `` called `Result::unwrap()` on an `Err` value: Error("address.addr:
@@ -2029,7 +2158,8 @@ fn an_account_signs_in_with_the_row_its_address_names_now() {
         "ann.new@example.test\n",
     )
     .unwrap();
-    assert!(!aterm_json::to_string(&added).unwrap().contains('@'));
+    assert_eq!(added["name"], json!("claude ann.new@example.test"));
+    assert_eq!(added["slug"], json!("claude-new-example"));
     assert_eq!(added["ad"], json!(ann));
     assert_eq!(added["address_born"], json!(false));
     let ac = keys::account_pk("claude", "ann.new@example.test").unwrap();
@@ -2137,7 +2267,6 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
     let (vault, logins) = sheets(scratch.path());
     import(paths, &["--apply"], &vault, &logins, &mut Vec::new());
     let claude = keys::account_pk("claude", "ann@example.invalid").unwrap();
-    let label = keys::default_account_label("claude", &claude).unwrap();
     let ann = Pk::new(&claude).unwrap();
     let now = NOW / 1000;
     let base = Event {
@@ -2185,7 +2314,10 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
     let pass = |at| flush::pass(paths, &spool, &Presence::default, false, at).unwrap();
     assert!(matches!(pass(now - 120), Flushed::Wrote { .. }));
     assert!(matches!(pass(now - 60), Flushed::Wrote { .. }));
-    let who = verb(paths, &["who", &label]).unwrap();
+    let who = verb(paths, &["who", "claude-ann-example"]).unwrap();
+    assert_eq!(who["ac"], json!(claude));
+    assert_eq!(who["slug"], json!("claude-ann-example"));
+    assert_eq!(who["name"], json!("claude ann@example.invalid"));
     assert_eq!(who["last_use"]["t"], json!(now - 600));
     assert_eq!(who["last_use"]["ago_s"], json!(600));
     assert!(
@@ -2193,7 +2325,7 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
             .as_str()
             .is_some_and(|u| u.len() == 32)
     );
-    let quota = verb(paths, &["quota", &label]).unwrap();
+    let quota = verb(paths, &["quota", "claude:ann@example.invalid"]).unwrap();
     let window = &quota["accounts"][0]["windows"][0];
     assert_eq!(window["window"], json!("5h"));
     assert_eq!(window["usage"]["state"], json!("current"));
@@ -2207,15 +2339,17 @@ fn the_journal_readers_say_who_used_an_account_and_its_quota() {
         .find(|p| p["ac"] == json!(claude))
         .expect("m3 prefers ann's account");
     assert_eq!(on["quota"][0]["usage"]["used_pct_x10"], json!(250));
-    assert!(!aterm_json::to_string(&m3).unwrap().contains('@'));
+    assert_eq!(on["slug"], json!("claude-ann-example"));
+    assert_eq!(on["name"], json!("claude ann@example.invalid"));
     let signins = verb(paths, &["signins"]).unwrap();
     assert_eq!(signins["accounts"][0]["machines"][0]["state"], json!("in"));
-    let log = verb(paths, &["log", &label, "--days", "1"]).unwrap();
+    let log = verb(paths, &["log", &claude, "--days", "1"]).unwrap();
     assert_eq!(log["events"].as_array().unwrap().len(), 3, "{log}");
     assert_eq!(log["events"][0]["kind"], json!("session-start"));
-    let text = aterm_json::to_string(&log).unwrap();
-    assert!(!text.contains('@'), "{text}");
+    assert_eq!(log["events"][0]["slug"], json!("claude-ann-example"));
     assert!(verb(paths, &["log", "nobody"]).is_err());
+    let both = verb(paths, &["log", "ann@example.invalid"]).unwrap_err();
+    assert!(both.to_string().contains("names 2 accounts"), "{both}");
 }
 
 /// `add account` reads its address from stdin's first line and returns at its newline (a
@@ -2231,14 +2365,15 @@ fn the_address_is_stdins_first_line_without_waiting_for_its_end() {
 }
 
 /// `machines m2` answers §7's "What runs on m2?": the machine's words, the hardware of the facts
-/// row bound to it (never its host names), its preferences by rank with each account's label,
-/// status and plan, the account it runs and does not prefer (its place row, with why), and the
+/// row bound to it (never its host names), its preferences by rank with each account's slug,
+/// name, status and plan, the account it runs and does not prefer (its place row, with why), and the
 /// latest `sum` row of the Mac bound to it; another Mac's facts, place and sum rows stay out.
 /// NEGATIVE CONTROL: with `runs_on` reading every `sum` row rather than the bound Macs'
 /// (`seen.sums.keys()` in place of `uuids`), m3's sum shows on m2: `left: 2 right: 1`.
 #[test]
 fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
     use crate::alab::{
+        account_names::Names,
         journal::{
             place::{Placed, Places, Why},
             seen::Seen,
@@ -2268,18 +2403,15 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
         (b.clone(), "mc-3".to_owned()),
     ]
     .into();
-    for (pk, label) in [
-        ("ac-1", "claude-111111"),
-        ("ac-2", "claude-222222"),
-        ("ac-3", "claude-333333"),
-    ] {
+    for pk in ["ac-1", "ac-2", "ac-3"] {
         lab.accounts.insert(
             pk.into(),
             Account {
                 pk: pk.into(),
                 provider: None,
                 realm: Some("claude".into()),
-                label: Some(label.into()),
+                slug: format!("claude-{pk}"),
+                name: Some(format!("claude {pk}@example.test")),
                 legacy_label: None,
                 login: Some(format!("{pk}@example.test")),
                 identity: None,
@@ -2288,6 +2420,17 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
                 region: None,
                 flow: None,
                 browser: None,
+                live: true,
+            },
+        );
+        let email = format!("{pk}@example.test");
+        lab.names.insert(
+            pk.into(),
+            Names {
+                slug: format!("claude-{pk}"),
+                name: Some(format!("claude {email}")),
+                email: Some(email.clone()),
+                login: Some(email),
                 live: true,
             },
         );
@@ -2360,21 +2503,22 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
     };
     let out = verbs::runs_on(&lab, None, &facts, &plans, &seen, "mc-2");
     assert_eq!(out["label"], json!("m2"));
-    let labels = |list: &Value| -> Vec<Value> {
+    let slugs = |list: &Value| -> Vec<Value> {
         list.as_array()
             .unwrap()
             .iter()
-            .map(|e| e["label"].clone())
+            .map(|e| e["slug"].clone())
             .collect()
     };
     assert_eq!(
-        labels(&out["prefers"]),
-        [json!("claude-111111"), json!("claude-222222")]
+        slugs(&out["prefers"]),
+        [json!("claude-ac-1"), json!("claude-ac-2")]
     );
+    assert_eq!(out["prefers"][0]["name"], json!("claude ac-1@example.test"));
     assert_eq!(out["prefers"][0]["rank"], json!(1));
     assert_eq!(out["prefers"][0]["plan"], json!("pl-max"));
     assert_eq!(out["prefers"][0]["status"], json!("active"));
-    assert_eq!(labels(&out["places"]), [json!("claude-333333")]);
+    assert_eq!(slugs(&out["places"]), [json!("claude-ac-3")]);
     assert_eq!(out["places"][0]["why"], json!("borrow"));
     assert_eq!(out["places"][0]["since"]["ago_s"], json!(600));
     assert_eq!(out["facts"].as_array().unwrap().len(), 1);
@@ -2383,8 +2527,6 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
     assert_eq!(out["sum"].as_array().unwrap().len(), 1);
     assert_eq!(out["sum"][0]["journal"], json!("on"));
     assert_eq!(out["sum"][0]["at"]["ago_s"], json!(60));
-    let text = aterm_json::to_string(&out).unwrap();
-    assert!(!text.contains('@'), "{text}");
 }
 
 /// Name matching prefers live rows to retired history. Within that group, canonical labels

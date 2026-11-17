@@ -345,7 +345,8 @@ impl Sel {
     }
 
     /// Whether a `need` selector pages a need that rose to `word`: a word it names, or one of a
-    /// family it names (`approval` takes `approval:<kind>`).
+    /// family it names (`approval` takes `approval:<kind>`; `wall` takes every `wall:<kind>`
+    /// and the bare `wall` of a wall whose kind nothing names).
     fn selects(&self, word: &str) -> bool {
         match self {
             Sel::Need(None) => true,

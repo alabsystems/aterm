@@ -7,9 +7,9 @@
 //! synthetic.
 
 use super::super::native_tables_tests::{
-    MC, WID, act, cell_says, key_with, one_sheet, open_with, pk_of, place, point_at, presented,
-    press_key, put_in, render, render_wide, said, settle, settle_write, shipped_themes, tall_sheet,
-    tree, two_macs, view_of, window_px, with_view_mut,
+    MC, VIEWPORT, WID, act, cell_says, key_with, one_sheet, open_with, pk_of, place, point_at,
+    presented, press_key, put_in, render, render_wide, said, settle, settle_write, shipped_themes,
+    tall_sheet, tree, two_macs, view_of, window_px, with_view_mut,
 };
 use super::super::*;
 use super::*;
@@ -1531,5 +1531,1237 @@ fn a_column_holding_a_refused_cell_is_never_hidden() {
     assert_eq!(
         painted(&ui, &format!("{}/note", line_of("account"))).as_deref(),
         Some("has a refused cell")
+    );
+}
+
+// --- The filters (docs/PLAN.md LT-41) --------------------------------------------------------
+
+use super::super::native_tables_filters::{
+    BLANK, CHIP, CLEAR, CLEAR_NONE, EMPTY, HAS, LEAST, MARK, MOST, REMOVE, value_key,
+};
+
+/// Six machines under four stored columns: `label` the key; `role`, words (worker three times,
+/// desk, build, one empty); `ram`, a whole number headed `RAM GB` (16, 64, 128, 32, one empty,
+/// 96); `chip` (one empty, two `M4 Pro`).
+fn fleet() -> Snapshot {
+    let mut snapshot = one_sheet(Shown::default());
+    let sheet = &mut snapshot.sheets[0];
+    sheet.key = "label".into();
+    let mut ram = column("ram", Group::Stored, true);
+    ram.label = "RAM GB".into();
+    ram.kind = ColumnKind::Number;
+    sheet.columns = vec![
+        column("label", Group::Stored, true),
+        column("role", Group::Stored, true),
+        ram,
+        column("chip", Group::Stored, true),
+    ];
+    let roles = ["worker", "worker", "desk", "", "worker", "build"];
+    let rams = ["16", "64", "128", "32", "", "96"];
+    let chips = ["M2", "M4 Pro", "", "M4 Pro", "M2", "M1"];
+    sheet.rows = (0..6)
+        .map(|n| {
+            let mut cells = BTreeMap::new();
+            cells.insert("label".to_owned(), text(&format!("m{n}")));
+            cells.insert("role".to_owned(), text(roles[n]));
+            cells.insert("ram".to_owned(), text(rams[n]));
+            cells.insert("chip".to_owned(), text(chips[n]));
+            SheetRow {
+                pk: pk_of(n),
+                cells,
+            }
+        })
+        .collect();
+    snapshot
+}
+
+fn mark_of(name: &str) -> String {
+    format!("{MARK}{name}")
+}
+
+fn value_of(value: &str) -> String {
+    value_key(value)
+}
+
+/// What a chip paints, by its column.
+fn chip_words(ui: &CompiledUi, name: &str) -> Option<String> {
+    painted(ui, &format!("{CHIP}{name}/words"))
+}
+
+/// The rows of [`fleet`] the grid shows, by their place in it (`0` for `m0`).
+fn fleet_shown(app: &App) -> Vec<usize> {
+    rows_in_order(app, 6)
+        .iter()
+        .filter_map(|pk| (0..6).find(|n| pk_of(*n) == *pk))
+        .collect()
+}
+
+/// Each column's header carries a mark, a press of its own that opens the list of the column's
+/// values (the header's own press still sorts): two one-press choices, then each value with the
+/// rows that hold it, the most held first and the empty rows last; a number's column takes `At
+/// least` and `At most`. Values chosen keep the rows that hold one of them, a bound the rows
+/// within it, `Only rows with a value` those that hold one, and filters join with and. Each
+/// filter that stands is a chip, in a line of its own under the tools, that says it in words,
+/// and whose close mark takes it away; `Clear filters` ends the line where two stand. The heading
+/// counts the rows shown of the rows the lifecycle filter leaves, and where no row passes the
+/// grid says so with `Clear filters`.
+/// NEGATIVE CONTROL: with `ColumnFilter::passes` taking the values chosen as passing every row
+/// (`chosen` made `true || …`), the role's two values keep every row: `` two values keep their
+/// rows left: Some("6 rows") right: Some("4 of 6 rows") ``.
+#[test]
+fn rows_are_filtered_by_the_values_of_a_column_and_each_filter_is_a_chip_in_words() {
+    let mut app = open_with(fleet());
+    let ui = render(&app);
+    assert_eq!(said(&ui, &mark_of("role")).as_deref(), Some("Filter Role"));
+    let head = place(&ui, "tables/head/role/seat");
+    let mark = place(&ui, &mark_of("role"));
+    assert!(
+        mark.x > head.x + head.width / 2.0 && mark.right() < head.right(),
+        "the mark stands at the header's right end: {mark:?} in {head:?}"
+    );
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("6 rows"));
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "no filter, no chips"
+    );
+    // The header's own press still sorts.
+    act(&mut app, "tables/head/role", None);
+    assert!(view_of(&app).sort.contains_key("machine"), "a header sorts");
+    act(&mut app, "tables/head/role", None);
+    act(&mut app, "tables/head/role", None);
+    assert!(!view_of(&app).sort.contains_key("machine"));
+
+    // The role's list: the choices, then its values, the most held first, the empty rows last.
+    act(&mut app, &mark_of("role"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, HAS).as_deref(),
+        Some("Only rows with a value, off, 5 rows")
+    );
+    assert_eq!(
+        said(&ui, EMPTY).as_deref(),
+        Some("Only rows that are empty, off, 1 row")
+    );
+    assert!(said(&ui, LEAST).is_none(), "words take no bounds");
+    assert_eq!(
+        said(&ui, &value_of("worker")).as_deref(),
+        Some("worker, not chosen, 3 rows")
+    );
+    assert_eq!(
+        said(&ui, BLANK).as_deref(),
+        Some("(empty), not chosen, 1 row")
+    );
+    let y = |key: &str| place(&ui, key).y;
+    assert!(
+        y(&value_of("worker")) < y(&value_of("build"))
+            && y(&value_of("build")) < y(&value_of("desk"))
+            && y(&value_of("desk")) < y(BLANK),
+        "the most held first, then by their words, the empty rows last"
+    );
+
+    // Two values keep the rows that hold one of them; their chip says them, as the list orders
+    // them.
+    act(&mut app, &value_of("worker"), None);
+    act(&mut app, &value_of("desk"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, "tables/count").as_deref(),
+        Some("4 of 6 rows"),
+        "two values keep their rows"
+    );
+    assert_eq!(fleet_shown(&app), [0, 1, 2, 4]);
+    assert_eq!(
+        chip_words(&ui, "role").as_deref(),
+        Some("ROLE is worker, desk")
+    );
+    assert_eq!(
+        said(&ui, &format!("{CHIP}role")).as_deref(),
+        Some("ROLE is worker, desk; change this filter")
+    );
+    assert_eq!(
+        said(&ui, &format!("{REMOVE}role")).as_deref(),
+        Some("Remove filter, ROLE is worker, desk")
+    );
+    assert_eq!(
+        said(&ui, &mark_of("role")).as_deref(),
+        Some("Filter Role, filtered")
+    );
+    assert!(said(&ui, CLEAR).is_none(), "one filter: no Clear filters");
+
+    // A number's bounds, joined with the role's.
+    act(&mut app, &mark_of("ram"), None);
+    act(&mut app, LEAST, Some(SemanticInput::Text("64".into())));
+    let ui = render(&app);
+    assert_eq!(fleet_shown(&app), [1, 2], "worker or desk, and 64 or more");
+    assert_eq!(
+        chip_words(&ui, "ram").as_deref(),
+        Some("RAM GB at least 64")
+    );
+    act(&mut app, MOST, Some(SemanticInput::Text("100".into())));
+    let ui = render(&app);
+    assert_eq!(fleet_shown(&app), [1]);
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("1 of 6 rows"));
+    assert_eq!(
+        chip_words(&ui, "ram").as_deref(),
+        Some("RAM GB at least 64 and at most 100")
+    );
+    assert_eq!(said(&ui, CLEAR).as_deref(), Some("Clear filters, all 2"));
+    // The role's chip taken away leaves the bounds: the build machine's 96 is within them.
+    act(&mut app, &format!("{REMOVE}role"), None);
+    assert_eq!(fleet_shown(&app), [1, 5]);
+    // A one-press choice: the chip has a value.
+    act(&mut app, &mark_of("chip"), None);
+    act(&mut app, HAS, None);
+    let ui = render(&app);
+    assert_eq!(chip_words(&ui, "chip").as_deref(), Some("CHIP has a value"));
+    assert_eq!(fleet_shown(&app), [1, 5]);
+    // Only the empty chips: no row passes, and the grid says so with Clear filters.
+    act(&mut app, EMPTY, None);
+    let ui = render(&app);
+    assert_eq!(chip_words(&ui, "chip").as_deref(), Some("CHIP is empty"));
+    assert!(fleet_shown(&app).is_empty());
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("0 of 6 rows"));
+    assert_eq!(
+        said(&ui, "tables/rows/none").as_deref(),
+        Some("No row passes these filters")
+    );
+    assert_eq!(said(&ui, CLEAR_NONE).as_deref(), Some("Clear filters"));
+    act(&mut app, CLEAR_NONE, None);
+    let ui = render(&app);
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("6 rows"));
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "every filter cleared"
+    );
+    // The empty value chosen beside others reads `or empty`; past three values a chip says how
+    // many more.
+    act(&mut app, &mark_of("role"), None);
+    for value in [value_of("worker"), value_of("build"), value_of("desk")] {
+        act(&mut app, &value, None);
+    }
+    act(&mut app, BLANK, None);
+    let ui = render(&app);
+    assert_eq!(
+        chip_words(&ui, "role").as_deref(),
+        Some("ROLE is worker, build, desk or empty")
+    );
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("6 rows"));
+    act(&mut app, &mark_of("ram"), None);
+    for value in ["16", "32", "64", "96"] {
+        act(&mut app, &value_of(value), None);
+    }
+    act(&mut app, BLANK, None);
+    let ui = render(&app);
+    assert_eq!(
+        chip_words(&ui, "ram").as_deref(),
+        Some("RAM GB is 16, 32, 64 and 1 more, or empty")
+    );
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("5 of 6 rows"));
+}
+
+/// A filter judges what the read holds, never words staged in a cell, and the rows it leaves are
+/// worked out again on a read: a row whose role is typed to another word stays, a row whose
+/// change is staged stays through a read that moves its value out of the filter, while a row
+/// the read moves out with nothing staged leaves; a new row stays shown, whatever it holds.
+/// NEGATIVE CONTROL: with the filters' step not keeping a row with a staged cell (its
+/// `staged(app, sheet, row)` clause removed), the read takes the first machine away: `` a row
+/// with a change staged stays left: [4] right: [0, 4] ``.
+#[test]
+fn a_filter_judges_what_the_read_holds_and_no_row_leaves_while_it_is_typed_in() {
+    let mut app = open_with(with_life(fleet(), None));
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("worker"), None);
+    act(&mut app, &mark_of("role"), None);
+    assert_eq!(fleet_shown(&app), [0, 1, 4]);
+    // Typed to another word, the first machine stays: the read holds worker.
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .stage("machine", &pk_of(0), "role", "build".into());
+    assert_eq!(fleet_shown(&app), [0, 1, 4], "typing moves no row");
+    // A read in which the first two machines are desks: the first, its change to build still
+    // staged, stays; the second leaves.
+    let mut moved = with_life(fleet(), None);
+    for n in [0, 1] {
+        moved.sheets[0].rows[n]
+            .cells
+            .insert("role".to_owned(), text("desk"));
+    }
+    app.native_runtime.tables_mut().unwrap().show(moved);
+    assert_eq!(
+        app.native_runtime.tables_mut().unwrap().staged.len(),
+        1,
+        "the change to build is still staged"
+    );
+    assert_eq!(
+        fleet_shown(&app),
+        [0, 4],
+        "a row with a change staged stays"
+    );
+    // A new row stays shown: it holds no role.
+    act(&mut app, rows::ADD, None);
+    let ui = render(&app);
+    let born = format!("{}1", rows::NEW);
+    assert!(
+        said(&ui, &format!("{CELL}{born}/label")).is_some(),
+        "the new row is shown"
+    );
+}
+
+/// The list of a column's values is a surface over the page that keeps the keys: the arrows
+/// move among its lines, Space presses one, and Escape closes it with the keys back on the
+/// mark it opened from (or the chip). A press on its heading reaches nothing under it: no
+/// header sorts and the list stays open. A value's line is named by a key of one word, its
+/// value's spaces written out, which a driver (`aterm ctl act`, whose keys hold no whitespace)
+/// can press.
+/// NEGATIVE CONTROL: with the list's Escape leaving the keys where they were (its
+/// `close_filter(app, true)` made `close_filter(app, false)`), they stay on a line no longer
+/// drawn: `` left: "tables/filter/value/worker" right: "tables/mark/role" ``.
+#[test]
+fn the_list_of_values_takes_the_keys_and_a_press_on_it_reaches_nothing_under_it() {
+    let mut app = open_with(fleet());
+    act(&mut app, &mark_of("role"), None);
+    assert_eq!(selected(&app).2, HAS);
+    press_key(&mut app, NamedKey::ArrowUp);
+    assert_eq!(selected(&app).2, HAS, "the first line stays the first");
+    press_key(&mut app, NamedKey::ArrowDown);
+    press_key(&mut app, NamedKey::ArrowDown);
+    assert_eq!(selected(&app).2, value_of("worker"));
+    assert!(
+        tree_has(&tree(&app), "tables/filter/line/0/ring"),
+        "the keys' ring is on the line"
+    );
+    press_key(&mut app, NamedKey::Space);
+    assert_eq!(fleet_shown(&app), [0, 1, 4], "Space chose the worker");
+    press_key(&mut app, NamedKey::Escape);
+    assert!(!view_of(&app).filters.is_open(), "Escape closes the list");
+    assert_eq!(selected(&app).2, mark_of("role"));
+    // From its chip, Escape puts the keys back on the chip.
+    act(&mut app, &format!("{CHIP}role"), None);
+    assert!(view_of(&app).filters.is_open());
+    press_key(&mut app, NamedKey::Escape);
+    assert_eq!(selected(&app).2, format!("{CHIP}role"));
+    // A press on its heading is the list's: it lies over the grid's header.
+    act(&mut app, &mark_of("chip"), None);
+    let ui = presented(&mut app);
+    let title = place(&ui, "tables/filter/head/title");
+    let (x, y) = (title.x + 10.0, title.y + title.height / 2.0);
+    assert_eq!(
+        ui.hit_test(x, y).map(|hit| hit.key.as_str().to_owned()),
+        Some("tables/filter/panel".to_owned())
+    );
+    let (px, py) = window_px(&mut app, x, y);
+    app.on_cursor_moved(WID, px, py);
+    click(&mut app);
+    let view = view_of(&app);
+    assert!(view.filters.is_open(), "the list stays open");
+    assert!(view.sort.is_empty(), "nothing sorted");
+    assert_eq!(selected(&app).2, HAS, "the keys stay on the list");
+    let pro = "tables/filter/value/M4%20Pro";
+    assert_eq!(value_of("M4 Pro"), pro);
+    assert_eq!(
+        said(&render(&app), pro).as_deref(),
+        Some("M4 Pro, not chosen, 2 rows")
+    );
+    act(&mut app, pro, None);
+    assert_eq!(
+        fleet_shown(&app),
+        [1],
+        "the key pressed chose M4 Pro, beside the worker"
+    );
+    assert_eq!(
+        chip_words(&render(&app), "chip").as_deref(),
+        Some("CHIP is M4 Pro")
+    );
+}
+
+/// Each table keeps its own filters while the tab lives, and a read keeps them; a filter on a
+/// column a person then hides stands, its chip with it, which opens the column's list though its
+/// mark is gone.
+/// NEGATIVE CONTROL: with `filters_of` reading the first table's filters whatever the sheet
+/// (`.get(sheet.name)` made `.values().next()`), the disks show the machines' chip: `` the disks
+/// have no filter ``.
+#[test]
+fn each_table_keeps_its_filters_and_a_hidden_columns_filter_stands_as_its_chip() {
+    let mut app = open_with(machines_and_disks());
+    act(&mut app, &mark_of("status"), None);
+    act(&mut app, EMPTY, None);
+    act(&mut app, &mark_of("status"), None);
+    assert_eq!(
+        said(&render(&app), "tables/count").as_deref(),
+        Some("0 of 3 rows")
+    );
+    act(&mut app, "tables/sheet/disk", None);
+    let ui = render(&app);
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the disks have no filter"
+    );
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("3 rows"));
+    act(&mut app, "tables/sheet/machine", None);
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .show(machines_and_disks());
+    let ui = render(&app);
+    assert_eq!(
+        chip_words(&ui, "status").as_deref(),
+        Some("STATUS is empty"),
+        "the machines keep theirs through a read"
+    );
+    // The status hidden: its mark goes with its header, its filter and chip stay.
+    act(&mut app, COLUMNS, None);
+    act(&mut app, &line_of("status"), None);
+    act(&mut app, COLUMNS, None);
+    let ui = render(&app);
+    assert!(!drawn(&ui, "status") && said(&ui, &mark_of("status")).is_none());
+    assert_eq!(
+        chip_words(&ui, "status").as_deref(),
+        Some("STATUS is empty")
+    );
+    assert_eq!(said(&ui, "tables/count").as_deref(), Some("0 of 3 rows"));
+    act(&mut app, &format!("{CHIP}status"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, EMPTY).as_deref(),
+        Some("Only rows that are empty, on, 0 rows")
+    );
+    let (chip, panel) = (
+        place(&ui, &format!("{CHIP}status/frame")),
+        place(&ui, "tables/filter/panel"),
+    );
+    assert!(
+        (panel.x - chip.x).abs() < 0.5 && panel.y > chip.bottom(),
+        "the list opens under its chip: {panel:?} under {chip:?}"
+    );
+}
+
+/// The chips' words read on their ground on every shipped theme, and their line, standing only
+/// while a filter does, is counted once in the page's height: the grid gives it its height and
+/// the gap under it, and the write bar still ends inside the window.
+/// NEGATIVE CONTROL: with the page leaving the line out of its room (its `room -= line + 10.0`
+/// removed), the grid keeps its height: `` the grid gives the line its room left: 694.0 right:
+/// 654.0 ``.
+#[test]
+fn the_chips_read_on_their_ground_and_their_line_is_counted_once_in_the_page() {
+    use crate::widget::DrawPrim;
+    let mut app = open_with(fleet());
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .stage("machine", &pk_of(0), "chip", "M9".into());
+    let ui = render(&app);
+    let work = place(&ui, "tables/work").height;
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("worker"), None);
+    act(&mut app, &mark_of("role"), None);
+    let ui = render(&app);
+    let line = place(&ui, "tables/chips");
+    let tools = place(&ui, "tables/tools");
+    assert!(line.y > tools.bottom(), "the chips stand under the tools");
+    assert_eq!(
+        place(&ui, "tables/work").height,
+        work - line.height - 10.0,
+        "the grid gives the line its room"
+    );
+    let bar = place(&ui, "tables/bar");
+    assert!(
+        bar.bottom() <= VIEWPORT.height,
+        "the write bar ends in the window: {bar:?}"
+    );
+    let mut under = Vec::new();
+    for (name, theme) in shipped_themes() {
+        let roles = crate::settings::Roles::from_theme(theme);
+        let painted = ui.painted(roles);
+        let prims = |key: &str| {
+            painted
+                .iter()
+                .find(|(painted, _)| painted.as_str() == key)
+                .map(|(_, prims)| prims.clone())
+                .unwrap_or_else(|| panic!("{key} is painted"))
+        };
+        let ground = prims(&format!("{CHIP}role/ground"))
+            .iter()
+            .find_map(|prim| match prim {
+                DrawPrim::Panel { fill, .. } => Some([fill[0], fill[1], fill[2]]),
+                _ => None,
+            })
+            .expect("the chip fills its ground");
+        for (what, key) in [
+            ("the chip's words", format!("{CHIP}role/words")),
+            ("its close mark", format!("{CHIP}role/close")),
+        ] {
+            let ink = prims(&key)
+                .iter()
+                .find_map(|prim| match prim {
+                    DrawPrim::Text { color, .. } => Some([color[0], color[1], color[2]]),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{key} draws words"));
+            let ratio = crate::native_appearance::contrast_ratio(ink, ground);
+            if ratio < crate::native_appearance::SHEET_WORD_FLOOR {
+                under.push(format!("{name}: {what} reads {ratio:.1}"));
+            }
+        }
+    }
+    assert!(under.is_empty(), "{} themes fail: {under:#?}", under.len());
+}
+
+/// Whether the page is writing, and how many changes wait to be written.
+fn writing_and_staged(app: &mut App) -> (bool, usize) {
+    let tables = app.native_runtime.tables_mut().unwrap();
+    (tables.writing, tables.staged.len())
+}
+
+/// [`fleet`] read again with the build machine (`m5`) a desk: no row holds build.
+fn fleet_without_build() -> Snapshot {
+    let mut moved = fleet();
+    moved.sheets[0].rows[5]
+        .cells
+        .insert("role".to_owned(), text("desk"));
+    moved
+}
+
+/// A value's line a press unchooses stays in the open list, unchosen, under the keys and the
+/// pointer, though no row holds that value any longer: Return then presses that line again,
+/// never the page's default button, Write.
+/// NEGATIVE CONTROL: with `offered` keeping no value of the open list's own (its `open.kept` left out), the
+/// line goes with the press: `` the unchosen line stays left: None right: Some("build, not
+/// chosen, 0 rows") ``.
+#[test]
+fn a_value_unchosen_keeps_its_line_while_the_list_is_open() {
+    let mut app = open_with(fleet());
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("build"), None);
+    act(&mut app, &mark_of("role"), None);
+    assert_eq!(fleet_shown(&app), [5]);
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .show(fleet_without_build());
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .stage("machine", &pk_of(0), "chip", "M9".into());
+    act(&mut app, &mark_of("role"), None);
+    let build = value_of("build");
+    assert_eq!(
+        said(&render(&app), &build).as_deref(),
+        Some("build, chosen, 0 rows"),
+        "a value chosen is offered though no row holds it"
+    );
+    // The choices, the worker's and the desk's lines, then the build's.
+    for _ in 0..4 {
+        press_key(&mut app, NamedKey::ArrowDown);
+    }
+    assert_eq!(selected(&app).2, build);
+    press_key(&mut app, NamedKey::Space);
+    let ui = presented(&mut app);
+    assert!(!tree_has(&tree(&app), "tables/chips"), "the filter is gone");
+    assert_eq!(
+        said(&ui, &build).as_deref(),
+        Some("build, not chosen, 0 rows"),
+        "the unchosen line stays"
+    );
+    assert_eq!(selected(&app).2, build, "the keys stay on it");
+    press_key(&mut app, NamedKey::Enter);
+    assert_eq!(
+        writing_and_staged(&mut app),
+        (false, 1),
+        "Return writes nothing"
+    );
+    assert_eq!(
+        said(&render(&app), &build).as_deref(),
+        Some("build, chosen, 0 rows"),
+        "Return pressed the line"
+    );
+}
+
+/// A read that takes the last row holding the value whose line has the keys takes that line
+/// from the open list; the keys go to the line now standing where it stood, so Return presses a
+/// line the list draws, never the page's default button, Write.
+/// NEGATIVE CONTROL: with `settle_filters` answering `false` while a list is open, the keys stay on the line
+/// the read took: `` the keys rest on the line where build stood left:
+/// "tables/filter/value/build" right: "tables/filter/value/desk" ``.
+#[test]
+fn a_read_that_takes_the_line_under_the_keys_leaves_them_on_a_line_drawn() {
+    let mut app = open_with(fleet());
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .stage("machine", &pk_of(0), "chip", "M9".into());
+    act(&mut app, &mark_of("role"), None);
+    // The choices, the worker's line, then the build's, as the list lays them out.
+    for _ in 0..3 {
+        press_key(&mut app, NamedKey::ArrowDown);
+    }
+    assert_eq!(selected(&app).2, value_of("build"));
+    presented(&mut app);
+    app.native_runtime
+        .tables_mut()
+        .unwrap()
+        .show(fleet_without_build());
+    // The runtime takes the reader's replies when it is woken for them.
+    app.native_runtime.poll_tables();
+    let ui = presented(&mut app);
+    let focus = selected(&app).2;
+    assert_eq!(
+        focus,
+        value_of("desk"),
+        "the keys rest on the line where build stood"
+    );
+    assert!(ui.semantic(&UiKey::new(focus)).is_some(), "a line drawn");
+    press_key(&mut app, NamedKey::Enter);
+    assert_eq!(
+        writing_and_staged(&mut app),
+        (false, 1),
+        "Return writes nothing"
+    );
+}
+
+static ALIASES: aterm_db::typed::Column = aterm_db::typed::Column::new(
+    "aliases",
+    aterm_db::typed::Ty::Set(&aterm_db::typed::Ty::Text(64)),
+);
+static LIMITS: aterm_db::typed::Column = aterm_db::typed::Column::new(
+    "limits",
+    aterm_db::typed::Ty::List(
+        &aterm_db::typed::Ty::Struct(aterm_db::alab::registry::LIMIT),
+        8,
+    ),
+);
+static SOURCES: aterm_db::typed::Column = aterm_db::typed::Column::new(
+    "notes_src",
+    aterm_db::typed::Ty::List(&aterm_db::typed::Ty::SrcRef, 8),
+);
+
+/// [`fleet`] with a set of words (`aliases`: the first machine's members are `Lab, east` and
+/// `m3`, which its cell shows as a JSON list; the second's `m2` and `m9`; the third's `m2`), a
+/// list of records the grid shows as JSON (`limits`, the first two machines') and a list of
+/// import coordinates (`notes_src`, the first machine's).
+fn fleet_with_sets() -> Snapshot {
+    let mut snapshot = fleet();
+    let sheet = &mut snapshot.sheets[0];
+    for (name, compiled) in [
+        ("aliases", &ALIASES),
+        ("limits", &LIMITS),
+        ("notes_src", &SOURCES),
+    ] {
+        let mut added = column(name, Group::Stored, true);
+        added.compiled = Some(compiled);
+        sheet.columns.push(added);
+    }
+    let records = r#"[{"by":"m3","ops":3},{"by":"m4","ops":1}]"#;
+    for (n, (aliases, limits, sources)) in [
+        (r#"["Lab, east","m3"]"#, records, r#"["xlsx:A1","xlsx:B2"]"#),
+        ("m2, m9", records, ""),
+        ("m2", "", ""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let cells = &mut sheet.rows[n].cells;
+        cells.insert("aliases".to_owned(), text(aliases));
+        cells.insert("limits".to_owned(), text(limits));
+        cells.insert("notes_src".to_owned(), text(sources));
+    }
+    snapshot
+}
+
+/// A set's or a list's row holds each of its members as its cell shows them, a JSON list of
+/// words (where a member holds a comma, or always for import coordinates) as its words; a list
+/// the grid shows as JSON of records holds its cell's words as one value. A chip on a set says it
+/// `includes` its values, which a row holds among others; the empty value beside them reads `or
+/// is empty`, and alone `is empty`, as `Only rows that are empty` says it.
+/// NEGATIVE CONTROL: with `held` splitting a JSON list on its commas (its `[` arm made `false && …`), the
+/// member holding a comma is no value: `` a member holding a comma is one value left: None
+/// right: Some("Lab, east, not chosen, 1 row") ``.
+#[test]
+fn a_sets_and_a_lists_values_are_their_members_as_the_grid_shows_them() {
+    let mut app = open_with(fleet_with_sets());
+    act(&mut app, &mark_of("aliases"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, &value_of("Lab, east")).as_deref(),
+        Some("Lab, east, not chosen, 1 row"),
+        "a member holding a comma is one value"
+    );
+    assert!(
+        said(&ui, &value_of("[\"Lab")).is_none(),
+        "no fragment of the JSON"
+    );
+    assert_eq!(
+        said(&ui, &value_of("m2")).as_deref(),
+        Some("m2, not chosen, 2 rows")
+    );
+    assert_eq!(
+        said(&ui, &value_of("m3")).as_deref(),
+        Some("m3, not chosen, 1 row")
+    );
+    act(&mut app, &value_of("m2"), None);
+    let ui = render(&app);
+    assert_eq!(fleet_shown(&app), [1, 2]);
+    assert_eq!(
+        chip_words(&ui, "aliases").as_deref(),
+        Some("ALIASES includes m2")
+    );
+    act(&mut app, BLANK, None);
+    assert_eq!(
+        chip_words(&render(&app), "aliases").as_deref(),
+        Some("ALIASES includes m2 or is empty")
+    );
+    assert_eq!(fleet_shown(&app), [1, 2, 3, 4, 5]);
+    act(&mut app, &value_of("m2"), None);
+    assert_eq!(
+        chip_words(&render(&app), "aliases").as_deref(),
+        Some("ALIASES is empty"),
+        "the empty value alone reads as its one-press choice"
+    );
+    // A list of records is one value, its cell's words; a list of import coordinates holds
+    // each of them.
+    act(&mut app, &mark_of("limits"), None);
+    let records = r#"[{"by":"m3","ops":3},{"by":"m4","ops":1}]"#;
+    assert_eq!(
+        said(&render(&app), &value_of(records)).as_deref(),
+        Some(format!("{records}, not chosen, 2 rows").as_str())
+    );
+    act(&mut app, &mark_of("notes_src"), None);
+    let ui = render(&app);
+    assert_eq!(
+        said(&ui, &value_of("xlsx:A1")).as_deref(),
+        Some("xlsx:A1, not chosen, 1 row")
+    );
+    assert_eq!(
+        said(&ui, &value_of("xlsx:B2")).as_deref(),
+        Some("xlsx:B2, not chosen, 1 row")
+    );
+}
+
+/// A row shown from elsewhere (a check's finding, a reference) that the filters pass keeps them,
+/// though the lifecycle filter left it out: the lifecycle filter alone gives way. A row the
+/// filters leave out shows once they are cleared.
+/// NEGATIVE CONTROL: with `show_row` clearing the filters wherever the row is not shown (its `passes` clause
+/// made `true`), the worker's filter goes: `` the filter the row passes stands left: None
+/// right: Some("ROLE is worker") ``.
+#[test]
+fn showing_a_row_the_filters_pass_keeps_them() {
+    let mut snapshot = with_life(fleet(), None);
+    snapshot.sheets[0].rows[0]
+        .cells
+        .insert(aterm_db::typed::LIFECYCLE.to_owned(), text("retired"));
+    let mut app = open_with(snapshot);
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("worker"), None);
+    act(&mut app, &mark_of("role"), None);
+    assert_eq!(fleet_shown(&app), [1, 4], "the retired worker is left out");
+    let show = |app: &mut App, pk: String| {
+        let mut view = TablesViewState::default();
+        with_view_mut(app, |state| view = std::mem::take(state));
+        view.show_row(
+            app.native_runtime.tables_mut().unwrap(),
+            "machine",
+            &pk,
+            None,
+        );
+        with_view_mut(app, |state| *state = view);
+    };
+    show(&mut app, pk_of(0));
+    assert_eq!(
+        chip_words(&render(&app), "role").as_deref(),
+        Some("ROLE is worker"),
+        "the filter the row passes stands"
+    );
+    assert_eq!(fleet_shown(&app), [0, 1, 4]);
+    assert_eq!(view_of(&app).row.as_deref(), Some(pk_of(0).as_str()));
+    // A desk: the filter leaves it out, and goes.
+    show(&mut app, pk_of(2));
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the filter is cleared"
+    );
+    assert!(fleet_shown(&app).contains(&2));
+}
+
+/// A row shown from elsewhere lets each of the find, the lifecycle filter and the filters on the
+/// columns' values give way only where it leaves the row out: a find that passes the row stands
+/// while the filters that alone leave it out are cleared; where the find or the lifecycle filter
+/// leaves it out too, that one gives way first, and the filters with it, so the row shows.
+/// NEGATIVE CONTROL (run once, restored with cp and touch): with `show_row` emptying the find
+/// wherever the row is not shown (its `found` test made `self.shown_rows(…)`'s), the find that
+/// passes the desk goes with the filters: `` the find that passes the row stands left: "" right:
+/// "m2" ``.
+#[test]
+fn showing_a_row_clears_only_what_leaves_it_out() {
+    let mut snapshot = with_life(fleet(), None);
+    snapshot.sheets[0].rows[3]
+        .cells
+        .insert(aterm_db::typed::LIFECYCLE.to_owned(), text("retired"));
+    let mut app = open_with(snapshot);
+    let show = |app: &mut App, pk: String| {
+        let mut view = TablesViewState::default();
+        with_view_mut(app, |state| view = std::mem::take(state));
+        view.show_row(
+            app.native_runtime.tables_mut().unwrap(),
+            "machine",
+            &pk,
+            None,
+        );
+        with_view_mut(app, |state| *state = view);
+    };
+    let workers = |app: &mut App| {
+        act(app, &mark_of("role"), None);
+        act(app, &value_of("worker"), None);
+        act(app, &mark_of("role"), None);
+    };
+    let find = |app: &App| view_of(app).find.value().to_owned();
+
+    // The find holds the desk (its label) and two M2s; the workers' filter alone leaves it out.
+    workers(&mut app);
+    act(&mut app, FIND, Some(SemanticInput::Text("m2".into())));
+    assert_eq!(fleet_shown(&app), [0, 4]);
+    show(&mut app, pk_of(2));
+    assert_eq!(find(&app), "m2", "the find that passes the row stands");
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the filter is cleared"
+    );
+    assert_eq!(fleet_shown(&app), [0, 2, 4]);
+
+    // The find leaves the desk out too: it is emptied, and the filter cleared.
+    workers(&mut app);
+    act(&mut app, FIND, Some(SemanticInput::Text("build".into())));
+    assert_eq!(fleet_shown(&app), Vec::<usize>::new());
+    show(&mut app, pk_of(2));
+    assert_eq!(find(&app), "");
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the filter is cleared"
+    );
+    assert_eq!(fleet_shown(&app), [0, 1, 2, 4, 5], "m3 is retired");
+
+    // The lifecycle filter leaves the retired m3 out too: it shows all rows, and the filter is
+    // cleared.
+    workers(&mut app);
+    show(&mut app, pk_of(3));
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the filter is cleared"
+    );
+    assert_eq!(fleet_shown(&app), [0, 1, 2, 3, 4, 5]);
+    assert_eq!(view_of(&app).row.as_deref(), Some(pk_of(3).as_str()));
+}
+
+/// The cell bar names a selected cell whose row the grid leaves out by what leaves it out: the
+/// find (`not among the rows found`, whatever else does too), the filters on the columns' values
+/// where the find passes it (`left out by the filters`), the lifecycle filter where both pass it
+/// (`not among the retired rows`). The row comes back, and its value with it, once none does.
+/// NEGATIVE CONTROL (run once, restored with cp and touch): with `left_out_words` saying
+/// `NOT_FOUND` of every row left out, the bar blames the find the row passes: `` the filters
+/// leave the desk out left: "not among the rows found" right: "left out by the filters" ``.
+#[test]
+fn the_cell_bar_says_what_leaves_the_selected_row_out() {
+    use super::super::native_tables_tests::bar_says;
+    let mut app = open_with(with_life(fleet(), None));
+    act(&mut app, &format!("tables/cell/{}/role", pk_of(2)), None);
+    let state = |app: &App| bar_says(&render(app)).last().cloned().unwrap_or_default();
+    assert_eq!(state(&app), "desk");
+
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("worker"), None);
+    act(&mut app, &mark_of("role"), None);
+    assert_eq!(
+        bar_says(&render(&app)).first().map(String::as_str),
+        Some("m2 \u{b7} Role"),
+        "the bar names the cell"
+    );
+    assert_eq!(
+        state(&app),
+        "left out by the filters",
+        "the filters leave the desk out"
+    );
+
+    act(&mut app, FIND, Some(SemanticInput::Text("build".into())));
+    assert_eq!(
+        state(&app),
+        "not among the rows found",
+        "the find leaves it out too"
+    );
+
+    act(&mut app, FIND, Some(SemanticInput::Text(String::new())));
+    act(&mut app, &format!("{REMOVE}role"), None);
+    act(&mut app, rows::FILTER, None);
+    assert_eq!(
+        state(&app),
+        "not among the retired rows",
+        "the lifecycle filter alone leaves the live desk out"
+    );
+
+    // Retired rows, then all of them.
+    act(&mut app, rows::FILTER, None);
+    assert!(fleet_shown(&app).contains(&2));
+    assert_eq!(state(&app), "desk", "the row back, its value with it");
+}
+
+static SEEN: aterm_db::typed::Column =
+    aterm_db::typed::Column::new("seen", aterm_db::typed::Ty::Time);
+
+/// `At least` and `At most` read a bound as the column's kind does: a whole number; a date,
+/// which is its whole day, or a date and its minute. A bound that does not read so (`2026-11-1`
+/// on the way to `2026-11-14`, `abc`) is marked invalid, leaves no row out and is no chip's; each
+/// field shows the form its words take while it is empty.
+/// NEGATIVE CONTROL: with `bound` keeping any words typed (`(!typed.is_empty()).then(…)` for its `Point::of`
+/// test), the date cut short stands as a chip: `` and bounds nothing ``.
+#[test]
+fn a_bound_reads_as_its_columns_kind_and_one_that_does_not_bounds_nothing() {
+    let mut snapshot = fleet();
+    let sheet = &mut snapshot.sheets[0];
+    let mut seen = column("seen", Group::SetByAterm, false);
+    seen.kind = ColumnKind::Time;
+    seen.compiled = Some(&SEEN);
+    sheet.columns.push(seen);
+    let times = [
+        "2026-11-05 09:00",
+        "2026-11-14 23:59",
+        "2026-11-15 10:00",
+        "",
+        "2026-11-14 08:00",
+        "2026-11-15 00:00",
+    ];
+    for (row, at) in sheet.rows.iter_mut().zip(times) {
+        row.cells.insert("seen".to_owned(), text(at));
+    }
+    let mut app = open_with(snapshot);
+    let invalid = |app: &App, key: &str| {
+        render(app)
+            .semantic(&UiKey::new(key.to_owned()))
+            .and_then(|node| node.state)
+            .is_some_and(|state| state.invalid)
+    };
+    let hint = |app: &App, key: &str| {
+        fn find<'a>(node: &'a UiNode, key: &str) -> Option<&'a UiNode> {
+            if node.key.as_str() == key {
+                return Some(node);
+            }
+            node.children.iter().find_map(|child| find(child, key))
+        }
+        match &find(&tree(app).root, key)?.content {
+            UiContent::TextField(control) => control.spec.placeholder.clone(),
+            _ => None,
+        }
+    };
+    act(&mut app, &mark_of("seen"), None);
+    assert_eq!(
+        hint(&app, MOST).as_deref(),
+        Some("2026-11-16 or 2026-11-16 14:05")
+    );
+    act(
+        &mut app,
+        MOST,
+        Some(SemanticInput::Text("2026-11-1".into())),
+    );
+    assert!(invalid(&app, MOST), "a date cut short is marked");
+    assert!(!tree_has(&tree(&app), "tables/chips"), "and bounds nothing");
+    assert_eq!(fleet_shown(&app), [0, 1, 2, 3, 4, 5]);
+    act(
+        &mut app,
+        MOST,
+        Some(SemanticInput::Text("2026-11-14".into())),
+    );
+    assert!(!invalid(&app, MOST));
+    assert_eq!(fleet_shown(&app), [0, 1, 4], "a date is its whole day");
+    assert_eq!(
+        chip_words(&render(&app), "seen").as_deref(),
+        Some("SEEN at most 2026-11-14")
+    );
+    act(
+        &mut app,
+        MOST,
+        Some(SemanticInput::Text("2026-11-14 12:00".into())),
+    );
+    assert_eq!(fleet_shown(&app), [0, 4], "a minute bounds by its minute");
+    act(&mut app, MOST, Some(SemanticInput::Text(String::new())));
+    act(
+        &mut app,
+        LEAST,
+        Some(SemanticInput::Text("2026-11-15".into())),
+    );
+    assert_eq!(fleet_shown(&app), [2, 5]);
+    // A number's bound.
+    act(&mut app, &mark_of("ram"), None);
+    assert_eq!(hint(&app, LEAST).as_deref(), Some("a whole number"));
+    act(&mut app, LEAST, Some(SemanticInput::Text("abc".into())));
+    assert!(invalid(&app, LEAST));
+    assert!(
+        chip_words(&render(&app), "ram").is_none(),
+        "no chip says it"
+    );
+    assert_eq!(fleet_shown(&app), [2, 5], "the time's bound alone stands");
+}
+
+/// A count of linked rows shows none as an empty cell, which a bound reads as its 0: `At most 2`
+/// keeps the rows no row links to, and `At least 1` leaves them out.
+/// NEGATIVE CONTROL: with `counts` answering `false`, `At most 2` leaves out the rows no row links to: ``
+/// left: [] right: ["mc-0000000000000000", "mc-0000000000000002"] ``.
+#[test]
+fn a_linked_counts_empty_cell_is_its_zero_to_a_bound() {
+    let mut snapshot = machines();
+    snapshot.sheets[0].rows[1]
+        .cells
+        .insert(LINKED.to_owned(), text("3"));
+    let mut app = open_with(snapshot);
+    let mark = mark_of(LINKED);
+    act(&mut app, &mark, None);
+    act(&mut app, MOST, Some(SemanticInput::Text("2".into())));
+    assert_eq!(rows_in_order(&app, 3), [pk_of(0), pk_of(2)]);
+    act(&mut app, MOST, Some(SemanticInput::Text(String::new())));
+    act(&mut app, LEAST, Some(SemanticInput::Text("1".into())));
+    assert_eq!(rows_in_order(&app, 3), [pk_of(1)]);
+}
+
+/// The open list stays where it opened while it is open: the first filter set brings the
+/// chips' line over the grid, and the last taken away (from its chip) takes the line, and
+/// neither moves the list under the pointer.
+/// NEGATIVE CONTROL: with `list` laying itself out afresh each time (its `open.at` arm made `false && …`),
+/// the list moves down under the chips' line: `` the list stays as the chips' line comes left:
+/// LogicalRect { x: 205.0, y: 360.0, width: 299.0, height: 28.0 } right: LogicalRect { x: 205.0,
+/// y: 320.0, width: 299.0, height: 28.0 } ``.
+#[test]
+fn the_open_list_stays_where_it_opened_as_the_chips_line_comes_and_goes() {
+    let mut app = open_with(fleet());
+    act(&mut app, &mark_of("role"), None);
+    let build = place(&render(&app), &value_of("build"));
+    act(&mut app, &value_of("worker"), None);
+    let ui = render(&app);
+    assert!(tree_has(&tree(&app), "tables/chips"));
+    assert_eq!(
+        place(&ui, &value_of("build")),
+        build,
+        "the list stays as the chips' line comes"
+    );
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &format!("{CHIP}role"), None);
+    let panel = place(&render(&app), "tables/filter/panel");
+    act(&mut app, &value_of("worker"), None);
+    let ui = render(&app);
+    assert!(
+        !tree_has(&tree(&app), "tables/chips"),
+        "the last filter gone"
+    );
+    assert_eq!(
+        place(&ui, "tables/filter/panel"),
+        panel,
+        "the list stays as the chips' line goes"
+    );
+}
+
+/// Chips that do not fit their line wrap onto the next, which the page counts in its height;
+/// every chip's close mark and `Clear filters` stay inside the line.
+/// NEGATIVE CONTROL: with `CHIP_LINES` 1, the chips stay on one line: `` the chips wrap onto a second line
+/// ``.
+#[test]
+fn chips_that_do_not_fit_wrap_and_every_close_mark_stays_on_the_page() {
+    let mut app = open_with(fleet());
+    let work = place(&render_wide(&app, 700.0), "tables/work").height;
+    act(&mut app, &mark_of("label"), None);
+    for n in 0..6 {
+        act(&mut app, &value_of(&format!("m{n}")), None);
+    }
+    act(&mut app, &mark_of("role"), None);
+    for value in ["worker", "build", "desk"] {
+        act(&mut app, &value_of(value), None);
+    }
+    act(&mut app, BLANK, None);
+    act(&mut app, &mark_of("ram"), None);
+    act(&mut app, LEAST, Some(SemanticInput::Text("16".into())));
+    act(&mut app, MOST, Some(SemanticInput::Text("128".into())));
+    act(&mut app, &mark_of("chip"), None);
+    act(&mut app, HAS, None);
+    act(&mut app, &mark_of("chip"), None);
+    let ui = render_wide(&app, 700.0);
+    assert!(
+        tree_has(&tree(&app), "tables/chips/line/1"),
+        "the chips wrap onto a second line"
+    );
+    let line = place(&ui, "tables/chips");
+    assert_eq!(
+        place(&ui, "tables/work").height,
+        work - line.height - 10.0,
+        "the grid gives the lines their room"
+    );
+    for name in ["label", "role", "ram", "chip"] {
+        let close = place(&ui, &format!("{REMOVE}{name}"));
+        assert!(
+            close.right() <= line.right() + 0.5 && close.bottom() <= line.bottom() + 0.5,
+            "{name}'s close mark is on the page: {close:?} in {line:?}"
+        );
+    }
+    let clear = place(&ui, CLEAR);
+    assert!(
+        clear.right() <= line.right() + 0.5 && clear.bottom() <= line.bottom() + 0.5,
+        "Clear filters is on the page: {clear:?} in {line:?}"
+    );
+}
+
+/// While the keys are on the open list, Page Down and Command-Home move them among its lines,
+/// and Shift with an arrow reaches neither the grid's selection nor its range: the list keeps
+/// the keys, and Escape still closes it.
+/// NEGATIVE CONTROL: with the filters' `act` leaving `ExtendFocus` to the page (its arm made `if false`),
+/// Shift-Down moves the selection and the keys into the grid: `` left: ("mc-0000000000000001",
+/// "label", "tables/cell/mc-0000000000000001/label") right: ("mc-0000000000000000", "label",
+/// "tables/filter/has") ``.
+#[test]
+fn the_page_keys_and_shift_with_an_arrow_stay_with_the_open_list() {
+    let mut app = open_with(fleet());
+    act(&mut app, &format!("{CELL}{}/label", pk_of(0)), None);
+    act(&mut app, &mark_of("role"), None);
+    presented(&mut app);
+    press_key(&mut app, NamedKey::PageDown);
+    let paged = selected(&app).2;
+    assert!(
+        ![HAS, EMPTY].contains(&paged.as_str()) && paged.starts_with("tables/filter/"),
+        "Page Down moves the keys a room's worth down the list: {paged}"
+    );
+    presented(&mut app);
+    press_key(&mut app, NamedKey::PageDown);
+    assert_eq!(selected(&app).2, BLANK, "and stops at its foot");
+    assert_eq!(view_of(&app).scroll.get(), 0.0, "the grid stays");
+    key_with(&mut app, Key::Named(NamedKey::Home), Modifiers::SUPER);
+    assert_eq!(selected(&app).2, HAS, "Command-Home its head");
+    key_with(&mut app, Key::Named(NamedKey::ArrowDown), Modifiers::SHIFT);
+    let view = view_of(&app);
+    assert!(view.filters.is_open());
+    assert_eq!(
+        selected(&app),
+        (pk_of(0), "label".to_owned(), HAS.to_owned())
+    );
+    assert!(view.anchor.is_none(), "no range");
+    press_key(&mut app, NamedKey::Escape);
+    assert!(!view_of(&app).filters.is_open());
+    assert_eq!(selected(&app).2, mark_of("role"));
+}
+
+/// The open list is one stop of Tab's: Tab or Shift-Tab from any of its lines closes it and goes
+/// on from the mark it opened from, to the control after or before the mark.
+/// NEGATIVE CONTROL: with the window's Tab not asking `tab_leaves_list` (its answer made `false && …`),
+/// Tab walks on into the list's next line: `` Tab closes the list ``.
+#[test]
+fn tab_leaves_the_open_list_from_its_mark() {
+    let mut app = open_with(fleet());
+    let order = presented(&mut app).focus_order;
+    let mark = UiKey::new(mark_of("role"));
+    let at = order.iter().position(|key| *key == mark).unwrap();
+    let (before, after) = (order[at - 1].clone(), order[at + 1].clone());
+    let none = Modifiers::empty();
+    act(&mut app, &mark_of("role"), None);
+    presented(&mut app);
+    press_key(&mut app, NamedKey::ArrowDown);
+    key_with(&mut app, Key::Named(NamedKey::Tab), none);
+    assert!(!view_of(&app).filters.is_open(), "Tab closes the list");
+    assert_eq!(
+        selected(&app).2,
+        after.as_str(),
+        "and goes on past the mark"
+    );
+    act(&mut app, &mark_of("role"), None);
+    presented(&mut app);
+    press_key(&mut app, NamedKey::ArrowDown);
+    key_with(&mut app, Key::Named(NamedKey::Tab), Modifiers::SHIFT);
+    assert!(!view_of(&app).filters.is_open());
+    assert_eq!(
+        selected(&app).2,
+        before.as_str(),
+        "Shift-Tab goes back past it"
+    );
+}
+
+/// A header's filter mark is a funnel drawn in lines, never a sort's triangle of bars: in the
+/// note's ink, in the primary one while a filter stands; open, its seat is washed and the funnel
+/// stays as it is.
+/// NEGATIVE CONTROL: with the mark's face drawn as `StyleRef::SortDown`, it is a sort's bars: `` the funnel
+/// is drawn in lines: Panel { x: 396.0, y: 172.0, w: 2.0, h: 2.0, radius: 0.0, fill: [208, 208,
+/// 208, 255] } ``.
+#[test]
+fn a_filter_mark_is_a_funnel_beside_a_sorts_triangle() {
+    use crate::widget::DrawPrim;
+    let mut app = open_with(fleet());
+    act(&mut app, "tables/head/role", None);
+    let roles = crate::settings::Roles::from_theme(aterm_render::Theme::default());
+    let prims = |ui: &CompiledUi, key: &str| {
+        ui.painted(roles)
+            .into_iter()
+            .find(|(painted, _)| painted.as_str() == key)
+            .map(|(_, prims)| prims)
+            .unwrap_or_else(|| panic!("{key} is painted"))
+    };
+    let glyph = format!("{}/glyph", mark_of("role"));
+    let inks = |ui: &CompiledUi| {
+        prims(ui, &glyph)
+            .iter()
+            .map(|prim| match prim {
+                DrawPrim::Line { color, .. } => [color[0], color[1], color[2]],
+                other => panic!("the funnel is drawn in lines: {other:?}"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let ui = render(&app);
+    assert!(
+        prims(&ui, "tables/head/role/mark")
+            .iter()
+            .all(|prim| matches!(prim, DrawPrim::Panel { .. })),
+        "the sort's mark is bars"
+    );
+    let note = crate::native_ui::readable_secondary(&roles);
+    assert_eq!(inks(&ui), [note; 5], "five lines in the note's ink");
+    act(&mut app, &mark_of("role"), None);
+    let ui = render(&app);
+    assert!(
+        !prims(&ui, &format!("{}/open", mark_of("role"))).is_empty(),
+        "open, washed"
+    );
+    assert_eq!(inks(&ui), [note; 5], "the same funnel");
+    act(&mut app, &value_of("worker"), None);
+    assert_eq!(
+        inks(&render(&app)),
+        [roles.text_primary; 5],
+        "filtered, in the primary ink"
+    );
+}
+
+/// A chip's press opens its column's list as the mark's does, and says so: expanded while the
+/// list it opened is open, collapsed while the list stands open from the mark.
+/// NEGATIVE CONTROL: with each chip built as closed (`chip`'s `open` passed `false`), the chip never says
+/// its list is open: `` opened from the chip left: Some(false) right: Some(true) ``.
+#[test]
+fn a_chip_says_whether_the_list_it_opened_is_open() {
+    let mut app = open_with(fleet());
+    let expanded = |ui: &CompiledUi, key: &str| {
+        ui.semantic(&UiKey::new(key.to_owned()))
+            .and_then(|node| node.state)
+            .and_then(|state| state.expanded)
+    };
+    let chip = format!("{CHIP}role");
+    act(&mut app, &mark_of("role"), None);
+    act(&mut app, &value_of("worker"), None);
+    let ui = render(&app);
+    assert_eq!(expanded(&ui, &mark_of("role")), Some(true));
+    assert_eq!(expanded(&ui, &chip), Some(false));
+    act(&mut app, &chip, None);
+    let ui = render(&app);
+    assert_eq!(expanded(&ui, &chip), Some(true), "opened from the chip");
+    assert_eq!(expanded(&ui, &mark_of("role")), Some(false));
+    act(&mut app, &chip, None);
+    assert_eq!(expanded(&render(&app), &chip), Some(false), "closed again");
+}
+
+/// Past the 200 most held values the list says in plain words how many more there are.
+/// NEGATIVE CONTROL: with the line's words as they were, `less held`: `` left: Some("5 more values, less
+/// held, are not listed") right: Some("5 more values, each in fewer rows, are not listed") ``.
+#[test]
+fn the_list_says_how_many_values_it_does_not_list() {
+    let mut app = open_with(tall_sheet(205, 2));
+    act(&mut app, &mark_of("label"), None);
+    assert_eq!(
+        said(&render(&app), "tables/filter/more").as_deref(),
+        Some("5 more values, each in fewer rows, are not listed")
     );
 }

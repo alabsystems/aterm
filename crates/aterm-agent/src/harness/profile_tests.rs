@@ -500,8 +500,144 @@ fn subscription_shared_profile_is_bound_to_the_captured_secure_storage_login() {
     assert!(read(&second_env, Some(&lone)).is_some());
 }
 
+/// A KEPT PROFILE ENVIRONMENT READS AS THE WHOLE ONE, AND HOLDS NO CREDENTIAL
+/// ([`ProfileEnv`]): over environments on the default home, a `CLAUDE_CONFIG_DIR`, a login
+/// directory and the custom-OAuth profile, each beside variables no reader reads (a `PATH`, a
+/// token of another tool), and environments on an API key, an empty credential, a vault token,
+/// with no selector at all and unread, the observed login ([`super::super::observe::claude_with`]
+/// on the environment's own route) and the subscription and plan
+/// ([`subscription_and_plan_with`], its records the Claude dir the whole environment names) of
+/// the kept entries are those of the whole environment. The four selected login files name four
+/// addresses, each observed through its own selector (and subscribed, but for the login
+/// directory's, whose shared profile names another account than its roster row), and no kept
+/// entry carries a secret's value.
+///
+/// NEGATIVE CONTROL (run 2026-11-15): with [`CUSTOM_OAUTH_ENV`] left out of
+/// `ProfileEnv::reads`, the test fails at `environment 3: ["HOME"]`, the custom-OAuth one: the
+/// whole environment observes and subscribes `custom@example.com` (its
+/// `.claude-custom-oauth.json`), the kept one `owner@example.com` (the plain `.claude.json`).
+#[test]
+fn a_kept_profile_env_reads_as_the_whole_one() {
+    use super::super::accounts::{AuthRoute, HOME_ENV, LOGIN_ENV, ProcessLogin, Roster, Row};
+    use super::super::observe::claude_with;
+    use super::super::token_route::{DESCRIPTOR_ENV, MARKER_ENV};
+
+    let root = tmp_dir("kept-env");
+    let home = root.path();
+    let records = home.join(".claude");
+    let (config, login) = (home.join("config"), home.join("login"));
+    for dir in [&records, &config, &login] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let now = 1_792_050_000;
+    let roster = Roster {
+        rows: vec![
+            Row {
+                label: "owner".into(),
+                email: Some("owner@example.com".into()),
+                ..Row::default()
+            },
+            Row {
+                label: "second".into(),
+                dir: Some(login.display().to_string()),
+                email: Some("login@example.com".into()),
+                ..Row::default()
+            },
+        ],
+    };
+    let var = |name: &str, value: &dyn std::fmt::Display| format!("{name}={value}");
+    let at_home = var("HOME", &home.display());
+    // Each selected environment, the address its login file names, and the one its subscription
+    // names: none under the login directory, whose shared profile (the default home's) names
+    // another account than the login's roster row.
+    let selected = [
+        (
+            vec![at_home.clone()],
+            "owner@example.com",
+            Some("owner@example.com"),
+        ),
+        (
+            vec![at_home.clone(), var(HOME_ENV, &config.display())],
+            "config@example.com",
+            Some("config@example.com"),
+        ),
+        (
+            vec![at_home.clone(), var(LOGIN_ENV, &login.display())],
+            "login@example.com",
+            None,
+        ),
+        (
+            vec![
+                at_home.clone(),
+                var(CUSTOM_OAUTH_ENV, &"https://oauth.example.test"),
+            ],
+            "custom@example.com",
+            Some("custom@example.com"),
+        ),
+    ];
+    for (env, email, _) in &selected {
+        let profile = login_profile_of(env, home).expect("a stored login's profile");
+        let body = json!({"oauthAccount": {"accountUuid": email, "emailAddress": email}});
+        std::fs::write(profile, aterm_json::to_string(&body).unwrap()).unwrap();
+    }
+    let secret = "sk-ant-kept-env-secret";
+    let mut envs: Vec<Vec<String>> = selected
+        .iter()
+        .map(|(env, ..)| {
+            let mut env = env.clone();
+            env.push("PATH=/usr/bin:/bin".into());
+            env.push(format!("GITHUB_TOKEN={secret}"));
+            env
+        })
+        .collect();
+    envs.extend([
+        vec![at_home.clone(), format!("ANTHROPIC_API_KEY={secret}")],
+        vec![at_home.clone(), "ANTHROPIC_API_KEY=".into()],
+        vec![
+            at_home.clone(),
+            format!("{DESCRIPTOR_ENV}=3"),
+            format!("{MARKER_ENV}=aterm-claude-token-ac-00000000000000a1"),
+        ],
+        vec!["PATH=/usr/bin:/bin".into()],
+        Vec::new(),
+    ]);
+    // The records are the Claude dir the whole environment names, as the footer's resolver holds
+    // it: its `CLAUDE_CONFIG_DIR`, else the default home's.
+    let read = |env: &[String], whole: &[String], route: AuthRoute| {
+        let records = exec_var(whole, HOME_ENV)
+            .flatten()
+            .map_or_else(|| records.clone(), std::path::PathBuf::from);
+        (
+            claude_with(env, home, route, Some(&roster), read_facts),
+            subscription_and_plan_with(env, home, &records, Some(&roster), (now, None), read_facts),
+        )
+    };
+    for (n, env) in envs.iter().enumerate() {
+        let route = ProcessLogin::of_exec_env(env).map_or(AuthRoute::Outside, |who| who.route);
+        let kept = ProfileEnv::of_exec_env(env);
+        assert_eq!(
+            read(kept.entries(), env, route),
+            read(env, env, route),
+            "environment {n}: {kept:?}"
+        );
+        assert!(
+            kept.entries().iter().all(|entry| !entry.contains(secret)),
+            "environment {n} keeps no secret: {kept:?}"
+        );
+        if let Some((_, email, subscribed)) = selected.get(n) {
+            let (seen, shown) = read(kept.entries(), env, route);
+            assert_eq!(seen.email(), Some(*email), "CONTROL: the selector is read");
+            assert_eq!(
+                shown.and_then(|(sub, ..)| sub.email).as_deref(),
+                *subscribed,
+                "CONTROL: environment {n}'s subscription"
+            );
+        }
+    }
+}
+
 fn parse_subscription(bytes: &[u8], now: i64) -> Result<SubscriptionDisplay, NoProfile> {
-    parse_selected(bytes).map(|selected| selected.subscription(now))
+    decode_facts(bytes).map(|facts| Selected::of(&facts).subscription(now))
 }
 
 #[test]

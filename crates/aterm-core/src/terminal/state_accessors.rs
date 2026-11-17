@@ -189,9 +189,12 @@ impl Terminal {
         Arc::clone(&self.title.window)
     }
 
-    /// Monotonic change epoch for the window title (OSC 0/2 or [`set_title`](Self::set_title))
-    /// and stored shell-reported cwd path/host (OSC 7 / OSC 633 `P;Cwd=`).
-    /// Cwd changes advance it even while an explicit title is set; identical cwd reports do not.
+    /// Monotonic change epoch for the window title (OSC 0/2 or [`set_title`](Self::set_title)),
+    /// the title a program's OSC 7501 report gives itself
+    /// ([`ProgramStateReport::title`](super::program_state::ProgramStateReport::title)), and
+    /// stored shell-reported cwd path/host (OSC 7 / OSC 633 `P;Cwd=`).
+    /// Cwd changes advance it even while an explicit title is set; identical cwd reports and
+    /// titles do not.
     #[inline]
     #[must_use]
     pub fn title_epoch(&self) -> u64 {

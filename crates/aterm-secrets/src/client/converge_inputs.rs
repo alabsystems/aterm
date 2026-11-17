@@ -35,12 +35,15 @@
 //! posts there is seen by this Mac's pass only when something else starts one
 //! (`docs/KNOWN_ISSUES.md`).
 
-use super::{Identity, Paths, State};
+#[cfg(unix)]
+use super::Paths;
+use super::{Identity, State};
 use crate::envelope::Envelope;
 use crate::membership_log::{EpochAudience, Log, NodeStanding};
 use crate::text::Document;
 use crate::{SecretBytes, age};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// The admin text of the applied envelope as this Mac holds it.
@@ -143,12 +146,16 @@ pub(super) fn owe(state: &mut State, moved: bool) {
 
 /// How long [`take_owed`] waits for the vault's state lock. A writer still there keeps the debt
 /// for the next round.
+#[cfg(unix)]
 const TAKE_WAIT: Duration = Duration::from_millis(250);
 
 /// Take the converge pass an apply left owed ([`owe`]), for a caller that then asks for the
 /// runner: the vault's subscriber and the node pass, after each round, whatever that round's own
 /// outcome. A caller that ends before its runner starts loses nothing: each starts one at its
 /// first look, and so takes what is owed as it begins and asks for no second runner. `false` where none is owed, or the state cannot be read or written now (it stays owed).
+///
+/// Unix only, as its callers (the subscriber's converge starter, the node pass) are.
+#[cfg(unix)]
 pub(super) fn take_owed(paths: &Paths) -> bool {
     if !super::load_state(paths).is_ok_and(|state| state.converge_owed) {
         return false;
@@ -174,7 +181,7 @@ thread_local! {
 }
 
 /// Run `apply` with the digest blind ([`BLIND`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn blind<T>(apply: impl FnOnce() -> T) -> T {
     /// Sight again when the apply ends, by a panic too.
     struct Sighted;
@@ -330,6 +337,6 @@ fn membership(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "converge_inputs_tests.rs"]
 mod tests;

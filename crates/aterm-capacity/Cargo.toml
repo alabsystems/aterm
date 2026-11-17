@@ -71,8 +71,9 @@ aterm-dirfd = { workspace = true }
 # Kept in the core toolchain so Targo and the resource report cannot diverge.
 trust-build-cpu = { workspace = true }
 trust-resource-provenance = { workspace = true }
-# `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` for bounded regular-file opens, and `kill`/`signal` in
-# interrupt tests: aterm-libc, first-party, which aterm-toolchain already links.
+# `O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK` for bounded regular-file opens, `tcgetpgrp`/`getpgrp`
+# for the terminal rule (`reading::person_at`), and `kill`/`signal` in interrupt tests:
+# aterm-libc, first-party, which aterm-toolchain already links.
 libc = { workspace = true }
 
 [dev-dependencies]
@@ -80,6 +81,11 @@ aterm-models-capacity = { workspace = true }
 trust-exec-policy = { workspace = true }
 # The one-minute hang detector (`aterm_spec::wait`).
 aterm-spec = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# An isolated terminal (`open_pty_pair`) for the live terminal rule's test
+# (`Live::person`), never the person's own. Workspace crate.
+aterm-pty = { workspace = true }
 
 [lints]
 workspace = true

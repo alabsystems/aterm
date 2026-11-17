@@ -142,8 +142,8 @@ fn unix_secs(time: std::time::SystemTime) -> Option<i64> {
 /// - On a token route the profile may be stale (`docs/DESIGN-claude-setup-token-2026-11-05.md`
 ///   §5.7): the account is the one whose token entry the marker names, the roster row whose
 ///   entry it is ([`TokenEntry::of_row`]); a marker no row names is [`Observation::Unread`].
-/// - On a stored login, the profile [`profile::login_record_of`] selects for `env`: a login
-///   directory's own, else the home's.
+/// - On a stored login, the profile `profile::login_profile_of` selects for `env`: a login
+///   directory's own, else the home's, read afresh ([`profile::read_facts`]).
 /// - Any other route (an environment token, an API key, a provider route) is unread.
 #[must_use]
 pub fn claude(
@@ -151,6 +151,23 @@ pub fn claude(
     user_home: &Path,
     route: AuthRoute,
     roster: Option<&Roster>,
+) -> Observation {
+    claude_with(env, user_home, route, roster, profile::read_facts)
+}
+
+/// [`claude`], of what `read` gives of the stored login's profile file: [`profile::read_facts`]
+/// of it, or a read the caller holds while the file's stamp stands (the footer's resolver, which
+/// decodes each profile once a change). `read` is asked only on a stored login. The file names
+/// the login ([`Observation::Seen`]) where it decoded with an address and the look after the
+/// read found its modification time; else a regular file there is [`Observation::SignedOut`],
+/// and anything else [`Observation::Unread`].
+#[must_use]
+pub fn claude_with<R: std::borrow::Borrow<profile::ProfileRead>>(
+    env: &[String],
+    user_home: &Path,
+    route: AuthRoute,
+    roster: Option<&Roster>,
+    read: impl FnOnce(&Path) -> R,
 ) -> Observation {
     match route {
         AuthRoute::Outside => Observation::Unread,
@@ -181,7 +198,17 @@ pub fn claude(
             })
         }
         AuthRoute::Stored => {
-            if let Some((record, path, mtime)) = profile::login_record_of(env, user_home) {
+            let Some(path) = profile::login_profile_of(env, user_home) else {
+                return Observation::Unread;
+            };
+            let held = read(&path);
+            let read = held.borrow();
+            let record = read
+                .facts
+                .as_ref()
+                .ok()
+                .and_then(profile::ProfileFacts::record);
+            if let (Some(record), Some(mtime)) = (record, read.modified) {
                 return Observation::Seen(Observed {
                     cli: Cli::Claude.into(),
                     email: record.email,
@@ -193,9 +220,10 @@ pub fn claude(
                     plan: record.plan.and_then(|plan| journal::plan_word(plan.word())),
                 });
             }
-            match profile::login_profile_of(env, user_home) {
-                Some(path) if path.is_file() => Observation::SignedOut { path },
-                _ => Observation::Unread,
+            if read.is_file {
+                Observation::SignedOut { path }
+            } else {
+                Observation::Unread
             }
         }
     }

@@ -63,11 +63,10 @@ fn account(cli: Cli, local: &str, label: &str, serial: usize) -> LabAccount {
     }
 }
 
-/// A settled lab that names this Mac `m16` and prefers `accounts` here.
+/// A lab that names this Mac `m16` and prefers `accounts` here.
 fn lab_of(accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         accounts,
         ..Lab::default()
     }
@@ -114,7 +113,7 @@ fn upkeep_pass(bed: &Bed, rediscovery: &Mutex<Rediscovery>, step: UpkeepStep) {
     );
 }
 
-/// A scratch home that keeps Kimi's and Grok's rosters, under a settled lab that prefers one
+/// A scratch home that keeps Kimi's and Grok's rosters, under a lab that prefers one
 /// account of each here and no Codex account, with a counting guard ([`Asked`]) and one memo
 /// of what the upkeep remembers for all of its passes.
 struct Scripted {

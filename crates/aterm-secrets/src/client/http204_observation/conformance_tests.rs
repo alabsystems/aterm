@@ -278,7 +278,7 @@ fn transition_with(before: &ModelState, action: &str, kind: i64, fault: Fault) -
                 })
         } else {
             let projected = project(&config, recipient, &state);
-            let observed = observe_http204_response(&f.paths, &config).unwrap();
+            let observed = super::tests::read_204(&f.paths, &config);
             assert_eq!(observed, projected);
             if fault == Fault::ReadClock || (fault == Fault::ReloadClock && phase == 3) {
                 // Unsafe projection: return a read clock without changing the

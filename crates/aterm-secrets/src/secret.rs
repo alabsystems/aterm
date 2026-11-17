@@ -71,7 +71,7 @@ impl From<String> for SecretBytes {
 }
 
 /// Read into `bytes`, wiping everything accumulated if the reader fails partway.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn read_to_end_wiping_on_error(
     mut reader: impl std::io::Read,
     bytes: &mut Vec<u8>,

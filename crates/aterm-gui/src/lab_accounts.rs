@@ -49,8 +49,9 @@ pub(crate) fn collect(config: &Path, now_ms: u64) -> LabAccounts {
                 aterm_agent::harness::alab_seen::current(false).as_deref(),
                 now_ms,
             );
-            // The token facts the window last read, read now where a minute has passed (§5.9).
-            crate::token_shown::refresh(now);
+            // The token facts the window last read (§5.9): the ask starts their lane where
+            // nothing did yet, and a later collection shows what it reads.
+            crate::token_lane::want();
             with_tokens(&mut lab, crate::token_shown::shown().as_deref());
             lab
         }

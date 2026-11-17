@@ -749,6 +749,11 @@ impl App {
                     } else {
                         ws.dock.written()
                     },
+                    dock_by_default: ws.dock.written_by_default(self.headless),
+                    // The scale the origin and frame above were read at.
+                    scale: os_window
+                        .filter(|_| pos.is_some() || inner_px.is_some())
+                        .map(|w| w.scale_factor()),
                 }
             })
             .collect();
@@ -2028,8 +2033,7 @@ impl App {
             && let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             && crate::app_window::restored_position_on_screen(window, x, y)
         {
-            let (x, y) = self.restored_origin(wid, window, x, y);
-            window.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+            window.set_outer_position(self.restored_origin(wid, window, x, y));
         }
         if !cfg!(windows)
             && wl.maximized == Some(true)
@@ -2088,6 +2092,24 @@ impl App {
         self.retire_unattached_restored_window(wid);
     }
 
+    /// [`Self::restore_window`]'s native window for row `wl`, before its tabs are rebuilt and it
+    /// attaches: made with no OS window, the front left as it was, holding the row's carried
+    /// frame, dock record ([`crate::app_window::DockRow::of`]) and maximize ask. It needs no
+    /// event loop, so a fixture drives the restore's own write of the record.
+    fn begin_native_restore_window(&mut self, wl: &restore::WindowLayout) -> WindowId {
+        let previous_front = self.frontmost_window;
+        let wid = self.create_native_restore_window(wl.rows, wl.cols);
+        self.frontmost_window = previous_front;
+        if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
+            let ws = &mut **route_guard_ws;
+            let frame = crate::app_window::CarriedFrame::of(wl);
+            ws.take_carried_frame(frame.map(|frame| frame.inner_px));
+            ws.dock.take_row(crate::app_window::DockRow::of(wl));
+            ws.restore_maximize_asked = wl.maximized == Some(true);
+        }
+        wid
+    }
+
     fn begin_native_sliced_fill(&mut self, mut wl: restore::WindowLayout) -> Option<FillingWindow> {
         if wl.migrate_legacy_tabs().is_none() || wl.restored_tabs.is_empty() {
             return None;
@@ -2110,8 +2132,7 @@ impl App {
         host.scale = self.unattached_window_scale();
         let frame = crate::app_window::CarriedFrame::of(&wl);
         host.take_carried_frame(frame.map(|frame| frame.inner_px));
-        host.dock.pref = wl.dock;
-        host.dock.birth = crate::app_window::DockBirth::of_row(&wl);
+        host.dock.take_row(crate::app_window::DockRow::of(&wl));
         host.restore_maximize_asked = wl.maximized == Some(true);
         Some(FillingWindow {
             wid,
@@ -3093,16 +3114,7 @@ impl App {
             let outer = (wl.outer_x, wl.outer_y);
             let maximized = wl.maximized;
             let show = wl.show;
-            let wid = self.create_native_restore_window(wl.rows, wl.cols);
-            self.frontmost_window = previous_front;
-            if let Some(mut route_guard_ws) = self.windows.get_mut(&wid) {
-                let ws = &mut **route_guard_ws;
-                let frame = crate::app_window::CarriedFrame::of(&wl);
-                ws.take_carried_frame(frame.map(|frame| frame.inner_px));
-                ws.dock.pref = wl.dock;
-                ws.dock.birth = crate::app_window::DockBirth::of_row(&wl);
-                ws.restore_maximize_asked = maximized == Some(true);
-            }
+            let wid = self.begin_native_restore_window(&wl);
             #[cfg(any(windows, target_os = "linux"))]
             self.stage_restore_placement(wid, outer, maximized);
             self.restore_into_window(wid, wl);
@@ -3125,8 +3137,7 @@ impl App {
                 && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
                 && crate::app_window::restored_position_on_screen(w, x, y)
             {
-                let (x, y) = self.restored_origin(wid, w, x, y);
-                w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+                w.set_outer_position(self.restored_origin(wid, w, x, y));
             }
             if !cfg!(windows)
                 && maximized == Some(true)
@@ -3160,7 +3171,7 @@ impl App {
             None,
             crate::app_window::CarriedFrame::of(&wl),
             (outer, maximized),
-            (wl.dock, crate::app_window::DockBirth::of_row(&wl)),
+            crate::app_window::DockRow::of(&wl),
         );
         drop(restoring);
         let Some(wid) = created else {
@@ -3182,8 +3193,7 @@ impl App {
             && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
             && crate::app_window::restored_position_on_screen(w, x, y)
         {
-            let (x, y) = self.restored_origin(wid, w, x, y);
-            w.set_outer_position(aterm_window::dpi::PhysicalPosition::new(x, y));
+            w.set_outer_position(self.restored_origin(wid, w, x, y));
         }
         if !cfg!(windows)
             && maximized == Some(true)

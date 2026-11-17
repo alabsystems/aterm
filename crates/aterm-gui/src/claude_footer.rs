@@ -12,9 +12,10 @@ use std::time::Duration;
 
 use aterm_agent::harness::accounts;
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts, LaunchFacts};
+use aterm_agent::harness::looks::{self, Heed, Input, Look};
 use aterm_agent::harness::observe::{self, Observation};
 use aterm_agent::harness::profile::{
-    SubscriptionDisplay, USAGE_SHOWN_S, WEEKLY_OUT, WeeklyFigure, WeeklyGap,
+    ProfileEnv, SubscriptionDisplay, USAGE_SHOWN_S, WEEKLY_OUT, WeeklyFigure, WeeklyGap,
 };
 use aterm_agent::harness::tap;
 use aterm_core::render::RenderInput;
@@ -28,8 +29,10 @@ use crate::{App, VisibleContentRoute, Wake, WindowId};
 
 /// The least interval between two footer asks the status sweep sends for a session whose output
 /// moved since its last ask ([`crate::session_status::StatusObserver::request_footer_if_due`]). A
-/// session nothing wrote to is not asked for again: the resolver's own clocks read it
-/// ([`FOLLOW_UPS`], [`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]).
+/// session nothing wrote to is not asked for again: on the watched arm ([`Arm::Watched`]) it is
+/// read when a file it reads moves, its process execs or a time it shows comes due, and on the
+/// clocks arm the resolver's own clocks read it ([`FOLLOW_UPS`], [`IDLE_RECHECK`],
+/// [`LONG_IDLE_RECHECK`]).
 pub(crate) const RECHECK: Duration = Duration::from_secs(2);
 
 /// Returns `true` if `program` is a harness-supported agent whose composer footer is rendered.
@@ -1692,8 +1695,39 @@ pub(crate) fn post_changed(session: u64) {
     }
 }
 
-/// The follow-up reads after every request, measured from it ([`crate::claude_registry`]).
+/// The follow-up reads after every request of a session on the clocks arm ([`Arm::Clocks`]),
+/// measured from it: a registry row written late and a transcript's last row are read on them.
+/// On the watched arm their watches read both.
 const FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
+
+/// Which clocks a watched session's reads keep (the footer cause design's §2.6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Arm {
+    /// Every file its last read looked at is watched ([`crate::claude_inputs::InputWatch`]), and
+    /// so is its process, whose exit is heard ([`Resolver::exit`]): it is read only for a cause
+    /// (an ask, a moved input, a placement, an exec, a time it shows coming due, a host fact's
+    /// bell, a usage fold its last read left behind), and it stays watched until its process
+    /// exits or its tab stops. No clock reads it.
+    Watched,
+    /// A look of it has no watch (no watcher, a refused watcher or placement, past
+    /// [`crate::claude_inputs::BUDGET`]), its process's exit is not heard (no process watch, no
+    /// kernel start to place one by), or it is not Claude Code's (agy, Muse Code and Kimi Code
+    /// read the process's working directory, which no event announces): it keeps the clocks
+    /// ([`FOLLOW_UPS`], [`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]) and lapses [`WATCH_FOR`] after
+    /// its last ask once its process is gone ([`still_watched`]). A session is on it until a
+    /// settle finds it watched, and again from any settle that does not ([`Resolver::arms`]).
+    Clocks,
+}
+
+impl Arm {
+    /// The word the dev row prints.
+    const fn word(self) -> &'static str {
+        match self {
+            Arm::Watched => "watched",
+            Arm::Clocks => "clocks",
+        }
+    }
+}
 
 /// Why one read ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1702,12 +1736,29 @@ enum Cause {
     Ask,
     /// One of [`FOLLOW_UPS`].
     FollowUp,
-    /// The registry watch saw the process's Claude dir move ([`Command::RowsMoved`]).
-    Event,
-    /// A registry watch was newly placed for the process's Claude dir.
+    /// A watch on a file the session's last read looked at fired, and the file stands otherwise
+    /// than that read looked at it ([`Command::InputMoved`]); or the process that runs the
+    /// sign-in whose record that read looked at exited, its record left standing
+    /// ([`Resolver::watch_sign_in`]).
+    Input,
+    /// A watch was placed, or placed again, on a file the session's last read looked at, and the
+    /// file had moved since that read ([`Resolver::settle`]).
     Placed,
-    /// The idle clock ([`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]).
+    /// The idle clock of a session on the clocks arm ([`IDLE_RECHECK`], [`LONG_IDLE_RECHECK`]).
     Idle,
+    /// The process watch heard the process exec ([`Command::ProcessMoved`]): its image is read
+    /// again.
+    Exec,
+    /// A time the session's last read posted came due ([`Found::changes_after`]): a figure's
+    /// age or reset, a wall's day, the tap's silence, the outlook's.
+    Deadline,
+    /// A host fact the read takes moved ([`Command::HostMoved`]): every watched session is read
+    /// again, whatever its floor.
+    Host,
+    /// The session's last read left its usage fold behind ([`Found::behind`]: it stopped at
+    /// [`footer::FOLD_BUDGET`] with more to read): it is read on at its floor, with no file moved,
+    /// until a read catches up.
+    Behind,
 }
 
 impl Cause {
@@ -1716,29 +1767,30 @@ impl Cause {
         match self {
             Cause::Ask => "ask",
             Cause::FollowUp => "follow-up",
-            Cause::Event => "event",
+            Cause::Input => "input",
             Cause::Placed => "placed",
             Cause::Idle => "idle",
+            Cause::Exec => "exec",
+            Cause::Deadline => "deadline",
+            Cause::Host => "host",
+            Cause::Behind => "behind",
         }
     }
 }
 
-/// How many times one turn places registry watches and reads what they were placed for
-/// ([`Resolver::settle`]).
-const PLACE_ROUNDS: usize = 8;
-
-/// How often a Claude Code session's facts are re-read while nothing asks.
+/// How often a session on the clocks arm ([`Arm::Clocks`]) is re-read while nothing asks, for
+/// [`WATCH_FOR`] after its last ask.
 const IDLE_RECHECK: Duration = Duration::from_secs(15);
+
+/// How long after its last ask a session on the clocks arm is read every [`IDLE_RECHECK`], and
+/// watched whether or not its process lives ([`still_watched`]).
 const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// How often a session is re-read once its last ask is [`WATCH_FOR`] old, while its agent's
-/// process lives ([`Resolver::retain`]).
+/// How often a session on the clocks arm is re-read once its last ask is [`WATCH_FOR`] old,
+/// while its agent's process lives ([`Resolver::retain`]).
 const LONG_IDLE_RECHECK: Duration = Duration::from_secs(60);
 
-/// How long the resolver's roster answers from its last read ([`RosterMemo`]).
-const ROSTER_RECHECK: Duration = Duration::from_secs(10);
-
-/// The re-read interval of a session last asked for at `asked`.
+/// The re-read interval of a session on the clocks arm last asked for at `asked`.
 fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration {
     if now.saturating_duration_since(asked) < WATCH_FOR {
         IDLE_RECHECK
@@ -1747,8 +1799,8 @@ fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration
     }
 }
 
-/// Whether a session last asked for at `asked` is still watched: for [`WATCH_FOR`] after that
-/// ask, and past it while `alive` says its process lives.
+/// Whether a session on the clocks arm last asked for at `asked` is still watched: for
+/// [`WATCH_FOR`] after that ask, and past it while `alive` says its process lives.
 fn still_watched(
     now: std::time::Instant,
     asked: std::time::Instant,
@@ -1806,19 +1858,42 @@ enum Command {
         pgid: Option<i32>,
         timeline: Option<Arc<Mutex<SessionTimeline>>>,
     },
-    /// The registry watch saw the Claude dir `dir`'s rows move ([`crate::claude_registry`]).
-    RowsMoved {
-        dir: PathBuf,
+    /// A watch on the looked path fired ([`crate::claude_inputs::Told::Input`]): each session a
+    /// look of which at it moved owes a read ([`Cause::Input`]).
+    InputMoved(PathBuf),
+    /// The watch on process `pid`, the one the kernel started at `started`, fired: it exec'd
+    /// ([`Resolver::execed`]), or it `exited` ([`Resolver::exit`]).
+    ProcessMoved {
+        pid: u32,
+        started: u64,
+        exited: bool,
     },
-    /// The registry watch saw a level outside a `sessions/` move ([`Resolver::settle`]).
-    LevelMoved,
+    /// The window asks for agent `pid`'s settings default, for the permission chip's click and
+    /// box ([`request_default`]): read where its last read is due ([`Asks::default`]), and no
+    /// footer read with it.
+    Default(u32),
+    /// A host fact a read takes moved ([`crate::host_facts`]): a window switch, a published
+    /// snapshot or the lab's journal ([`host_moved`]), the wall clock or the local time zone
+    /// (the input watch's wall watch, [`crate::claude_inputs::Told::Host`]). Every watched
+    /// session is read again ([`Cause::Host`]); a new zone forgets the offsets remembered
+    /// ([`forget_offsets`]).
+    HostMoved(crate::host_facts::Bell),
 }
 
-impl From<crate::claude_registry::Told> for Command {
-    fn from(told: crate::claude_registry::Told) -> Command {
+impl From<crate::claude_inputs::Told> for Command {
+    fn from(told: crate::claude_inputs::Told) -> Command {
         match told {
-            crate::claude_registry::Told::Rows(dir) => Command::RowsMoved { dir },
-            crate::claude_registry::Told::Level => Command::LevelMoved,
+            crate::claude_inputs::Told::Input(path) => Command::InputMoved(path),
+            crate::claude_inputs::Told::Process {
+                pid,
+                started,
+                exited,
+            } => Command::ProcessMoved {
+                pid,
+                started,
+                exited,
+            },
+            crate::claude_inputs::Told::Host(bell) => Command::HostMoved(bell),
         }
     }
 }
@@ -1856,18 +1931,17 @@ impl Lane {
         self.ended.load(Ordering::Acquire)
     }
 
-    /// Hand `job` to the resolver that runs, starting one with `start` (its receiver, a sender
-    /// to it, and the [`Ended`] its thread drops last) where none runs. A send that finds the
-    /// resolver ended starts another, which takes the job. The epoch the job was delivered
-    /// under, read before the send: a resolver that ends after taking it moves the epoch past
-    /// that. `None` where no resolver took the job.
+    /// Hand `command` (an ask, or a settings default's) to the resolver that runs, starting one
+    /// with `start` (its receiver, a sender to it, and the [`Ended`] its thread drops last) where
+    /// none runs. A send that finds the resolver ended starts another, which takes the command.
+    /// The epoch the command was delivered under, read before the send: a resolver that ends
+    /// after taking it moves the epoch past that. `None` where no resolver took the command.
     fn deliver<'a>(
         &'a self,
-        job: Job,
+        mut command: Command,
         start: impl Fn(Receiver<Command>, Sender<Command>, Ended<'a>) -> std::io::Result<()>,
     ) -> Option<u64> {
         let mut slot = self.tx.lock().unwrap_or_else(|p| p.into_inner());
-        let mut command = Command::Request(job);
         // Twice at most: once for the resolver that runs, once for the one started in the place
         // of a resolver the first send found ended.
         for _ in 0..2 {
@@ -1897,14 +1971,14 @@ impl Lane {
 
 static RESOLVER: Lane = Lane::new();
 
-/// Start the footer resolver's thread on `rx`, its registry watch telling it through `rows`.
+/// Start the footer resolver's thread on `rx`, its input watches telling it through `inputs`.
 fn start_resolver(
     rx: Receiver<Command>,
-    rows: Sender<Command>,
+    inputs: Sender<Command>,
     ended: Ended<'static>,
 ) -> std::io::Result<()> {
-    let sink: crate::claude_registry::Sink =
-        Arc::new(move |told| rows.send(Command::from(told)).is_ok());
+    let sink: crate::claude_inputs::Sink =
+        Arc::new(move |told| inputs.send(Command::from(told)).is_ok());
     crate::qos::spawn_lane_thread(
         "aterm-claude-footer",
         crate::qos::Role::Responsive,
@@ -1914,7 +1988,7 @@ fn start_resolver(
             let rx = rx;
             run(
                 &rx,
-                crate::claude_registry::RegistryWatch::new(atpkg::dirwatch::Watcher::new, sink),
+                crate::claude_inputs::InputWatch::new(atpkg::dirwatch::Watcher::new, sink),
             );
         },
     )
@@ -1955,14 +2029,24 @@ pub(crate) fn request_footer(
         return takes.then_some(ended);
     }
     RESOLVER.deliver(
-        Job {
+        Command::Request(Job {
             session,
             timeline: Arc::clone(timeline),
             pgid,
             wake: wake.clone(),
-        },
+        }),
         start_resolver,
     )
+}
+
+/// Asks the resolver, off this thread, to read agent `pid`'s settings default for the permission
+/// chip's click and box ([`Command::Default`]): that read alone, no footer read with it. A test
+/// captures the ask instead ([`DEFAULT_ASKS`]).
+pub(crate) fn request_default(pid: u32) {
+    #[cfg(test)]
+    DEFAULT_ASKS.with(|asks| asks.borrow_mut().push(pid));
+    #[cfg(not(test))]
+    let _ = RESOLVER.deliver(Command::Default(pid), start_resolver);
 }
 
 /// Stops background footer refreshes for foreground process group `pgid` on `session`.
@@ -2017,6 +2101,17 @@ thread_local! {
     /// ([`resolver_epoch`]), and whether the one standing takes an ask.
     pub(crate) static CAPTURED_RESOLVER: std::cell::Cell<(u64, bool)> =
         const { std::cell::Cell::new((0, true)) };
+    /// Thread-local log of the agents whose settings default [`request_default`] asked for in
+    /// tests.
+    pub(crate) static DEFAULT_ASKS: std::cell::RefCell<Vec<u32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A host fact a read takes moved ([`crate::host_facts::ring`]): the resolver that runs, if one
+/// does, reads every session it watches again ([`Command::HostMoved`]); none is started for it.
+#[cfg(not(test))]
+pub(crate) fn host_moved(bell: crate::host_facts::Bell) {
+    send(Command::HostMoved(bell));
 }
 
 fn send(command: Command) {
@@ -2028,18 +2123,39 @@ fn send(command: Command) {
 
 #[derive(Default)]
 struct WatchSchedule {
+    /// The follow-ups owed to sessions on the clocks arm ([`FOLLOW_UPS`]).
     owed: Vec<(std::time::Instant, Job)>,
     watched: HashMap<u64, Watch>,
+    /// Per session, the read a moved input owes it, at the instant its floor allows
+    /// ([`Self::owe`]), or the one a fold its last read left behind owes ([`Self::posted`]), and
+    /// why.
+    inputs: HashMap<u64, (std::time::Instant, Cause)>,
 }
 
 /// One watched session: its latest job, when it was last asked for and last read
-/// ([`IDLE_RECHECK`]), and whether its process is awaited ([`crate::claude_registry`]).
+/// ([`IDLE_RECHECK`]), whether its last read found no registry row for its process (the dev
+/// row's `registry-read`), when a time that read posted comes due ([`Found::due`]) and the wall
+/// second it stands for ([`Found::changes_after`], by which [`WatchSchedule::measure`] measures it
+/// again), whether that read was of Claude Code's registry ([`Found::watchable`]), and the arm it
+/// is on ([`Arm`]).
 struct Watch {
     job: Job,
     asked: std::time::Instant,
     read: std::time::Instant,
     awaiting: bool,
+    due: Option<std::time::Instant>,
+    deadline: Option<i64>,
+    watchable: bool,
+    arm: Arm,
 }
+
+/// The longest wait toward a deadline a read posted ([`Watch::due`]) where the input watch hears
+/// no sleep of the Mac ([`crate::claude_inputs::InputWatch::hears_wall`]: no wall clock watch,
+/// none polled, or one that hears steps alone): the deadline is a wall second, and the monotonic
+/// clock the resolver waits on stops while the Mac sleeps, so the resolver looks at the wall at
+/// least this often while a deadline is ahead ([`WatchSchedule::next`], [`WatchSchedule::measure`])
+/// and reads a deadline the Mac slept past within one look of the wake.
+const WALL_LOOK: Duration = Duration::from_secs(60);
 
 /// What one batch of commands asks of the resolver ([`WatchSchedule::accept`]).
 #[derive(Default)]
@@ -2048,29 +2164,75 @@ struct Accepted {
     latest: Vec<Job>,
     /// The watched sessions a stop retired.
     stopped: Vec<u64>,
-    /// The Claude dirs whose rows the registry watch saw move.
+    /// The looked paths whose watch fired.
     moved: HashSet<PathBuf>,
+    /// The processes, by pid and kernel start time, the process watch heard exec and not exit.
+    execed: HashSet<(u32, u64)>,
+    /// The processes the process watch heard exit.
+    exited: HashSet<(u32, u64)>,
+    /// The agents whose settings default the window asked for ([`Command::Default`]).
+    defaults: std::collections::BTreeSet<u32>,
+    /// The host facts that moved ([`Command::HostMoved`]).
+    host: std::collections::BTreeSet<crate::host_facts::Bell>,
 }
 
 impl WatchSchedule {
-    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask, unless `alive` says
-    /// the job's process lives ([`still_watched`]).
+    /// Drop the watches on the clocks arm whose time is up: [`WATCH_FOR`] after the last ask,
+    /// unless `alive` says the job's process lives ([`still_watched`]). A watch on the watched
+    /// arm stands until its process's exit is heard ([`Resolver::exit`]) or its tab stops.
     fn prune(&mut self, now: std::time::Instant, mut alive: impl FnMut(&Job) -> bool) {
-        self.watched
-            .retain(|_, watch| still_watched(now, watch.asked, || alive(&watch.job)));
+        self.watched.retain(|_, watch| {
+            watch.arm == Arm::Watched || still_watched(now, watch.asked, || alive(&watch.job))
+        });
     }
 
-    /// When the next read is owed on a clock.
-    fn next(&self, now: std::time::Instant) -> Option<std::time::Instant> {
+    /// When the next read is owed: by a moved input at its floor, at a time a session's last
+    /// read posted ([`Watch::due`]), or, on the clocks arm, on a clock. A wait toward a posted
+    /// time runs whole only where `wall_heard` (the input watch hears each sleep's wake,
+    /// [`crate::claude_inputs::InputWatch::hears_wall`]); otherwise it ends at most [`WALL_LOOK`]
+    /// after `now`, where the turn measures the time again from the wall ([`Self::measure`]).
+    fn next(&self, now: std::time::Instant, wall_heard: bool) -> Option<std::time::Instant> {
+        let look = |due: std::time::Instant| {
+            if wall_heard {
+                due
+            } else {
+                due.min(now + WALL_LOOK)
+            }
+        };
         self.owed
             .iter()
             .map(|(at, _)| *at)
+            .chain(self.inputs.values().map(|(at, _)| *at))
             .chain(
                 self.watched
                     .values()
+                    .filter(|watch| watch.arm == Arm::Clocks)
                     .map(|watch| watch.read + recheck_after(now, watch.asked)),
             )
+            .chain(
+                self.watched
+                    .values()
+                    .filter_map(|watch| watch.due.map(look)),
+            )
             .min()
+    }
+
+    /// Measure each posted time still ahead ([`Watch::due`]) again from the wall clock, which
+    /// reads `wall` at `now`: its wall second ([`Watch::deadline`]) less `wall`, from `now`, and
+    /// `now` itself where the wall has reached that second. The monotonic clock a wait runs on
+    /// stops while the Mac sleeps and does not follow a step of the wall clock, so a time a read
+    /// posted is kept by the wall it was posted on.
+    fn measure(&mut self, now: std::time::Instant, wall: std::time::SystemTime) {
+        for watch in self.watched.values_mut() {
+            let (Some(_), Some(second)) = (watch.due, watch.deadline) else {
+                continue;
+            };
+            let Ok(second) = u64::try_from(second) else {
+                continue;
+            };
+            let at = std::time::UNIX_EPOCH + Duration::from_secs(second);
+            watch.due = Some(now + at.duration_since(wall).unwrap_or(Duration::ZERO));
+        }
     }
 
     fn matches(job: &Job, session: u64, pgid: Option<i32>) -> bool {
@@ -2108,12 +2270,31 @@ impl WatchSchedule {
                         accepted.stopped.push(session);
                     }
                 }
-                Command::RowsMoved { dir } => {
-                    accepted.moved.insert(dir);
+                Command::InputMoved(path) => {
+                    accepted.moved.insert(path);
                 }
-                Command::LevelMoved => {}
+                Command::ProcessMoved {
+                    pid,
+                    started,
+                    exited,
+                } => {
+                    if exited {
+                        accepted.exited.insert((pid, started));
+                    } else {
+                        accepted.execed.insert((pid, started));
+                    }
+                }
+                Command::Default(pid) => {
+                    accepted.defaults.insert(pid);
+                }
+                Command::HostMoved(bell) => {
+                    accepted.host.insert(bell);
+                }
             }
         }
+        accepted
+            .execed
+            .retain(|process| !accepted.exited.contains(process));
         accepted.latest = latest.into_values().collect();
         accepted
     }
@@ -2128,16 +2309,38 @@ impl WatchSchedule {
         }
         self.watched.remove(&session);
         self.owed.retain(|(_, job)| job.session != session);
+        self.inputs.remove(&session);
         true
     }
 
+    /// Owe watched `session` a read for `cause` (a moved input): at `now`, or where that is
+    /// inside its floor, once [`RECHECK`] has passed since its last read (`Watch::read`), so the
+    /// causes a burst of writes makes inside the floor fold into one read at its end. A read
+    /// already owed stands.
+    fn owe(&mut self, session: u64, now: std::time::Instant, cause: Cause) {
+        let Some(watch) = self.watched.get(&session) else {
+            return;
+        };
+        let at = now.max(watch.read + RECHECK);
+        self.inputs.entry(session).or_insert((at, cause));
+    }
+
     /// Watch `job`, asked for and read at `asked`, that read having found its process's registry
-    /// row (`row`) or not.
+    /// row (`row`) or not. A session already watched for the same process keeps its arm; any
+    /// other starts on the clocks arm, and is owed the [`FOLLOW_UPS`] while it is on it.
     fn watch(&mut self, job: Job, asked: std::time::Instant, row: bool) {
         self.owed
             .retain(|(_, pending)| pending.session != job.session);
-        for delay in FOLLOW_UPS {
-            self.owed.push((asked + delay, job.clone()));
+        self.inputs.remove(&job.session);
+        let (arm, watchable) = self
+            .watched
+            .get(&job.session)
+            .filter(|watch| watch.job.pgid == job.pgid)
+            .map_or((Arm::Clocks, false), |watch| (watch.arm, watch.watchable));
+        if arm == Arm::Clocks {
+            for delay in FOLLOW_UPS {
+                self.owed.push((asked + delay, job.clone()));
+            }
         }
         self.watched.insert(
             job.session,
@@ -2146,8 +2349,65 @@ impl WatchSchedule {
                 asked,
                 read: asked,
                 awaiting: !row,
+                due: None,
+                deadline: None,
+                watchable,
+                arm,
             },
         );
+    }
+
+    /// What `session`'s last read posted ([`Found`]): when a time its facts hold comes due and
+    /// the wall second it is, in the place of the one before, and whether it read Claude Code's
+    /// registry. A read that left its usage fold behind ([`Found::behind`]) owes the next at its
+    /// floor, [`RECHECK`] after it ([`Cause::Behind`]), on either arm: the fold is read on in
+    /// budgeted slices until a read catches up, and a read that read nothing leaves nothing owed.
+    fn posted(&mut self, session: u64, found: &Found) {
+        let Some(watch) = self.watched.get_mut(&session) else {
+            return;
+        };
+        watch.due = found.due;
+        watch.deadline = found.changes_after;
+        watch.watchable = found.watchable;
+        if found.behind {
+            let at = watch.read + RECHECK;
+            self.inputs.entry(session).or_insert((at, Cause::Behind));
+        }
+    }
+
+    /// Put watched `session` on `arm` at `now`. Onto the watched arm, its follow-ups go; back
+    /// onto the clocks arm, the follow-ups of its last ask still ahead of `now` are owed again.
+    fn arm(&mut self, session: u64, arm: Arm, now: std::time::Instant) {
+        let Some(watch) = self.watched.get_mut(&session) else {
+            return;
+        };
+        if watch.arm == arm {
+            return;
+        }
+        watch.arm = arm;
+        match arm {
+            Arm::Watched => self.owed.retain(|(_, job)| job.session != session),
+            Arm::Clocks => {
+                let (asked, job) = (watch.asked, watch.job.clone());
+                for delay in FOLLOW_UPS {
+                    if asked + delay > now {
+                        self.owed.push((asked + delay, job.clone()));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The watched sessions a time their last read posted came due for at `now`, in session
+    /// order ([`Cause::Deadline`]).
+    fn due_deadlines(&self, now: std::time::Instant) -> Vec<Job> {
+        let mut due: Vec<&Watch> = self
+            .watched
+            .values()
+            .filter(|watch| watch.due.is_some_and(|due| due <= now))
+            .collect();
+        due.sort_by_key(|watch| watch.job.session);
+        due.into_iter().map(|watch| watch.job.clone()).collect()
     }
 
     fn due_followups(&mut self, now: std::time::Instant) -> Vec<Job> {
@@ -2156,70 +2416,123 @@ impl WatchSchedule {
         due.into_iter().map(|(_, job)| job).collect()
     }
 
+    /// A session on the clocks arm whose idle clock is due at `now`.
     fn due_idle(&self, now: std::time::Instant) -> Option<Job> {
         self.watched
             .values()
+            .filter(|watch| watch.arm == Arm::Clocks)
             .find(|watch| now >= watch.read + recheck_after(now, watch.asked))
             .map(|watch| watch.job.clone())
     }
 
-    /// The job of each session in `sessions` whose process is awaited, in session order.
-    fn awaited_in(&self, sessions: &HashSet<u64>) -> Vec<Job> {
-        let mut jobs: Vec<Job> = sessions
+    /// The owed input reads due at `now` ([`Self::owe`]), taken, in session order.
+    fn due_inputs(&mut self, now: std::time::Instant) -> Vec<(Job, Cause)> {
+        let mut due: Vec<(u64, Cause)> = self
+            .inputs
             .iter()
-            .filter_map(|session| self.watched.get(session))
-            .filter(|watch| watch.awaiting)
-            .map(|watch| watch.job.clone())
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(session, (_, cause))| (*session, *cause))
             .collect();
-        jobs.sort_by_key(|job| job.session);
-        jobs
+        due.sort_by_key(|(session, _)| *session);
+        due.into_iter()
+            .filter_map(|(session, cause)| {
+                self.inputs.remove(&session);
+                Some((self.watched.get(&session)?.job.clone(), cause))
+            })
+            .collect()
     }
 
     /// `session` was read at `at`, the read having found its process's registry row (`row`) or
-    /// not.
+    /// not: a read of it a moved input owed is read with it.
     fn read(&mut self, session: u64, at: std::time::Instant, row: bool) {
         if let Some(watch) = self.watched.get_mut(&session) {
             watch.read = at;
             watch.awaiting = !row;
         }
+        self.inputs.remove(&session);
     }
 
-    /// Whether `job`'s process is awaited as a read of it starts.
-    fn awaits(&self, job: &Job) -> bool {
+    /// Whether `job`'s process is awaited as a read of it starts, and the arm the read is taken
+    /// on: a session not watched for this process yet is on the clocks arm.
+    fn awaits(&self, job: &Job) -> (bool, Arm) {
         self.watched
             .get(&job.session)
-            .is_none_or(|watch| watch.job.pgid != job.pgid || watch.awaiting)
+            .filter(|watch| watch.job.pgid == job.pgid)
+            .map_or((true, Arm::Clocks), |watch| (watch.awaiting, watch.arm))
     }
 
-    /// One pass of the resolver thread ([`Resolver::turn`]).
+    /// One pass of the resolver thread ([`Resolver::turn`]): each read runs at the instant
+    /// `clock` gives as it starts. `execed` are the sessions whose process the process watch
+    /// heard exec; `host` says a host fact a read takes moved ([`Command::HostMoved`]). The asks
+    /// are read first, then, where `host`, every other watched session in session order on
+    /// either arm, whatever its floor ([`Cause::Host`]), then the reads moved inputs owe whose
+    /// floor has passed ([`Self::owe`]), then the follow-ups due, the execs, the times reads
+    /// posted that came due ([`Watch::due`]) and the idle clock (both clocks the clocks arm's
+    /// alone), each session at most once but for the idle clock. What each read posted replaces
+    /// its session's ([`Self::posted`]).
     fn serve(
         &mut self,
         latest: Vec<Job>,
-        moved: &HashSet<u64>,
-        mut read: impl FnMut(&Job, Cause, bool) -> bool,
+        execed: &HashSet<u64>,
+        host: bool,
+        mut read: impl FnMut(&Job, Cause, (bool, Arm), std::time::Instant) -> Found,
         mut clock: impl FnMut() -> std::time::Instant,
     ) -> std::time::Instant {
         let mut done: HashSet<u64> = HashSet::new();
         for job in latest {
-            let row = read(&job, Cause::Ask, self.awaits(&job));
+            let found = read(&job, Cause::Ask, self.awaits(&job), clock());
             done.insert(job.session);
-            self.watch(job, clock(), row);
+            let session = job.session;
+            self.watch(job, clock(), found.row);
+            self.posted(session, &found);
         }
         let now = clock();
-        for job in self.due_followups(now) {
-            let row = read(&job, Cause::FollowUp, self.awaits(&job));
-            done.insert(job.session);
-            self.read(job.session, clock(), row);
+        let mut reread = |schedule: &mut Self, job: &Job, cause: Cause| {
+            let found = read(job, cause, schedule.awaits(job), clock());
+            schedule.read(job.session, clock(), found.row);
+            schedule.posted(job.session, &found);
+        };
+        if host {
+            let mut watched: Vec<Job> = self
+                .watched
+                .values()
+                .map(|watch| watch.job.clone())
+                .collect();
+            watched.sort_by_key(|job| job.session);
+            for job in watched {
+                if done.insert(job.session) {
+                    reread(self, &job, Cause::Host);
+                }
+            }
         }
-        for job in self.awaited_in(moved) {
+        for (job, cause) in self.due_inputs(now) {
             if done.insert(job.session) {
-                let row = read(&job, Cause::Event, true);
-                self.read(job.session, clock(), row);
+                reread(self, &job, cause);
+            }
+        }
+        for job in self.due_followups(now) {
+            if done.insert(job.session) {
+                reread(self, &job, Cause::FollowUp);
+            }
+        }
+        let mut execs: Vec<Job> = execed
+            .iter()
+            .filter_map(|session| self.watched.get(session))
+            .map(|watch| watch.job.clone())
+            .collect();
+        execs.sort_by_key(|job| job.session);
+        for job in execs {
+            if done.insert(job.session) {
+                reread(self, &job, Cause::Exec);
+            }
+        }
+        for job in self.due_deadlines(now) {
+            if done.insert(job.session) {
+                reread(self, &job, Cause::Deadline);
             }
         }
         while let Some(job) = self.due_idle(now) {
-            let row = read(&job, Cause::Idle, self.awaits(&job));
-            self.read(job.session, clock(), row);
+            reread(self, &job, Cause::Idle);
         }
         now
     }
@@ -2230,7 +2543,8 @@ impl WatchSchedule {
 const MAX_KEPT: usize = 64;
 
 /// How often the resolver asks the kernel whether the processes it keeps caches for, and no longer
-/// watches, still live ([`ProcessTails`]).
+/// watches, still live ([`ProcessTails`]): of those it has no process watch on, which a session
+/// on the watched arm never is; a process watch's cache goes at its exit ([`Resolver::exit`]).
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
 /// The transcript caches of the Claude Code processes the resolver has read, keyed by process,
@@ -2281,7 +2595,20 @@ impl ProcessTails {
         &mut kept.cache
     }
 
-    /// Drop the caches whose process has left for good ([`SWEEP_EVERY`], [`birth_seconds`]).
+    /// The process (`pid`, `started`) exited: its cache goes.
+    fn forget(&mut self, pid: i32, started: u64) {
+        self.kept.remove(&(pid, Some(started)));
+    }
+
+    /// The processes, by pid and kernel start time, a cache is kept for.
+    fn processes(&self) -> impl Iterator<Item = (i32, u64)> + '_ {
+        self.kept
+            .keys()
+            .filter_map(|&(pid, started)| Some((pid, started?)))
+    }
+
+    /// Drop the caches whose process has left for good, as `alive` judges it each
+    /// [`SWEEP_EVERY`] ([`Resolver::retain`]: its process watch, else [`birth_seconds`]).
     fn retain(
         &mut self,
         schedule: &WatchSchedule,
@@ -2305,8 +2632,8 @@ impl ProcessTails {
 }
 
 /// The resolver thread.
-fn run(rx: &std::sync::mpsc::Receiver<Command>, registry: crate::claude_registry::RegistryWatch) {
-    let mut resolver = Resolver::new(registry, LIVE);
+fn run(rx: &std::sync::mpsc::Receiver<Command>, inputs: crate::claude_inputs::InputWatch) {
+    let mut resolver = Resolver::new(inputs, LIVE);
     loop {
         let now = std::time::Instant::now();
         resolver.retain(now);
@@ -2340,50 +2667,134 @@ struct Resolver {
     tails: ProcessTails,
     /// Per watched session: its usage fold.
     folds: HashMap<u64, footer::FooterCache>,
-    /// The accounts roster, for every session's label.
-    roster: RosterMemo,
-    registry: crate::claude_registry::RegistryWatch,
+    /// The machine's inputs every session's read shares: the roster, the login profiles, the
+    /// accounts stores and the outlook.
+    machine: MachineMemo,
+    /// Per watched session: what its last read looked at before it read ([`looks::record`]),
+    /// which [`Self::inputs`] watches.
+    looks: HashMap<u64, Vec<Look>>,
+    /// The watches on every looked path, and on the processes held for.
+    inputs: crate::claude_inputs::InputWatch,
+    /// The sign-in the accounts outlook last read running, and its holder's process by pid and
+    /// kernel start time, which [`Self::inputs`] watches ([`Self::watch_sign_in`]).
+    sign_in: Option<(accounts::RunningSignIn, (u32, u64))>,
     asks: Asks,
 }
 
 impl Resolver {
-    fn new(registry: crate::claude_registry::RegistryWatch, asks: Asks) -> Resolver {
+    fn new(inputs: crate::claude_inputs::InputWatch, asks: Asks) -> Resolver {
         Resolver {
             schedule: WatchSchedule::default(),
             known: HashMap::new(),
             tails: ProcessTails::default(),
             folds: HashMap::new(),
-            roster: RosterMemo::default(),
-            registry,
+            machine: MachineMemo::default(),
+            looks: HashMap::new(),
+            inputs,
+            sign_in: None,
             asks,
         }
     }
 
-    /// Before the thread sleeps at `now`: the watches whose time is up go ([`WATCH_FOR`] after
-    /// the last ask, once the job's process no longer lives: a live agent's footer is read on the
-    /// idle clock whatever it shows, since the status sweep asks again only when its tab writes),
-    /// with what the reads hold for their sessions, the tails of processes gone, and the registry
-    /// watches nothing awaits now.
+    /// Before the thread sleeps at `now`: the watches on the clocks arm whose time is up go
+    /// ([`WATCH_FOR`] after the last ask, once the job's process no longer lives: a live agent's
+    /// footer on that arm is read on the idle clock whatever it shows, since the status sweep
+    /// asks again only when its tab writes), with what the reads hold for their sessions, the
+    /// tails of processes gone, and the input and process watches nothing needs now. A watch on
+    /// the watched arm stands until its process's exit is heard. A process the process watch stands on lives until
+    /// that watch says it exited ([`Self::exit`]), which no turn asks the kernel again; one with
+    /// none (no watcher, a refused placement, no kernel start time to place it by) is asked
+    /// whether it lives ([`crate::control_auth::pid_alive`], and [`birth_seconds`] for a kept
+    /// tail).
     fn retain(&mut self, now: std::time::Instant) {
+        let (known, registry) = (&self.known, &self.inputs);
         self.schedule.prune(now, |job| {
-            u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
+            held_process(known, job.session)
+                .filter(|(pid, _)| i32::try_from(*pid) == Ok(job.pgid))
+                .is_some_and(|(pid, started)| registry.holds_process(pid, started))
+                || u32::try_from(job.pgid).is_ok_and(crate::control_auth::pid_alive)
         });
         let watched = &self.schedule.watched;
         self.known
             .retain(|session, _| watched.contains_key(session));
         self.folds
             .retain(|session, _| watched.contains_key(session));
+        self.looks
+            .retain(|session, _| watched.contains_key(session));
         self.tails.retain(
             &self.schedule,
-            |pgid, started| birth_seconds(pgid) == Some(started),
+            |pgid, started| {
+                u32::try_from(pgid).is_ok_and(|pid| registry.holds_process(pid, started))
+                    || birth_seconds(pgid) == Some(started)
+            },
             now,
         );
-        self.registry.let_go(&self.awaited());
+        let looked: HashSet<&std::path::Path> =
+            self.looks.values().flatten().map(Look::path).collect();
+        self.inputs.let_go_looks(&looked);
+        self.let_go_processes();
     }
 
-    /// When the next clock read is owed ([`WatchSchedule::next`]).
+    /// Let go of the process watches of every process nothing is held for: no session's
+    /// identity, no kept tail, and no running sign-in ([`Self::sign_in`]).
+    fn let_go_processes(&mut self) {
+        let held: HashSet<(u32, u64)> = self
+            .known
+            .keys()
+            .filter_map(|session| held_process(&self.known, *session))
+            .chain(
+                self.tails
+                    .processes()
+                    .filter_map(|(pid, started)| Some((u32::try_from(pid).ok()?, started))),
+            )
+            .chain(self.sign_in.as_ref().map(|(_, process)| *process))
+            .collect();
+        self.inputs.keep_processes(&held);
+    }
+
+    /// The process (`pid`, `started`) exited ([`Command::ProcessMoved`]): each watched session
+    /// whose process it was is stopped, with what the reads hold for it, and its tail goes; its
+    /// watch and the watches on what its reads looked at go at this turn's settle.
+    fn exit(&mut self, (pid, started): (u32, u64)) {
+        let Ok(pgid) = i32::try_from(pid) else {
+            return;
+        };
+        let sessions: Vec<u64> = self
+            .known
+            .iter()
+            .filter(|(_, identity)| identity.pid == pgid && identity.started == Some(started))
+            .map(|(session, _)| *session)
+            .collect();
+        for session in sessions {
+            self.schedule.stop(session, Some(pgid));
+            forget(session, &mut self.known, &mut self.folds);
+        }
+        self.tails.forget(pgid, started);
+    }
+
+    /// The processes the process watch heard exec ([`Command::ProcessMoved`]): each one's held
+    /// image goes, to be read again at the read the exec owes its sessions ([`Cause::Exec`]),
+    /// which are returned.
+    fn execed(&mut self, processes: &HashSet<(u32, u64)>) -> HashSet<u64> {
+        let mut sessions = HashSet::new();
+        if processes.is_empty() {
+            return sessions;
+        }
+        for (session, identity) in &mut self.known {
+            let process = u32::try_from(identity.pid).ok().zip(identity.started);
+            if process.is_some_and(|process| processes.contains(&process)) {
+                identity.image = None;
+                sessions.insert(*session);
+            }
+        }
+        sessions
+    }
+
+    /// When the next clock read is owed ([`WatchSchedule::next`]), a wait toward a posted time
+    /// held to [`WALL_LOOK`] where the input watch hears no sleep of the Mac
+    /// ([`crate::claude_inputs::InputWatch::hears_wall`]).
     fn next(&self, now: std::time::Instant) -> Option<std::time::Instant> {
-        self.schedule.next(now)
+        self.schedule.next(now, self.inputs.hears_wall())
     }
 
     /// One turn over `commands` ([`forget`], [`ProcessTails`], [`WatchSchedule::serve`],
@@ -2398,7 +2809,18 @@ impl Resolver {
         now
     }
 
-    /// [`Self::turn`]'s reads, before its registry watch is settled.
+    /// [`Self::turn`]'s reads, before its watches are settled: the processes heard to exit go
+    /// before any read ([`Self::exit`]), and a running sign-in's holder heard to exit or exec
+    /// owes each session that looked at its record a read at its floor ([`Self::watch_sign_in`],
+    /// [`Cause::Input`]); those heard to exec are read again ([`Self::execed`]), a
+    /// new local time zone forgets every offset remembered and owes the accounts outlook a replay
+    /// ([`forget_offsets`], `OutlookMemo::zone_set`), each session a look of which at a path
+    /// whose watch fired now stands otherwise is owed a read at its floor
+    /// ([`WatchSchedule::owe`], [`Cause::Input`]), and each settings default the window asked
+    /// for is read ([`Command::Default`], [`Asks::default`]), with no footer read. Then every
+    /// posted time still ahead is measured again from the wall clock ([`WatchSchedule::measure`],
+    /// [`Asks::wall`]) before the reads are served, so a time the wall reached unheard (a sleep
+    /// with no wake told, a step not announced) is read in this turn ([`Cause::Deadline`]).
     fn serve_commands(
         &mut self,
         commands: impl IntoIterator<Item = Command>,
@@ -2408,88 +2830,198 @@ impl Resolver {
         for session in accepted.stopped {
             forget(session, &mut self.known, &mut self.folds);
         }
-        let moved = self.sessions_under(&accepted.moved);
+        // The holder's exec ends its sign-in as its exit does: the lock is opened close-on-exec,
+        // and on Apple, whose process watch alone hears an exec, the record names the pid
+        // version the exec moves.
+        let signed_out = self.sign_in.as_ref().is_some_and(|(_, process)| {
+            accepted.exited.contains(process) || accepted.execed.contains(process)
+        });
+        for process in accepted.exited {
+            self.exit(process);
+        }
+        let execed = self.execed(&accepted.execed);
+        if accepted.host.contains(&crate::host_facts::Bell::Zone) {
+            forget_offsets();
+            self.machine.outlook.zone_set();
+        }
+        let now = clock();
+        for pid in accepted.defaults {
+            (self.asks.default)(pid, now);
+        }
+        for session in self.moved_looks(&accepted.moved) {
+            self.schedule.owe(session, now, Cause::Input);
+        }
+        if signed_out {
+            for session in self.looking_at(Input::SignIn) {
+                self.schedule.owe(session, now, Cause::Input);
+            }
+        }
+        self.schedule.measure(now, (self.asks.wall)(now));
         let mut reads = Reads {
             known: &mut self.known,
             tails: &mut self.tails,
             folds: &mut self.folds,
-            roster: &mut self.roster,
+            machine: &mut self.machine,
+            looks: &mut self.looks,
             asks: self.asks,
+            inputs: &mut self.inputs,
         };
         self.schedule.serve(
             accepted.latest,
-            &moved,
-            |job, cause, awaited| reads.resolve(job, cause, awaited),
+            &execed,
+            !accepted.host.is_empty(),
+            |job, cause, seen, at| reads.resolve(job, cause, seen, at),
             clock,
         )
     }
 
-    /// Place the registry watches the awaited processes need
-    /// ([`crate::claude_registry::RegistryWatch::reconcile`], [`Cause::Placed`]).
-    fn settle(&mut self, clock: &mut impl FnMut() -> std::time::Instant) {
-        for _ in 0..PLACE_ROUNDS {
-            let fresh: HashSet<PathBuf> = self
-                .registry
-                .reconcile(&self.awaited())
-                .into_iter()
-                .collect();
-            if fresh.is_empty() {
-                return;
-            }
-            let jobs = self.schedule.awaited_in(&self.sessions_under(&fresh));
-            let mut reads = Reads {
-                known: &mut self.known,
-                tails: &mut self.tails,
-                folds: &mut self.folds,
-                roster: &mut self.roster,
-                asks: self.asks,
-            };
-            for job in jobs {
-                let row = reads.resolve(&job, Cause::Placed, true);
-                self.schedule.read(job.session, clock(), row);
-            }
+    /// The watched sessions, in session order, a look of which at one of `paths` stands
+    /// otherwise now than its read looked at it ([`Look::moved`]: one look at each such path).
+    fn moved_looks(&self, paths: &HashSet<PathBuf>) -> Vec<u64> {
+        if paths.is_empty() {
+            return Vec::new();
         }
+        let mut now: HashMap<&std::path::Path, Option<aterm_uds::file_watch::FileStamp>> =
+            HashMap::new();
+        let mut sessions: Vec<u64> =
+            self.looks
+                .iter()
+                .filter(|(session, _)| self.schedule.watched.contains_key(session))
+                .filter(|(_, looks)| {
+                    looks.iter().any(|look| {
+                        paths.contains(look.path())
+                            && look.moved_to(*now.entry(look.path()).or_insert_with(|| {
+                                aterm_uds::file_watch::FileStamp::of(look.path())
+                            }))
+                    })
+                })
+                .map(|(session, _)| *session)
+                .collect();
+        sessions.sort_unstable();
+        sessions
     }
 
-    /// The awaited processes whose Claude dir a read has resolved.
-    fn awaited(&self) -> Vec<crate::claude_registry::Awaited> {
-        let mut awaited: Vec<_> = self
+    /// Place a watch on every path each watched session's last read looked at, and let go of
+    /// every other ([`crate::claude_inputs::InputWatch::reconcile`]); each session a look of
+    /// which at a path placed afresh moved since its read is owed a read at its floor
+    /// ([`Cause::Placed`]): a write between a read and its watch's placement is read, never
+    /// missed. Then put each session on its arm ([`Self::arms`]) and let go of the process
+    /// watches of processes nothing is held for now.
+    fn settle(&mut self, clock: &mut impl FnMut() -> std::time::Instant) {
+        let watched = &self.schedule.watched;
+        self.looks
+            .retain(|session, _| watched.contains_key(session));
+        let wants: std::collections::BTreeMap<u64, Vec<(PathBuf, Heed)>> = self
+            .looks
+            .iter()
+            .map(|(session, looks)| {
+                (
+                    *session,
+                    looks
+                        .iter()
+                        .map(|look| (look.path.clone(), look.heed))
+                        .collect(),
+                )
+            })
+            .collect();
+        let placed = self.inputs.reconcile(&wants);
+        let fresh: HashSet<PathBuf> = placed.fresh.into_iter().collect();
+        let now = clock();
+        for session in self.moved_looks(&fresh) {
+            self.schedule.owe(session, now, Cause::Placed);
+        }
+        if self.watch_sign_in() {
+            for session in self.looking_at(Input::SignIn) {
+                self.schedule.owe(session, now, Cause::Input);
+            }
+        }
+        self.arms(&placed.clocks, now);
+        self.let_go_processes();
+    }
+
+    /// Watch the process that runs the sign-in the accounts outlook last read running
+    /// (`OutlookMemo::sign_in_running`), the sign-in lock's holder, for its exit: a sign-in
+    /// killed mid-run leaves its record, which no file watch then tells, and the outlook says
+    /// `signing in` until a read finds the holder gone ([`Self::serve_commands`]). `true` where
+    /// the holder is gone already as its watch is placed, which owes that read now.
+    fn watch_sign_in(&mut self) -> bool {
+        use crate::claude_inputs::Placement;
+        let running = self.machine.outlook.sign_in_running();
+        if self.sign_in.as_ref().map(|(held, _)| held) != running {
+            self.sign_in = running.and_then(|running| {
+                let holder = running.holder();
+                let pid = u32::try_from(holder.pid).ok()?;
+                Some((running.clone(), (pid, birth_seconds(holder.pid)?)))
+            });
+        }
+        let Some((running, (pid, started))) = &self.sign_in else {
+            return false;
+        };
+        let placement = self.inputs.watch_process(*pid, *started, || {
+            running
+                .lives()
+                .then(|| birth_seconds(running.holder().pid))
+                .flatten()
+        });
+        matches!(placement, Placement::Gone)
+    }
+
+    /// The watched sessions, in session order, whose last read looked at `input`.
+    fn looking_at(&self, input: Input) -> Vec<u64> {
+        let mut sessions: Vec<u64> = self
+            .looks
+            .iter()
+            .filter(|(session, _)| self.schedule.watched.contains_key(session))
+            .filter(|(_, looks)| looks.iter().any(|look| look.input == input))
+            .map(|(session, _)| *session)
+            .collect();
+        sessions.sort_unstable();
+        sessions
+    }
+
+    /// Put each watched session on its arm at `now` ([`Arm`], [`WatchSchedule::arm`]): the
+    /// watched arm where its last read was of Claude Code's registry ([`Found::watchable`]) and
+    /// looked at something, the settle placed a watch on every path it looked at (it is not one
+    /// of `unwatched`, [`crate::claude_inputs::Placed::clocks`]), and its process, the job's, is
+    /// held with a process watch standing on it, so its exit is heard, as is the exit of the
+    /// running sign-in's holder where it looked at its record ([`Self::watch_sign_in`]); the
+    /// clocks arm otherwise.
+    fn arms(&mut self, unwatched: &std::collections::BTreeSet<u64>, now: std::time::Instant) {
+        let sign_in_unheard = self
+            .sign_in
+            .as_ref()
+            .is_some_and(|(_, (pid, started))| !self.inputs.holds_process(*pid, *started));
+        let arms: Vec<(u64, Arm)> = self
             .schedule
             .watched
             .iter()
-            .filter(|(_, watch)| watch.awaiting)
-            .filter_map(|(session, watch)| {
-                let identity = self
-                    .known
-                    .get(session)
-                    .filter(|identity| identity.pid == watch.job.pgid)?;
-                Some(crate::claude_registry::Awaited {
-                    dir: identity.dir.clone()?,
-                    pid: u32::try_from(watch.job.pgid).ok()?,
-                })
+            .map(|(session, watch)| {
+                let heard = held_process(&self.known, *session)
+                    .filter(|(pid, _)| i32::try_from(*pid) == Ok(watch.job.pgid))
+                    .is_some_and(|(pid, started)| self.inputs.holds_process(pid, started));
+                let looks = self.looks.get(session);
+                let watched = watch.watchable
+                    && heard
+                    && !unwatched.contains(session)
+                    && looks.is_some_and(|looks| !looks.is_empty())
+                    && !(sign_in_unheard
+                        && looks.is_some_and(|looks| {
+                            looks.iter().any(|look| look.input == Input::SignIn)
+                        }));
+                (*session, if watched { Arm::Watched } else { Arm::Clocks })
             })
             .collect();
-        awaited.sort_by(|a, b| (&a.dir, a.pid).cmp(&(&b.dir, b.pid)));
-        awaited
-    }
-
-    /// The watched sessions whose process's Claude dir is one of `dirs`.
-    fn sessions_under(&self, dirs: &HashSet<PathBuf>) -> HashSet<u64> {
-        if dirs.is_empty() {
-            return HashSet::new();
+        for (session, arm) in arms {
+            self.schedule.arm(session, arm, now);
         }
-        self.schedule
-            .watched
-            .iter()
-            .filter(|(session, watch)| {
-                self.known.get(session).is_some_and(|identity| {
-                    identity.pid == watch.job.pgid
-                        && identity.dir.as_ref().is_some_and(|dir| dirs.contains(dir))
-                })
-            })
-            .map(|(session, _)| *session)
-            .collect()
     }
+}
+
+/// The process, by pid and kernel start time, `session`'s identity holds, where its start time is
+/// known.
+fn held_process(known: &HashMap<u64, Identity>, session: u64) -> Option<(u32, u64)> {
+    let identity = known.get(&session)?;
+    Some((u32::try_from(identity.pid).ok()?, identity.started?))
 }
 
 /// The resolver's state one read touches.
@@ -2497,21 +3029,38 @@ struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
     folds: &'a mut HashMap<u64, footer::FooterCache>,
-    roster: &'a mut RosterMemo,
+    machine: &'a mut MachineMemo,
+    /// Where a read's looks are kept ([`Resolver::looks`]).
+    looks: &'a mut HashMap<u64, Vec<Look>>,
     asks: Asks,
+    /// Where a read places its process's watch ([`Hearing::Watch`]).
+    inputs: &'a mut crate::claude_inputs::InputWatch,
 }
 
 impl Reads<'_> {
-    /// Read `job`'s session for `cause`, and say whether its process's registry row answered.
-    fn resolve(&mut self, job: &Job, cause: Cause, awaited: bool) -> bool {
-        let found = resolve_and_post(
-            self.known,
-            self.tails,
-            self.folds.entry(job.session).or_default(),
-            self.roster,
-            job,
-            self.asks,
-        );
+    /// Read `job`'s session for `cause` at `at`, keeping what the read looked at, and say
+    /// whether its process's registry row answered and when a time its facts hold comes due.
+    /// `awaited` and `arm` are its process's as the read starts ([`WatchSchedule::awaits`]), for
+    /// the dev row.
+    fn resolve(
+        &mut self,
+        job: &Job,
+        cause: Cause,
+        (awaited, arm): (bool, Arm),
+        at: std::time::Instant,
+    ) -> Found {
+        let (found, looks) = looks::record(|| {
+            resolve_and_post_hearing(
+                self.known,
+                self.tails,
+                self.folds.entry(job.session).or_default(),
+                self.machine,
+                job,
+                self.asks,
+                (at, Hearing::Watch(self.inputs)),
+            )
+        });
+        self.looks.insert(job.session, looks);
         if crate::holder_image::DEV_ROWS && awaited {
             let open = self
                 .known
@@ -2523,16 +3072,17 @@ impl Reads<'_> {
                 .record_row(
                     REGISTRY_READ,
                     format!(
-                        "cause={} pid={} open={} row={} {}",
+                        "cause={} pid={} open={} row={} arm={} {}",
                         cause.word(),
                         job.pgid,
                         u8::from(open),
                         u8::from(found.row),
+                        arm.word(),
                         crate::holder_image::dev_tail()
                     ),
                 );
         }
-        found.row
+        found
     }
 }
 
@@ -2647,6 +3197,22 @@ pub(crate) const REGISTRY_READ: &str = "registry-read";
 struct Found {
     /// The process's registry row answered the read ([`footer::read_pid`] gave facts).
     row: bool,
+    /// The earliest wall second after the read's at which the facts it posted can say
+    /// otherwise with no input moved: the times they hold come due (a figure's age limits and
+    /// reset, a wall's day words and end, the store's week, the tap's effort going silent, the
+    /// outlook the pane draws). `None` where none is ahead.
+    changes_after: Option<i64>,
+    /// [`Self::changes_after`] on the monotonic clock the resolver waits on, from the wall instant
+    /// the read judged at ([`resolve_facts`]); `None` where the read had no wall instant.
+    due: Option<std::time::Instant>,
+    /// The read was of Claude Code's registry, whose files the input watch places: not of an
+    /// agy, Muse Code or Kimi Code process, whose card reads its working directory, which no
+    /// event announces ([`Arm::Clocks`]).
+    watchable: bool,
+    /// The read's usage fold stopped at its budget with more to read
+    /// ([`footer::FooterCache::behind`]): the facts it posted show no tokens, models, runtime or
+    /// goal yet, and no file need move for the next read to show more ([`Cause::Behind`]).
+    behind: bool,
 }
 
 /// Forget what the resolver's reads hold for `session` ([`stop_session`], [`stop`]).
@@ -2678,6 +3244,14 @@ struct Identity {
     pid: i32,
     started: Option<u64>,
     dir: Option<PathBuf>,
+    /// The process's exec image as its last read gave it ([`Image`]); `None` before a read that
+    /// answered, and once the process watch heard it exec ([`Resolver::execed`]).
+    image: Option<Image>,
+    /// The process watch stands on this process and hears its exec
+    /// ([`crate::claude_inputs::Placement::Watched`]): the held image is the process's until
+    /// that watch says otherwise. Without it an image no registry row has confirmed
+    /// ([`Self::launch_for`]) is read again at each read, and a new row's is read for it.
+    exec_heard: bool,
     launch: LaunchFacts,
     /// The image (`startedAt`) `launch`, `login` and `argv` were read for.
     launch_for: Option<Option<u64>>,
@@ -2685,8 +3259,9 @@ struct Identity {
     login: Option<accounts::ProcessLogin>,
     /// The process's argv ([`aterm_agent::harness::resume::of_entry`]).
     argv: Vec<String>,
-    /// The head of the task a `spawn agent=` worker was started with, read once per image from the
-    /// file its exec environment names ([`crate::survey::task_prompt_of_env`]).
+    /// The head of the task a `spawn agent=` worker was started with, read once per image, as a
+    /// registry row confirms it, from the file its exec environment names ([`Image::task_file`],
+    /// [`crate::survey::task_prompt_of_file`]).
     task: Option<String>,
     /// The image and settings directory the stored-login verdict belongs to.
     login_checked_for: Option<(Option<u64>, PathBuf)>,
@@ -2698,17 +3273,141 @@ struct Identity {
     /// judged beside [`Self::route`] ([`tap_line_refusal`]: its options and settings;
     /// its home and login are judged at each read, [`tap_refusal`]); `None` where one would.
     unoffered: Option<tap::Refusal>,
-    /// Exact captured exec environment, fingerprinted without retaining credentials.
+    /// Exact captured exec environment of the image `launch` was read from, fingerprinted
+    /// without retaining credentials ([`Image::stamp`]).
     env_stamp: Option<[u8; 32]>,
     /// The login address the process's login file named at the first read of this image
     /// (`started`): a later read that names another says the login moved under the running
     /// process (another tab's `/login`), which the file's modification time cannot say, since
     /// Claude Code rewrites its home profile while it runs.
     first_seen: Option<(Option<u64>, String)>,
+    /// The process's usage-tap reading as the last read read it ([`Self::tap_reading`]).
+    tap: std::cell::RefCell<Option<TapHeld>>,
+}
+
+/// A usage tap's reading as one read read it: its file, the file's stamp just before, and what
+/// [`tap::Reading::read`] gave.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TapHeld {
+    path: PathBuf,
+    stamp: Option<aterm_uds::file_watch::FileStamp>,
+    read: Option<(tap::Reading, i64)>,
+}
+
+impl Identity {
+    /// Process `pid`, which the kernel started at `started`, as the resolver first meets it.
+    fn new(pid: i32, started: Option<u64>) -> Identity {
+        Identity {
+            pid,
+            started,
+            dir: None,
+            image: None,
+            exec_heard: false,
+            launch: LaunchFacts::default(),
+            launch_for: None,
+            login: None,
+            argv: Vec::new(),
+            task: None,
+            login_checked_for: None,
+            route: aterm_agent::harness::accounts::AuthRoute::Outside,
+            unoffered: None,
+            env_stamp: None,
+            first_seen: None,
+            tap: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// The reading this process's usage tap wrote for tab `tab` in `dir` since the process
+    /// started, and its modification second ([`tap::Reading::read`]): looked at first
+    /// ([`Input::Tap`], its contents alone: a re-report only moves its modification time, which
+    /// the effort's silence bound reads at the next read and no watch waits on) and read again
+    /// only where its stamp moved since the last read of it.
+    fn tap_reading(&self, dir: &std::path::Path, tab: &str) -> Option<(tap::Reading, i64)> {
+        let pid = u32::try_from(self.pid).ok()?;
+        let started = i64::try_from(self.started?).ok()?;
+        let path = dir.join(tap::file_name(tab, pid)?);
+        let stamp = looks::note(Input::Tap, &path, Heed::Contents);
+        let mut held = self.tap.borrow_mut();
+        if let Some(memo) = held.as_ref()
+            && memo.path == path
+            && memo.stamp == stamp
+        {
+            return memo.read.clone();
+        }
+        #[cfg(test)]
+        if stamp.is_some() {
+            crate::work_counts::gathered(Input::Tap);
+        }
+        let read = tap::Reading::read(dir, tab, pid, started);
+        *held = Some(TapHeld {
+            path,
+            stamp,
+            read: read.clone(),
+        });
+        read
+    }
+
+    /// Read the process's exec image into [`Self::image`] ([`exec_args`]).
+    fn read_image(&mut self, asks: &Asks) {
+        self.image = exec_args(asks, self.pid).map(|args| Image::of(&args, self.pid));
+    }
+
+    /// The held image, where it is the one the launch facts were read from: a read after an
+    /// exec that has not been confirmed by the new image's registry row is no image of this
+    /// process's, nor is any where none was read.
+    fn confirmed_image(&self) -> Option<&Image> {
+        self.image
+            .as_ref()
+            .filter(|image| image.argv == self.argv && Some(image.stamp) == self.env_stamp)
+    }
+}
+
+/// One read of a process's exec image, its argv and environment ([`exec_args`]), as the resolver
+/// holds it for that image's life: the image is read once, and again only where the process watch
+/// heard it exec, where no watch hears its exec and no registry row has confirmed it, or where a
+/// new row names another image with no watch to say whether it exec'd ([`Identity::exec_heard`]).
+/// What a read of the footer takes of the image is kept, and its environment only as far as the
+/// profile readers read it ([`ProfileEnv`]): no credential is held.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Image {
+    /// The Claude dir its environment names ([`claude_dir_of_args`]).
+    dir: Option<PathBuf>,
+    argv: Vec<String>,
+    /// What its argv and environment say of its launch ([`footer::launch_facts_of`]).
+    launch: LaunchFacts,
+    /// What its environment says of its login ([`login_of_args`]).
+    login: Option<accounts::ProcessLogin>,
+    /// The file a `spawn agent=` worker's task was written to, which its environment names
+    /// ([`crate::survey::task_file_of_env`]), read when a registry row confirms the image.
+    task_file: Option<PathBuf>,
+    /// The tab its environment names ([`aterm_types::domain::ENV_PARENT_SESSION_ID`]).
+    tab: Option<String>,
+    /// What the profile readers read of its environment.
+    env: ProfileEnv,
+    /// Its whole environment's fingerprint ([`exec_env_stamp`]).
+    stamp: [u8; 32],
+}
+
+impl Image {
+    /// What `args`, one read of process `pid`'s image, holds.
+    fn of(args: &atpkg::caller_shell::ProcArgs, pid: i32) -> Image {
+        Image {
+            dir: claude_dir_of_args(Some(args), pid),
+            argv: args.argv.clone(),
+            launch: footer::launch_facts_of(&args.argv, &args.env),
+            login: login_of_args(Some(args)),
+            task_file: crate::survey::task_file_of_env(&args.env),
+            tab: env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID),
+            env: ProfileEnv::of_exec_env(&args.env),
+            stamp: exec_env_stamp(&args.env),
+        }
+    }
 }
 
 /// The kernel's start time of `pid`.
 fn birth_seconds(pid: i32) -> Option<u64> {
+    #[cfg(test)]
+    crate::work_counts::birth_read();
     #[cfg(unix)]
     {
         crate::seamless::read_process_birth(pid).map(|birth| birth.seconds)
@@ -2718,6 +3417,13 @@ fn birth_seconds(pid: i32) -> Option<u64> {
         let _ = pid;
         None
     }
+}
+
+/// [`Asks::args`] of `pid`: one read of its exec image's argv and environment.
+fn exec_args(asks: &Asks, pid: i32) -> Option<atpkg::caller_shell::ProcArgs> {
+    #[cfg(test)]
+    crate::work_counts::exec_args_read();
+    (asks.args)(pid)
 }
 
 /// `pid`'s argv and environment at exec, when this platform lets it be read.
@@ -2769,74 +3475,99 @@ fn exec_env_stamp(env: &[String]) -> [u8; 32] {
     digest.finalize()
 }
 
-/// The accounts roster as the resolver last read it ([`accounts::footer_label`]).
+/// The machine's inputs as the resolver last read them, which every session's read shares
+/// ([`crate::footer_inputs`]): the accounts roster ([`accounts::footer_label`]), each login
+/// profile, and the accounts outlook, whose accounts stores the footer's own week and the
+/// roster's bindings read too.
 #[derive(Default)]
-struct RosterMemo {
-    /// When `load` was last asked.
-    read: Option<std::time::Instant>,
-    /// What it answered.
-    roster: Option<accounts::Roster>,
-    /// The accounts outlook over it, replayed at most once a minute
-    /// ([`crate::accounts_outlook::OutlookMemo`]).
+struct MachineMemo {
+    roster: RosterMemo,
+    profiles: crate::footer_inputs::Profiles,
+    /// The accounts outlook over the roster, replayed for its causes
+    /// ([`crate::accounts_outlook::OutlookMemo`]), with the accounts stores it holds
+    /// ([`crate::accounts_outlook::OutlookMemo::stores`]).
     outlook: crate::accounts_outlook::OutlookMemo,
 }
 
-impl RosterMemo {
-    /// The roster; `load` is asked at most every [`ROSTER_RECHECK`].
-    fn at(
-        &mut self,
-        now: std::time::Instant,
-        load: impl FnOnce() -> Option<accounts::Roster>,
-    ) -> Option<&accounts::Roster> {
-        if self
-            .read
-            .is_none_or(|at| now.saturating_duration_since(at) >= ROSTER_RECHECK)
-        {
-            self.read = Some(now);
-            self.roster = load();
-        }
-        self.roster.as_ref()
+impl MachineMemo {
+    /// The roster `asks` names at wall second `now` ([`RosterMemo::at`]).
+    fn roster(&mut self, asks: RosterAsks, now: i64) -> Option<&accounts::Roster> {
+        self.roster.at(asks, &mut self.outlook.stores, now)
     }
 
     /// The quota views of the pane whose account is `tab` at wall second `now`
-    /// ([`crate::accounts_outlook::OutlookMemo::quota`]), over the roster [`Self::at`] gives.
+    /// ([`crate::accounts_outlook::OutlookMemo::quota`]), over the roster [`Self::roster`]
+    /// gives.
     fn quota(
         &mut self,
-        (instant, now): (std::time::Instant, i64),
-        load: impl FnOnce() -> Option<accounts::Roster>,
+        now: i64,
+        asks: RosterAsks,
         tab: &str,
         (own, movable): (Option<aterm_agent::harness::outlook::Figure>, bool),
     ) -> Option<crate::accounts_outlook::QuotaViews> {
-        self.at(instant, load);
-        self.outlook
-            .quota((instant, now), self.roster.as_ref(), tab, own, movable)
+        let roster = self.roster.at(asks, &mut self.outlook.stores, now);
+        self.outlook.quota(now, roster, tab, own, movable)
     }
 }
 
-/// The roster beside the `aterm.toml` this window loads ([`accounts::default_roster_path`]).
-fn live_roster() -> Option<accounts::Roster> {
+/// The accounts roster as the resolver last read it ([`RosterAsks`]).
+#[derive(Default)]
+struct RosterMemo {
+    /// The roster file's, held by the stamps of its files ([`crate::footer_inputs::Roster`]).
+    files: crate::footer_inputs::Roster,
+    /// A test's roster as [`RosterAsks::Given`] gave it: asked once.
+    #[cfg(test)]
+    given: Option<Option<accounts::Roster>>,
+}
+
+impl RosterMemo {
+    /// The roster `asks` names at wall second `now`: the file's, bound with the bindings
+    /// `stores` holds, read again only where a file it was read or bound from moved
+    /// ([`crate::footer_inputs::Roster::at`]); `None` where there is none.
+    fn at(
+        &mut self,
+        asks: RosterAsks,
+        stores: &mut crate::footer_inputs::Stores,
+        now: i64,
+    ) -> Option<&accounts::Roster> {
+        match asks {
+            RosterAsks::Files(files) => {
+                let (path, state) = files()?;
+                self.files.at(&path, state.as_deref(), stores, now)
+            }
+            #[cfg(test)]
+            RosterAsks::Given(load) => self
+                .given
+                .get_or_insert_with(|| {
+                    crate::work_counts::roster_loaded();
+                    load()
+                })
+                .as_ref(),
+        }
+    }
+}
+
+/// Where a read's roster comes from ([`Asks::roster`]).
+#[derive(Clone, Copy)]
+enum RosterAsks {
+    /// The roster file, and the harness state whose login bindings a configured roster is
+    /// bound with (`None`: none to bind it in); `None` where no roster file is named.
+    Files(fn() -> Option<(PathBuf, Option<PathBuf>)>),
+    /// A test's roster, asked once per memo.
+    #[cfg(test)]
+    Given(fn() -> Option<accounts::Roster>),
+}
+
+/// The roster beside the `aterm.toml` this window loads ([`accounts::default_roster_path`]), and
+/// the harness state its bindings are kept in; none in a unit test.
+fn live_roster() -> Option<(PathBuf, Option<PathBuf>)> {
     if cfg!(test) {
         return None;
     }
-    roster_at(
-        &accounts::default_roster_path()?,
-        crate::harness_host::harness_state,
-    )
-}
-
-/// The roster at `path` (`None` where it does not load): an unconfigured one as it reads, never
-/// asking for the harness's `state`; a configured one bound to the logins kept there, or `None`
-/// where it cannot be.
-fn roster_at(
-    path: &std::path::Path,
-    state: impl FnOnce() -> Option<PathBuf>,
-) -> Option<accounts::Roster> {
-    let roster = accounts::Roster::load(path).ok()?;
-    if roster.rows.is_empty() {
-        return Some(roster);
-    }
-    let now = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok())?;
-    accounts::Store::at(&state()?).bound(&roster, now).ok()
+    Some((
+        accounts::default_roster_path()?,
+        crate::harness_host::harness_state(),
+    ))
 }
 
 /// What a read asks outside Claude Code's own files.
@@ -2844,10 +3575,20 @@ fn roster_at(
 struct Asks {
     args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
     files: fn(u32) -> Option<Vec<PathBuf>>,
-    roster: fn() -> Option<accounts::Roster>,
+    roster: RosterAsks,
     home: fn() -> Option<PathBuf>,
     route: fn(u32, &[String], &str) -> accounts::AuthRoute,
     tap: TapAsks,
+    /// On the window's ask at an instant ([`Command::Default`]): read agent `pid`'s settings
+    /// default where its last read is due then, for the permission chip's click and box
+    /// ([`crate::permission_click::note_default`]). No footer read asks it.
+    default: fn(u32, std::time::Instant),
+    /// After a read: read the model catalog of the Claude Code build that says `version` where
+    /// it is unread or its folder moved, for the model card and the effort slider
+    /// ([`crate::claude_facts::note_catalog`]).
+    catalog: fn(Option<&str>),
+    /// The wall clock a read at a monotonic instant judges its facts at.
+    wall: fn(std::time::Instant) -> std::time::SystemTime,
 }
 
 /// What a read asks of the usage tap ([`Asks::tap`]).
@@ -2916,12 +3657,13 @@ fn process_files(pid: u32) -> Option<Vec<PathBuf>> {
     aterm_uds::holders::open_files(pid).ok()
 }
 
-/// [`process_args`], [`process_files`], [`live_roster`], [`aterm_types::dirs::home_dir`] and
-/// [`live_tap`].
+/// [`process_args`], [`process_files`], [`live_roster`], [`aterm_types::dirs::home_dir`],
+/// [`live_tap`], the settings default and the catalog the window's surfaces read, on the
+/// system's wall clock.
 const LIVE: Asks = Asks {
     files: process_files,
     args: process_args,
-    roster: live_roster,
+    roster: RosterAsks::Files(live_roster),
     home: aterm_types::dirs::home_dir,
     route: crate::harness_netprobe::auth_route_of_agent,
     tap: TapAsks {
@@ -2930,16 +3672,77 @@ const LIVE: Asks = Asks {
         restart: crate::restart_act::offered_for,
         room: crate::restart_act::tap_room_for,
     },
+    default: crate::permission_click::note_default,
+    catalog: crate::claude_facts::note_catalog,
+    wall: system_wall,
 };
 
-/// [`resolve_into`], then wake the loop when the facts moved.
+/// The system's wall clock, whatever the instant.
+fn system_wall(_: std::time::Instant) -> std::time::SystemTime {
+    std::time::SystemTime::now()
+}
+
+/// Where a read hears its process's exec and exit from ([`resolve_and_post_hearing`]).
+enum Hearing<'a> {
+    /// The resolver's process watch, placed on the process before its image is read
+    /// ([`crate::claude_inputs::InputWatch::watch_process`]), so an exec between the two is
+    /// heard.
+    Watch(&'a mut crate::claude_inputs::InputWatch),
+    /// Nowhere: an exec is told only by a new registry row (a test's lone read).
+    #[cfg(test)]
+    Deaf,
+}
+
+impl Hearing<'_> {
+    /// Hear process `pid`, which the kernel started at `started`, for `identity`: whether the
+    /// watch on it hears its exec ([`Identity::exec_heard`]). A watch placed now on a process
+    /// whose image is held drops that image, which an exec before the watch may have changed
+    /// unheard.
+    fn hear(&mut self, identity: &mut Identity, pid: i32, started: u64) {
+        use crate::claude_inputs::Placement;
+        let placement = match (self, u32::try_from(pid)) {
+            (Hearing::Watch(registry), Ok(watched)) => {
+                registry.watch_process(watched, started, || birth_seconds(pid))
+            }
+            _ => Placement::Unwatched,
+        };
+        identity.exec_heard = match placement {
+            Placement::Watched { exec, fresh } => {
+                if exec && fresh {
+                    identity.image = None;
+                }
+                exec
+            }
+            Placement::Gone | Placement::Unwatched => false,
+        };
+    }
+}
+
+/// [`resolve_and_post_hearing`] of a read that hears no exec ([`Hearing::Deaf`]).
+#[cfg(test)]
 fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
     tails: &mut ProcessTails,
     fold: &mut footer::FooterCache,
-    roster: &mut RosterMemo,
+    machine: &mut MachineMemo,
     job: &Job,
     asks: Asks,
+    at: std::time::Instant,
+) -> Found {
+    resolve_and_post_hearing(known, tails, fold, machine, job, asks, (at, Hearing::Deaf))
+}
+
+/// [`resolve_into`] at `at`, then wake the loop when the facts moved. The process is heard
+/// (`hearing`) before its image is read, and its image is read only where none is held, or
+/// where none is heard to exec and no registry row has confirmed it ([`Identity::exec_heard`]).
+fn resolve_and_post_hearing(
+    known: &mut HashMap<u64, Identity>,
+    tails: &mut ProcessTails,
+    fold: &mut footer::FooterCache,
+    machine: &mut MachineMemo,
+    job: &Job,
+    asks: Asks,
+    (at, mut hearing): (std::time::Instant, Hearing<'_>),
 ) -> Found {
     let (session, timeline, pgid) = (job.session, &job.timeline, job.pgid);
     let started = birth_seconds(pgid);
@@ -2948,31 +3751,20 @@ fn resolve_and_post(
         .is_some_and(|id| id.pid == pgid && id.started.is_some() && id.started == started)
         .then(|| known.remove(&session))
         .flatten();
-    let mut identity = cached.unwrap_or_else(|| Identity {
-        pid: pgid,
-        started,
-        dir: None,
-        launch: LaunchFacts::default(),
-        launch_for: None,
-        login: None,
-        argv: Vec::new(),
-        task: None,
-        login_checked_for: None,
-        route: aterm_agent::harness::accounts::AuthRoute::Outside,
-        unoffered: None,
-        env_stamp: None,
-        first_seen: None,
-    });
-    if identity.launch_for.is_none() {
-        identity.dir = claude_dir_of_args((asks.args)(pgid).as_ref(), pgid);
+    let mut identity = cached.unwrap_or_else(|| Identity::new(pgid, started));
+    match started {
+        Some(started) => hearing.hear(&mut identity, pgid, started),
+        None => identity.exec_heard = false,
     }
-    let tail = tails.cache(
-        session,
-        identity.pid,
-        identity.started,
-        std::time::Instant::now(),
-    );
-    let (moved, found, logged) = resolve_into(timeline, &mut identity, tail, fold, roster, asks);
+    if identity.image.is_none() || (!identity.exec_heard && identity.launch_for.is_none()) {
+        identity.read_image(&asks);
+        if identity.launch_for.is_none() {
+            identity.dir = identity.image.as_ref().and_then(|image| image.dir.clone());
+        }
+    }
+    let tail = tails.cache(session, identity.pid, identity.started, at);
+    let (moved, found, logged) =
+        resolve_into(timeline, &mut identity, tail, fold, machine, asks, at);
     job.wake.after(session, &logged);
     // This build's model catalog, which the model card and the effort slider read, is read
     // here, off the main thread.
@@ -2981,12 +3773,7 @@ fn resolve_and_post(
         .unwrap_or_else(|p| p.into_inner())
         .claude_footer_shown()
         .and_then(|facts| facts.version);
-    crate::claude_facts::note_catalog(version.as_deref(), std::time::Instant::now());
-    // The default permission mode of this agent's settings, which the permission chip's click
-    // and box read, is read here too, off the main thread.
-    if let Ok(pid) = u32::try_from(pgid) {
-        crate::permission_click::note_default(pid, std::time::Instant::now());
-    }
+    (asks.catalog)(version.as_deref());
     if identity.dir.is_some() {
         known.insert(session, identity);
     }
@@ -3001,10 +3788,15 @@ fn resolve_and_post(
     found
 }
 
+/// The offsets [`offset_at_cached`] remembers, until a new local time zone forgets them
+/// ([`forget_offsets`]).
+static OFFSET_ANSWERS: Mutex<Vec<OffsetAnswer>> = Mutex::new(Vec::new());
+
 /// A zone's offset from UTC at the instant `unix`.
 fn offset_at_cached(zone: Option<&str>, unix: i64) -> Option<i64> {
-    static ANSWERS: Mutex<Vec<OffsetAnswer>> = Mutex::new(Vec::new());
-    let mut answers = ANSWERS.lock().unwrap_or_else(|p| p.into_inner());
+    #[cfg(test)]
+    crate::host_facts::noted("local_offset");
+    let mut answers = OFFSET_ANSWERS.lock().unwrap_or_else(|p| p.into_inner());
     cached_offset(
         &mut answers,
         zone,
@@ -3016,6 +3808,15 @@ fn offset_at_cached(zone: Option<&str>, unix: i64) -> Option<i64> {
 
 /// One remembered offset.
 type OffsetAnswer = (Option<String>, i64, std::time::Instant, i64);
+
+/// The local time zone was set ([`crate::host_facts::Bell::Zone`]): every offset remembered goes,
+/// a named zone's with the local one's (a zone's rules may have come with the new setting).
+fn forget_offsets() {
+    OFFSET_ANSWERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
 
 /// [`offset_at_cached`] over `answers` at `now`, asking `read` on a miss.
 fn cached_offset(
@@ -3045,15 +3846,16 @@ fn cached_offset(
     Some(offset)
 }
 
-/// Read `identity`'s facts and publish them on `timeline`; the first part is `Some` when they
-/// moved.
+/// Read `identity`'s facts at `at` and publish them on `timeline`; the first part is `Some` when
+/// they moved.
 fn resolve_into(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
-    roster: &mut RosterMemo,
+    machine: &mut MachineMemo,
     asks: Asks,
+    at: std::time::Instant,
 ) -> (
     Option<Option<PathBuf>>,
     Found,
@@ -3073,7 +3875,7 @@ fn resolve_into(
             fold.set_floor(arm.floor_ms, arm.adopted_ms, arm.given);
         }
     }
-    let (moved, found) = resolve_facts(timeline, identity, tail, fold, roster, asks);
+    let (moved, found) = resolve_facts(timeline, identity, tail, fold, machine, asks, at);
     let logged = if fold.steps_armed() {
         let batch = fold.take_steps();
         let applied = crate::session_log::transcript::apply_batch(
@@ -3092,19 +3894,23 @@ fn resolve_into(
     (moved, found, logged)
 }
 
-/// What a Claude Code process really runs on ([`observe::claude`]), read afresh from the login
-/// file its own exec environment `args` selects (the pass's one read of it, already checked to be
-/// this image's); unread where no home is known.
+/// What a Claude Code process really runs on ([`observe::claude_with`]), from the login file its
+/// own exec environment selects (`env`, what the profile readers read of the image the launch
+/// facts were read from), as `profiles` holds it: decoded once a change of the file, whichever
+/// session reads it ([`crate::footer_inputs::Profiles`]); unread where no home is known.
 fn claude_observation(
-    args: &atpkg::caller_shell::ProcArgs,
+    env: &ProfileEnv,
     asks: &Asks,
     route: accounts::AuthRoute,
     roster: Option<&accounts::Roster>,
+    profiles: &mut crate::footer_inputs::Profiles,
 ) -> Observation {
     let Some(home) = (asks.home)() else {
         return Observation::Unread;
     };
-    observe::claude(&args.env, &home, route, roster)
+    observe::claude_with(env.entries(), &home, route, roster, |path| {
+        profiles.read(path)
+    })
 }
 
 /// The account title's clause where the login file contradicts the roster's belief:
@@ -3145,39 +3951,48 @@ fn account_detail(
     ))
 }
 
-/// [`resolve_into`]'s footer half.
+/// [`resolve_into`]'s footer half, at `at` and the wall second [`Asks::wall`] gives it.
 fn resolve_facts(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
-    roster: &mut RosterMemo,
+    machine: &mut MachineMemo,
     asks: Asks,
+    at: std::time::Instant,
 ) -> (Option<Option<PathBuf>>, Found) {
+    let read_at = (asks.wall)(at);
     let clock = footer::ReadClock {
-        read_at: std::time::SystemTime::now(),
-        now: aterm_agent::supervise::limit::unix_now(),
+        read_at,
+        now: aterm_time::unix_secs_at(read_at).map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX)),
         offset_at: &offset_at_cached,
     };
-    resolve_facts_at(timeline, identity, tail, fold, roster, asks, &clock)
+    let (moved, mut found) =
+        resolve_facts_at(timeline, identity, tail, fold, machine, asks, (&clock, at));
+    found.due = found.changes_after.and_then(|second| {
+        let wall = std::time::UNIX_EPOCH + Duration::from_secs(u64::try_from(second).ok()?);
+        Some(at + wall.duration_since(read_at).ok()?)
+    });
+    (moved, found)
 }
 
-/// The same worker read with an explicit clock.
+/// The same worker read with an explicit clock: the wall clock it judges at, and its instant on
+/// the monotonic one, which paces what the outlook's memo looks at again.
 fn resolve_facts_at(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
-    roster: &mut RosterMemo,
+    machine: &mut MachineMemo,
     asks: Asks,
-    clock: &footer::ReadClock<'_>,
+    clock: (&footer::ReadClock<'_>, std::time::Instant),
 ) -> (Option<Option<PathBuf>>, Found) {
     resolve_facts_at_with_cwd(
         timeline,
         identity,
         tail,
         fold,
-        roster,
+        machine,
         (asks, aterm_sysprobe::process_cwd),
         clock,
     )
@@ -3189,10 +4004,12 @@ fn resolve_facts_at_with_cwd(
     identity: &mut Identity,
     tail: &mut footer::TailCache,
     fold: &mut footer::FooterCache,
-    roster: &mut RosterMemo,
+    machine: &mut MachineMemo,
     capabilities: (Asks, impl Fn(u32) -> Option<PathBuf>),
-    clock: &footer::ReadClock<'_>,
+    (clock, at): (&footer::ReadClock<'_>, std::time::Instant),
 ) -> (Option<Option<PathBuf>>, Found) {
+    #[cfg(test)]
+    crate::work_counts::footer_derived();
     let (asks, cwd_of) = capabilities;
     let prog = timeline
         .lock()
@@ -3220,20 +4037,25 @@ fn resolve_facts_at_with_cwd(
         .and_then(|(pid, dir)| {
             let launch = |entry: &footer::SessionEntry| {
                 if identity.launch_for != Some(entry.started_at) {
-                    let args = (asks.args)(identity.pid);
-                    identity.launch = args
-                        .as_ref()
-                        .map(|a| footer::launch_facts_of(&a.argv, &a.env))
-                        .unwrap_or_default();
-                    identity.login = login_of_args(args.as_ref());
-                    identity.task = args
-                        .as_ref()
-                        .and_then(|a| crate::survey::task_prompt_of_env(&a.env));
-                    if args.is_some() {
+                    // The held image is this row's where the process watch hears its exec, or
+                    // where no row had confirmed it (it was read at this read's start); a new
+                    // row's image no watch vouches for is read for it.
+                    if identity.image.is_none()
+                        || !(identity.exec_heard || identity.launch_for.is_none())
+                    {
+                        identity.read_image(&asks);
+                    }
+                    let image = identity.image.as_ref();
+                    identity.launch = image.map(|image| image.launch.clone()).unwrap_or_default();
+                    identity.login = image.and_then(|image| image.login.clone());
+                    identity.task = image
+                        .and_then(|image| image.task_file.as_deref())
+                        .and_then(crate::survey::task_prompt_of_file);
+                    if image.is_some() {
                         identity.launch_for = Some(entry.started_at);
                     }
-                    identity.env_stamp = args.as_ref().map(|args| exec_env_stamp(&args.env));
-                    identity.argv = args.map(|a| a.argv).unwrap_or_default();
+                    identity.env_stamp = image.map(|image| image.stamp);
+                    identity.argv = image.map(|image| image.argv.clone()).unwrap_or_default();
                 }
                 if is_claude
                     && identity
@@ -3316,7 +4138,7 @@ fn resolve_facts_at_with_cwd(
             dirs = Some((cwd.clone(), repo_root));
             generation = None;
             flight_generation = None;
-            let args = (asks.args)(identity.pid);
+            let args = exec_args(&asks, identity.pid);
             identity.login = login_of_args(args.as_ref());
             identity.task = args
                 .as_ref()
@@ -3483,33 +4305,44 @@ fn resolve_facts_at_with_cwd(
             });
         }
     }
-    // One read of the process's exec environment a pass, for its observed login and its
-    // profile alike; another image's environment says nothing of this one.
-    let args = if is_claude {
-        (asks.args)(identity.pid).filter(|args| {
-            args.argv == identity.argv && Some(exec_env_stamp(&args.env)) == identity.env_stamp
-        })
-    } else {
-        None
-    };
+    // The process's exec image as it was read once (no read of its own here), for its observed
+    // login and its profile alike: its tab and what the profile readers read of its
+    // environment. An image the launch facts were not read from (one read after an exec its
+    // registry row has not confirmed) says nothing of this one.
+    let image = is_claude
+        .then(|| identity.confirmed_image())
+        .flatten()
+        .map(|image| (image.tab.clone(), image.env.clone()));
     // What Claude Code says its session's effort is, now, outranks what the transcript says the
     // turn's requests were sent with ([`own_tap_effort`]): the footer names the effort the
     // session is set to, as Claude Code's own `/effort` does.
-    if let (Some(facts), Some(args)) = (facts.as_mut(), args.as_ref())
-        && let Some(level) = own_tap_effort(identity, args, asks, clock.now)
+    // The tap's level stands until its file goes silent; where it says what the transcript says,
+    // its silence moves nothing, and no deadline is armed for it.
+    let mut heard = None;
+    if let (Some(facts), Some((tab, _))) = (facts.as_mut(), image.as_ref())
+        && let Some((level, silent)) = own_tap_effort(identity, tab.as_deref(), asks, clock.now)
     {
-        facts.effort = Some(level);
-        (facts.effort_open, facts.effort_for) = (false, None);
+        let tapped = (Some(level), false, None);
+        if (
+            facts.effort.clone(),
+            facts.effort_open,
+            facts.effort_for.clone(),
+        ) != tapped
+        {
+            heard = Some(silent);
+        }
+        (facts.effort, facts.effort_open, facts.effort_for) = tapped;
     }
     // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`): the login file
-    // this process reads names its account, read afresh on every pass.
-    let seen = match (args.as_ref(), identity.login.as_ref()) {
-        (Some(args), Some(who)) => claude_observation(
-            args,
-            &asks,
-            who.route,
-            roster.at(std::time::Instant::now(), asks.roster),
-        ),
+    // this process reads names its account, as it stands on every pass (decoded again whenever
+    // its stamp moved).
+    let seen = match (image.as_ref(), identity.login.as_ref()) {
+        (Some((_, env)), Some(who)) => {
+            let roster = machine
+                .roster
+                .at(asks.roster, &mut machine.outlook.stores, clock.now);
+            claude_observation(env, &asks, who.route, roster, &mut machine.profiles)
+        }
         _ => Observation::Unread,
     };
     // The address this image's login file named at its first read: a later one that differs
@@ -3531,7 +4364,7 @@ fn resolve_facts_at_with_cwd(
         // Claude Code's roster judges a login of Claude Code's registry alone: an agy or Muse
         // Code pane carries an environment too, but no row of this roster names its account.
         let listed = uses_claude_registry
-            .then(|| roster.at(std::time::Instant::now(), asks.roster))
+            .then(|| machine.roster(asks.roster, clock.now))
             .flatten();
         let shown = listed.and_then(|listed| accounts::footer_account(listed, who, &seen));
         facts.account = shown.as_ref().and_then(|shown| shown.label.clone());
@@ -3549,8 +4382,9 @@ fn resolve_facts_at_with_cwd(
             accounts::AuthRoute::Stored | accounts::AuthRoute::VaultToken { .. } => who.route,
             accounts::AuthRoute::Outside => accounts::AuthRoute::Outside,
         });
-        // The vault token facts every surface maps, read here at most once a minute (§5.9).
-        crate::token_shown::refresh(clock.now);
+        // The vault token facts every surface maps (§5.9): asked of their own lane, which reads
+        // them when a file they come from moves or a time they show comes due, never here.
+        crate::token_lane::want();
     }
     let model = is_claude
         .then(|| {
@@ -3561,52 +4395,68 @@ fn resolve_facts_at_with_cwd(
         })
         .flatten();
     let read = is_claude.then(|| {
-        args.as_ref().and_then(|args| {
+        image.as_ref().and_then(|(tab, env)| {
             // A refused auth-source check says nothing, and a registry write
-            // missed during an exec cannot borrow the prior image's verdict (`args` is this
-            // image's). A profile read leaves a token route out: its profile may be stale (§5.7).
+            // missed during an exec cannot borrow the prior image's verdict (`image` is the one
+            // the launch facts were read from). A profile read leaves a token route out: its
+            // profile may be stale (§5.7).
             if !identity.route.is_stored() {
                 return None;
             }
-            let tab = env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID);
-            aterm_agent::harness::profile::subscription_and_plan_for(
-                &args.env,
-                &(asks.home)()?,
-                identity.dir.as_deref()?,
-                roster.at(std::time::Instant::now(), asks.roster),
-                clock.now,
-                model.as_deref(),
+            let tab = tab.clone();
+            let (home, records) = ((asks.home)()?, identity.dir.as_deref()?);
+            let roster = machine
+                .roster
+                .at(asks.roster, &mut machine.outlook.stores, clock.now);
+            let profiles = &mut machine.profiles;
+            aterm_agent::harness::profile::subscription_and_plan_with(
+                env.entries(),
+                &home,
+                records,
+                roster,
+                (clock.now, model.as_deref()),
+                |path| profiles.read(path),
             )
-            .map(|(shown, plan)| (shown, plan, tab))
+            .map(|(shown, plan, changes)| (shown, plan, tab, changes))
         })
     });
     let plan = read.as_ref().and_then(|read| read.as_ref()?.1);
+    // The times the facts hold come due here ([`Found::changes_after`]): the profile's first.
+    let mut terms: Vec<Option<i64>> = vec![
+        heard,
+        read.as_ref()
+            .and_then(|read| read.as_ref())
+            .and_then(|(.., changes)| *changes),
+    ];
     // The account gate passed for this process's profile (`gated`): its own figures read
     // below are its account's, and the store's are read only under its own login's label.
     let gated = read
         .as_ref()
         .and_then(|read| read.as_ref())
-        .map(|(_, _, tab)| tab.clone());
+        .map(|(_, _, tab, _)| tab.clone());
     let mut subscription = read.map(|read| read.map(|(shown, ..)| shown).unwrap_or_default());
     if let Some(facts) = facts.as_mut()
         && is_claude
     {
         if let Some(sub) = subscription.as_mut() {
-            weekly_into(
+            let roster = machine
+                .roster
+                .at(asks.roster, &mut machine.outlook.stores, clock.now);
+            terms.push(weekly_into(
                 sub,
                 facts,
                 identity,
                 gated.as_ref().map(Option::as_deref),
-                (roster.at(std::time::Instant::now(), asks.roster), &seen),
+                (roster, &seen, &mut machine.outlook.stores),
                 asks,
                 clock.now,
-            );
+            ));
         }
         facts.subscription = subscription.clone();
         facts.plan = plan;
         // The quota view of this pane's account (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-        // §2, §5.1), built of the outlook this thread replays at most once a minute, hashed
-        // into the fingerprint, never the raw clock. Only under the label the account gate
+        // §2, §5.1), built of the outlook this thread replays for its causes, hashed into the
+        // fingerprint, never the raw clock. Only under the label the account gate
         // passed (`sub.label`): a pane whose gate refused says no row's figures, as its weekly
         // says none. Its own figure is the weekly's: a wall's `out`, never an inferred 100%.
         let views = subscription.as_ref().and_then(|sub| {
@@ -3617,8 +4467,8 @@ fn resolve_facts_at_with_cwd(
                 sub.weekly_figure
                     .map(|f| aterm_agent::harness::outlook::Figure::of_weekly(&f, clock.now))
             };
-            let views = roster.quota(
-                (std::time::Instant::now(), clock.now),
+            let views = machine.quota(
+                clock.now,
                 asks.roster,
                 &label,
                 (own, identity.route.on_account()),
@@ -3627,10 +4477,15 @@ fn resolve_facts_at_with_cwd(
             if gated.is_some()
                 && let Some(title) = sub.plan.as_deref()
             {
-                roster.outlook.note_plan(&label, title, clock.now);
+                machine.outlook.note_plan(&label, title, clock.now);
             }
             views
         });
+        // A pane that asks the outlook for its view says otherwise when the outlook does, and is
+        // read when a replay the outlook owes comes due, so that replay runs.
+        if subscription.as_ref().is_some_and(|sub| sub.label.is_some()) {
+            terms.push(machine.outlook.changes_after(clock.now));
+        }
         (facts.quota, facts.quota_observed) =
             views.map_or((None, None), |views| (Some(views.view), views.observed));
     }
@@ -3687,17 +4542,38 @@ fn resolve_facts_at_with_cwd(
                 .flatten()
         };
         if let Some(kept) = kept {
-            weekly_into(
+            let roster = machine
+                .roster
+                .at(asks.roster, &mut machine.outlook.stores, clock.now);
+            terms.push(weekly_into(
                 sub,
                 &kept,
                 identity,
                 gated.as_ref().map(Option::as_deref),
-                (roster.at(std::time::Instant::now(), asks.roster), &seen),
+                (roster, &seen, &mut machine.outlook.stores),
                 asks,
                 clock.now,
-            );
+            ));
+            terms.push(kept.usage.as_ref().and_then(|u| u.changes_after(clock.now)));
         }
     }
+    // The transcript's wall, and a screen card's weekly reset (Muse Code's and `agy`'s).
+    if let Some(facts) = facts.as_ref() {
+        terms.push(
+            facts
+                .usage
+                .as_ref()
+                .and_then(|u| u.changes_after(clock.now)),
+        );
+        terms.push(
+            facts
+                .subscription
+                .as_ref()
+                .and_then(|sub| sub.weekly_reset.as_ref()?.at)
+                .filter(|at| *at > clock.now),
+        );
+    }
+    let changes_after = terms.into_iter().flatten().filter(|t| *t > clock.now).min();
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     if facts.is_none()
         && identity.started.is_some()
@@ -3708,7 +4584,16 @@ fn resolve_facts_at_with_cwd(
             kept.plan = plan;
             timeline.set_claude_footer(identity.pid, identity.started, Some(kept))
         });
-        return (moved.then_some(None), Found { row });
+        return (
+            moved.then_some(None),
+            Found {
+                row,
+                changes_after,
+                due: None,
+                watchable: uses_claude_registry,
+                behind: false,
+            },
+        );
     }
     if let Some(f) = facts.as_mut()
         && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
@@ -3721,12 +4606,21 @@ fn resolve_facts_at_with_cwd(
     timeline.set_claude_excerpts(identity.pid, excerpts);
     timeline.set_claude_side(identity.pid, side);
     if row {
-        timeline.note_claude_footer_read(identity.pid, std::time::Instant::now());
+        timeline.note_claude_footer_read(identity.pid, at);
     }
     let moved = timeline
         .set_claude_footer(identity.pid, identity.started, facts)
         .then_some(denied);
-    (moved, Found { row })
+    (
+        moved,
+        Found {
+            row,
+            changes_after,
+            due: None,
+            watchable: uses_claude_registry,
+            behind: row && fold.behind(),
+        },
+    )
 }
 
 /// The weekly figure a Claude Code footer shows in `sub`, one age rule for every source
@@ -3735,17 +4629,30 @@ fn resolve_facts_at_with_cwd(
 /// reading, [`own_tap_figure`], and the `/usage` cache) say it while current; else a 7d wall in
 /// the transcript, or one the accounts store holds of its own account ([`own_stored_week`]),
 /// says the wall ([`WEEKLY_OUT`]), never a percentage; else the newest figure still shown, its
-/// own or the store's; else why none is ([`WeeklyGap`]).
+/// own or the store's; else why none is ([`WeeklyGap`]). The store is the one `stores` holds.
+///
+/// Returns the earliest wall second after `now` at which the same inputs say otherwise: each
+/// figure it judged ([`WeeklyFigure::changes_after`]: the profile's, the tap's week and five
+/// hours, where a tap figure turns the `Stale` gap at `at + 3601` and leaves `ClockInvalid` at
+/// `at − 60`) and, where it read the store, the store's ([`StoreWeek::changes_after`]).
 fn weekly_into(
     sub: &mut SubscriptionDisplay,
     facts: &FooterFacts,
     identity: &Identity,
     gated: Option<Option<&str>>,
-    (roster, seen): (Option<&accounts::Roster>, &Observation),
+    (roster, seen, stores): (
+        Option<&accounts::Roster>,
+        &Observation,
+        &mut crate::footer_inputs::Stores,
+    ),
     asks: Asks,
     now: i64,
-) {
+) -> Option<i64> {
     let shown = |figure: Option<WeeklyFigure>| figure.filter(|f| f.words(now).is_some());
+    let mut terms: Vec<Option<i64>> = vec![
+        sub.weekly_figure.and_then(|f| f.changes_after(now)),
+        sub.five_hour.and_then(|f| f.changes_after(now)),
+    ];
     let tapped = tap::carried_by(&identity.argv);
     sub.label = gated.and_then(|_| own_label(identity, roster, seen, asks));
     let seat = gated.map(|_| (asks.tap.seat)());
@@ -3773,6 +4680,7 @@ fn weekly_into(
         sub.five_hour = WeeklyFigure::newer(sub.five_hour, five);
     }
     let reading = tap.and_then(|reading| own_tap_figure(identity, reading));
+    terms.extend([five, reading].map(|f| f.and_then(|f| f.changes_after(now))));
     let own = gated.and_then(|_| WeeklyFigure::newer(shown(sub.weekly_figure), shown(reading)));
     let walled = facts
         .usage
@@ -3783,12 +4691,14 @@ fn weekly_into(
         Some(own) => Some(own),
         None => {
             let store = seat.as_ref().and_then(|seat| {
-                own_stored_week(identity, (roster, seen), asks, seat.store.as_deref()?, now)
+                let store = seat.store.as_deref()?;
+                own_stored_week(identity, (roster, seen), asks, (stores, store), now)
             });
+            terms.push(store.and_then(|week| week.changes_after));
             if walled || store.is_some_and(|week| week.walled) {
                 sub.weekly = Some(WEEKLY_OUT.into());
                 (sub.weekly_figure, sub.weekly_gap) = (None, None);
-                return;
+                return terms.into_iter().flatten().min();
             }
             WeeklyFigure::newer(own, store.and_then(|week| week.figure))
         }
@@ -3811,7 +4721,7 @@ fn weekly_into(
             WeeklyGap::TapOff
         } else if !seat.named {
             WeeklyGap::Unoffered(tap::Refusal::Exe)
-        } else if let Some(why) = tap_refusal(identity, asks, roster, now) {
+        } else if let Some(why) = tap_refusal(identity, asks, (roster, stores), now) {
             WeeklyGap::Unoffered(why)
         } else if let Some((tab, pid)) = gated
             .flatten()
@@ -3827,14 +4737,13 @@ fn weekly_into(
             WeeklyGap::Unrestarted
         }
     });
+    terms.into_iter().flatten().min()
 }
 
 /// The newest reading this process's usage tap wrote for tab `tab` in `dir` since the process
 /// started ([`tap::Reading::read`]), whatever its age.
 fn own_tap_reading(identity: &Identity, tab: &str, dir: &std::path::Path) -> Option<tap::Reading> {
-    let pid = u32::try_from(identity.pid).ok()?;
-    let started = i64::try_from(identity.started?).ok()?;
-    tap::Reading::read(dir, tab, pid, started).map(|(reading, _)| reading)
+    identity.tap_reading(dir, tab).map(|(reading, _)| reading)
 }
 
 /// THE EFFORT CLAUDE CODE SAYS THIS PROCESS'S SESSION IS SET TO, from its own usage tap: the
@@ -3846,31 +4755,34 @@ fn own_tap_reading(identity: &Identity, tab: &str, dir: &std::path::Path) -> Opt
 /// runs; the transcript names the effort that turn's requests are sent with, and records the
 /// switch only once the turn's reply lands.
 ///
-/// Read for a process whose own line carries aterm's tap ([`tap::carried_by`]) in the tab its
-/// exec environment `args` names, from the file that tab and pid name, written since the
-/// process started ([`tap::Reading::read`]), and only while that file is heard
+/// Read for a process whose own line carries aterm's tap ([`tap::carried_by`]) in the `tab` its
+/// exec environment names ([`Image::tab`]), from the file that tab and pid name, written since
+/// the process started ([`tap::Reading::read`]), and only while that file is heard
 /// ([`tap::SILENT_S`] of `now`, the bound [`tap::Silence`] judges a tap by). `None` otherwise
-/// (no tap, no reading yet, a tap gone silent, a build or model that names no effort), and the
-/// transcript's effort stands: never a level nothing reported.
+/// (no tap, no tab, no reading yet, a tap gone silent, a build or model that names no effort),
+/// and the transcript's effort stands: never a level nothing reported. With the level, the
+/// wall second its file goes silent at (`written + SILENT_S + 1`), when the transcript's effort
+/// stands again unless the tap writes before it.
 fn own_tap_effort(
     identity: &Identity,
-    args: &atpkg::caller_shell::ProcArgs,
+    tab: Option<&str>,
     asks: Asks,
     now: i64,
-) -> Option<String> {
+) -> Option<(String, i64)> {
     if !tap::carried_by(&identity.argv) {
         return None;
     }
-    let tab = env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID)?;
+    let tab = tab?;
     let dir = (asks.tap.seat)().dir?;
-    let pid = u32::try_from(identity.pid).ok()?;
-    let started = i64::try_from(identity.started?).ok()?;
-    let (reading, written) = tap::Reading::read(&dir, &tab, pid, started)?;
+    let (reading, written) = identity.tap_reading(&dir, tab)?;
     if now.saturating_sub(written) > tap::SILENT_S {
         return None;
     }
     let level = reading.effort?;
-    Some(footer::effort_level(&level).map_or(level, str::to_owned))
+    Some((
+        footer::effort_level(&level).map_or(level, str::to_owned),
+        written.saturating_add(tap::SILENT_S + 1),
+    ))
 }
 
 /// This process's own usage-tap figure: the week of its tap's `reading` ([`own_tap_reading`]),
@@ -3894,13 +4806,13 @@ fn own_tap_figure(identity: &Identity, reading: tap::Reading) -> Option<WeeklyFi
 /// Why no relaunch line would carry the usage tap for this process (`relaunch::tap_of`'s and
 /// `tap::gate`'s refusals), judged at each read: a Claude home or `HOME` of its own; a login no
 /// line taps as the machine's own (`tap::Armed::lone_for`: not the default one, nor the lone one
-/// the store binds `roster`'s one row to, nor, where the machine has no lone one, one `roster`
-/// names); else the image's own reason ([`tap_line_refusal`]). `None` where a line would, and
-/// where its login was not read.
+/// the store binds `roster`'s one row to, by the bindings `stores` holds, nor, where the machine
+/// has no lone one, one `roster` names); else the image's own reason ([`tap_line_refusal`]).
+/// `None` where a line would, and where its login was not read.
 fn tap_refusal(
     identity: &Identity,
     asks: Asks,
-    roster: Option<&accounts::Roster>,
+    (roster, stores): (Option<&accounts::Roster>, &mut crate::footer_inputs::Stores),
     now: i64,
 ) -> Option<tap::Refusal> {
     let login = identity.login.as_ref()?;
@@ -3915,9 +4827,8 @@ fn tap_refusal(
             .filter(|roster| roster.rows.len() == 1)
             .and_then(|roster| {
                 let store = (asks.tap.seat)().store?;
-                accounts::Store::at(&store)
-                    .bound(roster, now)
-                    .ok()?
+                let logins = stores.logins(&store, now).value().as_ref().ok()?;
+                accounts::bound(roster, logins)
                     .lone_login()
                     .map(str::to_owned)
             });
@@ -3956,6 +4867,10 @@ struct StoreWeek {
     /// The newer of its usage-tap figure (not cut by a limit reset since) and its sample's,
     /// while [`WeeklyFigure::words`] still says one.
     figure: Option<WeeklyFigure>,
+    /// The earliest wall second after the read at which the store's week says otherwise with
+    /// nothing saved since: its weekly wall's end, and each figure's terms
+    /// ([`WeeklyFigure::changes_after`]) while its window runs, the window's own end included.
+    changes_after: Option<i64>,
 }
 
 /// The store's figures of `acct`'s week at `now`, whatever their age: its usage-tap figure
@@ -3994,27 +4909,56 @@ pub(crate) fn store_figures(acct: &accounts::Account, now: i64) -> [Option<Weekl
 fn store_week(acct: &accounts::Account, now: i64) -> StoreWeek {
     let shown = |figure: Option<WeeklyFigure>| figure.filter(|f| f.words(now).is_some());
     let [tapped, sampled] = store_figures(acct, now);
+    let wall = acct
+        .walls
+        .get(accounts::WEEK_LIMIT)
+        .filter(|w| !w.cleared)
+        .and_then(|w| w.until)
+        .filter(|until| *until > now);
+    // A figure `store_figures` left out for its stamp ahead of the skew comes within it at its
+    // `at − 60`: each window that runs is judged whatever its figure's age.
+    let window = acct
+        .windows
+        .get(accounts::WEEK_LIMIT)
+        .filter(|w| w.current(now) && !w.cut())
+        .map(|w| WeeklyFigure {
+            used_x10: w.pct_x10,
+            resets_at: w.reset,
+            at: w.at,
+        });
+    let sample = acct.sample.as_ref().and_then(|sample| {
+        let (pct, resets_at) = sample.week(now)?;
+        Some(WeeklyFigure {
+            used_x10: pct.saturating_mul(10),
+            resets_at,
+            at: sample.week_read_at.unwrap_or(sample.at),
+        })
+    });
     StoreWeek {
-        walled: acct
-            .walls
-            .get(accounts::WEEK_LIMIT)
-            .is_some_and(|w| !w.cleared && w.until.is_some_and(|until| until > now)),
+        walled: wall.is_some(),
         figure: WeeklyFigure::newer(shown(tapped), shown(sampled)),
+        changes_after: [window, sample]
+            .into_iter()
+            .flatten()
+            .filter_map(|figure| figure.changes_after(now))
+            .chain(wall)
+            .min(),
     }
 }
 
 /// [`store_week`] of this process's own account ([`own_label`]) from the accounts store under
-/// harness state `store`; `None` where no label is judged, so no other account's week or wall
-/// reaches its footer.
+/// harness state `store`, as `stores` holds it (loaded once a change of its files,
+/// [`crate::footer_inputs::Stores::state`]); `None` where no label is judged, so no other
+/// account's week or wall reaches its footer.
 fn own_stored_week(
     identity: &Identity,
     (roster, seen): (Option<&accounts::Roster>, &Observation),
     asks: Asks,
-    store: &std::path::Path,
+    (stores, store): (&mut crate::footer_inputs::Stores, &std::path::Path),
     now: i64,
 ) -> Option<StoreWeek> {
     let label = own_label(identity, roster, seen, asks)?;
-    let (state, _) = accounts::Store::at(store).load(now).ok()?;
+    let state = stores.state(store, now).value().as_ref().ok()?;
     Some(store_week(state.accounts.get(&label)?, now))
 }
 
@@ -11353,6 +12297,11 @@ mod registry_tests;
 #[cfg(test)]
 #[path = "claude_footer_rig_tests.rs"]
 pub(crate) mod rig;
+
+/// What the resolver's reads cost on a scripted clock (`cause_tests::CauseRig`).
+#[cfg(all(test, unix))]
+#[path = "claude_footer_cause_tests.rs"]
+mod cause_tests;
 
 #[cfg(test)]
 #[path = "claude_footer_tests.rs"]

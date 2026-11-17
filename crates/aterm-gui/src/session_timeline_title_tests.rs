@@ -79,7 +79,7 @@ fn meta_set_title_writes_a_desc_claim() {
     );
     let listed = described(&h);
     assert!(
-        listed.contains("\ntitle - value=build%20agent by=ctl rank=ctl behind=- seq="),
+        listed.contains("\ntitle - value=build%20agent by=ctl rank=ctl ev=declared behind=- seq="),
         "{listed}"
     );
 
@@ -117,9 +117,8 @@ fn meta_set_title_writes_a_desc_claim() {
 /// answers OK, and leaves the title; its `meta unset title` withdraws its own claim and does
 /// not clear the person's.
 ///
-/// CONTROL: once the person clears their own title, the same control client's claim, still
-/// held, becomes the title; and with no claim of a person's a control client's stands at
-/// once (`meta_set_title_writes_a_desc_claim`).
+/// CONTROL: the person's own clear does remove their title, and the client's claim under it
+/// with it; and with no claim of a person's the same control client's title stands at once.
 #[test]
 fn a_ctl_title_under_a_persons_rename_is_listed_and_leaves_the_title() {
     let (h, store) = session(2);
@@ -161,14 +160,56 @@ fn a_ctl_title_under_a_persons_rename_is_listed_and_leaves_the_title() {
     );
     assert_eq!(title(&h, MetaEdit::Clear, Actor::Human), Ok(true));
     assert_eq!(
-        pin(&h).as_deref(),
-        Some("review the fold"),
-        "with the person's claim withdrawn the client's stands"
+        pin(&h),
+        None,
+        "a person's clear takes off their title and the client's under it"
     );
+    assert!(described(&h).contains("\ntitle - value=-\n"));
+    assert!(!described(&h).contains(" other "), "{}", described(&h));
     assert_eq!(
         records(&h).last().map(String::as_str),
-        Some("meta field=title value=review%20the%20fold by=human src=meta conf=exact"),
+        Some("meta field=title by=human src=meta conf=exact"),
         "the meta record names who moved the title"
+    );
+    assert_eq!(
+        meta(&h, &store, "set title review the fold"),
+        ("OK\n".to_string(), true),
+        "with no claim of a person's the client's stands"
+    );
+    assert_eq!(pin(&h).as_deref(), Some("review the fold"));
+}
+
+/// A withdrawal that leaves another author's claim standing makes that claim the title: the
+/// session's own program takes back the title it set over a control client's, and the pin
+/// moves to the client's text. The `meta` record carries the title that now stands and names
+/// who moved it, the withdrawer, not the author of the claim left standing.
+///
+/// CONTROL: with no claim under it the same withdrawal leaves nothing pinned, and its `meta`
+/// record carries no value.
+#[test]
+fn a_withdrawal_pins_the_claim_it_leaves_standing() {
+    let (h, store) = session(15);
+    assert_eq!(meta(&h, &store, "set title B"), ("OK\n".to_string(), true));
+    assert_eq!(title(&h, MetaEdit::Set("A"), Actor::Harness), Ok(true));
+    assert_eq!(pin(&h).as_deref(), Some("A"), "the program's stands");
+    assert_eq!(title(&h, MetaEdit::Clear, Actor::Harness), Ok(true));
+    assert_eq!(pin(&h).as_deref(), Some("B"), "the client's claim is left");
+    assert_eq!(
+        records(&h)[4..],
+        [
+            "desc field=title by=harness src=mark conf=claim",
+            "meta field=title value=B by=harness src=meta conf=exact",
+        ],
+        "the meta record carries the survivor's title and names who moved it"
+    );
+
+    let (h, _store) = session(16);
+    assert_eq!(title(&h, MetaEdit::Set("A"), Actor::Harness), Ok(true));
+    assert_eq!(title(&h, MetaEdit::Clear, Actor::Harness), Ok(true));
+    assert_eq!(pin(&h), None, "nothing was under it");
+    assert_eq!(
+        records(&h).last().map(String::as_str),
+        Some("meta field=title by=harness src=meta conf=exact")
     );
 }
 
@@ -359,66 +400,6 @@ fn a_restored_title_is_no_ones_claim() {
     assert_eq!(pin(&h).as_deref(), Some("mine now"));
 }
 
-/// A person who commits the rename field as it opened, holding the pinned title they do not
-/// claim, states nothing: no claim of theirs is written, so the title stays its author's and
-/// follows that author's next write. The same holds over a restored title nobody claims.
-///
-/// CONTROL: a person's commit of an edited text does take the title, and the control
-/// client's next write is listed and leaves it.
-#[test]
-fn an_unedited_rename_commit_leaves_the_title_its_authors() {
-    let (h, store) = session(9);
-    assert_eq!(meta(&h, &store, "set title C"), ("OK\n".to_string(), true));
-    let before = records(&h);
-    assert_eq!(title(&h, MetaEdit::Set("C"), Actor::Human), Ok(false));
-    assert_eq!(title(&h, MetaEdit::Set("  C "), Actor::Human), Ok(false));
-    assert_eq!(records(&h), before, "an unedited commit writes no record");
-    assert!(!described(&h).contains(" by=human "), "{}", described(&h));
-    assert_eq!(meta(&h, &store, "set title D"), ("OK\n".to_string(), true));
-    assert_eq!(
-        pin(&h).as_deref(),
-        Some("D"),
-        "the title follows its author"
-    );
-
-    let (h, store) = session(10);
-    let carried = SessionMeta {
-        user_title: Some("from last time".into()),
-        ..SessionMeta::default()
-    };
-    assert!(restore_carried_meta(&h.ctx, &carried));
-    assert_eq!(
-        title(&h, MetaEdit::Set("from last time"), Actor::Human),
-        Ok(false)
-    );
-    assert!(
-        records(&h).iter().all(|l| !l.starts_with("desc ")),
-        "an unedited commit of a restored title writes no claim: {:?}",
-        records(&h)
-    );
-    assert_eq!(pin(&h).as_deref(), Some("from last time"));
-    assert_eq!(
-        meta(&h, &store, "set title mine now"),
-        ("OK\n".to_string(), true),
-        "no claim of a person's stands over it"
-    );
-    assert_eq!(pin(&h).as_deref(), Some("mine now"));
-
-    let (h, store) = session(11);
-    assert_eq!(meta(&h, &store, "set title C"), ("OK\n".to_string(), true));
-    assert_eq!(title(&h, MetaEdit::Set("C2"), Actor::Human), Ok(true));
-    assert_eq!(pin(&h).as_deref(), Some("C2"));
-    assert_eq!(
-        records(&h)[2..],
-        [
-            "desc field=title value=C2 by=human src=mark conf=claim",
-            "meta field=title value=C2 by=human src=meta conf=exact",
-        ]
-    );
-    assert_eq!(meta(&h, &store, "set title D"), ("OK\n".to_string(), false));
-    assert_eq!(pin(&h).as_deref(), Some("C2"), "an edited commit is theirs");
-}
-
 /// A time-limited claim is never pinned, because the pin has no clock to take it back: under
 /// a program's live `ttl=` title claim, which outranks a control client's, a listed author's
 /// title write leaves the pin unset and the control client's pins the client's own text. A
@@ -542,5 +523,46 @@ fn a_title_write_spends_the_authors_mark_tokens_and_a_person_spends_none() {
         meta(&h, &store, "set title one more"),
         ("OK\n".to_string(), false),
         "taken, and listed under the person's"
+    );
+}
+
+/// A PROTOCOL LINE IS NO CLAIM FROM A CONTROL CLIENT: a description through the `mark` verb and a
+/// title through `meta set title` that the harness's turn-end readers would read a head in (the
+/// land check's answer, a need) are refused by name, and nothing is written or pinned.
+/// CONTROL: a person's rename to the same text is written and pinned, since a person is the one
+/// author the rule exempts.
+#[test]
+fn a_protocol_line_from_a_control_client_is_refused_and_a_persons_is_not() {
+    let (h, store) = session(18);
+    for text in ["LANDED", "NEEDS YOU: sign in to the vault"] {
+        let rest = format!(
+            "- desc field=description value={}",
+            aterm_codec::pct::encode(text)
+        );
+        assert_eq!(
+            crate::session_log::cmd_mark(&h.ctx, Actor::Ctl, true, &rest).0,
+            "ERR mark: value reads as a protocol line\n",
+            "{text}"
+        );
+        assert_eq!(
+            meta(&h, &store, &format!("set title {text}")),
+            ("ERR title reads as a protocol line\n".to_string(), false),
+            "{text}"
+        );
+    }
+    assert_eq!(records(&h), Vec::<String>::new(), "nothing written");
+    assert_eq!(pin(&h), None);
+    assert_eq!(
+        title(&h, MetaEdit::Set("LANDED"), Actor::Human),
+        Ok(true),
+        "CONTROL: a person's rename"
+    );
+    assert_eq!(pin(&h).as_deref(), Some("LANDED"));
+    assert!(
+        records(&h)
+            .iter()
+            .any(|r| r.starts_with("desc field=title value=LANDED by=human ")),
+        "{:?}",
+        records(&h)
     );
 }

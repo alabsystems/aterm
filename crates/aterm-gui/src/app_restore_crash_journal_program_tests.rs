@@ -491,6 +491,9 @@ fn an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_captur
             session: 0,
             reply: grid,
         },
+        crate::Wake::LeaseChanged {
+            session: aterm_session::SessionId::parse("tdr1vetaken").expect("a tab ID"),
+        },
     ] {
         let said = format!("{wake:?}");
         app.note_wake_activity(&wake);
@@ -556,4 +559,76 @@ fn a_control_reads_handler_leaves_the_restore_image_as_it_found_it() {
         before,
         "NEGATIVE CONTROL: a session's pinned title is in the image, so the comparison can fail"
     );
+}
+
+/// What a lease change's handler (`App::on_presence_wake`, the arm of `Wake::LeaseChanged`)
+/// leaves of the desk: the session's presence names the lease's holder after the take and
+/// nobody after the release, and the restore image captured after each equals the one captured
+/// before the take.
+///
+/// Negative control, run once by hand and restored by copy: `Wake::LeaseChanged` taken out of
+/// `Wake::only_observes` fails
+/// `an_observation_wake_owes_the_journal_nothing_and_a_desk_wake_owes_it_a_capture` with
+/// `LeaseChanged { session: SessionId("tdr1vetaken") } refreshes an observation no restore image
+/// reads`.
+#[test]
+fn a_lease_changes_handler_leaves_the_restore_image_as_it_found_it() {
+    crate::fabric::with_link_reset(|| {
+        let mut app = App::headless_for_test();
+        let session = app.next_session_id;
+        app.push_stub_tab(WindowId(0), crate::stub_session(session));
+        let ctx = app
+            .pool
+            .get(session)
+            .expect("the stub is pooled")
+            .ctx
+            .clone();
+        let lease = |taken: Option<crate::Lease>| {
+            *ctx.turn_lease
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = taken;
+        };
+        let before = app.capture_restore_manifest();
+        lease(Some(crate::Lease::Drive {
+            holder: "client".to_string(),
+            expires_us: crate::metrics::now_us() + 60_000_000,
+            conn: None,
+            hard: true,
+            here: false,
+            holder_pid: None,
+        }));
+        app.on_presence_wake(&ctx.self_id);
+        let tail = app.presence_status_tail(session);
+        assert!(
+            tail.starts_with("hand=lease:client hand_pid=- "),
+            "CONTROL: the handler read the lease: {tail}"
+        );
+        assert_eq!(
+            app.capture_restore_manifest(),
+            before,
+            "the lease taken wrote nothing a restore image reads"
+        );
+        lease(None);
+        app.on_presence_wake(&ctx.self_id);
+        let tail = app.presence_status_tail(session);
+        assert!(
+            tail.starts_with("hand=- hand_pid=- "),
+            "CONTROL: and its release: {tail}"
+        );
+        assert_eq!(
+            app.capture_restore_manifest(),
+            before,
+            "the lease released wrote nothing a restore image reads"
+        );
+        ctx.meta
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .user_title = Some("moved".to_string());
+        assert_ne!(
+            app.capture_restore_manifest(),
+            before,
+            "NEGATIVE CONTROL: a session's pinned title is in the image, so the comparison can \
+             fail"
+        );
+    });
 }

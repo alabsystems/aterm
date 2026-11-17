@@ -178,6 +178,14 @@ fn the_http_stub_rejects_an_incomplete_header_before_another_request() {
     assert_eq!(ended.unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
 }
 
+/// The HTTP 204 receipt one [`observe_receipts`] gives, where nothing holds the state lock.
+pub(super) fn read_204(paths: &Paths, config: &Config) -> Option<VaultHttp204Response> {
+    match observe_receipts(paths, config).unwrap() {
+        Observed::Read(receipts) => receipts.http204,
+        other => panic!("{other:?}: the fixture's state lock is there and free"),
+    }
+}
+
 pub(super) fn fixture(etag: Option<&str>, with_recipient: bool) -> Fixture {
     let root = aterm_tempfile::tempdir().unwrap();
     let paths = Paths::for_home(&root.path().join("member"));
@@ -226,11 +234,9 @@ fn actual_204_with_any_etag_is_retained_without_admission_and_reads_preserve_rec
     for etag in [Some("\"7\""), None, Some("not-a-sequence")] {
         let f = fixture(etag, false);
         let before = std::fs::read(f.paths.state_file()).unwrap();
-        assert_eq!(observe_http204_response(&f.paths, &f.config).unwrap(), None);
+        assert_eq!(read_204(&f.paths, &f.config), None);
         retain(&f.paths, &f.config, &f.request, Some(&f.reply));
-        let observed = observe_http204_response(&f.paths, &f.config)
-            .unwrap()
-            .unwrap();
+        let observed = read_204(&f.paths, &f.config).unwrap();
         assert_eq!(observed.source(), VaultNetworkSource::ConfiguredUrl);
         assert_eq!(observed.responded_at_ms(), f.reply.responded_at_ms());
         let mut state = load_state(&f.paths).unwrap();
@@ -245,10 +251,7 @@ fn actual_204_with_any_etag_is_retained_without_admission_and_reads_preserve_rec
         ));
         let after = std::fs::read(f.paths.state_file()).unwrap();
         assert_ne!(before, after);
-        assert_eq!(
-            observe_http204_response(&f.paths, &f.config).unwrap(),
-            Some(observed)
-        );
+        assert_eq!(read_204(&f.paths, &f.config), Some(observed));
         assert_eq!(
             std::fs::read(f.paths.state_file()).unwrap(),
             after,
@@ -259,7 +262,7 @@ fn actual_204_with_any_etag_is_retained_without_admission_and_reads_preserve_rec
         state.failed = true;
         save_state(&f.paths, &state).unwrap();
         assert_eq!(
-            observe_http204_response(&f.paths, &f.config).unwrap(),
+            read_204(&f.paths, &f.config),
             Some(observed),
             "route evidence is independent of materialization"
         );
@@ -380,26 +383,21 @@ fn retain_never_creates_or_repairs_a_lock_and_a_busy_lock_changes_no_state() {
 fn full_config_and_optional_recipient_context_gate_the_independent_read() {
     let f = fixture(None, false);
     retain(&f.paths, &f.config, &f.request, Some(&f.reply));
-    let original = observe_http204_response(&f.paths, &f.config)
-        .unwrap()
-        .unwrap();
+    let original = read_204(&f.paths, &f.config).unwrap();
     let mut changed = f.config.clone();
     changed.host.push_str("-changed");
     save_config(&f.paths, &changed).unwrap();
-    assert_eq!(observe_http204_response(&f.paths, &f.config).unwrap(), None);
-    assert_eq!(observe_http204_response(&f.paths, &changed).unwrap(), None);
+    assert_eq!(read_204(&f.paths, &f.config), None);
+    assert_eq!(read_204(&f.paths, &changed), None);
     save_config(&f.paths, &f.config).unwrap();
     machine_identity(&f.paths).unwrap();
     assert_eq!(
-        observe_http204_response(&f.paths, &f.config).unwrap(),
+        read_204(&f.paths, &f.config),
         None,
         "None to a new key is a different local context"
     );
     std::fs::remove_file(f.paths.identity_file()).unwrap();
-    assert_eq!(
-        observe_http204_response(&f.paths, &f.config).unwrap(),
-        Some(original)
-    );
+    assert_eq!(read_204(&f.paths, &f.config), Some(original));
 }
 
 #[test]
@@ -434,5 +432,5 @@ fn malformed_optional_receipt_does_not_block_loading_the_ordinary_state() {
     assert_eq!(state.membership, Stored::None);
     assert_eq!(state.heard, 0);
     save_state(&f.paths, &state).unwrap();
-    assert_eq!(observe_http204_response(&f.paths, &f.config).unwrap(), None);
+    assert_eq!(read_204(&f.paths, &f.config), None);
 }

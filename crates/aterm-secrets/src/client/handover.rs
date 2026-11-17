@@ -592,7 +592,7 @@ pub(super) fn checked_files_bundle(paths: &Paths, bundle: &Bundle) -> crate::Res
 
 /// Hand the Mac at `joiner` the Allow `member` signs for it under `host`, as a run does, so its
 /// join requests carry it: the tests' stand-in for a person's Allow and the typed phrase.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn test_hand_allowed(member: &Paths, joiner: &Paths, host: &str) {
     let bootstrap = crate::commons::bootstrap::Bootstrap::cached(member)
         .expect("member state")

@@ -3,12 +3,13 @@
 
 //! The converge pass's window lane (docs/DESIGN-init-on-by-default-2026-10-25.md §8.5): a
 //! windowed instance starts `aterm init --converge --trigger window` off the event loop at once
-//! and every [`crate::secrets_join::MEND_EVERY`] after, or at once when this window's network
+//! and every [`crate::secrets_join::MEND_EVERY`] after a settled pass, or at once when this window's network
 //! moved ([`crate::network_moved`], docs/DESIGN-fluid-swarm-2026-10-28.md F3c), beside the vault
 //! subscriber's mend. It covers a Mac whose subscriber runs a held copy of an older aterm, which
 //! an update never restarts onto new code, and it is the trigger that joins an open vault (Local
 //! Network is aterm.app's). The first-launch Secrets stage starts one pass of its own as it ends
-//! ([`start_after_secrets`]).
+//! ([`start_after_secrets`]). Standing unfinished work waits for an input or network transition
+//! without a maintenance or retry deadline; transient failures use bounded backoff.
 
 #![cfg_attr(not(unix), allow(dead_code))]
 
@@ -53,9 +54,9 @@ enum LaneWake {
     ),
 }
 
-/// Start the lane: a pass at once, then one every [`crate::secrets_join::MEND_EVERY`] or once
-/// the network moved, each waited for on the lane's own thread (never the event loop) and its
-/// exit said once per change. Whether the thread started; never joined.
+/// Start the lane: a pass at once, then maintenance, transient retry or input movement as its
+/// result allows. Each pass is waited for on the lane's own thread (never the event loop) and
+/// its exit said once per change. Whether the thread started; never joined.
 pub(crate) fn spawn_lane() -> bool {
     #[cfg(unix)]
     {
@@ -129,7 +130,7 @@ type LanePass<'a> = dyn FnMut(
 fn lane(
     pass: &mut LanePass<'_>,
     log: &mut dyn FnMut(&str),
-    wait: &mut dyn FnMut(std::time::Duration) -> Option<LaneWake>,
+    wait: &mut dyn FnMut(Option<std::time::Duration>) -> Option<LaneWake>,
     now_ms: &mut dyn FnMut() -> u64,
 ) {
     use aterm_secrets::converge::{Causes, MarkMoved, RepositoryWork, StartNote};
@@ -151,41 +152,45 @@ fn lane(
             }
             said = Some(ended.clone());
         }
-        let every = retry
-            .remaining(ended_ms)
-            .map_or(crate::secrets_join::MEND_EVERY, |pause| {
-                pause.min(crate::secrets_join::MEND_EVERY)
-            });
-        let mut moved = (MarkMoved::default(), 0);
-        let cause = match wait(every) {
-            None => return,
-            Some(LaneWake::Network(crate::network_moved::Woke::Timer)) => {
-                if ended == Ended::Ran {
+        let every = (ended != Ended::Standing).then(|| {
+            retry
+                .remaining(ended_ms)
+                .map_or(crate::secrets_join::MEND_EVERY, |pause| {
+                    pause.min(crate::secrets_join::MEND_EVERY)
+                })
+        });
+        let (cause, moved) = loop {
+            match wait(every) {
+                None => return,
+                Some(LaneWake::Network(crate::network_moved::Woke::Timer)) => {
+                    let cause = match ended {
+                        Ended::Standing => continue,
+                        Ended::Ran => {
+                            work = RepositoryWork::Refresh;
+                            Causes::TIMER
+                        }
+                        Ended::Unfinished => Causes::RETRY_UNFINISHED,
+                        Ended::Failed(_) | Ended::Unstarted(_) => Causes::RETRY_FAILED,
+                    };
+                    break (cause, (MarkMoved::default(), 0));
+                }
+                Some(LaneWake::Network(woke)) => {
                     work = RepositoryWork::Refresh;
+                    log(&moved_line(woke));
+                    break (Causes::NETWORK, (MarkMoved::default(), 0));
                 }
-                match ended {
-                    Ended::Ran => Causes::TIMER,
-                    Ended::Unfinished => Causes::RETRY_UNFINISHED,
-                    Ended::Failed(_) | Ended::Unstarted(_) => Causes::RETRY_FAILED,
-                }
-            }
-            Some(LaneWake::Network(woke)) => {
-                work = RepositoryWork::Refresh;
-                log(&moved_line(woke));
-                Causes::NETWORK
-            }
-            Some(LaneWake::Inputs(requested, classes, looks)) => {
-                moved = (classes, looks);
-                // A failed/unfinished request still owes its original stronger policy.
-                work = if ended == Ended::Ran {
-                    requested
-                } else {
-                    work.max(requested)
-                };
-                // Identity debt arrives as a repair and is not told apart here.
-                match requested {
-                    RepositoryWork::Repair => Causes::INPUT_REPAIR,
-                    RepositoryWork::Refresh => Causes::INPUT_REFRESH,
+                Some(LaneWake::Inputs(requested, classes, looks)) => {
+                    // An unfinished request still owes its original stronger policy.
+                    work = if ended == Ended::Ran {
+                        requested
+                    } else {
+                        work.max(requested)
+                    };
+                    let cause = match requested {
+                        RepositoryWork::Repair => Causes::INPUT_REPAIR,
+                        RepositoryWork::Refresh => Causes::INPUT_REFRESH,
+                    };
+                    break (cause, (classes, looks));
                 }
             }
         };
@@ -203,9 +208,9 @@ fn until_moved(
     moved: &mut crate::network_moved::Watch,
     wake: &mut aterm_secrets::client::ConvergenceWake,
     inputs: &mut aterm_secrets::client::ConvergenceInputs,
-    every: std::time::Duration,
+    every: Option<std::time::Duration>,
 ) -> Option<LaneWake> {
-    let deadline = std::time::Instant::now().checked_add(every);
+    let deadline = every.and_then(|every| std::time::Instant::now().checked_add(every));
     loop {
         // Metadata-only name traffic cannot starve a due network move or postpone the
         // original retry/maintenance deadline while semantic snapshots produce no work.
@@ -242,7 +247,7 @@ fn until_moved(
             Ok(None) => continue, // input bell, not cancellation of the lane
             Err(_) => {
                 return Some(LaneWake::Network(moved.wait(
-                    deadline.map_or(every, |at| {
+                    deadline.map_or(every.unwrap_or(crate::secrets_join::MEND_EVERY), |at| {
                         at.saturating_duration_since(std::time::Instant::now())
                     }),
                 )));
@@ -296,6 +301,8 @@ enum Ended {
     Ran,
     /// It ran without failure but admitted work is waiting; retry quietly.
     Unfinished,
+    /// It has standing work, owed again only once an input moves.
+    Standing,
     /// It exited with this status (a failed row, a refusal): the runner's log line says why.
     Failed(Option<i32>),
     /// It could not be started or waited for: why.
@@ -309,6 +316,7 @@ impl Ended {
         match self {
             Self::Ran => Last::Ended,
             Self::Unfinished => Last::Unfinished,
+            Self::Standing => Last::Standing,
             Self::Failed(_) | Self::Unstarted(_) => Last::Failed,
         }
     }
@@ -372,6 +380,7 @@ fn ended_status(status: std::process::ExitStatus) -> Ended {
     match status.code() {
         _ if status.success() => Ended::Ran,
         Some(code) if code == i32::from(aterm_secrets::converge::UNFINISHED) => Ended::Unfinished,
+        Some(code) if code == i32::from(aterm_secrets::converge::STANDING) => Ended::Standing,
         code => Ended::Failed(code),
     }
 }
@@ -393,7 +402,7 @@ fn hand_off_pass(mut child: aterm_uds::spawnfd::Child, mut ended: impl FnMut() +
 /// The aterm.log line for a lane pass that ended as `ended`; none for one that ran.
 fn ended_line(ended: &Ended) -> Option<String> {
     match ended {
-        Ended::Ran | Ended::Unfinished => None,
+        Ended::Ran | Ended::Unfinished | Ended::Standing => None,
         Ended::Failed(code) => Some(format!(
             "converge: the window's pass ended {} (its own aterm.log line says which row \
              failed, or why the pass was refused)",

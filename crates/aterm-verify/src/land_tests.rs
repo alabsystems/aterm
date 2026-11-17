@@ -208,6 +208,7 @@ fn quiet() -> Records<'static> {
         },
         interrupt: Box::new(|| None),
         tally: records::Tally::default(),
+        lock: None,
     }
 }
 
@@ -2620,6 +2621,8 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
         "build-disabled",
         "build-override",
         "build-default",
+        "identity-writer",
+        "identity-reader",
         "path-member",
         "nested-workspace",
         "nested-override",
@@ -2651,10 +2654,6 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
             ("crates/aterm/src/main.rs", "fn main() {}\n"),
             ("crates/aterm/build.rs", "// the fixed identity writer\n"),
             ("crates/aterm-stamp/src/lib.rs", "// runtime identity\n"),
-            (
-                "crates/aterm-census/src/guards/identity_read.rs",
-                "// the unchanged identity boundary\n",
-            ),
             (
                 "crates/agent/Cargo.toml",
                 if change == "inheritor" {
@@ -2860,6 +2859,17 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
                     "unknown" => lock.push_str("future-policy = true\n"),
                     _ => {}
                 }
+                if matches!(change, "identity-writer" | "identity-reader") {
+                    write(
+                        &world.rival,
+                        if change == "identity-writer" {
+                            "crates/aterm/build.rs"
+                        } else {
+                            "crates/aterm-stamp/src/lib.rs"
+                        },
+                        "// changed identity boundary\n",
+                    );
+                }
                 write(&world.rival, "Cargo.toml", &workspace);
                 write(&world.rival, "Cargo.lock", &lock);
                 git(&world.rival, &["add", "-A"]);
@@ -2911,6 +2921,15 @@ fn a_moved_main_composes_disjoint_or_convergent_changes_else_it_is_rejudged() {
                      compose: new main changes Cargo.lock beyond the product version"
                         .to_owned()
                 }
+                "identity-writer" | "identity-reader" => format!(
+                    ", and its change is not the isolated product-version move that alone may \
+                     compose: new main's \"{}\" differs from the base's",
+                    if change == "identity-writer" {
+                        "crates/aterm/build.rs"
+                    } else {
+                        "crates/aterm-stamp/src/lib.rs"
+                    }
+                ),
                 "format" | "mismatch" | "mode" => shapes("new main"),
                 "inheritor" | "root-package" | "workspace-override" | "build-disabled"
                 | "build-override" => shapes("the base"),
@@ -5012,6 +5031,7 @@ impl Store {
             },
             interrupt: Box::new(move || signal.get()),
             tally: records::Tally::default(),
+            lock: None,
         }
     }
 

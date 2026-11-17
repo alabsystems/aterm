@@ -133,7 +133,9 @@ pub(crate) fn install_proxy(proxy: EventLoopProxy<Wake>) {
     let _ = PROXY.set(proxy);
 }
 
-/// A session's drive lease changed hands.
+/// Asks the loop to read `session`'s presence again ([`Wake::LeaseChanged`]): a lease in its
+/// slot or one that names it as a turn's driver moved, its turn's input ended, or a turn into it
+/// submitted (`Wake::only_observes` lists who posts it).
 pub(crate) fn post_lease_changed(session: &SessionId) {
     #[cfg(test)]
     LEASE_WAKES.with(|w| w.borrow_mut().push(session.clone()));

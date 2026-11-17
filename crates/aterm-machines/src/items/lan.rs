@@ -97,10 +97,20 @@ impl install::Files for Through<'_> {
     fn code_directories(&self, path: &Path) -> std::io::Result<install::CodeDirectories> {
         self.0.code_directories(path)
     }
+
+    fn canonical(&self, path: &Path) -> std::io::Result<PathBuf> {
+        self.0.canonicalize(path)
+    }
+
+    fn owner(&self, path: &Path) -> std::io::Result<u32> {
+        self.0.stat(path).map(|stat| stat.uid)
+    }
 }
 
-/// The broker's install as `sys` reads it for the bundle it runs from: `None` off macOS or
-/// outside a bundle, else [`install::read`]'s answer.
+/// The broker's install as `sys` reads it for the bundle it runs from, a job another bundle of
+/// its signer holds read as held: `None` off macOS or outside a bundle, else [`install::read`]'s
+/// answer. It decides what is asked for, never what an elevation installs ([`LanBroker`]'s
+/// probe reads [`install::read_own`]).
 #[must_use]
 pub fn reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
     if !sys.macos() {
@@ -108,6 +118,18 @@ pub fn reading(sys: &dyn System) -> Option<Result<install::Reading, String>> {
     }
     let source = sys.running_app()?;
     Some(install::read(&Through(sys), &source))
+}
+
+/// The key of a broker install from the bundle `sys` runs from, as root's record of a refused
+/// apply holds it and an account reads it (`aterm_types::macos_setup::refused::broker_key`): the
+/// bundle and the code of its executable on disk. `None` outside a bundle or where that code
+/// cannot be read.
+pub(crate) fn refusal_key(sys: &dyn System) -> Option<String> {
+    let source = sys.running_app()?;
+    let code = sys
+        .code_directories(&source.join(install::BUNDLE_EXECUTABLE))
+        .ok()?;
+    aterm_types::macos_setup::refused::broker_key(&source, &code)
 }
 
 /// `[lan] broker = true`: the root LAN broker installed from the app bundle the elevation runs
@@ -151,6 +173,27 @@ struct Prepared<'a> {
 struct Before {
     image: Option<FileId>,
     plist: Option<FileId>,
+}
+
+/// How a broker apply ended short. `durable` says the failure is taken as the step's own, one
+/// that would recur with the same bundle: the strict check or the clone definitely refused it,
+/// or every round of the run published the job and it did not serve (launchd refusing it, or
+/// not answering about it, each time). A stop, lost custody, a job switched off and an
+/// operational error in any round (a check unanswered or not run, file I/O, a source that
+/// changed) are not: a bundle that fails the check that way every time is still asked for again
+/// (ATERM-KI-1116-3472).
+struct Failed {
+    why: String,
+    durable: bool,
+}
+
+impl Failed {
+    fn passing(why: impl Into<String>) -> Self {
+        Self {
+            why: why.into(),
+            durable: false,
+        }
+    }
 }
 
 enum StageError {
@@ -473,13 +516,15 @@ impl LanBroker {
     /// capped, and at most [`ROUNDS`] rounds run: a launch launchd still refuses, or a broker
     /// still not serving, then ends the transaction with that round's reason.
     /// Stop, lost custody or a job switched off ends the transaction.
-    fn apply_owned(&self, sys: &dyn System, source: &Path) -> Result<(), String> {
+    fn apply_owned(&self, sys: &dyn System, source: &Path) -> Result<(), Failed> {
         use aterm_secrets::converge::{Last, RunnerRetry};
         let pid = std::process::id();
         let start = sys
             .process_started(pid)
             .filter(|start| *start != 0)
-            .ok_or("the accepted root process's generation could not be read")?;
+            .ok_or_else(|| {
+                Failed::passing("the accepted root process's generation could not be read")
+            })?;
         let _stops = sys.defer_stops();
         let current = || -> Result<(), String> {
             if sys.stopped().is_some() {
@@ -491,29 +536,44 @@ impl LanBroker {
             }
             Ok(())
         };
-        current()?;
+        current().map_err(Failed::passing)?;
         let mut installing = Installing::default();
         let mut retry = RunnerRetry::default();
         let clock = std::time::Instant::now();
         let mut said = None;
         let mut rounds = 0_u32;
+        // The rounds that published the image and job and saw the job not serve.
+        let mut unserved = 0_u32;
         loop {
             let why = match installing.round(self, sys, source, &current) {
                 Ok(None) => return Ok(()),
-                Ok(Some(why)) => why,
+                Ok(Some(why)) => {
+                    unserved += 1;
+                    why
+                }
                 Err(error) => {
                     if !self.retained_root_run || !installing.retry(&error) {
-                        return Err(error.to_string());
+                        return Err(Failed {
+                            durable: matches!(
+                                error,
+                                StageError::Check(CheckError::Refused(_))
+                                    | StageError::Files(app_image::Error::Refused(_))
+                            ),
+                            why: error.to_string(),
+                        });
                     }
                     error.to_string()
                 }
             };
             rounds += 1;
             if rounds >= ROUNDS {
-                return Err(format!(
-                    "the LAN broker is not serving after {rounds} attempts in this root run, the \
-                     last: {why}; `sudo aterm machines here apply --plain` tries again"
-                ));
+                return Err(Failed {
+                    why: format!(
+                        "the LAN broker is not serving after {rounds} attempts in this root run, \
+                         the last: {why}; `sudo aterm machines here apply --plain` tries again"
+                    ),
+                    durable: unserved == rounds,
+                });
             }
             if said.as_ref() != Some(&why) {
                 aterm_log::warn!("LAN broker: {why}; retaining this root transaction for recovery");
@@ -527,7 +587,7 @@ impl LanBroker {
                 .remaining(elapsed())
                 .expect("failed retry has a deadline");
             while !left.is_zero() {
-                current()?;
+                current().map_err(Failed::passing)?;
                 let tick = left.min(Duration::from_secs(2));
                 sys.sleep(tick);
                 left = left.saturating_sub(tick);
@@ -634,7 +694,9 @@ impl Item for LanBroker {
                 why: NO_BUNDLE.to_owned(),
             };
         };
-        let reading = match install::read(&Through(sys), &source) {
+        // Against this bundle alone: an elevation installs the bundle it runs from, so a job
+        // another bundle holds is one it takes ([`install::read_own`]).
+        let reading = match install::read_own(&Through(sys), &source) {
             Ok(reading) => reading,
             Err(why) => return Probe::Unusable { why },
         };
@@ -668,12 +730,25 @@ impl Item for LanBroker {
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.note(Some(crate::init_clt::Unfinished::Other));
+        use aterm_types::macos_setup::refused::LAN_BROKER;
         let source = sys.running_app().ok_or(NO_BUNDLE)?;
-        let result = self.apply_owned(sys, &source);
-        if result.is_ok() {
-            self.note(None);
+        // The build the apply begins with is the one a later ask would read again.
+        let key = refusal_key(sys);
+        match self.apply_owned(sys, &source) {
+            Ok(()) => {
+                self.note(None);
+                crate::root_steps::clear_refusal(sys, LAN_BROKER);
+                Ok(())
+            }
+            Err(failed) => {
+                if failed.durable
+                    && let Some(key) = key
+                {
+                    crate::root_steps::record_refusal(sys, LAN_BROKER, &key);
+                }
+                Err(failed.why)
+            }
         }
-        result
     }
 
     fn unfinished(&self) -> Option<crate::init_clt::Unfinished> {

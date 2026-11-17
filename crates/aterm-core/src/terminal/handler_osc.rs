@@ -72,7 +72,9 @@ impl TerminalHandler<'_> {
     /// (Claude Code takes the protocol as unspoken once that reply comes first, and takes any
     /// reply whose body begins `?` as spoken); or a report (`state=<word>:app=<app>[:kind=<k>]`,
     /// `state=clear`), the root record only ([`super::program_state`]), at the batch's injected
-    /// wall clock.
+    /// wall clock. A report that changes the program's title
+    /// ([`super::program_state::ProgramStateReport::title`]) moves the title epoch, as an OSC 0
+    /// or 2 title does, so a host that watches the epoch reads it.
     #[inline]
     fn handle_osc_7501(
         &mut self,
@@ -94,8 +96,14 @@ impl TerminalHandler<'_> {
             return;
         }
         if let Ok(body) = std::str::from_utf8(body) {
+            let titled = self.program_state.title_seq();
             self.program_state
                 .accept_at(body, self.transient.process_wall_ms);
+            if self.program_state.title_seq() != titled {
+                self.title
+                    .epoch
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

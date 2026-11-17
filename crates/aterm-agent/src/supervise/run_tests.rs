@@ -10296,6 +10296,9 @@ impl IdleHost for ProbeHost {
         self.said.lock().unwrap().push(what);
         self.answer.lock().unwrap().map(RestartAnswer::unread)
     }
+    fn fable_room(&self, at: i64) {
+        self.said.lock().unwrap().push(format!("fable-room:{at}"));
+    }
     fn turn_ran(&self) {
         self.said.lock().unwrap().push("turn-ran".to_string());
     }

@@ -306,6 +306,9 @@ struct KnownMemory<'a> {
 }
 
 impl Machine for KnownMemory<'_> {
+    fn person(&self) -> bool {
+        self.inner.person()
+    }
     fn read(&self, path: Option<&Path>) -> aterm_capacity::Reading {
         let mut reading = self.inner.read(path);
         if !matches!((reading.available, reading.physical), (Some(available), Some(physical)) if physical > 0 && available <= physical)

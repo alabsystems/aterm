@@ -962,7 +962,7 @@ where
                         &mut |look, b, held| {
                             if let Some(share) = share {
                                 // One stamp places the dispatch for cores and for memory.
-                                share.placed(waiters.place_ms());
+                                share.placed(waiters.place());
                                 let rate = live();
                                 let (refused, moved) =
                                     share.refuses(b.charge, held, rate, Instant::now());
@@ -1315,16 +1315,17 @@ impl BinaryWaiters {
         drop(pending);
     }
 
-    /// The dispatch's place while it stands, unix ms: the stamp the run's live share places the
-    /// dispatch by too ([`crate::test_share::Live::placed`]). `None` before its first request
-    /// and once no record of it stands.
-    fn place_ms(&self) -> Option<u64> {
+    /// The dispatch's place while it stands, unix ms, and its mark
+    /// ([`aterm_capacity::admit::Place::standing`]): the stamp and mark the run's live share
+    /// places the dispatch by too ([`crate::test_share::Live::placed`]). `None` before its first
+    /// request and once no record of it stands.
+    fn place(&self) -> Option<(u64, bool)> {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .place
             .as_ref()
-            .and_then(aterm_capacity::admit::Place::standing_ms)
+            .and_then(aterm_capacity::admit::Place::standing)
     }
 
     /// Binary `index` started without its retained request (an overriding admission): the

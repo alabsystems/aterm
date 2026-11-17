@@ -25,7 +25,7 @@ fn a_glance_gives_each_path_the_lstat_it_took_first() {
     );
     write_atomic(&a, b"one", 0o600).unwrap();
     write_atomic(&b, b"second", 0o600).unwrap();
-    let len = |meta: Option<std::fs::Metadata>| meta.map(|meta| meta.len());
+    let len = |meta: Option<Meta>| meta.map(|meta| meta.len());
     let glance = Glance::new();
     assert_eq!(len(glance.symlink_metadata(&a).unwrap()), Some(3));
     assert_eq!(
@@ -89,6 +89,7 @@ fn a_glance_gives_each_path_the_lstat_it_took_first() {
 /// settled`: `left: (true, 1), right: (false, 0)`); with `Glance::first_stands` comparing a fresh
 /// `lstat` with another fresh one, not with the glance's first, the renamed copy stands (`a
 /// byte-identical copy renamed over`: `left: (true, 1), right: (false, 1)`).
+#[cfg(unix)]
 #[test]
 fn a_glances_first_look_stands_only_while_a_fresh_lstat_shows_it_settled() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -260,6 +261,7 @@ fn a_glance_fed_digest_is_kept_only_where_its_file_had_settled_when_the_glance_b
 /// reads a file changed a second before the ask once. A digest kept without its mode answers
 /// no change here wrongly, since APFS moves a file's change time at each `chmod`, which
 /// [`Seen`] holds for a coarser clock.
+#[cfg(unix)]
 #[test]
 fn a_digest_is_kept_while_its_file_stands_and_read_again_after_each_change() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -487,6 +489,7 @@ fn an_append_refuses_a_file_renamed_over_with_the_same_length() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_private_dir_is_made_and_narrowed_to_0700() {
     let root = scratch();
@@ -504,6 +507,7 @@ fn a_private_dir_is_made_and_narrowed_to_0700() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_symlinked_dir_is_refused() {
     let root = scratch();
@@ -515,6 +519,7 @@ fn a_symlinked_dir_is_refused() {
     assert!(error.0.contains("symlink"), "{error}");
 }
 
+#[cfg(unix)]
 #[test]
 fn private_reads_refuse_group_or_other_bits_and_symlinks() {
     let root = scratch();
@@ -619,6 +624,7 @@ fn a_read_fills_one_buffer_sized_from_the_files_length() {
     assert_eq!((bytes.len(), bytes.capacity()), (1000, 1001));
 }
 
+#[cfg(unix)]
 #[test]
 fn reads_are_bounded_and_a_fifo_never_blocks() {
     let root = scratch();
@@ -653,6 +659,7 @@ fn rename_noreplace_refuses_an_existing_target() {
     assert_eq!(std::fs::read(&b).expect("b"), b"a");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_rename_whose_unlink_fails_undoes_its_link() {
     let root = scratch();
@@ -684,6 +691,7 @@ fn a_rename_whose_unlink_fails_undoes_its_link() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn file_ids_tell_one_file_from_two() {
     let root = scratch();
@@ -702,6 +710,7 @@ fn file_ids_tell_one_file_from_two() {
     assert_ne!(file_id(&soft), file_id(&a));
 }
 
+#[cfg(unix)]
 #[test]
 fn wipe_removes_files_and_only_the_link_of_a_link() {
     let root = scratch();
@@ -768,6 +777,7 @@ fn a_judged_wipe_never_touches_a_file_renamed_over_the_one_it_judged() {
 }
 
 /// The names in `dir`, sorted.
+#[cfg(unix)]
 fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .expect("dir")
@@ -783,6 +793,7 @@ fn names_in(dir: &Path) -> Vec<String> {
     names
 }
 
+#[cfg(unix)]
 #[test]
 fn write_new_fills_only_an_empty_name() {
     let root = scratch();
@@ -818,6 +829,7 @@ fn write_new_fills_only_an_empty_name() {
 /// is (the same inode and times, `false`), and replaces anything else as [`write_atomic`] does
 /// (`true`): nothing there, other bytes of the same or another length, the same bytes under
 /// another mode, and a symlink to a file holding the bytes.
+#[cfg(unix)]
 #[test]
 fn a_write_if_changed_leaves_the_same_bytes_in_place() {
     let root = scratch();

@@ -17,7 +17,7 @@ pub(crate) enum Wire {
     /// Every byte, in memory.
     Whole(Arc<[u8]>),
     /// The record's frame in memory and the rest in its file, read back on first use.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     Shelved(Arc<Shelved>),
 }
 
@@ -30,7 +30,7 @@ impl Wire {
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {
             Self::Whole(bytes) => bytes,
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Shelved(shelved) => shelved.bytes().unwrap_or_default(),
         }
     }
@@ -39,7 +39,7 @@ impl Wire {
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Whole(bytes) => bytes.len(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Shelved(shelved) => shelved.len,
         }
     }
@@ -49,7 +49,7 @@ impl Wire {
     pub(crate) fn resident(&self) -> usize {
         match self {
             Self::Whole(bytes) => bytes.len(),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Shelved(shelved) => shelved
                 .frame
                 .len()
@@ -58,7 +58,7 @@ impl Wire {
     }
 
     /// Whether its bytes past the frame are still in the file, never read back.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn is_shelved(&self) -> bool {
         matches!(self, Self::Shelved(shelved) if shelved.read.get().is_none())
     }
@@ -73,7 +73,7 @@ impl Wire {
     pub(crate) fn read(&self) -> std::io::Result<std::borrow::Cow<'_, [u8]>> {
         match self {
             Self::Whole(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Shelved(shelved) => match shelved.read.get() {
                 Some(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
                 None => shelved
@@ -96,13 +96,13 @@ impl Wire {
     }
 
     /// Whether it is shelved: its frame alone in memory, read back or not.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const fn on_shelf(&self) -> bool {
         matches!(self, Self::Shelved(_))
     }
 
     /// The records file a shelved record's bytes are read back from.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn source(&self) -> Option<&Arc<Source>> {
         match self {
             Self::Whole(_) => None,
@@ -112,7 +112,7 @@ impl Wire {
 }
 
 /// A shelved record whose bytes did not read back as they were.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn unread() -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -124,7 +124,7 @@ fn unread() -> std::io::Error {
 /// it was checked against, held open, so a writer that renames a new file over the path leaves
 /// these bytes where they were. Every writer of a records file appends to it or replaces it
 /// whole, and none rewrites its bytes in place.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct Source {
     file: std::fs::File,
     /// The file's length when the head was checked against it: what holding it open keeps on
@@ -135,7 +135,7 @@ pub(crate) struct Source {
     read: std::sync::atomic::AtomicUsize,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Source {
     pub(crate) fn new(file: std::fs::File, len: u64) -> Self {
         Self {
@@ -159,6 +159,9 @@ impl Source {
     }
 
     fn read_at(&self, at: u64, len: usize) -> Option<Vec<u8>> {
+        #[cfg(windows)]
+        use crate::fsx::FileAt as _;
+        #[cfg(unix)]
         use std::os::unix::fs::FileExt as _;
         let mut bytes = vec![0; len];
         self.file.read_exact_at(&mut bytes, at).ok()?;
@@ -170,9 +173,11 @@ impl Source {
 }
 
 /// A record whose frame is in memory and whose payload and signature stay in its records file.
-/// What comes back is checked: its SHA-256 is the record's id (which the record had when it was
-/// verified in full, before the head that shelved it was written) and it begins with the frame.
-#[cfg(unix)]
+/// What comes back is checked: it begins with the frame and gives the record's id (which the
+/// record had when it was verified in full, before the head that shelved it was written): its
+/// SHA-256 for version 1, and for version 2 the SHA-256 of its shed form, with the ciphertext the
+/// one its signed fields name ([`super::whole_id`]).
+#[cfg(any(unix, windows))]
 pub(crate) struct Shelved {
     pub(crate) id: [u8; 32],
     pub(crate) len: usize,
@@ -186,7 +191,7 @@ pub(crate) struct Shelved {
     read: std::sync::OnceLock<Arc<[u8]>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Shelved {
     pub(crate) fn new(
         id: [u8; 32],
@@ -217,7 +222,12 @@ impl Shelved {
 
     fn read_back(&self) -> Option<Vec<u8>> {
         let bytes = self.source.read_at(self.at, self.len)?;
-        (bytes.starts_with(&self.frame) && super::digest(&bytes) == self.id).then_some(bytes)
+        let id = if self.frame.get(super::MAGIC.len()) == Some(&super::VERSION_TWO) {
+            super::whole_id(&bytes)
+        } else {
+            Some(super::digest(&bytes))
+        };
+        (bytes.starts_with(&self.frame) && id == Some(self.id)).then_some(bytes)
     }
 }
 
@@ -242,6 +252,22 @@ impl Payload {
             bytes: bytes.clone(),
             range,
         })
+    }
+
+    /// A shed version-2 record's ciphertext ([`super::Record::is_shed`]): `len` bytes its record
+    /// signs the SHA-256 of, of which it holds none, so it reads as no bytes and a local open of
+    /// it fails its authentication, as a shelved payload that does not read back does.
+    pub(super) fn shed(len: usize) -> Self {
+        Self {
+            bytes: Wire::Whole(Arc::from(Vec::new())),
+            range: 0..len,
+        }
+    }
+
+    /// Whether it is a shed record's ciphertext ([`Payload::shed`]): its length, and no bytes.
+    #[must_use]
+    pub fn is_shed(&self) -> bool {
+        self.range.end > self.bytes.len()
     }
 
     /// Its length, without reading a shelved record back.
@@ -286,7 +312,10 @@ impl AsRef<[u8]> for Payload {
 
 impl fmt::Debug for Payload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        #[cfg(unix)]
+        if self.is_shed() {
+            return write!(f, "<{} bytes shed>", self.len());
+        }
+        #[cfg(any(unix, windows))]
         if self.bytes.is_shelved() {
             return write!(f, "<{} bytes shelved>", self.len());
         }
@@ -298,7 +327,7 @@ impl fmt::Debug for Wire {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Whole(bytes) => fmt::Debug::fmt(bytes, f),
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             Self::Shelved(shelved) => write!(f, "<{} bytes shelved>", shelved.len),
         }
     }

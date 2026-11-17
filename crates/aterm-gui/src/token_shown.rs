@@ -3,9 +3,10 @@
 
 //! The vault token facts the window shows (`docs/DESIGN-claude-setup-token-2026-11-05.md`
 //! §5.9, §5.10, slice S12): one value-free read of this Mac's Claude Code accounts
-//! ([`aterm_agent::harness::accounts_token_view::view_here`]) on the footer's resolver thread, at
-//! most once per [`READ_EVERY_S`], posted as [`Tokens`] for the Account card, the Lab page, the
-//! harness page's state line and `ctl status`, which map it without reading a file.
+//! ([`aterm_agent::harness::accounts_token_view::view_here`]) on the token view's own lane
+//! ([`crate::token_lane`]), which reads only when a file it reads moved or a time it shows comes
+//! due, posted as [`Tokens`] ([`post`]) for the Account card, the Lab page, the harness page's
+//! state line and `ctl status`, which map it without reading a file.
 //!
 //! A fact keeps what the view typed (its state, its dates, the Mac that made it, the login half)
 //! beside the words, so a surface chooses its own words and never parses another's; and a read
@@ -25,9 +26,6 @@ use std::sync::Arc;
 use aterm_agent::harness::account_card::LoginHalf;
 use aterm_agent::harness::account_card::LoginHere;
 use aterm_agent::harness::token_state::TokenState;
-
-/// The least time between two reads of the token view.
-pub(crate) const READ_EVERY_S: i64 = 60;
 
 /// The quiet offer's one step, as the window runs it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,111 +242,59 @@ pub(crate) fn status_fields(
 }
 
 #[cfg(not(test))]
-static SHOWN: std::sync::Mutex<(Option<i64>, Option<Arc<Tokens>>)> =
-    std::sync::Mutex::new((None, None));
+static SHOWN: std::sync::Mutex<Option<Arc<Tokens>>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
 thread_local! {
-    /// A test's own facts: tests run side by side, and the resolver's read is a no-op in them.
+    /// A test's own facts: tests run side by side, and the lane's read posts nothing in them.
     static SHOWN: std::cell::RefCell<Option<Arc<Tokens>>> = const { std::cell::RefCell::new(None) };
     /// Each step a press asked for, as its words after `aterm`.
     pub(crate) static STEPS_ASKED: std::cell::RefCell<Vec<Vec<String>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// The facts the resolver last posted; `None` before its first read.
-#[must_use]
-pub(crate) fn shown() -> Option<Arc<Tokens>> {
+/// `f` over the facts the lane last posted.
+fn with_shown<T>(f: impl FnOnce(&mut Option<Arc<Tokens>>) -> T) -> T {
     #[cfg(not(test))]
     {
-        SHOWN
+        f(&mut SHOWN
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .1
-            .clone()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
     #[cfg(test)]
     {
-        SHOWN.with(|s| s.borrow().clone())
+        SHOWN.with(|s| f(&mut s.borrow_mut()))
     }
+}
+
+/// The facts the lane last posted; `None` before its first read.
+#[must_use]
+pub(crate) fn shown() -> Option<Arc<Tokens>> {
+    with_shown(|shown| shown.clone())
 }
 
 /// A test's facts on its own thread.
 #[cfg(test)]
 pub(crate) fn show(tokens: Option<Tokens>) {
-    SHOWN.with(|s| *s.borrow_mut() = tokens.map(Arc::new));
+    with_shown(|shown| *shown = tokens.map(Arc::new));
 }
 
-/// Read the token view again where [`READ_EVERY_S`] has passed since the last read at wall
-/// second `now` (the footer's resolver thread asks on each Claude Code resolve); a move posts
-/// the new facts and wakes the open Account card. A no-op in a unit test, which posts its own.
-pub(crate) fn refresh(now: i64) {
-    #[cfg(test)]
-    let _ = now;
-    #[cfg(not(test))]
-    {
-        let due = {
-            let mut shown = SHOWN
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let due = due(shown.0, now);
-            if due {
-                shown.0 = Some(now);
-            }
-            due
-        };
-        if !due {
-            return;
-        }
-        // With no harness state there is nothing to read from: the facts stay as they were
-        // (not read yet, before a first read), never "no vault".
-        let Some(read) = read(now).map(Arc::new) else {
-            return;
-        };
-        let moved = {
-            let mut shown = SHOWN
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let moved = shown.1.as_deref() != Some(&*read);
-            shown.1 = Some(read);
-            moved
-        };
+/// Post the facts a read of the token view found (the lane's, [`crate::token_lane`]): where they
+/// differ from the last posted, they replace them and wake the open Account card. Whether they
+/// moved.
+pub(crate) fn post(read: Tokens) -> bool {
+    let read = Arc::new(read);
+    let moved = with_shown(|shown| {
+        let moved = shown.as_deref() != Some(&*read);
         if moved {
-            crate::accounts_outlook::wake_card();
+            *shown = Some(read);
         }
+        moved
+    });
+    if moved {
+        crate::accounts_outlook::wake_card();
     }
-}
-
-/// Whether a read is owed at wall second `now` after one at `last`: [`READ_EVERY_S`] passed, or
-/// the clock stepped back.
-fn due(last: Option<i64>, now: i64) -> bool {
-    last.is_none_or(|at| now.saturating_sub(at) >= READ_EVERY_S || now < at)
-}
-
-/// One read of this Mac's token view at `now`, with each new offer pair recorded.
-#[cfg(all(unix, not(test)))]
-fn read(now: i64) -> Option<Tokens> {
-    use aterm_agent::harness::accounts_token_view::{ask_lab_here, steps_here, view_here};
-    let harness = crate::harness_host::harness_state()?;
-    let config = crate::app_config::config_path();
-    let home = aterm_types::dirs::home_dir();
-    let view = view_here(&harness, config.as_deref(), home.as_deref(), now);
-    if let (Some(accounts), Some(home)) = (&view, home.as_deref())
-        && let Err(why) = ask_lab_here(accounts, home, now)
-    {
-        aterm_log::warn!("accounts: the lab could not be asked for a token: {why}");
-    }
-    let steps = view
-        .as_deref()
-        .map(|accounts| steps_here(&harness, home.as_deref(), accounts))
-        .unwrap_or_default();
-    Some(facts_of_view(&harness, (view, &steps), now))
-}
-
-/// A platform with no vault tokens has no vault to read.
-#[cfg(all(not(unix), not(test)))]
-fn read(_now: i64) -> Option<Tokens> {
-    Some(Tokens::no_vault())
+    moved
 }
 
 /// The window's facts of a token view (`None`: no home or no vault configured under it, so

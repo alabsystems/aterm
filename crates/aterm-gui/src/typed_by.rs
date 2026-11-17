@@ -63,6 +63,9 @@ pub(crate) enum Who {
         pid: u32,
         comm: Option<String>,
         lineage: Vec<(i32, Option<i32>)>,
+        /// The walk stopped at [`LINEAGE_MAX`] with a parent above launchd unread, so a tab's
+        /// shell may be above the lineage ([`Who::lineage_cut`]).
+        cut: bool,
     },
     /// A caller its own lane names in words, shown as given.
     Word(String),
@@ -100,10 +103,51 @@ impl Who {
             lineage.push((p, pgid_of(p)));
             at = parent_of(p).filter(|&parent| parent != p);
         }
+        // The loop leaves a parent above launchd unread only at the bound: a read that failed
+        // leaves none, and launchd or the kernel ends the walk.
+        let cut = at.is_some_and(|p| p > 1);
         Self::Process {
             pid,
             comm: i32::try_from(pid).ok().and_then(comm_of),
             lineage,
+            cut,
+        }
+    }
+
+    /// `self` with the process group of every process in its lineage dropped, so a tab owns it
+    /// through its chain of parents alone ([`tab_session_of`] matches a tab's shell by pid or
+    /// by process group). A child that a double fork detached keeps its tab shell's process
+    /// group though no parent of it is that shell; read this way it lives in no tab.
+    pub(crate) fn parent_chain(self) -> Self {
+        match self {
+            Self::Process {
+                pid,
+                comm,
+                lineage,
+                cut,
+            } => Self::Process {
+                pid,
+                comm,
+                lineage: lineage.into_iter().map(|(p, _)| (p, None)).collect(),
+                cut,
+            },
+            Self::Edge { src, client } => Self::Edge {
+                src,
+                client: Box::new(client.parent_chain()),
+            },
+            other => other,
+        }
+    }
+
+    /// Whether the client's chain of parents was longer than aterm reads ([`LINEAGE_MAX`]
+    /// processes): a tab's shell may then be above what was read, so finding none in it does
+    /// not show that the client is in no tab. A parent that could not be read (another user's)
+    /// cuts nothing: the walk ended there, as it does at launchd.
+    pub(crate) fn lineage_cut(&self) -> bool {
+        match self {
+            Self::Process { cut, .. } => *cut,
+            Self::Edge { client, .. } => client.lineage_cut(),
+            Self::Aterm | Self::Bridge | Self::Word(_) => false,
         }
     }
 
@@ -463,12 +507,14 @@ pub(crate) fn tab_named(ctx: &SessionCtx) -> Named {
 /// typist ([`name`]), by the sessions `store` registers now: each tab found by its shell's pid and
 /// named as [`tab_named`] names it, so a program run from a tab (an `aterm ctl` a Claude Code's
 /// tool ran) is that tab's, past the CLI's own process. The `signal` verb names its asker so
-/// (the act's `from=`).
+/// (the act's `from=`). A tab whose shell exited is not among them: it holds no process, and
+/// since aterm reaped its shell that pid may name any other process.
 pub(crate) fn name_by_store(who: &Who, store: &crate::session_store::Store) -> Named {
     let tabs: Vec<(u64, i32, SessionId, Arc<SessionCtx>)> = store
         .read()
         .unwrap_or_else(|p| p.into_inner())
         .live_handles()
+        .filter(|h| h.state != crate::session_store::SessionState::Exited)
         .map(|h| {
             (
                 h.local_id,

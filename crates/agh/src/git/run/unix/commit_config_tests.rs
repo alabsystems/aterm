@@ -18,9 +18,13 @@ fn only_the_commit_projection_admits_paired_canonical_filter_metadata() {
         assert_eq!(verdict(values.as_bytes()), json!({"Allowed":{"keys":3}}));
         let names =
             format!("core.bare\0remote.{remote}.partialclonefilter\0remote.{remote}.promisor\0");
-        for read_only in [false, true] {
+        for access in [
+            ConfigAccess::Write,
+            ConfigAccess::Read,
+            ConfigAccess::ObjectSource,
+        ] {
             assert_eq!(
-                aterm_json::from_slice::<Value>(&project_config_names(names.as_bytes(), read_only))
+                aterm_json::from_slice::<Value>(&project_config_names(names.as_bytes(), access))
                     .unwrap(),
                 json!({"Refused":{"class":"Remote"}})
             );
@@ -93,22 +97,30 @@ fn truncated_or_oversized_value_inventory_never_becomes_admission() {
 }
 
 #[test]
-fn hook_directory_is_ignored_only_by_the_immutable_commit_projection() {
+fn hook_directory_is_ignored_only_by_the_commit_projection_and_an_object_source() {
     for key in ["core.hookspath", "core.hooksPath", "Core.HooksPath"] {
         for value in ["/fixture/hooks with spaces", "", "../private-directory"] {
             let input = format!("core.bare\ntrue\0{key}\n{value}\0");
             assert_eq!(verdict(input.as_bytes()), json!({"Allowed":{"keys":2}}));
             let names = format!("core.bare\0{key}\0");
-            for read_only in [false, true] {
+            for access in [ConfigAccess::Write, ConfigAccess::Read] {
                 assert_eq!(
                     aterm_json::from_slice::<Value>(&project_config_names(
                         names.as_bytes(),
-                        read_only
+                        access
                     ))
                     .unwrap(),
                     json!({"Refused":{"class":"Core"}})
                 );
             }
+            assert_eq!(
+                aterm_json::from_slice::<Value>(&project_config_names(
+                    names.as_bytes(),
+                    ConfigAccess::ObjectSource
+                ))
+                .unwrap(),
+                json!({"Allowed":{"keys":2}})
+            );
             let command = format!("{input}hook.x.command\nprivate-command\0");
             assert_eq!(
                 verdict(command.as_bytes()),

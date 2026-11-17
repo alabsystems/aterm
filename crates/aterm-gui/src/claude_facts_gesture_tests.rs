@@ -766,6 +766,7 @@ fn hovering_the_account_beside_a_wall_lights_both_its_spans() {
                     Some(Wall {
                         label: "5h",
                         resets: "3pm".into(),
+                        resets_at: 0,
                     }),
                     None,
                 ),

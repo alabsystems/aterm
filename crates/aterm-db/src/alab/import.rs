@@ -14,6 +14,8 @@
 //!   its own Mac first) writes a cell that is absent or still holds what an import wrote
 //!   (`cell::import_step`). A [`Mode::FillOnly`] source (every sheet, every other replica's
 //!   dump) writes a cell only where it is empty or holds this same source's earlier import; a
+//!   cell an automatic path wrote in a collection under the authority rules (an observer's
+//!   `pending` account) is written by either (`cell::import_outranks_automatic`); a
 //!   cell another source or the owner wrote differently is left as it is and becomes a
 //!   [`Kind::Differs`] finding, recorded by row key and column only in the source's row
 //!   (`source.differs`), never with a value. A cell the owner set, cleared or resolved since,
@@ -87,9 +89,12 @@
 //!   says anything else. Only a run that reads the logins sheet can know that, so only such a
 //!   run writes or withdraws the `+tag` link.
 
-use super::registry::{
-    ACCOUNT, ADDRESS, AddressHolder, AddressIndex, CLI, DIFFER_COLUMNS, MACHINE, MAILBOX,
-    MAX_DIFFERS, MODEL, PHONE, PLAN, PREFERENCE, PROVIDER, SOURCE,
+use super::{
+    registry::{
+        ACCOUNT, ADDRESS, AddressHolder, AddressIndex, CLI, DIFFER_COLUMNS, MACHINE, MAILBOX,
+        MAX_DIFFERS, MODEL, PHONE, PLAN, PREFERENCE, PROVIDER, SOURCE,
+    },
+    seeds,
 };
 use crate::{
     Error, Result,
@@ -1070,12 +1075,20 @@ enum Decided {
     Differs,
 }
 
-/// Decide one cell: `same` says whether a held value is what the source states. An absent cell
-/// is written, as is one an import wrote empty; one an import wrote is written by an
-/// authoritative source, or by the source that wrote it (`own`: the same kind, and the same
-/// file for a kind with several), and otherwise differs; one the owner set or a conflicted one
-/// is left.
-fn decide(field: Option<&Field>, same: impl Fn(&Value) -> bool, mode: Mode, own: bool) -> Decided {
+/// Decide one cell of `collection`: `same` says whether a held value is what the source states.
+/// An absent cell is written, as is one an import wrote empty; one an import wrote is written by
+/// an authoritative source, or by the source that wrote it (`own`: the same kind, and the same
+/// file for a kind with several), and otherwise differs; one an automatic path wrote is written
+/// by any source where the import outranks it (`cell::import_outranks_automatic`: an observer's
+/// `pending` birth of an account), as `cell::import_step` writes it; one the owner set, one an
+/// automatic path wrote elsewhere, or a conflicted one is left.
+fn decide(
+    collection: &Collection,
+    field: Option<&Field>,
+    same: impl Fn(&Value) -> bool,
+    mode: Mode,
+    own: bool,
+) -> Decided {
     match field {
         None => Decided::Write,
         Some(Field::Value(candidate)) if same(&candidate.value.x) => Decided::Unchanged,
@@ -1085,6 +1098,11 @@ fn decide(field: Option<&Field>, same: impl Fn(&Value) -> bool, mode: Mode, own:
             } else {
                 Decided::Differs
             }
+        }
+        Some(Field::Value(candidate))
+            if cell::import_outranks_automatic(collection, &candidate.value) =>
+        {
+            Decided::Write
         }
         Some(Field::Value(_) | Field::Set(_)) => Decided::Owner,
         Some(Field::Conflict { .. }) => Decided::Conflicted,
@@ -2433,12 +2451,6 @@ impl Planner<'_> {
         self.want(&ACCOUNT, &pk, "provider", json!(provider), at);
         self.want(&ACCOUNT, &pk, "realm", json!(realm), at);
         self.want(&ACCOUNT, &pk, "login", json!(address_pk), at);
-        // The default goes on a row with no label: a name the owner gave is no finding.
-        if self.held(&ACCOUNT, &pk, "label").is_none()
-            && let Ok(label) = keys::default_account_label(realm, &pk)
-        {
-            self.want(&ACCOUNT, &pk, "label", json!(label), at);
-        }
         Some(pk)
     }
 
@@ -2687,10 +2699,10 @@ impl Planner<'_> {
                 let label_at = coord(sheet, n, row, LABEL);
                 self.want(&ACCOUNT, &pk, "legacy_label", json!(legacy), &label_at);
             }
-            // `kimi-m16` is `<cli>-<machine label>`.
+            // `kimi-m16` is `<cli>-<machine label>`; `m106-m38` is a pair of machines.
             let reading = legacy
                 .split_once('-')
-                .filter(|(cli, _)| !guard::machine_shaped(cli))
+                .filter(|(cli, _)| seeds::CLIS.iter().any(|seed| seed.id == *cli))
                 .map_or(legacy, |(_, label)| label);
             let named: Vec<_> = Reading::parse(reading)
                 .ok()
@@ -3636,6 +3648,7 @@ impl Planner<'_> {
                 if let Some(row) = revived {
                     let lifecycle = row.fields.get(crate::typed::LIFECYCLE);
                     let decided = decide(
+                        collection,
                         lifecycle,
                         |held| *held == json!("live"),
                         mode_of(row_sheet),
@@ -3716,6 +3729,7 @@ impl Planner<'_> {
                             .and_then(|field| source_row(field, sources))
                             .is_some_and(|(_, wrote)| !states_phone_labels(wrote));
                     let mut decided = decide(
+                        collection,
                         field,
                         |held| *held == x,
                         mode_of(cell_sheet),
@@ -3879,6 +3893,7 @@ impl Planner<'_> {
                         };
                     }
                     let decided = decide(
+                        collection,
                         field,
                         |_| holds,
                         mode_of(wanted.at.sheet),
@@ -4282,7 +4297,7 @@ impl Planner<'_> {
                 continue;
             }
             let ended = json!("ended");
-            if cell::import_step(Some(field), &ended) != ImportStep::Write {
+            if cell::import_step(&PREFERENCE, Some(field), &ended) != ImportStep::Write {
                 continue;
             }
             let value = CellValue::imported(PREFERENCE.version, ended, &source);

@@ -93,6 +93,6 @@ pub fn member_authority(paths: &Paths, proving: &Proving<'_>) -> crate::Result<V
     Ok(witness)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "member_authority_tests.rs"]
 mod tests;

@@ -60,11 +60,13 @@ pub mod replica;
 pub mod resources;
 #[cfg(unix)]
 pub mod runtime;
+pub mod service_derivations;
 #[cfg(unix)]
 pub mod service_state;
 #[cfg(unix)]
 pub mod table;
 pub mod typed;
+pub mod words;
 
 /// Resolve application storage to an already admitted, fully preserved writer
 /// generation. Call before opening its secrets bootstrap or table directory.

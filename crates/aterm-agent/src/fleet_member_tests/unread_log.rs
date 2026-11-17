@@ -133,7 +133,8 @@ fn a_holder_signed_choice_moves_roster_registry_and_host_resolution() {
     );
 }
 
-/// Write `label` into the registry row `mac`.
+/// Write `label` into the registry row `mac`, as registration's own automatic write does: an
+/// owner's label stands, and registration never writes over it.
 fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
     use aterm_db::{
         alab::registry::MACHINE,
@@ -148,7 +149,7 @@ fn relabel(registry: &aterm_db::alab::Registry, mac: &str, label: &str) {
                     col: "label",
                     elem: None,
                 },
-                &CellValue::owner(MACHINE.version, aterm_json::Value::from(label)),
+                &CellValue::automatic(MACHINE.version, aterm_json::Value::from(label)),
             )
             .unwrap(),
         ]])

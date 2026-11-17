@@ -8,11 +8,13 @@ use crate::commons::{binding::Pending, node::Edit, roster::Role};
 /// The retirement itself fits here; the changed envelope's cascade needs more
 /// records afterwards. Discarding that later draft error would publish an
 /// unstamped envelope after already making the retirement durable.
+#[cfg(unix)]
 #[test]
 fn a_revoke_that_cannot_fit_its_cascade_refuses_before_retirement() {
     crate::crossing::fixture::LEGACY.within(revoke_at_a_full_held_store);
 }
 
+#[cfg(unix)]
 fn revoke_at_a_full_held_store() {
     use crate::crossing::fixture::LEGACY;
     use crate::membership_log::Body;

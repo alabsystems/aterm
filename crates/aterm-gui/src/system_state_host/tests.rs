@@ -5250,7 +5250,7 @@ fn a_page_in_an_occluded_window_is_not_shown() {
         !app.system_state_shown_views(instance).is_empty(),
         "in front, it is shown"
     );
-    app.on_occlusion_changed(wid, true);
+    app.on_occlusion_changed(wid, true, std::time::Instant::now());
     assert!(
         app.system_state_shown_views(instance).is_empty(),
         "an occluded window's page is not shown"
@@ -5259,7 +5259,7 @@ fn a_page_in_an_occluded_window_is_not_shown() {
         app.system_state_showing_windows().is_empty(),
         "nothing to redraw"
     );
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     assert!(
         !app.system_state_shown_views(instance).is_empty(),
         "back on screen, it is shown"
@@ -5442,12 +5442,12 @@ fn an_occluded_focused_window_is_not_in_front_for_on_screen_steps() {
         app.system_state_frontmost(),
         "precondition: the page is in front"
     );
-    app.on_occlusion_changed(wid, true);
+    app.on_occlusion_changed(wid, true, std::time::Instant::now());
     assert!(
         !app.system_state_frontmost(),
         "an occluded window puts macOS prompts on a screen nobody sees"
     );
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     assert!(
         app.system_state_frontmost(),
         "back on screen, it is in front"
@@ -5467,7 +5467,7 @@ fn a_window_focused_while_occluded_is_not_in_front_for_on_screen_steps() {
     assert!(app.commit_glassless_native_frame(wid));
     fresh(&mut app, running());
     app.window_focus_event(wid, false);
-    app.on_occlusion_changed(wid, true);
+    app.on_occlusion_changed(wid, true, std::time::Instant::now());
     app.window_focus_event(wid, true);
     assert!(
         app.windows[&wid].focused,
@@ -5477,7 +5477,7 @@ fn a_window_focused_while_occluded_is_not_in_front_for_on_screen_steps() {
         !app.system_state_frontmost(),
         "a key window behind a lock screen puts macOS prompts on a screen nobody sees"
     );
-    app.on_occlusion_changed(wid, false);
+    app.on_occlusion_changed(wid, false, std::time::Instant::now());
     assert!(
         app.system_state_frontmost(),
         "once macOS says it is visible, it is in front"

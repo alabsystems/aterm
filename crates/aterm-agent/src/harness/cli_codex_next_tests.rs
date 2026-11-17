@@ -4708,7 +4708,6 @@ fn a_renewal_with_no_email_names_a_step_that_keeps_the_roster_admitted() {
     };
     let lab = crate::harness::alab_roster::Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         bound: Default::default(),
         accounts: Vec::new(),
         aliases: BTreeMap::new(),

@@ -1288,13 +1288,13 @@ pub fn status_line(needs: &[Need]) -> Option<String> {
 ///
 /// # Errors
 /// This Mac's vault state cannot be read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn facts(paths: &crate::client::Paths, now: u64) -> crate::Result<Facts> {
     facts_with_commons(paths, now, || observed_commons(paths))
 }
 
 /// Commons observation may establish local custody. Keep it outside any retained State guard.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn observed_commons(paths: &crate::client::Paths) -> Commons {
     match crate::commons::observe(paths) {
         Ok(crate::commons::Observation::Visible(_)) => {
@@ -1311,7 +1311,7 @@ pub(crate) fn observed_commons(paths: &crate::client::Paths) -> Commons {
 
 /// Reuse the ordinary sight/policy producer with a supplied availability observation.
 /// The supplied Commons value is scheduling, never authority to publish or release a value.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn facts_with_commons(
     paths: &crate::client::Paths,
     now: u64,
@@ -1389,13 +1389,13 @@ pub const fn policy_for(configured: Option<bool>) -> Policy {
 }
 
 /// The scratch vaults a test treats under the ALab vault's policy ([`test_alab_policy`]).
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 static ALAB_FOR_TESTS: std::sync::Mutex<Vec<std::path::PathBuf>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Treat the scratch vault under `paths` under the ALab vault's compiled policy, as a test of a
 /// crate that raises needs does: a scratch vault is signed by a test key, never ALab's.
-#[cfg(all(unix, any(test, debug_assertions)))]
+#[cfg(all(any(unix, windows), any(test, debug_assertions)))]
 pub fn test_alab_policy(paths: &crate::client::Paths) {
     ALAB_FOR_TESTS
         .lock()
@@ -1403,7 +1403,7 @@ pub fn test_alab_policy(paths: &crate::client::Paths) {
         .push(paths.dir.clone());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn alab_for_tests(paths: &crate::client::Paths) -> bool {
     #[cfg(any(test, debug_assertions))]
     {

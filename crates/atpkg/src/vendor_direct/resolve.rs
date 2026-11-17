@@ -1081,6 +1081,8 @@ fn vouched(
             links: BTreeMap::new(),
             vendor: spec.vendor.to_string(),
             provenance: None,
+            key: String::new(),
+            key_inputs: String::new(),
         },
     };
     Candidate {

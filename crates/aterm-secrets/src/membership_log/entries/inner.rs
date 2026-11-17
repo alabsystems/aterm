@@ -184,7 +184,7 @@ pub(crate) fn load<'k>(
 
 /// The length a stored class value takes for the in-memory `value` (an upper bound for a
 /// plaintext, sealed under any epoch).
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn stored_len(value: &[u8]) -> usize {
     match of(value) {
         Form::Opened(plain) => plain.len() + OVERHEAD,

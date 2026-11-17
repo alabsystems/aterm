@@ -52,7 +52,7 @@ pub const SCOPE_REFUSED: &str = spotlight_scope::REFUSED;
 /// `sys` as the shared reading's port ([`spotlight_scope::Reads`]): the reading itself is
 /// `aterm-types`' so the window, which does not link this crate outside its tests, makes the
 /// same one from its own file reads.
-struct Port<'a>(&'a dyn System);
+pub(crate) struct Port<'a>(pub(crate) &'a dyn System);
 
 impl spotlight_scope::Reads for Port<'_> {
     fn macos(&self) -> bool {
@@ -108,12 +108,12 @@ fn wanted(sys: &dyn System, home: &Path) -> Result<BTreeSet<PathBuf>, String> {
 ///
 /// # Errors
 /// A file stands there that is not root's own regular file, or it could not be read.
-fn listed(sys: &dyn System, file: &str) -> Result<BTreeSet<PathBuf>, String> {
+pub(crate) fn listed(sys: &dyn System, file: &str) -> Result<BTreeSet<PathBuf>, String> {
     spotlight_scope::listed(&Port(sys), file)
 }
 
 /// Write `paths`, one a line, as root's file at `file`, readable by every account.
-fn list(sys: &dyn System, file: &str, paths: &BTreeSet<PathBuf>) -> Result<(), String> {
+pub(crate) fn list(sys: &dyn System, file: &str, paths: &BTreeSet<PathBuf>) -> Result<(), String> {
     let text: String = paths
         .iter()
         .map(|path| format!("{}\n", path.display()))
@@ -182,22 +182,25 @@ fn scope(sys: &dyn System, home: &Path) -> Result<Standing, String> {
     spotlight_scope::state(&Port(sys), home)
 }
 
-/// Whether setup's administrator step owes this account's home folder its Spotlight scope
-/// ([`Scope`]), as the account reads it with no prompt ([`spotlight_scope::owed`]): the one
-/// reading `aterm init` ([`crate::root_steps::owed`]) and the window
-/// ([`spotlight_scope::owed_here`]) share.
+/// Whether a folder of the console account's home is still Spotlight's to index though setup
+/// excludes it ([`spotlight_scope::owed`]): what [`crate::root_steps::owed`] names. It is work
+/// setup has, which an explicit request of the person's takes up; what asks for the password by
+/// itself is [`automatic_scope_owed`].
 #[must_use]
 pub fn scope_owed(sys: &dyn System) -> bool {
     spotlight_scope::owed(&Port(sys))
 }
 
-/// Whether first-time exclusions need an automatic password request.
+/// Whether setup's automatic ask owes this account's home its Spotlight scope
+/// ([`spotlight_scope::automatic_owed`]: only while setup's password never scoped the home),
+/// the one reading every run of `aterm init` and the window
+/// ([`spotlight_scope::automatic_owed_here`]) share.
 #[must_use]
 pub fn automatic_scope_owed(sys: &dyn System) -> bool {
     spotlight_scope::automatic_owed(&Port(sys))
 }
 
-/// The folders' last components, comma-separated.
+/// `paths`' last components, comma-separated.
 fn folder_names(paths: &BTreeSet<PathBuf>) -> String {
     paths
         .iter()
@@ -348,9 +351,10 @@ impl Item for Scope {
     }
     /// Exclude each folder no receipt names yet ([`Scope::exclude`]), then write the receipt.
     /// A folder the receipt names is never added again: where the configuration lacks it, a
-    /// person took it out. The receipt comes last, so a run that stopped before it is still
-    /// owed; the next one finds the folders excluded already and only writes the receipt. A
-    /// failure leaves [`SCOPE_REFUSED`] naming the folders it could not exclude.
+    /// person took it out. The receipt comes last, so a run that stopped before it leaves a
+    /// home never scoped still asked for ([`automatic_scope_owed`]) and any home's folders
+    /// still to exclude ([`scope_owed`]); the next one finds the folders excluded already and
+    /// only writes the receipt. A failure leaves [`SCOPE_REFUSED`] naming the folders it could not exclude.
     fn apply(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         if !sys.macos() {
             return Err("Spotlight is macOS's".into());
@@ -370,7 +374,7 @@ impl Item for Scope {
                     let _ = sys.remove(Path::new(SCOPE_REFUSED));
                 }
             }
-            // Best effort: without it the step is only asked for again.
+            // Best effort: without it a home never scoped is only asked for again.
             Err(_) => drop(list(sys, SCOPE_REFUSED, &add)),
         }
         done

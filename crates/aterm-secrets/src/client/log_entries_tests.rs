@@ -4,16 +4,21 @@
 use super::*;
 use crate::commons::binding::Pending;
 use crate::commons::bootstrap::{Bootstrap, Device};
-use crate::commons::journal::{Journal, State as JournalState, Trust};
-use crate::membership_log::{
-    Entrant, EpochAudience, Evidence, Kind, MemberId, Record, encode_records,
-};
+use crate::commons::journal::Journal;
+#[cfg(unix)]
+use crate::commons::journal::{State as JournalState, Trust};
+use crate::membership_log::{Entrant, EpochAudience, Evidence, Record, encode_records};
+#[cfg(unix)]
+use crate::membership_log::{Kind, MemberId};
+#[cfg(unix)]
 use crate::server::Options as ServerOptions;
 
+#[cfg(unix)]
 #[path = "coalesce_tests.rs"]
 mod coalesce;
 
 /// A home's content as the conformance searches keep and put back its states.
+#[cfg(unix)]
 #[path = "home_content_tests.rs"]
 pub(super) mod home_content;
 
@@ -40,6 +45,7 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
 /// The vault pass's ranked wrap-gap closer and epoch tender on `paths` alone
 /// ([`remove::vault_pass_at`]), at first sight and then a thousand gap steps on, past every grace
 /// and rank: what a Commons exchange's repair once signed at once.
+#[cfg(unix)]
 pub(super) fn vault_passes(paths: &Paths) -> Vec<Record> {
     let now = aterm_time::unix_millis().unwrap_or(0);
     let mut signed = Vec::new();
@@ -49,15 +55,18 @@ pub(super) fn vault_passes(paths: &Paths) -> Vec<Record> {
     signed
 }
 
+#[cfg(unix)]
 pub(super) fn start_loopback_server(store: &Path) -> crate::server::Running {
     start_loopback_server_at(store, None)
 }
 
+#[cfg(unix)]
 fn start_loopback_server_at(store: &Path, clock: Option<fn() -> u64>) -> crate::server::Running {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     start_server_on(listener, store, clock)
 }
 
+#[cfg(unix)]
 fn start_server_on(
     listener: std::net::TcpListener,
     store: &Path,
@@ -82,6 +91,7 @@ fn start_server_on(
 /// back is: on the address `addr` it had, which the lab's homes name as their source, over the
 /// store under `root` it kept, so it holds what it held when it stopped and nothing a Mac signed
 /// since.
+#[cfg(unix)]
 pub(crate) fn server_again(root: &Path, addr: std::net::SocketAddr) -> crate::server::Running {
     let listener = std::net::TcpListener::bind(addr).expect("bind the stopped server's address");
     start_server_on(listener, &root.join("s1"), None)
@@ -306,6 +316,7 @@ fn a_mac_reads_the_same_values_from_the_log_as_from_the_envelope() {
 /// lower id's `Put`). The arrival order reaches a register only in a log that stays in memory
 /// across inserts, where
 /// `entries::tests::every_arrival_order_of_concurrent_writes_reads_the_same_entries` catches it.
+#[cfg(unix)]
 #[test]
 fn concurrent_puts_both_survive_and_every_mac_reads_the_same_one() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -491,6 +502,7 @@ fn concurrent_puts_both_survive_and_every_mac_reads_the_same_one() {
     s1.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
     // Every server it reads is its own on loopback, which answers.
@@ -738,6 +750,7 @@ fn an_entry_edited_on_the_lower_seq_side_of_a_split_survives_the_heal() {
 /// Copy the private tree at `src` to `dst`, each entry with its mode: a home or a journal a replay
 /// starts from. A clone wherever one can be made, one call whatever the tree holds, which makes a
 /// model walk's copy of its Macs for every transition cost next to nothing.
+#[cfg(unix)]
 pub(super) fn copy_private_tree(src: &Path, dst: &Path) {
     use std::os::unix::fs::DirBuilderExt as _;
     let parent = dst.parent().expect("a copy's parent");
@@ -752,6 +765,7 @@ pub(super) fn copy_private_tree(src: &Path, dst: &Path) {
 }
 
 /// [`copy_private_tree`] where no clone can be made: off APFS, or into a `dst` that exists.
+#[cfg(unix)]
 fn copy_each_file(src: &Path, dst: &Path) {
     use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
     let mode = std::fs::metadata(src).expect("src dir metadata").mode();
@@ -772,6 +786,7 @@ fn copy_each_file(src: &Path, dst: &Path) {
     }
 }
 
+#[cfg(unix)]
 struct CommonsLogFixture {
     template: PathBuf,
     trust: Trust,
@@ -783,6 +798,7 @@ struct CommonsLogFixture {
     fork_right: Vec<u8>,
 }
 
+#[cfg(unix)]
 impl CommonsLogFixture {
     fn build(base: &Path) -> Self {
         let template = base.join("template");
@@ -905,6 +921,7 @@ impl CommonsLogFixture {
     }
 }
 
+#[cfg(unix)]
 struct CommonsLogHarness<'a> {
     fixture: &'a CommonsLogFixture,
     m1: Paths,
@@ -916,6 +933,7 @@ struct CommonsLogHarness<'a> {
     reconciled: bool,
 }
 
+#[cfg(unix)]
 impl<'a> CommonsLogHarness<'a> {
     fn replay(fixture: &'a CommonsLogFixture, run_dir: &Path, path: &[&str]) -> Self {
         copy_private_tree(&fixture.template, run_dir);
@@ -1132,6 +1150,7 @@ impl<'a> CommonsLogHarness<'a> {
 /// copying the template's homes instead of its run's, `RemoveBOnIslandA` from an admitted D reads
 /// `admitted_d: 0` against `1`. `prove_and_catch` and the skipped-reconcile run still hold each
 /// law and mutant.
+#[cfg(unix)]
 #[test]
 fn commons_log_model_conforms_and_catches_its_mutants() {
     let model = aterm_models_swarm::commons_log_model();
@@ -1224,6 +1243,7 @@ pub(super) fn member_key(paths: &Paths) -> (Bootstrap, crate::membership_log::Me
 /// A real apply under the former host-wrapper selector, with the current signed heads: it read
 /// `stale` in place and recorded that selection, which the current selector, choosing `current`,
 /// does not hold.
+#[cfg(unix)]
 pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMacs, Paths) {
     let lab = two_macs(&[
         (Audience::Everyone, "shared", b"initial"),
@@ -1374,6 +1394,7 @@ pub(super) fn stale_host_materialization(log_only: bool, legacy: bool) -> (TwoMa
 
 /// A one-admin vault on a loopback server: `m22` (admin) and `m7` (member), Commons enrolled,
 /// `entries` published, Genesis v2 signed and synced to `m7`.
+#[cfg(unix)]
 pub(crate) struct TwoMacs {
     pub(crate) root: aterm_tempfile::TempDir,
     pub(crate) server: crate::server::Running,
@@ -1384,11 +1405,13 @@ pub(crate) struct TwoMacs {
     pub(crate) m7: Paths,
 }
 
+#[cfg(unix)]
 pub(crate) fn two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
     two_macs_with(entries, false)
 }
 
 /// [`two_macs`], with `m7` an admin too where `m7_admin`.
+#[cfg(unix)]
 pub(crate) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool) -> TwoMacs {
     two_macs_at(entries, m7_admin, None)
 }
@@ -1396,6 +1419,7 @@ pub(crate) fn two_macs_with(entries: &[(Audience, &str, &[u8])], m7_admin: bool)
 /// [`two_macs_with`], its server started by [`crate::server::start_with_clock`] on `clock` (unix
 /// seconds) where one is given. A clock's lab is always built, its server having seen every
 /// publish by that clock.
+#[cfg(unix)]
 pub(super) fn two_macs_at(
     entries: &[(Audience, &str, &[u8])],
     m7_admin: bool,
@@ -1410,6 +1434,7 @@ pub(super) fn two_macs_at(
 /// [`two_macs`] with keys and a genesis no other lab holds: every other lab of the same entries
 /// is one vault under one signer, copied. For a test that needs a second vault, or searches keys
 /// for a rank.
+#[cfg(unix)]
 pub(super) fn fresh_two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
     built_two_macs(entries, false, None)
 }
@@ -1417,11 +1442,13 @@ pub(super) fn fresh_two_macs(entries: &[(Audience, &str, &[u8])]) -> TwoMacs {
 /// One lab, stopped, for every test that asks for that lab: each is written from it into that
 /// test's own folder, with its own server on its own port, so nothing on disk is shared. Building
 /// a `two_macs(&[])` lab makes 1,735 counted file reads; writing one, its 61 files (2026-11-05).
+#[cfg(unix)]
 pub(super) struct LabTemplate {
     tree: LabTree,
     signer: String,
 }
 
+#[cfg(unix)]
 impl LabTemplate {
     /// `lab`, stopped, whose `homes` are every home that names its url.
     pub(super) fn of(lab: TwoMacs, homes: &[&Paths]) -> Self {
@@ -1448,6 +1475,7 @@ impl LabTemplate {
 
 /// What `build` makes, made on a thread of its own: a seam a test has set on its thread is that
 /// test's, never in a template every later test starts from.
+#[cfg(unix)]
 pub(super) fn off_this_thread<T: Send>(build: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|scope| {
         scope
@@ -1461,6 +1489,7 @@ pub(super) fn off_this_thread<T: Send>(build: impl FnOnce() -> T + Send) -> T {
 }
 
 /// The template of `(entries, m7_admin)`, built once for each pair a test names.
+#[cfg(unix)]
 fn lab_template(
     entries: &[(Audience, &str, &[u8])],
     m7_admin: bool,
@@ -1492,11 +1521,14 @@ fn lab_template(
 }
 
 /// Each directory by name, with its mode.
+#[cfg(unix)]
 type TreeDirs = Vec<(PathBuf, u32)>;
 /// Each file by name, with its bytes and its mode.
+#[cfg(unix)]
 type TreeFiles = Vec<(PathBuf, Vec<u8>, u32)>;
 
 /// Each directory and each file under `root`.
+#[cfg(unix)]
 fn tree_of(root: &Path) -> (TreeDirs, TreeFiles) {
     fn walk(root: &Path, dir: &Path, dirs: &mut TreeDirs, files: &mut TreeFiles) {
         use std::os::unix::fs::MetadataExt as _;
@@ -1525,6 +1557,7 @@ fn tree_of(root: &Path) -> (TreeDirs, TreeFiles) {
 
 /// A stopped lab's folder as bytes, each directory and file with its mode: a real tree to write
 /// out, whose files hold the lab's url only as [`Self::of`] says.
+#[cfg(unix)]
 pub(super) struct LabTree {
     dirs: TreeDirs,
     files: TreeFiles,
@@ -1533,6 +1566,7 @@ pub(super) struct LabTree {
     homes: Vec<(PathBuf, PathBuf, Config)>,
 }
 
+#[cfg(unix)]
 impl LabTree {
     /// The tree at `root`, whose server has stopped and whose `homes` name `url` as their source:
     /// their `source.toml` says it and their `state.toml` binds its digests, and no file holds it
@@ -1672,6 +1706,7 @@ impl LabTree {
 }
 
 /// The lab [`two_macs_at`] describes, built step by step.
+#[cfg(unix)]
 fn built_two_macs(
     entries: &[(Audience, &str, &[u8])],
     m7_admin: bool,
@@ -1719,6 +1754,7 @@ fn built_two_macs(
 }
 
 /// Everything a home holds that its lab's url could change, read as a Mac reads it, the url aside.
+#[cfg(unix)]
 fn home_reads(paths: &Paths) -> String {
     let config = configured(paths).unwrap();
     let state = load_state(paths).unwrap();
@@ -1755,6 +1791,7 @@ fn home_reads(paths: &Paths) -> String {
 /// `[true, true, false, false, true], None` against the same and a refresh receipt. With
 /// [`LabTree::start`] handing the second lab the first one's folder, its server refuses (`another
 /// vault server holds the heard-history store`).
+#[cfg(unix)]
 #[test]
 fn a_lab_written_from_a_template_is_the_lab_it_copies() {
     let _answering = ServersAnswering::set();
@@ -1815,6 +1852,7 @@ fn a_lab_written_from_a_template_is_the_lab_it_copies() {
 /// NEGATIVE CONTROLS (2026-11-05): with [`copy_each_file`] leaving out `records.frontiers`, or
 /// making each directory `0700`, the `0755` `.config` a home holds reads `448`, `the copy made it`
 /// fails.
+#[cfg(unix)]
 #[test]
 fn a_clone_and_a_copy_of_a_home_are_the_same_tree() {
     let _answering = ServersAnswering::set();
@@ -1853,6 +1891,7 @@ fn a_clone_and_a_copy_of_a_home_are_the_same_tree() {
     assert_eq!(sorted(&cloned), sorted(&copied));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_log_behind_the_envelope_never_reads_an_older_value() {
     use crate::need::{self, GhProfile, Purpose, Want};
@@ -1986,16 +2025,19 @@ fn a_log_behind_the_envelope_never_reads_an_older_value() {
     drop(macs.root);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_edit_by_an_admin_with_no_seat_in_the_log_survives_the_mirror() {
     no_seat_edit_survives_mirror(false);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_parented_edit_survives_the_automatic_log_mirror() {
     no_seat_edit_survives_mirror(true);
 }
 
+#[cfg(unix)]
 fn no_seat_edit_survives_mirror(parented: bool) {
     // Every server it reads is its own on loopback, which answers.
     let _answering = ServersAnswering::set();
@@ -2110,6 +2152,7 @@ fn no_seat_edit_survives_mirror(parented: bool) {
     drop(macs.root);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_admin_whose_log_is_behind_never_mirrors_an_older_value() {
     let TwoMacs {
@@ -2154,6 +2197,7 @@ fn an_admin_whose_log_is_behind_never_mirrors_an_older_value() {
     drop(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn an_epoch_minted_outside_a_host_list_never_seals_that_lists_next_write() {
     let ring = Audience::Hosts(vec!["m22".to_owned()]);
@@ -2316,6 +2360,7 @@ fn a_mac_the_envelope_admits_stays_in_while_the_log_holds_no_wrap_for_it() {
 /// Two admins on two loopback servers, before a split: `st1` (`m22`, on `s1`) and `st2` (`m7`,
 /// on `s2`), with member `m8` (`m_v2`, on `s1`), a `0.145` member `m9` that reads only the
 /// envelope, `split-key` and `other-key` at `v0`, Commons enrolled and Genesis v2 synced.
+#[cfg(unix)]
 pub(super) struct SplitAdmins {
     pub(super) root: aterm_tempfile::TempDir,
     pub(super) s1: crate::server::Running,
@@ -2328,6 +2373,7 @@ pub(super) struct SplitAdmins {
     pub(super) m_0145_id: Identity,
 }
 
+#[cfg(unix)]
 pub(super) fn split_admins() -> SplitAdmins {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let s1 = start_loopback_server(&root.path().join("s1"));
@@ -2396,10 +2442,12 @@ pub(super) fn split_admins() -> SplitAdmins {
 }
 
 /// What a `0.145` Mac holding `id` reads from the envelope `url` serves: entry name to value.
+#[cfg(unix)]
 pub(super) fn envelope_view(url: &str, id: &Identity) -> (u64, BTreeMap<String, Vec<u8>>) {
     envelope_view_as(url, id, None)
 }
 
+#[cfg(unix)]
 fn envelope_view_as(
     url: &str,
     id: &Identity,
@@ -2427,6 +2475,7 @@ fn envelope_view_as(
     )
 }
 
+#[cfg(unix)]
 #[test]
 fn after_a_heal_an_admins_own_pass_mirrors_the_lower_seq_sides_edit() {
     // Every server it reads is its own on loopback, which answers.
@@ -2483,6 +2532,7 @@ fn after_a_heal_an_admins_own_pass_mirrors_the_lower_seq_sides_edit() {
 
 /// `admin` approves the machine `name` holding `id`, which moves the Commons control entry into
 /// a host list that adds it.
+#[cfg(unix)]
 fn approve(admin_paths: &Paths, name: &str, id: &Identity) {
     let recipient = id.recipient().to_bech32();
     let admin = admin_open(admin_paths).unwrap();
@@ -2494,6 +2544,7 @@ fn approve(admin_paths: &Paths, name: &str, id: &Identity) {
 
 /// Both `ids` read the Commons control entry from the envelope every one of `urls` serves, and
 /// from `admin_paths`' log.
+#[cfg(unix)]
 pub(super) fn assert_in_commons_control(
     admin_paths: &Paths,
     urls: &[String],
@@ -2525,6 +2576,7 @@ pub(super) fn assert_in_commons_control(
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn approvals_on_both_sides_of_a_split_keep_both_macs_in_commons_control() {
     // Every server it reads is its own on loopback, which answers.
@@ -2560,6 +2612,7 @@ fn approvals_on_both_sides_of_a_split_keep_both_macs_in_commons_control() {
 }
 
 /// How many `Epoch` records `paths`' log holds for `audience`.
+#[cfg(unix)]
 fn epochs_for(paths: &Paths, audience: &Audience) -> usize {
     let audience = crate::membership_log::EpochAudience::from(audience);
     load_records(paths)
@@ -2578,6 +2631,7 @@ fn epochs_for(paths: &Paths, audience: &Audience) -> usize {
 /// NEGATIVE CONTROL: write an audience this Mac cannot read as before (drop the `sealed_away`
 /// branch of `draft_document_diff`): the unset writes no `Delete`, m7 keeps `m7-cred` from the
 /// log, and every publish mints a fresh `[m7]` epoch.
+#[cfg(unix)]
 #[test]
 fn an_admin_outside_a_host_list_deletes_an_entry_there_for_every_mac_in_it() {
     let ring = Audience::Hosts(vec!["m7".to_owned()]);
@@ -2669,6 +2723,7 @@ fn an_admin_outside_a_host_list_deletes_an_entry_there_for_every_mac_in_it() {
 ///
 /// NEGATIVE CONTROL: as above (no `Delete` under the outside admin's epoch): m7's mirror overlays
 /// the still-live `m7-cred` and publishes it to every Mac again.
+#[cfg(unix)]
 #[test]
 fn an_admin_inside_a_host_list_never_restores_an_entry_an_outside_admin_deleted() {
     let ring = Audience::Hosts(vec!["m7".to_owned()]);
@@ -2727,6 +2782,7 @@ fn an_admin_inside_a_host_list_never_restores_an_entry_an_outside_admin_deleted(
 ///
 /// NEGATIVE CONTROL: drop the loop over `base`'s sections in `draft_document_diff`: m7 still
 /// reads both entries from the drafted log.
+#[cfg(unix)]
 #[test]
 fn an_admin_outside_a_host_list_that_drops_its_section_deletes_every_entry_there() {
     let ring = Audience::Hosts(vec!["m7".to_owned()]);
@@ -2798,6 +2854,7 @@ fn an_admin_outside_a_host_list_that_drops_its_section_deletes_every_entry_there
 /// NEGATIVE CONTROL (before F18 merged): drop `remove_from_log` from `admin_revoke`: m7 reads the
 /// revoked Mac's value as `gh-token`. Since F18, dropping it as well as the in-log
 /// retirement fails the revoke ("Commons retirement did not retain the requested restriction").
+#[cfg(unix)]
 #[test]
 fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -2897,6 +2954,7 @@ fn a_revoked_mac_cannot_rewrite_an_entry_for_the_macs_that_read_the_log() {
 }
 
 /// A Claude Code token's entry name ([`crate::entry_class::claude_token`]).
+#[cfg(unix)]
 const SPLIT_TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
 
 /// Two admins save different values for one entry while split. After the heal each admin's own
@@ -2910,6 +2968,7 @@ const SPLIT_TOKEN: &str = "aterm-claude-token-ac-0123456789abcdef";
 /// NEGATIVE CONTROL (2026-11-06, restored with cp from a backup plus touch, confirmed with cmp):
 /// with `conflicts` naming no entry a token, the token's conflict reads `token: false` where the
 /// test expects `token: true`.
+#[cfg(unix)]
 #[test]
 fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
     // Every server it reads is its own on loopback, which answers.
@@ -2987,6 +3046,7 @@ fn a_conflict_stays_until_a_person_saves_it_and_status_names_it() {
 ///
 /// NEGATIVE CONTROL: skip `adopt_held_draft` in the sync apply path's `Behind` branch: m22 and m7
 /// both wait on the records for good, and m7 keeps `token-v1`.
+#[cfg(unix)]
 #[test]
 fn a_publish_cut_short_after_the_server_stored_it_still_reaches_every_mac() {
     let macs = two_macs(&[(Audience::Everyone, "gh-token", b"token-v1".as_slice())]);
@@ -3040,6 +3100,7 @@ fn a_publish_cut_short_after_the_server_stored_it_still_reaches_every_mac() {
 /// `base` from `admin_base` when the overlay fails: the admins' passes fail on the dangling
 /// anchor, m8 marks its pass failed and reads nothing, and the next publish writes `other-key`
 /// back to `v0` on every Mac.
+#[cfg(unix)]
 #[test]
 fn an_anchor_removed_on_one_side_of_a_split_leaves_every_mac_reading() {
     // Every server it reads is its own on loopback, which answers.
@@ -3126,6 +3187,7 @@ fn an_anchor_removed_on_one_side_of_a_split_leaves_every_mac_reading() {
     lab.s2.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_admin_revoke_retires_in_log()
  {
@@ -3497,6 +3559,7 @@ fn log_witness_skips_inert_admit_concurrent_remove_excludes_epoch_writer_and_adm
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn configured_log_member_observation_is_stable_across_peer_records_and_concurrent_gap_closers_serialize()
  {
@@ -3684,6 +3747,7 @@ pub(super) fn newcomer(
 
 /// What `member`'s desk hands the Mac `request` names after a person's Allow and the phrase:
 /// [`hand_over`], as the window's desk runs it.
+#[cfg(unix)]
 pub(super) fn hand(
     member: &Paths,
     request: &crate::commons::binding::Request,
@@ -3722,6 +3786,7 @@ pub(super) fn hand(
 /// NEGATIVE CONTROL: the hold read no policy before it took the state (`policy: Vec::new()` in
 /// `take_handover_hold`), so the bundle reads it under the hold: fails with "a bundle built under
 /// the hold (log: true) names the policy's server: [\"http://127.0.0.1:…/v1/alab\"]".
+#[cfg(unix)]
 #[test]
 fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
     // An `.invalid` name (RFC 6761) fails at once: a `.local` one waited out an mDNS lookup of
@@ -3778,6 +3843,7 @@ fn a_bundle_built_under_the_desks_hold_names_the_policys_servers() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn bounded_member_cached_head_applies_new_admission_and_removal_without_a_server() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -3839,6 +3905,7 @@ fn bounded_member_cached_head_applies_new_admission_and_removal_without_a_server
 /// NEGATIVE CONTROL: in `log_base`, read `Stamp::NoLocker` as `LogBase::Unstamped` (F14's stamp
 /// rule alone): m40, which no envelope locker names, reads its absent lockers on its first sync
 /// and the `"m40 stays in after it syncs"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_member_without_the_admin_locker_admits_a_mac() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -3942,6 +4009,7 @@ fn a_member_without_the_admin_locker_admits_a_mac() {
 /// NEGATIVE CONTROL: in `write_from_log_bundle`, refuse an `Admit` signed by another member than
 /// the one whose `Allowed` the bundle carries: m40 refuses m22's bundle and the `"m40 takes m7's
 /// Admit from m22"` expect fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_whose_bundle_was_lost_takes_its_admit_from_another_member() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -3985,6 +4053,7 @@ fn a_mac_whose_bundle_was_lost_takes_its_admit_from_another_member() {
 /// NEGATIVE CONTROL: in `log_base`, read `Stamp::NoLocker` as `LogBase::Unstamped`: neither new
 /// Mac has an envelope locker, so each reads `Revoked` at its first sync after the heal and the
 /// `"m40 stays in after the heal"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_lan_and_a_laptop_each_admit_a_mac_and_both_stay_in_after_the_heal() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4051,6 +4120,7 @@ fn a_lan_and_a_laptop_each_admit_a_mac_and_both_stay_in_after_the_heal() {
 
 /// `member`'s desk running [`hand_over`] for the Mac `request` names, as the window's does,
 /// returning its result rather than a bundle.
+#[cfg(unix)]
 pub(super) fn hand_result(
     member: &Paths,
     request: &crate::commons::binding::Request,
@@ -4083,6 +4153,7 @@ pub(super) fn hand_result(
 ///
 /// NEGATIVE CONTROL: make `kept_out` return `None`: m7 signs a restoring `Admit` for m40 and
 /// the `"an Allow of a removed Mac"` expect_err fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4166,6 +4237,7 @@ fn a_mac_the_log_removed_is_not_let_back_in_by_a_members_allow() {
 
 /// A Mac that asks under `m99999` leaves the next Mac a valid label. A request that cannot
 /// enter the log is refused without handing the vault's files or recording an admission.
+#[cfg(unix)]
 #[test]
 fn a_failed_log_path_is_refused_and_m99999_leaves_a_label() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4217,6 +4289,7 @@ fn a_failed_log_path_is_refused_and_m99999_leaves_a_label() {
     drop(macs.root);
 }
 
+#[cfg(unix)]
 fn filled_join_log(member: &Paths, count: usize) -> crate::membership_log::Log {
     use crate::membership_log::Body;
     let bootstrap = Bootstrap::required(member).unwrap();
@@ -4252,6 +4325,7 @@ fn filled_join_log(member: &Paths, count: usize) -> crate::membership_log::Log {
 /// holds 8192, this fails building its lab (`sign genesis: Error("... a genesis under the larger
 /// budgets", Other)`), and `join_bundles_keep_waiting_records_local_and_fit_the_advertised_history`,
 /// whose lab is written from the template, passes.
+#[cfg(unix)]
 #[test]
 fn join_reader_capacity_is_checked_before_and_after_admission() {
     use crate::crossing::RecordsBound;
@@ -4370,6 +4444,7 @@ fn join_reader_capacity_is_checked_before_and_after_admission() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn join_bundles_keep_waiting_records_local_and_fit_the_advertised_history() {
     use crate::crossing::RecordsBound;
@@ -4650,6 +4725,7 @@ fn a_new_mac_takes_alabs_genesis_only_from_keys_its_build_names() {
 /// NEGATIVE CONTROL: drop the `recipient_is_removed` look from `auto_approve_listed`'s `allowed`:
 /// the approver lets m40 back in and the `"nothing for the removed m40"` assert fails
 /// (`left: ["m40"]`).
+#[cfg(unix)]
 #[test]
 fn a_mac_another_member_removed_is_not_let_back_in_by_the_allow_it_queued() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4732,6 +4808,7 @@ fn a_mac_another_member_removed_is_not_let_back_in_by_the_allow_it_queued() {
 /// before): the `"m40 keeps its Allowed"` assert fails, and no post reaches the approver. In
 /// `auto_approve_listed`, publish only for an approval or a roster change (drop `unaddressed`):
 /// m40 never gets a locker and the `"named in [machines], m40 posts it no more"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_the_log_admits_posts_its_allowed_until_an_admins_approver_names_it() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4792,6 +4869,7 @@ fn a_mac_the_log_admits_posts_its_allowed_until_an_admins_approver_names_it() {
 /// NEGATIVE CONTROL: in `wrap_gaps_pass`, count from `gap.opened_ms` again (`let first =
 /// gap.opened_ms;`): the rank-1 holder signs at its first look and the `"the rank-1 holder
 /// waits a step after it first sees the gap"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_gap_seen_long_after_it_opened_is_still_closed_by_one_holder_first() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4834,6 +4912,7 @@ fn a_gap_seen_long_after_it_opened_is_still_closed_by_one_holder_first() {
 
 /// Both log-bound and envelope-only approvals leave label allocation to registration.
 /// NEGATIVE CONTROL: restoring roster allocation makes either new recipient appear below.
+#[cfg(unix)]
 #[test]
 fn approval_leaves_new_labels_to_the_registry_instead_of_growing_the_roster() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -4914,6 +4993,7 @@ fn approval_leaves_new_labels_to_the_registry_instead_of_growing_the_roster() {
 /// NEGATIVE CONTROL: in `hand_over`, ignore `reads_log` (take the log path whenever the member
 /// can sign one): the Mac that does not read the log gets a log bundle and the
 /// `"a Mac that does not read the log gets files"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_vault_with_no_log_still_admits_by_the_allowed_relay() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4984,6 +5064,7 @@ fn a_vault_with_no_log_still_admits_by_the_allowed_relay() {
 /// and m7 only and puts `b-value` under it; then every Mac holds every record. Returns m40, the
 /// one wrap gap (epoch 2 to m40), and that gap's two holders, the one
 /// [`crate::membership_log::Log::gap_rank`] ranks first first.
+#[cfg(unix)]
 fn admitted_beside_a_concurrent_epoch(
     macs: &TwoMacs,
 ) -> (Paths, crate::membership_log::Gap, Paths, Paths) {
@@ -5071,6 +5152,7 @@ fn admitted_beside_a_concurrent_epoch(
 /// NEGATIVE CONTROL: in `wrap_gaps_pass`, skip every gap (`continue` before the rank check):
 /// no `Wrap` is signed, the `"the rank-0 holder closes the gap"` assert fails, and m40 never
 /// reads `b-value`.
+#[cfg(unix)]
 #[test]
 fn a_wrap_gap_after_a_concurrent_epoch_is_closed_by_one_holder() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -5132,6 +5214,10 @@ fn a_wrap_gap_after_a_concurrent_epoch_is_closed_by_one_holder() {
 /// NEGATIVE CONTROL: skip `m9`'s `enroll_commons_member_in_log` (leave it an unproved founder):
 /// `m7`'s retirement carries only the current seats, drops the seatless `m9`, and the
 /// `log_after_retire.wraps_maximal_audience_to(&EpochAudience::Commons, &m9_rec)` assert fails.
+#[cfg_attr(
+    windows,
+    ignore = "ATERM-KI-1116-48213: astream's whole-file lock on Windows refuses a read of the journal beside its live writer"
+)]
 #[test]
 fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_enrollment() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5420,6 +5506,7 @@ fn unproved_founders_respect_commons_audience_and_revocation_rotates_and_bars_en
 /// still wrapping the other island's removed Mac; after the merge the vault passes on `m22` (a
 /// remover, so it acts within a step) coalesce both into one epoch each that wraps neither, and the next pass,
 /// after a newcomer's admission, finds nothing due.
+#[cfg(unix)]
 #[test]
 fn the_tender_coalesces_concurrent_remove_epochs_and_skips_superseded_everyone_epochs() {
     use crate::commons::bootstrap::Device;
@@ -5570,6 +5657,7 @@ fn the_tender_coalesces_concurrent_remove_epochs_and_skips_superseded_everyone_e
 /// NEGATIVE CONTROL: in `ask_members_if_due`, gate on `!holds_allowed(paths)` alone (as before):
 /// the Mac holding the log asks nobody and the `"with a trusted log it asks the members"` assert
 /// fails.
+#[cfg(unix)]
 #[test]
 fn a_mac_holding_f10s_files_asks_the_members_again_once_it_holds_a_log() {
     use crate::envelope::{Retired, TEST_RETIRED};
@@ -5633,6 +5721,7 @@ fn a_mac_holding_f10s_files_asks_the_members_again_once_it_holds_a_log() {
 /// version to read on a Mac the log alone let in, so the run ends with "this Mac holds no applied
 /// vault to hand a new Mac" (where m40 also held a locker it would hand F10's files from a partial
 /// view instead).
+#[cfg(unix)]
 #[test]
 fn a_member_missing_an_epoch_only_as_its_own_wrap_gap_still_admits_by_the_log() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -5680,6 +5769,7 @@ fn a_member_missing_an_epoch_only_as_its_own_wrap_gap_still_admits_by_the_log() 
 /// NEGATIVE CONTROL: in `draft_document_diff`, drop `left_everyone` from the reuse test: the
 /// removal writes a `Delete` under the old epoch, m7 wraps that epoch to m40, and the `"no key
 /// that sealed the removed value"` assert fails.
+#[cfg(unix)]
 #[test]
 fn a_value_removed_from_everyone_stays_closed_to_a_mac_admitted_after() {
     let macs = two_macs(&[
@@ -5746,6 +5836,7 @@ fn a_value_removed_from_everyone_stays_closed_to_a_mac_admitted_after() {
 ///
 /// NEGATIVE CONTROL: in `log_path`, take the state lock with `StateLock::take` (as before): the
 /// run waits for the pass this test holds, and the one-minute hang detector fails.
+#[cfg(unix)]
 #[test]
 fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -5784,6 +5875,7 @@ fn a_busy_member_ends_a_log_run_with_the_refusal_inside_the_ask_exchanges_bound(
     drop(macs.root);
 }
 
+#[cfg(unix)]
 #[test]
 fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over_to_higher_seq_peer()
  {
@@ -5987,6 +6079,7 @@ fn log_bundle_newcomer_is_materialization_ready_before_first_sync_and_fails_over
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn code_only_log_member_is_removed_on_admin_publish_and_not_rewrapped_by_commons_or_gap_closers() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -6081,6 +6174,7 @@ fn code_only_log_member_is_removed_on_admin_publish_and_not_rewrapped_by_commons
     drop(macs.root);
 }
 
+#[cfg(unix)]
 #[test]
 fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -6206,6 +6300,7 @@ fn second_member_remove_after_sync_forms_quorum_and_voids_post_cutoff_records() 
 /// publish (0.154.0's rule: an omission the minter knew is a revocation): `m22`'s vault pass then
 /// reads `m7`'s omission from the narrowed epoch as a leaving out, no heal wraps it, and the
 /// first assert of step 1 fails.
+#[cfg(unix)]
 #[test]
 fn narrowing_commons_control_is_a_gap_the_heal_closes_and_only_a_remove_keeps_the_member_out() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -6770,6 +6865,7 @@ fn narrowing_commons_control_is_a_gap_the_heal_closes_and_only_a_remove_keeps_th
 /// lock bound while another local writer holds `StateLock`.
 /// NEGATIVE CONTROL: posting in `enroll_commons_member_in_log` before it returns keeps it from
 /// returning while the source holds the POST, and the hang detector fires.
+#[cfg(unix)]
 #[test]
 fn enrollment_returns_while_the_vault_source_holds_its_post() {
     use crate::commons::bootstrap::Device;
@@ -6923,6 +7019,7 @@ fn enrollment_returns_while_the_vault_source_holds_its_post() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by_log_label() {
     let macs = two_macs(&[
@@ -7387,6 +7484,7 @@ fn log_only_member_tracks_rotated_signer_applies_log_sync_and_revokes_cascade_by
 
 /// m7, a member with no admin locker, puts `shared = value` in the log alone, and the records
 /// reach the vault's server and m22.
+#[cfg(unix)]
 fn put_in_log_only(macs: &TwoMacs, value: &[u8]) {
     let (m22, m7) = (&macs.m22, &macs.m7);
     let log = load_records(m7).unwrap().log().unwrap().clone();
@@ -7419,6 +7517,7 @@ fn put_in_log_only(macs: &TwoMacs, value: &[u8]) {
 ///
 /// NEGATIVE CONTROL: make `mirror_still_needed` return `false` whatever was heard (the mirror
 /// stopped early): the first mirror publishes nothing, and the 0.145 Mac keeps reading `v1`.
+#[cfg(unix)]
 #[test]
 fn a_0_145_member_heard_in_14_days_keeps_the_mirror_on() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7531,6 +7630,7 @@ fn a_0_145_member_heard_in_14_days_keeps_the_mirror_on() {
 /// NEGATIVE CONTROL: read without naming the reader in `admin_open_with_candidates` (plain
 /// `transport::fetch` for the primary, or plain `fetch_within` for the probes): the open books a
 /// plain read on that server inside the window, and the mirror is published.
+#[cfg(unix)]
 #[test]
 fn an_admin_opening_the_vault_keeps_no_mirror_on() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7565,12 +7665,14 @@ fn an_admin_opening_the_vault_keeps_no_mirror_on() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 fn id7_of(macs: &TwoMacs) -> Identity {
     read_identity(&macs.m7).unwrap().unwrap()
 }
 
 /// F20's gate on its own: unknown keeps the mirror on; an unproved recipient counts only within
 /// 14 days; members' own recipients never keep it on.
+#[cfg(unix)]
 #[test]
 fn the_mirror_gate_counts_only_unproved_macs_heard_in_14_days() {
     let macs = two_macs(&[]);
@@ -7628,6 +7730,7 @@ fn the_mirror_gate_counts_only_unproved_macs_heard_in_14_days() {
 /// A modern server cannot speak for a server whose heard route is unsupported or unavailable.
 /// The second real loopback server first answers the same 404 an old server does, then holds
 /// the vault and supplies its own observations to the union.
+#[cfg(unix)]
 #[test]
 fn every_server_must_answer_before_the_mirror_can_stop() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -7717,6 +7820,7 @@ fn every_server_must_answer_before_the_mirror_can_stop() {
     macs.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn pending_request_members_are_verified_without_admin_credentials() {
     let macs = two_macs(&[]);
@@ -7733,6 +7837,7 @@ fn pending_request_members_are_verified_without_admin_credentials() {
     assert!(request_members(&empty, &config, None).unwrap().is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn an_admins_approved_recipient_is_not_pending_while_enrollment_is_unfinished() {
     let macs = two_macs(&[]);
@@ -7774,6 +7879,7 @@ fn an_admins_approved_recipient_is_not_pending_while_enrollment_is_unfinished() 
 /// the earlier sets (restored with cp from a backup plus touch, confirmed with cmp): v1's set keeps
 /// `shared`, which, read second, would put it back to `v1`, and the test fails "v1's set stays
 /// pending, less the name v2 wrote".
+#[cfg(unix)]
 #[test]
 fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
     let macs = two_macs(&[]);
@@ -7856,6 +7962,7 @@ fn pending_waiting_sets_land_by_version_and_a_later_write_of_a_name_wins() {
 }
 
 /// What [`unread_set`] saw.
+#[cfg(unix)]
 struct UnreadSet {
     macs: TwoMacs,
     /// The pending set's file m22 cannot read.
@@ -7876,6 +7983,7 @@ struct UnreadSet {
 /// m22 lands v2's set, so `late` waits; then v3's pending set no longer opens with m22's key.
 /// Over it m22 keeps a publish's write, keeps one that has none, reads v3 as stored and runs a
 /// vault pass, `control` setting [`log_entries::UNREAD_AS_NONE`] for all of them.
+#[cfg(unix)]
 fn unread_set(control: bool) -> UnreadSet {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
     let m22 = macs.m22.clone();
@@ -7935,6 +8043,7 @@ fn unread_set(control: bool) -> UnreadSet {
 /// its file is removed, as before W3), run in the test: the publish keeps its write, the file goes
 /// and the pass signs `late`, as the CONTROL asserts say; with the switch set for the first run
 /// too, the test fails "a publish that keeps a write refuses over a set that does not open".
+#[cfg(unix)]
 #[test]
 fn a_pending_set_that_does_not_open_is_never_read_as_none() {
     let run = unread_set(false);
@@ -7996,6 +8105,7 @@ fn a_pending_set_that_does_not_open_is_never_read_as_none() {
 /// W3), run in the test: the `[everyone]` edit is published, as the CONTROL assert says; with the
 /// switch set for the first run too, the test fails "an [everyone] edit over waiting writes that
 /// do not read refuses".
+#[cfg(unix)]
 #[test]
 fn a_draft_over_waiting_writes_that_do_not_read_refuses_an_everyone_edit() {
     for control in [false, true] {
@@ -8054,6 +8164,7 @@ fn a_draft_over_waiting_writes_that_do_not_read_refuses_an_everyone_edit() {
 /// NEGATIVE CONTROL: `admin_cached_unlocked` passing `land` to `admin_base` (restored with cp from
 /// a backup plus touch, confirmed with cmp): in this build with debug assertions the open panics
 /// "an exclusive take of … under this thread's own observation of it waits for good".
+#[cfg(unix)]
 #[test]
 fn a_cached_admin_open_under_an_authors_observation_lands_no_pending_set() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"v1".as_slice())]);
@@ -8090,6 +8201,7 @@ fn a_cached_admin_open_under_an_authors_observation_lands_no_pending_set() {
 ///
 /// NEGATIVE CONTROL: `forget_unsent` with its body cut to `return` (restored with cp from a
 /// backup plus touch, confirmed with cmp): the test fails "an unsent version's set goes".
+#[cfg(unix)]
 #[test]
 fn an_unsent_versions_pending_set_goes_where_the_lock_is_free() {
     let macs = two_macs(&[]);
@@ -8134,6 +8246,7 @@ fn an_unsent_versions_pending_set_goes_where_the_lock_is_free() {
 
 /// The pending sets that twelve publishes leave, each `[everyone]` write on a version no answer
 /// settled, with A3's count bound where `by_count` ([`log_entries::PENDING_BY_COUNT`]).
+#[cfg(unix)]
 fn twelve_pending(by_count: bool) -> (TwoMacs, Identity, usize) {
     let macs = two_macs(&[]);
     let identity = read_identity(&macs.m22).unwrap().unwrap();
@@ -8171,6 +8284,7 @@ fn twelve_pending(by_count: bool) -> (TwoMacs, Identity, usize) {
 /// whatever its version), run in the test: the four oldest of twelve go, and the CONTROL assert
 /// says so; with the switch set for the first run too, the test fails "every set whose version
 /// may be stored stays".
+#[cfg(unix)]
 #[test]
 fn no_pending_set_goes_by_count_and_a_landed_publish_settles_them_by_its_servers() {
     let (macs, identity, kept) = twelve_pending(false);
@@ -8248,6 +8362,7 @@ fn no_pending_set_goes_by_count_and_a_landed_publish_settles_them_by_its_servers
     control.server.stop();
 }
 
+#[cfg(unix)]
 #[test]
 fn legacy_frontier_repair_restores_the_verified_digest_and_keeps_the_damaged_state() {
     let root = aterm_tempfile::tempdir().expect("tempdir");

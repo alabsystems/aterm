@@ -4,7 +4,7 @@
 //! THE FOOTER'S FACTS, CLICKED.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aterm_agent::harness::footer::{self, FactKind, FactMask, FooterFacts};
@@ -69,32 +69,39 @@ impl EffortWish {
     }
 }
 
-/// How long a read catalog stands before the resolver reads it again.
-const CATALOG_RECHECK: Duration = Duration::from_secs(10);
-
 /// The most builds whose catalog is held: the sessions of one machine run a few.
 const CATALOGS_MAX: usize = 8;
 
 /// Each Claude Code build's model catalog, as the footer's resolver thread last read it
-/// ([`note_catalog`]): the main thread reads no file for a card. `None` is a build no sweep has
-/// cached.
+/// ([`note_catalog`]), with the stamp of the `builds` folder it was read from
+/// ([`crate::footer_inputs::Stamp`]): the main thread reads no file for a card. `None` is a build
+/// no sweep has cached.
 #[derive(Default)]
-pub(crate) struct Catalogs(Vec<(Option<String>, Instant, Option<Arc<switch_top::Baked>>)>);
+pub(crate) struct Catalogs(
+    Vec<(
+        Option<String>,
+        crate::footer_inputs::Stamp,
+        Option<Arc<switch_top::Baked>>,
+    )>,
+);
 
 impl Catalogs {
-    /// Whether `version`'s catalog is unread, or has stood [`CATALOG_RECHECK`] at `now`.
+    /// Whether `version`'s catalog is unread, or was read from a `builds` folder whose stamp is
+    /// not `builds`: a sweep caches each build's catalog there by a rename, which moves it.
     #[must_use]
-    pub(crate) fn due(&self, version: Option<&str>, now: Instant) -> bool {
-        !self.0.iter().any(|(v, at, _)| {
-            v.as_deref() == version && now.saturating_duration_since(*at) < CATALOG_RECHECK
-        })
+    pub(crate) fn due(&self, version: Option<&str>, builds: crate::footer_inputs::Stamp) -> bool {
+        !self
+            .0
+            .iter()
+            .any(|(v, at, _)| v.as_deref() == version && *at == builds)
     }
 
-    /// Hold `baked` as `version`'s, read at `now`.
+    /// Hold `baked` as `version`'s, read from a `builds` folder stamped `builds`. Past
+    /// [`CATALOGS_MAX`] builds, the one held longest ago goes.
     pub(crate) fn hold(
         &mut self,
         version: Option<&str>,
-        now: Instant,
+        builds: crate::footer_inputs::Stamp,
         baked: Option<switch_top::Baked>,
     ) {
         self.0.retain(|(v, _, _)| v.as_deref() != version);
@@ -102,7 +109,7 @@ impl Catalogs {
             self.0.remove(0);
         }
         self.0
-            .push((version.map(str::to_owned), now, baked.map(Arc::new)));
+            .push((version.map(str::to_owned), builds, baked.map(Arc::new)));
     }
 
     /// The catalog last read for `version`.
@@ -115,49 +122,80 @@ impl Catalogs {
     }
 }
 
-static CATALOGS: Mutex<Catalogs> = Mutex::new(Catalogs(Vec::new()));
+#[cfg(not(test))]
+static CATALOGS: std::sync::Mutex<Catalogs> = std::sync::Mutex::new(Catalogs(Vec::new()));
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own catalogs: tests run side by side, each with its own resolver stand-in.
+    static CATALOGS: std::cell::RefCell<Catalogs> =
+        const { std::cell::RefCell::new(Catalogs(Vec::new())) };
+}
+
+/// `f` over the catalogs the resolver last read, held for no longer than `f` runs.
+fn with_catalogs<T>(f: impl FnOnce(&mut Catalogs) -> T) -> T {
+    #[cfg(not(test))]
+    {
+        f(&mut CATALOGS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+    #[cfg(test)]
+    {
+        CATALOGS.with(|catalogs| f(&mut catalogs.borrow_mut()))
+    }
+}
 
 /// Read the catalog of the build a session on Claude Code `version` runs, off the main thread
-/// (the footer's resolver, after it read the session's facts) and at most every
-/// [`CATALOG_RECHECK`]: the build's cached catalog under the harness's state
-/// ([`switch_top::catalog`]). No lock is held over the read.
-pub(crate) fn note_catalog(version: Option<&str>, now: Instant) {
+/// (the footer's resolver, after it read the session's facts), where it is unread or its
+/// `builds` folder moved ([`note_catalog_under`]): the build's cached catalog under the
+/// harness's state ([`switch_top::catalog`]). A unit test reads nothing here: an ask no test
+/// captured reaches the real resolver thread ([`crate::claude_footer::request_footer`]), which
+/// reads no harness state in a test; a rig reads through [`note_catalog_under`].
+pub(crate) fn note_catalog(version: Option<&str>) {
     if cfg!(test) {
         return;
     }
-    let due = CATALOGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .due(version, now);
-    if !due {
-        return;
-    }
-    let Some(state) = crate::harness_host::harness_state() else {
+    note_catalog_under(version, crate::harness_host::harness_state);
+}
+
+/// Hold `version`'s cached catalog under the harness state `state` names, where it is due
+/// ([`Catalogs::due`]) at the stamp its `upgrade/builds` folder has now; with no state, nothing
+/// is read or held. A read where nothing is due is one look at that folder. No lock is held over
+/// the read.
+pub(crate) fn note_catalog_under(
+    version: Option<&str>,
+    state: impl FnOnce() -> Option<std::path::PathBuf>,
+) {
+    let Some(state) = state() else {
         return;
     };
+    let builds = crate::footer_inputs::looked(
+        aterm_agent::harness::looks::Input::Catalog,
+        &state.join("upgrade").join("builds"),
+    );
+    if !with_catalogs(|catalogs| catalogs.due(version, builds)) {
+        return;
+    }
+    #[cfg(test)]
+    {
+        crate::work_counts::catalog_read();
+        crate::work_counts::gathered(aterm_agent::harness::looks::Input::Catalog);
+    }
     let baked = switch_top::catalog(&state, version);
-    CATALOGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .hold(version, now, baked);
+    with_catalogs(|catalogs| catalogs.hold(version, builds, baked));
 }
 
 /// The catalog last read for `version`; `None` before the resolver's first read, and for a
 /// build no sweep has cached.
 pub(crate) fn catalog_read_for(version: Option<&str>) -> Option<Arc<switch_top::Baked>> {
-    CATALOGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(version)
+    with_catalogs(|catalogs| catalogs.get(version))
 }
 
 /// Hold `baked` as the catalog of the build that says `version`, as the resolver would.
 #[cfg(all(test, unix))]
 pub(crate) fn hold_catalog(version: &str, baked: switch_top::Baked) {
-    CATALOGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .hold(Some(version), Instant::now(), Some(baked));
+    with_catalogs(|catalogs| catalogs.hold(Some(version), None, Some(baked)));
 }
 
 /// A model family the model card offers the newest of. aterm holds families, never a model's

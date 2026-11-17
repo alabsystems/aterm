@@ -32,18 +32,19 @@ pub mod swarm;
 pub mod swarm_roster;
 pub mod text;
 pub mod transport;
+pub mod vault_txt;
 pub mod x25519;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod claude_token;
 pub mod cli;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod client;
 #[cfg(unix)]
 pub mod converge;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod discover;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod fsx;
 #[cfg(unix)]
 pub mod git_setup;
@@ -52,19 +53,21 @@ pub mod heard;
 #[cfg(unix)]
 pub mod home_lan;
 pub mod keychain_tools;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod members;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod need;
 #[cfg(unix)]
 pub mod network;
 #[cfg(unix)]
 pub mod operational;
+#[cfg(all(test, any(unix, windows)))]
+mod private_scratch;
 #[cfg(unix)]
 pub mod program_watch;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod records_storage;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod registry;
 #[cfg(unix)]
 pub mod release_keychain;
@@ -87,8 +90,15 @@ pub mod sync_diagnostic;
 pub mod wake;
 
 mod ed25519;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+mod identity_file;
+mod making;
+#[cfg(any(unix, windows))]
+pub mod off_record;
+#[cfg(any(unix, windows))]
 mod pass_counts;
+#[cfg(any(unix, windows))]
+mod pull_slots;
 mod secret;
 pub use secret::SecretBytes;
 
@@ -149,7 +159,7 @@ pub fn reserved_name(name: &str) -> bool {
 ///
 /// # Errors
 /// The name is invalid or reserved, there is no home directory, or local state cannot be read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read(name: &str) -> Result<Option<SecretBytes>> {
     client::read_in_place(&client::Paths::locate()?, name)
 }
@@ -159,7 +169,7 @@ pub fn read(name: &str) -> Result<Option<SecretBytes>> {
 ///
 /// # Errors
 /// A name is invalid or reserved, there is no home directory, or local state cannot be read.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub fn read_set(names: &[&str]) -> Result<Option<Vec<SecretBytes>>> {
     let paths = client::Paths::locate()?;
     let Some(expected) = client::config(&paths)? else {
@@ -189,8 +199,10 @@ pub enum LabMark {
     /// A process a lab lane marked made it (`ATERM_LAB_MEMBER_SERVICE`, which `lab mac nux
     /// --scenario vault-phrase` sets on its joiner).
     LabLane,
-    /// A build running inside a virtual machine made it (macOS's `kern.hv_vmm_present` reads
-    /// 1): the other `lab mac nux` guests run a release app, so only this catches them.
+    /// A build running inside a virtual machine made it (`aterm_sysprobe::vm_guest`: macOS's
+    /// `kern.hv_vmm_present` reads 1; on Windows the firmware names a hypervisor's or a cloud's
+    /// virtual hardware, or the processor a guest hypervisor's CPUID signature): the other `lab
+    /// mac nux` guests run a release app, so only this catches them.
     VirtualMachine,
     /// A process whose home is not its login's account home made it: a scratch `HOME` a check, an
     /// installer run or an agent gave a release app. Its vault key, fleet node key and node id are
@@ -231,7 +243,7 @@ impl LabMark {
 }
 
 /// What a process making a vault identity knows of itself ([`lab_identity`]): the live reading is
-/// `Making::now` (Unix), whose virtual-machine and home probes are inert in every test binary; a
+/// [`Making::now`], whose virtual-machine and home probes are inert in every test binary; a
 /// test states each fact instead.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Making {
@@ -393,7 +405,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Write one line to stderr, the log a launchd or systemd job keeps. A log that cannot take it
 /// (a full disk, a closed descriptor) loses the line rather than the job: `eprintln!` panics
 /// when its write fails, which would end a server or subscriber over a log line.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn log_line(line: &str) {
     use std::io::Write as _;
     let _ = writeln!(std::io::stderr().lock(), "{line}");

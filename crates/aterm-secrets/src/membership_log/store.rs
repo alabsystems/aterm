@@ -9,14 +9,14 @@
 //! stream.
 
 use super::{
-    Body, Kind, Log, MAX_HELD_RECORDS, MAX_RECORD, MAX_WAITING, Record, RecordBudgets, RecordId,
-    genesis,
+    Body, Kind, Log, MAX_HELD_RECORDS, MAX_RECORD, MAX_WAITING, Reading, Record, RecordBudgets,
+    RecordId, genesis,
 };
 use crate::{Error, Result};
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod framed;
 
 #[cfg(test)]
@@ -92,6 +92,20 @@ pub fn decode_records(bytes: &[u8]) -> Result<Vec<Record>> {
 /// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than `record_limit` records, or contains a
 /// malformed or invalidly signed record.
 pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<Record>> {
+    decode_records_in(bytes, record_limit, Reading::ONE)
+}
+
+/// [`decode_records_bounded`] as `reading` reads each record ([`Record::decode_in`]): a stream
+/// that holds one record of a layout `reading` does not read is refused whole, as a format-1 node
+/// refuses a stream holding a version-2 record or a `Checkpoint`, exactly as 0.204 does.
+///
+/// # Errors
+/// As [`decode_records_bounded`], or a record is of a layout `reading` does not read.
+pub fn decode_records_in(
+    bytes: &[u8],
+    record_limit: usize,
+    reading: Reading,
+) -> Result<Vec<Record>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
     }
@@ -101,12 +115,12 @@ pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<R
         if out.len() >= record_limit {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
-        let len = Record::wire_len_prefix(&bytes[at..])?;
+        let len = Record::wire_len_prefix(&bytes[at..], reading)?;
         let end = at
             .checked_add(len)
             .filter(|end| *end <= bytes.len() && len <= MAX_RECORD)
             .ok_or_else(|| Error::new("membership record is truncated"))?;
-        out.push(Record::decode(&bytes[at..end])?);
+        out.push(Record::decode_in(&bytes[at..end], reading)?);
         at = end;
     }
     Ok(out)
@@ -122,8 +136,18 @@ pub fn decode_records_bounded(bytes: &[u8], record_limit: usize) -> Result<Vec<R
 ///
 /// # Errors
 /// As [`decode_records`], but for a last record cut short.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn decode_records_before_cut(bytes: &[u8]) -> Result<Vec<Record>> {
+    decode_records_before_cut_in(bytes, Reading::ONE)
+}
+
+/// [`decode_records_before_cut`] as `reading` reads each record: what a cut frame is depends on
+/// the layouts it reads ([`Record::is_cut_frame`]).
+///
+/// # Errors
+/// As [`decode_records_before_cut`], or a whole record is of a layout `reading` does not read.
+#[cfg(any(unix, windows, test))]
+pub(crate) fn decode_records_before_cut_in(bytes: &[u8], reading: Reading) -> Result<Vec<Record>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
     }
@@ -133,12 +157,12 @@ pub(crate) fn decode_records_before_cut(bytes: &[u8]) -> Result<Vec<Record>> {
         if out.len() >= MAX_HELD_RECORDS {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
-        let len = match Record::wire_len_prefix(&bytes[at..]) {
+        let len = match Record::wire_len_prefix(&bytes[at..], reading) {
             Ok(len) => len,
-            Err(_) if Record::is_cut_frame(&bytes[at..]) => break,
+            Err(_) if Record::is_cut_frame(&bytes[at..], reading) => break,
             Err(refused) => return Err(refused),
         };
-        out.push(Record::decode(&bytes[at..at + len])?);
+        out.push(Record::decode_in(&bytes[at..at + len], reading)?);
         at += len;
     }
     Ok(out)
@@ -146,7 +170,7 @@ pub(crate) fn decode_records_before_cut(bytes: &[u8]) -> Result<Vec<Record>> {
 
 /// One record frame of a stream: its id (the SHA-256 of its bytes, which
 /// is [`Record::id`] for a record this build reads) and the parents its bytes name.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) struct Frame {
     pub(crate) id: RecordId,
     pub(crate) parents: Vec<RecordId>,
@@ -164,7 +188,7 @@ pub(crate) struct Frame {
 /// # Errors
 /// `bytes` exceeds [`MAX_RECORDS_STREAM`], holds more than [`MAX_HELD_RECORDS`] frames, or holds
 /// one this layout cannot frame (truncated, oversized, another layout version).
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(unix, windows)))]
 pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
     if bytes.len() > MAX_RECORDS_STREAM {
         return Err(Error::new("membership record stream is too large"));
@@ -175,7 +199,7 @@ pub(crate) fn frames(bytes: &[u8]) -> Result<Vec<Frame>> {
         if out.len() >= MAX_HELD_RECORDS {
             return Err(Error::new("membership record stream exceeds record bound"));
         }
-        let (len, parents) = Record::frame_prefix(&bytes[at..])?;
+        let (len, parents) = Record::frame_prefix(&bytes[at..], Reading::ONE)?;
         let end = at
             .checked_add(len)
             .filter(|end| *end <= bytes.len() && len <= MAX_RECORD)
@@ -216,7 +240,7 @@ pub(crate) fn readable_part(bytes: &[u8], frames: &[Frame]) -> Vec<u8> {
 }
 
 /// Which frames are readable and descend from no unreadable frame in this stream.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) fn readable_mask(
     frames: &[Frame],
     mut readable: impl FnMut(usize, &Frame) -> bool,
@@ -265,8 +289,21 @@ pub(crate) fn causal<R: Borrow<Record>>(
     records: impl IntoIterator<Item = R>,
     held: impl Fn(&RecordId) -> bool,
 ) -> Vec<R> {
-    let mut by_id: BTreeMap<RecordId, R> =
-        records.into_iter().map(|r| (record_of(&r).id, r)).collect();
+    // One record per id, and a whole version-2 record over its shed frame, in either order: a
+    // whole record always wins over its frame ([`Log::insert`]).
+    let mut by_id: BTreeMap<RecordId, R> = BTreeMap::new();
+    for record in records {
+        match by_id.entry(record_of(&record).id) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(record);
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                if record_of(slot.get()).is_whole_of(record_of(&record)) {
+                    slot.insert(record);
+                }
+            }
+        }
+    }
     let geneses: Vec<RecordId> = by_id
         .iter()
         .filter(|(_, r)| record_of(*r).kind() == Kind::Genesis)
@@ -496,11 +533,15 @@ pub struct Store {
     /// The budgets its log takes when its genesis arrives ([`RecordBudgets::current`] when the
     /// store was made).
     budgets: RecordBudgets,
+    /// The format it reads records at ([`Reading`]): what its recovery from a records file and
+    /// an open through the vault's head admit. [`Reading::ONE`] for every store this build makes;
+    /// a store is not where a format is decided, and nothing here stores a format mark.
+    reading: Reading,
     /// Each record of the stream it was recovered from, in the stream's order, with its length,
     /// where it took every frame of that stream ([`Store::recovering`]): where each record of a
     /// records file read whole stands in it, which the vault's head names
     /// ([`super::head::Origin`]) without reading the file again.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(super) file_order: Option<std::sync::Arc<[(RecordId, usize)]>>,
 }
 
@@ -544,7 +585,8 @@ impl Store {
             unrooted: BTreeMap::new(),
             lineage: None,
             budgets: RecordBudgets::current(),
-            #[cfg(unix)]
+            reading: Reading::ONE,
+            #[cfg(any(unix, windows))]
             file_order: None,
         }
     }
@@ -570,7 +612,8 @@ impl Store {
             unrooted: BTreeMap::new(),
             lineage: Some(lineage.to_vec()),
             budgets: RecordBudgets::current(),
-            #[cfg(unix)]
+            reading: Reading::ONE,
+            #[cfg(any(unix, windows))]
             file_order: None,
         }
     }
@@ -611,6 +654,21 @@ impl Store {
         self.budgets
     }
 
+    /// The format it reads records at ([`Reading`]).
+    #[must_use]
+    pub const fn reading(&self) -> Reading {
+        self.reading
+    }
+
+    /// This store, reading records at `reading` from now on: what a records file it recovers and
+    /// a head it opens admit. A store is told its format by the node it is the store of; it
+    /// decides none.
+    #[must_use]
+    pub const fn read_at(mut self, reading: Reading) -> Self {
+        self.reading = reading;
+        self
+    }
+
     /// The keys one of which must have signed the genesis this store takes, when it checks the
     /// genesis by its signer ([`Store::dormant`], [`Store::under`]) rather than by a compiled
     /// digest or not at all.
@@ -626,7 +684,7 @@ impl Store {
     }
 
     /// Keep an already-verified causal projection with this store's admission context.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn projected(mut self, log: Log) -> Result<Self> {
         if self
             .log()
@@ -673,13 +731,13 @@ impl Store {
     #[must_use]
     pub fn recovering(self, bytes: &[u8]) -> Self {
         let bytes = &bytes[..bytes.len().min(MAX_RECORDS_STREAM)];
-        if let Ok(records) = decode_records_bounded(bytes, self.budgets.held) {
+        if let Ok(records) = decode_records_in(bytes, self.budgets.held, self.reading) {
             return self.recover_decoded(records, true);
         }
         let mut records = Vec::new();
         let mut at = 0usize;
         while at < bytes.len() && records.len() < self.budgets.held {
-            let Ok(len) = Record::wire_len_prefix(&bytes[at..]) else {
+            let Ok(len) = Record::wire_len_prefix(&bytes[at..], self.reading) else {
                 break;
             };
             let Some(end) = at
@@ -688,7 +746,7 @@ impl Store {
             else {
                 break;
             };
-            if let Ok(record) = Record::decode(&bytes[at..end]) {
+            if let Ok(record) = Record::decode_in(&bytes[at..end], self.reading) {
                 records.push(record);
             }
             at = end;
@@ -697,7 +755,7 @@ impl Store {
     }
 
     fn recover_decoded(mut self, records: Vec<Record>, strict: bool) -> Self {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
             self.file_order = strict.then(|| {
                 records
@@ -751,7 +809,7 @@ impl Store {
     /// ([`super::payload::Source`]), each once: what holding them open keeps on disk after a
     /// writer replaced them, which the records cache charges ([`Store::footprint`] is what it
     /// keeps in memory).
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) fn shelf_len(&self) -> u64 {
         let mut sources: Vec<&std::sync::Arc<super::payload::Source>> = Vec::new();
         let records = self
@@ -831,11 +889,13 @@ impl Store {
 
     /// How many records `on_file` holds, where this store is `on_file` with complete records
     /// held after its own and nothing else: each holds a log and no record waiting on a parent,
-    /// and this log begins with every record of `on_file`'s, in `on_file`'s order. A file that
+    /// and this log begins with every record of `on_file`'s, in `on_file`'s order, each in the
+    /// same form (a whole version-2 record that took its shed frame's place keeps the frame's
+    /// id, and the file holds the frame's bytes). A file that
     /// holds exactly `on_file`'s records then holds exactly this store's once
     /// [`Store::write_held_from`] that count is on its end. `None` for any other pair: a file
     /// of them is written whole.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub(crate) fn extends(&self, on_file: &Self) -> Option<usize> {
         let (log, base) = (self.log.as_ref()?, on_file.log.as_ref()?);
@@ -852,7 +912,7 @@ impl Store {
             || begins
                 .iter()
                 .zip(base.order.iter())
-                .all(|(ours, theirs)| ours.id == theirs.id))
+                .all(|(ours, theirs)| ours.id == theirs.id && ours.is_shed() == theirs.is_shed()))
         .then_some(held)
     }
 
@@ -879,7 +939,7 @@ impl Store {
     }
 
     /// Bytes in the existing wire encoding, without allocating another copy.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub(crate) fn encoded_len(&self) -> usize {
         self.log.as_ref().map_or_else(
@@ -910,29 +970,32 @@ impl Store {
             .unwrap_or_else(super::empty_heads_digest)
     }
 
-    /// Whether `id` is already held (complete or waiting).
+    /// Whether `id` is already held (complete or waiting), or a final checkpoint this store's
+    /// log is rooted at dropped it ([`Log::knows`]): a dropped record is never taken again.
     #[must_use]
     pub fn contains(&self, id: &RecordId) -> bool {
         match &self.log {
-            Some(log) => log.held.contains_key(id) || log.waiting.contains_key(id),
+            Some(log) => log.knows(id) || log.waiting.contains_key(id),
             None => self.unrooted.contains_key(id),
         }
     }
 
-    /// Whether `id` is held with every parent (not waiting on one), without reading its bytes.
+    /// Whether `id` is held with every parent (not waiting on one), without reading its bytes,
+    /// or a final checkpoint this store's log is rooted at dropped it ([`Log::knows`]).
     #[must_use]
     pub fn holds(&self, id: &RecordId) -> bool {
-        self.log
-            .as_ref()
-            .is_some_and(|log| log.held.contains_key(id))
+        self.log.as_ref().is_some_and(|log| log.knows(id))
     }
 
     /// The record `id` when it is held but not complete: waiting on a parent, or held before a
     /// genesis. A store at its bound may let it go for another record ([`make_room`]), so a
     /// caller that offers it again with its parent (`server::apply_records`) still lands it.
     #[cfg_attr(
-        not(unix),
-        expect(dead_code, reason = "only the unix vault server offers records again")
+        not(any(unix, windows)),
+        expect(
+            dead_code,
+            reason = "only the vault server and a member's admission offer records again"
+        )
     )]
     pub(crate) fn uncomplete(&self, id: &RecordId) -> Option<&Record> {
         match &self.log {
@@ -955,7 +1018,7 @@ impl Store {
     /// every record it holds, keeps waiting or keeps before a genesis (a shelved record's frame
     /// and whatever was read back of it: [`Record::resident_len`]), and its reachability index's
     /// bytes.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, windows, test))]
     pub(crate) fn footprint(&self) -> usize {
         self.log.as_ref().map_or_else(
             || self.unrooted.values().map(Record::resident_len).sum(),
@@ -965,17 +1028,21 @@ impl Store {
 
     /// The most [`Store::footprint`] reaches: a store keeps at most [`MAX_RECORDS_STREAM`] bytes
     /// of records, and an index of at most [`MAX_HELD_RECORDS`] records.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub(crate) const MAX_FOOTPRINT: usize =
         MAX_RECORDS_STREAM + super::reach::reserved_for(MAX_HELD_RECORDS);
 
-    /// Every held record id, sorted.
+    /// Every held record id, sorted, and every id a final checkpoint its log is rooted at
+    /// dropped ([`Store::contains`]).
     #[must_use]
     pub fn inventory(&self) -> BTreeSet<RecordId> {
         let mut ids = BTreeSet::new();
         if let Some(log) = &self.log {
             ids.extend(log.order.iter().map(|r| r.id));
             ids.extend(log.waiting.keys().copied());
+            if let Some(rooting) = log.rooting() {
+                ids.extend(rooting.stubs.keys().copied());
+            }
         } else {
             ids.extend(self.unrooted.keys().copied());
         }
@@ -1074,7 +1141,8 @@ impl Store {
         let Some(log) = &self.log else {
             return Missing::default();
         };
-        let known = log.reach.closure(log.indexes(have));
+        // A peer that names a record this log dropped holds what that record follows.
+        let known = log.reach.closure(log.have_indexes(have));
         let lacked = log
             .order
             .iter()
@@ -1095,7 +1163,9 @@ impl Store {
         out
     }
 
-    /// Insert one decoded [`Record`], returning `true` when it was new to this store.
+    /// Insert one decoded [`Record`], returning `true` when it was new to this store, or when it
+    /// is a whole version-2 record that took the place of its shed frame ([`Log::insert`]): the
+    /// store's ids are the same, its bytes are not.
     ///
     /// # Errors
     /// The record belongs to another network, is a genesis none of a [`Store::dormant`] store's
@@ -1123,7 +1193,7 @@ impl Store {
             }));
         }
         if self.contains(&record.id) {
-            return Ok(false);
+            return Ok(self.take_whole(&record));
         }
         // Records that wait on a missing parent cost a seated key (a removed Mac's among them)
         // nothing to make, so they never shut out the genesis or a record whose parents are
@@ -1131,7 +1201,7 @@ impl Store {
         // one, and a record missing a parent finds no room. The genesis comes first, before any
         // bound.
         if let Some(log) = &mut self.log {
-            let complete = record.parents().iter().all(|p| log.held.contains_key(p));
+            let complete = log.parent_indexes(&record).is_some();
             if !complete
                 && (log.order.len() + log.waiting.len() >= log.budgets.held
                     || log.total_bytes().saturating_add(record.wire_len()) > MAX_RECORDS_STREAM)
@@ -1187,6 +1257,36 @@ impl Store {
         Ok(true)
     }
 
+    /// Put `whole` in the place of the shed frame of it this store holds, keeps waiting or keeps
+    /// before its genesis ([`Record::is_shed`]): a whole record always wins over its frame
+    /// ([`Log::insert`]), within the store's byte bounds. `true` where it took `whole`, which
+    /// changes the store's bytes and none of its ids.
+    fn take_whole(&mut self, whole: &Record) -> bool {
+        if let Some(log) = &mut self.log {
+            return log.take_whole(whole);
+        }
+        if !self
+            .unrooted
+            .get(whole.id())
+            .is_some_and(|frame| frame.is_whole_of(whole))
+        {
+            return false;
+        }
+        let unrooted_bytes: usize = self.unrooted.values().map(Record::wire_len).sum();
+        match self.unrooted.get_mut(whole.id()) {
+            Some(frame)
+                if unrooted_bytes
+                    .saturating_sub(frame.wire_len())
+                    .saturating_add(whole.wire_len())
+                    <= MAX_RECORDS_STREAM - MAX_RECORD =>
+            {
+                *frame = whole.clone();
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Decode and verify every record in `bytes`, then insert each one: if any record in the
     /// stream does not decode or verify, the store is left unchanged. A record [`Store::insert`]
     /// refuses is skipped and the rest are kept: which records a store refuses at its bounds
@@ -1196,7 +1296,9 @@ impl Store {
     /// record, and gives a waiting record's place only to a record it keeps, so a stream that
     /// adds nothing leaves the store as it was without a copy of a store that can reach
     /// [`MAX_RECORDS_STREAM`].
-    /// Returns how many new records entered the store.
+    /// Returns how many records entered the store: new ones, and whole version-2 records that
+    /// took their shed frames' places ([`Store::insert`]), which change its bytes and none of its
+    /// ids.
     ///
     /// # Errors
     /// `bytes` fails [`decode_records`], or no record entered the store and [`Store::insert`]
@@ -1207,7 +1309,7 @@ impl Store {
 
     /// [`Store::ingest`] of `records` already decoded and verified ([`Record::decode`]): each is
     /// inserted after any genesis, seat and parent among them, and a record [`Store::insert`]
-    /// refuses is skipped. Returns how many new records entered the store.
+    /// refuses is skipped. Returns how many records entered the store, as [`Store::ingest`].
     ///
     /// # Errors
     /// No record entered the store and [`Store::insert`] refused one.
@@ -1217,12 +1319,18 @@ impl Store {
         }
         let before = self.inventory();
         let mut refused = None;
+        // Whole records that took the place of a frame this store held before: counted apart,
+        // since the ids do not change.
+        let mut wholes = 0usize;
         for record in causal(records, |id| self.holds(id)) {
-            if let Err(e) = self.insert(record) {
-                refused = Some(e);
+            let known = before.contains(&record.id);
+            match self.insert(record) {
+                Ok(true) if known => wholes += 1,
+                Ok(_) => {}
+                Err(e) => refused = Some(e),
             }
         }
-        let added = self.inventory().difference(&before).count();
+        let added = self.inventory().difference(&before).count() + wholes;
         if added == 0
             && let Some(e) = refused
         {
@@ -1384,7 +1492,7 @@ pub(crate) fn without_written_call<T>(run: impl FnOnce() -> T) -> T {
 /// Hand `w` to this thread's [`with_written`] override, or else the process's [`on_written`]
 /// hook, if any. Its writers are the Unix client's records-file write ([`crate::client`]) and the
 /// tests.
-#[cfg(any(unix, test))]
+#[cfg(any(unix, windows, test))]
 pub(crate) fn written(w: &Written<'_>) {
     #[cfg(test)]
     if WRITTEN_CALL_REMOVED.with(std::cell::Cell::get) {

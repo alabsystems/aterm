@@ -255,6 +255,15 @@ enum Step {
     Close(String),
 }
 
+/// A record [`judge`] applied, for [`step`] to carry to the session in the same hold.
+#[derive(Debug, PartialEq, Eq)]
+enum Applied {
+    /// A `beat`: liveness, and nothing of the current-state record.
+    Beat,
+    /// A `state` record, for the session's current-state record.
+    State(StateRecord),
+}
+
 /// A `state` record [`judge`] took, for [`step`] to apply to the session's current-state
 /// record.
 #[derive(Debug, PartialEq, Eq)]
@@ -326,7 +335,7 @@ fn judge(
     granted: &[WireScope],
     bucket: &mut Bucket,
     now: u64,
-) -> (Step, Option<StateRecord>) {
+) -> (Step, Option<Applied>) {
     let next = state.acked.saturating_add(1);
     let record = match sent {
         Sent::Record(record) => record,
@@ -356,7 +365,7 @@ fn judge_record(
     granted: &[WireScope],
     bucket: &mut Bucket,
     now: u64,
-) -> (Step, Option<StateRecord>) {
+) -> (Step, Option<Applied>) {
     let next = state.acked.saturating_add(1);
     let seq = record.seq;
     if seq > next {
@@ -400,6 +409,7 @@ fn judge_record(
     match body {
         Body::Beat => {
             state.applied.insert(alab_wire::Kind::Beat.word());
+            applied = Some(Applied::Beat);
         }
         Body::State {
             state: said,
@@ -407,12 +417,12 @@ fn judge_record(
         } => match record.line() {
             Ok(line) => {
                 state.applied.insert(alab_wire::Kind::State.word());
-                applied = Some(StateRecord {
+                applied = Some(Applied::State(StateRecord {
                     seq,
                     state: *said,
                     composer: *composer,
                     line,
-                });
+                }));
             }
             // A record the codec read and cannot write back is kept as no line: not applied.
             Err(_) => state.unapplied += 1,
@@ -428,7 +438,8 @@ fn judge_record(
 /// lock: the claim is read again for every line, so a record is held to the grant that stands
 /// when it arrives, and a claim that left this connection ends the stream. A `state` record
 /// that was taken is applied in the same hold (meta, then the timeline), so no reader sees the
-/// kind applied and the record not yet moved.
+/// kind applied and the record not yet moved. An applied record of any kind opens the agent
+/// run of the claim's registry row where the tab has none (D15).
 fn step(
     ctx: &SessionCtx,
     conn: u64,
@@ -457,22 +468,25 @@ fn step(
         return Step::Close("the stream's state went to another claimant".to_string());
     };
     let (step, applied) = judge(state, sent, &granted, bucket, now);
-    if let Some(record) = applied {
-        let fed = StreamFed {
-            state: streamed(record.state),
-            composer: composer(record.composer),
-            epoch: state.epoch.clone(),
-            hseq: record.seq,
-            holder,
-            by: crate::session_log::sid_actor(ctx.self_id.as_str())
-                .unwrap_or(aterm_slog::Actor::Nobody),
-            agent,
-            line: record.line,
-        };
-        ctx.timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .publish_stream_state(fed);
+    if let Some(applied) = applied {
+        let by = crate::session_log::sid_actor(ctx.self_id.as_str())
+            .unwrap_or(aterm_slog::Actor::Nobody);
+        let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+        if let Applied::State(record) = applied {
+            timeline.publish_stream_state(StreamFed {
+                state: streamed(record.state),
+                composer: composer(record.composer),
+                epoch: state.epoch.clone(),
+                hseq: record.seq,
+                holder,
+                by,
+                agent,
+                line: record.line,
+            });
+        }
+        // D15: an applied record of any kind opens the agent run of the claim's row where
+        // none is open, whether or not it moved the agent word.
+        timeline.stream_applied_record(agent, by);
     }
     step
 }

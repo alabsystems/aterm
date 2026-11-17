@@ -6,7 +6,7 @@
 use crate::explain::WhySubject;
 
 /// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
-pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report|left] \
+pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|net|procs|why|report|boot|left] \
                          [scope=pane|tab|window|request|aterm|global] [instances=all] \
                          [top=<1-64>] [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; \
                          scope= on jobs disk procs (cores gpu mem net take it, rows unchanged), \
@@ -55,6 +55,8 @@ pub enum View {
     Why,
     /// Bounded CPU hardware, policy and preserved anomaly report.
     Report,
+    /// Bounded recorded boot cuts and their published-counter coverage.
+    Boot,
     /// What closed tabs and dead verify runs left running, and what macOS's program check holds,
     /// each with its proof and the token `end` takes.
     Left,
@@ -62,7 +64,7 @@ pub enum View {
 
 impl View {
     /// Every view, in the help's order.
-    pub const ALL: [View; 14] = [
+    pub const ALL: [View; 15] = [
         Self::Overview,
         Self::Tab,
         Self::Aterm,
@@ -76,6 +78,7 @@ impl View {
         Self::Procs,
         Self::Why,
         Self::Report,
+        Self::Boot,
         Self::Left,
     ];
 
@@ -96,6 +99,7 @@ impl View {
             Self::Procs => "procs",
             Self::Why => "why",
             Self::Report => "report",
+            Self::Boot => "boot",
             Self::Left => "left",
         }
     }
@@ -108,9 +112,13 @@ impl View {
     #[must_use]
     pub fn default_scope(self) -> Option<ScopeArg> {
         match self {
-            Self::Overview | Self::Tab | Self::Aterm | Self::Global | Self::Why | Self::Report => {
-                None
-            }
+            Self::Overview
+            | Self::Tab
+            | Self::Aterm
+            | Self::Global
+            | Self::Why
+            | Self::Report
+            | Self::Boot => None,
             Self::Jobs | Self::Disk | Self::Procs | Self::Left => Some(ScopeArg::Tab),
             Self::Cores | Self::Gpu | Self::Mem | Self::Net => Some(ScopeArg::Global),
         }
@@ -456,7 +464,7 @@ impl SysQuery {
             | View::Mem
             | View::Net
             | View::Why => true,
-            View::Report => true,
+            View::Report | View::Boot => true,
             View::Aterm => false,
             View::Jobs | View::Procs | View::Left => {
                 matches!(self.effective_scope(), Some(ScopeArg::Tab | ScopeArg::Pane))

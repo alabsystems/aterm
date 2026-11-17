@@ -953,6 +953,7 @@ fn a_waiting_row_always_says_why_and_never_in_the_engines_words() {
     const ENGINE: &str = "ENGINE LINE: waits for init.example@person";
     let all = Selection::all();
     for subject in Subject::all() {
+        let optional = subject == Subject::Access(Access::LocalNetwork);
         for (note, says) in [
             (None, WAITING_NOTE),
             (Some("   "), WAITING_NOTE),
@@ -971,14 +972,25 @@ fn a_waiting_row_always_says_why_and_never_in_the_engines_words() {
                     Vec::new()
                 };
                 let row = row_view(subject, &status, all);
-                assert_eq!(row.note.as_deref(), Some(says), "{subject:?} {note:?}");
+                assert_eq!(
+                    row.note.as_deref(),
+                    (!optional).then_some(says),
+                    "{subject:?} {note:?}"
+                );
                 assert!(!row.label.contains("ENGINE"), "{subject:?}: {}", row.label);
             }
             let mut app = SystemStateApp::new(Plan::from(all));
             app.publish(status);
             let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
             let key = format!("system-state/row/{}/note", row_slug(subject));
-            assert_eq!(label(&compiled, &key), says, "{key}");
+            if optional {
+                assert!(
+                    compiled.semantic(&UiKey::new(key.as_str())).is_none(),
+                    "{key}"
+                );
+            } else {
+                assert_eq!(label(&compiled, &key), says, "{key}");
+            }
             for node in &compiled.semantics {
                 let words = format!(
                     "{} {:?} {:?} {:?}",
@@ -1674,7 +1686,7 @@ fn headlines_say_the_state_in_the_designs_words() {
     assert_eq!(line(&status_of("checking")).text, "Checking this Mac…");
     assert_eq!(
         line(&status_of("running")).text,
-        "Setting up this Mac… 15 of 20"
+        "Setting up this Mac… 14 of 19"
     );
     let needs = line(&status_of("needs-you"));
     assert_eq!(needs.text, "Needs you: Full Disk Access");
@@ -3924,7 +3936,7 @@ fn a_waiting_vault_is_said_under_the_headline() {
 }
 
 /// Serious Mode shows the lockup's words alone (§4.5): the prompt, the words and the caret, with
-/// no kitty and no ribbon behind them.
+/// no road and no cat after them.
 #[test]
 fn serious_mode_shows_the_words_alone() {
     let mut app = SystemStateApp::new(Plan::default());
@@ -3945,7 +3957,10 @@ fn serious_mode_shows_the_words_alone() {
             panic!("the lockup is drawn by its audit");
         };
         assert_eq!(spec.audit_id, crate::native_ui::SYSTEM_STATE_BRAND_AUDIT);
-        assert_eq!(LockupSpec::parse(spec.paint.as_deref()).kitty, !serious);
+        assert_eq!(
+            LockupPaint::parse(spec.paint.as_deref()).spec.kitty,
+            !serious
+        );
         let mut prims = Vec::new();
         paint_lockup(
             &mut prims,
@@ -3977,6 +3992,129 @@ fn busy_setup_ignores_escape_and_accessibility_text_edits() {
     };
     assert_eq!(app.url.value(), Plan::default().vault_url);
     assert!(app.actions.is_empty());
+}
+
+/// A prior vault card kept through an observation has no current input authority. Native text
+/// events bypass action dispatch, so a stale focus must not edit or submit its disabled fields.
+/// The worker is idle here: a busy-only guard would leave this path open.
+#[test]
+fn retained_vault_fields_refuse_native_text_and_submit_until_a_fresh_read() {
+    let secrets = Subject::Setting(Setting::Secrets);
+    let mut prior = status_of("set-up");
+    prior.observed.retain(|row| row.subject != secrets);
+    prior
+        .observed
+        .push(reading(secrets, Standing::NeedsYou, Some("Not joined")).stamped(1_700_000_000));
+    let plan = prior.plan.clone().unwrap();
+    let mut app = SystemStateApp::new(plan.clone());
+    app.publish(prior.clone());
+    app.password
+        .input(TextInputEvent::Commit("kept-password".into()));
+    app.check_again(crate::CheckBy::Press);
+    assert!(matches!(
+        app.take_action(),
+        Some(SystemStateAction::Check(..))
+    ));
+    assert!(app.take_action().is_none());
+
+    let mut observing = prior.clone();
+    observing.busy = false;
+    observing.operation = None;
+    observing.last_known = prior.observed.clone();
+    observing.observed.retain(|row| row.subject != secrets);
+    observing.observed.push(Observation::unknown(secrets));
+    observing.unconfirmed_observations = vec![secrets];
+    observing.observing = vec![(secrets, Some(plan.vault_url.clone()), false)];
+    app.publish(observing);
+    assert!(
+        app.vault_editable(),
+        "the ordinary idle-worker gate is open"
+    );
+    assert!(
+        lines::card_items(&app, &page::page_rows(&app))
+            .iter()
+            .any(|item| item.retained && item.vault)
+    );
+    let (mut runtime, instance, view) = runtime_with_app(app);
+    let compiled = compile(
+        page_in(&runtime, view).0,
+        page_in(&runtime, view).1,
+        999.0,
+        1800.0,
+    );
+    for key in [
+        "system-state/url",
+        "system-state/password",
+        "system-state/vault/join",
+    ] {
+        assert!(
+            compiled
+                .semantic(&UiKey::new(key))
+                .expect("the retained control keeps its seat")
+                .state
+                .is_some_and(|state| !state.enabled)
+        );
+    }
+    for key in ["system-state/url", "system-state/password"] {
+        let before = page_in(&runtime, view)
+            .0
+            .field_projection(key)
+            .unwrap()
+            .text;
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::FocusChanged(Some(UiKey::new(key))),
+            )
+            .unwrap();
+        for event in [
+            AppEvent::TextInput(TextInputEvent::Commit("unwanted-edit".into())),
+            AppEvent::InsertText("another-edit".into()),
+            AppEvent::TextInput(TextInputEvent::Submit),
+        ] {
+            runtime.dispatch(instance, view, event).unwrap();
+            assert_eq!(
+                page_in(&runtime, view)
+                    .0
+                    .field_projection(key)
+                    .unwrap()
+                    .text,
+                before,
+                "a retained {key} took native input"
+            );
+            assert!(
+                runtime.take_system_state_action().is_none(),
+                "a retained field submitted a join"
+            );
+        }
+    }
+
+    runtime.publish_system_state(prior);
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::FocusChanged(Some(UiKey::new("system-state/url"))),
+        )
+        .unwrap();
+    runtime
+        .dispatch(
+            instance,
+            view,
+            AppEvent::TextInput(TextInputEvent::SelectAll),
+        )
+        .unwrap();
+    let fresh_url = "http://fresh.local:7484/v1/team";
+    runtime
+        .dispatch(instance, view, AppEvent::InsertText(fresh_url.into()))
+        .unwrap();
+    assert_eq!(page_in(&runtime, view).0.url.value(), fresh_url);
+    runtime
+        .dispatch(instance, view, AppEvent::TextInput(TextInputEvent::Submit))
+        .unwrap();
+    let (joined, _, _) = submitted(runtime.take_system_state_action());
+    assert_eq!(joined.vault_url, fresh_url, "fresh input can join again");
 }
 
 #[test]
@@ -4563,8 +4701,8 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         let progress = node("system-state/progress");
         assert_eq!(progress.role(), Role::ProgressIndicator, "{width}");
         assert_eq!(progress.label(), Some("Setup progress"), "{width}");
-        assert_eq!(progress.numeric_value(), Some(15.0), "{width}");
-        assert_eq!(progress.max_numeric_value(), Some(20.0), "{width}");
+        assert_eq!(progress.numeric_value(), Some(14.0), "{width}");
+        assert_eq!(progress.max_numeric_value(), Some(19.0), "{width}");
     }
 
     let dock = Subject::Setting(Setting::Dock);
@@ -4574,7 +4712,7 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
     cold.observing = vec![(spotlight, None, false), (dock, None, false)];
     let mut page = page_reading(&cold);
     let hero = hero_of(&page);
-    assert_eq!((hero.done, hero.total), (1, 20));
+    assert_eq!((hero.done, hero.total), (1, 19));
     assert!(hero.as_last_read);
     assert!(!page.headline().set_up);
     let compiled = compile(&page, &SystemStateViewState::default(), 999.0, 900.0);
@@ -4593,7 +4731,7 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         .clone();
     assert_eq!(progress.label(), Some("Setup progress as last read"));
     assert_eq!(progress.numeric_value(), Some(1.0));
-    assert_eq!(progress.max_numeric_value(), Some(20.0));
+    assert_eq!(progress.max_numeric_value(), Some(19.0));
     cold.observed
         .push(reading(dock, Standing::InPlace, Some("Current Dock")).stamped(1_700_000_000));
     cold.observing.retain(|(subject, _, _)| *subject != dock);
@@ -4876,8 +5014,8 @@ fn every_state_keeps_its_words_whole_and_apart_from_320_to_800() {
     );
 }
 
-/// The same at display scales 1x and 1.5x (the device pixels the brand's kitty
-/// is sized in), 1x text: the brand's words never run under its kitty. 2x is
+/// The same at display scales 1x and 1.5x (the device pixels the road and the
+/// cat are baked in), 1x text: the brand's words never run under its cat. 2x is
 /// the display the sweep above renders at (`cx`), with 1x text among its rungs.
 #[test]
 fn every_state_keeps_its_words_whole_at_every_display_scale() {
@@ -7819,7 +7957,6 @@ fn a_withheld_reading_is_no_failure_and_no_set_up_mac() {
 #[test]
 fn every_new_setup_requirement_is_visible_and_prevents_a_ready_page() {
     for access in [
-        Access::LocalNetwork,
         Access::NameRule,
         Access::SpotlightScope,
         Access::NetworkAuth,

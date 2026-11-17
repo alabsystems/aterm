@@ -415,6 +415,7 @@ impl EntrySnapshot {
         self.read_as(paths, Reading::Ordinary)
     }
 
+    #[cfg(unix)]
     pub(super) fn read_publication(&self, paths: &Paths) -> crate::Result<Option<VerifiedEntry>> {
         self.read_as(paths, Reading::PublicationMaterial)
     }
@@ -697,6 +698,7 @@ pub(crate) fn held_names(paths: &Paths, expected: &Config) -> crate::Result<Opti
 /// Exact authenticated publication-token bytes, read in place. The reading is narrowed to the
 /// two GitHub token names for the explicit release probe; its snapshot uses the same narrow
 /// mode on revalidation.
+#[cfg(unix)]
 pub(super) fn read_publication_material(
     paths: &Paths,
     expected: &Config,
@@ -841,6 +843,13 @@ pub(crate) fn read_claude_token_until(
 #[derive(Clone, Copy)]
 enum Reading {
     Ordinary,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "only the unix release tool reads publication material"
+        )
+    )]
     PublicationMaterial,
     Reserved,
     ReservedAndAdmin,

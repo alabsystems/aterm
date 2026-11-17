@@ -12,7 +12,6 @@ use crate::harness::alab_roster::test_machine;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::State;
 use std::collections::BTreeMap;
-use std::fs;
 
 /// This Mac's machine label in every bed.
 const ME: &str = "m1";
@@ -46,10 +45,9 @@ fn account(preferred: &[&str]) -> LabAccount {
     }
 }
 
-fn lab(accounts: Vec<LabAccount>, settled: bool) -> Lab {
+fn lab(accounts: Vec<LabAccount>) -> Lab {
     Lab {
         me: Some(test_machine(ME)),
-        settled,
         accounts,
         ..Lab::default()
     }
@@ -140,7 +138,7 @@ fn order_bed(state: &State) -> (Lab, Roster) {
         };
         rows.push(row(OWNER, false, class));
     }
-    (lab(vec![account(&preferred)], false), Roster { rows })
+    (lab(vec![account(&preferred)]), Roster { rows })
 }
 
 /// `state` once `x` has `got` as its row: `row` and `cls` read back, and the ghosts set where
@@ -286,9 +284,9 @@ fn label_kind(label: &str) -> i64 {
     }
 }
 
-/// The lab and roster a label-area `state` stands for: `x` preferred by no Mac, settled where
-/// `settled`; its row under the label `lbl` names, dirless where it is the default login
-/// (`dflt`), else at its own directory.
+/// The lab and roster a label-area `state` stands for: `x` preferred by no Mac, its legacy label
+/// `LEGACY`; its row under the label `lbl` names, dirless where it is the default login (`dflt`),
+/// else at its own directory.
 fn labels_bed(state: &State) -> (Lab, Roster) {
     let label = match state["lbl"] {
         0 => None,
@@ -300,33 +298,27 @@ fn labels_bed(state: &State) -> (Lab, Roster) {
         .map(|label| row(label, state["dflt"] == 1, Class::Pool))
         .into_iter()
         .collect();
-    (
-        lab(vec![account(&[])], state["settled"] == 1),
-        Roster { rows },
-    )
+    (lab(vec![account(&[])]), Roster { rows })
 }
 
-/// `state` once `x`'s row is `got`: `lbl` read back, and the ghosts set where the step breaks the
-/// law each names (`renamer` says which step it was).
-fn labels_project(state: &State, got: Option<&Row>, renamer: &str) -> State {
+/// `state` once a sync leaves `x`'s row as `got`: `lbl` read back, and the ghosts set where the
+/// sync breaks the law each names.
+fn labels_project(state: &State, got: Option<&Row>) -> State {
     let mut next = state.clone();
     let (was, lbl) = (state["lbl"], got.map_or(0, |row| label_kind(&row.label)));
-    match renamer {
-        "SyncLabels" if was == 0 && lbl == 1 => next.insert("minted", 1),
-        "SyncLabels" if was == 1 && lbl == 2 => next.insert("resynced", 1),
-        "Migrate" if was == 3 && lbl == 2 => next.insert("misnamed", 1),
-        "Migrate" if was == 1 && lbl == 2 && state["settled"] == 0 => next.insert("early", 1),
-        "Migrate" if was == 1 && lbl == 1 && state["settled"] == 1 => next.insert("stale", 1),
-        _ => None,
-    };
+    if was == 0 && lbl == 1 {
+        next.insert("minted", 1);
+    }
+    if was == 1 && lbl == 2 {
+        next.insert("resynced", 1);
+    }
     next.insert("lbl", lbl);
     next
 }
 
 /// The label area's projection of `action`: `SyncLabels` is the sync's composition, with `x`'s
-/// address as the default login's where `dflt`; `Migrate` is [`migrate`] on a scratch store and
-/// roster (its renames are [`renames`]'); the rows a Mac had, its default login and the inventory
-/// round set the bed.
+/// address as the default login's where `dflt`; the rows a Mac had and its default login set the
+/// bed.
 pub(crate) fn labels_transition(state: &State, action: &str) -> State {
     let (lab, existing) = labels_bed(state);
     let mut next = state.clone();
@@ -334,43 +326,30 @@ pub(crate) fn labels_transition(state: &State, action: &str) -> State {
         "SyncLabels" => {
             let default = (state["dflt"] == 1).then(|| email("x"));
             let synced = sync(&lab, &existing, default.as_deref());
-            return labels_project(state, x_row(&synced), action);
-        }
-        "Migrate" => {
-            let root = aterm_tempfile::TempDir::new().unwrap();
-            let store = Store::at(&root.path().join("state"));
-            let path = root.path().join("accounts.toml");
-            if !existing.rows.is_empty() {
-                fs::write(&path, accounts_sync::format_roster_toml(&existing).unwrap()).unwrap();
-            }
-            migrate(&lab, Cli::Claude, &store, &path, NOW, &[]).expect("the migration commits");
-            let migrated = Roster::load_for(Cli::Claude, &path).unwrap();
-            return labels_project(state, x_row(&migrated), action);
+            return labels_project(state, x_row(&synced));
         }
         "RowLegacy" => next.insert("lbl", 1),
         "RowOwner" => next.insert("lbl", 3),
         "DefaultLogin" => next.insert("dflt", 1),
-        "Settle" => next.insert("settled", 1),
         other => panic!("{other} is no label action"),
     };
     next
 }
 
-/// Every step a lab sync and a migration take is a `FleetMachineAssignment` successor from every
-/// state its label area reaches (§0: labels name no machine): the default login takes the lab's
-/// label, a sync renames no row, and a migration renames only from the legacy label and only once
-/// the registry is settled.
+/// Every step a lab sync takes is a `FleetMachineAssignment` successor from every state its label
+/// area reaches (§0: labels name no machine): the default login takes the lab's label, and a sync
+/// renames no row, its legacy row and the default login's included.
 /// NEGATIVE CONTROLS: the sheet path's fleet (`alab` cleared, so the default login is named by
 /// `local_account`) names the default login after the machine, breaking `NoMachineLabelMinted`;
-/// a migration that renames whatever row the lab calls by another label renames the owner's
-/// label, breaking `RenameOnlyFromLegacy`; neither is a successor. Run against the code, `migrate`
-/// without its settled gate renames the legacy row before the registry is settled, so `Migrate`
-/// steps to `early = 1`, no successor.
+/// a sync that gives the legacy row its account's lab label, as the deleted rename did, breaks
+/// `SyncNeverRenames`; neither is a successor.
 #[test]
-fn labels_come_from_the_lab_and_only_a_legacy_label_is_renamed() {
+fn labels_come_from_the_lab_and_no_sync_renames_a_row() {
     let model = aterm_models_harness::fleet_machine_assignment_model();
     let states = area_states(&model, 3);
-    assert!(states.len() > 8, "{} label states", states.len());
+    // No row, a legacy one or the owner's, each with and without the default login, and the
+    // default login's row the lab named.
+    assert_eq!(states.len(), 7, "{states:?}");
     conforms(&model, &states, labels_transition);
 
     let unnamed = states
@@ -397,20 +376,27 @@ fn labels_come_from_the_lab_and_only_a_legacy_label_is_renamed() {
     });
     let built =
         accounts_sync::build_machine_roster(&fleet, ME, &store, Some(&existing), Some(&email("x")));
-    let next = labels_project(unnamed, x_row(&built), "SyncLabels");
+    let next = labels_project(unnamed, x_row(&built));
     assert_eq!(next["minted"], 1, "{built:?}");
     assert!(!model.successors("SyncLabels", unnamed).contains(&next));
 
-    let owned = states
-        .iter()
-        .find(|s| s["lbl"] == 3 && s["settled"] == 1)
-        .expect("a settled row under the owner's label");
-    let (_, existing) = labels_bed(owned);
-    let mut renamed = existing.clone();
-    renamed.rows[0].label = LAB.to_owned();
-    let next = labels_project(owned, x_row(&renamed), "Migrate");
-    assert_eq!(next["misnamed"], 1);
-    assert!(!model.successors("Migrate", owned).contains(&next));
+    for dflt in [0, 1] {
+        let legacy = states
+            .iter()
+            .find(|s| s["lbl"] == 1 && s["dflt"] == dflt && s["resynced"] == 0)
+            .expect("a legacy row");
+        assert_eq!(labels_transition(legacy, "SyncLabels")["lbl"], 1);
+        let (lab, existing) = labels_bed(legacy);
+        let mut renamed = sync(&lab, &existing, (dflt == 1).then(|| email("x")).as_deref());
+        for row in &mut renamed.rows {
+            if row.label == LEGACY {
+                row.label = LAB.to_owned();
+            }
+        }
+        let next = labels_project(legacy, x_row(&renamed));
+        assert_eq!(next["resynced"], 1);
+        assert!(!model.successors("SyncLabels", legacy).contains(&next));
+    }
 }
 
 // 4. Mail.

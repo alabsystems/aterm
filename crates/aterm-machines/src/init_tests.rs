@@ -1712,6 +1712,39 @@ fn converge_transports_unfinished_repository_work_without_claiming_completion() 
     assert_eq!(converge_run(&["--converge"], &ports), exit(0));
 }
 
+/// A standing repository block is unfinished without asking the starter to repeat it on a
+/// clock. A changed input admits a fresh attempt, and a transient wait keeps its retry status.
+#[test]
+fn a_standing_row_transports_an_input_wait_without_a_timed_retry() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = crate::sync::tests::Inert::new(scratch.path());
+    ports.clone_is(OwedClone::Person("preserved checkout work".into()));
+    assert_eq!(
+        converge_run(&["--converge", "--trigger", "subscriber", "--json"], &ports),
+        exit(aterm_secrets::converge::STANDING),
+        "a standing row must not take the transient unfinished transport"
+    );
+    assert!(!ports.applies().contains(&"clone"));
+
+    ports.clone_is(OwedClone::Waiting("Git is installing".into()));
+    assert_eq!(
+        converge_run(&["--converge", "--trigger", "subscriber"], &ports),
+        exit(aterm_secrets::converge::UNFINISHED)
+    );
+    assert!(!ports.applies().contains(&"clone"));
+
+    ports.clone_is(OwedClone::Due("checkout destination changed".into()));
+    assert_eq!(converge_run(&["--converge"], &ports), exit(0));
+    assert_eq!(
+        ports
+            .applies()
+            .iter()
+            .filter(|call| **call == "clone")
+            .count(),
+        1
+    );
+}
+
 /// A subscriber's pass from a held copy is the installed app's: it runs `init --converge
 /// --trigger subscriber` there with this run's flags, ends with that run's exit, and runs no
 /// pass here. A window's or a person's pass never hands off, and a hand-off that cannot be
@@ -6394,7 +6427,8 @@ fn each_row_streams_as_it_finishes_and_the_rows_return_in_composition_order() {
 
 /// The grants an apply hands to the window's walk are the Permissions rows left to the
 /// person, in row order; a grant that is on, a row of another phase and an unknown word are
-/// not. NEGATIVE CONTROL: every needs-you row, read by outcome alone, takes the vault's too.
+/// not. An old app-level Local Network request is not a current requirement either.
+/// NEGATIVE CONTROL: every needs-you row, read by outcome alone, takes the vault's too.
 #[test]
 fn the_walk_takes_the_grants_the_permissions_phase_left_to_the_person() {
     let rows = [
@@ -6415,7 +6449,6 @@ fn the_walk_takes_the_grants_the_permissions_phase_left_to_the_person() {
         [
             Access::FullDiskAccess,
             Access::Debugger,
-            Access::LocalNetwork,
             Access::NameRule,
             Access::SpotlightScope,
             Access::NetworkAuth,
@@ -7280,7 +7313,10 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
                 Access::Debugger,
                 Grant::Unread("tccd did not answer".into()),
             ),
-            (Access::LocalNetwork, Grant::On),
+            (
+                Access::LocalNetwork,
+                Grant::NeedsYou("obsolete app consent must not be requested".into()),
+            ),
             (Access::NameRule, Grant::On),
             (Access::SpotlightScope, Grant::On),
             (Access::NetworkAuth, Grant::On),
@@ -7294,7 +7330,6 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
             "init.permissions.full-disk-access",
             "init.permissions.developer-tools",
             "init.permissions.debugger",
-            "init.permissions.local-network",
             "init.permissions.name-rule",
             "init.permissions.spotlight-scope",
             "init.permissions.network-auth",
@@ -7315,7 +7350,13 @@ fn each_missing_grant_is_one_row_naming_how_and_only_a_check_waits_on_it() {
     for row in &rows[3..] {
         assert!(matches!(row.probe(&sys, &alice), Probe::Ok { .. }));
     }
-    assert_eq!(permissions(no_grants, true).len(), 9);
+    assert_eq!(
+        permissions(no_grants, true).len(),
+        Access::ALL
+            .into_iter()
+            .filter(|access| access.needed_for(Selection::all()))
+            .count()
+    );
     let reported = run(
         &sys,
         &alice,
@@ -7376,7 +7417,6 @@ fn unread_required_authorizations_are_never_verified_or_successful_init_checks()
         )
         .unwrap();
         for access in [
-            Access::LocalNetwork,
             Access::NameRule,
             Access::SpotlightScope,
             Access::NetworkAuth,
@@ -7458,6 +7498,15 @@ fn tab_sudo() -> String {
 /// [`tab`] over `sys` (`live`: in the person's own login), composing `base.clt` alone as
 /// [`tab_entry`] does, its probe finding [`TAB_CC`] or nothing.
 fn tab_run(sys: &Fake, live: bool) -> TabRun {
+    tab_run_owing(sys, live, |_| Vec::new())
+}
+
+/// [`tab_run`] whose item reads the elevation's other steps owed as `owed` says.
+fn tab_run_owing(
+    sys: &Fake,
+    live: bool,
+    owed: fn(&dyn System) -> Vec<crate::root_steps::Owed>,
+) -> TabRun {
     let said = Arc::new(Mutex::new(Vec::new()));
     let out = crate::init_clt::Tab::new({
         let said = Arc::clone(&said);
@@ -7479,6 +7528,7 @@ fn tab_run(sys: &Fake, live: bool) -> TabRun {
                     }),
                     PathBuf::from(TAB_ATERM),
                 )
+                .with_owed(Box::new(owed))
                 .in_tab(tab.clone()),
             ),
             ..Base::none()
@@ -7534,6 +7584,114 @@ fn only_base_clt_under_the_tab_variable_is_the_tabs_program() {
     ] {
         assert!(!in_tab(tab_var, &parse(other)), "{other:?}");
     }
+}
+
+/// The tab's check is `--check --no-wait --only base.clt` alone under the tab's variable: the
+/// words a tab program an update replaced asks the installed build with.
+/// NEGATIVE CONTROL: without the variable, or with any other word, the same words are a
+/// person's check; and the tab's own run is no check.
+#[test]
+fn a_no_wait_check_of_base_clt_under_the_tab_variable_is_the_tabs_check() {
+    let tab_var = Some(std::ffi::OsStr::new("1"));
+    let parse =
+        |args: &[&str]| options(&args.iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+    let words = ["--check", "--no-wait", "--only", "base.clt"];
+    assert!(tab_check(tab_var, &parse(&words)));
+    assert!(!in_tab(tab_var, &parse(&words)));
+    assert!(!tab_check(None, &parse(&words)));
+    assert!(!tab_check(Some(std::ffi::OsStr::new("")), &parse(&words)));
+    for other in [
+        &["--only", "base.clt"][..],
+        &["--check", "--only", "base.clt"],
+        &["--plan", "--no-wait", "--only", "base.clt"],
+        &["--check", "--no-wait", "--only", "base"],
+        &["--check", "--no-wait", "--only", "base.clt", "--json"],
+        &["--check", "--no-wait"],
+    ] {
+        assert!(!tab_check(tab_var, &parse(other)), "{other:?}");
+    }
+}
+
+/// Only a person's run that applies or plans excludes the folders made since the home was
+/// scoped.
+/// NEGATIVE CONTROLS: their `--check` reads this Mac as the window does, and no run aterm
+/// decided asks for such a folder.
+#[test]
+fn only_a_persons_apply_or_plan_scopes_new_folders() {
+    assert!(scopes_new_folders(Decider::Person, Action::Apply));
+    assert!(scopes_new_folders(Decider::Person, Action::Plan));
+    assert!(!scopes_new_folders(Decider::Person, Action::Check));
+    for action in [Action::Apply, Action::Plan, Action::Check] {
+        assert!(!scopes_new_folders(Decider::Aterm, action), "{action:?}");
+    }
+}
+
+/// The tab's check answers by the installed build's own reading of this Mac as its tab's
+/// program stands, and by nothing else of `aterm init`: exit 0 where the Mac reads finished,
+/// 77 where the tools are not in place. It holds no setup record, reads no grant and prints
+/// no row: each of those ports panics here.
+/// NEGATIVE CONTROL: missing tools read short. (Which words are the tab's check is
+/// `a_no_wait_check_of_base_clt_under_the_tab_variable_is_the_tabs_check`'s.)
+#[test]
+fn the_tabs_check_reads_only_the_setup_item() {
+    struct NoRecords;
+    impl Records for NoRecords {
+        fn hold(&self, _pass: Pass, _wait: Option<&dyn Fn(&str)>) -> Result<Box<dyn Held>, Unheld> {
+            panic!("the tab's check held the setup records")
+        }
+    }
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = crate::sync::tests::Inert::new(scratch.path());
+    let words = || -> Vec<OsString> {
+        ["--check", "--no-wait", "--only", "base.clt"]
+            .into_iter()
+            .map(OsString::from)
+            .collect()
+    };
+    let answers = |present: bool| {
+        let host = Host {
+            decided: Decider::Person,
+            base: &|lock| {
+                assert_eq!(lock, BaseLock::Read);
+                Base {
+                    items: Vec::new(),
+                    held: None,
+                    clt: Some(crate::init_clt::CommandLineTools::new(
+                        Box::new(move |_| {
+                            if present {
+                                crate::init_clt::Found::Present("installed".into())
+                            } else {
+                                crate::init_clt::Found::Missing("no developer directory".into())
+                            }
+                        }),
+                        PathBuf::from("/Applications/aterm.app/Contents/MacOS/aterm"),
+                    )),
+                    toolset: None,
+                    targo: None,
+                }
+            },
+            full_disk_access: &|| panic!("the tab's check measured Full Disk Access"),
+            records: &NoRecords,
+            grants: |_| panic!("the tab's check read the grants"),
+            workstation_check: &|_| panic!("the tab's check read workstation observations"),
+            walk: &|_| panic!("the tab's check walked the grants"),
+            converge: &ports,
+            alab: &|| panic!("the tab's check read the ALab scope"),
+            present: || panic!("the tab's check read who is at the screen"),
+        };
+        let code = entry_with_system(
+            words(),
+            &host,
+            Some(std::ffi::OsStr::new("1")),
+            &|_, _| panic!("a check is not the tab's run"),
+            &|| true,
+            &|| Box::new(Fake::root()),
+            &|_| panic!("a check names no Mac"),
+        );
+        format!("{code:?}")
+    };
+    assert_eq!(answers(true), format!("{:?}", ExitCode::SUCCESS));
+    assert_eq!(answers(false), format!("{:?}", ExitCode::from(77)));
 }
 
 /// `aterm init --only base.clt` under the tab's variable is the tab's own run, whose code is
@@ -7818,6 +7976,60 @@ fn the_tab_ends_on_one_line_saying_why_the_install_did_not_finish() {
     sys.running(&[]);
     sys.answer(Some(go));
     ends_on(&tab_run(&sys, true), Unfinished::Other, false);
+}
+
+/// A tab aterm opened by itself for a step root already failed at for good (the tools there,
+/// developer mode off, root's record holding that reading) asks no password and ends on the
+/// line that says the steps are not set up, with that class's exit, which makes the window
+/// read the steps again. NEGATIVE CONTROL: with no record the same tab asks the password.
+#[test]
+fn the_tab_asks_nothing_for_a_step_root_already_failed_at() {
+    use crate::init_clt::Unfinished;
+    use aterm_types::macos_setup::refused::DEVELOPER_MODE;
+    let status = "/usr/sbin/DevToolsSecurity -status";
+    let sudo = format!("{} --root-steps-only", tab_sudo());
+    let mac = |record: bool| {
+        let mut sys = alice_with_checkout(501, None);
+        sys.running(&[]);
+        sys.tty = true;
+        sys.answer(Some(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_GO))
+            .file(TAB_CC, b"")
+            // The naming rule in place, so developer mode is the one step owed.
+            .stat_of(
+                aterm_types::macos_setup::ADMITTED_NAME_RULE,
+                Stat {
+                    uid: 0,
+                    gid: 0,
+                    mode: 0o440,
+                    dir: false,
+                    symlink: false,
+                    len: 1,
+                },
+            )
+            .on(status, Ran::ok("Developer mode is currently disabled.\n"))
+            .on(&sudo, Ran::ok(""));
+        if record {
+            sys.file(DEVELOPER_MODE, b"off\n");
+        }
+        sys
+    };
+    let asked = |sys: &Fake| sys.calls().iter().any(|call| call.starts_with("tty "));
+
+    let sys = mac(true);
+    let run = tab_run_owing(&sys, true, crate::root_steps::owed);
+    assert!(!asked(&sys), "{:?}", sys.calls());
+    assert_eq!(
+        run.said,
+        [
+            TAB_CLEAR.to_owned(),
+            format!("{}\n", Unfinished::StepsOwed.line()),
+        ]
+    );
+    assert_eq!(run.code, Unfinished::StepsOwed.tab_exit());
+
+    let sys = mac(false);
+    tab_run_owing(&sys, true, crate::root_steps::owed);
+    assert!(asked(&sys), "{:?}", sys.calls());
 }
 
 /// In Low Data Mode the tab asks for no password and ends on its own line, naming Low Data

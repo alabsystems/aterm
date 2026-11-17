@@ -3,13 +3,50 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn a_standing_row_waits_on_inputs_and_never_starts_for_a_timer() {
+    use aterm_secrets::converge::{MarkMoved, RepositoryWork};
+    let calls = std::cell::Cell::new(0);
+    let mut waits = Vec::new();
+    let mut wakes = [
+        Some(LaneWake::Network(crate::network_moved::Woke::Timer)),
+        Some(LaneWake::Network(crate::network_moved::Woke::Timer)),
+        Some(LaneWake::Inputs(
+            RepositoryWork::Repair,
+            MarkMoved::default(),
+            1,
+        )),
+        None,
+    ]
+    .into_iter();
+    lane_plain(
+        &mut |_, work| {
+            assert_eq!(
+                work,
+                RepositoryWork::Refresh,
+                "retain the standing pass's stronger work"
+            );
+            calls.set(calls.get() + 1);
+            Ended::Standing
+        },
+        &mut |_| panic!("standing work is quiet"),
+        &mut |every| {
+            waits.push(every);
+            wakes.next().unwrap()
+        },
+    );
+    assert_eq!(calls.get(), 2, "startup and one actual input wake");
+    assert_eq!(waits, [None; 4], "the kernel wait has no retry deadline");
+}
+
 /// [`lane`] for a test of its pacing: `pass` takes no start note, and the clock is the real one,
 /// as the lane's was before its passes were noted.
 #[cfg(unix)]
 fn lane_plain(
     pass: &mut dyn FnMut(&str, aterm_secrets::converge::RepositoryWork) -> Ended,
     log: &mut dyn FnMut(&str),
-    wait: &mut dyn FnMut(std::time::Duration) -> Option<LaneWake>,
+    wait: &mut dyn FnMut(Option<std::time::Duration>) -> Option<LaneWake>,
 ) {
     let clock = std::time::Instant::now();
     lane(
@@ -203,7 +240,11 @@ fn a_window_pass_meeting_a_held_lock_waits_for_it_and_runs_once_it_is_let_go() {
         );
         let (ends, waits) = lane_thread.join().expect("the lane");
         assert_eq!(ends, [Ended::Ran], "one pass, which ran");
-        assert_eq!(waits, [crate::secrets_join::MEND_EVERY], "then the recheck");
+        assert_eq!(
+            waits,
+            [Some(crate::secrets_join::MEND_EVERY)],
+            "then the recheck"
+        );
     });
     assert_eq!(starts(), 1);
 }
@@ -232,7 +273,7 @@ fn an_input_wake_carries_what_moved_the_inputs_mark() {
             &mut network,
             &mut wake,
             &mut inputs,
-            std::time::Duration::from_secs(60)
+            Some(std::time::Duration::from_secs(60))
         ),
         Some(LaneWake::Inputs(RepositoryWork::Repair, both, 2))
     );
@@ -394,10 +435,14 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
     assert_eq!(
         waits,
         [
-            crate::secrets_join::MEND_EVERY,
-            std::time::Duration::from_millis(aterm_secrets::converge::FIRST_RETRY_MS),
-            std::time::Duration::from_millis(2 * aterm_secrets::converge::FIRST_RETRY_MS),
-            crate::secrets_join::MEND_EVERY,
+            Some(crate::secrets_join::MEND_EVERY),
+            Some(std::time::Duration::from_millis(
+                aterm_secrets::converge::FIRST_RETRY_MS
+            )),
+            Some(std::time::Duration::from_millis(
+                2 * aterm_secrets::converge::FIRST_RETRY_MS
+            )),
+            Some(crate::secrets_join::MEND_EVERY),
         ]
     );
 
@@ -448,7 +493,7 @@ fn the_lane_runs_at_once_and_retries_before_the_mend_interval() {
         &mut |every| match calls.get() {
             1 | 3 => until_moved(&mut network, &mut wake, &mut inputs, every),
             2 => {
-                retry_wait = Some(every);
+                retry_wait = every;
                 Some(LaneWake::Network(crate::network_moved::Woke::Timer))
             }
             _ => None,
@@ -532,7 +577,7 @@ fn unfinished_work_retries_quietly_until_its_prerequisite_is_ready() {
                     .then_some(LaneWake::Network(crate::network_moved::Woke::Timer))
             },
         );
-        assert_eq!(waits, expected);
+        assert_eq!(waits, expected.into_iter().map(Some).collect::<Vec<_>>());
         assert!(logged.is_empty(), "{logged:?}");
     }
 }
@@ -574,8 +619,13 @@ fn the_converge_lane_wakes_on_a_route_change_and_says_why() {
             if passes.get() > 1 {
                 return None;
             }
-            assert_eq!(every, crate::secrets_join::MEND_EVERY);
-            let reason = until_moved(&mut watch, &mut input_wake, &mut inputs, HANG.min(every));
+            assert_eq!(every, Some(crate::secrets_join::MEND_EVERY));
+            let reason = until_moved(
+                &mut watch,
+                &mut input_wake,
+                &mut inputs,
+                Some(HANG.min(every.unwrap())),
+            );
             woke.set(reason);
             reason
         },

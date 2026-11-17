@@ -1667,3 +1667,38 @@ fn private_namespace_is_fixed_to_held_commands_without_exposing_lean_or_global_s
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[path = "native_tests.rs"]
 mod native_inputs;
+
+#[test]
+fn named_targo_prerequisite_binds_the_signed_frontend_and_refuses_changed_bytes() {
+    assert_eq!(Prerequisite::named("targo"), None);
+    let fixture = Fixture::new(Prerequisite::Targo);
+    crate::store::mark_build_ready(&fixture.root).unwrap();
+    let session = fixture.session(TRIPLE).unwrap();
+    assert!(
+        session
+            .acquire_all(&[Prerequisite::Targo])
+            .unwrap_err()
+            .contains("exact physical invocation")
+    );
+    let namespace_tool = session.acquire_build(Prerequisite::Targo, 7).unwrap();
+    assert!(
+        super::named::HeldBuild::new(Prerequisite::Targo, namespace_tool)
+            .unwrap_err()
+            .contains("exact physical invocation")
+    );
+    let tool = session.acquire_build(Prerequisite::Targo, 7).unwrap();
+    assert_eq!(tool.program(), "trust");
+    assert_eq!(tool.build(), 7);
+    assert_eq!(
+        tool.physical_path(),
+        fixture.root.join("bin/targo").canonicalize().unwrap()
+    );
+    tool.validate().unwrap();
+    std::fs::write(
+        tool.physical_path(),
+        b"replaced native response is not signed authority",
+    )
+    .unwrap();
+    assert!(tool.validate().is_err());
+    assert!(session.acquire_build(Prerequisite::Targo, 7).is_err());
+}

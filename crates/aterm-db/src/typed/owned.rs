@@ -27,8 +27,9 @@ pub struct Op {
     pub roster: Digest,
     /// The period table it was read from (a ring's period; 0 for a catalog table).
     pub period: u64,
-    /// A `Revert`: the owner's compensation of one earlier operation, never automatic.
-    pub revert: bool,
+    /// A `Revert`'s target: the earlier operation the owner's compensation undoes. A revert is
+    /// never automatic.
+    pub revert: Option<Digest>,
     pub changes: Vec<Change>,
 }
 
@@ -332,7 +333,7 @@ pub fn may_publish_schema(state: &SchemaState, ours: u32) -> bool {
 /// the owner's verb even where it restores a value written automatically, so it never spends
 /// the reverting Mac's quota (or lands past it, inert while `revert` reports success).
 pub fn automatic(table: &Table, op: &Op) -> bool {
-    automatic_record(table, op.revert, &op.changes)
+    automatic_record(table, op.revert.is_some(), &op.changes)
 }
 
 /// [`automatic`] for a record by its parts: whether it is a revert, and its changes.
@@ -543,7 +544,7 @@ pub(crate) mod commons {
                 sequence: operation.header.sequence,
                 roster: operation.roster,
                 period,
-                revert: matches!(command, Command::Revert { .. }),
+                revert: command.reverts(),
                 changes: command.changes()?.to_vec(),
             })
         }
@@ -554,7 +555,7 @@ pub(crate) mod commons {
             operation: Operation,
             command: Command,
         ) -> Option<Self> {
-            let revert = matches!(command, Command::Revert { .. });
+            let revert = command.reverts();
             Some(Self {
                 id: operation.header.id,
                 actor: operation.header.actor,

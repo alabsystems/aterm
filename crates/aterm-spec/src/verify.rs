@@ -39,8 +39,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Mutex;
+
+use aterm_uds::spawnfd::{Command, Tether as _};
 
 use crate::derive::{Liveness, Model};
 use crate::interp;
@@ -660,43 +661,40 @@ fn civil_from_unix_days(days: i64) -> (i64, u32, u32) {
     )
 }
 
-const PROBE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
-
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_output(bin: &Path, args: &[&str]) -> Option<std::process::Output> {
-    probe_output_within(bin, args, PROBE_HANG)
+    probe_output_within(bin, args, crate::wait::MUST_HAPPEN)
 }
 
+/// `bin args`, or `None` where it fails to start or makes no progress (no output, no CPU or
+/// I/O of its process tree) for `window`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn probe_output_within(
     bin: &Path,
     args: &[&str],
-    bound: std::time::Duration,
+    window: std::time::Duration,
 ) -> Option<std::process::Output> {
-    use std::process::Stdio;
-    use std::time::Instant;
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now().checked_add(bound);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if deadline.is_none_or(|d| Instant::now() < d) => {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    let mut cmd = owned_child(bin);
+    cmd.args(args);
+    aterm_uds::deadline::output_while_process_progressing(&mut cmd, window, "a checker's probe")
+        .ok()
+}
+
+/// A child of this checker, tied to this process so that it ends with the run that started it.
+/// Where the tie can end a whole group (this process's `main` armed the tether), the child leads
+/// a process group of its own, so everything it starts ends with it too. A process that never
+/// armed it (a test binary) keeps the child in its own group, where the terminal's signals still
+/// reach it. On 2026-11-15 four `ty` runs whose starter had died ran on under launchd until the
+/// Mac ran out of memory and panicked.
+#[cfg_attr(trust_verify, trust::skip)]
+fn owned_child(program: &Path) -> Command {
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.tether();
+    #[cfg(unix)]
+    if aterm_uds::tether::executable().is_some() {
+        cmd.process_group(0);
     }
-    child.wait_with_output().ok()
+    cmd
 }
 
 #[cfg_attr(trust_verify, trust::skip)]
@@ -1168,7 +1166,7 @@ impl TyCommand {
     /// `ty check <spec> --config <cfg>`, armed for the whole space.
     #[must_use]
     pub fn check(ty: &Path, spec: &Path, cfg: &Path) -> Self {
-        let mut cmd = Command::new(ty);
+        let mut cmd = owned_child(ty);
         cmd.arg("check")
             .arg(spec)
             .arg("--config")
@@ -1180,7 +1178,7 @@ impl TyCommand {
     /// `ty trace validate <trace> --spec <spec> --config <cfg>`.
     #[must_use]
     pub fn trace_validate(ty: &Path, trace: &Path, spec: &Path, cfg: &Path) -> Self {
-        let mut cmd = Command::new(ty);
+        let mut cmd = owned_child(ty);
         cmd.arg("trace")
             .arg("validate")
             .arg(trace)
@@ -1197,11 +1195,27 @@ impl TyCommand {
         self
     }
 
-    /// Run it, failing closed on a search that stopped early.
+    /// Run it while it makes progress, failing closed on a search that stopped early.
+    ///
+    /// # Errors
+    /// A spawn or capture failure; a run whose output and process tree (CPU, I/O) stood still
+    /// for a whole minute; a search `ty` reports it stopped early (exit 5, or a
+    /// `Model checking stopped:` line).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn output(&mut self) -> std::io::Result<std::process::Output> {
         with_scratch_ty_home(&mut self.0);
-        let out = self.0.output()?;
+        let out = aterm_uds::deadline::output_while_process_progressing(
+            &mut self.0,
+            crate::wait::MUST_HAPPEN,
+            "a ty run",
+        )
+        .map_err(|error| {
+            std::io::Error::other(format!(
+                "{}{:?}: {error}",
+                ty_evidence_header(Path::new(self.0.get_program())),
+                self.0,
+            ))
+        })?;
         if stopped_early(&out) {
             return Err(std::io::Error::other(format!(
                 "ty INCOMPLETE: the search was stopped by a resource limit — nothing was proved\n\
@@ -1226,13 +1240,9 @@ fn stopped_early(out: &std::process::Output) -> bool {
 
 /// Spawn a long-lived `ty` co-process (the `--cases` pool's one door) with [`TyCommand::output`]'s scratch HOME and piped stdin and stdout.
 #[cfg_attr(trust_verify, trust::skip)]
-pub(crate) fn ty_child(
-    cmd: &mut aterm_uds::spawnfd::Command,
-) -> std::io::Result<aterm_uds::spawnfd::Child> {
+pub(crate) fn ty_child(cmd: &mut Command) -> std::io::Result<aterm_uds::spawnfd::Child> {
     use aterm_uds::spawnfd::Stdio;
-    for (key, value) in scratch_ty_env() {
-        cmd.env(key, value);
-    }
+    with_scratch_ty_home(cmd);
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()
 }
 
@@ -2486,7 +2496,7 @@ impl CasesChild {
             reader_opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
         }
         let stderr_reader = reader_opts.open(&stderr_path).map_err(io)?;
-        let mut cmd = aterm_uds::spawnfd::command(ty);
+        let mut cmd = owned_child(ty);
         cmd.arg("trace")
             .arg("validate")
             .arg("--spec")

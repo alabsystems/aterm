@@ -886,7 +886,8 @@ fn a_claim_that_landed_unjournaled_is_spent_and_the_re_run_claims_anew() {
         "0.26.0",
         false,
     );
-    res.unwrap_err();
+    let error = res.unwrap_err().to_string();
+    assert!(error.contains("injected checkout failure"), "{error}");
     assert_eq!(
         origin_file(&fix, "RELEASES.ledger"),
         format!("{SEED_LEDGER}1790000000 0.26.0\n"),

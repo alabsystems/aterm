@@ -7,12 +7,18 @@
 //! budget, so a test can show it breaks a bound without running out the cubic count.
 //!
 //! Every resolution the tests run checks itself against it ([`check`]), and, up to
-//! [`ISLAND_OPS`] ops, against the island's fold too ([`island`], `aterm_mesh_core::convergence`'s
-//! `Register`, which law 5's proof reads step for step).
+//! [`ISLAND_OPS`] ops of a register no version-2 op writes, against the island's fold too
+//! ([`island`], `aterm_mesh_core::convergence`'s `Register`, which law 5's proof reads step for
+//! step). A version-2 op reads by its statement in every log ([`crate::membership_log::rooted`]),
+//! which the fold does not model: the oracle takes its carry and rep from the statement as the
+//! frames read it, and resolves the rest as it did, its rep possibly an op no other of the
+//! register is (one a prune dropped, or one this reader did not open).
 
 use super::super::{CandidateOp, DecodedOp};
 use super::Register;
+use crate::membership_log::RecordId;
 use crate::membership_log::eval;
+use crate::membership_log::rooted::Stated;
 use aterm_mesh_core::convergence::{Op, Register as Fold};
 use std::cell::Cell;
 
@@ -32,22 +38,31 @@ fn same_op(a: &DecodedOp, b: &DecodedOp) -> bool {
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::membership_log) struct Exhausted;
 
-/// What the replaced resolver read off a register: each op's carry and rep, the siblings, their
-/// winner, and whether the register is a conflict.
+/// What the replaced resolver read off a register: each op's carry and the id of its rep, the
+/// siblings, their winner, and whether the register is a conflict.
 #[derive(Debug, PartialEq, Eq)]
 pub(in crate::membership_log) struct Resolved {
     pub(in crate::membership_log) carries: Vec<bool>,
-    pub(in crate::membership_log) reps: Vec<usize>,
+    pub(in crate::membership_log) reps: Vec<RecordId>,
     pub(in crate::membership_log) siblings: Vec<usize>,
     pub(in crate::membership_log) winner: Option<usize>,
     pub(in crate::membership_log) conflict: bool,
 }
 
+/// The op an op stands for: one of the register's, or an op none of them is.
+#[derive(Clone, Copy)]
+enum Rep {
+    In(usize),
+    Out(RecordId),
+}
+
 struct Old<'a> {
     cands: &'a [CandidateOp],
     carries: Vec<bool>,
-    reps: Vec<usize>,
+    reps: Vec<Rep>,
     before: &'a dyn Fn(usize, usize) -> bool,
+    /// Whether a rep none of the register's ops is lies in the past of a record index.
+    outside: &'a dyn Fn(&RecordId, usize) -> bool,
     tests: Cell<usize>,
     budget: usize,
 }
@@ -56,6 +71,25 @@ impl Old<'_> {
     fn before(&self, a: usize, b: usize) -> bool {
         self.tests.set(self.tests.get() + 1);
         (self.before)(a, b)
+    }
+
+    /// The id of the op op `i` stands for.
+    fn rep_id(&self, i: usize) -> RecordId {
+        match self.reps[i] {
+            Rep::In(j) => self.cands[j].record_id,
+            Rep::Out(id) => id,
+        }
+    }
+
+    /// Whether the op op `c` stands for lies in the past of op `s`.
+    fn rep_before(&self, c: usize, s: usize) -> bool {
+        match self.reps[c] {
+            Rep::In(j) => self.before(self.cands[j].index, self.cands[s].index),
+            Rep::Out(id) => {
+                self.tests.set(self.tests.get() + 1);
+                (self.outside)(&id, self.cands[s].index)
+            }
+        }
     }
 
     fn spent(&self) -> Result<(), Exhausted> {
@@ -69,6 +103,16 @@ impl Old<'_> {
     fn classify(&mut self) -> Result<(), Exhausted> {
         let cands = self.cands;
         for k in 0..cands.len() {
+            if let Some(stated) = &cands[k].stated {
+                if let Stated::Carry(rep) = stated {
+                    self.carries[k] = true;
+                    self.reps[k] = cands
+                        .iter()
+                        .position(|op| op.record_id == *rep)
+                        .map_or(Rep::Out(*rep), Rep::In);
+                }
+                continue;
+            }
             let mut maximal: Vec<usize> = Vec::new();
             for b in (0..k).rev() {
                 if self.before(cands[b].index, cands[k].index)
@@ -104,9 +148,7 @@ impl Old<'_> {
         for &c in &maximal {
             if !self.carries[c]
                 || !maximal.iter().any(|&s| {
-                    s != c
-                        && !same_op(&cands[s].op, &cands[c].op)
-                        && self.before(cands[self.reps[c]].index, cands[s].index)
+                    s != c && !same_op(&cands[s].op, &cands[c].op) && self.rep_before(c, s)
                 })
             {
                 kept.push(c);
@@ -120,7 +162,7 @@ impl Old<'_> {
         siblings
             .iter()
             .copied()
-            .min_by_key(|&i| (self.cands[self.reps[i]].record_id, self.cands[i].record_id))
+            .min_by_key(|&i| (self.rep_id(i), self.cands[i].record_id))
     }
 
     fn siblings(&self) -> Result<Vec<usize>, Exhausted> {
@@ -142,18 +184,20 @@ impl Old<'_> {
 }
 
 /// Resolve `cands` (one register's ops, in record order) as the replaced resolver did, with
-/// `before` for causal precedence between record indexes, giving up once more than `budget`
-/// tests have run; with the tests it ran.
+/// `before` for causal precedence between record indexes and `outside` for a stated rep none of
+/// them is, giving up once more than `budget` tests have run; with the tests it ran.
 pub(in crate::membership_log) fn resolve(
     cands: &[CandidateOp],
     before: &dyn Fn(usize, usize) -> bool,
+    outside: &dyn Fn(&RecordId, usize) -> bool,
     budget: usize,
 ) -> (Result<Resolved, Exhausted>, usize) {
     let mut old = Old {
         cands,
         carries: vec![false; cands.len()],
-        reps: (0..cands.len()).collect(),
+        reps: (0..cands.len()).map(Rep::In).collect(),
         before,
+        outside,
         tests: Cell::new(0),
         budget,
     };
@@ -170,7 +214,7 @@ pub(in crate::membership_log) fn resolve(
             winner,
             conflict,
             carries: old.carries.clone(),
-            reps: old.reps.clone(),
+            reps: (0..cands.len()).map(|i| old.rep_id(i)).collect(),
         })
     });
     (resolved, old.tests.get())
@@ -181,7 +225,9 @@ pub(in crate::membership_log) fn resolved(register: &Register<'_>, siblings: &[u
     let winner = register.winner(siblings);
     Resolved {
         carries: register.carries.clone(),
-        reps: register.reps.clone(),
+        reps: (0..register.carries.len())
+            .map(|i| register.rep_id(i))
+            .collect(),
         siblings: siblings.to_vec(),
         winner,
         conflict: winner.is_some_and(|w| register.conflict(siblings, w)),
@@ -225,7 +271,9 @@ pub(in crate::membership_log) fn island(
     });
     Some(Resolved {
         carries: (0..n).map(|i| fold.carries(i)).collect(),
-        reps: (0..n).map(|i| by_id[fold.rep(i)]).collect(),
+        reps: (0..n)
+            .map(|i| cands[by_id[fold.rep(i)]].record_id)
+            .collect(),
         siblings: (0..n).filter(|&i| fold.is_sibling(i)).collect(),
         winner: fold.winner(),
         conflict: fold.conflict(),
@@ -242,19 +290,25 @@ thread_local! {
 }
 
 /// Check what `register` and its `siblings` resolved against the oracle, and, up to
-/// [`ISLAND_OPS`] ops, against the island's fold, reading causality from `effective`: every
-/// resolution a test runs checks itself, so every test that opens entries is a case of the
+/// [`ISLAND_OPS`] ops of a register no version-2 op writes, against the island's fold, reading
+/// causality from `effective` and, for a stated rep none of the register's ops is, `outside`:
+/// every resolution a test runs checks itself, so every test that opens entries is a case of the
 /// differential. A disagreement fails the test, or is counted under [`COUNT_ONLY`].
 pub(in crate::membership_log) fn check(
     cands: &[CandidateOp],
     effective: &eval::Effective,
+    outside: &dyn Fn(&RecordId, usize) -> bool,
     register: &Register<'_>,
     siblings: &[usize],
 ) {
     let before = |a, b| effective.before(a, b);
-    let (want, _) = resolve(cands, &before, usize::MAX);
+    let (want, _) = resolve(cands, &before, outside, usize::MAX);
     let want = want.expect("an unbounded budget never runs out");
-    let fold = island(cands, &before);
+    let fold = cands
+        .iter()
+        .all(|op| op.stated.is_none())
+        .then(|| island(cands, &before))
+        .flatten();
     let got = resolved(register, siblings);
     let (checked, wrong) = CHECKED.get();
     let disagrees = got != want || fold.as_ref().is_some_and(|fold| *fold != want);

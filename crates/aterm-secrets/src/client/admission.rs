@@ -249,5 +249,5 @@ fn recipients(doc: &Document) -> crate::Result<BTreeMap<[u8; 32], ()>> {
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

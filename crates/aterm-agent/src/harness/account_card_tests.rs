@@ -1352,3 +1352,93 @@ fn an_outside_logins_history_is_asked_for_by_key() {
     );
     assert_eq!(unkeyed, Some(HistoryWho::default()));
 }
+
+/// The law's sweep over a half whose read at `t` is `read(t)` (the half, and the second its read
+/// named), from `from` to `to`, every hour and at each second a read named and the one before:
+/// wherever two consecutive instants read otherwise, the earlier one's read named a second no
+/// later than the later one. Returns how many changes it saw.
+fn turns_sweep(
+    name: &str,
+    (from, to): (i64, i64),
+    read: impl Fn(i64) -> (LoginHalf, Option<i64>),
+) -> usize {
+    let mut at: BTreeSet<i64> = (from..to).step_by(3_600).collect();
+    for t in at.clone() {
+        if let Some(due) = read(t).1.filter(|due| *due < to) {
+            at.extend([due - 1, due]);
+        }
+    }
+    let at: Vec<i64> = at.into_iter().filter(|t| (from..to).contains(t)).collect();
+    let mut changes = 0;
+    for pair in at.windows(2) {
+        let ((was, due), (then, _)) = (read(pair[0]), read(pair[1]));
+        if was != then {
+            changes += 1;
+            assert!(
+                due.is_some_and(|due| due <= pair[1]),
+                "{name}: read at {} named {due:?}, but at {} it is {then:?} where it was {was:?}",
+                pair[0],
+                pair[1],
+            );
+        }
+    }
+    changes
+}
+
+/// A LOGIN HALF TURNS NO SOONER THAN THE SECOND ITS READ NAMED ([`LoginHalf::turns_after`], which
+/// the token view's deadline takes): a login whose records forecast its end ten days out reads
+/// `ok`, `ending` from a week before the end and `ended` at it; a login signed out here that runs
+/// on its vault token by the upkeep's reading reads in use until that reading is an hour old
+/// ([`accounts::TOKENS_HERE_FRESH_S`]) and signed out after, on a host where a launch starts on
+/// a token; a login not made here never turns.
+///
+/// NEGATIVE CONTROLS (run 2026-11-14): with `forecast_turns` naming the end alone, the forecast
+/// sweep fails where `Ok` turns `Ending` (`a forecast end: read at … named Some(<the end>)`);
+/// with `on_token_turns` leaving out the reading's age, the on-token sweep fails where `InUse`
+/// turns `SignedOut` (`a login on its token: read at … named Some(<the token's end>)`).
+#[test]
+fn a_login_half_turns_no_sooner_than_its_read_named() {
+    let end = NOW + 10 * D;
+    let forecast = |t: i64| {
+        (
+            LoginHalf::of_forecast(Some(end), t),
+            LoginHalf::forecast_turns(Some(end), t),
+        )
+    };
+    assert_eq!(
+        turns_sweep("a forecast end", (NOW, NOW + 11 * D), forecast),
+        2,
+        "ok, ending, ended"
+    );
+    assert_eq!(
+        LoginHalf::forecast_turns(None, NOW),
+        None,
+        "no end, no turn"
+    );
+
+    let alpha = row("alpha", "alpha.m20.1@example.test");
+    let logins = Logins::default();
+    let mut on_token = state();
+    on_token.lapsed_logins.insert("alpha".into());
+    on_token.tokens_here = Some(accounts::TokensHere {
+        read_at: NOW - 600,
+        ends: [("alpha".to_owned(), NOW + 2 * H)].into(),
+    });
+    let read = |t: i64| {
+        (
+            LoginHalf::of_row(&alpha, &logins, &on_token, true, t),
+            LoginHalf::turns_after(&alpha, &logins, &on_token, true, t),
+        )
+    };
+    let changes = turns_sweep("a login on its token", (NOW, NOW + 3 * H), read);
+    assert_eq!(
+        changes,
+        usize::from(crate::harness::token_route::LAUNCHES_ON_TOKEN),
+        "in use until the reading is an hour old, where a launch starts on a token"
+    );
+    assert_eq!(
+        LoginHalf::turns_after(&alpha, &logins, &on_token, false, NOW),
+        None,
+        "a login not made here never turns"
+    );
+}

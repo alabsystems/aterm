@@ -208,7 +208,7 @@ fn the_persons_stamps_cross_a_seamless_update_at_its_commit() {
         .expect("up 50 s");
     outgoing.worker_job_seen.insert(untouched, program_seen);
     let written = outgoing
-        .write_person_stamps_of(&[keyed, untouched], path.clone())
+        .write_person_stamps_of(&[keyed, untouched], path.clone(), std::time::Instant::now())
         .expect("written");
     assert_eq!(written, path);
     let body = std::fs::read_to_string(&path).expect("the sidecar");
@@ -388,6 +388,117 @@ fn the_awake_typing_age_leaves_the_sleep_out() {
     assert_eq!(HumanInputStamp::default().typed_awake_ms(2_000_000), None);
 }
 
+/// THE PASSWORD SHEET'S SPACING CROSSES A SEAMLESS UPDATE with the session its window shows:
+/// the outgoing process writes the streak and the quiet time left of a window still quiet, the
+/// successor's Commit puts it on the window that shows the shell adopted under that id, and
+/// the next unanswered sheet there widens from the carried streak.
+/// NEGATIVE CONTROLS: a window whose quiet time ran out and one never spaced write no row; in
+/// the successor the window that shows another session is not spaced; and a successor handed
+/// no sidecar spaces nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_sheet_spacing_crosses_a_seamless_update_onto_the_window_that_shows_its_session() {
+    use crate::App;
+    use crate::askpass::QUIET_BASE;
+    use std::time::{Duration, Instant};
+    let dir = crate::control_auth::socket_dir().expect("a private control dir");
+    let path = dir.join(format!(
+        "seamless-{}-{}.person",
+        std::process::id(),
+        aterm_uds::rand::hex_token::<8>().expect("a token")
+    ));
+    // Two windows, each showing one session.
+    let two_windows = || {
+        let mut app = App::headless_for_test();
+        let first = *app.pool.sessions.keys().max().expect("session 0");
+        let _ = app.insert_logical_window(crate::stub_session(1), 24, 80);
+        let second = *app.pool.sessions.keys().max().expect("a second session");
+        assert_ne!(first, second);
+        let window =
+            |app: &App, session| app.window_of_session(session).expect("a window shows it").0;
+        let (w1, w2) = (window(&app, first), window(&app, second));
+        assert_ne!(w1, w2, "PRECONDITION: one window each");
+        (app, [first, second], [w1, w2])
+    };
+
+    let (mut outgoing, [spaced, other], [w_spaced, w_other]) = two_windows();
+    let t0 = Instant::now();
+    outgoing.askpass_backoff.on_cancel(w_spaced, t0, t0);
+    outgoing.askpass_backoff.on_cancel(w_spaced, t0, t0);
+    // The other window's quiet time ran out before the handoff: nothing of it crosses.
+    outgoing.askpass_backoff.on_cancel(w_other, t0, t0);
+    let at = t0 + QUIET_BASE + Duration::from_secs(2);
+    let rows = outgoing.askpass_spacing_rows(&[spaced, other], at);
+    assert_eq!(
+        rows,
+        [(
+            spaced,
+            crate::seamless::PersonStamp::SheetQuiet {
+                streak: 2,
+                remaining_ms: 8_000,
+            }
+        )]
+    );
+    // The Commit's own writer puts that row in the sidecar, beside the sessions' stamps.
+    assert_eq!(
+        outgoing.write_person_stamps_of(&[spaced, other], path.clone(), at),
+        Some(path.clone())
+    );
+    let body = std::fs::read_to_string(&path).expect("the sidecar");
+    let quiet: Vec<&str> = body.lines().filter(|row| row.starts_with('q')).collect();
+    assert_eq!(quiet, [format!("q{spaced} 2:8000")], "{body:?}");
+
+    // The successor adopts each shell under its own id; the sidecar names the outgoing one.
+    let take = |carried: Option<std::path::PathBuf>| {
+        let (mut successor, [a, b], [wa, wb]) = two_windows();
+        // The shell the outgoing process called `spaced` is adopted here as `b`.
+        for (id, named) in [(a, other), (b, spaced)] {
+            successor
+                .pool
+                .sessions
+                .get_mut(&id)
+                .expect("live")
+                .session
+                .handoff_local_id = Some(named);
+        }
+        successor.handoff_person_stamps = carried;
+        let before = Instant::now();
+        successor.take_carried_person_stamps();
+        let after = Instant::now();
+        let quiet = |window| {
+            (
+                successor.askpass_backoff.quiet_for(window, before),
+                successor.askpass_backoff.carried(window, after),
+            )
+        };
+        (quiet(wa), quiet(wb), successor, wb)
+    };
+    let (other_window, spaced_window, mut successor, wb) = take(Some(path.clone()));
+    assert!(!path.exists(), "the sidecar was consumed");
+    assert_eq!(other_window, (None, None));
+    // Taken up at an instant between `before` and `after`: at least the carried 8 s is left
+    // counted from before it, and no more counted from after it.
+    let (from_before, from_after) = spaced_window;
+    assert!(
+        from_before.is_some_and(|left| left >= Duration::from_secs(8)),
+        "{from_before:?}"
+    );
+    assert!(
+        from_after.is_none_or(|(streak, left)| streak == 2 && left <= Duration::from_secs(8)),
+        "{from_after:?}"
+    );
+    // The next unanswered sheet there is the third of the streak.
+    let later = Instant::now() + Duration::from_secs(9);
+    successor.askpass_backoff.on_cancel(wb, later, later);
+    assert_eq!(
+        successor.askpass_backoff.quiet_for(wb, later),
+        Some(QUIET_BASE * 4)
+    );
+
+    let (other_window, spaced_window, ..) = take(None);
+    assert_eq!((other_window, spaced_window), ((None, None), (None, None)));
+}
+
 /// An older sidecar has no separate typing provenance. Its recent gesture may be a key,
 /// so adoption keeps that age conservatively. A modern pointing-only or untouched session
 /// must still carry no typing, and a modern typing age must survive normally.
@@ -421,7 +532,7 @@ fn legacy_stamps_keep_a_possible_key_and_modern_pointing_keeps_none() {
             ));
         } else {
             assert_eq!(
-                outgoing.write_person_stamps_of(&[named], path.clone()),
+                outgoing.write_person_stamps_of(&[named], path.clone(), std::time::Instant::now()),
                 Some(path.clone())
             );
         }

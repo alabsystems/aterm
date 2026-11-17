@@ -225,11 +225,16 @@ fn a_posted_key_that_wakes_an_unattended_window_asks_no_reading() {
 /// does beside a resting window; an open stats lens its own, a reading every
 /// `LENS_PERIOD` (240); a headless instance and `motion = "full"`, both always attended, the
 /// focused one (120). The filmed window is attended the same way
-/// (`lib_headless_video_tests::a_filmed_window_never_rests_while_another_does`).
+/// (`lib_headless_video_tests::a_filmed_window_never_rests_while_another_does`). The window
+/// that carries the page is on screen (and focused, as `install_window_state` makes it), and a
+/// window on screen that a person attends keeps the focused cadence of its own
+/// (`vitals_host::attends_readings`), so it is touched at 0 with the rig's window and both
+/// lapse at 40, whatever the time building it took: past that only the page keeps the cadence.
 ///
 /// Negative control, applied once by hand: the attention's lapse slows the stream whatever a
-/// page reads (the page's count falls to 57: a reading a second to 41, then one every
-/// `BACKGROUND_PERIOD` from 46).
+/// page reads (`vitals_audience` without its `page ||` term): "a page on screen" fails with
+/// the untouched window's 56 (a reading a second to 40, then one every `BACKGROUND_PERIOD` from
+/// 45) where 120.
 #[test]
 fn a_page_a_lens_a_headless_instance_and_full_motion_keep_their_cadence_unattended() {
     let every_second = secs(0..120);
@@ -244,9 +249,19 @@ fn a_page_a_lens_a_headless_instance_and_full_motion_keep_their_cadence_unattend
             .open_settings_tab_in_window(beside, SettingsRoute::Tabs)
     );
     page.app.frontmost_window = Some(page.wid);
+    page.app
+        .note_rest_event(beside, &crate::window_rest::tests::key(), page.t0);
+    assert!(
+        !page.app.windows[&beside].occluded,
+        "CONTROL: the page's window is on screen"
+    );
     assert!(page.app.tabs_page_on_screen());
     assert_eq!(page.run(span, &[]), every_second, "a page on screen");
     assert!(!page.app.windows[&page.wid].rest.attended());
+    assert!(
+        !page.app.windows[&beside].rest.attended(),
+        "the page's window lapsed too"
+    );
 
     let mut lens = Rig::new();
     lens.app

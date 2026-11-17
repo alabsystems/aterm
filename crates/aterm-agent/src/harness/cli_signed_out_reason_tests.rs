@@ -53,7 +53,6 @@ fn pool(tag: &str, default_names: &str) -> (Tmp, Env, TestSourceOverride) {
     .expect("config");
     let source = TestSourceOverride::new(SourceSnapshot::Present(std::sync::Arc::new(Lab {
         me: Some(test_machine("m16")),
-        settled: true,
         accounts: vec![LabAccount {
             pk: "ac-0000000000000001".into(),
             cli: Cli::Codex,

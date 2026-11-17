@@ -16,6 +16,7 @@
 use super::Keyed;
 use crate::age::Recipient;
 use crate::membership_log::reach::{Reach, tally};
+use crate::membership_log::rooted::VIRTUAL;
 use crate::membership_log::{Body, EpochAudience, Log, MemberId, RecordId, eval};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,8 +68,11 @@ impl Log {
     /// against the one it replaced ([`oracle::check`]).
     pub(super) fn keyed_epochs_in(&self, effective: &eval::Effective) -> Vec<Keyed> {
         let found = self.keyed_epochs_read(effective);
+        // The oracle reads held records alone: a rooted log's dependents may be stubs.
         #[cfg(test)]
-        oracle::check(self, effective, &found);
+        if self.rooting().is_none() {
+            oracle::check(self, effective, &found);
+        }
         found
     }
 
@@ -156,8 +160,10 @@ impl Log {
             .filter_map(|&e| {
                 let audience = audience_of(e)?;
                 let dependents = effective.dependents(e);
-                let mut holders: BTreeSet<MemberId> =
-                    dependents.iter().map(|&d| *self.order[d].actor()).collect();
+                let mut holders: BTreeSet<MemberId> = dependents
+                    .iter()
+                    .filter_map(|&d| self.actor_at(d))
+                    .collect();
                 for &(w, recipient) in wraps_of(e) {
                     if effective.opens_wrap(w)
                         && let Some(member) = member_of.get(&recipient)
@@ -171,20 +177,48 @@ impl Log {
         let reach = effective.reach();
         // Each keyed epoch's dependents as one set, and the newest of them: every dependent lies
         // in a reseal's past exactly when the newest do.
+        // In a rooted log a dependent a prune dropped stands at its stub's index past every held
+        // one's ([`crate::membership_log::rooted`]), after the held ones: it is read by
+        // [`Log::position_before`], not by the index's rows.
+        let split = |dependents: &[usize]| {
+            let at = dependents.partition_point(|&d| d < VIRTUAL);
+            (dependents[..at].to_vec(), dependents[at..].to_vec())
+        };
         let dependents: Vec<Vec<u64>> = held
             .iter()
             .map(|(_, _, dependents, _)| {
                 let mut set = Vec::new();
-                for &d in *dependents {
+                for &d in &split(dependents).0 {
                     insert(&mut set, d);
                 }
                 set
             })
             .collect();
+        let dropped_dependents: Vec<Vec<usize>> = held
+            .iter()
+            .map(|(_, _, dependents, _)| split(dependents).1)
+            .collect();
         let newest_dependents: Vec<Vec<usize>> = held
             .iter()
-            .map(|(_, _, dependents, _)| reach.maximal(dependents))
+            .map(|(_, _, dependents, _)| {
+                let (kept, dropped) = split(dependents);
+                if dropped.is_empty() {
+                    return reach.maximal(&kept);
+                }
+                let all: Vec<usize> = kept.iter().chain(&dropped).copied().collect();
+                all.iter()
+                    .copied()
+                    .filter(|&d| !all.iter().any(|&o| o != d && self.position_before(d, o)))
+                    .collect()
+            })
             .collect();
+        // Whether a dependent of the `j`th keyed epoch lies in the past of the epoch at `e2`.
+        let has_dependent_before = |j: usize, e2: usize| {
+            meets(reach, e2, &dependents[j])
+                || dropped_dependents[j]
+                    .iter()
+                    .any(|&d| self.position_before(d, e2))
+        };
         let (lists, groups): (Vec<&EpochAudience>, Vec<Vec<usize>>) = epochs.into_iter().unzip();
         // Each audience's keyed epochs, and those of them a current member holds.
         let of_audience: Vec<Vec<usize>> = lists
@@ -205,10 +239,9 @@ impl Log {
         // cover each keyed epoch (every dependent in their past) are kept as one set per keyed
         // epoch.
         let mut covering: Vec<Vec<u64>> = vec![Vec::new(); held.len()];
-        let at = &self.held;
         reach.frontiers(
             &groups,
-            |x| self.order[x].parents().iter().map(move |parent| at[parent]),
+            |x| self.placed_parents(x),
             |g, position, frontier| {
                 let e2 = groups[g][position];
                 let signer = self.order[e2].actor();
@@ -220,7 +253,7 @@ impl Log {
                     && of_audience[g]
                         .iter()
                         .copied()
-                        .filter(|&j| member_held[j] && meets(reach, e2, &dependents[j]))
+                        .filter(|&j| member_held[j] && has_dependent_before(j, e2))
                         .filter(|&j| {
                             #[cfg(test)]
                             if mutant(Mutant::ForgetCovering) {
@@ -232,7 +265,13 @@ impl Log {
                 if is_full {
                     for &j in &of_audience[g] {
                         tally(0, newest_dependents[j].len(), 0);
-                        let mut seen = newest_dependents[j].iter().map(|&d| reach.before(d, e2));
+                        let mut seen = newest_dependents[j].iter().map(|&d| {
+                            if d >= VIRTUAL {
+                                self.position_before(d, e2)
+                            } else {
+                                reach.before(d, e2)
+                            }
+                        });
                         #[cfg(test)]
                         let covers = if mutant(Mutant::AnyNewestDependent) {
                             seen.any(|before| before)
@@ -253,7 +292,7 @@ impl Log {
             .map(|((e, audience, dependents, holders), covering)| Keyed {
                 epoch: *self.order[e].id(),
                 audience: audience.clone(),
-                dependents: dependents.iter().map(|&d| *self.order[d].id()).collect(),
+                dependents: dependents.iter().filter_map(|&d| self.id_at(d)).collect(),
                 holders,
                 covered: covering.iter().any(|&word| word != 0),
             })

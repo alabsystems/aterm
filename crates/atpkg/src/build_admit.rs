@@ -211,8 +211,11 @@ pub enum FrontClaim {
         /// The memory it claims, bytes ([`Need::mem`]).
         mem: u64,
         /// The pid of each memory claim ahead of it, oldest first, as admission counts them: each
-        /// one held, and each one that waits since earlier (none of its own process, whose oldest
-        /// waiting claim this is); never a claim of no memory. A pid holding two is named twice.
+        /// one held, and each waiter ahead of it in the queue's order (one that leads, else one of
+        /// a higher [`Need::priority`], else one of its own priority since earlier: a person's
+        /// front stands behind no agent's claim it goes before), none of its own process, whose
+        /// first waiting claim this is; never a claim of no memory. A pid holding two is named
+        /// twice.
         ahead: Vec<u32>,
     },
     /// Its claim is admitted: it execs its build, or, where no holder armed, runs it.
@@ -228,16 +231,25 @@ pub fn front_claim(ledger: &Ledger, pid: u32) -> std::io::Result<Option<FrontCla
     Ok(front_claim_in(&ledger.list()?, pid))
 }
 
-/// What `records` (a ledger's live claims, [`Ledger::list`]) say of the front `pid`: its oldest
-/// claim that waits, with the claims ahead of it, else [`FrontClaim::Held`] where it holds one,
-/// else `None` (none laid yet, or one it no longer needs: a front that claims nothing execs at
-/// once). A reader of many fronts in one ledger lists it once and asks this of each.
+/// What `records` (a ledger's live claims, [`Ledger::list`]) say of the front `pid`: its first
+/// claim that waits in the queue's order, with the claims ahead of it, else [`FrontClaim::Held`]
+/// where it holds one, else `None` (none laid yet, or one it no longer needs: a front that claims
+/// nothing execs at once). A reader of many fronts in one ledger lists it once and asks this of each.
 #[must_use]
 pub fn front_claim_in(records: &[Record], pid: u32) -> Option<FrontClaim> {
+    // The queue's order, as admission's `decide` keeps it.
+    let queue = |r: &Record| {
+        (
+            r.held.is_none(),
+            !r.need.leads,
+            r.need.priority(),
+            r.order(),
+        )
+    };
     let Some(mine) = records
         .iter()
         .filter(|r| r.pid == pid && r.held.is_none())
-        .min_by_key(|r| r.order())
+        .min_by_key(|r| queue(r))
     else {
         return records
             .iter()
@@ -247,7 +259,7 @@ pub fn front_claim_in(records: &[Record], pid: u32) -> Option<FrontClaim> {
     let mut ahead: Vec<&Record> = records
         .iter()
         .filter(|r| r.order() != mine.order() && r.need.mem > 0)
-        .filter(|r| r.held.is_some() || r.order() < mine.order())
+        .filter(|r| r.held.is_some() || queue(r) < queue(mine))
         .collect();
     ahead.sort_by_key(|r| r.order());
     Some(FrontClaim::Waiting {
@@ -2665,6 +2677,16 @@ pub fn run_hidden(argv: &[std::ffi::OsString]) -> std::process::ExitCode {
     let in_tab = tab.is_some();
     #[cfg(not(unix))]
     let in_tab = false;
+    // Native maintenance owns its original admission and cleanup locks. Only the
+    // SAME signed selected frontend may establish this exception; an old tool,
+    // alias or unavailable capability keeps ordinary cache-owner observation.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if let (Some((tool, placed)), Some(words)) = (shim, words.as_deref())
+        && let Some(status) =
+            native_maintenance::run(target, tool, placed.to_str().unwrap_or(""), words)
+    {
+        return status;
+    }
     let mut built = None;
     if let Some((tool, placed)) = shim {
         let registered = words
@@ -3188,3 +3210,7 @@ pub use telemetry::BuildEnd;
 #[cfg(test)]
 #[path = "build_admit_tests.rs"]
 mod tests;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[path = "build_admit_native_maintenance.rs"]
+mod native_maintenance;

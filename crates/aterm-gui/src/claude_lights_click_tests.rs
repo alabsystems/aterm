@@ -1043,6 +1043,11 @@ fn a_click_before_the_settings_are_read_stands_nothing() {
             ),
             "refused as not read yet"
         );
+        assert!(
+            crate::claude_footer::DEFAULT_ASKS
+                .with(|asks| asks.borrow().contains(&snapshot(&tab, FIRST).pid)),
+            "the click asked for its agent's settings default alone"
+        );
         crate::permission_click::hold_default_for_test(
             &tab,
             snapshot(&tab, FIRST).pid,

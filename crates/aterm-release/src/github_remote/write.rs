@@ -401,9 +401,9 @@ impl Remote {
         };
         let mut seen = view("for it")?;
         // An earlier attempt at this same write: the same repository, refs, expected and new
-        // objects. It is settled by what origin holds; inside agh's window for it
-        // (`agh::Journal::closable`) it is never posted a second time, and past it a second
-        // post is the same compare-and-swap, which GitHub refuses where the first landed.
+        // objects. An exact origin observation can establish success without
+        // posting it again. Otherwise a live writer stays held; a dead writer
+        // permits the native boundary to reconcile its recorded batch.
         let own = seen.intent.op == agh::write::WriteOp::RefUpdateAtomic
             && seen.intent.request == asked.request;
         let made = |what: &str| {
@@ -414,8 +414,8 @@ impl Remote {
             Ok(After::Made)
         };
         let holds = || self.holds(&asked.wanted).map_err(|why| refused(&why));
-        // agh's next atomic write closes an intent whose writer can send nothing more
-        // (`agh::Journal::closable`), so the wait ends there and the write begins again.
+        // A dead writer lets the next atomic write reconcile its exact batch from origin
+        // (`agh::Journal::closable`), so the wait ends and recovery can proceed.
         let stops = |seen: &agh::journal::IntentView| {
             intents
                 .closable(seen)
@@ -610,6 +610,11 @@ pub(crate) fn claim_fixture_with_fx(
     bare: &std::path::Path,
     fx: std::sync::Arc<agh::Fx>,
 ) -> Remote {
+    // Libtest does not enter the cutter's native lifecycle dispatch. Use the
+    // real dev binary to hold each writer before exec while its identity is
+    // journaled; the independent credential helper below still refuses.
+    #[cfg(unix)]
+    aterm_uds::tether::through(aterm_tempfile::bin_exe("aterm-release"));
     let mut command = crate::ledger::object_git(repo).unwrap();
     command.args(["rev-parse", "--absolute-git-dir"]);
     let out = aterm_uds::deadline::output_while_process_progressing_complete_stdout(

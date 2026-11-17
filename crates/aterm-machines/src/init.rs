@@ -1168,6 +1168,20 @@ fn entry_with_system(
     if in_tab(tab_var, &options) {
         return ExitCode::from(tab_run(&options, host));
     }
+    if tab_check(tab_var, &options) {
+        let leave =
+            std::env::var_os(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_LEAVE_DEVELOPER_MODE)
+                .is_some_and(|value| !value.is_empty());
+        let explicit = std::env::var_os(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_EXPLICIT)
+            .is_some_and(|value| !value.is_empty());
+        let sys = system();
+        let finished = (host.base)(BaseLock::Read).clt.is_some_and(|clt| {
+            clt.reading_as_tab(leave)
+                .with_explicit_tab(explicit)
+                .finished_in_place(sys.as_ref())
+        });
+        return ExitCode::from(if finished { 0 } else { TAB_CHECK_SHORT });
+    }
     if options.converge {
         return converge_entry(&options, host.converge);
     }
@@ -1238,10 +1252,20 @@ fn entry_with_system(
                 &options,
                 &Front {
                     base: &|applies| {
-                        host.decided
+                        let mut base = host
+                            .decided
                             .compose((host.base)(options.base_lock(applies)), || {
                                 crate::init_clt::Unbidden::here(host.records)
-                            })
+                            });
+                        // A check judges this Mac by the rule the window reads; a person's run
+                        // that applies or plans also excludes the folders made since.
+                        base.clt = base.clt.map(|clt| {
+                            clt.scoping_new_folders(scopes_new_folders(
+                                host.decided,
+                                options.action,
+                            ))
+                        });
+                        base
                     },
                     groups: &groups,
                     full_disk_access: host.full_disk_access,
@@ -1458,6 +1482,36 @@ fn in_tab(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
             }
 }
 
+/// Whether a run's setup item also excludes from Spotlight the folders made since setup's
+/// password scoped the home ([`crate::init_clt::CommandLineTools::scoping_new_folders`]): a
+/// person's run that applies or plans. A `--check` says whether this Mac is set up, by the
+/// rule the window reads, so the two agree; a run aterm decided asks nothing for such a folder.
+fn scopes_new_folders(decided: Decider, action: Action) -> bool {
+    decided == Decider::Person && action != Action::Check
+}
+
+/// Whether this run is the Mac Setup tab's check: `--check --no-wait --only base.clt` alone,
+/// under the tab's own variable (`var`, set and not empty). A tab program an update replaced
+/// while it waited at its password prompt asks it of the build now installed
+/// ([`crate::init_clt::CommandLineTools::finished_in_place`], read as that build's tab program
+/// would read this Mac): its own rules are an older build's. The run prints nothing, writes
+/// nothing and exits 0 where the Mac reads finished, else [`TAB_CHECK_SHORT`]. Anywhere else
+/// the same words are a person's check, which speaks and judges as it always does.
+fn tab_check(var: Option<&std::ffi::OsStr>, options: &Options) -> bool {
+    var.is_some_and(|value| !value.is_empty())
+        && *options
+            == Options {
+                only: vec![crate::init_clt::ID.to_owned()],
+                action: Action::Check,
+                no_wait: true,
+                ..Options::default()
+            }
+}
+
+/// What the tab's check exits with where something is not in place ([`tab_check`]): a
+/// `--check`'s own code for a step left to a person.
+const TAB_CHECK_SHORT: u8 = 77;
+
 /// What the tab's run exits with when the window's go line never came ([`tab`]): neither 0 nor
 /// 1, which say the run printed its last line, so the window ends the tab itself if it still
 /// shows ([`aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_NOT_STARTED`]).
@@ -1569,7 +1623,8 @@ fn tab(
 /// it reaches only through them (no workstation item, question or setup record), at background
 /// QoS. `--check` probes and writes nothing. Its rows print as init's do, then a tally (or the
 /// JSON report). Exit 0 once admitted work settled (or a check ran without failure),
-/// [`aterm_secrets::converge::UNFINISHED`] while an apply pass has work left, and
+/// [`aterm_secrets::converge::STANDING`] while every unfinished admitted row waits for an
+/// input change, [`aterm_secrets::converge::UNFINISHED`] for other unfinished apply work, and
 /// [`aterm_secrets::converge::HELD`] for a pass that did not run for the lock: a person's
 /// (`--trigger init`, the default) that found another pass holding it, or a started one (any
 /// other trigger), which waits for it, whose starter ended while it waited, or a held copy's
@@ -1638,6 +1693,7 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
     };
     let failed = pass.rows.iter().any(|row| row.outcome.is_failure());
     let complete = pass.complete();
+    let waits_for_input = pass.waits_for_input();
     let answered = if options.json {
         match report_json(action, complete, pass.rows, &laps) {
             Ok(report) => answer(&format!("{report}\n")),
@@ -1659,13 +1715,17 @@ fn converge_entry(options: &Options, ports: &dyn crate::sync::Ports) -> ExitCode
             "aterm init: the pass's record was not written: {why}"
         ));
     }
-    if failed || pass.unrecorded.is_some() {
+    if pass.unrecorded.is_some() {
         ExitCode::FAILURE
     } else {
         answered.map_or_else(
             |failed| failed,
             |()| {
-                if mode == Mode::Apply && !complete {
+                if mode == Mode::Apply && waits_for_input {
+                    ExitCode::from(aterm_secrets::converge::STANDING)
+                } else if failed {
+                    ExitCode::FAILURE
+                } else if mode == Mode::Apply && !complete {
                     ExitCode::from(aterm_secrets::converge::UNFINISHED)
                 } else {
                     ExitCode::SUCCESS
@@ -1872,7 +1932,9 @@ fn walk_grants(rows: &[ItemReport]) -> Vec<Access> {
         .filter(|row| is_grant(row))
         .filter_map(|row| {
             let word = row.id.strip_prefix(PERMISSION)?;
-            Access::ALL.into_iter().find(|access| access.word() == word)
+            Access::ALL
+                .into_iter()
+                .find(|access| access.word() == word && access.needed_for(Selection::all()))
         })
         .collect()
 }
@@ -6434,6 +6496,9 @@ fn local_groups(
 /// Accessibility for a run that signs out (`sign_out`), read once for all of them by `grants`
 /// when the first is probed.
 fn permissions(grants: Grants, sign_out: bool) -> Vec<Box<dyn Item>> {
+    let mut selection = Selection::none();
+    selection.set(Setting::Permissions, true);
+    selection.set(Setting::Messages, sign_out);
     let readings = Arc::new(Readings {
         grants,
         sign_out,
@@ -6451,7 +6516,7 @@ fn permissions(grants: Grants, sign_out: bool) -> Vec<Box<dyn Item>> {
         Access::Accessibility,
     ]
     .into_iter()
-    .filter(|access| sign_out || *access != Access::Accessibility)
+    .filter(|access| access.needed_for(selection))
     .map(|access| {
         Box::new(Permission {
             access,

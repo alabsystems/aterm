@@ -74,14 +74,11 @@ fn complete(state: &State, action: &str, forget_end: bool) -> State {
             })
             .unwrap();
     }
-    let lab = lab_of(
-        true,
-        vec![LabAccount {
-            legacy_label: Some("legacy".into()),
-            identity: Some(email("canonical")),
-            ..lab_account("alias", "claude-canonical", &[("m22", Some(1))])
-        }],
-    );
+    let lab = lab_of(vec![LabAccount {
+        legacy_label: Some("legacy".into()),
+        identity: Some(email("canonical")),
+        ..lab_account("alias", "claude-canonical", &[("m22", Some(1))])
+    }]);
     bed.sync(&lab).unwrap();
     let first = bed.store.load(NOW).unwrap().0;
     let first_logins = bed.store.load_logins(NOW).unwrap().0;
@@ -92,11 +89,11 @@ fn complete(state: &State, action: &str, forget_end: bool) -> State {
     let after = bed.store.load(NOW).unwrap().0;
     let after_logins = bed.store.load_logins(NOW).unwrap().0;
     let after_roster = bed.roster();
-    let row = after_roster.row("claude-canonical").unwrap();
-    let account = &after.accounts["claude-canonical"];
+    let row = after_roster.row("legacy").unwrap();
+    let account = &after.accounts["legacy"];
     let prior_end_kept = !(1..=4).contains(&case)
         || (account.auth_at == before.accounts["legacy"].auth_at
-            && (!ended || after_logins.get("claude-canonical").unwrap().ended_at == Some(at)));
+            && (!ended || after_logins.get("legacy").unwrap().ended_at == Some(at)));
     next.insert("phase", if action == "Repeat" { 2 } else { 1 });
     next.insert(
         "ready",

@@ -1331,7 +1331,22 @@ fn cask_quoted_all(text: &str) -> Vec<String> {
 /// Brew's `#{version...}` interpolation subset a cask URL or
 /// artifact name uses in practice; anything else marks the
 /// record unsupported for install (info still shows it raw).
-fn cask_interpolate(text: &str, version: &str, unsupported: &mut Option<&'static str>) -> String {
+fn cask_interpolate(
+    text: &str,
+    version: &str,
+    locals: &[(String, String)],
+    unsupported: &mut Option<&'static str>,
+) -> String {
+    cask_interpolate_depth(text, version, locals, unsupported, 0)
+}
+
+fn cask_interpolate_depth(
+    text: &str,
+    version: &str,
+    locals: &[(String, String)],
+    unsupported: &mut Option<&'static str>,
+    depth: usize,
+) -> String {
     if !text.contains("#{") {
         return text.to_string();
     }
@@ -1341,7 +1356,30 @@ fn cask_interpolate(text: &str, version: &str, unsupported: &mut Option<&'static
     while nums.len() < 3 {
         nums.push("0");
     }
+    // `A || B` over csv parts: a missing csv part is
+    // Ruby nil, so the fallback wins (jasp's
+    // `version.csv.second || version.csv.first`).
+    let csv_part = |expr: &str| -> Option<String> {
+        match expr {
+            "version.csv.first" => Some(first.to_string()),
+            "version.csv.second" => csv.get(1).map(|s| (*s).to_string()),
+            "version.csv.third" => csv.get(2).map(|s| (*s).to_string()),
+            _ => None,
+        }
+    };
     let value = |expr: &str| -> Option<String> {
+        if let Some((a, b)) = expr.split_once(" || ") {
+            return csv_part(a.trim()).or_else(|| csv_part(b.trim()));
+        }
+        // `version.csv.first.<accessor>`: the numeric
+        // accessors already read the first csv part.
+        let normalized;
+        let expr = if let Some(rest) = expr.strip_prefix("version.csv.first.") {
+            normalized = format!("version.{rest}");
+            normalized.as_str()
+        } else {
+            expr
+        };
         Some(match expr {
             "version" => version.to_string(),
             "version.major" => nums[0].to_string(),
@@ -1357,7 +1395,23 @@ fn cask_interpolate(text: &str, version: &str, unsupported: &mut Option<&'static
             "version.csv.third" => csv.get(2).copied().unwrap_or_default().to_string(),
             "version.dots_to_underscores" => first.replace('.', "_"),
             "version.dots_to_hyphens" => first.replace('.', "-"),
-            _ => return None,
+            other => {
+                // Cask locals (`#{arch}`, `#{os}`,
+                // conditional folders/endings): their
+                // values interpolate recursively. An
+                // unresolved token inside a local makes
+                // the whole token unsupported.
+                let raw = locals.iter().find(|(n, _)| n == other)?.1.clone();
+                if depth >= 8 {
+                    return None;
+                }
+                let mut scratch = None;
+                let v = cask_interpolate_depth(&raw, version, locals, &mut scratch, depth + 1);
+                if scratch.is_some() {
+                    return None;
+                }
+                v
+            }
         })
     };
     let mut out = String::with_capacity(text.len());
@@ -1407,6 +1461,15 @@ fn macos_symbol_version(symbol: &str) -> Option<String> {
 /// Whether a trimmed Ruby line opens a `do … end` block.
 fn line_opens_block(t: &str) -> bool {
     t.ends_with(" do") || t.contains(" do |")
+}
+
+/// A line that closes a Ruby block: bare `end`, or
+/// `end` with a chained call (`end.flatten`,
+/// `end.join(…)`) or a trailing comment.
+fn line_closes_block(t: &str) -> bool {
+    t == "end"
+        || t.strip_prefix("end")
+            .is_some_and(|r| r.starts_with(['.', ')', ' ', '#']))
 }
 
 /// One quoted string token at the start of `s` (double quotes,
@@ -1635,15 +1698,212 @@ pub fn livecheck_block_present(text: &str) -> bool {
 /// is the one indented exactly two spaces (tap style);
 /// resource-level blocks nest deeper and are not this.
 #[must_use]
+/// `key: "value", …` conditional kwargs. A value is
+/// a plain quoted string or a nested
+/// `on_*_conditional(…)` call, resolved for this
+/// host on the spot.
+fn conditional_kwargs(s: &str) -> Option<Vec<(String, String)>> {
+    let s = s.trim();
+    let s = match s.strip_prefix('(') {
+        Some(r) => r.strip_suffix(')')?,
+        None => s,
+    };
+    // Split at commas outside quotes and parens.
+    let mut parts: Vec<String> = Vec::new();
+    let (mut depth, mut quoted, mut cur) = (0i32, false, String::new());
+    for c in s.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                parts.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    parts.push(cur);
+    let mut out = Vec::new();
+    for part in &parts {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (key, value) = part.split_once(':')?;
+        let key = key.trim().to_string();
+        let value = value.trim();
+        let value = if let Some((v, tail)) = quoted_token(value) {
+            if !tail.trim().is_empty() {
+                return None;
+            }
+            v
+        } else if let Some((kind, kw)) = ["on_arch_conditional", "on_system_conditional"]
+            .iter()
+            .find_map(|k| value.strip_prefix(k).map(|r| (*k, r)))
+        {
+            conditional_value(kind, &conditional_kwargs(kw.trim())?)?
+        } else {
+            return None;
+        };
+        out.push((key, value));
+    }
+    Some(out)
+}
+
+/// A cask's `on_arch_conditional` / `on_system_conditional`
+/// value for this host: an absent side interpolates
+/// as empty (Ruby `nil`).
+fn conditional_value(kind: &str, kwargs: &[(String, String)]) -> Option<String> {
+    let want = match kind {
+        "on_arch_conditional" => super::machine::current_arch_symbol(),
+        "on_system_conditional" => {
+            if cfg!(target_os = "macos") {
+                "macos"
+            } else {
+                "linux"
+            }
+        }
+        _ => return None,
+    };
+    Some(
+        kwargs
+            .iter()
+            .find(|(k, _)| k == want)
+            .map_or_else(String::new, |(_, v)| v.clone()),
+    )
+}
+
+/// Cask locals a livecheck `url`/`regex` may
+/// interpolate, resolved for this host:
+/// `<ident> = on_*_conditional …` assignments plus
+/// the `arch`/`os` stanzas (as `arch`/`os`).
+fn cask_livecheck_locals(lines: &[&str]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let set = |name: &str, value: String, out: &mut Vec<(String, String)>| {
+        if let Some(slot) = out.iter_mut().find(|(n, _)| n == name) {
+            slot.1 = value;
+        } else {
+            out.push((name.to_string(), value));
+        }
+    };
+    for line in lines {
+        let t = line.trim();
+        // `arch arm: "…", intel: "…"` / `os macos: "…", linux: "…"`
+        for (stanza, kind) in [
+            ("arch", "on_arch_conditional"),
+            ("os", "on_system_conditional"),
+        ] {
+            if let Some(rest) = t
+                .strip_prefix(stanza)
+                .and_then(|r| r.strip_prefix([' ', '(']))
+                && let Some(kwargs) = conditional_kwargs(rest)
+                && let Some(v) = conditional_value(kind, &kwargs)
+            {
+                set(stanza, v, &mut out);
+            }
+        }
+        // `<ident> = "…"` plain strings (kept raw; any
+        // interpolation inside them resolves when the
+        // local itself is substituted).
+        if let Some((name, rhs)) = t.split_once(" = ")
+            && let Some((value, tail)) = quoted_token(rhs.trim())
+            && tail.trim().is_empty()
+        {
+            let name = name.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                set(name, value, &mut out);
+            }
+        }
+        // `<ident> = on_arch_conditional …` / `on_system_conditional …`
+        if let Some((name, rhs)) = t.split_once(" = ") {
+            let name = name.trim();
+            if !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && let Some((kind, kw)) = ["on_arch_conditional", "on_system_conditional"]
+                    .iter()
+                    .find_map(|k| rhs.trim().strip_prefix(k).map(|r| (*k, r)))
+                && let Some(kwargs) = conditional_kwargs(kw.trim())
+                && let Some(v) = conditional_value(kind, &kwargs)
+            {
+                set(name, v, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// The epoch-seconds value of a `#{Time.now.to_i}`
+/// cache-buster token (optionally `* N`).
+fn time_now_token(token: &str, epoch: u64) -> Option<String> {
+    let rest = token.strip_prefix("Time.now.to_i")?.trim();
+    if rest.is_empty() {
+        return Some(epoch.to_string());
+    }
+    let n: u64 = rest.strip_prefix('*')?.trim().parse().ok()?;
+    Some((epoch * n).to_string())
+}
+
 pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec> {
     use super::formula::{LivecheckSpec, LivecheckUrl};
-    let mut lines = text.lines();
-    lines.find(|l| livecheck_block_open(l))?;
+    let all: Vec<&str> = text.lines().collect();
+    let open_idx = all.iter().position(|l| livecheck_block_open(l))?;
+    let locals = cask_livecheck_locals(&all[..open_idx]);
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    // Resolvable interpolations: cask locals and
+    // `Time.now.to_i` substitute here, at spec load —
+    // the moment brew evaluates the string. The
+    // `version` family stays verbatim for check time.
+    let token_value = |token: &str| -> Option<Option<String>> {
+        if let Some(v) = time_now_token(token, epoch) {
+            return Some(Some(v));
+        }
+        if let Some((_, v)) = locals.iter().find(|(n, _)| n == token) {
+            return Some(Some(v.clone()));
+        }
+        if matches!(
+            token,
+            "LATEST_VERSION"
+                | "version"
+                | "version.major"
+                | "version.minor"
+                | "version.patch"
+                | "version.major_minor"
+                | "version.major_minor_patch"
+        ) {
+            return Some(None);
+        }
+        None
+    };
+    let substitute = |s: &str| -> Option<String> {
+        let mut out = String::with_capacity(s.len());
+        let mut rest = s;
+        while let Some(i) = rest.find("#{") {
+            let j = rest[i + 2..].find('}')?;
+            let token = &rest[i + 2..i + 2 + j];
+            out.push_str(&rest[..i]);
+            match token_value(token)? {
+                Some(v) => out.push_str(&v),
+                None => {
+                    out.push_str("#{");
+                    out.push_str(token);
+                    out.push('}');
+                }
+            }
+            rest = &rest[i + 2 + j + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    };
+    let lines = all[open_idx + 1..].iter().copied();
     let mut body: Vec<&str> = Vec::new();
     let mut depth = 1usize;
     for line in lines {
         let t = line.trim();
-        if t == "end" {
+        if line_closes_block(t) {
             depth -= 1;
             if depth == 0 {
                 break;
@@ -1665,14 +1925,20 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
     while idx < body.len() {
         let t = body[idx];
         idx += 1;
-        if t == "end" {
+        if line_closes_block(t) {
             depth -= 1;
             if let Some((sym, params, lines)) = &mut json_capture {
                 if depth == 1 {
                     match sym.as_str() {
                         "xml" => spec.xml_block = parse_xml_shape(params, lines),
-                        "yaml" => spec.yaml_block = parse_yaml_shape(params, lines),
+                        "yaml" | "electron_builder" => {
+                            spec.yaml_block = parse_yaml_shape(params, lines)
+                        }
                         "extract_plist" => spec.plist_block = parse_plist_shape(params, lines),
+                        "page_match" | "sourceforge" => {
+                            spec.page_block = parse_page_shape(params, lines)
+                        }
+                        "github_releases" => spec.ghrel_block = parse_ghrel_shape(params, lines),
                         _ => spec.json_block = parse_json_shape(params, lines),
                     }
                     json_capture = None;
@@ -1696,6 +1962,11 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
         // and `#{version}` with a component accessor (kept
         // verbatim; substituted at check time).
         if depth == 1 && t.contains("#{") {
+            // A regex may only carry tokens that
+            // substitute now (cask locals, Time): the
+            // `version` family is check-time state a
+            // stored pattern cannot defer.
+            let is_regex = t.starts_with("regex(");
             let allowed = |line: &str| {
                 let mut rest = line;
                 while let Some(i) = rest.find("#{") {
@@ -1703,23 +1974,16 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                         return false;
                     };
                     let token = &rest[i + 2..i + 2 + j];
-                    if !matches!(
-                        token,
-                        "LATEST_VERSION"
-                            | "version"
-                            | "version.major"
-                            | "version.minor"
-                            | "version.patch"
-                            | "version.major_minor"
-                            | "version.major_minor_patch"
-                    ) {
-                        return false;
+                    match token_value(token) {
+                        Some(Some(_)) => {}
+                        Some(None) if !is_regex => {}
+                        _ => return false,
                     }
                     rest = &rest[i + 2 + j + 1..];
                 }
                 true
             };
-            if !(t.starts_with("url ") || t.starts_with("url(")) || !allowed(t) {
+            if !(t.starts_with("url ") || t.starts_with("url(") || is_regex) || !allowed(t) {
                 return None;
             }
         }
@@ -1734,6 +1998,7 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                     (LivecheckUrl::Symbol(sym), tail)
                 } else {
                     let (s, tail) = quoted_token(rest)?;
+                    let s = substitute(&s)?;
                     (
                         LivecheckUrl::Literal(
                             s.replace("#{LATEST_VERSION}", "<FORMULA_LATEST_VERSION>"),
@@ -1800,6 +2065,7 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                 }
             } else if let Some(rest) = t.strip_prefix("regex(") {
                 let (pattern, flags, tail) = regex_literal(rest)?;
+                let pattern = substitute(&pattern)?;
                 if tail.trim() != ")" {
                     return None;
                 }
@@ -1814,7 +2080,14 @@ pub fn parse_livecheck_block(text: &str) -> Option<super::formula::LivecheckSpec
                 {
                     return None;
                 }
-                if (sym == "json" || sym == "xml" || sym == "yaml" || sym == "extract_plist")
+                if (sym == "json"
+                    || sym == "xml"
+                    || sym == "yaml"
+                    || sym == "electron_builder"
+                    || sym == "github_releases"
+                    || sym == "page_match"
+                    || sym == "sourceforge"
+                    || sym == "extract_plist")
                     && opens
                 {
                     json_capture = Some((sym.clone(), tail.to_string(), Vec::new()));
@@ -2045,6 +2318,8 @@ fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::Js
     }
     let shape = if cur.is_empty() {
         JsonShape::Dig(path)
+    } else if let Some(sep) = split_first_tail(cur) {
+        JsonShape::DigSplitFirst(path, sep)
     } else if let Some(rest) = cur
         .strip_prefix("&.delete(")
         .or_else(|| cur.strip_prefix(".delete("))
@@ -2083,6 +2358,662 @@ fn parse_json_shape(params: &str, lines: &[String]) -> Option<super::formula::Js
         }
     };
     Some(JsonBlock { has_regex, shape })
+}
+
+/// A single-quoted Ruby string token: only `\\`
+/// and `\'` escape inside; the value keeps other
+/// backslashes verbatim (regex templates need them).
+fn single_quoted_token(s: &str) -> Option<(String, &str)> {
+    let rest = s.strip_prefix('\'')?;
+    let end = rest.find('\'')?;
+    Some((rest[..end].to_string(), &rest[end + 1..]))
+}
+
+/// A replacement template for a backreference `sub`:
+/// single- or double-quoted; backslashes only as
+/// `\0`..`\9` or `\\`.
+fn sub_template(tail: &str) -> Option<(String, &str)> {
+    let (tmpl, rest) = if tail.starts_with('\'') {
+        single_quoted_token(tail)?
+    } else {
+        quoted_token(tail)?
+    };
+    let bytes = tmpl.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            match bytes.get(i + 1) {
+                Some(b'0'..=b'9' | b'\\') => i += 1,
+                _ => return None,
+            }
+        }
+        i += 1;
+    }
+    Some((tmpl, rest))
+}
+
+/// The `(pat, flags, template)` of a `.sub(/pat/flags, '<tmpl>')`
+/// call at the start of `after` (after `.sub(`).
+fn sub_backref_args(after: &str) -> Option<(String, String, String)> {
+    let args = after
+        .strip_prefix(".sub(")
+        .or_else(|| after.strip_prefix("&.sub("))?;
+    let (pat, flags, tail) = regex_literal(args)?;
+    let tail = tail.trim().strip_prefix(',')?.trim();
+    let (tmpl, tail) = sub_template(tail)?;
+    if tail.trim() != ")" {
+        return None;
+    }
+    Some((pat, flags, tmpl))
+}
+
+/// Block statements: lines trimmed, comments
+/// stripped, continuations joined (a line starting
+/// with `.`, or while parens are unbalanced outside
+/// double quotes).
+fn block_statements(lines: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in lines {
+        let line = strip_trailing_comment(raw.trim()).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let depth = |s: &str| -> i32 {
+            let (mut d, mut quoted) = (0i32, false);
+            for c in s.chars() {
+                match c {
+                    '"' => quoted = !quoted,
+                    '(' if !quoted => d += 1,
+                    ')' if !quoted => d -= 1,
+                    _ => {}
+                }
+            }
+            d
+        };
+        if (line.starts_with('.') || out.last().is_some_and(|p: &String| depth(p) > 0))
+            && let Some(prev) = out.last_mut()
+        {
+            prev.push(' ');
+            prev.push_str(line);
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    out
+}
+
+/// The `(regex_source, tail)` of a `page.scan(…)`
+/// argument: the block's `regex` or a literal.
+fn scan_regex_arg(cur: &str) -> Option<(Option<(String, String)>, &str)> {
+    if let Some(tail) = cur.strip_prefix("regex") {
+        return Some((None, tail));
+    }
+    let (pat, flags, tail) = regex_literal(cur)?;
+    Some((Some((pat, flags)), tail))
+}
+
+/// Reduce the two-stage directory-walk page blocks
+/// (gnu-getopt, texlive, singular) to data. See
+/// `DirWalk` for the shape; anything off-template
+/// stays block-only.
+fn parse_dirwalk_shape(root: &str, lines: &[String]) -> Option<super::formula::PageShape> {
+    use super::formula::{DirBlank, DirWalk, PageShape};
+    let stmts = block_statements(lines);
+    let mut i = 0usize;
+    let peek = |i: usize| stmts.get(i).map(String::as_str);
+    // <v> = page.scan(<re>)<chain>
+    let first = peek(i)?;
+    let (v, rest) = first.split_once(" = ")?;
+    let v = v.trim().to_string();
+    if v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rest = rest.strip_prefix(&format!("{root}.scan("))?;
+    let (stage1_regex, tail) = scan_regex_arg(rest)?;
+    let mut cur = tail.strip_prefix(')')?.trim_start();
+    let (mut stage1_tr, mut reject_patch_ge) = (None, None);
+    loop {
+        cur = cur.trim_start();
+        if let Some(r) = cur.strip_prefix(".flatten") {
+            cur = r;
+        } else if let Some(r) = cur.strip_prefix(".uniq") {
+            cur = r;
+        } else if let Some(r) = cur.strip_prefix(".map { |") {
+            let (x, r) = r.split_once("| ")?;
+            let r = r.strip_prefix(&format!("Version.new({x}"))?;
+            let r = if let Some(r2) = r.strip_prefix(".tr(") {
+                let (from, t) = quoted_token(r2)?;
+                let t = t.trim().strip_prefix(',')?.trim();
+                let (to, t) = quoted_token(t)?;
+                if from.contains('\\') || to.contains('\\') {
+                    return None;
+                }
+                stage1_tr = Some((from, to));
+                t.trim().strip_prefix(')')?
+            } else {
+                r
+            };
+            cur = r.trim().strip_prefix(") }")?;
+        } else if let Some(r) = cur.strip_prefix(".reject { |") {
+            let (x, r) = r.split_once("| ")?;
+            let r = r.strip_prefix(&format!("{x}.patch >= "))?;
+            let (n_str, r) = r.split_once('}')?;
+            reject_patch_ge = Some(n_str.trim().parse().ok()?);
+            cur = r;
+        } else if let Some(r) = cur.strip_prefix(".sort_by { |") {
+            let (x, r) = r.split_once("| ")?;
+            cur = r
+                .strip_prefix(&format!("Version.new({x})"))?
+                .trim()
+                .strip_prefix('}')?;
+        } else if let Some(r) = cur.strip_prefix(".sort") {
+            cur = r;
+        } else {
+            break;
+        }
+    }
+    if !cur.trim().is_empty() {
+        return None;
+    }
+    i += 1;
+    // Blank guard (both spellings return nothing).
+    match peek(i)? {
+        s if s == format!("next {v} if {v}.blank?") || s == format!("next if {v}.blank?") => {
+            i += 1;
+        }
+        _ => return None,
+    }
+    let pc = "Homebrew::Livecheck::Strategy.page_content(";
+    // The directory template inside a page_content arg.
+    let dir_template =
+        |arg: &str, wname: &str| -> Option<(String, Option<(String, String)>, String)> {
+            let arg = arg.strip_prefix("URI.join(@url, ")?;
+            let arg = arg.trim().strip_suffix(',').unwrap_or(arg).trim();
+            let arg = arg.strip_suffix(").to_s")?;
+            if arg == wname {
+                return Some((String::new(), None, String::new()));
+            }
+            // The whole arg is the string literal; it
+            // may carry inner quotes (a `tr` call), so
+            // take first-to-last quote, not a token.
+            let inner = arg.strip_prefix('"')?.strip_suffix('"')?;
+            let plain = format!("#{{{wname}}}");
+            if let Some(pos) = inner.find(&plain) {
+                return Some((
+                    inner[..pos].to_string(),
+                    None,
+                    inner[pos + plain.len()..].to_string(),
+                ));
+            }
+            let tr_open = format!("#{{{wname}.to_s.tr(");
+            let pos = inner.find(&tr_open)?;
+            let rest = &inner[pos + tr_open.len()..];
+            let (from, t) = quoted_token(rest)?;
+            let t = t.trim().strip_prefix(',')?.trim();
+            let (to, t) = quoted_token(t)?;
+            let t = t.strip_prefix(")}")?;
+            Some((inner[..pos].to_string(), Some((from, to)), t.to_string()))
+        };
+    let mut walk = DirWalk {
+        stage1_regex,
+        stage1_tr,
+        reject_patch_ge,
+        last_two: false,
+        dir_pre: String::new(),
+        dir_tr: None,
+        dir_post: String::new(),
+        stage2_regex: None,
+        blank: DirBlank::Nothing,
+        empty_scan_stage1: false,
+    };
+    // gnu-getopt: last-two loop.
+    if peek(i) == Some("dir_versions = []") {
+        let open = peek(i + 1)?;
+        let w = open
+            .strip_prefix(&format!("{v}[-2..].reverse_each do |"))?
+            .strip_suffix('|')?
+            .to_string();
+        let fetch = peek(i + 2)?;
+        let arg = fetch
+            .strip_prefix(&format!("dir_page = {pc}"))?
+            .strip_suffix(')')?;
+        let (pre, tr, post) = dir_template(arg.trim(), &w)?;
+        if peek(i + 3)? != format!("next {v} if dir_page[:content].blank?")
+            || peek(i + 4)? != "dir_versions = dir_page[:content].scan(regex).flatten"
+            || peek(i + 5)? != "break unless dir_versions.empty?"
+            || peek(i + 6)? != "end"
+            || peek(i + 7)? != format!("dir_versions.presence || {v}")
+            || peek(i + 8).is_some()
+        {
+            return None;
+        }
+        walk.last_two = true;
+        walk.dir_pre = pre;
+        walk.dir_tr = tr;
+        walk.dir_post = post;
+        walk.blank = DirBlank::NextCandidate;
+        walk.empty_scan_stage1 = true;
+        return Some(PageShape::DirWalk(Box::new(walk)));
+    }
+    // Newest binding: `<w> = <v>.last[.to_s]`.
+    let bind = peek(i)?;
+    let (w, rhs) = bind.split_once(" = ")?;
+    let w = w.trim().to_string();
+    if rhs != format!("{v}.last") && rhs != format!("{v}.last.to_s") {
+        return None;
+    }
+    let fetch = peek(i + 1)?;
+    let (pvar, arg) = fetch.split_once(" = ")?;
+    let pvar = pvar.trim();
+    let arg = arg.strip_prefix(pc)?.strip_suffix(')')?;
+    let (pre, tr, post) = dir_template(arg.trim(), &w)?;
+    walk.dir_pre = pre;
+    walk.dir_tr = tr;
+    walk.dir_post = post;
+    walk.blank = match peek(i + 2)? {
+        s if s == format!("next {v} if {pvar}[:content].blank?") => DirBlank::Stage1,
+        s if s == format!("next if {pvar}[:content].blank?") => DirBlank::Nothing,
+        _ => return None,
+    };
+    let scan_stmt = peek(i + 3)?;
+    // texlive: bare scan result; singular: assigned + `||`.
+    if scan_stmt == format!("{pvar}[:content].scan(regex).flatten") && peek(i + 4).is_none() {
+        return Some(PageShape::DirWalk(Box::new(walk)));
+    }
+    let (dvar, rhs) = scan_stmt.split_once(" = ")?;
+    let rhs = rhs.strip_prefix(&format!("{pvar}[:content].scan("))?;
+    let (stage2, tail) = scan_regex_arg(rhs)?;
+    if tail != ").flatten"
+        || peek(i + 4)? != format!("{} || {v}", dvar.trim())
+        || peek(i + 5).is_some()
+    {
+        return None;
+    }
+    walk.stage2_regex = stage2;
+    Some(PageShape::DirWalk(Box::new(walk)))
+}
+
+/// Reduce a `:page_match`-family strategy block body
+/// to a data shape: `page.scan(regex).map { |match|
+/// match[0].tr("from", "to") }` (also written with
+/// `match.first` / safe navigation). The `tr`
+/// arguments are kept verbatim; negation and escapes
+/// do not reduce.
+fn parse_page_shape(params: &str, lines: &[String]) -> Option<super::formula::PageBlock> {
+    use super::formula::{PageBlock, PageShape};
+    let (root, has_regex) = block_params(params)?;
+    if !has_regex {
+        return None;
+    }
+    if let Some(shape) = parse_dirwalk_shape(&root, lines) {
+        return Some(PageBlock { shape });
+    }
+    let joined = join_block_lines(lines);
+    let cur = joined.trim().strip_prefix(root.as_str())?;
+    let cur = cur.strip_prefix(".scan(regex)")?;
+    let rest = strip_map_open(cur)?;
+    let (var, inner) = json_map_parts(rest)?;
+    if let Some(shape) = page_date_shape(&var, &inner) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = page_reject_shape(&var, &inner) {
+        return Some(PageBlock { shape });
+    }
+    if let Some(shape) = page_join_shape(&var, &inner) {
+        return Some(PageBlock { shape });
+    }
+    let mut after = inner.strip_prefix(var.as_str())?;
+    for pre in ["&.first", ".first", "[0]"] {
+        if let Some(r) = after.strip_prefix(pre) {
+            after = r;
+            break;
+        }
+    }
+    // `<capture>.tr("from", "to")`
+    if let Some(args) = after
+        .strip_prefix(".tr(")
+        .or_else(|| after.strip_prefix("&.tr("))
+    {
+        let (from, tail) = quoted_token(args)?;
+        let tail = tail.trim().strip_prefix(',')?.trim();
+        let (to, tail) = quoted_token(tail)?;
+        let tail = tail.trim();
+        if from.contains('\\') || to.contains('\\') || from.starts_with('^') {
+            return None;
+        }
+        if tail == ")" {
+            return Some(PageBlock {
+                shape: PageShape::ScanTr(from, to),
+            });
+        }
+        // Chained `.tr(…).sub(/pat/, '-\1')` (jxrlib).
+        let chained = tail.strip_prefix(')')?;
+        let (pat, flags, tmpl) = sub_backref_args(chained)?;
+        return Some(PageBlock {
+            shape: PageShape::ScanTrSubBackref(from, to, pat, flags, tmpl),
+        });
+    }
+    // `<capture>.gsub("from", "to")` — literal arguments.
+    if let Some(args) = after
+        .strip_prefix(".gsub(")
+        .or_else(|| after.strip_prefix("&.gsub("))
+    {
+        let (from, tail) = quoted_token(args)?;
+        let tail = tail.trim().strip_prefix(',')?.trim();
+        let (to, tail) = quoted_token(tail)?;
+        if tail.trim() != ")" || from.is_empty() || from.contains('\\') || to.contains('\\') {
+            return None;
+        }
+        return Some(PageBlock {
+            shape: PageShape::ScanGsub(from, to),
+        });
+    }
+    // `<capture>.sub(/pat/flags, "to")` — a literal
+    // replacement, or a backreference template.
+    if let Some(args) = after
+        .strip_prefix(".sub(")
+        .or_else(|| after.strip_prefix("&.sub("))
+    {
+        let (pat, flags, tail) = regex_literal(args)?;
+        let tail = tail.trim().strip_prefix(',')?.trim();
+        let (to, tail) = sub_template(tail)?;
+        if tail.trim() != ")" {
+            return None;
+        }
+        return Some(PageBlock {
+            shape: if to.contains('\\') {
+                PageShape::ScanSubBackref(pat, flags, to)
+            } else {
+                PageShape::ScanSub(pat, flags, to)
+            },
+        });
+    }
+    // `<capture>.scan(/\d{N}/).map(&:to_i).join(".")`.
+    if let Some(args) = after
+        .strip_prefix(".scan(/\\d{")
+        .or_else(|| after.strip_prefix("&.scan(/\\d{"))
+    {
+        let (n_str, tail) = args.split_once("}/)")?;
+        let n: usize = n_str.parse().ok()?;
+        let tail = tail.trim().strip_prefix(".map(&:to_i).join(")?;
+        let (sep, tail) = quoted_token(tail.trim())?;
+        if tail.trim() != ")" || n == 0 || sep.contains('\\') {
+            return None;
+        }
+        return Some(PageBlock {
+            shape: PageShape::ScanChunks(n, sep),
+        });
+    }
+    None
+}
+
+/// The vilistextum reject form:
+/// `((v = match.first) == "x") ? nil : v`.
+fn page_reject_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> {
+    let rest = inner.strip_prefix("((")?;
+    let (v, rest) = rest.split_once(" = ")?;
+    if v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let mut rest = rest;
+    for acc in [
+        format!("{var}&.first"),
+        format!("{var}.first"),
+        format!("{var}[0]"),
+    ] {
+        if let Some(r) = rest.strip_prefix(acc.as_str()) {
+            rest = r;
+            break;
+        }
+    }
+    let rest = rest.strip_prefix(") == ")?.trim();
+    let (lit, tail) = quoted_token(rest)?;
+    (tail.trim() == format!(") ? nil : {v}"))
+        .then_some(super::formula::PageShape::ScanRejectEq(lit))
+}
+
+/// The `Date.parse(<capture>)&.strftime("%Y%m%d")`
+/// map bodies (pari-*, http_load): the direct form
+/// and the assign-then-ternary form. Only the
+/// `%Y%m%d` format reduces.
+fn page_date_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> {
+    fn finish(rest: &str) -> Option<super::formula::PageShape> {
+        let rest = rest
+            .strip_prefix("&.strftime(")
+            .or_else(|| rest.strip_prefix(".strftime("))?;
+        let (fmt, tail) = quoted_token(rest)?;
+        (fmt == "%Y%m%d" && tail.trim() == ")").then_some(super::formula::PageShape::ScanDateYmd)
+    }
+    let accessors = [
+        format!("{var}&.first"),
+        format!("{var}.first"),
+        format!("{var}[0]"),
+    ];
+    if let Some(rest) = inner.strip_prefix("Date.parse(") {
+        for acc in &accessors {
+            if let Some(r) = rest
+                .strip_prefix(acc.as_str())
+                .and_then(|r| r.strip_prefix(')'))
+            {
+                return finish(r);
+            }
+        }
+        return None;
+    }
+    // `v = match&.first` then `v ? Date.parse(v)&.strftime(..) : nil`.
+    let (v, rest) = inner.split_once(" = ")?;
+    if v.is_empty() || !v.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let mut rest = rest;
+    for acc in &accessors {
+        if let Some(r) = rest.strip_prefix(acc.as_str()) {
+            rest = r;
+            break;
+        }
+    }
+    let rest = rest
+        .trim()
+        .strip_prefix(&format!("{v} ? Date.parse({v})"))?;
+    finish(rest.strip_suffix(" : nil")?.trim_end())
+}
+
+/// One block line with any trailing `#` comment
+/// outside double quotes removed.
+fn strip_trailing_comment(line: &str) -> &str {
+    let mut quoted = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '#' if !quoted && (i == 0 || line[..i].ends_with(' ')) => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+    }
+    line
+}
+
+/// Reduce a `:github_releases` strategy block to a
+/// data shape. The tap grammar is one statement per
+/// line: `json.map do |release|`, draft/prerelease
+/// and name guards, a `match = …&.match(regex)`
+/// capture from the tag (or each asset's download
+/// URL with a trailing `end.flatten`), `next if
+/// match.blank?`, and a result expression
+/// (`match[1]`, with `tr`, or a `Version` kept only
+/// when its patch is non-zero).
+fn parse_ghrel_shape(params: &str, lines: &[String]) -> Option<super::formula::GhRelBlock> {
+    use super::formula::{GhRelBlock, GhRelSource, GhRelThen};
+    let (root, has_regex) = block_params(params)?;
+    if !has_regex {
+        return None;
+    }
+    let stmts: Vec<String> = lines
+        .iter()
+        .map(|l| strip_trailing_comment(l.trim()).trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut i = 0usize;
+    let next = |i: &mut usize| -> Option<&str> {
+        let s = stmts.get(*i)?.as_str();
+        *i += 1;
+        Some(s)
+    };
+    // `<json>.map do |release|` (or filter_map)
+    let open = next(&mut i)?;
+    let rel = ["map", "filter_map"].iter().find_map(|m| {
+        open.strip_prefix(&format!("{root}.{m} do |"))
+            .and_then(|r| r.strip_suffix('|'))
+    })?;
+    if rel.is_empty() || !rel.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let rel = rel.to_string();
+    let (mut skip_draft, mut skip_prerelease) = (false, false);
+    let mut name_skip: Option<(String, String)> = None;
+    // Guards, in tap order (draft/prerelease, then name).
+    loop {
+        let line = stmts.get(i)?.as_str();
+        if line == format!("next if {rel}[\"draft\"] || {rel}[\"prerelease\"]") {
+            skip_draft = true;
+            skip_prerelease = true;
+            i += 1;
+        } else if line == format!("next if {rel}[\"draft\"]") {
+            skip_draft = true;
+            i += 1;
+        } else if let Some(rest) = line
+            .strip_prefix(&format!("next if {rel}[\"name\"]&.match?("))
+            .or_else(|| line.strip_prefix(&format!("next if {rel}[\"name\"].match?(")))
+        {
+            let (pat, flags, tail) = regex_literal(rest)?;
+            if tail.trim() != ")" {
+                return None;
+            }
+            name_skip = Some((pat, flags));
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    // Capture statement(s).
+    let mut source = GhRelSource::TagName;
+    let mut asset_var: Option<String> = None;
+    if let Some(r) = stmts
+        .get(i)?
+        .strip_prefix(&format!("{rel}[\"assets\"]&.map do |"))
+    {
+        let a = r.strip_suffix('|')?;
+        if a.is_empty() || !a.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        asset_var = Some(a.to_string());
+        source = GhRelSource::AssetDownloadUrl;
+        i += 1;
+    }
+    let cap = next(&mut i)?;
+    let (mvar, cap_rhs) = cap.split_once(" = ")?;
+    if mvar.is_empty() || !mvar.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    let expect_rhs = match (&source, &asset_var) {
+        (GhRelSource::AssetDownloadUrl, Some(a)) => {
+            format!("{a}[\"browser_download_url\"]&.match(regex)")
+        }
+        _ => format!("{rel}[\"tag_name\"]&.match(regex)"),
+    };
+    if cap_rhs != expect_rhs {
+        return None;
+    }
+    if next(&mut i)? != format!("next if {mvar}.blank?") {
+        return None;
+    }
+    // Result expression.
+    let expr = next(&mut i)?;
+    let then = if expr == format!("{mvar}[1]") {
+        GhRelThen::Identity
+    } else if let Some(args) = expr
+        .strip_prefix(&format!("{mvar}[1]&.tr("))
+        .or_else(|| expr.strip_prefix(&format!("{mvar}[1].tr(")))
+    {
+        let (from, tail) = quoted_token(args)?;
+        let tail = tail.trim().strip_prefix(',')?.trim();
+        let (to, tail) = quoted_token(tail)?;
+        if tail.trim() != ")" || from.contains('\\') || to.contains('\\') || from.starts_with('^') {
+            return None;
+        }
+        GhRelThen::Tr(from, to)
+    } else if let Some((v, rhs)) = expr.split_once(" = ") {
+        // `version = Version.new(match[1])`, a zero-patch
+        // guard, then the version itself.
+        if rhs != format!("Version.new({mvar}[1])")
+            || v.is_empty()
+            || !v.chars().all(|c| c.is_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        if next(&mut i)? != format!("next if {v}.patch.to_i.zero?") {
+            return None;
+        }
+        if next(&mut i)? != v {
+            return None;
+        }
+        GhRelThen::NonZeroPatch
+    } else {
+        return None;
+    };
+    // Closers: assets form has an inner `end` then
+    // `end.flatten`; tag form a plain `end`. Nothing
+    // may follow.
+    let tail: Vec<&str> = stmts[i..].iter().map(String::as_str).collect();
+    let closed = match source {
+        GhRelSource::TagName => tail == ["end"],
+        GhRelSource::AssetDownloadUrl => tail == ["end", "end.flatten"],
+    };
+    if !closed {
+        return None;
+    }
+    Some(GhRelBlock {
+        skip_draft,
+        skip_prerelease,
+        name_skip,
+        source,
+        then,
+    })
+}
+
+/// A dig tail of the form `&.split("<sep>")&.first`
+/// (either navigation spelling on either call): the
+/// literal separator (non-empty, backslash-free).
+fn split_first_tail(cur: &str) -> Option<String> {
+    let rest = cur
+        .strip_prefix("&.split(")
+        .or_else(|| cur.strip_prefix(".split("))?;
+    let (sep, tail) = quoted_token(rest)?;
+    let tail = tail.trim().strip_prefix(')')?;
+    if !(tail == "&.first" || tail == ".first") || sep.is_empty() || sep.contains('\\') {
+        return None;
+    }
+    Some(sep)
+}
+
+/// The multi-capture map forms: `match.join(".")`
+/// and jasp's `match[1] ? "#{match[0]},#{match[1]}"
+/// : match[0]`.
+fn page_join_shape(var: &str, inner: &str) -> Option<super::formula::PageShape> {
+    use super::formula::PageShape;
+    if let Some(args) = inner
+        .strip_prefix(&format!("{var}.join("))
+        .or_else(|| inner.strip_prefix(&format!("{var}&.join(")))
+    {
+        let (sep, tail) = quoted_token(args)?;
+        if tail.trim() != ")" || sep.contains('\\') {
+            return None;
+        }
+        return Some(PageShape::ScanJoin(sep));
+    }
+    let csv = format!("{var}[1] ? \"#{{{var}[0]}},#{{{var}[1]}}\" : {var}[0]");
+    (inner == csv).then_some(PageShape::ScanCsvOpt)
 }
 
 /// Reduce a `:yaml` strategy block body to a data shape:
@@ -2125,6 +3056,8 @@ fn parse_yaml_shape(params: &str, lines: &[String]) -> Option<super::formula::Ya
     }
     let shape = if cur.is_empty() {
         YamlShape::Dig(path)
+    } else if let Some(sep) = split_first_tail(cur) {
+        YamlShape::DigSplitFirst(path, sep)
     } else {
         let rest = cur
             .strip_prefix("&.[](regex, 1)")
@@ -2358,6 +3291,51 @@ fn rest_key(rest: &str, var: &str) -> Option<String> {
 /// line-wise, per-system blocks skipped (and marked
 /// unsupported for install), `#{version}` interpolation
 /// applied to url and artifact names.
+/// The `version` a host-matching per-system block
+/// declares (`on_arm`/`on_intel` by arch, `on_macos`/
+/// `on_linux` by OS; any other `on_*` block does not
+/// match). All enclosing conditionals must match.
+fn cask_host_version(text: &str) -> Option<String> {
+    let arch = super::machine::current_arch_symbol();
+    let mut stack: Vec<bool> = Vec::new();
+    for raw in text.lines() {
+        let t = raw.trim();
+        if t == "end" {
+            stack.pop();
+            continue;
+        }
+        if (t.starts_with("on_") || t.starts_with("language "))
+            && (t.ends_with(" do") || t.contains(" do |"))
+        {
+            let matched = if t.starts_with("on_arm") {
+                arch == "arm"
+            } else if t.starts_with("on_intel") {
+                arch == "intel"
+            } else if t.starts_with("on_macos") {
+                cfg!(target_os = "macos")
+            } else if t.starts_with("on_linux") {
+                cfg!(target_os = "linux")
+            } else {
+                false
+            };
+            stack.push(matched);
+            continue;
+        }
+        if line_opens_block(t) {
+            stack.push(true);
+            continue;
+        }
+        if !stack.is_empty()
+            && stack.iter().all(|m| *m)
+            && t.starts_with("version ")
+            && let Some(v) = cask_quoted(t, "version")
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
 #[must_use]
 pub fn parse_cask_rb_as_data(text: &str, token: &str) -> Cask {
     let mut c = Cask {
@@ -2508,9 +3486,17 @@ pub fn parse_cask_rb_as_data(text: &str, token: &str) -> Cask {
     if c.name.is_empty() {
         c.name = token.to_string();
     }
-    c.url = cask_interpolate(&c.url, &c.version, &mut unsupported);
+    // A version declared only inside host-matching
+    // `on_arm`/`on_intel`/`on_macos` blocks is still
+    // this host's file version (the record stays
+    // marked `variations`-unsupported for install).
+    if c.version.is_empty() {
+        c.version = cask_host_version(text).unwrap_or_default();
+    }
+    let locals = cask_livecheck_locals(&lines);
+    c.url = cask_interpolate(&c.url, &c.version, &locals, &mut unsupported);
     for artifact in &mut c.artifacts {
-        interpolate_artifact(artifact, &c.version, &mut unsupported);
+        interpolate_artifact(artifact, &c.version, &locals, &mut unsupported);
     }
     c.caveats = c.caveats.trim_start_matches('\u{1}').to_string();
     c.livecheck = parse_livecheck_block(text).map(|spec| {
@@ -2654,8 +3640,13 @@ fn parse_cask_artifact(line: &str, c: &mut Cask) {
 }
 
 /// Interpolate `#{version}` in an artifact's names.
-fn interpolate_artifact(a: &mut Artifact, version: &str, unsupported: &mut Option<&'static str>) {
-    let mut go = |s: &mut String| *s = cask_interpolate(s, version, unsupported);
+fn interpolate_artifact(
+    a: &mut Artifact,
+    version: &str,
+    locals: &[(String, String)],
+    unsupported: &mut Option<&'static str>,
+) {
+    let mut go = |s: &mut String| *s = cask_interpolate(s, version, locals, unsupported);
     match a {
         Artifact::App(s, _)
         | Artifact::Binary(s, _)

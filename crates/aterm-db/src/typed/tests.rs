@@ -54,6 +54,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -81,6 +82,7 @@ crate::att_collection!(
     ],
     unique: &[],
     max_row: 0,
+    authority: None,
 });
 
 crate::att_collection!(
@@ -97,6 +99,7 @@ crate::att_collection!(
         ],
         unique: &[&["addr"]],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -111,6 +114,7 @@ crate::att_collection!(
         columns: &[Column::new("n", Ty::Uint), Column::new("label", Ty::Label)],
         unique: &[],
         max_row: 4096,
+        authority: None,
     }
 );
 
@@ -125,6 +129,7 @@ crate::att_collection!(
         columns: &[Column::new("n", Ty::Uint)],
         unique: &[],
         max_row: 4096,
+        authority: None,
     }
 );
 
@@ -139,6 +144,7 @@ crate::att_collection!(
         columns: &[Column::new("events", Ty::Json(24 * 1024))],
         unique: &[],
         max_row: 24 * 1024,
+        authority: None,
     }
 );
 
@@ -225,7 +231,7 @@ impl Book {
                 sequence: *sequence,
                 roster: [7; 32],
                 period,
-                revert: false,
+                revert: None,
                 changes: changes.clone(),
             })
             .collect()
@@ -488,6 +494,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -506,6 +513,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -524,6 +532,7 @@ crate::att_collection!(
         ],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 
@@ -1350,10 +1359,16 @@ fn every_key_fits_the_grammar() {
     }
 }
 
-/// A re-import writes only a cell that is absent or that an earlier import wrote; an owner's
-/// value or a conflict is left and reported, and an unchanged cell spends nothing.
-/// NEGATIVE CONTROL: with `import_step` writing over an owner's value (its owner arm made
-/// `Write`), the owner's correction is overwritten and this fails.
+/// A re-import writes only a cell that is absent or that an earlier import wrote, or that an
+/// automatic path wrote in a collection under the authority rules (an observer's `pending` birth
+/// of a registry account, which an import's `active` outranks); an automatic value of a
+/// collection that never opted in (a Mac's registration of itself), an owner's value or a
+/// conflict is left and reported, and an unchanged cell spends nothing.
+/// NEGATIVE CONTROLS: with `import_step` writing over an owner's value (its owner arm made
+/// `Write`), the owner's correction is overwritten and this fails; with its automatic arm
+/// removed (`candidate.value.s.is_some()` alone), the observer's birth reads as the owner's:
+/// `` left: Finding("the owner set this cell since the import; it is left as it is") right:
+/// Write ``.
 #[test]
 fn import_never_writes_over_the_owner() {
     let source = "sr-0011223344556677";
@@ -1371,29 +1386,45 @@ fn import_never_writes_over_the_owner() {
         ],
         provisional: None,
     };
-    assert_eq!(cell::import_step(None, &json!("paused")), ImportStep::Write);
     assert_eq!(
-        cell::import_step(Some(&imported), &json!("paused")),
+        cell::import_step(&ACCOUNT, None, &json!("paused")),
         ImportStep::Write
     );
     assert_eq!(
-        cell::import_step(Some(&imported), &json!("pending")),
+        cell::import_step(&ACCOUNT, Some(&imported), &json!("paused")),
+        ImportStep::Write
+    );
+    let observed = Field::Value(candidate(CellValue::automatic(2, json!("pending"))));
+    assert_eq!(
+        cell::import_step(
+            &crate::alab::registry::ACCOUNT,
+            Some(&observed),
+            &json!("active")
+        ),
+        ImportStep::Write
+    );
+    assert!(matches!(
+        cell::import_step(&ACCOUNT, Some(&observed), &json!("active")),
+        ImportStep::Finding(_)
+    ));
+    assert_eq!(
+        cell::import_step(&ACCOUNT, Some(&imported), &json!("pending")),
         ImportStep::Unchanged
     );
     assert_eq!(
-        cell::import_step(Some(&owners), &json!("active")),
+        cell::import_step(&ACCOUNT, Some(&owners), &json!("active")),
         ImportStep::Unchanged
     );
     assert!(matches!(
-        cell::import_step(Some(&owners), &json!("paused")),
+        cell::import_step(&ACCOUNT, Some(&owners), &json!("paused")),
         ImportStep::Finding(_)
     ));
     assert!(matches!(
-        cell::import_step(Some(&cleared), &json!("paused")),
+        cell::import_step(&ACCOUNT, Some(&cleared), &json!("paused")),
         ImportStep::Finding(_)
     ));
     assert!(matches!(
-        cell::import_step(Some(&conflict), &json!("paused")),
+        cell::import_step(&ACCOUNT, Some(&conflict), &json!("paused")),
         ImportStep::Finding(_)
     ));
     // The provenance survives the round trip through a stored value.
@@ -1445,7 +1476,7 @@ fn an_owner_value_an_import_also_wrote_stays_the_owners() {
     let field = &row.fields["status"];
     assert!(matches!(field, Field::Value(c) if c.value.s.is_none()));
     assert!(matches!(
-        cell::import_step(Some(field), &json!("active")),
+        cell::import_step(&ACCOUNT, Some(field), &json!("active")),
         ImportStep::Finding(_)
     ));
 }
@@ -1620,10 +1651,13 @@ mod commons {
             } else {
                 owned::read_owned(&FACTS, &ops, historical)
             };
-            let addresses = cell::project(&ADDRESS, &log.cells_without(&quota.over))
-                .rows
-                .into_keys()
-                .collect();
+            let addresses = cell::project(
+                &ADDRESS,
+                &log.cells_without(None, &quota.over, &BTreeSet::new()),
+            )
+            .rows
+            .into_keys()
+            .collect();
             Ok((facts, addresses))
         })
         .unwrap()
@@ -1766,54 +1800,55 @@ fn a_lifecycle_conflict_never_reads_as_live() {
     assert!(!newer.live());
 }
 
-/// An account's label names no machine, in any spelling a machine has, and is free text past
-/// that: the guards still hold, and the default label passes for every realm. A preference's key
-/// is the pair alone, and names no rank.
-/// NEGATIVE CONTROL: with `guard::account_label` skipping `machine_shaped`, the first spelling is
-/// stored: `` called `Result::unwrap_err()` on an `Ok` value: () `` at `m2`.
+/// An account's label is a handle (`guard::handle`): words of lower-case letters and digits
+/// joined by one `-`, at most `keys::MAX_HANDLE` bytes, and a word shaped like a machine name is
+/// a word like any other, since the address an account signs in with can hold one. The free-text
+/// guards still hold. A preference's key is the pair alone, and names no rank.
+/// NEGATIVE CONTROL: with `guard::handle` admitting a space (`b == b' '` beside its letters and
+/// digits), "team a" is stored: `` "team a" is no handle: Ok(()) ``.
 #[test]
-fn an_account_label_names_no_machine() {
+fn an_account_label_is_a_handle_and_may_name_a_machine() {
     let label = crate::alab::registry::ACCOUNT.column("label").unwrap();
+    assert_eq!(label.ty, crate::typed::Ty::Handle(keys::MAX_HANDLE));
     let write = |text: &str| {
         cell::validate(&crate::alab::registry::ACCOUNT, label, &json!(text)).map_err(|e| e.0)
     };
-    for shaped in [
+    for fine in [
         "m2",
-        "M109",
-        "m2.3",
         "m27-2",
         "m106-m38",
         "kimi-m16",
-        "m2 spare",
         "m4max",
-        "claude.m8",
+        "research",
+        "max-plan",
+        "fb-gmail",
+        &"x".repeat(keys::MAX_HANDLE),
     ] {
-        let why = write(shaped).unwrap_err();
-        assert!(why.contains("names no machine"), "{shaped}: {why}");
-        assert!(!why.contains(shaped), "{why}");
-    }
-    for fine in ["research", "max-plan", "muse-1", "team a", "m", "mac mini"] {
         assert!(write(fine).is_ok(), "{fine}");
     }
-    for refused in ["", "  ", "a@example.test", &"x".repeat(33)] {
-        assert!(write(refused).is_err(), "{refused}");
+    for refused in [
+        "",
+        "team a",
+        "M109",
+        "m2.3",
+        "claude.m8",
+        "-m2",
+        "m2-",
+        "a@example.test",
+        &"x".repeat(keys::MAX_HANDLE + 1),
+    ] {
+        let why = write(refused).err();
+        assert!(
+            why.is_some(),
+            "{refused:?} is no handle: {:?}",
+            write(refused)
+        );
+        assert!(
+            refused.is_empty() || !why.unwrap().contains(refused),
+            "the rule quotes no value"
+        );
     }
     let account = keys::account_pk("claude", "a@example.test").unwrap();
-    for realm in [
-        "claude",
-        "codex",
-        "grok",
-        "kimi:global",
-        "kimi:mainland-cn",
-        "google",
-        "meta",
-    ] {
-        let label = keys::default_account_label(realm, &account).unwrap();
-        assert!(write(&label).is_ok(), "{label}");
-        assert_eq!(label.rsplit('-').next().unwrap(), &account[3..9]);
-    }
-    assert!(keys::default_account_label("carrier", &account).is_err());
-    assert!(keys::default_account_label("claude", "m8").is_err());
     let machine = keys::machine_pk("m8");
     let pk = keys::preference_pk(&machine, &account).unwrap();
     assert!(pk.starts_with("pf-") && pk.len() == 25, "{pk}");
@@ -2201,6 +2236,7 @@ crate::att_collection!(
         columns: &[Column::new("row", Ty::Enum(LIFE))],
         unique: &[],
         max_row: 0,
+        authority: None,
     }
 );
 

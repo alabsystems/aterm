@@ -116,6 +116,19 @@ impl Command {
             _ => None,
         }
     }
+    /// The operation a `Revert` compensates; no other command names one. Unix only, as its
+    /// reader (the typed reader of a commons table) is.
+    #[cfg(unix)]
+    pub(crate) const fn reverts(&self) -> Option<Digest> {
+        match self {
+            Self::Revert { operation, .. } => Some(*operation),
+            Self::Merge { .. }
+            | Self::Write { .. }
+            | Self::Budget { .. }
+            | Self::Spend { .. }
+            | Self::Revoke { .. } => None,
+        }
+    }
     /// Whether this write stops a key forever rather than giving it a value.
     pub(crate) fn stops(&self) -> bool {
         matches!(self, Self::Write { changes, .. } if changes.iter().any(|c| c.value.is_none()))

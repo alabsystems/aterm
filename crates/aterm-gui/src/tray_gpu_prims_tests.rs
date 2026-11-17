@@ -33,10 +33,12 @@ fn gpu_prims_refuses_text_and_images() {
         y: 0.0,
         w: 20.0,
         h: 20.0,
-        art: ImageArt::Kitty {
-            pose: ImageArt::BRAND_POSE,
+        art: ImageArt::Cat(aterm_effects::rainbow_road::CatArt {
+            pose: aterm_effects::rainbow_road::CatPose::Walk,
+            tilt: 0,
             dark: true,
-        },
+        }),
+        device: (40, 40),
         alpha: 255,
     };
     let icon = DrawPrim::BandIcon {

@@ -132,7 +132,7 @@ fn measure_initial_live_claim_projection() {
                 sequence: 1,
                 roster: [0; 32],
                 period: 0,
-                revert: false,
+                revert: None,
                 changes: [("label", format!("m{}", row + 1)), ("row", "live".into())]
                     .into_iter()
                     .map(|(column, value)| Change {
@@ -315,7 +315,7 @@ pub(super) fn operation(
         sequence: 1,
         roster: [0; 32],
         period: 0,
-        revert: false,
+        revert: None,
         changes: vec![Change {
             collection: MACHINE.name.into(),
             key: format!("{pk}.{column}"),
@@ -710,6 +710,7 @@ fn the_importer_adopts_the_canonical_node_holder() {
         causal: index,
         ops: vec![a, b],
         quota: Default::default(),
+        inert: Default::default(),
         owned: Default::default(),
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
@@ -788,6 +789,7 @@ fn a_partial_import_keeps_the_order_of_a_claim_the_source_already_renamed() {
         causal: target.clone(),
         ops: vec![first.clone(), second.clone()],
         quota: Default::default(),
+        inert: Default::default(),
         owned: Default::default(),
         complete: true,
         awaiting: crate::typed::Awaiting::NONE,
@@ -984,7 +986,7 @@ fn long_same_value_histories_keep_the_first_tenure_without_recursive_ancestry() 
             sequence,
             roster: [0; 32],
             period: 0,
-            revert: false,
+            revert: None,
             changes: vec![Change {
                 collection: MACHINE.name.into(),
                 key: "mc-0000000000000001.label".into(),
@@ -1018,7 +1020,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
 
     let withdrawn = operation(50, a_pk, "label", "m8", &[10, 20], &mut source);
     let mut restored = operation(5, a_pk, "label", "m7", &[50], &mut source);
-    restored.revert = true;
+    restored.revert = Some(withdrawn.id);
     // Compensation restores the exact beforeimage. Native cells contain their typed value;
     // after a roll the same value is enclosed in its original candidate and claim evidence.
     restored.changes[0].value = a.changes[0].value.clone();
@@ -1034,7 +1036,7 @@ fn restoring_a_withdrawn_claim_has_the_same_tenure_before_and_after_a_roll() {
     let carried = carried_operation(100, &original, Some(&evidence), &mut destination);
     let withdrawn = operation(50, a_pk, "label", "m8", &[100], &mut destination);
     let mut restored = operation(5, a_pk, "label", "m7", &[50], &mut destination);
-    restored.revert = true;
+    restored.revert = Some(withdrawn.id);
     let key = format!("{a_pk}.label");
     restored.changes[0].value = carried
         .changes
@@ -1091,7 +1093,7 @@ fn restoring_conflicted_or_opaque_claims_preserves_their_unresolved_evidence() {
         }
         let mut destination = Index::new(4);
         let mut restored = carried_operation(100, &cells(&[&a, &b]), None, &mut destination);
-        restored.revert = true;
+        restored.revert = Some(a.id);
         let raw = cells(&[&restored]);
         let interpreted = restored_cells(&MACHINE, &raw, [&restored].into_iter());
         assert!(matches!(interpreted, std::borrow::Cow::Borrowed(_)));

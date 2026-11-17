@@ -43,7 +43,7 @@ impl Verified {
 
     fn check(&self, key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bool {
         self.check_with(key, message, signature, || {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             crate::pass_counts::add(crate::pass_counts::Count::SignaturesComputed);
             astream_aead::signature::verify(key, message, signature)
         })

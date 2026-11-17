@@ -534,6 +534,17 @@ const PROVING_LOCK: &str = "proving.lock";
 pub struct ProofLock(std::fs::File);
 
 impl ProofLock {
+    #[cfg(windows)]
+    pub(crate) fn guards(&self, paths: &Paths) -> Result<()> {
+        let held = crate::fsx::id_of(&crate::fsx::meta_of(&self.0)?);
+        let (kind, named) = crate::fsx::kind_and_id(&paths.dir.join(PROVING_LOCK))?;
+        if kind != crate::fsx::Kind::File || named != Some(held) {
+            return Err(Error::new("the proof lock no longer guards this vault"));
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
     pub(crate) fn guards(&self, paths: &Paths) -> Result<()> {
         use std::os::unix::fs::MetadataExt as _;
         let held = self.0.metadata()?;

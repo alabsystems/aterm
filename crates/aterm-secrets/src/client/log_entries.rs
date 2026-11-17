@@ -21,7 +21,7 @@ mod commit_tests;
 #[path = "log_entries/held_draft_tests.rs"]
 mod held_draft_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "log_entries/held_conformance_tests.rs"]
 mod held_conformance_tests;
 
@@ -29,7 +29,7 @@ mod held_conformance_tests;
 #[path = "log_entries/enrollment_seat_tests.rs"]
 mod enrollment_seat_tests;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "log_entries/no_leak_tests.rs"]
 mod no_leak_tests;
 
@@ -378,7 +378,7 @@ pub(super) fn reads_log(log: &Log, identity: &Identity) -> bool {
 /// [`reads_log`] it. A log behind the envelope, or an envelope a writer with no seat in the log
 /// published, is read from its lockers instead, so an older log never stands in for a newer
 /// version.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn readable_log(
     paths: &Paths,
     config: &Config,
@@ -599,7 +599,7 @@ fn with_witnesses<T>(with: impl FnOnce(&mut std::collections::VecDeque<Answer>) 
 
 /// Forget what this thread remembers, as a process just started has: what it knows next is what
 /// the vault folder keeps ([`read_misses`]).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn forget_witnesses() {
     with_witnesses(std::collections::VecDeque::clear);
 }
@@ -730,7 +730,7 @@ fn keep_miss(paths: &Paths, miss: Answer) {
 
 /// Write beside the state a file that claims `claim` (a miss's byte, or one no build writes) for
 /// the search of `log` a writer at `paths` would run now.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn forge_kept_answer(paths: &Paths, log: &Log, claim: u8) {
     let reads = Reads::new(paths);
     let config = reads.config().unwrap().unwrap();
@@ -957,6 +957,9 @@ fn applied_stamp(
 
 /// Whether `log` holds every record the applied envelope was written at: the heads its stamp
 /// names, with their pasts. `true` where this Mac applied no stamped envelope.
+///
+/// Unix only, as its caller is ([`super::repair_legacy_frontier`]).
+#[cfg(unix)]
 pub(super) fn covers_applied_stamp(
     reads: &Reads<'_>,
     config: &Config,
@@ -3553,22 +3556,25 @@ pub use member::{
     Anchor, FIRST_ANCHOR, MemberEntry, MemberUnset, MemberWritten, OnBusy, RESEAL_REFUSAL, WaitFor,
     WriteRoute, member_set, member_unset, per_host_shadows, write_route,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) use member::{BEFORE_DRAFT, BEFORE_LAND, BEFORE_OUTCOME, UNSET_UNDER_OLD_EPOCH};
 #[cfg(any(test, debug_assertions))]
 pub use member::{TestPassClaim, test_hold_pass_claim};
 pub(crate) use member::{member_unset_names, member_waits_here, member_write};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) use waiting::pass_claim;
-#[cfg(test)]
+pub(super) use waiting::wait_files;
+#[cfg(all(test, unix))]
 pub(super) use waiting::{
     BASES_LOG_ONLY, BASES_WITHOUT_HELD, DRAFT_UNCLAIMED, DRAFTS_AT_ONCE, HELD_UNDEFERRED,
     MOVES_WAIT, NAMES_UNMERGED, OVERTAKEN_UNRECORDED, PASS_COMMITTED, PENDING_BY_COUNT,
-    RACE_UNDEFERRED, SETTLE_UNCARRIED, Shapes, TURN_WAITS, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING,
-    Values, WAITING_LOCK_TAKES, base_of, everyone_edit, held_values_or_unread, pending_reach,
-    waiting_and_pending, waiting_drafts, waiting_file, waiting_shapes, waiting_values, waits_over,
+    RACE_UNDEFERRED, SETTLE_UNCARRIED, Shapes, UNREAD_AS_NONE, VIEW_WITHOUT_WAITING, Values,
+    WAITING_LOCK_TAKES, base_of, pending_reach, waiting_and_pending, waiting_drafts, waiting_file,
+    waiting_shapes, waiting_values, waits_over,
 };
 pub use waiting::{Overtaken, Overtaker};
+#[cfg(test)]
+pub(super) use waiting::{TURN_WAITS, everyone_edit, held_values_or_unread};
 pub(super) use waiting::{
     Waiting, claim_draft, draft_turn, forget_unsent, forget_waiting, land_published, land_waiting,
     land_waiting_held, overlay_waiting_onto_document, overtaken_seen, read_overtaken,
@@ -6145,7 +6151,7 @@ pub fn remove_member_in_log(paths: &Paths, target: MemberId) -> crate::Result<Ve
     Ok(minted)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn retire_recipients_in_log_local(
     paths: &Paths,
     lock: &StateLock,
@@ -6407,7 +6413,7 @@ thread_local! {
 /// mints carries what 0.154.0's carry did and its passes heal no seat an epoch left out. A
 /// fixture builds the state 0.154.0 left a lab in with it, such as a Commons narrowing that
 /// leaves seated members out of control.
-#[cfg(any(test, debug_assertions))]
+#[cfg(all(unix, any(test, debug_assertions)))]
 pub(crate) fn as_0154<T>(f: impl FnOnce() -> T) -> T {
     use crate::membership_log::admission::OLD_GAP_RULE;
     let carry = OLD_CARRY.with(|cell| cell.replace(true));
@@ -8450,7 +8456,7 @@ fn read_gap_mark(paths: &Paths) -> Option<GapMark> {
 
 /// Each gap clock the mark holds, by epoch and recipient ([`GapSeen`]): what a conformance run
 /// reads of whether this Mac's closer has started a gap's ranks.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn gap_clocks(paths: &Paths) -> BTreeMap<(RecordId, String), GapSeen> {
     read_gap_mark(paths)
         .map(|mark| mark.seen)
@@ -8484,7 +8490,7 @@ fn write_gap_mark(
 
 /// The gap closer's mark at `paths` as a record landing leaves it: its heads digest no longer the
 /// log's, so the next pass looks again, and every gap's clock kept.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn gap_mark_after_a_record(paths: &Paths) {
     let mark = read_gap_mark(paths).expect("the gap closer's mark");
     write_gap_mark(paths, &[0xA5; 32], mark.due, &mark.seen).expect("the mark");

@@ -153,7 +153,20 @@ fn only_typed_words_and_the_agents_own_text_count() {
     assert_eq!(e.said.as_deref(), Some("the real answer"));
     let mut bang = rows;
     bang.push(user("<bash-input>git status</bash-input>"));
-    assert_eq!(texts(&excerpts(&bang)), ["! git status", "the real prompt"]);
+    let e = excerpts(&bang);
+    assert_eq!(texts(&e), ["! git status", "the real prompt"]);
+    assert_eq!(
+        e.prompts.iter().map(|p| p.shell).collect::<Vec<_>>(),
+        [true, false],
+        "a bash-mode entry is marked as a command line by its kind"
+    );
+    // CONTROL: a typed prompt that starts with `! ` is words to the agent.
+    let typed = excerpts(&[user("! not a shell command, a remark")]);
+    assert_eq!(texts(&typed), ["! not a shell command, a remark"]);
+    assert!(
+        typed.prompts.iter().all(|p| !p.shell),
+        "CONTROL: read from the kind, not the text"
+    );
 }
 
 /// Prompts are deduplicated by normalized content key and kept newest-first up to `PROMPTS_KEPT`.

@@ -4,16 +4,21 @@
 //! The node service's vault pass (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, §11 B10): no
 //! subscriber runs in any of these, as on a windowless Mac without one.
 
+#[cfg(unix)]
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
+#[cfg(unix)]
 use crate::client::log_entries_tests::{TwoMacs, hand, newcomer, two_macs};
 
 /// Far enough past any first sight for every rank's step and the settle grace.
+#[cfg(unix)]
 const PAST_EVERY_RANK: u64 = 1_000 * 60_000;
 
 /// A pace that looks at once: the wait for a pass to run is the test's hang detector, never this.
+#[cfg(unix)]
 const QUICK: NodePassPace = NodePassPace {
     every: Duration::from_secs(60),
     again: Duration::from_secs(5),
@@ -23,6 +28,7 @@ const QUICK: NodePassPace = NodePassPace {
 
 /// [`two_macs`], with m40 seated and m22's newest `[everyone]` and Commons epochs leaving it out:
 /// a gap on m22, which holds the keys. What m7 and m40 know stays out of it.
+#[cfg(unix)]
 fn a_gap_on_m22() -> (TwoMacs, Recipient) {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
     let (m22, m7) = (&macs.m22, &macs.m7);
@@ -44,6 +50,7 @@ fn a_gap_on_m22() -> (TwoMacs, Recipient) {
 
 /// Whether the last apply recorded `name` among what this Mac reads ([`State::held`]): the
 /// records alone hold a value before any pass applied it, so a read in place proves no pass ran.
+#[cfg(unix)]
 fn applied(paths: &Paths, name: &str) -> bool {
     load_state(paths)
         .ok()
@@ -52,12 +59,14 @@ fn applied(paths: &Paths, name: &str) -> bool {
 }
 
 /// Forget what this Mac's last apply recorded, as a state an older aterm wrote holds it.
+#[cfg(unix)]
 fn forget_held(paths: &Paths) {
     let mut state = load_state(paths).unwrap();
     state.held = None;
     save_state(paths, &state).unwrap();
 }
 
+#[cfg(unix)]
 fn wrapped(paths: &Paths, recipient: &Recipient) -> bool {
     load_records(paths)
         .unwrap()
@@ -67,10 +76,12 @@ fn wrapped(paths: &Paths, recipient: &Recipient) -> bool {
 }
 
 /// Sets its loop's stop when the test leaves it.
+#[cfg(unix)]
 struct Running<'scope> {
     stop: &'scope aterm_uds::stop::Stop,
 }
 
+#[cfg(unix)]
 impl Drop for Running<'_> {
     fn drop(&mut self) {
         self.stop.set();
@@ -79,6 +90,7 @@ impl Drop for Running<'_> {
 
 /// [`run_node_pass`] on `paths` on its own thread, its clock `clock`; `held` stands for the
 /// node's switches.
+#[cfg(unix)]
 fn spawn_pass<'scope>(
     scope: &'scope std::thread::Scope<'scope, '_>,
     paths: &'scope Paths,
@@ -119,6 +131,7 @@ fn spawn_pass<'scope>(
     Running { stop }
 }
 
+#[cfg(unix)]
 fn a_pass_ran_after(paths: &Paths, after_ms: u64) {
     aterm_spec::wait::until_within(
         aterm_spec::wait::MUST_HAPPEN,
@@ -131,6 +144,7 @@ fn a_pass_ran_after(paths: &Paths, after_ms: u64) {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn a_mac_with_no_subscriber_heals_a_gap_and_applies_a_new_record() {
     let (macs, m40) = a_gap_on_m22();
@@ -176,6 +190,7 @@ fn a_mac_with_no_subscriber_heals_a_gap_and_applies_a_new_record() {
 
 /// The negative control: the same gap, clock and record with the pass held, as `[swarm]` holds it
 /// or `MESH` off never starts it, and the gap stays and the new entry is not applied.
+#[cfg(unix)]
 #[test]
 fn a_held_pass_leaves_the_gap_and_applies_nothing() {
     let (macs, m40) = a_gap_on_m22();
@@ -209,6 +224,7 @@ fn a_held_pass_leaves_the_gap_and_applies_nothing() {
     assert_eq!(node_pass_receipt(m7), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_person_who_turned_the_agent_off_holds_the_pass() {
     let (macs, m40) = a_gap_on_m22();
@@ -233,6 +249,7 @@ fn a_person_who_turned_the_agent_off_holds_the_pass() {
     assert_eq!(node_pass_receipt(m22), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_stopped_node_does_not_make_inputs_or_start_convergence() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -255,6 +272,7 @@ fn a_stopped_node_does_not_make_inputs_or_start_convergence() {
     assert_eq!(node_pass_receipt(&macs.m7), None);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pass_waits_out_a_writer_and_then_heals() {
     let (macs, m40) = a_gap_on_m22();
@@ -286,6 +304,7 @@ fn a_pass_waits_out_a_writer_and_then_heals() {
     assert!(wrapped(m22, &m40));
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pass_past_its_wait_says_busy_and_reads_nothing_as_empty() {
     let (macs, m40) = a_gap_on_m22();
@@ -318,6 +337,7 @@ fn a_pass_past_its_wait_says_busy_and_reads_nothing_as_empty() {
     assert!(wrapped(m22, &m40), "once the writer went the pass healed");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_pass_is_due_on_a_new_record_on_its_timer_and_after_a_clock_set_back() {
     let stamp = |len: u64| {
@@ -346,6 +366,7 @@ fn a_pass_is_due_on_a_new_record_on_its_timer_and_after_a_clock_set_back() {
 /// The next timed pass counts from the look that read the clock, however long that look, its
 /// pass and the converge after it took.
 /// NEGATIVE CONTROL: a deadline counted from when the look ended comes that look's length late.
+#[cfg(unix)]
 #[test]
 fn a_passs_timer_counts_from_the_look_that_read_the_clock() {
     let wait = Duration::from_secs(60);
@@ -373,6 +394,7 @@ fn a_passs_timer_counts_from_the_look_that_read_the_clock() {
 
 /// A state no apply of this build recorded ([`State::held`] unset, as an older aterm wrote it) is
 /// applied again by the next pass, once per version: a pass that met it already does not loop.
+#[cfg(unix)]
 #[test]
 fn an_older_aterms_state_is_applied_again_once() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -397,6 +419,7 @@ fn an_older_aterms_state_is_applied_again_once() {
 
 /// An apply cut short (its state still `failed`) is finished by the next pass, with no new record.
 /// The subscriber's sync does the same through `failed`.
+#[cfg(unix)]
 #[test]
 fn an_apply_cut_short_is_finished_with_no_new_record() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -420,6 +443,7 @@ fn an_apply_cut_short_is_finished_with_no_new_record() {
 }
 
 /// A Mac that holds its vault as a log alone keeps the rule too, with no envelope to read.
+#[cfg(unix)]
 #[test]
 fn a_log_only_mac_applies_an_older_aterms_state_again_once() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -448,6 +472,7 @@ fn a_log_only_mac_applies_an_older_aterms_state_again_once() {
 
 /// A writer on the author's lock, which no look at the state sees, makes a due heal busy within
 /// the pass's wait: it never blocks in the lock past it.
+#[cfg(unix)]
 #[test]
 fn a_due_heal_under_the_authors_lock_says_busy_within_its_wait() {
     let (macs, m40) = a_gap_on_m22();
@@ -471,6 +496,7 @@ fn a_due_heal_under_the_authors_lock_says_busy_within_its_wait() {
 
 /// A pass that signed while the LAN stayed closed dials nothing, and owes its post to the first
 /// pass that may: the only way this Mac's server hears of it here.
+#[cfg(unix)]
 #[test]
 fn a_post_waits_for_the_lan_and_is_owed_until_it_is_made() {
     let (macs, m40) = a_gap_on_m22();
@@ -494,6 +520,7 @@ fn a_post_waits_for_the_lan_and_is_owed_until_it_is_made() {
 }
 
 /// The loop's wait after a pass that did not finish: soon, whatever the minute says.
+#[cfg(unix)]
 #[test]
 fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
     let (macs, _) = a_gap_on_m22();
@@ -552,6 +579,7 @@ fn a_busy_pass_in_the_loop_runs_again_soon_and_backs_off() {
 
 /// A version the pass applied starts one repair once the LAN allows. A subsequent relevant
 /// local-input change owes a refresh even when the signed records and wall clock stay fixed.
+#[cfg(unix)]
 #[test]
 fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -750,6 +778,7 @@ fn a_version_the_pass_applied_owes_one_converge_runner_once_the_lan_allows() {
 
 /// A pace whose timer never comes in a test, after a pass that finished or one that did not: a
 /// loop a bell rings looks only on what it hears.
+#[cfg(unix)]
 const FAR: NodePassPace = NodePassPace {
     every: Duration::from_secs(3_600),
     again: Duration::from_secs(3_600),
@@ -757,6 +786,7 @@ const FAR: NodePassPace = NodePassPace {
 };
 
 /// What a loop a bell rings did, in order.
+#[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Seen {
     /// A look: its read of the switches.
@@ -771,11 +801,13 @@ enum Seen {
 
 /// Changes of network a test makes by ringing `moved`. Each wait waits on what the loop waits on
 /// too, and notes itself and what it heard.
+#[cfg(unix)]
 struct TestRoutes<'a> {
     moved: &'a aterm_uds::ready::Doorbell,
     seen: &'a std::sync::Mutex<Vec<Seen>>,
 }
 
+#[cfg(unix)]
 impl super::super::member_routes::Changes for TestRoutes<'_> {
     fn wait(&mut self, deadline: Option<Instant>, also: &[BorrowedFd<'_>]) -> bool {
         self.seen.lock().unwrap().push(Seen::Wait(deadline));
@@ -792,6 +824,7 @@ impl super::super::member_routes::Changes for TestRoutes<'_> {
 
 /// [`run_node_pass_hearing`] on a Mac, its bell rung by its own watches and the test, its routes
 /// moved by the test, and each look and wait noted.
+#[cfg(unix)]
 struct Ringing<'a> {
     paths: &'a Paths,
     stop: aterm_uds::stop::Stop,
@@ -806,6 +839,7 @@ struct Ringing<'a> {
     pace: NodePassPace,
 }
 
+#[cfg(unix)]
 impl<'a> Ringing<'a> {
     fn new(paths: &'a Paths, held: bool) -> Self {
         Self {
@@ -918,6 +952,7 @@ impl<'a> Ringing<'a> {
 }
 
 /// A converge pass that ends at once, well: nothing it leaves owes a look sooner than its recheck.
+#[cfg(unix)]
 fn ended_well(
     root: &Path,
 ) -> impl Fn(crate::converge::RepositoryRequest) -> Option<aterm_uds::spawnfd::Child> {
@@ -928,6 +963,7 @@ fn ended_well(
 /// A held loop looks on its bell, and else only once a pass's wait, its backstop: the ring that
 /// lifts the hold runs the pass, after which the loop keeps its timer's deadline.
 /// NEGATIVE CONTROL: a wait that does not clear and read the bell spins on it and never looks.
+#[cfg(unix)]
 #[test]
 fn a_held_loop_waits_for_its_bell_and_its_backstop() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -987,6 +1023,7 @@ fn a_held_loop_waits_for_its_bell_and_its_backstop() {
 /// and no deadline come. The record comes once the off switch's watch's first look was told and
 /// looked at.
 /// NEGATIVE CONTROL: a loop that watched no records file waits out its hour-long timer.
+#[cfg(unix)]
 #[test]
 fn a_ringing_loop_hears_a_new_records_file() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1016,6 +1053,7 @@ fn a_ringing_loop_hears_a_new_records_file() {
 /// away once the records watch's first look was told and looked at, runs the pass with no
 /// deadline come.
 /// NEGATIVE CONTROL: a loop that watched no off switch waits out its hour-long backstop.
+#[cfg(unix)]
 #[test]
 fn a_ringing_loop_hears_its_off_switch_taken_away() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1044,6 +1082,7 @@ fn a_ringing_loop_hears_its_off_switch_taken_away() {
 /// go and finishes once the off switch's watch's first look was told and looked at.
 /// NEGATIVE CONTROL: a loop that watches no records while their layout names none waits out its
 /// hour-long retry.
+#[cfg(unix)]
 #[test]
 fn a_ringing_loop_hears_its_unfinished_records_layout_finished() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1135,6 +1174,7 @@ fn a_dead_brokers_retry_dials_again_without_a_look() {
 /// waiting again. It comes while the loop, its watch's first looks told and looked at, waits on a
 /// far deadline.
 /// NEGATIVE CONTROL: a wait that drops what its changes said waits again.
+#[cfg(unix)]
 #[test]
 fn a_change_of_network_owes_a_look() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1177,6 +1217,7 @@ fn a_change_of_network_owes_a_look() {
 /// come and no ring. It ends once the watch's first looks were told and looked at, and the ring
 /// that read the moved input was looked at too.
 /// NEGATIVE CONTROL: a wait that leaves the exit out waits out its timer and its recheck.
+#[cfg(unix)]
 #[test]
 fn a_runners_exit_owes_a_look() {
     let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
@@ -1264,6 +1305,7 @@ fn a_runners_exit_owes_a_look() {
 /// while it holds; a start the LAN lets through ends that backoff, and an exit is heard while its
 /// runner runs.
 /// NEGATIVE CONTROL: a `next_at` that takes the due's past retry wakes the loop each look.
+#[cfg(unix)]
 #[test]
 fn a_start_the_lan_holds_waits_on_the_lans_backoff() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1356,6 +1398,7 @@ fn a_start_the_lan_holds_waits_on_the_lans_backoff() {
     assert!(converge.exit().is_none(), "the look lets its exit go");
 }
 
+#[cfg(unix)]
 fn converge_program(root: &Path, name: &str, body: &str) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
@@ -1365,6 +1408,7 @@ fn converge_program(root: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
 fn ended_runner(exe: &Path) -> aterm_uds::spawnfd::Child {
     let mut child = crate::converge::start(
         exe,
@@ -1376,6 +1420,46 @@ fn ended_runner(exe: &Path) -> aterm_uds::spawnfd::Child {
     child
 }
 
+#[cfg(unix)]
+#[test]
+fn a_standing_row_parks_the_nodes_actual_runner_until_an_input_changes() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let standing = converge_program(
+        root.path(),
+        "standing",
+        &format!("exit {}", crate::converge::STANDING),
+    );
+    let calls = std::cell::Cell::new(0);
+    let start = |request: crate::converge::RepositoryRequest| {
+        assert_eq!(request.work(), crate::converge::RepositoryWork::Refresh);
+        calls.set(calls.get() + 1);
+        Some(ended_runner(&standing))
+    };
+    let mut converge = NodeConverge::default();
+    converge.tend_at(0, [None; 3], &|| true, &start);
+    converge.tend_at(1, [None; 3], &|| true, &start);
+    assert!(converge.runner.is_none());
+    assert!(converge.exit().is_none());
+    assert_eq!(converge.due.next_at(), None);
+    for at in [5_001, 60 * 60_000, 24 * 60 * 60_000] {
+        converge.tend_at(at, [None; 3], &|| true, &start);
+    }
+    assert_eq!(
+        calls.get(),
+        1,
+        "unchanged inputs never start another process"
+    );
+    converge
+        .due
+        .request(crate::converge::RepositoryRequest::Repair);
+    converge.tend_at(24 * 60 * 60_000 + 1, [None; 3], &|| true, &start);
+    converge.tend_at(24 * 60 * 60_000 + 2, [None; 3], &|| true, &start);
+    assert_eq!(calls.get(), 2, "one successor carries the standing refresh");
+    assert!(converge.runner.is_none());
+    assert_eq!(converge.due.next_at(), None);
+}
+
+#[cfg(unix)]
 #[test]
 fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold() {
     for code in [1, crate::converge::UNFINISHED] {
@@ -1448,6 +1532,7 @@ fn node_convergence_retries_unfinished_or_failed_runners_and_honors_the_lan_hold
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn node_convergence_coalesces_new_versions_while_a_runner_still_runs() {
     let root = aterm_tempfile::tempdir().unwrap();
@@ -1506,6 +1591,7 @@ fn a_mac_with_no_vault_gets_nothing_made() {
     assert!(!paths.dir.exists());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_receipt_reads_back_and_a_foreign_file_reads_as_none() {
     for receipt in [

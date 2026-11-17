@@ -910,6 +910,11 @@ pub(crate) enum PersonStamp {
     /// (`App::worker_job_seen`), which the tab's reading time counts from: `j<id> <age>`, whose
     /// nonnumeric id older readers ignore.
     JobSeen(u64),
+    /// The password sheet's spacing of the window that shows the session, where its quiet window
+    /// still runs (`askpass::Backoff::carried`): the streak of sheets that ended with no password
+    /// and the milliseconds of quiet left, `q<id> <streak>:<ms>`, whose nonnumeric id older
+    /// readers ignore. It holds no word of any prompt.
+    SheetQuiet { streak: u32, remaining_ms: u64 },
 }
 
 /// Write the person-stamps sidecar at `path`.
@@ -924,6 +929,10 @@ pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, Person
             PersonStamp::Untyped => format!("t{local_id} -\n"),
             PersonStamp::TypedAwake(age_ms) => format!("a{local_id} {age_ms}\n"),
             PersonStamp::JobSeen(age_ms) => format!("j{local_id} {age_ms}\n"),
+            PersonStamp::SheetQuiet {
+                streak,
+                remaining_ms,
+            } => format!("q{local_id} {streak}:{remaining_ms}\n"),
         })
         .collect();
     write_private_new(path, body.as_bytes()).is_some()
@@ -961,6 +970,17 @@ pub(crate) fn take_person_stamps(
             }
             if let Some(seen) = local_id.strip_prefix('j') {
                 return Some((uint(seen)?, PersonStamp::JobSeen(uint(age)?)));
+            }
+            if let Some(quiet) = local_id.strip_prefix('q') {
+                let (streak, remaining_ms) = age.split_once(':')?;
+                let streak = u32::try_from(uint(streak)?).ok().filter(|s| *s > 0)?;
+                return Some((
+                    uint(quiet)?,
+                    PersonStamp::SheetQuiet {
+                        streak,
+                        remaining_ms: uint(remaining_ms)?,
+                    },
+                ));
             }
             let stamp = match age.strip_prefix('-') {
                 Some(unkeyed) => PersonStamp::Unkeyed(uint(unkeyed)?),

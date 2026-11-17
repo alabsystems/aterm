@@ -25,6 +25,10 @@
 //!   ([`STEPS_ANNOUNCED`]).
 //! - Elsewhere [`WallWatch::start`] answers `None` and the owner keeps looking.
 //!
+//! A watch made by [`WallWatch::start_zoned`] also hears the local time zone set
+//! ([`Moved::zoned`]): libnotify's `com.apple.system.timezone` on macOS, a new `/etc/localtime`
+//! on Linux, nothing on Windows.
+//!
 //! A loop polls [`WallWatch::fds`] (readable means "something moved"; on Windows it waits on
 //! `WallWatch::bell`) and then calls [`WallWatch::take`], which empties every descriptor
 //! before it says what moved, so a move announced during the caller's reaction polls ready at
@@ -57,13 +61,16 @@ pub struct Moved {
     /// How long the system slept, when a will-sleep was heard before the wake: the wall clock's
     /// run past the monotonic one between the two.
     pub slept: Option<Duration>,
+    /// The local time zone was set, on a watch that hears it ([`WallWatch::start_zoned`]): the
+    /// wall clock reads another local hour at the same instant.
+    pub zoned: bool,
 }
 
 impl Moved {
     /// Whether anything moved.
     #[must_use]
     pub const fn any(&self) -> bool {
-        self.stepped || self.woke
+        self.stepped || self.woke || self.zoned
     }
 }
 
@@ -73,6 +80,8 @@ struct Heard {
     bell: Doorbell,
     stepped: AtomicBool,
     woke: AtomicBool,
+    /// A test's hand told a zone change ([`WallWatch::tell`]).
+    zoned: AtomicBool,
     /// Both clocks at the will-sleep, until its wake reads them.
     asleep_at: Mutex<Option<(Instant, SystemTime)>>,
     /// The sleep the last wake measured, until [`WallWatch::take`] hands it out.
@@ -85,6 +94,7 @@ impl Heard {
             bell: Doorbell::new()?,
             stepped: AtomicBool::new(false),
             woke: AtomicBool::new(false),
+            zoned: AtomicBool::new(false),
             asleep_at: Mutex::new(None),
             slept: Mutex::new(None),
         })
@@ -141,6 +151,7 @@ impl Heard {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
+            zoned: self.zoned.swap(false, Ordering::SeqCst),
         }
     }
 }
@@ -165,6 +176,9 @@ pub struct WallWatch {
     heard: Arc<Heard>,
     /// The system's own step announcement, where it has one.
     steps: Option<imp::Steps>,
+    /// The system's announcement of a new local time zone, on a watch started for it
+    /// ([`Self::start_zoned`]).
+    zone: Option<imp::Zone>,
     /// The sleep and wake listener; it hears until dropped.
     _power: Option<imp::Listening>,
     /// Whether a sleep's wake reaches this watch ([`Self::hears_sleep`]).
@@ -178,25 +192,42 @@ impl WallWatch {
     /// ([`Self::hears_sleep`]).
     #[must_use]
     pub fn start() -> Option<Self> {
+        Self::start_with(None)
+    }
+
+    /// [`Self::start`], hearing a change of the local time zone too ([`Moved::zoned`]): on macOS
+    /// libnotify's `com.apple.system.timezone`, which the system posts when its zone is set; on
+    /// Linux a new `/etc/localtime` (`timedatectl set-timezone` renames a link over it); not on
+    /// Windows. `None` where the system announces none of the three.
+    #[must_use]
+    pub fn start_zoned() -> Option<Self> {
+        Self::start_with(imp::Zone::start())
+    }
+
+    fn start_with(zone: Option<imp::Zone>) -> Option<Self> {
         let heard = Arc::new(Heard::new().ok()?);
         let steps = imp::Steps::start();
         let power = imp::power(&heard);
-        Self::of(heard, steps, power)
+        Self::of(heard, steps, power, zone)
     }
 
-    /// The watch the registered halves make, `None` where neither registered.
+    /// The watch the registered announcements make, `None` where none of them registered. Its
+    /// hearing of a sleep is its power half's, or its steps' where a resume is a step; a zone
+    /// announcement hears no sleep.
     fn of(
         heard: Arc<Heard>,
         steps: Option<imp::Steps>,
         power: Option<imp::Listening>,
+        zone: Option<imp::Zone>,
     ) -> Option<Self> {
-        if steps.is_none() && power.is_none() {
+        if steps.is_none() && power.is_none() && zone.is_none() {
             return None;
         }
         let hears_sleep = power.is_some() || (STEPS_TELL_A_RESUME && steps.is_some());
         Some(Self {
             heard,
             steps,
+            zone,
             _power: power,
             hears_sleep,
         })
@@ -212,6 +243,7 @@ impl WallWatch {
         Ok(Self {
             heard: Arc::new(Heard::new()?),
             steps: None,
+            zone: None,
             _power: None,
             hears_sleep: true,
         })
@@ -222,7 +254,12 @@ impl WallWatch {
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn steps_only() -> Option<Self> {
-        Self::of(Arc::new(Heard::new().ok()?), imp::Steps::start(), None)
+        Self::of(
+            Arc::new(Heard::new().ok()?),
+            imp::Steps::start(),
+            None,
+            None,
+        )
     }
 
     /// Whether this watch hears a sleep's wake: its power half registered (macOS, Windows), or
@@ -246,6 +283,7 @@ impl WallWatch {
         }
         self.heard.stepped.fetch_or(moved.stepped, Ordering::SeqCst);
         self.heard.woke.fetch_or(moved.woke, Ordering::SeqCst);
+        self.heard.zoned.fetch_or(moved.zoned, Ordering::SeqCst);
         self.heard.bell.ring();
     }
 
@@ -255,6 +293,7 @@ impl WallWatch {
     pub fn fds(&self) -> Vec<BorrowedFd<'_>> {
         let mut fds = vec![self.heard.bell.fd()];
         fds.extend(self.steps.as_ref().map(imp::Steps::fd));
+        fds.extend(self.zone.as_ref().map(imp::Zone::fd));
         fds
     }
 
@@ -270,8 +309,10 @@ impl WallWatch {
     #[must_use]
     pub fn take(&self) -> Moved {
         let stepped = self.steps.as_ref().is_some_and(imp::Steps::take);
+        let zoned = self.zone.as_ref().is_some_and(imp::Zone::take);
         let mut moved = self.heard.take();
         moved.stepped |= stepped;
+        moved.zoned |= zoned;
         moved
     }
 }
@@ -290,6 +331,10 @@ mod imp {
 
     /// The name every `settimeofday` posts (`<notify_keys.h>`'s `kNotifyClockSet`).
     const CLOCK_SET: &CStr = c"com.apple.system.clock_set";
+
+    /// The name posted when the system's time zone is set (`<notify_keys.h>`'s
+    /// `kNotifyTimeZoneChange`).
+    const TIME_ZONE: &CStr = c"com.apple.system.timezone";
 
     /// `NOTIFY_STATUS_OK`.
     const OK: u32 = 0;
@@ -394,6 +439,24 @@ mod imp {
             // SAFETY: the token this registration owns, cancelled once; libnotify closes its
             // descriptor with it.
             let _ = unsafe { notify_cancel(self.token) };
+        }
+    }
+
+    /// The registration for a new time zone: a [`Steps`] on [`TIME_ZONE`].
+    #[derive(Debug)]
+    pub(super) struct Zone(Steps);
+
+    impl Zone {
+        pub(super) fn start() -> Option<Self> {
+            Steps::on(TIME_ZONE).ok().map(Self)
+        }
+
+        pub(super) fn fd(&self) -> BorrowedFd<'_> {
+            self.0.fd()
+        }
+
+        pub(super) fn take(&self) -> bool {
+            self.0.take()
         }
     }
 
@@ -510,6 +573,77 @@ mod imp {
         }
     }
 
+    /// An inotify watch of `/etc`, which hears `/etc/localtime` made anew: `timedatectl
+    /// set-timezone` (and a package's `ln -sf`) renames a new link over it, and a watch of the
+    /// link itself would go with the old one.
+    #[derive(Debug)]
+    pub(super) struct Zone {
+        fd: OwnedFd,
+    }
+
+    impl Zone {
+        pub(super) fn start() -> Option<Self> {
+            let fd = crate::kept_out(|| {
+                // SAFETY: plain syscall; a non-negative result is a descriptor this call owns.
+                let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+                if fd < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: `fd` was just made and is owned by nobody else.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+            })
+            .ok()?;
+            /// `<sys/inotify.h>`'s bit for a write's close, which the generated libc does not carry.
+            const IN_CLOSE_WRITE: u32 = 0x0000_0008;
+            // SAFETY: the instance this owns and a NUL-terminated path.
+            let wd = unsafe {
+                libc::inotify_add_watch(
+                    fd.as_raw_fd(),
+                    c"/etc".as_ptr(),
+                    libc::IN_CREATE | libc::IN_MOVED_TO | IN_CLOSE_WRITE | libc::IN_DELETE,
+                )
+            };
+            (wd >= 0).then_some(Self { fd })
+        }
+
+        pub(super) fn fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+
+        /// Whether an event of `/etc` named `localtime` came since the last take: every event
+        /// read off, those of its other entries passed over.
+        pub(super) fn take(&self) -> bool {
+            /// `<sys/inotify.h>`'s event head: wd, mask, cookie, len (the generated libc carries
+            /// no `inotify_event`).
+            const HEAD: usize = 16;
+            let mut zoned = false;
+            let mut buf = [0_u8; 4096];
+            loop {
+                // SAFETY: reads into this frame's buffer from the instance this owns.
+                let read =
+                    unsafe { libc::read(self.fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+                let Ok(got) = usize::try_from(read) else {
+                    return zoned;
+                };
+                if got == 0 {
+                    return zoned;
+                }
+                let mut at = 0;
+                while at + HEAD <= got {
+                    let mut len = [0_u8; 4];
+                    len.copy_from_slice(&buf[at + 12..at + 16]);
+                    let len = usize::try_from(u32::from_ne_bytes(len)).unwrap_or(usize::MAX);
+                    let name = buf
+                        .get(at + HEAD..(at + HEAD).saturating_add(len).min(got))
+                        .unwrap_or_default();
+                    let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+                    zoned |= name == b"localtime";
+                    at = at.saturating_add(HEAD).saturating_add(len);
+                }
+            }
+        }
+    }
+
     /// Linux announces a resume on the timer itself: no listener.
     pub(super) fn power(_heard: &Arc<Heard>) -> Option<crate::power::Listening> {
         None
@@ -534,6 +668,24 @@ mod imp {
     pub(super) enum Steps {}
 
     impl Steps {
+        pub(super) fn start() -> Option<Self> {
+            None
+        }
+
+        pub(super) fn fd(&self) -> BorrowedFd<'_> {
+            match *self {}
+        }
+
+        pub(super) fn take(&self) -> bool {
+            match *self {}
+        }
+    }
+
+    /// Never made: nothing announces a new time zone here.
+    #[derive(Debug)]
+    pub(super) enum Zone {}
+
+    impl Zone {
         pub(super) fn start() -> Option<Self> {
             None
         }

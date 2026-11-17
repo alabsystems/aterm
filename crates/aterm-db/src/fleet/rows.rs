@@ -15,7 +15,7 @@
 
 use super::read::{At, Harness, How, Pair, State, Tally, Task};
 use crate::relation::{Cell, Row, Schema, col, opt};
-use crate::typed::{Member, Ty};
+use crate::typed::{Member, Ty, keys};
 use aterm_json::{Value, json};
 
 /// The status words of a machine row: the registry's, `retired` for a row its owner retired,
@@ -564,7 +564,7 @@ pub const SEEN_ON_MAX: usize = 64;
 pub struct AccountRow {
     pub account: String,
     pub provider: Option<String>,
-    /// Its label: the short name a person calls it by.
+    /// Its slug (`alab::account_names`): the one word every command names it by.
     pub slug: Option<String>,
     /// Its login address, held as the registry holds it and printed as it is.
     pub login: Option<String>,
@@ -638,7 +638,11 @@ pub static ACCOUNTS: Schema = Schema {
     columns: &[
         col("account", Ty::Key, "registry key"),
         opt("provider", Ty::Key, "its provider"),
-        opt("slug", Ty::AccountLabel(32), "its label"),
+        opt(
+            "slug",
+            Ty::Handle(keys::MAX_SLUG),
+            "its slug, the one word every command names it by",
+        ),
         opt("login", Ty::Email, "its login address"),
         opt("status", Ty::Enum(ACCOUNT_STATUS), "registry status"),
         opt(

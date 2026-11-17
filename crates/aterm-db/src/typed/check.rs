@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Reference and unique rules and findings (design §6). A table is one causal domain, so no foreign
-//! key or unique constraint is atomic against a concurrent writer and nothing cascades: every write
-//! this Mac authors, on any path, is refused when, with the write landed on its own view, a
-//! reference it makes names a row that view does not hold, two live rows come to share a declared
-//! unique set, a row live rows reference is retired, or a live row comes to name a row that is not
-//! live ([`refused`]); and every reader re-checks the converged rows and reports what it finds
-//! ([`findings`]), what concurrent writes left among them. A finding or refusal names collections,
-//! keys and columns, never a value, so an address never reaches a report.
+//! Reference and unique rules and findings (design §6). A table is one causal domain, so no
+//! foreign key or unique constraint is atomic against a concurrent writer and nothing cascades:
+//! every write this Mac authors, on any path, is refused when, with the write landed on its own
+//! view, a reference it makes names a row that view does not hold, two live rows come to share
+//! a declared unique set, a row live rows reference is retired, or a live row comes to name a
+//! row that is not live ([`refused`]); an owner write is refused too when it writes a fixed
+//! column of a row already born ([`fixed_after_birth`]); and every reader re-checks the
+//! converged rows and reports what it finds ([`findings`]), what concurrent writes left among
+//! them. A finding or refusal names collections, keys and columns, never a value, so an address
+//! never reaches a report.
 
 use super::{
     Collection, Column, Kind, Refused, Table, Ty, View,
@@ -452,6 +454,70 @@ pub fn unique_clash(table: &Table, rows: &[Vec<Change>], cells: &Cells) -> Optio
                     ),
                 });
             }
+        }
+    }
+    None
+}
+
+/// The first change of an owner write's `rows` that writes a `fixed` column of a row `cells`
+/// (the table as the writer reads it) has already born: its lifecycle register holds a value. A
+/// fixed column is written once, at the row's birth, in the record that writes its lifecycle;
+/// the authority rules hold any later write to one inert on every read (rule 4,
+/// `typed::authority`), so this build never signs one that would change it. A row a revert
+/// returned to unborn (its lifecycle's absence restored) may be born again; a revert that
+/// restores a fixed cell's absence, and a write that restates the one value the cell holds (a
+/// revert of a record whose write there was inert restores just that), ask for no rule.
+pub fn fixed_after_birth(table: &Table, rows: &[Vec<Change>], cells: &Cells) -> Option<Refused> {
+    for change in rows.iter().flatten() {
+        let Some(schema) = table
+            .collection(&change.collection)
+            .filter(|c| c.kind == Kind::Cells)
+        else {
+            continue;
+        };
+        if change.value.as_ref().is_none_or(aterm_json::Value::is_null) {
+            continue;
+        }
+        let Ok(key) = CellKey::parse(&change.key) else {
+            continue;
+        };
+        if key.elem.is_some() || !schema.column(key.col).is_some_and(|column| column.fixed) {
+            continue;
+        }
+        let x = |value: &aterm_json::Value| CellValue::decode(value).ok().map(|value| value.x);
+        let restates = cells
+            .get(&(schema.name.to_owned(), change.key.clone()))
+            .is_some_and(|register| match register.candidates.as_slice() {
+                [held] => change
+                    .value
+                    .as_ref()
+                    .and_then(x)
+                    .is_some_and(|new| x(&held.value) == Some(new)),
+                _ => false,
+            });
+        if restates {
+            continue;
+        }
+        let born = cells
+            .get(&(
+                schema.name.to_owned(),
+                format!("{}.{}", key.pk, super::LIFECYCLE),
+            ))
+            .is_some_and(|register| {
+                register
+                    .candidates
+                    .iter()
+                    .any(|candidate| !candidate.value.is_null())
+            });
+        if born {
+            return Some(Refused {
+                collection: schema.name,
+                pk: key.pk.to_owned(),
+                column: key.col.to_owned(),
+                rule: "this column is written once, at the row's birth; end this row and add \
+                       another"
+                    .to_owned(),
+            });
         }
     }
     None

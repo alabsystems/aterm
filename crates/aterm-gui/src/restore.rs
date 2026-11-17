@@ -1995,6 +1995,20 @@ pub(crate) struct WindowLayout {
     /// (`crate::app_window::birth_dock`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dock: Option<u16>,
+    /// The shown `dock` record was the default's, not a person's Show
+    /// (`crate::app_window::Dock::by_default`): `[navigator] dock` decides it at the next birth
+    /// as it decides an undecided window, and a person's Show is kept whatever it says. Absent
+    /// is false, so a row written before this field reads as a person's Show; a build that
+    /// predates the field ignores it and reads the record as shown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dock_by_default: bool,
+    /// The scale factor the row's physical px (`outer_x`, `outer_y`, `inner_px`) were read at,
+    /// the window's own at capture. On macOS a window's px are its points times its own scale,
+    /// so on displays of different scale the px alone do not say which display an origin lies
+    /// on (`crate::app_window::DesktopPlane`). Absent in a row from before it, or from a capture
+    /// with no OS window; a reader then takes the window's scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
 }
 
 impl WindowLayout {
@@ -2209,6 +2223,8 @@ impl WindowLayout {
     pub(crate) const fn lone_workers_list(rows: u16, cols: u16) -> Self {
         Self {
             dock: None,
+            dock_by_default: false,
+            scale: None,
             rows,
             cols,
             active_tab: 0,
@@ -2230,6 +2246,8 @@ impl WindowLayout {
     const fn spill_of(donor: &Self) -> Self {
         Self {
             dock: donor.dock,
+            dock_by_default: donor.dock_by_default,
+            scale: donor.scale,
             rows: donor.rows,
             cols: donor.cols,
             active_tab: 0,
@@ -2827,6 +2845,8 @@ impl RestoreManifest {
     pub(crate) fn one_terminal_for_test(log_ep: Option<u32>) -> RestoreManifest {
         RestoreManifest::new(vec![WindowLayout {
             dock: None,
+            dock_by_default: false,
+            scale: None,
             rows: 24,
             cols: 80,
             active_tab: 0,
@@ -2988,29 +3008,30 @@ impl AdmittedWindows {
 pub(crate) fn bootstrap_dock(
     manifest: Option<&RestoreManifest>,
     carried_origin: Option<(i32, i32)>,
-) -> (Option<u16>, crate::app_window::DockBirth) {
+) -> crate::app_window::DockRow {
     let Some(manifest) = manifest else {
-        return (None, crate::app_window::DockBirth::default());
+        return crate::app_window::DockRow::default();
     };
     match manifest.windows.first() {
         Some(row) => {
-            let birth = crate::app_window::DockBirth::of_row(row);
-            (
-                row.dock,
-                crate::app_window::DockBirth {
-                    origin: carried_origin.or(birth.origin),
-                    ..birth
+            let of_row = crate::app_window::DockRow::of(row);
+            crate::app_window::DockRow {
+                birth: crate::app_window::DockBirth {
+                    origin: carried_origin.or(of_row.birth.origin),
+                    ..of_row.birth
                 },
-            )
+                ..of_row
+            }
         }
-        None => (
-            None,
-            crate::app_window::DockBirth {
+        None => crate::app_window::DockRow {
+            birth: crate::app_window::DockBirth {
                 restored: true,
                 held: false,
                 origin: carried_origin,
+                scale: None,
             },
-        ),
+            ..crate::app_window::DockRow::default()
+        },
     }
 }
 

@@ -8,11 +8,11 @@
 //! the first unblocked tick, with no wait for a person. The row, headline and notes rules here
 //! are the page's model; [`lines`] says what the screen says from them and [`page`] draws it.
 
-mod kitty;
 pub(crate) mod lines;
 mod lockup;
 pub(crate) mod marks;
 mod page;
+mod prebake;
 pub(crate) mod repositories;
 
 use std::cell::{Cell, RefCell};
@@ -37,7 +37,21 @@ use crate::native_ui::{UiKey, UiTree};
 use crate::system_state_host::PhraseOutcome;
 use crate::workstation_setup::{Request, SetupAnswer, WorkstationSetupDecision};
 
-pub(crate) use lockup::{LockupSpec, paint_lockup};
+#[cfg(test)]
+pub(crate) use lockup::LockupSpec;
+pub(crate) use lockup::{LockupPaint, paint_lockup};
+
+/// The last System State view closed: the lockup's queued bakes and every image and mask kept
+/// for it go, until a page asks again.
+pub(crate) fn release_lockup_images() {
+    prebake::release();
+}
+
+/// Whether any System State view is on screen (its tab in front, its window neither minimised
+/// nor covered): hidden, the lockup's images and queued bakes go, and come back as it shows.
+pub(crate) fn lockup_shown(shown: bool) {
+    prebake::set_shown(shown);
+}
 #[cfg(any(test, feature = "bench-support"))]
 pub(crate) use marks::working_spinner;
 pub(crate) use marks::{paint_mark, paint_surface};
@@ -2129,6 +2143,14 @@ fn row_view_current(
     // waiting row is never without one ([`WAITING_NOTE`]).
     let explained = || reading.and_then(|o| o.note.clone().or_else(|| o.detail.clone()));
     let mut note = reading.and_then(|o| o.note.clone());
+    // The broker makes app TCC optional, but a current diagnostic may still offer the
+    // person's explicit System Settings route. Neither history nor an in-flight read does.
+    let optional_settings = (subject == Subject::Access(Access::LocalNetwork)
+        && standing == Some(Standing::NotNeeded)
+        && previous.is_none()
+        && !status.unconfirmed_observations.contains(&subject)
+        && status.observation_progress(subject, vault_url).is_none())
+    .then_some(Access::LocalNetwork);
     if !group_set_up && !managed {
         return RowView {
             subject,
@@ -2158,7 +2180,7 @@ fn row_view_current(
             value: RowValue::Muted(if offered { OFFERED_WORD } else { "Not needed" }.to_owned()),
             chip: None,
             note: note.filter(|note| !note.trim().is_empty()),
-            open: None,
+            open: optional_settings,
             turn_on_sync: false,
             install_tools: false,
             standing,
@@ -3459,7 +3481,7 @@ impl Steps {
 ///
 /// The working spinner is not this wake's: it is a moving node ([`crate::native_ui::NodeMotion`]),
 /// stepped by the window's own motion tick under the page's motion policy (§5.1, §5.5). The
-/// lockup's glide is SCR-3's; until it lands the caret and kitty jump to where the run stands,
+/// lockup's glide is SCR-3's; until it lands the cat and its road jump to where the run stands,
 /// and this rule holds the idle wake at zero and motion off the typing path.
 pub(crate) const fn page_owes_animation_wake(
     running: bool,
@@ -3506,9 +3528,13 @@ pub(crate) struct SystemStateViewState {
     /// page can show; the person opens one at a time.
     #[cfg(test)]
     every_line_open: Cell<bool>,
-    /// The kitty pose this view's lockup drew last, which it keeps until the next one is baked
-    /// ([`kitty::pose_to_draw`]).
-    kitty_pose: Cell<Option<aterm_effects::pet_glyphs_gen::PetGlyphId>>,
+    /// The road and the cat this view's lockup painted last, as baked (their moment, width and
+    /// scale), which it keeps painting until the next moment's images are kept
+    /// ([`lockup::LockupSpec::paint`]).
+    lockup_drawn: Cell<Option<lockup::Baked>>,
+    /// This view's part in what the lockup's worker bakes and keeps: what it wants, what it
+    /// drew; it goes with the view.
+    lockup_requester: prebake::Requester,
 }
 
 impl SystemStateViewState {
@@ -3835,6 +3861,15 @@ struct Awaiting {
     changed: Option<Selection>,
 }
 
+/// One reading's previous card, for display only. It neither supplies observations nor
+/// survives a change of plan or source; a later reading replaces it rather than growing history.
+struct CheckCard {
+    plan: Plan,
+    source: Option<String>,
+    headline: String,
+    items: Vec<lines::CardItem>,
+}
+
 pub(crate) struct SystemStateApp {
     /// The plan the page shows: the groups as the person (or the offer) set
     /// them.
@@ -3863,6 +3898,7 @@ pub(crate) struct SystemStateApp {
     /// The person's own disclosure of the vault fields; `None` follows the row.
     vault_open: Option<bool>,
     status: SetupStatus,
+    check_card: Option<CheckCard>,
     repositories: Vec<aterm_repository_progress::Progress>,
     request: Option<Request>,
     /// The offer in `request` waits for the page's own answer, which the page gives on its
@@ -4066,6 +4102,7 @@ impl SystemStateApp {
             phrase_came_to: None,
             vault_open: None,
             status: SetupStatus::default(),
+            check_card: None,
             repositories: Vec::new(),
             request: None,
             answer_waits: false,
@@ -4127,6 +4164,7 @@ impl SystemStateApp {
         self.submitted = self.plan.clone();
         self.url = TextInputState::new(self.plan.vault_url.clone());
         self.password = Password::default();
+        self.check_card = None;
         self.status = self.status.for_new_offer();
         self.request = Some(request);
         self.answer_waits = true;
@@ -4143,6 +4181,27 @@ impl SystemStateApp {
     /// nothing the page sent waits for the worker (and no offer is up); a
     /// vault address being typed stays as typed.
     pub(crate) fn publish(&mut self, status: SetupStatus) -> bool {
+        // An ordinary focus read has no Check action. Capture its previous presentation before
+        // adopting incoming state, including a first publication already carrying an unread
+        // early batch. An unrelated subset read leaves current controls alone.
+        if self.check_card.is_none()
+            && !status.observing.is_empty()
+            && let Some(card) = self.card_snapshot()
+            && card
+                .items
+                .iter()
+                .flat_map(lines::CardItem::subjects)
+                .any(|subject| {
+                    let source = Some(card.plan.vault_url.as_str());
+                    let begins = status.observation_progress(subject, source).is_some()
+                        && self.status.observation_progress(subject, source).is_none();
+                    let loses_reading = status.unconfirmed_observations.contains(&subject)
+                        && !self.status.unconfirmed_observations.contains(&subject);
+                    begins || loses_reading
+                })
+        {
+            self.check_card = Some(card);
+        }
         self.repositories.clone_from(&status.repositories);
         let mut changed = self.status != status;
         if self.request.is_none()
@@ -4170,6 +4229,17 @@ impl SystemStateApp {
             self.vault_open = None;
         }
         self.status = status;
+        if self.check_card.is_some() {
+            let rows = page::page_rows(self);
+            let current = lines::current_card_items(self, &rows);
+            if !self.card_refreshing()
+                || !self.check_card_current(&rows)
+                || self.new_card_problem(&rows, &current)
+            {
+                self.check_card = None;
+                changed = true;
+            }
+        }
         // The phrase field hid (the row no longer asks ALab's members): a phrase typed in it is
         // wiped, never kept for a field that is gone.
         if !self.phrase_asked() && !self.phrase.value().is_empty() {
@@ -4276,8 +4346,143 @@ impl SystemStateApp {
         let rows = page::page_rows(self);
         lines::card_items(self, &rows)
             .into_iter()
+            .filter(|item| !item.retained)
             .filter_map(|item| item.button.map(|button| button.key))
             .collect()
+    }
+
+    fn card_refreshing(&self) -> bool {
+        (self.status.busy && self.status.operation == Some(SetupOperation::Check))
+            || !self.status.observing.is_empty()
+    }
+
+    fn card_snapshot(&self) -> Option<CheckCard> {
+        let rows = page::page_rows(self);
+        let visible = lines::card_items(self, &rows);
+        let headline = lines::hero(self, &rows, &visible).headline;
+        let items: Vec<_> = visible
+            .into_iter()
+            .map(|mut item| {
+                item.retained = false;
+                item
+            })
+            .collect();
+        (!items.is_empty()).then(|| CheckCard {
+            plan: self.reviewed_plan(),
+            source: self.status.observed_vault_url.clone(),
+            headline,
+            items,
+        })
+    }
+
+    fn check_card_current(&self, rows: &[RowView]) -> bool {
+        self.check_card.as_ref().is_some_and(|card| {
+            self.plan_known
+                && !self.status.newer()
+                && !self.held()
+                && self.reviewed_plan() == card.plan
+                && self.status.observed_vault_url.as_deref().map(str::trim)
+                    == card.source.as_deref().map(str::trim)
+                && card
+                    .items
+                    .iter()
+                    .flat_map(lines::CardItem::subjects)
+                    .all(|subject| rows.iter().any(|row| row.subject == subject && row.managed))
+        })
+    }
+
+    /// Preserve the card's seats during a reading, without giving its old requirements or controls
+    /// current authority. Current failures, holds and changes of source always win.
+    fn card_with_history(
+        &self,
+        rows: &[RowView],
+        current: Vec<lines::CardItem>,
+    ) -> Vec<lines::CardItem> {
+        if self.card_refreshing()
+            && self.check_card_current(rows)
+            && !rows
+                .iter()
+                .any(|row| row.standing == Some(Standing::Failed))
+            && !current.iter().any(|item| item.mark == lines::Mark::Failed)
+            && !self.new_card_problem(rows, &current)
+        {
+            let mut items = self.check_card.as_ref().unwrap().items.clone();
+            for item in &mut items {
+                item.retained = true;
+            }
+            items
+        } else {
+            current
+        }
+    }
+
+    fn new_card_problem(&self, rows: &[RowView], current: &[lines::CardItem]) -> bool {
+        self.check_card.as_ref().is_some_and(|card| {
+            let previous_steps: Vec<_> = card
+                .items
+                .iter()
+                .flat_map(|item| &item.password_steps)
+                .collect();
+            let current_steps: Vec<_> = current
+                .iter()
+                .flat_map(|item| &item.password_steps)
+                .collect();
+            let same_password_requests = !current_steps.is_empty()
+                && current_steps
+                    .iter()
+                    .all(|step| previous_steps.contains(step))
+                && previous_steps
+                    .iter()
+                    .filter(|step| !current_steps.contains(step))
+                    .all(|step| {
+                        rows.iter().any(|row| {
+                            row.subject == step.subject
+                                && row.standing == Some(Standing::Unknown)
+                                && (self.status.unconfirmed_observations.contains(&row.subject)
+                                    || self
+                                        .status
+                                        .observation_progress(
+                                            row.subject,
+                                            Some(card.plan.vault_url.as_str()),
+                                        )
+                                        .is_some())
+                        })
+                    });
+            current.iter().any(|item| {
+                matches!(item.mark, lines::Mark::Failed | lines::Mark::NeedsYou)
+                    && !card.items.contains(item)
+                    && !(item.mark == lines::Mark::NeedsYou
+                        && !item.password_steps.is_empty()
+                        && same_password_requests)
+            }) || rows.iter().any(|row| {
+                row.standing == Some(Standing::Failed)
+                    && !card.items.iter().any(|item| {
+                        item.mark == lines::Mark::Failed && item.subject == Some(row.subject)
+                    })
+            })
+        })
+    }
+
+    fn retained_card_control(&self, key: &str) -> bool {
+        if self.check_card.is_none() {
+            return false;
+        }
+        let rows = page::page_rows(self);
+        lines::card_items(self, &rows).iter().any(|item| {
+            item.retained
+                && (item
+                    .button
+                    .as_ref()
+                    .is_some_and(|button| button.key == key || button.action == key)
+                    || (item.phrase && matches!(key, PHRASE_FIELD | PHRASE_JOIN))
+                    || (item.vault
+                        && matches!(
+                            key,
+                            "system-state/url"
+                                | "system-state/password"
+                                | "system-state/vault/join"
+                        )))
+        })
     }
 
     /// When the page next does something by itself, for the window's wake: `None` while nothing
@@ -4547,6 +4752,7 @@ impl SystemStateApp {
     /// and leaves a draft where it is. `changed` is what the worker takes of the plan onto the
     /// plan in force ([`SetupAnswer::changed`]).
     fn apply(&mut self, admission: Admission, submission: Submission, changed: Option<Selection>) {
+        self.check_card = None;
         let with_vault = submission == Submission::Join;
         let mut plan = self.plan.clone();
         plan.vault_url = if with_vault {
@@ -4672,6 +4878,7 @@ impl SystemStateApp {
     /// for a press the worker lifts every stage aterm parked (init-on-by-default design §6.5).
     fn check_again(&mut self, by: crate::CheckBy) {
         let plan = self.reviewed_plan();
+        self.check_card = self.card_snapshot();
         // A press waiting for another setup keeps its words: the reading goes beside it.
         if !self.status.queued {
             self.status.busy = true;
@@ -4782,6 +4989,14 @@ impl SystemStateApp {
     /// phrase is out, whether or not a run goes (the join is no part of one); the vault's own
     /// fields while they are editable ([`Self::vault_editable`]).
     fn takes_words(&self, view: &SystemStateViewState) -> bool {
+        let key = match view.common.last_focus.as_ref().map(UiKey::as_str) {
+            Some(PHRASE_FIELD) => PHRASE_FIELD,
+            Some("system-state/password") => "system-state/password",
+            _ => "system-state/url",
+        };
+        if self.retained_card_control(key) {
+            return false;
+        }
         if view
             .common
             .last_focus
@@ -4835,6 +5050,9 @@ impl SystemStateApp {
     /// One text input to the vault field `key`: `false` when `key` names
     /// no vault field. Return in the phrase field joins with it, as its Join does.
     fn field_event(&mut self, key: &str, event: TextInputEvent) -> bool {
+        if self.retained_card_control(key) {
+            return false;
+        }
         // Return in the vault's address or password joins, as its Join does.
         if matches!(key, "system-state/url" | "system-state/password")
             && event == TextInputEvent::Submit
@@ -4884,6 +5102,9 @@ impl SystemStateApp {
 
     /// One pressed control of the page.
     fn act(&mut self, view: &mut SystemStateViewState, key: &str, value: Option<SemanticInput>) {
+        if self.retained_card_control(key) {
+            return;
+        }
         if repositories::act(view, key) {
             return;
         }
@@ -4935,6 +5156,7 @@ impl SystemStateApp {
                 // Asked once: the worker keeps it, so a run that has not
                 // shown up yet stops once it does.
                 self.stopping = true;
+                self.check_card = None;
                 self.actions.push_back(SystemStateAction::Stop);
             }
             "system-state/check" if self.can_check() => self.check_again(crate::CheckBy::Press),
@@ -5384,7 +5606,13 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
     let in_place = || -> Vec<Observation> {
         Subject::all()
             .into_iter()
-            .map(|subject| read(subject, InPlace, Some(subject.wanted())))
+            .map(|subject| {
+                if subject == Subject::Access(Access::LocalNetwork) {
+                    read(subject, NotNeeded, Some("Handled by network helper"))
+                } else {
+                    read(subject, InPlace, Some(subject.wanted()))
+                }
+            })
             .collect()
     };
     let with = |mut all: Vec<Observation>, changes: Vec<Observation>| {
@@ -5748,10 +5976,6 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
         "required-access" | "required-password" => {
             status.observed = in_place();
             for (access, why) in [
-                (
-                    Access::LocalNetwork,
-                    "Allow aterm in macOS Local Network settings.",
-                ),
                 (
                     Access::NetworkAuth,
                     "Approve this Mac on an authorized ALab Mac.",
